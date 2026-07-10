@@ -20,6 +20,7 @@
 - Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
 - Preserved the employee-selected AWS profile and Region for CLI, SDK, and MCP processes while keeping Coreforge's managed inference profile model-only.
 
+- Clarified that `coreforge update` must run at the terminal prompt after exiting Coreforge, not as a chat message.
 - Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.
 
 - Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
@@ -340,6 +341,11 @@
 ### Removed
 
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers
+### Changed
+
+- Changed Coreforge startup update checks to compare independently versioned Coreforge product releases while keeping direct `omp update` on the fork engine release channel.
+- Changed Coreforge product update checks to honor opt-in `COREFORGE_UPDATE_CHANNEL=beta` and compare published beta and stable releases with SemVer precedence.
+
 
 ## [17.0.2] - 2026-07-17
 

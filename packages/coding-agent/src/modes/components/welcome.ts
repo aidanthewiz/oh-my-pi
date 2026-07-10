@@ -7,7 +7,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
-import { APP_NAME } from "@oh-my-pi/pi-utils";
+import { CF_BRAND } from "../../cli/cf-version";
 import { getCoreforgeGreetingName } from "../../identity/greeting";
 import { theme } from "../../modes/theme/theme";
 import tipsText from "./tips.txt" with { type: "text" };
@@ -137,7 +137,7 @@ export interface LspServerInfo {
 }
 
 /**
- * Premium welcome screen with block-based OMP logo and two-column layout.
+ * Premium welcome screen with a Coreforge hammer and two-column layout.
  */
 export class WelcomeComponent implements Component {
 	#animStart: number | null = null;
@@ -151,8 +151,6 @@ export class WelcomeComponent implements Component {
 
 	constructor(
 		private readonly version: string,
-		private modelName: string,
-		private providerName: string,
 		private recentSessions: RecentSession[] = [],
 		private lspServers: LspServerInfo[] = [],
 	) {}
@@ -200,12 +198,6 @@ export class WelcomeComponent implements Component {
 		this.invalidate();
 	}
 
-	setModel(modelName: string, providerName: string): void {
-		this.modelName = modelName;
-		this.providerName = providerName;
-		this.invalidate();
-	}
-
 	setRecentSessions(sessions: RecentSession[]): void {
 		this.recentSessions = sessions;
 		this.invalidate();
@@ -247,15 +239,11 @@ export class WelcomeComponent implements Component {
 		}
 		const dualContentWidth = boxWidth - 3; // 3 = │ + │ + │
 		const preferredLeftCol = 26;
-		const minLeftCol = 12; // logo width
+		const minLeftCol = WELCOME_HAMMER_WIDTH;
 		const minRightCol = 20;
 		const welcomeText = this.#welcomeText();
-		const leftMinContentWidth = Math.max(
-			minLeftCol,
-			visibleWidth(welcomeText),
-			visibleWidth(this.modelName),
-			visibleWidth(this.providerName),
-		);
+		const versionLabel = `${CF_BRAND} v${this.version}`;
+		const leftMinContentWidth = Math.max(minLeftCol, visibleWidth(welcomeText), visibleWidth(versionLabel));
 		const desiredLeftCol = Math.min(preferredLeftCol, Math.max(minLeftCol, Math.floor(dualContentWidth * 0.35)));
 		const dualLeftCol =
 			dualContentWidth >= minRightCol + 1
@@ -276,8 +264,7 @@ export class WelcomeComponent implements Component {
 			"",
 			...logoColored.map(l => this.#centerText(l, leftCol)),
 			"",
-			this.#centerText(theme.fg("muted", this.modelName), leftCol),
-			this.#centerText(theme.fg("borderMuted", this.providerName), leftCol),
+			this.#centerText(theme.fg("muted", versionLabel), leftCol),
 		];
 
 		// Right column separator
@@ -360,18 +347,9 @@ export class WelcomeComponent implements Component {
 
 		const lines: string[] = [];
 
-		// Top border with embedded title
-		const title = ` ${APP_NAME} v${this.version} `;
-		const titlePrefixRaw = hChar.repeat(3);
-		const titleStyled = theme.fg("dim", titlePrefixRaw) + theme.fg("muted", title);
-		const titleVisLen = visibleWidth(titlePrefixRaw) + visibleWidth(title);
+		// Top border
 		const titleSpace = boxWidth - 2;
-		if (titleVisLen >= titleSpace) {
-			lines.push(tl + truncateToWidth(titleStyled, titleSpace) + tr);
-		} else {
-			const afterTitle = titleSpace - titleVisLen;
-			lines.push(tl + titleStyled + theme.fg("dim", hChar.repeat(afterTitle)) + tr);
-		}
+		lines.push(tl + h.repeat(titleSpace) + tr);
 
 		// Content rows
 		const maxRows = showRightColumn ? Math.max(leftLines.length, rightLines.length) : leftLines.length;
@@ -459,6 +437,24 @@ export class WelcomeComponent implements Component {
 }
 
 export const PI_LOGO = ["▀██████████▀", " ╘██    ██  ", "  ██    ██  ", "  ██    ██  ", " ▄██▄  ▄██▄ "];
+
+/** Coreforge welcome mark: a Mjölnir-inspired hammer tilted 45 degrees. */
+const WELCOME_HAMMER = [
+	"           ⣠⠞⢁⣴⣦⡀",
+	"         ⡠⠊⣠⣴⣿⣿⣿⣿⣦⡀",
+	"        ⠚⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀",
+	"        ⠘⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀",
+	"          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠆",
+	"          ⢠⡀⠙⢿⣿⣿⣿⣿⣿⣿⣿⠟⢁⡴",
+	"        ⢠⣤⣤⣤⣤ ⠙⢿⣿⣿⣿⡿⠋⡠⠋",
+	"       ⣤⣤⣤⣤⡄    ⠙⠿⠋⠤⠊",
+	"     ⢠⣤⣤⣤⣤",
+	"    ⣤⣤⣤⣤⡄",
+	"  ⢠⣤⣤⣤⣤",
+	" ⣤⣤⣤⣤⡄",
+].map(line => line.padEnd(24));
+
+const WELCOME_HAMMER_WIDTH = Math.max(...WELCOME_HAMMER.map(line => visibleWidth(line)));
 
 /** Multi-stop palette for the diagonal gradient. */
 const GRADIENT_STOPS: ReadonlyArray<readonly [number, number, number]> = [
@@ -579,8 +575,8 @@ function introLogoFrame(progress: number): string[] {
 	const phase = ((((1 - eased) * INTRO_SWEEPS) % 1) + 1) % 1;
 	const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
 	const shineStrength = (1 - eased) ** 1.5;
-	return gradientLogo(PI_LOGO, phase, { strength: shineStrength, pos: shinePos });
+	return gradientLogo(WELCOME_HAMMER, phase, { strength: shineStrength, pos: shinePos });
 }
 
 /** Resting gradient frame, cached for re-renders outside of the intro. */
-const REST_FRAME = gradientLogo(PI_LOGO, 0);
+const REST_FRAME = gradientLogo(WELCOME_HAMMER, 0);

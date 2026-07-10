@@ -16,15 +16,9 @@ try {
  */
 import { parentPort } from "node:worker_threads";
 import type { CliConfig } from "@oh-my-pi/pi-utils/cli";
-import {
-	APP_NAME,
-	getActiveProfile,
-	MIN_BUN_VERSION,
-	resolveProfileEnv,
-	setProfile,
-	VERSION,
-} from "@oh-my-pi/pi-utils/dirs";
+import { APP_NAME, getActiveProfile, MIN_BUN_VERSION, resolveProfileEnv, setProfile } from "@oh-my-pi/pi-utils/dirs";
 import { declareWorkerHostEntry, installWorkerInbox } from "@oh-my-pi/pi-utils/worker-host";
+import { CF_COMMAND, CF_VERSION } from "./cli/cf-version";
 import { installProfileAlias, resolveProfileAliasCommandFromProcess } from "./cli/profile-alias";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
@@ -373,7 +367,16 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	return run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, help: showHelp });
+	// `bin` drives copy-paste help/usage/version output (`$ <bin> [COMMAND]`),
+	// so it is the invokable command name (CF_COMMAND / coreforge wrapper), not
+	// APP_NAME (the on-disk `omp` identifier).
+	return run({
+		bin: CF_COMMAND,
+		version: CF_VERSION,
+		argv: resolved.argv,
+		commands,
+		help: showHelp,
+	});
 }
 
 // Floating call instead of top-level await: TLA forces `--bytecode` (CJS

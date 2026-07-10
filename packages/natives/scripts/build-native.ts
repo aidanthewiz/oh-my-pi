@@ -326,6 +326,13 @@ async function stripAndVerifyNativeAddon(addonPath: string): Promise<void> {
 const isCI = Boolean(Bun.env.CI);
 const useLocalProfile = !isCI && !isCrossCompile;
 const profileLabel = useLocalProfile ? "local" : "ci";
+
+// Rust's LLVM objcopy can misalign the Mach-O LINKEDIT string table while
+// stripping cdylibs; macOS 27 rejects the resulting addon at dlopen. Keep the
+// Darwin CI artifact unstripped until rust-lang/rust#157750 reaches stable.
+if (targetPlatform === "darwin" && profileLabel === "ci") {
+	process.env.CARGO_PROFILE_CI_STRIP ??= "none";
+}
 const profileSuffix = ` (${profileLabel})`;
 
 const buildOutputDirPrefix = resolveBuildOutputDirPrefix(profileLabel);

@@ -1,0 +1,279 @@
+# Coreforge engine release - builds omp binaries from the patched coreforge
+# branch and publishes them as GitHub Releases on this private mirror.
+# Employees' `omp update` (patched to the cf channel, see
+# packages/coding-agent/src/cli/cf-channel.ts) pulls from these releases.
+# Coreforge appliances install the exact release selected by `engine.lock`.
+#
+# Trigger: a coreforge branch update associated with a merged pull request
+# allocates the next `v<upstream>.<roll>` tag and publishes that exact commit.
+# Direct branch updates do not publish; a manually pushed four-segment tag
+# remains the recovery path. The first three segments MUST match
+# packages/coding-agent/package.json; the fourth is the Coreforge patch roll.
+# Engine releases are channel-neutral dependency artifacts. Coreforge's
+# independent beta-first product release and stable promotion gates decide
+# which exact engine.lock pin employees receive.
+#
+# Build reuses upstream's release tooling (`bun run ci:release:build-binaries`
+# = scripts/ci-release-build-binaries.ts): per-target native embed, correct
+# bun --target names (e.g. bun-windows-x64-modern), darwin ad-hoc codesign,
+# and asset names matching getBinaryName() in update-cli.ts. Runner mapping
+# mirrors upstream's release matrix - darwin builds natively on macOS (the
+# script only codesigns when host is darwin; a Linux cross-build would ship
+# unsigned Mach-O that Gatekeeper kills); win32 is cross-built on Linux
+# exactly like upstream. One difference: upstream builds natives from source
+# in earlier CI jobs, we fetch the version-matched prebuilts from npm (our
+# patch never touches native code).
+#
+# This file lives only on the coreforge branch (never on main, which mirrors
+# upstream), so upstream syncs rebase it forward like any other patch commit.
+name: cf-release
+
+on:
+  push:
+    branches:
+      - coreforge
+    tags:
+      - "v*.*.*.*"
+
+permissions:
+  pull-requests: read
+  contents: write
+
+concurrency:
+  group: cf-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_release: ${{ steps.release.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.3"
+      - name: Resolve release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+          EVENT_REF_TYPE: ${{ github.ref_type }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          git fetch origin +coreforge:refs/remotes/origin/coreforge --tags --force --quiet
+          TIP="$(git rev-parse refs/remotes/origin/coreforge)"
+          PKG="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+
+          if [ "$EVENT_REF_TYPE" = "tag" ]; then
+            TAG="$EVENT_REF_NAME"
+            TAG_COMMIT="$(git rev-parse "$TAG^{commit}")"
+            if [ "$TAG_COMMIT" != "$TIP" ]; then
+              echo "tag commit $TAG_COMMIT is not the coreforge tip ($TIP) - refusing to release"
+              exit 1
+            fi
+          else
+            MERGED_PR_COUNT="$(
+              gh api "repos/${GITHUB_REPOSITORY}/commits/${EVENT_SHA}/pulls" \
+                --jq '[.[] | select(.merged_at != null and .base.ref == "coreforge")] | length'
+            )"
+            if [ "$MERGED_PR_COUNT" -eq 0 ]; then
+              echo "$EVENT_SHA was not introduced by a merged coreforge pull request - manual release required"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$EVENT_SHA" != "$TIP" ]; then
+              echo "coreforge advanced from $EVENT_SHA to $TIP - a newer run will publish the tip"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            LAST=0
+            while IFS= read -r candidate; do
+              roll="${candidate#v"${PKG}".}"
+              case "$candidate" in
+                "v${PKG}."[1-9]*) ;;
+                *) continue ;;
+              esac
+              case "$roll" in
+                *[!0-9]*) continue ;;
+              esac
+              if [ "$roll" -gt "$LAST" ]; then LAST="$roll"; fi
+            done < <(git tag --list "v${PKG}.*")
+
+            TAG="v${PKG}.$((LAST + 1))"
+            git tag "$TAG" "$EVENT_SHA"
+            # GitHub suppresses workflow recursion for tags pushed with
+            # GITHUB_TOKEN, so this run must continue through build and release.
+            git push origin "refs/tags/$TAG"
+          fi
+
+          ROLL="${TAG#v"${PKG}".}"
+          case "$TAG" in
+            "v${PKG}."[1-9]*) ;;
+            *) echo "tag $TAG does not extend package version $PKG"; exit 1 ;;
+          esac
+          case "$ROLL" in
+            *[!0-9]*) echo "tag $TAG has a non-numeric roll"; exit 1 ;;
+          esac
+          echo "release tag: $TAG"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-14
+            binary: omp-darwin-arm64
+          - target: darwin-x64
+            os: macos-15-intel
+            binary: omp-darwin-x64
+          - target: linux-x64
+            os: ubuntu-22.04
+            binary: omp-linux-x64
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            binary: omp-linux-arm64
+          - target: win32-x64
+            os: ubuntu-24.04
+            cross: "1"
+            binary: omp-windows-x64.exe
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_tag }}
+      - name: Guard tag is the coreforge branch tip
+        # Tag filters are globs, not ACLs: anyone who can push a tag could
+        # otherwise build+publish a release from an arbitrary commit. Ancestry
+        # alone is not enough - any older commit in coreforge history (e.g.
+        # predating the patch set or a hardening fix) would pass. Require the
+        # tagged commit to BE the current coreforge tip: releases are always
+        # cut from the tip (the branch is rebase-managed), so anything else
+        # is either stale or hostile. If the branch moved between tagging and
+        # this run, delete + re-tag on the new tip.
+        run: |
+          # +refspec: coreforge is rebase-managed; force-update the tracking
+          # ref so a reused runner with a stale origin/coreforge can't reject
+          # the non-fast-forward fetch before the guard compares SHAs.
+          git fetch origin +coreforge:refs/remotes/origin/coreforge --quiet
+          # Peel: for annotated tags GITHUB_SHA is the tag object, not the commit.
+          TAG_COMMIT="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          TIP="$(git rev-parse refs/remotes/origin/coreforge)"
+          if [ "$TAG_COMMIT" = "$TIP" ]; then
+            echo "tag commit $TAG_COMMIT is the coreforge tip - ok"
+          else
+            echo "tag commit $TAG_COMMIT is not the coreforge tip ($TIP) - refusing to release"
+            exit 1
+          fi
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.3"
+      - name: Guard tag against package version
+        run: |
+          TAG="${RELEASE_TAG#v}"
+          PKG="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          case "$TAG" in
+            "$PKG".*) echo "tag $TAG rolls upstream $PKG - ok" ;;
+            *) echo "tag $TAG does not extend package version $PKG"; exit 1 ;;
+          esac
+      - run: bun install --frozen-lockfile
+      - name: Fetch prebuilt native addon from npm
+        # @oh-my-pi/pi-natives-<target> ships every variant for its target in
+        # one package (x64: -baseline + -modern .node files; arm64: unsuffixed),
+        # with filenames exactly matching embed-native.ts's candidate list.
+        # Upstream builds these from source in earlier CI jobs; our patch never
+        # touches native code, so the version-matched prebuilt is identical.
+        run: |
+          PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          META="$(npm view "@oh-my-pi/pi-natives-${{ matrix.target }}@${PKG_VERSION}" dist.tarball dist.integrity --json)"
+          URL="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.tarball"])')"
+          INTEGRITY="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.integrity"])')"
+          curl -fsSL "$URL" -o /tmp/natives.tgz
+          NATIVES_INTEGRITY="$INTEGRITY" bun -e '
+            const [algorithm, expected] = process.env.NATIVES_INTEGRITY.split("-", 2);
+            if (algorithm !== "sha512" || !expected) throw new Error("npm did not publish a sha512 integrity value");
+            const archive = new Uint8Array(await Bun.file("/tmp/natives.tgz").arrayBuffer());
+            const actual = new Bun.CryptoHasher("sha512").update(archive).digest("base64");
+            if (actual !== expected) throw new Error("native addon archive failed npm integrity verification");
+          '
+          tar -xzf /tmp/natives.tgz -C /tmp
+          cp /tmp/package/*.node packages/natives/native/
+          ls packages/natives/native/*.node
+      - name: Inject channel version
+        run: bun scripts/set-cf-version.ts "${RELEASE_TAG#v}"
+      - name: Build binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target }}
+        run: bun run ci:release:build-binaries
+      - name: Smoke binary
+        # Cross-built win32 has no runner to execute on (matches upstream);
+        # native builds must report the injected channel version. The `--version`
+        # output is `<brand>/<version>` (brand = CF_COMMAND, `coreforge` by
+        # default, overridable for white-label), so assert the VERSION suffix
+        # rather than a hard-coded `omp/` prefix -- the stamped version is what
+        # this step exists to verify.
+        if: matrix.cross != '1'
+        run: |
+          OUT="$(./packages/coding-agent/binaries/${{ matrix.binary }} --version)"
+          echo "reported: $OUT"
+          VERSION="${RELEASE_TAG#v}"
+          case "$OUT" in
+            */"$VERSION") echo "version OK: $OUT" ;;
+            *) echo "::error::expected */$VERSION, got $OUT"; exit 1 ;;
+          esac
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: packages/coding-agent/binaries/${{ matrix.binary }}
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_tag }}
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.3"
+      - name: Fetch upstream release base
+        env:
+          OMP_UPSTREAM_REPO: can1357/oh-my-pi
+        run: |
+          UPSTREAM_TAG="${RELEASE_TAG%.*}"
+          git fetch --no-tags "https://github.com/${OMP_UPSTREAM_REPO}.git" \
+            "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/cf-release-notes.ts "$RELEASE_TAG" release-notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "coreforge engine $RELEASE_TAG" \
+            --notes-file release-notes.md

@@ -57,10 +57,21 @@ describe("createExtensionModelQuery", () => {
 
 	test("resolve() honors configured role aliases via the same settings-backed path as core", () => {
 		const settings = {
+			get: () => undefined,
 			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-opus-4-8" : undefined),
 		} as unknown as Settings;
 		const q = createExtensionModelQuery(registry(), settings, () => undefined);
 		expect(q.resolve("@slow")).toBe(claude);
+	});
+
+	test("list() and resolve() honor the enabledModels allowlist", () => {
+		const settings = {
+			get: (key: string) => (key === "enabledModels" ? ["anthropic/*"] : undefined),
+			getModelRole: () => undefined,
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(registry(), settings, () => undefined);
+		expect(q.list()).toEqual([claude]);
+		expect(q.resolve("gpt-5.4")).toBeUndefined();
 	});
 
 	test("family() groups a vendor's point releases and separates vendors", () => {

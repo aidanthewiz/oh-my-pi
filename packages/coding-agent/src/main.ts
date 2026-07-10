@@ -24,6 +24,15 @@ import {
 import chalk from "chalk";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
+import { fetchCfLatestProductRelease, fetchCfLatestRelease } from "./cli/cf-channel";
+import {
+	CF_COMMAND,
+	CF_DISPLAY_VERSION,
+	CF_PRODUCT_VERSION,
+	CF_VERSION,
+	compareCfProductVersions,
+	compareCfVersions,
+} from "./cli/cf-version";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
@@ -110,23 +119,21 @@ export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string)
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
 }
 
-async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
+async function checkForNewVersion(productVersion: string | undefined): Promise<string | undefined> {
 	if (!settings.get("startup.checkUpdate")) {
 		return;
 	}
 	try {
-		const response = await fetch("https://registry.npmjs.org/@oh-my-pi/pi-coding-agent/latest", {
-			signal: withTimeoutSignal(5_000),
-		});
-		if (!response.ok) return undefined;
-
-		const data = (await response.json()) as { version?: string };
-		const latestVersion = data.version;
-
-		if (latestVersion && Bun.semver.order(latestVersion, currentVersion) > 0) {
-			return latestVersion;
+		const release = productVersion
+			? await fetchCfLatestProductRelease(withTimeoutSignal(5_000))
+			: await fetchCfLatestRelease(withTimeoutSignal(5_000));
+		const currentVersion = productVersion ?? CF_VERSION;
+		const comparison = productVersion
+			? compareCfProductVersions(release.version, currentVersion)
+			: compareCfVersions(release.version, currentVersion);
+		if (comparison > 0) {
+			return release.version;
 		}
-
 		return undefined;
 	} catch {
 		return undefined;
@@ -688,7 +695,7 @@ export async function createSessionManager(
 		if (!match) {
 			throw new SessionResolutionError(
 				`Session "${forkSource}" not found.`,
-				"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.",
+				`Run \`${CF_COMMAND} --resume\` without an argument to pick from recent sessions, or \`${CF_COMMAND}\` to start a new one.`,
 			);
 		}
 		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
@@ -708,7 +715,7 @@ export async function createSessionManager(
 		if (!match) {
 			throw new SessionResolutionError(
 				`Session "${sessionArg}" not found.`,
-				"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.",
+				`Run \`${CF_COMMAND} --resume\` without an argument to pick from recent sessions, or \`${CF_COMMAND}\` to start a new one.`,
 			);
 		}
 		if (match.scope === "local") {
@@ -1105,7 +1112,7 @@ export async function runRootCommand(
 	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 
 	if (parsedArgs.version) {
-		writeStartupNotice(parsedArgs, `${VERSION}\n`);
+		writeStartupNotice(parsedArgs, `${CF_VERSION}\n`);
 		process.exit(0);
 	}
 
@@ -1576,7 +1583,7 @@ export async function runRootCommand(
 			stopStartupWatchdog();
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
 		} else if (isInteractive) {
-			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+			const versionCheckPromise = checkForNewVersion(CF_PRODUCT_VERSION).catch(() => undefined);
 			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
 
 			const modelScopeNotification = buildModelScopeNotification(
@@ -1601,7 +1608,7 @@ export async function runRootCommand(
 			logger.endTiming();
 			await runInteractiveMode(
 				session,
-				VERSION,
+				CF_DISPLAY_VERSION,
 				changelogMarkdown,
 				notifs,
 				versionCheckPromise,

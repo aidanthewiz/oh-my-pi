@@ -83,10 +83,7 @@ describe("mcp-managed provider", () => {
 	});
 
 	test("managed definition wins a same-name collision against the user mcp.json", async () => {
-		await writeManagedFile(
-			agentDir,
-			JSON.stringify({ mcpServers: { github: { command: "managed-github" } } }),
-		);
+		await writeManagedFile(agentDir, JSON.stringify({ mcpServers: { github: { command: "managed-github" } } }));
 		await writeUserMcpJson(agentDir, { mcpServers: { github: { command: "user-github" } } });
 
 		clearFsCache();
@@ -100,10 +97,7 @@ describe("mcp-managed provider", () => {
 	});
 
 	test("user disabledServers denylist hides a managed server", async () => {
-		await writeManagedFile(
-			agentDir,
-			JSON.stringify({ mcpServers: { "managed-x": { command: "managed-cmd" } } }),
-		);
+		await writeManagedFile(agentDir, JSON.stringify({ mcpServers: { "managed-x": { command: "managed-cmd" } } }));
 		await writeUserMcpJson(agentDir, { mcpServers: {}, disabledServers: ["managed-x"] });
 
 		clearFsCache();

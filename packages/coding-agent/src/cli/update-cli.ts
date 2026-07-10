@@ -8,13 +8,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
+import { $which, APP_NAME, isEnoent } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
+import type { CfRelease } from "./cf-channel";
+import { fetchCfAsset, fetchCfLatestRelease } from "./cf-channel";
+import { CF_VERSION, compareCfVersions } from "./cf-version";
 
-const REPO = "can1357/oh-my-pi";
+// [coreforge patch] REPO removed - release lookups/downloads go through
+// cf-channel.ts (Coreforce-CAD/oh-my-pi releases) instead of upstream GitHub.
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
@@ -263,52 +267,26 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 }
 
 /**
- * Get the latest release info from the npm registry.
- * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
+ * Get the latest release info from the coreforge channel (the private
+ * Coreforce-CAD mirror's GitHub Releases). [coreforge patch: upstream
+ * queries the npm registry here.]
  */
+let lastCfRelease: CfRelease | undefined;
 async function getLatestRelease(): Promise<ReleaseInfo> {
-	let response: Response;
 	try {
-		response = await fetch(`${NPM_REGISTRY}${PACKAGE}/latest`, {
-			signal: withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS),
-		});
+		lastCfRelease = await fetchCfLatestRelease(withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS));
+		return { tag: lastCfRelease.tag, version: lastCfRelease.version };
 	} catch (err) {
 		if (isTimeoutError(err)) {
 			throw new Error("Timed out fetching release info after 30s", { cause: err });
 		}
 		throw err;
 	}
-	if (!response.ok) {
-		throw new Error(`Failed to fetch release info: ${response.statusText}`);
-	}
-
-	const data = (await response.json()) as { version: string };
-	const version = data.version;
-	const tag = `v${version}`;
-
-	return {
-		tag,
-		version,
-	};
 }
 
-/**
- * Compare semver versions. Returns:
- * - negative if a < b
- * - 0 if a == b
- * - positive if a > b
- */
-function compareVersions(a: string, b: string): number {
-	const pa = a.split(".").map(Number);
-	const pb = b.split(".").map(Number);
-
-	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-		const na = pa[i] || 0;
-		const nb = pb[i] || 0;
-		if (na !== nb) return na - nb;
-	}
-	return 0;
-}
+// [coreforge patch] version comparison lives in cf-version.ts
+// (compareCfVersions) - segment-wise dotted-numeric, handles the channel's
+// 4-segment versions.
 
 interface BunInstallCachePruneResult {
 	scannedPackages: number;
@@ -496,16 +474,7 @@ export async function pruneBunInstallCache(
 	return { scannedPackages, removedEntries };
 }
 
-async function resolveBunInstallCacheDir(): Promise<string | undefined> {
-	try {
-		const result = await $`bun pm cache`.quiet().nothrow();
-		if (result.exitCode !== 0) return undefined;
-		const output = result.text().trim();
-		return output.length > 0 ? output : undefined;
-	} catch {
-		return undefined;
-	}
-}
+// [coreforge patch] resolveBunInstallCacheDir removed with the bun channel.
 
 export function resolveBunGlobalNodeModulesDirFromLocations(
 	globalBinDir: string | undefined,
@@ -520,41 +489,12 @@ export function resolveBunGlobalNodeModulesDirFromLocations(
 	return undefined;
 }
 
-async function resolveBunGlobalNodeModulesDir(cacheDir: string): Promise<string | undefined> {
-	try {
-		const result = await $`bun pm bin -g`.quiet().nothrow();
-		const globalBinDir = result.exitCode === 0 ? result.text().trim() : undefined;
-		return resolveBunGlobalNodeModulesDirFromLocations(globalBinDir, cacheDir);
-	} catch {
-		return resolveBunGlobalNodeModulesDirFromLocations(undefined, cacheDir);
-	}
-}
+// [coreforge patch] resolveBunGlobalNodeModulesDir and
+// collectInstalledPackageNames removed with the bun channel;
+// resolveBunGlobalNodeModulesDirFromLocations stays exported for its tests.
 
-async function collectInstalledPackageNames(nodeModulesDir: string): Promise<Set<string>> {
-	const packageNames = new Set<string>();
-	for (const entry of await readdirIfExists(nodeModulesDir)) {
-		if (!entry.isDirectory() || entry.name === ".bin") continue;
-		if (entry.name.startsWith("@")) {
-			for (const scopedEntry of await readdirIfExists(path.join(nodeModulesDir, entry.name))) {
-				if (scopedEntry.isDirectory()) packageNames.add(`${entry.name}/${scopedEntry.name}`);
-			}
-			continue;
-		}
-		packageNames.add(entry.name);
-	}
-	return packageNames;
-}
-
-async function pruneBunCacheAfterGlobalInstall(): Promise<BunInstallCachePruneResult | undefined> {
-	const cacheDir = await resolveBunInstallCacheDir();
-	if (!cacheDir) return undefined;
-	const globalNodeModulesDir = await resolveBunGlobalNodeModulesDir(cacheDir);
-	const packageNames = globalNodeModulesDir
-		? await collectInstalledPackageNames(globalNodeModulesDir)
-		: new Set<string>();
-	if (packageNames.size === 0 && !path.basename(cacheDir).toLowerCase().includes("omp")) return undefined;
-	return await pruneBunInstallCache(cacheDir, packageNames.size === 0 ? undefined : packageNames);
-}
+// [coreforge patch] pruneBunCacheAfterGlobalInstall removed with the bun
+// update channel; pruneBunInstallCache stays exported for its unit tests.
 
 /**
  * Detect a musl-libc Linux host (Alpine, Void-musl) so self-update replaces a
@@ -610,9 +550,16 @@ function getBinaryName(): string {
 }
 
 /**
- * Resolve the path that `omp` maps to in the user's PATH.
+ * Resolve the binary to update. [coreforge patch] Compiled builds update
+ * THEMSELVES (process.execPath) regardless of install name - the coreforge
+ * installer ships the binary as `omp-coreforge` so it cannot shadow a
+ * personal upstream omp install; $which("omp") would find the wrong one.
+ * Source runs (bun dev) keep the PATH lookup for parity with upstream.
  */
 function resolveOmpPath(): string | undefined {
+	if (process.env.PI_COMPILED === "true") {
+		return process.execPath;
+	}
 	return $which(APP_NAME) ?? undefined;
 }
 
@@ -626,8 +573,8 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 		const result = await $`${ompPath} --version`.quiet().nothrow();
 		if (result.exitCode !== 0) return { ok: false, path: ompPath };
 		const output = result.text().trim();
-		// Output format: "omp/X.Y.Z"
-		const match = output.match(/\/(\d+\.\d+\.\d+)/);
+		// Output format: "omp/X.Y.Z" or "omp/X.Y.Z.N" (coreforge channel rolls)
+		const match = output.match(/\/(\d+\.\d+\.\d+(?:\.\d+)?)/);
 		const actual = match?.[1];
 		return { ok: actual === expectedVersion, actual, path: ompPath };
 	} catch {
@@ -646,18 +593,9 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
 }
 
-/**
- * Print post-update verification result.
- */
-async function printVerification(expectedVersion: string): Promise<void> {
-	const result = await verifyInstalledVersion(expectedVersion);
-	if (result.ok) {
-		printVerifiedVersion(expectedVersion);
-		return;
-	}
-	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
-	console.log(chalk.yellow(`You may need to reinstall: curl -fsSL https://omp.sh/install | sh`));
-}
+// [coreforge patch] printVerification removed with the bun/brew/mise update
+// channels - the binary path verifies through replaceBinaryForUpdate, which
+// rolls back on mismatch instead of printing a reinstall hint.
 
 async function unlinkIfExists(filePath: string): Promise<void> {
 	try {
@@ -823,82 +761,25 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 	return ["install", "--force", `${MISE_TOOL}@${expectedVersion}`];
 }
 
-/**
- * Update via package manager.
- */
-async function updateViaBun(expectedVersion: string): Promise<void> {
-	console.log(chalk.dim("Updating via bun..."));
-	const args = buildBunInstallArgs(expectedVersion);
-	const result = await $`bun ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`bun install failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
-	try {
-		const pruneResult = await pruneBunCacheAfterGlobalInstall();
-		if (pruneResult && pruneResult.removedEntries > 0) {
-			console.log(chalk.dim(`Pruned ${pruneResult.removedEntries} stale Bun cache entries`));
-		}
-	} catch (err) {
-		console.log(chalk.yellow(`Warning: could not prune stale Bun cache entries: ${err}`));
-	}
-}
-
-async function updateViaNpm(expectedVersion: string): Promise<void> {
-	console.log(chalk.dim("Updating via npm..."));
-	const args = buildNpmInstallArgs(expectedVersion);
-	const result = await $`npm ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`npm install failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
-}
-
-async function updateViaHomebrew(expectedVersion: string, force: boolean): Promise<void> {
-	console.log(chalk.dim("Updating Homebrew formulae..."));
-	const update = await $`brew update`.nothrow();
-	if (update.exitCode !== 0) {
-		throw new Error(`brew update failed with exit code ${update.exitCode}`);
-	}
-
-	console.log(chalk.dim("Updating via Homebrew..."));
-	const args = buildHomebrewUpdateArgs(force);
-	const result = await $`brew ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`brew ${args[0]} failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
-}
-
-async function updateViaMise(expectedVersion: string, force: boolean): Promise<void> {
-	console.log(chalk.dim("Updating via mise..."));
-	const args = buildMiseUpgradeArgs();
-	const result = await $`mise ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`mise upgrade failed with exit code ${result.exitCode}`);
-	}
-
-	if (force) {
-		const forceArgs = buildMiseForceInstallArgs(expectedVersion);
-		const forceResult = await $`mise ${forceArgs}`.nothrow();
-		if (forceResult.exitCode !== 0) {
-			throw new Error(`mise install --force failed with exit code ${forceResult.exitCode}`);
-		}
-	}
-
-	await printVerification(expectedVersion);
-}
+// [coreforge patch] updateViaBun/updateViaHomebrew/updateViaMise removed -
+// those channels would install UPSTREAM omp over the patched build. The
+// exported build*Args helpers above are retained: their unit tests pin the
+// argv contracts, which keeps rebases onto upstream conflict-free.
 
 /**
  * Download a release binary to a target path, replacing an existing file.
+ * [coreforge patch: private-repo assets are fetched through the GitHub asset
+ * API with auth - browser_download_url 404s without a session.]
  */
 async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
 	const binaryName = getBinaryName();
-	const tag = `v${expectedVersion}`;
-	const url = `https://github.com/${REPO}/releases/download/${tag}/${binaryName}`;
+	if (lastCfRelease?.version !== expectedVersion) {
+		lastCfRelease = await fetchCfLatestRelease(withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS));
+	}
+	const asset = lastCfRelease.assets.find(a => a.name === binaryName);
+	if (!asset) {
+		throw new Error(`release ${lastCfRelease.tag} has no asset named ${binaryName}`);
+	}
 
 	const tempPath = `${targetPath}.new`;
 	// Unique per attempt: a stale backup from an earlier update may still be
@@ -910,18 +791,15 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 
 	let response: Response;
 	try {
-		response = await fetch(url, {
-			redirect: "follow",
-			signal: withTimeoutSignal(BINARY_DOWNLOAD_TIMEOUT_MS),
-		});
+		response = await fetchCfAsset(asset, withTimeoutSignal(BINARY_DOWNLOAD_TIMEOUT_MS));
 	} catch (err) {
 		if (isTimeoutError(err)) {
 			throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
 		}
 		throw err;
 	}
-	if (!response.ok || !response.body) {
-		throw new Error(`Download failed: ${response.statusText}`);
+	if (!response.body) {
+		throw new Error("Download failed: empty response body");
 	}
 	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
 	await pipeline(response.body, fileStream);
@@ -944,7 +822,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
  * Run the update command.
  */
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
-	console.log(chalk.dim(`Current version: ${VERSION}`));
+	console.log(chalk.dim(`Current version: ${CF_VERSION}`));
 
 	// Check for updates
 	let release: ReleaseInfo;
@@ -955,7 +833,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		process.exit(1);
 	}
 
-	const comparison = compareVersions(release.version, VERSION);
+	const comparison = compareCfVersions(release.version, CF_VERSION);
 
 	if (comparison <= 0 && !opts.force) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
@@ -973,20 +851,18 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		return;
 	}
 
-	// Choose update method based on the prioritized omp binary in PATH
+	// coreforge channel: the engine is only ever distributed as a compiled
+	// binary from the private mirror's releases. brew/mise/bun would install
+	// UPSTREAM omp over the patched build, so they are hard-disabled here.
 	try {
 		const target = await resolveUpdateTarget();
-		if (target.method === "brew") {
-			await updateViaHomebrew(release.version, opts.force);
-		} else if (target.method === "mise") {
-			await updateViaMise(release.version, opts.force);
-		} else if (target.method === "bun") {
-			await updateViaBun(release.version);
-		} else if (target.method === "npm") {
-			await updateViaNpm(release.version);
-		} else {
-			await updateViaBinaryAt(target.path, release.version);
+		if (target.method !== "binary") {
+			throw new Error(
+				`the ${APP_NAME} on PATH was installed via ${target.method} (upstream channel); ` +
+					"coreforge updates only manage the compiled binary - reinstall via the coreforge installer",
+			);
 		}
+		await updateViaBinaryAt(target.path, release.version);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
 		process.exit(1);

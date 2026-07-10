@@ -36,7 +36,10 @@ function installTestTheme(): void {
 	setThemeInstance(testTheme);
 }
 
-function createSelector(models: Model[], settings: Settings): { selector: ModelSelectorComponent; backgroundRefresh: Promise<void> } {
+function createSelector(
+	models: Model[],
+	settings: Settings,
+): { selector: ModelSelectorComponent; backgroundRefresh: Promise<void> } {
 	const refreshGate = Promise.withResolvers<void>();
 	const modelRegistry = {
 		getAll: () => models,
