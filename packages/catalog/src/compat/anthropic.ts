@@ -98,12 +98,23 @@ export function buildAnthropicCompat(spec: ModelSpec<"anthropic-messages">): Res
 	// signature-enforcing Anthropic — same failure class as GitHub Copilot #2851
 	// (issue #4192).
 	const isZenmux = modelMatchesHost(spec, "zenmux");
+	// Anthropic's first-party AWS external gateway (aws-external-anthropic) forwards
+	// to signature-enforcing Anthropic — same signing failure class (an empty
+	// signature 400s on replay), so it is treated as a signing endpoint below.
+	const isAwsExternalAnthropic = modelMatchesHost(spec, "anthropicAws");
 	const requiresThinkingEnabled = modelMatchesHost(spec, "moonshotNative") && matchesKimiK27CodeFamily(spec);
 	const isVertex = isVertexAnthropicRoute(baseUrl);
 	const isBedrock = isBedrockAnthropicRoute(baseUrl);
 	const isAzure = isAzureAnthropicRoute(baseUrl);
 	const signingEndpoint =
-		official || isCopilot || isZenmux || isCloudflareAnthropicGateway(baseUrl) || isVertex || isBedrock || isAzure;
+		official ||
+		isCopilot ||
+		isZenmux ||
+		isAwsExternalAnthropic ||
+		isCloudflareAnthropicGateway(baseUrl) ||
+		isVertex ||
+		isBedrock ||
+		isAzure;
 	const compat: ResolvedAnthropicCompat = {
 		officialEndpoint: official,
 		signingEndpoint,
@@ -137,7 +148,8 @@ export function buildAnthropicCompat(spec: ModelSpec<"anthropic-messages">): Res
 		// pointed remediation the first time the signing 400 fires (#4297).
 		//
 		// Known signing Anthropic-messages hosts (Copilot, ZenMux, Cloudflare
-		// AI Gateway `/anthropic`, Google Vertex `publishers/anthropic`, AWS
+		// AI Gateway `/anthropic`, Anthropic's first-party AWS external gateway
+		// (aws-external-anthropic), Google Vertex `publishers/anthropic`, AWS
 		// Bedrock `bedrock-runtime.<region>.amazonaws.com`, and Azure
 		// AI Inference / Foundry `<res>.(inference|services).ai.azure.com`)
 		// are excluded automatically because they can be recognised by provider

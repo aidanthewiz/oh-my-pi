@@ -127,12 +127,12 @@ export const isMinimaxM3FamilyModelId = memo((modelId: string): boolean => {
 
 /**
  * OpenAI gpt-oss family (`gpt-oss-20b`, `gpt-oss-120b`, `gpt-oss:120b`,
- * `vendor/gpt-oss-…`). The Harmony reasoning format only accepts
- * `low|medium|high` for `reasoning_effort` and rejects `minimal`, `xhigh`,
- * and `none`.
+ * `vendor/gpt-oss-…`, Bedrock's dotted `openai.gpt-oss-…`). The Harmony
+ * reasoning format only accepts `low|medium|high` for `reasoning_effort` and
+ * rejects `minimal`, `xhigh`, and `none`.
  */
 export const isOpenAIGptOssModelId = memo((modelId: string): boolean => {
-	return /(^|\/)gpt-oss[-:]/i.test(modelId);
+	return /(^|[/.])gpt-oss[-:]/i.test(modelId);
 });
 
 /** OpenAI model ids (gpt-*, chatgpt-*, o1/o3/o4 SKUs, codex-*, or openai/*). */

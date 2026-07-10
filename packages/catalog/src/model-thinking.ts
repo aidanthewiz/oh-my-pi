@@ -374,6 +374,11 @@ function getModelDefinedEfforts<TApi extends Api>(
 		// Baseten's gpt-oss router mirrors its GLM route: high/max only.
 		return HIGH_MAX_REASONING_EFFORTS;
 	}
+	if (spec.api === "openai-responses" && isOpenAIGptOssModelId(spec.id)) {
+		// gpt-oss's Harmony reasoning format accepts only low|medium|high
+		// regardless of the serving API (e.g. Bedrock-Mantle's /v1/responses).
+		return LOW_MEDIUM_HIGH_REASONING_EFFORTS;
+	}
 	return isOpenAICompatReasoningApi(spec.api) &&
 		(isMinimaxM2FamilyModelId(spec.id) ||
 			isOpenAIGptOssModelId(spec.id) ||

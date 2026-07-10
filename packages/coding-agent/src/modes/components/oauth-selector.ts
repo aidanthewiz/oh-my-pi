@@ -10,6 +10,7 @@ import {
 	Spacer,
 	TruncatedText,
 } from "@oh-my-pi/pi-tui";
+import { filterOAuthLoginProviders } from "../../config/oauth-login-gate";
 import { settings } from "../../config/settings";
 import { theme } from "../../modes/theme/theme";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
@@ -146,11 +147,15 @@ export class OAuthSelectorComponent extends Container {
 			// Hide a login entry when either its own id or the provider id it
 			// stores credentials under is disabled, so alias logins (e.g.
 			// `openai-codex-device` ⇒ `openai-codex`) disappear alongside the
-			// model provider they authenticate.
-			this.#allProviders = providers.filter(
-				provider =>
-					!disabled.has(provider.id) &&
-					!(provider.storeCredentialsAs && disabled.has(provider.storeCredentialsAs)),
+			// model provider they authenticate. `enabledModels` then drops model
+			// providers the org allowlist scoped out (their models could never
+			// be selected); non-model providers are unaffected.
+			this.#allProviders = filterOAuthLoginProviders(
+				providers.filter(
+					provider =>
+						!disabled.has(provider.id) &&
+						!(provider.storeCredentialsAs && disabled.has(provider.storeCredentialsAs)),
+				),
 			);
 		}
 		this.#filteredProviders = this.#allProviders;

@@ -34,6 +34,8 @@ import {
 	buildXaiOAuthStaticSeed,
 	clampFireworksKimiMaxTokens,
 	clampKimiK27CodeMaxTokens,
+	deriveAnthropicAwsModels,
+	deriveOpenAIAwsModels,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
@@ -521,6 +523,16 @@ async function generateModels() {
 	// Mythos 5). Deduped behind upstream entries; metadata is pinned in
 	// applyAnthropicCatalogPolicy.
 	allModels.push(...ANTHROPIC_CURATED_FALLBACK_MODELS);
+	// Claude Platform on AWS (`aws-external-anthropic.{region}.api.aws`): clone the
+	// assembled anthropic specs for the platform's model list so `anthropic-aws`
+	// tracks anthropic pricing/context automatically. The policy pass re-bakes
+	// `thinking` per id; the compat layer classifies the gateway as a signing host.
+	allModels.push(...deriveAnthropicAwsModels(allModels));
+	// OpenAI on AWS (`bedrock-mantle.{region}.api.aws`): clone the assembled
+	// first-party openai frontier specs (with AWS pricing + the Bedrock-served
+	// 272K window) and seed the open-weight Mantle models, so `openai-aws`
+	// capabilities track the first-party catalog automatically.
+	allModels.push(...deriveOpenAIAwsModels(allModels));
 	// Seed Sakana's documented Fugu models so the provider is usable when
 	// catalog generation has no live API key. If live `/v1/models` succeeds,
 	// Sakana is authoritative and stale seed IDs must stay out.

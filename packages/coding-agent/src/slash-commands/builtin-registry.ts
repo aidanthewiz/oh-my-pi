@@ -8,6 +8,7 @@ import { reset as resetCapabilities } from "../capability";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
 import { expandRoleAlias, getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
+import { filterOAuthLoginProviders } from "../config/oauth-login-gate";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
@@ -1268,6 +1269,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (args.length > 0) {
 				const matchedProvider = getOAuthProviders().find(provider => provider.id === args);
 				if (matchedProvider) {
+					if (!filterOAuthLoginProviders([matchedProvider]).length) {
+						runtime.ctx.showWarning(
+							`Provider "${args}" is off the org model allowlist (enabledModels); its models cannot be selected, so sign-in is disabled.`,
+						);
+						runtime.ctx.editor.setText("");
+						return;
+					}
 					if (manualInput.hasPending()) {
 						const pendingProvider = manualInput.pendingProviderId;
 						const message = pendingProvider

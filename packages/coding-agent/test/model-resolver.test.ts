@@ -924,9 +924,18 @@ describe("resolveAgentModelPatterns", () => {
 		expect(result).toEqual(["openai/gpt-4o"]);
 	});
 
-	test("slow priority falls forward to Opus 4.8 before older Opus aliases", () => {
+	test("slow priority prefers Opus 5, then Opus 4.8 before older aliases", () => {
 		const settings = Settings.isolated();
 		const patterns = resolveAgentModelPatterns({ agentModel: "@slow", settings });
+
+		const currentRegistry = {
+			getAvailable: () => [
+				createOpusModel("anthropic", "claude-opus-4-8", "Claude Opus 4.8"),
+				createOpusModel("anthropic", "claude-opus-5", "Claude Opus 5"),
+			],
+		} as Parameters<typeof resolveModelOverride>[1];
+		const current = resolveModelOverride(patterns, currentRegistry, settings);
+		expect(current.model?.id).toBe("claude-opus-5");
 
 		const dottedRegistry = {
 			getAvailable: () => [

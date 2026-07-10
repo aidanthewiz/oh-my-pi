@@ -101,6 +101,15 @@ async function callSearch(
 ): Promise<AnthropicApiResponse> {
 	const url = buildAnthropicUrl(auth);
 	const headers = buildAnthropicSearchHeaders(auth);
+	// Claude Platform on AWS requires the `anthropic-workspace-id` header on every
+	// request, including this web-search backend. When ANTHROPIC_SEARCH_BASE_URL (or
+	// the resolved base URL) points at the gateway, forward the configured workspace
+	// id so an API-key search request is accepted. (SigV4-only auth for the search
+	// backend is not wired here; set ANTHROPIC_SEARCH_API_KEY to use the gateway.)
+	const awsWorkspaceId = $env.ANTHROPIC_AWS_WORKSPACE_ID?.trim();
+	if (awsWorkspaceId && auth.baseUrl.includes("aws-external-anthropic")) {
+		headers["anthropic-workspace-id"] = awsWorkspaceId;
+	}
 
 	const systemBlocks = buildSystemBlocks(auth, model, systemPrompt);
 

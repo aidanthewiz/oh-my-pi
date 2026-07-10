@@ -37,6 +37,26 @@ describe("modelMatchesHost", () => {
 			modelMatchesHost({ provider: "custom", baseUrl: "https://api.fireworks.ai/inference/v1" }, "fireworks"),
 		).toBe(true);
 	});
+
+	test("matches the AWS external Anthropic gateway in any region, but not official Anthropic or Bedrock", () => {
+		for (const region of ["us-east-1", "eu-central-1", "ap-southeast-2", "us-gov-west-1"]) {
+			expect(
+				modelMatchesHost(
+					{ provider: "anthropic-aws", baseUrl: `https://aws-external-anthropic.${region}.api.aws` },
+					"anthropicAws",
+				),
+			).toBe(true);
+		}
+		expect(modelMatchesHost({ provider: "anthropic", baseUrl: "https://api.anthropic.com" }, "anthropicAws")).toBe(
+			false,
+		);
+		expect(
+			modelMatchesHost(
+				{ provider: "amazon-bedrock", baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com" },
+				"anthropicAws",
+			),
+		).toBe(false);
+	});
 });
 
 describe("endpoint shape predicates", () => {

@@ -6,6 +6,7 @@ export type { AuthGatewayBootOptions, ModelResolver } from "./auth-gateway/serve
 export * from "./auth-gateway/types";
 export * from "./auth-retry";
 export * from "./auth-storage";
+export * from "./aws-model-auth";
 export * from "./error/rate-limit";
 export * from "./provider-details";
 export * from "./providers/anthropic";

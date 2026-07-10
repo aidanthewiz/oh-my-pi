@@ -228,6 +228,11 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 				response = await this.#fetchOnce(fetchFn, url, headers, body, timeoutMs, callerSignal);
 			} catch (error) {
 				if (callerSignal?.aborted) throw createAbortError();
+				// Credential resolution failed before any bytes left the process: not a
+				// network fault. Retrying re-runs the same failure, and wrapping it as
+				// `Connection error.` hides the actionable auth message (and its
+				// AuthFailed classification) from the caller's recovery path.
+				if (error instanceof AIError.AwsCredentialsError) throw error;
 				if (attempt < maxRetries) {
 					await this.#backoff(attempt, undefined, callerSignal);
 					continue;

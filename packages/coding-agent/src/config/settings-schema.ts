@@ -370,6 +370,30 @@ export const SETTINGS_SCHEMA = {
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
 
+	// Managed product identity. Disabled by default so upstream omp remains
+	// unchanged; managed distributions enable and pin these non-secret values in
+	// config.managed.yml. OAuth tokens and profile attributes live in agent.db.
+	"identity.entra.enabled": { type: "boolean", default: false },
+	"identity.entra.tenantId": { type: "string", default: undefined },
+	"identity.entra.clientId": { type: "string", default: undefined },
+	"identity.entra.authorityHost": { type: "string", default: "login.microsoftonline.com" },
+	"identity.aws.profile": { type: "string", default: undefined },
+	"identity.aws.region": { type: "string", default: "us-east-1" },
+	// IAM Identity Center constants for the managed profile: with all four set
+	// the engine can ADOPT an existing matching profile (any name) or SEED the
+	// managed one into ~/.aws/config when none matches. Absent -> the profile
+	// must pre-exist (legacy behavior).
+	"identity.aws.ssoStartUrl": { type: "string", default: undefined },
+	"identity.aws.ssoRegion": { type: "string", default: undefined },
+	"identity.aws.ssoAccountId": { type: "string", default: undefined },
+	"identity.aws.ssoRoleName": { type: "string", default: undefined },
+	"identity.claude.workspaceId": { type: "string", default: undefined },
+	"identity.claude.baseUrl": {
+		type: "string",
+		default: "https://aws-external-anthropic.us-east-1.api.aws",
+	},
+	"identity.claude.inferenceGeo": { type: "string", default: undefined },
+
 	autoResume: {
 		type: "boolean",
 		default: false,

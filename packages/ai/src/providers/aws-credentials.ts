@@ -2,13 +2,13 @@
  * AWS credential resolution for the Bedrock provider.
  *
  * Chain (first hit wins):
- *  1. Static credentials from the environment
+ *  1. Static credentials from the environment outside managed model auth
  *     (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` [+ `AWS_SESSION_TOKEN`]).
  *  2. Profile in `~/.aws/credentials` (and `~/.aws/config` for SSO):
  *      - static `aws_access_key_id` / `aws_secret_access_key` / `aws_session_token`
- *      - SSO profile referencing a cached token in `~/.aws/sso/cache/*.json`,
- *        which we exchange for short-lived role credentials via
- *        `https://portal.sso.{region}.amazonaws.com/federation/credentials`.
+ *      - modern `sso-session` profiles through the AWS CLI credential exporter,
+ *        which silently refreshes the cached access token before returning
+ *        short-lived role credentials.
  *      - `credential_process` — an external command emitting the AWS SDK
  *        `Version: 1` JSON envelope on stdout. Used by `aws-vault`, `granted`,
  *        in-house brokers, etc.
@@ -23,6 +23,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { allowAmbientAwsModelCredentials, resolveAwsModelProfile, resolveAwsModelRegion } from "../aws-model-auth";
 import * as AIError from "../error";
 import type { FetchImpl } from "../types";
 import { raceWithSignal } from "../utils/abort";
@@ -34,9 +35,9 @@ export interface ResolvedCredentials extends AwsCredentials {
 }
 
 export interface CredentialResolveOptions {
-	/** Named profile from `~/.aws/credentials` / `~/.aws/config`. */
+	/** Named profile from AWS config; ignored when managed model authentication is active. */
 	profile?: string;
-	/** Falls back to env (`AWS_REGION` / `AWS_DEFAULT_REGION`) and finally `us-east-1`. */
+	/** Falls back to the active model-auth region and finally `us-east-1`. */
 	region?: string;
 	signal?: AbortSignal;
 	fetch?: FetchImpl;
@@ -54,6 +55,63 @@ const FILE_SESSION_CREDS_TTL_MS = 5 * 60_000;
  * credential_process/SSO/IMDS fetch must not pin the inflight slot forever.
  */
 const SHARED_RESOLVE_TIMEOUT_MS = 30_000;
+/**
+ * Minimum spacing between {@link AwsCredentialRecoveryHandler} invocations for
+ * one profile/region after a recovery attempt failed to produce working
+ * credentials. Without it, every request of a long-lived session would spawn
+ * another sign-in attempt.
+ */
+const RECOVERY_COOLDOWN_MS = 60_000;
+
+const MANAGED_MODEL_CHILD_CLEARED_ENV_VARS = [
+	"AWS_PROFILE",
+	"AWS_DEFAULT_PROFILE",
+	"AWS_REGION",
+	"AWS_DEFAULT_REGION",
+	"AWS_ACCESS_KEY_ID",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+	"AWS_ROLE_ARN",
+	"AWS_WEB_IDENTITY_TOKEN_FILE",
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	"AWS_CONFIG_FILE",
+	"AWS_SHARED_CREDENTIALS_FILE",
+] as const;
+
+/** Resolution failures a fresh interactive sign-in can plausibly repair. */
+const RECOVERABLE_RECOVERY_KINDS: Partial<Record<AIError.AwsCredentialsErrorKind, true>> = {
+	"sso-token-missing": true,
+	"sso-token-expired": true,
+};
+
+export interface AwsCredentialRecoveryRequest {
+	profile: string;
+	region: string;
+	kind: AIError.AwsCredentialsErrorKind;
+	error: AIError.AwsCredentialsError;
+}
+
+/**
+ * Re-authentication callback for expired/missing SSO sessions. Returns whether
+ * a fresh session was established; resolution is retried exactly once when it
+ * returns `true`.
+ */
+export type AwsCredentialRecoveryHandler = (request: AwsCredentialRecoveryRequest) => Promise<boolean> | boolean;
+
+let recoveryHandler: AwsCredentialRecoveryHandler | undefined;
+const recoveryCooldown: Map<string, number> = new Map();
+
+/**
+ * Install the process-wide re-authentication callback consulted when credential
+ * resolution fails on an expired/missing SSO session. Pass `undefined` to
+ * remove it. Without a handler, resolution keeps its previous behavior: the
+ * typed {@link AIError.AwsCredentialsError} propagates to the caller.
+ */
+export function setAwsCredentialRecoveryHandler(handler: AwsCredentialRecoveryHandler | undefined): void {
+	recoveryHandler = handler;
+	recoveryCooldown.clear();
+}
 
 interface CacheEntry {
 	creds: ResolvedCredentials;
@@ -64,9 +122,14 @@ const cache: Map<string, CacheEntry> = new Map();
 const inflight: Map<string, Promise<ResolvedCredentials>> = new Map();
 
 export async function resolveAwsCredentials(opts: CredentialResolveOptions = {}): Promise<ResolvedCredentials> {
-	const profile = opts.profile || $env.AWS_PROFILE || "default";
-	const region = opts.region || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1";
-	const cacheKey = `${profile}\x00${region}`;
+	const allowAmbientCredentials = allowAmbientAwsModelCredentials();
+	const profile = allowAmbientCredentials
+		? opts.profile || resolveAwsModelProfile() || "default"
+		: resolveAwsModelProfile() || "default";
+	const region = allowAmbientCredentials
+		? opts.region || resolveAwsModelRegion() || "us-east-1"
+		: resolveAwsModelRegion() || "us-east-1";
+	const cacheKey = `${profile}\x00${region}\x00${allowAmbientCredentials ? "ambient" : "managed"}`;
 
 	const hit = cache.get(cacheKey);
 	if (hit && hit.expiresAt - REFRESH_SKEW_MS > Date.now()) return hit.creds;
@@ -81,7 +144,7 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 	const fetchImpl = opts.fetch ?? (globalThis.fetch as FetchImpl);
 	const promise = (async () => {
 		try {
-			const creds = await resolveFresh(profile, region, AbortSignal.timeout(SHARED_RESOLVE_TIMEOUT_MS), fetchImpl);
+			const creds = await resolveFreshWithRecovery(profile, region, cacheKey, allowAmbientCredentials, fetchImpl);
 			cache.set(cacheKey, { creds, expiresAt: creds.expiresAt ?? Number.POSITIVE_INFINITY });
 			return creds;
 		} finally {
@@ -92,29 +155,109 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 	return raceWithSignal(promise, opts.signal);
 }
 
+/**
+ * One resolution pass, plus at most one re-authentication and re-resolve when
+ * the failure is an expired/missing SSO session and a recovery handler is
+ * installed. Bounded by construction: a single handler invocation and a single
+ * retry per resolution, with {@link RECOVERY_COOLDOWN_MS} spacing while
+ * recovery keeps failing. Runs inside the single-flight slot, so concurrent
+ * requests of one conversation share the same sign-in instead of racing.
+ */
+async function resolveFreshWithRecovery(
+	profile: string,
+	region: string,
+	cacheKey: string,
+	allowAmbientCredentials: boolean,
+	fetchImpl: FetchImpl,
+): Promise<ResolvedCredentials> {
+	try {
+		const creds = await resolveFresh(
+			profile,
+			region,
+			allowAmbientCredentials,
+			AbortSignal.timeout(SHARED_RESOLVE_TIMEOUT_MS),
+			fetchImpl,
+		);
+		recoveryCooldown.delete(cacheKey);
+		return creds;
+	} catch (error) {
+		if (!(await runCredentialRecovery(profile, region, cacheKey, error))) throw error;
+		try {
+			const creds = await resolveFresh(
+				profile,
+				region,
+				allowAmbientCredentials,
+				AbortSignal.timeout(SHARED_RESOLVE_TIMEOUT_MS),
+				fetchImpl,
+			);
+			recoveryCooldown.delete(cacheKey);
+			return creds;
+		} catch (retryError) {
+			if (
+				!(retryError instanceof AIError.AwsCredentialsError) ||
+				RECOVERABLE_RECOVERY_KINDS[retryError.kind] !== true
+			) {
+				recoveryCooldown.delete(cacheKey);
+			}
+			throw retryError;
+		}
+	}
+}
+
+/** Whether the installed handler ran and reported a fresh session. */
+async function runCredentialRecovery(
+	profile: string,
+	region: string,
+	cacheKey: string,
+	error: unknown,
+): Promise<boolean> {
+	const handler = recoveryHandler;
+	if (!handler) return false;
+	if (!(error instanceof AIError.AwsCredentialsError)) return false;
+	if (RECOVERABLE_RECOVERY_KINDS[error.kind] !== true) return false;
+	const lastAttempt = recoveryCooldown.get(cacheKey);
+	if (lastAttempt !== undefined && Date.now() - lastAttempt < RECOVERY_COOLDOWN_MS) return false;
+	recoveryCooldown.set(cacheKey, Date.now());
+	try {
+		return await handler({ profile, region, kind: error.kind, error });
+	} catch (recoveryError) {
+		logger.warn("AWS credential recovery handler failed", {
+			profile,
+			kind: error.kind,
+			error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+		});
+		return false;
+	}
+}
+
 async function resolveFresh(
 	profile: string,
 	region: string,
+	allowAmbientCredentials: boolean,
 	signal?: AbortSignal,
 	fetchImpl: FetchImpl = globalThis.fetch as FetchImpl,
 ): Promise<ResolvedCredentials> {
-	// 1. Environment first — matches the AWS SDK chain order.
-	const envCreds = readEnvCredentials();
-	if (envCreds) return envCreds;
+	// Standard AWS environment credentials belong to operational tools when
+	// managed model authentication is active.
+	if (allowAmbientCredentials) {
+		const envCreds = readEnvCredentials();
+		if (envCreds) return envCreds;
+	}
 
 	// 2. Profile (static or SSO).
-	const profileCreds = await readProfileCredentials(profile, region, signal, fetchImpl);
+	const profileCreds = await readProfileCredentials(profile, region, allowAmbientCredentials, signal, fetchImpl);
 	if (profileCreds) return profileCreds;
 
-	// 3. EC2 IMDSv2.
-	if ($env.AWS_EC2_METADATA_DISABLED?.toLowerCase() !== "true") {
+	// EC2 task/instance identity is another ambient operational source.
+	if (allowAmbientCredentials && $env.AWS_EC2_METADATA_DISABLED?.toLowerCase() !== "true") {
 		const imdsCreds = await readImdsCredentials(signal, fetchImpl);
 		if (imdsCreds) return imdsCreds;
 	}
 
 	throw new AIError.AwsCredentialsError(
-		`Unable to resolve AWS credentials. Set AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY, ` +
-			`or configure profile '${profile}' in ~/.aws/credentials (or ~/.aws/config for SSO).`,
+		allowAmbientCredentials
+			? `Unable to resolve AWS credentials. Set AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY, or configure profile '${profile}' in ~/.aws/credentials (or ~/.aws/config for SSO).`
+			: `Unable to resolve managed AWS model profile '${profile}' from ~/.aws/config.`,
 		"resolution",
 	);
 }
@@ -176,12 +319,15 @@ async function readIniFile(p: string): Promise<IniFile | undefined> {
 async function readProfileCredentials(
 	profile: string,
 	region: string,
+	allowAmbientCredentials: boolean,
 	signal: AbortSignal | undefined,
 	fetchImpl: FetchImpl,
 ): Promise<ResolvedCredentials | undefined> {
-	const home = os.homedir();
-	const credentialsPath = $env.AWS_SHARED_CREDENTIALS_FILE || path.join(home, ".aws", "credentials");
-	const configPath = $env.AWS_CONFIG_FILE || path.join(home, ".aws", "config");
+	const home = process.platform === "win32" ? $env.USERPROFILE || os.homedir() : $env.HOME || os.homedir();
+	const defaultCredentialsPath = path.join(home, ".aws", "credentials");
+	const defaultConfigPath = path.join(home, ".aws", "config");
+	const credentialsPath = (allowAmbientCredentials && $env.AWS_SHARED_CREDENTIALS_FILE) || defaultCredentialsPath;
+	const configPath = (allowAmbientCredentials && $env.AWS_CONFIG_FILE) || defaultConfigPath;
 
 	const credentialsIni = await readIniFile(credentialsPath);
 	const configIni = await readIniFile(configPath);
@@ -206,14 +352,63 @@ async function readProfileCredentials(
 	}
 
 	if (merged.sso_account_id && merged.sso_role_name) {
+		// Modern sso-session profiles carry a refresh token. Delegate these to the
+		// AWS CLI so its supported token provider renews the hourly access token;
+		// our direct cache exchange below intentionally remains as the no-CLI and
+		// legacy-profile fallback.
+		if (merged.sso_session) {
+			const refreshed = await readSsoCredentialsViaAwsCli(profile, allowAmbientCredentials, signal);
+			if (refreshed) return refreshed;
+		}
 		return readSsoCredentials(merged, configIni, region, signal, fetchImpl);
 	}
 
 	if (merged.credential_process) {
-		return readCredentialProcess(profile, merged.credential_process, signal);
+		return readCredentialProcess(profile, merged.credential_process, allowAmbientCredentials, signal);
 	}
 
 	return undefined;
+}
+
+/**
+ * Resolve a modern SSO profile through the AWS CLI token provider. Unlike a
+ * direct read of ~/.aws/sso/cache, `export-credentials` uses the refresh token
+ * stored by `aws sso login`, so one browser sign-in survives the access token's
+ * hourly rotation. The caller falls back to the direct resolver when the CLI is
+ * unavailable (legacy OMP installs and non-CLI environments).
+ */
+function classifyAwsCliSsoFailure(message: string): AIError.AwsCredentialsErrorKind {
+	if (/error loading sso token|sso token[\s\S]*(?:not found|does not exist)/i.test(message)) {
+		return "sso-token-missing";
+	}
+	if (/(?:sso (?:token|session)|token)[\s\S]*(?:expired|invalid|refresh failed)/i.test(message)) {
+		return "sso-token-expired";
+	}
+	return "sso-role";
+}
+
+async function readSsoCredentialsViaAwsCli(
+	profile: string,
+	allowAmbientCredentials: boolean,
+	signal: AbortSignal | undefined,
+): Promise<ResolvedCredentials | undefined> {
+	const executable = Bun.which("aws", { PATH: $env.PATH });
+	if (!executable) return undefined;
+	try {
+		return await runCredentialCommand(
+			profile,
+			[executable, "configure", "export-credentials", "--profile", profile, "--format", "process"],
+			allowAmbientCredentials,
+			signal,
+			"AWS CLI SSO credential export",
+			"sso-role",
+		);
+	} catch (error) {
+		if (!(error instanceof AIError.AwsCredentialsError) || error.kind !== "sso-role") throw error;
+		const kind = classifyAwsCliSsoFailure(error.message);
+		if (kind === error.kind) throw error;
+		throw new AIError.AwsCredentialsError(error.message, kind, { cause: error });
+	}
 }
 
 interface SsoCachedToken {
@@ -302,7 +497,8 @@ async function loadSsoCachedToken(
 	startUrl: string,
 	sessionName: string | undefined,
 ): Promise<SsoCachedToken | undefined> {
-	const cacheDir = path.join(os.homedir(), ".aws", "sso", "cache");
+	const home = process.platform === "win32" ? $env.USERPROFILE || os.homedir() : $env.HOME || os.homedir();
+	const cacheDir = path.join(home, ".aws", "sso", "cache");
 	let entries: string[];
 	try {
 		entries = await fs.promises.readdir(cacheDir);
@@ -357,15 +553,38 @@ interface CredentialProcessEnvelope {
 async function readCredentialProcess(
 	profile: string,
 	command: string,
+	allowAmbientCredentials: boolean,
 	signal: AbortSignal | undefined,
 ): Promise<ResolvedCredentials> {
-	const argv = buildCredentialProcessArgv(profile, command);
+	return runCredentialCommand(
+		profile,
+		buildCredentialProcessArgv(profile, command),
+		allowAmbientCredentials,
+		signal,
+		"AWS credential_process",
+		"credential-process",
+	);
+}
+
+async function runCredentialCommand(
+	profile: string,
+	argv: string[],
+	allowAmbientCredentials: boolean,
+	signal: AbortSignal | undefined,
+	source: string,
+	kind: AIError.AwsCredentialsErrorKind,
+): Promise<ResolvedCredentials> {
+	const environment = allowAmbientCredentials ? undefined : { ...Bun.env };
+	if (environment) {
+		for (const key of MANAGED_MODEL_CHILD_CLEARED_ENV_VARS) delete environment[key];
+	}
 	const child = Bun.spawn(argv, {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		windowsHide: true,
 		signal,
+		...(environment ? { env: environment } : {}),
 	});
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(child.stdout).text(),
@@ -374,10 +593,7 @@ async function readCredentialProcess(
 	]);
 	if (exitCode !== 0) {
 		const tail = stderr.trim().slice(-512) || stdout.trim().slice(-512) || "(no output)";
-		throw new AIError.AwsCredentialsError(
-			`AWS credential_process for profile '${profile}' exited ${exitCode}: ${tail}`,
-			"credential-process",
-		);
+		throw new AIError.AwsCredentialsError(`${source} for profile '${profile}' exited ${exitCode}: ${tail}`, kind);
 	}
 
 	let parsed: CredentialProcessEnvelope;
@@ -385,21 +601,21 @@ async function readCredentialProcess(
 		parsed = JSON.parse(stdout) as CredentialProcessEnvelope;
 	} catch (err) {
 		throw new AIError.AwsCredentialsError(
-			`AWS credential_process for profile '${profile}' did not emit valid JSON: ${String(err)}`,
-			"credential-process",
+			`${source} for profile '${profile}' did not emit valid JSON: ${String(err)}`,
+			kind,
 			{ cause: err },
 		);
 	}
 	if (parsed.Version !== 1) {
 		throw new AIError.AwsCredentialsError(
-			`AWS credential_process for profile '${profile}' returned unsupported Version ${parsed.Version ?? "<missing>"}; expected 1.`,
-			"credential-process",
+			`${source} for profile '${profile}' returned unsupported Version ${parsed.Version ?? "<missing>"}; expected 1.`,
+			kind,
 		);
 	}
 	if (!parsed.AccessKeyId || !parsed.SecretAccessKey) {
 		throw new AIError.AwsCredentialsError(
-			`AWS credential_process for profile '${profile}' returned envelope without AccessKeyId/SecretAccessKey.`,
-			"credential-process",
+			`${source} for profile '${profile}' returned envelope without AccessKeyId/SecretAccessKey.`,
+			kind,
 		);
 	}
 
@@ -570,9 +786,10 @@ async function readImdsCredentials(
 	}
 }
 
-/** Test/diagnostic helper — drops cached credentials. */
+/** Test/diagnostic helper — drops cached credentials and recovery back-off state. */
 export function clearAwsCredentialCache(): void {
 	cache.clear();
+	recoveryCooldown.clear();
 }
 
 /**
@@ -580,7 +797,8 @@ export function clearAwsCredentialCache(): void {
  * 401/403 responses so stale credentials are re-resolved instead of served until restart.
  */
 export function invalidateAwsCredentialCache(opts: { profile?: string; region?: string } = {}): void {
-	const profile = opts.profile || $env.AWS_PROFILE || "default";
-	const region = opts.region || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1";
-	cache.delete(`${profile}\x00${region}`);
+	const allowAmbientCredentials = allowAmbientAwsModelCredentials();
+	const profile = opts.profile || resolveAwsModelProfile() || "default";
+	const region = opts.region || resolveAwsModelRegion() || "us-east-1";
+	cache.delete(`${profile}\x00${region}\x00${allowAmbientCredentials ? "ambient" : "managed"}`);
 }

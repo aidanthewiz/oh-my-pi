@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Claude Opus 5 metadata and Claude Platform on AWS availability with 1M context, 128K output, adaptive thinking, and current token pricing.
+
 ## [17.0.9] - 2026-07-23
 
 ### Changed
@@ -136,6 +140,10 @@
 
 - Fixed parsing of SAP AI Core Claude model IDs in version-first format (e.g., anthropic--claude-4.8-opus), restoring adaptive thinking metadata and capability gates.
 - Fixed GitHub Copilot Business and Enterprise model discovery to correctly preserve vision capabilities instead of downgrading models to text-only.
+### Added
+
+- Added `openai-aws` as a first-class provider for **OpenAI on AWS** — OpenAI models served by Amazon Bedrock through the `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint. Frontier entries (`openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`, `openai.gpt-5.6-luna`) are cloned from the first-party `openai` specs at generation time (capabilities/thinking stay in sync) with AWS Bedrock pricing and the Bedrock-served 272K context window on the `openai/v1` path; the open-weight `openai.gpt-oss-120b` / `openai.gpt-oss-20b` are curated statics on the bare `/v1` path. Every entry must be Mantle-available, Responses-compatible, and permit `data_retention_mode: none` in the account's Models API metadata; GPT-5.5 and GPT-5.4 fail the retention requirement and are deliberately absent. First-party promotion targets are dropped so a Mantle model never promotes to a direct OpenAI endpoint; cross-provider overflow escalation is configured in org policy (models overlay), not the bundle.
+- The gpt-oss family effort ladder (`low|medium|high`, Harmony format) now also applies to `openai-responses` specs and to Bedrock's dotted `openai.gpt-oss-*` ids.
 
 ## [16.4.2] - 2026-07-10
 
@@ -311,6 +319,14 @@
 - Fixed CoreWeave Serverless Inference project-header detection to ensure blank OpenAI-Project overrides do not block the `COREWEAVE_PROJECT` fallback.
 - Fixed LiteLLM MiniMax M3 discovery to remove reseller-only display suffixes and invalidated the model cache to clear stale suffixes immediately.
 - Fixed ZenMux's `anthropic-messages` proxy being misclassified as a non-signing reasoning endpoint (`replayUnsignedThinking: true`), matching the GitHub Copilot fix (#2851). ZenMux's `zenmux.ai/api/anthropic` route forwards to signature-enforcing Anthropic, so replaying a stripped/unsigned historical `thinking` block as `signature: ""` — most visibly an end_turn-bound checkpoint/branch-return turn whose signature the transform must strip — caused `400 messages.1.content.0: Invalid signature in thinking` on Claude Sonnet 5 and other reasoning models. ([#4192](https://github.com/can1357/oh-my-pi/issues/4192))
+### Added
+
+- Added `anthropic-aws` as a first-class provider for **Claude Platform on AWS** — Anthropic's first-party Messages API served through AWS (`aws-external-anthropic.{region}.api.aws`), distinct from Amazon Bedrock (Anthropic operates the stack; AWS provides auth + Marketplace billing). Uses the same `/v1` surface, model IDs, and capabilities as the first-party Claude API (extended/adaptive thinking, prompt caching, tool use incl. the web-search server tool, batch, PDF, vision, 1M context). Dual auth mirrors the `AnthropicAWS` SDK: an API key via `ANTHROPIC_AWS_API_KEY` (sent as an `Authorization: Bearer` token, authorized by the `aws-external-anthropic:CallWithBearerToken` IAM action), or the AWS SigV4 credential chain (service `aws-external-anthropic`) when no key is set. Reads `ANTHROPIC_AWS_WORKSPACE_ID` (required `anthropic-workspace-id` header) and `AWS_REGION`/`AWS_DEFAULT_REGION` (endpoint region). First-party-only billing features not offered by the platform (priority service tier, fast mode) remain gated to the `anthropic` provider.
+- `anthropic-aws` can pin inference geography via the `ANTHROPIC_AWS_INFERENCE_GEO` env var (`us` for US-only data centers at 1.1x pricing, or `global`), applied only to models that accept it (Opus 4.6 / Sonnet 4.6 and later; older models reject `inference_geo` with a 400). The Anthropic web-search backend also forwards the `anthropic-workspace-id` header when `ANTHROPIC_SEARCH_BASE_URL` targets the gateway.
+
+### Fixed
+
+- Fixed Anthropic's first-party "Claude on AWS" external gateway (`aws-external-anthropic.<region>.api.aws`) being misclassified as a non-signing reasoning endpoint (`replayUnsignedThinking: true`). It forwards to signature-enforcing Anthropic, so replaying an unsigned/summarized `thinking` block as `signature: ""` caused a `400 Invalid signature in thinking block` on multi-turn tool use. It is now recognized as a signing host (new `anthropicAws` known host) and degrades such blocks to text like the official API and GitHub Copilot's proxy ([#2851](https://github.com/can1357/oh-my-pi/issues/2851)). Auth is an API-key Bearer token (or AWS SigV4) plus an `anthropic-workspace-id` header, so it is never treated as the OAuth-official host.
 
 ## [16.2.13] - 2026-07-01
 

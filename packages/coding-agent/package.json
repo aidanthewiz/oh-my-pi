@@ -50,6 +50,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",
+    "@azure/msal-node": "catalog:",
     "@babel/parser": "catalog:",
     "@babel/traverse": "catalog:",
     "@mozilla/readability": "catalog:",

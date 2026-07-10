@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { scheduler } from "node:timers/promises";
 import * as tls from "node:tls";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
+import { parseKnownModel, semverGte } from "@oh-my-pi/pi-catalog/identity/classify";
 import { mapEffortToAnthropicAdaptiveEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
@@ -16,8 +17,10 @@ import {
 	parseStreamingJsonThrottled,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
+import { resolveAwsModelProfile, resolveAwsModelRegion } from "../aws-model-auth";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
+import { anthropicBaseUrlIsAwsGateway, resolveAnthropicAwsWorkspaceId } from "../registry/anthropic-aws-env";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
 	AnthropicFallbackContent,
@@ -82,11 +85,14 @@ import type {
 	RawMessageStreamEvent,
 	TextBlockParam,
 } from "./anthropic-wire";
+import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-credentials";
+import { signRequest } from "./aws-sigv4";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
+import { deleteHeaderCaseInsensitive, headerInitToRecord } from "./http-headers";
 import { transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -619,6 +625,108 @@ export function wrapFetchForCch(base: FetchImpl): FetchImpl {
 			return base(input, { ...init, body: encoded });
 		}
 		return base(input, init);
+	};
+}
+
+// --- Claude Platform on AWS (aws-external-anthropic gateway) ----------------
+// Anthropic's first-party Messages API on AWS. Dual auth mirrors the AnthropicAWS
+// SDK: an API key sent as a Bearer token (authorized by the
+// `aws-external-anthropic:CallWithBearerToken` IAM action) or the AWS SigV4
+// credential chain. Every request also carries a workspace id header and a
+// region-scoped base URL.
+
+/** Sentinel returned by the registry when SigV4 credentials (not an API key) are present. */
+const AUTHENTICATED_API_KEY_SENTINEL = "<authenticated>";
+/** AWS SigV4 service name for the gateway (per docs: `aws:amz:<region>:aws-external-anthropic`). */
+const ANTHROPIC_AWS_SIGV4_SERVICE = "aws-external-anthropic";
+const ANTHROPIC_AWS_DEFAULT_REGION = "us-east-1";
+
+/**
+ * The active model-auth region, then the region segment of
+ * `ANTHROPIC_BASE_URL` when it is the gateway host. Managed Coreforge model
+ * routing uses its isolated region; ordinary sessions use the standard AWS
+ * region environment.
+ */
+function resolveAnthropicAwsRegion(): string | undefined {
+	const explicit = resolveAwsModelRegion();
+	if (explicit) return explicit;
+	if (anthropicBaseUrlIsAwsGateway()) {
+		return regionFromAnthropicAwsBaseUrl($env.ANTHROPIC_BASE_URL?.trim());
+	}
+	return undefined;
+}
+
+/**
+ * Resolve the Claude Platform on AWS endpoint. The catalog bakes the us-east-1
+ * gateway; rewrite the region segment from the active model-auth region so a
+ * workspace bound to any region reaches its matching regional endpoint.
+ */
+function resolveAnthropicAwsBaseUrl(model: Model<"anthropic-messages">): string {
+	const region = resolveAnthropicAwsRegion();
+	if (region) return `https://aws-external-anthropic.${region}.api.aws`;
+	return (
+		normalizeAnthropicBaseUrl(model.baseUrl) ??
+		`https://aws-external-anthropic.${ANTHROPIC_AWS_DEFAULT_REGION}.api.aws`
+	);
+}
+
+/** Extract the region segment from an `aws-external-anthropic.{region}.api.aws` URL. */
+export function regionFromAnthropicAwsBaseUrl(baseUrl: string | undefined): string | undefined {
+	if (!baseUrl) return undefined;
+	return /aws-external-anthropic\.([^./]+)\.api\.aws/i.exec(baseUrl)?.[1];
+}
+
+/**
+ * Wrap fetch so each Claude Platform on AWS request is AWS SigV4-signed (service
+ * `aws-external-anthropic`) via the standard AWS credential provider chain. Used
+ * only when no API key is configured. Any client-set `Authorization`/`X-Api-Key`
+ * is stripped before signing so the SigV4 signature is the sole credential; every
+ * remaining header (including `anthropic-workspace-id`) is signed. The signing
+ * region must equal the region in the endpoint URL. Secrets are never logged.
+ */
+export function wrapFetchForAnthropicAwsSigV4(base: FetchImpl, region: string, profile?: string): FetchImpl {
+	return async (input, init) => {
+		const urlString = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+		const url = new URL(urlString);
+		const method = (init?.method ?? (input instanceof Request ? input.method : "POST")).toUpperCase();
+		// The AnthropicMessagesClient posts a JSON string body; also accept the
+		// common binary forms so the payload hash matches the bytes actually sent.
+		// Other BodyInit shapes (streams, FormData) are not used on this path.
+		const rawBody = init?.body;
+		let bodyText: string;
+		if (typeof rawBody === "string") bodyText = rawBody;
+		else if (rawBody instanceof Uint8Array) bodyText = new TextDecoder().decode(rawBody);
+		else if (rawBody instanceof ArrayBuffer) bodyText = new TextDecoder().decode(rawBody);
+		else bodyText = "";
+		const body = new TextEncoder().encode(bodyText);
+		const headers = headerInitToRecord(init?.headers);
+		// The SigV4 signature is the only credential; drop competing auth + the host
+		// header (signRequest re-derives host from the URL).
+		deleteHeaderCaseInsensitive(headers, "authorization");
+		deleteHeaderCaseInsensitive(headers, "x-api-key");
+		deleteHeaderCaseInsensitive(headers, "host");
+		const credentials = await resolveAwsCredentials({
+			region,
+			profile,
+			signal: init?.signal ?? undefined,
+			fetch: base,
+		});
+		const signed = await signRequest({
+			method,
+			host: url.host,
+			path: url.pathname,
+			query: url.search.replace(/^\?/, ""),
+			body,
+			region,
+			service: ANTHROPIC_AWS_SIGV4_SERVICE,
+			credentials,
+			headers,
+		});
+		const response = await base(input, { ...init, headers: { ...headers, ...signed } });
+		if (response.status === 401 || response.status === 403) {
+			invalidateAwsCredentialCache({ profile, region });
+		}
+		return response;
 	};
 }
 
@@ -1193,6 +1301,9 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	}
 	if (model.provider === "anthropic") {
 		return normalizeAnthropicBaseUrl(model.baseUrl) ?? "https://api.anthropic.com";
+	}
+	if (model.provider === "anthropic-aws") {
+		return resolveAnthropicAwsBaseUrl(model);
 	}
 	return normalizeAnthropicBaseUrl(model.baseUrl);
 }
@@ -2857,6 +2968,51 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
+	// Claude Platform on AWS: inject the mandatory `anthropic-workspace-id` header,
+	// then authenticate with either the API key or, when only AWS credentials are
+	// present, SigV4 request signing. Per the docs the gateway authenticates an API
+	// key as a Bearer token (IAM authorizes it via the
+	// `aws-external-anthropic:CallWithBearerToken` action) — NOT the first-party
+	// `x-api-key` scheme — so drop any `x-api-key`; `buildAnthropicHeaders` already
+	// emitted `Authorization: Bearer <key>` for this non-official base URL.
+	if (model.provider === "anthropic-aws") {
+		const awsHeaders = { ...defaultHeaders };
+		deleteHeaderCaseInsensitive(awsHeaders, "x-api-key");
+		const workspaceId = resolveAnthropicAwsWorkspaceId();
+		if (workspaceId) awsHeaders["anthropic-workspace-id"] = workspaceId;
+		const useApiKey = !!apiKey && apiKey !== AUTHENTICATED_API_KEY_SENTINEL;
+		if (useApiKey) {
+			// Keep the `Authorization: Bearer <key>` credential `buildAnthropicHeaders`
+			// built; leave `apiKey` null so the client never re-adds `X-Api-Key`.
+			return {
+				isOAuthToken: false,
+				apiKey: null,
+				authToken: null,
+				baseURL: baseUrl,
+				maxRetries: 5,
+				defaultHeaders: awsHeaders,
+				fetch: cchFetch,
+				fetchOptions,
+			};
+		}
+		// SigV4 path: strip the sentinel Bearer so the AWS signature is the sole
+		// credential, then sign per-request with the AWS credential chain. The signing
+		// region must equal the endpoint region, so derive it from the base URL.
+		deleteHeaderCaseInsensitive(awsHeaders, "authorization");
+		const region =
+			regionFromAnthropicAwsBaseUrl(baseUrl) ?? resolveAnthropicAwsRegion() ?? ANTHROPIC_AWS_DEFAULT_REGION;
+		return {
+			isOAuthToken: false,
+			apiKey: null,
+			authToken: null,
+			baseURL: baseUrl,
+			maxRetries: 5,
+			defaultHeaders: awsHeaders,
+			fetch: wrapFetchForAnthropicAwsSigV4(baseFetch, region, resolveAwsModelProfile()),
+			fetchOptions,
+		};
+	}
+
 	// OpenCode Go and Umans validate Anthropic-compatible API-key auth through
 	// `X-Api-Key`; bearer-only requests reach the endpoint but fail auth.
 	if (model.provider === "opencode-go" || model.provider === "umans") {
@@ -3219,6 +3375,27 @@ type AnthropicParamBuildOptions = {
 	/** Sanitized server-side fallback entries; defaults to `options?.fallbacks` when omitted. */
 	fallbacks?: AnthropicOptions["fallbacks"];
 };
+/** Normalize `ANTHROPIC_AWS_INFERENCE_GEO` to a supported value, else undefined. */
+function resolveAnthropicAwsInferenceGeo(): "us" | "global" | undefined {
+	const raw = $env.ANTHROPIC_AWS_INFERENCE_GEO?.trim().toLowerCase();
+	return raw === "us" || raw === "global" ? raw : undefined;
+}
+
+/**
+ * Claude Platform on AWS supports pinning inference geography per request via
+ * `inference_geo` ("us" — US-only data centers, 1.1x pricing; or "global"). It is
+ * accepted on Opus 4.6 / Sonnet 4.6 and later; Opus 4.5, Sonnet 4.5, and Haiku
+ * 4.5 reject it with a 400. Apply the env-configured value only to eligible
+ * `anthropic-aws` models so the request never 400s on an unsupported model.
+ */
+function applyAnthropicAwsInferenceGeo(params: MessageCreateParamsStreaming, model: Model<"anthropic-messages">): void {
+	if (model.provider !== "anthropic-aws") return;
+	const geo = resolveAnthropicAwsInferenceGeo();
+	if (!geo) return;
+	const parsed = parseKnownModel(model.id);
+	if (parsed.family !== "anthropic" || !semverGte(parsed.version, "4.6")) return;
+	(params as MessageCreateParamsStreaming & { inference_geo?: string }).inference_geo = geo;
+}
 
 function buildParams(
 	model: Model<"anthropic-messages">,
@@ -3443,6 +3620,7 @@ function buildParams(
 	applyPromptCaching(params, cacheControl);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
+	applyAnthropicAwsInferenceGeo(params, model);
 
 	return params;
 }

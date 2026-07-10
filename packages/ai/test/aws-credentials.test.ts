@@ -3,16 +3,23 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
+	MANAGED_AWS_MODEL_AUTH_MODE,
+} from "@oh-my-pi/pi-ai";
+import {
 	clearAwsCredentialCache,
 	resolveAwsCredentials,
+	setAwsCredentialRecoveryHandler,
 	tokenizeCredentialProcessCommand,
 } from "@oh-my-pi/pi-ai/providers/aws-credentials";
 import { removeWithRetries } from "../../utils/src/temp";
 
-// `credential_process` integration coverage. Drives a real `Bun.spawn`
-// against a fixture script so the JSON envelope contract, exit-code
-// handling, abort propagation, cache behavior, and the POSIX-style
-// tokenizer are all exercised end-to-end.
+// Process-backed credential integration coverage. Drives real `Bun.spawn`
+// calls against fixture scripts so credential_process and modern SSO export
+// envelopes, exit handling, abort propagation, and caching are exercised
+// end-to-end.
 
 const ENV_KEYS = [
 	"AWS_ACCESS_KEY_ID",
@@ -24,6 +31,12 @@ const ENV_KEYS = [
 	"AWS_CONFIG_FILE",
 	"AWS_SHARED_CREDENTIALS_FILE",
 	"AWS_EC2_METADATA_DISABLED",
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
+	"PATH",
+	"HOME",
+	"USERPROFILE",
 ] as const;
 
 function quoteForConfig(p: string): string {
@@ -32,6 +45,15 @@ function quoteForConfig(p: string): string {
 	// paths survive without further escaping.
 	return `"${p.replace(/(["])/g, "\\$1")}"`;
 }
+
+const MODERN_SSO_CONFIG = `sso_session = managed-session
+sso_account_id = 111122223333
+sso_role_name = ModelAccess
+
+[sso-session managed-session]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+sso_registration_scopes = sso:account:access`;
 
 describe("tokenizeCredentialProcessCommand", () => {
 	test("splits on whitespace", () => {
@@ -75,7 +97,7 @@ describe("tokenizeCredentialProcessCommand", () => {
 	});
 });
 
-describe("resolveAwsCredentials credential_process", () => {
+describe("resolveAwsCredentials process-backed profiles", () => {
 	let tmp: string;
 	const saved = new Map<string, string | undefined>();
 
@@ -87,6 +109,8 @@ describe("resolveAwsCredentials credential_process", () => {
 		Bun.env.AWS_EC2_METADATA_DISABLED = "true";
 		tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aws-credproc-"));
 		clearAwsCredentialCache();
+		Bun.env.HOME = tmp;
+		Bun.env.USERPROFILE = tmp;
 	});
 
 	afterEach(async () => {
@@ -97,12 +121,26 @@ describe("resolveAwsCredentials credential_process", () => {
 		saved.clear();
 		await removeWithRetries(tmp);
 		clearAwsCredentialCache();
+		setAwsCredentialRecoveryHandler(undefined);
 	});
 
 	async function writeFixture(name: string, body: string): Promise<string> {
 		const p = path.join(tmp, name);
 		await Bun.write(p, body);
 		return p;
+	}
+
+	async function installFakeAws(body: string): Promise<void> {
+		const script = await writeFixture("fake-aws.js", body);
+		const isWindows = process.platform === "win32";
+		const executable = await writeFixture(
+			isWindows ? "aws.cmd" : "aws",
+			isWindows
+				? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
+				: `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`,
+		);
+		if (!isWindows) await fs.chmod(executable, 0o755);
+		Bun.env.PATH = `${tmp}${path.delimiter}${saved.get("PATH") ?? ""}`;
 	}
 
 	async function writeConfig(profile: string, line: string): Promise<void> {
@@ -114,6 +152,13 @@ describe("resolveAwsCredentials credential_process", () => {
 		const sharedPath = path.join(tmp, "credentials");
 		await Bun.write(sharedPath, "");
 		Bun.env.AWS_SHARED_CREDENTIALS_FILE = sharedPath;
+	}
+
+	async function writeDefaultConfig(profile: string, line: string): Promise<void> {
+		const awsDir = path.join(tmp, ".aws");
+		await fs.mkdir(awsDir, { recursive: true });
+		await Bun.write(path.join(awsDir, "config"), `[profile ${profile}]\n${line}\n`);
+		await Bun.write(path.join(awsDir, "credentials"), "");
 	}
 
 	test("parses a Version 1 envelope and honors Expiration", async () => {
@@ -128,6 +173,62 @@ describe("resolveAwsCredentials credential_process", () => {
 		expect(creds.secretAccessKey).toBe("sek");
 		expect(creds.sessionToken).toBe("tok");
 		expect(creds.expiresAt).toBe(Date.parse("2099-01-01T00:00:00Z"));
+	});
+
+	test("managed model auth ignores operational credentials, explicit options, and config redirects", async () => {
+		await writeConfig(
+			"model-inference",
+			"aws_access_key_id = REDIRECTEDKEY\naws_secret_access_key = redirected-secret",
+		);
+		await writeDefaultConfig("model-inference", "aws_access_key_id = MODELKEY\naws_secret_access_key = model-secret");
+		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
+		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
+		Bun.env[AWS_MODEL_REGION_ENV] = "us-east-1";
+		Bun.env.AWS_PROFILE = "employee-operations";
+		Bun.env.AWS_REGION = "eu-west-1";
+		Bun.env.AWS_ACCESS_KEY_ID = "OPERATIONALKEY";
+		Bun.env.AWS_SECRET_ACCESS_KEY = "operational-secret";
+
+		const creds = await resolveAwsCredentials({ profile: "employee-operations", region: "eu-west-1" });
+		expect(creds.accessKeyId).toBe("MODELKEY");
+		expect(creds.secretAccessKey).toBe("model-secret");
+	});
+
+	test("managed credential processes do not inherit operational AWS settings", async () => {
+		const childEnvPath = path.join(tmp, "child-env.json");
+		const script = await writeFixture(
+			"managed-process.js",
+			`await Bun.write(${JSON.stringify(childEnvPath)}, JSON.stringify({
+				profile: Bun.env.AWS_PROFILE ?? null,
+				region: Bun.env.AWS_REGION ?? null,
+				accessKey: Bun.env.AWS_ACCESS_KEY_ID ?? null,
+				config: Bun.env.AWS_CONFIG_FILE ?? null,
+				credentials: Bun.env.AWS_SHARED_CREDENTIALS_FILE ?? null
+			}));
+			console.log(JSON.stringify({Version:1,AccessKeyId:"MODELPROCESSKEY",SecretAccessKey:"model-process-secret"}));`,
+		);
+		await writeConfig("model-inference", "aws_access_key_id = WRONGKEY\naws_secret_access_key = wrong-secret");
+		await writeDefaultConfig(
+			"model-inference",
+			`credential_process = ${quoteForConfig(process.execPath)} ${quoteForConfig(script)}`,
+		);
+		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
+		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
+		Bun.env[AWS_MODEL_REGION_ENV] = "us-east-1";
+		Bun.env.AWS_PROFILE = "employee-operations";
+		Bun.env.AWS_REGION = "eu-west-1";
+		Bun.env.AWS_ACCESS_KEY_ID = "OPERATIONALKEY";
+		Bun.env.AWS_SECRET_ACCESS_KEY = "operational-secret";
+
+		const creds = await resolveAwsCredentials();
+		expect(creds.accessKeyId).toBe("MODELPROCESSKEY");
+		expect(JSON.parse(await Bun.file(childEnvPath).text())).toEqual({
+			profile: null,
+			region: null,
+			accessKey: null,
+			config: null,
+			credentials: null,
+		});
 	});
 
 	test("caches by profile so the helper is only invoked once", async () => {
@@ -175,5 +276,107 @@ describe("resolveAwsCredentials credential_process", () => {
 		const promise = resolveAwsCredentials({ profile: "hangs", signal: ctrl.signal });
 		setTimeout(() => ctrl.abort(new Error("test abort")), 50);
 		await expect(promise).rejects.toBeDefined();
+	});
+
+	test("uses AWS CLI token refresh for a modern SSO session", async () => {
+		const argvPath = path.join(tmp, "aws-argv.json");
+		await installFakeAws(
+			`await Bun.write(${JSON.stringify(argvPath)}, JSON.stringify(Bun.argv.slice(2)));
+console.log(JSON.stringify({Version:1,AccessKeyId:"ASIAREFRESHED",SecretAccessKey:"secret",SessionToken:"session",Expiration:"2099-01-01T00:00:00Z"}));`,
+		);
+		await writeConfig("managed", MODERN_SSO_CONFIG);
+
+		const creds = await resolveAwsCredentials({ profile: "managed", region: "us-east-1" });
+
+		expect(creds).toEqual({
+			accessKeyId: "ASIAREFRESHED",
+			secretAccessKey: "secret",
+			sessionToken: "session",
+			expiresAt: Date.parse("2099-01-01T00:00:00Z"),
+		});
+		expect(JSON.parse(await Bun.file(argvPath).text())).toEqual([
+			"configure",
+			"export-credentials",
+			"--profile",
+			"managed",
+			"--format",
+			"process",
+		]);
+	});
+
+	test("falls back to the cached token exchange when AWS CLI is unavailable", async () => {
+		Bun.env.PATH = tmp;
+		await writeConfig("managed", MODERN_SSO_CONFIG);
+		const cacheDir = path.join(tmp, ".aws", "sso", "cache");
+		await fs.mkdir(cacheDir, { recursive: true });
+		const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode("managed-session"));
+		const hash = Buffer.from(digest).toString("hex");
+		await Bun.write(
+			path.join(cacheDir, `${hash}.json`),
+			JSON.stringify({
+				accessToken: "cached-token",
+				expiresAt: "2099-01-01T00:00:00Z",
+				startUrl: "https://example.awsapps.com/start",
+				region: "us-east-1",
+			}),
+		);
+
+		const creds = await resolveAwsCredentials({
+			profile: "managed",
+			fetch: async (_input, init) => {
+				expect(new Headers(init?.headers).get("x-amz-sso_bearer_token")).toBe("cached-token");
+				return Response.json({
+					roleCredentials: {
+						accessKeyId: "ASIAFALLBACK",
+						secretAccessKey: "secret",
+						sessionToken: "session",
+						expiration: Date.parse("2099-01-01T00:00:00Z"),
+					},
+				});
+			},
+		});
+
+		expect(creds.accessKeyId).toBe("ASIAFALLBACK");
+	});
+
+	test("does not fall back when AWS CLI credential export fails", async () => {
+		await installFakeAws(`process.stderr.write("AccessDenied: role is not assigned"); process.exit(17);`);
+		await writeConfig("managed", MODERN_SSO_CONFIG);
+
+		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({ kind: "sso-role" });
+	});
+
+	test("classifies an exhausted AWS CLI SSO session as an expired token", async () => {
+		await installFakeAws(`process.stderr.write("The SSO session has expired and refresh failed"); process.exit(1);`);
+		await writeConfig("managed", MODERN_SSO_CONFIG);
+
+		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({
+			kind: "sso-token-expired",
+		});
+	});
+	test("clears recovery cooldown after a non-auth post-login failure", async () => {
+		const counterPath = path.join(tmp, "recovery-calls.txt");
+		await installFakeAws(
+			`const fs=require("node:fs");
+			 const prev=fs.existsSync(${JSON.stringify(counterPath)})?Number(fs.readFileSync(${JSON.stringify(counterPath)},"utf8")):0;
+			 fs.writeFileSync(${JSON.stringify(counterPath)},String(prev+1));
+			 process.stderr.write(prev===0?"The SSO session has expired and refresh failed":"AccessDenied: role is not assigned");
+			 process.exit(1);`,
+		);
+		await writeConfig("managed", MODERN_SSO_CONFIG);
+		let recoveries = 0;
+		setAwsCredentialRecoveryHandler(() => {
+			recoveries += 1;
+			return true;
+		});
+
+		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({ kind: "sso-role" });
+		expect(recoveries).toBe(1);
+
+		await installFakeAws(`process.stderr.write("The SSO session has expired and refresh failed"); process.exit(1);`);
+		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({
+			kind: "sso-token-expired",
+		});
+		expect(recoveries).toBe(2);
 	});
 });

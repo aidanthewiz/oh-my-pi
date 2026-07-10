@@ -49,6 +49,7 @@ import {
 	type OpenAIResponsesToolChoice,
 } from "../utils/tool-choice";
 import { compactGrammarDefinition } from "./grammar";
+import { applyOpenAIAwsRequestSetup } from "./openai-aws";
 import {
 	applyOpenAIReasoningEffortFallback,
 	clearOpenAIReasoningEffortFallbackState,
@@ -421,7 +422,7 @@ const streamOpenAIResponsesOnce = (
 			const routingSessionId = getOpenAIResponsesRoutingSessionId(options);
 			const promptCacheSessionId = getOpenAIPromptCacheKey(options);
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const { headers, copilotPremiumRequests, baseUrl } = resolveOpenAIRequestSetup(model, {
+			const setup = resolveOpenAIRequestSetup(model, {
 				apiKey,
 				extraHeaders: options?.headers,
 				initiatorOverride: options?.initiatorOverride,
@@ -429,6 +430,14 @@ const streamOpenAIResponsesOnce = (
 				openAISessionId: routingSessionId,
 				promptCacheSessionId,
 			});
+			// OpenAI on AWS (Bedrock-Mantle): rewrite the endpoint region from env
+			// and, on the credential-chain path, SigV4-sign each request instead of
+			// sending a Bearer credential. The wire shape is unchanged.
+			const awsSetup =
+				model.provider === "openai-aws" ? applyOpenAIAwsRequestSetup(setup, apiKey, options?.fetch) : undefined;
+			const { headers, copilotPremiumRequests } = awsSetup ? { ...setup, headers: awsSetup.headers } : setup;
+			const baseUrl = awsSetup?.baseUrl ?? setup.baseUrl;
+			const requestFetch = awsSetup ? awsSetup.fetch : options?.fetch;
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const strictToolsScope = getOpenAIStrictToolsScope(model, baseUrl);
@@ -455,7 +464,12 @@ const streamOpenAIResponsesOnce = (
 				}
 				return fallbackKey;
 			};
-			if (isOpenAIResponsesStatefulEnabled(options, baseUrl) && routingSessionId && providerSessionState) {
+			if (awsSetup) {
+				// Bedrock-Mantle stores responses for 30 days when `store` is unset
+				// (the API default). Org policy is zero retention: always send
+				// `store: false` and never chain stored responses on this provider.
+				params.store = false;
+			} else if (isOpenAIResponsesStatefulEnabled(options, baseUrl) && routingSessionId && providerSessionState) {
 				chainState = getOpenAIResponsesChainState(providerSessionState, model, baseUrl, routingSessionId);
 				if (!chainState.disabled) {
 					// Platform `previous_response_id` chaining only resolves stored responses.
@@ -516,7 +530,7 @@ const streamOpenAIResponsesOnce = (
 								headers: headersWithTimeout,
 								body: requestParams,
 								signal: requestSignal,
-								fetch: options?.fetch,
+								fetch: requestFetch,
 								// Transient 408/429/5xx get Retry-After-aware transport
 								// retries; the first-event watchdog aborts `requestSignal`,
 								// so retries cannot extend the caller's deadline.

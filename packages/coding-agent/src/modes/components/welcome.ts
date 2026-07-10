@@ -8,6 +8,7 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
+import { getCoreforgeGreetingName } from "../../identity/greeting";
 import { theme } from "../../modes/theme/theme";
 import tipsText from "./tips.txt" with { type: "text" };
 
@@ -215,6 +216,12 @@ export class WelcomeComponent implements Component {
 		this.invalidate();
 	}
 
+	/** Personalized greeting when a Coreforge identity is signed in. */
+	#welcomeText(): string {
+		const firstName = getCoreforgeGreetingName();
+		return firstName ? `Welcome back, ${firstName}!` : "Welcome back!";
+	}
+
 	render(termWidth: number): readonly string[] {
 		const animating = this.#animStart != null;
 		if (!animating && this.#cachedLines && this.#cachedWidth === termWidth) {
@@ -242,9 +249,10 @@ export class WelcomeComponent implements Component {
 		const preferredLeftCol = 26;
 		const minLeftCol = 12; // logo width
 		const minRightCol = 20;
+		const welcomeText = this.#welcomeText();
 		const leftMinContentWidth = Math.max(
 			minLeftCol,
-			visibleWidth("Welcome back!"),
+			visibleWidth(welcomeText),
 			visibleWidth(this.modelName),
 			visibleWidth(this.providerName),
 		);
@@ -264,7 +272,7 @@ export class WelcomeComponent implements Component {
 		// Left column - centered content
 		const leftLines = [
 			"",
-			this.#centerText(theme.bold("Welcome back!"), leftCol),
+			this.#centerText(theme.bold(welcomeText), leftCol),
 			"",
 			...logoColored.map(l => this.#centerText(l, leftCol)),
 			"",

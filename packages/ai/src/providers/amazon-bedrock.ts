@@ -11,6 +11,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $env, $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { resolveAwsModelRegion } from "../aws-model-auth";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import type {
@@ -140,16 +141,16 @@ function regionServesGeo(region: string, geo: string): boolean {
  * Resolve the Bedrock runtime region for a request. An explicit per-request
  * region and an ARN-embedded region win outright. Otherwise, for a geo-prefixed
  * cross-region inference profile (`us.`/`eu.`/`apac.`/`au.`/`jp.`/`us-gov.`), an
- * ambient region (`AWS_REGION` / `AWS_DEFAULT_REGION`) is honored only when it
- * can serve the profile's geo; a mismatched or absent ambient region is
- * corrected to the geo default so an `eu.`/`apac.` profile never POSTs to a `us`
- * endpoint (and vice versa). `global.` profiles have no geo entry, so the
- * ambient region (or `us-east-1`) is used unchanged.
+ * active model-auth region is honored only when it can serve the profile's
+ * geo; a mismatched or absent region is corrected to the geo default so an
+ * `eu.`/`apac.` profile never POSTs to a `us` endpoint (and vice versa).
+ * `global.` profiles have no geo entry, so the active model region (or
+ * `us-east-1`) is used unchanged.
  */
 function resolveBedrockRegion(modelId: string, options: BedrockOptions): string {
 	const explicit = options.region || inferRegionFromBedrockArn(modelId);
 	if (explicit) return explicit;
-	const ambient = $env.AWS_REGION || $env.AWS_DEFAULT_REGION;
+	const ambient = resolveAwsModelRegion();
 	const geo = inferenceProfileGeo(modelId);
 	if (geo) {
 		if (ambient && regionServesGeo(ambient, geo)) return ambient;

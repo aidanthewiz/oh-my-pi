@@ -63,6 +63,17 @@ const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxToken
 };
 
 /**
+ * OpenAI pricing published 30 Jul 2026. Codex uses the same rates as
+ * subscription-credit shadow prices. AWS pricing belongs to
+ * `deriveOpenAIAwsModels`, so the generator has one source for those rates.
+ */
+const GPT_5_6_PRICING = {
+	luna: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+	terra: { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
+	sol: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+} as const;
+
+/**
  * Apply upstream metadata corrections to a mutable array of models, then
  * re-bake canonical thinking metadata so generated catalogs always carry the
  * deriver's output for the post-policy spec.
@@ -344,6 +355,7 @@ function inferGeneratedApplyPatchToolType(
 }
 
 function applyOpenAICatalogPolicy(model: ModelSpec<Api>, parsedModel: OpenAIModel): void {
+	applyGpt56Pricing(model);
 	// Codex models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
 		model.contextWindow = 272000;
@@ -370,4 +382,12 @@ function applyOpenAICatalogPolicy(model: ModelSpec<Api>, parsedModel: OpenAIMode
 	if (model.api === "openai-codex-responses" && semverEqual(parsedModel.version, "5.6")) {
 		model.contextWindow = 372000;
 	}
+}
+
+function applyGpt56Pricing(model: ModelSpec<Api>): void {
+	if (model.provider !== "openai" && model.provider !== "openai-codex") return;
+	const id = model.id.toLowerCase();
+	const sku = (["luna", "terra", "sol"] as const).find(candidate => id.includes(`gpt-5.6-${candidate}`));
+	if (!sku) return;
+	Object.assign(model.cost, GPT_5_6_PRICING[sku]);
 }

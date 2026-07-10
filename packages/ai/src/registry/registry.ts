@@ -3,6 +3,7 @@ import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
 import { amazonBedrockProvider } from "./amazon-bedrock";
 import { anthropicProvider } from "./anthropic";
+import { anthropicAwsProvider } from "./anthropic-aws";
 import { azureProvider } from "./azure";
 import { basetenProvider } from "./baseten";
 import { cerebrasProvider } from "./cerebras";
@@ -39,6 +40,7 @@ import { nvidiaProvider } from "./nvidia";
 import { ollamaProvider } from "./ollama";
 import { ollamaCloudProvider } from "./ollama-cloud";
 import { openaiProvider } from "./openai";
+import { openaiAwsProvider } from "./openai-aws";
 import { openaiCodexProvider } from "./openai-codex";
 import { openaiCodexDeviceProvider } from "./openai-codex-device";
 import { opencodeGoProvider } from "./opencode-go";
@@ -143,6 +145,8 @@ const ALL = [
 	mistralProvider,
 	minimaxProvider,
 	amazonBedrockProvider,
+	anthropicAwsProvider,
+	openaiAwsProvider,
 ];
 
 export type RegistryDef = (typeof ALL)[number];

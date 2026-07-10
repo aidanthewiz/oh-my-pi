@@ -47,6 +47,176 @@ async function withCatalogDiscoveryTimeout<T>(timeoutMs: number, run: (signal: A
 }
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+
+/**
+ * Claude Platform on AWS — Anthropic's first-party Messages API served through AWS
+ * (`aws-external-anthropic.{region}.api.aws`). The catalog bakes the us-east-1
+ * endpoint as a default; the transport rewrites the region segment from
+ * `AWS_REGION` / `AWS_DEFAULT_REGION` at request time.
+ */
+export const ANTHROPIC_AWS_EXTERNAL_BASE_URL = "https://aws-external-anthropic.us-east-1.api.aws";
+
+/**
+ * Model IDs generally available on Claude Platform on AWS (per Anthropic docs:
+ * "Claude Platform on AWS" > "Available models"). IDs are identical to the
+ * first-party Claude API — no Bedrock `anthropic.` prefixes. The generator clones
+ * these anthropic specs into the `anthropic-aws` provider so pricing/context stay
+ * in sync; `thinking` is re-baked per id by the policy pass.
+ */
+export const ANTHROPIC_AWS_PLATFORM_MODEL_IDS: readonly string[] = [
+	"claude-opus-5",
+	"claude-fable-5",
+	"claude-opus-4-8",
+	"claude-opus-4-7",
+	"claude-opus-4-6",
+	"claude-opus-4-5",
+	"claude-sonnet-5",
+	"claude-sonnet-4-6",
+	"claude-sonnet-4-5",
+	"claude-haiku-4-5",
+];
+
+/**
+ * Derive the Claude Platform on AWS (`anthropic-aws`) catalog by cloning the
+ * first-party `anthropic` Messages models named in {@link ANTHROPIC_AWS_PLATFORM_MODEL_IDS}
+ * onto the `anthropic-aws` provider + gateway base URL. IDs and capabilities are
+ * identical to the first-party API, so the specs are copied verbatim (pricing,
+ * context, thinking); only `provider` and `baseUrl` change. Signing behaviour is
+ * applied later by the compat layer (`anthropicAws` host) and the policy pass.
+ * Deduped by id; non-anthropic providers and non-`anthropic-messages` models are
+ * ignored. Used by the generator (`generate-models.ts`).
+ */
+export function deriveAnthropicAwsModels(models: readonly ModelSpec<Api>[]): ModelSpec<"anthropic-messages">[] {
+	const platformIds = new Set(ANTHROPIC_AWS_PLATFORM_MODEL_IDS);
+	const derived = new Map<string, ModelSpec<"anthropic-messages">>();
+	for (const model of models) {
+		if (model.provider !== "anthropic" || model.api !== "anthropic-messages") continue;
+		if (!platformIds.has(model.id) || derived.has(model.id)) continue;
+		derived.set(model.id, {
+			...(model as ModelSpec<"anthropic-messages">),
+			provider: "anthropic-aws",
+			baseUrl: ANTHROPIC_AWS_EXTERNAL_BASE_URL,
+		});
+	}
+	return [...derived.values()];
+}
+
+/**
+ * OpenAI on AWS — OpenAI models served by Amazon Bedrock through the
+ * `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint. The
+ * catalog bakes the us-east-1 endpoint; the transport rewrites the region
+ * segment from `AWS_REGION` / `AWS_DEFAULT_REGION` at request time. Frontier
+ * ids (`openai.gpt-5.x`) are served on the `openai/v1` path; open-weight ids
+ * (`openai.gpt-oss-*`) on the bare `/v1` path (per the AWS model cards).
+ */
+export const OPENAI_AWS_MANTLE_FRONTIER_BASE_URL = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+export const OPENAI_AWS_MANTLE_OSS_BASE_URL = "https://bedrock-mantle.us-east-1.api.aws/v1";
+
+interface OpenAIAwsFrontierOverride {
+	/** First-party `openai` id the spec is cloned from. */
+	readonly sourceId: string;
+	/** AWS Bedrock on-demand pricing ($/MTok) — differs from first-party OpenAI. */
+	readonly cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	/** Context window served by Bedrock (per the AWS model card; smaller than the plain API's). */
+	readonly contextWindow: number;
+}
+
+/**
+ * Frontier OpenAI models exposed on Bedrock-Mantle (per the AWS "OpenAI"
+ * model-card catalog, July 2026). Curation policy: every entry must (1) be
+ * generally available on Bedrock-Mantle, (2) support the Responses API this
+ * provider speaks, and (3) permit `data_retention_mode: none` in the
+ * account's Models API metadata. GPT-5.6 Sol/Terra/Luna pass all three.
+ * GPT-5.5 and GPT-5.4 fail the retention check (`allowed_modes` carries no
+ * `none`) and are deliberately absent.
+ * Pricing per aws.amazon.com/bedrock/pricing (fetched 30 Jul 2026).
+ * Context is 272K per the AWS model cards, not the plain API's 1.05M window.
+ */
+const OPENAI_AWS_FRONTIER_MODELS: readonly OpenAIAwsFrontierOverride[] = [
+	{
+		sourceId: "gpt-5.6-sol",
+		cost: { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.88 },
+		contextWindow: 272_000,
+	},
+	{
+		sourceId: "gpt-5.6-terra",
+		cost: { input: 2.2, output: 13.2, cacheRead: 0.22, cacheWrite: 2.75 },
+		contextWindow: 272_000,
+	},
+	{
+		sourceId: "gpt-5.6-luna",
+		cost: { input: 0.22, output: 1.32, cacheRead: 0.022, cacheWrite: 0.275 },
+		contextWindow: 272_000,
+	},
+];
+
+/**
+ * Open-weight OpenAI models on Bedrock-Mantle (`/v1` path). Not cloned from a
+ * first-party spec — the plain OpenAI API does not serve them. Kept as cheap
+ * utility tiers (120b ≈ frontier-adjacent reasoning at $0.15/$0.60; 20b at
+ * half that). Pricing: aws.amazon.com/bedrock/pricing standard tier (13 Jul
+ * 2026); context/max-output per the AWS model cards (128K / 16K).
+ */
+const OPENAI_AWS_OSS_MODELS: readonly ModelSpec<"openai-responses">[] = [
+	{
+		id: "openai.gpt-oss-120b",
+		name: "gpt-oss-120b",
+		api: "openai-responses",
+		provider: "openai-aws",
+		baseUrl: OPENAI_AWS_MANTLE_OSS_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	},
+	{
+		id: "openai.gpt-oss-20b",
+		name: "gpt-oss-20b",
+		api: "openai-responses",
+		provider: "openai-aws",
+		baseUrl: OPENAI_AWS_MANTLE_OSS_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0.07, output: 0.3, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	},
+];
+
+/**
+ * Derive the OpenAI-on-AWS (`openai-aws`) catalog: frontier entries clone the
+ * first-party `openai` Responses specs named in {@link OPENAI_AWS_FRONTIER_MODELS}
+ * (capabilities/thinking stay in sync automatically) onto the `openai.`-namespaced
+ * Bedrock id with AWS pricing, the Bedrock-served context window, and the Mantle
+ * gateway base URL; open-weight entries are static curated specs. First-party
+ * promotion targets are dropped so a Mantle model never promotes to a direct
+ * OpenAI endpoint. Used by the generator (`generate-models.ts`).
+ */
+export function deriveOpenAIAwsModels(models: readonly ModelSpec<Api>[]): ModelSpec<"openai-responses">[] {
+	const derived = new Map<string, ModelSpec<"openai-responses">>();
+	for (const override of OPENAI_AWS_FRONTIER_MODELS) {
+		const source = models.find(
+			(model): model is ModelSpec<"openai-responses"> =>
+				model.provider === "openai" && model.api === "openai-responses" && model.id === override.sourceId,
+		);
+		if (!source) continue;
+		const { contextPromotionTarget: _dropped, ...base } = source;
+		derived.set(`openai.${override.sourceId}`, {
+			...base,
+			id: `openai.${override.sourceId}`,
+			provider: "openai-aws",
+			baseUrl: OPENAI_AWS_MANTLE_FRONTIER_BASE_URL,
+			cost: override.cost,
+			contextWindow: override.contextWindow,
+		});
+	}
+	for (const model of OPENAI_AWS_OSS_MODELS) {
+		derived.set(model.id, model);
+	}
+	return [...derived.values()];
+}
+
 const ANTHROPIC_OAUTH_BETA =
 	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 
@@ -187,6 +357,18 @@ function buildAnthropicReferenceMap(
  * by the generator's policy pass (scripts/generated-policies.ts).
  */
 export const ANTHROPIC_CURATED_FALLBACK_MODELS: readonly ModelSpec<"anthropic-messages">[] = [
+	{
+		id: "claude-opus-5",
+		name: "Claude Opus 5",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+	},
 	{
 		id: "claude-sonnet-5",
 		name: "Claude Sonnet 5",

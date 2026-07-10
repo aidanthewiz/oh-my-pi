@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed expired AWS IAM Identity Center sessions being retried as generic Anthropic connection failures; credential resolution can now invoke a bounded, single-flight re-authentication callback and preserve actionable AWS errors when recovery fails.
+- Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region.
+
 ## [17.0.9] - 2026-07-23
 
 ### Added
@@ -83,6 +88,8 @@
 - Fixed `kimi-code` Anthropic-format requests ignoring custom provider base URLs.
 - Fixed an issue where GPT-5.6 Codex Responses-Lite requests failed with an HTTP 400 error due to invalid `tool_choice` parameters after tools were rewritten, by automatically downgrading forced hosted choices to `tool_choice: "auto"` while preserving explicit tool-use constraints.
 - Fixed Cursor streams prematurely reporting success before late CONNECT or gRPC terminal failures were observed, and resolved issues rejecting transport ends without a `turnEnded` signal.
+- Automatically invalidate and rotate OAuth credentials when an "invalidated oauth token" error occurs
+- Fixed modern AWS IAM Identity Center profiles failing every hour by resolving them through the AWS CLI token provider, which silently renews cached SSO access tokens before rotating role credentials.
 
 ## [17.0.1] - 2026-07-16
 
@@ -191,6 +198,10 @@
 - Fixed an issue in the Responses API where empty tool results were incorrectly serialized with a "(see attached image)" placeholder, causing models to look for non-existent attachments.
 - Fixed OpenAI Responses server non-streaming envelopes to always include the required "incomplete_details" field, using null for completed responses.
 - Preserved Cloud Code Assist tool schemas when mixed-type unions carry branch-local validation descriptions.
+### Added
+
+- Added the `openai-aws` provider (**OpenAI on AWS**, Amazon Bedrock's `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint). Reuses the standard `openai-responses` transport; the provider branch rewrites the endpoint region from `AWS_REGION`/`AWS_DEFAULT_REGION` and authenticates with either an Amazon Bedrock API key (`OPENAI_AWS_API_KEY`, or the AWS-documented `AWS_BEARER_TOKEN_BEDROCK`) sent as an `Authorization: Bearer` token (IAM action `bedrock-mantle:CallWithBearerToken`), or AWS SigV4 request signing (service `bedrock-mantle`) through the standard credential chain — the same dual-auth shape as `anthropic-aws`. On 401/403 the cached chain credentials are invalidated so rotated keys re-resolve without a restart. `OPENAI_API_KEY` is never read: the first-party key cannot authenticate against Bedrock and must not advertise availability. Every `openai-aws` request carries an explicit `store: false` and stateful `previous_response_id` chaining stays off — Bedrock-Mantle retains stored responses for 30 days, and this provider is used under a zero-retention policy (guaranteed only when the account's `data_retention_mode` is `none`).
+- Added native-name fallback for the Claude Platform on AWS provider: when `ANTHROPIC_BASE_URL` is the `aws-external-anthropic.{region}.api.aws` gateway, the native `ANTHROPIC_API_KEY` / `ANTHROPIC_WORKSPACE_ID` are accepted in place of `ANTHROPIC_AWS_API_KEY` / `ANTHROPIC_AWS_WORKSPACE_ID`, so a machine configured per AWS's own onboarding works with no extra environment variables. The two credential families never cross: a native workspace id authenticates only with the native `ANTHROPIC_API_KEY` (the AWS console's Bearer path) and never falls through to the SigV4 credential chain, while the SigV4/`AWS_PROFILE` path is reserved for the AWS-scoped `ANTHROPIC_AWS_WORKSPACE_ID`. The AWS-scoped names still take precedence, and the endpoint/signing region is derived from the gateway base URL when `AWS_REGION` is unset.
 
 ## [16.4.2] - 2026-07-10
 
@@ -408,6 +419,9 @@
 - Fixed certificate verification errors for custom gateways behind private CA bundles by ensuring NODE_EXTRA_CA_CERTS is respected across all provider fetches.
 - Fixed Claude Fable demoted-thinking replay to use markdown-italic assistant prose instead of <thinking> tags, preventing context issues after model switches.
 - Fixed OpenAI Responses replay errors (400 Bad Request) caused by missing reasoning items during history replay.
+### Added
+
+- Added transport support for the `anthropic-aws` provider (**Claude Platform on AWS**, `aws-external-anthropic.{region}.api.aws`). Injects the required `anthropic-workspace-id` header (`ANTHROPIC_AWS_WORKSPACE_ID`) and rewrites the endpoint region from `AWS_REGION`/`AWS_DEFAULT_REGION`. Dual auth: an `ANTHROPIC_AWS_API_KEY` sent as an `Authorization: Bearer` token (authorized by the `aws-external-anthropic:CallWithBearerToken` IAM action), or AWS SigV4 request signing (service `aws-external-anthropic`, using the standard credential provider chain) when no key is set. Pins data residency per request via `ANTHROPIC_AWS_INFERENCE_GEO` (`us`/`global`) on models that support it (Opus 4.6 / Sonnet 4.6 and later).
 
 ## [16.2.13] - 2026-07-01
 

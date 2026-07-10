@@ -55,6 +55,8 @@ import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { configurePersistentPluginPolicy } from "./extensibility/plugins/policy";
+import { setCoreforgeGreetingName } from "./identity/greeting";
+import { ensureCoreforgeIdentityAtStartup } from "./identity/startup";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
@@ -1189,6 +1191,21 @@ export async function runRootCommand(
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
+
+	// [coreforge patch] Default sign-in is Microsoft Entra SSO; explicit env
+	// configuration (.env or exported vars) is honored as a user override and
+	// skips the managed identity defaults entirely. Must run before model
+	// scope/session resolution so anthropic-aws sees the managed env defaults.
+	const coreforgeIdentity = await logger.time(
+		"coreforgeIdentity",
+		ensureCoreforgeIdentityAtStartup,
+		settingsInstance,
+		{ interactive: isInteractive },
+	);
+	setCoreforgeGreetingName(coreforgeIdentity.firstName);
+	for (const notice of coreforgeIdentity.notices) {
+		notifs.push({ kind: "warn", message: notice });
+	}
 
 	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
 	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;

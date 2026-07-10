@@ -33,6 +33,8 @@ export const KNOWN_HOSTS = {
 	vercelAIGateway: { providers: ["vercel-ai-gateway"], urlMarkers: ["ai-gateway.vercel.sh"] },
 	githubCopilot: { providers: ["github-copilot"], urlMarkers: ["githubcopilot.com", "copilot-api."] },
 	anthropic: { providers: ["anthropic"], urlMarkers: ["api.anthropic.com"] },
+	/** Anthropic's first-party "Claude on AWS" external gateway. A signing endpoint (forwards to signature-enforcing Anthropic) authed via an API-key Bearer token or AWS SigV4, plus a required `anthropic-workspace-id` header, not OAuth — so it gates signing-proxy compat, never the OAuth-official host. */
+	anthropicAws: { urlMarkers: ["aws-external-anthropic"] },
 	/** DeepSeek's first-party API only — gates direct-API quirks (max_tokens field, thinking extraBody). */
 	deepseekDirect: { providers: ["deepseek"], urlMarkers: ["api.deepseek.com"] },
 	/** Any DeepSeek-operated host (first-party API, web-chat fronts). Wider than `deepseekDirect` on purpose. */

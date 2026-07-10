@@ -95,6 +95,18 @@ export const CATALOG_PROVIDERS = [
 		catalogDiscovery: { label: "Anthropic" },
 	},
 	{
+		// Claude Platform on AWS: Anthropic's first-party Messages API on AWS
+		// (`aws-external-anthropic.{region}.api.aws`), NOT Amazon Bedrock. Models are
+		// cloned from `anthropic` at generation time (same IDs/capabilities), so this
+		// entry runs on bundled models like `amazon-bedrock` — no discovery manager.
+		// Auth (an ANTHROPIC_AWS_API_KEY Bearer token, or the AWS SigV4 credential
+		// chain) and the workspace/region headers are applied by the anthropic
+		// transport's `anthropic-aws` branch.
+		id: "anthropic-aws",
+		defaultModel: "claude-opus-4-8",
+		envVars: ["ANTHROPIC_AWS_API_KEY"],
+	},
+	{
 		id: "azure",
 		defaultModel: "gpt-5.5",
 		envVars: ["AZURE_OPENAI_API_KEY"],
@@ -299,6 +311,20 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "gpt-5.5",
 		envVars: ["OPENAI_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => openaiModelManagerOptions(config),
+	},
+	{
+		// OpenAI on AWS: OpenAI models served by Amazon Bedrock through the
+		// `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint.
+		// Models are derived at generation time (frontier ids cloned from the
+		// first-party `openai` specs with AWS pricing; open-weight ids curated),
+		// so this entry runs on bundled models like `anthropic-aws` — no
+		// discovery manager. Auth (an OPENAI_AWS_API_KEY Bearer token, or the
+		// AWS SigV4 credential chain, service `bedrock-mantle`) and the region
+		// rewrite are applied by the `openai-responses` transport's openai-aws
+		// branch.
+		id: "openai-aws",
+		defaultModel: "openai.gpt-5.6-terra",
+		envVars: ["OPENAI_AWS_API_KEY"],
 	},
 	{
 		id: "openai-codex",

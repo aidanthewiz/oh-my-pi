@@ -11,10 +11,14 @@
 ### Changed
 
 - Routed default collaboration and encrypted-share links through `agent-collab.internal.somahub.io` and branded the public browser and share experiences as Coreforce Agent Collab without exposing the internal Coreforge product name.
+- Routed default collaboration and encrypted-share links through the Coreforce-operated GovCloud relay.
 - Prioritized Claude Opus 5 during automatic slow-model selection.
 - Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
 
 ### Fixed
+
+- Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
+- Preserved the employee-selected AWS profile and Region for CLI, SDK, and MCP processes while keeping Coreforge's managed inference profile model-only.
 
 - Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.
 
@@ -408,6 +412,10 @@
 - Fixed Ctrl+L (`app.display.reset`) not refreshing the dark/light theme on certain terminals by issuing a background re-query before repainting.
 - Fixed a failing advisor stalling the primary agent: the per-turn catch-up gate parked the primary for up to its full 30s budget while a broken advisor (unsupported model, dead endpoint, render bug) retried — and an advisor exception could abort the primary's turn-end outright. A failing advisor now releases parked waiters the moment its turn fails (before any async hook), refuses new parks until a turn succeeds, and the turn-end boundary isolates advisor exceptions completely; a failed render restores the delta cursor so nothing is lost when the advisor recovers.
 - Fixed advisors retrying a permanently rejected request forever (e.g. `invalid_request_error: model not supported with this account`): unlike quota exhaustion — which pauses with a notice until an explicit reset — this class notified once and silently kept re-attempting every turn, re-building heavy context in a shared daemon. The runtime now hard-stops after a permanent rejection or three consecutive backlog-drop cycles, with a visible notice; an explicit reset (`/new`, config rebuild, restart) re-enables it. `waitForCatchup` resolves immediately while halted so the primary agent is never parked on a runtime that cannot drain.
+### Fixed
+
+- Coreforge managed identity now revalidates AWS IAM Identity Center on every interactive startup, opening `aws sso login` in the same terminal only when the cached session expired. Managed AWS profile adoption also requires the configured account, portal, and role, preventing a broader role in the same account from being injected into the agent.
+
 
 ## [17.0.1] - 2026-07-16
 
@@ -857,6 +865,19 @@
 ### Removed
 
 - Removed the bundled plan subagent from available task agents.
+### Added
+
+- Added per-spawn `contextFilePolicy` control for task and eval orchestrators: inherited global/local context remains the default, while `none` starts a deliberately context-agnostic agent.
+- Added a managed Coreforge product identity: Microsoft Entra SSO (authorization code + PKCE via the system browser, with device-code fallback) is the default first-run sign-in on managed installs, gated by the org-managed `identity.entra.*` settings and dormant until a tenant/client ID is provisioned. The signed-in identity persists stable, non-secret profile attributes (`tid`/`oid`, name, email) in `agent.db` alongside an MSAL token cache, drives AWS IAM Identity Center sign-in for the managed `identity.aws.*` profile, and activates the managed Claude Platform on AWS defaults (`AWS_PROFILE`, `ANTHROPIC_AWS_WORKSPACE_ID`, gateway base URL) for the existing SigV4 path. A complete explicit environment credential path always wins and disables the managed defaults. New `omp identity login|status|logout` command manages the identity; the welcome screen greets the signed-in user by first name.
+
+### Changed
+
+- Task and eval subagents now inherit the parent's complete ordered context-file set by default instead of silently dropping `AGENTS.md`; orchestrators can request a fresh worker explicitly with `contextFilePolicy: "none"`.
+
+### Fixed
+
+- Ordered global context instructions before project and work-directory files, stated the conflict precedence explicitly, and propagated the ordered context through the default task/eval subagent path so local `AGENTS.md`/`CLAUDE.md` guidance can override the bundled baseline across the agent tree.
+- Fixed `omp identity login` reporting an AWS SSO failure as a sign-in failure and exiting without the welcome message even though the Entra profile was already persisted; the AWS step now has its own error path (mirrors the startup gate).
 
 ## [16.4.2] - 2026-07-10
 

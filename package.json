@@ -16,6 +16,7 @@
     ],
     "catalog": {
       "@agentclientprotocol/sdk": "1.2.1",
+      "@azure/msal-node": "5.4.0",
       "@babel/generator": "^7.29.7",
       "@babel/parser": "^7.29.7",
       "@babel/traverse": "^7.29.7",

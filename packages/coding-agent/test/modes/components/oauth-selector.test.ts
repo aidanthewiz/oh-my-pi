@@ -187,4 +187,54 @@ describe("OAuthSelectorComponent", () => {
 			expect(rendered).toContain("OpenCode Go");
 		});
 	});
+
+	describe("enabledModels login gate", () => {
+		afterEach(() => {
+			resetSettingsForTest();
+		});
+
+		it("hides off-allowlist model providers from the login list even when searched", async () => {
+			resetSettingsForTest();
+			await Settings.init({ inMemory: true, overrides: { enabledModels: ["anthropic-aws/*", "openai-aws/*"] } });
+
+			const component = new OAuthSelectorComponent(
+				"login",
+				authStorage,
+				() => {},
+				() => {},
+			);
+			for (const char of "anthropic") {
+				component.handleInput(char);
+			}
+			const rendered = component
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+			expect(rendered).not.toContain("Anthropic");
+		});
+
+		it("keeps off-allowlist providers with stored credentials as logout targets", async () => {
+			resetSettingsForTest();
+			await Settings.init({ inMemory: true, overrides: { enabledModels: ["anthropic-aws/*", "openai-aws/*"] } });
+
+			const component = new OAuthSelectorComponent(
+				"logout",
+				{
+					has: (providerId: string) => providerId === "anthropic",
+					hasAuth: (providerId: string) => providerId === "anthropic",
+					getCredentialOrigin: (_providerId: string) => undefined,
+				} as unknown as AuthStorage,
+				() => {},
+				() => {},
+			);
+			for (const char of "anthropic") {
+				component.handleInput(char);
+			}
+			const rendered = component
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+			expect(rendered).toContain("Anthropic");
+		});
+	});
 });
