@@ -1,26 +1,34 @@
 /**
- * MCP JSON Provider
+ * Managed MCP Provider
  *
- * Discovers standalone mcp.json / .mcp.json files in the project root.
- * This is a fallback for projects that have a standalone mcp.json without any config directory.
+ * Discovers org-managed MCP server definitions from `<agentDir>/mcp.managed.json`.
+ * The file is a read-only distribution artifact (symlinked/copied into the
+ * profile by an installer, e.g. Coreforge); the engine never writes it.
  *
- * Priority: 5 (low, as this is a fallback after tool-specific providers)
+ * Ownership split: this file carries DEFINITIONS only. User STATE stays in the
+ * user-owned `mcp.json` — the `disabledServers` denylist, the `enabledServers`
+ * allowlist, and per-server `enabled` toggles written by `/mcp enable|disable`
+ * all apply on top (see `loadAllMCPConfigs`). `disabledServers`/`enabledServers`
+ * keys inside this file are intentionally ignored.
+ *
+ * Priority: 110 — above native (100) so a managed definition wins name
+ * collisions against every other source; the user state filters above still
+ * run post-dedup, so users keep control over what actually connects.
  */
 import * as path from "node:path";
-import { logger, tryParseJson } from "@oh-my-pi/pi-utils";
+import { getAgentDir, logger, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
 
-const PROVIDER_ID = "mcp-json";
-const DISPLAY_NAME = "MCP Config";
+const PROVIDER_ID = "mcp-managed";
+const DISPLAY_NAME = "Coreforge Managed";
+export const MANAGED_MCP_FILENAME = "mcp.managed.json";
 
-/**
- * Raw MCP JSON format (matches Claude Desktop's format).
- */
-interface MCPConfigFile {
+/** Same wire shape as mcp.json's `mcpServers` map (state keys ignored). */
+interface ManagedMCPConfigFile {
 	mcpServers?: Record<
 		string,
 		{
@@ -52,21 +60,21 @@ interface MCPConfigFile {
 	>;
 }
 
-/**
- * Transform raw MCP config to canonical MCPServer format.
- */
-function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServer[] {
+function transformManagedConfig(config: ManagedMCPConfigFile, source: SourceMeta): MCPServer[] {
 	const servers: MCPServer[] = [];
 
 	if (config.mcpServers) {
 		for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-			// Runtime type validation for user-controlled JSON values
+			// Runtime type validation for file-controlled JSON values
 			let enabled: boolean | undefined;
 			if (serverConfig.enabled !== undefined) {
 				if (typeof serverConfig.enabled === "boolean") {
 					enabled = serverConfig.enabled;
 				} else {
-					logger.warn("MCP server has invalid 'enabled' value, ignoring", { name, value: serverConfig.enabled });
+					logger.warn("Managed MCP server has invalid 'enabled' value, ignoring", {
+						name,
+						value: serverConfig.enabled,
+					});
 				}
 			}
 
@@ -79,7 +87,10 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				) {
 					timeout = serverConfig.timeout;
 				} else {
-					logger.warn("MCP server has invalid 'timeout' value, ignoring", { name, value: serverConfig.timeout });
+					logger.warn("Managed MCP server has invalid 'timeout' value, ignoring", {
+						name,
+						value: serverConfig.timeout,
+					});
 				}
 			}
 
@@ -99,7 +110,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				_source: source,
 			};
 
-			// Expand environment variables
+			// Expand ${VAR} / ${VAR:-default} placeholders
 			if (server.command) server.command = expandEnvVarsDeep(server.command);
 			if (server.args) server.args = expandEnvVarsDeep(server.args);
 			if (server.env) server.env = expandEnvVarsDeep(server.env);
@@ -115,58 +126,37 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 	return servers;
 }
 
-/**
- * Load MCP servers from a JSON file.
- */
-export async function loadMCPJsonFile(
-	path: string,
-	level: "user" | "project",
-	providerId: string = PROVIDER_ID,
-): Promise<LoadResult<MCPServer>> {
+async function load(_ctx: LoadContext): Promise<LoadResult<MCPServer>> {
 	const warnings: string[] = [];
 	const items: MCPServer[] = [];
 
-	const content = await readFile(path);
+	// Profile-scoped like the native user config: getAgentDir() points at the
+	// active profile's agent directory, not the literal home.
+	const filePath = path.join(getAgentDir(), MANAGED_MCP_FILENAME);
+	const content = await readFile(filePath);
 	if (content === null) {
-		return { items, warnings };
+		// Missing file = feature unused; byte-identical upstream behavior.
+		return { items, warnings: undefined };
 	}
 
-	const config = tryParseJson<MCPConfigFile>(content);
+	const config = tryParseJson<ManagedMCPConfigFile>(content);
 	if (!config) {
-		warnings.push(`Failed to parse JSON in ${path}`);
+		warnings.push(`Failed to parse JSON in ${filePath}`);
 		return { items, warnings };
 	}
 
-	const source = createSourceMeta(providerId, path, level);
-	const servers = transformMCPConfig(config, source);
-	items.push(...servers);
+	const source = createSourceMeta(PROVIDER_ID, filePath, "user");
+	items.push(...transformManagedConfig(config, source));
 
-	return { items, warnings };
+	return { items, warnings: warnings.length > 0 ? warnings : undefined };
 }
 
-/**
- * MCP JSON Provider loader.
- */
-async function load(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
-	const filenames = ["mcp.json", ".mcp.json"];
-	const results = await Promise.all(
-		filenames.map(filename => loadMCPJsonFile(path.join(ctx.cwd, filename), "project")),
-	);
-
-	const allItems = results.flatMap(r => r.items);
-	const allWarnings = results.flatMap(r => r.warnings ?? []);
-
-	return {
-		items: allItems,
-		warnings: allWarnings.length > 0 ? allWarnings : undefined,
-	};
-}
-
-// Register provider
+// Register provider — above native (100) so managed definitions win name
+// collisions; user disable/enable state still applies post-dedup.
 registerProvider(mcpCapability.id, {
 	id: PROVIDER_ID,
 	displayName: DISPLAY_NAME,
-	description: "Load MCP servers from standalone mcp.json or .mcp.json in project root",
-	priority: 5,
+	description: "Org-managed MCP server definitions from <agentDir>/mcp.managed.json",
+	priority: 110,
 	load,
 });

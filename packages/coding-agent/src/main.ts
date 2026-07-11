@@ -54,6 +54,7 @@ import { formatExtensionLoadNotifications } from "./extensibility/extensions/loa
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { configurePersistentPluginPolicy } from "./extensibility/plugins/policy";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
@@ -1129,16 +1130,7 @@ export async function runRootCommand(
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
-	// Kick off plugin-root preload in parallel with the remaining startup work.
-	// Awaited later (before extension/skill discovery in createAgentSession needs it).
 	const home = os.homedir();
-	const pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
-			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
-			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
-	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
-	// warning before we reach the await site below.
-	pluginPreloadPromise.catch(() => {});
 
 	// Register CLI-provided extension package paths (`--extension`, `--hook`) so
 	// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
@@ -1168,6 +1160,17 @@ export async function runRootCommand(
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}
+	configurePersistentPluginPolicy(
+		settingsInstance.get("plugins.persistentPolicy"),
+		settingsInstance.get("plugins.persistentAllowlist"),
+	);
+	// Preloading starts only after managed plugin policy is available; it reads
+	// manifests and paths but never executes extension code.
+	const pluginPreloadPromise =
+		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
+			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
+	pluginPreloadPromise.catch(() => {});
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}
@@ -1213,6 +1216,15 @@ export async function runRootCommand(
 	// Apply --advisor CLI flag (ephemeral, not persisted)
 	if (parsedArgs.advisor) {
 		settingsInstance.override("advisor.enabled", true);
+	}
+	// MCP escape hatches (ephemeral, not persisted). Runtime overrides sit
+	// above the managed settings layer, so these intentionally pierce org
+	// policy for one process.
+	if (parsedArgs.mcpProjectConfig) {
+		settingsInstance.override("mcp.enableProjectConfig", true);
+	}
+	if (parsedArgs.mcpProviders?.length) {
+		settingsInstance.override("mcp.discoveryProviders", parsedArgs.mcpProviders);
 	}
 
 	await logger.time(
@@ -1375,6 +1387,10 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
+	// --no-mcp: skip MCP discovery/connections entirely for this run.
+	if (parsedArgs.noMcp) {
+		sessionOptions.enableMCP = false;
+	}
 
 	// OTEL: register global OTLP exporters when an endpoint is configured via
 	// env, then switch on the agent loop's telemetry hooks so traces, run-level

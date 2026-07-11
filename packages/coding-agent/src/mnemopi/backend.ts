@@ -7,7 +7,7 @@ import type * as MnemopiDiagnoseNs from "@oh-my-pi/pi-mnemopi/diagnose";
 import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { resolveRoleSelection } from "../config/model-resolver";
+import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
 import type {
 	MemoryBackend,
 	MemoryBackendSaveInput,
@@ -511,7 +511,11 @@ async function resolveMnemopiProviderOptions(
 	}
 
 	try {
-		const resolved = resolveRoleSelection(["tiny", "smol"], settings, modelRegistry.getAvailable());
+		const resolved = resolveRoleSelection(
+			["tiny", "smol"],
+			settings,
+			getAllowedAvailableModels(modelRegistry, settings),
+		);
 		const model = resolved?.model;
 		if (!model) {
 			logger.warn("Mnemopi: llmMode=smol but no tiny/smol model resolved; continuing without LLM.");

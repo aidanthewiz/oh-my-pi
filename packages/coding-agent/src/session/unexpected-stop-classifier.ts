@@ -2,7 +2,7 @@ import { type AssistantMessage, completeSimple } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
-import { resolveRoleSelection } from "../config/model-resolver";
+import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import unexpectedStopClassifierPrompt from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
@@ -67,7 +67,11 @@ export async function classifyUnexpectedStop(
 }
 
 async function classifyOnline(text: string, deps: ClassifyUnexpectedStopDeps): Promise<boolean | undefined> {
-	const resolved = resolveRoleSelection(["tiny", "smol"], deps.settings, deps.registry.getAvailable());
+	const resolved = resolveRoleSelection(
+		["tiny", "smol"],
+		deps.settings,
+		getAllowedAvailableModels(deps.registry, deps.settings),
+	);
 	const model = resolved?.model;
 	if (!model) {
 		throw new Error("unexpected-stop: no tiny/smol model available for classification");

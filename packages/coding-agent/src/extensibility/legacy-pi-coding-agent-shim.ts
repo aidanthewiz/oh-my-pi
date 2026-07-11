@@ -56,6 +56,11 @@ import { discoverExtensionPaths, loadExtensionFromFactory, loadExtensions } from
 import { ExtensionRuntime } from "./extensions/loader";
 import type { ExtensionFactory, ToolDefinition } from "./extensions/types";
 import { getEnabledPlugins, resolvePluginExtensionPaths, type ScopedInstalledPlugin } from "./plugins/loader";
+import {
+	createPersistentPluginPolicy,
+	filterPersistentExtensionPaths,
+	withPersistentPluginPolicy,
+} from "./plugins/policy";
 import type { Skill } from "./skills";
 import { loadSkillsFromDir } from "./skills";
 import { Type } from "./typebox";
@@ -718,43 +723,49 @@ export class DefaultPackageManager {
 	/** Resolve enabled extension paths with their OMP plugin provenance. */
 	async resolve(_onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
 		const settings = await this.#settingsManager;
-		const configuredPaths = settings.get("extensions") ?? [];
-		const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
-		const [extensionPaths, plugins] = await Promise.all([
-			discoverExtensionPaths(configuredPaths, this.#cwd, disabledExtensionIds),
-			getEnabledPlugins(this.#cwd),
-		]);
-		const pluginByExtensionPath = new Map<string, ScopedInstalledPlugin>();
-		for (const plugin of plugins) {
-			for (const extensionPath of resolvePluginExtensionPaths(plugin)) {
-				pluginByExtensionPath.set(path.resolve(extensionPath), plugin);
+		const policy = createPersistentPluginPolicy(
+			settings.get("plugins.persistentPolicy"),
+			settings.get("plugins.persistentAllowlist"),
+		);
+		return withPersistentPluginPolicy(policy, async () => {
+			const configuredPaths = filterPersistentExtensionPaths(settings.get("extensions") ?? [], this.#cwd);
+			const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
+			const [extensionPaths, plugins] = await Promise.all([
+				discoverExtensionPaths(configuredPaths, this.#cwd, disabledExtensionIds),
+				getEnabledPlugins(this.#cwd),
+			]);
+			const pluginByExtensionPath = new Map<string, ScopedInstalledPlugin>();
+			for (const plugin of plugins) {
+				for (const extensionPath of resolvePluginExtensionPaths(plugin)) {
+					pluginByExtensionPath.set(path.resolve(extensionPath), plugin);
+				}
 			}
-		}
 
-		const extensions = extensionPaths.map(extensionPath => {
-			const resolvedPath = path.resolve(extensionPath);
-			const plugin = pluginByExtensionPath.get(resolvedPath);
-			const agentDirRelative = path.relative(path.resolve(this.#agentDir), resolvedPath);
-			const metadata: PathMetadata = plugin
-				? {
-						source: `npm:${plugin.name}`,
-						scope: plugin.scope,
-						origin: "package",
-						baseDir: plugin.path,
-					}
-				: {
-						source: "auto",
-						scope:
-							agentDirRelative === "" ||
-							(!agentDirRelative.startsWith("..") && !path.isAbsolute(agentDirRelative))
-								? "user"
-								: "project",
-						origin: "top-level",
-					};
-			return { path: resolvedPath, enabled: true, metadata };
+			const extensions = extensionPaths.map(extensionPath => {
+				const resolvedPath = path.resolve(extensionPath);
+				const plugin = pluginByExtensionPath.get(resolvedPath);
+				const agentDirRelative = path.relative(path.resolve(this.#agentDir), resolvedPath);
+				const metadata: PathMetadata = plugin
+					? {
+							source: `npm:${plugin.name}`,
+							scope: plugin.scope,
+							origin: "package",
+							baseDir: plugin.path,
+						}
+					: {
+							source: "auto",
+							scope:
+								agentDirRelative === "" ||
+								(!agentDirRelative.startsWith("..") && !path.isAbsolute(agentDirRelative))
+									? "user"
+									: "project",
+							origin: "top-level",
+						};
+				return { path: resolvedPath, enabled: true, metadata };
+			});
+
+			return { extensions, skills: [], prompts: [], themes: [] };
 		});
-
-		return { extensions, skills: [], prompts: [], themes: [] };
 	}
 }
 

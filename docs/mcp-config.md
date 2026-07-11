@@ -19,6 +19,12 @@ OMP can discover MCP servers from multiple tools (`.claude/`, `.cursor/`, `.vsco
 
 The native provider also reads `.omp/.mcp.json` and `~/.omp/agent/.mcp.json` for compatibility, but OMP writes to the primary `mcp.json` paths above.
 
+Coreforge can also load repository-root `.coreforge/mcp.json`. When general
+project MCP loading is disabled, this source loads only when the repository's
+`origin` is on GitHub and its organization appears in
+`mcp.trustedProjectGitHubOrganizations`. Its values use the same `${VAR}` and
+`${VAR:-default}` environment expansion as the other MCP files.
+
 OMP also accepts fallback standalone files in the project root:
 
 - `mcp.json`

@@ -117,17 +117,84 @@ const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
 const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 
+// Scrub ambient entries that can't be forwarded to a native execve spawn
+// (bad names, NUL values) or are macOS malloc toggles we never propagate.
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];
 	if (!isSafeEnvName(key) || isMacosMallocStackLoggingEnvName(key) || value === undefined || !isSafeEnvValue(value)) {
 		delete Bun.env[key];
 	}
 }
+// Managed mode — set by the coreforge launcher (`OMP_DOTENV_OVERRIDE=1`).
+// The flag is a LAUNCHER-ONLY signal: it is honored from the process
+// environment and never sourced from any `.env` file layer (see the loops
+// below — no file layer can introduce it into `Bun.env`).
+//
+// Provenance is unrecoverable when Bun's dotenv autoload is on: the launch-cwd
+// `.env` merges into `Bun.env` before this module runs, so a launcher-set flag
+// and a project-file flag are byte-identical (`"1"`). The one observable that
+// cannot be disambiguated is BOTH the ambient env and the project `.env`
+// declaring `"1"` — a real managed launch colliding with a stray copy of the
+// line, or a project file forging the flag under autoload. Guessing either way
+// is unsafe (silent mode flip vs. silent downgrade + project-cred gap-fill),
+// so we refuse loudly instead. (The shipped engine disables autoload —
+// compiled `--no-compile-autoload-dotenv`, source mode a clean cwd — so this
+// can only trigger there if the project `.env` literally carries the flag.)
+if (Bun.env.OMP_DOTENV_OVERRIDE === "1" && projectEnv.OMP_DOTENV_OVERRIDE === "1") {
+	throw new Error(
+		`OMP_DOTENV_OVERRIDE=1 is set in both the process environment and ${path.join(process.cwd(), ".env")}. ` +
+			"This flag is a launcher-only signal and must not appear in a project .env " +
+			"(a managed launch cannot be told apart from a forged one). " +
+			"Remove that line from the project .env, or unset the environment variable.",
+	);
+}
+const managedDotenv = Bun.env.OMP_DOTENV_OVERRIDE === "1";
 
-for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
-	for (const key in file) {
-		if (!isMacosMallocStackLoggingEnvName(key) && !Bun.env[key]) {
-			Bun.env[key] = file[key];
+// Strip any ambient key whose value came from the launch-cwd `.env` (equality
+// match, the subtraction `filterChildShellEnv` uses) up front, so the project
+// file cannot linger as ambient fallback for a key the agent `.env` leaves
+// empty. The flag key is exempt: it is launcher-only (collision already
+// refused above), so stripping it could only erase a real launcher signal.
+// The default branch below re-applies projectEnv as its normal gap-fill layer,
+// so unmanaged precedence is unchanged; managed mode intentionally never re-adds it.
+for (const key in projectEnv) {
+	if (key === "OMP_DOTENV_OVERRIDE") continue;
+	if (Bun.env[key] === projectEnv[key]) delete Bun.env[key];
+}
+
+// The agent/profile `.env` becomes the single authoritative credential source:
+//   1. its non-empty keys OVERRIDE the ambient environment, so a stale shell
+//      export (e.g. an old OPENAI_API_KEY in ~/.zshrc) can never shadow the
+//      org-managed value — "just put it in .env" always wins;
+//   2. the ambient environment only fills keys the profile `.env` leaves unset
+//      or empty, so a machine whose shell is already configured still starts
+//      with an empty .env (shell fallback);
+//   3. the project / config-root / $HOME `.env` layers are skipped entirely, so
+//      a random project's `.env` can never inject credentials.
+// Default (flag unset) preserves upstream precedence exactly: ambient wins,
+// then the file layers fill gaps in project > agent > config-root > home order.
+
+if (managedDotenv) {
+	// The agent/profile `.env` is authoritative. Non-empty values OVERRIDE the
+	// ambient env; an empty value defers to the ambient value so a shipped
+	// placeholder (`OPENAI_API_KEY=`) still allows shell fallback. Any key the
+	// agent `.env` omits falls back to the remaining real ambient env — the
+	// project `.env` was already evicted above, so the cwd cannot inject creds.
+	for (const key in agentEnv) {
+		if (isMacosMallocStackLoggingEnvName(key)) continue;
+		if (key === "OMP_DOTENV_OVERRIDE") continue; // launcher-only — never file-sourced
+		const value = agentEnv[key];
+		if (value === "") continue; // placeholder — let the ambient value (if any) stand
+		Bun.env[key] = value;
+	}
+} else {
+	// Upstream default: ambient wins; files fill gaps, most-specific first.
+	for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
+		for (const key in file) {
+			if (key === "OMP_DOTENV_OVERRIDE") continue; // launcher-only — never file-sourced
+			if (!isMacosMallocStackLoggingEnvName(key) && !Bun.env[key]) {
+				Bun.env[key] = file[key];
+			}
 		}
 	}
 }

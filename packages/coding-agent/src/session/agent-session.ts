@@ -184,10 +184,10 @@ import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mod
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
-	filterAvailableModelsByEnabledPatterns,
 	formatModelSelectorValue,
 	formatModelString,
 	formatModelStringWithRouting,
+	getAllowedAvailableModels,
 	getModelMatchPreferences,
 	parseModelString,
 	type ResolvedModelRoleValue,
@@ -249,7 +249,14 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { RecoveredRetryError } from "../extensibility/shared-events";
-import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
+import {
+	type LoadSkillsOptions,
+	type LoadSkillsResult,
+	loadSkills,
+	type Skill,
+	type SkillWarning,
+	setActiveSkills,
+} from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
@@ -924,6 +931,8 @@ export interface AgentSessionConfig {
 	/** Custom commands (TypeScript slash commands) */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
+	/** Session-scoped skill loader used by runtime refreshes. */
+	reloadSkills?: (options: LoadSkillsOptions) => Promise<LoadSkillsResult>;
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
 	/** Tool registry for LSP and settings */
@@ -2107,6 +2116,7 @@ export class AgentSession {
 
 	#skillsSettings: SkillsSettings | undefined;
 	#skillsReloadable: boolean;
+	#reloadSkills: ((options: LoadSkillsOptions) => Promise<LoadSkillsResult>) | undefined;
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -2775,6 +2785,7 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsReloadable = config.skillsReloadable ?? true;
 		this.#skillsSettings = config.skillsSettings;
+		this.#reloadSkills = config.reloadSkills;
 		this.#modelRegistry = config.modelRegistry;
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -3088,7 +3099,7 @@ export class AgentSession {
 					continue;
 				}
 			} else {
-				const sel = resolveAdvisorRoleSelection(this.settings, this.#modelRegistry.getAvailable());
+				const sel = resolveAdvisorRoleSelection(this.settings, this.getAvailableModels());
 				if (!sel) {
 					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
 					if (emitWarnings) {
@@ -3816,7 +3827,7 @@ export class AgentSession {
 			} satisfies SessionMessageEntry;
 		});
 
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		const candidates = this.#resolveCompactionModelCandidates(advisorModel, availableModels);
 		if (candidates.length === 0) {
 			// No compaction candidates, fallback to re-prime
@@ -7615,11 +7626,12 @@ export class AgentSession {
 
 		resetCapabilities();
 		const skillsSettings = this.settings.getGroup("skills");
-		const discovered = await loadSkills({
+		const loadOptions = {
 			...skillsSettings,
 			cwd: this.sessionManager.getCwd(),
 			disabledExtensions: this.settings.get("disabledExtensions") ?? [],
-		});
+		};
+		const discovered = await (this.#reloadSkills?.(loadOptions) ?? loadSkills(loadOptions));
 		this.#skills = discovered.skills;
 		this.#skillWarnings = discovered.warnings;
 		this.#skillsSettings = skillsSettings;
@@ -8400,7 +8412,7 @@ export class AgentSession {
 	}
 
 	resolveRoleModel(role: string): Model | undefined {
-		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model).model;
+		return this.#resolveRoleModelFull(role, this.getAvailableModels(), this.model).model;
 	}
 
 	/**
@@ -8409,7 +8421,7 @@ export class AgentSession {
 	 * from role configuration (e.g., "anthropic/claude-sonnet-4-5:xhigh").
 	 */
 	resolveRoleModelWithThinking(role: string): ResolvedModelRoleValue {
-		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model);
+		return this.#resolveRoleModelFull(role, this.getAvailableModels(), this.model);
 	}
 
 	/**
@@ -10312,7 +10324,7 @@ export class AgentSession {
 	 * still guard on `models.length`).
 	 */
 	getRoleModelCycle(roleOrder: readonly string[]): RoleModelCycle | undefined {
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		if (availableModels.length === 0) return undefined;
 
 		const currentModel = this.model;
@@ -10444,7 +10456,7 @@ export class AgentSession {
 
 	async #cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		const previousEditMode = this.#resolveActiveEditMode();
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -10473,14 +10485,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * Get all available models with valid API keys, filtered by `enabledModels` when configured.
-	 * See {@link filterAvailableModelsByEnabledPatterns} for supported pattern forms and limitations.
+	 * Get all available models with valid API keys, filtered by `enabledModels`
+	 * when configured — resolved against THIS session's settings (path scope).
+	 * See {@link getAllowedAvailableModels} for pattern forms and limitations.
 	 */
 	getAvailableModels(): Model[] {
-		const all = this.#modelRegistry.getAvailable();
-		const patterns = this.settings.get("enabledModels");
-		if (!patterns || patterns.length === 0) return all;
-		return filterAvailableModelsByEnabledPatterns(all, patterns, this.settings);
+		return getAllowedAvailableModels(this.#modelRegistry, this.settings);
 	}
 
 	// =========================================================================
@@ -11042,7 +11052,7 @@ export class AgentSession {
 			// engine never silently runs a local summary on a configured-but-non-
 			// remote compactionModel. If filtering empties the chain, warn and fall
 			// back to the full chain so the operation still completes.
-			const availableModels = this.#modelRegistry.getAvailable();
+			const availableModels = this.getAvailableModels();
 			const requireProviderRemote = Boolean(compactMode?.requiresRemote && !effectiveSettings.remoteEndpoint);
 			let compactionCandidates = this.#getCompactionModelCandidates(
 				availableModels,
@@ -11886,7 +11896,7 @@ export class AgentSession {
 			const failedModel = this.#modelRegistry.find(assistantMessage.provider, assistantMessage.model);
 			const failedWindow = failedModel?.contextWindow ?? 0;
 			const promotionTarget = failedModel
-				? this.#resolveContextPromotionConfiguredTarget(failedModel, this.#modelRegistry.getAvailable())
+				? this.#resolveContextPromotionConfiguredTarget(failedModel, this.getAvailableModels())
 				: undefined;
 			if (
 				failedModel &&
@@ -13051,7 +13061,7 @@ export class AgentSession {
 	}
 
 	async #resolveContextPromotionTarget(currentModel: Model, contextWindow: number): Promise<Model | undefined> {
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		if (availableModels.length === 0) return undefined;
 
 		const candidate = this.#resolveContextPromotionConfiguredTarget(currentModel, availableModels);
@@ -13482,8 +13492,7 @@ export class AgentSession {
 		options?: SummaryOptions,
 		precomputedCandidates?: Model[],
 	): Promise<CompactionResult> {
-		const candidates =
-			precomputedCandidates ?? this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+		const candidates = precomputedCandidates ?? this.#getCompactionModelCandidates(this.getAvailableModels());
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 
 		for (const candidate of candidates) {
@@ -14036,7 +14045,7 @@ export class AgentSession {
 				return COMPACTION_CHECK_NONE;
 			}
 
-			const availableModels = this.#modelRegistry.getAvailable();
+			const availableModels = this.getAvailableModels();
 			if (availableModels.length === 0) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
@@ -16827,7 +16836,7 @@ export class AgentSession {
 				this.sessionManager.getLastModelChangeRole(),
 			);
 			if (targetModelStrings.length > 0) {
-				const availableModels = this.#modelRegistry.getAvailable();
+				const availableModels = this.getAvailableModels();
 				let match: Model | undefined;
 				for (const targetModelStr of targetModelStrings) {
 					const slashIdx = targetModelStr.indexOf("/");

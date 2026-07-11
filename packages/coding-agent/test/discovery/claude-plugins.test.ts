@@ -6,9 +6,14 @@ import { loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import {
 	clearClaudePluginRootsCache,
+	injectPluginDirRoots,
 	listClaudePluginRoots,
 	parseClaudePluginsRegistry,
 } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
+import {
+	createPersistentPluginPolicy,
+	withPersistentPluginPolicy,
+} from "@oh-my-pi/pi-coding-agent/extensibility/plugins/policy";
 import { loadSlashCommands } from "@oh-my-pi/pi-coding-agent/extensibility/slash-commands";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -74,6 +79,7 @@ describe("listClaudePluginRoots", () => {
 	});
 
 	afterEach(async () => {
+		await injectPluginDirRoots(tempDir, [], tempDir);
 		clearClaudePluginRootsCache();
 		clearFsCache();
 		vi.restoreAllMocks();
@@ -89,6 +95,30 @@ describe("listClaudePluginRoots", () => {
 		const result = await listClaudePluginRoots(tempDir);
 		expect(result.roots).toEqual([]);
 		expect(result.warnings).toEqual([]);
+	});
+
+	test("keeps explicit one-session plugin capabilities under allowlist policy", async () => {
+		const pluginRoot = path.join(tempDir, "explicit-plugin");
+		await fs.mkdir(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+		await fs.mkdir(path.join(pluginRoot, "skills", "explicit-skill"), { recursive: true });
+		await fs.writeFile(
+			path.join(pluginRoot, ".claude-plugin", "plugin.json"),
+			JSON.stringify({ name: "explicit-plugin" }),
+		);
+		await fs.writeFile(
+			path.join(pluginRoot, "skills", "explicit-skill", "SKILL.md"),
+			"---\nname: explicit-skill\ndescription: Explicit session skill.\n---\n\n# Explicit\n",
+		);
+
+		await withPersistentPluginPolicy(createPersistentPluginPolicy("allowlist", []), async () => {
+			await injectPluginDirRoots(tempDir, [pluginRoot], tempDir);
+			const listed = await listClaudePluginRoots(tempDir, tempDir);
+			expect(listed.roots.map(root => root.id)).toEqual(["explicit-plugin@__local__"]);
+			expect(listed.roots[0]?.persistent).toBe(false);
+
+			const skills = await loadCapability<Skill>("skills", { cwd: tempDir });
+			expect(skills.all.find(skill => skill.name === "explicit-skill")).toBeDefined();
+		});
 	});
 
 	test("parses plugin with user scope", async () => {

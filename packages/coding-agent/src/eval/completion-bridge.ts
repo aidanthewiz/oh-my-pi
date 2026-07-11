@@ -20,6 +20,7 @@ import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit
 import {
 	expandRoleAlias,
 	formatModelString,
+	getAllowedAvailableModels,
 	getModelMatchPreferences,
 	resolveModelFromString,
 } from "../config/model-resolver";
@@ -68,7 +69,7 @@ export interface EvalCompletionResult {
 function resolveTierModel(tier: CompletionTier, session: ToolSession): Model<Api> | undefined {
 	const modelRegistry = session.modelRegistry;
 	if (!modelRegistry) return undefined;
-	const available = modelRegistry.getAvailable();
+	const available = getAllowedAvailableModels(modelRegistry, session.settings);
 	if (available.length === 0) return undefined;
 
 	const matchPreferences = getModelMatchPreferences(session.settings);

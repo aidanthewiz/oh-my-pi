@@ -1705,6 +1705,35 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"plugins.persistentPolicy": {
+		type: "enum",
+		values: ["open", "allowlist"] as const,
+		default: "open",
+		ui: {
+			tab: "interaction",
+			group: "Plugins",
+			label: "Persistent Plugin Policy",
+			description:
+				"Load persistent plugins freely or, in allowlist mode, load only exact user-installed plugin IDs. Project plugin registries and configured extension paths are denied; one-session CLI plugin paths remain available.",
+			options: [
+				{ value: "open", label: "Open" },
+				{ value: "allowlist", label: "Allowlist" },
+			],
+		},
+	},
+
+	"plugins.persistentAllowlist": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "interaction",
+			group: "Plugins",
+			label: "Persistent Plugin Allowlist",
+			description:
+				"Exact user-installed OMP package names or marketplace plugin IDs allowed when persistent plugin policy is allowlist.",
+		},
+	},
+
 	collapseChangelog: {
 		type: "boolean",
 		default: false,
@@ -3959,6 +3988,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"mcp.trustedProjectGitHubOrganizations": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "Trusted MCP GitHub Organizations",
+			description:
+				"GitHub organizations whose origin repositories may load .coreforge/mcp.json while general project MCP config is disabled.",
+		},
+	},
+
 	"mcp.renderMarkdownResults": {
 		type: "boolean",
 		default: true,
@@ -3970,6 +4011,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"mcp.discoveryProviders": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "MCP Discovery Providers",
+			description:
+				"Allowlist of discovery providers whose MCP servers load (e.g. native, mcp-json, codex). Empty = all providers (default).",
+		},
+	},
 	"mcp.notifications": {
 		type: "boolean",
 		default: false,

@@ -106,29 +106,51 @@ export function validateProviderConfiguration(
 	}
 }
 
+/**
+ * Org-managed models overlay filename, resolved against the agent directory
+ * (`<agentDir>/models.managed.yml`). When present it is deep-merged ABOVE the
+ * user's `models.yml` by {@link ModelRegistry} (managed wins per provider /
+ * per model-override field), so a managed distribution (e.g. the coreforge
+ * launcher's profile) can pin model metadata — notably per-seat
+ * `contextPromotionTarget` — without clobbering an employee's own `models.yml`
+ * (custom providers/keys). The engine only ever READS this file; distribution
+ * tooling ships it (symlink or copy). Absent file = upstream behaviour.
+ */
+export const MANAGED_MODELS_FILENAME = "models.managed.yml";
+
+const validateModelsConfig = (config: ModelsConfig): void => {
+	const providers = config.providers ?? {};
+	for (const providerName in providers) {
+		const providerConfig = providers[providerName];
+		validateProviderConfiguration(
+			providerName,
+			{
+				baseUrl: providerConfig.baseUrl,
+				headers: providerConfig.headers,
+				apiKey: providerConfig.apiKey,
+				api: providerConfig.api as Api | undefined,
+				auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
+				discovery: providerConfig.discovery as ProviderDiscovery | undefined,
+				compat: providerConfig.compat,
+				remoteCompaction: providerConfig.remoteCompaction,
+				disableStrictTools: providerConfig.disableStrictTools,
+				modelOverrides: providerConfig.modelOverrides,
+				models: (providerConfig.models ?? []) as ProviderValidationModel[],
+			},
+			"models-config",
+		);
+	}
+};
+
 export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsConfigSchema).withValidation(
 	"models",
-	config => {
-		const providers = config.providers ?? {};
-		for (const providerName in providers) {
-			const providerConfig = providers[providerName];
-			validateProviderConfiguration(
-				providerName,
-				{
-					baseUrl: providerConfig.baseUrl,
-					headers: providerConfig.headers,
-					apiKey: providerConfig.apiKey,
-					api: providerConfig.api as Api | undefined,
-					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
-					discovery: providerConfig.discovery as ProviderDiscovery | undefined,
-					compat: providerConfig.compat,
-					remoteCompaction: providerConfig.remoteCompaction,
-					disableStrictTools: providerConfig.disableStrictTools,
-					modelOverrides: providerConfig.modelOverrides,
-					models: (providerConfig.models ?? []) as ProviderValidationModel[],
-				},
-				"models-config",
-			);
-		}
-	},
+	validateModelsConfig,
 );
+
+// Org-managed overlay (see MANAGED_MODELS_FILENAME). A distinct id ("models.managed")
+// gives it its own default path `<agentDir>/models.managed.yml` and its own
+// migration/cache slot, so it never collides with the user's `models.yml`.
+export const ManagedModelsConfigFile = new ConfigFile<ModelsConfig>(
+	"models.managed",
+	ModelsConfigSchema,
+).withValidation("models.managed", validateModelsConfig);

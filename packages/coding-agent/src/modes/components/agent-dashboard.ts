@@ -17,6 +17,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
 import {
 	type Component,
 	Container,
@@ -39,6 +40,7 @@ import { getConfigDirs } from "../../config";
 import type { ModelRegistry } from "../../config/model-registry";
 import {
 	formatModelString,
+	getAllowedAvailableModels,
 	resolveAgentModelPatterns,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
@@ -739,9 +741,11 @@ export class AgentDashboard extends Container {
 				settings?.getModelRole("default"),
 			settings,
 		);
+		// resolveModelOverride resolves against the allowlist-filtered set (it
+		// applies getAllowedAvailableModels with these settings), so both the
+		// override and the fallback below respect enabledModels.
 		const { model } = resolveModelOverride(modelPatterns, modelRegistry, settings);
-		const fallbackModel = modelRegistry.getAvailable()[0];
-		const selectedModel = model ?? fallbackModel;
+		const selectedModel = model ?? this.#getAllowedModels()[0];
 		if (!selectedModel) {
 			throw new Error("No available model to generate agent specification.");
 		}
@@ -830,12 +834,18 @@ export class AgentDashboard extends Container {
 		this.#rebuildAndRender();
 	}
 
-	#getModelSuggestions(input: string): string[] {
+	/** Registry availables narrowed by the `enabledModels` allowlist (when set),
+	 * resolved against this dashboard's settings instance (path scope). */
+	#getAllowedModels(): Model[] {
 		const modelRegistry = this.modelContext.modelRegistry;
 		if (!modelRegistry) return [];
+		return getAllowedAvailableModels(modelRegistry, this.#settingsManager ?? undefined);
+	}
+
+	#getModelSuggestions(input: string): string[] {
 		const query = input.trim().toLowerCase();
 		if (!query) return [];
-		const available = modelRegistry.getAvailable();
+		const available = this.#getAllowedModels();
 		const seen = new Set<string>();
 		const matches: string[] = [];
 		for (const model of available) {

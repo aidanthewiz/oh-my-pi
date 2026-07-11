@@ -125,6 +125,7 @@ async function loadTomlConfig(_ctx: LoadContext, path: string): Promise<Record<s
 
 /** Codex MCP server config format (from config.toml) */
 interface CodexMCPConfig {
+	enabled?: boolean;
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
@@ -164,6 +165,13 @@ function extractMCPServersFromToml(
 			url: config.url,
 			...(rooted.cwd !== undefined && { cwd: rooted.cwd }),
 		};
+
+		// Honor Codex's own per-server toggle: `enabled = false` in config.toml
+		// must not be imported as an enabled server (it previously was, so OMP
+		// spawned servers Codex itself had disabled).
+		if (typeof config.enabled === "boolean") {
+			server.enabled = config.enabled;
+		}
 
 		// Build env by merging explicit env and forwarded env_vars
 		const env: Record<string, string> = { ...config.env };
@@ -207,7 +215,10 @@ function extractMCPServersFromToml(
 		}
 		// Note: validation of transport vs endpoint is handled by mcpCapability.validate()
 
-		// Map Codex tool_timeout_sec (seconds) to MCPServer timeout (milliseconds)
+		// Map Codex tool_timeout_sec (seconds) to MCPServer timeout (milliseconds).
+		// `startup_timeout_sec`, `enabled_tools`, and `disabled_tools` are
+		// intentionally not honored: OMP has a single per-server timeout and no
+		// per-tool allow/deny surface for MCP servers.
 		if (typeof config.tool_timeout_sec === "number" && config.tool_timeout_sec > 0) {
 			server.timeout = config.tool_timeout_sec * 1000;
 		}

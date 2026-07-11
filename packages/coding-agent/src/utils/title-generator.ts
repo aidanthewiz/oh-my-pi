@@ -8,7 +8,7 @@ import { StreamMarkupHealing } from "@oh-my-pi/pi-ai/utils/stream-markup-healing
 import { isTerminalHeadless, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 
-import { resolveRoleSelection } from "../config/model-resolver";
+import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
@@ -44,7 +44,7 @@ const LEADING_PROSE_THINKING_PREAMBLE_RE =
 	/^[ \t]*(?:(?:here(?:['’]s| is)[ \t]+(?:a|the|my)[ \t]+)|my[ \t]+)?(?:thinking|thought|reasoning)[ \t]+process[ \t]*:?[ \t]*(?:\r?\n|$)/i;
 
 function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api> | undefined {
-	const availableModels = registry.getAvailable();
+	const availableModels = getAllowedAvailableModels(registry, settings);
 	if (availableModels.length === 0) return undefined;
 
 	const titleModel = resolveRoleSelection(["tiny", "commit", "smol"], settings, availableModels)?.model;

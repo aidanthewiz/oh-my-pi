@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a production relay server and signed container release workflow for end-to-end encrypted `/collab` sessions and `/share` blobs.
+- Authenticated Coreforce relay hosts and encrypted-share uploads with short-lived AWS identity proofs, and added one-time browser authorization for `/collab` and `/share` viewers.
+- Added trusted repository-root `.coreforge/mcp.json` discovery and managed persistent-plugin allowlisting for Coreforge deployments.
+
+### Changed
+
+- Routed default collaboration and encrypted-share links through `agent-collab.internal.somahub.io` and branded the public browser and share experiences as Coreforce Agent Collab without exposing the internal Coreforge product name.
+- Prioritized Claude Opus 5 during automatic slow-model selection.
+- Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
+
+### Fixed
+
+- Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.
+
+- Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
+- Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
+
 ## [17.0.9] - 2026-07-23
 
 ### Added

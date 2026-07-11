@@ -15,6 +15,7 @@ import {
 import { reset as resetCapabilities } from "../../capability";
 import {
 	formatModelSelectorValue,
+	getAllowedAvailableModels,
 	resolveAdvisorRoleSelection,
 	resolveModelRoleValue,
 } from "../../config/model-resolver";
@@ -270,7 +271,7 @@ export class SelectorController {
 			// (NOT the first live advisor, which may be a named advisor from another scope).
 			const advisorRoleSel = resolveAdvisorRoleSelection(
 				this.ctx.settings,
-				this.ctx.session.modelRegistry.getAvailable(),
+				getAllowedAvailableModels(this.ctx.session.modelRegistry, this.ctx.settings),
 			);
 			const defaultAdvisorModel = advisorRoleSel?.model;
 			const deps: AdvisorConfigDeps = {

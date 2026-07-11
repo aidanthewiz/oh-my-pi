@@ -113,6 +113,17 @@ export default class Index extends Command {
 		"no-pty": Flags.boolean({
 			description: "Disable PTY-based interactive bash execution",
 		}),
+		// MCP escape hatches: runtime parsing happens in `cli/args.ts parseArgs`;
+		// declared here so oclif's auto-generated `--help` lists them.
+		"no-mcp": Flags.boolean({
+			description: "Disable MCP discovery and connections entirely for this run",
+		}),
+		"mcp-project-config": Flags.boolean({
+			description: "Load project-level MCP config (.mcp.json) for this run, overriding managed policy",
+		}),
+		"mcp-providers": Flags.string({
+			description: "Comma-separated MCP discovery provider allowlist for this run (e.g. native,mcp-json,codex)",
+		}),
 		tools: Flags.string({
 			description: "Comma-separated list of tools to enable (default: all)",
 		}),

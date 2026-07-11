@@ -225,6 +225,12 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 			});
 		}
 	},
+	"--mcp-providers": (result, value) => {
+		result.mcpProviders = value
+			.split(",")
+			.map(s => s.trim())
+			.filter(Boolean);
+	},
 };
 
 /**
@@ -290,6 +296,8 @@ export const VALUELESS_FLAGS: ReadonlySet<string> = new Set([
 	"--no-session",
 	"--no-tools",
 	"--no-lsp",
+	"--no-mcp",
+	"--mcp-project-config",
 	"--no-pty",
 	"--hide-thinking",
 	"--advisor",

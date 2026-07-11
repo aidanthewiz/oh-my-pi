@@ -31,6 +31,10 @@ export interface MCPToolsLoadOptions {
 	onStatus?: (event: McpConnectionStatusEvent) => void;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
+	/** Allowlist of discovery provider ids whose MCP servers load (empty/omitted = all providers) */
+	discoveryProviders?: string[];
+	/** GitHub organizations trusted to load .coreforge/mcp.json while project config is disabled */
+	trustedProjectGitHubOrganizations?: string[];
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
@@ -71,6 +75,8 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 		result = await manager.discoverAndConnect({
 			onStatus: options?.onStatus,
 			enableProjectConfig: options?.enableProjectConfig,
+			discoveryProviders: options?.discoveryProviders,
+			trustedProjectGitHubOrganizations: options?.trustedProjectGitHubOrganizations,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
 		});

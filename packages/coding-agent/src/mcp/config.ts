@@ -9,6 +9,9 @@ import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
+import { COREFORGE_MCP_PROVIDER_ID } from "../discovery/coreforge";
+import { parseGitUrl } from "../extensibility/plugins/git-url";
+import * as git from "../utils/git";
 import { readDisabledServers, readEnabledServers } from "./config-writer";
 import type { MCPServerConfig } from "./types";
 
@@ -16,6 +19,10 @@ import type { MCPServerConfig } from "./types";
 export interface LoadMCPConfigsOptions {
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
+	/** Allowlist of discovery provider ids whose MCP servers load (empty/omitted = all providers) */
+	discoveryProviders?: string[];
+	/** GitHub organizations trusted to load .coreforge/mcp.json while project config is disabled */
+	trustedProjectGitHubOrganizations?: string[];
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
@@ -85,6 +92,23 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	};
 }
 
+async function isTrustedCoreforgeProject(cwd: string, organizations: readonly string[]): Promise<boolean> {
+	if (organizations.length === 0) return false;
+	let originUrl: string | undefined;
+	try {
+		originUrl = await git.remote.url(cwd, "origin");
+	} catch {
+		return false;
+	}
+	if (!originUrl) return false;
+	const source = parseGitUrl(originUrl);
+	if (source?.host.toLowerCase() !== "github.com") return false;
+	const organization = source.path.split("/", 1)[0];
+	if (!organization) return false;
+	const trusted = new Set(organizations.map(value => value.toLowerCase()));
+	return trusted.has(organization.toLowerCase());
+}
+
 /**
  * Load all MCP server configs from standard locations.
  * Uses the capability system for multi-source discovery.
@@ -98,12 +122,19 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const filterBrowser = options?.filterBrowser ?? false;
 
 	// Load MCP servers via capability system
-	const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
+	const result = await loadCapability<MCPServer>(mcpCapability.id, {
+		cwd,
+		providers: options?.discoveryProviders?.length ? options.discoveryProviders : undefined,
+	});
 
-	// Filter out project-level configs if disabled
-	const servers = enableProjectConfig
-		? result.items
-		: result.items.filter(server => server._source.level !== "project");
+	const allowCoreforgeProject =
+		!enableProjectConfig && (await isTrustedCoreforgeProject(cwd, options?.trustedProjectGitHubOrganizations ?? []));
+	const servers = result.items.filter(
+		server =>
+			enableProjectConfig ||
+			server._source.level !== "project" ||
+			(allowCoreforgeProject && server._source.provider === COREFORGE_MCP_PROVIDER_ID),
+	);
 
 	// Load user-level disable/force-enable lists. The denylist always wins; the
 	// allowlist overrides a non-writable source config's `enabled: false`.

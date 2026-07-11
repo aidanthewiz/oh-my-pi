@@ -5,7 +5,12 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { extractTextContent } from "../commit/utils";
 
-import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
+import {
+	expandRoleAlias,
+	getAllowedAvailableModels,
+	getModelMatchPreferences,
+	resolveModelFromString,
+} from "../config/model-resolver";
 import inspectImageDescription from "../prompts/tools/inspect-image.md" with { type: "text" };
 import inspectImageSystemPromptTemplate from "../prompts/tools/inspect-image-system.md" with { type: "text" };
 import {
@@ -143,7 +148,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 			throw new ToolError("Model registry is unavailable for inspect_image.");
 		}
 
-		const availableModels = modelRegistry.getAvailable();
+		const availableModels = getAllowedAvailableModels(modelRegistry, this.session.settings);
 		if (availableModels.length === 0) {
 			throw new ToolError("No models available for inspect_image.");
 		}

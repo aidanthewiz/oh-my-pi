@@ -22,7 +22,12 @@ import type { Api, completeSimple, ImageContent, Model, TextContent } from "@oh-
 import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
+import {
+	expandRoleAlias,
+	getAllowedAvailableModels,
+	getModelMatchPreferences,
+	resolveModelFromString,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import describeUserPrompt from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
@@ -101,7 +106,7 @@ function formatImageBlock(localUrl: string, description: string): string {
  * never returning a text-only model.
  */
 function resolveVisionModel(deps: DescribeAttachedImagesDeps): Model<Api> | undefined {
-	const available = deps.modelRegistry.getAvailable();
+	const available = getAllowedAvailableModels(deps.modelRegistry, deps.settings);
 	if (available.length === 0) return undefined;
 	const preferences = getModelMatchPreferences(deps.settings);
 	const resolvePattern = (pattern: string | undefined): Model<Api> | undefined => {

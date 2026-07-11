@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { configurePersistentPluginPolicy } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/policy";
 import { getActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -170,6 +171,44 @@ This skill is added after session creation.
 		await session.refreshSkills();
 
 		expect(session.skills.some((s: Skill) => s.name === "runtime-added-skill")).toBe(false);
+	});
+
+	it("refreshSkills retains the session persistent-plugin policy", async () => {
+		const projectPluginsDir = path.join(tempDir, ".omp", "plugins");
+		const pluginDir = path.join(projectPluginsDir, "node_modules", "project-skill-plugin");
+		const pluginSkillDir = path.join(pluginDir, "skills", "project-plugin-skill");
+		fs.mkdirSync(pluginSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(projectPluginsDir, "package.json"),
+			JSON.stringify({ private: true, dependencies: { "project-skill-plugin": "1.0.0" } }),
+		);
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "project-skill-plugin", version: "1.0.0", omp: {} }),
+		);
+		fs.writeFileSync(
+			path.join(pluginSkillDir, "SKILL.md"),
+			"---\nname: project-plugin-skill\ndescription: Must stay blocked on refresh.\n---\n\n# Blocked\n",
+		);
+		configurePersistentPluginPolicy("open", []);
+		const settings = createIsolatedSkillsSettings();
+		settings.set("plugins.persistentPolicy", "allowlist");
+		settings.set("plugins.persistentAllowlist", []);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(tempDir),
+			modelRegistry: sharedModelRegistry,
+			settings,
+		});
+
+		try {
+			expect(session.skills.some((skill: Skill) => skill.name === "project-plugin-skill")).toBe(false);
+			await session.refreshSkills();
+			expect(session.skills.some((skill: Skill) => skill.name === "project-plugin-skill")).toBe(false);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("manage_skill hot-registers managed skills in the active session", async () => {

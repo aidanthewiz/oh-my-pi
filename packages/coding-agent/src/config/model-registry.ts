@@ -86,7 +86,13 @@ import {
 	getOllamaContextLengthOverride,
 	normalizeLiteLLMDiscoveryBaseUrl,
 } from "./model-discovery";
-import { ModelsConfigFile, type ProviderValidationModel, validateProviderConfiguration } from "./models-config";
+import {
+	MANAGED_MODELS_FILENAME,
+	ManagedModelsConfigFile,
+	ModelsConfigFile,
+	type ProviderValidationModel,
+	validateProviderConfiguration,
+} from "./models-config";
 import type { ModelOverride, ModelsConfig, ProviderAuthMode } from "./models-config-schema";
 import { settings } from "./settings";
 
@@ -245,6 +251,59 @@ function mergeByModelKey<T extends { provider: string; id: string }>(
 		}
 	}
 	return merged;
+}
+
+/**
+ * Deep-merge an org-managed {@link ModelsConfig} overlay ABOVE the user's,
+ * mirroring the Settings `config.managed.yml` layer for model metadata. The
+ * managed layer wins on every conflict, but only at leaf granularity so it can
+ * pin one field (e.g. a seat's `contextPromotionTarget`) without discarding the
+ * employee's sibling config:
+ *   - provider present only in one side  -> taken verbatim
+ *   - provider in both                   -> scalar/object fields: managed wins;
+ *     `models[]` merged by `id` (managed entry replaces the user entry of the
+ *     same id, others preserved); `modelOverrides{}` merged by model id, and
+ *     within a shared id the override fields are shallow-merged (managed wins).
+ * Returns a new object; neither input is mutated. `base`/`managed` undefined is
+ * treated as an empty config.
+ */
+function mergeModelsConfig(base: ModelsConfig | undefined, managed: ModelsConfig | undefined): ModelsConfig {
+	const baseProviders = base?.providers ?? {};
+	const managedProviders = managed?.providers ?? {};
+	if (Object.keys(managedProviders).length === 0) return { providers: { ...baseProviders } };
+
+	const providers: NonNullable<ModelsConfig["providers"]> = { ...baseProviders };
+	for (const [name, managedProvider] of Object.entries(managedProviders)) {
+		const baseProvider = baseProviders[name];
+		if (!baseProvider) {
+			providers[name] = managedProvider;
+			continue;
+		}
+		// models[]: managed entries replace same-id user entries, order = user
+		// entries first (updated in place) then managed-only additions.
+		let models = baseProvider.models;
+		if (managedProvider.models && managedProvider.models.length > 0) {
+			const byId = new Map((baseProvider.models ?? []).map(m => [m.id, m]));
+			for (const m of managedProvider.models) byId.set(m.id, m);
+			models = [...byId.values()];
+		}
+		// modelOverrides{}: merge by model id; within a shared id, shallow-merge
+		// fields so managed pins one attribute without dropping the user's others.
+		let modelOverrides = baseProvider.modelOverrides;
+		if (managedProvider.modelOverrides) {
+			modelOverrides = { ...(baseProvider.modelOverrides ?? {}) };
+			for (const [id, ov] of Object.entries(managedProvider.modelOverrides)) {
+				modelOverrides[id] = { ...(modelOverrides[id] ?? {}), ...ov };
+			}
+		}
+		providers[name] = {
+			...baseProvider,
+			...managedProvider,
+			...(models !== undefined ? { models } : {}),
+			...(modelOverrides !== undefined ? { modelOverrides } : {}),
+		};
+	}
+	return { providers };
 }
 
 interface BuiltInDiscoveryResult {
@@ -770,7 +829,8 @@ export class ModelRegistry {
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
-	#lastStaticLoadMtime: number | null = null;
+	#managedModelsConfigFile: ConfigFile<ModelsConfig>;
+	#lastStaticLoadMtime: string | null = null;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
 	#cacheDbPath?: string;
@@ -831,6 +891,13 @@ export class ModelRegistry {
 				? () => Promise.reject(new Error("network disabled in model-registry runtime test"))
 				: wrapFetchForExtraCa(fetch));
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
+		// Org-managed overlay lives beside the user models file (same dir), so an
+		// explicit modelsPath relocates it too; undefined keeps its own default
+		// (`<agentDir>/models.managed.yml`). Deep-merged above the user config in
+		// #loadCustomModels; absent file = upstream behaviour.
+		this.#managedModelsConfigFile = ManagedModelsConfigFile.relocate(
+			modelsPath ? path.join(path.dirname(modelsPath), MANAGED_MODELS_FILENAME) : undefined,
+		);
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
 		this.authStorage.setFallbackResolver(provider => {
@@ -990,13 +1057,20 @@ export class ModelRegistry {
 		await this.#refreshRuntimeDiscoveries(strategy, new Set(this.#runtimeModelManagers.keys()));
 	}
 
+	// Composite mtime signature over BOTH the user models.yml and the managed
+	// overlay, so a managed-only edit still invalidates the "unchanged" fast path.
+	#staticModelsMtimeSignature(): string {
+		return `${this.#modelsConfigFile.getMtimeMs() ?? "-"}\u0000${this.#managedModelsConfigFile.getMtimeMs() ?? "-"}`;
+	}
+
 	#reloadStaticModels(): void {
-		const currentMtime = this.#modelsConfigFile.getMtimeMs();
-		if (currentMtime !== null && currentMtime === this.#lastStaticLoadMtime) {
-			// Models config unchanged since last load; reloading would be redundant.
+		const currentSignature = this.#staticModelsMtimeSignature();
+		if (currentSignature === this.#lastStaticLoadMtime) {
+			// Neither models.yml nor the managed overlay changed since last load.
 			return;
 		}
 		this.#modelsConfigFile.invalidate();
+		this.#managedModelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
 		this.#keylessProviders.clear();
 		this.#discoverableProviders = [];
@@ -1076,7 +1150,7 @@ export class ModelRegistry {
 		// collapse effort-tier variants here so X/X-thinking twins fold.
 		const withModelOverrides = this.#applyModelOverrides(collapseBuiltModelVariants(combined), this.#modelOverrides);
 		this.#models = this.#applyLlamaCppQwenThinkingToModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
-		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
+		this.#lastStaticLoadMtime = this.#staticModelsMtimeSignature();
 	}
 
 	/** Load built-in models, applying provider-level overrides only.
@@ -1363,6 +1437,8 @@ export class ModelRegistry {
 	#loadCustomModels(): CustomModelsResult {
 		const { value, error, status } = this.#modelsConfigFile.tryLoad();
 
+		// A broken USER models.yml stays a hard error (surfaced in the UI) exactly
+		// as before — the managed overlay never rescues a file we couldn't parse.
 		if (status === "error") {
 			return {
 				models: [],
@@ -1374,7 +1450,23 @@ export class ModelRegistry {
 				error,
 				found: true,
 			};
-		} else if (status === "not-found") {
+		}
+
+		// Org-managed overlay: deep-merged ABOVE the user config (managed wins).
+		// Tolerant like the Settings managed layer — a malformed managed file is
+		// logged and skipped, never bricking model loading. Absent = empty layer.
+		const managedLoad = this.#managedModelsConfigFile.tryLoad();
+		if (managedLoad.status === "error") {
+			logger.warn("Ignoring malformed managed models overlay", {
+				path: this.#managedModelsConfigFile.path(),
+				error: managedLoad.error,
+			});
+		}
+		const managedConfig = managedLoad.status === "ok" ? managedLoad.value : undefined;
+		const hasManaged = (managedConfig?.providers && Object.keys(managedConfig.providers).length > 0) ?? false;
+
+		// No user file AND no managed providers -> upstream "not-found" behaviour.
+		if (status === "not-found" && !hasManaged) {
 			return {
 				models: [],
 				overrides: new Map(),
@@ -1386,12 +1478,14 @@ export class ModelRegistry {
 			};
 		}
 
+		const merged = mergeModelsConfig(status === "ok" ? value : undefined, managedConfig);
+
 		const overrides = new Map<string, ProviderOverride>();
 		const allModelOverrides = new Map<string, Map<string, ModelOverride>>();
 		const keylessProviders = new Set<string>();
 		const discoverableProviders: DiscoveryProviderConfig[] = [];
-		const providerEntries = Object.entries(value.providers ?? {});
-		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
+		const providerEntries = Object.entries(merged.providers ?? {});
+		const configuredProviders = new Set(Object.keys(merged.providers ?? {}));
 		for (const [providerName, providerConfig] of providerEntries) {
 			const resolvedProviderHeaders = resolveConfigHeaders(providerConfig.headers);
 			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools/transport are present
@@ -1464,7 +1558,7 @@ export class ModelRegistry {
 		}
 
 		return {
-			models: this.#parseModels(value),
+			models: this.#parseModels(merged),
 			overrides,
 			modelOverrides: allModelOverrides,
 			keylessProviders,

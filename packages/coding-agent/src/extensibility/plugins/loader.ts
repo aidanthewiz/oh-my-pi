@@ -10,6 +10,7 @@ import { getPluginsDir, getPluginsLockfile, isEnoent } from "@oh-my-pi/pi-utils"
 import { getConfigDirPaths } from "../../config";
 import { registerPluginCacheInvalidator, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import { installLegacyPiSpecifierShim } from "./legacy-pi-compat";
+import { isPersistentPluginAllowed, persistentPluginPolicyCacheKey } from "./policy";
 import { normalizePluginRuntimeConfig } from "./runtime-config";
 import type { InstalledPlugin, PluginManifest, PluginRuntimeConfig, ProjectPluginOverrides } from "./types";
 
@@ -23,7 +24,7 @@ installLegacyPiSpecifierShim();
 const enabledPluginsCache = new Map<string, Promise<ScopedInstalledPlugin[]>>();
 
 function enabledPluginsCacheKey(cwd: string, home?: string): string {
-	return `${path.resolve(cwd)}\0${home === undefined ? "" : path.resolve(home)}`;
+	return `${path.resolve(cwd)}\0${home === undefined ? "" : path.resolve(home)}\0${persistentPluginPolicyCacheKey()}`;
 }
 
 function clearEnabledPluginsCache(): void {
@@ -206,13 +207,13 @@ async function loadEnabledPlugins(cwd: string, home?: string): Promise<ScopedIns
 		}
 	}
 
-	if (projectPlugins.length === 0) return userPlugins;
-	if (userPlugins.length === 0) return projectPlugins;
-
-	// Project entries shadow user entries with the same package name.
 	const merged = new Map<string, ScopedInstalledPlugin>();
-	for (const plugin of userPlugins) merged.set(plugin.name, plugin);
-	for (const plugin of projectPlugins) merged.set(plugin.name, plugin);
+	for (const plugin of userPlugins) {
+		if (isPersistentPluginAllowed(plugin.name, plugin.scope)) merged.set(plugin.name, plugin);
+	}
+	for (const plugin of projectPlugins) {
+		if (isPersistentPluginAllowed(plugin.name, plugin.scope)) merged.set(plugin.name, plugin);
+	}
 	return Array.from(merged.values());
 }
 

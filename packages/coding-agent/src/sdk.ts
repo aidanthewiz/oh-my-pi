@@ -86,6 +86,11 @@ import {
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
 import {
+	createPersistentPluginPolicy,
+	filterPersistentExtensionPaths,
+	withPersistentPluginPolicy,
+} from "./extensibility/plugins/policy";
+import {
 	loadSkills as loadSkillsInternal,
 	type Skill,
 	type SkillWarning,
@@ -690,9 +695,16 @@ export async function discoverSessionExtensionPaths(
 	if (options.disableExtensionDiscovery) {
 		return options.additionalExtensionPaths ?? [];
 	}
-	const configuredPaths = [...(options.additionalExtensionPaths ?? []), ...(settings.get("extensions") ?? [])];
-	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
-	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds);
+	const policy = createPersistentPluginPolicy(
+		settings.get("plugins.persistentPolicy"),
+		settings.get("plugins.persistentAllowlist"),
+	);
+	return withPersistentPluginPolicy(policy, async () => {
+		const persistentPaths = filterPersistentExtensionPaths(settings.get("extensions") ?? [], cwd);
+		const configuredPaths = [...(options.additionalExtensionPaths ?? []), ...persistentPaths];
+		const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
+		return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds);
+	});
 }
 
 /**
@@ -1236,6 +1248,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		options.settingsManager ??
 		logger.time("settings", Settings.init, { cwd, agentDir }));
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
+	const persistentPluginPolicy = createPersistentPluginPolicy(
+		settings.get("plugins.persistentPolicy"),
+		settings.get("plugins.persistentAllowlist"),
+	);
+	const withSessionPluginPolicy = <T>(run: () => T): T => withPersistentPluginPolicy(persistentPluginPolicy, run);
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
 	}
@@ -1257,7 +1274,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// session-context build, tool creation, MCP discovery, and extension discovery.
 	const contextFilesPromise = options.contextFiles
 		? Promise.resolve(options.contextFiles)
-		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
+		: logger.time("discoverContextFiles", () => withSessionPluginPolicy(() => discoverContextFiles(cwd, agentDir)));
 	contextFilesPromise.catch(() => {});
 	const activeRepoContextPromise = logger.time("resolveActiveRepoContext", async () => {
 		try {
@@ -1268,26 +1285,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	});
 	activeRepoContextPromise.catch(() => {});
-	const watchdogFilesPromise = logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
+	const watchdogFilesPromise = logger.time("discoverWatchdogFiles", () =>
+		withSessionPluginPolicy(() => discoverWatchdogFiles(cwd, agentDir)),
+	);
 	watchdogFilesPromise.catch(() => {});
-	const advisorConfigsPromise = logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
+	const advisorConfigsPromise = logger.time("discoverAdvisorConfigs", () =>
+		withSessionPluginPolicy(() => discoverAdvisorConfigs(cwd, agentDir)),
+	);
 	advisorConfigsPromise.catch(() => {});
 	const promptTemplatesPromise = options.promptTemplates
 		? Promise.resolve(options.promptTemplates)
-		: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
+		: logger.time("discoverPromptTemplates", () =>
+				withSessionPluginPolicy(() => discoverPromptTemplates(cwd, agentDir)),
+			);
 	promptTemplatesPromise.catch(() => {});
 	const slashCommandsPromise = options.slashCommands
 		? Promise.resolve(options.slashCommands)
-		: logger.time("discoverSlashCommands", discoverSlashCommands, cwd);
+		: logger.time("discoverSlashCommands", () => withSessionPluginPolicy(() => discoverSlashCommands(cwd)));
 	slashCommandsPromise.catch(() => {});
 	const skillsSettings = settings.getGroup("skills");
 	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
 	const discoveredSkillsPromise =
 		options.skills === undefined
-			? logger.time("discoverSkills", discoverSkills, cwd, agentDir, {
-					...skillsSettings,
-					disabledExtensions: disabledExtensionIds,
-				})
+			? logger.time("discoverSkills", () =>
+					withSessionPluginPolicy(() =>
+						discoverSkills(cwd, agentDir, {
+							...skillsSettings,
+							disabledExtensions: disabledExtensionIds,
+						}),
+					),
+				)
 			: undefined;
 	discoveredSkillsPromise?.catch(() => {});
 
@@ -1515,7 +1542,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+					: await withSessionPluginPolicy(() => loadCapability<Rule>(ruleCapability.id, { cwd }));
 			const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
 				builtinRules: ttsrSettings.builtinRules,
 				disabledRules: ttsrSettings.disabledRules,
@@ -1818,6 +1845,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const mcpDiscoverOptions = {
 			onStatus: onMCPStatus,
 			enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
+			// MCP-scoped provider allowlist (empty = all providers); unlike
+			// `disabledProviders` this filters ONLY the mcps capability.
+			discoveryProviders: settings.get("mcp.discoveryProviders"),
+			trustedProjectGitHubOrganizations: settings.get("mcp.trustedProjectGitHubOrganizations"),
 			// Always filter Exa - we have native integration
 			filterExa: true,
 			// Filter browser MCP servers when builtin browser tool is active
@@ -1839,7 +1870,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					void (async () => {
 						try {
 							const mcpResult = await logger.time("discoverAndLoadMCPTools", () =>
-								deferredMCPManager.discoverAndConnect(mcpDiscoverOptions),
+								withSessionPluginPolicy(() => deferredMCPManager.discoverAndConnect(mcpDiscoverOptions)),
 							);
 							// The session can be torn down while servers are still connecting.
 							// Don't resurrect tools on a disposed session, and don't leak the
@@ -1861,11 +1892,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					})();
 				};
 			} else {
-				const mcpResult = await logger.time("discoverAndLoadMCPTools", discoverAndLoadMCPTools, cwd, {
-					...mcpDiscoverOptions,
-					cacheStorage: settings.getStorage(),
-					authStorage,
-				});
+				const mcpResult = await logger.time("discoverAndLoadMCPTools", () =>
+					withSessionPluginPolicy(() =>
+						discoverAndLoadMCPTools(cwd, {
+							...mcpDiscoverOptions,
+							cacheStorage: settings.getStorage(),
+							authStorage,
+						}),
+					),
+				);
 				mcpManager = mcpResult.manager;
 				toolSession.mcpManager = mcpManager;
 
@@ -1926,7 +1961,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// pending-action queueing.
 			customToolPaths =
 				options.preloadedCustomToolPaths ??
-				(await logger.time("discoverCustomToolPaths", () => discoverCustomToolPaths([], cwd)));
+				(await logger.time("discoverCustomToolPaths", () =>
+					withSessionPluginPolicy(() => discoverCustomToolPaths([], cwd)),
+				));
 			const customToolsLoadResult = await logger.time("loadCustomTools", () =>
 				loadCustomTools(customToolPaths, cwd, builtInToolNames, action => queueResolveHandler(toolSession, action)),
 			);
@@ -3068,6 +3105,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings,
 			skillsReloadable: options.skills === undefined,
 			skillsSettings: settings.getGroup("skills"),
+			reloadSkills: loadOptions => withSessionPluginPolicy(() => loadSkillsInternal(loadOptions)),
 			modelRegistry,
 			toolRegistry,
 			createVibeTools:

@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
 import type { ApiKeyResolverRegistry } from "../config/api-key-resolver";
 import {
+	getAllowedAvailableModels,
 	getModelMatchPreferences,
 	type ModelLookupRegistry,
 	parseModelPattern,
@@ -39,7 +40,7 @@ export async function resolvePrimaryModel(
 	settings: Settings,
 	modelRegistry: CommitModelRegistry,
 ): Promise<ResolvedCommitModel> {
-	const available = modelRegistry.getAvailable();
+	const available = getAllowedAvailableModels(modelRegistry, settings);
 	const matchPreferences = getModelMatchPreferences(settings);
 	const resolved = override
 		? resolveModelRoleValue(override, available, { settings, matchPreferences })
@@ -65,7 +66,7 @@ export async function resolveSmolModel(
 	fallbackModel: Model<Api>,
 	fallbackApiKey: ApiKey,
 ): Promise<ResolvedCommitModel> {
-	const available = modelRegistry.getAvailable();
+	const available = getAllowedAvailableModels(modelRegistry, settings);
 	const resolvedSmol = resolveRoleSelection(["smol"], settings, available);
 	if (resolvedSmol?.model) {
 		const apiKey = await modelRegistry.getApiKey(resolvedSmol.model);

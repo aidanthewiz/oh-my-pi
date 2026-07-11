@@ -101,6 +101,16 @@ Behavior split:
 - SDK: when `disableExtensionDiscovery=true`, it still loads `additionalExtensionPaths` via `loadExtensions()`.
 - CLI path building (`main.ts`) currently clears CLI extension paths when `--no-extensions` is set, so explicit `-e/--hook` are not forwarded in that mode.
 
+
+### Restrict persistent plugins
+
+Set `plugins.persistentPolicy: allowlist` to load only exact user-installed
+entries from `plugins.persistentAllowlist`. OMP-installed packages match by
+package name and marketplace plugins match their `plugin@marketplace` ID.
+Project plugin registries and configured `extensions` paths remain blocked,
+even if their local package metadata claims an allowlisted name. Explicit
+one-session CLI paths such as `--plugin-dir` and `--extension` remain available.
+
 ### Disable specific extension modules
 
 `disabledExtensions` setting filters by extension id format:

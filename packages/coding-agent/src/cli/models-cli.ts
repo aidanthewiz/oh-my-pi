@@ -16,6 +16,7 @@ import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { ModelRegistry } from "../config/model-registry";
+import { getAllowedAvailableModels } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import {
 	discoverAndLoadExtensions,
@@ -23,6 +24,11 @@ import {
 	emitSessionShutdownEvent,
 	loadExtensions,
 } from "../extensibility/extensions";
+import {
+	createPersistentPluginPolicy,
+	filterPersistentExtensionPaths,
+	withPersistentPluginPolicy,
+} from "../extensibility/plugins/policy";
 import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
 import { EventBus } from "../utils/event-bus";
@@ -173,11 +179,12 @@ function boxTable(columns: BoxColumn[], rows: string[][]): string[] {
 /** `omp models ls`/`find`: provider-grouped listing (one box table per provider). */
 function renderProviderModels(
 	modelRegistry: ModelRegistry,
+	settings: Settings | undefined,
 	action: ModelsAction,
 	pattern: string | undefined,
 	json: boolean,
 ): void {
-	const available = modelRegistry.getAvailable();
+	const available = getAllowedAvailableModels(modelRegistry, settings);
 	const needle = pattern?.toLowerCase();
 	let filtered = available;
 
@@ -273,6 +280,8 @@ function renderProviderModels(
  */
 export interface RunModelsListingOptions {
 	modelRegistry: ModelRegistry;
+	/** Settings context for the `enabledModels` allowlist (path-scoped vs `cwd`). */
+	settings?: Settings;
 	cwd: string;
 	action?: ModelsAction;
 	pattern?: string;
@@ -290,6 +299,7 @@ export interface RunModelsListingOptions {
 export async function runModelsListing(options: RunModelsListingOptions): Promise<void> {
 	const {
 		modelRegistry,
+		settings,
 		cwd,
 		action = "ls",
 		pattern,
@@ -299,16 +309,23 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		disabledExtensionIds = [],
 		disableExtensionDiscovery = false,
 	} = options;
+	const policy = createPersistentPluginPolicy(
+		settings?.get("plugins.persistentPolicy") ?? "open",
+		settings?.get("plugins.persistentAllowlist") ?? [],
+	);
 
 	const eventBus = new EventBus();
-	const extensionsResult = disableExtensionDiscovery
-		? await loadExtensions(additionalExtensionPaths, cwd, eventBus)
-		: await discoverAndLoadExtensions(
-				[...additionalExtensionPaths, ...settingsExtensions],
-				cwd,
-				eventBus,
-				disabledExtensionIds,
-			);
+	const extensionsResult = await withPersistentPluginPolicy(policy, async () => {
+		const persistentExtensions = filterPersistentExtensionPaths(settingsExtensions, cwd);
+		return disableExtensionDiscovery
+			? loadExtensions(additionalExtensionPaths, cwd, eventBus)
+			: discoverAndLoadExtensions(
+					[...additionalExtensionPaths, ...persistentExtensions],
+					cwd,
+					eventBus,
+					disabledExtensionIds,
+				);
+	});
 	const extensionRunner =
 		extensionsResult.extensions.length > 0
 			? new ExtensionRunner(
@@ -338,7 +355,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		// Discover runtime (extension) provider catalogs now that they are registered.
 		await modelRegistry.refreshRuntimeProviders(action === "refresh" ? "online" : "online-if-uncached");
 
-		renderProviderModels(modelRegistry, action, pattern, json);
+		renderProviderModels(modelRegistry, settings, action, pattern, json);
 	} finally {
 		await emitSessionShutdownEvent(extensionRunner);
 	}
@@ -373,6 +390,7 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 		const cliExtensionPaths = command.flags.noExtensions ? [] : (command.flags.extensions ?? []);
 		await runModelsListing({
 			modelRegistry,
+			settings,
 			cwd,
 			action,
 			pattern,

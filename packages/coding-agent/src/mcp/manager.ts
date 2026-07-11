@@ -153,6 +153,10 @@ export interface MCPLoadResult {
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
+	/** Allowlist of discovery provider ids whose MCP servers load (empty/omitted = all providers) */
+	discoveryProviders?: string[];
+	/** GitHub organizations trusted to load .coreforge/mcp.json while project config is disabled */
+	trustedProjectGitHubOrganizations?: string[];
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
@@ -331,6 +335,8 @@ export class MCPManager {
 		try {
 			loadedConfigs = await loadAllMCPConfigs(this.cwd, {
 				enableProjectConfig: options?.enableProjectConfig,
+				discoveryProviders: options?.discoveryProviders,
+				trustedProjectGitHubOrganizations: options?.trustedProjectGitHubOrganizations,
 				filterExa: options?.filterExa,
 				filterBrowser: options?.filterBrowser,
 			});

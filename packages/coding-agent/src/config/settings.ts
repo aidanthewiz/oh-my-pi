@@ -49,6 +49,18 @@ import {
 export type * from "./settings-schema";
 export * from "./settings-schema";
 
+/**
+ * Org-managed settings overlay filename, resolved against the agent directory
+ * (`<agentDir>/config.managed.yml`). When present it is loaded as an extra
+ * settings layer that overrides `config.yml`/project/CLI overlays but stays
+ * below runtime overrides, so a managed distribution (e.g. the coreforge
+ * launcher's profile) can pin org policy — model roles, share server — while
+ * per-session switches and CLI flags keep working. The engine only ever READS
+ * this file; distribution tooling ships it (symlink or copy). Absent file =
+ * upstream behaviour, byte-identical.
+ */
+export const MANAGED_CONFIG_FILENAME = "config.managed.yml";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
@@ -318,9 +330,13 @@ export class Settings {
 	#project: RawSettings = {};
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
+	/** Org-managed overlay from config.managed.yml (read-only; wins over global/project/CLI) */
+	#managed: RawSettings = {};
+	/** Absolute path of the managed overlay, or null when in-memory */
+	#managedPath: string | null;
 	/** Runtime overrides (not persisted) */
 	#overrides: RawSettings = {};
-	/** Merged view (global + project + overrides) */
+	/** Merged view (global + project + managed + overrides) */
 	#merged: RawSettings = {};
 	/** Cached resolved values from the merged view, including defaults/path scoping */
 	#resolvedCache = new Map<SettingPath, unknown>();
@@ -357,6 +373,7 @@ export class Settings {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		this.#managedPath = options.inMemory ? null : path.join(this.#agentDir, MANAGED_CONFIG_FILENAME);
 		const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
@@ -569,10 +586,12 @@ export class Settings {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#configPath = this.#configPath;
+		cloned.#managedPath = this.#managedPath;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#configFiles = [...this.#configFiles];
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
+		cloned.#managed = structuredClone(this.#managed);
 		cloned.#overrides = this.#buildOriginalOverrides();
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
@@ -1005,8 +1024,9 @@ export class Settings {
 
 		this.#project = await projectPromise;
 		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#managed = await this.#loadManagedOverlay();
 
-		// Build merged view (global → project → overrides; project wins over global)
+		// Build merged view (global → project → CLI overlays → managed → overrides)
 		this.#rebuildMerged();
 		this.#fireAllHooks();
 		return this;
@@ -1022,6 +1042,7 @@ export class Settings {
 
 		this.#project = await projectPromise;
 		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#managed = await this.#loadManagedOverlay();
 		this.#rebuildMerged();
 		return this;
 	}
@@ -1093,6 +1114,20 @@ export class Settings {
 			merged = this.#deepMerge(merged, await this.#loadOverlayYaml(filePath));
 		}
 		return merged;
+	}
+
+	/**
+	 * Load the org-managed overlay (`<agentDir>/config.managed.yml`) when
+	 * present. Missing file = empty layer (the common, unmanaged case). Unlike
+	 * `--config` overlays the file is not user-supplied on the command line, so
+	 * a malformed managed file must not brick startup: it is logged and treated
+	 * as empty rather than thrown (mirrors `#loadYaml` tolerance). Distribution
+	 * tooling validates the file before shipping it.
+	 */
+	async #loadManagedOverlay(): Promise<RawSettings> {
+		if (!this.#managedPath) return {};
+		const loaded = await this.#loadYamlIfPresent(this.#managedPath);
+		return loaded ?? {};
 	}
 
 	/**
@@ -1801,6 +1836,7 @@ export class Settings {
 	#rebuildMerged(): void {
 		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#projectSettingsForMerge());
 		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
+		this.#merged = this.#deepMerge(this.#merged, this.#managed);
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
 		this.#resolvedCache.clear();
 		this.#editVariantCache = undefined;

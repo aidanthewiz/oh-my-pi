@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { configurePersistentPluginPolicy } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/policy";
 import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 const currentPiCodingAgentPath = Bun.resolveSync("@oh-my-pi/pi-coding-agent", import.meta.dir);
@@ -11,11 +12,13 @@ const currentPiExtensionsPath = Bun.resolveSync("@oh-my-pi/pi-coding-agent/exten
 describe("plugin extension discovery", () => {
 	let projectDir: TempDir;
 	let tempHome = "";
+	let pluginDir = "";
 	const originalAgentDir = getAgentDir();
 	const xdgVars = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
 	const originalXdg = new Map<string, string | undefined>();
 
 	beforeEach(() => {
+		configurePersistentPluginPolicy("open", []);
 		projectDir = TempDir.createSync("@pi-plugin-ext-");
 		// Redirect the whole config root to an isolated temp home so plugin discovery
 		// resolves into `<tempHome>/.omp/plugins` on every platform. Two things are needed:
@@ -40,7 +43,7 @@ describe("plugin extension discovery", () => {
 		if (!pluginsDir.startsWith(tempHome + path.sep)) {
 			throw new Error(`plugin isolation failed: getPluginsDir() resolved outside the temp home: ${pluginsDir}`);
 		}
-		const pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
+		pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
 		fs.mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -73,6 +76,7 @@ describe("plugin extension discovery", () => {
 	});
 
 	afterEach(() => {
+		configurePersistentPluginPolicy("open", []);
 		projectDir.removeSync();
 		spyOn(os, "homedir").mockRestore();
 		for (const [key, value] of originalXdg) {
@@ -91,6 +95,59 @@ describe("plugin extension discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(extension).toBeDefined();
 		expect(extension?.commands.has("plugin-ext")).toBe(true);
+	});
+
+	it("blocks installed plugins omitted from an enforced allowlist", async () => {
+		configurePersistentPluginPolicy("allowlist", []);
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions.some(ext => ext.path.endsWith(path.join("dist", "extension.ts")))).toBe(false);
+	});
+
+	it("loads an installed plugin named in the enforced allowlist", async () => {
+		configurePersistentPluginPolicy("allowlist", ["@demo/plugin"]);
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions.some(ext => ext.path.endsWith(path.join("dist", "extension.ts")))).toBe(true);
+	});
+
+	it("rejects an allowlisted package name from the project plugin root", async () => {
+		const projectPluginsDir = path.join(projectDir.path(), ".omp", "plugins");
+		const projectPluginDir = path.join(projectPluginsDir, "node_modules", "@demo", "plugin");
+		fs.mkdirSync(path.join(projectPluginDir, "dist"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectPluginsDir, "package.json"),
+			JSON.stringify({ private: true, dependencies: { "@demo/plugin": "1.0.0" } }),
+		);
+		fs.writeFileSync(
+			path.join(projectPluginDir, "package.json"),
+			JSON.stringify({
+				name: "@demo/plugin",
+				version: "1.0.0",
+				omp: { extensions: ["./dist/project-extension.ts"] },
+			}),
+		);
+		fs.writeFileSync(
+			path.join(projectPluginDir, "dist", "project-extension.ts"),
+			'export default function(pi) { pi.registerCommand("project-spoof", { handler: async () => {} }); }\n',
+		);
+		configurePersistentPluginPolicy("allowlist", ["@demo/plugin"]);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions.some(ext => ext.commands.has("plugin-ext"))).toBe(true);
+		expect(result.extensions.some(ext => ext.commands.has("project-spoof"))).toBe(false);
+	});
+
+	it("keeps an explicit one-session plugin path available under allowlist policy", async () => {
+		configurePersistentPluginPolicy("allowlist", []);
+		const result = await discoverAndLoadExtensions([pluginDir], projectDir.path());
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions.some(ext => ext.path.endsWith(path.join("dist", "extension.ts")))).toBe(true);
 	});
 
 	it("loads installed legacy Pi plugin extensions from Windows drive-letter paths", async () => {

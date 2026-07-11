@@ -1289,7 +1289,7 @@ export function resolveModelOverride(
 	settings?: Settings,
 ): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean; warning?: string } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = getAllowedAvailableModels(modelRegistry, settings);
 	const matchPreferences = getModelMatchPreferences(settings);
 	let warning: string | undefined;
 	for (const pattern of modelPatterns) {
@@ -1616,6 +1616,27 @@ function findExactCliModel(
 	const preferred = availableModels.find(isFlatMatch);
 	if (preferred) return preferred;
 	return availableModels === allModels ? undefined : allModels.find(isFlatMatch);
+}
+
+/**
+ * Settings-scoped sync companion to {@link resolveAllowedModels}: registry
+ * availability narrowed by the `enabledModels` allowlist resolved from the
+ * GIVEN settings instance, so path-scoped configs resolve against that
+ * instance's cwd. Model-selection/execution sites that hold a scoped
+ * `Settings` should use this instead of raw `modelRegistry.getAvailable()`
+ * (which knows nothing about the caller's path scope).
+ *
+ * Note: `disabledProviders` is still applied inside `getAvailable()` through
+ * the global settings context; only the `enabledModels` layer is scoped here.
+ */
+export function getAllowedAvailableModels(
+	modelRegistry: Pick<ModelRegistry, "getAvailable">,
+	settings: Settings | undefined,
+): Model<Api>[] {
+	const available = modelRegistry.getAvailable();
+	const patterns = settings?.get("enabledModels");
+	if (!patterns || patterns.length === 0) return available;
+	return filterAvailableModelsByEnabledPatterns(available, patterns);
 }
 
 export interface ResolveCliModelResult {

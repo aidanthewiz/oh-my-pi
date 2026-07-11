@@ -21,6 +21,7 @@ import { getAgentDir, isEnoent, logger, tryParseJson } from "@oh-my-pi/pi-utils"
 import { readDirEntries, readFile } from "../capability/fs";
 import type { LoadContext } from "../capability/types";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
+import { filterPersistentExtensionPaths } from "../extensibility/plugins/policy";
 import { expandTilde } from "../tools/path-utils";
 import { listClaudePluginRoots } from "./helpers";
 
@@ -135,10 +136,14 @@ async function isDirectory(p: string): Promise<boolean> {
  */
 export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtensionRoot[]> {
 	const { project, user } = scopeDirs(ctx);
-	const [projectExtensions, userExtensions, installedPlugins] = await Promise.all([
+	const [rawProjectExtensions, rawUserExtensions, installedPlugins] = await Promise.all([
 		readSettingsExtensions(path.join(project, "settings.json")),
 		readSettingsExtensions(path.join(user, "settings.json")),
 		listInstalledPluginRoots(ctx),
+	]);
+	const [projectExtensions, userExtensions] = await Promise.all([
+		filterPersistentExtensionPaths(rawProjectExtensions, ctx.cwd),
+		filterPersistentExtensionPaths(rawUserExtensions, ctx.cwd),
 	]);
 
 	const candidates: InjectedRoot[] = [
