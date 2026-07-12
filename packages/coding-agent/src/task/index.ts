@@ -304,6 +304,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task, model: params.model };
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
+	if (params.contextFilePolicy !== undefined) item.contextFilePolicy = params.contextFilePolicy;
 	if ("isolated" in params) item.isolated = params.isolated;
 	return [item];
 }
@@ -322,6 +323,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
 	if (item.model !== undefined) spawn.model = item.model;
+	if (item.contextFilePolicy !== undefined) spawn.contextFilePolicy = item.contextFilePolicy;
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
@@ -525,6 +527,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const model = formatModelForApproval(params.model);
 		if (model) lines.push(`Model: ${model}`);
+		if (params.contextFilePolicy === "none") {
+			lines.push("Context files: none (fresh)");
+		}
 		if (typeof params.task === "string") {
 			lines.push(`Task:\n${truncateForPrompt(params.task)}`);
 		}
@@ -542,6 +547,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const itemModel = formatModelForApproval(firstTask.model);
 			if (itemModel) lines.push(`Model: ${itemModel}`);
+			if (firstTask.contextFilePolicy === "none") {
+				lines.push("Context files: none (fresh)");
+			}
 			if (typeof firstTask.task === "string") {
 				lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
 			}
@@ -1429,6 +1437,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				model: params.model,
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
+				...(params.contextFilePolicy !== undefined ? { contextFilePolicy: params.contextFilePolicy } : {}),
 				identity: { id: preAllocatedId, label: params.name },
 				index: spawnIndex,
 				parentToolCallId: toolCallId,

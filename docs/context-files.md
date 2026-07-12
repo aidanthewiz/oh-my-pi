@@ -87,12 +87,15 @@ When two providers describe the *same* scope, the higher-priority provider wins.
 Discovered files are then deduplicated by scope:
 
 - **One user context file** is kept across all providers. Because `native` has the highest priority, `~/.omp/agent/AGENTS.md` shadows every other user-level context file.
+- **Global baseline before local overrides.** The surviving user-level file is rendered first, followed by project files ordered from farther ancestors to the current directory. A project/work-directory instruction therefore appears later and is more prominent, so clear local conflicts override the global baseline.
 - **One project context file per directory depth.** Depth is measured from the current directory: the cwd is depth 0, its parent depth 1, and so on. Config subdirectories of an ancestor (`.claude/`, `.github/`, `.gemini/`, …) count as the same depth as that ancestor.
 - **At the same depth, the higher-priority provider shadows the rest.**
 - **Across depths, multiple files survive.** In a monorepo, an ancestor `AGENTS.md` and a package-level one are different depths and both load.
 - **Byte-identical files are collapsed.** If two surviving files have exactly the same content, only the copy closest to the cwd is kept.
 
 After deduplication, project files are sorted so **farther ancestors appear first** and files **closer to the cwd appear last**. Later files sit nearer the end of the context block, where they are most prominent.
+
+Task- and eval-spawned agents inherit the same ordered context-file set as the parent by default. This keeps the global baseline and repository or work-directory overrides consistent across the agent tree. An orchestrator that deliberately needs an agnostic/fresh worker can set that spawn's `contextFilePolicy` to `none`, which omits inherited context files for that worker only.
 
 ### Worked shadowing example
 

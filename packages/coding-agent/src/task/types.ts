@@ -105,6 +105,8 @@ export interface SubagentLifecyclePayload {
 
 /** Display cap for a normalized one-line label (roster line, registry `displayName`, prompt field). */
 export const LABEL_MAX = 80;
+export type ContextFilePolicy = "inherit" | "none";
+const CONTEXT_FILE_POLICY_SCHEMA = "'inherit' | 'none'";
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
@@ -116,6 +118,7 @@ export const taskItemSchema = type({
 	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
+	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
@@ -125,6 +128,7 @@ const taskItemSchemaIsolated = type({
 	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
+	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -135,6 +139,8 @@ export interface TaskItem {
 	name?: string;
 	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
 	agent?: string;
+	/** Context inheritance for this spawn. Default `inherit`; `none` starts without parent context files. */
+	contextFilePolicy?: ContextFilePolicy;
 	/** The work; required by the schema. */
 	task?: string;
 	/** Explicit model selector or fallback chain for this spawn, including optional reasoning suffixes. */
@@ -154,6 +160,7 @@ export const taskSchema = type({
 	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
+	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -164,6 +171,7 @@ const taskSchemaNoIsolation = type({
 	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
+	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"+": "delete",
 });
 const taskSchemaBatch = type({
@@ -209,6 +217,7 @@ function createTaskSchema(options: {
 				"model?": "string | string[]",
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
+				"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 				"isolated?": "boolean",
 				"+": "delete",
 			});
@@ -225,6 +234,7 @@ function createTaskSchema(options: {
 			"model?": "string | string[]",
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
+			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 			"+": "delete",
 		});
 		return type.raw({
@@ -241,6 +251,7 @@ function createTaskSchema(options: {
 			"model?": "string | string[]",
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
+			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 			"isolated?": "boolean",
 			"+": "delete",
 		});
@@ -252,6 +263,7 @@ function createTaskSchema(options: {
 		"model?": "string | string[]",
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
+		"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 		"+": "delete",
 	});
 }
@@ -291,6 +303,8 @@ export interface TaskParams {
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
 	agent?: string;
+	/** Context inheritance for the flat spawn. Default `inherit`; `none` starts without parent context files. */
+	contextFilePolicy?: ContextFilePolicy;
 	/** The work (flat form). */
 	task?: string;
 	/** Explicit model selector or fallback chain for the spawn, including optional reasoning suffixes. */

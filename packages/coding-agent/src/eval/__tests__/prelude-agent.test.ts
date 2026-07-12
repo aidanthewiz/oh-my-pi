@@ -97,6 +97,17 @@ describe("eval js agent() handle", () => {
 		expect(node.text).toBe(payload);
 	});
 
+	it("forwards the orchestrator's context policy to the agent bridge", async () => {
+		let seenArgs: Record<string, unknown> | undefined;
+		const sandbox = loadPrelude(async (_name, args) => {
+			seenArgs = args as Record<string, unknown>;
+			return { text: "fresh", details: { agent: "task", id: "fresh-1", structured: false } };
+		});
+
+		await (sandbox.agent as AgentHelper)("start fresh", { contextFilePolicy: "none" });
+
+		expect(seenArgs?.contextFilePolicy).toBe("none");
+	});
 	it("falls back to a null handle without throwing when the bridge omits details", async () => {
 		const sandbox = loadPrelude(async () => ({ text: "lonely" }));
 		const node = await (sandbox.agent as AgentHelper)("x", { handle: true });

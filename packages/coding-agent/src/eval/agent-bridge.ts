@@ -8,7 +8,7 @@ import {
 	StructuredSubagentError,
 	type StructuredSubagentSchemaMode,
 } from "../task/structured-subagent";
-import type { AgentProgress, SingleResult } from "../task/types";
+import type { AgentProgress, ContextFilePolicy, SingleResult } from "../task/types";
 import type { NestedRepoPatch } from "../task/worktree";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
@@ -31,6 +31,7 @@ const agentArgsSchema = type({
 	"apply?": "boolean",
 	"merge?": "boolean",
 	"handle?": "boolean",
+	"contextFilePolicy?": "'inherit' | 'none'",
 });
 
 interface EvalAgentArgs {
@@ -40,6 +41,8 @@ interface EvalAgentArgs {
 	label?: string;
 	schema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
+	/** Parent context inheritance. Default `inherit`; `none` starts a context-agnostic agent. */
+	contextFilePolicy?: ContextFilePolicy;
 	isolated?: boolean;
 	apply?: boolean;
 	merge?: boolean;
@@ -151,6 +154,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					...(parsed.model !== undefined ? { model: parsed.model } : {}),
 					...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 					...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
+					...(parsed.contextFilePolicy !== undefined ? { contextFilePolicy: parsed.contextFilePolicy } : {}),
 					...(parsed.label !== undefined ? { identity: { label: parsed.label } } : {}),
 					...(isolation ? { isolation } : {}),
 					...(parsed.handle ? { retainArtifacts: true } : {}),

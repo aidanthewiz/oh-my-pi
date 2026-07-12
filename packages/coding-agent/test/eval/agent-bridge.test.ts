@@ -46,14 +46,20 @@ describe("runEvalAgent", () => {
 			getArtifactsDir: () => "/tmp/parent-artifacts",
 			getSessionId: () => "parent-session",
 		};
+		const contextFiles = [
+			{ path: "/profile/AGENTS.md", content: "Global baseline." },
+			{ path: "/repo/AGENTS.md", content: "Repository override.", depth: 1 },
+			{ path: "/repo/pkg/.claude/CLAUDE.md", content: "Package override.", depth: 0 },
+		];
 		const session = {
 			cwd: "/tmp",
 			settings: Settings.isolated(),
 			getSessionSpawns: () => "*",
 			getSessionFile: () => null,
+			getAgentId: () => "BridgeParent",
 			mcpManager,
 			localProtocolOptions,
-			getAgentId: () => "BridgeParent",
+			contextFiles,
 		} as unknown as ToolSession;
 
 		await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
@@ -63,6 +69,30 @@ describe("runEvalAgent", () => {
 		expect(options?.mcpManager).toBe(mcpManager);
 		expect(options?.localProtocolOptions).toBe(localProtocolOptions);
 		expect(options?.parentAgentId).toBe("BridgeParent");
+		expect(options?.contextFiles).toBe(contextFiles);
+	});
+
+	it("lets the eval orchestrator request a context-agnostic agent", async () => {
+		const agent: AgentDefinition = {
+			name: "task",
+			description: "Task agent",
+			systemPrompt: "Handle task",
+			source: "bundled",
+		};
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		const runSubprocessSpy = vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult());
+		const session = {
+			cwd: "/tmp",
+			settings: Settings.isolated(),
+			getSessionSpawns: () => "*",
+			getSessionFile: () => null,
+			contextFiles: [{ path: "/profile/AGENTS.md", content: "Global baseline." }],
+		} as unknown as ToolSession;
+
+		await runEvalAgent({ prompt: "do work", agent: "task", contextFilePolicy: "none" }, { session });
+
+		expect(runSubprocessSpy).toHaveBeenCalledTimes(1);
+		expect(runSubprocessSpy.mock.calls[0]?.[0].contextFiles).toEqual([]);
 	});
 
 	it("returns executor-parsed structured data through the public eval bridge", async () => {

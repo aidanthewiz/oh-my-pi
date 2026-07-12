@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { type } from "arktype";
 import { Settings } from "../config/settings";
 import type { ToolSession } from "../tools";
 import * as taskDiscovery from "./discovery";
@@ -45,6 +46,33 @@ describe("task spawn policy surfaces", () => {
 		const parsed = schema({ task: "check" });
 
 		expect(parsed).toEqual({ agent: "fact-finder", task: "check" });
+	});
+
+	it("accepts per-spawn context inheritance policy in flat and batch schemas", () => {
+		const flat = getTaskSchema({ isolationEnabled: false, batchEnabled: false });
+		expect(flat({ task: "start fresh", contextFilePolicy: "none" })).toEqual({
+			agent: "task",
+			task: "start fresh",
+			contextFilePolicy: "none",
+		});
+
+		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true });
+		expect(
+			batch({
+				context: "shared",
+				tasks: [
+					{ task: "inherit", contextFilePolicy: "inherit" },
+					{ task: "fresh", contextFilePolicy: "none" },
+				],
+			}),
+		).toEqual({
+			context: "shared",
+			tasks: [
+				{ agent: "task", task: "inherit", contextFilePolicy: "inherit" },
+				{ agent: "task", task: "fresh", contextFilePolicy: "none" },
+			],
+		});
+		expect(flat({ task: "invalid", contextFilePolicy: "sometimes" })).toBeInstanceOf(type.errors);
 	});
 
 	it("filters the agent list to the restricted spawn policy in the description", async () => {

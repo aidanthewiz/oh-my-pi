@@ -91,6 +91,7 @@ describe("advisor", () => {
 			]);
 			expect(rendered).toBeDefined();
 			expect(rendered).toContain('<file path="/repo/AGENTS.md">');
+			expect(rendered).toContain("Treat a clear conflict in a later, more local file as an override");
 			// Content is injected verbatim (noEscape) so backticks/markup survive for the model.
 			expect(rendered).toContain("Use `bun check`, never `tsc`.");
 			expect(rendered).toContain("No `any` unless absolutely necessary.");

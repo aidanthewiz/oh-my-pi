@@ -519,7 +519,7 @@ function completion(prompt::String; model="default", system=nothing, schema=noth
     return schema === nothing ? text : Main.json_parse(string(text))
 end
 
-function agent(prompt::String; agent="task", model=nothing, label=nothing, schema=nothing, schema_mode=nothing, isolated=nothing, apply=nothing, merge=nothing, handle=false, kwargs...)
+function agent(prompt::String; agent="task", model=nothing, label=nothing, schema=nothing, schema_mode=nothing, isolated=nothing, apply=nothing, merge=nothing, context_file_policy=nothing, handle=false, kwargs...)
     args_dict = Dict{String, Any}("prompt" => prompt)
     if agent !== nothing
         args_dict["agent"] = agent
@@ -535,6 +535,9 @@ function agent(prompt::String; agent="task", model=nothing, label=nothing, schem
     end
     if schema_mode !== nothing
         args_dict["schemaMode"] = schema_mode
+    end
+    if context_file_policy !== nothing
+        args_dict["contextFilePolicy"] = context_file_policy
     end
     if isolated !== nothing
         args_dict["isolated"] = Bool(isolated)

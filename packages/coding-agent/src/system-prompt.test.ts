@@ -2,7 +2,9 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildSystemPrompt } from "./system-prompt";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { clearCache as clearFsCache } from "./capability/fs";
+import { buildSystemPrompt, loadProjectContextFiles } from "./system-prompt";
 
 interface ProbeRunResult {
 	elapsedMs: number;
@@ -231,6 +233,85 @@ describe("non-Linux system prompt CPU model", () => {
 		} finally {
 			cpus.mockRestore();
 			Object.defineProperty(process, "platform", { value: originalPlatform });
+		}
+	});
+});
+
+describe("project context file ordering", () => {
+	it("places global context before farther and nearer project instructions", async () => {
+		const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-context-order-"));
+		const tempHome = path.join(tempRoot, "home");
+		const profileAgentDir = path.join(tempHome, "profile", "agent");
+		const projectRoot = path.join(tempRoot, "repo");
+		const projectCwd = path.join(projectRoot, "packages", "app");
+		const originalHome = process.env.HOME;
+		const originalAgentDir = getAgentDir();
+		const home = spyOn(os, "homedir").mockReturnValue(tempHome);
+
+		try {
+			process.env.HOME = tempHome;
+			setAgentDir(profileAgentDir);
+			await fs.mkdir(projectCwd, { recursive: true });
+			await fs.mkdir(profileAgentDir, { recursive: true });
+			await fs.mkdir(path.join(projectCwd, ".claude"), { recursive: true });
+			await fs.writeFile(path.join(profileAgentDir, "AGENTS.md"), "global baseline\n");
+			await fs.writeFile(path.join(projectRoot, "AGENTS.md"), "repo baseline\n");
+			await fs.writeFile(path.join(projectCwd, ".claude", "CLAUDE.md"), "package override\n");
+			clearFsCache();
+
+			const files = await loadProjectContextFiles({ cwd: projectCwd });
+
+			expect(files.map(file => file.content)).toEqual([
+				"global baseline\n",
+				"repo baseline\n",
+				"package override\n",
+			]);
+		} finally {
+			home.mockRestore();
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			setAgentDir(originalAgentDir);
+			clearFsCache();
+			await fs.rm(tempRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("renders explicit local-over-global conflict precedence for default and custom prompts", async () => {
+		const contextFiles = [
+			{ path: "/profile/AGENTS.md", content: "Global baseline." },
+			{ path: "/repo/AGENTS.md", content: "Repository override.", depth: 1 },
+			{ path: "/repo/pkg/.claude/CLAUDE.md", content: "Package override.", depth: 0 },
+		];
+		const workspaceTree = {
+			rootPath: "/repo/pkg",
+			rendered: "",
+			truncated: false,
+			totalLines: 0,
+			agentsMdFiles: [],
+		};
+
+		for (const resolvedCustomPrompt of [undefined, "Custom system prompt."]) {
+			const { systemPrompt } = await buildSystemPrompt({
+				cwd: "/repo/pkg",
+				resolvedCustomPrompt,
+				contextFiles,
+				skills: [],
+				toolNames: [],
+				workspaceTree,
+				activeRepoContext: null,
+			});
+			const rendered = systemPrompt.join("\n");
+
+			expect(rendered).toContain(
+				"A clear conflict in a later, more local file overrides an earlier instruction; no marker or configuration flag is required.",
+			);
+			expect(rendered).toContain('path="/profile/AGENTS.md"');
+			expect(rendered).toContain('path="/repo/AGENTS.md"');
+			expect(rendered).toContain('path="/repo/pkg/.claude/CLAUDE.md"');
+			expect(rendered.indexOf('path="/profile/AGENTS.md"')).toBeLessThan(rendered.indexOf('path="/repo/AGENTS.md"'));
+			expect(rendered.indexOf('path="/repo/AGENTS.md"')).toBeLessThan(
+				rendered.indexOf('path="/repo/pkg/.claude/CLAUDE.md"'),
+			);
 		}
 	});
 });

@@ -491,13 +491,16 @@ if "__omp_prelude_loaded__" not in globals():
         isolated=None,
         apply=None,
         merge=None,
+        context_file_policy=None,
         handle=False,
     ):
         """Run a subagent and return its final output or structured data.
 
         `schema` overrides agent and session schemas. `schema_mode` is
-        `"permissive"` or `"strict"`. `handle=True` returns the child output
-        reference and metadata, with parsed data under `"data"` when available.
+        `"permissive"` or `"strict"`. Parent context is inherited by default;
+        `context_file_policy="none"` starts without parent context files.
+        `handle=True` returns the child output reference and metadata, with
+        parsed data under `"data"` when available.
         """
         args = {"prompt": prompt}
         if agent is not None:
@@ -510,6 +513,8 @@ if "__omp_prelude_loaded__" not in globals():
             args["schema"] = schema
         if schema_mode is not None:
             args["schemaMode"] = schema_mode
+        if context_file_policy is not None:
+            args["contextFilePolicy"] = context_file_policy
         if isolated is not None:
             args["isolated"] = bool(isolated)
         if apply is not None:

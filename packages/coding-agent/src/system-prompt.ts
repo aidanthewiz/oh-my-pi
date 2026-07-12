@@ -332,9 +332,14 @@ export interface LoadContextFilesOptions {
 	cwd?: string;
 }
 
-function dedupeExactContextFiles(
-	contextFiles: Array<{ path: string; content: string; depth?: number }>,
-): Array<{ path: string; content: string; depth?: number }> {
+export interface LoadedContextFile {
+	path: string;
+	content: string;
+	level?: ContextFile["level"];
+	depth?: number;
+}
+
+function dedupeExactContextFiles(contextFiles: LoadedContextFile[]): LoadedContextFile[] {
 	const lastIndexByContent = new Map<string, number>();
 	for (const [index, file] of contextFiles.entries()) {
 		// Keep the closest matching context entry when content is byte-for-byte identical.
@@ -346,12 +351,10 @@ function dedupeExactContextFiles(
 
 /**
  * Load all project context files using the capability API.
- * Returns {path, content, depth} entries for all discovered context files.
- * Files are sorted by depth (descending) so files closer to cwd appear last/more prominent.
+ * Returns path, content, level, and depth for all discovered context files.
+ * User-level files form the baseline; project files follow from farthest ancestor to cwd.
  */
-export async function loadProjectContextFiles(
-	options: LoadContextFilesOptions = {},
-): Promise<Array<{ path: string; content: string; depth?: number }>> {
+export async function loadProjectContextFiles(options: LoadContextFilesOptions = {}): Promise<LoadedContextFile[]> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
 	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
@@ -366,16 +369,20 @@ export async function loadProjectContextFiles(
 			return {
 				path: contextFile.path,
 				content: await expandAtImports(contextFile.content, contextFile.path),
+				level: contextFile.level,
 				depth: contextFile.depth,
 			};
 		}),
 	);
 
-	// Sort by depth (descending): higher depth (farther from cwd) comes first,
-	// so files closer to cwd appear later and are more prominent
+	// Global/user instructions are the baseline. Project files are ordered from
+	// farthest ancestor to the current directory so a closer work-directory
+	// instruction is more prominent and can explicitly override the baseline.
 	files.sort((a, b) => {
-		const depthA = a.depth ?? -1;
-		const depthB = b.depth ?? -1;
+		if (a.level !== b.level) return a.level === "user" ? -1 : 1;
+		if (a.level === "user") return 0;
+		const depthA = a.depth ?? 0;
+		const depthB = b.depth ?? 0;
 		return depthB - depthA;
 	});
 

@@ -35,6 +35,7 @@ import { resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type ContextFilePolicy,
 	canSpawnAtDepth,
 	type SingleResult,
 	type StructuredSubagentOutput,
@@ -87,6 +88,8 @@ export interface StructuredSubagentRequest {
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
 	outputSchema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
+	/** Parent context inheritance. Default `inherit`; `none` starts without parent context files. */
+	contextFilePolicy?: ContextFilePolicy;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -413,7 +416,7 @@ function buildExecutorOptions(
 		settings: session.settings,
 		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
 		enableMCP,
-		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
+		contextFiles: request.contextFilePolicy === "none" ? [] : session.contextFiles,
 		skills,
 		autoloadSkills,
 		workspaceTree: session.workspaceTree,

@@ -25,6 +25,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
   - `model`: Explicit non-empty model selector or non-empty fallback chain for this spawn. A `:reasoning` suffix is preserved. Overrides agent-specific model settings.
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
   - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+  - `contextFilePolicy`: `"inherit"` (default) forwards the ordered global baseline and local overrides; `"none"` starts a deliberately context-agnostic agent.
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
   - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
@@ -39,6 +40,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 - `model`: Explicit non-empty model selector or non-empty fallback chain for this spawn. A `:reasoning` suffix is preserved. Overrides agent-specific model settings.
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+- `contextFilePolicy`: `"inherit"` (default) forwards the ordered global baseline and local overrides; `"none"` starts a deliberately context-agnostic agent.
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
 - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.

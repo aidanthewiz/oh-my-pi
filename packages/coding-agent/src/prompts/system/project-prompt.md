@@ -9,6 +9,7 @@ PROJECT
 {{#if contextFiles.length}}
 <repo-rules>
 You MUST follow the context files below for all tasks:
+Files are ordered from the global baseline to the most local scope. A clear conflict in a later, more local file overrides an earlier instruction; no marker or configuration flag is required.
 {{#each contextFiles}}
 <file path="{{path}}">
 {{content}}
