@@ -27,6 +27,7 @@ import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-intera
 import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
+import { enforceDestructiveCommandGuard, isDestructiveCommandGuardConfigured } from "./destructive-command-guard";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import {
@@ -80,33 +81,14 @@ export function wrapShellLineForClientTerminal(
 }
 
 /**
- * Bash patterns flagged as safety critical for approval policy.
+ * Shell-security patterns outside DCG's destructive-operation scope.
  *
- * Kept intentionally tight — the cost of a false negative is data loss or a compromised host,
- * while false positives remain actionable through user policy control.
- * New patterns should target shapes that are virtually never legitimate in automation.
+ * These remain approval signals for non-yolo sessions. Destructive Git,
+ * filesystem, disk, infrastructure, and database decisions belong to DCG.
  */
 export const CRITICAL_BASH_PATTERNS = [
-	// Recursive destruction.
-	/\brm\s+-[a-z]*[rRfF][a-z]*\s+\//i, // rm -rf /, rm -fr /, rm -r /, rm -f /…
-	/\bsudo\s+rm\b/i, // any `sudo rm`.
-	/\bchmod\s+-R\s+[0-7]+\s+\//i, // `chmod -R 777 /`.
-	/\bchmod\s+-R\s+[ugoa+\-=rwxXst,]+\s+\//, // `chmod -R u+x /`, `chmod -R u+rwx,o+w /etc` (symbolic mode, root target).
-	/\bchown\s+-R\s+\S+\s+\//i, // `chown -R user /`.
-
 	// Fork bomb (a few common spacings).
 	/:\(\)\s*\{\s*:\s*\|\s*:/i,
-
-	// Disk / filesystem destruction.
-	/>\s*\/dev\/sd[a-z]/i, // write to disk device.
-	/\bmkfs(\.|\b)/i, // format filesystem.
-	/\bdd\s+if=.+of=\/dev\//i, // dd to a device.
-	/\bshred\s+\/dev\//i,
-	/\bcryptsetup\b/i,
-
-	// System-config destruction.
-	/>\s*\/etc\/(?:passwd|shadow|sudoers)\b/i,
-	/\btee\s+(?:-a\s+)?\/etc\/(?:passwd|shadow|sudoers)\b/i, // `tee /etc/passwd`, `tee -a /etc/sudoers`.
 
 	// Remote-fetch-then-execute (curl/wget piped to a shell or process-subbed).
 	/\b(?:curl|wget|fetch)\b[^|]*\|\s*(?:bash|sh|zsh|fish)\b/i,
@@ -126,6 +108,22 @@ export const CRITICAL_BASH_PATTERNS = [
 	// Network-shell exfil.
 	/\bnc\b[^|;]*\s-[a-zA-Z]*[ec][a-zA-Z]*\s/i, // `nc -e` / `nc -c`.
 ] as const;
+
+const FALLBACK_DESTRUCTIVE_BASH_PATTERNS = [
+	/\brm\s+-[a-z]*[rRfF][a-z]*\s+\//i,
+	/\bsudo\s+rm\b/i,
+	/\bchmod\s+-R\s+[0-7]+\s+\//i,
+	/\bchmod\s+-R\s+[ugoa+\-=rwxXst,]+\s+\//,
+	/\bchown\s+-R\s+\S+\s+\//i,
+	/>\s*\/dev\/sd[a-z]/i,
+	/\bmkfs(\.|\b)/i,
+	/\bdd\s+if=.+of=\/dev\//i,
+	/\bshred\s+\/dev\//i,
+	/\bcryptsetup\b/i,
+	/>\s*\/etc\/(?:passwd|shadow|sudoers)\b/i,
+	/\btee\s+(?:-a\s+)?\/etc\/(?:passwd|shadow|sudoers)\b/i,
+] as const;
+const ALL_CRITICAL_BASH_PATTERNS = [...CRITICAL_BASH_PATTERNS, ...FALLBACK_DESTRUCTIVE_BASH_PATTERNS];
 
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
 	try {
@@ -384,7 +382,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
-		if (command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
+		const patterns = isDestructiveCommandGuardConfigured() ? CRITICAL_BASH_PATTERNS : ALL_CRITICAL_BASH_PATTERNS;
+		if (command !== "" && patterns.some(pattern => pattern.test(command))) {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
 		}
 		return "exec";
@@ -814,12 +813,6 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
 		}
 
-		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
-		// number touched by a mutating `gh` subcommand inside this bash call so
-		// subsequent issue:// / pr:// reads pick up the post-mutation state
-		// instead of the cached pre-mutation snapshot.
-		invalidateGithubCacheForBashCommand(command);
-
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
 		let cwdStat: fs.Stats;
 		try {
@@ -833,6 +826,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		if (!cwdStat.isDirectory()) {
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
+
+		await enforceDestructiveCommandGuard(command, commandCwd, signal);
+
+		// Invalidate only after every execution gate has allowed the command.
+		invalidateGithubCacheForBashCommand(command);
 
 		// A timeout of 0 is an explicit long-running-command contract: the user
 		// must still cancel the call or job, but OMP does not impose a deadline.

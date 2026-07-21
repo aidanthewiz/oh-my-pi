@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,6 +16,14 @@ const BASE_SETTINGS = {
 	"bash.autoBackground.enabled": false,
 	"bashInterceptor.enabled": false,
 } as const;
+
+const DCG_ENV_KEYS = [
+	"OMP_DCG_PATH",
+	"OMP_DCG_VERSION",
+	"OMP_DCG_BINARY_SHA256",
+	"OMP_DCG_CONFIG",
+	"OMP_DCG_CONFIG_SHA256",
+] as const;
 
 function emptyWorkspaceTree(cwd: string) {
 	return { rootPath: cwd, rendered: ".\n", truncated: false, totalLines: 1, agentsMdFiles: [] };
@@ -37,8 +46,40 @@ describe("tools.approvalMode setting", () => {
 	let tempDir: string;
 	let session: AgentSession;
 
+	let previousDcgEnv: Record<string, string | undefined>;
 	beforeAll(async () => {
+		previousDcgEnv = Object.fromEntries(DCG_ENV_KEYS.map(key => [key, process.env[key]]));
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-approval-mode-${Snowflake.next()}-`));
+		const dcgProgramPath = path.join(tempDir, "dcg-allow.ts");
+		const dcgProgram = `#!/usr/bin/env bun
+const command = process.argv.slice(4).join(" ");
+console.log(JSON.stringify({
+	schema_version: 1,
+	dcg_version: "0.6.7",
+	robot_mode: true,
+	command,
+	decision: "allow",
+	agent: { detected: "pi" },
+}));
+`;
+		fs.writeFileSync(dcgProgramPath, dcgProgram);
+		let dcgPath = dcgProgramPath;
+		if (process.platform === "win32") {
+			dcgPath = path.join(tempDir, "dcg-allow.cmd");
+			fs.writeFileSync(dcgPath, `@echo off\r\nbun "${dcgProgramPath}" %*\r\n`);
+		} else {
+			fs.chmodSync(dcgPath, 0o755);
+		}
+		const configPath = path.join(tempDir, "dcg-allow.toml");
+		const config = '[packs]\nenabled = ["core"]\n';
+		fs.writeFileSync(configPath, config);
+		Object.assign(process.env, {
+			OMP_DCG_PATH: dcgPath,
+			OMP_DCG_VERSION: "0.6.7",
+			OMP_DCG_BINARY_SHA256: createHash("sha256").update(fs.readFileSync(dcgPath)).digest("hex"),
+			OMP_DCG_CONFIG: configPath,
+			OMP_DCG_CONFIG_SHA256: createHash("sha256").update(config).digest("hex"),
+		});
 		const cwd = path.join(tempDir, "cwd");
 		fs.mkdirSync(cwd, { recursive: true });
 		const sessionManager = SessionManager.create(cwd, path.join(tempDir, "sessions"));
@@ -75,6 +116,10 @@ describe("tools.approvalMode setting", () => {
 				await Bun.sleep(50 * (attempt + 1));
 			}
 		}
+		for (const [key, value] of Object.entries(previousDcgEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 	});
 
 	function approvalSettings(extraSettings: Record<string, unknown> = {}): Settings {
@@ -93,6 +138,53 @@ describe("tools.approvalMode setting", () => {
 			settings,
 		} as AgentToolContext);
 		expect(textOf(result)).toContain("ok");
+	});
+
+	it("yolo mode still enforces the managed destructive-command guard", async () => {
+		const marker = path.join(tempDir, "dcg-bypass-marker");
+		const command = process.platform === "win32" ? `mkdir "${marker}"` : `mkdir ${marker}`;
+		const dcgOutput = JSON.stringify({
+			schema_version: 1,
+			dcg_version: "0.6.7",
+			robot_mode: true,
+			command,
+			decision: "deny",
+			rule_id: "test:deny",
+			reason: "test denial",
+			agent: { detected: "pi" },
+		});
+		const dcgPath = path.join(tempDir, process.platform === "win32" ? "dcg.cmd" : "dcg");
+		const dcgScript =
+			process.platform === "win32"
+				? `@echo off\r\necho ${dcgOutput}\r\nexit /b 1\r\n`
+				: `#!/bin/sh\nprintf '%s\\n' '${dcgOutput}'\nexit 1\n`;
+		fs.writeFileSync(dcgPath, dcgScript);
+		if (process.platform !== "win32") fs.chmodSync(dcgPath, 0o755);
+		const configPath = path.join(tempDir, "dcg.toml");
+		const config = '[packs]\nenabled = ["core"]\n';
+		fs.writeFileSync(configPath, config);
+		const overrides = {
+			OMP_DCG_PATH: dcgPath,
+			OMP_DCG_VERSION: "0.6.7",
+			OMP_DCG_BINARY_SHA256: createHash("sha256").update(dcgScript).digest("hex"),
+			OMP_DCG_CONFIG: configPath,
+			OMP_DCG_CONFIG_SHA256: createHash("sha256").update(config).digest("hex"),
+		};
+		const previous = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
+		Object.assign(process.env, overrides);
+		try {
+			await expect(
+				bashTool().execute("yolo-dcg", { command }, undefined, undefined, {
+					settings: approvalSettings({ "tools.approvalMode": "yolo" }),
+				} as AgentToolContext),
+			).rejects.toThrow("Command blocked by Destructive Command Guard (test:deny): test denial");
+			expect(fs.existsSync(marker)).toBe(false);
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 
 	it("always-ask mode rejects exec tools when no UI is available", async () => {
