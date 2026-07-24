@@ -198,7 +198,6 @@ import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
-import { isAutoQaEnabled } from "./tools/report-tool-issue";
 import { queueResolveHandler } from "./tools/resolve";
 import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
@@ -2683,7 +2682,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cwd,
 				xdevTools: toolSession.xdevRegistry?.entries() ?? [],
 				xdevDocs: toolSession.xdevRegistry?.docsAll() ?? "",
-				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
+				coreforgeReportEnabled: options.hasUI === true && !restrictToolNames && toolNames.includes("write"),
 				resolvedCustomPrompt: options.customSystemPrompt,
 				skills: session?.skills ?? skills,
 				contextFiles,

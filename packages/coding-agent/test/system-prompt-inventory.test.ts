@@ -71,7 +71,11 @@ describe("system prompt tool inventory", () => {
 
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
-	async function render(opts: { nativeTools: boolean; inlineToolDescriptors: boolean }): Promise<string> {
+	async function render(opts: {
+		nativeTools: boolean;
+		inlineToolDescriptors: boolean;
+		coreforgeReportEnabled?: boolean;
+	}): Promise<string> {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
 			contextFiles: [],
@@ -82,9 +86,27 @@ describe("system prompt tool inventory", () => {
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
 			nativeTools: opts.nativeTools,
 			inlineToolDescriptors: opts.inlineToolDescriptors,
+			coreforgeReportEnabled: opts.coreforgeReportEnabled,
 		});
 		return systemPrompt.join("\n\n");
 	}
+
+	it("routes tool problems through the Coreforge issue workflow", async () => {
+		const prompt = await render({
+			nativeTools: true,
+			inlineToolDescriptors: false,
+			coreforgeReportEnabled: true,
+		});
+
+		expect(prompt).toContain("Coreforge does not send automated QA telemetry");
+		expect(prompt).toContain("write `<tool>: <concise description>` as plain text to `xd://report_issue`");
+		expect(prompt).toContain("per-occurrence consent");
+		expect(prompt).toContain("automatically starts the Coreforge `/report` workflow");
+		expect(prompt).toContain("requires explicit confirmation");
+
+		const headlessPrompt = await render({ nativeTools: true, inlineToolDescriptors: false });
+		expect(headlessPrompt).not.toContain("xd://report_issue");
+	});
 
 	function inventoryFrom(text: string): string {
 		// Tolerate either prompt layout: the merge-base "# Inventory" / "ENV" framing and the

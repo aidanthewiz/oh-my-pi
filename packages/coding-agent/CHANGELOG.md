@@ -26,6 +26,13 @@
 - Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
 - Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
 
+### Changed
+
+- Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
+
+- Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
+- Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
+
 ## [17.0.9] - 2026-07-23
 
 ### Added

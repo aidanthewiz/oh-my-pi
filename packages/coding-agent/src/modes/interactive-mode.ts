@@ -61,7 +61,7 @@ import {
 	isSettingsInitialized,
 	onModelRolesChanged,
 	onStatusLineSessionAccentChanged,
-	Settings,
+	type Settings,
 	settings,
 } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
@@ -116,7 +116,7 @@ import type { ConfiguredThinkingLevel } from "../thinking";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
-import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
+import { setCoreforgeReportHandler } from "../tools/report-tool-issue";
 import {
 	formatPhaseDisplayName,
 	selectCollapsedTodos,
@@ -202,6 +202,7 @@ import type {
 import { UiHelpers } from "./utils/ui-helpers";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
+const COREFORGE_REPORT_IDLE_DELAY_MS = 1_000;
 
 const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 	low: "dim",
@@ -450,6 +451,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	loopPrompt: string | undefined = undefined;
 	loopLimit: LoopLimitRuntime | undefined = undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
+	#coreforgeReportConsentTimer: NodeJS.Timeout | undefined;
 	#todoAutoClearTimer: NodeJS.Timeout | undefined;
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
 	todoPhases: TodoPhase[] = [];
@@ -532,6 +534,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingCommandOutput: Component[] = [];
 	#pendingCommandOutputSessionId: string | undefined;
 	#pendingSlashCommands: SlashCommand[] = [];
+	#pendingCoreforgeReports: string[] = [];
+	#pendingCoreforgeReportConsents: Array<{ tool: string; report: string }> = [];
 	/** Built-in editor autocomplete provider, before extension wrapping. */
 	#baseAutocompleteProvider: AutocompleteProvider | undefined;
 	/** Extension-registered provider factories, applied in registration order (#4919). */
@@ -863,13 +867,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// FIRST and its dispose() would otherwise persist the generic "dispose".
 		this.#cleanupUnsubscribe = postmortem.register("session-teardown", reason => this.#signalTeardown!(reason));
 
-		// Wire the report_tool_issue consent gate to the Yes/No dialog popup.
-		// The handler is process-global — subagent tools (which can't reach
-		// `showHookSelector` on their own) resolve through this exact closure.
-		// `Settings.instance` is the disk-backed singleton; passing it explicitly
-		// guarantees the decision persists even when the prompt is triggered
-		// from a subagent whose own `Settings` is an in-memory snapshot.
-		setAutoQaConsentHandler(() => this.#promptAutoQaConsent(), Settings.instance);
+		// Subagent device writes share this process-global bridge to the parent UI.
+		setCoreforgeReportHandler((tool, report) => this.#deferCoreforgeReport(tool, report));
 
 		await logger.time(
 			"InteractiveMode.init:slashCommands",
@@ -1230,6 +1229,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
 		}
+		const queuedReport = this.#pendingCoreforgeReports.shift();
+		if (queuedReport) {
+			return {
+				text: queuedReport,
+				display: false,
+				streamingBehavior: "followUp",
+				cancelled: false,
+				started: true,
+			};
+		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
@@ -1237,6 +1246,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 		this.#scheduleLoopAutoSubmit();
 		this.#scheduleGoalContinuation();
+		this.#scheduleCoreforgeReportConsent();
 
 		using _ = new EventLoopKeepalive();
 		return await promise;
@@ -3675,60 +3685,66 @@ export class InteractiveMode implements InteractiveModeContext {
 		closePlanReview();
 	}
 
-	/**
-	 * Pool of consent-prompt variants. Each entry is `[headline, reassurance]`;
-	 * the second line always promises the same scope (tool name + confusion
-	 * details, never personal data) so users learn what they're consenting to
-	 * even as the top line rotates.
-	 *
-	 * Kept in-module rather than i18n'd because the whole charm is the tone
-	 * — translations would need to preserve it deliberately, not auto-render.
-	 */
-	static #AUTOQA_CONSENT_PROMPTS: ReadonlyArray<readonly [string, string]> = [
-		[
-			"😤 Your agent is fuming about a tool.",
-			"Wanna let it vent to the devs? Just the tool name + what set it off, nothing personal.",
-		],
-		[
-			"😵‍💫 Your agent is having an existential crisis over a tool.",
-			"Forward the dread to the devs? Tool + what broke its little mind, no personal info.",
-		],
-		[
-			"😭 Your agent wants to cry about a misbehaving tool.",
-			"Let it cry to the devs? Tool + the tears, never anything personal.",
-		],
-		[
-			"🤬 Your agent is BIG MAD at one of the tools.",
-			"Pass the rant along? Just the tool name and what enraged it, nothing personal.",
-		],
-		[
-			"🫠 Your agent is melting down over a tool.",
-			"Mop up by alerting the devs? Tool + what melted it, no personal info.",
-		],
-		[
-			"🤯 Your agent's brain broke at a tool's nonsense.",
-			"Ship the pieces to the devs? Tool name + the confusion, never anything personal.",
-		],
-		[
-			"😩 Your agent is begging to file a complaint about a tool.",
-			"Hand it the form? Tool + what wronged it, nothing personal.",
-		],
-		[
-			"🥲 Your agent put on a brave face but a tool did it dirty.",
-			"Let it tell the devs the truth? Tool name + the dirt, no personal info.",
-		],
-	];
+	async #deferCoreforgeReport(tool: string, report: string): Promise<"deferred"> {
+		this.#pendingCoreforgeReportConsents.push({ tool, report });
+		this.showStatus("Tool issue saved for review when the agent is idle.");
+		this.#scheduleCoreforgeReportConsent();
+		return "deferred";
+	}
+
+	#scheduleCoreforgeReportConsent(): void {
+		if (
+			this.#coreforgeReportConsentTimer ||
+			!this.onInputCallback ||
+			this.#pendingCoreforgeReportConsents.length === 0
+		) {
+			return;
+		}
+		this.#coreforgeReportConsentTimer = setTimeout(() => {
+			this.#coreforgeReportConsentTimer = undefined;
+			if (!this.onInputCallback) return;
+			const pending = this.#pendingCoreforgeReportConsents.shift();
+			if (pending) {
+				void this.#promptCoreforgeReport(pending.tool, pending.report).finally(() =>
+					this.#scheduleCoreforgeReportConsent(),
+				);
+			}
+		}, COREFORGE_REPORT_IDLE_DELAY_MS);
+	}
+
+	#cancelCoreforgeReportConsent(): void {
+		if (!this.#coreforgeReportConsentTimer) return;
+		clearTimeout(this.#coreforgeReportConsentTimer);
+		this.#coreforgeReportConsentTimer = undefined;
+	}
 
 	/**
-	 * Show the report_tool_issue consent popup and return the user's decision.
-	 * Invoked by the process-global consent handler the tool dispatches to;
-	 * subagent invocations bubble up here through the shared module state.
+	 * Ask before turning the automatic failure signal into a `/report` turn.
+	 * `/report` performs its own draft approval before any GitHub mutation.
 	 */
-	async #promptAutoQaConsent(): Promise<boolean | null> {
-		const pool = InteractiveMode.#AUTOQA_CONSENT_PROMPTS;
-		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
-		const choice = await this.showHookSelector(`${headline}\n${body}`, ["Yes", "No"]);
-		return choice === "Yes";
+	async #promptCoreforgeReport(tool: string, report: string): Promise<boolean | null> {
+		const summary = truncateToWidth(report.replace(/\s+/g, " ").trim(), 120);
+		const choice = await this.showHookSelector(
+			`Tool issue detected: ${tool}\nPrepare Coreforge /report with this failure?\n${summary}\nNothing is filed until you approve the issue draft.`,
+			["Prepare /report", "Dismiss"],
+		);
+		if (choice === undefined) return null;
+		if (choice !== "Prepare /report") return false;
+
+		this.#pendingCoreforgeReports.push(`/report ${tool}: ${report}`);
+		if (this.onInputCallback) {
+			const queuedReport = this.#pendingCoreforgeReports.shift();
+			if (queuedReport) {
+				this.onInputCallback({
+					text: queuedReport,
+					display: false,
+					streamingBehavior: "followUp",
+					cancelled: false,
+					started: true,
+				});
+			}
+		}
+		return true;
 	}
 
 	stop(): void {
@@ -3739,6 +3755,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelTodoAutoClearTimer();
 		this.#cancelObserverUiSyncTimer();
 		this.#cancelGoalContinuation();
+		this.#cancelCoreforgeReportConsent();
 		if (this.#sttController) {
 			this.#sttController.dispose();
 			this.#sttController = undefined;
@@ -3765,9 +3782,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#cleanupUnsubscribe) {
 			this.#cleanupUnsubscribe();
 		}
-		// Clear the process-global consent handler so it doesn't outlive this
-		// InteractiveMode instance (e.g. test harnesses, headless re-init).
-		setAutoQaConsentHandler(null, null);
+		setCoreforgeReportHandler(null);
 		if (this.isInitialized) {
 			this.ui.stop();
 			this.isInitialized = false;

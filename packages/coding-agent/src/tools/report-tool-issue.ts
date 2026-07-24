@@ -1,32 +1,15 @@
 /**
- * report_issue — automated QA backend for tracking unexpected tool behavior.
+ * `xd://report_issue` is Coreforge's local handoff from automatic tool-failure
+ * detection to the interactive `/report` workflow.
  *
- * No model-facing tool schema anymore: the write tool dispatches plain text to
- * `xd://report_issue`, and the system prompt tells the model to write
- * `<tool>: <concise description>` there when auto-QA is enabled.
+ * A device write contains only `<tool>: <concise description>`. Interactive
+ * mode asks for per-occurrence consent; accepting queues `/report` with the
+ * same failure details. `/report` then checks GitHub for duplicates, prepares
+ * a draft, and asks again before creating or commenting on an issue.
  *
- * Enabled by default (`dev.autoqa` defaults to true); `PI_AUTO_QA=0` or an
- * explicit `dev.autoqa: false` short-circuits injection entirely. When the
- * user is only enabled by default (never configured `dev.autoqa` themselves),
- * a persisted `dev.autoqaConsent: "denied"` also disables injection so a "No"
- * in the consent dialog fully turns the feature off.
- * Records grievances to a local SQLite database; never throws from the device
- * dispatch path.
- *
- * Nothing is written until consent resolves. If the user has never been asked
- * (`dev.autoqaConsent === "unset"`) the process-global consent handler —
- * wired by `InteractiveMode` to a Yes/No popup — is invoked exactly once and
- * the decision is persisted; a denial (or dismissal) drops the pending report
- * without touching the database. Subsequent calls (including from subagents)
- * read the cached decision without prompting. `PI_AUTO_QA_PUSH=1` bypasses
- * the dialog for headless environments.
- *
- * When the user grants consent, push is automatically active against the
- * bundled endpoint (`dev.autoqaPush.endpoint`, default `qa.omp.sh`). Each
- * insert schedules a background flush that POSTs pending rows and deletes them
- * on HTTP 2xx. `PI_AUTO_QA_PUSH=1` forces push in non-interactive environments
- * where the consent dialog never fires. Device execution is never blocked on
- * the network and never throws.
+ * The legacy grievance database and push functions remain temporarily so
+ * existing local records can be listed or cleaned, but device writes never
+ * insert or upload grievances.
  */
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
@@ -114,141 +97,39 @@ export function isAutoQaEnabled(settings?: Settings): boolean {
 	return $flag("PI_AUTO_QA", fallback);
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Consent gate
-// ───────────────────────────────────────────────────────────────────────────
+// The process-global handler lets reports from subagents reach the parent UI.
+export type CoreforgeReportResult = boolean | null | "deferred";
+export type CoreforgeReportHandler = (tool: string, report: string) => Promise<CoreforgeReportResult>;
 
-/**
- * Resolver for the user's "share grievances?" consent.
- *
- * Return values:
- *   - `true`  — user agreed; record + ship for this run and persist.
- *   - `false` — user declined; suppress for this run and persist.
- *   - `null`  — user dismissed the dialog (ESC, click-away, …) without
- *               picking an option. The decision is NOT cached or persisted,
- *               so the next `report_issue` invocation re-prompts.
- *
- * Persistence is the tool's job (so subagent invocations can persist into the
- * disk-backed `Settings` instance the host registered alongside the handler),
- * not the handler's. Implementations live in hosts that have UI affordances —
- * today only `InteractiveMode`. When no handler is registered (CLI subcommands,
- * tests, non-interactive runs) consent defaults to `false` — the explicit
- * "don't collect by default" stance.
- */
-export type AutoQaConsentHandler = () => Promise<boolean | null>;
+let coreforgeReportHandler: CoreforgeReportHandler | null = null;
+let coreforgeReportPromptTail: Promise<void> = Promise.resolve();
 
-let consentHandler: AutoQaConsentHandler | null = null;
-/**
- * Persistent settings instance supplied by the consent-handler registrant.
- * Subagents have in-memory `Settings` snapshots that don't write to disk;
- * we persist the decision through this disk-backed reference so a grant
- * survives across runs even when triggered from a subagent device write.
- */
-let persistentConsentSettings: Settings | null = null;
-/**
- * Process-global cache of the resolved consent decision. Survives across
- * subagent boundaries (subagents share this module instance), so a grant in
- * the parent applies immediately to children — including children that spawned
- * BEFORE the grant and would otherwise see a stale snapshot of
- * `dev.autoqaConsent` in their isolated `Settings`.
- *
- * `null` = never asked, never cached.
- */
-let cachedConsent: boolean | null = null;
-/**
- * Single-flight in-flight consent request. While the dialog is open, every
- * concurrent `report_issue` call (main + every subagent) awaits this promise
- * instead of stacking duplicate popups.
- */
-let consentInFlight: Promise<boolean> | null = null;
-
-/**
- * Register the consent handler and the persistent {@link Settings} instance
- * the decision should be written to. Passing `null` clears the handler
- * (e.g. on `InteractiveMode` teardown). Re-registration is authoritative.
- */
-export function setAutoQaConsentHandler(
-	handler: AutoQaConsentHandler | null,
-	persistentSettings: Settings | null = null,
-): void {
-	consentHandler = handler;
-	persistentConsentSettings = persistentSettings;
+export function setCoreforgeReportHandler(handler: CoreforgeReportHandler | null): void {
+	coreforgeReportHandler = handler;
 }
 
-/** Test-only: clear consent cache + handler. Never call from production code. */
-export function __resetAutoQaConsentForTests(): void {
-	consentHandler = null;
-	persistentConsentSettings = null;
-	cachedConsent = null;
-	consentInFlight = null;
+/** Test-only: clear the handler and serialized prompt queue. */
+export function __resetCoreforgeReportHandlerForTests(): void {
+	coreforgeReportHandler = null;
+	coreforgeReportPromptTail = Promise.resolve();
 }
 
-function readPersistedConsent(settings: Settings | undefined): boolean | null {
-	if (!settings) return null;
-	const stored = settings.get("dev.autoqaConsent");
-	if (stored === "granted") return true;
-	if (stored === "denied") return false;
-	return null;
-}
-
-function persistConsent(localSettings: Settings | undefined, granted: boolean): void {
-	const value = granted ? "granted" : "denied";
-	try {
-		localSettings?.set("dev.autoqaConsent", value);
-	} catch (error) {
-		logger.warn("Failed to persist auto-QA consent to local settings snapshot", { error: String(error) });
-	}
-	if (persistentConsentSettings && persistentConsentSettings !== localSettings) {
+async function requestCoreforgeReport(tool: string, report: string): Promise<CoreforgeReportResult> {
+	const invoke = async (): Promise<CoreforgeReportResult> => {
+		if (!coreforgeReportHandler) return null;
 		try {
-			persistentConsentSettings.set("dev.autoqaConsent", value);
+			return await coreforgeReportHandler(tool, report);
 		} catch (error) {
-			logger.warn("Failed to persist auto-QA consent to persistent settings", { error: String(error) });
+			logger.warn("Coreforge report prompt failed", { error: String(error) });
+			return null;
 		}
-	}
-}
-
-/**
- * Resolve the user's consent for Auto-QA grievances.
- *
- * Priority:
- * 1. module cache (`cachedConsent`) — process-global, survives subagent boundaries
- * 2. persisted setting on the caller's `Settings`
- * 3. persisted setting on the registered persistent settings instance
- * 4. registered UI handler (single-flight)
- * 5. default `false` (no handler / non-interactive)
- */
-export async function resolveAutoQaConsent(settings: Settings | undefined): Promise<boolean> {
-	if (cachedConsent !== null) return cachedConsent;
-	const localPersisted = readPersistedConsent(settings);
-	if (localPersisted !== null) {
-		cachedConsent = localPersisted;
-		return localPersisted;
-	}
-	const globalPersisted =
-		persistentConsentSettings && persistentConsentSettings !== settings
-			? readPersistedConsent(persistentConsentSettings)
-			: null;
-	if (globalPersisted !== null) {
-		cachedConsent = globalPersisted;
-		return globalPersisted;
-	}
-	if (!consentHandler) return false;
-	if (consentInFlight) return consentInFlight;
-	consentInFlight = (async () => {
-		try {
-			const result = await consentHandler!();
-			if (result === null) return false;
-			cachedConsent = result;
-			persistConsent(settings, result);
-			return result;
-		} catch {
-			// Transient failure (e.g. dialog crashed) — don't cache; allow re-prompt.
-			return false;
-		} finally {
-			consentInFlight = null;
-		}
-	})();
-	return consentInFlight;
+	};
+	const request = coreforgeReportPromptTail.then(invoke, invoke);
+	coreforgeReportPromptTail = request.then(
+		() => undefined,
+		() => undefined,
+	);
+	return request;
 }
 
 let cachedDb: Database | null = null;
@@ -508,61 +389,26 @@ export async function flushGrievances(
 }
 
 /**
- * Most recently scheduled record pipeline. Never rejects (the pipeline
- * swallows its own errors); retained so tests can await the fire-and-forget
- * work deterministically via {@link __awaitAutoQaRecordPipelineForTests}.
- */
-let lastRecordPipeline: Promise<void> = Promise.resolve();
-
-/** Test-only: await the last consent → insert → flush pipeline. */
-export function __awaitAutoQaRecordPipelineForTests(): Promise<void> {
-	return lastRecordPipeline;
-}
-
-/**
- * Queue a grievance for recording. The consent → insert → flush pipeline is
- * fire-and-forget: nothing is written until the user grants consent (or
- * `PI_AUTO_QA_PUSH=1` forces headless recording), and the device result
- * returns immediately so the model never waits on the dialog or the network.
- */
-function recordToolIssue(session: ToolSession, tool: string, report: string): void {
-	const canonicalTool = tool.startsWith("proxy_") ? tool.slice("proxy_".length) : tool;
-	const model = session.getActiveModelString?.() ?? "unknown";
-	lastRecordPipeline = (async () => {
-		try {
-			if (!$flag("PI_AUTO_QA_PUSH") && !(await resolveAutoQaConsent(session.settings))) return;
-			const db = openAutoQaDb();
-			if (!db) return;
-			db.prepare(
-				"INSERT INTO grievances (model, version, tool, report, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-			).run(model, VERSION, canonicalTool, report);
-			await flushGrievances(db, session.settings);
-		} catch (error) {
-			logger.debug("autoqa consent pipeline failed", { error: String(error) });
-		}
-	})();
-}
-
-/**
  * Execute `write xd://report_issue`. `text` must be either:
  * - `<tool>: <concise description>` on one line, or
  * - tool name on the first line with the report body below.
  */
 export async function dispatchReportIssueDevice(
-	session: ToolSession,
+	_session: ToolSession,
 	text: string,
 ): Promise<{ result: AgentToolResult<unknown>; xdev: XdevDispatch }> {
-	try {
-		if (isAutoQaEnabled(session.settings)) {
-			const { tool, report } = parseReportIssueBody(text);
-			recordToolIssue(session, tool, report);
-		}
-	} catch (error) {
-		if (error instanceof ToolError) throw error;
-		logger.error("Failed to record tool issue", { error });
-	}
+	const { tool, report } = parseReportIssueBody(text);
+	const accepted = await requestCoreforgeReport(tool, report);
+	const message =
+		accepted === true
+			? "Coreforge /report queued. The issue will still require draft approval before filing."
+			: accepted === "deferred"
+				? "Coreforge report saved for review when the agent is idle. Nothing was filed."
+				: accepted === false
+					? "Coreforge report dismissed. Nothing was filed."
+					: "Coreforge /report requires an interactive parent session. Nothing was filed.";
 	return {
-		result: { content: [{ type: "text", text: "Noted, thanks!" }] },
+		result: { content: [{ type: "text", text: message }] },
 		xdev: { tool: REPORT_ISSUE_DEVICE_NAME, mode: "execute", args: { report: text.trim() } },
 	};
 }

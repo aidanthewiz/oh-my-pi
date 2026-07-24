@@ -1,10 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
-function makeSession(): ToolSession {
+let tempDir: TempDir;
+
+function makeSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
-		cwd: "/tmp",
+		cwd: tempDir.path(),
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
@@ -25,8 +30,20 @@ function makeSession(): ToolSession {
 			},
 		},
 		getClientBridge: () => undefined,
+		...overrides,
 	} as unknown as ToolSession;
 }
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	tempDir = TempDir.createSync("@pi-bash-result-");
+	await Settings.init({ inMemory: true, cwd: tempDir.path() });
+});
+
+afterEach(() => {
+	resetSettingsForTest();
+	tempDir.removeSync();
+});
 
 describe("BashTool execution results", () => {
 	it("resolves with an error result carrying execution details instead of throwing", async () => {
@@ -58,8 +75,25 @@ describe("BashTool execution results", () => {
 	it("preserves the executor cancellation notice without classifying it as a timeout", async () => {
 		const tool = new BashTool(makeSession());
 		const controller = new AbortController();
-		const execution = tool.execute("call-cancel", { command: "sleep 3" }, controller.signal);
-		await Bun.sleep(20);
+		let markStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			markStarted = resolve;
+		});
+		const execution = tool.execute(
+			"call-cancel",
+			{ command: "printf started; sleep 3" },
+			controller.signal,
+			update => {
+				const text = update.content.find(block => block.type === "text")?.text ?? "";
+				if (text.includes("started")) markStarted();
+			},
+		);
+		await Promise.race([
+			started,
+			execution.then(() => {
+				throw new Error("Command completed before emitting its startup output");
+			}),
+		]);
 		controller.abort();
 
 		const error = await execution.catch(error => error);
@@ -78,6 +112,24 @@ describe("BashTool execution results", () => {
 		const text = result.content.find(c => c.type === "text")?.text ?? "";
 		expect(text).toContain("hi");
 		expect(text).not.toContain("Command exited with code");
+	});
+
+	it("links the raw artifact when the per-line column cap drops bytes", async () => {
+		Settings.instance.set("tools.outputMaxColumns", 8);
+		const artifactPath = path.join(tempDir.path(), "bash-column-cap.txt");
+		const tool = new BashTool(
+			makeSession({
+				allocateOutputArtifact: async () => ({ path: artifactPath, id: "bash-column-cap" }),
+			}),
+		);
+
+		const result = await tool.execute("call-column-cap", {
+			command: "printf 'abcdefghijklmnopqrstuvwxyz\\n'",
+		});
+		const text = result.content.find(c => c.type === "text")?.text ?? "";
+
+		expect(text).toContain("[raw output: artifact://bash-column-cap]");
+		expect(await Bun.file(artifactPath).text()).toBe("abcdefghijklmnopqrstuvwxyz\n");
 	});
 
 	it("preserves final-stage output when a pipeline ends in head or tail", async () => {

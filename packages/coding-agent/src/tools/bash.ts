@@ -439,7 +439,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 	#formatResultOutput(result: BashResult | BashInteractiveResult): string {
 		const outputText = normalizeResultOutput(result);
-		return outputText || "(no output)";
+		if (!outputText) return "(no output)";
+		if (!result.columnDroppedBytes || !result.artifactId) return outputText;
+		const footer = `[raw output: artifact://${result.artifactId}]`;
+		return outputText.endsWith(footer) ? outputText : `${outputText}\n${footer}`;
 	}
 
 	/**

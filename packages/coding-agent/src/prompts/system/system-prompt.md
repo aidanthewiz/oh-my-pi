@@ -115,9 +115,9 @@ You MUST use the specialized tool over its shell equivalent:
 {{#has tools "bash"}}- `{{toolRefs.bash}}`: real binaries and short fact pipelines only. Commands shadowing the specialized tools above are blocked.{{/has}}
 {{#has tools "bash"}}- Litmus: one external-CLI call or short pipeline returning a count, frequency, set difference, or checksum → bash. Merely moves, pages, or trims bytes a tool can fetch → use the tool.{{/has}}
 
-{{#if autoQaEnabled}}
+{{#if coreforgeReportEnabled}}
 <critical>
-`{{toolRefs.write}} xd://report_issue` powers automated QA. If ANY tool returns output inconsistent with its described behavior given your parameters, write `<tool>: <concise description>` as plain text to `xd://report_issue`. Don't hesitate — false positives are fine.
+Coreforge does not send automated QA telemetry. If ANY tool returns output inconsistent with its documented behavior given your parameters, write `<tool>: <concise description>` as plain text to `xd://report_issue`. The device asks the user for per-occurrence consent and, when accepted, automatically starts the Coreforge `/report` workflow with the same failure details. `/report` checks for duplicates, drafts the GitHub issue, shows the draft, and requires explicit confirmation before filing in `Coreforce-CAD/coreforge`.
 </critical>
 {{/if}}
 

@@ -2,15 +2,14 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import * as reportIssue from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import {
-	__awaitAutoQaRecordPipelineForTests,
-	__resetAutoQaConsentForTests,
 	__resetAutoQaFlushStateForTests,
+	__resetCoreforgeReportHandlerForTests,
 	dispatchReportIssueDevice,
 	flushGrievances,
 	isAutoQaEnabled,
 	reportIssueDeviceUsage,
+	setCoreforgeReportHandler,
 } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { mockFetch } from "../helpers/fetch-mock";
@@ -107,8 +106,8 @@ describe("flushGrievances", () => {
 		expect(isAutoQaEnabled(Settings.isolated({ "dev.autoqa": false }))).toBe(true);
 	});
 
-	it("enables auto QA by default with consent still unset", () => {
-		expect(isAutoQaEnabled(Settings.isolated())).toBe(true);
+	it("disables auto QA by default", () => {
+		expect(isAutoQaEnabled(Settings.isolated())).toBe(false);
 	});
 
 	it("vetoes default-on auto QA once the user denied consent", () => {
@@ -350,88 +349,75 @@ describe("flushGrievances", () => {
 });
 
 describe("dispatchReportIssueDevice", () => {
+	const session = {} as ToolSession;
+
 	afterEach(() => {
-		__resetAutoQaConsentForTests();
+		__resetCoreforgeReportHandlerForTests();
 	});
 
-	/** Drain the fire-and-forget consent → insert → flush pipeline. */
-	async function settlePipeline(): Promise<void> {
-		await __awaitAutoQaRecordPipelineForTests();
-	}
-
-	/** Auto QA on, consent already granted, push disabled (empty endpoint). */
-	function consentedSettings(): Settings {
-		return Settings.isolated({
-			"dev.autoqa": true,
-			"dev.autoqaConsent": "granted",
-			"dev.autoqaPush.endpoint": "",
+	it("forwards the same tool failure to the Coreforge report handler", async () => {
+		let received: { tool: string; report: string } | undefined;
+		setCoreforgeReportHandler(async (tool, report) => {
+			received = { tool, report };
+			return true;
 		});
-	}
 
-	it("records a grievance from `<tool>: <report>` text", async () => {
-		Bun.env.PI_AUTO_QA = "1";
-		const db = openTempDb();
-		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
-		try {
-			const session = { settings: consentedSettings() } as ToolSession;
-			const { result, xdev } = await dispatchReportIssueDevice(
-				session,
-				"read: selector parse dropped trailing line",
-			);
-			const first = result.content[0];
-			expect(first?.type).toBe("text");
-			if (first?.type === "text") expect(first.text).toBe("Noted, thanks!");
-			expect(xdev.tool).toBe("report_issue");
-			await settlePipeline();
-			expect(selectIds(db)).toHaveLength(1);
-			const row = db.prepare("SELECT tool, report FROM grievances").get() as { tool: string; report: string };
-			expect(row).toEqual({ tool: "read", report: "selector parse dropped trailing line" });
-		} finally {
-			openSpy.mockRestore();
-			db.close();
-		}
+		const { result, xdev } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
+
+		expect(received).toEqual({ tool: "read", report: "selector parse dropped trailing line" });
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: "Coreforge /report queued. The issue will still require draft approval before filing.",
+		});
+		expect(xdev.tool).toBe("report_issue");
 	});
 
 	it("accepts the two-line fallback body format", async () => {
-		Bun.env.PI_AUTO_QA = "1";
-		const db = openTempDb();
-		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
-		try {
-			const session = { settings: consentedSettings() } as ToolSession;
-			await dispatchReportIssueDevice(session, "grep\nreported matches include a deleted file");
-			await settlePipeline();
-			const row = db.prepare("SELECT tool, report FROM grievances").get() as { tool: string; report: string };
-			expect(row).toEqual({ tool: "grep", report: "reported matches include a deleted file" });
-		} finally {
-			openSpy.mockRestore();
-			db.close();
-		}
+		let received: { tool: string; report: string } | undefined;
+		setCoreforgeReportHandler(async (tool, report) => {
+			received = { tool, report };
+			return true;
+		});
+
+		await dispatchReportIssueDevice(session, "grep\nreported matches include a deleted file");
+
+		expect(received).toEqual({ tool: "grep", report: "reported matches include a deleted file" });
 	});
 
-	it("writes nothing while consent is unresolved", async () => {
-		Bun.env.PI_AUTO_QA = "1";
-		const originalPush = Bun.env.PI_AUTO_QA_PUSH;
-		delete Bun.env.PI_AUTO_QA_PUSH;
-		const db = openTempDb();
-		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
-		try {
-			// Consent unset and no UI handler registered → resolves to false.
-			const session = { settings: Settings.isolated({ "dev.autoqa": true }) } as ToolSession;
-			const { result } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
-			const first = result.content[0];
-			if (first?.type === "text") expect(first.text).toBe("Noted, thanks!");
-			await settlePipeline();
-			expect(selectIds(db)).toHaveLength(0);
-		} finally {
-			if (originalPush === undefined) delete Bun.env.PI_AUTO_QA_PUSH;
-			else Bun.env.PI_AUTO_QA_PUSH = originalPush;
-			openSpy.mockRestore();
-			db.close();
-		}
+	it("asks separately for every reported failure", async () => {
+		let calls = 0;
+		setCoreforgeReportHandler(async () => {
+			calls += 1;
+			return false;
+		});
+
+		await dispatchReportIssueDevice(session, "read: first failure");
+		await dispatchReportIssueDevice(session, "grep: second failure");
+
+		expect(calls).toBe(2);
+	});
+
+	it("does not file when the user dismisses the handoff", async () => {
+		setCoreforgeReportHandler(async () => false);
+
+		const { result } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
+
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: "Coreforge report dismissed. Nothing was filed.",
+		});
+	});
+
+	it("degrades safely without an interactive parent session", async () => {
+		const { result } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
+
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: "Coreforge /report requires an interactive parent session. Nothing was filed.",
+		});
 	});
 
 	it("rejects malformed body text with a usage hint", async () => {
-		const session = { settings: Settings.isolated({ "dev.autoqa": true }) } as ToolSession;
 		await expect(dispatchReportIssueDevice(session, "just a vague sentence")).rejects.toThrow(
 			reportIssueDeviceUsage(),
 		);

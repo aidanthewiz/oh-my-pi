@@ -5145,24 +5145,23 @@ export const SETTINGS_SCHEMA = {
 
 	"dev.autoqa": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "tools",
 			group: "Developer",
 			label: "Auto QA",
-			description:
-				"Automated tool issue reporting (xd://report_issue). On by default; the first report asks for consent, and denying it disables reporting until re-enabled explicitly",
+			description: "Legacy upstream Auto QA telemetry (disabled in Coreforge; use /report instead)",
 		},
 	},
 
 	"dev.autoqaPush.endpoint": {
 		type: "string",
-		default: "https://qa.omp.sh/v1/grievances" as const,
+		default: "" as const,
 		ui: {
 			tab: "tools",
 			group: "Developer",
 			label: "Auto QA Push Endpoint",
-			description: "Full URL receiving Auto QA JSON reports (default https://qa.omp.sh/v1/grievances)",
+			description: "Legacy Auto QA endpoint (unset in Coreforge)",
 		},
 	},
 
@@ -5172,15 +5171,8 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	/**
-	 * User decision on sharing automatic `report_tool_issue` grievances.
-	 *
-	 *   - `"unset"`  — never asked; the first `report_tool_issue` invocation
-	 *                  pops a consent dialog and persists the answer here.
-	 *   - `"granted"` — record and (when push is configured) ship grievances.
-	 *   - `"denied"`  — silently no-op every `report_tool_issue` call.
-	 *
-	 * Owned by `packages/coding-agent/src/tools/report-tool-issue.ts` via the
-	 * process-global consent handler registered by `InteractiveMode`.
+	 * Legacy upstream consent value retained so existing config files continue
+	 * to parse. Coreforge never reads it: every `/report` handoff asks again.
 	 *
 	 * @default "unset"
 	 */

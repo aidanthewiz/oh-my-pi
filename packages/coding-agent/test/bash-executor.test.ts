@@ -1316,7 +1316,14 @@ describe("executeBash :async: background retention", () => {
 				});
 				expect(res.cancelled).toBe(false);
 
-				await pollUntil(() => fs.existsSync(pidFile), Date.now() + 4000);
+				// This integration test waits on an OS child process, so fake timers cannot drive readiness.
+				await pollUntil(() => {
+					try {
+						return Number.isInteger(Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10));
+					} catch {
+						return false;
+					}
+				}, Date.now() + 4000);
 				pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
 				expect(Number.isInteger(pid)).toBe(true);
 
