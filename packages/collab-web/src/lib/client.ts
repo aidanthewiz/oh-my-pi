@@ -22,6 +22,7 @@ import type {
 } from "@oh-my-pi/pi-wire";
 import { importRoomKey } from "./codec";
 import { COLLAB_PROTO, encodeBase64Url, parseCollabLink } from "./link";
+import type { RelayAuthTokenProvider } from "./relay-auth";
 import { CollabSocket } from "./socket";
 
 export type ConnectionPhase = "connecting" | "waiting" | "live" | "reconnecting" | "ended";
@@ -121,12 +122,17 @@ export class GuestClient {
 	#snapshot: GuestSnapshot;
 
 	/** @throws Error when the link does not parse. */
-	constructor(link: string, displayName: string) {
+	constructor(link: string, displayName: string, getAuthToken?: RelayAuthTokenProvider) {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		this.#name = displayName;
 		this.#writeToken = parsed.writeToken ? encodeBase64Url(parsed.writeToken) : undefined;
-		this.#socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: importRoomKey(parsed.key) });
+		this.#socket = new CollabSocket({
+			wsUrl: parsed.wsUrl,
+			role: "guest",
+			key: importRoomKey(parsed.key),
+			getAuthToken,
+		});
 		this.#socket.onOpen = () => this.#handleOpen();
 		this.#socket.onFrame = frame => this.#applyFrameSafe(frame);
 		this.#socket.onControl = msg => {

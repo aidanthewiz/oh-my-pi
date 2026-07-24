@@ -387,6 +387,7 @@ export const SETTINGS_SCHEMA = {
 	"identity.aws.ssoRegion": { type: "string", default: undefined },
 	"identity.aws.ssoAccountId": { type: "string", default: undefined },
 	"identity.aws.ssoRoleName": { type: "string", default: undefined },
+	"identity.relay.audience": { type: "string", default: undefined },
 	"identity.claude.workspaceId": { type: "string", default: undefined },
 	"identity.claude.baseUrl": {
 		type: "string",

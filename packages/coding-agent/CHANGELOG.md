@@ -12,6 +12,7 @@
 
 - Routed default collaboration and encrypted-share links through `agent-collab.internal.somahub.io` and branded the public browser and share experiences as Coreforce Agent Collab without exposing the internal Coreforge product name.
 - Routed default collaboration and encrypted-share links through the Coreforce-operated GovCloud relay.
+- Routed default collaboration and encrypted-share links through `coreforge-relay.internal.somahub.io` and rebranded the hosted browser and share experiences as Coreforge.
 - Prioritized Claude Opus 5 during automatic slow-model selection.
 - Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
 
@@ -26,9 +27,15 @@
 - Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
 - Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
 
+
+### Changed
+
+- Routed default collaboration and encrypted-share links through the Coreforce-operated GovCloud relay.
 ### Changed
 
 - Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
+
+- Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.
 
 - Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
 - Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.

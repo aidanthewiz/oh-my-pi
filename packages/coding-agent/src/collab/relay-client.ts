@@ -15,6 +15,7 @@ const FATAL_CLOSE_REASONS: Record<number, string> = {
 	4004: "no such room",
 	4009: "a host is already connected for this room",
 	4029: "room is full",
+	4401: "relay authentication failed",
 };
 
 const BACKOFF_BASE_MS = 1_000;
@@ -30,6 +31,8 @@ export interface CollabSocketOptions {
 	wsUrl: string;
 	role: "host" | "guest";
 	key: CryptoKey;
+	/** Fresh five-minute identity proof for each connection attempt. */
+	getAuthToken?: () => Promise<string>;
 }
 
 export class CollabSocket {
@@ -43,6 +46,8 @@ export class CollabSocket {
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
 	#retryTimer: NodeJS.Timeout | undefined;
+	#opening = false;
+	#authenticated = false;
 	#backpressureDrainTimer: NodeJS.Timeout | undefined;
 	#attempt = 0;
 	/** Terminal state: intentional close or fatal failure. Cleared by connect(). */
@@ -59,11 +64,11 @@ export class CollabSocket {
 	}
 
 	get isOpen(): boolean {
-		return this.#ws?.readyState === WebSocket.OPEN;
+		return this.#authenticated && this.#ws?.readyState === WebSocket.OPEN;
 	}
 
 	connect(): void {
-		if (this.#ws || this.#retryTimer) return;
+		if (this.#ws || this.#retryTimer || this.#opening) return;
 		this.#closed = false;
 		this.#attempt = 0;
 		this.#openSocket();
@@ -76,11 +81,11 @@ export class CollabSocket {
 					logger.debug("collab: dropping frame, socket closed", { t: frame.t });
 					return;
 				}
-				const openWs = this.#ws;
+				const openWs = this.#authenticated ? this.#ws : null;
 				if (openWs && openWs.readyState === WebSocket.OPEN) this.#drainPendingSends(openWs);
 				const sealed = await seal(this.#opts.key, frame);
 				const envelope = packEnvelope(targetPeer, sealed);
-				const ws = this.#ws;
+				const ws = this.#authenticated ? this.#ws : null;
 				if (ws && ws.readyState === WebSocket.OPEN) {
 					if (this.#pendingSends.length > 0) {
 						this.#enqueuePendingSend(envelope, frame.t);
@@ -151,11 +156,13 @@ export class CollabSocket {
 
 	/** Intentional close: clears any retry timer, suppresses reconnect. A later connect() starts fresh. */
 	close(): void {
-		const hadActivity = this.#ws !== null || this.#retryTimer !== undefined;
+		const hadActivity = this.#ws !== null || this.#retryTimer !== undefined || this.#opening;
 		this.#clearRetry();
 		this.#clearBackpressureDrain();
 		const wasClosed = this.#closed;
 		this.#closed = true;
+		this.#opening = false;
+		this.#authenticated = false;
 		this.#pendingSends.length = 0;
 		const ws = this.#ws;
 		this.#ws = null;
@@ -170,18 +177,37 @@ export class CollabSocket {
 	}
 
 	#openSocket(): void {
+		const getAuthToken = this.#opts.getAuthToken;
+		if (!getAuthToken) {
+			this.#createSocket();
+			return;
+		}
+		this.#opening = true;
+		void getAuthToken()
+			.then(token => {
+				if (this.#closed) return;
+				this.#opening = false;
+				this.#createSocket(token);
+			})
+			.catch((error: unknown) => {
+				this.#opening = false;
+				this.#failFatal(`relay authentication failed: ${error instanceof Error ? error.message : String(error)}`);
+			});
+	}
+
+	#createSocket(authToken?: string): void {
 		this.#clearBackpressureDrain();
+		this.#authenticated = false;
 		const ws = new WebSocket(`${this.#opts.wsUrl}?role=${this.#opts.role}`);
 		ws.binaryType = "arraybuffer";
 		this.#ws = ws;
 		ws.onopen = () => {
 			if (this.#ws !== ws) return;
-			this.#attempt = 0;
-			if (this.#pendingSends.length > 0) {
-				this.#drainPendingSends(ws);
-				if (this.#pendingSends.length > 0) this.#scheduleBackpressureDrain(ws);
+			if (authToken) {
+				ws.send(JSON.stringify({ t: "auth", token: authToken }));
+				return;
 			}
-			this.onOpen?.();
+			this.#finishOpen(ws);
 		};
 		ws.onmessage = (event: MessageEvent) => {
 			if (this.#ws !== ws) return;
@@ -193,20 +219,38 @@ export class CollabSocket {
 		ws.onclose = (event: CloseEvent) => {
 			if (this.#ws !== ws) return;
 			this.#clearBackpressureDrain();
+			this.#authenticated = false;
 			this.#ws = null;
 			this.#handleClose(event.code, event.reason);
 		};
 	}
 
+	#finishOpen(ws: WebSocket): void {
+		if (this.#ws !== ws || this.#authenticated) return;
+		this.#authenticated = true;
+		this.#attempt = 0;
+		if (this.#pendingSends.length > 0) {
+			this.#drainPendingSends(ws);
+			if (this.#pendingSends.length > 0) this.#scheduleBackpressureDrain(ws);
+		}
+		this.onOpen?.();
+	}
+
 	#handleMessage(ws: WebSocket, data: unknown): void {
 		if (typeof data === "string") {
 			try {
-				this.onControl?.(JSON.parse(data) as RelayControlMessage);
+				const message = JSON.parse(data) as RelayControlMessage;
+				if (message.t === "auth-ok") {
+					this.#finishOpen(ws);
+					return;
+				}
+				this.onControl?.(message);
 			} catch {
 				logger.debug("collab: ignoring malformed control message");
 			}
 			return;
 		}
+		if (!this.#authenticated) return;
 		const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data instanceof Uint8Array ? data : null;
 		if (!bytes) return;
 		const envelope = unpackEnvelope(bytes);
@@ -235,6 +279,8 @@ export class CollabSocket {
 		const fatalReason = FATAL_CLOSE_REASONS[code];
 		if (fatalReason !== undefined) {
 			this.#closed = true;
+			this.#opening = false;
+			this.#authenticated = false;
 			this.#pendingSends.length = 0;
 			this.onClose?.(fatalReason, false);
 			return;
@@ -247,6 +293,8 @@ export class CollabSocket {
 	#failFatal(reason: string): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#opening = false;
+		this.#authenticated = false;
 		this.#clearRetry();
 		this.#pendingSends.length = 0;
 		const ws = this.#ws;

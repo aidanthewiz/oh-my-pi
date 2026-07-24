@@ -19,6 +19,7 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
+import { createRelayIdentityTokenProvider } from "../identity/relay";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
@@ -226,7 +227,10 @@ export class CollabGuestLink {
 
 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
 
-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+		const getAuthToken = createRelayIdentityTokenProvider(this.#ctx.settings, parsed.wsUrl, message =>
+			this.#ctx.showStatus(message, { dim: true }),
+		);
+		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key, getAuthToken });
 		this.#socket = socket;
 
 		const firstWelcome = Promise.withResolvers<void>();

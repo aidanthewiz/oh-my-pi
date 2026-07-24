@@ -7,10 +7,10 @@
  * (gist or relay store), decrypts it with the `#<key>` fragment in-browser, and
  * hands the JSON to template.js via `window.__OMP_SESSION_DATA__`.
  *
- * The relay repo's build script runs this and embeds the output via go:embed.
  */
 import * as path from "node:path";
-import { generateThemeVars, getTemplate } from "../src/export/html";
+import { getTemplate } from "../src/export/html/template-renderer";
+import { webExportThemeVars } from "../src/export/html/web-palette";
 
 const outPath = process.argv[2];
 if (!outPath) {
@@ -19,10 +19,9 @@ if (!outPath) {
 }
 
 const loaderJs = await Bun.file(new URL("../src/export/html/share-loader.js", import.meta.url).pathname).text();
-// Pin the omp brand palette (collab-web pink/purple identity) — the viewer is
-// a public artifact matching the live my.omp.sh client, not a per-user export
-// that should mirror the host's terminal theme.
-const themeVars = await generateThemeVars("web");
+// Pin the omp brand palette so the viewer matches the live collab-web client,
+// not a per-user export that should mirror the host's terminal theme.
+const themeVars = webExportThemeVars();
 
 const html = getTemplate()
 	.replace("<theme-vars/>", () => `<style>:root { ${themeVars} }</style>`)

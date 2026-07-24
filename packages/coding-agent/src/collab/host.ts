@@ -21,6 +21,7 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import { createRelayIdentityTokenProvider } from "../identity/relay";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
@@ -220,7 +221,10 @@ export class CollabHost {
 		if ("error" in parsed) throw new Error(parsed.error);
 		const key = await importRoomKey(rawKey);
 
-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key });
+		const getAuthToken = createRelayIdentityTokenProvider(this.#ctx.settings, parsed.wsUrl, message =>
+			this.#ctx.showStatus(message, { dim: true }),
+		);
+		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key, getAuthToken });
 		this.#socket = socket;
 		this.#sessionId = this.#ctx.sessionManager.getSessionId();
 

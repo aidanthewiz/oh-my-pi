@@ -18027,8 +18027,8 @@ export class AgentSession {
 	 * @returns Path to exported file
 	 */
 	async exportToHtml(outputPath?: string): Promise<string> {
-		// Public HTML export ships in the omp brand palette (collab-web
-		// pink/purple), matching my.omp.sh — not the host's terminal theme.
+		// Public HTML export ships in the collab-web pink/purple brand palette,
+		// not the host's terminal theme.
 		// Callers who want a themed export can pass `palette: "theme"` with
 		// `themeName` directly to `exportSessionToHtml`.
 		const { exportSessionToHtml } = await import("../export/html");

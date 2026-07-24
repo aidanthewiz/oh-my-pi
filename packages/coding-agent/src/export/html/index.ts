@@ -6,34 +6,10 @@ import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/
 import type { SessionEntry, SessionHeader } from "../../session/session-entries";
 import { loadEntriesFromFile } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
-import templateCss from "./template.css" with { type: "text" };
-import templateHtml from "./template.html" with { type: "text" };
-import templateJs from "./template.js" with { type: "text" };
-// Pre-built React tool renderers: built by `gen:tool-views` (`bun run gen:tool-views`),
-// run automatically by root `prepare` on install and by `prepack` at publish.
-import toolViewsJs from "./tool-views.generated.js" with { type: "text" };
+import { getTemplate } from "./template-renderer";
 import { webExportThemeVars } from "./web-palette";
 
-let cachedTemplate: string | undefined;
-
-/** Compose the standalone export template: minified CSS, tool renderers, and viewer JS inlined. */
-export function getTemplate(): string {
-	if (cachedTemplate) return cachedTemplate;
-	const minifiedCss = templateCss
-		.replace(/\/\*[\s\S]*?\*\//g, "")
-		.replace(/\s+/g, " ")
-		.replace(/\s*([{}:;,])\s*/g, "$1")
-		.trim();
-	// Function replacements so `$'`, `$&`, `$$`, etc. inside the embedded
-	// CSS/JS are not interpreted as substitution patterns. The cast is safe:
-	// `with { type: "text" }` yields a string at runtime; bun-types just types
-	// every *.html import as HTMLBundle (TS can't vary types by import attribute).
-	cachedTemplate = (templateHtml as unknown as string)
-		.replace("<template-css/>", () => `<style>${minifiedCss}</style>`)
-		.replace("<template-tool-views/>", () => `<script>${toolViewsJs}</script>`)
-		.replace("<template-js/>", () => `<script>${templateJs}</script>`);
-	return cachedTemplate;
-}
+export { getTemplate };
 
 export interface ExportOptions {
 	outputPath?: string;
@@ -41,7 +17,7 @@ export interface ExportOptions {
 	 * Which color palette the export ships with.
 	 * - `"web"` (default) — the omp brand identity (collab-web pink/purple),
 	 *   so public HTML exports and the `/s/<id>` share viewer match the live
-	 *   `my.omp.sh` client. See `web-palette.ts`.
+	 *   collab-web client. See `web-palette.ts`.
 	 * - `"theme"` — derive from `themeName` (or the active TUI theme), preserving
 	 *   the pre-15.12 behavior where an export mirrored the user's terminal.
 	 */
@@ -121,9 +97,9 @@ function deriveExportColors(baseColor: string): { pageBg: string; cardBg: string
  * Two call shapes:
  *   • `generateThemeVars("web" | "theme", themeName?)` — explicit palette.
  *     `"web"` (the default for public artifacts) returns the fixed omp brand
- *     palette from `web-palette.ts` — collab-web pink/purple identity, shared
- *     with the live `my.omp.sh` client, so exports and the share viewer render
- *     identically to it. `"theme"` derives from the TUI theme via
+ *     palette from `web-palette.ts` — collab-web pink/purple identity, so
+ *     exports and the share viewer render identically to the live web client.
+ *     `"theme"` derives from the TUI theme via
  *     `getResolvedThemeColors(themeName)` plus the three
  *     `export.{pageBg,cardBg,infoBg}` surface overrides.
  *   • `generateThemeVars(themeName)` — legacy single-arg form: derive from the

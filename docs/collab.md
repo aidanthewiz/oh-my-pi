@@ -15,15 +15,18 @@ prints
 ```
 Collab session started!
  • Join from another terminal: omp join "mgAYTZwEnpRQtca0CTgn-Q.gdJUbTovD94ofDaa8YvhY0-ty16w4fn8PgB6PLnoA30"
- • or any web browser: my.omp.sh/#mgAYTZwEnpRQtca0CTgn-Q.gdJUbTovD94ofDaa8YvhY0-ty16w4fn8PgB6PLnoA30
+ • or any web browser: agent-collab.internal.somahub.io/#mgAYTZwEnpRQtca0CTgn-Q.gdJUbTovD94ofDaa8YvhY0-ty16w4fn8PgB6PLnoA30
+ • If a browser asks for approval: coreforge relay authorize <code>
 ```
 
 The browser line is click-to-join (an OSC 8 hyperlink to the full `https://` deep link): the relay serves the web guest client at `/`, and the room id + key ride in the URL fragment. From another omp (any directory, any machine), either form works:
 
 Running `/collab` or `/collab view` starts or displays the active hosting session, rendering both the terminal/browser join links and their corresponding QR codes.
 
+When a browser displays an approval code, the session host runs `coreforge relay authorize <code>` in another signed-in terminal. The public page never needs to expose the internal product name.
+
 ```
-/join my.omp.sh/#mgAYTZwEnpRQtca0CTgn-Q.gdJU…
+/join agent-collab.internal.somahub.io/#mgAYTZwEnpRQtca0CTgn-Q.gdJU…
 ```
 
 The guest's previous session is restored on `/leave` (or when the host stops).
@@ -45,7 +48,7 @@ The guest's previous session is restored on `/leave` (or when the host stops).
 Accepted by `/join <link>` and `omp join "<link>"`:
 
 ```
-<roomId>.<key>                                                    → default relay (wss://my.omp.sh)
+<roomId>.<key>                                                    → default relay (wss://agent-collab.internal.somahub.io)
 <roomId>#<key>                                                    → legacy bare form
 host[:port]/r/<roomId>.<key>                                     → custom relay, wss:// inferred
 host[:port]/r/<roomId>#<key>                                     → legacy direct relay form
@@ -103,21 +106,27 @@ Set `collab.webUrl` when the browser UI is hosted separately from the websocket 
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `collab.relayUrl` | `wss://my.omp.sh` | Relay used by `/collab` when no relay is passed inline |
+| `collab.relayUrl` | `wss://agent-collab.internal.somahub.io` | Relay used by `/collab` when no relay is passed inline |
 | `collab.webUrl` | empty | Browser UI URL for `/collab` links; empty derives from relay; explicit `http://` is allowed only for localhost |
 | `collab.displayName` | OS username | Name shown to other participants |
-| `share.serverUrl` | `https://my.omp.sh/s` | Share viewer/upload base used by `/share` (links are `<base>/<id>#<key>`) |
+| `share.serverUrl` | `https://agent-collab.internal.somahub.io/s` | Share viewer/upload base used by `/share` (links are `<base>/<id>#<key>`) |
 | `share.redactSecrets` | `true` | Run the secret obfuscator over `/share` snapshots before upload |
 
 ## Self-hosting the relay
 
-The relay is a small content-blind Go service. It keeps no state beyond live connections and exposes:
+The Coreforce fork includes a protocol-compatible, content-blind Bun service in `packages/relay`. The upstream relay implementation and image are not published, so this service implements the documented client contract directly and is tested with the production `CollabSocket` client. It exposes:
 
 - `GET /` — the static collab-web guest client (target of the `/collab` deep link),
 - `GET /r/<roomId>?role=host|guest` — WebSocket upgrade,
 - `POST /s` / `GET /s/<id>` / `GET /s/<id>/raw` — `/share` blob upload, viewer page, and blob fetch,
-- `GET /healthz` — liveness.
+- `GET /healthz` — liveness,
+- `GET /metrics` — in-cluster Prometheus metrics.
 
+The relay routes only the 4-byte peer prefix and opaque AES-GCM frames. `/share` stores only ciphertext on a bounded persistent volume; the URL-fragment key never reaches the service. Files expire after `SHARE_TTL_SECONDS` (seven days by default), uploads are capped by `SHARE_MAX_BYTES` (1 MB), and total storage is capped by `SHARE_MAX_STORAGE_BYTES` (1 GB).
+
+Each client address may host at most 25 rooms and upload 20 shares per hour by default (`MAX_HOST_ROOMS_PER_CLIENT`, `MAX_SHARE_UPLOADS_PER_CLIENT`, and `SHARE_UPLOAD_WINDOW_SECONDS`). Idle rooms expire after one hour and every room expires after one day (`ROOM_IDLE_TIMEOUT_SECONDS` and `ROOM_MAX_AGE_SECONDS`). Set `TRUSTED_PROXY_HOPS` only when every request reaches the service through that many trusted proxies; the Coreforce ALB deployment uses `1` so limits use the client address appended by the ALB.
+
+Build the production image with `docker build -f Dockerfile.relay .`. Runtime paths are configured by `COLLAB_WEB_ROOT`, `SHARE_VIEWER_PATH`, and `SHARE_DATA_DIR`; global ceilings are configured by `MAX_ROOMS`, `MAX_GUESTS_PER_ROOM`, and `MAX_WS_PAYLOAD_BYTES`.
 
 ## Architecture notes
 

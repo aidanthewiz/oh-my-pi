@@ -15,7 +15,7 @@ import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
-import { shareSession } from "../../export/share";
+import { DEFAULT_SHARE_URL, shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
 	diffMentalModelContent,
@@ -27,6 +27,7 @@ import {
 	seedAlreadyExists,
 	summarizeMentalModel,
 } from "../../hindsight";
+import { createRelayIdentityTokenProvider } from "../../identity/relay";
 import { resolveMemoryBackend } from "../../memory-backend";
 import { BashExecutionComponent } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
@@ -223,8 +224,12 @@ export class CommandController {
 		// Default: encrypted snapshot to a secret gist (preferred) or the share
 		// server; the key rides in the link fragment and never leaves the client.
 		try {
+			const serverUrl = this.ctx.settings.get("share.serverUrl") ?? DEFAULT_SHARE_URL;
 			const result = await shareSession(this.ctx.session.sessionManager, {
-				serverUrl: this.ctx.settings.get("share.serverUrl"),
+				serverUrl,
+				getAuthToken: createRelayIdentityTokenProvider(this.ctx.settings, serverUrl, message =>
+					this.ctx.showStatus(message, { dim: true }),
+				),
 				store: this.ctx.settings.get("share.store"),
 				state: this.ctx.session.state,
 				obfuscator: this.ctx.settings.get("share.redactSecrets") ? this.ctx.session.obfuscator : undefined,
@@ -233,6 +238,7 @@ export class CommandController {
 			restoreEditor();
 
 			const lines = [`Share URL: ${result.url}`];
+			lines.push("Browser approval: coreforge relay authorize <code>");
 			if (result.gistUrl) lines.push(`Gist: ${result.gistUrl}`);
 			if (result.truncated) lines.push("Note: large content was trimmed to fit the share size limit.");
 			this.ctx.showStatus(lines.join("\n"));

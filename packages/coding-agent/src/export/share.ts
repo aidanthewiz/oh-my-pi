@@ -75,6 +75,8 @@ export interface ShareSessionOptions {
 	 * undefined to skip redaction entirely.
 	 */
 	obfuscator?: SecretObfuscator;
+	/** Fresh managed relay identity proof, required by authenticated share servers. */
+	getAuthToken?: () => Promise<string>;
 }
 
 export interface ShareSessionResult {
@@ -298,10 +300,10 @@ export async function shareSession(sm: SessionManager, options?: ShareSessionOpt
 			};
 		}
 		// gh unusable or gist creation failed — fall back to the share server.
-		return shareViaServer(key, data, base, keyText, forGist);
+		return shareViaServer(key, data, base, keyText, options?.getAuthToken, forGist);
 	}
 
-	return shareViaServer(key, data, base, keyText);
+	return shareViaServer(key, data, base, keyText, options?.getAuthToken);
 }
 
 /** Strip trailing slashes so `<base>/<id>` composes cleanly. */
@@ -441,13 +443,14 @@ async function shareViaServer(
 	data: SessionData,
 	base: string,
 	keyText: string,
+	getAuthToken?: () => Promise<string>,
 	preFit?: SealedSession,
 ): Promise<ShareSessionResult> {
 	const forServer =
 		preFit && preFit.sealed.byteLength <= SERVER_MAX_SEALED_BYTES
 			? preFit
 			: await sealToFit(key, data, SERVER_MAX_SEALED_BYTES);
-	const id = await uploadToServer(forServer.sealed, base);
+	const id = await uploadToServer(forServer.sealed, base, getAuthToken);
 	return {
 		url: `${base}/${id}#${keyText}`,
 		method: "server",
@@ -457,12 +460,16 @@ async function shareViaServer(
 }
 
 /** POST the sealed blob to the share server; returns the assigned id. */
-async function uploadToServer(sealed: Uint8Array, base: string): Promise<string> {
+async function uploadToServer(sealed: Uint8Array, base: string, getAuthToken?: () => Promise<string>): Promise<string> {
+	const token = getAuthToken ? await getAuthToken() : undefined;
 	let res: Response;
 	try {
 		res = await fetch(base, {
 			method: "POST",
-			headers: { "Content-Type": "application/octet-stream" },
+			headers: {
+				"Content-Type": "application/octet-stream",
+				...(token ? { Authorization: `Bearer ${token}` } : {}),
+			},
 			body: sealed,
 		});
 	} catch (err) {

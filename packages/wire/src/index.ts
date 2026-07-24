@@ -418,11 +418,11 @@ export const ROOM_KEY_BYTES = 32;
  */
 export const WRITE_TOKEN_BYTES = 16;
 
-/** Default public relay; bare `<roomId>.<key>` links resolve against it. */
-export const DEFAULT_RELAY_URL = "wss://my.omp.sh";
+/** Default Coreforce relay; bare `<roomId>.<key>` links resolve against it. */
+export const DEFAULT_RELAY_URL = "wss://agent-collab.internal.somahub.io";
 
-/** Default share viewer/upload base; `/share` links resolve against `<base>/<id>#<key>`. */
-export const DEFAULT_SHARE_URL = "https://my.omp.sh/s";
+/** Default Coreforce share viewer/upload base; `/share` links resolve against `<base>/<id>#<key>`. */
+export const DEFAULT_SHARE_URL = "https://agent-collab.internal.somahub.io/s";
 
 export interface ParsedCollabLink {
 	/** wss://host[:port]/r/<roomId> — no query, no fragment. */
@@ -437,8 +437,19 @@ export interface ParsedCollabLink {
 // Relay control messages (TEXT JSON, unencrypted, no session data)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** First client frame on an authenticated relay WebSocket. */
+export interface RelayAuthRequest {
+	t: "auth";
+	token: string;
+}
+
+/** Relay acknowledgement sent only after identity verification and room registration. */
+export type RelayAuthAccepted = { t: "auth-ok" };
+
 /** Relay → host control message. */
 export type RelayControlToHost = { t: "peer-joined" | "peer-left"; peer: number };
 /** Relay → guest control message. */
 export type RelayControlToGuest = { t: "room-closed" };
-export type RelayControlMessage = RelayControlToHost | RelayControlToGuest;
+/** Relay → any authenticated client. */
+export type RelayControlToClient = RelayAuthAccepted;
+export type RelayControlMessage = RelayControlToHost | RelayControlToGuest | RelayControlToClient;

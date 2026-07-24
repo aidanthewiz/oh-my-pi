@@ -91,6 +91,8 @@ describe("/collab slash command QR code rendering", () => {
 		expect(harness.ctx.collabHost).toBeInstanceOf(CollabHost);
 		const statusText = harness.showStatus.mock.calls[0]?.[0] as string;
 		expect(statusText).toContain("my.omp.sh/#started-full");
+		expect(statusText).toContain('coreforge join "relay.example.com/r/full-control"');
+		expect(statusText).not.toContain("omp join");
 		const presented = harness.present.mock.calls[0]?.[0] as readonly unknown[];
 		expect(presented[0]).toBeInstanceOf(Spacer);
 		expect(presented[1]).toBeInstanceOf(CollabQrCodeComponent);
@@ -111,6 +113,8 @@ describe("/collab slash command QR code rendering", () => {
 		const statusText = harness.showStatus.mock.calls[0]?.[0] as string;
 		expect(statusText).toContain("my.omp.sh/#started-view");
 		expect(statusText).not.toContain("my.omp.sh/#started-full");
+		expect(statusText).toContain('coreforge join "relay.example.com/r/read-only"');
+		expect(statusText).not.toContain("omp join");
 		const presented = harness.present.mock.calls[0]?.[0] as readonly unknown[];
 		expect(presented[0]).toBeInstanceOf(Spacer);
 		expect(presented[1]).toBeInstanceOf(CollabQrCodeComponent);

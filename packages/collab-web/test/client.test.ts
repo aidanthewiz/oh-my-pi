@@ -308,3 +308,145 @@ describe("GuestClient frame apply", () => {
 		expect(after.entries).toBe(before.entries);
 	});
 });
+
+describe("relay authentication", () => {
+	it("requests a fresh token when a transient disconnect reconnects", async () => {
+		vi.useFakeTimers();
+		const originalWebSocket = globalThis.WebSocket;
+		const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+		class TestWebSocket {
+			static readonly CONNECTING = 0;
+			static readonly OPEN = 1;
+			static readonly CLOSING = 2;
+			static readonly CLOSED = 3;
+			static instances: TestWebSocket[] = [];
+			readonly sent: unknown[] = [];
+			readyState = TestWebSocket.CONNECTING;
+			binaryType = "";
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: unknown }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: ((event: { code: number; reason: string }) => void) | null = null;
+
+			constructor(readonly url: string) {
+				TestWebSocket.instances.push(this);
+			}
+
+			open(): void {
+				this.readyState = TestWebSocket.OPEN;
+				this.onopen?.();
+			}
+
+			send(data: unknown): void {
+				this.sent.push(data);
+			}
+
+			receive(data: unknown): void {
+				this.onmessage?.({ data });
+			}
+
+			drop(): void {
+				this.readyState = TestWebSocket.CLOSED;
+				this.onclose?.({ code: 1006, reason: "" });
+			}
+
+			close(code = 1000, reason = ""): void {
+				this.readyState = TestWebSocket.CLOSED;
+				this.onclose?.({ code, reason });
+			}
+		}
+
+		let socket: CollabSocket | undefined;
+		try {
+			globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+			const refreshedToken = Promise.withResolvers<string | undefined>();
+			const getAuthToken = vi
+				.fn<() => Promise<string | undefined>>()
+				.mockResolvedValueOnce("first-token")
+				.mockImplementationOnce(() => refreshedToken.promise);
+			socket = new CollabSocket({
+				wsUrl: "ws://relay.example/r/room",
+				role: "guest",
+				key: {} as CryptoKey,
+				getAuthToken,
+			});
+
+			socket.connect();
+			for (let flush = 0; flush < 2; flush++) await Promise.resolve();
+			expect(TestWebSocket.instances).toHaveLength(1);
+			TestWebSocket.instances[0]?.open();
+			expect(TestWebSocket.instances[0]?.sent).toEqual([JSON.stringify({ t: "auth", token: "first-token" })]);
+			TestWebSocket.instances[0]?.receive(JSON.stringify({ t: "auth-ok" }));
+			TestWebSocket.instances[0]?.drop();
+			vi.advanceTimersByTime(1000);
+
+			expect(getAuthToken).toHaveBeenCalledTimes(2);
+			expect(TestWebSocket.instances).toHaveLength(1);
+			refreshedToken.resolve("second-token");
+			for (let flush = 0; flush < 2; flush++) await Promise.resolve();
+			expect(TestWebSocket.instances).toHaveLength(2);
+			TestWebSocket.instances[1]?.open();
+			expect(TestWebSocket.instances[1]?.sent).toEqual([JSON.stringify({ t: "auth", token: "second-token" })]);
+		} finally {
+			socket?.close();
+			globalThis.WebSocket = originalWebSocket;
+			random.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("times out a stalled token request and retries without opening a socket", async () => {
+		vi.useFakeTimers();
+		const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const getAuthToken = vi.fn((_signal: AbortSignal) => new Promise<string | undefined>(() => {}));
+		const onClose = vi.fn();
+		const socket = new CollabSocket({
+			wsUrl: "ws://relay.example/r/room",
+			role: "guest",
+			key: {} as CryptoKey,
+			getAuthToken,
+		});
+		socket.onClose = onClose;
+		try {
+			socket.connect();
+			expect(getAuthToken).toHaveBeenCalledTimes(1);
+
+			vi.advanceTimersByTime(16 * 60 * 1_000);
+			for (let flush = 0; flush < 4; flush++) await Promise.resolve();
+			expect(onClose).toHaveBeenCalledWith("Relay authorization timed out", true);
+
+			vi.advanceTimersByTime(1_000);
+			expect(getAuthToken).toHaveBeenCalledTimes(2);
+		} finally {
+			socket.close();
+			random.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("treats permanent token failures as terminal", async () => {
+		vi.useFakeTimers();
+		const getAuthToken = vi.fn(async (_signal: AbortSignal) => {
+			throw new Error("Relay authorization denied");
+		});
+		const onClose = vi.fn();
+		const socket = new CollabSocket({
+			wsUrl: "ws://relay.example/r/room",
+			role: "guest",
+			key: {} as CryptoKey,
+			getAuthToken,
+		});
+		socket.onClose = onClose;
+		try {
+			socket.connect();
+			for (let flush = 0; flush < 4; flush++) await Promise.resolve();
+			expect(onClose).toHaveBeenCalledWith("Relay authorization denied", false);
+
+			vi.advanceTimersByTime(60_000);
+			expect(getAuthToken).toHaveBeenCalledTimes(1);
+		} finally {
+			socket.close();
+			vi.useRealTimers();
+		}
+	});
+});

@@ -1,0 +1,173 @@
+name: relay
+
+on:
+  pull_request:
+    branches:
+      - coreforge
+    paths:
+      - ".github/workflows/relay.yml"
+      - "Dockerfile.relay"
+      - "Dockerfile.relay.dockerignore"
+      - "bun.lock"
+      - "package.json"
+      - "packages/collab-web/**"
+      - "packages/coding-agent/scripts/generate-share-viewer.ts"
+      - "packages/coding-agent/src/cli-commands.ts"
+      - "packages/coding-agent/src/cli/relay-cli.ts"
+      - "packages/coding-agent/src/commands/relay.ts"
+      - "packages/coding-agent/src/config/settings-schema.ts"
+      - "packages/coding-agent/src/export/share.ts"
+      - "packages/coding-agent/src/identity/relay.ts"
+      - "packages/coding-agent/src/modes/controllers/command-controller.ts"
+      - "packages/coding-agent/src/slash-commands/builtin-registry.ts"
+      - "packages/coding-agent/src/collab/**"
+      - "packages/coding-agent/src/export/html/**"
+      - "packages/relay/**"
+      - "packages/wire/**"
+  push:
+    tags:
+      - "relay/v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build native addon for coding-agent tests
+        run: bun --cwd=packages/natives run build
+
+      - name: Check relay clients
+        run: |
+          bun --cwd=packages/wire run check
+          bun --cwd=packages/collab-web run check
+          bun --cwd=packages/coding-agent run check
+
+      - name: Test relay clients
+        run: |
+          bun test packages/coding-agent/test/relay-identity.test.ts packages/coding-agent/test/share.test.ts packages/coding-agent/test/collab/relay-client-backpressure.test.ts
+          bun --cwd=packages/collab-web run test
+
+      - name: Check relay package
+        run: bun --cwd=packages/relay run check
+
+      - name: Test relay package
+        run: bun --cwd=packages/relay run test
+
+      - name: Build browser clients and relay
+        run: |
+          bun --cwd=packages/collab-web run build
+          bun packages/coding-agent/scripts/generate-share-viewer.ts /tmp/share-viewer.html
+          bun --cwd=packages/relay run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build relay image
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: Dockerfile.relay
+          push: false
+          platforms: linux/amd64
+
+  publish:
+    name: publish
+    if: startsWith(github.ref, 'refs/tags/relay/v')
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_USE_FIPS_ENDPOINT: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Guard tag and package version
+        id: version
+        shell: bash
+        run: |
+          git fetch origin +coreforge:refs/remotes/origin/coreforge --quiet
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          tip="$(git rev-parse refs/remotes/origin/coreforge)"
+          if [ "${tag_commit}" != "${tip}" ]; then
+            echo "tag commit ${tag_commit} is not the coreforge tip ${tip}" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#relay/v}"
+          package_version="$(jq -r .version packages/relay/package.json)"
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "${version}" =~ ${semver_re} ]] || [ "${#version}" -gt 128 ] || [ "${version}" != "${package_version}" ]; then
+            echo "tag version ${version} must be Docker-compatible SemVer without build metadata and equal relay package ${package_version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: arn:aws-us-gov:iam::800128555654:role/SomaPlatformProdRelayPublish
+          aws-region: us-gov-west-1
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity --output json
+
+      - name: Log in to ECR
+        id: ecr
+        shell: bash
+        run: |
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.us-gov-west-1.amazonaws.com"
+          echo "registry=${registry}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password --region us-gov-west-1 | docker login --username AWS --password-stdin "${registry}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push relay image
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: Dockerfile.relay
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.ecr.outputs.registry }}/apps/omp-relay:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/Coreforce-CAD/oh-my-pi
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.1"
+
+      - name: Sign and verify image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/apps/omp-relay@${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          cosign sign --yes "${IMAGE}"
+          cosign verify \
+            --certificate-identity-regexp 'https://github\.com/Coreforce-CAD/oh-my-pi/\.github/workflows/relay\.yml@refs/tags/relay/v.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}"

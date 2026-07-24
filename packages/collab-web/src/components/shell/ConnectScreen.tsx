@@ -31,8 +31,8 @@ export function ConnectScreen({ defaultName, error, onConnect }: ConnectScreenPr
 			<form className="sh-connect-card" onSubmit={submit}>
 				<div className="sh-connect-head">
 					<div className="sh-lockup">
-						<span className="sh-lockup-mark" aria-hidden="true" />
-						<span className="sh-lockup-pi">π</span> omp collab
+						<img className="sh-lockup-mark" src="/favicon.png" alt="" aria-hidden="true" />
+						Coreforce Agent Collab
 					</div>
 					<ThemeToggle />
 				</div>
@@ -49,7 +49,7 @@ export function ConnectScreen({ defaultName, error, onConnect }: ConnectScreenPr
 						autoComplete="off"
 						autoFocus
 					/>
-					<span className="sh-field-hint">paste a /collab link from any omp session</span>
+					<span className="sh-field-hint">paste an agent collaboration link</span>
 				</label>
 				<label className="sh-field">
 					<span className="sh-field-label">display name</span>

@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS build
+WORKDIR /src
+
+COPY package.json bun.lock tsconfig.base.json tsconfig.json tsconfig.tools.json biome.json bunfig.toml ./
+COPY packages ./packages
+COPY python/robomp/web ./python/robomp/web
+COPY patches ./patches
+RUN bun install --frozen-lockfile
+RUN bun --cwd=packages/collab-web run build \
+ && mkdir -p /out \
+ && bun packages/coding-agent/scripts/generate-share-viewer.ts /out/share-viewer.html \
+ && bun build packages/relay/src/main.ts --target=bun --minify --outfile=/out/server.js \
+ && bun build packages/relay/src/jwks-mirror.ts --target=bun --minify --outfile=/out/jwks-mirror.js
+
+FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS runtime
+WORKDIR /app
+ENV HOST=0.0.0.0 \
+    PORT=8080 \
+    COLLAB_WEB_ROOT=/app/public \
+    SHARE_VIEWER_PATH=/app/share-viewer.html \
+    SHARE_DATA_DIR=/data/shares
+COPY --from=build --chown=bun:bun /out/server.js /app/server.js
+COPY --from=build --chown=bun:bun /out/jwks-mirror.js /app/jwks-mirror.js
+COPY --from=build --chown=bun:bun /out/share-viewer.html /app/share-viewer.html
+COPY --from=build --chown=bun:bun /src/packages/collab-web/dist /app/public
+RUN mkdir -p /data/shares && chown -R bun:bun /data
+USER bun
+EXPOSE 8080
+ENTRYPOINT ["bun", "/app/server.js"]

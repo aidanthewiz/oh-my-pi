@@ -3,8 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
-import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
+import { CF_COMMAND } from "../cli/cf-version";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
 import { expandRoleAlias, getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
@@ -17,7 +18,7 @@ import {
 	resolveActiveProjectRegistryPath,
 	resolveOrDefaultProjectRegistryPath,
 } from "../discovery/helpers.js";
-import { shareSession } from "../export/share";
+import { DEFAULT_SHARE_URL, shareSession } from "../export/share";
 import { PluginManager } from "../extensibility/plugins";
 import {
 	getInstalledPluginsRegistryPath,
@@ -26,6 +27,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
+import { createRelayIdentityTokenProvider } from "../identity/relay";
 import { resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -112,8 +114,9 @@ function collabLinkHint(host: CollabHost, heading: string, view = false): string
 	const webLink = view ? host.webViewLink : host.webLink;
 	return [
 		theme.fg("success", heading),
-		` ${bullet} ${theme.fg("muted", view ? "Watch from another terminal:" : "Join from another terminal:")} ${APP_NAME} join "${link}"`,
+		` ${bullet} ${theme.fg("muted", view ? "Watch from another terminal:" : "Join from another terminal:")} ${CF_COMMAND} join "${link}"`,
 		` ${bullet} ${theme.fg("muted", "or any web browser:")} ${collabWebLinkClickable(webLink)}`,
+		` ${bullet} ${theme.fg("muted", "If a browser asks for approval:")} coreforge relay authorize <code>`,
 		theme.fg(
 			"dim",
 			view
@@ -668,13 +671,16 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Share session via an encrypted link (share server or secret gist)",
 		handle: async (_command, runtime) => {
 			try {
+				const serverUrl = runtime.settings.get("share.serverUrl") ?? DEFAULT_SHARE_URL;
 				const result = await shareSession(runtime.sessionManager, {
-					serverUrl: runtime.settings.get("share.serverUrl"),
+					serverUrl,
+					getAuthToken: createRelayIdentityTokenProvider(runtime.settings, serverUrl),
 					store: runtime.settings.get("share.store"),
 					state: runtime.session.state,
 					obfuscator: runtime.settings.get("share.redactSecrets") ? runtime.session.obfuscator : undefined,
 				});
 				const lines = [`Share URL: ${result.url}`];
+				lines.push("Browser approval: coreforge relay authorize <code>");
 				if (result.gistUrl) lines.push(`Gist: ${result.gistUrl}`);
 				if (result.truncated) lines.push("Note: large content was trimmed to fit the share size limit.");
 				await runtime.output(lines.join("\n"));

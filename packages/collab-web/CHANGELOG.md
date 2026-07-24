@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added one-time browser authorization and session-token reuse for authenticated Coreforce relay rooms.
+
+### Changed
+
+- Branded the hosted client as Coreforce Agent Collab with the Coreforce hammer mark, moved public URLs to `agent-collab.internal.somahub.io`, and disabled crawler indexing without exposing the internal Coreforge product name.
+
 ## [17.0.8] - 2026-07-22
 
 ### Fixed

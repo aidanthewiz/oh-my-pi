@@ -6,8 +6,10 @@ import { Banners } from "./components/shell/Banners";
 import { Composer } from "./components/shell/Composer";
 import { ConnectScreen } from "./components/shell/ConnectScreen";
 import { HeaderBar } from "./components/shell/HeaderBar";
+import { RelayAuthScreen } from "./components/shell/RelayAuthScreen";
 import { Toasts } from "./components/shell/Toasts";
 import { Transcript } from "./components/transcript/Transcript";
+import { clearRelayBrowserToken, getRelayBrowserToken } from "./lib/auth";
 import { GuestClient } from "./lib/client";
 import { useGuestSnapshot } from "./lib/use-guest";
 import type { ToolRenderHost } from "./tool-render";
@@ -40,11 +42,35 @@ export function App(): ReactNode {
 	const [client, setClient] = useState<GuestClient | null>(null);
 	const [connectError, setConnectError] = useState<string | null>(null);
 	const credsRef = useRef<Creds | null>(null);
+	const [authorizing, setAuthorizing] = useState(false);
+	const [authCode, setAuthCode] = useState<string | null>(null);
 
-	const connect = useCallback((link: string, name: string): void => {
+	const connect = useCallback(async (link: string, name: string): Promise<void> => {
+		const authorize = async (signal?: AbortSignal): Promise<string | undefined> => {
+			setAuthorizing(true);
+			setAuthCode(null);
+			try {
+				return await getRelayBrowserToken(progress => setAuthCode(progress.userCode), signal);
+			} finally {
+				setAuthorizing(false);
+			}
+		};
+		let accessToken: string | undefined;
+		try {
+			accessToken = await authorize();
+		} catch (err) {
+			setConnectError(err instanceof Error ? err.message : String(err));
+			return;
+		}
+		let firstConnection = true;
+		const getAuthToken = async (signal: AbortSignal): Promise<string | undefined> => {
+			if (!firstConnection) return authorize(signal);
+			firstConnection = false;
+			return accessToken;
+		};
 		let next: GuestClient;
 		try {
-			next = new GuestClient(link, name);
+			next = new GuestClient(link, name, getAuthToken);
 		} catch (err) {
 			setConnectError(err instanceof Error ? err.message : String(err));
 			return;
@@ -74,7 +100,10 @@ export function App(): ReactNode {
 
 	const rejoin = useCallback((): void => {
 		const creds = credsRef.current;
-		if (creds) connect(creds.link, creds.name);
+		if (creds) {
+			clearRelayBrowserToken();
+			void connect(creds.link, creds.name);
+		}
 	}, [connect]);
 
 	// Visual Viewport: adjust app height to fit screen space when mobile keyboard opens.
@@ -104,9 +133,10 @@ export function App(): ReactNode {
 	}, [connect]);
 
 	useEffect(() => {
-		if (!client) document.title = "omp collab";
+		if (!client) document.title = "Coreforce Agent Collab";
 	}, [client]);
 
+	if (authorizing) return <RelayAuthScreen userCode={authCode} />;
 	if (!client) {
 		return <ConnectScreen defaultName={storedName()} error={connectError} onConnect={connect} />;
 	}
@@ -149,7 +179,7 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 
 	const title = snap.header?.title ?? snap.state?.sessionName ?? "session";
 	useEffect(() => {
-		document.title = `${title} · omp collab`;
+		document.title = `${title} · Coreforce Agent Collab`;
 	}, [title]);
 
 	const drawerAgent = selectedId != null ? snap.agents.find(a => a.id === selectedId) : undefined;

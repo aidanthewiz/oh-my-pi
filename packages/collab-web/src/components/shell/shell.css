@@ -597,16 +597,12 @@
 }
 
 .sh-lockup-mark {
-	width: 16px;
-	height: 16px;
+	width: 24px;
+	height: 24px;
 	flex: none;
-	background: var(--brand-mark-gradient);
-	border-radius: 4px;
+	display: block;
 }
 
-.sh-lockup-pi {
-	color: var(--accent);
-}
 
 .sh-connect-sub {
 	font-size: 12px;
@@ -669,6 +665,25 @@
 	justify-content: center;
 	padding: 7px 10px;
 	margin-top: 8px;
+}
+
+.sh-auth-code {
+	font-size: 22px;
+	font-weight: 600;
+	letter-spacing: 0.12em;
+	text-align: center;
+}
+
+.sh-auth-command {
+	display: block;
+	padding: 9px;
+	overflow-wrap: anywhere;
+	font: 12px / 1.5 var(--font-mono);
+	color: var(--fg);
+	background: var(--bg-inset);
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	user-select: all;
 }
 
 /* ---- responsive mobile styles ---- */

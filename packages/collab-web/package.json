@@ -3,8 +3,8 @@
   "name": "@oh-my-pi/collab-web",
   "version": "16.3.6",
   "private": true,
-  "description": "Browser guest client and local relay tools for omp collab live sessions",
-  "homepage": "https://omp.sh",
+  "description": "Browser guest client and local relay tools for Coreforce agent collaboration",
+  "homepage": "https://agent-collab.internal.somahub.io",
   "author": "Can Boluk",
   "license": "MIT",
   "repository": {

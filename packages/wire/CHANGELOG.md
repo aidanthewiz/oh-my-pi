@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added relay authentication request/acknowledgement control frames so clients wait for verified identity before exchanging collaboration frames.
+
+### Changed
+
+- Changed the default collaboration and encrypted-share endpoints to `agent-collab.internal.somahub.io`.
+
 ## [16.3.0] - 2026-07-02
 
 ### Breaking Changes
