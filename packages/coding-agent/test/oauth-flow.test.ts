@@ -85,6 +85,29 @@ describe("mcp oauth flow", () => {
 		expect(authUrl.searchParams.get("state")).toBe("test-state");
 	});
 
+	it("uses the configured client name for dynamic client registration", async () => {
+		let registrationPayload: Record<string, unknown> | null = null;
+
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://www.figma.com/oauth/mcp",
+				tokenUrl: "https://api.figma.com/v1/oauth/token",
+				clientName: "Coreforge",
+				fetch: mockFigmaRegistration(payload => {
+					registrationPayload = payload;
+				}),
+			},
+			{},
+		);
+
+		await flow.generateAuthUrl("test-state", "http://127.0.0.1:53174/callback");
+
+		expect(registrationPayload).not.toBeNull();
+		expect((registrationPayload as { client_name?: string } | null)?.client_name).toBe("Coreforge");
+		expect(flow.branding?.displayName).toBe("Coreforge");
+		expect(flow.branding?.iconDataUrl).toStartWith("data:image/svg+xml,");
+	});
+
 	it("includes discovered scopes in dynamic client registration", async () => {
 		let registrationPayload: Record<string, unknown> | null = null;
 		const scopes = "openid profile email offline_access";

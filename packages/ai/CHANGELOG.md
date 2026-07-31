@@ -6,6 +6,7 @@
 
 - Fixed expired AWS IAM Identity Center sessions being retried as generic Anthropic connection failures; credential resolution can now invoke a bounded, single-flight re-authentication callback and preserve actionable AWS errors when recovery fails.
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region.
+- Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 
 ## [17.0.9] - 2026-07-23
 

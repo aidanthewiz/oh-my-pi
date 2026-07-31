@@ -3,7 +3,7 @@
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<title>oh my pi · authentication</title>
+		<title>__OAUTH_BRAND_NAME__ · authentication</title>
 		<style>
 			:root {
 				/* dark, slightly purple-tinted neutrals — never #000 */
@@ -107,7 +107,8 @@
 				gap: 0.5rem;
 				margin-bottom: 2rem;
 			}
-			.brand svg {
+			.brand svg,
+			.brand img {
 				width: 22px;
 				height: 22px;
 			}
@@ -252,17 +253,8 @@
 		<span aria-hidden="true" class="grid-bg"></span>
 		<div id="app" class="container">
 			<div class="brand">
-				<svg viewBox="0 0 64 64" aria-hidden="true">
-					<defs>
-						<linearGradient id="pi-grad" x1="0" y1="0" x2="1" y2="1">
-							<stop offset="0" stop-color="oklch(0.7 0.24 340)" />
-							<stop offset=".5" stop-color="oklch(0.62 0.21 295)" />
-							<stop offset="1" stop-color="oklch(0.81 0.14 200)" />
-						</linearGradient>
-					</defs>
-					<path fill="url(#pi-grad)" d="M10 14h44v9H43v33h-9V23h-9v22h-9V23H10z" />
-				</svg>
-				<span class="wordmark">oh my pi</span>
+				__OAUTH_BRAND_ICON__
+				<span class="wordmark">__OAUTH_BRAND_NAME__</span>
 			</div>
 
 			<div class="mark-wrap">

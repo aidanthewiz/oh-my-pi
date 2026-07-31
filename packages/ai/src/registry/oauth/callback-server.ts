@@ -26,6 +26,48 @@ const CALLBACK_PATH = "/callback";
  */
 const LAUNCH_PATH = "/launch";
 
+const DEFAULT_CALLBACK_BRAND_NAME = "oh my pi";
+const DEFAULT_CALLBACK_BRAND_ICON = `<svg viewBox="0 0 64 64" aria-hidden="true">
+	<defs>
+		<linearGradient id="pi-grad" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0" stop-color="oklch(0.7 0.24 340)" />
+			<stop offset=".5" stop-color="oklch(0.62 0.21 295)" />
+			<stop offset="1" stop-color="oklch(0.81 0.14 200)" />
+		</linearGradient>
+	</defs>
+	<path fill="url(#pi-grad)" d="M10 14h44v9H43v33h-9V23h-9v22h-9V23H10z" />
+</svg>`;
+
+function escapeHtml(value: string): string {
+	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}
+
+function renderCallbackPage(state: object, branding: OAuthCallbackBranding | undefined): string {
+	const displayName = branding?.displayName.trim() || DEFAULT_CALLBACK_BRAND_NAME;
+	const iconDataUrl = branding?.iconDataUrl?.trim();
+	const icon = iconDataUrl
+		? `<img src="${escapeHtml(iconDataUrl)}" alt="" />`
+		: branding
+			? ""
+			: DEFAULT_CALLBACK_BRAND_ICON;
+	const replacements: Record<string, string> = {
+		__OAUTH_STATE__: JSON.stringify(state),
+		__OAUTH_BRAND_NAME__: escapeHtml(displayName),
+		__OAUTH_BRAND_ICON__: icon,
+	};
+	return (templateHtml as unknown as string).replace(
+		/__OAUTH_(?:STATE|BRAND_NAME|BRAND_ICON)__/g,
+		placeholder => replacements[placeholder] ?? placeholder,
+	);
+}
+
+export interface OAuthCallbackBranding {
+	/** Product name shown in the loopback completion page. */
+	displayName: string;
+	/** Optional product icon encoded as an image data URL. */
+	iconDataUrl?: string;
+}
+
 export type CallbackResult = { code: string; state: string };
 
 export interface OAuthCallbackFlowOptions {
@@ -48,6 +90,8 @@ export interface OAuthCallbackFlowOptions {
 	 * an actionable message before opening the browser.
 	 */
 	allowPortFallback?: boolean;
+	/** Optional product branding for the loopback completion page. */
+	branding?: OAuthCallbackBranding;
 	/** Skip the local callback server entirely; the user pastes the code or redirect URL back. */
 	manualInputOnly?: boolean;
 }
@@ -62,6 +106,7 @@ export abstract class OAuthCallbackFlow {
 	callbackHostname: string;
 	redirectUri?: string;
 	allowPortFallback: boolean;
+	readonly branding?: OAuthCallbackBranding;
 	#manualInputOnly: boolean;
 	#callbackResolve?: (result: CallbackResult) => void;
 	#callbackReject?: (error: string) => void;
@@ -94,6 +139,7 @@ export abstract class OAuthCallbackFlow {
 		this.callbackHostname = preferredPortOrOptions.callbackHostname ?? DEFAULT_HOSTNAME;
 		this.redirectUri = preferredPortOrOptions.redirectUri;
 		this.allowPortFallback = preferredPortOrOptions.allowPortFallback ?? true;
+		this.branding = preferredPortOrOptions.branding;
 		this.#manualInputOnly = preferredPortOrOptions.manualInputOnly ?? false;
 	}
 
@@ -345,13 +391,10 @@ export abstract class OAuthCallbackFlow {
 			}
 		});
 
-		return new Response(
-			(templateHtml as unknown as string).replaceAll("__OAUTH_STATE__", JSON.stringify(resultState)),
-			{
-				status: resultState.ok ? 200 : 500,
-				headers: { "Content-Type": "text/html" },
-			},
-		);
+		return new Response(renderCallbackPage(resultState, this.branding), {
+			status: resultState.ok ? 200 : 500,
+			headers: { "Content-Type": "text/html" },
+		});
 	}
 
 	/**

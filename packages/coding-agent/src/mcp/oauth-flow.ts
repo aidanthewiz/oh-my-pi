@@ -11,6 +11,7 @@ import type { OAuthController, OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/ty
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import type { OAuthCredential } from "../session/auth-storage";
+import coreforgeHammerSvg from "./coreforge-hammer.svg" with { type: "text" };
 
 /** Credential-id prefix for OMP-managed MCP OAuth credentials keyed by profile and server URL. */
 const MCP_OAUTH_URL_CREDENTIAL_PREFIX = "mcp_oauth:";
@@ -195,6 +196,8 @@ function staticClientIdFromConfig(config: MCPOAuthConfig): string | undefined {
 	}
 }
 
+const COREFORGE_HAMMER_DATA_URL = `data:image/svg+xml,${encodeURIComponent(coreforgeHammerSvg)}`;
+
 function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOptions {
 	const redirectUri = resolveRedirectUri(config.redirectUri);
 	validateRedirectConfig(config, redirectUri);
@@ -215,6 +218,13 @@ function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOption
 		callbackPath: resolveCallbackPath(config.callbackPath, redirectUri),
 		callbackHostname: resolveCallbackHostname(redirectUri),
 		redirectUri,
+		branding: config.clientName?.trim()
+			? {
+					displayName: config.clientName.trim(),
+					iconDataUrl:
+						config.clientName.trim().toLowerCase() === "coreforge" ? COREFORGE_HAMMER_DATA_URL : undefined,
+				}
+			: undefined,
 		allowPortFallback,
 	};
 }
@@ -279,6 +289,8 @@ export interface MCPOAuthConfig {
 	tokenUrl: string;
 	/** Dynamic client registration endpoint advertised by the authorization server. */
 	registrationUrl?: string;
+	/** Client display name sent during OAuth dynamic client registration. */
+	clientName?: string;
 	/** Client ID (optional when already embedded in authorization URL) */
 	clientId?: string;
 	/** Client secret (optional for PKCE flows) */
@@ -575,7 +587,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 
 		try {
 			const registrationBody: Record<string, unknown> = {
-				client_name: "oh-my-pi",
+				client_name: this.config.clientName?.trim() || "oh-my-pi",
 				redirect_uris: [redirectUri],
 				grant_types: ["authorization_code", "refresh_token"],
 				response_types: ["code"],

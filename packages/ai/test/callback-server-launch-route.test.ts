@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { OAuthCallbackFlow } from "@oh-my-pi/pi-ai/registry/oauth/callback-server";
+import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "@oh-my-pi/pi-ai/registry/oauth/callback-server";
 import type { OAuthAuthInfo, OAuthCredentials } from "@oh-my-pi/pi-ai/registry/oauth/types";
 
 /**
@@ -40,7 +40,7 @@ class LaunchProbeFlow extends OAuthCallbackFlow {
  * Returns the captured auth info, the abort controller (so tests can shut the
  * flow down), and the pending `login` promise (so tests can await teardown).
  */
-async function startFlowAndWaitForAuth(): Promise<{
+async function startFlowAndWaitForAuth(options: Partial<OAuthCallbackFlowOptions> = {}): Promise<{
 	info: OAuthAuthInfo;
 	abort: AbortController;
 	login: Promise<void>;
@@ -54,7 +54,7 @@ async function startFlowAndWaitForAuth(): Promise<{
 			},
 			signal: abort.signal,
 		},
-		{ preferredPort: 0, allowPortFallback: true },
+		{ preferredPort: 0, allowPortFallback: true, ...options },
 	);
 	// Kick off login in the background; tests own its lifetime via `abort`.
 	const login = flow.login().catch(() => undefined) as Promise<void>;
@@ -129,6 +129,42 @@ describe("OAuthCallbackFlow /launch route", () => {
 		expect(html).toContain("You have successfully logged in.<br>You can now close this tab.");
 		expect(html).toContain("Close Window");
 		expect(html).not.toContain("This window will close automatically.");
+		await login;
+	});
+
+	it("serves configured product branding on the callback page", async () => {
+		const iconDataUrl = "data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%201%201%22%3E%3C%2Fsvg%3E";
+		const { info, login } = await startFlowAndWaitForAuth({
+			branding: { displayName: "Coreforge", iconDataUrl },
+		});
+		const authUrl = new URL(info.url);
+		const redirectUri = authUrl.searchParams.get("redirect_uri");
+		const state = authUrl.searchParams.get("state") ?? "";
+
+		const response = await fetch(`${redirectUri}?code=test-code&state=${encodeURIComponent(state)}`);
+		const html = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(html).toContain("<title>Coreforge · authentication</title>");
+		expect(html).toContain('<span class="wordmark">Coreforge</span>');
+		expect(html).toContain(`<img src="${iconDataUrl}" alt="" />`);
+		expect(html).not.toContain("oh my pi");
+		await login;
+	});
+
+	it("renders placeholder-like product names literally", async () => {
+		const displayName = "Coreforge __OAUTH_BRAND_ICON__";
+		const { info, login } = await startFlowAndWaitForAuth({ branding: { displayName } });
+		const authUrl = new URL(info.url);
+		const redirectUri = authUrl.searchParams.get("redirect_uri");
+		const state = authUrl.searchParams.get("state") ?? "";
+
+		const response = await fetch(`${redirectUri}?code=test-code&state=${encodeURIComponent(state)}`);
+		const html = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(html).toContain(`<title>${displayName} · authentication</title>`);
+		expect(html).toContain(`<span class="wordmark">${displayName}</span>`);
 		await login;
 	});
 

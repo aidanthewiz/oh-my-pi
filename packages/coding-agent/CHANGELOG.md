@@ -11,8 +11,6 @@
 ### Changed
 
 - Routed default collaboration and encrypted-share links through `agent-collab.internal.somahub.io` and branded the public browser and share experiences as Coreforce Agent Collab without exposing the internal Coreforge product name.
-- Routed default collaboration and encrypted-share links through the Coreforce-operated GovCloud relay.
-- Routed default collaboration and encrypted-share links through `coreforge-relay.internal.somahub.io` and rebranded the hosted browser and share experiences as Coreforge.
 - Prioritized Claude Opus 5 during automatic slow-model selection.
 - Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
 
@@ -20,21 +18,9 @@
 
 - Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
 - Preserved the employee-selected AWS profile and Region for CLI, SDK, and MCP processes while keeping Coreforge's managed inference profile model-only.
+- Allowed MCP server definitions to brand dynamic registration and the local OAuth completion page, including the Coreforge wordmark and hammer icon.
 
 - Clarified that `coreforge update` must run at the terminal prompt after exiting Coreforge, not as a chat message.
-- Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.
-
-- Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
-- Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
-
-
-### Changed
-
-- Routed default collaboration and encrypted-share links through the Coreforce-operated GovCloud relay.
-### Changed
-
-- Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
-
 - Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.
 
 - Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
@@ -374,6 +360,12 @@
 - Added per-advisor on/off toggle (`enabled: false` in `WATCHDOG.yml`): advisors stay in the roster but their runtime is never built — they show `○` in `/advisor status` rather than disappearing. Existing configs are backward-compatible (defaults to `true` when absent).
 - Colored the status line's advisor `++` badge by roster health (green all running, yellow quota-exhausted, red failed, dim paused); per-advisor glyphs (`●`/`○`/`✕`) show in `/advisor status`.
 - Added real provider quota display (usage percent, window, reset timer) to `/advisor status` and the `/advisor configure` preview.
+### Fixed
+
+- Coreforge managed identity now revalidates AWS IAM Identity Center on every interactive startup, opening `aws sso login` in the same terminal only when the cached session expired. Managed AWS profile adoption also requires the configured account, portal, and role, preventing a broader role in the same account from being injected into the agent.
+
+
+## [17.0.1] - 2026-07-16
 
 ### Changed
 
@@ -432,10 +424,6 @@
 - Fixed Ctrl+L (`app.display.reset`) not refreshing the dark/light theme on certain terminals by issuing a background re-query before repainting.
 - Fixed a failing advisor stalling the primary agent: the per-turn catch-up gate parked the primary for up to its full 30s budget while a broken advisor (unsupported model, dead endpoint, render bug) retried — and an advisor exception could abort the primary's turn-end outright. A failing advisor now releases parked waiters the moment its turn fails (before any async hook), refuses new parks until a turn succeeds, and the turn-end boundary isolates advisor exceptions completely; a failed render restores the delta cursor so nothing is lost when the advisor recovers.
 - Fixed advisors retrying a permanently rejected request forever (e.g. `invalid_request_error: model not supported with this account`): unlike quota exhaustion — which pauses with a notice until an explicit reset — this class notified once and silently kept re-attempting every turn, re-building heavy context in a shared daemon. The runtime now hard-stops after a permanent rejection or three consecutive backlog-drop cycles, with a visible notice; an explicit reset (`/new`, config rebuild, restart) re-enables it. `waitForCatchup` resolves immediately while halted so the primary agent is never parked on a runtime that cannot drain.
-### Fixed
-
-- Coreforge managed identity now revalidates AWS IAM Identity Center on every interactive startup, opening `aws sso login` in the same terminal only when the cached session expired. Managed AWS profile adoption also requires the configured account, portal, and role, preventing a broader role in the same account from being injected into the agent.
-
 
 ## [17.0.1] - 2026-07-16
 

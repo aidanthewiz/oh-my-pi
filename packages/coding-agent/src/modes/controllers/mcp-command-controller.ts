@@ -681,6 +681,7 @@ export class MCPCommandController {
 		clientSecret: string,
 		scopes: string,
 		opts?: {
+			clientName?: string;
 			callbackPort?: number;
 			callbackPath?: string;
 			redirectUri?: string;
@@ -751,6 +752,7 @@ export class MCPCommandController {
 					authorizationUrl: authUrl,
 					tokenUrl: tokenUrl,
 					registrationUrl: opts?.registrationUrl,
+					clientName: opts?.clientName,
 					clientId: resolvedClientId,
 					clientSecret: resolvedClientSecret,
 					scopes: scopes || undefined,
@@ -1753,6 +1755,7 @@ export class MCPCommandController {
 				flowClientSecret,
 				oauth.scopes ?? "",
 				{
+					clientName: found.config.oauth?.clientName,
 					callbackPort: found.config.oauth?.callbackPort,
 					callbackPath: found.config.oauth?.callbackPath,
 					redirectUri: found.config.oauth?.redirectUri,

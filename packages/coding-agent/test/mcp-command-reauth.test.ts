@@ -117,6 +117,7 @@ describe("/mcp auth commands", () => {
 						envserver: {
 							type: "http",
 							url: RAW_SERVER_URL,
+							oauth: { clientName: "Coreforge" },
 						},
 					},
 				},
@@ -186,6 +187,7 @@ describe("/mcp auth commands", () => {
 			new Error(`HTTP 401: WWW-Authenticate: Bearer resource_metadata="${resourceMetadataUrl}"`),
 		);
 		const registrationRequests: string[] = [];
+		const registrationPayloads: Record<string, unknown>[] = [];
 		const fetchMock = Object.assign(
 			async (input: string | URL | Request, init?: RequestInit | BunFetchRequestInit): Promise<Response> => {
 				const url = String(input);
@@ -210,6 +212,7 @@ describe("/mcp auth commands", () => {
 					);
 				}
 				if (url === "https://auth.example.com/auth/v1/oauth/register" && init?.method === "POST") {
+					registrationPayloads.push(JSON.parse(String(init.body)) as Record<string, unknown>);
 					registrationRequests.push(url);
 					return new Response(JSON.stringify({ client_id: "pathful-dcr-client" }), {
 						status: 201,
@@ -238,6 +241,7 @@ describe("/mcp auth commands", () => {
 
 		expect(showError).not.toHaveBeenCalled();
 		expect(registrationRequests).toEqual(["https://auth.example.com/auth/v1/oauth/register"]);
+		expect(registrationPayloads).toEqual([expect.objectContaining({ client_name: "Coreforge" })]);
 		expect(authStorage.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
 			type: "oauth",
 			clientId: "pathful-dcr-client",

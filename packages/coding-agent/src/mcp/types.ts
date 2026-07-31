@@ -69,6 +69,8 @@ interface MCPServerConfigBase {
 	auth?: MCPAuthConfig;
 	/** OAuth configuration for servers requiring explicit client credentials */
 	oauth?: {
+		/** Client display name sent during OAuth dynamic client registration */
+		clientName?: string;
 		clientId?: string;
 		clientSecret?: string;
 		redirectUri?: string;
