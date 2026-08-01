@@ -112,13 +112,13 @@ const nativeAndIntegrationPackages = [
 const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 
 // Repo-level script tests. CI's `workspace` bucket only runs the merge gates:
-// the concurrency regression (the GHA-config guard) and the .d.ts extension
-// rewrite (guards published-type resolution; hermetic temp-dir suite). A local
-// full run also exercises the release-notes and link-omp tests. (A
-// `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
-// silently ignores unmatched filters when at least one other filter matches.)
+// Repo script tests cover the release fail-closed guard, Bazel driver, release
+// helpers, and published-type extension rewriting. A local full run also
+// exercises the release-notes and link-omp tests. (A `ci-test-ts.test.ts` entry
+// used to sit here but the file never existed; Bun silently ignores unmatched
+// filters when at least one other filter matches.)
 const repoScriptTests = [
-	"scripts/ci-concurrency.test.ts",
+	"scripts/release-disabled.test.ts",
 	"scripts/bazel-natives.test.ts",
 	"scripts/ci-release-notes.test.ts",
 	"scripts/ci-release-publish.test.ts",
@@ -350,7 +350,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 						"test",
 						"--parallel=4",
 						...onlyFailuresArgs,
-						"scripts/ci-concurrency.test.ts",
+						"scripts/release-disabled.test.ts",
 						"scripts/bazel-natives.test.ts",
 						"scripts/ci-release-publish.test.ts",
 						"scripts/fix-dts-extensions.test.ts",

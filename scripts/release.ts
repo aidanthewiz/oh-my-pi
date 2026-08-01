@@ -378,10 +378,8 @@ async function cmdRelease(versionOrBump: string): Promise<void> {
 	if (success) {
 		console.log(`=== Released v${version} ===`);
 	} else {
-		// CI's `concurrency` block (.github/workflows/ci.yml) recognizes a
-		// release run by its `chore: bump version to vX.Y.Z` subject (#2564),
-		// so retries that keep that subject also get the per-sha, never-cancel
-		// group. Reword the body, not the subject.
+		// Keep the release subject stable across retries because external release
+		// automation may classify the run from that subject.
 		console.log("\nTo retry after fixing (repeat until CI passes):");
 		console.log(`  git commit -m "chore: bump version to ${version}" -m "<what was fixed>"`);
 		console.log(`  git tag -f v${version}`);
@@ -396,6 +394,12 @@ async function cmdRelease(versionOrBump: string): Promise<void> {
 // =============================================================================
 // Main
 // =============================================================================
+
+const ciWorkflowPath = new URL("../.github/workflows/ci.yml", import.meta.url);
+if (!(await Bun.file(ciWorkflowPath).exists())) {
+	console.error("Release automation is disabled in this repository: .github/workflows/ci.yml is absent.");
+	process.exit(1);
+}
 
 const arg = process.argv[2];
 

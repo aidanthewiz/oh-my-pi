@@ -2,7 +2,7 @@
 
 Builds the pi_natives NAPI cdylib for every shipped target with hermetic
 toolchains, replacing cargo-zigbuild/cargo-xwin/sccache plus the hand-rolled
-CI caches with Bazel's content-addressed action cache (see infra/bazel-remote.yaml).
+CI caches with Bazel's content-addressed action cache.
 
 Layout:
   //:natives-<target>      release-grade renamed .node artifacts (root BUILD.bazel)
@@ -11,7 +11,7 @@ Layout:
   @crates//...             third-party crates from Cargo.lock via crate_universe
 
 The cargo workspace stays authoritative for local iteration (rust-analyzer,
-`cargo nextest`, napi typedef regeneration); Bazel is the artifact and CI
+`cargo nextest`, napi typedef regeneration); Bazel is the artifact build
 pipeline. `crate_universe` derives the Bazel dependency graph directly from
 Cargo.toml/Cargo.lock and the module annotations; no separate repin step is required.
 """

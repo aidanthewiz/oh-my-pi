@@ -228,8 +228,7 @@ async function main(): Promise<void> {
 	} else {
 		const labels = resolveTargetLabels(options.targets, host);
 		const bazel = resolveBazelBinary();
-		// CI hands cache wiring (remote or disk) through a bazelrc fragment so
-		// endpoint composition stays in .github/actions/bazel-cache.
+		// Optional callers may provide cache wiring through a Bazel RC fragment.
 		const rcPath = Bun.env.OMP_BAZEL_RC?.trim();
 		const startupArgs = rcPath ? [`--bazelrc=${rcPath}`] : [];
 

@@ -105,7 +105,7 @@ bazelisk build //:natives-darwin-arm64
 bazelisk build //:natives-linux-all
 ```
 
-The driver runs one `bazel build` for all requested targets, locates outputs via `bazel cquery --output=files` (falling back to the `bazel-bin/natives-<t>/<canonical>.node` path convention), and copies them dereferenced into `--dest` (default `packages/natives/native`). Extra args after `--` go to bazel verbatim. It resolves `bazelisk` (or `bazel`) from `PATH` and honors an `OMP_BAZEL_RC` env var as a `--bazelrc=` startup option (that's how CI injects cache wiring).
+The driver runs one `bazel build` for all requested targets, locates outputs via `bazel cquery --output=files` (falling back to the `bazel-bin/natives-<t>/<canonical>.node` path convention), and copies them dereferenced into `--dest` (default `packages/natives/native`). Extra args after `--` go to bazel verbatim. It resolves `bazelisk` (or `bazel`) from `PATH` and honors an `OMP_BAZEL_RC` env var as a `--bazelrc=` startup option for caller-supplied Bazel configuration.
 
 Building `linux-all` into one dest would clobber gnu addons with musl ones (shared basenames) — the driver refuses; use separate invocations with separate `--dest` dirs.
 
@@ -119,69 +119,17 @@ bun --cwd=packages/natives run build:bindings   # = bun scripts/build-bindings.t
 
 This runs the napi CLI (host-only, local cargo profile) against `crates/pi-natives`, installs the regenerated `index.d.ts`, normalizes the addon filename, and re-renders the explicit ESM exports + runtime enum objects via `gen-enums.ts`. Commit the resulting `index.js`/`index.d.ts` changes.
 
-### Opt-in remote cache (`.bazelrc.user`)
+### Opt-in local cache (`.bazelrc.user`)
 
-`.bazelrc` ends with `try-import %workspace%/.bazelrc.user` (gitignored). The bazel-remote endpoint is cluster-internal only; if you can reach it (VPN/tailnet), wire it read-only:
+`.bazelrc` ends with `try-import %workspace%/.bazelrc.user` (gitignored). Configure local disk and repository caches there:
 
-```
+```text
 # .bazelrc.user
-build --config=cache-ro
-build --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092
-build --tls_certificate=infra/bazel-remote/ca.crt
+build --disk_cache=~/.cache/omp-bazel-disk
+build --repository_cache=~/.cache/omp-bazel-repo
 ```
 
-`cache-ro`/`cache-rw` in `.bazelrc` carry only policy (upload on/off, `--remote_local_fallback`, retries/timeout so a cache outage never fails the build); endpoint + credentials are always composed by the consumer. A plain `--disk_cache=<dir>` line also works fine here.
-
-## CI
-
-### Split Rust validation and addon production
-
-`.github/workflows/ci.yml` separates `rust_validate` from `native_addons`; TypeScript jobs depend only on `native_addons`.
-
-**Pull requests never build or validate Rust.** Native-affecting PRs are rare enough that they don't warrant a PR-side bazel build: `rust_validate` is skipped entirely (`if: github.event_name != 'pull_request'`), and `native_addons` fetches the latest release's Linux x64 addon pair from the `@oh-my-pi/pi-natives-linux-x64` npm leaf, smoke-loads both, and uploads them as the `native-addons` workflow artifact. The loader skips its version sentinel for workspace loads, so release-versioned addons load fine under a newer checkout. A PR whose TypeScript tests depend on changed native behavior fails visibly (and CI emits a notice on any native-touching PR); the Rust side is validated post-merge on main and again at release.
-
-On non-PR events both jobs run on `omp-kata` pods against the cluster remote cache. `rust_validate` runs:
-
-```bash
-bazelisk --bazelrc="$rc" test //crates/...                 # full Rust suite
-# clippy scope mirrors `cargo clippy --workspace` (libraries only), split by
-# lint policy via a query kind filter:
-bazelisk query "kind('rust_library|rust_shared_library', //crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-voice/... + //crates/pi-walker/...)" \
-  | xargs bazelisk --bazelrc="$rc" build --config=clippy-strict --
-bazelisk query "kind('rust_library|rust_shared_library', //crates/... - (…strict set…) - //crates/vendor/brush-core/... - //crates/vendor/brush-builtins/...)" \
-  | xargs bazelisk --bazelrc="$rc" build --config=clippy --
-bazelisk --bazelrc="$rc" build --config=rustfmt //crates/...
-```
-
-- `--config=clippy` = rules_rust clippy aspect + `-Dwarnings`; `--config=clippy-strict` layers the generated `bazel/clippy.bazelrc` for crates with `[lints] workspace = true`.
-- `--config=rustfmt` = rustfmt aspect against the workspace `rustfmt.toml`.
-
-`native_addons` on main builds `//:natives-linux-all` and uploads every `.node` output as the `native-addons` workflow artifact. Downstream jobs use `.github/actions/native-artifacts` to download that artifact and install the requested target set without invoking Bazel.
-
-No toolchain setup steps are required for native jobs: bazelisk is on the GitHub images and baked into the kata runner image; Bazel fetches Rust/zig/LLVM/xwin hermetically.
-
-### Hosted cache warmer
-
-`.github/workflows/bazel-cache-warm.yml` seeds the GitHub-hosted caches that have no other reliable producer: the `release-darwin-*` bazel disk caches (built on the same macOS images as the `release_binary` darwin matrix, so a release's bazel build is the version-bump delta instead of a ~40-min cold graph) and the shared bun store entry PR jobs restore but never save. It triggers only on pushes that can change those archives (crate/bazel/lock inputs, `bun.lock`, `.github/**`).
-
-### `bazel-cache` action (`.github/actions/bazel-cache`)
-
-Single source of truth for cache wiring, emitted as a bazelrc fragment (its `rc` output) that consumers pass via `bazelisk --bazelrc=...` or `OMP_BAZEL_RC`. Two modes are selected via `BAZEL_REMOTE_USER`/`BAZEL_REMOTE_PASSWORD`:
-
-| Runner | Fragment contents |
-| --- | --- |
-| omp-kata pod | `--config=ci --config=cache-rw --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092 --tls_certificate=infra/bazel-remote/ca.crt --remote_header='authorization=Basic <b64 ci creds>'` |
-| GitHub-hosted | `--config=ci --disk_cache=~/.cache/omp-bazel-disk --repository_cache=~/.cache/omp-bazel-repo` |
-
-Hosted disk caches use `bazel-disk-v3-<scope>-<os>-<arch>-<config-hash>-<source-hash>`. The config hash covers Cargo/Bazel/toolchain settings; the source hash covers `crates/**` and root `BUILD.bazel`. Restores fall back from the exact key to the config-scoped prefix, then to a bare `<scope>-<os>-<arch>` prefix — the bare fallback is what keeps release version bumps (which rewrite `Cargo.toml`/`Cargo.lock` and thus the config hash) from rebuilding cold; bazel's content-addressed action keys make a stale archive a partial hit, never a wrong output. An inexact restore permits one refreshed exact-key save, and restored entries untouched for 14 days are pruned so archives don't grow without bound. The remote endpoint resolves only inside the cluster.
-
-### Native artifact actions
-
-`.github/actions/bazel-natives` is the direct builder: `bazel-cache` → `OMP_BAZEL_RC=<rc> bun scripts/bazel-natives.ts <targets> --dest <dest>`, followed by a disk-cache save after a hosted miss. `.github/actions/native-artifacts` is the no-build consumer: download `native-addons` → run the same driver with `--source`.
-
-### Release binary builds and publishing
-
-Binary builds are build-only and run in parallel with the test fan-out. `release_binary` (Linux + Windows matrices) needs only `native_addons`, whose workflow artifact supplies their addons. `release_binary_darwin` needs only `release_metadata` and starts the moment a release run is detected: darwin artifacts cannot be cross-built on Linux, so each macOS leg builds its own architecture through `bazel-natives` with scope `release-<target_id>` (seeded near HEAD by the warm workflow — normally just the version-bump delta), then `bun run ci:release:build-binaries` embeds and compiles the executable. Publishing is held behind `release_gate` (the aggregate of every validation job): `release_native_leaves` downloads all built addons and publishes the five `@oh-my-pi/pi-natives-<tag>` leaves from one linux runner, and the GitHub release / verify / core npm chain runs beside it.
+Remote-cache endpoints and credentials must remain in the user-specific file; the repository commits neither.
 
 ## Debugging playbook
 
@@ -224,10 +172,8 @@ bazelisk build --nobuild //:natives-win32-x64-baseline
 
 ### Cache behavior
 
-- **omp-kata:** read-write gRPC to the in-cluster bazel-remote (`grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092`, TLS via the committed `infra/bazel-remote/ca.crt`, htpasswd user `ci`). `--remote_local_fallback` plus retries make an outage degrade to local execution rather than fail the build.
-- **GitHub-hosted:** no cluster access; only the darwin release/warm jobs build with bazel here. The v3 `actions/cache` disk key separates config and source generations with prefix + bare fallbacks (see the `bazel-cache` action section above); `.github/workflows/bazel-cache-warm.yml` publishes the `release-darwin-*` archives from the same macOS images as the release consumers.
-- **msvc repos:** the ~2 GiB LLVM download is sha256-pinned and repository-cache backed; the ~1 GiB xwin CRT/SDK splat is fetched from the Microsoft CDN inside the repo rule and is **not** repo-cache backed — a cold output base re-downloads it. Microsoft advances the VS channel payload over time, so remote-cache hit rates for win32 actions degrade gracefully after an MS bump (same property the previous cross toolchain had). Win32 link actions also don't share cache entries across host OSes (linux vs mac clang binaries).
-- Server-side operations (deploy, TLS/auth, egress, poisoning boundary): `infra/docs/04-arc-and-caching.md` §5.
+- Optional local disk and repository caches are configured in `.bazelrc.user`.
+- **msvc repositories:** the LLVM download is SHA-256 pinned and repository-cache backed. The xwin CRT/SDK payload comes from the Microsoft CDN and is not repository-cache backed. Microsoft can advance that payload, so remote-cache hit rates may decrease after an update. Win32 link actions also do not share cache entries across host operating systems.
 
 ## Target/variant model and naming conventions
 
