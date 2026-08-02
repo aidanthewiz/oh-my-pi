@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	groupCoreforceCommitSubjects,
 	parseCoreforceVersion,
+	RELEASE_BODY_BUDGET,
 	renderCoreforceReleaseNotes,
 	selectCoreforceRangeBase,
 	selectPreviousCoreforceTag,
@@ -83,5 +84,52 @@ describe("Coreforce release body", () => {
 		expect(body).toContain("compare/v17.0.2.3...v17.0.9.1");
 		expect(body).toContain("compare/v17.0.2...v17.0.9");
 		expect(body).toContain("engine.lock");
+	});
+
+	it("compacts oversized upstream details without dropping release metadata", () => {
+		const groups = groupCoreforceCommitSubjects(["feat(models): add managed model routing (#14)"]);
+		const upstreamNotes = `## @oh-my-pi/pi-ai\n\n### Changed\n\n${Array.from(
+			{ length: 2_000 },
+			(_, index) => `- Upstream detail ${index}: ${"x".repeat(80)}`,
+		).join("\n")}`;
+		const body = renderCoreforceReleaseNotes({
+			currentTag: "v17.2.4.1",
+			currentSha: "0123456789abcdef",
+			previousTag: "v17.0.9.20",
+			coreforceGroups: groups,
+			upstreamNotes,
+		});
+
+		expect(body.length).toBeLessThanOrEqual(RELEASE_BODY_BUDGET);
+		expect(body).toContain("Add managed model routing");
+		expect(body).toContain("Detailed upstream notes are omitted");
+		expect(body).not.toContain("Upstream detail 1999");
+		expect(body).toContain("compare/v17.0.9...v17.2.4");
+		expect(body).toContain("engine.lock");
+	});
+
+	it("falls back to linked summaries when every detailed section is oversized", () => {
+		const coreforceGroups = {
+			"Breaking Changes": [],
+			Security: [],
+			Added: Array.from({ length: 2_000 }, (_, index) => `Coreforce detail ${index}: ${"x".repeat(80)}`),
+			Changed: [],
+			Fixed: [],
+			Maintenance: [],
+		};
+		const body = renderCoreforceReleaseNotes({
+			currentTag: "v17.2.4.1",
+			currentSha: "0123456789abcdef",
+			previousTag: "v17.0.9.20",
+			coreforceGroups,
+			upstreamNotes: `## @oh-my-pi/pi-ai\n\n### Changed\n\n- ${"y".repeat(RELEASE_BODY_BUDGET)}`,
+		});
+
+		expect(body.length).toBeLessThanOrEqual(RELEASE_BODY_BUDGET);
+		expect(body).not.toContain("## Highlights");
+		expect(body).toContain("Detailed Coreforce changes are omitted");
+		expect(body).toContain("Detailed upstream notes are omitted");
+		expect(body).toContain("Coreforce full changelog");
+		expect(body).toContain("Upstream full changelog");
 	});
 });
