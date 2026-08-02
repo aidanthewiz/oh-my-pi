@@ -111,15 +111,14 @@ const nativeAndIntegrationPackages = [
 // and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 
-// Repo-level script tests. CI's `workspace` bucket only runs the merge gate:
-// the .d.ts extension rewrite (guards published-type resolution; hermetic
-// temp-dir suite). A local full run also exercises the release-notes and
-// link-omp tests. (The upstream ci.yml concurrency regression test was
-// removed with the upstream workflows on this mirror; a `ci-test-ts.test.ts`
-// entry used to sit here but the file never existed — bun silently ignores
-// unmatched filters when at least one other filter matches.)
+// Repo-level script tests cover the CoreForge release channel, Bazel driver,
+// release helpers, and published-type extension rewriting. A local full run also
+// exercises the release-notes and link-omp tests. (A `ci-test-ts.test.ts` entry
+// used to sit here but the file never existed; Bun silently ignores unmatched
+// filters when at least one other filter matches.)
 const repoScriptTests = [
-	"scripts/ci-build-native.test.ts",
+	"scripts/cf-release-notes.test.ts",
+	"scripts/bazel-natives.test.ts",
 	"scripts/ci-release-notes.test.ts",
 	"scripts/ci-release-publish.test.ts",
 	"scripts/fix-dts-extensions.test.ts",
@@ -146,7 +145,6 @@ const codingAgentSingletonPathPatterns = [
 const codingAgentUiPathPatterns = [
 	/^test\/modes\//,
 	/^test\/(interactive-mode|main-interactive|input-controller|streaming|status-line|keybindings|editor|hook|theme|setup-wizard|job-renderer|tool-args-reveal|tool-execution)[^/]*\.test\.ts$/,
-	/^src\/modes\/components\//,
 ];
 
 const codingAgentRuntimePathPatterns = [
@@ -298,10 +296,7 @@ function classifyCodingAgentTest(testFile: string, content: string): CodingAgent
 async function getCodingAgentTestPartition(): Promise<CodingAgentTestPartition> {
 	codingAgentTestPartitionPromise ??= (async () => {
 		const codingAgentDir = path.join(repoRoot, "packages/coding-agent");
-		const testFiles = [
-			...(await collectTestsUnder(path.join(codingAgentDir, "test"), codingAgentDir)),
-			...(await collectTestsUnder(path.join(codingAgentDir, "src"), codingAgentDir)),
-		].sort();
+		const testFiles = (await collectTestsUnder(path.join(codingAgentDir, "test"), codingAgentDir)).sort();
 		const partition: CodingAgentTestPartition = {
 			singleton: [],
 			ui: [],
@@ -354,7 +349,8 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 						"test",
 						"--parallel=4",
 						...onlyFailuresArgs,
-						"scripts/ci-build-native.test.ts",
+						"scripts/cf-release-notes.test.ts",
+						"scripts/bazel-natives.test.ts",
 						"scripts/ci-release-publish.test.ts",
 						"scripts/fix-dts-extensions.test.ts",
 					],
@@ -408,16 +404,15 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	}
 }
 
-// The omp-kata runner pods inject sccache S3 credentials (`AWS_*`) and config
-// (`SCCACHE_*`) pod-wide via `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
+// The omp-kata runner pods may inject cloud credentials (`AWS_*`) pod-wide via
+// `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
 // and a host may carry provider API keys. Any of these make env-sensitive code
 // non-deterministic in tests — e.g. leaked AWS creds make `amazon-bedrock` look
 // authenticated and win the provider startup fallback over `anthropic`. Run the
 // suites in a hermetic environment with all credential / cloud-config variables
 // stripped so resolution depends only on the test's own fixtures.
-const SCRUBBED_ENV_PREFIXES = ["AWS_", "SCCACHE_", "GOOGLE_CLOUD_"];
+const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_"];
 const SCRUBBED_ENV_NAMES = new Set([
-	"RUSTC_WRAPPER",
 	"GITHUB_TOKEN",
 	"GH_TOKEN",
 	"COPILOT_GITHUB_TOKEN",
@@ -471,9 +466,9 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 	}
 }
 
-// Child env shared by every spawned test process: the parent env with all CI
-// credential / cloud-config variables scrubbed (see SCRUBBED_ENV_* above) and
-// GITHUB_ACTIONS cleared so suites resolve only against their own fixtures.
+// Child env shared by every spawned test process: the parent env with the
+// private test-runtime marker set, all CI credential / cloud-config variables
+// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -497,6 +492,7 @@ function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
+		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};
@@ -559,6 +555,7 @@ function isCI(): boolean {
 // memory-constrained laptop), or `all`/`max` to launch every chunk at once.
 function testConcurrency(total: number): number {
 	const raw = Bun.env.OMP_TEST_CONCURRENCY?.trim().toLowerCase();
+	if (!raw) return Math.min(Math.max(1, os.availableParallelism()), total);
 	if (raw === "all" || raw === "max") {
 		return total;
 	}
@@ -566,7 +563,7 @@ function testConcurrency(total: number): number {
 	if (Number.isFinite(override) && override >= 1) {
 		return Math.min(Math.floor(override), total);
 	}
-	return Math.min(Math.max(1, os.availableParallelism()), total);
+	throw new Error(`Invalid OMP_TEST_CONCURRENCY=${JSON.stringify(raw)}; expected a positive integer, all, or max`);
 }
 
 // ANSI styling for interactive runs only; disabled when stdout is not a TTY or
@@ -889,9 +886,11 @@ if (import.meta.main) {
 	}
 
 	const testCommands = await commandsForMode(requestedMode as Mode);
-	// Outside CI, fan the independent chunk processes out across cores; CI keeps the
-	// sequential, fail-fast path so each memory-capped runner job stays bounded.
-	if (!isDryRun && !isCI() && testCommands.length > 1) {
+	const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
+	// CI defaults to one process at a time, but memory-sized workflow buckets
+	// explicitly opt into bounded process concurrency. Local runs fan out by
+	// default and may use the same override.
+	if (!isDryRun && testCommands.length > 1 && (!isCI() || explicitConcurrency)) {
 		await runTestCommandsInParallel(testCommands, testConcurrency(testCommands.length));
 	} else {
 		for (const testCommand of testCommands) {

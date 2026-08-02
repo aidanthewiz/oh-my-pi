@@ -4,12 +4,8 @@
 
 import type { Api, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { ConfigFile } from "./config-file";
-import {
-	type ModelsConfig,
-	ModelsConfigSchema,
-	type ProviderAuthMode,
-	type ProviderDiscovery,
-} from "./models-config-schema";
+import type { ModelsConfig, ProviderAuthMode, ProviderDiscovery } from "./models-config-schema";
+import { getModelsConfigSchema } from "./models-config-schema-bundle";
 
 export type ProviderValidationMode = "models-config" | "runtime-register";
 
@@ -142,15 +138,15 @@ const validateModelsConfig = (config: ModelsConfig): void => {
 	}
 };
 
-export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsConfigSchema).withValidation(
-	"models",
-	validateModelsConfig,
-);
+export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", {
+	kind: "deferred",
+	resolve: getModelsConfigSchema,
+}).withValidation("models", validateModelsConfig);
 
 // Org-managed overlay (see MANAGED_MODELS_FILENAME). A distinct id ("models.managed")
 // gives it its own default path `<agentDir>/models.managed.yml` and its own
 // migration/cache slot, so it never collides with the user's `models.yml`.
-export const ManagedModelsConfigFile = new ConfigFile<ModelsConfig>(
-	"models.managed",
-	ModelsConfigSchema,
-).withValidation("models.managed", validateModelsConfig);
+export const ManagedModelsConfigFile = new ConfigFile<ModelsConfig>("models.managed", {
+	kind: "deferred",
+	resolve: getModelsConfigSchema,
+}).withValidation("models.managed", validateModelsConfig);

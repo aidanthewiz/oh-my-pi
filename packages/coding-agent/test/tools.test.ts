@@ -237,7 +237,7 @@ function createTestToolSession(
 		getArtifactsDir: () => sessionDir,
 		allocateOutputArtifact: async (toolType: string) => {
 			fs.mkdirSync(sessionDir, { recursive: true });
-			const id = `artifact-${++artifactCounter}`;
+			const id = String(++artifactCounter);
 			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
 		},
 		settings,
@@ -635,6 +635,66 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
 			expect(result.details?.truncation?.totalLines).toBe(3500);
 			expect(result.details?.truncation?.outputLines).toBe(defaultLimit);
+		});
+
+		it("should spill oversized read output to an artifact", async () => {
+			const testFile = path.join(testDir, "oversized-read.txt");
+			const line = "0123456789".repeat(20);
+			fs.writeFileSync(testFile, `${Array.from({ length: 3500 }, () => line).join("\n")}\n`);
+			const spillSettings = Settings.isolated({
+				"tools.artifactSpillThreshold": 20,
+				"tools.artifactTailBytes": 1,
+				"tools.artifactTailLines": 10,
+				"tools.artifactHeadBytes": 1,
+			});
+			const defaultLimit = spillSettings.get("read.defaultLimit");
+			const spillManager = SessionManager.create(testDir, path.join(testDir, "spill-sessions"));
+			await spillManager.ensureOnDisk();
+			const spillSession = createTestToolSession(testDir, spillSettings, {
+				getSessionFile: () => spillManager.getSessionFile() ?? null,
+				getArtifactsDir: () => spillManager.getArtifactsDir(),
+				localProtocolOptions: {
+					getArtifactsDir: () => spillManager.getArtifactsDir(),
+					getSessionId: () => spillManager.getSessionId(),
+				},
+			});
+			const spillReadTool = wrapToolWithMetaNotice(new ReadTool(spillSession));
+			const context = {
+				...createTestToolContext(["read"]),
+				settings: spillSettings,
+				sessionManager: spillManager,
+			};
+
+			try {
+				const result = await spillReadTool.execute(
+					"test-call-read-spill",
+					{ path: testFile },
+					undefined,
+					undefined,
+					context,
+				);
+				const truncation = result.details?.meta?.truncation;
+				const output = getTextOutput(result);
+
+				expect(truncation?.artifactId).toBeDefined();
+				expect(Buffer.byteLength(output, "utf-8")).toBeLessThan(20 * 1024);
+				expect(output).toContain("artifact://");
+				expect(truncation?.nextOffset).toBe(defaultLimit + 1);
+				expect(output).toContain(`Use :${defaultLimit + 1} to continue`);
+
+				const saveArtifact = vi.spyOn(spillManager, "saveArtifact");
+				const artifactResult = await spillReadTool.execute(
+					"test-call-read-spilled-artifact",
+					{ path: `artifact://${truncation?.artifactId}` },
+					undefined,
+					undefined,
+					context,
+				);
+				expect(getTextOutput(artifactResult)).toContain(line);
+				expect(saveArtifact).not.toHaveBeenCalled();
+			} finally {
+				await spillManager.close();
+			}
 		});
 
 		it("should render directories as a two-level tree without capping root entries", async () => {
@@ -1450,7 +1510,6 @@ function b() {
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
 			expect(getTextOutput(result)).toContain("Backgrounded as job");
-			expect(getTextOutput(result)).toContain("start");
 
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
@@ -1463,8 +1522,62 @@ function b() {
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
+			expect(deliveries[0]?.text).toContain("start");
 			expect(deliveries[0]?.text).toContain("done");
 			expect(updates).toEqual(updatesAtBackground);
+			await asyncJobManager.dispose();
+		});
+
+		it("backgrounds a running command when the steering signal fires mid-wait", async () => {
+			const asyncJobManager = new AsyncJobManager({});
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated({
+							"bash.autoBackground.enabled": true,
+							// High threshold: only the steering signal can background this.
+							"bash.autoBackground.thresholdMs": 60_000,
+						}),
+						{
+							getSessionId: () => "test-session",
+							asyncJobManager,
+						},
+					),
+				),
+			);
+
+			const steering = new AbortController();
+			steering.abort();
+			const result = await autoBackgroundBashTool.execute(
+				"test-call-steer-background",
+				{ command: "printf 'start\\n'; sleep 0.05; printf 'done\\n'" },
+				undefined,
+				undefined,
+				{
+					...createTestToolContext([]),
+					toolCall: {
+						batchId: "batch-1",
+						index: 0,
+						total: 1,
+						toolCalls: [{ id: "test-call-steer-background", name: "bash" }],
+						steeringSignal: steering.signal,
+					},
+				},
+			);
+
+			// The steer backgrounds the command instead of killing it: the call
+			// returns a running job and the command finishes on its own.
+			expect(result.details?.async?.state).toBe("running");
+			expect(getTextOutput(result)).toContain("Backgrounded early to handle an incoming message");
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) {
+				throw new Error("expected a steer-backgrounded job id");
+			}
+			const job = asyncJobManager.getJob(jobId);
+			expect(job?.status).toBe("running");
+			await job?.promise;
+			expect(asyncJobManager.getJob(jobId)?.status).toBe("completed");
 			await asyncJobManager.dispose();
 		});
 

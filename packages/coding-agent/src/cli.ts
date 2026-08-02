@@ -17,11 +17,19 @@ try {
 import { parentPort } from "node:worker_threads";
 import type { CliConfig } from "@oh-my-pi/pi-utils/cli";
 import { APP_NAME, getActiveProfile, MIN_BUN_VERSION, resolveProfileEnv, setProfile } from "@oh-my-pi/pi-utils/dirs";
-import { declareWorkerHostEntry, installWorkerInbox } from "@oh-my-pi/pi-utils/worker-host";
+import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
+import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
+import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { CF_COMMAND, CF_VERSION } from "./cli/cf-version";
 import { installProfileAlias, resolveProfileAliasCommandFromProcess } from "./cli/profile-alias";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import { startJsEvalProcess } from "./eval/js/process-entry";
+import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
+import { TERMINAL_OUTPUT_WORKER_ARG } from "./launch/terminal-output-worker-protocol";
+import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
+import { smokeTestComputerWorker } from "./tools/computer/supervisor";
+import { startComputerWorker } from "./tools/computer/worker-entry";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -30,7 +38,7 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.exit(1);
 }
 
-process.title = APP_NAME;
+setProcessName(APP_NAME);
 
 // `Bun.build`-API compiled Windows executables report `import.meta.main ===
 // false`: the standalone loader keys the entry module with native backslashes
@@ -73,8 +81,9 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestTtsWorker } = await import("./tts/tts-client");
 	const { smokeTestMnemopiEmbedWorker } = await import("./mnemopi/embed-client");
 	const { smokeTestJsEvalWorker } = await import("./eval/js/context-manager");
-	// Smoke dependencies stay lazy so normal CLI startup does not load worker clients.
+	// Other smoke dependencies stay lazy so normal CLI startup does not load their worker clients.
 	const { smokeTestDaemonBroker } = await import("./launch/client");
+	const { smokeTestTerminalOutputWorker } = await import("./launch/terminal-output-worker-client");
 	await smokeTestSyncWorker();
 
 	const statsServer = await startServer(0);
@@ -92,9 +101,11 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestTinyTitleWorker();
 	await smokeTestSttWorker();
 	await smokeTestJsEvalWorker();
+	await smokeTestComputerWorker();
 	await smokeTestTtsWorker();
 	await smokeTestMnemopiEmbedWorker();
 	await smokeTestDaemonBroker();
+	await smokeTestTerminalOutputWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -120,7 +131,7 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		// spawning (the smoke ping, the first parse request) would be dropped.
 		// Park early events and replay them once the module's handler is live.
 		// Worker-thread entries using `parentPort` need the same sync-prefix
-		// buffering; the tab/eval cases install that inbox below before import.
+		// buffering; the computer/tab/eval cases install that inbox below.
 		const scope = globalThis as unknown as { onmessage: ((event: MessageEvent) => void) | null };
 		const pending: MessageEvent[] = [];
 		const buffer = (event: MessageEvent): void => {
@@ -135,15 +146,18 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		return true;
 	}
 	// Bun flushes messages the parent posted before spawn once this entry's
-	// top-level evaluation completes, delivering them only to listeners present
-	// at that moment. These worker modules are imported dynamically below, so
-	// their own `parentPort.on("message")` lands after the flush and the parent's
-	// synchronous `init` is dropped. Install a buffering inbox synchronously here
-	// (still inside the entry's sync prefix) so the handshake survives; the worker
-	// module binds the real handler once loaded.
+	// top-level evaluation completes. Install a buffering inbox synchronously
+	// before binding the selected worker's real handler so the parent's
+	// synchronous `init` survives. The dynamically imported tab/eval modules
+	// consume the same inbox after their module evaluation begins.
 	if (arg === TAB_WORKER_ARG) {
 		if (parentPort) installWorkerInbox(parentPort);
 		await import("./tools/browser/tab-worker-entry");
+		return true;
+	}
+	if (arg === COMPUTER_WORKER_ARG) {
+		if (parentPort) installWorkerInbox(parentPort);
+		startComputerWorker();
 		return true;
 	}
 	if (arg === JS_EVAL_WORKER_ARG) {
@@ -152,11 +166,15 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		return true;
 	}
 	if (arg === JS_EVAL_PROCESS_ARG) {
-		const { startJsEvalProcess } = await import("./eval/js/process-entry");
+		// The bootstrap-safe interceptor seam is linked statically so this selector
+		// cannot load profile-scoped environment state after dispatch has begun.
 		// The JS evaluator forwards user-controlled payloads (tool-call args,
 		// display outputs); a non-serializable one must fail that cell, not
 		// SIGKILL the kernel and erase the eval session's state.
-		await runIpcSubprocessWorker(startJsEvalProcess, { rethrowConnectedSendErrors: true });
+		await runIpcSubprocessWorker<JsWorkerInbound, JsWorkerOutbound>(
+			transport => startJsEvalProcess(transport, interceptUnhandledRejections),
+			{ rethrowConnectedSendErrors: true },
+		);
 		return true;
 	}
 	if (arg === STT_WORKER_ARG) {
@@ -172,6 +190,12 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 	if (arg === MNEMOPI_EMBED_WORKER_ARG) {
 		const { startMnemopiEmbedWorker } = await import("./mnemopi/embed-worker");
 		await runIpcSubprocessWorker(startMnemopiEmbedWorker);
+		return true;
+	}
+	if (arg === TERMINAL_OUTPUT_WORKER_ARG) {
+		if (parentPort) installWorkerInbox(parentPort);
+		// This selector is the isolation boundary; a static import would evaluate xterm in normal CLI startup.
+		await import("./launch/terminal-output-worker");
 		return true;
 	}
 	if (arg === DAEMON_BROKER_WORKER_ARG) {
@@ -331,7 +355,7 @@ export async function runCli(argv: string[]): Promise<void> {
 	// synchronous prefix of `runWorkerEntrypoint`, and Bun flushes the
 	// worker's parked initial messages as soon as the entry module's
 	// top-level evaluation finishes.
-	if (resolvedArgv[0]?.startsWith("__omp_worker_")) {
+	if (isWorkerHostSelector(resolvedArgv[0])) {
 		const dispatched = await runWorkerEntrypoint(resolvedArgv[0]);
 		if (!dispatched) {
 			process.stderr.write(`Error: unknown worker selector: ${resolvedArgv[0]}\n`);

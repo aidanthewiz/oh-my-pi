@@ -3,6 +3,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
+	MANAGED_AWS_MODEL_AUTH_MODE,
+} from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ensureCoreforgeAwsSso } from "@oh-my-pi/pi-coding-agent/identity/aws-sso";
 import {
@@ -173,8 +179,11 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(true);
 		expect(result.identityAvailable).toBe(true);
-		expect(env.AWS_PROFILE).toBe("somacommercial");
-		expect(env.AWS_REGION).toBe("us-east-1");
+		expect(env.AWS_PROFILE).toBeUndefined();
+		expect(env.AWS_REGION).toBeUndefined();
+		expect(env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("somacommercial");
+		expect(env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
 		expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe("wrkspc_test");
 		expect(env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 	});
@@ -192,13 +201,12 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 			},
 		});
 		applyCoreforgeIdentityProviderDefaults(settings, env, () => profile);
-		expect(env.AWS_PROFILE).toBe("my-own-name");
+		expect(env.AWS_PROFILE).toBeUndefined();
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("my-own-name");
 	});
 
-	it("clears ambient model-auth envs (incl. the AWS chain) and overwrites with managed values when signed in", () => {
+	it("clears ambient model-auth envs while preserving the operational AWS chain", () => {
 		const settings = identitySettings();
-		// Every ambient path a user might have exported pre-Entra, including the
-		// generic AWS chain that SigV4-authenticates the AWS model providers.
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-ant-stale",
 			ANTHROPIC_WORKSPACE_ID: "ws-stale",
@@ -214,30 +222,29 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 			PERPLEXITY_API_KEY: "pplx-keep",
 		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
-		// Managed values win (force-set, not only-missing).
-		expect(env.AWS_PROFILE).toBe("somacommercial");
+
+		expect(env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("somacommercial");
+		expect(env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
 		expect(env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 		expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe("wrkspc_test");
-		// Direct provider keys and the AWS chain that has no managed replacement
-		// are removed so they cannot authenticate AWS models or shadow the SSO profile.
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.ANTHROPIC_WORKSPACE_ID).toBeUndefined();
 		expect(env.OPENAI_API_KEY).toBeUndefined();
 		expect(env.OPENAI_AWS_API_KEY).toBeUndefined();
 		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
-		expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
-		expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
-		expect(env.AWS_CONFIG_FILE).toBeUndefined();
-		expect(env.AWS_SHARED_CREDENTIALS_FILE).toBeUndefined();
-		expect(result.clearedKeys).toContain("AWS_ACCESS_KEY_ID");
-		expect(result.clearedKeys).toContain("AWS_CONFIG_FILE");
-		expect(result.clearedKeys).toContain("AWS_SHARED_CREDENTIALS_FILE");
 		expect(result.clearedKeys).toContain("OPENAI_API_KEY");
-		// Non-model credentials are untouched.
+
+		expect(env.AWS_PROFILE).toBe("user-profile");
+		expect(env.AWS_ACCESS_KEY_ID).toBe("AKIASTALE");
+		expect(env.AWS_SECRET_ACCESS_KEY).toBe("secretstale");
+		expect(env.AWS_CONFIG_FILE).toBe("/home/dev/.aws/other-config");
+		expect(env.AWS_SHARED_CREDENTIALS_FILE).toBe("/home/dev/.aws/other-creds");
+		expect(result.clearedKeys).not.toContain("AWS_ACCESS_KEY_ID");
 		expect(env.PERPLEXITY_API_KEY).toBe("pplx-keep");
 	});
 
-	it("clears ambient model-auth envs even when provisioned but NOT signed in (envs never authenticate AWS models)", () => {
+	it("blocks ambient model auth before sign-in without changing operational AWS credentials", () => {
 		const settings = identitySettings();
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-ant-stale",
@@ -249,12 +256,12 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => undefined);
 		expect(result.entraProvisioned).toBe(true);
 		expect(result.identityAvailable).toBe(false);
-		expect(result.appliedKeys).toEqual([]);
-		// Nothing signed in, so no managed values are injected — but the ambient
-		// model-auth path is still cleared, so no AWS model can authenticate.
+		expect(result.appliedKeys).toEqual([AWS_MODEL_AUTH_MODE_ENV]);
+		expect(env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
-		expect(env.AWS_PROFILE).toBeUndefined();
+		expect(env.AWS_PROFILE).toBe("user-profile");
 		expect(env.GITHUB_TOKEN).toBe("ghp-keep");
 	});
 
@@ -280,10 +287,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env.ANTHROPIC_API_KEY).toBe("sk-keep");
 	});
 
-	it("still clears ambient model-auth envs when a signed-in identity hits a malformed managed value", () => {
-		// Entra provisioned + signed in, but the overlay ships a bad claude
-		// baseUrl so resolveCoreforgeClaudeConfig throws. The clear MUST still
-		// run — provisioned Entra can never leave ambient AWS-model auth live.
+	it("still blocks ambient model auth when a signed-in identity hits a malformed managed value", () => {
 		const settings = identitySettings({ "identity.claude.baseUrl": "https://not-the-gateway.example.com" });
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-stale",
@@ -292,11 +296,12 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(true);
-		expect(result.appliedKeys).toEqual([]); // nothing injected — resolve threw
+		expect(result.appliedKeys).toEqual([AWS_MODEL_AUTH_MODE_ENV]);
+		expect(env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
-		expect(env.AWS_PROFILE).toBeUndefined();
 		expect(env.OPENAI_AWS_API_KEY).toBeUndefined();
-		// The diagnostic is returned (not swallowed) so startup can surface it.
+		expect(env.AWS_PROFILE).toBe("user-profile");
 		expect(result.configError).toContain("Invalid managed Claude Platform on AWS URL");
 	});
 });

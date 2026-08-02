@@ -115,6 +115,8 @@ Ask for a rename and you get a rename. The call goes through workspace/willRenam
 
 ![omp TUI: `LSP references` returns five hits across three files for the symbol `formatBytes`, then `LSP rename` applies the change with edits to format.ts/report.ts/cli.ts, then a `Search formatBytes 0 matches` confirmation. Final line: 'Rename complete. Five edits across three files…'.](https://omp.sh/captures/lsp.webp)
 
+_[Read the LSP config docs](docs/lsp-config.md)_
+
 ### 03 · Drives a real debugger
 
 A C binary segfaults: the agent attaches lldb, steps to the bad pointer, reads the frame. A Go service hangs: it attaches dlv and walks the goroutines. A Python process is wedged: debugpy, pause, inspect, evaluate. Most agents are still sprinkling print statements.
@@ -290,6 +292,13 @@ Three standalone, lowercase words opt a turn into specialized agent behavior:
 
 They trigger only in prose, not inside code spans, fenced code blocks, XML/HTML sections, identifiers, or paths. See [Magic keywords](docs/magic-keywords.md) for exact matching rules and configuration.
 
+### Session controls
+
+Slash commands shift how a whole session runs:
+
+- `/vibe` — enter [Vibe mode](docs/vibe-mode.md): act as a director driving persistent `fast`/`good` worker sessions with a `read`-only toolset.
+- `/fresh` — reset the provider stream state (stale prompt cache, wedged stream) without changing the local transcript. See [Session operations](docs/session-operations-export-share-fork-resume.md#fresh).
+
 ## Forty-plus providers, hundreds of models, _one /model away_.
 
 Roles route work by intent. `default` for normal turns. `smol` for cheap subagent fan-out. `slow` for deep reasoning. `plan` for plan mode. `commit` for changelogs. Override at launch with `--smol`, `--slow`, or `--plan`; cycle through the configured models for the active role with `Ctrl+P`. Swap the active model mid-session with the `/model` slash command.
@@ -385,6 +394,8 @@ Twenty-five backends. Pin one, or let `auto` walk the chain in order.
 | `ecosia`     | no key (browser)       |
 | `mojeek`     | no key (browser)       |
 | `public`     | no key (all of the above, consolidated) |
+
+Exa also accepts a stored API key through `/login exa`; explicit keyless selection uses the public MCP fallback.
 
 ### Specialised handlers
 
