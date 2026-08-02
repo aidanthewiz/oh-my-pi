@@ -5,6 +5,8 @@ import { mergePackageSection } from "./ci-release-notes";
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const DEFAULT_REPOSITORY = "Coreforce-CAD/oh-my-pi";
 const DEFAULT_UPSTREAM_REPOSITORY = "can1357/oh-my-pi";
+const GITHUB_RELEASE_BODY_LIMIT = 125_000;
+export const RELEASE_BODY_BUDGET = 120_000;
 
 export interface CoreforceVersion {
 	tag: string;
@@ -202,52 +204,75 @@ export function renderCoreforceReleaseNotes(options: {
 	const upstreamRepository = options.upstreamRepository ?? DEFAULT_UPSTREAM_REPOSITORY;
 	const coreforceHighlights = collectCoreforceHighlights(options.coreforceGroups, 6);
 	const upstreamHighlights = collectMarkdownHighlights(options.upstreamNotes, 8);
-	const sections: string[] = [
-		`Coreforge engine \`${current.tag}\` combines oh-my-pi \`v${current.upstream}\` with Coreforce-managed identity, model, policy, and release capabilities.`,
-	];
-
-	const highlightSections: string[] = [];
-	if (coreforceHighlights.length > 0) {
-		highlightSections.push(`### Coreforce\n\n${coreforceHighlights.map(entry => `- ${entry}`).join("\n")}`);
-	}
-	if (upstreamHighlights.length > 0) {
-		highlightSections.push(`### Upstream\n\n${upstreamHighlights.map(entry => `- ${entry}`).join("\n")}`);
-	}
-	if (highlightSections.length > 0) sections.push(`## Highlights\n\n${highlightSections.join("\n\n")}`);
-
 	const coreforceBody = renderGroups(options.coreforceGroups);
-	sections.push(
-		`## Coreforce changes\n\n${coreforceBody || "No Coreforce-specific changes since the previous release."}`,
-	);
+	const upstreamNotes = options.upstreamNotes.trim();
+	const coreforceChangelogUrl = previous
+		? `https://github.com/${repository}/compare/${previous.tag}...${current.tag}`
+		: `https://github.com/${repository}/commits/${current.tag}`;
+	const upstreamChangelogUrl =
+		previous && previous.upstream !== current.upstream
+			? `https://github.com/${upstreamRepository}/compare/v${previous.upstream}...v${current.upstream}`
+			: `https://github.com/${upstreamRepository}/releases/tag/v${current.upstream}`;
 
-	if (options.upstreamNotes.trim()) {
-		const range = previous
-			? `\`v${previous.upstream}\` through \`v${current.upstream}\``
-			: `\`v${current.upstream}\``;
-		sections.push(
-			`## Upstream oh-my-pi changes\n\nChanges included from ${range}.\n\n${options.upstreamNotes.trim()}`,
-		);
-	} else {
-		sections.push(`## Upstream oh-my-pi changes\n\nThis release remains on upstream \`v${current.upstream}\`.`);
-	}
+	const render = (detailMode: "full" | "compact-upstream" | "compact-all", includeHighlights: boolean): string => {
+		const sections: string[] = [
+			`Coreforge engine \`${current.tag}\` combines oh-my-pi \`v${current.upstream}\` with Coreforce-managed identity, model, policy, and release capabilities.`,
+		];
 
-	sections.push(
-		`## Using this release\n\nCoreforge appliances select this immutable engine release through \`engine.lock\`. Direct \`omp update\` on the Coreforce channel also installs it.\n\nBuilt from \`${options.currentSha}\`.`,
-	);
-
-	const comparisons: string[] = [];
-	if (previous) {
-		comparisons.push(
-			`[Coreforce full changelog](https://github.com/${repository}/compare/${previous.tag}...${current.tag})`,
-		);
-		if (previous.upstream !== current.upstream) {
-			comparisons.push(
-				`[Upstream full changelog](https://github.com/${upstreamRepository}/compare/v${previous.upstream}...v${current.upstream})`,
-			);
+		if (includeHighlights) {
+			const highlightSections: string[] = [];
+			if (coreforceHighlights.length > 0) {
+				highlightSections.push(`### Coreforce\n\n${coreforceHighlights.map(entry => `- ${entry}`).join("\n")}`);
+			}
+			if (upstreamHighlights.length > 0) {
+				highlightSections.push(`### Upstream\n\n${upstreamHighlights.map(entry => `- ${entry}`).join("\n")}`);
+			}
+			if (highlightSections.length > 0) sections.push(`## Highlights\n\n${highlightSections.join("\n\n")}`);
 		}
-	}
-	if (comparisons.length > 0) sections.push(comparisons.join(" | "));
-	return `${sections.join("\n\n")}\n`;
+
+		sections.push(
+			detailMode === "compact-all"
+				? `## Coreforce changes\n\nDetailed Coreforce changes are omitted because the combined notes exceed GitHub's ${GITHUB_RELEASE_BODY_LIMIT}-character limit. [Browse Coreforce commits](${coreforceChangelogUrl}).`
+				: `## Coreforce changes\n\n${coreforceBody || "No Coreforce-specific changes since the previous release."}`,
+		);
+
+		if (upstreamNotes) {
+			const range = previous
+				? `\`v${previous.upstream}\` through \`v${current.upstream}\``
+				: `\`v${current.upstream}\``;
+			sections.push(
+				detailMode === "full"
+					? `## Upstream oh-my-pi changes\n\nChanges included from ${range}.\n\n${upstreamNotes}`
+					: `## Upstream oh-my-pi changes\n\nChanges included from ${range}. Detailed upstream notes are omitted because the combined notes exceed GitHub's ${GITHUB_RELEASE_BODY_LIMIT}-character limit. [Browse upstream changes](${upstreamChangelogUrl}).`,
+			);
+		} else {
+			sections.push(`## Upstream oh-my-pi changes\n\nThis release remains on upstream \`v${current.upstream}\`.`);
+		}
+
+		sections.push(
+			`## Using this release\n\nCoreforge appliances select this immutable engine release through \`engine.lock\`. Direct \`omp update\` on the Coreforce channel also installs it.\n\nBuilt from \`${options.currentSha}\`.`,
+		);
+
+		const comparisons: string[] = [];
+		if (previous) {
+			comparisons.push(`[Coreforce full changelog](${coreforceChangelogUrl})`);
+			if (previous.upstream !== current.upstream) {
+				comparisons.push(`[Upstream full changelog](${upstreamChangelogUrl})`);
+			}
+		}
+		if (comparisons.length > 0) sections.push(comparisons.join(" | "));
+		return `${sections.join("\n\n")}\n`;
+	};
+
+	let body = render("full", true);
+	if (body.length <= RELEASE_BODY_BUDGET) return body;
+	body = render("compact-upstream", true);
+	if (body.length <= RELEASE_BODY_BUDGET) return body;
+	body = render("compact-all", true);
+	if (body.length <= RELEASE_BODY_BUDGET) return body;
+	body = render("compact-all", false);
+	if (body.length <= RELEASE_BODY_BUDGET) return body;
+	throw new Error(`Release notes exceed the ${RELEASE_BODY_BUDGET}-character publication budget after compaction.`);
 }
 
 async function loadPackageName(packageDirectory: string): Promise<string> {
