@@ -2,7 +2,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import { type BaseType, type } from "arktype";
 import type { AgentSessionEvent } from "../session/agent-session";
-import type { ConfiguredThinkingLevel } from "../thinking";
+import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
 import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
@@ -110,12 +110,13 @@ const CONTEXT_FILE_POLICY_SCHEMA = "'inherit' | 'none'";
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
+// Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
+const effortRule = '"lo" | "med" | "hi"' as const;
 
 export const taskItemSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -125,7 +126,6 @@ const taskItemSchemaIsolated = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -143,8 +143,8 @@ export interface TaskItem {
 	contextFilePolicy?: ContextFilePolicy;
 	/** The work; required by the schema. */
 	task?: string;
-	/** Explicit model selector or fallback chain for this spawn, including optional reasoning suffixes. */
-	model?: string | string[];
+	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
+	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -157,7 +157,6 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -168,7 +167,6 @@ const taskSchemaNoIsolation = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -206,15 +204,17 @@ function createTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
 	defaultAgent: string;
+	effortEnabled: boolean;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
+	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
 			const item = type.raw({
 				"name?": "string",
 				agent,
 				task: "string",
-				"model?": "string | string[]",
+				...effortField,
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
 				"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -231,7 +231,7 @@ function createTaskSchema(options: {
 			"name?": "string",
 			agent,
 			task: "string",
-			"model?": "string | string[]",
+			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -248,7 +248,7 @@ function createTaskSchema(options: {
 			"name?": "string",
 			agent,
 			task: "string",
-			"model?": "string | string[]",
+			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -260,7 +260,7 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent,
 		task: "string",
-		"model?": "string | string[]",
+		...effortField,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -268,26 +268,23 @@ function createTaskSchema(options: {
 	});
 }
 
-export function getTaskSchema(options: { isolationEnabled: boolean; batchEnabled: boolean }): DynamicTaskSchema;
+/** Build the task wire schema for the current settings and spawn policy. */
 export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
-	defaultAgent: string;
-}): TaskToolSchemaInstance;
-export function getTaskSchema(options: {
-	isolationEnabled: boolean;
-	batchEnabled: boolean;
+	effortEnabled?: boolean;
 	defaultAgent?: string;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
-	if (defaultAgent === "task") {
+	const effortEnabled = options.effortEnabled ?? false;
+	if (defaultAgent === "task" && !effortEnabled) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
-	const schema = createTaskSchema({ ...options, defaultAgent });
+	const schema = createTaskSchema({ ...options, effortEnabled, defaultAgent });
 	taskSchemaCache.set(key, schema);
 	return schema;
 }
@@ -307,8 +304,8 @@ export interface TaskParams {
 	contextFilePolicy?: ContextFilePolicy;
 	/** The work (flat form). */
 	task?: string;
-	/** Explicit model selector or fallback chain for the spawn, including optional reasoning suffixes. */
-	model?: string | string[];
+	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
+	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */

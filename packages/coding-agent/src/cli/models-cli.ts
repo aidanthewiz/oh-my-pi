@@ -18,12 +18,7 @@ import chalk from "chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { getAllowedAvailableModels } from "../config/model-resolver";
 import { Settings } from "../config/settings";
-import {
-	discoverAndLoadExtensions,
-	ExtensionRunner,
-	emitSessionShutdownEvent,
-	loadExtensions,
-} from "../extensibility/extensions";
+import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
 import {
 	createPersistentPluginPolicy,
 	filterPersistentExtensionPaths,
@@ -292,7 +287,7 @@ export interface RunModelsListingOptions {
 	settingsExtensions?: string[];
 	/** Disabled extension ids from settings (`disabledExtensions`). */
 	disabledExtensionIds?: string[];
-	/** When true, skip discovery and only load `additionalExtensionPaths`. */
+	/** When true, exclude ambient factories and resolve only `additionalExtensionPaths`. */
 	disableExtensionDiscovery?: boolean;
 }
 
@@ -317,14 +312,16 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 	const eventBus = new EventBus();
 	const extensionsResult = await withPersistentPluginPolicy(policy, async () => {
 		const persistentExtensions = filterPersistentExtensionPaths(settingsExtensions, cwd);
-		return disableExtensionDiscovery
-			? loadExtensions(additionalExtensionPaths, cwd, eventBus)
-			: discoverAndLoadExtensions(
-					[...additionalExtensionPaths, ...persistentExtensions],
-					cwd,
-					eventBus,
-					disabledExtensionIds,
-				);
+		const configuredPaths = disableExtensionDiscovery
+			? additionalExtensionPaths
+			: [...additionalExtensionPaths, ...persistentExtensions];
+		return discoverAndLoadExtensions(
+			configuredPaths,
+			cwd,
+			eventBus,
+			disableExtensionDiscovery ? undefined : disabledExtensionIds,
+			{ ambient: !disableExtensionDiscovery },
+		);
 	});
 	const extensionRunner =
 		extensionsResult.extensions.length > 0
@@ -387,7 +384,7 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 		}
 		await modelRegistry.refresh(action === "refresh" ? "online" : "online-if-uncached");
 
-		const cliExtensionPaths = command.flags.noExtensions ? [] : (command.flags.extensions ?? []);
+		const cliExtensionPaths = command.flags.extensions ?? [];
 		await runModelsListing({
 			modelRegistry,
 			settings,

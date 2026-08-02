@@ -16,6 +16,7 @@ import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
@@ -90,6 +91,8 @@ export interface StructuredSubagentRequest {
 	schemaMode?: StructuredSubagentSchemaMode;
 	/** Parent context inheritance. Default `inherit`; `none` starts without parent context files. */
 	contextFilePolicy?: ContextFilePolicy;
+	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
+	effort?: TaskEffort;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -373,9 +376,12 @@ function buildExecutorOptions(
 		getArtifactsDir: session.getArtifactsDir ?? (() => null),
 		getSessionId: session.getSessionId ?? (() => null),
 	};
-	const enableMCP = !policy.planMode && (session.enableMCP ?? true);
+	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
+	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
 		cwd: session.cwd,
+		additionalDirectories: session.additionalDirectories,
+		getApiKey: session.getApiKey,
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
@@ -392,6 +398,7 @@ function buildExecutorOptions(
 		modelOverride: policy.modelOverride,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
+		effort: request.effort,
 		...(policy.schema.source === "none"
 			? {}
 			: {
@@ -406,7 +413,7 @@ function buildExecutorOptions(
 		enableLsp: policy.enableLsp,
 		enableIrc: policy.enableIrc,
 		maxRuntimeMs: request.maxRuntimeMs,
-		restrictToolNames: policy.planMode,
+		restrictToolNames,
 		keepAlive: request.keepAlive,
 		signal: request.signal,
 		eventBus: session.eventBus,
@@ -422,8 +429,8 @@ function buildExecutorOptions(
 		workspaceTree: session.workspaceTree,
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,
-		preloadedExtensionPaths: policy.planMode ? [] : session.extensionPaths,
-		preloadedCustomToolPaths: policy.planMode ? [] : session.customToolPaths,
+		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
+		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),

@@ -48,6 +48,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	const shared = {
 		enabled: server.enabled,
 		timeout: server.timeout,
+		requestIdFormat: server.requestIdFormat,
 		auth: server.auth,
 		oauth: server.oauth,
 	};
@@ -121,20 +122,8 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
 
-	// Load MCP servers via capability system
-	const result = await loadCapability<MCPServer>(mcpCapability.id, {
-		cwd,
-		providers: options?.discoveryProviders?.length ? options.discoveryProviders : undefined,
-	});
-
 	const allowCoreforgeProject =
 		!enableProjectConfig && (await isTrustedCoreforgeProject(cwd, options?.trustedProjectGitHubOrganizations ?? []));
-	const servers = result.items.filter(
-		server =>
-			enableProjectConfig ||
-			server._source.level !== "project" ||
-			(allowCoreforgeProject && server._source.provider === COREFORGE_MCP_PROVIDER_ID),
-	);
 
 	// Load user-level disable/force-enable lists. The denylist always wins; the
 	// allowlist overrides a non-writable source config's `enabled: false`.
@@ -143,14 +132,38 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		readDisabledServers(userPath).then(list => new Set(list)),
 		readEnabledServers(userPath).then(list => new Set(list)),
 	]);
-	// Convert to legacy format and preserve source metadata
+
+	// Scope exclusions drop entries entirely BEFORE deduplication: with project
+	// config disabled, a project entry must not shadow anything.
+	const includeServer = (server: MCPServer & { _source: SourceMeta }): boolean =>
+		(enableProjectConfig ||
+			server._source.level !== "project" ||
+			(allowCoreforgeProject && server._source.provider === COREFORGE_MCP_PROVIDER_ID)) &&
+		(options?.discoveryProviders?.length ? options.discoveryProviders.includes(server._source.provider) : true);
+
+	// Disabled servers are suppressed rather than dropped: they still own their
+	// name at key-level dedupe (a disabled project `foo` keeps a same-named,
+	// lower-priority user `foo` disabled), but never equivalence-shadow a
+	// differently-named enabled server — otherwise the disabled alias would be
+	// removed downstream and starve the surviving connection.
+	const suppressServer = (server: MCPServer & { _source: SourceMeta }): boolean => {
+		if (disabledServers.has(server.name)) return true;
+		if (server.enabled === false && !forcedEnabled.has(server.name)) return true;
+		return false;
+	};
+
+	const result = await loadCapability<MCPServer>(mcpCapability.id, {
+		cwd,
+		providers: options?.discoveryProviders?.length ? options.discoveryProviders : undefined,
+		filter: includeServer,
+		suppress: suppressServer,
+	});
+
+	// Convert to legacy format and preserve source metadata.
 	let configs: Record<string, MCPServerConfig> = {};
 	let sources: Record<string, SourceMeta> = {};
-	for (const server of servers) {
-		const config = convertToLegacyConfig(server);
-		if (disabledServers.has(server.name)) continue;
-		if (config.enabled === false && !forcedEnabled.has(server.name)) continue;
-		configs[server.name] = config;
+	for (const server of result.items) {
+		configs[server.name] = convertToLegacyConfig(server);
 		sources[server.name] = server._source;
 	}
 

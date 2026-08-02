@@ -9,7 +9,9 @@ import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
-import { createMCPProxyTools, createSubagentSettings } from "./executor";
+import type { EventBus } from "../utils/event-bus";
+import { attachIrcWakeTurnMonitor, createMCPProxyTools, createSubagentSettings } from "./executor";
+import type { AgentDefinition } from "./types";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is
@@ -24,6 +26,12 @@ export interface PersistedSubagentReviveContext {
 	settings: Settings;
 	/** LSP policy of the top-level session; revived subagents inherit it rather than defaulting on. */
 	enableLsp: boolean;
+	/**
+	 * Shared event bus feeding RPC/collab subagent subscriptions. Passed through
+	 * to the wake-turn monitor so an IRC send to a cold-revived subagent emits
+	 * the same lifecycle/progress frames a live run does.
+	 */
+	eventBus?: EventBus;
 }
 
 /**
@@ -71,7 +79,7 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 			parentId = registry.get(parentId)?.parentId;
 		}
-		return async () => {
+		return async expectedRef => {
 			// Re-open fresh on every revive: park closes the writer, so this takes
 			// the single-writer lock cleanly and restores the full message history.
 			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
@@ -97,6 +105,7 @@ export function createPersistedSubagentReviverFactory(
 				agentDisplayName: ref.displayName,
 				parentTaskPrefix: ref.id,
 				parentAgentId: ref.parentId,
+				expectedAgentRef: expectedRef,
 				taskDepth,
 				toolNames: init.tools,
 				outputSchema: init.outputSchema,
@@ -131,8 +140,25 @@ export function createPersistedSubagentReviverFactory(
 			// Without it the idle-TTL timer never clears on a turn and the lifecycle
 			// could park the agent mid-run.
 			session.subscribe(event => {
-				if (event.type === "agent_start") registry.setStatus(ref.id, "running");
-				else if (event.type === "agent_end") registry.setStatus(ref.id, "idle");
+				if (event.type === "agent_start") registry.setStatus(ref.id, "running", session);
+				else if (event.type === "agent_end") registry.setStatus(ref.id, "idle", session);
+			});
+			// Persisted files predate an agent-source field, so cold-revived frames
+			// report the runtime-neutral `user` source; name comes from the ref.
+			const wakeAgent: AgentDefinition = {
+				name: ref.displayName,
+				description: "",
+				systemPrompt: init.systemPrompt,
+				source: "user",
+			};
+			attachIrcWakeTurnMonitor(session, {
+				id: ref.id,
+				agent: wakeAgent,
+				eventBus: ctx.eventBus,
+				sessionFile,
+				outputSchema: init.outputSchema,
+				outputSchemaMode: init.outputSchemaMode,
+				artifactsDir: ctx.session.sessionFile?.slice(0, -6),
 			});
 			return session;
 		};

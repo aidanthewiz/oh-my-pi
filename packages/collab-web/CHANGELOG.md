@@ -9,6 +9,24 @@
 ### Changed
 
 - Branded the hosted client as Coreforce Agent Collab with the Coreforce hammer mark, moved public URLs to `agent-collab.internal.somahub.io`, and disabled crawler indexing without exposing the internal Coreforge product name.
+## [17.2.2] - 2026-07-31
+
+### Fixed
+
+- Fixed an issue where the guest UI could incorrectly appear idle (such as the loading spinner disappearing) while the host agent was still running after a reconnection, and ensured tool cards are properly cleared if a connection drop occurs.
+
+## [17.2.0] - 2026-07-30
+
+### Fixed
+
+- Fixed an issue where the agent would stop silently without a message by ensuring terminal auto-retry failures are properly surfaced as error notices.
+
+## [17.1.0] - 2026-07-24
+
+### Fixed
+
+- Fixed action metadata loss on xd://resolve, xd://reject, and xd://propose cards to ensure correct action badges are rendered.
+- Added proper rendering support for reject, propose, and hub-family aliases (irc, job, await, poll, cancel_job) to prevent them from falling back to generic JSON.
 
 ## [17.0.8] - 2026-07-22
 

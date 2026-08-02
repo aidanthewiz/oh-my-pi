@@ -22,6 +22,16 @@ export interface CfReleaseAsset {
 	/** Asset API URL (`…/releases/assets/<id>`) - the auth-compatible download endpoint. */
 	url: string;
 	size: number;
+	/** GitHub-provided content digest, when available for the uploaded asset. */
+	digest?: string | null;
+}
+
+type CfFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+export interface CfFetchOptions {
+	fetchImpl?: CfFetch;
+	/** undefined resolves the normal token chain; null forces the unauthenticated path. */
+	tokenOverride?: string | null;
 }
 
 function isCfReleaseAsset(value: unknown): value is CfReleaseAsset {
@@ -33,7 +43,8 @@ function isCfReleaseAsset(value: unknown): value is CfReleaseAsset {
 		"url" in value &&
 		typeof value.url === "string" &&
 		"size" in value &&
-		typeof value.size === "number"
+		typeof value.size === "number" &&
+		(!("digest" in value) || value.digest === null || typeof value.digest === "string")
 	);
 }
 
@@ -102,12 +113,17 @@ function parseCfRelease(data: unknown): CfRelease {
  * Throws when no token is available or the API call fails - callers on the
  * interactive path surface the error; the startup check swallows it.
  */
-async function fetchLatestRelease(repo: string, signal?: AbortSignal): Promise<CfRelease> {
-	const token = await resolveCfToken();
+async function fetchLatestRelease(
+	repo: string,
+	signal?: AbortSignal,
+	options: CfFetchOptions = {},
+): Promise<CfRelease> {
+	const token =
+		options.tokenOverride === undefined ? await resolveCfToken() : options.tokenOverride?.trim() || undefined;
 	if (!token) {
 		throw new Error("no GitHub token for the coreforge update channel (set GITHUB_TOKEN or run `gh auth login`)");
 	}
-	const response = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+	const response = await (options.fetchImpl ?? fetch)(`https://api.github.com/repos/${repo}/releases/latest`, {
 		headers: apiHeaders(token),
 		signal,
 	});
@@ -160,17 +176,22 @@ export async function fetchCfLatestProductRelease(signal?: AbortSignal): Promise
 	}
 }
 /** Fetch the latest fork engine release used by the binary updater. */
-export function fetchCfLatestRelease(signal?: AbortSignal): Promise<CfRelease> {
-	return fetchLatestRelease(CF_ENGINE_RELEASE_REPO, signal);
+export function fetchCfLatestRelease(signal?: AbortSignal, options?: CfFetchOptions): Promise<CfRelease> {
+	return fetchLatestRelease(CF_ENGINE_RELEASE_REPO, signal, options);
 }
 
 /**
  * Open a download stream for a private release asset via the asset API.
  */
-export async function fetchCfAsset(asset: CfReleaseAsset, signal?: AbortSignal): Promise<Response> {
-	const token = await resolveCfToken();
+export async function fetchCfAsset(
+	asset: CfReleaseAsset,
+	signal?: AbortSignal,
+	options: CfFetchOptions = {},
+): Promise<Response> {
+	const token =
+		options.tokenOverride === undefined ? await resolveCfToken() : options.tokenOverride?.trim() || undefined;
 	if (!token) throw new Error("no GitHub token for the coreforge update channel");
-	const response = await fetch(asset.url, {
+	const response = await (options.fetchImpl ?? fetch)(asset.url, {
 		headers: { Authorization: `Bearer ${token}`, Accept: "application/octet-stream" },
 		redirect: "follow",
 		signal,

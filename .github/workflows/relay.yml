@@ -48,8 +48,25 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build native addon for coding-agent tests
-        run: bun --cwd=packages/natives run build
+      - name: Fetch prebuilt native addon for coding-agent tests
+        # Relay validation does not cover native source paths. Use the
+        # integrity-checked addon published for this exact upstream version.
+        run: |
+          PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          META="$(npm view "@oh-my-pi/pi-natives-linux-x64@${PKG_VERSION}" dist.tarball dist.integrity --json)"
+          URL="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.tarball"])')"
+          INTEGRITY="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.integrity"])')"
+          curl -fsSL "$URL" -o /tmp/natives.tgz
+          NATIVES_INTEGRITY="$INTEGRITY" bun -e '
+            const [algorithm, expected] = process.env.NATIVES_INTEGRITY.split("-", 2);
+            if (algorithm !== "sha512" || !expected) throw new Error("npm did not publish a sha512 integrity value");
+            const archive = new Uint8Array(await Bun.file("/tmp/natives.tgz").arrayBuffer());
+            const actual = new Bun.CryptoHasher("sha512").update(archive).digest("base64");
+            if (actual !== expected) throw new Error("native addon archive failed npm integrity verification");
+          '
+          tar -xzf /tmp/natives.tgz -C /tmp
+          cp /tmp/package/*.node packages/natives/native/
+          ls packages/natives/native/*.node
 
       - name: Check relay clients
         run: |

@@ -52,50 +52,132 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 	}
 	return result;
 }
+// Bun autoloads the project's dotenv files into `process.env` before user code
+// runs — including inside `bun build --compile` binaries — so a snapshot of
+// `Bun.env` is only pre-dotenv when autoloading was explicitly disabled. Linux
+// keeps the original exec environment in procfs, which is authoritative.
+function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
+	if (process.platform === "linux") {
+		try {
+			const values = new Map<string, string>();
+			for (const entry of fs.readFileSync("/proc/self/environ", "utf8").split("\0")) {
+				const separator = entry.indexOf("=");
+				if (separator > 0) values.set(entry.slice(0, separator), entry.slice(separator + 1));
+			}
+			return values;
+		} catch {}
+	}
+	if (!process.execArgv.includes("--no-env-file")) return undefined;
+	const values = new Map<string, string>();
+	for (const key in Bun.env) {
+		const value = Bun.env[key];
+		if (value !== undefined) values.set(key, value);
+	}
+	return values;
+}
 
-/** Filters process env for child shells without launch-cwd `.env.local` values. */
+const launchEnvValues = readLaunchEnv();
+const projectEnvNamesLoadedByOmp = new Set<string>();
+
+function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
+	const expanded: Record<string, string> = {};
+	for (const key in values) {
+		expanded[key] = values[key].replace(
+			/(\\)?\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g,
+			(match, escaped: string | undefined, braced: string | undefined, bare: string | undefined) => {
+				if (escaped) return match.slice(1);
+				const name = braced ?? bare;
+				if (!name) return match;
+				return env[name] ?? expanded[name] ?? "";
+			},
+		);
+	}
+	return expanded;
+}
+
+/** Filters process env for child shells without launch-cwd dotenv values. */
 export function filterChildShellEnv(
 	env: Record<string, string | undefined>,
 	cwd: string = process.cwd(),
 ): Record<string, string> {
 	const result = filterProcessEnv(env);
-	const launchLocalEnv = parseEnvFile(path.join(cwd, ".env.local"));
-	for (const key in launchLocalEnv) {
-		if (result[key] === launchLocalEnv[key]) delete result[key];
+	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
+	const nodeEnvName = `.env.${env.NODE_ENV || "development"}`;
+	const modeEnv = parseEnvFile(path.join(cwd, nodeEnvName));
+	const localEnv = parseEnvFile(path.join(cwd, ".env.local"));
+	const launchEnv = { ...projectEnv, ...modeEnv, ...localEnv };
+	const expandedLaunchEnv = {
+		...expandDotenvValues(projectEnv, result),
+		...expandDotenvValues(modeEnv, result),
+		...expandDotenvValues(localEnv, result),
+	};
+	for (const key in launchEnv) {
+		const launchValue = launchEnvValues?.get(key);
+		if (launchValue !== undefined) {
+			// Launcher-owned name: it keeps the launcher's own value. Bun overwrites
+			// an empty launcher value with the dotenv one, so restore the launcher
+			// value whenever what survived is exactly what the dotenv file defines.
+			if (
+				result[key] !== launchValue &&
+				(result[key] === launchEnv[key] || result[key] === expandedLaunchEnv[key])
+			) {
+				result[key] = launchValue;
+			}
+			continue;
+		}
+		if (launchEnvValues || projectEnvNamesLoadedByOmp.has(key)) {
+			// Strong provenance: the launch environment is known and this name is
+			// absent from it, or OMP itself injected the value — either way it came
+			// from a project dotenv file, not the parent shell.
+			delete result[key];
+		} else if (result[key] === launchEnv[key] || result[key] === expandedLaunchEnv[key]) {
+			// No launch-env snapshot (dotenv autoloaded without procfs): best-effort
+			// value match against the Bun-parsed dotenv.
+			delete result[key];
+		}
 	}
 	return result;
 }
 
 /**
- * Parses a .env file synchronously and extracts key-value string pairs.
- * Ignores lines that are empty or start with '#'. Trims whitespace.
- * Allows values to be quoted with single or double quotes.
- * Returns an object of key-value pairs.
+ * Parse one dotenv line with Bun-compatible semantics: an optional `export`
+ * prefix, full-line `#` comments, inline `#` comments after whitespace on
+ * unquoted values, and single/double/backtick quoting (a `#` inside quotes
+ * stays literal). Returns undefined for blank lines, comments, and malformed
+ * names.
+ */
+function parseEnvLine(line: string): { key: string; value: string } | undefined {
+	const trimmed = line.trim();
+	if (!trimmed || trimmed.startsWith("#")) return undefined;
+	const eqIndex = trimmed.indexOf("=");
+	if (eqIndex === -1) return undefined;
+	let key = trimmed.slice(0, eqIndex).trim();
+	const exported = key.match(/^export[ \t]+(.*)$/);
+	if (exported) key = exported[1].trim();
+	if (!isValidEnvName(key)) return undefined;
+	const raw = trimmed.slice(eqIndex + 1).replace(/^[ \t]+/, "");
+	const quote = raw[0];
+	if (quote === '"' || quote === "'" || quote === "`") {
+		let close = raw.indexOf(quote, 1);
+		while (close !== -1 && raw[close - 1] === "\\") close = raw.indexOf(quote, close + 1);
+		return { key, value: close === -1 ? raw.slice(1) : raw.slice(1, close) };
+	}
+	const commentIndex = raw.search(/[ \t]#/);
+	return { key, value: (commentIndex === -1 ? raw : raw.slice(0, commentIndex)).trimEnd() };
+}
+
+/**
+ * Parses a .env file synchronously into key-value string pairs using
+ * {@link parseEnvLine} for Bun-compatible line semantics, then mirrors valid
+ * `OMP_` variables to their `PI_` aliases.
  */
 export function parseEnvFile(filePath: string): Record<string, string> {
 	const result: Record<string, string> = {};
 	try {
 		const content = fs.readFileSync(filePath, "utf-8");
 		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			// Skip comments and blank lines
-			if (!trimmed || trimmed.startsWith("#")) continue;
-
-			const eqIndex = trimmed.indexOf("=");
-			if (eqIndex === -1) continue;
-
-			const key = trimmed.slice(0, eqIndex).trim();
-			if (!isValidEnvName(key)) continue;
-
-			let value = trimmed.slice(eqIndex + 1).trim();
-
-			// Remove surrounding quotes (" or ')
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-
-			result[key] = value;
+			const parsed = parseEnvLine(line);
+			if (parsed && isSafeEnvValue(parsed.value)) result[parsed.key] = parsed.value;
 		}
 	} catch {
 		// File doesn't exist or can't be read - return empty result
@@ -156,7 +238,8 @@ const managedDotenv = Bun.env.OMP_DOTENV_OVERRIDE === "1";
 // empty. The flag key is exempt: it is launcher-only (collision already
 // refused above), so stripping it could only erase a real launcher signal.
 // The default branch below re-applies projectEnv as its normal gap-fill layer,
-// so unmanaged precedence is unchanged; managed mode intentionally never re-adds it.
+// so unmanaged precedence is unchanged; managed mode intentionally never
+// re-adds it.
 for (const key in projectEnv) {
 	if (key === "OMP_DOTENV_OVERRIDE") continue;
 	if (Bun.env[key] === projectEnv[key]) delete Bun.env[key];
@@ -194,6 +277,7 @@ if (managedDotenv) {
 			if (key === "OMP_DOTENV_OVERRIDE") continue; // launcher-only — never file-sourced
 			if (!isMacosMallocStackLoggingEnvName(key) && !Bun.env[key]) {
 				Bun.env[key] = file[key];
+				if (file === projectEnv) projectEnvNamesLoadedByOmp.add(key);
 			}
 		}
 	}
@@ -242,9 +326,13 @@ export function $envpos(name: string, defaultValue: number): number {
 	return parsed;
 }
 
-/** True when `BUN_ENV` or `NODE_ENV` is the string `test`. */
+const BUN_TEST_ENTRY_PATTERN = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
+
+/** True when the process is an explicitly marked test child or Bun is running a test entrypoint. */
 export function isBunTestRuntime(): boolean {
-	return Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
+	if (Bun.env.PI_TEST_RUNTIME === "1") return true;
+	const hasTestEnvironment = Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
+	return hasTestEnvironment && BUN_TEST_ENTRY_PATTERN.test(Bun.main);
 }
 
 let terminalHeadless = isBunTestRuntime();
@@ -296,6 +384,23 @@ export function setInteractiveHost(interactive: boolean): boolean {
 	const previous = interactiveHost;
 	interactiveHost = interactive;
 	return previous;
+}
+
+/**
+ * SQLite `busy_timeout` for the session-critical databases (agent.db,
+ * history.db, stats.db).
+ *
+ * Interactive hosts tolerate a longer synchronous wait on lock contention
+ * (SQLITE_BUSY during WAL recovery/checkpoint — see oh-my-pi#2421): the
+ * operator sees a brief freeze and the statement eventually completes.
+ * Headless hosts (print/RPC/ACP/eval/SDK) run a protocol on the same thread —
+ * a multi-second synchronous busy-wait freezes their event loop and stalls
+ * every in-flight frame with no liveness signal, so they use a short timeout
+ * and rely on the existing asynchronous open/retry paths to recover from
+ * contention instead of blocking.
+ */
+export function getDbBusyTimeoutMs(): number {
+	return isInteractiveHost() ? 5000 : 1000;
 }
 
 /**

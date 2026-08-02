@@ -9,8 +9,10 @@ import type { ModelManagerConfig, ProviderCatalogEntry, ProviderDescriptor } fro
 import { googleModelManagerOptions, googleVertexModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
+	aiandModelManagerOptions,
 	aimlApiModelManagerOptions,
 	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	basetenModelManagerOptions,
 	cerebrasModelManagerOptions,
@@ -20,12 +22,14 @@ import {
 	firepassModelManagerOptions,
 	fireworksModelManagerOptions,
 	githubCopilotModelManagerOptions,
+	gmiCloudModelManagerOptions,
 	groqModelManagerOptions,
 	huggingfaceModelManagerOptions,
 	kiloModelManagerOptions,
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	metaModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
@@ -39,6 +43,8 @@ import {
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
 	sakanaModelManagerOptions,
+	siliconflowCnModelManagerOptions,
+	siliconflowModelManagerOptions,
 	syntheticModelManagerOptions,
 	togetherModelManagerOptions,
 	umansModelManagerOptions,
@@ -61,6 +67,14 @@ import {
 
 export const CATALOG_PROVIDERS = [
 	{
+		id: "aiand",
+		defaultModel: "moonshotai/kimi-k2.7-code",
+		envVars: ["AIAND_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => aiandModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "ai&" },
+	},
+	{
 		id: "aimlapi",
 		defaultModel: "gpt-5.5-2026-04-23",
 		envVars: ["AIMLAPI_API_KEY"],
@@ -74,6 +88,14 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["ALIBABA_CODING_PLAN_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => alibabaCodingPlanModelManagerOptions(config),
 		catalogDiscovery: { label: "Alibaba Coding Plan" },
+	},
+	{
+		id: "alibaba-token-plan",
+		defaultModel: "qwen3.7-plus",
+		envVars: ["ALIBABA_TOKEN_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => alibabaTokenPlanModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "QwenCloud Token Plan" },
 	},
 	{
 		id: "baseten",
@@ -179,6 +201,14 @@ export const CATALOG_PROVIDERS = [
 		dynamicModelsAuthoritative: true,
 	},
 	{
+		id: "gmi-cloud",
+		defaultModel: "deepseek-ai/DeepSeek-V4-Flash",
+		envVars: ["GMI_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => gmiCloudModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "GMI Cloud" },
+	},
+	{
 		id: "google",
 		defaultModel: "gemini-3.1-pro-preview",
 		envVars: ["GEMINI_API_KEY"],
@@ -260,6 +290,13 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "devstral-medium-latest",
 		envVars: ["MISTRAL_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => mistralModelManagerOptions(config),
+	},
+	{
+		id: "meta",
+		defaultModel: "muse-spark-1.1",
+		envVars: ["MODEL_API_KEY", "META_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => metaModelManagerOptions(config),
+		catalogDiscovery: { label: "Meta Model API" },
 	},
 	{
 		id: "moonshot",
@@ -377,6 +414,20 @@ export const CATALOG_PROVIDERS = [
 		createModelManagerOptions: (config: ModelManagerConfig) => sakanaModelManagerOptions(config),
 		dynamicModelsAuthoritative: true,
 		catalogDiscovery: { label: "Sakana AI" },
+	},
+	{
+		id: "siliconflow",
+		defaultModel: "zai-org/GLM-5.1",
+		envVars: ["SILICONFLOW_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => siliconflowModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+	},
+	{
+		id: "siliconflow-cn",
+		defaultModel: "deepseek-ai/DeepSeek-V4-Pro",
+		envVars: ["SILICONFLOW_CN_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => siliconflowCnModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "synthetic",

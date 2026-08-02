@@ -16,7 +16,6 @@ import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import { getGitLabDuoModels } from "@oh-my-pi/pi-ai/providers/gitlab-duo";
 import { $env } from "@oh-my-pi/pi-utils";
 import { ANTIGRAVITY_PRIMARY_ENDPOINT, fetchAntigravityDiscoveryModels } from "../src/discovery/antigravity";
-import { fetchCodexModels } from "../src/discovery/codex";
 import { buildGitLabDuoWorkflowFallbackModel } from "../src/discovery/gitlab-duo-workflow";
 import { createModelManager } from "../src/model-manager";
 import prevModelsJson from "../src/models.json" with { type: "json" };
@@ -29,6 +28,8 @@ import {
 } from "../src/provider-models/descriptor-types";
 import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import {
+	AIAND_STATIC_MODELS,
+	ALIBABA_TOKEN_PLAN_STATIC_MODELS,
 	ANTHROPIC_CURATED_FALLBACK_MODELS,
 	buildFireworksFastSeed,
 	buildXaiOAuthStaticSeed,
@@ -36,22 +37,30 @@ import {
 	clampKimiK27CodeMaxTokens,
 	deriveAnthropicAwsModels,
 	deriveOpenAIAwsModels,
+	fetchWellKnownModels,
+	GMI_CLOUD_STATIC_MODELS,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
+	kimiCodeMaxTokens,
+	META_MUSE_STATIC_MODELS,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
 	projectOpenAIProReasoningAliases,
 	SAKANA_FUGU_STATIC_MODELS,
 	stripFireworksDeepSeekThinkingToggle,
 } from "../src/provider-models/openai-compat";
+import { type OpenAICodexAccount, openaiCodexModelManagerOptions } from "../src/provider-models/special";
 import type { Api, ModelSpec } from "../src/types";
 import { cleanModelName } from "../src/utils";
 import { collapseEffortVariantsAcrossProviders } from "../src/variant-collapse";
-import { JWT_CLAIM_PATH } from "../src/wire/codex";
 import {
+	applyAntigravityPricingFallback,
 	applyCanonicalLimitFallback,
 	applyGeneratedModelPolicies,
+	applyOllamaCloudOutputCap,
 	CLOUDFLARE_FALLBACK_MODEL,
+	dropUnsupportedBedrockGeoIds,
+	hasBillableCost,
 	linkOpenAIPromotionTargets,
 } from "./generated-policies";
 
@@ -105,13 +114,16 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 
 	return undefined;
 }
+type CatalogProviderFetchResult = { models: ModelSpec[]; succeeded: boolean };
 
-async function fetchProviderModelsFromCatalog(descriptor: CatalogProviderDescriptor): Promise<ModelSpec[]> {
+async function fetchProviderModelsFromCatalog(
+	descriptor: CatalogProviderDescriptor,
+): Promise<CatalogProviderFetchResult> {
 	const apiKey = await resolveProviderApiKey(descriptor.providerId, descriptor.catalogDiscovery);
 
 	if (!apiKey && !allowsUnauthenticatedCatalogDiscovery(descriptor)) {
 		console.log(`No ${descriptor.catalogDiscovery.label} credentials found (env or agent.db), using fallback models`);
-		return [];
+		return { models: [], succeeded: false };
 	}
 
 	try {
@@ -130,33 +142,32 @@ async function fetchProviderModelsFromCatalog(descriptor: CatalogProviderDescrip
 			console.warn(
 				`${descriptor.catalogDiscovery.label} dynamic fetch failed (stale cache merge), using fallback models`,
 			);
-			return [];
+			return { models: [], succeeded: false };
 		}
 		const models = result.models.filter(model => model.provider === descriptor.providerId);
 		if (models.length === 0) {
-			console.warn(`${descriptor.catalogDiscovery.label} discovery returned no models, using fallback models`);
-			return [];
+			console.warn(`${descriptor.catalogDiscovery.label} discovery returned no models`);
+			return { models: [], succeeded: true };
 		}
 		console.log(`Fetched ${models.length} models from ${descriptor.catalogDiscovery.label} model manager`);
 		// The manager returns built models; models.json stores specs (sparse compat).
-		return models.map(model => toModelSpec(model));
+		return { models: models.map(model => toModelSpec(model)), succeeded: true };
 	} catch (error) {
 		console.error(`Failed to fetch ${descriptor.catalogDiscovery.label} models:`, error);
-		return [];
+		return { models: [], succeeded: false };
 	}
 }
 
 async function loadModelsDevData(): Promise<ModelSpec[]> {
 	try {
-		console.log("Fetching models from models.dev API...");
-		const response = await fetch("https://models.dev/api.json");
-		const data = await response.json();
+		console.log("Fetching stencil.so catalog from catalog.stencil.so...");
+		const data = await fetchWellKnownModels();
 		const models = mapModelsDevToModels(data as Record<string, unknown>, MODELS_DEV_PROVIDER_DESCRIPTORS);
 		models.sort((a, b) => a.id.localeCompare(b.id));
-		console.log(`Loaded ${models.length} tool-capable models from models.dev`);
+		console.log(`Loaded ${models.length} tool-capable models from stencil.so`);
 		return models;
 	} catch (error) {
-		console.error("Failed to load models.dev data:", error);
+		console.error("Failed to load stencil.so data:", error);
 		return [];
 	}
 }
@@ -206,7 +217,7 @@ function applyGlobalModelsDevFallback(
 			name: reference.name,
 			reasoning: reference.reasoning,
 			input: reference.input,
-			// Fill unknown endpoint limits from same-id models.dev references, but keep
+			// Fill unknown endpoint limits from same-id stencil.so references, but keep
 			// provider-specific values when discovery returned them explicitly.
 			contextWindow: model.contextWindow ?? reference.contextWindow,
 			maxTokens: model.maxTokens ?? reference.maxTokens,
@@ -229,9 +240,6 @@ function applyPremiumMultiplierOverrides(models: readonly ModelSpec[]): ModelSpe
 		};
 	});
 }
-function hasBillableCost(cost: ModelSpec["cost"]): boolean {
-	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
-}
 
 function applyUmansPricingFallback(models: readonly ModelSpec[], modelsDevModels: readonly ModelSpec[]): ModelSpec[] {
 	const paygCosts = new Map<string, ModelSpec["cost"]>();
@@ -242,7 +250,7 @@ function applyUmansPricingFallback(models: readonly ModelSpec[], modelsDevModels
 	}
 
 	// The public endpoint exposes this technical alias for Umans Flash, but
-	// models.dev publishes pricing only for the recommended `umans-flash` id.
+	// stencil.so publishes pricing only for the recommended `umans-flash` id.
 	const flashCost = paygCosts.get("umans-flash");
 	if (flashCost) {
 		paygCosts.set("umans-qwen3.6-35b-a3b", flashCost);
@@ -298,6 +306,12 @@ function applyKimiMaxTokensCap(models: readonly ModelSpec[]): ModelSpec[] {
 		}
 		if (model.provider === "venice" && isKimiK27CodeModelId(model.id)) {
 			const capped = clampKimiK27CodeMaxTokens(model.id, model.maxTokens);
+			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
+		}
+		if (model.provider === "kimi-code") {
+			// Discovery snapshots carried maxTokens=32000 uniformly (#6711); pin the
+			// documented per-family output ceilings and leave legacy K2 rows as-is.
+			const capped = kimiCodeMaxTokens(model.id, model.maxTokens);
 			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
 		}
 		return model;
@@ -431,49 +445,49 @@ async function fetchAntigravityModels(): Promise<ModelSpec<"google-gemini-cli">[
 }
 
 /**
- * Extract accountId from a Codex JWT access token.
+ * Resolve every stored Codex OAuth account and union their account-scoped
+ * `/models` catalogs through the same manager path the runtime uses (#6265).
+ * Fails closed: any account that cannot resolve or fetch aborts discovery and
+ * returns [] (non-authoritative), so a partial per-account snapshot never
+ * replaces the previous bundle's model set.
  */
-function extractCodexAccountId(accessToken: string): string | null {
-	try {
-		const parts = accessToken.split(".");
-		if (parts.length !== 3) return null;
-		const payload = parts[1] ?? "";
-		const decoded = JSON.parse(Buffer.from(payload, "base64").toString("utf-8"));
-		const accountId = decoded?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
-		return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
-	} catch {
-		return null;
-	}
-}
-
 async function fetchCodexDiscoveryModels(): Promise<ModelSpec<"openai-codex-responses">[]> {
-	const access = await getOAuthAccessFromStorage("openai-codex");
-	if (!access) {
+	const accounts: OpenAICodexAccount[] = [];
+	try {
+		const authStorage = await discoverAuthStorage();
+		try {
+			const accesses = await authStorage.getOAuthAccesses("openai-codex");
+			for (const access of accesses) {
+				if (!access.ok) {
+					console.warn(`Codex account failed to resolve (${access.error}), keeping previous models.`);
+					return [];
+				}
+				accounts.push({ accessToken: access.accessToken, accountId: access.accountId });
+			}
+		} finally {
+			authStorage.close();
+		}
+	} catch (error) {
+		console.warn(
+			"Warning: Failed to retrieve Codex credentials:",
+			error instanceof Error ? error.message : String(error),
+		);
+		return [];
+	}
+	if (accounts.length === 0) {
 		console.log("No Codex credentials found, will use previous models.");
 		console.log("Tip: If you are logged in under a specific profile, run with OMP_PROFILE=<name>.");
 		return [];
 	}
-	try {
-		console.log("Fetching models from Codex API...");
-		const accessToken = access.accessToken;
-		const accountId = access.accountId ?? extractCodexAccountId(accessToken);
-		const codexDiscovery = await fetchCodexModels({
-			accessToken,
-			accountId: accountId ?? undefined,
-		});
-		if (codexDiscovery === null) {
-			console.warn("Codex API fetch failed");
-			return [];
-		}
-		if (codexDiscovery.models.length > 0) {
-			console.log(`Fetched ${codexDiscovery.models.length} models from Codex API`);
-			return codexDiscovery.models;
-		}
-		return [];
-	} catch (error) {
-		console.error("Failed to fetch Codex models:", error);
+	console.log(`Fetching models from Codex API for ${accounts.length} account(s)...`);
+	const options = openaiCodexModelManagerOptions({ resolveAccounts: async () => accounts });
+	const models = await options.fetchDynamicModels?.();
+	if (!models) {
+		console.warn("Codex API fetch failed, keeping previous models.");
 		return [];
 	}
+	console.log(`Fetched ${models.length} models from Codex API`);
+	return [...models];
 }
 
 async function generateModels() {
@@ -486,20 +500,30 @@ async function generateModels() {
 	const catalogProviderModelBatches = await Promise.all(
 		catalogProviderDescriptors.map(async descriptor => ({
 			descriptor,
-			models: await fetchProviderModelsFromCatalog(descriptor),
+			...(await fetchProviderModelsFromCatalog(descriptor)),
 		})),
 	);
+	// A provider is authoritative once its endpoint snapshot can replace the
+	// stencil.so / previous-snapshot rows. Requiring fetched models keeps a
+	// flaky empty-but-200 discovery from silently wiping another provider's
+	// bundled catalog; only alibaba-token-plan treats an empty success as
+	// authoritative, because its `/models` allowlist reflects the subscribed
+	// edition and must not be widened by the curated seed below.
 	const authoritativeCatalogProviders = new Set(
 		catalogProviderModelBatches
-			.filter(batch => batch.descriptor.dynamicModelsAuthoritative === true && batch.models.length > 0)
+			.filter(
+				batch =>
+					batch.descriptor.dynamicModelsAuthoritative === true &&
+					(batch.models.length > 0 || (batch.succeeded && batch.descriptor.providerId === "alibaba-token-plan")),
+			)
 			.map(batch => batch.descriptor.providerId),
 	);
 	const catalogProviderModels = catalogProviderModelBatches.flatMap(batch => batch.models);
 	const bundledModelsDevModels = modelsDevModels.filter(model => !authoritativeCatalogProviders.has(model.provider));
 	// getGitLabDuoModels returns built models; project back to spec stage for the bundle.
 	const gitLabDuoModels = getGitLabDuoModels().map(model => toModelSpec(model));
-	// Combine models. models.dev has priority unless a provider's successful endpoint
-	// discovery is authoritative; those endpoint snapshots replace models.dev rows.
+	// Combine models. stencil.so has priority unless a provider's successful endpoint
+	// discovery is authoritative; those endpoint snapshots replace stencil.so rows.
 	let allModels = applyGlobalModelsDevFallback(
 		[...bundledModelsDevModels, ...catalogProviderModels, ...gitLabDuoModels],
 		modelsDevModels,
@@ -509,7 +533,7 @@ async function generateModels() {
 		allModels.push(CLOUDFLARE_FALLBACK_MODEL as ModelSpec<"anthropic-messages">);
 	}
 
-	// xai-oauth is not in models.dev; its descriptor's catalogDiscovery fetch
+	// xai-oauth is not in stencil.so; its descriptor's catalogDiscovery fetch
 	// only succeeds with live SuperGrok OAuth credentials (and on success the
 	// dynamic entries — already overlaid by applyXAIOAuthCuration — win dedup
 	// below). Always push the curated seed so a regen without credentials, or
@@ -518,8 +542,14 @@ async function generateModels() {
 	// persisted `modelRoles.default = "xai-oauth/<id>"` is honored before the
 	// async refresh fires (interactive boot does not await refresh).
 	allModels.push(...buildXaiOAuthStaticSeed());
+	// Seed QwenCloud's documented Token Plan models when credentialed
+	// discovery is unavailable. A successful `/models` response is authoritative
+	// for the subscribed edition and must not be widened by the fallback.
+	if (!authoritativeCatalogProviders.has("alibaba-token-plan")) {
+		allModels.push(...ALIBABA_TOKEN_PLAN_STATIC_MODELS);
+	}
 	// Seed Anthropic models that are live on the first-party API or in limited
-	// release but that models.dev has not catalogued yet (e.g. Claude Fable 5 /
+	// release but that stencil.so has not catalogued yet (e.g. Claude Fable 5 /
 	// Mythos 5). Deduped behind upstream entries; metadata is pinned in
 	// applyAnthropicCatalogPolicy.
 	allModels.push(...ANTHROPIC_CURATED_FALLBACK_MODELS);
@@ -533,11 +563,26 @@ async function generateModels() {
 	// 272K window) and seed the open-weight Mantle models, so `openai-aws`
 	// capabilities track the first-party catalog automatically.
 	allModels.push(...deriveOpenAIAwsModels(allModels));
+	// Seed Meta's documented Muse model so first-run selection does not depend on
+	// credentials or live discovery.
+	allModels.push(...META_MUSE_STATIC_MODELS);
 	// Seed Sakana's documented Fugu models so the provider is usable when
 	// catalog generation has no live API key. If live `/v1/models` succeeds,
 	// Sakana is authoritative and stale seed IDs must stay out.
 	if (!authoritativeCatalogProviders.has("sakana")) {
 		allModels.push(...SAKANA_FUGU_STATIC_MODELS);
+	}
+	// Seed ai&'s documented catalog so the provider is usable when generation
+	// has no AIAND_API_KEY. A live org-scoped `/v1/models` snapshot is
+	// authoritative and replaces the seed.
+	if (!authoritativeCatalogProviders.has("aiand")) {
+		allModels.push(...AIAND_STATIC_MODELS);
+	}
+	// Seed the GMI Cloud default model so a fresh install (and a regen without a
+	// `GMI_API_KEY`) still resolves the descriptor's `defaultModel` synchronously
+	// at boot. If live `/v1/models` discovery succeeds, it is authoritative.
+	if (!authoritativeCatalogProviders.has("gmi-cloud")) {
+		allModels.push(...GMI_CLOUD_STATIC_MODELS);
 	}
 	// Seed the GitLab Duo Agent fallback model so a fresh install (no credentialed
 	// dynamic discovery/cache yet) still surfaces the provider's default model in the
@@ -590,7 +635,7 @@ async function generateModels() {
 	}
 	// Merge previous models.json entries as fallback for provider/model pairs not
 	// fetched dynamically. Providers covered by authoritative endpoint discovery
-	// or authoritative models.dev sources keep that upstream list exactly, so
+	// or authoritative stencil.so sources keep that upstream list exactly, so
 	// retired entries from the previous snapshot do not reappear during regeneration.
 	// Discovery-only providers (local inference servers) — never bundle static models.
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
@@ -617,11 +662,13 @@ async function generateModels() {
 	allModels = applyUmansPricingFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
+	allModels = applyAntigravityPricingFallback(allModels);
 	allModels = applyKimiMaxTokensCap(allModels);
 	allModels = applyFireworksDeepSeekReasoningShape(allModels);
 	allModels = dropFireworksWireIds(allModels);
 	allModels = dropUnusableZaiContextTierIds(allModels);
 	allModels = dropXiaomiAudioOnlyIds(allModels);
+	allModels = dropUnsupportedBedrockGeoIds(allModels);
 	allModels = normalizeAntigravityEndpoint(allModels);
 	// Normalize display names: gateway author prefixes ("OpenAI: …"), alias
 	// markers ("(latest)"), provider attribution ("(Antigravity)"), and
@@ -643,6 +690,9 @@ async function generateModels() {
 	// Fill remaining null endpoint limits from each model's canonical-family
 	// reference. Runs last so canonical ids and explicit policy limits are final.
 	applyCanonicalLimitFallback(allModels);
+	// Pin every Ollama Cloud model's max-output to the enforced ceiling; runs
+	// after canonical fallback so finalized context windows drive the cap.
+	applyOllamaCloudOutputCap(allModels);
 
 	for (const model of allModels) {
 		canonicalizeModelCompat(model);
