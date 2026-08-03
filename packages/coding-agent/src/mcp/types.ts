@@ -229,6 +229,21 @@ export interface MCPAuthChallenge {
 	readonly wwwAuthenticate: readonly string[];
 }
 
+/** Context supplied to an MCP OAuth handler for lifecycle cancellation. */
+export interface MCPAuthHandlerContext {
+	readonly signal: AbortSignal;
+}
+
+/**
+ * Thrown when an MCP OAuth flow is cancelled by the user or its owning session.
+ */
+export class MCPOAuthCancelledError extends Error {
+	constructor(message = "OAuth flow cancelled") {
+		super(message);
+		this.name = "MCPOAuthCancelledError";
+	}
+}
+
 /** tools/call response */
 export interface MCPToolCallResult {
 	content: MCPContent[];

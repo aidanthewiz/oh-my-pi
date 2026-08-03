@@ -39,6 +39,7 @@ import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
 import type {
 	MCPAuthChallenge,
+	MCPAuthHandlerContext,
 	MCPGetPromptResult,
 	MCPPrompt,
 	MCPRequestOptions,
@@ -50,15 +51,34 @@ import type {
 	MCPToolDefinition,
 	MCPTransport,
 } from "./types";
-import { MCPNotificationMethods } from "./types";
+import { MCPNotificationMethods, MCPOAuthCancelledError } from "./types";
 
 type ToolLoadResult = {
 	connection: MCPServerConnection;
 	serverTools: MCPToolDefinition[];
 };
 
+interface MCPAuthQueueEntry {
+	id: number;
+	serverName: string;
+	generation: number;
+	signal: AbortSignal;
+}
+
 interface AuthRefreshableMCPTransport extends MCPTransport {
 	onAuthError?: () => Promise<Record<string, string> | null>;
+}
+
+function getInitialAuthChallenge(error: unknown, config: MCPServerConfig): MCPAuthChallenge | undefined {
+	if (config.enabled === false || (config.type !== "http" && config.type !== "sse")) return undefined;
+
+	const message = error instanceof Error ? error.message : String(error);
+	if (!/^HTTP (?:401|403):/i.test(message)) return undefined;
+
+	const wwwAuthenticate = message
+		.match(/\[WWW-Authenticate:\s*([\s\S]*?)(?:;\s*Mcp-Auth-Server:|\]\s*$)/i)?.[1]
+		?.trim();
+	return { wwwAuthenticate: wwwAuthenticate ? [wwwAuthenticate] : [] };
 }
 
 function isAuthRefreshableMCPTransport(transport: MCPTransport): transport is AuthRefreshableMCPTransport {
@@ -174,8 +194,19 @@ export interface MCPDiscoverOptions {
 }
 
 /** Handles an MCP `WWW-Authenticate` challenge and returns refreshed config. */
-export type MCPAuthHandler = (serverName: string, challenge: MCPAuthChallenge) => Promise<MCPServerConfig | undefined>;
+export type MCPAuthHandler = (
+	serverName: string,
+	challenge: MCPAuthChallenge,
+	context?: MCPAuthHandlerContext,
+) => Promise<MCPServerConfig | undefined>;
 
+export type MCPAuthQueueEvent =
+	| { type: "queued"; serverName: string; queue: readonly string[] }
+	| { type: "started"; serverName: string; queue: readonly string[] }
+	| { type: "completed"; serverName: string; queue: readonly string[] }
+	| { type: "cancelled"; serverName: string; queue: readonly string[] };
+
+export type MCPAuthQueueHandler = (event: MCPAuthQueueEvent) => void;
 /**
  * MCP Server Manager.
  *
@@ -198,7 +229,6 @@ export class MCPManager {
 	static resetForTests(): void {
 		MCPManager.#instance = undefined;
 	}
-
 	#connections = new Map<string, MCPServerConnection>();
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
@@ -206,13 +236,19 @@ export class MCPManager {
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
 	#authHandler?: MCPAuthHandler;
-	#notificationListeners = new Set<(serverName: string, method: string, params: unknown) => void>();
+	#authHandlerQueue: Promise<void> = Promise.resolve();
+	#authQueueAbortController = new AbortController();
+	#authQueueGeneration = 0;
+	#nextAuthQueueId = 0;
+	#authQueueEntries = new Map<number, MCPAuthQueueEntry>();
+	#authQueueHandler?: MCPAuthQueueHandler;
 	/**
 	 * Notifications received before any listener attached, to be drained on
 	 * the first {@link addNotificationListener} call. Bounded by
 	 * {@link NOTIFICATION_BUFFER_CAP}, drop-oldest on overflow.
 	 */
 	#pendingNotifications: Array<{ server: string; method: string; params: unknown }> = [];
+	#notificationListeners = new Set<(serverName: string, method: string, params: unknown) => void>();
 	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void | Promise<void>;
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
 	#onPromptsChanged?: (serverName: string) => void;
@@ -385,9 +421,126 @@ export class MCPManager {
 		this.#authStorage = authStorage;
 	}
 
-	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
+	/** Set the callback used to complete OAuth after an MCP auth challenge. */
 	setAuthHandler(handler: MCPAuthHandler | undefined): void {
 		this.#authHandler = handler;
+	}
+
+	/** Set the callback used to report serialized MCP OAuth progress. */
+	setAuthQueueHandler(handler: MCPAuthQueueHandler | undefined): void {
+		this.#authQueueHandler = handler;
+	}
+
+	/** Cancel the active MCP OAuth flow and every queued flow. */
+	cancelAuthQueue(): void {
+		if (this.#authQueueEntries.size === 0) return;
+		this.#cancelAuthQueue();
+	}
+
+	#authQueueSnapshot(): string[] {
+		return Array.from(this.#authQueueEntries.values(), entry => entry.serverName);
+	}
+
+	#emitAuthQueueEvent(event: MCPAuthQueueEvent): void {
+		try {
+			this.#authQueueHandler?.(event);
+		} catch (error) {
+			logger.debug("MCP auth queue handler threw", { error });
+		}
+	}
+
+	#finishAuthQueueEntry(entry: MCPAuthQueueEntry, type: "completed" | "cancelled"): void {
+		if (!this.#authQueueEntries.delete(entry.id)) return;
+		this.#emitAuthQueueEvent({
+			type,
+			serverName: entry.serverName,
+			queue: this.#authQueueSnapshot(),
+		});
+	}
+
+	#cancelAuthQueue(): void {
+		const entries = Array.from(this.#authQueueEntries.values());
+		this.#authQueueGeneration++;
+		this.#authQueueAbortController.abort("MCP OAuth queue cancelled");
+		this.#authQueueEntries.clear();
+
+		const remaining = entries.map(entry => entry.serverName);
+		for (const entry of entries) {
+			const index = remaining.indexOf(entry.serverName);
+			if (index >= 0) remaining.splice(index, 1);
+			this.#emitAuthQueueEvent({
+				type: "cancelled",
+				serverName: entry.serverName,
+				queue: [...remaining],
+			});
+		}
+
+		this.#authHandlerQueue = Promise.resolve();
+		this.#authQueueAbortController = new AbortController();
+	}
+
+	/**
+	 * Serialize OAuth flows so concurrent startup challenges cannot share a
+	 * callback port.
+	 */
+	#runAuthHandler(name: string, challenge: MCPAuthChallenge): Promise<MCPServerConfig | undefined> {
+		if (!this.#authHandler) return Promise.resolve(undefined);
+
+		const entry: MCPAuthQueueEntry = {
+			id: ++this.#nextAuthQueueId,
+			serverName: name,
+			generation: this.#authQueueGeneration,
+			signal: this.#authQueueAbortController.signal,
+		};
+		this.#authQueueEntries.set(entry.id, entry);
+		this.#emitAuthQueueEvent({
+			type: "queued",
+			serverName: name,
+			queue: this.#authQueueSnapshot(),
+		});
+
+		const run = async (): Promise<MCPServerConfig | undefined> => {
+			if (entry.generation !== this.#authQueueGeneration || entry.signal.aborted) {
+				this.#finishAuthQueueEntry(entry, "cancelled");
+				throw new MCPOAuthCancelledError();
+			}
+
+			this.#emitAuthQueueEvent({
+				type: "started",
+				serverName: name,
+				queue: this.#authQueueSnapshot(),
+			});
+
+			let cancelled = false;
+			try {
+				const refreshedConfig = await this.#authHandler?.(name, challenge, { signal: entry.signal });
+				if (entry.generation !== this.#authQueueGeneration || entry.signal.aborted) {
+					cancelled = true;
+					throw new MCPOAuthCancelledError();
+				}
+				return refreshedConfig;
+			} catch (error) {
+				cancelled =
+					error instanceof MCPOAuthCancelledError ||
+					entry.generation !== this.#authQueueGeneration ||
+					entry.signal.aborted;
+				if (error instanceof MCPOAuthCancelledError) {
+					this.#cancelAuthQueue();
+				} else if (cancelled) {
+					throw new MCPOAuthCancelledError();
+				}
+				throw error;
+			} finally {
+				this.#finishAuthQueueEntry(entry, cancelled ? "cancelled" : "completed");
+			}
+		};
+
+		const result = this.#authHandlerQueue.then(run, run);
+		this.#authHandlerQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 
 	/**
@@ -482,8 +635,9 @@ export class MCPManager {
 			this.#serverConfigs.set(name, config);
 
 			// Resolve auth config before connecting, but do so per-server in parallel.
-			const connectionPromise = (async () => {
-				const resolvedConfig = await this.#resolveAuthConfig(config);
+			let connectionConfig = config;
+			const connectWithConfig = async (candidateConfig: MCPServerConfig): Promise<MCPServerConnection> => {
+				const resolvedConfig = await this.#resolveAuthConfig(candidateConfig);
 				return connectToServer(name, resolvedConfig, {
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
@@ -492,12 +646,27 @@ export class MCPManager {
 						return this.#handleServerRequest(method, params);
 					},
 				});
+			};
+			const connectionPromise = (async () => {
+				try {
+					return await connectWithConfig(connectionConfig);
+				} catch (error) {
+					const authChallenge = getInitialAuthChallenge(error, connectionConfig);
+					if (!authChallenge) throw error;
+
+					const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
+					if (!refreshedConfig) throw error;
+
+					connectionConfig = refreshedConfig;
+					this.#serverConfigs.set(name, refreshedConfig);
+					return connectWithConfig(refreshedConfig);
+				}
 			})().then(
 				connection => {
-					// Store original config (without resolved tokens) to keep
-					// cache keys stable and avoid leaking rotating credentials.
-					connection.config = config;
-					this.#serverConfigs.set(name, config);
+					// Store config without resolved tokens to keep cache keys stable and
+					// avoid leaking rotating credentials.
+					connection.config = connectionConfig;
+					this.#serverConfigs.set(name, connectionConfig);
 					if (sources[name]) {
 						connection._source = sources[name];
 					}
@@ -512,10 +681,10 @@ export class MCPManager {
 					// too and need the same mid-session refresh hook.
 					if (
 						isAuthRefreshableMCPTransport(connection.transport) &&
-						lookupMcpOAuthCredential(this.#authStorage, config)
+						lookupMcpOAuthCredential(this.#authStorage, connectionConfig)
 					) {
 						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+							const refreshed = await this.#resolveAuthConfig(connectionConfig, { forceRefresh: true });
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -559,7 +728,7 @@ export class MCPManager {
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					void this.#onToolsChanged?.(this.#tools);
-					void this.toolCache?.set(name, config, serverTools);
+					void this.toolCache?.set(name, connectionConfig, serverTools);
 
 					onStatus?.({ type: "connected", serverName: name });
 					await this.#loadServerResourcesAndPrompts(name, connection);
@@ -567,6 +736,10 @@ export class MCPManager {
 				.catch(error => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
+					if (error instanceof MCPOAuthCancelledError) {
+						onStatus?.({ type: "cancelled", serverName: name });
+						return;
+					}
 					const message = error instanceof Error ? error.message : String(error);
 					onStatus?.({ type: "failed", serverName: name, error: message });
 					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
@@ -620,6 +793,7 @@ export class MCPManager {
 					const reconnect = () => this.reconnectServer(name);
 					allTools.push(...MCPTool.fromTools(connection, serverTools, reconnect));
 				} else if (task.tracked.status === "rejected") {
+					if (task.tracked.reason instanceof MCPOAuthCancelledError) continue;
 					const message =
 						task.tracked.reason instanceof Error ? task.tracked.reason.message : String(task.tracked.reason);
 					errors.set(name, message);
@@ -899,6 +1073,7 @@ export class MCPManager {
 	 * Disconnect from all servers.
 	 */
 	async disconnectAll(): Promise<void> {
+		this.#cancelAuthQueue();
 		// Invalidate any in-flight reconnection attempts that outlive this call.
 		// They captured the old epoch; after increment they'll detect staleness.
 		this.#epoch++;
@@ -1008,11 +1183,12 @@ export class MCPManager {
 				return null;
 			}
 			try {
-				const refreshedConfig = await this.#authHandler(name, authChallenge);
+				const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
 				if (!refreshedConfig) return null;
 				config = refreshedConfig;
 				this.#serverConfigs.set(name, config);
 			} catch (error) {
+				if (error instanceof MCPOAuthCancelledError) return null;
 				logger.error("MCP auth challenge handling failed", { path: `mcp:${name}`, error });
 				return null;
 			}

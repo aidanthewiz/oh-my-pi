@@ -6,6 +6,7 @@ export const MCP_CONNECTION_STATUS_EVENT_CHANNEL = "mcp:connection-status";
 export type McpConnectionStatusEvent =
 	| { type: "connecting"; serverNames: string[] }
 	| { type: "connected"; serverName: string }
+	| { type: "cancelled"; serverName: string }
 	| { type: "failed"; serverName: string; error: string };
 
 export type McpConnectionStatusSnapshot = {
@@ -107,6 +108,7 @@ export function isMcpConnectionStatusEvent(data: unknown): data is McpConnection
 		case "connecting":
 			return isStringArray(data.serverNames);
 		case "connected":
+		case "cancelled":
 			return typeof data.serverName === "string";
 		case "failed":
 			return typeof data.serverName === "string" && typeof data.error === "string";
