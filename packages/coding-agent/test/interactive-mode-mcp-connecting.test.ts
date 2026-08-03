@@ -141,6 +141,28 @@ describe("InteractiveMode MCP connection status", () => {
 		]);
 	});
 
+	it("removes cancelled servers without rendering them as failures", () => {
+		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+
+		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
+			type: "connecting",
+			serverNames: ["rootly", "sentry"],
+		} satisfies McpConnectionStatusEvent);
+		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
+			type: "cancelled",
+			serverName: "rootly",
+		} satisfies McpConnectionStatusEvent);
+		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
+			type: "connected",
+			serverName: "sentry",
+		} satisfies McpConnectionStatusEvent);
+
+		expect(showStatusSpy.mock.calls.map(call => call[0])).toEqual([
+			"Connecting to MCP servers: rootly, sentry…",
+			"Connected to MCP server: sentry.",
+		]);
+	});
+
 	it("rejects a malformed mcp:connection-status payload via the guard instead of letting it throw", () => {
 		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
 		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});

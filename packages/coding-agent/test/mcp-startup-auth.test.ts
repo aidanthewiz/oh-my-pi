@@ -7,7 +7,11 @@
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import type { MCPAuthChallenge, MCPHttpServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import {
+	type MCPAuthChallenge,
+	type MCPHttpServerConfig,
+	MCPOAuthCancelledError,
+} from "@oh-my-pi/pi-coding-agent/mcp/types";
 
 type RequestRecord = {
 	url: string;
@@ -152,6 +156,51 @@ describe("MCP startup OAuth", () => {
 			expect(result.connectedServers).toEqual(["rootly", "sentry"]);
 		} finally {
 			releaseFirstFlow.resolve();
+			await manager.disconnectAll();
+		}
+	});
+
+	test("cancels the active OAuth flow and every queued flow", async () => {
+		const manager = new MCPManager(process.cwd());
+		const rootlyConfig = httpConfig(ROOTLY_URL);
+		const sentryConfig = httpConfig(SENTRY_URL);
+		installMcpFetch(new Set([ROOTLY_URL, SENTRY_URL]));
+
+		const firstFlowStarted = Promise.withResolvers<void>();
+		const queueEvents: Array<{ type: string; serverName: string; queue: readonly string[] }> = [];
+		const statuses: Array<{ type: string; serverName?: string }> = [];
+		const handler = vi.fn(async (name: string, _challenge: MCPAuthChallenge, context?: { signal: AbortSignal }) => {
+			firstFlowStarted.resolve();
+			await new Promise<void>((_resolve, reject) => {
+				context?.signal.addEventListener("abort", () => reject(new MCPOAuthCancelledError()), { once: true });
+			});
+			return name === "rootly" ? rootlyConfig : sentryConfig;
+		});
+		manager.setAuthHandler(handler);
+		manager.setAuthQueueHandler(event => queueEvents.push(event));
+
+		try {
+			const resultPromise = manager.connectServers({ rootly: rootlyConfig, sentry: sentryConfig }, {}, event =>
+				statuses.push(event),
+			);
+			await firstFlowStarted.promise;
+			manager.cancelAuthQueue();
+			const result = await resultPromise;
+
+			expect(handler).toHaveBeenCalledTimes(1);
+			expect(result.connectedServers).toEqual([]);
+			expect(result.errors).toEqual(new Map());
+			expect(queueEvents.filter(event => event.type === "cancelled").map(event => event.serverName)).toEqual([
+				"rootly",
+				"sentry",
+			]);
+			expect(
+				statuses
+					.filter(event => event.type === "cancelled")
+					.map(event => event.serverName)
+					.sort(),
+			).toEqual(["rootly", "sentry"]);
+		} finally {
 			await manager.disconnectAll();
 		}
 	});

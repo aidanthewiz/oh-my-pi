@@ -99,6 +99,7 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 		expect(isMcpConnectionStatusEvent({ type: "connecting", serverNames: [] })).toBe(true);
 		expect(isMcpConnectionStatusEvent({ type: "connected", serverName: "a" })).toBe(true);
 		expect(isMcpConnectionStatusEvent({ type: "failed", serverName: "a", error: "boom" })).toBe(true);
+		expect(isMcpConnectionStatusEvent({ type: "cancelled", serverName: "a" })).toBe(true);
 
 		expect(isMcpConnectionStatusEvent(null)).toBe(false);
 		expect(isMcpConnectionStatusEvent(undefined)).toBe(false);
@@ -107,6 +108,7 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 		expect(isMcpConnectionStatusEvent({ type: "connecting", serverNames: "alpha" })).toBe(false);
 		expect(isMcpConnectionStatusEvent({ type: "connecting", serverNames: ["ok", 3] })).toBe(false);
 		expect(isMcpConnectionStatusEvent({ type: "connected", serverName: 1 })).toBe(false);
+		expect(isMcpConnectionStatusEvent({ type: "cancelled", serverName: 1 })).toBe(false);
 		expect(isMcpConnectionStatusEvent({ type: "failed", serverName: "a" })).toBe(false);
 	});
 });

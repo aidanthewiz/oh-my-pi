@@ -82,7 +82,7 @@ import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import type { MCPManager } from "../mcp";
+import type { MCPAuthQueueEvent, MCPManager } from "../mcp";
 import {
 	formatMCPConnectionStatusMessage,
 	isMcpConnectionStatusEvent,
@@ -671,6 +671,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpConnectedServers = new Set<string>();
 	#mcpFailedServers = new Map<string, string>();
 	#welcomeComponent?: WelcomeComponent;
+	#mcpAuthActiveServer?: string;
+	#mcpAuthQueue: string[] = [];
+	#mcpAuthCompletedCount = 0;
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
 
 	constructor(
@@ -692,9 +695,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#toolUiContextSetter = setToolUIContext;
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
-		this.mcpManager?.setAuthHandler((serverName, challenge) =>
-			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
+		this.mcpManager?.setAuthHandler((serverName, challenge, context) =>
+			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge, context),
 		);
+		this.mcpManager?.setAuthQueueHandler(event => this.#handleMcpAuthQueueEvent(event));
 		this.#eventBus = eventBus;
 		if (eventBus) {
 			this.#eventBusUnsubscribers.push(
@@ -836,6 +840,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#mcpPendingServers.delete(event.serverName);
 			this.#mcpFailedServers.delete(event.serverName);
 			this.#mcpConnectedServers.add(event.serverName);
+		} else if (event.type === "cancelled") {
+			this.#mcpPendingServers.delete(event.serverName);
+			this.#mcpConnectedServers.delete(event.serverName);
+			this.#mcpFailedServers.delete(event.serverName);
+			return;
 		} else {
 			this.#trackMcpStatusServer(event.serverName);
 			this.#mcpPendingServers.delete(event.serverName);
@@ -868,6 +877,45 @@ export class InteractiveMode implements InteractiveModeContext {
 		});
 	}
 
+	#handleMcpAuthQueueEvent(event: MCPAuthQueueEvent): void {
+		const previousQueueLength = this.#mcpAuthQueue.length;
+		this.#mcpAuthQueue = [...event.queue];
+		if (event.type === "queued" && previousQueueLength === 0 && !this.#mcpAuthActiveServer) {
+			this.#mcpAuthCompletedCount = 0;
+		}
+		if (event.type === "started") {
+			this.#mcpAuthActiveServer = event.serverName;
+		} else if (
+			(event.type === "completed" || event.type === "cancelled") &&
+			this.#mcpAuthActiveServer === event.serverName
+		) {
+			this.#mcpAuthActiveServer = undefined;
+			if (event.type === "completed") this.#mcpAuthCompletedCount++;
+		}
+
+		if (this.settings.get("startup.quiet") || this.#isShuttingDown) return;
+
+		const active = this.#mcpAuthActiveServer;
+		if (active) {
+			const queued = this.#mcpAuthQueue.filter(serverName => serverName !== active);
+			const total = this.#mcpAuthCompletedCount + this.#mcpAuthQueue.length;
+			const progress = total > 1 ? ` (${this.#mcpAuthCompletedCount + 1} of ${total})` : "";
+			const suffix =
+				queued.length === 0
+					? ""
+					: ` Queued: ${queued.map(serverName => truncateToWidth(serverName, TRUNCATE_LENGTHS.SHORT)).join(", ")}.`;
+			this.showStatus(
+				`Authorizing MCP server ${truncateToWidth(active, TRUNCATE_LENGTHS.SHORT)}${progress}.${suffix} Esc cancels all queued sign-ins.`,
+			);
+			return;
+		}
+
+		if (event.type === "cancelled" && this.#mcpAuthQueue.length === 0) {
+			this.#mcpAuthCompletedCount = 0;
+			this.showStatus("MCP authorization cancelled.");
+		}
+	}
+
 	playWelcomeIntro(): void {
 		const welcome = this.#welcomeComponent;
 		// Component-scoped: the intro only mutates the welcome box's own rows,
@@ -892,7 +940,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// signal arriving mid-Ctrl+C no-ops instead of racing a second dispose.
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.editor.getText(),
-			beginDispose: () => this.session.beginDispose(),
+			beginDispose: () => {
+				this.mcpManager?.cancelAuthQueue();
+				this.session.beginDispose();
+			},
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: reason =>
 				this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS, reason }),
@@ -4020,7 +4071,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	async shutdown(): Promise<void> {
 		if (this.#isShuttingDown) return;
 		this.#isShuttingDown = true;
-
+		this.mcpManager?.cancelAuthQueue();
 		await this.#liveCommandController.stop();
 
 		this.#btwController.dispose();

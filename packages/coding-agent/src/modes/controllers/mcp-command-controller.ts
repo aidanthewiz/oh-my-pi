@@ -48,12 +48,14 @@ import {
 	searchSmitheryRegistry,
 	toConfigName,
 } from "../../mcp/smithery-registry";
-import type {
-	MCPAuthChallenge,
-	MCPAuthConfig,
-	MCPConfigFile,
-	MCPServerConfig,
-	MCPServerConnection,
+import {
+	type MCPAuthChallenge,
+	type MCPAuthConfig,
+	type MCPAuthHandlerContext,
+	type MCPConfigFile,
+	MCPOAuthCancelledError,
+	type MCPServerConfig,
+	type MCPServerConnection,
 } from "../../mcp/types";
 import { shortenPath } from "../../tools/render-utils";
 import { urlHyperlinkAlways } from "../../tui";
@@ -214,19 +216,6 @@ interface OAuthFlowResult {
 	credentialId: string;
 	clientId?: string;
 	resource?: string;
-}
-
-/**
- * Thrown by {@link MCPCommandController}'s OAuth handler when the user (or a
- * caller-supplied {@link AbortSignal}) cancels the in-flight flow. Distinct
- * from network/timeout failures so callers can surface a neutral
- * "cancelled" status instead of an error banner.
- */
-export class MCPOAuthCancelledError extends Error {
-	constructor(message = "OAuth flow cancelled") {
-		super(message);
-		this.name = "MCPOAuthCancelledError";
-	}
 }
 
 /** Reason recorded on the OAuth flow's AbortController when the user hits Esc. */
@@ -1758,13 +1747,29 @@ export class MCPCommandController {
 	}
 
 	/** Reauthorize a server after a tool-level OAuth challenge. */
-	async handleMCPAuthChallenge(name: string, challenge: MCPAuthChallenge): Promise<MCPServerConfig | undefined> {
-		return this.#handleReauth(name, { silent: true, reload: false, authChallenge: challenge });
+	async handleMCPAuthChallenge(
+		name: string,
+		challenge: MCPAuthChallenge,
+		context?: MCPAuthHandlerContext,
+	): Promise<MCPServerConfig | undefined> {
+		return this.#handleReauth(name, {
+			silent: true,
+			reload: false,
+			authChallenge: challenge,
+			abortSignal: context?.signal,
+			rethrowCancellation: true,
+		});
 	}
 
 	async #handleReauth(
 		name: string | undefined,
-		options: { silent?: boolean; reload?: boolean; authChallenge?: MCPAuthChallenge } = {},
+		options: {
+			silent?: boolean;
+			reload?: boolean;
+			authChallenge?: MCPAuthChallenge;
+			abortSignal?: AbortSignal;
+			rethrowCancellation?: boolean;
+		} = {},
 	): Promise<MCPServerConfig | undefined> {
 		if (!name) {
 			if (!options.silent) this.ctx.showError("Server name required. Usage: /mcp reauth <name>");
@@ -1831,6 +1836,7 @@ export class MCPCommandController {
 					serverUrl,
 					resource: oauthResource,
 					stripSameOriginResource: oauthResourceIsFallback,
+					abortSignal: options.abortSignal,
 				},
 			);
 
@@ -1880,6 +1886,7 @@ export class MCPCommandController {
 			return updatedConfig;
 		} catch (error) {
 			if (error instanceof MCPOAuthCancelledError) {
+				if (options.rethrowCancellation) throw error;
 				if (!options.silent) this.ctx.showStatus(`Reauthorization cancelled for "${name}"`);
 				return;
 			}

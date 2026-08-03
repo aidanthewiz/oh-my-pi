@@ -291,6 +291,44 @@ export async function setServerForceEnabled(filePath: string, name: string, forc
 	});
 }
 
+/**
+ * Atomically apply user-level enabled/disabled overrides for several servers.
+ *
+ * Existing entries for unrelated servers and local server definitions remain
+ * unchanged. Each supplied server ends in exactly one override list.
+ */
+export async function setServerOverrides(filePath: string, selections: ReadonlyMap<string, boolean>): Promise<void> {
+	for (const name of selections.keys()) {
+		const nameError = validateServerName(name);
+		if (nameError) throw new Error(`Invalid server name "${name}": ${nameError}`);
+	}
+
+	await withConfigLock(filePath, async () => {
+		const config = await readMCPConfigFile(filePath);
+		const enabledServers = new Set(config.enabledServers ?? []);
+		const disabledServers = new Set(config.disabledServers ?? []);
+
+		for (const [name, enabled] of selections) {
+			if (enabled) {
+				disabledServers.delete(name);
+				enabledServers.add(name);
+			} else {
+				enabledServers.delete(name);
+				disabledServers.add(name);
+			}
+		}
+
+		const updated: MCPConfigFile = {
+			...config,
+			enabledServers: enabledServers.size > 0 ? Array.from(enabledServers).sort() : undefined,
+			disabledServers: disabledServers.size > 0 ? Array.from(disabledServers).sort() : undefined,
+		};
+		if (!updated.enabledServers) delete updated.enabledServers;
+		if (!updated.disabledServers) delete updated.disabledServers;
+		await writeMCPConfigFile(filePath, updated);
+	});
+}
+
 /** Paths and target state for toggling one MCP server across known config files. */
 export interface SetMcpServerEnabledOptions {
 	userPath: string;
