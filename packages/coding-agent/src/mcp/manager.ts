@@ -61,6 +61,18 @@ interface AuthRefreshableMCPTransport extends MCPTransport {
 	onAuthError?: () => Promise<Record<string, string> | null>;
 }
 
+function getInitialAuthChallenge(error: unknown, config: MCPServerConfig): MCPAuthChallenge | undefined {
+	if (config.enabled === false || (config.type !== "http" && config.type !== "sse")) return undefined;
+
+	const message = error instanceof Error ? error.message : String(error);
+	if (!/^HTTP (?:401|403):/i.test(message)) return undefined;
+
+	const wwwAuthenticate = message
+		.match(/\[WWW-Authenticate:\s*([\s\S]*?)(?:;\s*Mcp-Auth-Server:|\]\s*$)/i)?.[1]
+		?.trim();
+	return { wwwAuthenticate: wwwAuthenticate ? [wwwAuthenticate] : [] };
+}
+
 function isAuthRefreshableMCPTransport(transport: MCPTransport): transport is AuthRefreshableMCPTransport {
 	return "onAuthError" in transport;
 }
@@ -198,7 +210,6 @@ export class MCPManager {
 	static resetForTests(): void {
 		MCPManager.#instance = undefined;
 	}
-
 	#connections = new Map<string, MCPServerConnection>();
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
@@ -206,6 +217,7 @@ export class MCPManager {
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
 	#authHandler?: MCPAuthHandler;
+	#authHandlerQueue: Promise<void> = Promise.resolve();
 	#notificationListeners = new Set<(serverName: string, method: string, params: unknown) => void>();
 	/**
 	 * Notifications received before any listener attached, to be drained on
@@ -385,9 +397,21 @@ export class MCPManager {
 		this.#authStorage = authStorage;
 	}
 
-	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
+	/** Set the callback used to complete OAuth after an MCP auth challenge. */
 	setAuthHandler(handler: MCPAuthHandler | undefined): void {
 		this.#authHandler = handler;
+	}
+	/**
+	 * Serialize OAuth flows so concurrent startup challenges cannot share a callback port.
+	 */
+	#runAuthHandler(name: string, challenge: MCPAuthChallenge): Promise<MCPServerConfig | undefined> {
+		const run = async (): Promise<MCPServerConfig | undefined> => this.#authHandler?.(name, challenge);
+		const result = this.#authHandlerQueue.then(run, run);
+		this.#authHandlerQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 
 	/**
@@ -482,8 +506,9 @@ export class MCPManager {
 			this.#serverConfigs.set(name, config);
 
 			// Resolve auth config before connecting, but do so per-server in parallel.
-			const connectionPromise = (async () => {
-				const resolvedConfig = await this.#resolveAuthConfig(config);
+			let connectionConfig = config;
+			const connectWithConfig = async (candidateConfig: MCPServerConfig): Promise<MCPServerConnection> => {
+				const resolvedConfig = await this.#resolveAuthConfig(candidateConfig);
 				return connectToServer(name, resolvedConfig, {
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
@@ -492,12 +517,27 @@ export class MCPManager {
 						return this.#handleServerRequest(method, params);
 					},
 				});
+			};
+			const connectionPromise = (async () => {
+				try {
+					return await connectWithConfig(connectionConfig);
+				} catch (error) {
+					const authChallenge = getInitialAuthChallenge(error, connectionConfig);
+					if (!authChallenge) throw error;
+
+					const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
+					if (!refreshedConfig) throw error;
+
+					connectionConfig = refreshedConfig;
+					this.#serverConfigs.set(name, refreshedConfig);
+					return connectWithConfig(refreshedConfig);
+				}
 			})().then(
 				connection => {
-					// Store original config (without resolved tokens) to keep
-					// cache keys stable and avoid leaking rotating credentials.
-					connection.config = config;
-					this.#serverConfigs.set(name, config);
+					// Store config without resolved tokens to keep cache keys stable and
+					// avoid leaking rotating credentials.
+					connection.config = connectionConfig;
+					this.#serverConfigs.set(name, connectionConfig);
 					if (sources[name]) {
 						connection._source = sources[name];
 					}
@@ -512,10 +552,10 @@ export class MCPManager {
 					// too and need the same mid-session refresh hook.
 					if (
 						isAuthRefreshableMCPTransport(connection.transport) &&
-						lookupMcpOAuthCredential(this.#authStorage, config)
+						lookupMcpOAuthCredential(this.#authStorage, connectionConfig)
 					) {
 						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+							const refreshed = await this.#resolveAuthConfig(connectionConfig, { forceRefresh: true });
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -559,7 +599,7 @@ export class MCPManager {
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					void this.#onToolsChanged?.(this.#tools);
-					void this.toolCache?.set(name, config, serverTools);
+					void this.toolCache?.set(name, connectionConfig, serverTools);
 
 					onStatus?.({ type: "connected", serverName: name });
 					await this.#loadServerResourcesAndPrompts(name, connection);
@@ -1008,7 +1048,7 @@ export class MCPManager {
 				return null;
 			}
 			try {
-				const refreshedConfig = await this.#authHandler(name, authChallenge);
+				const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
 				if (!refreshedConfig) return null;
 				config = refreshedConfig;
 				this.#serverConfigs.set(name, config);
