@@ -89,6 +89,7 @@ interface MCPServerConfigBase {
 		clientId?: string;
 		clientSecret?: string;
 		redirectUri?: string;
+		/** Local callback port. Set to 0 for an OS-assigned port and fresh dynamic client registration. */
 		callbackPort?: number;
 		callbackPath?: string;
 		/** `prompt` param for the authorization request (default "consent"; "" to omit) */

@@ -251,6 +251,68 @@ describe("mcp oauth flow", () => {
 			refresh: "refresh-token",
 		});
 	});
+
+	it("uses an OS-assigned callback port for dynamic client registration", async () => {
+		let registeredRedirectUri = "";
+		let advertisedRedirectUri = "";
+		let tokenRedirectUri = "";
+		const fetchImpl: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/register") {
+				const payload = JSON.parse(String(init?.body)) as { redirect_uris?: string[] };
+				registeredRedirectUri = payload.redirect_uris?.[0] ?? "";
+				return new Response(JSON.stringify({ client_id: "ephemeral-client" }), {
+					status: 201,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://provider.example/token") {
+				tokenRedirectUri = new URLSearchParams(String(init?.body)).get("redirect_uri") ?? "";
+				return new Response(
+					JSON.stringify({
+						access_token: "access-token",
+						refresh_token: "refresh-token",
+						expires_in: 3600,
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		};
+
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				registrationUrl: "https://provider.example/register",
+				callbackPort: 0,
+				fetch: fetchImpl,
+			},
+			{
+				onAuth: info => {
+					const authUrl = new URL(info.url);
+					advertisedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
+					const state = authUrl.searchParams.get("state") ?? "";
+					queueMicrotask(() => {
+						void completeLocalOAuthCallback(`${advertisedRedirectUri}?code=test-code&state=${state}`);
+					});
+				},
+				signal: AbortSignal.timeout(1_000),
+			},
+		);
+
+		const credentials = await flow.login();
+		const callbackUrl = new URL(advertisedRedirectUri);
+
+		expect(callbackUrl.hostname).toBe("localhost");
+		expect(callbackUrl.port).not.toBe("");
+		expect(callbackUrl.port).not.toBe("0");
+		expect(registeredRedirectUri).toBe(advertisedRedirectUri);
+		expect(tokenRedirectUri).toBe(advertisedRedirectUri);
+		expect(flow.resolvedClientId).toBe("ephemeral-client");
+		expect(credentials.access).toBe("access-token");
+	});
+
 	it("sends MCP resource indicator in authorization and token requests", async () => {
 		let authResource = "";
 		let tokenRequestBody = "";

@@ -1803,13 +1803,21 @@ export class MCPCommandController {
 			// A user-supplied client secret may live in either block (the wizard
 			// writes it to auth.clientSecret); DCR secrets are embedded in the
 			// stored credential and never echoed back into config files.
+			//
+			// Port 0 requests a fresh OS-assigned callback port. A client
+			// registered for an earlier random port cannot be reused with it, so
+			// ephemeral callbacks must perform DCR again unless the server
+			// advertises its own client id.
+			const ephemeralCallback = found.config.oauth?.callbackPort === 0;
 			const configuredClientId = found.config.oauth?.clientId ?? currentAuth?.clientId;
 			const existingCredential = lookupMcpOAuthCredentialForServer(authStorage, currentAuth, serverUrl)?.credential;
-			const flowClientId = oauth.clientId ?? configuredClientId ?? existingCredential?.clientId ?? "";
+			const flowClientId =
+				oauth.clientId ?? (ephemeralCallback ? "" : (configuredClientId ?? existingCredential?.clientId ?? ""));
 			const storedClientSecret =
 				existingCredential?.clientId === flowClientId ? existingCredential.clientSecret : undefined;
 			const userClientSecret = found.config.oauth?.clientSecret ?? currentAuth?.clientSecret;
-			const flowClientSecret = userClientSecret ?? storedClientSecret ?? "";
+			const flowClientSecret =
+				ephemeralCallback && !oauth.clientId ? "" : (userClientSecret ?? storedClientSecret ?? "");
 
 			if (!options.silent) {
 				this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));

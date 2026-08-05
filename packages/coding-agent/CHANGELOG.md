@@ -19,6 +19,7 @@
 - Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
 - Preserved the employee-selected AWS profile and Region for CLI, SDK, and MCP processes while keeping Coreforge's managed inference profile model-only.
 - Allowed MCP server definitions to brand dynamic registration and the local OAuth completion page, including the Coreforge wordmark and hammer icon.
+- Allowed hosted MCP OAuth definitions to request OS-assigned callback ports and register a fresh client during reauthorization.
 
 - Clarified that `coreforge update` must run at the terminal prompt after exiting Coreforge, not as a chat message.
 - Fixed `/collab` printing the internal `omp join` command instead of the runnable `coreforge join` command. The browser approval screen now distinguishes browser approval from automatic terminal authentication and shows the complete host authorization command.

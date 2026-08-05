@@ -403,6 +403,77 @@ describe("/mcp auth commands", () => {
 		});
 	});
 
+	test("registers a fresh client when reauth uses an OS-assigned callback port", async () => {
+		const saved = JSON.parse(await Bun.file(configPath).text()) as TestConfigFile;
+		const server = saved.mcpServers?.envserver;
+		if (!server) throw new Error("envserver fixture missing");
+		server.oauth = { ...server.oauth, callbackPort: 0 };
+		await Bun.write(configPath, `${JSON.stringify(saved, null, 2)}\n`);
+
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		await authStorage.set(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL), {
+			type: "oauth",
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: Date.now() + 3_600_000,
+			tokenUrl: "https://auth.example.com/token",
+			clientId: "old-port-client",
+			clientSecret: "old-port-secret",
+			resource: EXPANDED_SERVER_URL,
+		} as oauthFlow.MCPStoredOAuthCredential);
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+
+		const registrations: Record<string, unknown>[] = [];
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit | BunFetchRequestInit): Promise<Response> => {
+				const url = String(input);
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server") {
+					return new Response(JSON.stringify({ registration_endpoint: "https://auth.example.com/register" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://auth.example.com/register") {
+					registrations.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+					return new Response(JSON.stringify({ client_id: "new-port-client", client_secret: "new-port-secret" }), {
+						status: 201,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected fetch: ${url}`);
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+		let authorizationUrl = "";
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async function (
+			this: oauthFlow.MCPOAuthFlow,
+		) {
+			authorizationUrl = (await this.generateAuthUrl("state", "http://localhost:53193/callback")).url;
+			return {
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 3_600_000,
+			};
+		});
+		const { controller, showError } = createController(authStorage);
+
+		await controller.handle("/mcp reauth envserver");
+
+		expect(showError).not.toHaveBeenCalled();
+		expect(registrations).toEqual([expect.objectContaining({ redirect_uris: ["http://localhost:53193/callback"] })]);
+		expect(new URL(authorizationUrl).searchParams.get("client_id")).toBe("new-port-client");
+		expect(authorizationUrl).not.toContain("old-port-client");
+		expect(authStorage.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
+			type: "oauth",
+			access: "fresh-access",
+			clientId: "new-port-client",
+			clientSecret: "new-port-secret",
+		});
+	});
+
 	test("Esc aborts the OAuth flow during /mcp reauth", async () => {
 		const authStorage = freshAuthStorage();
 		await authStorage.reload();
