@@ -98,8 +98,9 @@
         },
         "callbackPort": {
           "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Local OAuth callback port. Set to 0 to request an OS-assigned port and fresh dynamic client registration."
         },
         "callbackPath": {
           "type": "string"
