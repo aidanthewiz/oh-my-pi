@@ -145,4 +145,66 @@ describe("lintFigure", () => {
 		expect(first).toEqual(second);
 		expect(first.map(finding => finding.rule)).toEqual(["empty-figure", "palette-closure"]);
 	});
+
+	it("fails a node that renders outside the zone it declared", () => {
+		// The failure mode a straddle check cannot see: the node sits wholly inside
+		// a DIFFERENT zone, so nothing crosses a boundary.
+		const figure = makeFigure(1);
+		figure.nodes[0] = { ...figure.nodes[0]!, x: 400, y: 0, width: 160, height: 64 };
+		figure.nodeOverlays[figure.nodes[0]!.id] = {
+			kind: "default",
+			focal: false,
+			label: "N",
+			zone: "left",
+		};
+		figure.zones = [{ id: "left", label: "Left", x: 0, y: 0, width: 200, height: 200, depth: 0 }];
+
+		const findings = lintFigure(figure, skin as Skin);
+		const hit = findings.find(f => f.rule === "zone-membership");
+		expect(hit?.severity).toBe("error");
+		expect(hit?.message).toContain("renders outside");
+	});
+
+	it("fails a zone collapsed to a sliver", () => {
+		const figure = makeFigure(1);
+		figure.zones = [{ id: "z", label: "Z", x: 0, y: 0, width: 296, height: 4, depth: 0 }];
+
+		const findings = lintFigure(figure, skin as Skin);
+		const hit = findings.find(f => f.rule === "zone-bounds");
+		expect(hit?.severity).toBe("error");
+		expect(hit?.message).toContain("296x4");
+	});
+
+	it("warns when two sibling zones overlap but not when one nests in the other", () => {
+		const overlapping = makeFigure(1);
+		overlapping.zones = [
+			{ id: "a", label: "A", x: 0, y: 0, width: 200, height: 200, depth: 0 },
+			{ id: "b", label: "B", x: 100, y: 0, width: 200, height: 200, depth: 0 },
+		];
+		expect(lintFigure(overlapping, skin as Skin).some(f => f.rule === "zone-overlap")).toBe(true);
+
+		const nested = makeFigure(1);
+		nested.zones = [
+			{ id: "outer", label: "Outer", x: 0, y: 0, width: 300, height: 300, depth: 0 },
+			{ id: "inner", label: "Inner", x: 50, y: 50, width: 100, height: 100, depth: 1 },
+		];
+		expect(lintFigure(nested, skin as Skin).some(f => f.rule === "zone-overlap")).toBe(false);
+	});
+
+	it("fails two edges that share one route", () => {
+		const figure = makeFigure(2);
+		const route = [
+			{ x: 40, y: 80 },
+			{ x: 40, y: 176 },
+		];
+		const base = { style: "solid" as const, hasArrowStart: false, hasArrowEnd: true };
+		figure.edges = [
+			{ source: "node-0", target: "node-1", points: route, ...base },
+			{ source: "node-0", target: "node-1", points: route, ...base },
+		];
+
+		const findings = lintFigure(figure, skin as Skin);
+		const hit = findings.find(f => f.rule === "duplicate-edge-path");
+		expect(hit?.severity).toBe("error");
+	});
 });

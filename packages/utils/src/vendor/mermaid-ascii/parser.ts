@@ -439,6 +439,9 @@ const NODE_PATTERNS: Array<{ regex: RegExp; shape: NodeShape }> = [
 /** Regex for a bare node reference (just an ID, no shape brackets) */
 const BARE_NODE_REGEX = /^([\w-]+)/
 
+// Keep hyphens in IDs, but stop before an inline edge operator.
+const BARE_EDGE_OPERATOR_REGEX = /(-->|-.->|==>|---|-\.-|===)/
+
 /** Regex for ::: class shorthand suffix — matches :::className immediately after a node */
 const CLASS_SHORTHAND_REGEX = /^:::([\w][\w-]*)/
 
@@ -584,11 +587,21 @@ function consumeNode(
   if (id === null) {
     const bareMatch = text.match(BARE_NODE_REGEX)
     if (bareMatch) {
-      id = bareMatch[1]!
+      let bareId = bareMatch[1]!
+      let consumedLength = bareMatch[0].length
+      const edgeMatch = text.match(BARE_EDGE_OPERATOR_REGEX)
+      if (edgeMatch?.index !== undefined && edgeMatch.index < consumedLength) {
+        const candidateId = text.slice(0, edgeMatch.index)
+        if (/^[\w-]*\w$/u.test(candidateId)) {
+          bareId = candidateId
+          consumedLength = edgeMatch.index
+        }
+      }
+      id = bareId
       if (!graph.nodes.has(id)) {
         registerNode(graph, subgraphStack, { id, label: id, shape: 'rectangle' })
       }
-      remaining = text.slice(bareMatch[0].length)
+      remaining = text.slice(consumedLength)
     }
   }
 

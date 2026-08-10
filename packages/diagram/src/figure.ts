@@ -18,6 +18,11 @@ export interface NodeOverlay {
 	label: string;
 	sublabel?: string;
 	badge?: string;
+	/**
+	 * Zone the spec declared this node into, when any. Layout cannot be trusted to
+	 * honour it, so the lint compares declared membership against final geometry.
+	 */
+	zone?: string;
 }
 
 /** Per-edge semantics the positioned graph does not carry. */

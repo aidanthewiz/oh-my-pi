@@ -89,6 +89,85 @@ export function lintFigure(figure: PositionedFigure, skin: Skin): LintFinding[] 
 		}
 	}
 
+	// A straddle check alone cannot see the worst failure: a node sitting wholly
+	// inside the wrong zone, or a zone collapsed to a sliver beside its members.
+	// Declared membership is the only ground truth for that, so it is compared
+	// against final geometry here.
+	const zoneById: Record<string, PositionedFigure["zones"][number]> = {};
+	for (const zone of figure.zones) zoneById[zone.id] = zone;
+	for (const node of figure.nodes) {
+		const declared = figure.nodeOverlays[node.id]?.zone;
+		if (declared === undefined) continue;
+		const zone = zoneById[declared];
+		if (zone === undefined) {
+			findings.push({
+				rule: "zone-membership",
+				severity: "error",
+				message: `Node ${node.id} declares zone ${declared}, which the layout did not produce.`,
+			});
+			continue;
+		}
+		const contained =
+			node.x >= zone.x &&
+			node.y >= zone.y &&
+			node.x + node.width <= zone.x + zone.width &&
+			node.y + node.height <= zone.y + zone.height;
+		if (!contained) {
+			findings.push({
+				rule: "zone-membership",
+				severity: "error",
+				message: `Node ${node.id} declares zone ${declared} but renders outside it.`,
+			});
+		}
+	}
+
+	for (const zone of figure.zones) {
+		// A zone narrower or shorter than a single grid step cannot enclose anything
+		// and is the signature of a collapsed bounding box.
+		if (zone.width <= 8 || zone.height <= 8) {
+			findings.push({
+				rule: "zone-bounds",
+				severity: "error",
+				message: `Zone ${zone.id} collapsed to ${zone.width}x${zone.height} and encloses nothing.`,
+			});
+		}
+	}
+
+	// Overlapping boundaries are legible but ambiguous: a reader cannot tell which
+	// zone a node in the intersection belongs to. Placement, not the box, decides
+	// this, so it is reported rather than corrected.
+	for (let i = 0; i < figure.zones.length; i++) {
+		for (let j = i + 1; j < figure.zones.length; j++) {
+			const a = figure.zones[i]!;
+			const b = figure.zones[j]!;
+			if (a.id === b.id) continue;
+			const nested = a.depth !== b.depth;
+			const intersects = a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+			if (intersects && !nested) {
+				findings.push({
+					rule: "zone-overlap",
+					severity: "warning",
+					message: `Zones ${a.id} and ${b.id} overlap, so membership in the intersection is ambiguous.`,
+				});
+			}
+		}
+	}
+
+	const routes = new Map<string, string>();
+	for (const edge of figure.edges) {
+		const key = edge.points.map(point => `${point.x},${point.y}`).join(" ");
+		const previous = routes.get(key);
+		if (previous !== undefined) {
+			findings.push({
+				rule: "duplicate-edge-path",
+				severity: "error",
+				message: `Edges ${previous} and ${edge.source}->${edge.target} share one route, so they cannot be told apart.`,
+			});
+		} else {
+			routes.set(key, `${edge.source}->${edge.target}`);
+		}
+	}
+
 	for (const [edgeId, overlay] of Object.entries(figure.edgeOverlays)) {
 		if (overlay.label !== undefined && overlay.label.length > 14) {
 			findings.push({

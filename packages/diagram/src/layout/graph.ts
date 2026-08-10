@@ -160,6 +160,7 @@ function makeNodeOverlays(spec: DiagramSpec): Record<string, NodeOverlay> {
 			label: node.label,
 			sublabel: node.sublabel,
 			badge: node.badge,
+			zone: node.zone,
 		};
 	}
 	return overlays;

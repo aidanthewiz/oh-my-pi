@@ -34,4 +34,13 @@ describe("layoutPositionedGraph", () => {
 			expect(node.y + node.height).toBeLessThanOrEqual(group!.y + group!.height);
 		}
 	});
+
+	it("separates parallel routes so each relationship stays traceable", () => {
+		// The router returns one best path per node pair, so parallel edges arrive
+		// with identical geometry and would render as a single connector.
+		const graph = layoutPositionedGraph("flowchart TD\nA[One] --> B[Two]\nA --> B\nA --> B\nA --> B");
+		expect(graph.edges).toHaveLength(4);
+		const routes = graph.edges.map(edge => edge.points.map(point => `${point.x},${point.y}`).join(" "));
+		expect(new Set(routes).size).toBe(4);
+	});
 });

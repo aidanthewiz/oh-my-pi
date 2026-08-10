@@ -76,6 +76,47 @@ function projectGroup(sg: AsciiSubgraph): PositionedGroup {
 	};
 }
 
+/** Perpendicular separation between routes that would otherwise coincide. */
+const FAN_STEP = 8;
+
+/**
+ * Separate routes that resolved to the same polyline.
+ *
+ * The router picks one best path per node pair, so parallel relationships all
+ * receive identical geometry and render as a single connector carrying several
+ * labels — the figure then silently contradicts its source. Each subsequent route
+ * on a shared polyline is offset perpendicular to its own run so every
+ * relationship stays independently traceable.
+ *
+ * Endpoints move with the run, which is why the offset is applied to every point
+ * rather than to interior bends only: an endpoint left in place would reattach
+ * the fanned route to the original edge and undo the separation.
+ */
+function fanCoincidentEdges(edges: PositionedEdge[]): void {
+	const seen = new Map<string, number>();
+	for (const edge of edges) {
+		const key = edge.points.map(point => `${point.x},${point.y}`).join(" ");
+		const rank = seen.get(key) ?? 0;
+		seen.set(key, rank + 1);
+		if (rank === 0 || edge.points.length < 2) continue;
+
+		// Alternate sides so a fan grows symmetrically about the original route.
+		const magnitude = Math.ceil(rank / 2) * FAN_STEP;
+		const offset = rank % 2 === 1 ? magnitude : -magnitude;
+		const first = edge.points[0]!;
+		const last = edge.points[edge.points.length - 1]!;
+		const vertical = Math.abs(last.y - first.y) >= Math.abs(last.x - first.x);
+		edge.points = edge.points.map(point =>
+			vertical ? { x: point.x + offset, y: point.y } : { x: point.x, y: point.y + offset },
+		);
+		if (edge.labelPosition) {
+			edge.labelPosition = vertical
+				? { x: edge.labelPosition.x + offset, y: edge.labelPosition.y }
+				: { x: edge.labelPosition.x, y: edge.labelPosition.y + offset };
+		}
+	}
+}
+
 /** Translate a group tree so nested children keep their parent's inset. */
 function offsetGroup(group: PositionedGroup, offset: number): PositionedGroup {
 	return {
@@ -128,6 +169,7 @@ export function layoutPositionedGraph(
 			},
 		};
 	});
+	fanCoincidentEdges(edges);
 	const groups = graph.subgraphs
 		.filter(sg => sg.parent === null)
 		.map(sg => offsetGroup(projectGroup(sg), GRAPH_MARGIN));
