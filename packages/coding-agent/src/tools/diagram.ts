@@ -132,10 +132,18 @@ export class DiagramTool implements AgentTool<typeof diagramSchema, DiagramToolD
 			// A bare filename goes to the shared artifacts directory so generated
 			// files land in one predictable place instead of the project tree or a
 			// temp dir. An explicit path always wins.
-			const target =
-				params.out.includes("/") || params.out.includes("\\")
-					? params.out
-					: path.join(getArtifactsDir(), params.out);
+			//
+			// Plan mode is the exception: it holds the working tree read-only and
+			// gives the session its own `local://` artifact sandbox, so a bare name
+			// resolves there. Sending it to the global directory instead would trip
+			// the guard and fail the one path this tool recommends.
+			const bareName = !params.out.includes("/") && !params.out.includes("\\");
+			const planMode = this.session.getPlanModeState?.()?.enabled === true;
+			const target = bareName
+				? planMode
+					? `local://${params.out}`
+					: path.join(getArtifactsDir(), params.out)
+				: params.out;
 			enforcePlanModeWrite(this.session, target, { op: "create" });
 			resolvedPath = resolvePlanPath(this.session, target);
 			await Bun.write(resolvedPath, rendered.html);

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type DiagramParams, DiagramTool, type DiagramToolDetails } from "@oh-my-pi/pi-coding-agent/tools/diagram";
+import { getAgentDir, getArtifactsDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
 const spec = {
 	type: "architecture" as const,
@@ -20,7 +21,7 @@ const spec = {
 	],
 };
 
-function createSession(cwd: string): ToolSession {
+function createSession(cwd: string, overrides: Partial<Record<string, unknown>> = {}): ToolSession {
 	const settings = { get: (_path: string): boolean => false } as unknown as ToolSession["settings"];
 	return {
 		cwd,
@@ -28,7 +29,8 @@ function createSession(cwd: string): ToolSession {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings,
-	};
+		...overrides,
+	} as unknown as ToolSession;
 }
 
 function textFromResult(result: AgentToolResult<DiagramToolDetails>): string {
@@ -53,6 +55,40 @@ describe("DiagramTool", () => {
 		expect(html.startsWith("<!doctype html>")).toBe(true);
 		expect(result.details?.resolvedPath).toBe(path.resolve(out));
 		expect(textFromResult(result)).toContain("ASCII preview:");
+	});
+
+	it("routes a bare filename into the shared artifacts directory", async () => {
+		testDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-diagram-"));
+		// Redirect the agent dir so the test never writes into the real home.
+		const previousAgentDir = getAgentDir();
+		setAgentDir(path.join(testDir, "agent"));
+		try {
+			const result = await new DiagramTool(createSession(testDir)).execute("call-1", {
+				spec,
+				out: "bare-name.html",
+			});
+			const resolved = result.details?.resolvedPath;
+			expect(resolved).toBe(path.join(getArtifactsDir(), "bare-name.html"));
+			expect((await fs.readFile(resolved as string, "utf8")).startsWith("<!doctype html>")).toBe(true);
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
+
+	it("routes a bare filename into the session sandbox under plan mode", async () => {
+		testDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-diagram-"));
+		const sandbox = path.join(testDir, "artifacts");
+		const session = createSession(testDir, {
+			getArtifactsDir: () => sandbox,
+			getSessionId: () => "diagram-session",
+			getPlanModeState: () => ({ enabled: true, planFilePath: "local://plan.md" }),
+		});
+
+		// Plan mode holds the working tree read-only; a bare name must land in the
+		// session sandbox rather than being rejected by the guard.
+		const result = await new DiagramTool(session).execute("call-1", { spec, out: "planned.html" });
+		expect(result.details?.resolvedPath).toBe(path.join(sandbox, "local", "planned.html"));
+		expect((await fs.readFile(path.join(sandbox, "local", "planned.html"), "utf8")).length).toBeGreaterThan(0);
 	});
 
 	it("requires exactly one source", async () => {
