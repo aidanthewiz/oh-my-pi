@@ -1,6 +1,7 @@
 /**
  * Tool wrappers for extensions.
  */
+import { randomInt } from "node:crypto";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -12,7 +13,13 @@ import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } 
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
-import { type ApprovalMode, formatApprovalPrompt, resolveApproval, truncateForPrompt } from "../../tools/approval";
+import {
+	type ApprovalMode,
+	formatApprovalPrompt,
+	type RuntimeApprovalCapableTool,
+	resolveApproval,
+	truncateForPrompt,
+} from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
@@ -137,6 +144,10 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
 	});
 }
 
+function runtimeApprovalChallenge(): string {
+	return `RUN ${randomInt(1000, 10_000)}`;
+}
+
 /**
  * Wraps a tool with extension callbacks for interception.
  * - Emits tool_call event before execution (can block)
@@ -233,6 +244,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
+		const runtimeApprovalTool = this.tool as AgentTool<TParameters, TDetails> & RuntimeApprovalCapableTool;
+		const runtimeApproval = await runtimeApprovalTool.prepareRuntimeApproval?.(
+			toolCallId,
+			effectiveParams,
+			signal,
+			context,
+		);
+		if (runtimeApproval && !runtimeApprovalTool.approveRuntimeApproval) {
+			throw new Error(`Tool "${this.tool.name}" requested runtime approval without a grant handler.`);
+		}
+
 		// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
 		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
 		// input that newly resolves to `deny` is caught here even though the original passed the
@@ -257,8 +279,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, this.tool.name);
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
 		const approvalCheck = {
-			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
-			reason: resolved.reason,
+			required:
+				runtimeApproval !== undefined ||
+				pendingSafetyChecks.length > 0 ||
+				(resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+			reason: runtimeApproval?.reason ?? resolved.reason,
 		};
 
 		if (approvalCheck.required) {
@@ -288,11 +313,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				});
 			};
 
-			// Provider safety checks fail closed without an interactive prompt. Unlike
-			// ordinary tier approval, no setting or yolo mode may bypass this gate.
+			// Runtime and provider safety approvals fail closed without an interactive
+			// prompt. Unlike ordinary tier approval, no setting or yolo mode may bypass
+			// either gate.
 			if (!this.runner.hasUI()) {
 				const reason = "no interactive UI available";
 				await emitApprovalResolved(false, reason);
+				if (runtimeApproval) {
+					throw new Error(
+						`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
+					);
+				}
 				if (pendingSafetyChecks.length > 0) {
 					throw new Error(
 						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
@@ -308,22 +339,40 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
-			let choice: string | undefined;
+			let approved: boolean;
+			let denialReason = "denied by user";
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				if (runtimeApproval) {
+					const challenge = runtimeApprovalChallenge();
+					const safetySuffix =
+						pendingSafetyChecks.length > 0
+							? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+							: "";
+					const response = await uiContext.input(
+						`${runtimeApproval.prompt}${safetySuffix}\n\nType ${challenge} to execute this exact command once.`,
+						`Type ${challenge}`,
+					);
+					approved = response?.trim() === challenge;
+					if (response !== undefined && !approved) denialReason = "confirmation challenge did not match";
+				} else {
+					const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+					const safetyPrompt =
+						pendingSafetyChecks.length > 0
+							? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+							: basePrompt;
+					const choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+					approved = choice === "Approve";
+				}
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				throw err;
 			}
-			const approved = choice === "Approve";
-			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+			await emitApprovalResolved(approved, approved ? undefined : denialReason);
 			if (!approved) {
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
+			}
+			if (runtimeApproval) {
+				runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
 			}
 			if (pendingSafetyChecks.length > 0) {
 				if (!context) throw new Error("Provider safety approval context is unavailable");
