@@ -76,15 +76,19 @@ export const SKINS: Record<string, Skin> = {
 			accent: "#f78279",
 			accentTint: "rgba(247,130,121,0.14)",
 			link: "#179fce",
-			danger: "#e73d4a",
+			danger: "#f4626d",
 		},
 		fonts: { sans: SANS, mono: MONO },
 		gridSize: 40,
 	},
-	// Sampled `accent` (#f78279) measures roughly 2.1:1 on white and fails both
-	// as text and as a thin stroke; sampled `link` (#179fce) fails similarly.
-	// `accent` and `link` below are the only deliberate departures from sampled
-	// values, and the reason is contrast rather than taste.
+	// Three tokens deliberately depart from the sampled values, all for contrast
+	// on white rather than taste. Sampled `accent` (#f78279) measures about 2.1:1
+	// and sampled `link` (#179fce) fails similarly, so both are darkened.
+	//
+	// `rule` is darkened furthest because it carries two jobs: hairlines AND the
+	// uppercase zone, badge, and legend labels. The sampled #b7d1e2 measures
+	// 1.59:1 on white, which is illegible as small text; #52768f measures 4.83:1
+	// and stays lighter than `muted` so the two roles remain distinct.
 	"soma-light": {
 		id: "soma-light",
 		mode: "light",
@@ -92,14 +96,16 @@ export const SKINS: Record<string, Skin> = {
 			page: "#ffffff",
 			paper: "#ffffff",
 			paper2: "#edf4f8",
-			grid: "rgba(7,40,64,0.06)",
+			// 6% ink is invisible on white; the blueprint grid is the skin's
+			// signature, so light mode needs more of it than dark mode.
+			grid: "rgba(7,40,64,0.10)",
 			ink: "#072840",
 			ink2: "#1d4e6b",
 			muted: "#4a6b85",
-			soft: "#6b8ba3",
-			rule: "#b7d1e2",
-			accent: "#d9503f",
-			accentTint: "rgba(217,80,63,0.10)",
+			soft: "#5b7a92",
+			rule: "#52768f",
+			accent: "#c8422f",
+			accentTint: "rgba(200,66,47,0.10)",
 			link: "#10688a",
 			danger: "#b3252f",
 		},
