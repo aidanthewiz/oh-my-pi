@@ -111,4 +111,20 @@ describe("DiagramTool", () => {
 		expect(text).toContain("No branded artifact was written");
 		expect(result.details?.resolvedPath).toBeUndefined();
 	});
+
+	it("writes a standalone svg artifact when format is svg", async () => {
+		testDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-diagram-"));
+		const out = path.join(testDir, "figure.svg");
+		const result = await new DiagramTool(createSession(testDir)).execute("call-1", {
+			spec,
+			out,
+			format: "svg",
+		});
+		const svg = await fs.readFile(out, "utf8");
+
+		expect(svg.startsWith("<svg")).toBe(true);
+		expect(svg).not.toContain("<!doctype");
+		expect(result.details?.resolvedPath).toBe(path.resolve(out));
+		expect(textFromResult(result)).toContain("SVG artifact");
+	});
 });

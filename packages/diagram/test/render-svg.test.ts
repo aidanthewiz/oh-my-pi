@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { edgeKey, type PositionedFigure } from "../src/figure";
-import { renderSvgDocument } from "../src/render/svg";
+import { renderSvgDocument, renderSvgFragment } from "../src/render/svg";
 import { resolveSkin } from "../src/skin";
 
 function fixture(legend = true): PositionedFigure {
@@ -69,5 +69,32 @@ describe("renderSvgDocument", () => {
 		for (const color of new Set(Object.values(dark.colors))) {
 			if (!Object.values(light.colors).includes(color)) expect(html).not.toContain(color);
 		}
+	});
+
+	test("emits a standalone svg that carries its own palette and typography", () => {
+		const skin = resolveSkin("soma-navy");
+		const svg = renderSvgFragment(fixture(), skin);
+
+		// A bare figure, not a page.
+		expect(svg.startsWith("<svg")).toBe(true);
+		expect(svg).not.toContain("<!doctype");
+		expect(svg).not.toContain("<body");
+		expect([...svg.matchAll(/<\/svg>/g)]).toHaveLength(1);
+
+		// Self-contained: tokens AND the class rules that consume them must travel
+		// with it, or a lifted figure renders in a default serif with no palette.
+		expect(svg).toContain("<style>");
+		expect(svg).toContain(skin.colors.accent);
+		expect(svg).toContain("font-family:var(--mono)");
+		expect(svg).toContain("font-family:var(--sans)");
+
+		// Still offline and still accessible.
+		expect(svg).not.toContain("<script");
+		expect(svg).not.toContain("<link");
+		expect(svg).not.toContain("@import");
+		expect(svg).toContain('aria-labelledby="fig-title fig-desc"');
+
+		// title/desc stay first so assistive tech reads them before the style node.
+		expect(svg.indexOf("</desc>")).toBeLessThan(svg.indexOf("<style>"));
 	});
 });

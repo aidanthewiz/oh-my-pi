@@ -11,6 +11,7 @@ import { type LintFinding, type RenderedDiagram, renderDiagram, SKINS } from "@o
 import { getArtifactsDir, prompt, renderMermaidAsciiSafe } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import diagramDescription from "../prompts/tools/diagram.md" with { type: "text" };
+import { copyToClipboard } from "../utils/clipboard";
 import type { ToolSession } from "./index";
 import { formatPathRelativeToCwd } from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
@@ -20,7 +21,13 @@ const diagramSchema = type({
 	"spec?": type("object").describe("typed diagram spec object; renderDiagram validates its exact shape"),
 	"mermaid?": type("string").describe("Mermaid source shorthand for an ASCII preview"),
 	"out?": type("string").describe(
-		"where to save the standalone HTML artifact; a bare filename lands in the agent artifacts directory, while any path containing a separator is used as given",
+		"where to save the artifact; a bare filename lands in the agent artifacts directory, while any path containing a separator is used as given",
+	),
+	"format?": type("'html'|'svg'").describe(
+		"artifact format; html is a full page, svg is a standalone figure for Figma or a doc. Defaults to html",
+	),
+	"copy?": type("boolean").describe(
+		"copy the standalone SVG markup to the clipboard; Figma, Illustrator, and Inkscape accept pasted SVG. Markup only, not a raster image",
 	),
 	"skin?": type("string").describe(`skin id; registered ids: ${Object.keys(SKINS).join(", ")}`),
 	"preview?": type("'ascii'|'none'").describe("preview mode; defaults to ascii"),
@@ -146,8 +153,19 @@ export class DiagramTool implements AgentTool<typeof diagramSchema, DiagramToolD
 				: params.out;
 			enforcePlanModeWrite(this.session, target, { op: "create" });
 			resolvedPath = resolvePlanPath(this.session, target);
-			await Bun.write(resolvedPath, rendered.html);
-			content.push(`Wrote branded HTML artifact to ${formatPathRelativeToCwd(resolvedPath, this.session.cwd)}.`);
+			const format = params.format ?? "html";
+			await Bun.write(resolvedPath, format === "svg" ? rendered.svg : rendered.html);
+			content.push(
+				`Wrote branded ${format.toUpperCase()} artifact to ${formatPathRelativeToCwd(resolvedPath, this.session.cwd)}.`,
+			);
+		}
+
+		if (params.copy === true) {
+			// Text copy, so it also reaches a remote session through OSC 52. The
+			// clipboard has no image-write path, so this is markup rather than a
+			// raster image, and the message says so.
+			await copyToClipboard(rendered.svg);
+			content.push("Copied the standalone SVG markup to the clipboard.");
 		}
 
 		content.push(...renderFindings(rendered.findings));

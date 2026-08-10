@@ -7,7 +7,7 @@
 import { renderMermaidAsciiSafe } from "@oh-my-pi/pi-utils";
 import { layoutGraph, specToMermaid } from "./layout/graph";
 import { type LintFinding, lintFigure } from "./lint";
-import { renderSvgDocument } from "./render/svg";
+import { renderSvgDocument, renderSvgFragment } from "./render/svg";
 import { resolveSkin } from "./skin";
 import { type DiagramSpec, parseSpec } from "./spec";
 
@@ -16,7 +16,7 @@ export { edgeKey } from "./figure";
 export { layoutGraph, specToMermaid } from "./layout/graph";
 export type { LintFinding } from "./lint";
 export { lintFigure } from "./lint";
-export { renderSvgDocument } from "./render/svg";
+export { renderSvgDocument, renderSvgFragment } from "./render/svg";
 export type { Skin, SkinColors } from "./skin";
 export { DEFAULT_SKIN_ID, resolveSkin, SKINS } from "./skin";
 export * from "./spec";
@@ -24,6 +24,8 @@ export * from "./spec";
 export interface RenderedDiagram {
 	/** Standalone HTML document with inline SVG. Self-contained and offline. */
 	html: string;
+	/** Standalone `.svg` document with skin tokens declared on the svg element. */
+	svg: string;
 	/** Terminal preview. Null when the shorthand does not parse. */
 	ascii: string | null;
 	/** Invariant findings. Errors mean the figure was rejected before emit. */
@@ -51,6 +53,7 @@ export function renderDiagram(input: unknown): RenderedDiagram {
 
 	return {
 		html: renderSvgDocument(figure, skin),
+		svg: renderSvgFragment(figure, skin),
 		ascii: renderMermaidAsciiSafe(specToMermaid(spec)),
 		findings,
 		skinId: skin.id,

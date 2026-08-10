@@ -192,3 +192,37 @@ export function renderSvgDocument(figure: PositionedFigure, skin: Skin): string 
 	const svg = `<svg class="diagram-svg" role="img" aria-labelledby="fig-title fig-desc" viewBox="0 0 ${numberText(width)} ${numberText(height)}" xmlns="http://www.w3.org/2000/svg"><title id="fig-title">${escapeXml(figure.title)}</title><desc id="fig-desc">${escapeXml(figure.description)}</desc><defs><pattern id="grid" width="${numberText(skin.gridSize)}" height="${numberText(skin.gridSize)}" patternUnits="userSpaceOnUse"><path d="M ${numberText(skin.gridSize)} 0 L 0 0 0 ${numberText(skin.gridSize)}" fill="none" stroke="var(--grid)" stroke-width="1"/></pattern><marker id="arrow-default" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 8 4 L 0 8 Z" fill="var(--muted)"/></marker><marker id="arrow-primary" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 8 4 L 0 8 Z" fill="var(--accent)"/></marker><marker id="arrow-link" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 8 4 L 0 8 Z" fill="var(--link)"/></marker></defs><rect x="0" y="0" width="${numberText(width)}" height="${numberText(height)}" fill="var(--paper)"/><rect x="0" y="0" width="${numberText(width)}" height="${numberText(height)}" fill="url(#grid)"/>${zones}${edgeMarkup}${nodes}${legend}</svg>`;
 	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeXml(figure.title)}</title><style>${css}</style></head><body><main class="figure-page">${figure.eyebrow ? `<div class="eyebrow">${escapeXml(figure.eyebrow)}</div>` : ""}${figure.title ? `<div class="figure-chrome"><h1>${escapeXml(figure.title)}</h1>${figure.standfirst ? `<p class="standfirst">${escapeXml(figure.standfirst)}</p>` : ""}</div>` : ""}${svg}</main></body></html>`;
 }
+
+/**
+ * Render a positioned figure as a standalone `.svg` document.
+ *
+ * The figure markup styles itself through CSS custom properties and classes that
+ * the HTML document declares in its stylesheet. Lifted out on its own the SVG
+ * would lose both its palette and its typography, so that same stylesheet is
+ * carried inside the `svg` element. In a standalone SVG the root element is the
+ * `<svg>`, so the sheet's `:root` token declarations apply to it directly.
+ *
+ * Derived from {@link renderSvgDocument}, and reusing its stylesheet verbatim, so
+ * there is one source for both the markup and the styling and the two cannot
+ * drift. Every slice point is emitted by that function, so all are present.
+ */
+export function renderSvgFragment(figure: PositionedFigure, skin: Skin): string {
+	const document = renderSvgDocument(figure, skin);
+
+	const styleStart = document.indexOf("<style>");
+	const styleEnd = document.indexOf("</style>");
+	const start = document.indexOf("<svg");
+	const end = document.indexOf("</svg>");
+	if (styleStart < 0 || styleEnd < 0 || start < 0 || end < 0) {
+		throw new Error("renderSvgFragment: figure markup or stylesheet not found");
+	}
+
+	const css = document.slice(styleStart + "<style>".length, styleEnd);
+	const svg = document.slice(start, end + "</svg>".length);
+
+	// Injected after the accessible description so title and desc stay the first
+	// children, which is what assistive technology reads first. The figure ground
+	// is painted here because the document paints it on `body`.
+	const style = `<style>${css}svg{background:var(--paper)}</style>`;
+	return svg.replace("</desc>", `</desc>${style}`);
+}
