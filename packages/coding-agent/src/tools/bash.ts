@@ -27,12 +27,17 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
-import { truncateForPrompt } from "./approval";
+import { type RuntimeToolApprovalRequest, truncateForPrompt } from "./approval";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
-import { enforceDestructiveCommandGuard, isDestructiveCommandGuardConfigured } from "./destructive-command-guard";
+import {
+	type DcgAskDecision,
+	type DcgDecision,
+	enforceDestructiveCommandGuard,
+	isDestructiveCommandGuardConfigured,
+} from "./destructive-command-guard";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import {
@@ -290,6 +295,51 @@ export interface BashToolDetails {
 }
 
 export interface BashToolOptions {}
+
+interface PreparedBashExecution {
+	command: string;
+	commandCwd: string;
+	dcgDecision: DcgDecision;
+	hasLocalUrls: boolean;
+	resolvedEnv: Record<string, string> | undefined;
+}
+
+function formatDcgRuntimeApproval(
+	input: BashToolInput,
+	prepared: PreparedBashExecution,
+	decision: DcgAskDecision,
+): RuntimeToolApprovalRequest {
+	const rule = decision.ruleId ?? "unknown rule";
+	const environment = prepared.resolvedEnv ? JSON.stringify(prepared.resolvedEnv) : "{}";
+	return {
+		reason: `Destructive Command Guard requires review (${rule})`,
+		prompt: [
+			"Destructive Command Guard requires explicit review.",
+			`Rule: ${rule}`,
+			`Reason: ${decision.reason}`,
+			`Working directory (exact JSON string): ${JSON.stringify(prepared.commandCwd)}`,
+			`Additional environment (exact JSON object): ${environment}`,
+			`Execution mode: ${input.async === true ? "background" : input.pty === true ? "interactive PTY" : "foreground"}`,
+			`Requested timeout seconds: ${input.timeout ?? 300}`,
+			"",
+			"Command (exact JSON string; newlines and control characters are escaped):",
+			JSON.stringify(prepared.command),
+			"",
+			"Review the entire command before entering the confirmation challenge.",
+		].join("\n"),
+	};
+}
+
+function bashInputFingerprint(input: BashToolInput): string {
+	return JSON.stringify({
+		command: input.command,
+		env: input.env,
+		timeout: input.timeout,
+		cwd: input.cwd,
+		async: input.async,
+		pty: input.pty,
+	});
+}
 
 type ManagedBashJobCompletion =
 	| {
@@ -549,6 +599,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;
+	readonly #preparedExecutions = new WeakMap<
+		object,
+		{ toolCallId: string; approved: boolean; inputFingerprint: string; execution: PreparedBashExecution }
+	>();
 
 	constructor(private readonly session: ToolSession) {
 		this.#asyncEnabled = this.session.settings.get("async.enabled");
@@ -560,6 +614,123 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			),
 		);
 		this.parameters = this.#asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
+	}
+
+	async #prepareExecution(
+		input: BashToolInput,
+		signal?: AbortSignal,
+		ctx?: AgentToolContext,
+		ensureLocalParentDirs = true,
+	): Promise<PreparedBashExecution> {
+		const rawCommand = input.command;
+		let command = rawCommand;
+		let cwd = input.cwd;
+		const env = normalizeBashEnv(input.env);
+		const hasLocalUrls = [rawCommand, input.cwd, ...Object.values(env ?? {})].some(value =>
+			value?.includes("local:/"),
+		);
+
+		// Extract leading `cd <path> && ...` into cwd when the model ignores the
+		// cwd parameter. Keep multiline scripts intact.
+		if (!cwd) {
+			const cdMatch = command.match(/^cd[ \t]+((?:[^&\\\n\r]|\\.)+?)[ \t]*&&[ \t]*/);
+			if (cdMatch && !/[$`(]/.test(cdMatch[1])) {
+				cwd = cdMatch[1].trim().replace(/^["']|["']$/g, "");
+				command = command.slice(cdMatch[0].length);
+			}
+		}
+		if (input.async === true && !this.#asyncEnabled) {
+			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
+		}
+
+		if (this.session.settings.get("bashInterceptor.enabled")) {
+			const rules = this.session.settings.getBashInterceptorRules();
+			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
+			for (const commandToCheck of commandsToCheck) {
+				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
+				if (interception.block) {
+					throw new ToolError(interception.message ?? "Command blocked");
+				}
+			}
+		}
+
+		const internalUrlOptions: InternalUrlExpansionOptions = {
+			skills: this.session.skills ?? [],
+			internalRouter: InternalUrlRouter.instance(),
+			cwd: this.session.cwd,
+			localOptions: {
+				getArtifactsDir: this.session.getArtifactsDir,
+				getSessionId: this.session.getSessionId,
+			},
+		};
+		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs });
+		const resolvedEnv = env
+			? Object.fromEntries(
+					await Promise.all(
+						Object.entries(env).map(async ([key, value]) => [
+							key,
+							await expandInternalUrls(value, {
+								...internalUrlOptions,
+								ensureLocalParentDirs,
+								noEscape: true,
+							}),
+						]),
+					),
+				)
+			: undefined;
+
+		if (cwd?.includes("://") || cwd?.includes("local:/")) {
+			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
+		}
+
+		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
+		let cwdStat: fs.Stats;
+		try {
+			cwdStat = await fs.promises.stat(commandCwd);
+		} catch (err) {
+			if (isEnoent(err)) {
+				throw new ToolError(`Working directory does not exist: ${commandCwd}`);
+			}
+			throw err;
+		}
+		if (!cwdStat.isDirectory()) {
+			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
+		}
+
+		const dcgDecision = await enforceDestructiveCommandGuard(command, commandCwd, signal);
+		return { command, commandCwd, dcgDecision, hasLocalUrls, resolvedEnv };
+	}
+
+	async prepareRuntimeApproval(
+		toolCallId: string,
+		args: unknown,
+		signal?: AbortSignal,
+		context?: AgentToolContext,
+	): Promise<RuntimeToolApprovalRequest | undefined> {
+		if (typeof args !== "object" || args === null) return undefined;
+		const input = args as BashToolInput;
+		const execution = await this.#prepareExecution(input, signal, context, false);
+		this.#preparedExecutions.set(args, {
+			toolCallId,
+			approved: false,
+			inputFingerprint: bashInputFingerprint(input),
+			execution,
+		});
+		if (execution.dcgDecision.decision === "allow") return undefined;
+		return formatDcgRuntimeApproval(input, execution, execution.dcgDecision);
+	}
+
+	approveRuntimeApproval(toolCallId: string, args: unknown): void {
+		if (typeof args !== "object" || args === null) return;
+		const cached = this.#preparedExecutions.get(args);
+		if (
+			cached?.toolCallId !== toolCallId ||
+			cached.inputFingerprint !== bashInputFingerprint(args as BashToolInput) ||
+			cached.execution.dcgDecision.decision !== "ask"
+		) {
+			return;
+		}
+		cached.approved = true;
 	}
 
 	#formatResultOutput(result: BashResult | BashInteractiveResult): string {
@@ -887,106 +1058,51 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	}
 
 	async execute(
-		_toolCallId: string,
-		{
-			command: rawCommand,
-			env: rawEnv,
-			timeout: rawTimeout = 300,
-			cwd,
-
-			async: asyncRequested = false,
-			pty = false,
-		}: BashToolInput,
+		toolCallId: string,
+		input: BashToolInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
-		let command = rawCommand;
-		const env = normalizeBashEnv(rawEnv);
-
-		// Extract leading `cd <path> && ...` into cwd when the model ignores the cwd parameter.
-		// Constrained to a single line so a `&&` that sits on a later line of a multiline
-		// script can't pull the entire script into the "cwd" capture.
-		if (!cwd) {
-			const cdMatch = command.match(/^cd[ \t]+((?:[^&\\\n\r]|\\.)+?)[ \t]*&&[ \t]*/);
-			// Skip extraction when the path needs shell expansion ($VAR, $(...),
-			// backticks) — resolveToCwd only expands `~`, so routing those through
-			// cwd would reject commands the shell itself handles fine.
-			if (cdMatch && !/[$`(]/.test(cdMatch[1])) {
-				cwd = cdMatch[1].trim().replace(/^["']|["']$/g, "");
-				command = command.slice(cdMatch[0].length);
+		const cached = this.#preparedExecutions.get(input);
+		if (cached) this.#preparedExecutions.delete(input);
+		const cacheMatches = cached?.toolCallId === toolCallId && cached.inputFingerprint === bashInputFingerprint(input);
+		let runtimeApproved = cacheMatches === true && cached.approved;
+		let prepared = cacheMatches ? cached.execution : await this.#prepareExecution(input, signal, ctx);
+		if (cacheMatches && prepared.hasLocalUrls) {
+			const materialized = await this.#prepareExecution(input, signal, ctx);
+			const commandChanged =
+				materialized.command !== prepared.command ||
+				materialized.commandCwd !== prepared.commandCwd ||
+				JSON.stringify(materialized.resolvedEnv) !== JSON.stringify(prepared.resolvedEnv);
+			const approvalChanged =
+				materialized.dcgDecision.decision === "ask" &&
+				(prepared.dcgDecision.decision !== "ask" ||
+					materialized.dcgDecision.ruleId !== prepared.dcgDecision.ruleId ||
+					materialized.dcgDecision.reason !== prepared.dcgDecision.reason);
+			if (commandChanged) {
+				throw new ToolError("Bash command expansion changed after approval; review the command again.");
 			}
+			if (approvalChanged) runtimeApproved = false;
+			prepared = materialized;
 		}
-		if (asyncRequested && !this.#asyncEnabled) {
-			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
-		}
-
-		// Check both the original command and the cwd-normalized command so
-		// leading `cd ... &&` wrappers do not hide either shell-navigation rules
-		// or the dedicated-tool command that follows the directory change.
-		if (this.session.settings.get("bashInterceptor.enabled")) {
-			const rules = this.session.settings.getBashInterceptorRules();
-			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
-			for (const commandToCheck of commandsToCheck) {
-				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
-				if (interception.block) {
-					throw new ToolError(interception.message ?? "Command blocked");
-				}
-			}
+		if (prepared.dcgDecision.decision === "ask" && !runtimeApproved) {
+			const rule = prepared.dcgDecision.ruleId ? ` (${prepared.dcgDecision.ruleId})` : "";
+			throw new ToolError(
+				`Command requires interactive approval by Destructive Command Guard${rule}: ${prepared.dcgDecision.reason}`,
+			);
 		}
 
-		const internalUrlOptions: InternalUrlExpansionOptions = {
-			skills: this.session.skills ?? [],
-			internalRouter: InternalUrlRouter.instance(),
-			cwd: this.session.cwd,
-			localOptions: {
-				getArtifactsDir: this.session.getArtifactsDir,
-				getSessionId: this.session.getSessionId,
-			},
-		};
-		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
-			? Object.fromEntries(
-					await Promise.all(
-						Object.entries(env).map(async ([key, value]) => [
-							key,
-							await expandInternalUrls(value, {
-								...internalUrlOptions,
-								ensureLocalParentDirs: true,
-								noEscape: true,
-							}),
-						]),
-					),
-				)
-			: undefined;
-
-		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
-		if (cwd?.includes("://") || cwd?.includes("local:/")) {
-			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
-		}
-
-		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
-		let cwdStat: fs.Stats;
-		try {
-			cwdStat = await fs.promises.stat(commandCwd);
-		} catch (err) {
-			if (isEnoent(err)) {
-				throw new ToolError(`Working directory does not exist: ${commandCwd}`);
-			}
-			throw err;
-		}
-		if (!cwdStat.isDirectory()) {
-			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
-		}
-
-		await enforceDestructiveCommandGuard(command, commandCwd, signal);
+		const { command, commandCwd, resolvedEnv } = prepared;
+		const asyncRequested = input.async ?? false;
+		const pty = input.pty ?? false;
+		const requestedTimeoutSec = input.timeout ?? 300;
 
 		// Invalidate only after every execution gate has allowed the command.
 		invalidateGithubCacheForBashCommand(command);
 
 		// A timeout of 0 is an explicit long-running-command contract: the user
 		// must still cancel the call or job, but OMP does not impose a deadline.
-		const requestedTimeoutSec = rawTimeout;
 		const timeoutDisabled = requestedTimeoutSec === 0;
 		const maxTimeout = this.session.settings.get("tools.maxTimeout");
 		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);

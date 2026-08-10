@@ -69,6 +69,14 @@ interface DcgTestOutput {
 	agent?: { detected?: unknown };
 }
 
+export interface DcgAskDecision {
+	decision: "ask";
+	ruleId?: string;
+	reason: string;
+}
+
+export type DcgDecision = { decision: "allow" } | DcgAskDecision;
+
 interface DcgConfiguration {
 	binaryPath: string;
 	version: string;
@@ -266,11 +274,11 @@ export async function enforceDestructiveCommandGuard(
 	cwd: string,
 	signal?: AbortSignal,
 	runtime: DestructiveCommandGuardRuntime = {},
-): Promise<void> {
+): Promise<DcgDecision> {
 	const env = runtime.env ?? process.env;
 	const required = runtime.required ?? (runtime.env === undefined && DCG_EXPECTED_AT_STARTUP);
 	const config = resolveConfiguration(env, required);
-	if (!config) return;
+	if (!config) return { decision: "allow" };
 
 	await Promise.all([
 		verifyManagedFile(config.binaryPath, config.binarySha256, "managed executable"),
@@ -286,15 +294,27 @@ export async function enforceDestructiveCommandGuard(
 	});
 	const output = parseOutput(result, config, command);
 
-	if (result.exitCode === 0 && output.decision === "allow" && output.allowlist === undefined) return;
-	if (result.exitCode === 1 && output.decision === "deny") {
-		const rule = typeof output.rule_id === "string" ? ` (${output.rule_id})` : "";
+	if (result.exitCode === 0 && output.decision === "allow" && output.allowlist === undefined) {
+		return { decision: "allow" };
+	}
+	if (result.exitCode === 1 && (output.decision === "ask" || output.decision === "deny")) {
+		const ruleId = typeof output.rule_id === "string" ? output.rule_id : undefined;
 		const reason =
 			typeof output.reason === "string"
 				? output.reason
 				: typeof output.explanation === "string"
 					? output.explanation
-					: "destructive command detected";
+					: output.decision === "ask"
+						? "explicit approval required"
+						: "destructive command detected";
+		if (output.decision === "ask") {
+			return {
+				decision: "ask",
+				...(ruleId ? { ruleId } : {}),
+				reason,
+			};
+		}
+		const rule = ruleId ? ` (${ruleId})` : "";
 		throw new ToolError(`Command blocked by Destructive Command Guard${rule}: ${reason}`);
 	}
 

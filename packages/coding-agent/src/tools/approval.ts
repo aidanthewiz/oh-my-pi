@@ -6,12 +6,27 @@
  * - compare a tool capability tier against the active approval mode,
  * - format the generic approval prompt body.
  */
-import type { AgentTool, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolContext, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
 
 export type { ToolApproval, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
 
 export type ApprovalPolicy = "allow" | "deny" | "prompt";
 export type ApprovalMode = "always-ask" | "write" | "yolo";
+
+export interface RuntimeToolApprovalRequest {
+	reason: string;
+	prompt: string;
+}
+
+export interface RuntimeApprovalCapableTool {
+	prepareRuntimeApproval?(
+		toolCallId: string,
+		args: unknown,
+		signal?: AbortSignal,
+		context?: AgentToolContext,
+	): Promise<RuntimeToolApprovalRequest | undefined>;
+	approveRuntimeApproval?(toolCallId: string, args: unknown): void;
+}
 
 type ApprovalSubject = Pick<AgentTool, "name" | "approval" | "formatApprovalDetails">;
 
