@@ -185,3 +185,4 @@ export function renderMermaidASCII(
 
 /** Lowercase alias kept as the public name used by the pi-utils wrapper. */
 export const renderMermaidAscii = renderMermaidASCII
+export { layoutPositionedGraph, CELL_W, CELL_H } from "./positioned";

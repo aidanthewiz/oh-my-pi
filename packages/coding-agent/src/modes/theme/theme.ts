@@ -3050,6 +3050,9 @@ export function getMarkdownTheme(): MarkdownTheme {
 					border: theme.getColorHex("border"),
 					line: theme.getColorHex("muted"),
 					arrow: theme.getColorHex("accent"),
+					accent: theme.getColorHex("accent"),
+					// xychart uses bg only for isDarkBackground shade polarity, not as a surface color.
+					bg: theme.isLight ? "#ffffff" : "#000000",
 					corner: theme.getColorHex("muted"),
 					junction: theme.getColorHex("borderMuted"),
 				};

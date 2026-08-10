@@ -80,9 +80,9 @@
         "@mozilla/readability": "catalog:",
         "@oh-my-pi/hashline": "catalog:",
         "@oh-my-pi/omp-stats": "catalog:",
-        "@oh-my-pi/pi-agent-core": "catalog:",
         "@oh-my-pi/pi-ai": "catalog:",
         "@oh-my-pi/pi-catalog": "catalog:",
+        "@oh-my-pi/pi-diagram": "catalog:",
         "@oh-my-pi/pi-mnemopi": "catalog:",
         "@oh-my-pi/pi-natives": "catalog:",
         "@oh-my-pi/pi-tui": "catalog:",
@@ -140,6 +140,17 @@
         "@types/bun": "catalog:",
         "@types/react": "catalog:",
         "@types/react-dom": "catalog:",
+      },
+    },
+    "packages/diagram": {
+      "name": "@oh-my-pi/pi-diagram",
+      "version": "17.2.4",
+      "dependencies": {
+        "@oh-my-pi/pi-utils": "catalog:",
+        "arktype": "catalog:",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
       },
     },
     "packages/hashline": {
@@ -389,6 +400,7 @@
     "@oh-my-pi/pi-ai": "17.2.4",
     "@oh-my-pi/pi-catalog": "17.2.4",
     "@oh-my-pi/pi-coding-agent": "17.2.4",
+    "@oh-my-pi/pi-diagram": "17.2.4",
     "@oh-my-pi/pi-mnemopi": "17.2.4",
     "@oh-my-pi/pi-natives": "17.2.4",
     "@oh-my-pi/pi-tui": "17.2.4",
@@ -801,6 +813,8 @@
     "@oh-my-pi/pi-catalog": ["@oh-my-pi/pi-catalog@workspace:packages/catalog"],
 
     "@oh-my-pi/pi-coding-agent": ["@oh-my-pi/pi-coding-agent@workspace:packages/coding-agent"],
+
+    "@oh-my-pi/pi-diagram": ["@oh-my-pi/pi-diagram@workspace:packages/diagram"],
 
     "@oh-my-pi/pi-metaharness": ["@oh-my-pi/pi-metaharness@workspace:packages/metaharness"],
 
