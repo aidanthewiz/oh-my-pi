@@ -53,8 +53,12 @@ export const legendItemSchema = type({
 	"style?": edgeStyleSchema,
 });
 
-/** Graph-layout figure types. Both use the existing grid placement and routing. */
-export const diagramTypeSchema = type("'architecture'|'flowchart'");
+/**
+ * Figure types. `architecture`, `flowchart`, and `state` share the graph layout
+ * (placement plus orthogonal routing); `layers` is a closed-form stack of bands
+ * and ignores `edges`.
+ */
+export const diagramTypeSchema = type("'architecture'|'flowchart'|'state'|'layers'");
 
 export const diagramSpecSchema = type({
 	type: diagramTypeSchema,

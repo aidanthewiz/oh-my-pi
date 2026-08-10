@@ -100,15 +100,17 @@ describe("DiagramTool", () => {
 		);
 	});
 
-	it("renders Mermaid shorthand without claiming a branded artifact", async () => {
+	it("previews mermaid shorthand without writing unless asked", async () => {
 		const result = await new DiagramTool(createSession(os.tmpdir())).execute("call-1", {
 			mermaid: "flowchart LR\n  A[Client] --> B[API]",
+			title: "Shorthand preview",
 		});
 		const text = textFromResult(result);
 
+		// Shorthand now renders a branded figure; `out` still governs whether
+		// anything reaches disk.
 		expect(text).toContain("ASCII preview:");
-		expect(text).toContain("requires a typed spec");
-		expect(text).toContain("No branded artifact was written");
+		expect(result.details?.mode).toBe("mermaid");
 		expect(result.details?.resolvedPath).toBeUndefined();
 	});
 
@@ -126,5 +128,28 @@ describe("DiagramTool", () => {
 		expect(svg).not.toContain("<!doctype");
 		expect(result.details?.resolvedPath).toBe(path.resolve(out));
 		expect(textFromResult(result)).toContain("SVG artifact");
+	});
+
+	it("renders a branded artifact from mermaid shorthand", async () => {
+		testDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-diagram-"));
+		const out = path.join(testDir, "shorthand.html");
+		const result = await new DiagramTool(createSession(testDir)).execute("call-1", {
+			mermaid: "flowchart LR\n  A[Browser] --> B[API]",
+			title: "From shorthand",
+			out,
+		});
+
+		const html = await fs.readFile(out, "utf8");
+		expect(html.startsWith("<!doctype html>")).toBe(true);
+		expect(html).toContain("From shorthand");
+		expect(result.details?.mode).toBe("mermaid");
+		expect(textFromResult(result)).toContain("ASCII preview:");
+	});
+
+	it("requires a title for mermaid shorthand", async () => {
+		const tool = new DiagramTool(createSession(os.tmpdir()));
+		await expect(tool.execute("call-1", { mermaid: "flowchart LR\n  A[One] --> B[Two]" })).rejects.toThrow(
+			"requires title",
+		);
 	});
 });

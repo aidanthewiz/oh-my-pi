@@ -97,3 +97,70 @@ describe("diagram graph layout", () => {
 		expect(figure.nodes.find(node => node.id === "svc:a b")?.label).toBe('Alpha ["x"]');
 	});
 });
+
+test("emits state diagrams through the shared layout path", () => {
+	const spec = parseSpec({
+		type: "state",
+		title: "Lifecycle",
+		direction: "LR",
+		nodes: [
+			{ id: "idle", label: "Idle", zone: "runtime" },
+			{ id: "running", label: "Running", zone: "runtime" },
+			{ id: "done", label: "Done" },
+		],
+		edges: [
+			{ from: "idle", to: "running", label: "start" },
+			{ from: "running", to: "done", label: "finish" },
+		],
+		zones: [{ id: "runtime", label: "Runtime" }],
+	});
+
+	const source = specToMermaid(spec);
+	expect(source.startsWith("stateDiagram-v2")).toBe(true);
+	expect(source).toContain("direction LR");
+	expect(source).not.toContain("flowchart");
+	expect(() => layoutPositionedGraph(source)).not.toThrow();
+
+	const figure = layoutGraph(spec);
+	expect(figure.nodes).toHaveLength(3);
+	expect(figure.edges).toHaveLength(2);
+	expect(figure.zones).toHaveLength(1);
+	expect(figure.nodes.map(node => node.label).sort()).toEqual(["Done", "Idle", "Running"]);
+	const runtime = figure.zones[0]!;
+	const idle = figure.nodes.find(node => node.id === "idle")!;
+	expect(runtime.id).toBe("runtime");
+	expect(runtime.label).toBe("Runtime");
+	expect(runtime.width).toBeGreaterThan(idle.width);
+	expect(runtime.height).toBeGreaterThan(idle.height);
+	expect(idle.x).toBeGreaterThanOrEqual(runtime.x);
+	expect(idle.y).toBeGreaterThanOrEqual(runtime.y);
+	expect(idle.x + idle.width).toBeLessThanOrEqual(runtime.x + runtime.width);
+	expect(idle.y + idle.height).toBeLessThanOrEqual(runtime.y + runtime.height);
+	expect(figure.edges.map(edge => edge.label)).toEqual(["start", "finish"]);
+	expect(figure.edgeOverlays[edgeKey("idle", "running", 0)]?.label).toBe("start");
+	expect(figure.edgeOverlays[edgeKey("running", "done", 0)]?.label).toBe("finish");
+});
+
+test("sanitizes Mermaid metacharacters in state ids", () => {
+	const spec = parseSpec({
+		type: "state",
+		title: "Hostile state input",
+		nodes: [
+			{ id: "state|one", label: "One", zone: "zone{a}" },
+			{ id: "state-->two", label: "Two" },
+		],
+		edges: [{ from: "state|one", to: "state-->two", label: "advance" }],
+		zones: [{ id: "zone{a}", label: "Zone" }],
+	});
+
+	const source = specToMermaid(spec);
+	expect(source).not.toContain("state|one");
+	expect(source).not.toContain("state-->two");
+	expect(source).not.toContain("zone{a}");
+
+	const figure = layoutGraph(spec);
+	expect(figure.nodes).toHaveLength(2);
+	expect(figure.edges).toHaveLength(1);
+	expect(figure.zones).toHaveLength(1);
+	expect(figure.nodes.map(node => node.id).sort()).toEqual(["state-->two", "state|one"]);
+});

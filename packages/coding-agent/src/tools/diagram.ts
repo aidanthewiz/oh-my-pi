@@ -7,8 +7,14 @@ import type {
 	ToolApproval,
 } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
-import { type LintFinding, type RenderedDiagram, renderDiagram, SKINS } from "@oh-my-pi/pi-diagram";
-import { getArtifactsDir, prompt, renderMermaidAsciiSafe } from "@oh-my-pi/pi-utils";
+import {
+	type LintFinding,
+	type RenderedDiagram,
+	renderDiagram,
+	renderMermaidDiagram,
+	SKINS,
+} from "@oh-my-pi/pi-diagram";
+import { getArtifactsDir, prompt } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import diagramDescription from "../prompts/tools/diagram.md" with { type: "text" };
 import { copyToClipboard } from "../utils/clipboard";
@@ -19,7 +25,12 @@ import { ToolError } from "./tool-errors";
 
 const diagramSchema = type({
 	"spec?": type("object").describe("typed diagram spec object; renderDiagram validates its exact shape"),
-	"mermaid?": type("string").describe("Mermaid source shorthand for an ASCII preview"),
+	"mermaid?": type("string").describe(
+		"Mermaid flowchart or state source; renders a branded artifact and an ASCII preview, but carries no node kinds, focal marks, or badges",
+	),
+	"title?": type("string").describe("figure title; required with mermaid, which carries no name of its own"),
+	"eyebrow?": type("string").describe("uppercase kicker above the title, used with mermaid"),
+	"standfirst?": type("string").describe("one or two sentences of context, used with mermaid"),
 	"out?": type("string").describe(
 		"where to save the artifact; a bare filename lands in the agent artifacts directory, while any path containing a separator is used as given",
 	),
@@ -108,26 +119,28 @@ export class DiagramTool implements AgentTool<typeof diagramSchema, DiagramToolD
 		}
 
 		const preview = params.preview ?? "ascii";
-		const mermaid = params.mermaid;
-		if (mermaid !== undefined) {
-			const ascii = preview === "ascii" ? renderMermaidAsciiSafe(mermaid) : null;
-			const content = [
-				"Mermaid shorthand rendered as ASCII only; branded HTML artifact emission currently requires a typed spec.",
-				"No branded artifact was written.",
-			];
-			if (ascii !== null) content.push("", "ASCII preview:", ascii);
-			else if (preview === "ascii") content.push("", "ASCII preview was unavailable for this Mermaid source.");
-			return {
-				content: [{ type: "text", text: content.join("\n") }],
-				details: { mode: "mermaid" },
-			};
-		}
-
 		let rendered: RenderedDiagram;
+		let mode: "spec" | "mermaid";
 		try {
-			const diagramInput = params.skin === undefined ? params.spec : { ...params.spec, skin: params.skin };
-			rendered = renderDiagram(diagramInput);
+			if (params.mermaid !== undefined) {
+				// A figure and its accessible description both need a name, and
+				// Mermaid source carries none, so the caller must supply one.
+				if (params.title === undefined || params.title.trim().length === 0) {
+					throw new ToolError("diagram requires title when rendering Mermaid shorthand.");
+				}
+				mode = "mermaid";
+				rendered = renderMermaidDiagram(params.mermaid, {
+					title: params.title,
+					eyebrow: params.eyebrow,
+					standfirst: params.standfirst,
+					skin: params.skin,
+				});
+			} else {
+				mode = "spec";
+				rendered = renderDiagram(params.skin === undefined ? params.spec : { ...params.spec, skin: params.skin });
+			}
 		} catch (error) {
+			if (error instanceof ToolError) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			throw new ToolError(`Unable to render diagram: ${message}`);
 		}
@@ -173,7 +186,7 @@ export class DiagramTool implements AgentTool<typeof diagramSchema, DiagramToolD
 		return {
 			content: [{ type: "text", text: content.join("\n") }],
 			details: {
-				mode: "spec",
+				mode,
 				resolvedPath,
 				skinId: rendered.skinId,
 				width: rendered.width,

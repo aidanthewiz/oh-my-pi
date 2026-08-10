@@ -75,9 +75,45 @@ function appendZoneLines(
 	lines.push("end");
 }
 
-/** Convert a typed diagram specification to the Mermaid source used by layout and ASCII rendering. */
+function appendStateZoneLines(
+	lines: string[],
+	zone: DiagramZone,
+	zones: DiagramZone[],
+	nodes: DiagramNode[],
+	ids: { nodes: Map<string, string>; zones: Map<string, string> },
+): void {
+	lines.push(`state ${ids.zones.get(zone.id)!} {`);
+	for (const node of nodes) {
+		if (node.zone === zone.id) lines.push(`state "${paddedNodeLabel(node)}" as ${ids.nodes.get(node.id)!}`);
+	}
+	for (const child of zones) {
+		if (child.parent === zone.id) appendStateZoneLines(lines, child, zones, nodes, ids);
+	}
+	lines.push("}");
+}
+
+/** Convert a typed diagram specification to the Mermaid source used by layout and ASCII rendering.
+ *
+ * The `style` field is not expressible for state figures, so it affects only SVG rendering, not the ASCII preview.
+ */
 export function specToMermaid(spec: DiagramSpec): string {
 	const ids = safeIds(spec);
+	if (spec.type === "state") {
+		const lines = ["stateDiagram-v2"];
+		if (spec.direction !== undefined) lines.push(`direction ${spec.direction}`);
+		for (const node of spec.nodes) {
+			if (node.zone === undefined) lines.push(`state "${paddedNodeLabel(node)}" as ${ids.nodes.get(node.id)!}`);
+		}
+		const zones = spec.zones ?? [];
+		for (const zone of zones.filter(candidate => candidate.parent === undefined)) {
+			appendStateZoneLines(lines, zone, zones, spec.nodes, ids);
+		}
+		for (const edge of spec.edges ?? []) {
+			const label = edge.label === undefined ? "" : ` : ${mermaidSafeLines(edge.label).join(" ")}`;
+			lines.push(`${ids.nodes.get(edge.from)!} --> ${ids.nodes.get(edge.to)!}${label}`);
+		}
+		return lines.join("\n");
+	}
 	const lines = [`flowchart ${spec.direction ?? "TD"}`];
 	const zones = spec.zones ?? [];
 	for (const zone of zones.filter(candidate => candidate.parent === undefined)) {
