@@ -9,7 +9,7 @@ import {
 	enforceDestructiveCommandGuard,
 } from "@oh-my-pi/pi-coding-agent/tools/destructive-command-guard";
 
-function output(command: string, decision: "allow" | "deny", extra: Record<string, unknown> = {}): string {
+function output(command: string, decision: "allow" | "ask" | "deny", extra: Record<string, unknown> = {}): string {
 	return JSON.stringify({
 		schema_version: 1,
 		dcg_version: "0.6.7",
@@ -58,7 +58,9 @@ describe("Destructive Command Guard enforcement", () => {
 			return { exitCode: 0, stdout: output(options.command, "allow"), stderr: "" };
 		};
 
-		await enforceDestructiveCommandGuard("git status", tempDir, undefined, { env, run });
+		await expect(enforceDestructiveCommandGuard("git status", tempDir, undefined, { env, run })).resolves.toEqual({
+			decision: "allow",
+		});
 
 		expect(invocation?.binaryPath).toBe(env.OMP_DCG_PATH);
 		expect(invocation?.cwd).toBe(tempDir);
@@ -88,12 +90,33 @@ describe("Destructive Command Guard enforcement", () => {
 		);
 	});
 
+	it("returns an explicit ask decision with the matched rule and reason", async () => {
+		const run: DcgProcessRunner = async options => ({
+			exitCode: 1,
+			stdout: output(options.command, "ask", {
+				rule_id: "strict_git:worktree-remove",
+				reason: "git worktree remove deletes a linked working tree.",
+			}),
+			stderr: "",
+		});
+
+		await expect(
+			enforceDestructiveCommandGuard("git worktree remove ../old", tempDir, undefined, { env, run }),
+		).resolves.toEqual({
+			decision: "ask",
+			ruleId: "strict_git:worktree-remove",
+			reason: "git worktree remove deletes a linked working tree.",
+		});
+	});
+
 	it("fails closed on protocol and process inconsistencies", async () => {
 		const cases: DcgProcessResult[] = [
 			{ exitCode: 3, stdout: "", stderr: "configuration error" },
 			{ exitCode: 0, stdout: output("different command", "allow"), stderr: "" },
 			{ exitCode: 0, stdout: output("git status", "deny"), stderr: "" },
 			{ exitCode: 0, stdout: output("git status", "allow", { allowlist: { layer: "user" } }), stderr: "" },
+			{ exitCode: 0, stdout: output("git status", "ask"), stderr: "" },
+			{ exitCode: 1, stdout: output("git status", "allow"), stderr: "" },
 		];
 
 		for (const result of cases) {
