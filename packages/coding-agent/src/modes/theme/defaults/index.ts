@@ -3,6 +3,7 @@ import amethyst from "./amethyst.json" with { type: "json" };
 import anthracite from "./anthracite.json" with { type: "json" };
 import basalt from "./basalt.json" with { type: "json" };
 import birch from "./birch.json" with { type: "json" };
+import coreforce from "./coreforce.json" with { type: "json" };
 import dark_abyss from "./dark-abyss.json" with { type: "json" };
 import dark_arctic from "./dark-arctic.json" with { type: "json" };
 import dark_aurora from "./dark-aurora.json" with { type: "json" };
@@ -103,6 +104,7 @@ export const defaultThemes = {
 	anthracite: anthracite,
 	basalt: basalt,
 	birch: birch,
+	coreforce: coreforce,
 	"dark-abyss": dark_abyss,
 	"dark-arctic": dark_arctic,
 	"dark-aurora": dark_aurora,

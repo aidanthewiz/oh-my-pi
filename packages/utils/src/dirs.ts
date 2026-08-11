@@ -775,6 +775,18 @@ export function getBlobsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "blobs", "data");
 }
 
+/**
+ * Get the agent-produced artifact directory (~/.omp/agent/artifacts).
+ *
+ * One predictable home for durable files a tool generates for the user —
+ * diagrams, exports, rendered reports — so output does not scatter across the
+ * project tree and temp directories. Distinct from {@link getBlobsDir}, which is
+ * a content-addressed internal store rather than user-facing output.
+ */
+export function getArtifactsDir(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "artifacts", "data");
+}
+
 /** Get the custom themes directory (~/.omp/agent/themes). */
 export function getCustomThemesDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "themes");

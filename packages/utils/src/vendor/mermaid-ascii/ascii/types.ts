@@ -117,6 +117,8 @@ export interface AsciiEdge {
 
 /** A subgraph container with bounding box for rendering. */
 export interface AsciiSubgraph {
+  /** Subgraph identifier from the source. Distinct from `name`, which is the displayed title. */
+  id: string
   name: string
   nodes: AsciiNode[]
   parent: AsciiSubgraph | null

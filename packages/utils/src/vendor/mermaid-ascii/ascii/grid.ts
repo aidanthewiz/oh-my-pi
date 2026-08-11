@@ -303,41 +303,25 @@ function calculateSubgraphBoundingBox(graph: AsciiGraph, sg: AsciiSubgraph): voi
   sg.maxY = maxY + subgraphPadding
 }
 
-/** Ensure non-overlapping root subgraphs have minimum spacing. */
-function ensureSubgraphSpacing(graph: AsciiGraph): void {
-  const minSpacing = 1
-  const rootSubgraphs = graph.subgraphs.filter(sg => sg.parent === null && sg.nodes.length > 0)
-
-  for (let i = 0; i < rootSubgraphs.length; i++) {
-    for (let j = i + 1; j < rootSubgraphs.length; j++) {
-      const sg1 = rootSubgraphs[i]!
-      const sg2 = rootSubgraphs[j]!
-
-      // Horizontal overlap → adjust vertical
-      if (sg1.minX < sg2.maxX && sg1.maxX > sg2.minX) {
-        if (sg1.maxY >= sg2.minY - minSpacing && sg1.minY < sg2.minY) {
-          sg2.minY = sg1.maxY + minSpacing + 1
-        } else if (sg2.maxY >= sg1.minY - minSpacing && sg2.minY < sg1.minY) {
-          sg1.minY = sg2.maxY + minSpacing + 1
-        }
-      }
-      // Vertical overlap → adjust horizontal
-      if (sg1.minY < sg2.maxY && sg1.maxY > sg2.minY) {
-        if (sg1.maxX >= sg2.minX - minSpacing && sg1.minX < sg2.minX) {
-          sg2.minX = sg1.maxX + minSpacing + 1
-        } else if (sg2.maxX >= sg1.minX - minSpacing && sg2.minX < sg1.minX) {
-          sg1.minX = sg2.maxX + minSpacing + 1
-        }
-      }
-    }
-  }
-}
-
+/**
+ * A subgraph box is exactly its content extent plus padding.
+ *
+ * An earlier pass nudged root boxes apart to avoid visually adjacent borders, but
+ * it moved only the near edge and never the matching far edge, so a box could be
+ * pushed past its own far side and invert (min > max). Callers clamped the
+ * negative extent, which is how a zone became a 4-unit strip while its members
+ * rendered inside a neighbouring zone.
+ *
+ * Any adjustment made independently of node positions can break containment, so
+ * there is none: separation between subgraphs is a placement concern, not a
+ * post-hoc box edit. Boxes may therefore abut or overlap when placement
+ * interleaves members of different subgraphs; that is visible and reportable,
+ * unlike a silently mislabelled figure.
+ */
 export function calculateSubgraphBoundingBoxes(graph: AsciiGraph): void {
-  for (const sg of graph.subgraphs) {
-    calculateSubgraphBoundingBox(graph, sg)
-  }
-  ensureSubgraphSpacing(graph)
+	for (const sg of graph.subgraphs) {
+		calculateSubgraphBoundingBox(graph, sg)
+	}
 }
 
 /**

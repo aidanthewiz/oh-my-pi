@@ -3874,6 +3874,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"diagram.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Diagram",
+			description: "Enable the diagram tool for architecture and flow diagrams",
+		},
+	},
+
 	// Optional tools
 
 	"debug.enabled": {

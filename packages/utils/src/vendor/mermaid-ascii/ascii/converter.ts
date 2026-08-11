@@ -128,6 +128,7 @@ function convertSubgraph(
   }
 
   const sg: AsciiSubgraph = {
+    id: mSg.id,
     name: mSg.label,
     nodes: [],
     parent,

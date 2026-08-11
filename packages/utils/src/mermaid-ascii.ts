@@ -1,6 +1,16 @@
-import { type AsciiRenderOptions, renderMermaidASCII } from "./vendor/mermaid-ascii";
+import { type AsciiRenderOptions, layoutPositionedGraph, renderMermaidASCII } from "./vendor/mermaid-ascii";
 
+export type {
+	EdgeStyle,
+	NodeShape,
+	Point,
+	PositionedEdge,
+	PositionedGraph,
+	PositionedGroup,
+	PositionedNode,
+} from "./vendor/mermaid-ascii/types";
 export type { AsciiRenderOptions as MermaidAsciiRenderOptions };
+export { layoutPositionedGraph };
 
 export function renderMermaidAscii(source: string, options?: AsciiRenderOptions): string {
 	return renderMermaidASCII(source, options);
