@@ -80,6 +80,19 @@ describe("AWS relay identity verification", () => {
 		});
 	});
 
+	test("accepts an omitted identity store ARN and rejects a mismatched one", async () => {
+		const withoutStoreArn = claims();
+		const context = withoutStoreArn["https://sts.amazonaws.com/"] as Record<string, unknown>;
+		delete context.identity_store_arn;
+		await expect(verifier().verify(await sign(withoutStoreArn))).resolves.toEqual({
+			userId: USER_ID,
+			subject: `${ROLE_PREFIX}4f9ea1f053d8aae5`,
+		});
+
+		context.identity_store_arn = "arn:aws:identitystore::891455110252:identitystore/d-other";
+		await expect(verifier().verify(await sign(withoutStoreArn))).rejects.toThrow("identity store");
+	});
+
 	test("rejects audience, role, lifetime, and signature drift", async () => {
 		await expect(verifier().verify(await sign(claims({ aud: "https://other.example" })))).rejects.toThrow("audience");
 		await expect(verifier().verify(await sign(claims({ sub: `${ROLE_PREFIX}not-a-suffix` })))).rejects.toThrow(

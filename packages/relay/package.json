@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/relay",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "Content-blind WebSocket relay and encrypted share store for Coreforce agent collaboration",
   "main": "./src/main.ts",
