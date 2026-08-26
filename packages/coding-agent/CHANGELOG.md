@@ -18,6 +18,7 @@
 
 - Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
 - Accepted AWS STS relay proofs when the optional Identity Center store ARN claim is absent, while still rejecting a mismatched ARN when AWS emits one.
+- Fixed the signed relay image publisher to stage the integrity-checked Linux native addon in its isolated build job.
 - Preserved the employee-selected AWS profile and Region for CLI, SDK, and MCP processes while keeping Coreforge's managed inference profile model-only.
 - Allowed MCP server definitions to brand dynamic registration and the local OAuth completion page, including the Coreforge wordmark and hammer icon.
 - Allowed hosted MCP OAuth definitions to request OS-assigned callback ports and register a fresh client during reauthorization.
