@@ -126,7 +126,7 @@ export class AwsRelayIdentityVerifier implements RelayIdentityVerifier {
 		if (!hasExactAudience(claims.aud, this.#options.audience)) throw new Error("identity token audience is invalid");
 		if (aws.aws_account !== this.#options.awsAccountId) throw new Error("identity token account is invalid");
 		if (aws.org_id !== this.#options.awsOrganizationId) throw new Error("identity token organization is invalid");
-		if (aws.identity_store_arn !== this.#options.identityStoreArn) {
+		if (aws.identity_store_arn !== undefined && aws.identity_store_arn !== this.#options.identityStoreArn) {
 			throw new Error("identity token identity store is invalid");
 		}
 		if (aws.source_region !== this.#options.sourceRegion) throw new Error("identity token source region is invalid");
