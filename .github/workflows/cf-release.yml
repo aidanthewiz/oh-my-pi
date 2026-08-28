@@ -224,9 +224,7 @@ jobs:
           } > "$RUNNER_TEMP/coreforge-bazel.rc"
           export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
           read -r -a targets <<< "$NATIVE_TARGETS"
-          for target in "${targets[@]}"; do
-            bun scripts/bazel-natives.ts "$target"
-          done
+          bun scripts/bazel-natives.ts "${targets[@]}"
           ls packages/natives/native/*.node
       - name: Package source-built native addon
         run: |
