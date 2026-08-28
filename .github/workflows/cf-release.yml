@@ -194,6 +194,12 @@ jobs:
             "$PKG".*) echo "tag $TAG rolls upstream $PKG - ok" ;;
             *) echo "tag $TAG does not extend package version $PKG"; exit 1 ;;
           esac
+      - name: Reclaim disk for Windows native cross-build
+        if: matrix.target == 'win32-x64'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
       - run: bun install --frozen-lockfile
       - name: Cache Bazel native builds
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
