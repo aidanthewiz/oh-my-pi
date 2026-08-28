@@ -222,6 +222,22 @@ jobs:
             bun scripts/bazel-natives.ts "$target"
           done
           ls packages/natives/native/*.node
+      - name: Package source-built native addon
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          addons=(packages/natives/native/pi_natives."${{ matrix.target }}"*.node)
+          expected=1
+          if [ "${{ matrix.target }}" = "linux-x64" ]; then expected=2; fi
+          if [ "${#addons[@]}" -ne "$expected" ]; then
+            echo "expected $expected native files for ${{ matrix.target }}, found ${#addons[@]}" >&2
+            printf '  %s\n' "${addons[@]}" >&2
+            exit 1
+          fi
+          mkdir -p release-assets/package
+          cp "${addons[@]}" release-assets/package/
+          tar -czf "release-assets/coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz" \
+            -C release-assets package
       - name: Inject channel version
         run: bun scripts/set-cf-version.ts "${RELEASE_TAG#v}"
       - name: Build binary
@@ -261,6 +277,11 @@ jobs:
           name: binary-${{ matrix.target }}
           path: packages/coding-agent/binaries/${{ matrix.binary }}
           if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.target }}
+          path: release-assets/coreforge-pi-natives-${{ matrix.target }}-${{ env.RELEASE_TAG }}.tgz
+          if-no-files-found: error
 
   release:
     needs: [prepare, build]
@@ -286,6 +307,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
           path: release-assets
           merge-multiple: true
       - name: Build Coreforge Browser Relay extension
@@ -320,6 +346,16 @@ jobs:
           curl -fsSL -o omp-darwin-arm64 \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/omp-darwin-arm64"
           chmod +x omp-darwin-arm64
+      - name: Verify published source-install native addon
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
+          tar -xzf "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
+          test -f package/pi_natives.darwin-arm64.node
+          node -e 'require("./package/pi_natives.darwin-arm64.node")'
       - name: Verify published macOS arm64 binary
         run: |
           codesign -dvvv ./omp-darwin-arm64

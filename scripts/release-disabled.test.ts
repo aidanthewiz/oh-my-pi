@@ -33,4 +33,7 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	]) {
 		expect(workflow).toContain(target);
 	}
+	expect(workflow).toContain('coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz');
+	expect(workflow).toContain("pattern: native-*");
+	expect(workflow).toContain('node -e \'require("./package/pi_natives.darwin-arm64.node")\'');
 });
