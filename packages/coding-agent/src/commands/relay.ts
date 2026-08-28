@@ -1,10 +1,12 @@
 import { Args, Command, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
+import { relayHelp as commandHelp } from "../cli/command-help";
 import { runRelayAuthorizeCommand } from "../cli/relay-cli";
 
 const RELAY_ACTIONS = ["authorize"] as const;
 
 export default class Relay extends Command {
-	static description = "Approve a browser for Coreforce Agent Collab";
+	static description = commandHelp.description;
 
 	static args = {
 		action: Args.string({ description: "Sub-command", required: false, options: [...RELAY_ACTIONS] }),
@@ -14,7 +16,7 @@ export default class Relay extends Command {
 	async run(): Promise<void> {
 		const { args } = await this.parse(Relay);
 		if (!args.action || !args.code) {
-			renderCommandHelp("omp", "relay", Relay);
+			renderCommandHelp(CF_COMMAND, "relay", Relay);
 			return;
 		}
 		const exitCode = await runRelayAuthorizeCommand(args.code);

@@ -7,6 +7,21 @@
 - Fixed expired AWS IAM Identity Center sessions being retried as generic Anthropic connection failures; credential resolution can now invoke a bounded, single-flight re-authentication callback and preserve actionable AWS errors when recovery fails.
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
+## [17.2.5] - 2026-08-03
+
+### Changed
+
+- Standardized tool-call examples in `renderToolExamples` and `renderToolInventory` to use Python keyword-argument syntax (`name(key="value")`) across all models, removing the model-specific dialect parameter and the `DialectRenderOptions.example` flag.
+- Updated `renderToolInventory` to render the tool catalog as a unified OpenAI-Harmony-style `## functions` block using TypeScript type declarations and comments, replacing the previous per-tool Markdown sections.
+- Added a `style: "harmony"` option to `jsonSchemaToTypeScript` for generating compact, comma-delimited TypeScript definitions.
+
+### Fixed
+
+- Fixed a session-blocking issue where unescaped Harmony control tokens in replayed assistant responses and tool inputs caused subsequent requests to be rejected with `invalid_prompt` errors.
+- Fixed an issue where Codex Responses dropped native image-generation results from assistant content and replays due to stale `generating` statuses.
+- Fixed Anthropic stream truncation handling where unexpected connection closures were incorrectly treated as clean stops, causing the agent loop to halt silently mid-sentence.
+- Optimized Anthropic prompt caching to prevent unnecessary cache invalidation of the entire system prefix when volatile project footer details (such as current working directory, date, or workspace tree) change.
+
 ## [17.2.4] - 2026-08-01
 
 ### Fixed

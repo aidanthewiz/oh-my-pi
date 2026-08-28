@@ -35,7 +35,7 @@ function createSession(cwd: string, overrides: Partial<Record<string, unknown>> 
 
 function textFromResult(result: AgentToolResult<DiagramToolDetails>): string {
 	const block = result.content[0];
-	if (!block || block.type !== "text") throw new Error("expected text content");
+	if (block?.type !== "text") throw new Error("expected text content");
 	return block.text;
 }
 

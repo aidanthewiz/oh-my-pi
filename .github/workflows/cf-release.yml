@@ -265,6 +265,10 @@ jobs:
           pattern: binary-*
           path: release-assets
           merge-multiple: true
+      - name: Build Coreforge Browser Relay extension
+        run: |
+          bun --cwd=packages/browser-relay run build
+          cp packages/browser-relay/dist/coreforge-browser-relay-extension.zip release-assets/
       - name: Generate release notes
         env:
           GH_TOKEN: ${{ github.token }}

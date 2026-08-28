@@ -1,8 +1,11 @@
 /**
  * Run onboarding setup or install dependencies for optional features.
  */
+
 import { Args, Command, Flags, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
 import { parseArgs } from "../cli/args";
+import { CF_COMMAND } from "../cli/cf-version";
+import { setupHelp as commandHelp } from "../cli/command-help";
 import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
 import { runRootCommand } from "../main";
 import { initTheme } from "../modes/theme/theme";
@@ -21,7 +24,7 @@ export async function runOnboardingSetup(deps: OnboardingSetupDependencies = {})
 	const stdinIsTTY = deps.stdinIsTTY ?? process.stdin.isTTY;
 	const stdoutIsTTY = deps.stdoutIsTTY ?? process.stdout.isTTY;
 	if (!stdinIsTTY || !stdoutIsTTY) {
-		(deps.writeStderr ?? (text => process.stderr.write(text)))("omp setup requires an interactive TTY.\n");
+		(deps.writeStderr ?? (text => process.stderr.write(text)))(`${CF_COMMAND} setup requires an interactive TTY.\n`);
 		(deps.exit ?? process.exit)(1);
 		return;
 	}
@@ -29,8 +32,7 @@ export async function runOnboardingSetup(deps: OnboardingSetupDependencies = {})
 }
 
 export default class Setup extends Command {
-	static description = "Run onboarding setup or install dependencies for optional features";
-
+	static description = commandHelp.description;
 	static args = {
 		component: Args.string({
 			description: "Optional component to install",
@@ -48,7 +50,7 @@ export default class Setup extends Command {
 		const { args, flags } = await this.parse(Setup);
 		if (!args.component) {
 			if (flags.check || flags.json) {
-				renderCommandHelp("omp", "setup", Setup);
+				renderCommandHelp(CF_COMMAND, "setup", Setup);
 				return;
 			}
 			await runOnboardingSetup();

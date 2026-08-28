@@ -1,6 +1,7 @@
 /**
  * `omp auth-gateway` — run a forward proxy that injects auth from the broker.
  */
+
 import { Args, Command, Flags, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
 import {
 	AUTH_GATEWAY_ACTIONS,
@@ -8,11 +9,12 @@ import {
 	type AuthGatewayCommandArgs,
 	runAuthGatewayCommand,
 } from "../cli/auth-gateway-cli";
+import { CF_COMMAND } from "../cli/cf-version";
+import { authGatewayHelp as commandHelp } from "../cli/command-help";
 import { initTheme } from "../modes/theme/theme";
 
 export default class AuthGateway extends Command {
-	static description = "Run an auth-gateway forward proxy backed by the configured broker";
-
+	static description = commandHelp.description;
 	static args = {
 		action: Args.string({
 			description: "Sub-command",
@@ -36,21 +38,21 @@ export default class AuthGateway extends Command {
 	};
 
 	static examples = [
-		"# Boot the gateway against the configured broker\n  omp auth-gateway serve",
-		"# Boot on a non-default port\n  omp auth-gateway serve --bind=127.0.0.1:4000",
-		"# Print the gateway bearer token (creates one on first run)\n  omp auth-gateway token",
-		"# Rotate the gateway bearer token\n  omp auth-gateway token --regenerate",
-		"# Run on loopback without any bearer (anyone on this host can call)\n  omp auth-gateway serve --no-auth",
-		"# Show local gateway + broker config status\n  omp auth-gateway status",
-		"# Probe each broker credential to see which one is producing 401s\n  omp auth-gateway check",
-		"# Same, machine-readable for scripts\n  omp auth-gateway check --json",
-		"# Strict check — also exercises each credential with a real chat-completion ping\n  omp auth-gateway check --strict",
+		`# Boot the gateway against the configured broker\n  ${CF_COMMAND} auth-gateway serve`,
+		`# Boot on a non-default port\n  ${CF_COMMAND} auth-gateway serve --bind=127.0.0.1:4000`,
+		`# Print the gateway bearer token (creates one on first run)\n  ${CF_COMMAND} auth-gateway token`,
+		`# Rotate the gateway bearer token\n  ${CF_COMMAND} auth-gateway token --regenerate`,
+		`# Run on loopback without any bearer (anyone on this host can call)\n  ${CF_COMMAND} auth-gateway serve --no-auth`,
+		`# Show local gateway + broker config status\n  ${CF_COMMAND} auth-gateway status`,
+		`# Probe each broker credential to see which one is producing 401s\n  ${CF_COMMAND} auth-gateway check`,
+		`# Same, machine-readable for scripts\n  ${CF_COMMAND} auth-gateway check --json`,
+		`# Strict check — also exercises each credential with a real chat-completion ping\n  ${CF_COMMAND} auth-gateway check --strict`,
 	];
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(AuthGateway);
 		if (!args.action) {
-			renderCommandHelp("omp", "auth-gateway", AuthGateway);
+			renderCommandHelp(CF_COMMAND, "auth-gateway", AuthGateway);
 			return;
 		}
 		const cmd: AuthGatewayCommandArgs = {

@@ -15,7 +15,7 @@ try {
  * lightweight CLI runner from pi-utils.
  */
 import { parentPort } from "node:worker_threads";
-import type { CliConfig } from "@oh-my-pi/pi-utils/cli";
+import type { CliConfig, CommandMetadata } from "@oh-my-pi/pi-utils/cli";
 import { APP_NAME, getActiveProfile, MIN_BUN_VERSION, resolveProfileEnv, setProfile } from "@oh-my-pi/pi-utils/dirs";
 import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
 import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
@@ -27,6 +27,7 @@ import { startJsEvalProcess } from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
 import { TERMINAL_OUTPUT_WORKER_ARG } from "./launch/terminal-output-worker-protocol";
+import { LSP_MUX_WORKER_ARG } from "./lsp/mux/protocol";
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
 import { smokeTestComputerWorker } from "./tools/computer/supervisor";
 import { startComputerWorker } from "./tools/computer/worker-entry";
@@ -54,9 +55,13 @@ const isProcessEntry = import.meta.main || process.env.PI_COMPILED === "true";
 // `@oh-my-pi/pi-utils/env` eagerly loads `.env` from the agent directory at
 // import time, so it must not be imported before `setProfile` runs.
 
-async function showHelp(config: CliConfig): Promise<void> {
-	const { renderRootHelp } = await import("@oh-my-pi/pi-utils/cli");
-	const { getExtraHelpText } = await import("./cli/args");
+async function showHelp(config: CliConfig<CommandMetadata>): Promise<void> {
+	// Root help historically loads the selected profile's environment. The
+	// lazily loaded help module imports it statically after profile bootstrap.
+	const [{ renderRootHelp }, { getExtraHelpText }] = await Promise.all([
+		import("@oh-my-pi/pi-utils/cli"),
+		import("./cli/help-extra"),
+	]);
 	renderRootHelp(config);
 	const extra = getExtraHelpText();
 	if (extra.trim().length > 0) {
@@ -83,6 +88,7 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestJsEvalWorker } = await import("./eval/js/context-manager");
 	// Other smoke dependencies stay lazy so normal CLI startup does not load their worker clients.
 	const { smokeTestDaemonBroker } = await import("./launch/client");
+	const { smokeTestLspMux } = await import("./lsp/mux/daemon");
 	const { smokeTestTerminalOutputWorker } = await import("./launch/terminal-output-worker-client");
 	await smokeTestSyncWorker();
 
@@ -105,6 +111,7 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestTtsWorker();
 	await smokeTestMnemopiEmbedWorker();
 	await smokeTestDaemonBroker();
+	await smokeTestLspMux();
 	await smokeTestTerminalOutputWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
@@ -202,6 +209,11 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		// Worker selectors must dispatch before the normal command graph loads.
 		const { startDaemonBrokerFromEnvironment } = await import("./launch/broker");
 		await startDaemonBrokerFromEnvironment();
+		return true;
+	}
+	if (arg === LSP_MUX_WORKER_ARG) {
+		const { startLspMuxFromEnvironment } = await import("./lsp/mux/server");
+		await startLspMuxFromEnvironment();
 		return true;
 	}
 	return false;
@@ -399,7 +411,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		version: CF_VERSION,
 		argv: resolved.argv,
 		commands,
-		help: showHelp,
+		metadataHelp: showHelp,
 	});
 }
 
