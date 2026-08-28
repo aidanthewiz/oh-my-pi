@@ -1,9 +1,11 @@
 import { Args, Command, Flags, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
+import { identityHelp as commandHelp } from "../cli/command-help";
 import type { IdentityAction, IdentityCommandArgs } from "../cli/identity-cli";
 import { IDENTITY_ACTIONS, runIdentityCommand } from "../cli/identity-cli";
 
 export default class Identity extends Command {
-	static description = "Manage the signed-in Coreforge identity";
+	static description = commandHelp.description;
 
 	static args = {
 		action: Args.string({
@@ -24,7 +26,7 @@ export default class Identity extends Command {
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Identity);
 		if (!args.action) {
-			renderCommandHelp("omp", "identity", Identity);
+			renderCommandHelp(CF_COMMAND, "identity", Identity);
 			return;
 		}
 		const command: IdentityCommandArgs = {

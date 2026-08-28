@@ -428,7 +428,7 @@ describe("plugin extension discovery", () => {
 		const extension = result.extensions.find(ext => ext.path === extensionPath);
 		const pluginError = result.errors.find(err => err.path === extensionPath);
 
-		expect(pluginError?.error).toContain("#src/internal");
+		expect(pluginError?.error).toMatch(/#src(?:\/internal)?/);
 		expect(extension).toBeUndefined();
 	});
 

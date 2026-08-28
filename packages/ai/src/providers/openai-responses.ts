@@ -49,7 +49,6 @@ import {
 	type OpenAIResponsesToolChoice,
 } from "../utils/tool-choice";
 import { compactGrammarDefinition } from "./grammar";
-import { applyOpenAIAwsRequestSetup } from "./openai-aws";
 import {
 	applyOpenAIReasoningEffortFallback,
 	clearOpenAIReasoningEffortFallbackState,
@@ -441,14 +440,9 @@ const streamOpenAIResponsesOnce = (
 				openAISessionId: routingSessionId,
 				promptCacheSessionId,
 			});
-			// OpenAI on AWS (Bedrock-Mantle): rewrite the endpoint region from env
-			// and, on the credential-chain path, SigV4-sign each request instead of
-			// sending a Bearer credential. The wire shape is unchanged.
-			const awsSetup =
-				model.provider === "openai-aws" ? applyOpenAIAwsRequestSetup(setup, apiKey, options?.fetch) : undefined;
-			const { headers, copilotPremiumRequests } = awsSetup ? { ...setup, headers: awsSetup.headers } : setup;
-			const baseUrl = awsSetup?.baseUrl ?? setup.baseUrl;
-			const requestFetch = awsSetup ? awsSetup.fetch : options?.fetch;
+			const { headers, copilotPremiumRequests } = setup;
+			const baseUrl = setup.baseUrl;
+			const requestFetch = options?.fetch;
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const strictToolsScope = getOpenAIStrictToolsScope(model, baseUrl);
@@ -456,7 +450,13 @@ const streamOpenAIResponsesOnce = (
 				resolveCacheRetention(options?.cacheRetention) !== "none" && options?.promptCache?.mode === "explicit"
 					? (options.promptCache.breakpoint ?? "latest-stable-message")
 					: undefined;
-			if (isOpenAIResponsesStatefulEnabled(options, baseUrl) && routingSessionId && providerSessionState) {
+			const zeroDataRetention = model.provider === "bedrock-mantle";
+			if (
+				!zeroDataRetention &&
+				isOpenAIResponsesStatefulEnabled(options, baseUrl) &&
+				routingSessionId &&
+				providerSessionState
+			) {
 				chainState = getOpenAIResponsesChainState(providerSessionState, model, baseUrl, routingSessionId);
 				if (chainState.canAppend && chainState.lastPromptCacheBreakpointPolicy !== promptCacheBreakpointPolicy) {
 					resetOpenAIResponsesChainState(chainState);
@@ -493,7 +493,7 @@ const streamOpenAIResponsesOnce = (
 				}
 				return fallbackKey;
 			};
-			if (awsSetup) {
+			if (zeroDataRetention) {
 				// Bedrock-Mantle stores responses for 30 days when `store` is unset
 				// (the API default). Org policy is zero retention: always send
 				// `store: false` and never chain stored responses on this provider.

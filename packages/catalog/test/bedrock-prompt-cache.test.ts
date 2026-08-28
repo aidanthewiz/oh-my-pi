@@ -128,6 +128,23 @@ describe("Bedrock prompt-cache compat", () => {
 			expect(buildModel(bedrockSpec({ id })).compat).toEqual(expected);
 		}
 	});
+	test("bundles Nova 2 Lite with the published limits and reasoning surface", () => {
+		const nova = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "global.amazon.nova-2-lite-v1:0");
+		expect(nova).toMatchObject({
+			contextWindow: 1_000_000,
+			maxTokens: 64_000,
+			cost: {
+				input: 0.33,
+				output: 2.75,
+				cacheRead: 0.0825,
+				cacheWrite: 0.33,
+			},
+			thinking: {
+				mode: "effort",
+				efforts: ["low", "medium", "high"],
+			},
+		});
+	});
 
 	test("keeps unknown routes conservative and honors sparse profile overrides", () => {
 		const opaqueProfileId = "arn:aws:bedrock:us-east-1:123:application-inference-profile/opaque";

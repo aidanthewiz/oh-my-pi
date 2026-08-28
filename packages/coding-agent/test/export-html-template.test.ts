@@ -19,9 +19,9 @@ interface TemplateProbeResult {
 }
 
 const expectedTemplate: TemplateProbeResult = {
-	chars: 377_294,
-	bytes: 377_472,
-	sha256: "b9ad23abd693c48760e00417c94725f868ca133d283be46fe1da2ab60e625255",
+	chars: 376_468,
+	bytes: 376_624,
+	sha256: "ddf3aafbd04881847325bf255a3f4763a1235d4e5f5bb6f00d3f843481c4043a",
 	stableCache: true,
 	assetsRemoved: 0,
 };
@@ -111,6 +111,14 @@ beforeAll(async () => {
 		compile: { outfile: compiledPath },
 	});
 	expect(compiled.success, compiled.logs.map(log => log.message).join("\n")).toBe(true);
+	if (process.platform === "darwin") {
+		const sign = Bun.spawn(["codesign", "--force", "--sign", "-", compiledPath], {
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		const [signExitCode, signStderr] = await Promise.all([sign.exited, new Response(sign.stderr).text()]);
+		expect(signExitCode, signStderr).toBe(0);
+	}
 }, 120_000);
 
 afterAll(() => {

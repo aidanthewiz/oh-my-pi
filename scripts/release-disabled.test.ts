@@ -17,3 +17,23 @@ test("release command fails fast when repository workflow is absent", async () =
 	expect(stdout).toBe("");
 	expect(stderr).toContain("Release automation is disabled in this repository");
 });
+
+test("Coreforce releases build native addons from fork sources", async () => {
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
+
+	expect(workflow).toContain('bun scripts/bazel-natives.ts "$target"');
+	expect(workflow).not.toContain('npm view "@oh-my-pi/pi-natives-');
+	for (const target of [
+		"darwin-arm64",
+		"darwin-x64-baseline",
+		"linux-x64-baseline",
+		"linux-x64-modern",
+		"linux-arm64",
+		"win32-x64-baseline",
+	]) {
+		expect(workflow).toContain(target);
+	}
+	expect(workflow).toContain('coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz');
+	expect(workflow).toContain("pattern: native-*");
+	expect(workflow).toContain('node -e \'require("./package/pi_natives.darwin-arm64.node")\'');
+});

@@ -37,7 +37,9 @@ async function pingComputerWorker(
 		argv,
 	});
 	const response = Promise.withResolvers<unknown>();
-	worker.addEventListener("message", event => response.resolve(event.data));
+	worker.addEventListener("message", event => {
+		if (event.data?.type === "pong" && event.data.id === id) response.resolve(event.data);
+	});
 	worker.addEventListener("error", event => response.reject(event.error ?? new Error(event.message)));
 	worker.postMessage({ type: "ping", id });
 	try {
@@ -124,6 +126,14 @@ it("keeps non-computer selectors isolated in a compiled single-entry worker host
 	);
 	const [buildExitCode, buildStderr] = await Promise.all([build.exited, new Response(build.stderr).text()]);
 	expect(buildExitCode, buildStderr).toBe(0);
+	if (process.platform === "darwin") {
+		const sign = Bun.spawn(["codesign", "--force", "--sign", "-", outfile], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [signExitCode, signStderr] = await Promise.all([sign.exited, new Response(sign.stderr).text()]);
+		expect(signExitCode, signStderr).toBe(0);
+	}
 	const proc = Bun.spawn([outfile], {
 		cwd: packageDir,
 		stdout: "pipe",

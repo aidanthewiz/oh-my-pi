@@ -1,9 +1,10 @@
 import { getMCPConfigPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import { Args, Command } from "@oh-my-pi/pi-utils/cli";
+import { mcpHelp as commandHelp } from "../cli/command-help";
 import { setServerOverrides } from "../mcp/config-writer";
 
 export default class Mcp extends Command {
-	static description = "Manage MCP server state";
+	static description = commandHelp.description;
 
 	static args = {
 		action: Args.string({

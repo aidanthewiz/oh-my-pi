@@ -307,10 +307,20 @@ function isGpt56PlusWireEffortModel<TApi extends Api>(spec: ModelSpec<TApi>): bo
 	return parsed !== null && semverGte(parsed.version, "5.6");
 }
 
+function isBedrockNova2Lite<TApi extends Api>(spec: ModelSpec<TApi>): boolean {
+	if (spec.api !== "bedrock-converse-stream") return false;
+	const id = spec.id.toLowerCase();
+	const nova2LiteId = "amazon.nova-2-lite-v1:0";
+	return id === nova2LiteId || id.endsWith(`.${nova2LiteId}`);
+}
+
 function getModelDefinedEfforts<TApi extends Api>(
 	spec: ModelSpec<TApi>,
 	compat: CompatOf<TApi>,
 ): readonly Effort[] | undefined {
+	if (isBedrockNova2Lite(spec)) {
+		return LOW_MEDIUM_HIGH_REASONING_EFFORTS;
+	}
 	if (isGlm52ReasoningEffortModelId(spec.id)) {
 		// GLM-5.2's reasoning_effort dialect is host-specific (verified against
 		// live endpoints):
@@ -663,6 +673,9 @@ function inferThinkingControlMode<TApi extends Api>(
 			return "budget";
 
 		case "bedrock-converse-stream":
+			if (isBedrockNova2Lite(spec)) {
+				return "effort";
+			}
 			if (parsedModel.family === "anthropic") {
 				if (isAnthropicAdaptiveGenAtLeast(parsedModel, "4.6")) {
 					return "anthropic-adaptive";

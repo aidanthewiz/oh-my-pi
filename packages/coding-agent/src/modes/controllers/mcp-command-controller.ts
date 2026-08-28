@@ -1800,24 +1800,25 @@ export class MCPCommandController {
 			const oauth = await this.#resolveOAuthEndpointsFromServer(runtimeBaseConfig, options.authChallenge);
 			const serverUrl =
 				runtimeBaseConfig.type === "http" || runtimeBaseConfig.type === "sse" ? runtimeBaseConfig.url : undefined;
-			// A user-supplied client secret may live in either block (the wizard
-			// writes it to auth.clientSecret); DCR secrets are embedded in the
-			// stored credential and never echoed back into config files.
-			//
-			// Port 0 requests a fresh OS-assigned callback port. A client
-			// registered for an earlier random port cannot be reused with it, so
-			// ephemeral callbacks must perform DCR again unless the server
-			// advertises its own client id.
-			const ephemeralCallback = found.config.oauth?.callbackPort === 0;
-			const configuredClientId = found.config.oauth?.clientId ?? currentAuth?.clientId;
+			// Client credentials drive the token exchange, so they must come from the
+			// env-expanded runtime config; `found.config`/`currentAuth` may still hold
+			// `${...}` placeholders. Port 0 also requires fresh DCR credentials because
+			// a client registered for an earlier random port cannot be reused.
+			const runtimeAuth = currentAuth ? expandEnvVarsDeep(currentAuth) : undefined;
+			const ephemeralCallback = runtimeBaseConfig.oauth?.callbackPort === 0;
+			const configuredClientId = runtimeBaseConfig.oauth?.clientId ?? runtimeAuth?.clientId;
 			const existingCredential = lookupMcpOAuthCredentialForServer(authStorage, currentAuth, serverUrl)?.credential;
 			const flowClientId =
 				oauth.clientId ?? (ephemeralCallback ? "" : (configuredClientId ?? existingCredential?.clientId ?? ""));
 			const storedClientSecret =
 				existingCredential?.clientId === flowClientId ? existingCredential.clientSecret : undefined;
-			const userClientSecret = found.config.oauth?.clientSecret ?? currentAuth?.clientSecret;
 			const flowClientSecret =
-				ephemeralCallback && !oauth.clientId ? "" : (userClientSecret ?? storedClientSecret ?? "");
+				ephemeralCallback && !oauth.clientId
+					? ""
+					: (runtimeBaseConfig.oauth?.clientSecret ?? runtimeAuth?.clientSecret ?? storedClientSecret ?? "");
+			// Persisted separately below: keep the raw `${...}` placeholder in the file
+			// rather than writing the resolved secret back to (possibly shared) config.
+			const userClientSecret = found.config.oauth?.clientSecret ?? currentAuth?.clientSecret;
 
 			if (!options.silent) {
 				this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));

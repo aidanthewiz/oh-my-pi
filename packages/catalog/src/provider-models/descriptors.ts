@@ -15,6 +15,7 @@ import {
 	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	basetenModelManagerOptions,
+	bedrockMantleModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
 	coreWeaveModelManagerOptions,
@@ -108,6 +109,13 @@ export const CATALOG_PROVIDERS = [
 	{
 		id: "amazon-bedrock",
 		defaultModel: "us.anthropic.claude-opus-4-8",
+	},
+	{
+		id: "bedrock-mantle",
+		defaultModel: "openai.gpt-5.6-terra",
+		envVars: ["AWS_BEARER_TOKEN_BEDROCK"],
+		createModelManagerOptions: (config: ModelManagerConfig) => bedrockMantleModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "anthropic",
@@ -348,20 +356,6 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "gpt-5.5",
 		envVars: ["OPENAI_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => openaiModelManagerOptions(config),
-	},
-	{
-		// OpenAI on AWS: OpenAI models served by Amazon Bedrock through the
-		// `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint.
-		// Models are derived at generation time (frontier ids cloned from the
-		// first-party `openai` specs with AWS pricing; open-weight ids curated),
-		// so this entry runs on bundled models like `anthropic-aws` — no
-		// discovery manager. Auth (an OPENAI_AWS_API_KEY Bearer token, or the
-		// AWS SigV4 credential chain, service `bedrock-mantle`) and the region
-		// rewrite are applied by the `openai-responses` transport's openai-aws
-		// branch.
-		id: "openai-aws",
-		defaultModel: "openai.gpt-5.6-terra",
-		envVars: ["OPENAI_AWS_API_KEY"],
 	},
 	{
 		id: "openai-codex",

@@ -212,7 +212,6 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 			ANTHROPIC_WORKSPACE_ID: "ws-stale",
 			ANTHROPIC_BASE_URL: "https://aws-external-anthropic.us-east-1.api.aws",
 			OPENAI_API_KEY: "sk-openai-stale",
-			OPENAI_AWS_API_KEY: "bedrock-stale",
 			AWS_BEARER_TOKEN_BEDROCK: "bearer-stale",
 			AWS_ACCESS_KEY_ID: "AKIASTALE",
 			AWS_SECRET_ACCESS_KEY: "secretstale",
@@ -231,7 +230,6 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.ANTHROPIC_WORKSPACE_ID).toBeUndefined();
 		expect(env.OPENAI_API_KEY).toBeUndefined();
-		expect(env.OPENAI_AWS_API_KEY).toBeUndefined();
 		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		expect(result.clearedKeys).toContain("OPENAI_API_KEY");
 
@@ -292,7 +290,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-stale",
 			AWS_PROFILE: "user-profile",
-			OPENAI_AWS_API_KEY: "bedrock-stale",
+			AWS_BEARER_TOKEN_BEDROCK: "bedrock-stale",
 		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(true);
@@ -300,7 +298,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
-		expect(env.OPENAI_AWS_API_KEY).toBeUndefined();
+		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		expect(env.AWS_PROFILE).toBe("user-profile");
 		expect(result.configError).toContain("Invalid managed Claude Platform on AWS URL");
 	});

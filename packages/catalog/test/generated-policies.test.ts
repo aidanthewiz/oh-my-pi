@@ -124,9 +124,9 @@ describe("generated model policies", () => {
 		expect(models[3]?.contextWindow).toBe(1050000);
 	});
 
-	it("pins first-party GPT-5.6 prices without overwriting derived AWS prices", () => {
+	it("pins first-party GPT-5.6 prices without overwriting Bedrock Mantle prices", () => {
 		const stale = { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 };
-		const awsDerived = { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.88 };
+		const mantleNative = { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.88 };
 		const models: ModelSpec<Api>[] = [
 			createSpec({ id: "gpt-5.6-luna", api: "openai-responses", provider: "openai", cost: { ...stale } }),
 			createSpec({
@@ -138,8 +138,8 @@ describe("generated model policies", () => {
 			createSpec({
 				id: "openai.gpt-5.6-sol",
 				api: "openai-responses",
-				provider: "openai-aws",
-				cost: { ...awsDerived },
+				provider: "bedrock-mantle",
+				cost: { ...mantleNative },
 			}),
 			createSpec({
 				id: "openai/gpt-5.6-luna",
@@ -153,7 +153,7 @@ describe("generated model policies", () => {
 
 		expect(models[0]?.cost).toEqual({ input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 });
 		expect(models[1]?.cost).toEqual({ input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 });
-		expect(models[2]?.cost).toEqual(awsDerived);
+		expect(models[2]?.cost).toEqual(mantleNative);
 		expect(models[3]?.cost).toEqual(stale);
 	});
 

@@ -149,7 +149,7 @@ describe("mcp-managed provider", () => {
 				agentDir,
 				JSON.stringify({
 					mcpServers: {
-						"env-server": { command: "cmd", env: { TOKEN: "${OMP_TEST_MANAGED_TOKEN}" } },
+						"env-server": { command: "cmd", env: { TOKEN: "$" + "{OMP_TEST_MANAGED_TOKEN}" } },
 					},
 				}),
 			);

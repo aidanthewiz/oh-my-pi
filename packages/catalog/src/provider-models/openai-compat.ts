@@ -31,6 +31,7 @@ import {
 } from "../wire/github-copilot";
 import { createBundledReferenceMap, createReferenceResolver, toModelSpec } from "./bundled-references";
 import { getDefaultModelDiscoveryBaseUrl, resolveModelCacheProviderId } from "./cache-provider-id";
+import type { ModelManagerConfig } from "./descriptor-types";
 
 const MODELS_DEV_URL = "https://catalog.stencil.so/models.json.zstd";
 
@@ -106,122 +107,6 @@ export function deriveAnthropicAwsModels(models: readonly ModelSpec<Api>[]): Mod
 			provider: "anthropic-aws",
 			baseUrl: ANTHROPIC_AWS_EXTERNAL_BASE_URL,
 		});
-	}
-	return [...derived.values()];
-}
-
-/**
- * OpenAI on AWS — OpenAI models served by Amazon Bedrock through the
- * `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint. The
- * catalog bakes the us-east-1 endpoint; the transport rewrites the region
- * segment from `AWS_REGION` / `AWS_DEFAULT_REGION` at request time. Frontier
- * ids (`openai.gpt-5.x`) are served on the `openai/v1` path; open-weight ids
- * (`openai.gpt-oss-*`) on the bare `/v1` path (per the AWS model cards).
- */
-export const OPENAI_AWS_MANTLE_FRONTIER_BASE_URL = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
-export const OPENAI_AWS_MANTLE_OSS_BASE_URL = "https://bedrock-mantle.us-east-1.api.aws/v1";
-
-interface OpenAIAwsFrontierOverride {
-	/** First-party `openai` id the spec is cloned from. */
-	readonly sourceId: string;
-	/** AWS Bedrock on-demand pricing ($/MTok) — differs from first-party OpenAI. */
-	readonly cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
-	/** Context window served by Bedrock (per the AWS model card; smaller than the plain API's). */
-	readonly contextWindow: number;
-}
-
-/**
- * Frontier OpenAI models exposed on Bedrock-Mantle (per the AWS "OpenAI"
- * model-card catalog, July 2026). Curation policy: every entry must (1) be
- * generally available on Bedrock-Mantle, (2) support the Responses API this
- * provider speaks, and (3) permit `data_retention_mode: none` in the
- * account's Models API metadata. GPT-5.6 Sol/Terra/Luna pass all three.
- * GPT-5.5 and GPT-5.4 fail the retention check (`allowed_modes` carries no
- * `none`) and are deliberately absent.
- * Pricing per aws.amazon.com/bedrock/pricing (fetched 30 Jul 2026).
- * Context is 272K per the AWS model cards, not the plain API's 1.05M window.
- */
-const OPENAI_AWS_FRONTIER_MODELS: readonly OpenAIAwsFrontierOverride[] = [
-	{
-		sourceId: "gpt-5.6-sol",
-		cost: { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.88 },
-		contextWindow: 272_000,
-	},
-	{
-		sourceId: "gpt-5.6-terra",
-		cost: { input: 2.2, output: 13.2, cacheRead: 0.22, cacheWrite: 2.75 },
-		contextWindow: 272_000,
-	},
-	{
-		sourceId: "gpt-5.6-luna",
-		cost: { input: 0.22, output: 1.32, cacheRead: 0.022, cacheWrite: 0.275 },
-		contextWindow: 272_000,
-	},
-];
-
-/**
- * Open-weight OpenAI models on Bedrock-Mantle (`/v1` path). Not cloned from a
- * first-party spec — the plain OpenAI API does not serve them. Kept as cheap
- * utility tiers (120b ≈ frontier-adjacent reasoning at $0.15/$0.60; 20b at
- * half that). Pricing: aws.amazon.com/bedrock/pricing standard tier (13 Jul
- * 2026); context/max-output per the AWS model cards (128K / 16K).
- */
-const OPENAI_AWS_OSS_MODELS: readonly ModelSpec<"openai-responses">[] = [
-	{
-		id: "openai.gpt-oss-120b",
-		name: "gpt-oss-120b",
-		api: "openai-responses",
-		provider: "openai-aws",
-		baseUrl: OPENAI_AWS_MANTLE_OSS_BASE_URL,
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128_000,
-		maxTokens: 16_384,
-	},
-	{
-		id: "openai.gpt-oss-20b",
-		name: "gpt-oss-20b",
-		api: "openai-responses",
-		provider: "openai-aws",
-		baseUrl: OPENAI_AWS_MANTLE_OSS_BASE_URL,
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0.07, output: 0.3, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128_000,
-		maxTokens: 16_384,
-	},
-];
-
-/**
- * Derive the OpenAI-on-AWS (`openai-aws`) catalog: frontier entries clone the
- * first-party `openai` Responses specs named in {@link OPENAI_AWS_FRONTIER_MODELS}
- * (capabilities/thinking stay in sync automatically) onto the `openai.`-namespaced
- * Bedrock id with AWS pricing, the Bedrock-served context window, and the Mantle
- * gateway base URL; open-weight entries are static curated specs. First-party
- * promotion targets are dropped so a Mantle model never promotes to a direct
- * OpenAI endpoint. Used by the generator (`generate-models.ts`).
- */
-export function deriveOpenAIAwsModels(models: readonly ModelSpec<Api>[]): ModelSpec<"openai-responses">[] {
-	const derived = new Map<string, ModelSpec<"openai-responses">>();
-	for (const override of OPENAI_AWS_FRONTIER_MODELS) {
-		const source = models.find(
-			(model): model is ModelSpec<"openai-responses"> =>
-				model.provider === "openai" && model.api === "openai-responses" && model.id === override.sourceId,
-		);
-		if (!source) continue;
-		const { contextPromotionTarget: _dropped, ...base } = source;
-		derived.set(`openai.${override.sourceId}`, {
-			...base,
-			id: `openai.${override.sourceId}`,
-			provider: "openai-aws",
-			baseUrl: OPENAI_AWS_MANTLE_FRONTIER_BASE_URL,
-			cost: override.cost,
-			contextWindow: override.contextWindow,
-		});
-	}
-	for (const model of OPENAI_AWS_OSS_MODELS) {
-		derived.set(model.id, model);
 	}
 	return [...derived.values()];
 }
@@ -3015,6 +2900,22 @@ export const ALIBABA_TOKEN_PLAN_STATIC_MODELS: readonly ModelSpec<"openai-comple
 	},
 ];
 
+const ALIBABA_TOKEN_PLAN_NON_CHAT_MODEL_PREFIXES = [
+	"fun-asr",
+	"happyhorse-",
+	"qwen-audio-",
+	"qwen-image-",
+	"text-embedding-",
+	"wan2.7-",
+] as const;
+
+function isAlibabaTokenPlanChatModelId(id: string): boolean {
+	const normalized = id.trim().toLowerCase();
+	return (
+		normalized.length > 0 && !ALIBABA_TOKEN_PLAN_NON_CHAT_MODEL_PREFIXES.some(prefix => normalized.startsWith(prefix))
+	);
+}
+
 export interface AlibabaTokenPlanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
@@ -3041,19 +2942,30 @@ export function alibabaTokenPlanModelManagerOptions(
 					provider: "alibaba-token-plan",
 					baseUrl,
 					apiKey,
-					filterModel: (_entry, model) =>
-						ALIBABA_TOKEN_PLAN_STATIC_MODELS.some(reference => reference.id === model.id),
+					filterModel: (_entry, model) => isAlibabaTokenPlanChatModelId(model.id),
 					mapModel: (_entry, defaults) => {
 						const reference = ALIBABA_TOKEN_PLAN_STATIC_MODELS.find(model => model.id === defaults.id);
-						return reference
-							? {
-									...reference,
-									id: defaults.id,
-									api: defaults.api,
-									provider: defaults.provider,
-									baseUrl: defaults.baseUrl,
-								}
-							: defaults;
+						if (reference) {
+							return {
+								...reference,
+								id: defaults.id,
+								api: defaults.api,
+								provider: defaults.provider,
+								baseUrl: defaults.baseUrl,
+							};
+						}
+						// DeepSeek V4 family models discovered dynamically need reasoning config
+						if (defaults.id.startsWith("deepseek-v4")) {
+							return {
+								...defaults,
+								reasoning: true,
+								thinking: {
+									mode: "effort" as const,
+									efforts: [Effort.High, Effort.Max],
+								},
+							};
+						}
+						return defaults;
 					},
 					fetch: config?.fetch,
 				}),
@@ -3788,6 +3700,126 @@ export const META_MUSE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] =
 		},
 	},
 ];
+
+// ---------------------------------------------------------------------------
+// 15.76 Amazon Bedrock Mantle
+// ---------------------------------------------------------------------------
+
+const BEDROCK_MANTLE_BASE_URL = "https://bedrock-mantle.{region}.api.aws/openai/v1";
+const BEDROCK_MANTLE_GPT_5_X_THINKING: ThinkingConfig = {
+	mode: "effort",
+	efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+};
+const BEDROCK_MANTLE_GPT_5_6_THINKING: ThinkingConfig = {
+	mode: "effort",
+	efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
+};
+
+/**
+ * OpenAI frontier models served exclusively through Bedrock Mantle's Responses
+ * endpoint. Pricing is per million tokens from the Amazon Bedrock pricing page.
+ */
+export const BEDROCK_MANTLE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] = [
+	{
+		id: "openai.gpt-5.4",
+		name: "GPT-5.4",
+		api: "openai-responses",
+		provider: "bedrock-mantle",
+		baseUrl: BEDROCK_MANTLE_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 2.75, output: 16.5, cacheRead: 0.275, cacheWrite: 0 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+		thinking: BEDROCK_MANTLE_GPT_5_X_THINKING,
+	},
+	{
+		id: "openai.gpt-5.5",
+		name: "GPT-5.5",
+		api: "openai-responses",
+		provider: "bedrock-mantle",
+		baseUrl: BEDROCK_MANTLE_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 0 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+		thinking: BEDROCK_MANTLE_GPT_5_X_THINKING,
+	},
+	{
+		id: "openai.gpt-5.6-luna",
+		name: "GPT-5.6 Luna",
+		api: "openai-responses",
+		provider: "bedrock-mantle",
+		baseUrl: BEDROCK_MANTLE_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0.22, output: 1.32, cacheRead: 0.022, cacheWrite: 0.275 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+		thinking: BEDROCK_MANTLE_GPT_5_6_THINKING,
+	},
+	{
+		id: "openai.gpt-5.6-sol",
+		name: "GPT-5.6 Sol",
+		api: "openai-responses",
+		provider: "bedrock-mantle",
+		baseUrl: BEDROCK_MANTLE_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.88 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+		thinking: BEDROCK_MANTLE_GPT_5_6_THINKING,
+	},
+	{
+		id: "openai.gpt-5.6-terra",
+		name: "GPT-5.6 Terra",
+		api: "openai-responses",
+		provider: "bedrock-mantle",
+		baseUrl: BEDROCK_MANTLE_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 2.2, output: 13.2, cacheRead: 0.22, cacheWrite: 2.75 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+		thinking: BEDROCK_MANTLE_GPT_5_6_THINKING,
+	},
+];
+
+const BEDROCK_MANTLE_MODEL_BY_ID: Partial<Record<string, ModelSpec<"openai-responses">>> = Object.fromEntries(
+	BEDROCK_MANTLE_STATIC_MODELS.map(model => [model.id, model]),
+);
+
+export function bedrockMantleModelManagerOptions(
+	config: ModelManagerConfig = {},
+): ModelManagerOptions<"openai-responses"> {
+	const inferenceBaseUrl = config.baseUrl ?? BEDROCK_MANTLE_BASE_URL;
+	const discoveryBaseUrl = inferenceBaseUrl.replace(/\/openai\/v1\/?$/, "/v1");
+	return {
+		providerId: "bedrock-mantle",
+		staticModels: BEDROCK_MANTLE_STATIC_MODELS,
+		// The bearer-scoped /v1/models response lists only the models enabled for
+		// the account; a successful fetch replaces the static seed instead of
+		// merging, so disabled models are not selectable.
+		dynamicModelsAuthoritative: true,
+		...(config.authenticated && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-responses",
+					provider: "bedrock-mantle",
+					baseUrl: discoveryBaseUrl,
+					fetch: config.fetch,
+					mapModel: (entry, defaults) =>
+						mapWithBundledReference(
+							entry,
+							{ ...defaults, baseUrl: BEDROCK_MANTLE_BASE_URL },
+							BEDROCK_MANTLE_MODEL_BY_ID[defaults.id],
+						),
+				}),
+		}),
+	};
+}
 
 export interface MetaModelManagerConfig {
 	apiKey?: string;
@@ -5217,6 +5249,11 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 											}
 										: {}),
 								};
+						const defaultCost = copilotTierCost(tokenPrices.defaultTier);
+						if (defaultCost) {
+							// Cache writes are not reported per tier; retain the bundled provider rate.
+							base.cost = { ...defaultCost, cacheWrite: base.cost.cacheWrite };
+						}
 						const variant = createCopilotLongContextVariant(
 							base,
 							contextWindow,
@@ -5632,8 +5669,24 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_BEDROCK: readonly ModelsDevProviderDescrip
 		},
 		transformModel: (model, modelId, m) => {
 			const crossRegionId = bedrockCrossRegionId(modelId);
+			// models.dev still carries Nova 2 Lite's preview limits. Keep the
+			// bundled native route aligned with the published AWS model card.
+			// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-2-lite.html
+			const modelCardOverrides: Partial<ModelSpec<Api>> =
+				modelId === "amazon.nova-2-lite-v1:0"
+					? {
+							contextWindow: 1_000_000,
+							maxTokens: 64_000,
+							cost: { input: 0.33, output: 2.75, cacheRead: 0.0825, cacheWrite: 0.33 },
+							thinking: {
+								mode: "effort",
+								efforts: [Effort.Low, Effort.Medium, Effort.High],
+							},
+						}
+					: {};
 			const bedrockModel: ModelSpec<Api> = {
 				...model,
+				...modelCardOverrides,
 				id: crossRegionId,
 				name: toModelName(m.name, crossRegionId),
 			};
