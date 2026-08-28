@@ -12,6 +12,7 @@
 import type { ExtToRelayMessage, RelayToExtMessage, TabSnapshot } from "../../coding-agent/src/tools/browser/relay/protocol";
 
 const DEFAULT_PORT = 9224;
+const INJECTED_TOKEN = "__COREFORGE_BROWSER_RELAY_TOKEN__";
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 10_000;
@@ -24,13 +25,13 @@ interface RelaySettings {
 	port: number;
 	token: string;
 }
-
 async function loadSettings(): Promise<RelaySettings> {
-	const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: "" });
+	const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: INJECTED_TOKEN });
 	const port = Number(stored.port);
+	const storedToken = typeof stored.token === "string" ? stored.token.trim() : "";
 	return {
 		port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : DEFAULT_PORT,
-		token: typeof stored.token === "string" ? stored.token : "",
+		token: storedToken || INJECTED_TOKEN,
 	};
 }
 

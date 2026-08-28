@@ -8,6 +8,7 @@ import { anthropicProvider } from "./anthropic";
 import { anthropicAwsProvider } from "./anthropic-aws";
 import { azureProvider } from "./azure";
 import { basetenProvider } from "./baseten";
+import { bedrockMantleProvider } from "./bedrock-mantle";
 import { cerebrasProvider } from "./cerebras";
 import { cloudflareAiGatewayProvider } from "./cloudflare-ai-gateway";
 import { coreWeaveProvider } from "./coreweave";
@@ -45,7 +46,6 @@ import { nvidiaProvider } from "./nvidia";
 import { ollamaProvider } from "./ollama";
 import { ollamaCloudProvider } from "./ollama-cloud";
 import { openaiProvider } from "./openai";
-import { openaiAwsProvider } from "./openai-aws";
 import { openaiCodexProvider } from "./openai-codex";
 import { openaiCodexDeviceProvider } from "./openai-codex-device";
 import { opencodeGoProvider } from "./opencode-go";
@@ -160,7 +160,7 @@ const ALL = [
 	minimaxProvider,
 	amazonBedrockProvider,
 	anthropicAwsProvider,
-	openaiAwsProvider,
+	bedrockMantleProvider,
 	gmiCloudProvider,
 ];
 

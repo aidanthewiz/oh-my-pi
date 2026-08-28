@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { removeWithRetries } from "../../utils/src/temp";
 import { withEnv } from "./helpers";
 
 const profileArn = "arn:aws:bedrock:us-east-2:1234567890:application-inference-profile/company-opus-48";
@@ -23,12 +27,77 @@ const profileModel: Model<"bedrock-converse-stream"> = buildModel({
 		supportsDisplay: true,
 	},
 });
+const nova2LiteModel: Model<"bedrock-converse-stream"> = buildModel({
+	id: "global.amazon.nova-2-lite-v1:0",
+	name: "Nova 2 Lite",
+	api: "bedrock-converse-stream",
+	provider: "amazon-bedrock",
+	baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+	reasoning: true,
+	input: ["text", "image"],
+	cost: { input: 0.33, output: 2.75, cacheRead: 0.0825, cacheWrite: 0.33 },
+	contextWindow: 1_000_000,
+	maxTokens: 64_000,
+	thinking: {
+		mode: "effort",
+		efforts: [Effort.Low, Effort.Medium, Effort.High],
+	},
+});
+
+interface CapturedBedrockPayload {
+	inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number };
+	additionalModelRequestFields?: {
+		reasoningConfig?: { type?: string; maxReasoningEffort?: string };
+		thinking?: unknown;
+	};
+}
 
 function userContext(): Context {
 	return {
 		messages: [{ role: "user", content: "Say hello", timestamp: 0 }],
 	};
 }
+async function captureNova2Payload(reasoning: Effort): Promise<CapturedBedrockPayload> {
+	const controller = new AbortController();
+	controller.abort();
+	const { promise, resolve } = Promise.withResolvers<CapturedBedrockPayload>();
+	void streamBedrock(nova2LiteModel, userContext(), {
+		bearerToken: "test-token",
+		signal: controller.signal,
+		reasoning,
+		maxTokens: 16,
+		temperature: 0.7,
+		topP: 0.9,
+		onPayload: payload => {
+			resolve(payload as CapturedBedrockPayload);
+		},
+	});
+	return promise;
+}
+
+describe("Nova 2 Lite reasoning", () => {
+	test("uses the native Nova reasoningConfig at medium effort", async () => {
+		const payload = await captureNova2Payload(Effort.Medium);
+		expect(payload.additionalModelRequestFields).toEqual({
+			reasoningConfig: {
+				type: "enabled",
+				maxReasoningEffort: "medium",
+			},
+		});
+		expect(payload.inferenceConfig).toEqual({
+			maxTokens: 16,
+			temperature: 0.7,
+			topP: 0.9,
+		});
+	});
+
+	test("omits unsupported sampling controls at high effort", async () => {
+		const payload = await captureNova2Payload(Effort.High);
+		expect(payload.additionalModelRequestFields?.reasoningConfig?.maxReasoningEffort).toBe("high");
+		expect(payload.inferenceConfig?.temperature).toBeUndefined();
+		expect(payload.inferenceConfig?.topP).toBeUndefined();
+	});
+});
 
 describe("Bedrock inference profile ARNs", () => {
 	test("routes requests to the ARN region and preserves the ARN model id", async () => {
@@ -138,7 +207,7 @@ function bedrockModel(id: string): Model<"bedrock-converse-stream"> {
 
 async function capturedRequestHost(
 	model: Model<"bedrock-converse-stream">,
-	options: { region?: string } = {},
+	options: { region?: string; profile?: string } = {},
 ): Promise<string> {
 	const calls: string[] = [];
 	const customFetch: FetchImpl = Object.assign(
@@ -211,6 +280,31 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 				"bedrock-runtime.eu-central-1.amazonaws.com",
 			);
 		});
+	});
+
+	test("uses the selected profile region when environment regions are absent", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "bedrock-profile-region-"));
+		try {
+			const configPath = path.join(tmp, "config");
+			await Bun.write(configPath, "[profile regional]\nregion = eu-west-2\n");
+			await withEnv(
+				{
+					AWS_REGION: undefined,
+					AWS_DEFAULT_REGION: undefined,
+					AWS_PROFILE: "regional",
+					AWS_CONFIG_FILE: configPath,
+				},
+				async () => {
+					expect(
+						await capturedRequestHost(bedrockModel("eu.anthropic.claude-opus-4-8"), {
+							profile: "regional",
+						}),
+					).toBe("bedrock-runtime.eu-west-2.amazonaws.com");
+				},
+			);
+		} finally {
+			await removeWithRetries(tmp);
+		}
 	});
 
 	test("explicit per-request region wins over the geo prefix and ambient region", async () => {

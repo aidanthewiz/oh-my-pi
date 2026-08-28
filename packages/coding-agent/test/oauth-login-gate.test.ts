@@ -27,7 +27,7 @@ afterEach(() => {
 
 describe("filterOAuthLoginProviders", () => {
 	it("drops model providers outside the enabledModels allowlist, keeps non-model providers", async () => {
-		await initSettings(["anthropic-aws/*", "openai-aws/openai.gpt-5.6-sol"]);
+		await initSettings(["anthropic-aws/*", "bedrock-mantle/openai.gpt-5.6-sol"]);
 		const ids = filterOAuthLoginProviders(PROVIDERS).map(p => p.id);
 		expect(ids).toEqual(["perplexity", "tavily"]);
 	});

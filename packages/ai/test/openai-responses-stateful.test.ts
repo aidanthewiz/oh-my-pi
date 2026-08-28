@@ -6,6 +6,7 @@ import { buildOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog/compat/openai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
+const bedrockMantleModel = getBundledModel("bedrock-mantle", "openai.gpt-5.6-terra") as Model<"openai-responses">;
 
 const explicitPromptCacheModel: Model<"openai-responses"> = {
 	...model,
@@ -108,6 +109,44 @@ describe("openai-responses stateful chaining", () => {
 		expect(deltaInput[0]?.role).toBe("user");
 		expect(JSON.stringify(deltaInput)).toContain("Second question");
 		expect(JSON.stringify(deltaInput)).not.toContain("Answer 1");
+	});
+
+	it("never stores or chains Bedrock Mantle responses", async () => {
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = createCapturingFetch(sentRequests);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: "test-key",
+			sessionId: "bedrock-mantle-zdr-session",
+			providerSessionState,
+			statefulResponses: true,
+			fetch: fetchMock,
+		};
+		const firstUser = { role: "user" as const, content: "First question", timestamp: 1000 };
+		const firstResponse = await streamOpenAIResponses(
+			bedrockMantleModel,
+			{ systemPrompt, messages: [firstUser] },
+			options,
+		).result();
+		const secondResponse = await streamOpenAIResponses(
+			bedrockMantleModel,
+			{
+				systemPrompt,
+				messages: [firstUser, firstResponse, { role: "user", content: "Second question", timestamp: 1001 }],
+			},
+			options,
+		).result();
+
+		expect(firstResponse.stopReason).toBe("stop");
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(sentRequests).toHaveLength(2);
+		expect(sentRequests[0]?.store).toBe(false);
+		expect(sentRequests[1]?.store).toBe(false);
+		expect(sentRequests[0]?.previous_response_id).toBeUndefined();
+		expect(sentRequests[1]?.previous_response_id).toBeUndefined();
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("First question");
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("Answer 1");
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("Second question");
 	});
 
 	it("keeps the automatic explicit cache breakpoint stable across chained turns", async () => {

@@ -1,5 +1,6 @@
 // extension/background.ts
 var DEFAULT_PORT = 9224;
+var INJECTED_TOKEN = "__COREFORGE_BROWSER_RELAY_TOKEN__";
 var PING_INTERVAL_MS = 20000;
 var RECONNECT_MIN_MS = 1000;
 var RECONNECT_MAX_MS = 1e4;
@@ -7,11 +8,12 @@ var ws = null;
 var reconnectDelay = RECONNECT_MIN_MS;
 var pingTimer = null;
 async function loadSettings() {
-  const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: "" });
+  const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: INJECTED_TOKEN });
   const port = Number(stored.port);
+  const storedToken = typeof stored.token === "string" ? stored.token.trim() : "";
   return {
     port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : DEFAULT_PORT,
-    token: typeof stored.token === "string" ? stored.token : ""
+    token: storedToken || INJECTED_TOKEN
   };
 }
 function snapshot(tab) {

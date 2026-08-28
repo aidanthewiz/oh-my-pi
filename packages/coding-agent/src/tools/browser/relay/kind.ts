@@ -17,6 +17,31 @@ export interface RelayKind {
 /** Default endpoint of the `omp-browser-relay` CLI. */
 export const DEFAULT_RELAY_URL = "http://127.0.0.1:9224";
 
+/**
+ * Build the authenticated CDP WebSocket endpoint on the configured relay
+ * authority. Discovery controls only the expected `/cdp` path; it cannot
+ * redirect the machine-local token to another host.
+ */
+export function resolveRelayWebSocketEndpoint(cdpUrl: string, advertisedUrl: string, token: string): string {
+	const advertised = new URL(advertisedUrl, cdpUrl);
+	if (
+		(advertised.protocol !== "ws:" && advertised.protocol !== "wss:") ||
+		advertised.pathname.replace(/\/+$/, "") !== "/cdp"
+	) {
+		throw new Error("invalid relay CDP websocket endpoint");
+	}
+	const endpoint = new URL(cdpUrl);
+	if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+		throw new Error("relay discovery endpoint must use HTTP or HTTPS");
+	}
+	endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+	endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/cdp`;
+	endpoint.search = "";
+	endpoint.hash = "";
+	endpoint.searchParams.set("token", token);
+	return endpoint.toString();
+}
+
 export interface ResolveRelayKindOptions {
 	/** `browser.relay` setting; `PI_BROWSER_RELAY=0|1` overrides it. */
 	settingEnabled?: boolean;

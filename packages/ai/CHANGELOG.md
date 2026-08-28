@@ -2,11 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added native Amazon Nova 2 Lite reasoning control for Bedrock Converse: low, medium, and high efforts send the documented `reasoningConfig`, and high effort omits unsupported sampling controls.
+
 ### Fixed
 
 - Fixed expired AWS IAM Identity Center sessions being retried as generic Anthropic connection failures; credential resolution can now invoke a bounded, single-flight re-authentication callback and preserve actionable AWS errors when recovery fails.
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
+## [17.2.6] - 2026-08-03
+
+### Added
+
+- Added profile-aware Bedrock Mantle region selection, authenticated model discovery, bearer-token or SigV4 authentication, and credential refresh handling for OpenAI Responses models.
+
+### Fixed
+
+- Fixed an issue where Ollama requests without a user-role message would fail to generate output or silently fail with a misleading error.
+
 ## [17.2.5] - 2026-08-03
 
 ### Changed

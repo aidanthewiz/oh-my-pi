@@ -112,7 +112,6 @@ export function resolveCoreforgeClaudeConfig(settings: Settings): CoreforgeClaud
  */
 const MODEL_AUTH_ENV_VARS: readonly string[] = [
 	"OPENAI_API_KEY",
-	"OPENAI_AWS_API_KEY",
 	"AWS_BEARER_TOKEN_BEDROCK",
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_WORKSPACE_ID",

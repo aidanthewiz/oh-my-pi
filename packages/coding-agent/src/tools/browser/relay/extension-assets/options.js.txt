@@ -15,7 +15,10 @@ document.getElementById("save").addEventListener("click", async () => {
 		status.textContent = "invalid port";
 		return;
 	}
-	await chrome.storage.local.set({ port, token: tokenInput.value });
+	const token = tokenInput.value.trim();
+	await chrome.storage.local.set({ port });
+	if (token === "") await chrome.storage.local.remove("token");
+	else await chrome.storage.local.set({ token });
 	status.textContent = "saved";
 	setTimeout(() => {
 		status.textContent = "";

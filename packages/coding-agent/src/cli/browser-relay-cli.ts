@@ -3,6 +3,8 @@
  * its Chrome extension. Standalone CLI command — console output here is
  * intentional user-facing output.
  */
+
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getBrowserRelayDir } from "@oh-my-pi/pi-utils";
 import { probeRelayServer } from "../tools/browser/relay/daemon";
@@ -12,7 +14,10 @@ import optionsHtml from "../tools/browser/relay/extension-assets/options.html.tx
 import optionsJs from "../tools/browser/relay/extension-assets/options.js.txt" with { type: "text" };
 import { DEFAULT_RELAY_URL } from "../tools/browser/relay/kind";
 import { type RelayServer, startRelayServer } from "../tools/browser/relay/server";
+import { ensureBrowserRelayToken, writeBrowserRelayToken } from "../tools/browser/relay/token";
 import { CF_BRAND, CF_COMMAND } from "./cf-version";
+
+const INJECTED_TOKEN = "__COREFORGE_BROWSER_RELAY_TOKEN__";
 
 export const BROWSER_RELAY_ACTIONS = ["serve", "install"] as const;
 export type BrowserRelayAction = (typeof BROWSER_RELAY_ACTIONS)[number];
@@ -29,7 +34,6 @@ export interface BrowserRelayCommandArgs {
 }
 
 const EXTENSION_FILES: Record<string, string> = {
-	"background.js": backgroundJs,
 	"manifest.json": manifestJson,
 	"options.html": optionsHtml,
 	"options.js": optionsJs,
@@ -45,11 +49,19 @@ export async function runBrowserRelayCommand(args: BrowserRelayCommandArgs): Pro
 	}
 	await runServe(args);
 }
-
 async function runInstall(dirOverride: string | undefined): Promise<void> {
 	const dir = dirOverride ? path.resolve(dirOverride) : path.join(getBrowserRelayDir(), "extension");
-	for (const name in EXTENSION_FILES) {
-		await Bun.write(path.join(dir, name), EXTENSION_FILES[name]!);
+	const token = await ensureBrowserRelayToken();
+	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+	await fs.chmod(dir, 0o700);
+	const background = backgroundJs.replace(JSON.stringify(INJECTED_TOKEN), JSON.stringify(token));
+	if (background === backgroundJs) throw new Error("Browser Relay extension token placeholder is missing");
+	await Bun.write(path.join(dir, "background.js"), background);
+	for (const [name, contents] of Object.entries(EXTENSION_FILES)) {
+		await Bun.write(path.join(dir, name), contents);
+	}
+	for (const name of ["background.js", ...Object.keys(EXTENSION_FILES)]) {
+		await fs.chmod(path.join(dir, name), 0o600);
 	}
 	console.log(`Installed the ${CF_BRAND} Browser Relay extension to ${dir}`);
 	console.log("");
@@ -69,10 +81,13 @@ async function runServe(args: BrowserRelayCommandArgs): Promise<void> {
 				console.error(`[relay] ${message}${data ? ` ${JSON.stringify(data)}` : ""}`);
 			}
 		: undefined;
-	let relay: RelayServer;
+	const token = args.token === undefined ? await ensureBrowserRelayToken() : args.token.trim();
+	let relay: RelayServer | undefined;
 	try {
-		relay = startRelayServer({ port: args.port, token: args.token, group: args.group !== false, log });
+		relay = startRelayServer({ port: args.port, token, group: args.group !== false, log });
+		if (args.token !== undefined) await writeBrowserRelayToken(token);
 	} catch (err) {
+		if (relay) relay.stop();
 		// The port is machine-global while relays can be started by any project's
 		// broker (or by hand): losing the bind to a live relay is success.
 		if (err instanceof Error && "code" in err && err.code === "EADDRINUSE") {
@@ -85,9 +100,11 @@ async function runServe(args: BrowserRelayCommandArgs): Promise<void> {
 		}
 		throw err;
 	}
+	if (!relay) throw new Error("Browser relay failed to start");
+	const runningRelay = relay;
 
 	console.log(`${CF_BRAND} browser relay listening on http://127.0.0.1:${args.port}`);
-	console.log(`  extension endpoint  ws://127.0.0.1:${args.port}/ext${args.token ? "?token=***" : ""}`);
+	console.log(`  extension endpoint  ws://127.0.0.1:${args.port}/ext?token=***`);
 	if (args.port === DEFAULT_RELAY_PORT) {
 		console.log(`  enable with         ${CF_COMMAND} config set browser.relay true`);
 	} else {
@@ -101,10 +118,10 @@ async function runServe(args: BrowserRelayCommandArgs): Promise<void> {
 
 	let announced = false;
 	const readiness = setInterval(() => {
-		if (relay.bridge.ready && !announced) {
+		if (runningRelay.bridge.ready && !announced) {
 			announced = true;
 			console.log(`Extension connected. The ${CF_BRAND} browser tool can now drive your tabs.`);
-		} else if (!relay.bridge.ready && announced) {
+		} else if (!runningRelay.bridge.ready && announced) {
 			announced = false;
 			console.log("Extension disconnected; waiting for it to reconnect...");
 		}
@@ -112,7 +129,7 @@ async function runServe(args: BrowserRelayCommandArgs): Promise<void> {
 
 	const shutdown = () => {
 		clearInterval(readiness);
-		relay.stop();
+		runningRelay.stop();
 		process.exit(0);
 	};
 	process.on("SIGINT", shutdown);

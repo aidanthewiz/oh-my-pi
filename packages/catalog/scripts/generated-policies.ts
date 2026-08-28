@@ -66,6 +66,22 @@ export function dropUnsupportedBedrockGeoIds(models: readonly ModelSpec[]): Mode
 	return models.filter(model => !(model.provider === "amazon-bedrock" && model.id === "jp.anthropic.claude-opus-5"));
 }
 
+const BEDROCK_MANTLE_OPENAI_MODEL_IDS: Record<string, true> = {
+	"openai.gpt-5.4": true,
+	"openai.gpt-5.5": true,
+	"openai.gpt-5.6-luna": true,
+	"openai.gpt-5.6-sol": true,
+	"openai.gpt-5.6-terra": true,
+};
+
+/**
+ * models.dev exposes these Responses-only models under amazon-bedrock, whose
+ * descriptor uses Converse. The working Mantle rows come from the static seed.
+ */
+export function dropBedrockMantleOpenAIModels(models: readonly ModelSpec[]): ModelSpec[] {
+	return models.filter(model => !(model.provider === "amazon-bedrock" && BEDROCK_MANTLE_OPENAI_MODEL_IDS[model.id]));
+}
+
 /** True when any component of a model's per-million-token cost is nonzero. */
 export function hasBillableCost(cost: ModelSpec["cost"]): boolean {
 	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
@@ -137,8 +153,8 @@ const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxToken
 
 /**
  * OpenAI pricing published 30 Jul 2026. Codex uses the same rates as
- * subscription-credit shadow prices. AWS pricing belongs to
- * `deriveOpenAIAwsModels`, so the generator has one source for those rates.
+ * subscription-credit shadow prices. The native Bedrock Mantle seed owns its
+ * distinct AWS pricing.
  */
 const GPT_5_6_PRICING = {
 	luna: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },

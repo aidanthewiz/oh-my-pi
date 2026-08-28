@@ -1,27 +1,29 @@
 /**
  * HTTP + WebSocket server for the browser relay.
  *
- * Impersonates Chrome's CDP discovery endpoint so the omp browser tool (and
- * any puppeteer client) can connect with a plain `browserURL`:
- * - `GET /json/version` → 200 with `webSocketDebuggerUrl` once the extension
- *   is connected, 503 before that (clients like `waitForCdp` keep polling).
- * - `GET /json` / `/json/list` → attachable page targets (debugging aid).
- * - `WS /cdp` → downstream CDP clients (puppeteer).
- * - `WS /ext` → the Chrome extension (token-gated when configured).
+ * Impersonates Chrome's CDP discovery endpoint for authenticated Puppeteer clients:
+ * - `GET /json/version` → public liveness and an uncredentialed WebSocket path.
+ * - `GET /json` / `/json/list` → token-gated attachable page targets.
+ * - `WS /cdp` → token-gated downstream CDP clients.
+ * - `WS /ext` → token-gated Chrome extension.
  *
- * Binds loopback only: anything that can reach this port can drive the
- * user's logged-in browser.
+ * Binds loopback only. Every endpoint that can inspect or drive browser state
+ * requires the machine-local shared secret.
  */
 import { RelayBridge } from "./bridge";
 
 /** Options for {@link startRelayServer}. */
 export interface RelayServerOptions {
 	port: number;
-	/** Shared secret the extension must present as `?token=`; unset disables the check. */
-	token?: string;
+	/** Nonempty shared secret required by extension and CDP websocket clients. */
+	token: string;
 	/** Group tabs the agent actively drives under one per-window Chrome tab group (default on); `false` disables. */
 	group?: boolean | { title: string; color: string };
 	log?: (message: string, data?: Record<string, unknown>) => void;
+}
+
+function authorized(url: URL, token: string): boolean {
+	return token.length > 0 && url.searchParams.get("token") === token;
 }
 
 /** A running relay server. */
@@ -46,6 +48,8 @@ const DEFAULT_GROUP = { title: "coreforge", color: "cyan" } as const;
 
 /** Start the relay server on 127.0.0.1. Throws if the port is taken. */
 export function startRelayServer(opts: RelayServerOptions): RelayServer {
+	const token = opts.token.trim();
+	if (token === "") throw new Error("Browser relay token must be nonempty");
 	const log = opts.log ?? (() => {});
 	const group =
 		opts.group === false ? null : opts.group === true || opts.group === undefined ? DEFAULT_GROUP : opts.group;
@@ -62,6 +66,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				// Browsers set Origin on websocket upgrades; native CDP clients
 				// don't. Reject any Origin so a web page can't drive the relay.
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
+				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
 				const data: SocketData = { role: "cdp" };
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
@@ -71,9 +76,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				if (origin && !origin.startsWith("chrome-extension://")) {
 					return new Response("Forbidden", { status: 403 });
 				}
-				if (opts.token && url.searchParams.get("token") !== opts.token) {
-					return new Response("Unauthorized", { status: 401 });
-				}
+				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
 				const data: SocketData = { role: "ext" };
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
@@ -86,6 +89,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				return Response.json(bridge.versionInfo(`ws://127.0.0.1:${opts.port}/cdp`));
 			}
 			if (path === "/json" || path === "/json/list") {
+				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
 				return Response.json(bridge.listTargets());
 			}
 			return new Response("Not found", { status: 404 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { DEFAULT_RELAY_URL, resolveRelayKind } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import { resolveRelayWebSocketEndpoint } from "../../src/tools/browser/relay/kind";
 
 describe("resolveRelayKind", () => {
 	it("is disabled by default", () => {
@@ -34,5 +35,24 @@ describe("resolveRelayKind", () => {
 			kind: "relay",
 			cdpUrl: DEFAULT_RELAY_URL,
 		});
+	});
+});
+
+describe("resolveRelayWebSocketEndpoint", () => {
+	it("keeps the token on the configured relay authority", () => {
+		const endpoint = new URL(
+			resolveRelayWebSocketEndpoint("https://relay.example.test/base", "ws://attacker.example/cdp", "secret token"),
+		);
+
+		expect(endpoint.protocol).toBe("wss:");
+		expect(endpoint.host).toBe("relay.example.test");
+		expect(endpoint.pathname).toBe("/base/cdp");
+		expect(endpoint.searchParams.get("token")).toBe("secret token");
+	});
+
+	it("rejects discovery responses that do not advertise the CDP websocket path", () => {
+		expect(() =>
+			resolveRelayWebSocketEndpoint("http://127.0.0.1:9224", "ws://127.0.0.1:9224/other", "secret"),
+		).toThrow("invalid relay CDP websocket endpoint");
 	});
 });

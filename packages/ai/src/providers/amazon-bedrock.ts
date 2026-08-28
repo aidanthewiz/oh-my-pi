@@ -10,10 +10,10 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { $env, $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
-import { resolveAwsModelRegion } from "../aws-model-auth";
+import { $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
+import { resolveAwsBearerToken } from "../registry/aws";
 import type {
 	Api,
 	AssistantMessage,
@@ -31,6 +31,7 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
+import { resolveAwsAmbientRegion } from "../utils/aws-profile";
 import {
 	clearStreamingPartialJson,
 	kStreamingBlockIndex,
@@ -75,11 +76,9 @@ export interface BedrockOptions extends StreamOptions {
 	 */
 	thinkingDisplay?: BedrockThinkingDisplay;
 }
-const AUTHENTICATED_API_KEY_SENTINEL = "<authenticated>";
 
 function resolveBearerToken(options: BedrockOptions): string | undefined {
-	const apiKey = options.apiKey === AUTHENTICATED_API_KEY_SENTINEL ? undefined : options.apiKey;
-	return options.bearerToken || apiKey || $env.AWS_BEARER_TOKEN_BEDROCK;
+	return resolveAwsBearerToken(options.apiKey, options.bearerToken);
 }
 
 function inferRegionFromBedrockArn(modelId: string): string | undefined {
@@ -150,7 +149,7 @@ function regionServesGeo(region: string, geo: string): boolean {
 function resolveBedrockRegion(modelId: string, options: BedrockOptions): string {
 	const explicit = options.region || inferRegionFromBedrockArn(modelId);
 	if (explicit) return explicit;
-	const ambient = resolveAwsModelRegion();
+	const ambient = resolveAwsAmbientRegion(options.profile);
 	const geo = inferenceProfileGeo(modelId);
 	if (geo) {
 		if (ambient && regionServesGeo(ambient, geo)) return ambient;
@@ -329,14 +328,18 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				const tc = toolConfig.toolChoice;
 				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
 			}
+			const nova2Reasoning = additionalModelRequestFields?.reasoningConfig as
+				| { maxReasoningEffort?: unknown }
+				| undefined;
+			const omitSampling = nova2Reasoning?.maxReasoningEffort === "high";
 
 			const commandInput: ConverseStreamRequest = {
 				messages: convertedMessages,
 				system: buildSystemPrompt(context.systemPrompt, promptCachePolicy),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
-					temperature: options.temperature,
-					topP: options.topP,
+					temperature: omitSampling ? undefined : options.temperature,
+					topP: omitSampling ? undefined : options.topP,
 				},
 				toolConfig,
 				additionalModelRequestFields,
@@ -987,6 +990,19 @@ function mapStopReason(reason: string | undefined): StopReason {
 	}
 }
 
+const NOVA_2_LITE_MODEL_ID = "amazon.nova-2-lite-v1:0";
+
+function isNova2LiteModelId(modelId: string): boolean {
+	const normalized = modelId.toLowerCase();
+	return normalized === NOVA_2_LITE_MODEL_ID || normalized.endsWith(`.${NOVA_2_LITE_MODEL_ID}`);
+}
+
+function mapNova2ReasoningEffort(effort: Effort): "low" | "medium" | "high" {
+	if (effort === "minimal" || effort === "low") return "low";
+	if (effort === "medium") return "medium";
+	return "high";
+}
+
 function buildAdditionalModelRequestFields(
 	model: Model<"bedrock-converse-stream">,
 	options: BedrockOptions,
@@ -995,6 +1011,15 @@ function buildAdditionalModelRequestFields(
 	if (!reasoning || !model.reasoning) return undefined;
 
 	const mode = model.thinking?.mode;
+	if (isNova2LiteModelId(model.id)) {
+		const effort = mapNova2ReasoningEffort(requireSupportedEffort(model, reasoning));
+		return {
+			reasoningConfig: {
+				type: "enabled",
+				maxReasoningEffort: effort,
+			},
+		};
+	}
 	if (mode === "anthropic-adaptive") {
 		const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
 		// Starting with Claude Opus 4.7 and Claude Fable/Mythos 5, Anthropic switched

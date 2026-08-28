@@ -112,20 +112,10 @@ const nativeAndIntegrationPackages = [
 // and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 
-// Repo-level script tests cover the CoreForge release channel, Bazel driver,
-// release helpers, and published-type extension rewriting. A local full run also
-// exercises the release-notes and link-omp tests. (A `ci-test-ts.test.ts` entry
-// used to sit here but the file never existed; Bun silently ignores unmatched
-// filters when at least one other filter matches.)
-const repoScriptTests = [
-	"scripts/cf-release-notes.test.ts",
-	"scripts/bazel-natives.test.ts",
-	"scripts/ci-release-notes.test.ts",
-	"scripts/ci-release-publish.test.ts",
-	"scripts/fix-dts-extensions.test.ts",
-	"scripts/link-omp.test.ts",
-];
-
+// This fork-only suite covers the Coreforge release channel. Upstream removed
+// its repository script tests in v17.2.6; retain only the independent Coreforge
+// contract here.
+const repoScriptTests = ["scripts/cf-release-notes.test.ts"];
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
 	/^test\/[^/]*(ask|gh|irc|task|eval|search|read|write|edit|ast|resolve|sqlite|web-search|fetch|image|ssh|tool)[^/]*\.test\.ts$/,
@@ -345,16 +335,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 				{
 					label: "scripts",
 					cwd: ".",
-					command: [
-						"bun",
-						"test",
-						"--parallel=4",
-						...onlyFailuresArgs,
-						"scripts/cf-release-notes.test.ts",
-						"scripts/bazel-natives.test.ts",
-						"scripts/ci-release-publish.test.ts",
-						"scripts/fix-dts-extensions.test.ts",
-					],
+					command: ["bun", "test", "--parallel=4", ...onlyFailuresArgs, ...repoScriptTests],
 				},
 			];
 		case "native":
@@ -382,20 +363,15 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 			];
 		// `local-ts` is the full local TypeScript run that root `bun run test:ts`
 		// drives: every package the old `--workspaces` fan-out covered (the CI
-		// `all` set PLUS mnemopi and robomp-web, which CI omits) and every repo
-		// script test, routed through this one quiet runner so the whole suite
-		// shares one progress stream and one failure report.
+		// `all` set PLUS mnemopi and robomp-web, which CI omits), routed through
+		// this one quiet runner so the whole suite shares one progress stream and
+		// one failure report. Repo script tests remain available via `test:scripts`.
 		case "local-ts":
 			return [
 				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8, { extraArgs: onlyFailuresArgs })),
 				...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...localOnlyWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...(await commandsForMode("coding-agent-heavy")),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: ["bun", "test", "--parallel=4", ...onlyFailuresArgs, ...repoScriptTests],
-				},
 			];
 		// `local` is what root `bun run test` drives: the full TS suite plus the
 		// Rust task, so a single invocation reports TS and Rust together. The Rust

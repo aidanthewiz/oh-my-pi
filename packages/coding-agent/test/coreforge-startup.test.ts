@@ -48,8 +48,8 @@ function throwingStore(): never {
 
 describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 	it("degrades to signed-out AND clears ambient model-auth envs when the store cannot open", async () => {
-		const previous = Bun.env.OPENAI_AWS_API_KEY;
-		Bun.env.OPENAI_AWS_API_KEY = "bedrock-key";
+		const previous = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-key";
 		try {
 			const result = await ensureCoreforgeIdentityAtStartup(identitySettings(), {
 				interactive: false,
@@ -60,18 +60,18 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			expect(result.notices[0]).toContain("Coreforge identity store unavailable");
 			expect(result.notices[0]).toContain("EACCES");
 			// Store failure must not leave ambient AWS-model auth live when provisioned.
-			expect(Bun.env.OPENAI_AWS_API_KEY).toBeUndefined();
+			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		} finally {
-			if (previous === undefined) delete Bun.env.OPENAI_AWS_API_KEY;
-			else Bun.env.OPENAI_AWS_API_KEY = previous;
+			if (previous === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previous;
 		}
 	});
 
 	it("prompts for sign-in (does not fall back to envs) when provisioned, non-interactive, not signed in", async () => {
 		// Ambient env auth used to suppress the managed flow entirely; now, with
 		// Entra provisioned, it must NOT — the user is told to sign in instead.
-		const previous = Bun.env.OPENAI_AWS_API_KEY;
-		Bun.env.OPENAI_AWS_API_KEY = "bedrock-key";
+		const previous = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-key";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
 			const result = await ensureCoreforgeIdentityAtStartup(identitySettings(), {
@@ -83,10 +83,10 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			// Integration proof: the real startup path cleared the ambient model-auth
 			// var (not just the unit-level applyDefaults), so no env can authenticate
 			// an AWS model when provisioned.
-			expect(Bun.env.OPENAI_AWS_API_KEY).toBeUndefined();
+			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		} finally {
-			if (previous === undefined) delete Bun.env.OPENAI_AWS_API_KEY;
-			else Bun.env.OPENAI_AWS_API_KEY = previous;
+			if (previous === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previous;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -133,8 +133,8 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 		// Provisioning intent (IDs present) but a bad tenant UUID -> resolve
 		// throws -> can't sign in, but ambient envs must STILL be cleared so
 		// they cannot authenticate AWS models.
-		const previous = Bun.env.OPENAI_AWS_API_KEY;
-		Bun.env.OPENAI_AWS_API_KEY = "bedrock-key";
+		const previous = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-key";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
 			const settings = Settings.isolated({
@@ -148,10 +148,10 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 				createStore: () => new CoreforgeIdentityStore(path.join(dir, "agent.db")),
 			});
 			expect(result.notices.some(n => n.includes("managed identity settings are invalid"))).toBe(true);
-			expect(Bun.env.OPENAI_AWS_API_KEY).toBeUndefined();
+			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		} finally {
-			if (previous === undefined) delete Bun.env.OPENAI_AWS_API_KEY;
-			else Bun.env.OPENAI_AWS_API_KEY = previous;
+			if (previous === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previous;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -160,8 +160,8 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 		// Malformed tenantId (Entra resolve throws) AND bad Claude baseUrl
 		// (applyDefaults' resolve throws). The user must see both, not just the
 		// Entra one — the catch path must not drop applied.configError.
-		const previous = Bun.env.OPENAI_AWS_API_KEY;
-		Bun.env.OPENAI_AWS_API_KEY = "bedrock-key";
+		const previous = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-key";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
 			const store = new CoreforgeIdentityStore(path.join(dir, "agent.db"));
@@ -195,17 +195,17 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			});
 			expect(result.notices.some(n => n.includes("tenant ID"))).toBe(true);
 			expect(result.notices.some(n => n.includes("Invalid managed Claude Platform on AWS URL"))).toBe(true);
-			expect(Bun.env.OPENAI_AWS_API_KEY).toBeUndefined();
+			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		} finally {
-			if (previous === undefined) delete Bun.env.OPENAI_AWS_API_KEY;
-			else Bun.env.OPENAI_AWS_API_KEY = previous;
+			if (previous === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previous;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
 	it("surfaces a notice (not silent) when a signed-in identity has a bad managed Claude baseUrl", async () => {
-		const previous = Bun.env.OPENAI_AWS_API_KEY;
-		Bun.env.OPENAI_AWS_API_KEY = "bedrock-key";
+		const previous = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-key";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
 			const store = new CoreforgeIdentityStore(path.join(dir, "agent.db"));
@@ -238,14 +238,14 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 				createStore: () => store,
 			});
 			// Auth was cleared AND the reason is surfaced — never a silent failure.
-			expect(Bun.env.OPENAI_AWS_API_KEY).toBeUndefined();
+			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 			expect(result.notices.some(n => n.includes("Invalid managed Claude Platform on AWS URL"))).toBe(true);
 			// The "authoritative / set enabled:false" suppression notice must NOT
 			// fire here — it would contradict the "settings invalid" notice.
 			expect(result.notices.some(n => n.includes("managed Entra identity is authoritative"))).toBe(false);
 		} finally {
-			if (previous === undefined) delete Bun.env.OPENAI_AWS_API_KEY;
-			else Bun.env.OPENAI_AWS_API_KEY = previous;
+			if (previous === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previous;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -261,14 +261,14 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			OMP_OPERATIONAL_AWS_REGION_SET: Bun.env.OMP_OPERATIONAL_AWS_REGION_SET,
 			OMP_OPERATIONAL_AWS_REGION: Bun.env.OMP_OPERATIONAL_AWS_REGION,
 		};
-		const previousKey = Bun.env.OPENAI_AWS_API_KEY;
+		const previousKey = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
 		Bun.env.AWS_PROFILE = "adopted-model-inference";
 		Bun.env.AWS_REGION = "us-east-1";
 		Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET = "1";
 		Bun.env.OMP_OPERATIONAL_AWS_PROFILE = "employee-operations";
 		Bun.env.OMP_OPERATIONAL_AWS_REGION_SET = "1";
 		Bun.env.OMP_OPERATIONAL_AWS_REGION = "eu-west-1";
-		Bun.env.OPENAI_AWS_API_KEY = "bedrock-stale";
+		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-stale";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
 			const store = new CoreforgeIdentityStore(path.join(dir, "agent.db"));
@@ -318,19 +318,21 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("adopted-model-inference");
 			expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
 			expect(Bun.env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
-			// Stale ambient openai-aws key with no managed replacement is cleared,
-			// and the suppression is surfaced as a notice (P2: not silent).
-			expect(Bun.env.OPENAI_AWS_API_KEY).toBeUndefined();
+			// Stale ambient Bedrock bearer credentials cannot bypass the managed
+			// profile. Startup reports that suppression instead of hiding it.
+			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 			expect(
-				result.notices.some(n => n.includes("ignored ambient credentials") && n.includes("OPENAI_AWS_API_KEY")),
+				result.notices.some(
+					n => n.includes("ignored ambient credentials") && n.includes("AWS_BEARER_TOKEN_BEDROCK"),
+				),
 			).toBe(true);
 		} finally {
 			for (const [key, value] of Object.entries(previousOperationalEnv)) {
 				if (value === undefined) delete Bun.env[key];
 				else Bun.env[key] = value;
 			}
-			if (previousKey === undefined) delete Bun.env.OPENAI_AWS_API_KEY;
-			else Bun.env.OPENAI_AWS_API_KEY = previousKey;
+			if (previousKey === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previousKey;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});

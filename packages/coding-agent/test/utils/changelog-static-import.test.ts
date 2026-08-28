@@ -145,6 +145,14 @@ describe("changelog static import resources", () => {
 				},
 			});
 			expect(buildOutput.success, buildOutput.logs.map(log => log.message).join("\n")).toBe(true);
+			if (process.platform === "darwin") {
+				const sign = Bun.spawn(["codesign", "--force", "--sign", "-", binaryPath], {
+					stdout: "ignore",
+					stderr: "pipe",
+				});
+				const [signExitCode, signStderr] = await Promise.all([sign.exited, new Response(sign.stderr).text()]);
+				expect(signExitCode, signStderr).toBe(0);
+			}
 
 			const result = await runProbe([binaryPath, missingPackageChangelogPath], unrelatedCwd);
 			expect(result.version).toBe(VERSION);

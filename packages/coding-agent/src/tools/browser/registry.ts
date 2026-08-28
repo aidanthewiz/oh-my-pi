@@ -16,7 +16,8 @@ import {
 	type UserAgentOverride,
 } from "./launch";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
-import type { RelayKind } from "./relay/kind";
+import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
+import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
 import { ensureSharedBrowser } from "./shared-daemon";
 
 export type PuppeteerBrowserKind =
@@ -161,6 +162,42 @@ export function normalizeConnectedCdpUrl(rawCdpUrl: string): string {
 	return cdpUrl;
 }
 
+function relayEndpoint(rawUrl: string): { cdpUrl: string; token?: string } {
+	const parsed = new URL(rawUrl);
+	const token = parsed.searchParams.get("token")?.trim() || undefined;
+	parsed.searchParams.delete("token");
+	return { cdpUrl: normalizeConnectedCdpUrl(parsed.toString()), token };
+}
+
+async function relayBrowserWSEndpoint(
+	cdpUrl: string,
+	token: string | undefined,
+	signal?: AbortSignal,
+): Promise<string> {
+	if (!token) {
+		throw new ToolError(
+			`The ${CF_BRAND} browser relay requires a token. Add ?token=... to the configured relay URL or use a loopback relay.`,
+		);
+	}
+	const timeout = AbortSignal.timeout(RELAY_EXTENSION_WAIT_MS);
+	const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+	const response = await fetch(`${cdpUrl}/json/version`, { signal: fetchSignal });
+	if (!response.ok) {
+		await response.body?.cancel();
+		throw new ToolError(
+			`The ${CF_BRAND} browser relay did not return CDP version information (HTTP ${response.status}).`,
+		);
+	}
+	const version = (await response.json()) as { webSocketDebuggerUrl?: unknown };
+	if (typeof version.webSocketDebuggerUrl !== "string" || version.webSocketDebuggerUrl.length === 0) {
+		throw new ToolError(`The ${CF_BRAND} browser relay returned an invalid CDP websocket endpoint.`);
+	}
+	try {
+		return resolveRelayWebSocketEndpoint(cdpUrl, version.webSocketDebuggerUrl, token);
+	} catch {
+		throw new ToolError(`The ${CF_BRAND} browser relay returned an invalid CDP websocket endpoint.`);
+	}
+}
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "cmux") {
 		const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
@@ -214,13 +251,20 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		};
 	}
 	if (kind.kind === "relay") {
-		const cdpUrl = normalizeConnectedCdpUrl(kind.cdpUrl);
+		const configured = relayEndpoint(kind.cdpUrl);
+		const cdpUrl = configured.cdpUrl;
+		const loopback = isLoopbackRelayUrl(cdpUrl);
+		let token = configured.token;
+		if (loopback) {
+			if (token === undefined) token = await ensureBrowserRelayToken();
+			else await writeBrowserRelayToken(token);
+		}
 		// Loopback relays are owned by a machine-global broker and auto-started
 		// on demand (the extension dials in on its own). Hosts without a CLI
 		// worker entry (bun test, SDK embedding) never spawn brokers. Remote
 		// relay URLs must already be serving.
 		let autoStarted = false;
-		if (isLoopbackRelayUrl(cdpUrl) && (isCompiledBinary() || workerHostEntry() !== null)) {
+		if (loopback && (isCompiledBinary() || workerHostEntry() !== null)) {
 			autoStarted = await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
 		}
 		// The relay answers /json/version with 503 until its extension dials in.
@@ -237,9 +281,10 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 					: `${CF_BRAND} browser relay is not reachable at ${cdpUrl}. Start it with \`${CF_COMMAND} browser-relay\` (or check the endpoint), and make sure the ${CF_BRAND} Browser Relay extension is loaded in Chrome.`,
 			);
 		}
+		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);
 		const puppeteer = await loadPuppeteer();
 		const browser = await puppeteer.connect({
-			browserURL: cdpUrl,
+			browserWSEndpoint,
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});

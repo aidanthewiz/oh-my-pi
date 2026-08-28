@@ -195,7 +195,7 @@ describe("OAuthSelectorComponent", () => {
 
 		it("hides off-allowlist model providers from the login list even when searched", async () => {
 			resetSettingsForTest();
-			await Settings.init({ inMemory: true, overrides: { enabledModels: ["anthropic-aws/*", "openai-aws/*"] } });
+			await Settings.init({ inMemory: true, overrides: { enabledModels: ["anthropic-aws/*", "bedrock-mantle/*"] } });
 
 			const component = new OAuthSelectorComponent(
 				"login",
@@ -215,7 +215,7 @@ describe("OAuthSelectorComponent", () => {
 
 		it("keeps off-allowlist providers with stored credentials as logout targets", async () => {
 			resetSettingsForTest();
-			await Settings.init({ inMemory: true, overrides: { enabledModels: ["anthropic-aws/*", "openai-aws/*"] } });
+			await Settings.init({ inMemory: true, overrides: { enabledModels: ["anthropic-aws/*", "bedrock-mantle/*"] } });
 
 			const component = new OAuthSelectorComponent(
 				"logout",

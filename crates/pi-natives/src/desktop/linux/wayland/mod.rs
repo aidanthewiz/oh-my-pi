@@ -106,12 +106,16 @@ impl Backend for WaylandBackend {
 		DesktopCapabilities {
 			backend: "wayland".to_string(),
 			display_server: Some("wayland".to_string()),
-			capture: true,
+			capture: cfg!(feature = "wayland-pipewire"),
 			input: self.input.is_some(),
 			ax: self.ax.is_some(),
 			background_window_input: false,
 			delivery_modes: vec!["foreground".to_string(), "background".to_string()],
-			capture_permission: "prompt-or-granted".to_string(),
+			capture_permission: if cfg!(feature = "wayland-pipewire") {
+				"prompt-or-granted".to_string()
+			} else {
+				"unavailable".to_string()
+			},
 			input_permission: if self.input.is_some() {
 				"granted".to_string()
 			} else {
@@ -255,6 +259,29 @@ impl Backend for WaylandBackend {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn capabilities_reflect_pipewire_support() {
+		let mut backend = WaylandBackend {
+			display:     DisplaySelector::All,
+			ax:          None,
+			ax_error:    None,
+			input:       None,
+			input_error: None,
+			displays:    Vec::new(),
+		};
+		let capabilities = backend.capabilities();
+
+		#[cfg(feature = "wayland-pipewire")]
+		{
+			assert!(capabilities.capture);
+			assert_eq!(capabilities.capture_permission, "prompt-or-granted");
+		}
+		#[cfg(not(feature = "wayland-pipewire"))]
+		{
+			assert!(!capabilities.capture);
+			assert_eq!(capabilities.capture_permission, "unavailable");
+		}
+	}
 	#[test]
 	fn window_background_delivery_is_structurally_rejected() {
 		let target = Target::Window("w1".to_string());
