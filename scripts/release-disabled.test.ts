@@ -23,6 +23,8 @@ test("Coreforce releases build native addons from fork sources", async () => {
 
 	expect(workflow).toContain('bun scripts/bazel-natives.ts "${targets[@]}"');
 	expect(workflow).not.toContain('npm view "@oh-my-pi/pi-natives-');
+	expect(workflow).not.toContain("curl -fsSL -o omp-darwin-arm64");
+	expect(workflow).toContain('--pattern "omp-darwin-arm64"');
 	expect(workflow).toContain("Reclaim disk for Windows native cross-build");
 	expect(workflow).toContain("if: matrix.target == 'win32-x64'");
 	expect(workflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
