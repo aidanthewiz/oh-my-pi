@@ -346,9 +346,12 @@ jobs:
       contents: read
     steps:
       - name: Download published macOS arm64 binary
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL -o omp-darwin-arm64 \
-            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/omp-darwin-arm64"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "omp-darwin-arm64"
           chmod +x omp-darwin-arm64
       - name: Verify published source-install native addon
         env:
