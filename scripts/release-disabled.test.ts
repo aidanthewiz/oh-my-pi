@@ -20,11 +20,22 @@ test("release command fails fast when repository workflow is absent", async () =
 
 test("Coreforce releases build native addons from fork sources", async () => {
 	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
+	const binaryDownloadStart = workflow.indexOf("      - name: Download published macOS arm64 binary");
+	const nativeVerifyStart = workflow.indexOf(
+		"      - name: Verify published source-install native addon",
+		binaryDownloadStart,
+	);
+	expect(binaryDownloadStart).toBeGreaterThanOrEqual(0);
+	expect(nativeVerifyStart).toBeGreaterThan(binaryDownloadStart);
+	const binaryDownloadStep = workflow.slice(binaryDownloadStart, nativeVerifyStart);
 
 	expect(workflow).toContain('bun scripts/bazel-natives.ts "${targets[@]}"');
 	expect(workflow).not.toContain('npm view "@oh-my-pi/pi-natives-');
-	expect(workflow).not.toContain("curl -fsSL -o omp-darwin-arm64");
-	expect(workflow).toContain('--pattern "omp-darwin-arm64"');
+	expect(binaryDownloadStep).not.toContain("curl");
+	expect(binaryDownloadStep).toContain("GH_TOKEN: ${{ github.token }}");
+	expect(binaryDownloadStep).toContain('gh release download "$RELEASE_TAG"');
+	expect(binaryDownloadStep).toContain('--repo "$GITHUB_REPOSITORY"');
+	expect(binaryDownloadStep).toContain('--pattern "omp-darwin-arm64"');
 	expect(workflow).toContain("Reclaim disk for Windows native cross-build");
 	expect(workflow).toContain("if: matrix.target == 'win32-x64'");
 	expect(workflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
