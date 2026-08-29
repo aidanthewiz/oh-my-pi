@@ -103,7 +103,7 @@ function expandDotenvValues(values: Record<string, string>, env: Record<string, 
 	return expanded;
 }
 
-/** Filters child env, then applies explicit overlays before reserving dotenv controls. */
+/** Filters child env and explicit overlays, then reserves dotenv controls. */
 export function filterChildShellEnv(
 	env: Record<string, string | undefined>,
 	cwd: string = process.cwd(),
@@ -153,6 +153,9 @@ export function filterChildShellEnv(
 			if (value === undefined) delete result[key];
 			else result[key] = value;
 		}
+	}
+	for (const key in result) {
+		if (managedAgentEnvNames.has(managedEnvName(key))) delete result[key];
 	}
 	// Bun autoloads cwd dotenv files after exec, which can repopulate values
 	// removed above. BUN_OPTIONS also covers Bun shebang executables whose argv

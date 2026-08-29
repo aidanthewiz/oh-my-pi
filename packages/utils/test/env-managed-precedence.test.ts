@@ -41,6 +41,7 @@ async function resolveEnvInChild(opts: {
 	managed: boolean;
 	cwd?: string;
 	projectEnvContent?: string;
+	childOverlay?: Record<string, string | undefined>;
 	// Simulate Bun's implicit cwd `.env` autoload: load the project `.env` into
 	// the child's Bun.env BEFORE the module runs (via --env-file), reproducing
 	// the contamination the shipped engine disables. Used to prove a project
@@ -83,7 +84,7 @@ async function resolveEnvInChild(opts: {
 				`const childKeys = ${JSON.stringify(opts.childKeys ?? [])};`,
 				"const out = {};",
 				"for (const k of keys) out[k] = $env[k];",
-				"const childEnv = filterChildShellEnv(Bun.env);",
+				`const childEnv = filterChildShellEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
 				"for (const k of childKeys) out['child:' + k] = childEnv[k];",
 				"process.stdout.write(JSON.stringify(out));",
 			].join("\n"),
@@ -402,6 +403,23 @@ describe("child process dotenv boundary", () => {
 		}
 	});
 
+	it("does not restore managed profile values through a child overlay", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "OPENAI_API_KEY=managed-secret\n",
+			ambient: {},
+			keys: ["OPENAI_API_KEY"],
+			childKeys: ["OPENAI_API_KEY", "MCP_ONLY"],
+			childOverlay: {
+				OPENAI_API_KEY: "managed-secret",
+				MCP_ONLY: "explicit-value",
+			},
+			managed: true,
+		});
+		expect(out.OPENAI_API_KEY).toBe("managed-secret");
+		expect(out["child:OPENAI_API_KEY"]).toBeUndefined();
+		expect(out["child:MCP_ONLY"]).toBe("explicit-value");
+	});
+
 	it("does not honor the child sentinel without Bun's launch-time option", async () => {
 		const out = await resolveEnvInChild({
 			agentEnvContent: "MANAGED_PROFILE_SECRET=from-managed-profile\n",
@@ -417,10 +435,12 @@ describe("child process dotenv boundary", () => {
 			agentEnvContent: "OpenAi_Api_Key=from-managed-profile\n",
 			ambient: { OPENAI_API_KEY: "from-ambient-shell" },
 			keys: ["OPENAI_API_KEY"],
-			childKeys: ["OPENAI_API_KEY"],
+			childKeys: ["OPENAI_API_KEY", "openai_api_key"],
+			childOverlay: { openai_api_key: "from-managed-profile" },
 			managed: true,
 		});
 		expect(out.OPENAI_API_KEY).toBe("from-managed-profile");
 		expect(out["child:OPENAI_API_KEY"]).toBeUndefined();
+		expect(out["child:openai_api_key"]).toBeUndefined();
 	});
 });
