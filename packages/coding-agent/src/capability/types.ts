@@ -102,6 +102,8 @@ export interface SourceMeta {
 	path: string;
 	/** Whether this came from user-level, project-level, or native config */
 	level: "user" | "project" | "native";
+	/** SHA-256 of the exact source bytes parsed, when the provider records content integrity */
+	contentSha256?: string;
 }
 
 /**

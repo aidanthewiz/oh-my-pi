@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
+import type { MCPProjectTrustRequest } from "@oh-my-pi/pi-coding-agent/mcp/project-trust";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
@@ -18,7 +19,21 @@ async function runGit(cwd: string, ...args: string[]): Promise<void> {
 	}
 }
 
-describe("trusted Coreforge project MCP config", () => {
+async function writeCoreforgeConfig(projectDir: string, command = "trusted-command"): Promise<void> {
+	await fs.writeFile(
+		path.join(projectDir, ".coreforge", "mcp.json"),
+		JSON.stringify({
+			mcpServers: {
+				trusted: {
+					command,
+					env: { TOKEN: `\${PI_CORE_MCP_TOKEN}` },
+				},
+			},
+		}),
+	);
+}
+
+describe("Coreforge project MCP config", () => {
 	let projectDir = "";
 	let agentDir = "";
 
@@ -28,17 +43,7 @@ describe("trusted Coreforge project MCP config", () => {
 		setAgentDir(agentDir);
 		process.env.PI_CORE_MCP_TOKEN = "from-coreforge-env";
 		await fs.mkdir(path.join(projectDir, ".coreforge"));
-		await fs.writeFile(
-			path.join(projectDir, ".coreforge", "mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					trusted: {
-						command: "trusted-command",
-						env: { TOKEN: `\${PI_CORE_MCP_TOKEN}` },
-					},
-				},
-			}),
-		);
+		await writeCoreforgeConfig(projectDir);
 		await fs.writeFile(
 			path.join(projectDir, ".mcp.json"),
 			JSON.stringify({ mcpServers: { generic: { command: "generic-command" } } }),
@@ -61,36 +66,123 @@ describe("trusted Coreforge project MCP config", () => {
 		await removeWithRetries(agentDir);
 	});
 
-	test("loads only .coreforge/mcp.json for an allowlisted origin organization", async () => {
-		const { configs, sources } = await loadAllMCPConfigs(projectDir, {
+	test("does not trust repository MCP commands from mutable origin metadata", async () => {
+		const { configs } = await loadAllMCPConfigs(projectDir, {
 			enableProjectConfig: false,
 			discoveryProviders: ["coreforge", "mcp-json"],
-			trustedProjectGitHubOrganizations: ["coreforce-cad"],
+		});
+
+		expect(configs.trusted).toBeUndefined();
+		expect(configs.generic).toBeUndefined();
+	});
+
+	test("persists approval for the canonical checkout and exact config bytes", async () => {
+		const requests: MCPProjectTrustRequest[] = [];
+		const first = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge", "mcp-json"],
+			requestProjectTrust: async request => {
+				requests.push(request);
+				return true;
+			},
+		});
+
+		expect(first.configs.trusted?.type).toBe("stdio");
+		expect(first.configs.generic).toBeUndefined();
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.projectRoot).toBe(await fs.realpath(projectDir));
+		expect(requests[0]?.configPath).toBe(path.join(await fs.realpath(projectDir), ".coreforge", "mcp.json"));
+		expect(requests[0]?.configSha256).toMatch(/^[0-9a-f]{64}$/);
+
+		clearFsCache();
+		const second = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge", "mcp-json"],
+		});
+		expect(second.configs.trusted?.type).toBe("stdio");
+		expect(second.configs.generic).toBeUndefined();
+
+		const store = JSON.parse(await fs.readFile(path.join(agentDir, "mcp-project-trust.json"), "utf8"));
+		expect(store).toEqual({
+			version: 1,
+			entries: [{ projectRoot: await fs.realpath(projectDir), configSha256: requests[0]?.configSha256 }],
+		});
+	});
+
+	test("requires approval again after the project config changes", async () => {
+		let approvedDigest = "";
+		await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge"],
+			requestProjectTrust: async request => {
+				approvedDigest = request.configSha256;
+				return true;
+			},
+		});
+
+		await writeCoreforgeConfig(projectDir, "changed-command");
+		clearFsCache();
+		const withoutApproval = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge"],
+		});
+		expect(withoutApproval.configs.trusted).toBeUndefined();
+
+		let changedDigest = "";
+		const declined = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge"],
+			requestProjectTrust: async request => {
+				changedDigest = request.configSha256;
+				return false;
+			},
+		});
+		expect(changedDigest).not.toBe(approvedDigest);
+		expect(declined.configs.trusted).toBeUndefined();
+
+		const reapproved = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge"],
+			requestProjectTrust: async () => true,
+		});
+		const trusted = reapproved.configs.trusted;
+		expect(trusted?.type).toBe("stdio");
+		if (trusted?.type !== "stdio") throw new Error("trusted MCP server did not use stdio");
+		expect(trusted.command).toBe("changed-command");
+
+		clearFsCache();
+		const persisted = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge"],
+		});
+		expect(persisted.configs.trusted?.type).toBe("stdio");
+	});
+
+	test("does not load config bytes changed while approval is pending", async () => {
+		const { configs } = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: false,
+			discoveryProviders: ["coreforge"],
+			requestProjectTrust: async () => {
+				await writeCoreforgeConfig(projectDir, "swapped-command");
+				clearFsCache();
+				return true;
+			},
+		});
+
+		expect(configs.trusted).toBeUndefined();
+	});
+
+	test("loads .coreforge/mcp.json when general project config is enabled", async () => {
+		const { configs, sources } = await loadAllMCPConfigs(projectDir, {
+			enableProjectConfig: true,
+			discoveryProviders: ["coreforge"],
 		});
 
 		const trusted = configs.trusted;
 		expect(trusted?.type).toBe("stdio");
 		if (trusted?.type !== "stdio") throw new Error("trusted MCP server did not use stdio");
-		expect(trusted.env).toEqual({ TOKEN: "${PI_CORE_MCP_TOKEN}" });
+		expect(trusted.env).toEqual({ TOKEN: `\${PI_CORE_MCP_TOKEN}` });
 		expect(sources.trusted?.provider).toBe("coreforge");
 		expect(configs.generic).toBeUndefined();
-	});
-
-	test("rejects .coreforge/mcp.json for a different origin organization", async () => {
-		await runGit(projectDir, "remote", "set-url", "origin", "https://github.com/example/project.git");
-		const { configs } = await loadAllMCPConfigs(projectDir, {
-			enableProjectConfig: false,
-			discoveryProviders: ["coreforge"],
-			trustedProjectGitHubOrganizations: ["Coreforce-CAD"],
-		});
-		expect(configs.trusted).toBeUndefined();
-	});
-
-	test("requires an explicit trusted organization even for the Coreforge provider", async () => {
-		const { configs } = await loadAllMCPConfigs(projectDir, {
-			enableProjectConfig: false,
-			discoveryProviders: ["coreforge"],
-		});
-		expect(configs.trusted).toBeUndefined();
 	});
 });

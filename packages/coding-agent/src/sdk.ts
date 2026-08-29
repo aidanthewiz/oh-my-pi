@@ -28,7 +28,17 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	getAgentDir,
+	getProjectDir,
+	logger,
+	postmortem,
+	prompt,
+	Snowflake,
+	sanitizeText,
+} from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
 	discoverAdvisorConfigs,
@@ -115,6 +125,7 @@ import {
 	discoverAndLoadMCPTools,
 	type MCPLoadResult,
 	MCPManager,
+	type MCPProjectTrustRequest,
 	MCPToolCache,
 	type MCPToolsLoadResult,
 	parseMCPToolName,
@@ -1903,6 +1914,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		toolSession.mcpManager = mcpManager;
 		toolSession.enableMCP = enableMCP;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
+		const projectTrustUI = deferMCPDiscoveryForUI ? Promise.withResolvers<ExtensionUIContext>() : undefined;
 		const customTools: CustomTool[] = [];
 		let startDeferredMCPDiscovery: ((liveSession: AgentSession) => void) | undefined;
 		const startupQuiet = settings.get("startup.quiet");
@@ -1914,10 +1926,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const mcpDiscoverOptions = {
 			onStatus: onMCPStatus,
 			enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
+			requestProjectTrust: projectTrustUI
+				? async (request: MCPProjectTrustRequest) => {
+						const ui = await projectTrustUI.promise;
+						return ui.confirm(
+							"Trust project MCP configuration?",
+							`Allow commands from ${sanitizeText(request.configPath)} to run automatically?\n\n` +
+								"Trust applies only to this checkout and exact file contents. Any change requires approval again.",
+						);
+					}
+				: undefined,
 			// MCP-scoped provider allowlist (empty = all providers); unlike
 			// `disabledProviders` this filters ONLY the mcps capability.
 			discoveryProviders: settings.get("mcp.discoveryProviders"),
-			trustedProjectGitHubOrganizations: settings.get("mcp.trustedProjectGitHubOrganizations"),
 			// Always filter Exa - we have native integration
 			filterExa: true,
 			// Filter browser MCP servers when builtin browser tool is active
@@ -3199,6 +3220,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
 			toolContextStore.setUIContext(uiContext, hasUI);
+			if (hasUI) projectTrustUI?.resolve(uiContext);
 		};
 
 		const initialTools = initialToolNames

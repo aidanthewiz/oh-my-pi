@@ -12,19 +12,18 @@ import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { COREFORGE_MCP_PROVIDER_ID } from "../discovery/coreforge";
 import { MANAGED_MCP_FILENAME, MANAGED_MCP_PROVIDER_ID } from "../discovery/mcp-managed";
-import { parseGitUrl } from "../extensibility/plugins/git-url";
-import * as git from "../utils/git";
 import { readDisabledServers, readEnabledServers } from "./config-writer";
+import { type MCPProjectTrustHandler, resolveCoreforgeProjectTrust } from "./project-trust";
 import type { MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
+	/** Requests one-time approval for repository-owned .coreforge/mcp.json */
+	requestProjectTrust?: MCPProjectTrustHandler;
 	/** Allowlist of discovery provider ids whose MCP servers load (empty/omitted = all providers) */
 	discoveryProviders?: string[];
-	/** GitHub organizations trusted to load .coreforge/mcp.json while project config is disabled */
-	trustedProjectGitHubOrganizations?: string[];
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
@@ -134,23 +133,6 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	};
 }
 
-async function isTrustedCoreforgeProject(cwd: string, organizations: readonly string[]): Promise<boolean> {
-	if (organizations.length === 0) return false;
-	let originUrl: string | undefined;
-	try {
-		originUrl = await git.remote.url(cwd, "origin");
-	} catch {
-		return false;
-	}
-	if (!originUrl) return false;
-	const source = parseGitUrl(originUrl);
-	if (source?.host.toLowerCase() !== "github.com") return false;
-	const organization = source.path.split("/", 1)[0];
-	if (!organization) return false;
-	const trusted = new Set(organizations.map(value => value.toLowerCase()));
-	return trusted.has(organization.toLowerCase());
-}
-
 /**
  * Load all MCP server configs from standard locations.
  * Uses the capability system for multi-source discovery.
@@ -162,9 +144,12 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
-
-	const allowCoreforgeProject =
-		!enableProjectConfig && (await isTrustedCoreforgeProject(cwd, options?.trustedProjectGitHubOrganizations ?? []));
+	const coreforgeProviderEnabled =
+		!options?.discoveryProviders?.length || options.discoveryProviders.includes(COREFORGE_MCP_PROVIDER_ID);
+	const trustedCoreforgeProject =
+		!enableProjectConfig && coreforgeProviderEnabled
+			? await resolveCoreforgeProjectTrust(cwd, { requestTrust: options?.requestProjectTrust })
+			: undefined;
 
 	// Load user-level disable/force-enable lists. The denylist always wins; the
 	// allowlist overrides a non-writable source config's `enabled: false`.
@@ -176,11 +161,16 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 
 	// Scope exclusions drop entries entirely BEFORE deduplication: with project
 	// config disabled, a project entry must not shadow anything.
-	const includeServer = (server: MCPServer & { _source: SourceMeta }): boolean =>
-		(enableProjectConfig ||
-			server._source.level !== "project" ||
-			(allowCoreforgeProject && server._source.provider === COREFORGE_MCP_PROVIDER_ID)) &&
-		(options?.discoveryProviders?.length ? options.discoveryProviders.includes(server._source.provider) : true);
+	const includeServer = (server: MCPServer & { _source: SourceMeta }): boolean => {
+		const trustedCoreforgeSource =
+			server._source.level === "project" &&
+			server._source.provider === COREFORGE_MCP_PROVIDER_ID &&
+			server._source.contentSha256 === trustedCoreforgeProject?.configSha256;
+		return (
+			(enableProjectConfig || server._source.level !== "project" || trustedCoreforgeSource) &&
+			(options?.discoveryProviders?.length ? options.discoveryProviders.includes(server._source.provider) : true)
+		);
+	};
 
 	// Disabled servers are suppressed rather than dropped: they still own their
 	// name at key-level dedupe (a disabled project `foo` keeps a same-named,

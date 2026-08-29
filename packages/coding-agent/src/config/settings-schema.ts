@@ -4405,18 +4405,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"mcp.trustedProjectGitHubOrganizations": {
-		type: "array",
-		default: [] as string[],
-		ui: {
-			tab: "tools",
-			group: "Discovery & MCP",
-			label: "Trusted MCP GitHub Organizations",
-			description:
-				"GitHub organizations whose origin repositories may load .coreforge/mcp.json while general project MCP config is disabled.",
-		},
-	},
-
 	"mcp.renderMarkdownResults": {
 		type: "boolean",
 		default: true,

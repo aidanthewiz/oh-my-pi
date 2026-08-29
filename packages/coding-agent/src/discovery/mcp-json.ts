@@ -6,6 +6,7 @@
  *
  * Priority: 5 (low, as this is a fallback after tool-specific providers)
  */
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { logger, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
@@ -147,7 +148,10 @@ export async function loadMCPJsonFile(
 		return { items, warnings };
 	}
 
-	const source = createSourceMeta(providerId, path, level);
+	const source = {
+		...createSourceMeta(providerId, path, level),
+		contentSha256: createHash("sha256").update(content).digest("hex"),
+	};
 	const servers = transformMCPConfig(config, source);
 	items.push(...servers);
 

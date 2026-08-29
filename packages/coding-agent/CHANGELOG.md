@@ -6,7 +6,7 @@
 
 - Added a production relay server and signed container release workflow for end-to-end encrypted `/collab` sessions and `/share` blobs.
 - Authenticated Coreforce relay hosts and encrypted-share uploads with short-lived AWS identity proofs, and added one-time browser authorization for `/collab` and `/share` viewers.
-- Added trusted repository-root `.coreforge/mcp.json` discovery and managed persistent-plugin allowlisting for Coreforge deployments.
+- Added repository-root `.coreforge/mcp.json` discovery with persisted checkout-and-content approval, plus managed persistent-plugin allowlisting for Coreforge deployments.
 
 ### Changed
 
