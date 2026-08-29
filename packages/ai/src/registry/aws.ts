@@ -54,7 +54,8 @@ export function resolveAwsRegistryApiKey(): string | undefined {
 
 /** Resolve a real AWS bearer token while filtering the registry's auth marker. */
 export function resolveAwsBearerToken(apiKey?: string, bearerToken?: string): string | undefined {
+	if (bearerToken) return bearerToken;
 	if (!allowAmbientAwsModelCredentials()) return undefined;
 	const resolvedApiKey = apiKey === AUTHENTICATED_SENTINEL ? undefined : apiKey;
-	return bearerToken || resolvedApiKey || $env.AWS_BEARER_TOKEN_BEDROCK;
+	return resolvedApiKey || $env.AWS_BEARER_TOKEN_BEDROCK;
 }
