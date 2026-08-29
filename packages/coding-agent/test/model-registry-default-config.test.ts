@@ -219,10 +219,13 @@ function loadDefaultRegistryModel(lookup: ModelLookup): ModelSnapshot | undefine
 			authStorage.close();
 		}
 	`;
+	const env = { ...process.env };
+	delete env.OMP_PROFILE;
+	delete env.PI_PROFILE;
 	const result = Bun.spawnSync([process.execPath, "-e", script], {
 		cwd: packageRoot,
 		env: {
-			...process.env,
+			...env,
 			PI_CODING_AGENT_DIR: tempDir.path(),
 		},
 		stdout: "pipe",
