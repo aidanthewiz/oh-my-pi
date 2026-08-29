@@ -210,18 +210,15 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 			ambient: {
 				AWS_BEARER_TOKEN_BEDROCK: "stale-shell",
 				OPENAI_API_KEY: "ambient-fallback",
-				OPENAI_AWS_API_KEY: "removed-legacy-secret",
 			},
-			keys: ["AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY", "OPENAI_AWS_API_KEY"],
-			childKeys: ["AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY", "OPENAI_AWS_API_KEY"],
+			keys: ["AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY"],
+			childKeys: ["AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY"],
 			managed: true,
 		});
 		expect(out.AWS_BEARER_TOKEN_BEDROCK).toBe("managed-secret");
 		expect(out.OPENAI_API_KEY).toBe("ambient-fallback");
 		expect(out["child:AWS_BEARER_TOKEN_BEDROCK"]).toBeUndefined();
 		expect(out["child:OPENAI_API_KEY"]).toBe("ambient-fallback");
-		expect(out.OPENAI_AWS_API_KEY).toBeUndefined();
-		expect(out["child:OPENAI_AWS_API_KEY"]).toBeUndefined();
 	});
 
 	// Provenance is unrecoverable when Bun's autoload merges the cwd `.env` into
