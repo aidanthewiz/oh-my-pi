@@ -78,6 +78,14 @@ function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 
 const launchEnvValues = readLaunchEnv();
 const projectEnvNamesLoadedByOmp = new Set<string>();
+const managedAgentEnvNames = new Set<string>();
+const BUN_NO_ENV_FILE_OPTION = "--no-env-file";
+const BUN_NO_ENV_FILE_OPTION_RE = /(?:^|\s)--no-env-file(?:\s|$)/;
+const skipOmpDotenvFiles = Bun.env.OMP_NO_ENV_FILE === "1" && process.execArgv.includes(BUN_NO_ENV_FILE_OPTION);
+
+function managedEnvName(name: string): string {
+	return process.platform === "win32" ? name.toUpperCase() : name;
+}
 
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
 	const expanded: Record<string, string> = {};
@@ -95,12 +103,16 @@ function expandDotenvValues(values: Record<string, string>, env: Record<string, 
 	return expanded;
 }
 
-/** Filters process env for child shells without launch-cwd dotenv values. */
+/** Filters child env, then applies explicit overlays before reserving dotenv controls. */
 export function filterChildShellEnv(
 	env: Record<string, string | undefined>,
 	cwd: string = process.cwd(),
+	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	const result = filterProcessEnv(env);
+	for (const key in result) {
+		if (managedAgentEnvNames.has(managedEnvName(key))) delete result[key];
+	}
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const nodeEnvName = `.env.${env.NODE_ENV || "development"}`;
 	const modeEnv = parseEnvFile(path.join(cwd, nodeEnvName));
@@ -136,6 +148,20 @@ export function filterChildShellEnv(
 			delete result[key];
 		}
 	}
+	for (const overlay of overlays) {
+		for (const [key, value] of Object.entries(overlay ?? {})) {
+			if (value === undefined) delete result[key];
+			else result[key] = value;
+		}
+	}
+	// Bun autoloads cwd dotenv files after exec, which can repopulate values
+	// removed above. BUN_OPTIONS also covers Bun shebang executables whose argv
+	// cannot be amended at this spawn boundary.
+	const bunOptions = result.BUN_OPTIONS?.trim();
+	if (!bunOptions || !BUN_NO_ENV_FILE_OPTION_RE.test(bunOptions)) {
+		result.BUN_OPTIONS = bunOptions ? `${bunOptions} ${BUN_NO_ENV_FILE_OPTION}` : BUN_NO_ENV_FILE_OPTION;
+	}
+	result.OMP_NO_ENV_FILE = "1";
 	return result;
 }
 
@@ -193,11 +219,14 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
-const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+// `filterChildShellEnv` pairs its private sentinel with Bun's launch-time
+// `--no-env-file` option. Requiring both prevents a repository `.env` from
+// forging the sentinel after process launch while also blocking OMP's explicit
+// home/config/profile/project loaders in filtered Bun descendants.
+const homeEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(os.homedir(), ".env"));
+const piEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getConfigRootDir(), ".env"));
+const agentEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getAgentDir(), ".env"));
+const projectEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(process.cwd(), ".env"));
 
 // Scrub ambient entries that can't be forwarded to a native execve spawn
 // (bad names, NUL values) or are macOS malloc toggles we never propagate.
@@ -269,6 +298,7 @@ if (managedDotenv) {
 		const value = agentEnv[key];
 		if (value === "") continue; // placeholder — let the ambient value (if any) stand
 		Bun.env[key] = value;
+		managedAgentEnvNames.add(managedEnvName(key));
 	}
 } else {
 	// Upstream default: ambient wins; files fill gaps, most-specific first.
@@ -282,6 +312,10 @@ if (managedDotenv) {
 		}
 	}
 }
+
+// The fork no longer accepts this compatibility alias. Remove it before any
+// extension or child process can observe a stale exported credential.
+delete Bun.env.OPENAI_AWS_API_KEY;
 
 // Directory-affecting keys (XDG_*_HOME, and in default mode PI_CODING_AGENT_DIR)
 // may have just arrived from the profile/agent `.env` applied above. The dirs

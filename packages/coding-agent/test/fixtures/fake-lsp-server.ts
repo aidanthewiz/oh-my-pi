@@ -99,6 +99,8 @@ async function handleRequest(message: JsonRpcMessage): Promise<void> {
 				didChange: didChangeSnapshot,
 				didClose: [...didClose],
 				notifications: [...notifications],
+				openAiKey: process.env.OPENAI_API_KEY ?? "",
+				path: process.env.PATH ?? "",
 			});
 			break;
 		}

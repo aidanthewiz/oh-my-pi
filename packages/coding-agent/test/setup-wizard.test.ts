@@ -548,16 +548,29 @@ describe("setup wizard web search tab", () => {
 });
 
 describe("omp setup onboarding trigger", () => {
-	it("starts the normal interactive command with forced setup wizard", async () => {
+	it("starts the normal interactive command with forced setup wizard and forwarded managed flags", async () => {
 		let forceSetupWizard: boolean | undefined;
-		await runOnboardingSetup({
-			stdinIsTTY: true,
-			stdoutIsTTY: true,
-			runRoot: async (_parsed, _rawArgs, deps) => {
-				forceSetupWizard = deps?.forceSetupWizard;
+		let parsedExtensions: string[] | undefined;
+		let parsedMcpProviders: string[] | undefined;
+		let receivedRawArgs: string[] | undefined;
+		const rawArgs = ["--extension", "/managed/l3.ts", "--mcp-providers", "native"];
+		await runOnboardingSetup(
+			{
+				stdinIsTTY: true,
+				stdoutIsTTY: true,
+				runRoot: async (parsed, forwardedRawArgs, deps) => {
+					forceSetupWizard = deps?.forceSetupWizard;
+					parsedExtensions = parsed.extensions;
+					parsedMcpProviders = parsed.mcpProviders;
+					receivedRawArgs = forwardedRawArgs;
+				},
 			},
-		});
+			rawArgs,
+		);
 		expect(forceSetupWizard).toBe(true);
+		expect(parsedExtensions).toEqual(["/managed/l3.ts"]);
+		expect(parsedMcpProviders).toEqual(["native"]);
+		expect(receivedRawArgs).toEqual(rawArgs);
 	});
 
 	it("rejects onboarding setup without an interactive TTY", async () => {

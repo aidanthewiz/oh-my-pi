@@ -103,6 +103,86 @@ describe("StdioTransport.connect", () => {
 	});
 });
 
+it("removes project dotenv values while preserving explicit server env", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-env-boundary-"));
+	const projectKey = `OMP_MCP_PROJECT_SECRET_${Date.now()}`;
+	const projectSecret = "project-controlled-mcp-secret";
+	const explicitKey = `OMP_MCP_EXPLICIT_SECRET_${Date.now()}`;
+	const explicitSecret = "explicit-server-secret";
+	const previous = Bun.env[projectKey];
+	await Bun.write(path.join(cwd, ".env"), `${projectKey}=${projectSecret}\n`);
+	Bun.env[projectKey] = projectSecret;
+	const transport = new StdioTransport({
+		command: process.execPath,
+		args: ["-e", "await Bun.sleep(60_000)"],
+		cwd,
+		env: { [explicitKey]: explicitSecret },
+	});
+	const spawnSpy = spyOn(Bun, "spawn");
+
+	try {
+		await transport.connect();
+		const call = spawnSpy.mock.calls[0];
+		if (!call) throw new Error("expected StdioTransport.connect() to spawn exactly one subprocess");
+		const spawnOptions = call[1];
+		const childEnv = spawnOptions?.env as Record<string, string | undefined>;
+		expect(childEnv[projectKey]).toBeUndefined();
+		expect(childEnv[explicitKey]).toBe(explicitSecret);
+	} finally {
+		await transport.close();
+		spawnSpy.mockRestore();
+		if (previous === undefined) delete Bun.env[projectKey];
+		else Bun.env[projectKey] = previous;
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
+it("does not let explicit server env reopen managed dotenv loading", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-managed-env-boundary-"));
+	const agentDir = path.join(cwd, "agent");
+	const outputPath = path.join(cwd, "child-env.json");
+	const secretKey = `OMP_MCP_MANAGED_SECRET_${Date.now()}`;
+	await fs.mkdir(agentDir, { recursive: true });
+	await Bun.write(path.join(agentDir, ".env"), `${secretKey}=managed-profile-secret\n`);
+	const envModuleUrl = new URL("../../../../utils/src/env.ts", import.meta.url).href;
+	const script = [
+		`const { $env } = await import(${JSON.stringify(envModuleUrl)});`,
+		`await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify({ secret: $env[${JSON.stringify(secretKey)}], sentinel: process.env.OMP_NO_ENV_FILE, bunOptions: process.env.BUN_OPTIONS }));`,
+		"await Bun.sleep(60_000);",
+	].join("\n");
+	const transport = new StdioTransport({
+		command: process.execPath,
+		args: ["-e", script],
+		cwd,
+		env: {
+			BUN_OPTIONS: "",
+			OMP_NO_ENV_FILE: "0",
+			OMP_PROFILE: "",
+			PI_CODING_AGENT_DIR: agentDir,
+			PI_PROFILE: "",
+		},
+	});
+
+	try {
+		await transport.connect();
+		for (let attempt = 0; attempt < 100 && !(await Bun.file(outputPath).exists()); attempt++) {
+			await Bun.sleep(20);
+		}
+		expect(await Bun.file(outputPath).exists()).toBeTrue();
+		const childEnv = JSON.parse(await Bun.file(outputPath).text()) as {
+			secret?: string;
+			sentinel?: string;
+			bunOptions?: string;
+		};
+		expect(childEnv.secret).toBeUndefined();
+		expect(childEnv.sentinel).toBe("1");
+		expect(childEnv.bunOptions).toBe("--no-env-file");
+	} finally {
+		await transport.close();
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
 // Regression for #3945: request() awaited stdin.write/flush, so a child that
 // stops draining stdin would park the async fn past the timeout timer and past
 // `return promise`, orphaning the deferred rejection and hanging the caller

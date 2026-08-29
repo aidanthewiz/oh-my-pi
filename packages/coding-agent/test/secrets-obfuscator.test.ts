@@ -9,8 +9,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Message, TextContent } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	builtinCredentialSecretEntries,
+	collectSettingsSecrets,
 	getExistingSecretPlaceholderKey,
 	getSecretPlaceholderKey,
 	getSecretPlaceholderKeySync,
@@ -75,6 +77,31 @@ describe("builtinCredentialSecretEntries", () => {
 			const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
 			expect(args.old_string).toBe(fileLine);
 		}
+	});
+});
+
+describe("collectSettingsSecrets", () => {
+	it("protects credential-marked settings independently of token shape or secrets.enabled", () => {
+		const brokerToken = "opaque-broker-credential-value";
+		const shortPassword = "tiny";
+		const settings = Settings.isolated({
+			"auth.broker.token": brokerToken,
+			"searxng.basicPassword": shortPassword,
+			"searxng.endpoint": "https://search.example.test",
+			"secrets.enabled": false,
+		});
+
+		const entries = collectSettingsSecrets(settings);
+		expect(entries.map(entry => entry.friendlyName)).toEqual(["auth.broker.token", "searxng.basicPassword"]);
+
+		const obfuscator = new SecretObfuscator(entries);
+		const providerView = obfuscator.obfuscate(
+			`token=${brokerToken}\npassword=${shortPassword}\nendpoint=https://search.example.test`,
+		);
+		expect(providerView).not.toContain(brokerToken);
+		expect(providerView).not.toContain(shortPassword);
+		expect(providerView).toContain("endpoint=https://search.example.test");
+		expect(deobfuscateToolArguments(obfuscator, { old_string: providerView }).old_string).toContain(brokerToken);
 	});
 });
 

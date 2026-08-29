@@ -1,6 +1,6 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { $flag, $which, logger } from "@oh-my-pi/pi-utils";
+import { $flag, $which, filterChildShellEnv, logger } from "@oh-my-pi/pi-utils";
 import { TOML } from "bun";
 
 /**
@@ -99,12 +99,13 @@ async function parseConfig(): Promise<LspmuxConfig | null> {
 /**
  * Check if lspmux server is running via `lspmux status`.
  */
-async function checkServerRunning(binaryPath: string): Promise<boolean> {
+async function checkServerRunning(binaryPath: string, cwd: string = process.cwd()): Promise<boolean> {
 	try {
 		const proc = Bun.spawn([binaryPath, "status"], {
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			env: filterChildShellEnv(Bun.env, cwd),
 		});
 
 		const exited = await Promise.race([
@@ -129,7 +130,7 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
  *
  * Set PI_DISABLE_LSPMUX=1 to disable.
  */
-export async function detectLspmux(): Promise<LspmuxState> {
+export async function detectLspmux(cwd: string = process.cwd()): Promise<LspmuxState> {
 	const now = Date.now();
 	if (cachedState && now - cacheTimestamp < STATE_CACHE_TTL_MS) {
 		return cachedState;
@@ -147,8 +148,7 @@ export async function detectLspmux(): Promise<LspmuxState> {
 		cacheTimestamp = now;
 		return cachedState;
 	}
-
-	const [config, running] = await Promise.all([parseConfig(), checkServerRunning(binaryPath)]);
+	const [config, running] = await Promise.all([parseConfig(), checkServerRunning(binaryPath, cwd)]);
 
 	cachedState = { available: true, running, binaryPath, config };
 	cacheTimestamp = now;
@@ -222,12 +222,16 @@ export function wrapWithLspmux(
 /**
  * Get lspmux-wrapped command if available, otherwise return original.
  * This is the main entry point for config.ts integration.
- *
  * @param command - Original LSP server command
  * @param args - Original command arguments
+ * @param cwd - Project directory used for child environment filtering
  * @returns Command and args to use (possibly wrapped with lspmux)
  */
-export async function getLspmuxCommand(command: string, args?: string[]): Promise<LspmuxWrappedCommand> {
-	const state = await detectLspmux();
+export async function getLspmuxCommand(
+	command: string,
+	args?: string[],
+	cwd: string = process.cwd(),
+): Promise<LspmuxWrappedCommand> {
+	const state = await detectLspmux(cwd);
 	return wrapWithLspmux(command, args, state);
 }

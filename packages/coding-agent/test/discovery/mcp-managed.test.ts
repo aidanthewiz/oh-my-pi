@@ -142,7 +142,7 @@ describe("mcp-managed provider", () => {
 		expect(warnings[0]).toContain("mcp.managed.json");
 	});
 
-	test("expands ${VAR} placeholders in env values", async () => {
+	test(`expands \${VAR} placeholders in env values`, async () => {
 		process.env.OMP_TEST_MANAGED_TOKEN = "secret-token";
 		try {
 			await writeManagedFile(

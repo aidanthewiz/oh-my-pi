@@ -129,4 +129,38 @@ describe("BiomeClient format", () => {
 
 		expect(result).toBe(content);
 	});
+
+	test("does not pass managed profile secrets to Biome", async () => {
+		const tempDir = await makeTempDir();
+		const targetFile = path.join(tempDir, "example.ts");
+		const envCapture = path.join(tempDir, "child-env.txt");
+		const command = path.join(tempDir, "biome-env-probe");
+		const previousSecret = Bun.env.OPENAI_API_KEY;
+		Bun.env.OPENAI_API_KEY = "managed-profile-sentinel";
+		try {
+			await Bun.write(path.join(tempDir, ".env"), "OPENAI_API_KEY=managed-profile-sentinel\n");
+			await Bun.write(
+				command,
+				`#!/bin/sh
+printf '%s\n' "\${OPENAI_API_KEY-}" > "${envCapture}"
+printf '%s\n' "\${PATH-}" >> "${envCapture}"
+test "$1" = "format" || exit 7
+test "$2" = "--write" || exit 8
+printf 'export const value: number = 1;\\n' > "$3"
+`,
+			);
+			await fs.chmod(command, 0o755);
+			await Bun.write(targetFile, "export const value:number=1\n");
+
+			const result = await new BiomeClient(biomeConfig(command), tempDir).format(targetFile, "ignored");
+
+			expect(result).toBe("export const value: number = 1;\n");
+			const [secret, childPath] = (await Bun.file(envCapture).text()).split("\n");
+			expect(secret).toBe("");
+			expect(childPath).toBe(Bun.env.PATH ?? "");
+		} finally {
+			if (previousSecret === undefined) delete Bun.env.OPENAI_API_KEY;
+			else Bun.env.OPENAI_API_KEY = previousSecret;
+		}
+	});
 });

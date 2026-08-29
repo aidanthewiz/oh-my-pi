@@ -33,6 +33,9 @@ const MANAGED_KEYS = [
 	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
 	"AWS_WEB_IDENTITY_TOKEN_FILE",
 	"AWS_ROLE_ARN",
+	"OMP_MODEL_AWS_AUTH_MODE",
+	"OMP_MODEL_AWS_PROFILE",
+	"OMP_MODEL_AWS_REGION",
 ] as const;
 
 const GATEWAY_URL = "https://aws-external-anthropic.us-east-1.api.aws";

@@ -11,6 +11,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { assertAwsModelRegion } from "../aws-model-auth";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { resolveAwsBearerToken } from "../registry/aws";
@@ -148,7 +149,7 @@ function regionServesGeo(region: string, geo: string): boolean {
  */
 function resolveBedrockRegion(modelId: string, options: BedrockOptions): string {
 	const explicit = options.region || inferRegionFromBedrockArn(modelId);
-	if (explicit) return explicit;
+	if (explicit) return assertAwsModelRegion(explicit);
 	const ambient = resolveAwsAmbientRegion(options.profile);
 	const geo = inferenceProfileGeo(modelId);
 	if (geo) {
@@ -311,9 +312,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 		const blocks = output.content as Block[];
 		let rawRequestDump: RawHttpRequestDump | undefined;
-		const region = resolveBedrockRegion(model.id, options);
 
 		try {
+			const region = resolveBedrockRegion(model.id, options);
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
 			const promptCachePolicy = resolvePromptCachePolicy(model, cacheRetention);
 			const convertedMessages = convertMessages(context, model, promptCachePolicy);

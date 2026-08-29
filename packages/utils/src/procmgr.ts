@@ -37,15 +37,14 @@ export function isExecutable(path: string): boolean {
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
-	return {
-		...filterChildShellEnv(Bun.env),
+	return filterChildShellEnv(Bun.env, undefined, {
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",
 		OMPCODE: "1",
 		CLAUDECODE: "1",
 		...(noCI ? {} : { CI: "true" }),
-	} as Record<string, string>;
+	});
 }
 
 /**

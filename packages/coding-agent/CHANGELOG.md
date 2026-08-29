@@ -29,6 +29,10 @@
 
 - Deferred Coreforge `/report` consent prompts until the agent is idle so tool issue detection no longer blocks active background work.
 - Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
+- Preserved managed extension and MCP provider selection through `setup` and `join` session entry points.
+- Reported configured provider-discovery freshness in JSON model listings instead of silently presenting stale or unavailable catalogs as current.
+- Protected credential-marked settings and removed managed profile values from repository-controlled subprocess environments.
+- Required an explicit bearer credential for custom `pi-native` provider transports.
 ## [17.2.6] - 2026-08-03
 
 ### Added

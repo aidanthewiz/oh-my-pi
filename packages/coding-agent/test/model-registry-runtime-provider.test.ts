@@ -13,6 +13,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { runModelsListing } from "@oh-my-pi/pi-coding-agent/cli/models-cli";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { logger, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -300,6 +301,53 @@ describe("ModelRegistry runtime provider registration", () => {
 			api: "openai-responses",
 			endpoint: modelEndpoint,
 			model: "model-compact",
+		});
+	});
+
+	test("JSON listing reports failed configured discovery as stale", async () => {
+		const providerName = "stale-configured-provider";
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[providerName]: {
+						baseUrl: "https://runtime.example.com/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		const staleRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: offlineFetch });
+		await staleRegistry.refresh("online");
+
+		const captured: string[] = [];
+		const originalWrite = process.stdout.write;
+		Reflect.set(process.stdout, "write", (chunk: string | Uint8Array) => {
+			captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			await runModelsListing({
+				modelRegistry: staleRegistry,
+				cwd: tempDir,
+				action: "ls",
+				pattern: providerName,
+				json: true,
+				disableExtensionDiscovery: true,
+			});
+		} finally {
+			process.stdout.write = originalWrite;
+		}
+
+		const payload = JSON.parse(captured.join("")) as {
+			providerDiscovery: Array<{ provider: string; status: string; stale: boolean }>;
+		};
+		expect(payload.providerDiscovery).toContainEqual({
+			provider: providerName,
+			status: "unavailable",
+			stale: true,
 		});
 	});
 

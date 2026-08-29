@@ -2,6 +2,7 @@
  * SwiftLint CLI-based linter client.
  * Parses SwiftLint's JSON reporter output into LSP Diagnostic format.
  */
+import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 /** Shape of a single violation from `swiftlint lint --reporter json`. */
@@ -39,6 +40,7 @@ async function runSwiftLint(
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			env: filterChildShellEnv(Bun.env, cwd),
 		});
 
 		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);

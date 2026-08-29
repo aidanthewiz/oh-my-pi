@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed managed profile dotenv values and the retired `OPENAI_AWS_API_KEY` alias from repository-controlled child environments.
+
 ## [17.2.6] - 2026-08-03
 
 ### Added

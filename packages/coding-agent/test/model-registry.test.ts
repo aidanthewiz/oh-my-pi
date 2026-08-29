@@ -1438,6 +1438,23 @@ describe("ModelRegistry", () => {
 			expect(invalid.find("myprovider", "my-model")).toBeUndefined();
 		});
 
+		test("pi-native provider config requires an explicit gateway bearer", () => {
+			writeRawModelsJson({
+				gateway: {
+					baseUrl: "https://gateway.example/v1",
+					api: "openai-responses",
+					transport: "pi-native",
+					models: [],
+				},
+			});
+
+			const invalid = new ModelRegistry(authStorage, modelsJsonPath);
+			const error = invalid.getError();
+
+			expect(error?.message).toContain("providers.gateway");
+			expect(error?.message).toContain("apiKey is required when transport is pi-native");
+		});
+
 		test("model override can change cost fields partially", () => {
 			const sonnet = getModelsForProvider(costPartial, "openrouter").find(m => m.id === "anthropic/claude-sonnet-4");
 			// Input cost should be overridden

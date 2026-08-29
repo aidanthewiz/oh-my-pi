@@ -362,6 +362,8 @@ export class Settings {
 	/** Cached resolved values from the merged view, including defaults/path scoping */
 	#resolvedCache = new Map<SettingPath, unknown>();
 	#editVariantCache: readonly EditVariantEntry[] | undefined;
+	/** Per-instance effective-setting change notifications. */
+	#effectiveSettingSignal = new SettingSignal<[path: SettingPath | undefined]>("effective setting");
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
@@ -529,6 +531,11 @@ export class Settings {
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
 
+	/** Subscribe to effective-value changes. `path` is undefined after a full project-scope reload. */
+	onEffectiveSettingChanged(cb: (path: SettingPath | undefined) => void): () => void {
+		return this.#effectiveSettingSignal.on(cb);
+	}
+
 	/**
 	 * Apply runtime overrides (not persisted).
 	 */
@@ -565,6 +572,7 @@ export class Settings {
 
 	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
 		if (Object.is(value, prev)) return;
+		this.#effectiveSettingSignal.fire(path);
 		if (path === "statusLine.sessionAccent") {
 			statusLineSessionAccentSignal.fire();
 		}
@@ -663,6 +671,7 @@ export class Settings {
 		}
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prevModelRoles);
+		this.#effectiveSettingSignal.fire(undefined);
 		this.#fireAllHooks();
 	}
 

@@ -2169,11 +2169,28 @@ export class ModelRegistry {
 			if (options.dynamicModelsAuthoritative && !result.stale) {
 				authoritativeProviders.add(options.providerId);
 			}
+			this.#providerDiscoveryStates.set(options.providerId, {
+				provider: options.providerId,
+				status: result.stale ? (models.length > 0 ? "cached" : "unavailable") : models.length > 0 ? "ok" : "empty",
+				optional: true,
+				stale: result.stale,
+				...(result.stale ? {} : { fetchedAt: Date.now() }),
+				models: models.map(model => model.id),
+			});
 			return { models, authoritativeProviders };
 		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
 			logger.warn("model discovery failed for provider", {
 				provider: options.providerId,
-				error: error instanceof Error ? error.message : String(error),
+				error: message,
+			});
+			this.#providerDiscoveryStates.set(options.providerId, {
+				provider: options.providerId,
+				status: "unavailable",
+				optional: true,
+				stale: true,
+				models: [],
+				error: message,
 			});
 			return { models: [], authoritativeProviders: new Set() };
 		}
@@ -2471,6 +2488,12 @@ export class ModelRegistry {
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {
 		return this.#providerDiscoveryStates.get(provider);
+	}
+
+	getProviderDiscoveryStates(): ProviderDiscoveryState[] {
+		return [...this.#providerDiscoveryStates.values()].sort((left, right) =>
+			left.provider.localeCompare(right.provider),
+		);
 	}
 
 	/**

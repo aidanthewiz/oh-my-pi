@@ -9,6 +9,7 @@ import { setupHelp as commandHelp } from "../cli/command-help";
 import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
 import { runRootCommand } from "../main";
 import { initTheme } from "../modes/theme/theme";
+import { launchHelp } from "./launch-help";
 
 const COMPONENTS: SetupComponent[] = ["python", "speech"];
 
@@ -20,7 +21,10 @@ export interface OnboardingSetupDependencies {
 	exit?: (code: number) => never;
 }
 
-export async function runOnboardingSetup(deps: OnboardingSetupDependencies = {}): Promise<void> {
+export async function runOnboardingSetup(
+	deps: OnboardingSetupDependencies = {},
+	rawArgs: string[] = [],
+): Promise<void> {
 	const stdinIsTTY = deps.stdinIsTTY ?? process.stdin.isTTY;
 	const stdoutIsTTY = deps.stdoutIsTTY ?? process.stdout.isTTY;
 	if (!stdinIsTTY || !stdoutIsTTY) {
@@ -28,7 +32,7 @@ export async function runOnboardingSetup(deps: OnboardingSetupDependencies = {})
 		(deps.exit ?? process.exit)(1);
 		return;
 	}
-	await (deps.runRoot ?? runRootCommand)(parseArgs([]), [], { forceSetupWizard: true });
+	await (deps.runRoot ?? runRootCommand)(parseArgs(rawArgs), rawArgs, { forceSetupWizard: true });
 }
 
 export default class Setup extends Command {
@@ -44,6 +48,8 @@ export default class Setup extends Command {
 	static flags = {
 		check: Flags.boolean({ char: "c", description: "Check if dependencies are installed" }),
 		json: Flags.boolean({ description: "Output status as JSON" }),
+		extension: launchHelp.flags.extension,
+		"mcp-providers": launchHelp.flags["mcp-providers"],
 	};
 
 	async run(): Promise<void> {
@@ -53,7 +59,11 @@ export default class Setup extends Command {
 				renderCommandHelp(CF_COMMAND, "setup", Setup);
 				return;
 			}
-			await runOnboardingSetup();
+			const rawArgs = [
+				...(flags.extension ?? []).flatMap(extension => ["--extension", extension]),
+				...(flags["mcp-providers"] ? ["--mcp-providers", flags["mcp-providers"]] : []),
+			];
+			await runOnboardingSetup({}, rawArgs);
 			return;
 		}
 		const cmd: SetupCommandArgs = {

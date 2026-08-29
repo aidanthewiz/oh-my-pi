@@ -7,6 +7,16 @@ export const MANAGED_AWS_MODEL_AUTH_MODE = "managed";
 
 type EnvironmentLike = Record<string, string | undefined>;
 
+const AWS_REGION_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d+$/;
+
+export function assertAwsModelRegion(region: string): string {
+	const value = region.trim();
+	if (!AWS_REGION_PATTERN.test(value)) {
+		throw new Error(`Invalid AWS model region: ${region || "<empty>"}`);
+	}
+	return value;
+}
+
 export function isManagedAwsModelAuth(env: EnvironmentLike = $env): boolean {
 	return env[AWS_MODEL_AUTH_MODE_ENV] === MANAGED_AWS_MODEL_AUTH_MODE;
 }
@@ -18,7 +28,7 @@ export function resolveAwsModelProfile(env: EnvironmentLike = $env): string | un
 
 export function resolveAwsModelRegion(env: EnvironmentLike = $env): string | undefined {
 	const value = isManagedAwsModelAuth(env) ? env[AWS_MODEL_REGION_ENV] : env.AWS_REGION || env.AWS_DEFAULT_REGION;
-	return value?.trim() || undefined;
+	return value?.trim() ? assertAwsModelRegion(value) : undefined;
 }
 
 export function allowAmbientAwsModelCredentials(env: EnvironmentLike = $env): boolean {

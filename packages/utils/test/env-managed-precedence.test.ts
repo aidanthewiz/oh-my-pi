@@ -37,6 +37,7 @@ async function resolveEnvInChild(opts: {
 	agentEnvContent: string;
 	ambient: Record<string, string | undefined>;
 	keys: string[];
+	childKeys?: string[];
 	managed: boolean;
 	cwd?: string;
 	projectEnvContent?: string;
@@ -77,10 +78,13 @@ async function resolveEnvInChild(opts: {
 		await Bun.write(
 			probePath,
 			[
-				`import { $env } from ${JSON.stringify(envUrl)};`,
+				`import { $env, filterChildShellEnv } from ${JSON.stringify(envUrl)};`,
 				`const keys = ${JSON.stringify(opts.keys)};`,
+				`const childKeys = ${JSON.stringify(opts.childKeys ?? [])};`,
 				"const out = {};",
 				"for (const k of keys) out[k] = $env[k];",
+				"const childEnv = filterChildShellEnv(Bun.env);",
+				"for (const k of childKeys) out['child:' + k] = childEnv[k];",
 				"process.stdout.write(JSON.stringify(out));",
 			].join("\n"),
 		);
@@ -198,6 +202,27 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 		expect(out.PERPLEXITY_API_KEY).toBeUndefined(); // project .env never consulted
 	});
 
+	it("keeps managed profile values inside the engine process", async () => {
+		const out = await resolveEnvInChild({
+			profile: "coreforge",
+			agentEnvContent: "AWS_BEARER_TOKEN_BEDROCK=managed-secret\nOPENAI_API_KEY=\n",
+			ambient: {
+				AWS_BEARER_TOKEN_BEDROCK: "stale-shell",
+				OPENAI_API_KEY: "ambient-fallback",
+				OPENAI_AWS_API_KEY: "removed-legacy-secret",
+			},
+			keys: ["AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY", "OPENAI_AWS_API_KEY"],
+			childKeys: ["AWS_BEARER_TOKEN_BEDROCK", "OPENAI_API_KEY", "OPENAI_AWS_API_KEY"],
+			managed: true,
+		});
+		expect(out.AWS_BEARER_TOKEN_BEDROCK).toBe("managed-secret");
+		expect(out.OPENAI_API_KEY).toBe("ambient-fallback");
+		expect(out["child:AWS_BEARER_TOKEN_BEDROCK"]).toBeUndefined();
+		expect(out["child:OPENAI_API_KEY"]).toBe("ambient-fallback");
+		expect(out.OPENAI_AWS_API_KEY).toBeUndefined();
+		expect(out["child:OPENAI_AWS_API_KEY"]).toBeUndefined();
+	});
+
 	// Provenance is unrecoverable when Bun's autoload merges the cwd `.env` into
 	// Bun.env before the module runs: a launcher-set flag and a project-file flag
 	// are byte-identical ("1"). The one ambiguous observable — BOTH Bun.env and
@@ -293,5 +318,109 @@ describe("default dotenv precedence (flag unset) is unchanged", () => {
 		});
 		expect(out.ANTHROPIC_AWS_WORKSPACE_ID).toBe("ws-dotenv");
 		expect(out.OPENAI_API_KEY).toBe("from-project-dir");
+	});
+});
+
+describe("child process dotenv boundary", () => {
+	it("prevents a Bun child from reloading filtered cwd dotenv values", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-child-env-"));
+		try {
+			await fs.writeFile(path.join(root, ".env"), "PROJECT_ONLY_SECRET=from-project-dotenv\n");
+			// env.ts mutates Bun.env eagerly; load it here to keep the parent clean
+			// while this case exercises a fresh child-process boundary.
+			const { filterChildShellEnv } = await import(envUrl);
+			const childEnv = filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: undefined }, root);
+			const proc = Bun.spawn(
+				[process.execPath, "-e", 'process.stdout.write(process.env.PROJECT_ONLY_SECRET ?? "")'],
+				{
+					cwd: root,
+					env: childEnv,
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [stdout, stderr, exitCode] = await Promise.all([
+				readStream(proc.stdout as ReadableStream<Uint8Array>),
+				readStream(proc.stderr as ReadableStream<Uint8Array>),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			expect(stdout).toBe("");
+			expect(childEnv.BUN_OPTIONS).toBe("--no-env-file");
+			expect(filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: "--smol" }, root).BUN_OPTIONS).toBe(
+				"--smol --no-env-file",
+			);
+			expect(
+				filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: "--smol" }, root, {
+					BUN_OPTIONS: "",
+					OMP_NO_ENV_FILE: "0",
+				}),
+			).toEqual(expect.objectContaining({ BUN_OPTIONS: "--no-env-file", OMP_NO_ENV_FILE: "1" }));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("prevents a filtered Bun child from reloading the managed profile", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-child-profile-"));
+		try {
+			const agentDir = path.join(root, "agent");
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(path.join(agentDir, ".env"), "MANAGED_PROFILE_SECRET=from-managed-profile\n");
+			const probePath = path.join(root, "profile-probe.ts");
+			await Bun.write(
+				probePath,
+				`import ${JSON.stringify(envUrl)};\nprocess.stdout.write(process.env.MANAGED_PROFILE_SECRET ?? "");`,
+			);
+			const { filterChildShellEnv } = await import(envUrl);
+			const childEnv = filterChildShellEnv(
+				{
+					PATH: Bun.env.PATH,
+					HOME: Bun.env.HOME,
+					OMP_DOTENV_OVERRIDE: "1",
+					PI_CODING_AGENT_DIR: agentDir,
+					BUN_OPTIONS: undefined,
+				},
+				root,
+			);
+			const proc = Bun.spawn([process.execPath, probePath], {
+				cwd: root,
+				env: childEnv,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				readStream(proc.stdout as ReadableStream<Uint8Array>),
+				readStream(proc.stderr as ReadableStream<Uint8Array>),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			expect(stdout).toBe("");
+			expect(childEnv.OMP_NO_ENV_FILE).toBe("1");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not honor the child sentinel without Bun's launch-time option", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "MANAGED_PROFILE_SECRET=from-managed-profile\n",
+			ambient: { OMP_NO_ENV_FILE: "1" },
+			keys: ["MANAGED_PROFILE_SECRET"],
+			managed: true,
+		});
+		expect(out.MANAGED_PROFILE_SECRET).toBe("from-managed-profile");
+	});
+
+	it.skipIf(process.platform !== "win32")("removes managed profile keys regardless of Windows casing", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "OpenAi_Api_Key=from-managed-profile\n",
+			ambient: { OPENAI_API_KEY: "from-ambient-shell" },
+			keys: ["OPENAI_API_KEY"],
+			childKeys: ["OPENAI_API_KEY"],
+			managed: true,
+		});
+		expect(out.OPENAI_API_KEY).toBe("from-managed-profile");
+		expect(out["child:OPENAI_API_KEY"]).toBeUndefined();
 	});
 });

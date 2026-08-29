@@ -15,7 +15,7 @@ import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import { ModelRegistry } from "../config/model-registry";
+import { ModelRegistry, type ProviderDiscoveryStatus } from "../config/model-registry";
 import { getAllowedAvailableModels } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
@@ -83,8 +83,15 @@ interface ModelJson {
 	cost: Model<Api>["cost"];
 }
 
+interface ProviderDiscoveryJson {
+	provider: string;
+	status: ProviderDiscoveryStatus;
+	stale: boolean;
+}
+
 interface ModelsJson {
 	models: ModelJson[];
+	providerDiscovery: ProviderDiscoveryJson[];
 }
 
 function writeLine(line = ""): void {
@@ -211,7 +218,13 @@ function renderProviderModels(
 				`Warning: models.yml validation failed — custom providers disabled\n${configError.message}\n`,
 			);
 		}
-		const output: ModelsJson = { models: filtered.slice().sort(byProviderThenId).map(toModelJson) };
+		const providerDiscovery = modelRegistry
+			.getProviderDiscoveryStates()
+			.map(({ provider, status, stale }): ProviderDiscoveryJson => ({ provider, status, stale }));
+		const output: ModelsJson = {
+			models: filtered.slice().sort(byProviderThenId).map(toModelJson),
+			providerDiscovery,
+		};
 		writeLine(JSON.stringify(output));
 		return;
 	}

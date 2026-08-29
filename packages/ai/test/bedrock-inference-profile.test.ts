@@ -209,23 +209,35 @@ async function capturedRequestHost(
 	model: Model<"bedrock-converse-stream">,
 	options: { region?: string; profile?: string } = {},
 ): Promise<string> {
-	const calls: string[] = [];
-	const customFetch: FetchImpl = Object.assign(
-		async (input: string | URL | Request, _init?: RequestInit) => {
-			calls.push(String(input instanceof Request ? input.url : input));
-			return new Response("nope", { status: 418 });
+	let host: string | undefined;
+	await withEnv(
+		{
+			OMP_MODEL_AWS_AUTH_MODE: undefined,
+			OMP_MODEL_AWS_PROFILE: undefined,
+			OMP_MODEL_AWS_REGION: undefined,
 		},
-		{ preconnect: fetch.preconnect },
+		async () => {
+			const calls: string[] = [];
+			const customFetch: FetchImpl = Object.assign(
+				async (input: string | URL | Request, _init?: RequestInit) => {
+					calls.push(String(input instanceof Request ? input.url : input));
+					return new Response("nope", { status: 418 });
+				},
+				{ preconnect: fetch.preconnect },
+			);
+			const result = await streamBedrock(model, userContext(), {
+				bearerToken: "test-token",
+				fetch: customFetch,
+				maxTokens: 16,
+				...options,
+			}).result();
+			expect(result.stopReason).toBe("error");
+			expect(calls).toHaveLength(1);
+			host = new URL(calls[0]).host;
+		},
 	);
-	const result = await streamBedrock(model, userContext(), {
-		bearerToken: "test-token",
-		fetch: customFetch,
-		maxTokens: 16,
-		...options,
-	}).result();
-	expect(result.stopReason).toBe("error");
-	expect(calls).toHaveLength(1);
-	return new URL(calls[0]).host;
+	if (!host) throw new Error("Bedrock request was not captured");
+	return host;
 }
 
 describe("Bedrock cross-region inference-profile geo routing", () => {
@@ -313,6 +325,31 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 				"bedrock-runtime.eu-west-3.amazonaws.com",
 			);
 		});
+	});
+
+	test("rejects a malformed explicit region before attaching credentials", async () => {
+		await withEnv(
+			{
+				OMP_MODEL_AWS_AUTH_MODE: undefined,
+				OMP_MODEL_AWS_PROFILE: undefined,
+				OMP_MODEL_AWS_REGION: undefined,
+			},
+			async () => {
+				let fetchCalls = 0;
+				const result = await streamBedrock(bedrockModel("global.anthropic.claude-opus-4-8"), userContext(), {
+					region: "bedrock.attacker.example#",
+					bearerToken: "secret-token",
+					maxTokens: 16,
+					fetch: async () => {
+						fetchCalls++;
+						return new Response("unexpected");
+					},
+				}).result();
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain("Invalid AWS model region");
+				expect(fetchCalls).toBe(0);
+			},
+		);
 	});
 });
 
