@@ -382,10 +382,9 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 }
 
 // Hosted runners may inject cloud credentials, GitHub Actions injects
-// GITHUB_TOKEN, and Coreforge launches the suite with managed DCG state.
-// Credential leakage changes provider selection, while inherited DCG state
-// makes ordinary tool fixtures depend on the caller's policy. Strip both;
-// their focused tests install explicit fixtures.
+// GITHUB_TOKEN, and Coreforge launches the suite with an active profile and
+// managed DCG state. Strip caller-owned state so ordinary fixtures stay
+// hermetic; focused profile and guard tests install explicit fixtures.
 const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_", "OMP_DCG_", "DCG_"];
 const SCRUBBED_ENV_NAMES = new Set([
 	"GITHUB_TOKEN",
@@ -394,6 +393,11 @@ const SCRUBBED_ENV_NAMES = new Set([
 	"GOOGLE_APPLICATION_CREDENTIALS",
 	"ANTHROPIC_OAUTH_TOKEN",
 	"XAI_OAUTH_TOKEN",
+	"OMP_PROFILE",
+	"PI_PROFILE",
+	"PI_CODING_AGENT_DIR",
+	"PI_CONFIG_DIR",
+	"OMP_DOTENV_OVERRIDE",
 ]);
 
 function isScrubbedEnvVar(key: string): boolean {
