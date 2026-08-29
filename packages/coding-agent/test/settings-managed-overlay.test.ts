@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { MANAGED_CONFIG_FILENAME, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { MANAGED_CONFIG_FILE_ENV, MANAGED_CONFIG_FILENAME, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -39,6 +39,7 @@ describe("Settings managed overlay", () => {
 		AgentStorage.resetInstance();
 		restoreSettingsTestState(settingsState);
 		settingsState = undefined;
+		delete Bun.env[MANAGED_CONFIG_FILE_ENV];
 		await tempDir?.remove();
 	});
 
@@ -58,6 +59,20 @@ describe("Settings managed overlay", () => {
 
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		expect(settings.getModelRole("default")).toBe("anthropic-aws/org-pinned");
+	});
+
+	it("uses an invocation-specific managed overlay when selected", async () => {
+		await writeManaged({ modelRoles: { default: "anthropic-aws/profile-backend" } });
+		const overridePath = tempDir.join("catalog-managed.yml");
+		await Bun.write(
+			overridePath,
+			YAML.stringify({ modelRoles: { default: "openai-codex/catalog-backend" } }, null, 2),
+		);
+		Bun.env[MANAGED_CONFIG_FILE_ENV] = overridePath;
+
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+		expect(settings.getModelRole("default")).toBe("openai-codex/catalog-backend");
 	});
 
 	it("deep-merges records so user-added keys survive", async () => {

@@ -5,8 +5,9 @@ import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir, isEexist, isEisdir, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
-import { daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
+import { daemonBrokerEndpoint, daemonBrokerRuntimeDir, daemonRuntimeDir } from "./paths";
 import {
+	DAEMON_BROKER_PROTOCOL_VERSION,
 	DAEMON_BROKER_WORKER_ARG,
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
@@ -202,6 +203,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		socket.write(
 			`${JSON.stringify({
 				id,
+				protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
 				token: this.#token,
 				owners: [...this.#completionSinks.keys()],
 				detachedOwners: [...this.#preservedCompletionOwners],
@@ -427,6 +429,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		socket.write(
 			`${JSON.stringify({
 				id: crypto.randomUUID(),
+				protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
 				token: this.#token,
 				owners: [...this.#completionSinks.keys()],
 				detachedOwners: [...this.#preservedCompletionOwners],
@@ -470,7 +473,8 @@ export async function createDaemonBrokerClient(
 	options: DaemonBrokerClientOptions = {},
 ): Promise<DaemonBrokerClient> {
 	const canonical = await canonicalProjectDir(projectDir);
-	const runtimeDir = options.runtimeDir ?? daemonRuntimeDir(canonical);
+	const runtimeRoot = options.runtimeDir ?? daemonRuntimeDir(canonical);
+	const runtimeDir = daemonBrokerRuntimeDir(runtimeRoot);
 	const token = await readOrCreateToken(runtimeDir);
 	return new SocketDaemonClient(canonical, runtimeDir, token, options);
 }
@@ -511,7 +515,13 @@ export async function smokeTestDaemonBroker(): Promise<void> {
 	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 	try {
 		const ping = await client.request({ op: "ping" });
-		if (ping.op !== "ping" || ping.projectDir !== client.projectDir) throw new Error("daemon broker ping mismatch");
+		if (
+			ping.op !== "ping" ||
+			ping.projectDir !== client.projectDir ||
+			ping.protocolVersion !== DAEMON_BROKER_PROTOCOL_VERSION
+		) {
+			throw new Error("daemon broker ping mismatch");
+		}
 		await client.request({ op: "shutdown" });
 	} finally {
 		client.close();

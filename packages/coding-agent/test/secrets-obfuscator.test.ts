@@ -2452,6 +2452,34 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(secondPlaceholder)).toBe(firstPlaceholder);
 	});
 
+	it("fails closed when a live-added credential equals an active placeholder", () => {
+		const sharedKey = "D".repeat(43);
+		const obfuscator = new SecretObfuscator(
+			[{ type: "plain", content: "legacy-secret", friendlyName: "old" }],
+			sharedKey,
+		);
+		const activePlaceholder = obfuscator.obfuscate("legacy-secret");
+
+		expect(() =>
+			obfuscator.addPlainEntries([{ type: "plain", content: activePlaceholder, friendlyName: "new" }]),
+		).toThrow("restart the session");
+		expect(() => obfuscator.obfuscate(activePlaceholder)).toThrow("restart the session");
+		expect(() => obfuscator.deobfuscate(activePlaceholder)).toThrow("restart the session");
+
+		const restarted = new SecretObfuscator(
+			[
+				{ type: "plain", content: "legacy-secret", friendlyName: "old" },
+				{ type: "plain", content: activePlaceholder, friendlyName: "new" },
+			],
+			sharedKey,
+		);
+		const restartedLegacy = restarted.obfuscate("legacy-secret");
+		const restartedNew = restarted.obfuscate(activePlaceholder);
+		expect(restartedLegacy).not.toBe(activePlaceholder);
+		expect(restarted.deobfuscate(restartedLegacy)).toBe("legacy-secret");
+		expect(restarted.deobfuscate(restartedNew)).toBe(activePlaceholder);
+	});
+
 	it("keeps no-name placeholders unprefixed but content-derived", () => {
 		const first = new SecretObfuscator([
 			{ type: "plain", content: "alpha-secret" },

@@ -107,7 +107,7 @@ it("removes project dotenv values while preserving explicit server env", async (
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-env-boundary-"));
 	const projectKey = `OMP_MCP_PROJECT_SECRET_${Date.now()}`;
 	const projectSecret = "project-controlled-mcp-secret";
-	const explicitKey = `OMP_MCP_EXPLICIT_SECRET_${Date.now()}`;
+	const explicitKey = `OMP_MCP_EXPLICIT_VALUE_${Date.now()}`;
 	const explicitSecret = "explicit-server-secret";
 	const previous = Bun.env[projectKey];
 	await Bun.write(path.join(cwd, ".env"), `${projectKey}=${projectSecret}\n`);

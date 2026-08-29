@@ -25,7 +25,7 @@ const mantleModel: Model<"openai-responses"> = buildModel({
 	name: "GPT-5.6 Sol",
 	api: "openai-responses",
 	provider: "bedrock-mantle",
-	baseUrl: "https://bedrock-mantle.{region}.api.aws/openai/v1",
+	baseUrl: "https://bedrock-mantle.{region}.api.aws/v1",
 	reasoning: true,
 	input: ["text", "image"],
 	cost: { input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.88 },
@@ -104,7 +104,7 @@ describe("Bedrock Mantle authentication", () => {
 			AWS_BEARER_TOKEN_BEDROCK: "test-token",
 			AWS_REGION: "us-east-2",
 		});
-		expect(capture.url).toStartWith("https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses");
+		expect(capture.url).toStartWith("https://bedrock-mantle.us-east-2.api.aws/v1/responses");
 		expect(capture.authorization).toBe("Bearer test-token");
 	});
 
@@ -122,6 +122,39 @@ describe("Bedrock Mantle authentication", () => {
 		expect(capture.authorization).toBe("Bearer test-token");
 	});
 
+	test("rebuilds bearer-authenticated Request inputs against the resolved regional endpoint", async () => {
+		let forwarded: Request | undefined;
+		const baseFetch = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				forwarded =
+					input instanceof Request
+						? new Request(input, init)
+						: new Request(input instanceof URL ? input.href : input, init);
+				return new Response("captured", { status: 418 });
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		await withEnv(cleanAwsEnv, async () => {
+			const authenticatedFetch = createBedrockMantleAuthenticatedFetch({
+				apiKey: "test-token",
+				providerOptions: { region: "us-east-2" },
+				fetch: baseFetch,
+			});
+			const request = new Request("https://bedrock-mantle.{region}.api.aws/v1/responses", {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-request-header": "preserved" },
+				body: '{"input":"preserved"}',
+			});
+			await authenticatedFetch(request, { headers: { "x-init-header": "merged" } });
+		});
+		expect(forwarded?.url).toBe("https://bedrock-mantle.us-east-2.api.aws/v1/responses");
+		expect(forwarded?.method).toBe("POST");
+		expect(forwarded?.headers.get("authorization")).toBe("Bearer test-token");
+		expect(forwarded?.headers.get("x-request-header")).toBe("preserved");
+		expect(forwarded?.headers.get("x-init-header")).toBe("merged");
+		expect(await forwarded?.text()).toBe('{"input":"preserved"}');
+	});
+
 	test("uses the selected profile region when environment regions are absent", async () => {
 		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "bedrock-mantle-region-"));
 		try {
@@ -133,7 +166,7 @@ describe("Bedrock Mantle authentication", () => {
 				AWS_CONFIG_FILE: configPath,
 				AWS_SHARED_CREDENTIALS_FILE: path.join(tmp, "missing-credentials"),
 			});
-			expect(capture.url).toStartWith("https://bedrock-mantle.eu-west-2.api.aws/openai/v1/responses");
+			expect(capture.url).toStartWith("https://bedrock-mantle.eu-west-2.api.aws/v1/responses");
 		} finally {
 			await removeWithRetries(tmp);
 		}
@@ -152,7 +185,7 @@ describe("Bedrock Mantle authentication", () => {
 					fetch: captureFetch(capture),
 				});
 				expect(config?.authenticated).toBeTrue();
-				expect(config?.baseUrl).toBe("https://bedrock-mantle.eu-west-2.api.aws/openai/v1");
+				expect(config?.baseUrl).toBe("https://bedrock-mantle.eu-west-2.api.aws/v1");
 				await config?.fetch?.("https://bedrock-mantle.eu-west-2.api.aws/v1/models", { method: "GET" });
 			},
 		);
@@ -160,7 +193,8 @@ describe("Bedrock Mantle authentication", () => {
 		expect(capture.body).toBeUndefined();
 	});
 
-	test("does not enable account-scoped discovery for SigV4-only credentials", async () => {
+	test("prepares SigV4-authenticated model discovery", async () => {
+		const capture: Capture = {};
 		await withEnv(
 			{
 				...cleanAwsEnv,
@@ -169,11 +203,18 @@ describe("Bedrock Mantle authentication", () => {
 				AWS_REGION: "eu-west-2",
 			},
 			async () => {
-				const config = getProviderDefinition("bedrock-mantle")?.prepareModelDiscovery?.({});
-				expect(config?.authenticated).toBeFalse();
-				expect(config?.baseUrl).toBeUndefined();
+				clearAwsCredentialCache();
+				const config = getProviderDefinition("bedrock-mantle")?.prepareModelDiscovery?.({
+					fetch: captureFetch(capture),
+				});
+				expect(config?.authenticated).toBeTrue();
+				expect(config?.baseUrl).toBe("https://bedrock-mantle.eu-west-2.api.aws/v1");
+				await config?.fetch?.("https://bedrock-mantle.eu-west-2.api.aws/v1/models", { method: "GET" });
 			},
 		);
+		expect(capture.authorization).toContain("/eu-west-2/bedrock-mantle/aws4_request");
+		expect(capture.authorization).not.toContain("content-type");
+		expect(capture.body).toBeUndefined();
 	});
 
 	test("SigV4-signs with the standard AWS credential chain", async () => {
@@ -183,7 +224,7 @@ describe("Bedrock Mantle authentication", () => {
 			AWS_SESSION_TOKEN: "test-session-token",
 			AWS_REGION: "us-west-2",
 		});
-		expect(capture.url).toStartWith("https://bedrock-mantle.us-west-2.api.aws/openai/v1/responses");
+		expect(capture.url).toStartWith("https://bedrock-mantle.us-west-2.api.aws/v1/responses");
 		expect(capture.authorization).toContain("/us-west-2/bedrock-mantle/aws4_request");
 		expect(capture.securityToken).toBe("test-session-token");
 	});
@@ -208,7 +249,7 @@ describe("Bedrock Mantle authentication", () => {
 				AWS_PROFILE: "employee-operations",
 				AWS_REGION: "eu-west-1",
 			});
-			expect(capture.url).toStartWith("https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses");
+			expect(capture.url).toStartWith("https://bedrock-mantle.us-east-1.api.aws/v1/responses");
 			expect(capture.authorization).toContain("Credential=MODELKEY/");
 			expect(capture.authorization).toContain("/us-east-1/bedrock-mantle/aws4_request");
 			expect(capture.authorization).not.toStartWith("Bearer ");
@@ -266,7 +307,7 @@ describe("Bedrock Mantle authentication", () => {
 			await streamSimple(mantleModel, context, options).result();
 		});
 		expect(resolverCalls).toBe(1);
-		expect(capture.url).toStartWith("https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses");
+		expect(capture.url).toStartWith("https://bedrock-mantle.us-east-2.api.aws/v1/responses");
 		expect(capture.authorization).toBe("Bearer resolved-token");
 	});
 
@@ -297,11 +338,15 @@ describe("Bedrock Mantle authentication", () => {
 
 	test("rejects overridden and look-alike endpoints before bearer authentication", async () => {
 		const invalidBaseUrls = [
-			"https://listener.example/openai/v1",
-			"https://bedrock-mantle.us-east-1.api.aws.listener.example/openai/v1",
-			"https://user@bedrock-mantle.us-east-1.api.aws/openai/v1",
-			"http://bedrock-mantle.us-east-1.api.aws/openai/v1",
-			"https://bedrock-mantle.us-east-1.api.aws:8443/openai/v1",
+			"https://listener.example/v1",
+			"https://bedrock-mantle.us-east-1.api.aws.listener.example/v1",
+			"https://user@bedrock-mantle.us-east-1.api.aws/v1",
+			"http://bedrock-mantle.us-east-1.api.aws/v1",
+			"https://bedrock-mantle.us-east-1.api.aws:8443/v1",
+			"https://bedrock-mantle.us-east-1.api.aws/evil",
+			"https://bedrock-mantle.us-east-1.api.aws/v1/extra",
+			"https://bedrock-mantle.us-east-1.api.aws/v1?redirect=listener.example",
+			"https://bedrock-mantle.us-east-1.api.aws/v1#listener.example",
 		];
 		for (const baseUrl of invalidBaseUrls) {
 			await expectRejectedEndpoint(baseUrl, {
@@ -311,8 +356,24 @@ describe("Bedrock Mantle authentication", () => {
 		}
 	});
 
+	test("rejects authenticated fetch paths outside the Mantle OpenAI prefix", async () => {
+		const capture: Capture = {};
+		await withEnv(cleanAwsEnv, async () => {
+			const authenticatedFetch = createBedrockMantleAuthenticatedFetch({
+				apiKey: "must-not-leak",
+				providerOptions: { region: "us-east-1" },
+				fetch: captureFetch(capture),
+			});
+			await expect(
+				authenticatedFetch("https://bedrock-mantle.us-east-1.api.aws/openai/v1/models", { method: "GET" }),
+			).rejects.toThrow("Bedrock Mantle endpoint must use");
+		});
+		expect(capture.url).toBeUndefined();
+		expect(capture.authorization).toBeUndefined();
+	});
+
 	test("rejects an overridden endpoint before SigV4 authentication", async () => {
-		await expectRejectedEndpoint("https://listener.example/openai/v1", {
+		await expectRejectedEndpoint("https://listener.example/v1", {
 			AWS_ACCESS_KEY_ID: "AKIAMUSTNOTLEAK",
 			AWS_SECRET_ACCESS_KEY: "must-not-leak",
 			AWS_SESSION_TOKEN: "must-not-leak",

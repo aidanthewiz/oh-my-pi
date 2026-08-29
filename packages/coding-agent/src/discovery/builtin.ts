@@ -28,7 +28,7 @@ import {
 	buildRuleFromMarkdown,
 	createSourceMeta,
 	discoverExtensionModulePaths,
-	expandEnvVarsDeep,
+	expandEnvVarsDeepForConfigLevel,
 	getExtensionNameFromPath,
 	loadFilesFromDir,
 	parseRequestIdFormat,
@@ -108,7 +108,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		const data = tryParseJson<{ mcpServers?: Record<string, unknown> }>(content);
 		if (!data?.mcpServers) return result;
 
-		const expanded = expandEnvVarsDeep(data.mcpServers);
+		const expanded = expandEnvVarsDeepForConfigLevel(data.mcpServers, level);
 		for (const [serverName, config] of Object.entries(expanded)) {
 			const serverConfig = config as Record<string, unknown>;
 

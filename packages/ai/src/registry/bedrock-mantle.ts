@@ -18,16 +18,13 @@ export const bedrockMantleProvider = {
 	mapSimpleOptions: options => ({ providerOptions: options.providerOptions }),
 	prepareModelDiscovery: config => {
 		const bearerToken = resolveAwsBearerToken(config.apiKey);
-		if (!bearerToken) {
-			return { ...config, apiKey: undefined, authenticated: false };
-		}
 		const region = resolveAwsRegion();
 		return {
 			authenticated: true,
-			baseUrl: `https://bedrock-mantle.${encodeURIComponent(region)}.api.aws/openai/v1`,
+			baseUrl: `https://bedrock-mantle.${encodeURIComponent(region)}.api.aws/v1`,
 			fetch: createBedrockMantleAuthenticatedFetch({
 				fetch: config.fetch,
-				providerOptions: { bearerToken, region },
+				providerOptions: { ...(bearerToken ? { bearerToken } : {}), region },
 			}),
 		};
 	},

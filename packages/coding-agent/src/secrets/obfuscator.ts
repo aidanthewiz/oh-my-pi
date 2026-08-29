@@ -579,6 +579,10 @@ export class SecretObfuscator {
 	 *  placeholder existed) and would survive verbatim in provider-visible text. */
 	#configuredSecretValues = new Set<string>();
 
+	/** A live-added secret matched an existing placeholder, so this instance
+	 * cannot distinguish the old placeholder from the new credential. */
+	#livePlaceholderCollision = false;
+
 	/** Regex values seen in the current obfuscate input, used to keep friendly labels from exposing normalized matches that are discovered later in the same pass. */
 	#currentRegexSecretValues = new Set<string>();
 
@@ -645,6 +649,14 @@ export class SecretObfuscator {
 	 * after a credential setting rotates.
 	 */
 	addPlainEntries(entries: readonly SecretEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type === "plain" && this.#lookupLiveAlias(entry.content) !== undefined) {
+				this.#livePlaceholderCollision = true;
+				throw new Error(
+					"A credential added during this session equals an active secret placeholder; restart the session before using the updated credential",
+				);
+			}
+		}
 		// Collect the full batch before minting placeholders so one new secret
 		// cannot appear in another new secret's friendly placeholder.
 		for (const entry of entries) {
@@ -711,7 +723,16 @@ export class SecretObfuscator {
 	}
 
 	/** Obfuscate all secrets in text. Bidirectional placeholders for obfuscate mode, one-way for replace. */
+	#assertNoLivePlaceholderCollision(): void {
+		if (this.#livePlaceholderCollision) {
+			throw new Error(
+				"A credential added during this session equals an active secret placeholder; restart the session before using the updated credential",
+			);
+		}
+	}
+
 	obfuscate(text: string, sharedRegexSecretValues?: ReadonlySet<string>): string {
+		this.#assertNoLivePlaceholderCollision();
 		if (!this.#hasAny) return text;
 		this.#currentRegexSecretValues = this.collectRegexSecretValuesForObfuscation(text);
 		for (const secretValue of sharedRegexSecretValues ?? []) {
@@ -912,6 +933,7 @@ export class SecretObfuscator {
 
 	/** Deobfuscate keyed placeholders for provider output, tool-call arguments, replay, and display. */
 	deobfuscate(text: string): string {
+		this.#assertNoLivePlaceholderCollision();
 		return this.#deobfuscate(text);
 	}
 
@@ -1311,6 +1333,7 @@ export class SecretObfuscator {
 	}
 
 	collectRegexSecretValuesForObfuscation(text: string): Set<string> {
+		this.#assertNoLivePlaceholderCollision();
 		const values = this.#collectRegexSecretValues(text);
 		let result = text;
 		let origin = "I".repeat(text.length);
@@ -1406,6 +1429,7 @@ export class SecretObfuscator {
 	}
 
 	stripUnsafeFriendlyPlaceholderPrefixes(text: string, sharedRegexSecretValues: ReadonlySet<string>): string {
+		this.#assertNoLivePlaceholderCollision();
 		const previousRegexSecretValues = this.#currentRegexSecretValues;
 		this.#currentRegexSecretValues = new Set(sharedRegexSecretValues);
 		try {

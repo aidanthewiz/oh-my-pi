@@ -9,7 +9,7 @@ import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { createSourceMeta, expandEnvVarsDeep, getProjectPath } from "./helpers";
+import { createSourceMeta, expandEnvVarsDeepForConfigLevel, getProjectPath } from "./helpers";
 
 const PROVIDER_ID = "vscode";
 const DISPLAY_NAME = "VS Code";
@@ -79,7 +79,7 @@ async function loadMCPConfig(
 		const raw = config as Record<string, unknown>;
 
 		// Expand environment variables
-		const expanded = expandEnvVarsDeep(raw);
+		const expanded = expandEnvVarsDeepForConfigLevel(raw, level);
 
 		const server: MCPServer = {
 			name,

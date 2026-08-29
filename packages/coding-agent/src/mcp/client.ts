@@ -71,12 +71,15 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 /**
  * Create a transport for the given server config.
  */
-async function createTransport(config: MCPServerConfig): Promise<MCPTransport> {
+async function createTransport(
+	config: MCPServerConfig,
+	options?: { preserveExplicitCredentials?: boolean; preserveOperationalAws?: boolean },
+): Promise<MCPTransport> {
 	const serverType = config.type ?? "stdio";
 
 	switch (serverType) {
 		case "stdio":
-			return createStdioTransport(config as MCPStdioServerConfig);
+			return createStdioTransport(config as MCPStdioServerConfig, options);
 		case "http":
 			return createHttpTransport(config as MCPHttpServerConfig);
 		case "sse":
@@ -138,13 +141,18 @@ export async function connectToServer(
 		signal?: AbortSignal;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
+		preserveExplicitCredentials?: boolean;
+		preserveOperationalAws?: boolean;
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
 	let transport: MCPTransport | undefined;
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = await createTransport(config);
+		transport = await createTransport(config, {
+			preserveExplicitCredentials: options?.preserveExplicitCredentials,
+			preserveOperationalAws: options?.preserveOperationalAws,
+		});
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}

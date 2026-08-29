@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import * as timers from "node:timers/promises";
-import { logger, ptree, untilAborted } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, logger, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import { DapClient } from "./client";
 import type {
@@ -1343,17 +1343,14 @@ export class DapSessionManager {
 			if (!Array.isArray(args.args) || args.args.length === 0) {
 				throw new Error("runInTerminal request did not include a command");
 			}
+			const cwd = path.resolve(session.cwd, args.cwd ?? ".");
 			const env = Object.fromEntries(
 				Object.entries(args.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
 			);
 			const proc = ptree.spawn(args.args, {
-				cwd: path.resolve(session.cwd, args.cwd ?? "."),
+				cwd,
 				stdin: "pipe",
-				env: {
-					...Bun.env,
-					...NON_INTERACTIVE_ENV,
-					...env,
-				},
+				env: filterChildShellEnv(Bun.env, cwd, NON_INTERACTIVE_ENV, env),
 				detached: true,
 			});
 			return { processId: proc.pid } satisfies DapRunInTerminalResponse;

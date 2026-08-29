@@ -3,6 +3,7 @@ import type { PathLike } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import { registerDaemonProjectPresence } from "../../src/launch/presence";
 
 describe("daemon presence canonicalProjectDir EISDIR fallback", () => {
@@ -36,7 +37,7 @@ describe("daemon presence canonicalProjectDir EISDIR fallback", () => {
 			expect(typeof presence.close).toBe("function");
 			expect(realpathCalls).toBe(1);
 
-			const clientsDir = path.join(runtimeDir, "clients");
+			const clientsDir = path.join(daemonBrokerRuntimeDir(runtimeDir), "clients");
 			const entries = await fs.readdir(clientsDir);
 			expect(entries).toHaveLength(1);
 

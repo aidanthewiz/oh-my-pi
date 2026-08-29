@@ -23,7 +23,7 @@ import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
 
-const PROVIDER_ID = "mcp-managed";
+export const MANAGED_MCP_PROVIDER_ID = "mcp-managed";
 const DISPLAY_NAME = "Coreforge Managed";
 export const MANAGED_MCP_FILENAME = "mcp.managed.json";
 
@@ -145,7 +145,7 @@ async function load(_ctx: LoadContext): Promise<LoadResult<MCPServer>> {
 		return { items, warnings };
 	}
 
-	const source = createSourceMeta(PROVIDER_ID, filePath, "user");
+	const source = createSourceMeta(MANAGED_MCP_PROVIDER_ID, filePath, "user");
 	items.push(...transformManagedConfig(config, source));
 
 	return { items, warnings: warnings.length > 0 ? warnings : undefined };
@@ -154,7 +154,7 @@ async function load(_ctx: LoadContext): Promise<LoadResult<MCPServer>> {
 // Register provider — above native (100) so managed definitions win name
 // collisions; user disable/enable state still applies post-dedup.
 registerProvider(mcpCapability.id, {
-	id: PROVIDER_ID,
+	id: MANAGED_MCP_PROVIDER_ID,
 	displayName: DISPLAY_NAME,
 	description: "Org-managed MCP server definitions from <agentDir>/mcp.managed.json",
 	priority: 110,

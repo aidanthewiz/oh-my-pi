@@ -232,6 +232,11 @@ function renderProviderModels(
 	if (configError) {
 		writeModelsConfigError(configError);
 	}
+	for (const { provider, status, stale } of modelRegistry.getProviderDiscoveryStates()) {
+		if (!stale) continue;
+		const detail = status === "unavailable" ? "unavailable" : "using stale cached data";
+		writeLine(chalk.yellow(`Warning: model discovery for "${provider}" is ${detail}.`));
+	}
 
 	if (available.length === 0) {
 		writeLine("No models available. Set API keys in environment variables.");

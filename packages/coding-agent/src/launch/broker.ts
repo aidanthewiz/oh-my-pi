@@ -18,6 +18,7 @@ import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from
 import { daemonBrokerEndpoint } from "./paths";
 import { hasLiveDaemonProjectPresence } from "./presence";
 import {
+	DAEMON_BROKER_PROTOCOL_VERSION,
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
 	DAEMON_PTY_COLUMNS,
@@ -559,7 +560,11 @@ class DaemonBroker {
 	async #dispatch(operation: DaemonOperation): Promise<DaemonRpcResult> {
 		switch (operation.op) {
 			case "ping":
-				return { op: "ping", projectDir: this.#projectDir };
+				return {
+					op: "ping",
+					projectDir: this.#projectDir,
+					protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+				};
 			case "start":
 				return this.#start(operation.spec, operation.owner);
 			case "list": {

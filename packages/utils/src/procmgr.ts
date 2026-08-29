@@ -19,6 +19,7 @@ export interface ShellConfigOptions {
 	configSource?: string;
 }
 let cachedShellConfig: ShellConfig | null = null;
+let cachedShellIsCustom = false;
 
 /**
  * Check if a shell binary is executable.
@@ -74,7 +75,8 @@ function getShellPrefix(): string | undefined {
 /**
  * Build full shell config from a shell path.
  */
-function buildConfig(shell: string): ShellConfig {
+function buildConfig(shell: string, isCustom = false): ShellConfig {
+	cachedShellIsCustom = isCustom;
 	return {
 		shell,
 		args: getShellArgs(shell),
@@ -172,12 +174,12 @@ export function getShellConfig(customShellPath?: string, options: ShellConfigOpt
 		if (!fs.existsSync(customShellPath)) {
 			throw new Error(`Custom shell path not found: ${customShellPath}\nPlease update shellPath in ${configSource}`);
 		}
-		if (cachedShellConfig?.shell !== customShellPath) {
-			cachedShellConfig = buildConfig(customShellPath);
+		if (cachedShellConfig?.shell !== customShellPath || cachedShellIsCustom !== true) {
+			cachedShellConfig = buildConfig(customShellPath, true);
 		}
 		return cachedShellConfig;
 	}
-	if (cachedShellConfig) {
+	if (cachedShellConfig && !cachedShellIsCustom) {
 		return cachedShellConfig;
 	}
 

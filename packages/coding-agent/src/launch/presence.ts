@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEisdir, isEnoent, postmortem } from "@oh-my-pi/pi-utils";
-import { daemonRuntimeDir } from "./paths";
+import { daemonBrokerRuntimeDir, daemonRuntimeDir } from "./paths";
 
 const CLIENTS_DIR = "clients";
 
@@ -26,7 +26,8 @@ export async function registerDaemonProjectPresence(
 	runtimeOverride?: string,
 ): Promise<DaemonProjectPresence> {
 	const canonical = await canonicalProjectDir(projectDir);
-	const runtimeDir = runtimeOverride ?? daemonRuntimeDir(canonical);
+	const runtimeRoot = runtimeOverride ?? daemonRuntimeDir(canonical);
+	const runtimeDir = daemonBrokerRuntimeDir(runtimeRoot);
 	const clientsDir = path.join(runtimeDir, CLIENTS_DIR);
 	await fs.mkdir(clientsDir, { recursive: true, mode: 0o700 });
 	const id = `${process.pid}-${crypto.randomUUID()}`;

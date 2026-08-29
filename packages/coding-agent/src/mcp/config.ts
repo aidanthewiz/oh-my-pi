@@ -4,12 +4,14 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
+import { getAgentDir, getMCPConfigPath } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { COREFORGE_MCP_PROVIDER_ID } from "../discovery/coreforge";
+import { MANAGED_MCP_FILENAME, MANAGED_MCP_PROVIDER_ID } from "../discovery/mcp-managed";
 import { parseGitUrl } from "../extensibility/plugins/git-url";
 import * as git from "../utils/git";
 import { readDisabledServers, readEnabledServers } from "./config-writer";
@@ -37,6 +39,45 @@ export interface LoadMCPConfigsResult {
 	exaApiKeys: string[];
 	/** Source metadata for each server */
 	sources: Record<string, SourceMeta>;
+}
+
+export interface MCPChildCredentialPolicy {
+	preserveExplicitCredentials: boolean;
+	preserveOperationalAws: boolean;
+}
+
+const MANAGED_AWS_MCP_SERVER_ID = "coreforge-aws-agent-toolkit";
+const MANAGED_AWS_MCP_COMMAND_ENV = "OMP_MANAGED_AWS_MCP_COMMAND";
+const MANAGED_MCP_CWD_ENV = "OMP_MANAGED_MCP_CWD";
+
+/**
+ * Grant operational AWS only to the launcher-pinned managed AWS wrapper.
+ * User/native definitions may forward credentials they explicitly configure,
+ * but never inherit ambient operational AWS.
+ */
+export function resolveMCPChildCredentialPolicy(
+	name: string,
+	config: MCPServerConfig,
+	source: SourceMeta | undefined,
+	env: Record<string, string | undefined> = Bun.env,
+): MCPChildCredentialPolicy {
+	const expectedCommand = env[MANAGED_AWS_MCP_COMMAND_ENV]?.trim();
+	const expectedCwd = env[MANAGED_MCP_CWD_ENV]?.trim();
+	const isManagedAwsWrapper =
+		name === MANAGED_AWS_MCP_SERVER_ID &&
+		source?.provider === MANAGED_MCP_PROVIDER_ID &&
+		source.level === "user" &&
+		source.path === path.join(getAgentDir(), MANAGED_MCP_FILENAME) &&
+		config.type === "stdio" &&
+		Boolean(expectedCommand && path.isAbsolute(expectedCommand)) &&
+		config.command === expectedCommand &&
+		Boolean(expectedCwd && path.isAbsolute(expectedCwd)) &&
+		config.cwd === expectedCwd;
+
+	return {
+		preserveExplicitCredentials: !isManagedAwsWrapper && (source?.level === "user" || source?.level === "native"),
+		preserveOperationalAws: isManagedAwsWrapper,
+	};
 }
 
 /**

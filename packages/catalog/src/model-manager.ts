@@ -69,6 +69,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 export interface ModelResolutionResult<TApi extends Api = Api> {
 	models: Model<TApi>[];
 	stale: boolean;
+	/** Timestamp of the last successful dynamic fetch, including authoritative cache reuse. */
+	fetchedAt?: number;
 }
 
 /**
@@ -240,7 +242,11 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cacheFingerprintMatches &&
 		!cacheHasUnresolvedHeaders
 	) {
-		return { models: collapseBuiltModelVariants(restoredCache.models), stale: false };
+		return {
+			models: collapseBuiltModelVariants(restoredCache.models),
+			stale: false,
+			...(cache.authoritative && hasDynamicFetcher ? { fetchedAt: cache.updatedAt } : {}),
+		};
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -271,15 +277,17 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		dynamicModelsAuthoritative && dynamicFetchSucceeded ? retainModelIds(mergedModels, dynamicModels) : mergedModels,
 	);
 	const dynamicAuthoritative = !hasDynamicFetcher || dynamicFetchSucceeded || shouldUseFreshCacheAsAuthoritative;
+	let fetchedAt = cache?.authoritative && hasDynamicFetcher ? cache.updatedAt : undefined;
 	if (shouldFetchFromNetwork) {
 		if (dynamicFetchSucceeded) {
 			const mergedSnapshot = mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), dynamicModels);
 			const snapshotModels = dynamicModelsAuthoritative
 				? retainModelIds(mergedSnapshot, dynamicModels)
 				: mergedSnapshot;
+			const updatedAt = now();
 			writeModelCache(
 				cacheProviderId,
-				now(),
+				updatedAt,
 				collapseBuiltModelVariants(snapshotModels),
 				dynamicCacheAuthoritative,
 				staticFingerprint,
@@ -287,6 +295,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				staticModels,
 				restorableHeaderFallback,
 			);
+			fetchedAt = updatedAt;
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
 			// stale state remains visible while retry backoff still applies.
@@ -328,6 +337,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	return {
 		models,
 		stale: !dynamicAuthoritative,
+		...(fetchedAt === undefined ? {} : { fetchedAt }),
 	};
 }
 

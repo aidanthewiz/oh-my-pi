@@ -20,7 +20,7 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import {
 	buildRuleFromMarkdown,
 	createSourceMeta,
-	expandEnvVarsDeep,
+	expandEnvVarsDeepForConfigLevel,
 	getProjectPath,
 	getUserPath,
 	loadFilesFromDir,
@@ -44,7 +44,7 @@ function parseServerConfig(
 		return { warning: `Invalid server config for "${name}" in ${path}` };
 	}
 
-	const server = expandEnvVarsDeep(serverConfig as Record<string, unknown>);
+	const server = expandEnvVarsDeepForConfigLevel(serverConfig as Record<string, unknown>, scope);
 	return {
 		server: {
 			name,

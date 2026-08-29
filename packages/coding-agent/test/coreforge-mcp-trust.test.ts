@@ -71,7 +71,7 @@ describe("trusted Coreforge project MCP config", () => {
 		const trusted = configs.trusted;
 		expect(trusted?.type).toBe("stdio");
 		if (trusted?.type !== "stdio") throw new Error("trusted MCP server did not use stdio");
-		expect(trusted.env).toEqual({ TOKEN: "from-coreforge-env" });
+		expect(trusted.env).toEqual({ TOKEN: "${PI_CORE_MCP_TOKEN}" });
 		expect(sources.trusted?.provider).toBe("coreforge");
 		expect(configs.generic).toBeUndefined();
 	});

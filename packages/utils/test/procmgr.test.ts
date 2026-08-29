@@ -13,6 +13,35 @@ describe("getShellConfig", () => {
 			`Custom shell path not found: ${missingShell}\nPlease update shellPath in ${configPath}`,
 		);
 	});
+
+	it("strips AWS credentials from every shell command environment", () => {
+		const previous = {
+			AWS_PROFILE: Bun.env.AWS_PROFILE,
+			AWS_ACCESS_KEY_ID: Bun.env.AWS_ACCESS_KEY_ID,
+			AWS_SECRET_ACCESS_KEY: Bun.env.AWS_SECRET_ACCESS_KEY,
+			AWS_SESSION_TOKEN: Bun.env.AWS_SESSION_TOKEN,
+		};
+		try {
+			Bun.env.AWS_PROFILE = "employee-operations";
+			Bun.env.AWS_ACCESS_KEY_ID = "AKIA-SHELL";
+			Bun.env.AWS_SECRET_ACCESS_KEY = "shell-secret";
+			Bun.env.AWS_SESSION_TOKEN = "shell-session";
+
+			for (const config of [getShellConfig(process.execPath), getShellConfig()]) {
+				expect(config.env.AWS_PROFILE).toBeUndefined();
+				expect(config.env.AWS_ACCESS_KEY_ID).toBeUndefined();
+				expect(config.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+				expect(config.env.AWS_SESSION_TOKEN).toBeUndefined();
+				expect(config.env.AWS_CONFIG_FILE).toBe(os.devNull);
+				expect(config.env.AWS_SHARED_CREDENTIALS_FILE).toBe(os.devNull);
+			}
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+		}
+	});
 });
 
 describe("resolveWindowsShell", () => {

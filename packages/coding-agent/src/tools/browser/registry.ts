@@ -1,5 +1,12 @@
 import * as path from "node:path";
-import { isCompiledBinary, logger, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
+import {
+	filterChildShellEnv,
+	getProjectDir,
+	isCompiledBinary,
+	logger,
+	withTimeout,
+	workerHostEntry,
+} from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { CF_BRAND, CF_COMMAND } from "../../cli/cf-version";
@@ -318,6 +325,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		const port = await findFreeCdpPort();
 		const launchArgs = [...(opts.appArgs ?? []), `--remote-debugging-port=${port}`];
 		const child = Bun.spawn([exe, ...launchArgs], {
+			env: filterChildShellEnv(Bun.env, getProjectDir()),
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",

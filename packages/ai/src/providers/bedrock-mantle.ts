@@ -14,13 +14,19 @@ export interface BedrockMantleOptions extends OpenAIResponsesOptions {
 
 const AWS_REGION_RE = /^[a-z0-9-]+$/;
 
-function resolveBedrockMantleUrl(input: string | URL | Request, region: string): URL {
+function resolveBedrockMantleUrl(
+	input: string | URL | Request,
+	region: string,
+	pathKind: "base" | "request" = "request",
+): URL {
 	if (!AWS_REGION_RE.test(region)) {
 		throw new Error(`Invalid AWS region for Bedrock Mantle: ${region}`);
 	}
 	const expectedHost = `bedrock-mantle.${region}.api.aws`;
 	const raw = input instanceof Request ? input.url : input.toString();
 	const url = new URL(raw.replaceAll("{region}", region));
+	const validPath =
+		pathKind === "base" ? url.pathname === "/v1" : url.pathname === "/v1" || url.pathname.startsWith("/v1/");
 	if (
 		url.protocol !== "https:" ||
 		url.hostname !== expectedHost ||
@@ -28,9 +34,10 @@ function resolveBedrockMantleUrl(input: string | URL | Request, region: string):
 		url.username !== "" ||
 		url.password !== "" ||
 		url.search !== "" ||
-		url.hash !== ""
+		url.hash !== "" ||
+		!validPath
 	) {
-		throw new Error(`Bedrock Mantle endpoint must use https://${expectedHost}`);
+		throw new Error(`Bedrock Mantle endpoint must use https://${expectedHost}/v1`);
 	}
 	return url;
 }
@@ -54,6 +61,7 @@ function createSignedFetch(options: BedrockMantleOptions, region: string): Fetch
 		const headers = new Headers(input instanceof Request ? input.headers : undefined);
 		for (const [name, value] of new Headers(init?.headers)) headers.set(name, value);
 		headers.delete("authorization");
+		const contentType = headers.get("content-type");
 		const body = await requestBody(input, init);
 		const credentials = await resolveAwsCredentials({
 			profile: options.providerOptions?.profile,
@@ -70,7 +78,7 @@ function createSignedFetch(options: BedrockMantleOptions, region: string): Fetch
 			region,
 			service: "bedrock-mantle",
 			credentials,
-			headers: { "content-type": headers.get("content-type") ?? "application/json" },
+			...(contentType ? { headers: { "content-type": contentType } } : {}),
 		});
 		for (const [name, value] of Object.entries(signed)) {
 			if (value !== undefined && name !== "host") headers.set(name, value);
@@ -103,7 +111,8 @@ export function createBedrockMantleAuthenticatedFetch(options: BedrockMantleOpti
 		const headers = new Headers(input instanceof Request ? input.headers : undefined);
 		for (const [name, value] of new Headers(init?.headers)) headers.set(name, value);
 		headers.set("authorization", `Bearer ${bearerToken}`);
-		return baseFetch(input instanceof Request ? input : url, { ...init, headers });
+		const resolvedInput = input instanceof Request ? new Request(url.href, input) : url;
+		return baseFetch(resolvedInput, { ...init, headers });
 	};
 	return Object.assign(authenticatedFetch, baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {});
 }
@@ -118,7 +127,7 @@ export function prepareBedrockMantleRequest(
 	options: BedrockMantleOptions,
 ): PreparedBedrockMantleRequest {
 	const region = resolveAwsRegion(options.providerOptions?.region, options.providerOptions?.profile);
-	const resolvedModel = { ...model, baseUrl: resolveBedrockMantleUrl(model.baseUrl, region).toString() };
+	const resolvedModel = { ...model, baseUrl: resolveBedrockMantleUrl(model.baseUrl, region, "base").toString() };
 	const bearerToken = resolveBearerToken(options);
 	if (bearerToken) {
 		return { model: resolvedModel, options: { ...options, apiKey: bearerToken } };
