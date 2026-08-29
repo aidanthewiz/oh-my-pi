@@ -381,14 +381,12 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	}
 }
 
-// The omp-kata runner pods may inject cloud credentials (`AWS_*`) pod-wide via
-// `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
-// and a host may carry provider API keys. Any of these make env-sensitive code
-// non-deterministic in tests — e.g. leaked AWS creds make `amazon-bedrock` look
-// authenticated and win the provider startup fallback over `anthropic`. Run the
-// suites in a hermetic environment with all credential / cloud-config variables
-// stripped so resolution depends only on the test's own fixtures.
-const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_"];
+// Hosted runners may inject cloud credentials, GitHub Actions injects
+// GITHUB_TOKEN, and Coreforge launches the suite with managed DCG state.
+// Credential leakage changes provider selection, while inherited DCG state
+// makes ordinary tool fixtures depend on the caller's policy. Strip both;
+// their focused tests install explicit fixtures.
+const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_", "OMP_DCG_", "DCG_"];
 const SCRUBBED_ENV_NAMES = new Set([
 	"GITHUB_TOKEN",
 	"GH_TOKEN",
