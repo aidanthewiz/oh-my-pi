@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,7 +14,16 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/dap/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+
+const ORIGINAL_AGENT_DIR = getAgentDir();
+let testHome: string | undefined;
+
+beforeEach(async () => {
+	testHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-dap-launch-home-"));
+	spyOn(os, "homedir").mockReturnValue(testHome);
+	setAgentDir(path.join(testHome, ".omp", "agent"));
+});
 
 const TEST_ADAPTER: DapResolvedAdapter = {
 	name: "lldb-dap",
@@ -160,8 +169,11 @@ class FakeDapClient {
 	}
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
+	setAgentDir(ORIGINAL_AGENT_DIR);
+	if (testHome) await removeWithRetries(testHome);
+	testHome = undefined;
 });
 
 describe("DAP launch failure handling", () => {

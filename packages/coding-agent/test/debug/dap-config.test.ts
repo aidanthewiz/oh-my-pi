@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,6 +15,13 @@ import { injectPluginDirRoots } from "../../src/discovery/helpers";
 const tempDirs: string[] = [];
 const ORIGINAL_OMP_PLUGIN_DIR = process.env.OMP_PLUGIN_DIR;
 const ORIGINAL_OMP_MARKETPLACE_DIR = process.env.OMP_MARKETPLACE_DIR;
+const ORIGINAL_AGENT_DIR = piUtils.getAgentDir();
+
+beforeEach(async () => {
+	const home = await makeTempDir("omp-dap-config-home-");
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	piUtils.setAgentDir(path.join(home, ".omp", "agent"));
+});
 
 async function makeTempDir(prefix: string): Promise<string> {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -63,6 +70,7 @@ function requireSelectedAdapter(selection: LaunchAdapterSelection): DapResolvedA
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	piUtils.setAgentDir(ORIGINAL_AGENT_DIR);
 	if (ORIGINAL_OMP_PLUGIN_DIR === undefined) {
 		delete process.env.OMP_PLUGIN_DIR;
 	} else {
