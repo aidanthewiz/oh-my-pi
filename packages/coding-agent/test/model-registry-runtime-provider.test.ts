@@ -13,6 +13,8 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { AUTHENTICATED_SENTINEL } from "@oh-my-pi/pi-ai/registry";
+import { runModelsListing } from "@oh-my-pi/pi-coding-agent/cli/models-cli";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { logger, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -301,6 +303,227 @@ describe("ModelRegistry runtime provider registration", () => {
 			endpoint: modelEndpoint,
 			model: "model-compact",
 		});
+	});
+
+	test("fresh-cache discovery preserves the original fetch timestamp", async () => {
+		const providerName = "dynamic-freshness-provider";
+		let fetches = 0;
+		let now = Date.UTC(2026, 7, 28, 12);
+		const fetchedAt = now;
+		const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			registry.registerProvider(
+				providerName,
+				{
+					baseUrl: "https://runtime.example.com/v1",
+					apiKey: "RUNTIME_KEY",
+					api: "openai-responses",
+					fetchDynamicModels: async () => {
+						fetches++;
+						return [{ ...baseModel, id: "freshness-model" }];
+					},
+				},
+				"ext://runtime",
+			);
+
+			await registry.refreshRuntimeProviders("online");
+			expect(registry.getProviderDiscoveryState(providerName)?.fetchedAt).toBe(fetchedAt);
+			now += 60 * 60 * 1_000;
+			await registry.refreshRuntimeProviders("online-if-uncached");
+
+			expect(fetches).toBe(1);
+			expect(registry.getProviderDiscoveryState(providerName)?.fetchedAt).toBe(fetchedAt);
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+
+	test("configured discovery preserves cache age and reports failed backoff as cached", async () => {
+		const providerName = "configured-freshness-provider";
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[providerName]: {
+						baseUrl: "https://runtime.example.com/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		let now = Math.ceil(fs.statSync(modelsJsonPath).mtimeMs) + 1_000;
+		const initialFetchedAt = now;
+		const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+		let fetches = 0;
+		let failDiscovery = false;
+		const configuredFetch: FetchImpl = async input => {
+			const url = String(input);
+			if (url !== "https://runtime.example.com/v1/models") {
+				throw new Error(`Unexpected URL: ${url}`);
+			}
+			fetches++;
+			if (failDiscovery) throw new Error("injected discovery failure");
+			return Response.json({ data: [{ id: "configured-model", context_length: 32_768 }] });
+		};
+		const configuredRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: configuredFetch });
+		try {
+			await configuredRegistry.refresh("online");
+			expect(configuredRegistry.getProviderDiscoveryState(providerName)?.fetchedAt).toBe(initialFetchedAt);
+			const fetchesAfterOnline = fetches;
+
+			now += 60 * 60 * 1_000;
+			await configuredRegistry.refresh("online-if-uncached");
+			expect(fetches).toBe(fetchesAfterOnline);
+			expect(configuredRegistry.getProviderDiscoveryState(providerName)?.fetchedAt).toBe(initialFetchedAt);
+
+			failDiscovery = true;
+			await configuredRegistry.refresh("online");
+			const fetchesAfterFailure = fetches;
+			expect(configuredRegistry.getProviderDiscoveryState(providerName)?.status).toBe("cached");
+			await configuredRegistry.refresh("online-if-uncached");
+			expect(fetches).toBe(fetchesAfterFailure);
+			expect(configuredRegistry.getProviderDiscoveryState(providerName)?.status).toBe("cached");
+			expect(configuredRegistry.getProviderDiscoveryState(providerName)?.stale).toBe(true);
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+
+	test("JSON listing reports failed configured discovery as stale", async () => {
+		const providerName = "stale-configured-provider";
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[providerName]: {
+						baseUrl: "https://runtime.example.com/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		const staleRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: offlineFetch });
+		await staleRegistry.refresh("online");
+
+		const captured: string[] = [];
+		const originalWrite = process.stdout.write;
+		Reflect.set(process.stdout, "write", (chunk: string | Uint8Array) => {
+			captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			await runModelsListing({
+				modelRegistry: staleRegistry,
+				cwd: tempDir,
+				action: "ls",
+				pattern: providerName,
+				json: true,
+				disableExtensionDiscovery: true,
+			});
+		} finally {
+			process.stdout.write = originalWrite;
+		}
+
+		const payload = JSON.parse(captured.join("")) as {
+			providerDiscovery: Array<{ provider: string; status: string; stale: boolean }>;
+		};
+		expect(payload.providerDiscovery).toContainEqual({
+			provider: providerName,
+			status: "unavailable",
+			stale: true,
+		});
+	});
+
+	test("human listing warns when configured discovery is unavailable", async () => {
+		const providerName = "stale-configured-provider";
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[providerName]: {
+						baseUrl: "https://runtime.example.com/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		const staleRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: offlineFetch });
+		await staleRegistry.refresh("online");
+
+		const captured: string[] = [];
+		const originalWrite = process.stdout.write;
+		Reflect.set(process.stdout, "write", (chunk: string | Uint8Array) => {
+			captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			await runModelsListing({
+				modelRegistry: staleRegistry,
+				cwd: tempDir,
+				action: "ls",
+				pattern: providerName,
+				json: false,
+				disableExtensionDiscovery: true,
+			});
+		} finally {
+			process.stdout.write = originalWrite;
+		}
+
+		const output = captured.join("");
+		const warning = `Warning: model discovery for "${providerName}" is unavailable.`;
+		expect(output).toContain(warning);
+		expect(output.indexOf(warning)).toBeLessThan(output.indexOf(`No models matching "${providerName}"`));
+	});
+
+	test("JSON listing reports failed SigV4 discovery seeds as stale", async () => {
+		const providerName = "bedrock-mantle";
+		const previousBearerToken = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+		try {
+			authStorage.setRuntimeApiKey(providerName, AUTHENTICATED_SENTINEL);
+			await registry.refresh("online");
+
+			const captured: string[] = [];
+			const originalWrite = process.stdout.write;
+			Reflect.set(process.stdout, "write", (chunk: string | Uint8Array) => {
+				captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+				return true;
+			});
+			try {
+				await runModelsListing({
+					modelRegistry: registry,
+					cwd: tempDir,
+					action: "ls",
+					pattern: providerName,
+					json: true,
+					disableExtensionDiscovery: true,
+				});
+			} finally {
+				process.stdout.write = originalWrite;
+			}
+
+			const payload = JSON.parse(captured.join("")) as {
+				models: Array<{ provider: string }>;
+				providerDiscovery: Array<{ provider: string; status: string; stale: boolean }>;
+			};
+			expect(payload.models.some(model => model.provider === providerName)).toBe(true);
+			expect(payload.providerDiscovery).toContainEqual(
+				expect.objectContaining({
+					provider: providerName,
+					status: "cached",
+					stale: true,
+				}),
+			);
+		} finally {
+			if (previousBearerToken === undefined) delete Bun.env.AWS_BEARER_TOKEN_BEDROCK;
+			else Bun.env.AWS_BEARER_TOKEN_BEDROCK = previousBearerToken;
+		}
 	});
 
 	test("configured discovery suppresses extension fetchDynamicModels for the same provider", async () => {

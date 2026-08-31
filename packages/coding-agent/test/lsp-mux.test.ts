@@ -29,6 +29,8 @@ interface FakeState {
 	didChange: Record<string, number[]>;
 	didClose: string[];
 	notifications: string[];
+	openAiKey: string;
+	path: string;
 }
 
 interface PublishDiagnosticsParams {
@@ -192,7 +194,7 @@ describe("LspMuxServer", () => {
 	beforeEach(async () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-lsp-mux-test-"));
 		socketPath = path.join(tmpDir, "mux.sock");
-		connectParams = { command: process.execPath, args: ["run", fixturePath], cwd: tmpDir };
+		connectParams = { command: process.execPath, args: ["--no-env-file", "run", fixturePath], cwd: tmpDir };
 		server = new LspMuxServer();
 		await server.listen(socketPath);
 	});
@@ -229,6 +231,26 @@ describe("LspMuxServer", () => {
 			expect(firstInfo.version).toBe(String(first.connected.pid));
 			expect(secondInfo.version).toBe(firstInfo.version);
 			expect((await state(first.client)).initializeCount).toBe(1);
+		},
+		10_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"filters managed profile secrets from the language server environment",
+		async () => {
+			const previousSecret = Bun.env.OPENAI_API_KEY;
+			Bun.env.OPENAI_API_KEY = "managed-profile-sentinel";
+			try {
+				await Bun.write(path.join(tmpDir, ".env"), "OPENAI_API_KEY=managed-profile-sentinel\n");
+				const { client } = await link();
+				await initialize(client);
+				const childState = await state(client);
+				expect(childState.openAiKey).toBe("");
+				expect(childState.path).toBe(Bun.env.PATH ?? "");
+			} finally {
+				if (previousSecret === undefined) delete Bun.env.OPENAI_API_KEY;
+				else Bun.env.OPENAI_API_KEY = previousSecret;
+			}
 		},
 		10_000,
 	);

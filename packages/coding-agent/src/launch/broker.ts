@@ -3,13 +3,22 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
-import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
+import {
+	filterChildShellEnv,
+	isEexist,
+	isEnoent,
+	logger,
+	postmortem,
+	procmgr,
+	sanitizeText,
+	setProcessName,
+} from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
-import { workerEnvFromParent } from "../subprocess/worker-client";
 import { daemonBrokerEndpoint } from "./paths";
 import { hasLiveDaemonProjectPresence } from "./presence";
 import {
+	DAEMON_BROKER_PROTOCOL_VERSION,
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
 	DAEMON_PTY_COLUMNS,
@@ -551,7 +560,11 @@ class DaemonBroker {
 	async #dispatch(operation: DaemonOperation): Promise<DaemonRpcResult> {
 		switch (operation.op) {
 			case "ping":
-				return { op: "ping", projectDir: this.#projectDir };
+				return {
+					op: "ping",
+					projectDir: this.#projectDir,
+					protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+				};
 			case "start":
 				return this.#start(operation.spec, operation.owner);
 			case "list": {
@@ -712,7 +725,7 @@ class DaemonBroker {
 		record.pty = session;
 		const options = {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent({ TERM: "xterm-256color", ...record.spec.env }),
+			env: filterChildShellEnv(Bun.env, record.spec.cwd, { TERM: "xterm-256color" }, record.spec.env),
 			cols: DAEMON_PTY_COLUMNS,
 			rows: DAEMON_PTY_ROWS,
 		};
@@ -768,7 +781,7 @@ class DaemonBroker {
 	#launchPipe(record: ManagedDaemon, generation: number): void {
 		const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent(record.spec.env),
+			env: filterChildShellEnv(Bun.env, record.spec.cwd, record.spec.env),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -793,7 +806,7 @@ class DaemonBroker {
 		try {
 			const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 				cwd: record.spec.cwd,
-				env: workerEnvFromParent(record.spec.env),
+				env: filterChildShellEnv(Bun.env, record.spec.cwd, record.spec.env),
 				stdio: ["ignore", output.fd, output.fd],
 				...DAEMON_SPAWN_OPTIONS,
 			});

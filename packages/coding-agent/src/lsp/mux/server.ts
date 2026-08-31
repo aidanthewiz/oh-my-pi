@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
-import { isRecord, logger, postmortem, ptree, setProcessName } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, isRecord, logger, postmortem, ptree, setProcessName } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../../jsonrpc/message-framing";
 import type { LspJsonRpcId, LspJsonRpcNotification, LspJsonRpcRequest, LspJsonRpcResponse } from "../types";
 import {
@@ -113,7 +113,7 @@ class ServerInstance {
 		this.proc = ptree.spawn([params.command, ...params.args], {
 			cwd: params.cwd,
 			stdin: "pipe",
-			env: { ...Bun.env, ...params.env },
+			env: filterChildShellEnv(Bun.env, params.cwd, params.env),
 		});
 	}
 

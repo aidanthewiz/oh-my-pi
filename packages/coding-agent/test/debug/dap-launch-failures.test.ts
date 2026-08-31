@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,7 +14,16 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/dap/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+
+const ORIGINAL_AGENT_DIR = getAgentDir();
+let testHome: string | undefined;
+
+beforeEach(async () => {
+	testHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-dap-launch-home-"));
+	spyOn(os, "homedir").mockReturnValue(testHome);
+	setAgentDir(path.join(testHome, ".omp", "agent"));
+});
 
 const TEST_ADAPTER: DapResolvedAdapter = {
 	name: "lldb-dap",
@@ -160,8 +169,11 @@ class FakeDapClient {
 	}
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
+	setAgentDir(ORIGINAL_AGENT_DIR);
+	if (testHome) await removeWithRetries(testHome);
+	testHome = undefined;
 });
 
 describe("DAP launch failure handling", () => {
@@ -362,6 +374,71 @@ describe("DAP launch failure handling", () => {
 		} finally {
 			await client?.dispose();
 			await removeWithRetries(cwd);
+		}
+	});
+
+	it("does not expose managed profile values to repository-controlled adapters", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-env-boundary-"));
+		const cwd = path.join(root, "project");
+		const home = path.join(root, "home");
+		const agentDir = path.join(home, ".omp", "profiles", "coreforge", "agent");
+		const key = `OMP_DAP_MANAGED_SECRET_${Date.now()}`;
+		const secret = "managed-profile-dap-secret";
+		const outputPath = path.join(root, "adapter-env.json");
+		const probePath = path.join(root, "probe.ts");
+		const emptyEnvFile = path.join(root, "empty.env");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await Bun.write(path.join(agentDir, ".env"), `${key}=${secret}\n`);
+		await Bun.write(emptyEnvFile, "");
+		const clientUrl = new URL("../../src/dap/client.ts", import.meta.url).href;
+		await Bun.write(
+			probePath,
+			[
+				`import { DapClient } from ${JSON.stringify(clientUrl)};`,
+				`const key = ${JSON.stringify(key)};`,
+				`const outputPath = ${JSON.stringify(outputPath)};`,
+				`const cwd = ${JSON.stringify(cwd)};`,
+				"const adapter = {",
+				'  name: "test-dap", command: process.execPath, resolvedCommand: process.execPath,',
+				`  args: ["-e", ${JSON.stringify(`await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify({ value: Bun.env[${JSON.stringify(key)}] })); await Bun.sleep(60_000);`)}],`,
+				'  languages: [], fileTypes: [], rootMarkers: [], launchDefaults: {}, attachDefaults: {}, connectMode: "stdio", acceptsDirectoryProgram: false,',
+				"};",
+				"let client;",
+				"try {",
+				"  client = await DapClient.spawn({ adapter, cwd });",
+				"  for (let attempt = 0; attempt < 100 && !(await Bun.file(outputPath).exists()); attempt++) await Bun.sleep(10);",
+				"  const child = JSON.parse(await Bun.file(outputPath).text());",
+				"  process.stdout.write(JSON.stringify({ engineValue: Bun.env[key], childValue: child.value }));",
+				"} finally {",
+				"  await client?.dispose();",
+				"}",
+			].join("\n"),
+		);
+
+		try {
+			const proc = Bun.spawn([process.execPath, `--env-file=${emptyEnvFile}`, probePath], {
+				cwd,
+				env: {
+					PATH: Bun.env.PATH,
+					HOME: home,
+					OMP_PROFILE: "coreforge",
+					OMP_DOTENV_OVERRIDE: "1",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			const captured = JSON.parse(stdout) as { engineValue?: string; childValue?: string };
+			expect(captured.engineValue).toBe(secret);
+			expect(captured.childValue).toBeUndefined();
+		} finally {
+			await removeWithRetries(root);
 		}
 	});
 

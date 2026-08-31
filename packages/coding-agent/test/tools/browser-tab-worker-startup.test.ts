@@ -1,6 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
-import { initializeTabWorkerForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import { buildTabWorkerEnv, initializeTabWorkerForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 
 class FakeStartupWorker {
 	#errorHandlers = new Set<(error: Error) => void>();
@@ -39,6 +39,13 @@ const initPayload = {
 	safeDir: "/tmp/omp-puppeteer",
 	timeoutMs: 1_000,
 };
+const SECRET_KEY = "BROWSER_WORKER_PARENT_SECRET";
+const MANAGED_SECRET_KEY = "OMP_MANAGED_BROWSER_WORKER_SECRET";
+
+afterEach(() => {
+	delete Bun.env[SECRET_KEY];
+	delete Bun.env[MANAGED_SECRET_KEY];
+});
 
 describe("browser tab worker startup", () => {
 	it("surfaces worker startup errors instead of waiting for the generic init timeout", async () => {
@@ -49,5 +56,15 @@ describe("browser tab worker startup", () => {
 
 		await expect(pending).rejects.toThrow("Tab worker failed during startup: Cannot find tab-worker-entry.ts");
 		expect(worker.sent).toEqual([{ type: "init", payload: initPayload }]);
+	});
+	it("scrubs ambient and managed credentials from the worker environment", () => {
+		Bun.env[SECRET_KEY] = "ambient-secret";
+		Bun.env[MANAGED_SECRET_KEY] = "managed-secret";
+
+		const env = buildTabWorkerEnv();
+
+		expect(env[SECRET_KEY]).toBeUndefined();
+		expect(env[MANAGED_SECRET_KEY]).toBeUndefined();
+		expect(env.PATH ?? "").toBe(Bun.env.PATH ?? "");
 	});
 });

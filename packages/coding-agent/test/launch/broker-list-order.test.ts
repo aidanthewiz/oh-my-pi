@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import type { DaemonSnapshot, DaemonSpec } from "../../src/launch/protocol";
 
 const TERMINAL_HISTORY_LIMIT = 10;
@@ -39,7 +40,7 @@ function terminalSnapshot(index: number): DaemonSnapshot {
 }
 
 async function seedTerminalRecord(runtimeDir: string, cwd: string, snapshot: DaemonSnapshot): Promise<void> {
-	const metaPath = path.join(runtimeDir, "daemons", snapshot.name, "meta.json");
+	const metaPath = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons", snapshot.name, "meta.json");
 	await Bun.write(metaPath, JSON.stringify({ daemon: snapshot, spec: spec(snapshot.name, cwd) }));
 }
 

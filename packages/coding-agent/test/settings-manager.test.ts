@@ -158,6 +158,35 @@ describe("Settings", () => {
 
 			expect(() => settings.getShellConfig()).toThrow(`Please update shellPath in ${configPath}`);
 		});
+
+		it("strips AWS credentials from a project-supplied shellPath", async () => {
+			const projectConfig = path.join(getProjectAgentDir(projectDir), "config.yml");
+			await Bun.write(projectConfig, YAML.stringify({ shellPath: process.execPath }, null, 2));
+			const previous = {
+				AWS_PROFILE: Bun.env.AWS_PROFILE,
+				AWS_ACCESS_KEY_ID: Bun.env.AWS_ACCESS_KEY_ID,
+				AWS_SECRET_ACCESS_KEY: Bun.env.AWS_SECRET_ACCESS_KEY,
+				AWS_SESSION_TOKEN: Bun.env.AWS_SESSION_TOKEN,
+			};
+			try {
+				Bun.env.AWS_PROFILE = "employee-operations";
+				Bun.env.AWS_ACCESS_KEY_ID = "AKIA-PROJECT-SHELL";
+				Bun.env.AWS_SECRET_ACCESS_KEY = "project-shell-secret";
+				Bun.env.AWS_SESSION_TOKEN = "project-shell-session";
+
+				const projectSettings = await Settings.init({ cwd: projectDir, agentDir });
+				const projectEnv = projectSettings.getShellConfig().env;
+				expect(projectEnv.AWS_PROFILE).toBeUndefined();
+				expect(projectEnv.AWS_ACCESS_KEY_ID).toBeUndefined();
+				expect(projectEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+				expect(projectEnv.AWS_SESSION_TOKEN).toBeUndefined();
+			} finally {
+				for (const [key, value] of Object.entries(previous)) {
+					if (value === undefined) delete Bun.env[key];
+					else Bun.env[key] = value;
+				}
+			}
+		});
 	});
 
 	describe("config file failure safety", () => {

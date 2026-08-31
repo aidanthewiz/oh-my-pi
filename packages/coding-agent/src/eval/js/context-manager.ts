@@ -1,24 +1,17 @@
-import { logger, postmortem, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
-import {
-	createWorkerHandle,
-	createWorkerSubprocess,
-	resolveWorkerSpawnCmd,
-	workerEnvFromParent,
-} from "../../subprocess/worker-client";
+import { filterChildShellEnv, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { createWorkerHandle, createWorkerSubprocess, resolveWorkerSpawnCmd } from "../../subprocess/worker-client";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
 import { attachSessionOwner, resolveOwnerScopedSessionKey, type SessionOwners } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
-import { WorkerCore } from "./worker-core";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
 	JsDisplayOutput,
 	RunErrorPayload,
 	SessionSnapshot,
-	Transport,
 	WorkerInbound,
 	WorkerOutbound,
 } from "./worker-protocol";
@@ -225,11 +218,12 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
  * `omp --smoke-test` so binary / source / tarball installs all exercise it.
  */
 export async function smokeTestJsEvalWorker(): Promise<void> {
-	const worker = spawnJsWorker();
+	const cwd = process.cwd();
+	const worker = spawnJsWorker(cwd);
 	const session: JsSession = {
 		sessionKey: "smoke",
 		sessionId: "smoke",
-		cwd: process.cwd(),
+		cwd,
 		worker,
 		state: "alive",
 		pending: new Map(),
@@ -237,7 +231,7 @@ export async function smokeTestJsEvalWorker(): Promise<void> {
 		hasFallbackOwner: false,
 	};
 	try {
-		await initWorker(session, { cwd: process.cwd(), sessionId: "smoke" }, WORKER_INIT_TIMEOUT_MS);
+		await initWorker(session, { cwd, sessionId: "smoke" }, WORKER_INIT_TIMEOUT_MS);
 		if (worker.mode !== "process") {
 			throw new Error("JS eval worker smoke fell back from the isolated subprocess");
 		}
@@ -324,7 +318,7 @@ async function acquireSession(
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
 		// and subprocess IPC can arrive immediately after the evaluator loads.
-		const worker = spawnJsWorker();
+		const worker = spawnJsWorker(snapshot.cwd);
 		const session: JsSession = {
 			sessionKey,
 			sessionId: snapshot.sessionId,
@@ -343,23 +337,15 @@ async function acquireSession(
 				await initWorker(session, snapshot, readyTimeoutMs);
 				break;
 			} catch (error) {
-				// Runtime crash/load failures surface asynchronously via the runtime's
-				// error callback, after the synchronous spawn try/catch has returned.
-				// Preserve the full process -> Worker -> inline ladder for those failures.
+				// Process startup can fall back only to a Worker with an isolated
+				// environment. Never run repository-provided eval code inline.
 				const failed = session.worker;
 				await failed.terminate().catch(() => undefined);
-				if (failed.mode === "inline") throw error;
-				if (failed.mode === "process") {
-					logger.warn("JS eval subprocess init failed; retrying with a Bun Worker", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-					session.worker = spawnBunWorker();
-				} else {
-					logger.warn("JS eval worker init failed; retrying with inline worker (no sync-loop guard)", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-					session.worker = spawnInlineWorker();
-				}
+				if (failed.mode !== "process") throw error;
+				logger.warn("JS eval subprocess init failed; retrying with an isolated Bun Worker", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				session.worker = spawnBunWorker(snapshot.cwd);
 				session.state = "alive";
 			}
 		}
@@ -579,41 +565,34 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function spawnJsWorker(): WorkerHandle {
-	if (!useWorkerThreadForTests) {
-		try {
-			return spawnJsProcess();
-		} catch (err) {
-			// Fall through to the Bun Worker rung: a worker thread still interrupts
-			// synchronous infinite loops via terminate(), which the inline fallback
-			// cannot.
-			logger.warn("JS eval subprocess spawn failed; falling back to a Bun Worker", {
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}
-	return spawnBunWorker();
-}
-
-function spawnBunWorker(): WorkerHandle {
+function spawnJsWorker(cwd: string): WorkerHandle {
+	if (useWorkerThreadForTests) return spawnBunWorker(cwd);
 	try {
-		const hostEntry = workerHostEntry();
-		const worker = hostEntry
-			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"] })
-			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
-		return wrapBunWorker(worker);
+		return spawnJsProcess(cwd);
 	} catch (err) {
-		logger.warn("Bun Worker spawn failed; using inline JS eval worker (no sync-loop guard)", {
+		logger.warn("JS eval subprocess spawn failed; falling back to an isolated Bun Worker", {
 			error: err instanceof Error ? err.message : String(err),
 		});
-		return spawnInlineWorker();
+		return spawnBunWorker(cwd);
 	}
 }
 
-function spawnJsProcess(): WorkerHandle {
+function spawnBunWorker(cwd: string): WorkerHandle {
+	const options: WorkerOptions = {
+		type: "module",
+		env: filterChildShellEnv(Bun.env, cwd),
+	};
+	const hostEntry = workerHostEntry();
+	const worker = hostEntry
+		? new Worker(hostEntry, { ...options, argv: ["__omp_worker_js_eval"] })
+		: new Worker(new URL("./worker-entry.ts", import.meta.url).href, options);
+	return wrapBunWorker(worker);
+}
+
+function spawnJsProcess(cwd: string): WorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		env: filterChildShellEnv(Bun.env, cwd),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,
@@ -718,67 +697,4 @@ function errorFromWorkerEvent(event: ErrorEvent): Error {
 	if (event.error instanceof Error) return event.error;
 	if (event.message) return new Error(event.message);
 	return new Error("Unknown JS eval worker error");
-}
-
-/**
- * Inline fallback for environments where Bun cannot spawn the worker entry
- * (e.g. some test runners). Preserves behavior but cannot interrupt synchronous
- * infinite loops because user code runs on the main thread.
- */
-function spawnInlineWorker(): WorkerHandle {
-	const hostListeners = new Set<(message: WorkerOutbound) => void>();
-	const workerListeners = new Set<(message: WorkerInbound) => void>();
-	const workerTransport: Transport = {
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of hostListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			workerListeners.add(handler);
-			return () => workerListeners.delete(handler);
-		},
-		close: () => {},
-	};
-	const core = new WorkerCore(workerTransport, {
-		mode: "inline",
-		interceptUnhandledRejections: postmortem.interceptUnhandledRejections,
-	});
-	return {
-		mode: "inline",
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of workerListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			hostListeners.add(handler);
-			return () => hostListeners.delete(handler);
-		},
-		onError: () => () => {},
-		async close() {
-			const { promise: closed, resolve } = Promise.withResolvers<boolean>();
-			let settled = false;
-			let timeout: NodeJS.Timeout | undefined;
-			let unsubscribe = (): void => {};
-			const finish = (value: boolean): void => {
-				if (settled) return;
-				settled = true;
-				if (timeout) clearTimeout(timeout);
-				unsubscribe();
-				hostListeners.clear();
-				workerListeners.clear();
-				resolve(value);
-			};
-			unsubscribe = this.onMessage(msg => {
-				if (msg.type === "closed") finish(true);
-			});
-			this.send({ type: "close" });
-			timeout = setTimeout(() => finish(false), workerCloseTimeoutMs);
-			return await closed;
-		},
-		async terminate() {
-			hostListeners.clear();
-			workerListeners.clear();
-			core.dispose();
-		},
-	};
 }

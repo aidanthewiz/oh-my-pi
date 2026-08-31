@@ -284,8 +284,7 @@ describe("JavaScript eval worker lifecycle", () => {
 
 	it("falls back to a Bun Worker when the subprocess cannot spawn", async () => {
 		using tempDir = TempDir.createSync("@omp-js-spawn-fallback-");
-		// Exercise the production ladder (process -> worker -> inline), not the
-		// worker-thread test seam the surrounding describe enables.
+		// Exercise the production process-to-isolated-worker ladder.
 		setJsEvalWorkerThreadForTests(false);
 		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
 		installFakeWorker(stats, { exitOnClose: true, settleRuns: true });
@@ -313,8 +312,7 @@ describe("JavaScript eval worker lifecycle", () => {
 
 	it("falls back to a Bun Worker when the subprocess fails during initialization", async () => {
 		using tempDir = TempDir.createSync("@omp-js-init-fallback-");
-		// Exercise the production ladder (process -> worker -> inline), not the
-		// worker-thread test seam the surrounding describe enables.
+		// Exercise the production process-to-isolated-worker ladder.
 		setJsEvalWorkerThreadForTests(false);
 		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
 		installFakeWorker(stats, { exitOnClose: true, settleRuns: true });
@@ -349,22 +347,48 @@ describe("JavaScript eval worker lifecycle", () => {
 		}
 	});
 
-	it("falls back to the inline worker when the spawned worker errors during startup", async () => {
+	it("fails closed when the isolated worker errors during startup", async () => {
 		using tempDir = TempDir.createSync("@omp-js-worker-error-");
 		const stats: FakeWorkerStats = { closeRequests: 0, terminateCalls: 0 };
 		installFakeWorker(stats, { exitOnClose: true, settleRuns: true, errorOnStart: true });
 
 		const session = makeSession(tempDir.path());
 		const sessionId = `js-worker-error:${crypto.randomUUID()}`;
-
-		// The spawned worker emits an `error` event instead of `ready`. Without fail-fast
-		// error handling the handshake would stall until WORKER_INIT_TIMEOUT_MS (15s); with
-		// it, the handshake rejects at once and the inline worker runs the cell.
 		const result = await executeJs("return String(6 * 7);", { cwd: tempDir.path(), sessionId, session });
-		expect(result.exitCode).toBe(0);
-		expect(result.output.trim()).toBe("42");
-		// The errored primary worker is torn down before the inline retry takes over.
+
+		expect(result.exitCode).toBe(1);
+		expect(result.output).toContain("fake worker failed to start");
 		expect(stats.terminateCalls).toBe(1);
+	});
+});
+
+describe("JavaScript eval credential boundary", () => {
+	afterEach(async () => {
+		await disposeAllVmContexts();
+		setJsEvalWorkerThreadForTests(false);
+	});
+
+	it.each([
+		["subprocess", false],
+		["worker fallback", true],
+	] as const)("does not expose parent credentials in the %s", async (_mode, useWorker) => {
+		using tempDir = TempDir.createSync("@omp-js-credential-boundary-");
+		const key = `OMP_EVAL_${crypto.randomUUID().replaceAll("-", "")}_TOKEN`;
+		const previous = Bun.env[key];
+		Bun.env[key] = "parent-credential";
+		setJsEvalWorkerThreadForTests(useWorker);
+		try {
+			const result = await executeJs(`return process.env[${JSON.stringify(key)}] ?? "absent";`, {
+				cwd: tempDir.path(),
+				sessionId: `js-credential-boundary:${crypto.randomUUID()}`,
+				session: makeSession(tempDir.path()),
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.output.trim()).toBe("absent");
+		} finally {
+			if (previous === undefined) delete Bun.env[key];
+			else Bun.env[key] = previous;
+		}
 	});
 });
 

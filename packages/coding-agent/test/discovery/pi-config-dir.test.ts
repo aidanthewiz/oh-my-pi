@@ -4,16 +4,21 @@ import * as path from "node:path";
 import type { LoadContext } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { getConfigDirs } from "@oh-my-pi/pi-coding-agent/config";
 import { getUserPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, getAgentDir } from "@oh-my-pi/pi-utils";
 
 describe("PI_CONFIG_DIR", () => {
-	const original = process.env.PI_CONFIG_DIR;
+	const original = {
+		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+		PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+		OMP_PROFILE: process.env.OMP_PROFILE,
+		PI_PROFILE: process.env.PI_PROFILE,
+	};
 	afterEach(() => {
-		if (original === undefined) {
-			delete process.env.PI_CONFIG_DIR;
-		} else {
-			process.env.PI_CONFIG_DIR = original;
+		for (const [key, value] of Object.entries(original)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
 		}
+		__resetDirsFromEnvForTests();
 	});
 
 	test("getUserPath resolves the native user scope via getAgentDir (profile-aware)", () => {
@@ -32,6 +37,10 @@ describe("PI_CONFIG_DIR", () => {
 
 	test("getConfigDirs respects PI_CONFIG_DIR for user base", () => {
 		process.env.PI_CONFIG_DIR = ".config/omp";
+		delete process.env.PI_CODING_AGENT_DIR;
+		delete process.env.OMP_PROFILE;
+		delete process.env.PI_PROFILE;
+		__resetDirsFromEnvForTests();
 		const result = getConfigDirs("commands", { project: false });
 		const expected = path.resolve(path.join(os.homedir(), ".config/omp", "agent", "commands"));
 		expect(result[0]).toEqual({ path: expected, source: ".omp", level: "user" });

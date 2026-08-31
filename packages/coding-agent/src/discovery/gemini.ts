@@ -31,7 +31,7 @@ import {
 	calculateDepth,
 	createSourceMeta,
 	discoverExtensionModulePaths,
-	expandEnvVarsDeep,
+	expandEnvVarsDeepForConfigLevel,
 	getProjectPath,
 	getUserPath,
 } from "./helpers";
@@ -90,7 +90,7 @@ async function loadMCPFromSettings(
 		return { items, warnings };
 	}
 
-	const servers = expandEnvVarsDeep(parsed.mcpServers);
+	const servers = expandEnvVarsDeepForConfigLevel(parsed.mcpServers, level);
 
 	for (const [name, config] of Object.entries(servers)) {
 		if (!config || typeof config !== "object") {

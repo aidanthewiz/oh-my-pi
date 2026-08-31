@@ -4,6 +4,11 @@ import {
 	AWS_MODEL_REGION_ENV,
 	MANAGED_AWS_MODEL_AUTH_MODE,
 } from "@oh-my-pi/pi-ai";
+import {
+	OPERATIONAL_AWS_ENV_NAMES,
+	registerChildEnvRedactions,
+	registerOperationalAwsEnvProvenance,
+} from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import type { CoreforgeAwsSsoConstants } from "./aws-profile";
 import type { CoreforgeAwsConfig } from "./aws-sso";
@@ -124,21 +129,47 @@ const MODEL_AUTH_ENV_VARS: readonly string[] = [
 	AWS_MODEL_REGION_ENV,
 ];
 
-const OPERATIONAL_AWS_ENV_VARS = ["AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_PROFILE", "AWS_DEFAULT_REGION"] as const;
-
 /**
- * Restore AWS selectors captured by the Coreforge launcher before managed
- * `.env` loading. Returns the pre-restore profile for managed-profile cleanup.
+ * Preserve model selectors loaded from the managed `.env`, then restore the
+ * shell-owned AWS credential chain captured by the Coreforge launcher.
+ * Returns the pre-restore profile for managed-profile cleanup.
  */
 export function restoreCoreforgeOperationalAwsEnvironment(env: EnvironmentLike = Bun.env): string | undefined {
 	const profileBeforeRestore = env.AWS_PROFILE?.trim() || undefined;
-	for (const key of OPERATIONAL_AWS_ENV_VARS) {
+	const modelProfileBeforeRestore = profileBeforeRestore || env.AWS_DEFAULT_PROFILE?.trim() || undefined;
+	const modelRegionBeforeRestore = env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || undefined;
+	const hasLauncherSnapshot = OPERATIONAL_AWS_ENV_NAMES.some(key => {
+		const state = env[`OMP_OPERATIONAL_${key}_SET`];
+		return state === "0" || state === "1";
+	});
+	const preservedModelSelectors: string[] = [];
+	if (hasLauncherSnapshot && modelProfileBeforeRestore && !hasValue(env[AWS_MODEL_PROFILE_ENV])) {
+		env[AWS_MODEL_PROFILE_ENV] = modelProfileBeforeRestore;
+		preservedModelSelectors.push(AWS_MODEL_PROFILE_ENV);
+	}
+	if (hasLauncherSnapshot && modelRegionBeforeRestore && !hasValue(env[AWS_MODEL_REGION_ENV])) {
+		env[AWS_MODEL_REGION_ENV] = modelRegionBeforeRestore;
+		preservedModelSelectors.push(AWS_MODEL_REGION_ENV);
+	}
+	const restoredOperationalAws: Array<readonly [string, string | undefined]> = [];
+	const launcherAliasNames: string[] = [];
+	for (const key of OPERATIONAL_AWS_ENV_NAMES) {
 		const stateKey = `OMP_OPERATIONAL_${key}_SET`;
 		const valueKey = `OMP_OPERATIONAL_${key}`;
-		if (env[stateKey] === "1" && hasValue(env[valueKey])) env[key] = env[valueKey];
+		const value = env[valueKey];
+		launcherAliasNames.push(stateKey, valueKey);
+		if (env[stateKey] === "1" && hasValue(value)) env[key] = value;
 		else if (env[stateKey] === "0") delete env[key];
-		delete env[stateKey];
-		delete env[valueKey];
+		if (env[stateKey] === "0" || env[stateKey] === "1") restoredOperationalAws.push([key, env[key]]);
+	}
+	if (env === Bun.env) {
+		if (preservedModelSelectors.length > 0) registerChildEnvRedactions(preservedModelSelectors);
+		registerChildEnvRedactions(launcherAliasNames);
+		registerOperationalAwsEnvProvenance(restoredOperationalAws);
+	}
+	for (const key of OPERATIONAL_AWS_ENV_NAMES) {
+		delete env[`OMP_OPERATIONAL_${key}_SET`];
+		delete env[`OMP_OPERATIONAL_${key}`];
 	}
 	return profileBeforeRestore;
 }
@@ -162,7 +193,10 @@ export function applyCoreforgeIdentityProviderDefaults(
 	env: EnvironmentLike = Bun.env,
 	loadIdentity: typeof loadCoreforgeIdentityProfile = loadCoreforgeIdentityProfile,
 ): AppliedCoreforgeDefaults {
-	const profileBeforeOperationalRestore = restoreCoreforgeOperationalAwsEnvironment(env);
+	const profilesBeforeOperationalRestore = [env.AWS_PROFILE?.trim(), env.AWS_DEFAULT_PROFILE?.trim()].filter(
+		(profile): profile is string => Boolean(profile),
+	);
+	restoreCoreforgeOperationalAwsEnvironment(env);
 	// Provisioning = raw tenant+client ID presence, NOT the validating resolve:
 	// IDs present-but-malformed is still provisioning INTENT, and must trigger
 	// the clear (a bad UUID must not let ambient envs authenticate AWS models).
@@ -181,6 +215,10 @@ export function applyCoreforgeIdentityProviderDefaults(
 			removedManagedAwsProfile: false,
 		};
 	}
+	// Managed model routing is injected after dotenv initialization. Register
+	// those names explicitly so repository children cannot inherit the injected
+	// profile, Region, workspace, endpoint, or future provider credentials.
+	if (env === Bun.env) registerChildEnvRedactions(MODEL_AUTH_ENV_VARS);
 	const identity = loadIdentity();
 	const identityAvailable = identity !== undefined;
 	// Resolve every managed value BEFORE mutating env, so the clear+inject below
@@ -223,7 +261,7 @@ export function applyCoreforgeIdentityProviderDefaults(
 	}
 	const clearedKeys: string[] = [];
 	const hadManagedAwsProfile =
-		reservedModelProfile !== undefined && profileBeforeOperationalRestore === reservedModelProfile;
+		reservedModelProfile !== undefined && profilesBeforeOperationalRestore.includes(reservedModelProfile);
 	// Clear provider model-auth vars, then force-set the isolated managed values.
 	for (const key of MODEL_AUTH_ENV_VARS) {
 		if (hasValue(env[key]) && managed[key] === undefined) {
@@ -237,10 +275,21 @@ export function applyCoreforgeIdentityProviderDefaults(
 		env[key] = value;
 		appliedKeys.push(key);
 	}
-	const removedManagedAwsProfile =
-		hadManagedAwsProfile || (reservedModelProfile !== undefined && env.AWS_PROFILE?.trim() === reservedModelProfile);
-	if (reservedModelProfile !== undefined && env.AWS_PROFILE?.trim() === reservedModelProfile) {
-		delete env.AWS_PROFILE;
+	if (env === Bun.env) {
+		registerChildEnvRedactions(Object.keys(managed), [
+			managed.ANTHROPIC_AWS_WORKSPACE_ID,
+			managed.ANTHROPIC_BASE_URL,
+		]);
+	}
+	const operationalProfileKeys = ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"] as const;
+	const restoredReservedProfile =
+		reservedModelProfile !== undefined &&
+		operationalProfileKeys.some(key => env[key]?.trim() === reservedModelProfile);
+	const removedManagedAwsProfile = hadManagedAwsProfile || restoredReservedProfile;
+	if (reservedModelProfile !== undefined) {
+		for (const key of operationalProfileKeys) {
+			if (env[key]?.trim() === reservedModelProfile) delete env[key];
+		}
 	}
 	return {
 		entraProvisioned: true,

@@ -32,7 +32,7 @@ import {
 	buildExtensionModuleItems,
 	createSourceMeta,
 	discoverExtensionModulePaths,
-	expandEnvVarsDeep,
+	expandEnvVarsDeepForConfigLevel,
 	getProjectPath,
 	getUserPath,
 	loadFilesFromDir,
@@ -179,7 +179,7 @@ function extractMCPServers(
 		return { items, warnings };
 	}
 
-	const servers = expandEnvVarsDeep(config.mcp as Record<string, unknown>);
+	const servers = expandEnvVarsDeepForConfigLevel(config.mcp as Record<string, unknown>, level);
 
 	for (const [name, raw] of Object.entries(servers)) {
 		if (!raw || typeof raw !== "object") {

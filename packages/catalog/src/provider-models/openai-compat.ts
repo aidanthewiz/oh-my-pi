@@ -3705,7 +3705,7 @@ export const META_MUSE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] =
 // 15.76 Amazon Bedrock Mantle
 // ---------------------------------------------------------------------------
 
-const BEDROCK_MANTLE_BASE_URL = "https://bedrock-mantle.{region}.api.aws/openai/v1";
+const BEDROCK_MANTLE_BASE_URL = "https://bedrock-mantle.{region}.api.aws/v1";
 const BEDROCK_MANTLE_GPT_5_X_THINKING: ThinkingConfig = {
 	mode: "effort",
 	efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
@@ -3795,7 +3795,6 @@ export function bedrockMantleModelManagerOptions(
 	config: ModelManagerConfig = {},
 ): ModelManagerOptions<"openai-responses"> {
 	const inferenceBaseUrl = config.baseUrl ?? BEDROCK_MANTLE_BASE_URL;
-	const discoveryBaseUrl = inferenceBaseUrl.replace(/\/openai\/v1\/?$/, "/v1");
 	return {
 		providerId: "bedrock-mantle",
 		staticModels: BEDROCK_MANTLE_STATIC_MODELS,
@@ -3808,7 +3807,7 @@ export function bedrockMantleModelManagerOptions(
 				fetchOpenAICompatibleModels({
 					api: "openai-responses",
 					provider: "bedrock-mantle",
-					baseUrl: discoveryBaseUrl,
+					baseUrl: inferenceBaseUrl,
 					fetch: config.fetch,
 					mapModel: (entry, defaults) =>
 						mapWithBundledReference(

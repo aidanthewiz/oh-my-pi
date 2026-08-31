@@ -125,9 +125,10 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
 }
 
 /**
- * Snapshot the parent environment for the child. `process.env` carries
- * `undefined` slots that `Bun.spawn` rejects, so filter them out; an optional
- * `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
+ * Snapshot the parent environment for a trusted engine worker. Repository-controlled
+ * subprocesses must call `filterChildShellEnv` at their spawn boundary instead.
+ * `process.env` carries `undefined` slots that `Bun.spawn` rejects, so filter them out;
+ * an optional `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
  */
 export function workerEnvFromParent(overlay?: Record<string, string>): Record<string, string> {
 	const base = $env as Record<string, string | undefined>;

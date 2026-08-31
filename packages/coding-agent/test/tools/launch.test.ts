@@ -4,7 +4,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
-import { daemonBrokerEndpoint } from "../../src/launch/paths";
+import { daemonBrokerEndpoint, daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import { registerDaemonProjectPresence } from "../../src/launch/presence";
 import type {
 	DaemonCompletionNotification,
@@ -12,6 +12,7 @@ import type {
 	DaemonSnapshot,
 	DaemonSpec,
 } from "../../src/launch/protocol";
+import { DAEMON_BROKER_PROTOCOL_VERSION } from "../../src/launch/protocol";
 
 const cleanupDirs: string[] = [];
 
@@ -56,7 +57,7 @@ async function publishCompletionOwner(
 	subscriptionId: string,
 	completionAcks: string[] = [],
 ): Promise<void> {
-	const socket = net.createConnection(daemonBrokerEndpoint(projectDir, runtimeDir));
+	const socket = net.createConnection(daemonBrokerEndpoint(projectDir, daemonBrokerRuntimeDir(runtimeDir)));
 	const connected = Promise.withResolvers<void>();
 	const responded = Promise.withResolvers<void>();
 	let buffer = "";
@@ -71,7 +72,8 @@ async function publishCompletionOwner(
 	socket.write(
 		`${JSON.stringify({
 			id: crypto.randomUUID(),
-			token: (await Bun.file(path.join(runtimeDir, "broker.token")).text()).trim(),
+			protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+			token: (await Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.token")).text()).trim(),
 			owners: [owner],
 			completionEvents: true,
 			completionAcks,
@@ -171,6 +173,37 @@ afterEach(async () => {
 });
 
 describe("daemon broker", () => {
+	it("does not contact an unversioned broker from an older engine", async () => {
+		if (process.platform === "win32") return;
+		const projectDir = await tempDir("omp-daemon-version-project-");
+		const runtimeDir = await tempDir("omp-daemon-version-runtime-");
+		const oldEndpoint = path.join(runtimeDir, "broker.sock");
+		let oldContacted = false;
+		const oldServer = net.createServer(socket => {
+			oldContacted = true;
+			socket.destroy();
+		});
+		await new Promise<void>((resolve, reject) => {
+			oldServer.once("error", reject);
+			oldServer.listen(oldEndpoint, resolve);
+		});
+
+		let client: DaemonBrokerClient | undefined;
+		try {
+			client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+			const ping = await client.request({ op: "ping" });
+			expect(ping).toEqual({
+				op: "ping",
+				projectDir: client.projectDir,
+				protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+			});
+			expect(oldContacted).toBeFalse();
+		} finally {
+			if (client) await shutdown(client);
+			await new Promise<void>(resolve => oldServer.close(() => resolve()));
+		}
+	}, 20_000);
+
 	it("shares PTY output and input across project clients", async () => {
 		const projectDir = await tempDir("omp-daemon-project-");
 		const runtimeDir = await tempDir("omp-daemon-runtime-");
@@ -460,7 +493,7 @@ esac
 			const stopped = await waitUntil(() => !processExists(daemonPid), 5_000);
 			const socketRemoved = await waitUntil(
 				() =>
-					Bun.file(path.join(runtimeDir, "broker.sock"))
+					Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock"))
 						.exists()
 						.then(exists => !exists),
 				5_000,
@@ -513,7 +546,7 @@ esac
 			// Broker shutdown happens in another process, so fake timers cannot observe its lease release.
 			const brokerStopped = await waitUntil(
 				() =>
-					Bun.file(path.join(runtimeDir, "broker.pid"))
+					Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))
 						.exists()
 						.then(exists => !exists),
 				5_000,
@@ -581,7 +614,7 @@ esac
 			expect(
 				await waitUntil(
 					() =>
-						Bun.file(path.join(runtimeDir, "broker.pid"))
+						Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))
 							.exists()
 							.then(exists => !exists),
 					5_000,
@@ -685,7 +718,12 @@ esac
 			});
 			if (started.op !== "start") throw new Error("detached daemon did not start");
 			first.close();
-			const metaPath = path.join(runtimeDir, "daemons", "pending-recovery-exit", "meta.json");
+			const metaPath = path.join(
+				daemonBrokerRuntimeDir(runtimeDir),
+				"daemons",
+				"pending-recovery-exit",
+				"meta.json",
+			);
 			expect(
 				await waitUntil(async () => {
 					const meta = (await Bun.file(metaPath).json()) as { pendingCompletions?: unknown[] };
@@ -719,7 +757,7 @@ esac
 					},
 				}),
 			);
-			const brokerPidPath = path.join(runtimeDir, "broker.pid");
+			const brokerPidPath = path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid");
 			const { pid: brokerPid } = (await Bun.file(brokerPidPath).json()) as { pid: number };
 			process.kill(brokerPid, "SIGKILL");
 			expect(await waitUntil(() => !processExists(brokerPid), 3_000)).toBeTrue();
@@ -784,7 +822,9 @@ esac
 			});
 			if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("daemon did not start");
 			daemonPid = started.daemon.pid;
-			const { pid: brokerPid } = (await Bun.file(path.join(runtimeDir, "broker.pid")).json()) as { pid: number };
+			const { pid: brokerPid } = (await Bun.file(
+				path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"),
+			).json()) as { pid: number };
 			process.kill(brokerPid, "SIGKILL");
 			expect(await waitUntil(() => !processExists(brokerPid), 3_000)).toBeTrue();
 			first.close();
@@ -1099,7 +1139,7 @@ esac
 			delivered.resolve();
 			await accepted.promise;
 		});
-		const metaPath = path.join(runtimeDir, "daemons", "delayed-sink", "meta.json");
+		const metaPath = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons", "delayed-sink", "meta.json");
 		try {
 			await client.request({
 				op: "start",
@@ -1281,7 +1321,12 @@ esac
 				},
 				owner,
 			});
-			const metaPath = path.join(runtimeDir, "daemons", "superseded-owner-exit", "meta.json");
+			const metaPath = path.join(
+				daemonBrokerRuntimeDir(runtimeDir),
+				"daemons",
+				"superseded-owner-exit",
+				"meta.json",
+			);
 			const firstMetadata = (await Bun.file(metaPath).json()) as { completionSubscriptionId?: string };
 			if (!firstMetadata.completionSubscriptionId)
 				throw new Error("first completion subscription was not persisted");
@@ -1348,7 +1393,12 @@ esac
 				throw new Error("detached daemon did not start");
 			}
 			pid = started.daemon.pid;
-			const metaPath = path.join(runtimeDir, "daemons", "recovered-superseded-owner-exit", "meta.json");
+			const metaPath = path.join(
+				daemonBrokerRuntimeDir(runtimeDir),
+				"daemons",
+				"recovered-superseded-owner-exit",
+				"meta.json",
+			);
 			const beforeRecovery = (await Bun.file(metaPath).json()) as { completionSubscriptionId?: string };
 			expect(beforeRecovery.completionSubscriptionId).toBeString();
 
@@ -1356,7 +1406,7 @@ esac
 			expect(
 				await waitUntil(
 					() =>
-						Bun.file(path.join(runtimeDir, "broker.pid"))
+						Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))
 							.exists()
 							.then(exists => !exists),
 					5_000,
@@ -1439,7 +1489,7 @@ esac
 			expect(
 				await waitUntil(
 					() =>
-						Bun.file(path.join(runtimeDir, "broker.sock"))
+						Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock"))
 							.exists()
 							.then(exists => !exists),
 					3_000,
@@ -1448,7 +1498,7 @@ esac
 		} finally {
 			first.close();
 			second?.close();
-			if (await Bun.file(path.join(runtimeDir, "broker.sock")).exists()) {
+			if (await Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock")).exists()) {
 				const rescue = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 200 });
 				await shutdown(rescue);
 			}
@@ -1491,7 +1541,7 @@ esac
 			expect(
 				await waitUntil(
 					() =>
-						Bun.file(path.join(runtimeDir, "broker.sock"))
+						Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock"))
 							.exists()
 							.then(exists => !exists),
 					3_000,
@@ -1510,7 +1560,7 @@ esac
 		} finally {
 			client.close();
 			recovered?.close();
-			if (await Bun.file(path.join(runtimeDir, "broker.sock")).exists()) {
+			if (await Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock")).exists()) {
 				const rescue = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 200 });
 				await shutdown(rescue);
 			}
@@ -1594,7 +1644,7 @@ esac
 			expect(
 				await waitUntil(
 					() =>
-						Bun.file(path.join(runtimeDir, "broker.sock"))
+						Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock"))
 							.exists()
 							.then(exists => !exists),
 					3_000,
@@ -1603,7 +1653,7 @@ esac
 		} finally {
 			unregister();
 			first.close();
-			if (await Bun.file(path.join(runtimeDir, "broker.sock")).exists()) {
+			if (await Bun.file(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.sock")).exists()) {
 				const rescue = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 200 });
 				await shutdown(rescue);
 			}

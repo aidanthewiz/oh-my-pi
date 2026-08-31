@@ -7,7 +7,7 @@ import type {
 	AgentToolUpdateCallback,
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
-import { isEnoent, logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, isEnoent, logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
@@ -709,6 +709,7 @@ async function resolveGoWorkspaceDiagnosticsCommand(cwd: string, signal?: AbortS
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			env: filterChildShellEnv(Bun.env, cwd),
 		});
 		const abortHandler = () => {
 			proc.kill();
@@ -788,6 +789,7 @@ async function runWorkspaceDiagnostics(
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			env: filterChildShellEnv(Bun.env, cwd),
 		});
 		const abortHandler = () => {
 			proc.kill();

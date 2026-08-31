@@ -18,7 +18,7 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import {
 	type ClaudePluginRoot,
 	createSourceMeta,
-	expandEnvVarsDeep,
+	expandEnvVarsDeepForConfigLevel,
 	listClaudePluginRoots,
 	loadFilesFromDir,
 	scanSkillsFromDir,
@@ -565,8 +565,10 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				...(raw.args !== undefined && { args: substitutePluginRoot(raw.args, root.path) }),
 				...(raw.env !== undefined && { env: substitutePluginRoot(raw.env, root.path) }),
 				...(rooted.cwd !== undefined && { cwd: rooted.cwd }),
-				...(raw.url !== undefined && { url: expandEnvVarsDeep(raw.url) }),
-				...(raw.headers !== undefined && { headers: expandEnvVarsDeep(raw.headers) }),
+				...(raw.url !== undefined && { url: expandEnvVarsDeepForConfigLevel(raw.url, root.scope) }),
+				...(raw.headers !== undefined && {
+					headers: expandEnvVarsDeepForConfigLevel(raw.headers, root.scope),
+				}),
 				...(raw.auth !== undefined && { auth: raw.auth }),
 				...(raw.oauth !== undefined && { oauth: raw.oauth }),
 				...(raw.type !== undefined && { transport: raw.type as MCPServer["transport"] }),

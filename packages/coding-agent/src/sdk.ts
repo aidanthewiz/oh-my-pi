@@ -28,7 +28,17 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	getAgentDir,
+	getProjectDir,
+	logger,
+	postmortem,
+	prompt,
+	Snowflake,
+	sanitizeText,
+} from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
 	discoverAdvisorConfigs,
@@ -115,6 +125,7 @@ import {
 	discoverAndLoadMCPTools,
 	type MCPLoadResult,
 	MCPManager,
+	type MCPProjectTrustRequest,
 	MCPToolCache,
 	type MCPToolsLoadResult,
 	parseMCPToolName,
@@ -130,6 +141,7 @@ import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-re
 import {
 	builtinCredentialSecretEntries,
 	collectEnvSecrets,
+	collectSettingsSecrets,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
 	getExistingSecretPlaceholderKey,
@@ -1403,28 +1415,35 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// key is resolved lazily per request via ModelRegistry.resolver.
 	const hasModelAuth = (candidate: Model): boolean => modelRegistry.hasConfiguredAuth(candidate);
 
-	// Load and create secret obfuscator early so resumed session state and prompt warnings
-	// reflect actual loaded secrets, not just the setting toggle.
+	// Load and create the secret obfuscator early so resumed session state and
+	// prompt warnings reflect actual loaded secrets, not just the setting toggle.
+	// Credential-marked settings are always protected because they can originate
+	// in managed config files that repository tools can read.
 	let obfuscator: SecretObfuscator | undefined;
-	if (settings.get("secrets.enabled")) {
-		const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
-		const envEntries = collectEnvSecrets();
-		// Built-in credential-pattern entries come last so user-configured entries
-		// (plain literals, custom regexes) take precedence in the scan order.
-		const allEntries = [...envEntries, ...fileEntries, ...builtinCredentialSecretEntries()];
-		// Only CONFIGURED entries force startup key creation: a configured
-		// obfuscate-mode secret — or a default (no custom `replacement`)
-		// replace-mode regex whose key-derived idempotent fallback marker needs a
-		// stable key across restarts (see `secretEntryNeedsPlaceholderKey`) —
-		// mints placeholders as soon as the obfuscator is built. The built-in
-		// credential-pattern entry matches dynamically, so it resolves the
-		// persisted key lazily on first match instead of creating the key file
-		// for every secrets.enabled session; a session whose content never
-		// contains a credential-shaped token must not require the key, otherwise a
-		// headless run on an unwritable default config root pays for a feature it
-		// does not use.
-		const needsPlaceholderKey = secretEntriesNeedPlaceholderKey([...envEntries, ...fileEntries]);
-		const explicitAgentDir = options.agentDir;
+	const explicitAgentDir = options.agentDir;
+	const settingsEntries = collectSettingsSecrets(settings);
+	const configurableSecretsEnabled = settings.get("secrets.enabled");
+	if (configurableSecretsEnabled || settingsEntries.length > 0) {
+		const fileEntries = configurableSecretsEnabled
+			? await logger.time("loadSecrets", loadSecrets, cwd, agentDir)
+			: [];
+		const envEntries = configurableSecretsEnabled ? collectEnvSecrets() : [];
+		// Built-in credential-pattern entries come last so configured entries
+		// (settings, environment values, plain literals, and custom regexes) take
+		// precedence in the scan order.
+		const allEntries = [
+			...settingsEntries,
+			...envEntries,
+			...fileEntries,
+			...(configurableSecretsEnabled ? builtinCredentialSecretEntries() : []),
+		];
+		// Only configured entries force startup key creation: an obfuscate-mode
+		// secret — or a default replace-mode regex whose key-derived idempotent
+		// fallback marker needs a stable key across restarts — mints placeholders
+		// as soon as the obfuscator is built. The built-in credential-pattern
+		// entry matches dynamically, so it resolves the persisted key lazily on
+		// first match instead of creating the key file for every enabled session.
+		const needsPlaceholderKey = secretEntriesNeedPlaceholderKey([...settingsEntries, ...envEntries, ...fileEntries]);
 		const placeholderKey = needsPlaceholderKey
 			? await getSecretPlaceholderKey(explicitAgentDir)
 			: await getExistingSecretPlaceholderKey(explicitAgentDir);
@@ -1435,16 +1454,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			);
 		}
 		if (obfuscator?.hasSecrets() !== true && placeholderKey !== undefined) {
-			// No configured entry produced an active secret (e.g. only ignored short
-			// plain entries, or no entries at all), but a persisted key exists. Build a
-			// redaction-only obfuscator so a tool read of the key file does not ship the
-			// reusable HMAC key to the provider.
+			// No configured entry produced an active secret, but a persisted key
+			// exists. Redact the key itself from repository tool output.
 			obfuscator = new SecretObfuscator(
 				[{ type: "plain", mode: "replace", content: placeholderKey }],
 				placeholderKey,
 			);
 		}
 	}
+	// Keep an inert obfuscator available so credential settings introduced after
+	// session creation can become protected without replacing every consumer.
+	obfuscator ??= new SecretObfuscator([], () => getSecretPlaceholderKeySync(explicitAgentDir));
 	const secretsEnabled = obfuscator?.hasSecrets() === true;
 
 	// An abnormal process exit after a non-terminal message tail is durable
@@ -1894,6 +1914,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		toolSession.mcpManager = mcpManager;
 		toolSession.enableMCP = enableMCP;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
+		const projectTrustUI = deferMCPDiscoveryForUI ? Promise.withResolvers<ExtensionUIContext>() : undefined;
 		const customTools: CustomTool[] = [];
 		let startDeferredMCPDiscovery: ((liveSession: AgentSession) => void) | undefined;
 		const startupQuiet = settings.get("startup.quiet");
@@ -1905,10 +1926,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const mcpDiscoverOptions = {
 			onStatus: onMCPStatus,
 			enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
+			requestProjectTrust: projectTrustUI
+				? async (request: MCPProjectTrustRequest) => {
+						const ui = await projectTrustUI.promise;
+						return ui.confirm(
+							"Trust project MCP configuration?",
+							`Allow commands from ${sanitizeText(request.configPath)} to run automatically?\n\n` +
+								"Trust applies only to this checkout and exact file contents. Any change requires approval again.",
+						);
+					}
+				: undefined,
 			// MCP-scoped provider allowlist (empty = all providers); unlike
 			// `disabledProviders` this filters ONLY the mcps capability.
 			discoveryProviders: settings.get("mcp.discoveryProviders"),
-			trustedProjectGitHubOrganizations: settings.get("mcp.trustedProjectGitHubOrganizations"),
 			// Always filter Exa - we have native integration
 			filterExa: true,
 			// Filter browser MCP servers when builtin browser tool is active
@@ -3190,6 +3220,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
 			toolContextStore.setUIContext(uiContext, hasUI);
+			if (hasUI) projectTrustUI?.resolve(uiContext);
 		};
 
 		const initialTools = initialToolNames
@@ -3583,6 +3614,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			};
 		}
+		disposeCallbacks.add(
+			settings.onEffectiveSettingChanged(() => {
+				obfuscator?.addPlainEntries(collectSettingsSecrets(settings));
+			}),
+		);
 
 		if (model?.api === "openai-codex-responses") {
 			// `.api` equality doesn't narrow the generic; the guard makes this cast sound.

@@ -1557,6 +1557,8 @@ describe("lsp regressions", () => {
 	it("treats a go.work-only root as a Go workspace for workspace diagnostics", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-go-work-only-");
 		const spawnCalls: BunSpawnCall[] = [];
+		const previousSecret = Bun.env.OPENAI_API_KEY;
+		Bun.env.OPENAI_API_KEY = "managed-profile-sentinel";
 		recordBunSpawn(spawnCalls, cmd => {
 			if (cmd.join("\0") === "go\0work\0edit\0-json") {
 				return { stdout: JSON.stringify({ Use: [{ DiskPath: "./service" }] }) };
@@ -1567,6 +1569,7 @@ describe("lsp regressions", () => {
 		try {
 			const serviceDir = path.join(tempDir.path(), "service");
 			await fs.promises.mkdir(serviceDir, { recursive: true });
+			await Bun.write(path.join(tempDir.path(), ".env"), "OPENAI_API_KEY=managed-profile-sentinel\n");
 			await Bun.write(path.join(tempDir.path(), "go.work"), ["go 1.22", "", "use ./service", ""].join("\n"));
 			await Bun.write(path.join(serviceDir, "go.mod"), "module example.com/service\n\ngo 1.22\n");
 
@@ -1580,6 +1583,8 @@ describe("lsp regressions", () => {
 			expect(buildCalls).toHaveLength(1);
 			expect(buildCalls[0]?.cmd).toEqual(["go", "build", "./service/..."]);
 			expect(buildCalls[0]?.options?.cwd).toBe(tempDir.path());
+			expect(buildCalls[0]?.options?.env?.OPENAI_API_KEY).toBeUndefined();
+			expect(buildCalls[0]?.options?.env?.PATH).toBe(Bun.env.PATH);
 			const output = textResult(result);
 			expect(output).toContain("Workspace diagnostics (");
 			expect(output).toContain("go build");
@@ -1587,6 +1592,8 @@ describe("lsp regressions", () => {
 			expect(output).not.toContain("Cannot detect project type");
 		} finally {
 			tempDir.removeSync();
+			if (previousSecret === undefined) delete Bun.env.OPENAI_API_KEY;
+			else Bun.env.OPENAI_API_KEY = previousSecret;
 		}
 	});
 

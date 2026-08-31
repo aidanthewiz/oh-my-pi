@@ -123,7 +123,11 @@ export function resolveCopilotHome(home: string): string {
 /**
  * Create source metadata for an item.
  */
-export function createSourceMeta(provider: string, filePath: string, level: "user" | "project"): SourceMeta {
+export function createSourceMeta(
+	provider: string,
+	filePath: string,
+	level: "user" | "project",
+): SourceMeta & { level: "user" | "project" } {
 	return {
 		provider,
 		providerName: "", // Filled in by registry
@@ -430,13 +434,74 @@ export async function scanSkillsFromDir(
 	return { items, warnings };
 }
 
+const PROJECT_CONFIG_ENV_NAMES = new Set([
+	"APPDATA",
+	"BUN_INSTALL",
+	"CARGO_HOME",
+	"CI",
+	"COLORTERM",
+	"COMMONPROGRAMFILES",
+	"COMMONPROGRAMFILES(X86)",
+	"COMSPEC",
+	"GOPATH",
+	"GOROOT",
+	"HOME",
+	"JAVA_HOME",
+	"LANG",
+	"LOCALAPPDATA",
+	"LOGNAME",
+	"NODE_ENV",
+	"NVM_DIR",
+	"PATH",
+	"PATHEXT",
+	"PNPM_HOME",
+	"PROGRAMDATA",
+	"PROGRAMFILES",
+	"PROGRAMFILES(X86)",
+	"PWD",
+	"RUSTUP_HOME",
+	"SHELL",
+	"SYSTEMROOT",
+	"TEMP",
+	"TERM",
+	"TMP",
+	"TMPDIR",
+	"USER",
+	"USERNAME",
+	"USERPROFILE",
+	"VOLTA_HOME",
+	"WINDIR",
+	"XDG_CACHE_HOME",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+]);
+
+function projectConfigEnvironment(): Record<string, string> {
+	const result: Record<string, string> = {};
+	const allowed: Array<[string, string]> = [];
+	for (const [name, value] of Object.entries(Bun.env)) {
+		if (
+			value !== undefined &&
+			(PROJECT_CONFIG_ENV_NAMES.has(name.toUpperCase()) || name.toUpperCase().startsWith("LC_"))
+		) {
+			result[name] = value;
+			allowed.push([name, value]);
+		}
+	}
+	for (const [name, value] of allowed) {
+		result[name.toUpperCase()] ??= value;
+	}
+	return result;
+}
+
 /**
  * Expand environment variables in a string.
  * Supports ${VAR} and ${VAR:-default} syntax.
  */
-function expandEnvVars(value: string, extraEnv?: Record<string, string>): string {
+function expandEnvVars(value: string, extraEnv?: Record<string, string>, inheritProcessEnv: boolean = true): string {
 	return value.replace(/\$\{([^}:]+)(?::-([^}]*))?\}/g, (_, varName: string, defaultValue?: string) => {
-		const envValue = extraEnv?.[varName] ?? Bun.env[varName];
+		const envValue = extraEnv?.[varName] ?? (inheritProcessEnv ? Bun.env[varName] : undefined);
 		if (envValue !== undefined) return envValue;
 		if (defaultValue !== undefined) return defaultValue;
 		return `\${${varName}}`;
@@ -446,21 +511,31 @@ function expandEnvVars(value: string, extraEnv?: Record<string, string>): string
 /**
  * Recursively expand environment variables in an object.
  */
-export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>): T {
+export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>, inheritProcessEnv: boolean = true): T {
 	if (typeof obj === "string") {
-		return expandEnvVars(obj, extraEnv) as T;
+		return expandEnvVars(obj, extraEnv, inheritProcessEnv) as T;
 	}
 	if (Array.isArray(obj)) {
-		return obj.map(item => expandEnvVarsDeep(item, extraEnv)) as T;
+		return obj.map(item => expandEnvVarsDeep(item, extraEnv, inheritProcessEnv)) as T;
 	}
 	if (obj !== null && typeof obj === "object") {
 		const result: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(obj)) {
-			result[key] = expandEnvVarsDeep(value, extraEnv);
+			result[key] = expandEnvVarsDeep(value, extraEnv, inheritProcessEnv);
 		}
 		return result as T;
 	}
 	return obj;
+}
+
+/** Expands project-owned configuration from a non-secret process allowlist. */
+export function expandProjectEnvVarsDeep<T>(obj: T): T {
+	return expandEnvVarsDeep(obj, projectConfigEnvironment(), false);
+}
+
+export function expandEnvVarsDeepForConfigLevel<T>(obj: T, level: "user" | "project"): T {
+	if (level === "project") return expandProjectEnvVarsDeep(obj);
+	return expandEnvVarsDeep(obj);
 }
 
 /**

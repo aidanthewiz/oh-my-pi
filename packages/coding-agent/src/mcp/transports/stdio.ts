@@ -7,7 +7,13 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getProjectDir, readJsonl } from "@oh-my-pi/pi-utils";
+import {
+	filterChildShellEnv,
+	filterTrustedChildShellEnv,
+	filterUserMcpChildEnv,
+	getProjectDir,
+	readJsonl,
+} from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
 import type {
@@ -559,7 +565,13 @@ export class StdioTransport implements MCPTransport {
 	onNotification?: (method: string, params: unknown) => void;
 	onRequest?: (method: string, params: unknown) => Promise<unknown>;
 
-	constructor(private config: MCPStdioServerConfig) {}
+	constructor(
+		private config: MCPStdioServerConfig,
+		private credentialPolicy: {
+			preserveExplicitCredentials?: boolean;
+			preserveOperationalAws?: boolean;
+		} = {},
+	) {}
 
 	get connected(): boolean {
 		return this.#connected;
@@ -571,11 +583,12 @@ export class StdioTransport implements MCPTransport {
 	async connect(): Promise<void> {
 		if (this.#connected) return;
 
-		const env = {
-			...Bun.env,
-			...this.config.env,
-		};
 		const cwd = this.config.cwd ?? getProjectDir();
+		const env = this.credentialPolicy.preserveOperationalAws
+			? filterTrustedChildShellEnv(Bun.env, cwd, this.config.env)
+			: this.credentialPolicy.preserveExplicitCredentials
+				? filterUserMcpChildEnv(Bun.env, cwd, this.config.env)
+				: filterChildShellEnv(Bun.env, cwd, this.config.env);
 		const spawnCommand = await resolveStdioSpawnCommand(this.config, {
 			cwd,
 			env,
@@ -898,8 +911,11 @@ export class StdioTransport implements MCPTransport {
 /**
  * Create and connect a stdio transport.
  */
-export async function createStdioTransport(config: MCPStdioServerConfig): Promise<StdioTransport> {
-	const transport = new StdioTransport(config);
+export async function createStdioTransport(
+	config: MCPStdioServerConfig,
+	options?: { preserveExplicitCredentials?: boolean; preserveOperationalAws?: boolean },
+): Promise<StdioTransport> {
+	const transport = new StdioTransport(config, options);
 	await transport.connect();
 	return transport;
 }

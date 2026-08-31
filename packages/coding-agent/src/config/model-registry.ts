@@ -1907,15 +1907,19 @@ export class ModelRegistry {
 				? cached
 					? "cached"
 					: "idle"
-				: result.models.length > 0
-					? "ok"
-					: "empty";
+				: result.stale
+					? result.models.length > 0
+						? "cached"
+						: "unavailable"
+					: result.models.length > 0
+						? "ok"
+						: "empty";
 		this.#providerDiscoveryStates.set(providerId, {
 			provider: providerId,
 			status,
 			optional: providerConfig.optional ?? false,
 			stale: result.stale || status === "cached" || ((cacheOlderThanConfig || bypassFreshCache) && status !== "ok"),
-			fetchedAt: discoveryError ? cached?.updatedAt : Date.now(),
+			...(result.fetchedAt === undefined ? {} : { fetchedAt: result.fetchedAt }),
 			models: result.models.map(model => model.id),
 			error: discoveryError,
 		});
@@ -2165,15 +2169,43 @@ export class ModelRegistry {
 			const models = result.models.map(model =>
 				model.provider === options.providerId ? model : { ...model, provider: options.providerId },
 			);
+			const authoritativeDiscoveryUnavailable =
+				options.dynamicModelsAuthoritative === true && options.fetchDynamicModels === undefined;
+			const discoveryStale = result.stale || authoritativeDiscoveryUnavailable;
 			const authoritativeProviders = new Set<string>();
-			if (options.dynamicModelsAuthoritative && !result.stale) {
+			if (options.dynamicModelsAuthoritative && !discoveryStale) {
 				authoritativeProviders.add(options.providerId);
 			}
+			this.#providerDiscoveryStates.set(options.providerId, {
+				provider: options.providerId,
+				status: authoritativeDiscoveryUnavailable
+					? "unavailable"
+					: result.stale
+						? models.length > 0
+							? "cached"
+							: "unavailable"
+						: models.length > 0
+							? "ok"
+							: "empty",
+				optional: true,
+				stale: discoveryStale,
+				...(discoveryStale || result.fetchedAt === undefined ? {} : { fetchedAt: result.fetchedAt }),
+				models: models.map(model => model.id),
+			});
 			return { models, authoritativeProviders };
 		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
 			logger.warn("model discovery failed for provider", {
 				provider: options.providerId,
-				error: error instanceof Error ? error.message : String(error),
+				error: message,
+			});
+			this.#providerDiscoveryStates.set(options.providerId, {
+				provider: options.providerId,
+				status: "unavailable",
+				optional: true,
+				stale: true,
+				models: [],
+				error: message,
 			});
 			return { models: [], authoritativeProviders: new Set() };
 		}
@@ -2471,6 +2503,12 @@ export class ModelRegistry {
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {
 		return this.#providerDiscoveryStates.get(provider);
+	}
+
+	getProviderDiscoveryStates(): ProviderDiscoveryState[] {
+		return [...this.#providerDiscoveryStates.values()].sort((left, right) =>
+			left.provider.localeCompare(right.provider),
+		);
 	}
 
 	/**

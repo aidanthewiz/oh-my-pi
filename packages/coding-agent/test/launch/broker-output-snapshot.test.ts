@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { setProcessName, TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import {
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
@@ -48,7 +49,7 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 		const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 		const previousTitle = process.title;
 		process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
-		process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
+		process.env[DAEMON_RUNTIME_DIR_ENV] = daemonBrokerRuntimeDir(runtimeDir);
 		process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
 		const broker = startDaemonBrokerFromEnvironment();
 		restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);

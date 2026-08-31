@@ -29,10 +29,10 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(nativeVerifyStart).toBeGreaterThan(binaryDownloadStart);
 	const binaryDownloadStep = workflow.slice(binaryDownloadStart, nativeVerifyStart);
 
-	expect(workflow).toContain('bun scripts/bazel-natives.ts "${targets[@]}"');
+	expect(workflow).toContain(`bun scripts/bazel-natives.ts "\${targets[@]}"`);
 	expect(workflow).not.toContain('npm view "@oh-my-pi/pi-natives-');
 	expect(binaryDownloadStep).not.toContain("curl");
-	expect(binaryDownloadStep).toContain("GH_TOKEN: ${{ github.token }}");
+	expect(binaryDownloadStep).toContain(`GH_TOKEN: \${{ github.token }}`);
 	expect(binaryDownloadStep).toContain('gh release download "$RELEASE_TAG"');
 	expect(binaryDownloadStep).toContain('--repo "$GITHUB_REPOSITORY"');
 	expect(binaryDownloadStep).toContain('--pattern "omp-darwin-arm64"');
@@ -49,7 +49,7 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	]) {
 		expect(workflow).toContain(target);
 	}
-	expect(workflow).toContain('coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz');
+	expect(workflow).toContain(`coreforge-pi-natives-\${{ matrix.target }}-\${RELEASE_TAG}.tgz`);
 	expect(workflow).toContain("pattern: native-*");
-	expect(workflow).toContain('node -e \'require("./package/pi_natives.darwin-arm64.node")\'');
+	expect(workflow).toContain("node -e 'require(\"./package/pi_natives.darwin-arm64.node\")'");
 });

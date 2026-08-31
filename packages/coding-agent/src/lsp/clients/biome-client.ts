@@ -3,7 +3,7 @@
  * Uses Biome's CLI with JSON output instead of LSP (which has stale diagnostics issues).
  */
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, logger } from "@oh-my-pi/pi-utils";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 // =============================================================================
@@ -100,6 +100,7 @@ async function runBiome(
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			env: filterChildShellEnv(Bun.env, cwd),
 		});
 
 		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);

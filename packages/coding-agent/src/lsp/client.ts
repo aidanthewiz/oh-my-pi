@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit } from "./edits";
@@ -751,9 +751,8 @@ export async function getOrCreateClient(
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
 
-		// Wrap with lspmux if available and supported
 		const { command, args, env } = isLspmuxSupported(baseCommand)
-			? await getLspmuxCommand(baseCommand, baseArgs)
+			? await getLspmuxCommand(baseCommand, baseArgs, cwd)
 			: { command: baseCommand, args: baseArgs };
 
 		// Prefer the broker-shared server unless an external lspmux wrapper is
@@ -766,7 +765,7 @@ export async function getOrCreateClient(
 		proc ??= ptree.spawn([command, ...args], {
 			cwd,
 			stdin: "pipe",
-			env: env ? { ...Bun.env, ...env } : undefined,
+			env: filterChildShellEnv(Bun.env, cwd, env),
 		});
 
 		let resolveProjectLoaded!: () => void;

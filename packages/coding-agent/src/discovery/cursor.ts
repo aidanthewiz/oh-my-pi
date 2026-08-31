@@ -26,7 +26,7 @@ import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import {
 	buildRuleFromMarkdown,
 	createSourceMeta,
-	expandEnvVarsDeep,
+	expandEnvVarsDeepForConfigLevel,
 	getProjectPath,
 	getUserPath,
 	loadFilesFromDir,
@@ -52,7 +52,7 @@ function parseMCPServers(
 		return { items, warning: `${path}: missing or invalid 'mcpServers' key` };
 	}
 
-	const servers = expandEnvVarsDeep(parsed.mcpServers);
+	const servers = expandEnvVarsDeepForConfigLevel(parsed.mcpServers, level);
 	for (const [name, config] of Object.entries(servers)) {
 		const serverConfig = config as Record<string, unknown>;
 		items.push({

@@ -10,6 +10,7 @@ import { Process } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import {
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
@@ -27,7 +28,7 @@ function startBroker(projectDir: string, runtimeDir: string): Promise<void> {
 	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
-	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
+	process.env[DAEMON_RUNTIME_DIR_ENV] = daemonBrokerRuntimeDir(runtimeDir);
 	process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
 	const broker = startDaemonBrokerFromEnvironment();
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);

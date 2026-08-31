@@ -78,6 +78,110 @@ function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 
 const launchEnvValues = readLaunchEnv();
 const projectEnvNamesLoadedByOmp = new Set<string>();
+const managedAgentEnvNames = new Set<string>();
+const managedAgentEnvValues = new Set<string>();
+const BUN_NO_ENV_FILE_OPTION = "--no-env-file";
+const BUN_NO_ENV_FILE_OPTION_RE = /(?:^|\s)--no-env-file(?:\s|$)/;
+const skipOmpDotenvFiles = Bun.env.OMP_NO_ENV_FILE === "1" && process.execArgv.includes(BUN_NO_ENV_FILE_OPTION);
+
+function managedEnvName(name: string): string {
+	return process.platform === "win32" ? name.toUpperCase() : name;
+}
+
+export const OPERATIONAL_AWS_ENV_NAMES = [
+	"AWS_PROFILE",
+	"AWS_DEFAULT_PROFILE",
+	"AWS_REGION",
+	"AWS_DEFAULT_REGION",
+	"AWS_ACCESS_KEY_ID",
+	"AWS_ACCESS_KEY",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SECRET_KEY",
+	"AWS_SESSION_TOKEN",
+	"AWS_SECURITY_TOKEN",
+	"AWS_CONFIG_FILE",
+	"AWS_SHARED_CREDENTIALS_FILE",
+	"AWS_SDK_LOAD_CONFIG",
+	"AWS_ROLE_ARN",
+	"AWS_ROLE_SESSION_NAME",
+	"AWS_WEB_IDENTITY_TOKEN_FILE",
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN",
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+	"AWS_EC2_METADATA_SERVICE_ENDPOINT",
+	"AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+	"AMAZON_ACCESS_KEY_ID",
+	"AMAZON_SECRET_ACCESS_KEY",
+	"AMAZON_SESSION_TOKEN",
+] as const;
+const operationalAwsEnvNames = new Set<string>(OPERATIONAL_AWS_ENV_NAMES.map(managedEnvName));
+const trustedOperationalAwsValues = new Map<string, string>();
+const CREDENTIAL_ENV_NAMES = new Set(
+	[
+		"ANTHROPIC_CUSTOM_HEADERS",
+		"CLAUDE_CODE_CLIENT_KEY",
+		"PERPLEXITY_COOKIES",
+		"AZURE_CONFIG_DIR",
+		"CLOUDSDK_CONFIG",
+		"DOCKER_CONFIG",
+		"GH_CONFIG_DIR",
+		"GIT_ASKPASS",
+		"GIT_SSH_COMMAND",
+		"GOOGLE_APPLICATION_CREDENTIALS",
+		"GPG_AGENT_INFO",
+		"KRB5CCNAME",
+		"KRB5_CLIENT_KTNAME",
+		"KRB5_KTNAME",
+		"KUBECONFIG",
+		"NETRC",
+		"NPM_CONFIG_USERCONFIG",
+		"SSH_AGENT_PID",
+		"SSH_ASKPASS",
+		"SSH_AUTH_SOCK",
+	].map(managedEnvName),
+);
+const CREDENTIAL_ENV_NAME_RE =
+	/(?:^|_)(?:ACCESS_KEY(?:_ID)?|API_KEY|BEARER|CREDENTIALS?|PASSWORD|PRIVATE_KEY|SECRET(?:_ACCESS_KEY)?|SESSION_TOKEN|TOKEN)(?:$|_)/;
+
+function hasCredentialValue(name: string): boolean {
+	const classified = name.toUpperCase();
+	return (
+		CREDENTIAL_ENV_NAMES.has(classified) ||
+		CREDENTIAL_ENV_NAME_RE.test(classified) ||
+		classified.startsWith("AWS_SSO_") ||
+		classified.startsWith("OMP_OPERATIONAL_AWS_")
+	);
+}
+
+function isCredentialEnvName(name: string): boolean {
+	const classified = name.toUpperCase();
+	return operationalAwsEnvNames.has(managedEnvName(name)) || hasCredentialValue(classified);
+}
+
+/** Prevent the named values and their current contents from crossing repository child-process boundaries. */
+export function registerChildEnvRedactions(names: Iterable<string>, values: Iterable<string | undefined> = []): void {
+	for (const name of names) {
+		if (isSafeEnvName(name)) managedAgentEnvNames.add(managedEnvName(name));
+	}
+	for (const value of values) {
+		if (value) managedAgentEnvValues.add(value);
+	}
+}
+
+/**
+ * Record exact launcher-captured AWS values. Trusted child modes may preserve
+ * only these values when a repository dotenv assignment is indistinguishable
+ * from Bun's preloaded environment on platforms without launch provenance.
+ */
+export function registerOperationalAwsEnvProvenance(entries: Iterable<readonly [string, string | undefined]>): void {
+	for (const [name, value] of entries) {
+		const normalized = managedEnvName(name);
+		if (!operationalAwsEnvNames.has(normalized)) continue;
+		if (value) trustedOperationalAwsValues.set(normalized, value);
+		else trustedOperationalAwsValues.delete(normalized);
+	}
+}
 
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
 	const expanded: Record<string, string> = {};
@@ -95,12 +199,54 @@ function expandDotenvValues(values: Record<string, string>, env: Record<string, 
 	return expanded;
 }
 
-/** Filters process env for child shells without launch-cwd dotenv values. */
-export function filterChildShellEnv(
+interface ChildEnvPolicy {
+	preserveOperationalAws: boolean;
+	preserveExplicitCredentials: boolean;
+}
+
+function scrubChildCredentials(
+	result: Record<string, string>,
+	protectedValues: ReadonlySet<string>,
+	policy: ChildEnvPolicy,
+	explicitOverlayNames: ReadonlySet<string> = new Set(),
+): void {
+	for (const key in result) {
+		const normalized = managedEnvName(key);
+		const managedName = managedAgentEnvNames.has(normalized);
+		const managedValue = managedAgentEnvValues.has(result[key]);
+		const credentialName = isCredentialEnvName(key);
+		const protectedValue = protectedValues.has(result[key]);
+		const trustedAws =
+			policy.preserveOperationalAws && operationalAwsEnvNames.has(normalized) && !managedName && !managedValue;
+		const explicitCredential =
+			policy.preserveExplicitCredentials &&
+			credentialName &&
+			explicitOverlayNames.has(normalized) &&
+			!managedName &&
+			!managedValue;
+		if (
+			managedName ||
+			managedValue ||
+			(credentialName && !trustedAws && !explicitCredential) ||
+			(protectedValue && !trustedAws && !explicitCredential)
+		) {
+			delete result[key];
+		}
+	}
+}
+
+function filterChildShellEnvInternal(
+	policy: ChildEnvPolicy,
 	env: Record<string, string | undefined>,
-	cwd: string = process.cwd(),
+	cwd: string,
+	overlays: Array<Readonly<Record<string, string | undefined>> | undefined>,
 ): Record<string, string> {
+	const protectedValues = new Set(managedAgentEnvValues);
+	for (const [key, value] of Object.entries(env)) {
+		if (value && hasCredentialValue(key)) protectedValues.add(value);
+	}
 	const result = filterProcessEnv(env);
+	scrubChildCredentials(result, protectedValues, policy);
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const nodeEnvName = `.env.${env.NODE_ENV || "development"}`;
 	const modeEnv = parseEnvFile(path.join(cwd, nodeEnvName));
@@ -112,6 +258,12 @@ export function filterChildShellEnv(
 		...expandDotenvValues(localEnv, result),
 	};
 	for (const key in launchEnv) {
+		const normalized = managedEnvName(key);
+		const trustedOperationalValue =
+			policy.preserveOperationalAws &&
+			operationalAwsEnvNames.has(normalized) &&
+			trustedOperationalAwsValues.get(normalized) === result[key];
+		if (trustedOperationalValue) continue;
 		const launchValue = launchEnvValues?.get(key);
 		if (launchValue !== undefined) {
 			// Launcher-owned name: it keeps the launcher's own value. Bun overwrites
@@ -136,7 +288,79 @@ export function filterChildShellEnv(
 			delete result[key];
 		}
 	}
+	const explicitOverlayNames = new Set<string>();
+	for (const overlay of overlays) {
+		for (const [key, value] of Object.entries(overlay ?? {})) {
+			explicitOverlayNames.add(managedEnvName(key));
+			if (value === undefined) delete result[key];
+			else result[key] = value;
+		}
+	}
+	scrubChildCredentials(result, protectedValues, policy, explicitOverlayNames);
+	const hasExplicitAwsCredentials =
+		policy.preserveExplicitCredentials &&
+		Array.from(explicitOverlayNames).some(
+			name =>
+				operationalAwsEnvNames.has(name) &&
+				name !== managedEnvName("AWS_REGION") &&
+				name !== managedEnvName("AWS_DEFAULT_REGION"),
+		);
+	if (!policy.preserveOperationalAws && !hasExplicitAwsCredentials) {
+		result.AWS_CONFIG_FILE = os.devNull;
+		result.AWS_SHARED_CREDENTIALS_FILE = os.devNull;
+		result.AWS_EC2_METADATA_DISABLED = "true";
+	}
+	// Bun autoloads cwd dotenv files after exec, which can repopulate values
+	// removed above. BUN_OPTIONS also covers Bun shebang executables whose argv
+	// cannot be amended at this spawn boundary.
+	const bunOptions = result.BUN_OPTIONS?.trim();
+	if (!bunOptions || !BUN_NO_ENV_FILE_OPTION_RE.test(bunOptions)) {
+		result.BUN_OPTIONS = bunOptions ? `${bunOptions} ${BUN_NO_ENV_FILE_OPTION}` : BUN_NO_ENV_FILE_OPTION;
+	}
+	result.OMP_NO_ENV_FILE = "1";
 	return result;
+}
+
+/** Builds a minimal environment for repository-controlled child processes. */
+export function filterChildShellEnv(
+	env: Record<string, string | undefined>,
+	cwd: string = process.cwd(),
+	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
+): Record<string, string> {
+	return filterChildShellEnvInternal(
+		{ preserveOperationalAws: false, preserveExplicitCredentials: false },
+		env,
+		cwd,
+		overlays,
+	);
+}
+
+/** Preserves ambient operational AWS selectors for repository shell commands. */
+export function filterTrustedChildShellEnv(
+	env: Record<string, string | undefined>,
+	cwd: string = process.cwd(),
+	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
+): Record<string, string> {
+	return filterChildShellEnvInternal(
+		{ preserveOperationalAws: true, preserveExplicitCredentials: false },
+		env,
+		cwd,
+		overlays,
+	);
+}
+
+/** Permits credentials explicitly configured by trusted user-level MCP config. */
+export function filterUserMcpChildEnv(
+	env: Record<string, string | undefined>,
+	cwd: string = process.cwd(),
+	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
+): Record<string, string> {
+	return filterChildShellEnvInternal(
+		{ preserveOperationalAws: false, preserveExplicitCredentials: true },
+		env,
+		cwd,
+		overlays,
+	);
 }
 
 /**
@@ -193,11 +417,14 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
-const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+// `filterChildShellEnv` pairs its private sentinel with Bun's launch-time
+// `--no-env-file` option. Requiring both prevents a repository `.env` from
+// forging the sentinel after process launch while also blocking OMP's explicit
+// home/config/profile/project loaders in filtered Bun descendants.
+const homeEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(os.homedir(), ".env"));
+const piEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getConfigRootDir(), ".env"));
+const agentEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getAgentDir(), ".env"));
+const projectEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(process.cwd(), ".env"));
 
 // Scrub ambient entries that can't be forwarded to a native execve spawn
 // (bad names, NUL values) or are macOS malloc toggles we never propagate.
@@ -269,6 +496,7 @@ if (managedDotenv) {
 		const value = agentEnv[key];
 		if (value === "") continue; // placeholder — let the ambient value (if any) stand
 		Bun.env[key] = value;
+		managedAgentEnvNames.add(managedEnvName(key));
 	}
 } else {
 	// Upstream default: ambient wins; files fill gaps, most-specific first.

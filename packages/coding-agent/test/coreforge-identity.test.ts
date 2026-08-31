@@ -20,7 +20,9 @@ import { validateCoreforgeEntraConfig } from "@oh-my-pi/pi-coding-agent/identity
 import {
 	applyCoreforgeIdentityProviderDefaults,
 	resolveCoreforgeEntraConfig,
+	restoreCoreforgeOperationalAwsEnvironment,
 } from "@oh-my-pi/pi-coding-agent/identity/runtime";
+import { OPERATIONAL_AWS_ENV_NAMES } from "@oh-my-pi/pi-utils";
 
 const TENANT_ID = "11111111-2222-4333-8444-555555555555";
 const CLIENT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -188,6 +190,73 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 	});
 
+	it("keeps managed and operational credentials out of repository child environments", async () => {
+		const script = `
+			import {
+				AWS_MODEL_PROFILE_ENV,
+				AWS_MODEL_REGION_ENV,
+			} from "@oh-my-pi/pi-ai";
+			import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+			import { applyCoreforgeIdentityProviderDefaults } from "@oh-my-pi/pi-coding-agent/identity/runtime";
+			import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
+
+			const settings = Settings.isolated({
+				"identity.entra.enabled": true,
+				"identity.entra.tenantId": "${TENANT_ID}",
+				"identity.entra.clientId": "${CLIENT_ID}",
+				"identity.aws.profile": "managed-coreforge",
+				"identity.aws.region": "us-east-1",
+				"identity.claude.workspaceId": "wrkspc_sensitive",
+				"identity.claude.baseUrl": "https://aws-external-anthropic.us-east-1.api.aws",
+			});
+			applyCoreforgeIdentityProviderDefaults(settings, Bun.env, () => ({}));
+			const child = filterChildShellEnv(Bun.env, process.cwd(), {
+				LEAKED_WORKSPACE: Bun.env.ANTHROPIC_AWS_WORKSPACE_ID,
+				SCOPE: "global",
+				REGION_LABEL: "us-east-1",
+			});
+			const modelKeys = [
+				AWS_MODEL_PROFILE_ENV,
+				AWS_MODEL_REGION_ENV,
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+			];
+			process.stdout.write(JSON.stringify({
+				exposedModelKeys: modelKeys.filter((key) => child[key] !== undefined),
+				exposedRenamedKeys: ["LEAKED_WORKSPACE"].filter((key) => child[key] !== undefined),
+				scope: child.SCOPE,
+				regionLabel: child.REGION_LABEL,
+				awsProfile: child.AWS_PROFILE,
+				awsRegion: child.AWS_REGION,
+			}));
+		`;
+		const proc = Bun.spawn([process.execPath, "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			env: {
+				PATH: Bun.env.PATH,
+				HOME: Bun.env.HOME,
+				BUN_OPTIONS: "--no-env-file",
+				OMP_NO_ENV_FILE: "1",
+				AWS_PROFILE: "employee-ops",
+				AWS_REGION: "us-west-2",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({
+			exposedModelKeys: [],
+			exposedRenamedKeys: [],
+			scope: "global",
+			regionLabel: "us-east-1",
+		});
+	});
+
 	it("prefers the identity's adopted AWS profile name over the settings constant", () => {
 		const settings = identitySettings();
 		const env: Record<string, string | undefined> = {};
@@ -203,6 +272,49 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		applyCoreforgeIdentityProviderDefaults(settings, env, () => profile);
 		expect(env.AWS_PROFILE).toBeUndefined();
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("my-own-name");
+	});
+
+	it("removes a reserved model profile from the AWS default-profile alias", () => {
+		const settings = identitySettings();
+		const env: Record<string, string | undefined> = {
+			AWS_DEFAULT_PROFILE: "my-own-name",
+		};
+		const profile = sampleProfile({
+			aws: {
+				profile: "my-own-name",
+				region: "us-east-1",
+				accountId: "891455110252",
+				roleArn: "arn:test",
+				validatedAt: Date.now(),
+			},
+		});
+
+		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => profile);
+
+		expect(env.AWS_DEFAULT_PROFILE).toBeUndefined();
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("my-own-name");
+		expect(result.removedManagedAwsProfile).toBe(true);
+	});
+
+	it("restores the full launcher-captured AWS chain and removes every alias", () => {
+		const env: Record<string, string | undefined> = {
+			AWS_PROFILE: "managed-model-profile",
+			AWS_REGION: "managed-model-region",
+		};
+		for (const key of OPERATIONAL_AWS_ENV_NAMES) {
+			env[`OMP_OPERATIONAL_${key}_SET`] = "1";
+			env[`OMP_OPERATIONAL_${key}`] = `launcher-${key}`;
+		}
+
+		restoreCoreforgeOperationalAwsEnvironment(env);
+
+		for (const key of OPERATIONAL_AWS_ENV_NAMES) {
+			expect(env[key]).toBe(`launcher-${key}`);
+			expect(env[`OMP_OPERATIONAL_${key}_SET`]).toBeUndefined();
+			expect(env[`OMP_OPERATIONAL_${key}`]).toBeUndefined();
+		}
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("managed-model-profile");
+		expect(env[AWS_MODEL_REGION_ENV]).toBe("managed-model-region");
 	});
 
 	it("clears ambient model-auth envs while preserving the operational AWS chain", () => {

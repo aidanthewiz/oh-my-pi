@@ -1,6 +1,11 @@
 /**
  * Cross-process daemon broker protocol shared by the tool, client, and broker.
  */
+/**
+ * Wire and runtime namespace version. Increment for any compatibility or
+ * security-boundary change that must not reuse brokers from older engines.
+ */
+export const DAEMON_BROKER_PROTOCOL_VERSION = 2;
 /** Hidden CLI selector used to re-enter the daemon broker worker. */
 export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
 
@@ -96,7 +101,7 @@ export type DaemonOperation =
 
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
-	| { op: "ping"; projectDir: string }
+	| { op: "ping"; projectDir: string; protocolVersion: number }
 	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
@@ -120,6 +125,7 @@ export type DaemonRpcResult =
 
 /** Authenticated request envelope used by socket clients. */
 export interface DaemonWireRequest {
+	protocolVersion: number;
 	id: string;
 	token: string;
 	owners?: string[];
@@ -282,8 +288,15 @@ export function parseDaemonSnapshot(value: unknown): DaemonSnapshot {
 /** Decode a socket request before the broker acts on it. */
 export function parseDaemonWireRequest(value: unknown): DaemonWireRequest {
 	const source = record(value, "daemon request");
+	const protocolVersion = numberValue(source.protocolVersion, "request.protocolVersion");
+	if (protocolVersion !== DAEMON_BROKER_PROTOCOL_VERSION) {
+		throw new Error(
+			`Unsupported daemon broker protocol ${protocolVersion}; expected ${DAEMON_BROKER_PROTOCOL_VERSION}`,
+		);
+	}
 	return {
 		id: stringValue(source.id, "request.id"),
+		protocolVersion,
 		token: stringValue(source.token, "request.token"),
 		owners: source.owners === undefined ? undefined : stringArray(source.owners, "request.owners"),
 		detachedOwners:
@@ -399,7 +412,11 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 	const source = record(value, `${operation.op} result`);
 	switch (operation.op) {
 		case "ping":
-			return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir") };
+			return {
+				op: "ping",
+				projectDir: stringValue(source.projectDir, "result.projectDir"),
+				protocolVersion: numberValue(source.protocolVersion, "result.protocolVersion"),
+			};
 		case "start":
 			return {
 				op: "start",

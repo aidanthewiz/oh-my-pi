@@ -16,7 +16,7 @@ import { logger, ptree } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../../jsonrpc/message-framing";
 import { daemonClientForProject } from "../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
-import { daemonRuntimeDir } from "../../launch/paths";
+import { daemonBrokerRuntimeDir, daemonRuntimeDir } from "../../launch/paths";
 import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../../subprocess/worker-client";
 import type { LspJsonRpcRequest, LspJsonRpcResponse, LspTransport, LspWriteSink } from "../types";
 import {
@@ -225,7 +225,7 @@ async function probeMux(endpoint: string): Promise<boolean> {
  */
 async function ensureLspMuxDaemon(projectDir: string, signal?: AbortSignal): Promise<string | null> {
 	const client = await daemonClientForProject(projectDir);
-	const endpoint = lspMuxEndpoint(client.projectDir, daemonRuntimeDir(client.projectDir));
+	const endpoint = lspMuxEndpoint(client.projectDir, daemonBrokerRuntimeDir(daemonRuntimeDir(client.projectDir)));
 	// The broker connection doubles as the presence lease keeping the daemon alive.
 	await client.request({ op: "ping" }, signal);
 	if (await probeMux(endpoint)) return endpoint;

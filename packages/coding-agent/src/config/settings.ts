@@ -58,15 +58,15 @@ export * from "./settings-schema";
 
 /**
  * Org-managed settings overlay filename, resolved against the agent directory
- * (`<agentDir>/config.managed.yml`). When present it is loaded as an extra
- * settings layer that overrides `config.yml`/project/CLI overlays but stays
- * below runtime overrides, so a managed distribution (e.g. the coreforge
- * launcher's profile) can pin org policy — model roles, share server — while
- * per-session switches and CLI flags keep working. The engine only ever READS
- * this file; distribution tooling ships it (symlink or copy). Absent file =
- * upstream behaviour, byte-identical.
+ * (`<agentDir>/config.managed.yml`). `OMP_MANAGED_CONFIG_FILE` can select a
+ * different read-only overlay for one invocation, such as an isolated catalog
+ * refresh that must not use the profile's normal model backend. The layer
+ * overrides `config.yml`/project/CLI overlays but stays below runtime
+ * overrides. The engine only reads this file; distribution tooling ships it
+ * as a symlink or copy. An absent file preserves upstream behavior.
  */
 export const MANAGED_CONFIG_FILENAME = "config.managed.yml";
+export const MANAGED_CONFIG_FILE_ENV = "OMP_MANAGED_CONFIG_FILE";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -362,6 +362,8 @@ export class Settings {
 	/** Cached resolved values from the merged view, including defaults/path scoping */
 	#resolvedCache = new Map<SettingPath, unknown>();
 	#editVariantCache: readonly EditVariantEntry[] | undefined;
+	/** Per-instance effective-setting change notifications. */
+	#effectiveSettingSignal = new SettingSignal<[path: SettingPath | undefined]>("effective setting");
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
@@ -394,7 +396,10 @@ export class Settings {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
-		this.#managedPath = options.inMemory ? null : path.join(this.#agentDir, MANAGED_CONFIG_FILENAME);
+		const managedOverride = Bun.env[MANAGED_CONFIG_FILE_ENV]?.trim();
+		this.#managedPath = options.inMemory
+			? null
+			: path.resolve(this.#cwd, expandTilde(managedOverride || path.join(this.#agentDir, MANAGED_CONFIG_FILENAME)));
 		const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
@@ -529,6 +534,11 @@ export class Settings {
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
 
+	/** Subscribe to effective-value changes. `path` is undefined after a full project-scope reload. */
+	onEffectiveSettingChanged(cb: (path: SettingPath | undefined) => void): () => void {
+		return this.#effectiveSettingSignal.on(cb);
+	}
+
 	/**
 	 * Apply runtime overrides (not persisted).
 	 */
@@ -565,6 +575,7 @@ export class Settings {
 
 	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
 		if (Object.is(value, prev)) return;
+		this.#effectiveSettingSignal.fire(path);
 		if (path === "statusLine.sessionAccent") {
 			statusLineSessionAccentSignal.fire();
 		}
@@ -663,6 +674,7 @@ export class Settings {
 		}
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prevModelRoles);
+		this.#effectiveSettingSignal.fire(undefined);
 		this.#fireAllHooks();
 	}
 
@@ -697,6 +709,9 @@ export class Settings {
 		}
 		if (Object.hasOwn(this.#configOverlay, "shellPath")) {
 			configSource = this.#overlayShellPathSource ?? "the active config overlay";
+		}
+		if (Object.hasOwn(this.#managed, "shellPath")) {
+			configSource = this.#managedPath ?? "the managed settings overlay";
 		}
 		if (Object.hasOwn(this.#overrides, "shellPath")) {
 			configSource = "the runtime settings override";

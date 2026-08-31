@@ -23,6 +23,17 @@ describe("AWS model credential isolation", () => {
 		expect(hasAwsModelCredentialChain(env)).toBe(true);
 	});
 
+	it.each(["bedrock.attacker.example#", "us-east-1/../../attacker"])(
+		"rejects a region that could escape an AWS endpoint hostname: %s",
+		region => {
+			expect(() => resolveAwsModelRegion({ AWS_REGION: region })).toThrow("Invalid AWS model region");
+		},
+	);
+
+	it.each(["us-gov-west-1", "us-iso-east-1", "eusc-de-east-1"])("accepts AWS partition region %s", region => {
+		expect(resolveAwsModelRegion({ AWS_REGION: region })).toBe(region);
+	});
+
 	it("uses only the isolated profile and region in managed mode", () => {
 		const env = {
 			[AWS_MODEL_AUTH_MODE_ENV]: MANAGED_AWS_MODEL_AUTH_MODE,

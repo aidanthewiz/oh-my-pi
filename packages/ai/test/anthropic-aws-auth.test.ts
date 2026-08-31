@@ -26,6 +26,9 @@ const AWS_ENV_KEYS = [
 	"AWS_SESSION_TOKEN",
 	"AWS_PROFILE",
 	"ANTHROPIC_AWS_INFERENCE_GEO",
+	"OMP_MODEL_AWS_AUTH_MODE",
+	"OMP_MODEL_AWS_PROFILE",
+	"OMP_MODEL_AWS_REGION",
 ] as const;
 
 const savedEnv: Record<string, string | undefined> = {};

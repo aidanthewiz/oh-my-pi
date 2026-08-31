@@ -6,13 +6,14 @@
  *
  * Priority: 5 (low, as this is a fallback after tool-specific providers)
  */
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { logger, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { createSourceMeta, expandEnvVarsDeep, parseRequestIdFormat } from "./helpers";
+import { createSourceMeta, expandEnvVarsDeepForConfigLevel, parseRequestIdFormat } from "./helpers";
 
 const PROVIDER_ID = "mcp-json";
 const DISPLAY_NAME = "MCP Config";
@@ -56,7 +57,7 @@ interface MCPConfigFile {
 /**
  * Transform raw MCP config to canonical MCPServer format.
  */
-function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServer[] {
+function transformMCPConfig(config: MCPConfigFile, source: SourceMeta & { level: "user" | "project" }): MCPServer[] {
 	const servers: MCPServer[] = [];
 
 	if (config.mcpServers) {
@@ -110,14 +111,14 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 			};
 
 			// Expand environment variables
-			if (server.command) server.command = expandEnvVarsDeep(server.command);
-			if (server.args) server.args = expandEnvVarsDeep(server.args);
-			if (server.env) server.env = expandEnvVarsDeep(server.env);
-			if (server.cwd) server.cwd = expandEnvVarsDeep(server.cwd);
-			if (server.url) server.url = expandEnvVarsDeep(server.url);
-			if (server.headers) server.headers = expandEnvVarsDeep(server.headers);
-			if (server.auth) server.auth = expandEnvVarsDeep(server.auth);
-			if (server.oauth) server.oauth = expandEnvVarsDeep(server.oauth);
+			if (server.command) server.command = expandEnvVarsDeepForConfigLevel(server.command, source.level);
+			if (server.args) server.args = expandEnvVarsDeepForConfigLevel(server.args, source.level);
+			if (server.env) server.env = expandEnvVarsDeepForConfigLevel(server.env, source.level);
+			if (server.cwd) server.cwd = expandEnvVarsDeepForConfigLevel(server.cwd, source.level);
+			if (server.url) server.url = expandEnvVarsDeepForConfigLevel(server.url, source.level);
+			if (server.headers) server.headers = expandEnvVarsDeepForConfigLevel(server.headers, source.level);
+			if (server.auth) server.auth = expandEnvVarsDeepForConfigLevel(server.auth, source.level);
+			if (server.oauth) server.oauth = expandEnvVarsDeepForConfigLevel(server.oauth, source.level);
 			servers.push(server);
 		}
 	}
@@ -147,7 +148,10 @@ export async function loadMCPJsonFile(
 		return { items, warnings };
 	}
 
-	const source = createSourceMeta(providerId, path, level);
+	const source = {
+		...createSourceMeta(providerId, path, level),
+		contentSha256: createHash("sha256").update(content).digest("hex"),
+	};
 	const servers = transformMCPConfig(config, source);
 	items.push(...servers);
 

@@ -2,7 +2,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env } from "@oh-my-pi/pi-utils";
-import { allowAmbientAwsModelCredentials, resolveAwsModelProfile, resolveAwsModelRegion } from "../aws-model-auth";
+import {
+	allowAmbientAwsModelCredentials,
+	assertAwsModelRegion,
+	resolveAwsModelProfile,
+	resolveAwsModelRegion,
+} from "../aws-model-auth";
 
 /** INI sections with `profile ` / `sso-session ` prefixes normalized. */
 export type AwsIniFile = Record<string, Record<string, string>>;
@@ -67,13 +72,14 @@ export function resolveAwsProfileRegion(profile?: string): string | undefined {
 
 /** Region selected by the environment or active shared-config profile. */
 export function resolveAwsAmbientRegion(profile?: string): string | undefined {
-	return resolveAwsModelRegion() || resolveAwsProfileRegion(profile);
+	const region = resolveAwsModelRegion() || resolveAwsProfileRegion(profile);
+	return region ? assertAwsModelRegion(region) : undefined;
 }
 
 /** Resolve the region precedence shared by AWS transports and credential exchanges. */
 export function resolveAwsRegion(explicitRegion?: string, profile?: string): string {
 	const selectedRegion = allowAmbientAwsModelCredentials() ? explicitRegion : undefined;
-	return selectedRegion || resolveAwsAmbientRegion(profile) || "us-east-1";
+	return assertAwsModelRegion(selectedRegion || resolveAwsAmbientRegion(profile) || "us-east-1");
 }
 
 export function hasConfiguredAwsProfile(profile?: string): boolean {

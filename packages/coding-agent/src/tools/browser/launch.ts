@@ -1,7 +1,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, getPuppeteerDir, logger, removeWithRetries } from "@oh-my-pi/pi-utils";
+import {
+	$which,
+	filterChildShellEnv,
+	getProjectDir,
+	getPuppeteerDir,
+	logger,
+	removeWithRetries,
+} from "@oh-my-pi/pi-utils";
 import type * as BrowsersNs from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
 import stealthTamperingScript from "../puppeteer/00_stealth_tampering.txt" with { type: "text" };
@@ -133,7 +140,7 @@ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const sysChrome = resolveSystemChromium();
 	if (sysChrome) return sysChrome;
-	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+	const envPath = filterChildShellEnv(Bun.env, getProjectDir()).PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
 	if (chromiumExecutablePromise) return chromiumExecutablePromise;
 
@@ -354,6 +361,7 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 			headless: opts.headless,
 			defaultViewport: opts.headless ? initialViewport : null,
 			executablePath,
+			env: filterChildShellEnv(Bun.env, getProjectDir()),
 			args: launchArgs,
 			ignoreDefaultArgs: [
 				...new Set([...stealthIgnoreDefaultArgs(executablePath), ...(opts.ignoreDefaultArgs ?? [])]),

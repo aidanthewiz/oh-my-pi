@@ -26,13 +26,20 @@ import {
 	subscribeToResources,
 	unsubscribeFromResources,
 } from "./client";
-import { type LoadMCPConfigsResult, loadAllMCPConfigs, validateServerConfig } from "./config";
+import {
+	type LoadMCPConfigsResult,
+	loadAllMCPConfigs,
+	resolveMCPChildCredentialPolicy,
+	validateServerConfig,
+} from "./config";
 import {
 	lookupMcpOAuthCredential,
+	lookupProjectMcpOAuthCredential,
 	type MCPOAuthCredentialLookup,
 	selectMcpOAuthRefreshMaterial,
 } from "./oauth-credentials";
 import { type MCPStoredOAuthCredential, refreshMCPOAuthToken } from "./oauth-flow";
+import type { MCPProjectTrustHandler } from "./project-trust";
 import type { McpConnectionStatusEvent } from "./startup-events";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
@@ -83,6 +90,16 @@ function getInitialAuthChallenge(error: unknown, config: MCPServerConfig): MCPAu
 
 function isAuthRefreshableMCPTransport(transport: MCPTransport): transport is AuthRefreshableMCPTransport {
 	return "onAuthError" in transport;
+}
+
+function lookupMcpOAuthCredentialForSource(
+	authStorage: AuthStorage | null | undefined,
+	config: MCPServerConfig,
+	sourceLevel: SourceMeta["level"] | undefined,
+): MCPOAuthCredentialLookup | undefined {
+	return sourceLevel === "project"
+		? lookupProjectMcpOAuthCredential(authStorage, config)
+		: lookupMcpOAuthCredential(authStorage, config);
 }
 type TrackedPromise<T> = {
 	promise: Promise<T>;
@@ -181,10 +198,10 @@ export interface MCPLoadResult {
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
+	/** Requests one-time approval for repository-owned .coreforge/mcp.json */
+	requestProjectTrust?: MCPProjectTrustHandler;
 	/** Allowlist of discovery provider ids whose MCP servers load (empty/omitted = all providers) */
 	discoveryProviders?: string[];
-	/** GitHub organizations trusted to load .coreforge/mcp.json while project config is disabled */
-	trustedProjectGitHubOrganizations?: string[];
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
@@ -552,8 +569,8 @@ export class MCPManager {
 		try {
 			loadedConfigs = await loadAllMCPConfigs(this.cwd, {
 				enableProjectConfig: options?.enableProjectConfig,
+				requestProjectTrust: options?.requestProjectTrust,
 				discoveryProviders: options?.discoveryProviders,
-				trustedProjectGitHubOrganizations: options?.trustedProjectGitHubOrganizations,
 				filterExa: options?.filterExa,
 				filterBrowser: options?.filterBrowser,
 			});
@@ -636,8 +653,10 @@ export class MCPManager {
 
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			let connectionConfig = config;
+			const source = sources[name];
+			const sourceLevel = source?.level;
 			const connectWithConfig = async (candidateConfig: MCPServerConfig): Promise<MCPServerConnection> => {
-				const resolvedConfig = await this.#resolveAuthConfig(candidateConfig);
+				const resolvedConfig = await this.#resolveAuthConfig(candidateConfig, { sourceLevel });
 				return connectToServer(name, resolvedConfig, {
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
@@ -645,6 +664,7 @@ export class MCPManager {
 					onRequest: (method, params) => {
 						return this.#handleServerRequest(method, params);
 					},
+					...resolveMCPChildCredentialPolicy(name, resolvedConfig, source),
 				});
 			};
 			const connectionPromise = (async () => {
@@ -681,10 +701,13 @@ export class MCPManager {
 					// too and need the same mid-session refresh hook.
 					if (
 						isAuthRefreshableMCPTransport(connection.transport) &&
-						lookupMcpOAuthCredential(this.#authStorage, connectionConfig)
+						lookupMcpOAuthCredentialForSource(this.#authStorage, connectionConfig, sourceLevel)
 					) {
 						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(connectionConfig, { forceRefresh: true });
+							const refreshed = await this.#resolveAuthConfig(connectionConfig, {
+								forceRefresh: true,
+								sourceLevel,
+							});
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -1013,7 +1036,10 @@ export class MCPManager {
 	 * Pass `oauth: false` to skip OAuth credential injection (used by reauth's
 	 * unauthenticated probe, which must observe the server's bare 401).
 	 */
-	async prepareConfig(config: MCPServerConfig, options?: { oauth?: boolean }): Promise<MCPServerConfig> {
+	async prepareConfig(
+		config: MCPServerConfig,
+		options?: { oauth?: boolean; sourceLevel?: SourceMeta["level"] },
+	): Promise<MCPServerConfig> {
 		return this.#resolveAuthConfig(config, options);
 	}
 
@@ -1263,7 +1289,7 @@ export class MCPManager {
 		source: SourceMeta | undefined,
 		reconnectEpoch: number,
 	): Promise<MCPServerConnection> {
-		const resolvedConfig = await this.#resolveAuthConfig(config);
+		const resolvedConfig = await this.#resolveAuthConfig(config, { sourceLevel: source?.level });
 		const connection = await connectToServer(name, resolvedConfig, {
 			onNotification: (method, params) => {
 				this.#handleServerNotification(name, method, params);
@@ -1271,6 +1297,7 @@ export class MCPManager {
 			onRequest: (method, params) => {
 				return this.#handleServerRequest(method, params);
 			},
+			...resolveMCPChildCredentialPolicy(name, resolvedConfig, source),
 		});
 
 		connection.config = config;
@@ -1287,9 +1314,15 @@ export class MCPManager {
 
 		// Wire auth refresh for HTTP-like transports, and reconnect for any transport.
 		// Same gate as connectServers: any resolvable managed credential.
-		if (isAuthRefreshableMCPTransport(connection.transport) && lookupMcpOAuthCredential(this.#authStorage, config)) {
+		if (
+			isAuthRefreshableMCPTransport(connection.transport) &&
+			lookupMcpOAuthCredentialForSource(this.#authStorage, config, source?.level)
+		) {
 			connection.transport.onAuthError = async () => {
-				const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+				const refreshed = await this.#resolveAuthConfig(config, {
+					forceRefresh: true,
+					sourceLevel: source?.level,
+				});
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
@@ -1553,13 +1586,16 @@ export class MCPManager {
 	 */
 	async #resolveAuthConfig(
 		config: MCPServerConfig,
-		opts?: { forceRefresh?: boolean; oauth?: boolean },
+		opts?: { forceRefresh?: boolean; oauth?: boolean; sourceLevel?: SourceMeta["level"] },
 	): Promise<MCPServerConfig> {
 		let resolved: MCPServerConfig = { ...config };
 
 		const auth = config.auth;
+		const refreshAuth = opts?.sourceLevel === "project" ? undefined : auth;
 		const lookup: MCPOAuthCredentialLookup | undefined =
-			opts?.oauth !== false ? lookupMcpOAuthCredential(this.#authStorage, config) : undefined;
+			opts?.oauth !== false
+				? lookupMcpOAuthCredentialForSource(this.#authStorage, config, opts?.sourceLevel)
+				: undefined;
 		if (lookup && this.#authStorage) {
 			const { credentialId } = lookup;
 			try {
@@ -1573,14 +1609,14 @@ export class MCPManager {
 						forceRefresh: opts?.forceRefresh,
 						refreshSkewMs: REFRESH_BUFFER_MS,
 						canRefresh: current => {
-							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const material = selectMcpOAuthRefreshMaterial(current, refreshAuth);
 							return Boolean(current.refresh && material?.tokenUrl);
 						},
 						refresh: (current, signal) => {
 							if (current.refresh === REMOTE_REFRESH_SENTINEL) {
 								throw new Error("MCP OAuth refresh token is broker-redacted; local refresh is unavailable");
 							}
-							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const material = selectMcpOAuthRefreshMaterial(current, refreshAuth);
 							const tokenUrl = material?.tokenUrl;
 							if (!current.refresh || !tokenUrl) {
 								throw new Error("MCP OAuth credential is missing refresh material");
@@ -1599,7 +1635,7 @@ export class MCPManager {
 							});
 						},
 						mergeRefreshedCredential: (current, refreshed) => {
-							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const material = selectMcpOAuthRefreshMaterial(current, refreshAuth);
 							const tokenUrl = material?.tokenUrl;
 							const clientId = material?.clientId;
 							const clientSecret = material?.clientSecret;
@@ -1666,7 +1702,7 @@ export class MCPManager {
 			if (resolved.env) {
 				const nextEnv: Record<string, string> = {};
 				for (const [key, value] of Object.entries(resolved.env)) {
-					const resolvedValue = await resolveConfigValue(value);
+					const resolvedValue = opts?.sourceLevel === "project" ? value : await resolveConfigValue(value);
 					if (resolvedValue) nextEnv[key] = resolvedValue;
 				}
 				resolved = { ...resolved, env: nextEnv };
@@ -1675,7 +1711,7 @@ export class MCPManager {
 			if (resolved.headers) {
 				const nextHeaders: Record<string, string> = {};
 				for (const [key, value] of Object.entries(resolved.headers)) {
-					const resolvedValue = await resolveConfigValue(value);
+					const resolvedValue = opts?.sourceLevel === "project" ? value : await resolveConfigValue(value);
 					if (resolvedValue) nextHeaders[key] = resolvedValue;
 				}
 				resolved = { ...resolved, headers: nextHeaders };

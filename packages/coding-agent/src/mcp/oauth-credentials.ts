@@ -73,6 +73,28 @@ export function lookupMcpOAuthCredential(
 	return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url);
 }
 
+/**
+ * Project configuration may reuse only an OAuth credential minted for the
+ * exact HTTP endpoint. It cannot name another stored credential or expand the
+ * endpoint through the credential-bearing process environment.
+ */
+export function lookupProjectMcpOAuthCredential(
+	authStorage: AuthStorage | null | undefined,
+	config: MCPServerConfig,
+): MCPOAuthCredentialLookup | undefined {
+	if (
+		!authStorage ||
+		(config.type !== "http" && config.type !== "sse") ||
+		config.auth?.type === "apikey" ||
+		hasMcpAuthorizationHeader(config)
+	) {
+		return undefined;
+	}
+	const credentialId = mcpOAuthCredentialId(config.url);
+	const credential = authStorage.get(credentialId);
+	return credential?.type === "oauth" ? { credentialId, credential } : undefined;
+}
+
 export function selectMcpOAuthRefreshMaterial(
 	credential: MCPStoredOAuthCredential,
 	auth: MCPAuthConfig | undefined,

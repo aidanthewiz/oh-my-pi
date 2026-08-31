@@ -107,12 +107,12 @@ describe("/mcp auth commands", () => {
 	beforeEach(async () => {
 		projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-reauth-project-"));
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-reauth-agent-"));
-		configPath = path.join(projectDir, ".mcp.json");
 		originalMcpHost = Bun.env.MCP_HOST;
 		Bun.env.MCP_HOST = "mcp.example.com";
 		process.env.MCP_HOST = "mcp.example.com";
 		setProjectDir(projectDir);
 		setAgentDir(agentDir);
+		configPath = getMCPConfigPath("user", projectDir);
 		await Bun.write(
 			configPath,
 			`${JSON.stringify(
@@ -167,6 +167,10 @@ describe("/mcp auth commands", () => {
 		expect(connectToServer).toHaveBeenCalledWith(
 			expect.any(String),
 			expect.objectContaining({ url: EXPANDED_SERVER_URL }),
+			expect.objectContaining({
+				preserveExplicitCredentials: true,
+				preserveOperationalAws: false,
+			}),
 		);
 		expect(authStorage.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
 			type: "oauth",
@@ -617,7 +621,7 @@ describe("/mcp auth commands", () => {
 		});
 		const { controller, showError } = createController(authStorage, {
 			getServerConfig: vi.fn(() => ({ type: "http", url: EXPANDED_SERVER_URL })),
-			getSource: vi.fn(() => ({ provider: "test", path: "/tmp/discovered.json" })),
+			getSource: vi.fn(() => ({ provider: "test", path: "/tmp/discovered.json", level: "user" })),
 		});
 
 		await controller.handle("/mcp unauth discovered");

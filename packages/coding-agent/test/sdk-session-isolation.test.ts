@@ -402,6 +402,85 @@ describe("createAgentSession session storage isolation", () => {
 		});
 	});
 
+	it("protects credential settings rotated during an active session", async () => {
+		await withClearedSecretEnv(async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-settings-secret-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwd = path.join(tempDir, "project");
+			const agentDir = path.join(tempDir, "agent");
+			fs.mkdirSync(cwd, { recursive: true });
+			const oldToken = "broker-token-before-rotation";
+			const newToken = "broker-token-after-rotation";
+			const settings = Settings.isolated();
+			settings.set("auth.broker.token", oldToken);
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				modelRegistry: sharedModelRegistry,
+				settings,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			const obfuscator = session.obfuscator;
+			try {
+				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
+				settings.set("auth.broker.token", newToken);
+				expect(obfuscator?.obfuscate(newToken)).not.toContain(newToken);
+				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
+			} finally {
+				await session.dispose();
+			}
+			const postDisposeToken = "broker-token-after-dispose";
+			settings.set("auth.broker.token", postDisposeToken);
+			expect(obfuscator?.obfuscate(postDisposeToken)).toBe(postDisposeToken);
+		});
+	});
+
+	it("protects credential settings introduced by a project-scope reload", async () => {
+		await withClearedSecretEnv(async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-reload-secret-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const projectA = path.join(tempDir, "project-a");
+			const projectB = path.join(tempDir, "project-b");
+			const agentDir = path.join(tempDir, "agent");
+			fs.mkdirSync(projectA, { recursive: true });
+			fs.mkdirSync(path.join(projectB, ".omp"), { recursive: true });
+			const oldToken = "broker-token-before-project-move";
+			const newToken = "broker-token-after-project-move";
+			fs.writeFileSync(path.join(projectB, ".omp", "config.yml"), `auth:\n  broker:\n    token: ${newToken}\n`);
+			const settings = await Settings.loadIsolated({ cwd: projectA, agentDir });
+			settings.set("auth.broker.token", oldToken);
+			const { session } = await createAgentSession({
+				cwd: projectA,
+				agentDir,
+				modelRegistry: sharedModelRegistry,
+				settings,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			const obfuscator = session.obfuscator;
+			try {
+				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
+				await settings.reloadForCwd(projectB);
+				expect(settings.get("auth.broker.token")).toBe(newToken);
+				expect(obfuscator?.obfuscate(newToken)).not.toContain(newToken);
+				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
+			} finally {
+				await session.dispose();
+			}
+		});
+	});
+
 	it("restores keyed assistant placeholders across reloads", async () => {
 		await withClearedSecretEnv(async () => {
 			await withTempConfigRoot(async () => {

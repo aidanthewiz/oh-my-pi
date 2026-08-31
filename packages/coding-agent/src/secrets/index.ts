@@ -4,7 +4,14 @@ import * as path from "node:path";
 import { SENSITIVE_TOKEN_RE } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { getSecretPlaceholderKeyPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
-import { regexHasUnresolvableShortMatchFallback, type SecretEntry, sanitizeSecretFriendlyName } from "./obfuscator";
+import type { Settings } from "../config/settings";
+import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
+import {
+	MIN_OBFUSCATE_SECRET_LEN,
+	regexHasUnresolvableShortMatchFallback,
+	type SecretEntry,
+	sanitizeSecretFriendlyName,
+} from "./obfuscator";
 import { compileSecretRegex } from "./regex";
 
 const PLACEHOLDER_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -194,6 +201,33 @@ export function collectEnvSecrets(): SecretEntry[] {
 		if (seen.has(value)) continue;
 		seen.add(value);
 		entries.push({ type: "plain", content: value, mode: "obfuscate" });
+	}
+	return entries;
+}
+
+const CONFIG_CREDENTIAL_REPLACEMENT = "[CONFIG_CREDENTIAL_REDACTED]";
+
+/** Collect effective values for every setting declared as a credential. */
+export function collectSettingsSecrets(settings: Pick<Settings, "get">): SecretEntry[] {
+	const entries: SecretEntry[] = [];
+	const seen = new Set<string>();
+	for (const [rawPath, definition] of Object.entries(SETTINGS_SCHEMA)) {
+		if (!("credential" in definition) || definition.credential !== true) continue;
+		const settingPath = rawPath as SettingPath;
+		const value = settings.get(settingPath) as unknown;
+		if (typeof value !== "string" || value.length === 0 || seen.has(value)) continue;
+		seen.add(value);
+		entries.push(
+			value.length >= MIN_OBFUSCATE_SECRET_LEN
+				? { type: "plain", content: value, mode: "obfuscate", friendlyName: settingPath }
+				: {
+						type: "plain",
+						content: value,
+						mode: "replace",
+						replacement: CONFIG_CREDENTIAL_REPLACEMENT,
+						friendlyName: settingPath,
+					},
+		);
 	}
 	return entries;
 }

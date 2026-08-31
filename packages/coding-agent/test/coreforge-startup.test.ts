@@ -11,6 +11,7 @@ import {
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CoreforgeIdentityStore } from "@oh-my-pi/pi-coding-agent/identity/coreforge-store";
 import { ensureCoreforgeIdentityAtStartup } from "@oh-my-pi/pi-coding-agent/identity/startup";
+import { filterChildShellEnv, filterTrustedChildShellEnv } from "@oh-my-pi/pi-utils";
 
 // The startup gate's "never throws" contract at its outermost boundary: the
 // identity store constructor performs filesystem work (mkdir + SQLite open)
@@ -91,7 +92,7 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 		}
 	});
 
-	it("restores shell-owned AWS selectors before disabled or unprovisioned identity exits", async () => {
+	it("restores launcher-owned AWS credentials before disabled or unprovisioned identity exits", async () => {
 		const previous = {
 			AWS_PROFILE: Bun.env.AWS_PROFILE,
 			AWS_REGION: Bun.env.AWS_REGION,
@@ -99,16 +100,53 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			OMP_OPERATIONAL_AWS_PROFILE: Bun.env.OMP_OPERATIONAL_AWS_PROFILE,
 			OMP_OPERATIONAL_AWS_REGION_SET: Bun.env.OMP_OPERATIONAL_AWS_REGION_SET,
 			OMP_OPERATIONAL_AWS_REGION: Bun.env.OMP_OPERATIONAL_AWS_REGION,
+			AWS_ACCESS_KEY_ID: Bun.env.AWS_ACCESS_KEY_ID,
+			AWS_SECRET_ACCESS_KEY: Bun.env.AWS_SECRET_ACCESS_KEY,
+			AWS_SESSION_TOKEN: Bun.env.AWS_SESSION_TOKEN,
+			AWS_CONFIG_FILE: Bun.env.AWS_CONFIG_FILE,
+			OMP_OPERATIONAL_AWS_ACCESS_KEY_ID_SET: Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID_SET,
+			OMP_OPERATIONAL_AWS_ACCESS_KEY_ID: Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID,
+			OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY_SET: Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY_SET,
+			OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY: Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY,
+			OMP_OPERATIONAL_AWS_SESSION_TOKEN_SET: Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN_SET,
+			OMP_OPERATIONAL_AWS_SESSION_TOKEN: Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN,
+			OMP_OPERATIONAL_AWS_CONFIG_FILE_SET: Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE_SET,
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE,
 		};
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
+		fs.writeFileSync(
+			path.join(dir, ".env"),
+			[
+				"AWS_PROFILE=$AWS_PROFILE",
+				"AWS_REGION=$AWS_REGION",
+				"AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID",
+				"AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY",
+				"AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN",
+				"AWS_CONFIG_FILE=$AWS_CONFIG_FILE",
+			].join("\n"),
+		);
 		try {
 			for (const enabled of [false, true]) {
+				delete Bun.env[AWS_MODEL_PROFILE_ENV];
+				delete Bun.env[AWS_MODEL_REGION_ENV];
 				Bun.env.AWS_PROFILE = "managed-dotenv-profile";
 				Bun.env.AWS_REGION = "us-east-1";
 				Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET = "1";
 				Bun.env.OMP_OPERATIONAL_AWS_PROFILE = "employee-operations";
 				Bun.env.OMP_OPERATIONAL_AWS_REGION_SET = "1";
 				Bun.env.OMP_OPERATIONAL_AWS_REGION = "eu-west-1";
+				Bun.env.AWS_ACCESS_KEY_ID = "managed-dotenv-access-key";
+				Bun.env.AWS_SECRET_ACCESS_KEY = "managed-dotenv-secret";
+				Bun.env.AWS_SESSION_TOKEN = "managed-dotenv-session";
+				Bun.env.AWS_CONFIG_FILE = "/tmp/managed-dotenv-aws-config";
+				Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID_SET = "1";
+				Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID = "AKIA-LAUNCHER";
+				Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY_SET = "1";
+				Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY = "launcher-secret";
+				Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN_SET = "1";
+				Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN = "launcher-session";
+				Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE_SET = "1";
+				Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE = "/tmp/launcher-aws-config";
 				const settings = Settings.isolated({ "identity.entra.enabled": enabled });
 				const result = await ensureCoreforgeIdentityAtStartup(settings, {
 					interactive: false,
@@ -117,6 +155,22 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 				expect(result.notices).toEqual([]);
 				expect(Bun.env.AWS_PROFILE).toBe("employee-operations");
 				expect(Bun.env.AWS_REGION).toBe("eu-west-1");
+				expect(Bun.env.AWS_ACCESS_KEY_ID).toBe("AKIA-LAUNCHER");
+				expect(Bun.env.AWS_SECRET_ACCESS_KEY).toBe("launcher-secret");
+				expect(Bun.env.AWS_SESSION_TOKEN).toBe("launcher-session");
+				expect(Bun.env.AWS_CONFIG_FILE).toBe("/tmp/launcher-aws-config");
+				const trustedChild = filterTrustedChildShellEnv(Bun.env, dir);
+				expect(trustedChild.AWS_PROFILE).toBe("employee-operations");
+				expect(trustedChild.AWS_REGION).toBe("eu-west-1");
+				expect(trustedChild.AWS_ACCESS_KEY_ID).toBe("AKIA-LAUNCHER");
+				expect(trustedChild.AWS_SECRET_ACCESS_KEY).toBe("launcher-secret");
+				expect(trustedChild.AWS_SESSION_TOKEN).toBe("launcher-session");
+				expect(trustedChild.AWS_CONFIG_FILE).toBe("/tmp/launcher-aws-config");
+				expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("managed-dotenv-profile");
+				expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
+				const child = filterChildShellEnv(Bun.env);
+				expect(child[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
+				expect(child[AWS_MODEL_REGION_ENV]).toBeUndefined();
 				expect(Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET).toBeUndefined();
 				expect(Bun.env.OMP_OPERATIONAL_AWS_REGION_SET).toBeUndefined();
 			}

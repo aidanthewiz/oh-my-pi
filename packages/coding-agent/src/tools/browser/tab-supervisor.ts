@@ -1,4 +1,13 @@
-import { getPuppeteerDir, logger, postmortem, Snowflake, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
+import {
+	filterChildShellEnv,
+	getProjectDir,
+	getPuppeteerDir,
+	logger,
+	postmortem,
+	Snowflake,
+	withTimeout,
+	workerHostEntry,
+} from "@oh-my-pi/pi-utils";
 import type { Page, Target } from "puppeteer-core";
 import { callSessionTool } from "../../eval/js/tool-bridge";
 import { webpExclusionForModel } from "../../utils/image-loading";
@@ -23,7 +32,6 @@ import type {
 	RunResultOk,
 	SessionSnapshot,
 	Transferable,
-	Transport,
 	WorkerInbound,
 	WorkerInitPayload,
 	WorkerOutbound,
@@ -37,7 +45,7 @@ interface WorkerHandle {
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
 	terminate(): Promise<void>;
-	readonly mode: "worker" | "inline";
+	readonly mode: "worker";
 }
 
 export type DialogPolicy = "accept" | "dismiss";
@@ -274,29 +282,14 @@ async function acquireTabImpl(
 	try {
 		info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
 	} catch (error) {
-		// `BuildMessage`-class failures arrive asynchronously via the worker's `error` event,
-		// after `spawnTabWorker`'s synchronous try/catch has already returned. Fall back to
-		// the inline worker here so module-resolution failures don't poison every tab open.
 		await worker.terminate().catch(() => undefined);
-		if (worker.mode === "inline" || isReportedInitFailure(error)) {
-			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			throw error;
-		}
-		logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		worker = await spawnInlineWorker();
-		try {
-			info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
-		} catch (inlineError) {
-			await worker.terminate().catch(() => undefined);
-			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			const finalError = new ToolError(
-				`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
-			);
-			(finalError as { cause?: unknown }).cause = error;
-			throw finalError;
-		}
+		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+		if (isReportedInitFailure(error)) throw error;
+		const finalError = new ToolError(
+			`Failed to start isolated browser tab worker: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		Object.defineProperty(finalError, "cause", { value: error, configurable: true });
+		throw finalError;
 	}
 
 	// If the caller aborted while we were spawning/initializing the worker, tear
@@ -510,14 +503,7 @@ async function runInTabWithSnapshot(
 				error instanceof ToolError && error.message.startsWith("Browser code execution timed out after ");
 			if (runTimedOut || error instanceof RecoverableWorkerError) {
 				try {
-					if (tab.worker.mode === "inline") {
-						const reason = runTimedOut
-							? "Browser code execution timed out; tab killed"
-							: "Browser request interception cleanup failed; tab killed";
-						await forceKillTab(name, reason);
-					} else {
-						await recycleTimedOutWorkerTab(tab, opts.timeoutMs + GRACE_MS);
-					}
+					await recycleTimedOutWorkerTab(tab, opts.timeoutMs + GRACE_MS);
 				} catch (recycleError) {
 					logger.warn("Failed to recycle browser tab worker; killing tab", {
 						error: recycleError instanceof Error ? recycleError.message : String(recycleError),
@@ -822,7 +808,7 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		timeoutMs,
 		activateForScreenshot: tab.activateForScreenshot,
 	};
-	let worker = await spawnTabWorker();
+	const worker = await spawnTabWorker();
 	try {
 		const info = await initializeTabWorker(worker, payload, timeoutMs);
 		tab.worker = worker;
@@ -831,21 +817,11 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		worker.onMessage(msg => handleTabMessage(tab, msg));
 	} catch (error) {
 		await worker.terminate().catch(() => undefined);
-		worker = await spawnInlineWorker();
-		try {
-			const info = await initializeTabWorker(worker, payload, timeoutMs);
-			tab.worker = worker;
-			tab.info = info;
-			tab.state = "alive";
-			worker.onMessage(msg => handleTabMessage(tab, msg));
-		} catch (inlineError) {
-			await worker.terminate().catch(() => undefined);
-			const finalError = new ToolError(
-				`Failed to recycle timed-out browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
-			);
-			Object.defineProperty(finalError, "cause", { value: error, configurable: true });
-			throw finalError;
-		}
+		const finalError = new ToolError(
+			`Failed to recycle isolated browser tab worker: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		Object.defineProperty(finalError, "cause", { value: error, configurable: true });
+		throw finalError;
 	}
 }
 
@@ -951,18 +927,25 @@ async function raceWithTimeout<T>(
 }
 
 async function spawnTabWorker(): Promise<WorkerHandle> {
+	const options: WorkerOptions = {
+		type: "module",
+		env: buildTabWorkerEnv(),
+	};
 	try {
 		const hostEntry = workerHostEntry();
 		const worker = hostEntry
-			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_tab"] })
-			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
+			? new Worker(hostEntry, { ...options, argv: ["__omp_worker_tab"] })
+			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, options);
 		return wrapBunWorker(worker);
-	} catch (err) {
-		logger.warn("Bun Worker spawn failed; using inline tab worker (no sync-loop guard)", {
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return spawnInlineWorker();
+	} catch (error) {
+		throw new ToolError(
+			`Failed to spawn isolated browser tab worker: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
+}
+
+export function buildTabWorkerEnv(): Record<string, string> {
+	return filterChildShellEnv(Bun.env, getProjectDir());
 }
 
 function wrapBunWorker(worker: Worker): WorkerHandle {
@@ -990,43 +973,6 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 		async terminate() {
 			worker.terminate();
 		},
-	};
-}
-
-/**
- * Inline fallback for environments where Bun cannot compile or spawn the worker
- * entry. This preserves normal browser behavior but cannot interrupt synchronous
- * infinite loops because user code runs on the main thread.
- */
-async function spawnInlineWorker(): Promise<WorkerHandle> {
-	const hostListeners = new Set<(message: WorkerOutbound) => void>();
-	const workerListeners = new Set<(message: WorkerInbound) => void>();
-	const workerTransport: Transport = {
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of hostListeners) listener(msg as WorkerOutbound);
-			}),
-		onMessage: handler => {
-			const typed = handler as (message: WorkerInbound) => void;
-			workerListeners.add(typed);
-			return () => workerListeners.delete(typed);
-		},
-		close: () => {},
-	};
-	const { WorkerCore } = await import("./tab-worker");
-	new WorkerCore(workerTransport);
-	return {
-		mode: "inline",
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of workerListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			hostListeners.add(handler);
-			return () => hostListeners.delete(handler);
-		},
-		onError: () => () => {},
-		async terminate() {},
 	};
 }
 

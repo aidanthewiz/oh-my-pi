@@ -18,6 +18,7 @@ export * from "./loader";
 export * from "./manager";
 // OAuth Discovery
 export * from "./oauth-discovery";
+export * from "./project-trust";
 // Tool bridge
 export * from "./tool-bridge";
 // Tool cache

@@ -9,8 +9,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Message, TextContent } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	builtinCredentialSecretEntries,
+	collectSettingsSecrets,
 	getExistingSecretPlaceholderKey,
 	getSecretPlaceholderKey,
 	getSecretPlaceholderKeySync,
@@ -75,6 +77,31 @@ describe("builtinCredentialSecretEntries", () => {
 			const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
 			expect(args.old_string).toBe(fileLine);
 		}
+	});
+});
+
+describe("collectSettingsSecrets", () => {
+	it("protects credential-marked settings independently of token shape or secrets.enabled", () => {
+		const brokerToken = "opaque-broker-credential-value";
+		const shortPassword = "tiny";
+		const settings = Settings.isolated({
+			"auth.broker.token": brokerToken,
+			"searxng.basicPassword": shortPassword,
+			"searxng.endpoint": "https://search.example.test",
+			"secrets.enabled": false,
+		});
+
+		const entries = collectSettingsSecrets(settings);
+		expect(entries.map(entry => entry.friendlyName)).toEqual(["auth.broker.token", "searxng.basicPassword"]);
+
+		const obfuscator = new SecretObfuscator(entries);
+		const providerView = obfuscator.obfuscate(
+			`token=${brokerToken}\npassword=${shortPassword}\nendpoint=https://search.example.test`,
+		);
+		expect(providerView).not.toContain(brokerToken);
+		expect(providerView).not.toContain(shortPassword);
+		expect(providerView).toContain("endpoint=https://search.example.test");
+		expect(deobfuscateToolArguments(obfuscator, { old_string: providerView }).old_string).toContain(brokerToken);
 	});
 });
 
@@ -2423,6 +2450,34 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		expect(secondPlaceholder).toMatch(/^\$\$OTHER_[A-Z0-9]+(?::[ULCM])?\$\$$/);
 		expect(obfuscator.deobfuscate(secondPlaceholder)).toBe(firstPlaceholder);
+	});
+
+	it("fails closed when a live-added credential equals an active placeholder", () => {
+		const sharedKey = "D".repeat(43);
+		const obfuscator = new SecretObfuscator(
+			[{ type: "plain", content: "legacy-secret", friendlyName: "old" }],
+			sharedKey,
+		);
+		const activePlaceholder = obfuscator.obfuscate("legacy-secret");
+
+		expect(() =>
+			obfuscator.addPlainEntries([{ type: "plain", content: activePlaceholder, friendlyName: "new" }]),
+		).toThrow("restart the session");
+		expect(() => obfuscator.obfuscate(activePlaceholder)).toThrow("restart the session");
+		expect(() => obfuscator.deobfuscate(activePlaceholder)).toThrow("restart the session");
+
+		const restarted = new SecretObfuscator(
+			[
+				{ type: "plain", content: "legacy-secret", friendlyName: "old" },
+				{ type: "plain", content: activePlaceholder, friendlyName: "new" },
+			],
+			sharedKey,
+		);
+		const restartedLegacy = restarted.obfuscate("legacy-secret");
+		const restartedNew = restarted.obfuscate(activePlaceholder);
+		expect(restartedLegacy).not.toBe(activePlaceholder);
+		expect(restarted.deobfuscate(restartedLegacy)).toBe("legacy-secret");
+		expect(restarted.deobfuscate(restartedNew)).toBe(activePlaceholder);
 	});
 
 	it("keeps no-name placeholders unprefixed but content-derived", () => {

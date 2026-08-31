@@ -57,6 +57,19 @@ function bashApproval(command: string, settingsOverrides: Record<string, unknown
 	return approval({ command });
 }
 
+function withoutManagedDcg<T>(run: () => T): T {
+	const previous = new Map(DCG_ENV_KEYS.map(key => [key, process.env[key]]));
+	for (const key of DCG_ENV_KEYS) delete process.env[key];
+	try {
+		return run();
+	} finally {
+		for (const [key, value] of previous) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
 describe("resolveApproval tier matrix", () => {
 	const cases: Array<[ApprovalMode, "read" | "write" | "exec", "allow" | "prompt"]> = [
 		["always-ask", "read", "allow"],
@@ -176,9 +189,7 @@ describe("MCP fallback and prompt formatting", () => {
 
 describe("tool-owned dynamic approval declarations", () => {
 	it("classifies critical bash patterns through BashTool.approval", () => {
-		const previous = Object.fromEntries(DCG_ENV_KEYS.map(key => [key, process.env[key]]));
-		for (const key of DCG_ENV_KEYS) delete process.env[key];
-		try {
+		withoutManagedDcg(() => {
 			for (const command of [
 				"rm -rf /",
 				":(){ :|:& };:",
@@ -195,12 +206,7 @@ describe("tool-owned dynamic approval declarations", () => {
 					reason: "Critical pattern detected",
 				});
 			}
-		} finally {
-			for (const [key, value] of Object.entries(previous)) {
-				if (value === undefined) delete process.env[key];
-				else process.env[key] = value;
-			}
-		}
+		});
 	});
 
 	it("delegates destructive patterns to DCG while retaining shell-security approval signals", () => {
@@ -277,20 +283,22 @@ describe("tool-owned dynamic approval declarations", () => {
 	});
 
 	it("keeps critical bash patterns prompt-gated unless explicitly denied", () => {
-		const settingsOverrides = {
-			"bash.patterns": [{ match: "*", approval: "allow" }],
-		};
+		withoutManagedDcg(() => {
+			const settingsOverrides = {
+				"bash.patterns": [{ match: "*", approval: "allow" }],
+			};
 
-		expect(bashApproval("rm -rf /", settingsOverrides)).toEqual({
-			tier: "exec",
-			override: true,
-			reason: "Critical pattern detected",
+			expect(bashApproval("rm -rf /", settingsOverrides)).toEqual({
+				tier: "exec",
+				override: true,
+				reason: "Critical pattern detected",
+			});
+			expect(bashApproval("echo hello", settingsOverrides)).toEqual({
+				tier: "write",
+				policy: "allow",
+			});
+			expect(bashApproval("echo hello && rm file.txt", settingsOverrides)).toBe("exec");
 		});
-		expect(bashApproval("echo hello", settingsOverrides)).toEqual({
-			tier: "write",
-			policy: "allow",
-		});
-		expect(bashApproval("echo hello && rm file.txt", settingsOverrides)).toBe("exec");
 	});
 
 	it("applies the first matching bash approval pattern", () => {

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { type DaemonOperation, parseDaemonRpcResult, parseDaemonWireRequest } from "../../src/launch/protocol";
+import {
+	DAEMON_BROKER_PROTOCOL_VERSION,
+	type DaemonOperation,
+	parseDaemonRpcResult,
+	parseDaemonWireRequest,
+} from "../../src/launch/protocol";
 
 const operation: Extract<DaemonOperation, { op: "logs" }> = {
 	op: "logs",
@@ -45,6 +50,7 @@ describe("launch logs compatibility", () => {
 	it("preserves the rendered-row request for upgraded brokers", () => {
 		const request = parseDaemonWireRequest({
 			id: "request-1",
+			protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
 			token: "token-1",
 			operation: { ...operation, renderTerminalRows: true },
 		});
@@ -54,6 +60,7 @@ describe("launch logs compatibility", () => {
 	it("preserves completion owner changes on reconnect requests", () => {
 		const request = parseDaemonWireRequest({
 			id: "request-1",
+			protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
 			token: "token-1",
 			owners: ["session-owner"],
 			detachedOwners: ["parked-owner"],
@@ -66,6 +73,17 @@ describe("launch logs compatibility", () => {
 		expect(request.detachedOwners).toEqual(["parked-owner"]);
 		expect(request.completionUnsubscribes).toEqual(["disposed-owner"]);
 		expect(request.completionSubscriptionId).toBe("subscription-1");
+	});
+
+	it("rejects brokers from an older security boundary", () => {
+		expect(() =>
+			parseDaemonWireRequest({
+				id: "request-1",
+				protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION - 1,
+				token: "token-1",
+				operation: { op: "ping" },
+			}),
+		).toThrow(`expected ${DAEMON_BROKER_PROTOCOL_VERSION}`);
 	});
 
 	it("decodes raw terminal text from an already-running legacy broker", () => {

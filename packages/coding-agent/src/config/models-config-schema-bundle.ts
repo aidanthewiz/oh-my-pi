@@ -303,6 +303,9 @@ export const getModelsConfigSchemaBundle = once(() => {
 		if (value.apiKey !== undefined && typeof value.apiKey === "string" && value.apiKey.length === 0) {
 			return ctx.mustBe("apiKey a non-empty string");
 		}
+		if (value.transport === "pi-native" && value.apiKey === undefined) {
+			return ctx.mustBe("apiKey is required when transport is pi-native");
+		}
 		return true;
 	});
 

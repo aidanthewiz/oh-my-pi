@@ -40,7 +40,7 @@ describe("Amazon Bedrock OpenAI routing", () => {
 		for (const model of BEDROCK_MANTLE_STATIC_MODELS) {
 			expect(model.provider).toBe("bedrock-mantle");
 			expect(model.api).toBe("openai-responses");
-			expect(model.baseUrl).toBe("https://bedrock-mantle.{region}.api.aws/openai/v1");
+			expect(model.baseUrl).toBe("https://bedrock-mantle.{region}.api.aws/v1");
 		}
 		expect(DEFAULT_MODEL_PER_PROVIDER["bedrock-mantle"]).toBe("openai.gpt-5.6-terra");
 	});
@@ -77,7 +77,7 @@ describe("Amazon Bedrock OpenAI routing", () => {
 		);
 		const managerOptions = bedrockMantleModelManagerOptions({
 			authenticated: true,
-			baseUrl: "https://bedrock-mantle.eu-west-2.api.aws/openai/v1",
+			baseUrl: "https://bedrock-mantle.eu-west-2.api.aws/v1",
 			fetch: fetchImpl,
 		});
 
@@ -87,7 +87,7 @@ describe("Amazon Bedrock OpenAI routing", () => {
 		expect(models).toHaveLength(2);
 		expect(models?.[0]).toMatchObject({
 			id: "openai.gpt-5.6-luna",
-			baseUrl: "https://bedrock-mantle.{region}.api.aws/openai/v1",
+			baseUrl: "https://bedrock-mantle.{region}.api.aws/v1",
 			cost: { input: 0.22, output: 1.32, cacheRead: 0.022, cacheWrite: 0.275 },
 		});
 		const descriptor = PROVIDER_DESCRIPTORS.find(descriptor => descriptor.providerId === "bedrock-mantle");
