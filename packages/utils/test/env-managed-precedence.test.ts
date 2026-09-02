@@ -41,12 +41,15 @@ async function resolveEnvInChild(opts: {
 	managed: boolean;
 	cwd?: string;
 	projectEnvContent?: string;
+	projectLocalEnvContent?: string;
 	childOverlay?: Record<string, string | undefined>;
-	// Simulate Bun's implicit cwd `.env` autoload: load the project `.env` into
-	// the child's Bun.env BEFORE the module runs (via --env-file), reproducing
-	// the contamination the shipped engine disables. Used to prove a project
-	// `.env` can neither activate managed mode nor leak as ambient fallback.
-	autoloadProject?: boolean;
+	spawnedChildKeys?: string[];
+	// Let Bun perform its normal cwd dotenv autoload, including `.env.local`.
+	autoloadDefaultProject?: boolean;
+	// Use Bun's real `--no-env-file` launch option. This models Coreforge's
+	// source launcher and gives the env module authoritative launch provenance.
+	launchWithNoEnvFile?: boolean;
+	launcherPolicy?: Record<string, string | undefined>;
 	// When set, model the real shipped launch: a named profile whose agent `.env`
 	// lives at `$HOME/.omp/profiles/<profile>/agent/.env`. Named profiles ignore
 	// PI_CODING_AGENT_DIR (dirs.ts DirResolver), so this drives OMP_PROFILE + HOME.
@@ -69,23 +72,35 @@ async function resolveEnvInChild(opts: {
 		if (opts.projectEnvContent !== undefined) {
 			await fs.writeFile(path.join(cwd, ".env"), opts.projectEnvContent);
 		}
-
-		// An empty env file to pass to `--env-file`, disabling Bun's cwd `.env`
-		// autoload cross-platform (`/dev/null` is not portable to Windows CI).
+		if (opts.projectLocalEnvContent !== undefined) {
+			await fs.writeFile(path.join(cwd, ".env.local"), opts.projectLocalEnvContent);
+		}
 		const emptyEnvFile = path.join(root, "empty.env");
 		await fs.writeFile(emptyEnvFile, "");
 
 		const probePath = path.join(root, "probe.ts");
+		const spawnedProbe = `const out = {}; for (const k of ${JSON.stringify(opts.spawnedChildKeys ?? [])}) out[k] = process.env[k]; process.stdout.write(JSON.stringify(out));`;
 		await Bun.write(
 			probePath,
 			[
-				`import { $env, filterChildShellEnv } from ${JSON.stringify(envUrl)};`,
+				`import { $env, filterChildShellEnv, filterTrustedChildShellEnv, filterUserMcpChildEnv } from ${JSON.stringify(envUrl)};`,
 				`const keys = ${JSON.stringify(opts.keys)};`,
 				`const childKeys = ${JSON.stringify(opts.childKeys ?? [])};`,
+				`const spawnedChildKeys = ${JSON.stringify(opts.spawnedChildKeys ?? [])};`,
 				"const out = {};",
 				"for (const k of keys) out[k] = $env[k];",
 				`const childEnv = filterChildShellEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
 				"for (const k of childKeys) out['child:' + k] = childEnv[k];",
+				`const trustedChildEnv = filterTrustedChildShellEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
+				`const userMcpChildEnv = filterUserMcpChildEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
+				"for (const k of childKeys) out['trusted:' + k] = trustedChildEnv[k];",
+				"for (const k of childKeys) out['userMcp:' + k] = userMcpChildEnv[k];",
+				"if (spawnedChildKeys.length) {",
+				`  const spawned = Bun.spawn([process.execPath, '-e', ${JSON.stringify(spawnedProbe)}], { env: childEnv, stdout: 'pipe', stderr: 'pipe' });`,
+				"  const [stdout, exitCode] = await Promise.all([new Response(spawned.stdout).text(), spawned.exited]);",
+				"  if (exitCode !== 0) throw new Error('spawned probe failed with ' + exitCode);",
+				"  out.spawned = JSON.parse(stdout);",
+				"}",
 				"process.stdout.write(JSON.stringify(out));",
 			].join("\n"),
 		);
@@ -103,21 +118,26 @@ async function resolveEnvInChild(opts: {
 			...opts.ambient,
 			HOME: opts.profile ? home : process.env.HOME,
 			...(opts.profile ? { OMP_PROFILE: opts.profile } : { PI_CODING_AGENT_DIR: agentDir }),
-			// Set the flag deterministically from `managed` in BOTH directions, so
-			// a case that puts OMP_DOTENV_OVERRIDE in `ambient` can never flip the
-			// mode: managed -> "1", unmanaged -> undefined (evicted).
 			OMP_DOTENV_OVERRIDE: opts.managed ? "1" : undefined,
+			OMP_CF_PRODUCT_VERSION: opts.managed ? "test-product-version" : undefined,
+			...(opts.managed
+				? {
+						AZURE_CORE_COLLECT_TELEMETRY: "no",
+						GREPTILE_TELEMETRY_DISABLED: "1",
+						...opts.launcherPolicy,
+					}
+				: {}),
 		};
 
-		// By default the empty `--env-file` disables Bun's implicit cwd `.env`
-		// autoload, matching the shipped engine (compiled `--no-compile-autoload-
-		// dotenv`, source mode a clean `.dev-cwd`) so we test env.ts, not Bun's
-		// preloader. With `autoloadProject`, point `--env-file` at the project
-		// `.env` instead, reproducing the autoload contamination the reviewer
-		// flagged (project values in Bun.env before the module runs).
-		const envFile =
-			opts.autoloadProject && opts.projectEnvContent !== undefined ? path.join(cwd, ".env") : emptyEnvFile;
-		const proc = Bun.spawn([process.execPath, `--env-file=${envFile}`, probePath], {
+		// Managed source launches disable Bun's implicit dotenv loading. The
+		// fallback explicit empty file models the compiled launcher contract.
+		const launchWithNoEnvFile = opts.launchWithNoEnvFile ?? opts.managed;
+		const args = opts.autoloadDefaultProject
+			? [probePath]
+			: launchWithNoEnvFile
+				? ["--no-env-file", probePath]
+				: [`--env-file=${emptyEnvFile}`, probePath];
+		const proc = Bun.spawn([process.execPath, ...args], {
 			stdout: "pipe",
 			stderr: "pipe",
 			cwd,
@@ -203,6 +223,119 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 		expect(out.PERPLEXITY_API_KEY).toBeUndefined(); // project .env never consulted
 	});
 
+	it("keeps launcher telemetry opt-outs across dotenv collisions, overlays, and a spawned child", async () => {
+		const policyNames = [
+			"AZURE_CORE_COLLECT_TELEMETRY",
+			"GREPTILE_TELEMETRY_DISABLED",
+			"OMP_DOTENV_OVERRIDE",
+			"OMP_CF_PRODUCT_VERSION",
+			"AZURE_MCP_COLLECT_TELEMETRY",
+			"AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT",
+			"ARBITRARY_DOTENV_ONLY",
+		];
+		const out = await resolveEnvInChild({
+			profile: "coreforge",
+			agentEnvContent: [
+				"AZURE_CORE_COLLECT_TELEMETRY=yes",
+				"GREPTILE_TELEMETRY_DISABLED=0",
+				"OMP_CF_PRODUCT_VERSION=forged-profile",
+				"AZURE_MCP_COLLECT_TELEMETRY=true",
+				"AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT=true",
+			].join("\n"),
+			ambient: {},
+			projectEnvContent: [
+				"AZURE_CORE_COLLECT_TELEMETRY=yes-project",
+				"GREPTILE_TELEMETRY_DISABLED=0-project",
+				"OMP_CF_PRODUCT_VERSION=test-product-version",
+				"AZURE_MCP_COLLECT_TELEMETRY=true-project",
+				"AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT=true-project",
+				"ARBITRARY_DOTENV_ONLY=from-project",
+			].join("\n"),
+			keys: policyNames,
+			childKeys: policyNames,
+			spawnedChildKeys: policyNames,
+			childOverlay: {
+				AZURE_CORE_COLLECT_TELEMETRY: "yes-overlay",
+				GREPTILE_TELEMETRY_DISABLED: "0-overlay",
+				OMP_DOTENV_OVERRIDE: "0",
+				OMP_CF_PRODUCT_VERSION: "forged-overlay",
+				AZURE_MCP_COLLECT_TELEMETRY: "true-overlay",
+				AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT: "true-overlay",
+			},
+			managed: true,
+			launchWithNoEnvFile: true,
+		});
+		expect(out.AZURE_CORE_COLLECT_TELEMETRY).toBe("no");
+		expect(out.GREPTILE_TELEMETRY_DISABLED).toBe("1");
+		expect(out.OMP_DOTENV_OVERRIDE).toBe("1");
+		expect(out.OMP_CF_PRODUCT_VERSION).toBe("test-product-version");
+		expect(out["child:AZURE_CORE_COLLECT_TELEMETRY"]).toBe("no");
+		expect(out["child:GREPTILE_TELEMETRY_DISABLED"]).toBe("1");
+		expect(out["child:OMP_DOTENV_OVERRIDE"]).toBe("1");
+		expect(out["child:OMP_CF_PRODUCT_VERSION"]).toBe("test-product-version");
+		expect(out["child:AZURE_MCP_COLLECT_TELEMETRY"]).toBeUndefined();
+		expect(out["child:AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT"]).toBeUndefined();
+		expect(out["child:ARBITRARY_DOTENV_ONLY"]).toBeUndefined();
+		for (const prefix of ["trusted:", "userMcp:"]) {
+			expect(out[`${prefix}AZURE_CORE_COLLECT_TELEMETRY`]).toBe("no");
+			expect(out[`${prefix}GREPTILE_TELEMETRY_DISABLED`]).toBe("1");
+			expect(out[`${prefix}OMP_DOTENV_OVERRIDE`]).toBe("1");
+			expect(out[`${prefix}OMP_CF_PRODUCT_VERSION`]).toBe("test-product-version");
+			expect(out[`${prefix}AZURE_MCP_COLLECT_TELEMETRY`]).toBeUndefined();
+			expect(out[`${prefix}AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT`]).toBeUndefined();
+			expect(out[`${prefix}ARBITRARY_DOTENV_ONLY`]).toBeUndefined();
+		}
+		expect(out.spawned as unknown).toEqual({
+			AZURE_CORE_COLLECT_TELEMETRY: "no",
+			GREPTILE_TELEMETRY_DISABLED: "1",
+			OMP_DOTENV_OVERRIDE: "1",
+			OMP_CF_PRODUCT_VERSION: "test-product-version",
+		});
+	});
+
+	it("accepts managed provenance with an explicit empty launch env file", async () => {
+		const out = await resolveEnvInChild({
+			profile: "coreforge",
+			agentEnvContent: "AZURE_CORE_COLLECT_TELEMETRY=yes\nGREPTILE_TELEMETRY_DISABLED=0\n",
+			ambient: {},
+			projectEnvContent: "OMP_CF_PRODUCT_VERSION=test-product-version\n",
+			keys: [
+				"OMP_DOTENV_OVERRIDE",
+				"OMP_CF_PRODUCT_VERSION",
+				"AZURE_CORE_COLLECT_TELEMETRY",
+				"GREPTILE_TELEMETRY_DISABLED",
+			],
+			managed: true,
+			launchWithNoEnvFile: false,
+		});
+		expect(out.OMP_DOTENV_OVERRIDE).toBe("1");
+		expect(out.OMP_CF_PRODUCT_VERSION).toBe("test-product-version");
+		expect(out.AZURE_CORE_COLLECT_TELEMETRY).toBe("no");
+		expect(out.GREPTILE_TELEMETRY_DISABLED).toBe("1");
+	});
+
+	it("does not propagate launcher values that are not exact opt-outs", async () => {
+		const out = await resolveEnvInChild({
+			profile: "coreforge",
+			agentEnvContent: "AZURE_CORE_COLLECT_TELEMETRY=no\nGREPTILE_TELEMETRY_DISABLED=1\n",
+			ambient: {},
+			keys: [],
+			childKeys: ["AZURE_CORE_COLLECT_TELEMETRY", "GREPTILE_TELEMETRY_DISABLED"],
+			childOverlay: {
+				AZURE_CORE_COLLECT_TELEMETRY: "no",
+				GREPTILE_TELEMETRY_DISABLED: "1",
+			},
+			managed: true,
+			launchWithNoEnvFile: true,
+			launcherPolicy: {
+				AZURE_CORE_COLLECT_TELEMETRY: "yes",
+				GREPTILE_TELEMETRY_DISABLED: "0",
+			},
+		});
+		expect(out["child:AZURE_CORE_COLLECT_TELEMETRY"]).toBeUndefined();
+		expect(out["child:GREPTILE_TELEMETRY_DISABLED"]).toBeUndefined();
+	});
+
 	it("keeps managed profile values inside the engine process", async () => {
 		const out = await resolveEnvInChild({
 			profile: "coreforge",
@@ -231,7 +364,7 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 	it("REFUSES when a project .env flag reaches Bun.env via autoload (ambiguous provenance)", async () => {
 		const out = await resolveEnvInChild({
 			managed: false, // launcher did NOT set the flag; only the project file does
-			autoloadProject: true,
+			autoloadDefaultProject: true,
 			agentEnvContent: "ANTHROPIC_AWS_WORKSPACE_ID=ws-agent\n",
 			ambient: {},
 			projectEnvContent: "OMP_DOTENV_OVERRIDE=1\nOPENAI_API_KEY=from-project\n",
@@ -242,17 +375,16 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 		expect(out.__stderr).toContain("OMP_DOTENV_OVERRIDE=1 is set in both");
 	});
 
-	it("a launcher-flagged run does NOT leak an autoloaded project value into an empty agent key", async () => {
+	it("a managed source launch does not leak a project value into an empty agent key", async () => {
 		const out = await resolveEnvInChild({
 			managed: true, // launcher set the flag for real
-			autoloadProject: true,
 			agentEnvContent: "OPENAI_API_KEY=\n", // empty placeholder -> would defer to ambient
 			ambient: {},
 			projectEnvContent: "OPENAI_API_KEY=from-project\n",
 			keys: ["OPENAI_API_KEY"],
 		});
-		// The autoloaded project value is stripped before agentEnv applies, so the
-		// empty placeholder finds no ambient fallback -> no cwd credential inject.
+		// Managed mode excludes the project value before the empty profile
+		// placeholder falls back to the real launch environment.
 		expect(out.OPENAI_API_KEY).toBeUndefined();
 	});
 
@@ -265,7 +397,7 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 	it("REFUSES a launcher+project same-line flag collision (no creds resolved)", async () => {
 		const out = await resolveEnvInChild({
 			managed: true, // launcher set the flag for real...
-			autoloadProject: true, // ...and the project `.env` also carries the line (collision)
+			autoloadDefaultProject: true, // ...and the project `.env` also carries the line (collision)
 			agentEnvContent: "OPENAI_API_KEY=\n",
 			ambient: {},
 			projectEnvContent: "OMP_DOTENV_OVERRIDE=1\nOPENAI_API_KEY=from-project\n",
@@ -313,9 +445,60 @@ describe("default dotenv precedence (flag unset) is unchanged", () => {
 			projectEnvContent: "OPENAI_API_KEY=from-project-dir\n",
 			keys: ["OPENAI_API_KEY", "ANTHROPIC_AWS_WORKSPACE_ID"],
 			managed: false,
+			launchWithNoEnvFile: true,
 		});
 		expect(out.ANTHROPIC_AWS_WORKSPACE_ID).toBe("ws-dotenv");
 		expect(out.OPENAI_API_KEY).toBe("from-project-dir");
+	});
+	it("does not invent Coreforge child policy for an unmanaged launch", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "",
+			ambient: { AZURE_CORE_COLLECT_TELEMETRY: "yes" },
+			keys: ["AZURE_CORE_COLLECT_TELEMETRY"],
+			childKeys: ["AZURE_CORE_COLLECT_TELEMETRY"],
+			managed: false,
+		});
+		expect(out.AZURE_CORE_COLLECT_TELEMETRY).toBe("yes");
+		expect(out["child:AZURE_CORE_COLLECT_TELEMETRY"]).toBe("yes");
+	});
+
+	it("does not trust PI_COMPILED from a project dotenv as launch provenance", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "",
+			ambient: {},
+			projectEnvContent: "PI_COMPILED=1\nDATABASE_URL=from-project\n",
+			keys: ["DATABASE_URL"],
+			childKeys: ["DATABASE_URL"],
+			managed: false,
+			autoloadDefaultProject: true,
+		});
+		expect(out.DATABASE_URL).toBe("from-project");
+		expect(out["child:DATABASE_URL"]).toBeUndefined();
+	});
+
+	it("does not let .env.local forge managed mode or launcher policy", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "OPENAI_API_KEY=from-managed-profile\n",
+			ambient: { OPENAI_API_KEY: "from-shell" },
+			projectLocalEnvContent: [
+				"PI_COMPILED=1",
+				"OMP_DOTENV_OVERRIDE=1",
+				"OMP_CF_PRODUCT_VERSION=forged",
+				"AZURE_CORE_COLLECT_TELEMETRY=no",
+				"GREPTILE_TELEMETRY_DISABLED=1",
+			].join("\n"),
+			keys: ["OPENAI_API_KEY"],
+			childKeys: ["AZURE_CORE_COLLECT_TELEMETRY", "GREPTILE_TELEMETRY_DISABLED"],
+			childOverlay: {
+				AZURE_CORE_COLLECT_TELEMETRY: "yes",
+				GREPTILE_TELEMETRY_DISABLED: "0",
+			},
+			managed: false,
+			autoloadDefaultProject: true,
+		});
+		expect(out.OPENAI_API_KEY).toBe("from-shell");
+		expect(out["child:AZURE_CORE_COLLECT_TELEMETRY"]).toBe("yes");
+		expect(out["child:GREPTILE_TELEMETRY_DISABLED"]).toBe("0");
 	});
 });
 
@@ -423,6 +606,7 @@ describe("child process dotenv boundary", () => {
 			ambient: { OMP_NO_ENV_FILE: "1" },
 			keys: ["MANAGED_PROFILE_SECRET"],
 			managed: true,
+			launchWithNoEnvFile: false,
 		});
 		expect(out.MANAGED_PROFILE_SECRET).toBe("from-managed-profile");
 	});
@@ -439,6 +623,31 @@ describe("child process dotenv boundary", () => {
 		expect(out.OPENAI_API_KEY).toBe("from-managed-profile");
 		expect(out["child:OPENAI_API_KEY"]).toBeUndefined();
 		expect(out["child:openai_api_key"]).toBeUndefined();
+	});
+
+	it.skipIf(process.platform !== "win32")("enforces launcher policy regardless of Windows casing", async () => {
+		const out = await resolveEnvInChild({
+			profile: "coreforge",
+			agentEnvContent: "",
+			ambient: {},
+			keys: [],
+			childKeys: [
+				"AZURE_CORE_COLLECT_TELEMETRY",
+				"azure_core_collect_telemetry",
+				"GREPTILE_TELEMETRY_DISABLED",
+				"greptile_telemetry_disabled",
+			],
+			childOverlay: {
+				azure_core_collect_telemetry: "yes",
+				greptile_telemetry_disabled: "0",
+			},
+			managed: true,
+			launchWithNoEnvFile: true,
+		});
+		expect(out["child:AZURE_CORE_COLLECT_TELEMETRY"]).toBe("no");
+		expect(out["child:azure_core_collect_telemetry"]).toBeUndefined();
+		expect(out["child:GREPTILE_TELEMETRY_DISABLED"]).toBe("1");
+		expect(out["child:greptile_telemetry_disabled"]).toBeUndefined();
 	});
 
 	it("strips operational credentials and renamed protected values from repository children", async () => {
