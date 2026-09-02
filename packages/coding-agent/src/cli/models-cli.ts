@@ -24,6 +24,7 @@ import {
 	filterPersistentExtensionPaths,
 	withPersistentPluginPolicy,
 } from "../extensibility/plugins/policy";
+import { ensureCoreforgeIdentityAtStartup } from "../identity/startup";
 import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
 import { EventBus } from "../utils/event-bus";
@@ -395,6 +396,10 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 	const authStorage = await discoverAuthStorage();
 	try {
 		const settings = await Settings.init({ cwd, configFiles: command.flags.config });
+		const identity = await ensureCoreforgeIdentityAtStartup(settings, { interactive: false });
+		for (const notice of identity.notices) {
+			process.stderr.write(`${notice}\n`);
+		}
 		const modelRegistry = new ModelRegistry(authStorage);
 
 		if (action === "refresh" && !json && process.stderr.isTTY) {
