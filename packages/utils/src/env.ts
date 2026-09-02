@@ -52,41 +52,75 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 	}
 	return result;
 }
+function managedEnvName(name: string): string {
+	return process.platform === "win32" ? name.toUpperCase() : name;
+}
+
 // Bun autoloads the project's dotenv files into `process.env` before user code
-// runs — including inside `bun build --compile` binaries — so a snapshot of
-// `Bun.env` is only pre-dotenv when autoloading was explicitly disabled. Linux
-// keeps the original exec environment in procfs, which is authoritative.
+// runs — including inside `bun build --compile` binaries. Linux keeps the
+// original exec environment in procfs. Other platforms may use Bun.env only
+// when the launcher disabled implicit dotenv loading or supplied an explicit
+// env file; Coreforge's compiled launcher supplies an empty one.
 function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 	if (process.platform === "linux") {
 		try {
 			const values = new Map<string, string>();
 			for (const entry of fs.readFileSync("/proc/self/environ", "utf8").split("\0")) {
 				const separator = entry.indexOf("=");
-				if (separator > 0) values.set(entry.slice(0, separator), entry.slice(separator + 1));
+				if (separator > 0) values.set(managedEnvName(entry.slice(0, separator)), entry.slice(separator + 1));
 			}
 			return values;
 		} catch {}
 	}
-	if (!process.execArgv.includes("--no-env-file")) return undefined;
+	const controlledDotenv = process.execArgv.some(arg => arg === "--no-env-file" || arg.startsWith("--env-file="));
+	if (!controlledDotenv) return undefined;
 	const values = new Map<string, string>();
 	for (const key in Bun.env) {
 		const value = Bun.env[key];
-		if (value !== undefined) values.set(key, value);
+		if (value !== undefined) values.set(managedEnvName(key), value);
 	}
 	return values;
 }
 
 const launchEnvValues = readLaunchEnv();
+const COREFORGE_MANAGED_LAUNCH_MARKERS = ["OMP_DOTENV_OVERRIDE", "OMP_CF_PRODUCT_VERSION"] as const;
+const COREFORGE_MANAGED_RUNTIME_NAMES = [...COREFORGE_MANAGED_LAUNCH_MARKERS, "BUN_OPTIONS"] as const;
+const COREFORGE_MANAGED_CHILD_POLICY = {
+	AZURE_CORE_COLLECT_TELEMETRY: "no",
+	GREPTILE_TELEMETRY_DISABLED: "1",
+} as const;
 const projectEnvNamesLoadedByOmp = new Set<string>();
 const managedAgentEnvNames = new Set<string>();
 const managedAgentEnvValues = new Set<string>();
+
+function isCoreforgeManagedLaunch(): boolean {
+	const override = launchEnvValues?.get(managedEnvName("OMP_DOTENV_OVERRIDE"));
+	const productVersion = launchEnvValues?.get(managedEnvName("OMP_CF_PRODUCT_VERSION"));
+	return override === "1" && productVersion !== undefined && productVersion.trim() !== "";
+}
+
+const coreforgeManagedLaunch = isCoreforgeManagedLaunch();
+const launcherCapturedManagedChildEnv: Record<string, string> = {};
+if (coreforgeManagedLaunch) {
+	for (const name of COREFORGE_MANAGED_LAUNCH_MARKERS) {
+		const value = launchEnvValues?.get(managedEnvName(name));
+		if (value !== undefined) launcherCapturedManagedChildEnv[name] = value;
+	}
+	const bunOptions = launchEnvValues?.get(managedEnvName("BUN_OPTIONS"));
+	if (bunOptions?.includes("--env-file=") && process.execArgv.some(arg => arg.startsWith("--env-file="))) {
+		launcherCapturedManagedChildEnv.BUN_OPTIONS = bunOptions;
+	}
+	for (const [name, value] of Object.entries(COREFORGE_MANAGED_CHILD_POLICY)) {
+		if (launchEnvValues?.get(managedEnvName(name)) === value) launcherCapturedManagedChildEnv[name] = value;
+	}
+}
 const BUN_NO_ENV_FILE_OPTION = "--no-env-file";
 const BUN_NO_ENV_FILE_OPTION_RE = /(?:^|\s)--no-env-file(?:\s|$)/;
 const skipOmpDotenvFiles = Bun.env.OMP_NO_ENV_FILE === "1" && process.execArgv.includes(BUN_NO_ENV_FILE_OPTION);
 
-function managedEnvName(name: string): string {
-	return process.platform === "win32" ? name.toUpperCase() : name;
-}
+const coreforgeManagedChildEnvNames = new Set(
+	[...COREFORGE_MANAGED_RUNTIME_NAMES, ...Object.keys(COREFORGE_MANAGED_CHILD_POLICY)].map(managedEnvName),
+);
 
 export const OPERATIONAL_AWS_ENV_NAMES = [
 	"AWS_PROFILE",
@@ -214,6 +248,7 @@ function scrubChildCredentials(
 		const normalized = managedEnvName(key);
 		const managedName = managedAgentEnvNames.has(normalized);
 		const managedValue = managedAgentEnvValues.has(result[key]);
+
 		const credentialName = isCredentialEnvName(key);
 		const protectedValue = protectedValues.has(result[key]);
 		const trustedAws =
@@ -233,6 +268,14 @@ function scrubChildCredentials(
 			delete result[key];
 		}
 	}
+}
+
+export function applyLauncherCapturedChildPolicy(result: Record<string, string | undefined>): void {
+	if (!coreforgeManagedLaunch) return;
+	for (const key in result) {
+		if (coreforgeManagedChildEnvNames.has(managedEnvName(key))) delete result[key];
+	}
+	for (const [name, value] of Object.entries(launcherCapturedManagedChildEnv)) result[name] = value;
 }
 
 function filterChildShellEnvInternal(
@@ -264,7 +307,7 @@ function filterChildShellEnvInternal(
 			operationalAwsEnvNames.has(normalized) &&
 			trustedOperationalAwsValues.get(normalized) === result[key];
 		if (trustedOperationalValue) continue;
-		const launchValue = launchEnvValues?.get(key);
+		const launchValue = launchEnvValues?.get(normalized);
 		if (launchValue !== undefined) {
 			// Launcher-owned name: it keeps the launcher's own value. Bun overwrites
 			// an empty launcher value with the dotenv one, so restore the launcher
@@ -297,6 +340,7 @@ function filterChildShellEnvInternal(
 		}
 	}
 	scrubChildCredentials(result, protectedValues, policy, explicitOverlayNames);
+	applyLauncherCapturedChildPolicy(result);
 	const hasExplicitAwsCredentials =
 		policy.preserveExplicitCredentials &&
 		Array.from(explicitOverlayNames).some(
@@ -434,21 +478,9 @@ for (const key of Object.keys(Bun.env)) {
 		delete Bun.env[key];
 	}
 }
-// Managed mode — set by the coreforge launcher (`OMP_DOTENV_OVERRIDE=1`).
-// The flag is a LAUNCHER-ONLY signal: it is honored from the process
-// environment and never sourced from any `.env` file layer (see the loops
-// below — no file layer can introduce it into `Bun.env`).
-//
-// Provenance is unrecoverable when Bun's dotenv autoload is on: the launch-cwd
-// `.env` merges into `Bun.env` before this module runs, so a launcher-set flag
-// and a project-file flag are byte-identical (`"1"`). The one observable that
-// cannot be disambiguated is BOTH the ambient env and the project `.env`
-// declaring `"1"` — a real managed launch colliding with a stray copy of the
-// line, or a project file forging the flag under autoload. Guessing either way
-// is unsafe (silent mode flip vs. silent downgrade + project-cred gap-fill),
-// so we refuse loudly instead. (The shipped engine disables autoload —
-// compiled `--no-compile-autoload-dotenv`, source mode a clean cwd — so this
-// can only trigger there if the project `.env` literally carries the flag.)
+// Managed mode is valid only for a launch that carries both the launcher-only
+// override and a non-empty Coreforge product-version marker. The launch snapshot
+// is captured before profile dotenv authority, so dotenv files cannot activate it.
 if (Bun.env.OMP_DOTENV_OVERRIDE === "1" && projectEnv.OMP_DOTENV_OVERRIDE === "1") {
 	throw new Error(
 		`OMP_DOTENV_OVERRIDE=1 is set in both the process environment and ${path.join(process.cwd(), ".env")}. ` +
@@ -457,7 +489,7 @@ if (Bun.env.OMP_DOTENV_OVERRIDE === "1" && projectEnv.OMP_DOTENV_OVERRIDE === "1
 			"Remove that line from the project .env, or unset the environment variable.",
 	);
 }
-const managedDotenv = Bun.env.OMP_DOTENV_OVERRIDE === "1";
+const managedDotenv = coreforgeManagedLaunch;
 
 // Strip any ambient key whose value came from the launch-cwd `.env` (equality
 // match, the subtraction `filterChildShellEnv` uses) up front, so the project
@@ -498,6 +530,7 @@ if (managedDotenv) {
 		Bun.env[key] = value;
 		managedAgentEnvNames.add(managedEnvName(key));
 	}
+	applyLauncherCapturedChildPolicy(Bun.env);
 } else {
 	// Upstream default: ambient wins; files fill gaps, most-specific first.
 	for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
