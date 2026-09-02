@@ -122,7 +122,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const { processed, files } = await syncAllSessions({ onProgress: progress.onProgress });
 	progress.finish();
 	const total = await getTotalMessageCount();
-	console.log(`Synced ${processed} new entries from ${files} files (${total} total)\n`);
+	if (!cmd.json) console.log(`Synced ${processed} new entries from ${files} files (${total} total)\n`);
 
 	if (cmd.json) {
 		const stats = await getDashboardStats();
