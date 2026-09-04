@@ -13,6 +13,7 @@
 - Routed default collaboration and encrypted-share links through `agent-collab.internal.somahub.io` and branded the public browser and share experiences as Coreforce Agent Collab without exposing the internal Coreforge product name.
 - Prioritized Claude Opus 5 during automatic slow-model selection.
 - Coreforge no longer sends upstream Auto QA telemetry. The existing automatic tool-failure signal now asks for per-occurrence consent and, when accepted, starts `/report` with the same details; that workflow checks for duplicates and requires draft confirmation before filing in `Coreforce-CAD/coreforge`.
+- Removed the Coreforge startup warning that listed ambient credentials cleared by the managed Entra identity.
 
 ### Fixed
 

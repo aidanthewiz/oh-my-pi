@@ -373,13 +373,9 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
 			expect(Bun.env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 			// Stale ambient Bedrock bearer credentials cannot bypass the managed
-			// profile. Startup reports that suppression instead of hiding it.
+			// profile, but their removal is not surfaced as a startup warning.
 			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
-			expect(
-				result.notices.some(
-					n => n.includes("ignored ambient credentials") && n.includes("AWS_BEARER_TOKEN_BEDROCK"),
-				),
-			).toBe(true);
+			expect(result.notices.some(n => n.includes("AWS_BEARER_TOKEN_BEDROCK"))).toBe(false);
 		} finally {
 			for (const [key, value] of Object.entries(previousOperationalEnv)) {
 				if (value === undefined) delete Bun.env[key];
