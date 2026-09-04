@@ -375,7 +375,7 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			// Stale ambient Bedrock bearer credentials cannot bypass the managed
 			// profile, but their removal is not surfaced as a startup warning.
 			expect(Bun.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
-			expect(result.notices.some(n => n.includes("ignored ambient credentials"))).toBe(false);
+			expect(result.notices.some(n => n.includes("AWS_BEARER_TOKEN_BEDROCK"))).toBe(false);
 		} finally {
 			for (const [key, value] of Object.entries(previousOperationalEnv)) {
 				if (value === undefined) delete Bun.env[key];
