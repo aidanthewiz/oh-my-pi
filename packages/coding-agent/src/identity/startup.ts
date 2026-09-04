@@ -182,23 +182,11 @@ export async function ensureCoreforgeIdentityAtStartup(
 				clearedKeys: applied.clearedKeys,
 				removedManagedAwsProfile: applied.removedManagedAwsProfile,
 			});
-			// Make suppression visible, not silent: name the ambient vars we
-			// ignored and the escape hatch, so a dev debugging with exported AWS
-			// creds sees why they had no effect. Normal path ONLY by design — the
-			// store-fail and malformed-config paths already emit a louder, more
-			// actionable notice ("store unavailable" / "settings invalid"); the
-			// var list matters here, where auth is valid and suppression would
-			// otherwise be silent. Suppressed when configError is set: that path
-			// pushes its own "settings invalid" notice, and "identity is
-			// authoritative / set enabled:false" would contradict it.
+			// The cleared keys remain in the debug record for diagnostics without
+			// interrupting managed startup with an actionable notice.
 			if (applied.removedManagedAwsProfile && !applied.configError) {
 				notices.push(
 					"Coreforge isolated its managed inference profile from operational AWS tools; local AWS settings remain authoritative.",
-				);
-			}
-			if (applied.clearedKeys.length > 0 && !applied.configError) {
-				notices.push(
-					`Coreforge ignored ambient credentials (${applied.clearedKeys.join(", ")}) — managed Entra identity is authoritative. Set identity.entra.enabled: false to use your own.`,
 				);
 			}
 			// A malformed managed value (bad Claude baseUrl/geo) cleared auth but
