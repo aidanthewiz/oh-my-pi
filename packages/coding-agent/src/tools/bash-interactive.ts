@@ -10,7 +10,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
-import { sanitizeText } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, sanitizeText } from "@oh-my-pi/pi-utils";
 import type * as XtermModule from "@xterm/headless";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Settings } from "../config/settings";
@@ -399,13 +399,10 @@ export async function runInteractiveBashPty(
 							command: options.command,
 							cwd: options.cwd,
 							timeoutMs: options.timeoutMs,
-							// Interactive PTY: inherit the user's environment (the Rust side
-							// applies these as overrides), with a real TERM so editors,
-							// pagers, and TUIs behave like a normal terminal.
-							env: {
-								TERM: "xterm-256color",
-								...options.env,
-							},
+							// Native PTYs inherit the parent environment unless explicitly
+							// cleared. Pass the complete filtered child environment.
+							clearEnv: true,
+							env: filterChildShellEnv(Bun.env, options.cwd, { TERM: "xterm-256color" }, options.env),
 							signal: options.signal,
 							cols,
 							rows,

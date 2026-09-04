@@ -181,6 +181,21 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 		expect(out.OPENAI_API_KEY).toBe("from-shell");
 	});
 
+	it("preserves a launcher value when the project dotenv repeats it", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "",
+			ambient: {
+				HTTPS_PROXY: "https://proxy.example",
+				SENTINEL: "stable",
+			},
+			keys: ["HTTPS_PROXY", "SENTINEL"],
+			managed: true,
+			projectEnvContent: "HTTPS_PROXY=https://proxy.example\nSENTINEL=stable\n",
+		});
+		expect(out.HTTPS_PROXY).toBe("https://proxy.example");
+		expect(out.SENTINEL).toBe("stable");
+	});
+
 	it("ambient FILLS a key absent from the profile .env entirely", async () => {
 		const out = await resolveEnvInChild({
 			agentEnvContent: "ANTHROPIC_AWS_WORKSPACE_ID=ws-dotenv\n",

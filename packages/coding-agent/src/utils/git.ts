@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, hasFsCode, isEisdir, isEnoent, isEnotdir, Snowflake } from "@oh-my-pi/pi-utils";
+import { $which, filterChildShellEnv, hasFsCode, isEisdir, isEnoent, isEnotdir, Snowflake } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
@@ -401,10 +401,10 @@ function buildNonInteractiveEnv(
 	};
 }
 
-function buildGitEnv(overrides?: Record<string, string | undefined>): Record<string, string | undefined> {
+function buildGitEnv(cwd: string, overrides?: Record<string, string | undefined>): Record<string, string | undefined> {
 	return buildNonInteractiveEnv(
 		{
-			...process.env,
+			...filterChildShellEnv(process.env, cwd),
 			GIT_OPTIONAL_LOCKS: "0",
 			...AMBIENT_GIT_ENV,
 			...overrides,
@@ -443,7 +443,7 @@ function gitSpawnSyncText(
 	try {
 		const result = Bun.spawnSync(["git", ...commandArgs], {
 			cwd,
-			env: buildGitEnv(),
+			env: buildGitEnv(cwd),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
@@ -478,7 +478,7 @@ async function git(cwd: string, args: readonly string[], options: CommandOptions
 	try {
 		child = Bun.spawn(["git", ...commandArgs], {
 			cwd,
-			env: buildGitEnv(options.env),
+			env: buildGitEnv(cwd, options.env),
 			signal: options.signal,
 			stdin: normalizeStdin(options.stdin),
 			stdout: "pipe",

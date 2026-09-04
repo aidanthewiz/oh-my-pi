@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isRecord, ptree, sanitizeText } from "@oh-my-pi/pi-utils";
+import { $which, filterChildShellEnv, isRecord, ptree, sanitizeText } from "@oh-my-pi/pi-utils";
+import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import * as git from "../utils/git";
 import { type CleanseParserKind, parseCleanseDiagnostics } from "./parsers";
 import type { CleanseCheckResult, CleanseDiagnostic, CleanseDiagnosticReport, SkippedCleanseCheck } from "./types";
@@ -323,6 +324,7 @@ async function cargoWorkspacePackages(state: DiscoveryState, root: string, cargo
 		[cargo, "metadata", "--no-deps", "--format-version=1", "--manifest-path", manifest],
 		{
 			cwd: path.resolve(state.projectCwd, root),
+			env: filterChildShellEnv(Bun.env, path.resolve(state.projectCwd, root), NON_INTERACTIVE_ENV),
 			stderr: "full",
 			allowNonZero: true,
 		},
@@ -914,6 +916,7 @@ async function runChecker(
 	try {
 		const result = await ptree.exec([plan.executable, ...plan.args], {
 			cwd: plan.cwd,
+			env: filterChildShellEnv(Bun.env, plan.cwd, NON_INTERACTIVE_ENV),
 			signal,
 			stderr: "full",
 			allowNonZero: true,

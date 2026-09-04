@@ -501,7 +501,9 @@ const managedDotenv = coreforgeManagedLaunch;
 // re-adds it.
 for (const key in projectEnv) {
 	if (key === "OMP_DOTENV_OVERRIDE") continue;
-	if (Bun.env[key] === projectEnv[key]) delete Bun.env[key];
+	if (Bun.env[key] === projectEnv[key] && launchEnvValues?.get(managedEnvName(key)) !== Bun.env[key]) {
+		delete Bun.env[key];
+	}
 }
 
 // The agent/profile `.env` becomes the single authoritative credential source:

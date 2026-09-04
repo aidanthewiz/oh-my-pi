@@ -111,6 +111,22 @@ describe("git subprocess config", () => {
 		]);
 	});
 
+	it("does not expose parent credentials to repository Git hooks", async () => {
+		const original = process.env.MANAGED_PROFILE_SECRET;
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+		process.env.MANAGED_PROFILE_SECRET = "parent-secret";
+		try {
+			await git.commit("/work/pi", "fix: filter Git child environment");
+		} finally {
+			if (original === undefined) delete process.env.MANAGED_PROFILE_SECRET;
+			else process.env.MANAGED_PROFILE_SECRET = original;
+		}
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.options.env).not.toHaveProperty("MANAGED_PROFILE_SECRET");
+	});
+
 	it("preserves the caller's GPG_TTY for signing-capable commands", async () => {
 		const originalGpgTty = process.env.GPG_TTY;
 		const spawnCalls: SpawnCall[] = [];

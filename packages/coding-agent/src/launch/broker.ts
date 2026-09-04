@@ -725,6 +725,7 @@ class DaemonBroker {
 		record.pty = session;
 		const options = {
 			cwd: record.spec.cwd,
+			clearEnv: true,
 			env: filterChildShellEnv(Bun.env, record.spec.cwd, { TERM: "xterm-256color" }, record.spec.env),
 			cols: DAEMON_PTY_COLUMNS,
 			rows: DAEMON_PTY_ROWS,

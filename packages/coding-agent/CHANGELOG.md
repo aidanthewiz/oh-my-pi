@@ -33,7 +33,7 @@
 - Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
 - Preserved managed extension and MCP provider selection through `setup` and `join` session entry points.
 - Reported configured provider-discovery freshness in JSON model listings instead of silently presenting stale or unavailable catalogs as current.
-- Protected credential-marked settings, removed managed profile values from repository-controlled subprocess environments, and preserved launcher-enforced telemetry opt-outs through trusted worker re-entry.
+- Protected credential-marked settings, preserved launcher-enforced telemetry opt-outs through trusted worker re-entry, and removed managed profile values from repository PTYs, direnv, Git hooks, cleanse checkers, and other repository-controlled subprocesses.
 - Initialized managed Coreforge identity before `models` provider discovery so authenticated Claude and Bedrock routes appear in fresh utility-command catalogs.
 - Required an explicit bearer credential for custom `pi-native` provider transports.
 ## [17.2.6] - 2026-08-03

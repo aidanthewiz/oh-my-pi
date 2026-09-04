@@ -31,6 +31,8 @@ pub struct PtyStartOptions<'env> {
 	pub cwd:        Option<String>,
 	/// Environment variables for this command.
 	pub env:        Option<HashMap<String, String>>,
+	/// Replace the inherited process environment instead of overlaying it.
+	pub clear_env:  Option<bool>,
 	/// Timeout in milliseconds before cancelling.
 	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling the operation.
@@ -55,6 +57,8 @@ pub struct PtyArgvStartOptions<'env> {
 	pub cwd:         Option<String>,
 	/// Environment variables for this command.
 	pub env:         Option<HashMap<String, String>>,
+	/// Replace the inherited process environment instead of overlaying it.
+	pub clear_env:   Option<bool>,
 	/// Timeout in milliseconds before cancelling.
 	pub timeout_ms:  Option<u32>,
 	/// Abort signal for cancelling the operation.
@@ -84,11 +88,12 @@ enum PtyCommand {
 
 #[derive(Clone)]
 struct PtyRunConfig {
-	command: PtyCommand,
-	cwd:     Option<String>,
-	env:     Option<HashMap<String, String>>,
-	cols:    u16,
-	rows:    u16,
+	command:   PtyCommand,
+	cwd:       Option<String>,
+	env:       Option<HashMap<String, String>>,
+	clear_env: bool,
+	cols:      u16,
+	rows:      u16,
 }
 
 enum ReaderEvent {
@@ -145,11 +150,12 @@ impl PtySession {
 		on_start: Option<ThreadsafeFunction<u32>>,
 	) -> Result<PromiseRaw<'env, PtyRunResult>> {
 		let run_config = PtyRunConfig {
-			command: PtyCommand::Shell { command: options.command, shell: options.shell },
-			cwd:     options.cwd,
-			env:     options.env,
-			cols:    options.cols.unwrap_or(120).clamp(20, 400),
-			rows:    options.rows.unwrap_or(40).clamp(5, 200),
+			command:   PtyCommand::Shell { command: options.command, shell: options.shell },
+			cwd:       options.cwd,
+			env:       options.env,
+			clear_env: options.clear_env.unwrap_or(false),
+			cols:      options.cols.unwrap_or(120).clamp(20, 400),
+			rows:      options.rows.unwrap_or(40).clamp(5, 200),
 		};
 		self.start_config(env, run_config, options.timeout_ms, options.signal, on_chunk, on_start)
 	}
@@ -167,11 +173,15 @@ impl PtySession {
 		on_start: Option<ThreadsafeFunction<u32>>,
 	) -> Result<PromiseRaw<'env, PtyRunResult>> {
 		let run_config = PtyRunConfig {
-			command: PtyCommand::Argv { application: options.application, args: options.args },
-			cwd:     options.cwd,
-			env:     options.env,
-			cols:    options.cols.unwrap_or(120).clamp(20, 400),
-			rows:    options.rows.unwrap_or(40).clamp(5, 200),
+			command:   PtyCommand::Argv {
+				application: options.application,
+				args:        options.args,
+			},
+			cwd:       options.cwd,
+			env:       options.env,
+			clear_env: options.clear_env.unwrap_or(false),
+			cols:      options.cols.unwrap_or(120).clamp(20, 400),
+			rows:      options.rows.unwrap_or(40).clamp(5, 200),
 		};
 		self.start_config(env, run_config, options.timeout_ms, options.signal, on_chunk, on_start)
 	}
@@ -337,6 +347,9 @@ fn run_pty_sync(
 	};
 	if let Some(cwd) = config.cwd.as_ref() {
 		cmd.cwd(cwd);
+	}
+	if config.clear_env {
+		cmd.env_clear();
 	}
 	if let Some(env) = config.env.as_ref() {
 		for (key, value) in env {
