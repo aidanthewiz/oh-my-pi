@@ -113,10 +113,16 @@ const nativeAndIntegrationPackages = [
 // and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 
-// This fork-only suite covers the Coreforge release channel. Upstream removed
-// its repository script tests in v17.2.6; retain only the independent Coreforge
-// contract here.
-const repoScriptTests = ["scripts/cf-release-notes.test.ts"];
+// Repository-level suites cover retained maintenance scripts and the fork-only
+// Coreforge release channel. Workspace test discovery does not include root scripts.
+const repoScriptTests = [
+	"scripts/cf-release-notes.test.ts",
+	"scripts/ci-release-build-binaries.test.ts",
+	"scripts/fix-changelogs.test.ts",
+	"scripts/inline-functions.test.ts",
+	"scripts/musl-release.test.ts",
+	"scripts/release-disabled.test.ts",
+];
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
 	/^test\/[^/]*(ask|gh|irc|task|eval|search|read|write|edit|ast|resolve|sqlite|web-search|fetch|image|ssh|tool)[^/]*\.test\.ts$/,
