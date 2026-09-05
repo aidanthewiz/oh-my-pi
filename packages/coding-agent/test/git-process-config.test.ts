@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import type { Subprocess } from "bun";
 
@@ -105,6 +108,7 @@ describe("git subprocess config", () => {
 			"-c",
 			"core.untrackedCache=false",
 			"push",
+			"--no-verify",
 			"--no-follow-tags",
 			"fork",
 			"HEAD:refs/heads/feature",
@@ -112,21 +116,87 @@ describe("git subprocess config", () => {
 	});
 
 	it("does not expose parent credentials to repository Git hooks", async () => {
-		const original = process.env.MANAGED_PROFILE_SECRET;
+		const originalSecret = process.env.MANAGED_PROFILE_SECRET;
+		const originalSocket = process.env.SSH_AUTH_SOCK;
 		const spawnCalls: SpawnCall[] = [];
 		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
 		process.env.MANAGED_PROFILE_SECRET = "parent-secret";
+		process.env.SSH_AUTH_SOCK = "/tmp/coreforge-test-hook-agent.sock";
 		try {
 			await git.commit("/work/pi", "fix: filter Git child environment");
 		} finally {
-			if (original === undefined) delete process.env.MANAGED_PROFILE_SECRET;
-			else process.env.MANAGED_PROFILE_SECRET = original;
+			if (originalSecret === undefined) delete process.env.MANAGED_PROFILE_SECRET;
+			else process.env.MANAGED_PROFILE_SECRET = originalSecret;
+			if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+			else process.env.SSH_AUTH_SOCK = originalSocket;
 		}
 
 		expect(spawnCalls).toHaveLength(1);
 		expect(spawnCalls[0]?.options.env).not.toHaveProperty("MANAGED_PROFILE_SECRET");
+		expect(spawnCalls[0]?.options.env).not.toHaveProperty("SSH_AUTH_SOCK");
 	});
 
+	it("preserves Git authentication only for network operations", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-git-network-auth-"));
+		const originalSocket = process.env.SSH_AUTH_SOCK;
+		const originalSshCommand = process.env.GIT_SSH_COMMAND;
+		const originalGitAskpass = process.env.GIT_ASKPASS;
+		const originalSshAskpass = process.env.SSH_ASKPASS;
+		const originalToken = process.env.GH_TOKEN;
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+		process.env.SSH_AUTH_SOCK = "/tmp/coreforge-test-agent.sock";
+		process.env.GIT_SSH_COMMAND = "ssh -o IdentitiesOnly=yes";
+		process.env.GIT_ASKPASS = "/tmp/coreforge-test-git-askpass";
+		process.env.SSH_ASKPASS = "/tmp/coreforge-test-ssh-askpass";
+		process.env.GH_TOKEN = "not-for-git-hooks";
+		try {
+			await git.push(root, { remote: "origin", refspec: "HEAD" });
+			await git.fetch(root, "origin", "main", "refs/remotes/origin/main");
+			await git.clone("git@example.com:org/repo.git", path.join(root, "clone"));
+		} finally {
+			if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+			else process.env.SSH_AUTH_SOCK = originalSocket;
+			if (originalSshCommand === undefined) delete process.env.GIT_SSH_COMMAND;
+			else process.env.GIT_SSH_COMMAND = originalSshCommand;
+			if (originalGitAskpass === undefined) delete process.env.GIT_ASKPASS;
+			else process.env.GIT_ASKPASS = originalGitAskpass;
+			if (originalSshAskpass === undefined) delete process.env.SSH_ASKPASS;
+			else process.env.SSH_ASKPASS = originalSshAskpass;
+			if (originalToken === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = originalToken;
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+
+		expect(spawnCalls).toHaveLength(3);
+		for (const call of spawnCalls) {
+			expect(call.options.env?.SSH_AUTH_SOCK).toBe("/tmp/coreforge-test-agent.sock");
+			expect(call.options.env?.GIT_SSH_COMMAND).toBe("ssh -o IdentitiesOnly=yes");
+			expect(call.options.env?.GIT_ASKPASS).toBe("/tmp/coreforge-test-git-askpass");
+			expect(call.options.env?.SSH_ASKPASS).toBe("/tmp/coreforge-test-ssh-askpass");
+			expect(call.options.env).not.toHaveProperty("GH_TOKEN");
+		}
+	});
+
+	it("rejects Git authentication paths injected by repository dotenv files", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-git-auth-env-"));
+		const originalSocket = process.env.SSH_AUTH_SOCK;
+		const injectedSocket = path.join(root, "repo-agent.sock");
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+		await fs.promises.writeFile(path.join(root, ".env"), `SSH_AUTH_SOCK=${injectedSocket}\n`);
+		process.env.SSH_AUTH_SOCK = injectedSocket;
+		try {
+			await git.push(root, { remote: "origin", refspec: "HEAD" });
+		} finally {
+			if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+			else process.env.SSH_AUTH_SOCK = originalSocket;
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.options.env?.SSH_AUTH_SOCK).not.toBe(injectedSocket);
+	});
 	it("preserves the caller's GPG_TTY for signing-capable commands", async () => {
 		const originalGpgTty = process.env.GPG_TTY;
 		const spawnCalls: SpawnCall[] = [];

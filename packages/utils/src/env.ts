@@ -188,6 +188,16 @@ function hasCredentialValue(name: string): boolean {
 	);
 }
 
+const GIT_CREDENTIAL_ENV_NAMES: Readonly<Record<string, true>> = {
+	GIT_ASKPASS: true,
+	GIT_SSH: true,
+	GIT_SSH_COMMAND: true,
+	GPG_AGENT_INFO: true,
+	SSH_AGENT_PID: true,
+	SSH_ASKPASS: true,
+	SSH_AUTH_SOCK: true,
+};
+
 function isCredentialEnvName(name: string): boolean {
 	const classified = name.toUpperCase();
 	return operationalAwsEnvNames.has(managedEnvName(name)) || hasCredentialValue(classified);
@@ -234,8 +244,9 @@ function expandDotenvValues(values: Record<string, string>, env: Record<string, 
 }
 
 interface ChildEnvPolicy {
-	preserveOperationalAws: boolean;
 	preserveExplicitCredentials: boolean;
+	preserveGitCredentials: boolean;
+	preserveOperationalAws: boolean;
 }
 
 function scrubChildCredentials(
@@ -253,6 +264,11 @@ function scrubChildCredentials(
 		const protectedValue = protectedValues.has(result[key]);
 		const trustedAws =
 			policy.preserveOperationalAws && operationalAwsEnvNames.has(normalized) && !managedName && !managedValue;
+		const trustedGitCredential =
+			policy.preserveGitCredentials &&
+			GIT_CREDENTIAL_ENV_NAMES[normalized] === true &&
+			!managedName &&
+			!managedValue;
 		const explicitCredential =
 			policy.preserveExplicitCredentials &&
 			credentialName &&
@@ -262,8 +278,8 @@ function scrubChildCredentials(
 		if (
 			managedName ||
 			managedValue ||
-			(credentialName && !trustedAws && !explicitCredential) ||
-			(protectedValue && !trustedAws && !explicitCredential)
+			(credentialName && !trustedAws && !trustedGitCredential && !explicitCredential) ||
+			(protectedValue && !trustedAws && !trustedGitCredential && !explicitCredential)
 		) {
 			delete result[key];
 		}
@@ -372,7 +388,7 @@ export function filterChildShellEnv(
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
-		{ preserveOperationalAws: false, preserveExplicitCredentials: false },
+		{ preserveExplicitCredentials: false, preserveGitCredentials: false, preserveOperationalAws: false },
 		env,
 		cwd,
 		overlays,
@@ -386,7 +402,7 @@ export function filterTrustedChildShellEnv(
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
-		{ preserveOperationalAws: true, preserveExplicitCredentials: false },
+		{ preserveExplicitCredentials: false, preserveGitCredentials: false, preserveOperationalAws: true },
 		env,
 		cwd,
 		overlays,
@@ -400,7 +416,21 @@ export function filterUserMcpChildEnv(
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
-		{ preserveOperationalAws: false, preserveExplicitCredentials: true },
+		{ preserveExplicitCredentials: true, preserveGitCredentials: false, preserveOperationalAws: false },
+		env,
+		cwd,
+		overlays,
+	);
+}
+
+/** Preserves credential-agent paths used by authenticated Git commands. */
+export function filterGitChildShellEnv(
+	env: Record<string, string | undefined>,
+	cwd: string = process.cwd(),
+	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
+): Record<string, string> {
+	return filterChildShellEnvInternal(
+		{ preserveExplicitCredentials: false, preserveGitCredentials: true, preserveOperationalAws: false },
 		env,
 		cwd,
 		overlays,
