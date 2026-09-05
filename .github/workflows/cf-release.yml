@@ -25,7 +25,7 @@
 # silently substituting upstream npm prebuilts.
 #
 # This file lives only on the coreforge branch (never on main, which mirrors
-# upstream), so upstream syncs rebase it forward like any other patch commit.
+# upstream), so upstream syncs merge it forward like any other fork change.
 name: cf-release
 
 on:
@@ -49,6 +49,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       should_release: ${{ steps.release.outputs.should_release }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -70,9 +71,9 @@ jobs:
 
           if [ "$EVENT_REF_TYPE" = "tag" ]; then
             TAG="$EVENT_REF_NAME"
-            TAG_COMMIT="$(git rev-parse "$TAG^{commit}")"
-            if [ "$TAG_COMMIT" != "$TIP" ]; then
-              echo "tag commit $TAG_COMMIT is not the coreforge tip ($TIP) - refusing to release"
+            RELEASE_SHA="$(git rev-parse "$TAG^{commit}")"
+            if [ "$RELEASE_SHA" != "$TIP" ]; then
+              echo "tag commit $RELEASE_SHA is not the coreforge tip ($TIP) - refusing to release"
               exit 1
             fi
           else
@@ -92,6 +93,7 @@ jobs:
             fi
 
             LAST=0
+            RESUME_TAG=""
             while IFS= read -r candidate; do
               roll="${candidate#v"${PKG}".}"
               case "$candidate" in
@@ -102,13 +104,25 @@ jobs:
                 *[!0-9]*) continue ;;
               esac
               if [ "$roll" -gt "$LAST" ]; then LAST="$roll"; fi
+
+              candidate_commit="$(git rev-parse "$candidate^{commit}")"
+              if [ "$candidate_commit" = "$EVENT_SHA" ] &&
+                 ! gh release view "$candidate" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                if [ -n "$RESUME_TAG" ]; then
+                  echo "multiple unpublished release tags point at $EVENT_SHA: $RESUME_TAG and $candidate"
+                  exit 1
+                fi
+                RESUME_TAG="$candidate"
+              fi
             done < <(git tag --list "v${PKG}.*")
 
-            TAG="v${PKG}.$((LAST + 1))"
-            git tag "$TAG" "$EVENT_SHA"
-            # GitHub suppresses workflow recursion for tags pushed with
-            # GITHUB_TOKEN, so this run must continue through build and release.
-            git push origin "refs/tags/$TAG"
+            if [ -n "$RESUME_TAG" ]; then
+              TAG="$RESUME_TAG"
+              echo "resuming unpublished release tag $TAG"
+            else
+              TAG="v${PKG}.$((LAST + 1))"
+            fi
+            RELEASE_SHA="$EVENT_SHA"
           fi
 
           ROLL="${TAG#v"${PKG}".}"
@@ -120,8 +134,11 @@ jobs:
             *[!0-9]*) echo "tag $TAG has a non-numeric roll"; exit 1 ;;
           esac
           echo "release tag: $TAG"
-          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_tag=$TAG"
+            echo "should_release=true"
+            echo "release_sha=$RELEASE_SHA"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -159,30 +176,23 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-          ref: ${{ needs.prepare.outputs.release_tag }}
-      - name: Guard tag is the coreforge branch tip
-        # Tag filters are globs, not ACLs: anyone who can push a tag could
-        # otherwise build+publish a release from an arbitrary commit. Ancestry
-        # alone is not enough - any older commit in coreforge history (e.g.
-        # predating the patch set or a hardening fix) would pass. Require the
-        # tagged commit to BE the current coreforge tip: releases are always
-        # cut from the tip (the branch is rebase-managed), so anything else
-        # is either stale or hostile. If the branch moved between tagging and
-        # this run, delete + re-tag on the new tip.
+          ref: ${{ needs.prepare.outputs.release_sha }}
+      - name: Guard release commit is the coreforge branch tip
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
-          # +refspec: coreforge is rebase-managed; force-update the tracking
-          # ref so a reused runner with a stale origin/coreforge can't reject
-          # the non-fast-forward fetch before the guard compares SHAs.
           git fetch origin +coreforge:refs/remotes/origin/coreforge --quiet
-          # Peel: for annotated tags GITHUB_SHA is the tag object, not the commit.
-          TAG_COMMIT="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
           TIP="$(git rev-parse refs/remotes/origin/coreforge)"
-          if [ "$TAG_COMMIT" = "$TIP" ]; then
-            echo "tag commit $TAG_COMMIT is the coreforge tip - ok"
-          else
-            echo "tag commit $TAG_COMMIT is not the coreforge tip ($TIP) - refusing to release"
+          if [ "$HEAD_COMMIT" != "$RELEASE_SHA" ]; then
+            echo "checkout $HEAD_COMMIT does not match prepared commit $RELEASE_SHA"
             exit 1
           fi
+          if [ "$RELEASE_SHA" != "$TIP" ]; then
+            echo "prepared commit $RELEASE_SHA is not the coreforge tip ($TIP) - refusing to release"
+            exit 1
+          fi
+          echo "release commit $RELEASE_SHA is the coreforge tip - ok"
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: "1.3"
@@ -297,7 +307,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-          ref: ${{ needs.prepare.outputs.release_tag }}
+          ref: ${{ needs.prepare.outputs.release_sha }}
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: "1.3"
@@ -326,6 +336,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bun scripts/cf-release-notes.ts "$RELEASE_TAG" release-notes.md
+      - name: Create immutable release tag
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin +coreforge:refs/remotes/origin/coreforge --quiet
+          TIP="$(git rev-parse refs/remotes/origin/coreforge)"
+          if [ "$RELEASE_SHA" != "$TIP" ]; then
+            echo "coreforge advanced from $RELEASE_SHA to $TIP before publication - refusing to tag"
+            exit 1
+          fi
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" --force --quiet
+            TAG_COMMIT="$(git rev-parse "$RELEASE_TAG^{commit}")"
+            if [ "$TAG_COMMIT" != "$RELEASE_SHA" ]; then
+              echo "release tag $RELEASE_TAG already points at $TAG_COMMIT, expected $RELEASE_SHA"
+              exit 1
+            fi
+            echo "release tag $RELEASE_TAG already identifies $RELEASE_SHA - resuming"
+          else
+            git push origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
+          fi
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
