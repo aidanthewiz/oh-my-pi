@@ -10,6 +10,7 @@ import * as path from "node:path";
 import * as tls from "node:tls";
 import * as zlib from "node:zlib";
 import { PtySession } from "@oh-my-pi/pi-natives";
+import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
 import xterm from "@xterm/headless";
 
 const DEFAULT_PROXY_HOST = "127.0.0.1";
@@ -719,18 +720,19 @@ export async function runClaudeMessagesCapture(args: ClaudeTraceCommandArgs = {}
 	const timeoutMs = args.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const message = args.message ?? DEFAULT_MESSAGE;
 	const cwd = path.resolve(args.cwd ?? process.cwd());
-	const env = {
+	const env = filterChildShellEnv(Bun.env, cwd, {
 		HTTPS_PROXY: proxy.url,
 		HTTP_PROXY: proxy.url,
 		NODE_TLS_REJECT_UNAUTHORIZED: "0",
 		TERM: "xterm-256color",
-	};
+	});
 	let ptyOutput = "";
 	const runPromise = session.start(
 		{
 			command,
 			cwd,
 			timeoutMs,
+			clearEnv: true,
 			env,
 			cols: DEFAULT_COLS,
 			rows: DEFAULT_ROWS,

@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- Kept `coreforge stats --json` and `omp-stats --json` machine-readable by sending sync progress to stderr and suppressing human completion summaries.
+
 - Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
 - Accepted AWS STS relay proofs when the optional Identity Center store ARN claim is absent, while still rejecting a mismatched ARN when AWS emits one.
 - Fixed the signed relay image publisher to stage the integrity-checked Linux native addon in its isolated build job.
@@ -32,7 +34,7 @@
 - Added the raw `artifact://` footer to bash results whenever the per-line output cap drops bytes, making the existing uncapped capture discoverable.
 - Preserved managed extension and MCP provider selection through `setup` and `join` session entry points.
 - Reported configured provider-discovery freshness in JSON model listings instead of silently presenting stale or unavailable catalogs as current.
-- Protected credential-marked settings and removed managed profile values from repository-controlled subprocess environments.
+- Protected credential-marked settings, preserved launcher-enforced telemetry opt-outs through trusted worker re-entry, and removed managed profile values from repository PTYs, direnv, Git hooks, cleanse checkers, and other repository-controlled subprocesses.
 - Initialized managed Coreforge identity before `models` provider discovery so authenticated Claude and Bedrock routes appear in fresh utility-command catalogs.
 - Required an explicit bearer credential for custom `pi-native` provider transports.
 ## [17.2.6] - 2026-08-03

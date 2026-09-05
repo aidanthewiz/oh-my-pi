@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+
 ## [17.2.6] - 2026-08-03
 
 ### Added

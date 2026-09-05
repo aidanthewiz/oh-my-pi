@@ -1624,6 +1624,8 @@ export interface PtyArgvStartOptions {
   cwd?: string
   /** Environment variables for this command. */
   env?: Record<string, string>
+  /** Replace the inherited process environment instead of overlaying it. */
+  clearEnv?: boolean
   /** Timeout in milliseconds before cancelling. */
   timeoutMs?: number
   /** Abort signal for cancelling the operation. */
@@ -1652,6 +1654,8 @@ export interface PtyStartOptions {
   cwd?: string
   /** Environment variables for this command. */
   env?: Record<string, string>
+  /** Replace the inherited process environment instead of overlaying it. */
+  clearEnv?: boolean
   /** Timeout in milliseconds before cancelling. */
   timeoutMs?: number
   /** Abort signal for cancelling the operation. */

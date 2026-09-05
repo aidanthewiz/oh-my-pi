@@ -117,6 +117,25 @@ describe.skipIf(!hasDirenv)("loadDirenvEnv (real direnv, allow-list honored)", (
 		expect(diff?.set.PATH).toContain(path.join(root, "bin"));
 	});
 
+	it("does not expose parent credentials to an allowed .envrc", async () => {
+		const root = tmp();
+		const capture = path.join(root, "captured");
+		await Bun.write(
+			path.join(root, ".envrc"),
+			`printf %s "\${MANAGED_PROFILE_SECRET-unset}" > ${JSON.stringify(capture)}\n`,
+		);
+		await allowEnvrc(root);
+		const original = Bun.env.MANAGED_PROFILE_SECRET;
+		Bun.env.MANAGED_PROFILE_SECRET = "parent-secret";
+		try {
+			await loadDirenvEnv(root);
+			expect(await fs.readFile(capture, "utf8")).toBe("unset");
+		} finally {
+			if (original === undefined) delete Bun.env.MANAGED_PROFILE_SECRET;
+			else Bun.env.MANAGED_PROFILE_SECRET = original;
+		}
+	});
+
 	it("reports variables a .envrc unsets", async () => {
 		const root = tmp();
 		await Bun.write(path.join(root, ".envrc"), "unset PI_DIRENV_UNSET_TEST\n");
@@ -322,4 +341,40 @@ describe.skipIf(!hasDirenv)("applyDirenvPreflight (shared all-backends preflight
 		expect(command).toBe("noop");
 		expect(env).toBe(callerEnv);
 	});
+});
+
+it("does not expose parent credentials to the direnv process", async () => {
+	const root = tmp();
+	const binDir = path.join(root, "bin");
+	const capture = path.join(root, "captured");
+	await fs.mkdir(binDir);
+	await Bun.write(path.join(root, ".envrc"), "export SAFE_VALUE=loaded\n");
+	const fakeDirenv = path.join(binDir, "direnv");
+	await Bun.write(
+		fakeDirenv,
+		`#!/bin/sh\nprintf %s "\${MANAGED_PROFILE_SECRET-unset}" > ${JSON.stringify(capture)}\nprintf '{}'\n`,
+	);
+	await fs.chmod(fakeDirenv, 0o755);
+	const probe = path.join(root, "probe.ts");
+	const direnvUrl = import.meta.resolve("@oh-my-pi/pi-coding-agent/exec/direnv");
+	await Bun.write(
+		probe,
+		`import { loadDirenvEnv } from ${JSON.stringify(direnvUrl)};\nif (!await loadDirenvEnv(process.cwd())) process.exit(2);\n`,
+	);
+
+	const proc = Bun.spawn([process.execPath, "--no-env-file", probe], {
+		cwd: root,
+		env: {
+			HOME: root,
+			PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
+			MANAGED_PROFILE_SECRET: "parent-secret",
+		},
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+
+	expect(exitCode, stderr).toBe(0);
+	expect(await fs.readFile(capture, "utf8")).toBe("unset");
 });

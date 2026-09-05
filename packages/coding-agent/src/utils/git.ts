@@ -1,7 +1,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, hasFsCode, isEisdir, isEnoent, isEnotdir, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$which,
+	filterChildShellEnv,
+	filterGitChildShellEnv,
+	hasFsCode,
+	isEisdir,
+	isEnoent,
+	isEnotdir,
+	Snowflake,
+} from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
@@ -375,6 +384,7 @@ async function collectSubprocessResult(
 interface CommandOptions {
 	readonly env?: Record<string, string | undefined>;
 	readonly maxOutputBytes?: number;
+	readonly preserveGitCredentials?: boolean;
 	readonly readOnly?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stdin?: string | Uint8Array | ArrayBuffer | SharedArrayBuffer;
@@ -401,15 +411,29 @@ function buildNonInteractiveEnv(
 	};
 }
 
-function buildGitEnv(overrides?: Record<string, string | undefined>): Record<string, string | undefined> {
+function buildGitEnv(
+	cwd: string,
+	overrides?: Record<string, string | undefined>,
+	preserveGitCredentials = false,
+): Record<string, string | undefined> {
+	const filteredEnv = preserveGitCredentials
+		? filterGitChildShellEnv(process.env, cwd)
+		: filterChildShellEnv(process.env, cwd);
+	const nonInteractiveEnv = preserveGitCredentials
+		? {
+				...GIT_NON_INTERACTIVE_ENV,
+				GIT_ASKPASS: filteredEnv.GIT_ASKPASS ?? GIT_NON_INTERACTIVE_ENV.GIT_ASKPASS,
+				SSH_ASKPASS: filteredEnv.SSH_ASKPASS ?? GIT_NON_INTERACTIVE_ENV.SSH_ASKPASS,
+			}
+		: GIT_NON_INTERACTIVE_ENV;
 	return buildNonInteractiveEnv(
 		{
-			...process.env,
+			...filteredEnv,
 			GIT_OPTIONAL_LOCKS: "0",
 			...AMBIENT_GIT_ENV,
 			...overrides,
 		},
-		GIT_NON_INTERACTIVE_ENV,
+		nonInteractiveEnv,
 	);
 }
 
@@ -443,7 +467,7 @@ function gitSpawnSyncText(
 	try {
 		const result = Bun.spawnSync(["git", ...commandArgs], {
 			cwd,
-			env: buildGitEnv(),
+			env: buildGitEnv(cwd),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
@@ -478,7 +502,7 @@ async function git(cwd: string, args: readonly string[], options: CommandOptions
 	try {
 		child = Bun.spawn(["git", ...commandArgs], {
 			cwd,
-			env: buildGitEnv(options.env),
+			env: buildGitEnv(cwd, options.env, options.preserveGitCredentials),
 			signal: options.signal,
 			stdin: normalizeStdin(options.stdin),
 			stdout: "pipe",
@@ -1395,11 +1419,13 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 	// branch — rejected refs ("permission denied") on remotes the user
 	// cannot tag (e.g. PR-head forks), failing the call after the branch
 	// itself already updated. Tool pushes push exactly the named refspec.
-	const args = ["push", "--no-follow-tags"];
+	// Authenticated pushes bypass repository pre-push hooks because Git exposes
+	// the transport credentials to those hooks before contacting the remote.
+	const args = ["push", "--no-verify", "--no-follow-tags"];
 	if (options.forceWithLease) args.push("--force-with-lease");
 	if (options.remote) args.push(options.remote);
 	if (options.refspec) args.push(options.refspec);
-	await runEffect(cwd, args, { signal: options.signal });
+	await runEffect(cwd, args, { signal: options.signal, preserveGitCredentials: true });
 }
 
 /** Checkout a ref. */
@@ -1418,6 +1444,7 @@ export async function fetch(
 	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], {
 		signal: options.signal,
 		timeoutMs: resolveTimeoutMs(options.timeoutMs, GIT_NETWORK_TIMEOUT_MS),
+		preserveGitCredentials: true,
 	});
 }
 
@@ -2153,6 +2180,7 @@ export async function clone(url: string, targetDir: string, options: CloneOption
 		await runEffect(path.dirname(absoluteTarget), args, {
 			signal: options.signal,
 			timeoutMs: resolveTimeoutMs(options.timeoutMs, GIT_NETWORK_TIMEOUT_MS),
+			preserveGitCredentials: true,
 		});
 		if (options.sha) {
 			try {

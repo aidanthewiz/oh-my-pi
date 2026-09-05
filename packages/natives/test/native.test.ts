@@ -643,6 +643,40 @@ describe("pi-natives", () => {
 			expect(JSON.parse(output.trim())).toEqual(expected);
 		});
 
+		it("can replace the inherited process environment", async () => {
+			const original = process.env.PTY_PARENT_SECRET;
+			process.env.PTY_PARENT_SECRET = "parent-secret";
+			try {
+				const session = new PtySession();
+				let output = "";
+				const result = await session.startArgv(
+					{
+						application: process.execPath,
+						args: [
+							"-e",
+							"process.stdout.write(JSON.stringify({ inherited: process.env.PTY_PARENT_SECRET, explicit: process.env.PTY_EXPLICIT }))",
+						],
+						cwd: testDir,
+						clearEnv: true,
+						env: { PTY_EXPLICIT: "explicit-value" },
+						timeoutMs: 5_000,
+						cols: 80,
+						rows: 24,
+					},
+					(error, chunk) => {
+						if (error) throw error;
+						output += chunk;
+					},
+				);
+
+				expect(result.exitCode).toBe(0);
+				expect(JSON.parse(output.trim())).toEqual({ explicit: "explicit-value" });
+			} finally {
+				if (original === undefined) delete process.env.PTY_PARENT_SECRET;
+				else process.env.PTY_PARENT_SECRET = original;
+			}
+		});
+
 		it("reports the child PID as soon as the PTY process starts", async () => {
 			const session = new PtySession();
 			const started = Promise.withResolvers<{ error: Error | null; pid: number }>();

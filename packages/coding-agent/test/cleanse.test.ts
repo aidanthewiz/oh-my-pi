@@ -15,6 +15,7 @@ import type {
 	CleanseDiagnosticReport,
 } from "@oh-my-pi/pi-coding-agent/cleanse/types";
 import { resolveCliArgv } from "@oh-my-pi/pi-coding-agent/cli-commands";
+import { ptree } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -107,6 +108,37 @@ describe("cleanse diagnostics", () => {
 			});
 			expect(report.diagnostics[0]?.message).toContain("bun test (.) failed with exit code 3");
 		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("does not expose parent credentials to repository checkers", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cleanse-env-"));
+		const original = Bun.env.MANAGED_PROFILE_SECRET;
+		try {
+			await Bun.write(path.join(root, "settings.gradle"), "");
+			await Bun.write(path.join(root, "Main.java"), "final class Main {}\n");
+			const wrapper = path.join(root, "gradlew");
+			await Bun.write(wrapper, "#!/bin/sh\nexit 0\n");
+			await fs.chmod(wrapper, 0o755);
+			const execSpy = vi.spyOn(ptree, "exec").mockResolvedValue({
+				stdout: "",
+				stderr: "",
+				ok: true,
+				exitCode: 0,
+			});
+			Bun.env.MANAGED_PROFILE_SECRET = "parent-secret";
+
+			const suite = await cleanseCheckers.discoverCleanseDiagnosticSuite(root);
+			const report = await suite.run();
+
+			expect(report.checks[0]?.exitCode).toBe(0);
+			expect(execSpy).toHaveBeenCalledTimes(1);
+			expect(execSpy.mock.calls[0]?.[1]?.env).toBeDefined();
+			expect(execSpy.mock.calls[0]?.[1]?.env).not.toHaveProperty("MANAGED_PROFILE_SECRET");
+		} finally {
+			if (original === undefined) delete Bun.env.MANAGED_PROFILE_SECRET;
+			else Bun.env.MANAGED_PROFILE_SECRET = original;
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, logger } from "@oh-my-pi/pi-utils";
+import { $which, filterChildShellEnv, logger } from "@oh-my-pi/pi-utils";
 
 /** Default cap on a single `direnv` invocation. The first export for a devenv
  *  `.envrc` can build a shell; callers may raise this via `bash.direnvLoadTimeoutMs`. */
@@ -56,12 +56,13 @@ function direnvBinary(): string | null {
 	return direnvLookup.bin;
 }
 
-/** direnv computes its diff relative to the spawning env; strip any inherited
- *  direnv state so it loads the target `.envrc` from a clean baseline. */
-function cleanSpawnEnv(): Record<string, string> {
-	const out: Record<string, string> = {};
-	for (const [key, value] of Object.entries(Bun.env)) {
-		if (value !== undefined && !key.startsWith("DIRENV_")) out[key] = value;
+/** direnv computes its diff relative to the spawning env. Apply the repository
+ * child boundary first, then strip inherited direnv state so it loads the
+ * target `.envrc` from a clean baseline. */
+function cleanSpawnEnv(cwd: string): Record<string, string> {
+	const out = filterChildShellEnv(Bun.env, cwd);
+	for (const key in out) {
+		if (key.startsWith("DIRENV_")) delete out[key];
 	}
 	return out;
 }
@@ -124,7 +125,7 @@ export async function loadDirenvEnv(
 
 	const dir = path.dirname(envrcPath);
 	const timeoutMs = opts?.timeoutMs ?? DEFAULT_DIRENV_TIMEOUT_MS;
-	const env = cleanSpawnEnv();
+	const env = cleanSpawnEnv(dir);
 	try {
 		const { exitCode, stdout, stderr } = await runDirenv(bin, ["export", "json"], dir, timeoutMs, env, opts?.signal);
 		if (exitCode !== 0) {

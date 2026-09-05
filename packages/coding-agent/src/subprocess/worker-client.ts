@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	$env,
+	applyLauncherCapturedChildPolicy,
 	isBunTestRuntime,
 	isCompiledBinary,
 	logger,
@@ -118,17 +119,18 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
 	if (isCompiledBinary()) return { cmd: [executable, workerArg] };
 	const hostEntry = workerHostEntry();
 	if (hostEntry) {
-		return { cmd: [executable, path.basename(hostEntry), workerArg], cwd: path.dirname(hostEntry) };
+		return { cmd: [executable, "--no-env-file", path.basename(hostEntry), workerArg], cwd: path.dirname(hostEntry) };
 	}
 	const packageRoot = path.resolve(import.meta.dir, "..", "..");
-	return { cmd: [executable, "src/cli.ts", workerArg], cwd: packageRoot };
+	return { cmd: [executable, "--no-env-file", "src/cli.ts", workerArg], cwd: packageRoot };
 }
 
 /**
  * Snapshot the parent environment for a trusted engine worker. Repository-controlled
  * subprocesses must call `filterChildShellEnv` at their spawn boundary instead.
  * `process.env` carries `undefined` slots that `Bun.spawn` rejects, so filter them out;
- * an optional `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
+ * an optional `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys,
+ * then launcher policy wins over both.
  */
 export function workerEnvFromParent(overlay?: Record<string, string>): Record<string, string> {
 	const base = $env as Record<string, string | undefined>;
@@ -140,6 +142,7 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
+	applyLauncherCapturedChildPolicy(merged);
 	return merged;
 }
 

@@ -477,8 +477,10 @@ describe("ModelRegistry runtime provider registration", () => {
 
 		const output = captured.join("");
 		const warning = `Warning: model discovery for "${providerName}" is unavailable.`;
+		const noModels = output.indexOf("No models ");
 		expect(output).toContain(warning);
-		expect(output.indexOf(warning)).toBeLessThan(output.indexOf(`No models matching "${providerName}"`));
+		expect(noModels).toBeGreaterThanOrEqual(0);
+		expect(output.indexOf(warning)).toBeLessThan(noModels);
 	});
 
 	test("JSON listing reports failed SigV4 discovery seeds as stale", async () => {

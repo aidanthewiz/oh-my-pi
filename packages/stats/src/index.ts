@@ -156,7 +156,7 @@ Examples:
 		});
 		if (tty && lastWidth > 0) process.stderr.write(`\r${" ".repeat(lastWidth)}\r`);
 		const total = await getTotalMessageCount();
-		console.log(`Synced ${processed} new entries from ${files} files (${total} total)\n`);
+		if (!values.json) console.log(`Synced ${processed} new entries from ${files} files (${total} total)\n`);
 
 		if (values.json) {
 			const stats = await getDashboardStats();
