@@ -1,0 +1,135 @@
+# Non-publishing release dry run for changes targeting the Coreforge engine.
+# This workflow is separate from cf-release.yml so pull request code never runs
+# in a job that can receive contents: write.
+name: cf-verify
+
+on:
+  pull_request:
+    branches:
+      - coreforge
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-14
+            binary: omp-darwin-arm64
+            native_targets: darwin-arm64
+          - target: darwin-x64
+            os: macos-15-intel
+            binary: omp-darwin-x64
+            native_targets: darwin-x64-baseline
+          - target: linux-x64
+            os: ubuntu-22.04
+            binary: omp-linux-x64
+            native_targets: "linux-x64-baseline linux-x64-modern"
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            binary: omp-linux-arm64
+            native_targets: linux-arm64
+          - target: win32-x64
+            os: ubuntu-24.04
+            cross: "1"
+            binary: omp-windows-x64.exe
+            native_targets: win32-x64-baseline
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.3"
+      - name: Resolve verification version
+        run: |
+          PKG="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          echo "VERIFY_VERSION=${PKG}.0" >> "$GITHUB_ENV"
+      - name: Reclaim disk for Windows native cross-build
+        if: matrix.target == 'win32-x64'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+      - run: bun install --frozen-lockfile
+      - name: Cache Bazel native builds
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cache/omp-bazel-disk
+            ~/.cache/omp-bazel-repo
+          key: coreforge-verify-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          restore-keys: |
+            coreforge-verify-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build native addon from Coreforge sources
+        env:
+          NATIVE_TARGETS: ${{ matrix.native_targets }}
+        run: |
+          set -euo pipefail
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          mkdir -p "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
+          {
+            echo "common --config=ci"
+            echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
+            echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
+          } > "$RUNNER_TEMP/coreforge-bazel.rc"
+          export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
+          read -r -a targets <<< "$NATIVE_TARGETS"
+          bun scripts/bazel-natives.ts "${targets[@]}"
+          ls packages/natives/native/*.node
+      - name: Package source-built native addon
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          addons=(packages/natives/native/pi_natives."${{ matrix.target }}"*.node)
+          expected=1
+          if [ "${{ matrix.target }}" = "linux-x64" ]; then expected=2; fi
+          if [ "${#addons[@]}" -ne "$expected" ]; then
+            echo "expected $expected native files for ${{ matrix.target }}, found ${#addons[@]}" >&2
+            printf '  %s\n' "${addons[@]}" >&2
+            exit 1
+          fi
+          mkdir -p release-assets/package
+          cp "${addons[@]}" release-assets/package/
+          archive="release-assets/coreforge-pi-natives-${{ matrix.target }}-verify.tgz"
+          tar -czf "$archive" -C release-assets package
+          test -s "$archive"
+      - name: Inject verification channel version
+        run: bun scripts/set-cf-version.ts "$VERIFY_VERSION"
+      - name: Build binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target }}
+        run: bun run ci:release:build-binaries
+      - name: Smoke binary
+        if: matrix.cross != '1'
+        run: |
+          OUT="$(./packages/coding-agent/binaries/${{ matrix.binary }} --version)"
+          echo "reported: $OUT"
+          case "$OUT" in
+            */"$VERIFY_VERSION") echo "version OK: $OUT" ;;
+            *) echo "::error::expected */$VERIFY_VERSION, got $OUT"; exit 1 ;;
+          esac
+      - name: Verify binary asset
+        run: test -s "packages/coding-agent/binaries/${{ matrix.binary }}"
+
+  browser_relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.3"
+      - run: bun install --frozen-lockfile
+      - name: Build Coreforge Browser Relay extension
+        run: |
+          bun --cwd=packages/browser-relay run build
+          test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip

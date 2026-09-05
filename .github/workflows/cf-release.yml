@@ -34,9 +34,6 @@ on:
       - coreforge
     tags:
       - "v*.*.*.*"
-  pull_request:
-    branches:
-      - coreforge
 
 permissions:
   contents: read
@@ -53,7 +50,6 @@ jobs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       should_release: ${{ steps.release.outputs.should_release }}
       release_sha: ${{ steps.release.outputs.release_sha }}
-      publish: ${{ steps.release.outputs.publish }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -65,7 +61,6 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
           EVENT_REF_NAME: ${{ github.ref_name }}
           EVENT_REF_TYPE: ${{ github.ref_type }}
           EVENT_SHA: ${{ github.sha }}
@@ -73,16 +68,6 @@ jobs:
           git fetch origin +coreforge:refs/remotes/origin/coreforge --tags --force --quiet
           TIP="$(git rev-parse refs/remotes/origin/coreforge)"
           PKG="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            {
-              echo "release_tag=v${PKG}.0"
-              echo "should_release=true"
-              echo "release_sha=$EVENT_SHA"
-              echo "publish=false"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           if [ "$EVENT_REF_TYPE" = "tag" ]; then
             TAG="$EVENT_REF_NAME"
@@ -153,7 +138,6 @@ jobs:
             echo "release_tag=$TAG"
             echo "should_release=true"
             echo "release_sha=$RELEASE_SHA"
-            echo "publish=true"
           } >> "$GITHUB_OUTPUT"
 
   build:
@@ -194,7 +178,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.release_sha }}
       - name: Guard release commit is the coreforge branch tip
-        if: github.event_name == 'push'
         env:
           RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
@@ -314,28 +297,11 @@ jobs:
           path: release-assets/coreforge-pi-natives-${{ matrix.target }}-${{ env.RELEASE_TAG }}.tgz
           if-no-files-found: error
 
-  verify_release_assets:
-    needs: prepare
-    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.publish != 'true'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ needs.prepare.outputs.release_sha }}
-      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
-        with:
-          bun-version: "1.3"
-      - run: bun install --frozen-lockfile
-      - name: Build Coreforge Browser Relay extension
-        run: |
-          bun --cwd=packages/browser-relay run build
-          test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip
-
   release:
     permissions:
       contents: write
     needs: [prepare, build]
-    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.publish == 'true'
+    if: needs.prepare.outputs.should_release == 'true'
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     runs-on: ubuntu-24.04
@@ -405,7 +371,7 @@ jobs:
 
   verify_release:
     needs: [prepare, release]
-    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.publish == 'true'
+    if: needs.prepare.outputs.should_release == 'true'
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
