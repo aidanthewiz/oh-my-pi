@@ -5,6 +5,16 @@
 ### Fixed
 
 - Bound managed dotenv mode and child policy to trusted launcher provenance, preserved launcher values that match project dotenv entries, and removed managed profile values from repository-controlled child environments.
+## [17.2.9] - 2026-08-05
+
+### Added
+
+- Added a public `compareVersions` utility (`@oh-my-pi/pi-utils`) that compares two version strings with SemVer-2.0 prerelease ordering, build-metadata stripping, and numeric segment comparison without float overflow; never throws.
+
+### Fixed
+
+- Honor the current process `PATH` when caching executable lookups, preventing stale tool paths after environment reloads.
+- Parsed account-cap reset windows such as “Your limit will reset in 13 minutes” so credential backoff honors the provider's full reset duration.
 
 ## [17.2.6] - 2026-08-03
 

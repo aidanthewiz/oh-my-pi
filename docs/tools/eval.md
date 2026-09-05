@@ -149,9 +149,10 @@ A stateless, tool-free one-shot model call:
 
 Runs one subagent through `runStructuredSubagent(...)`:
 
-- JS supports the preferred `await agent(prompt, { agent?, model?, label?, schema?, schemaMode?, isolated?, apply?, merge?, handle? })`; legacy positional slots are still implemented.
-- Python/Ruby/Julia use keyword arguments (`schema_mode` outside JS).
-- `agent` defaults from the current spawn policy. `model` may pin a selector/fallback chain. `schema` overrides agent/session schemas; `schemaMode`/`schema_mode` chooses `permissive` or `strict`.
+- JS supports the preferred `await agent(prompt, { agent?, label?, schema?, schemaMode?, contextFilePolicy?, isolated?, apply?, merge?, handle? })`; legacy positional slots are still implemented.
+- Python/Ruby/Julia use keyword arguments (`schema_mode` and `context_file_policy` outside JS).
+- `agent` defaults from the current spawn policy; the selected agent's frontmatter model and settings always apply (there is no per-call model override — `model` is not accepted). `schema` overrides agent/session schemas; `schemaMode`/`schema_mode` chooses `permissive` or `strict`.
+- Parent context files are inherited by default. Set `contextFilePolicy="none"` or `context_file_policy="none"` for a context-agnostic child.
 - `isolated` requests isolation. `apply` controls whether captured changes are integrated; `merge=false` selects patch mode while the normal setting controls branch mode.
 - `handle=true` returns `{ text, output, handle, id, agent }`, optional parsed `data`, and isolation metadata instead of only output/data.
 - Eval subagents are one-shot (`keepAlive=false`), are unregistered/disposed after completion, and **do not share the caller's eval executor** (`shareEvalSession=false`). Their code mutations therefore do not appear in the caller's retained VM/kernel.
