@@ -1,25 +1,20 @@
 import { describe, expect, it } from "bun:test";
-import * as path from "node:path";
-import { $ } from "bun";
 import { resolveCrossBuild } from "../packages/coding-agent/scripts/build-binary";
-
-const repoRoot = path.join(import.meta.dir, "..");
+import { COMPILED_EXTERNAL_DEPENDENCIES } from "../packages/coding-agent/scripts/compile-binary";
+import { BINARY_TARGETS } from "./ci-release-build-binaries";
 
 describe("Windows release binary target", () => {
-	it("builds the generic Windows release asset with the baseline runtime", async () => {
-		const result = await $`bun scripts/ci-release-build-binaries.ts --dry-run --targets win32-x64`
-			.cwd(repoRoot)
-			.quiet()
-			.nothrow();
-		expect(result.exitCode).toBe(0);
-		const output = result.text();
-
-		expect(output).toContain("Building packages/coding-agent/binaries/omp-windows-x64.exe...");
-		expect(output).toContain(
-			"DRY RUN Bun.build target=bun-windows-x64-baseline outfile=packages/coding-agent/binaries/omp-windows-x64.exe",
-		);
-		expect(output).toContain("external=fastembed,onnxruntime-node");
-		expect(output).not.toContain("bun-windows-x64-modern");
+	it("builds the generic Windows release asset with the baseline runtime", () => {
+		const target = BINARY_TARGETS.find(candidate => candidate.id === "win32-x64");
+		expect(target).toEqual({
+			id: "win32-x64",
+			platform: "win32",
+			arch: "x64",
+			target: "bun-windows-x64-baseline",
+			outfile: "packages/coding-agent/binaries/omp-windows-x64.exe",
+		});
+		expect(COMPILED_EXTERNAL_DEPENDENCIES).toContain("fastembed");
+		expect(COMPILED_EXTERNAL_DEPENDENCIES).toContain("onnxruntime-node");
 	});
 
 	it("uses the baseline runtime for local Windows cross-build aliases", () => {

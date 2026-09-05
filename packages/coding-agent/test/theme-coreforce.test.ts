@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { getSeriesColor } from "../../utils/src/vendor/mermaid-ascii/xychart/colors";
 import { defaultThemes } from "../src/modes/theme/defaults";
 import coreforceTheme from "../src/modes/theme/defaults/coreforce.json" with { type: "json" };

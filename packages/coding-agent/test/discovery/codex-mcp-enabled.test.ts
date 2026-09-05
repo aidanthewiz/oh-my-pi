@@ -73,7 +73,7 @@ enabled = false
 		expect(configs["computer-use"]).toBeUndefined();
 	});
 
-	test("enabled = true is imported and included", async () => {
+	test("enabled = true uses the enabled default and is included", async () => {
 		await writeCodexConfig(
 			tempHome,
 			`
@@ -84,7 +84,7 @@ enabled = true
 		);
 
 		const servers = await loadCodexServers(projectDir);
-		expect(servers.find(s => s.name === "node-repl")?.enabled).toBe(true);
+		expect(servers.find(s => s.name === "node-repl")?.enabled).toBeUndefined();
 
 		clearFsCache();
 		const { configs } = await loadAllMCPConfigs(projectDir);

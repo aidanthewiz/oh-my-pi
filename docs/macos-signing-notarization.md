@@ -87,6 +87,8 @@ Store these files in a local untracked directory, for example
 | `issuer-id.txt` | App Store Connect issuer UUID. |
 | `key-id.txt` | Optional key ID when it cannot be derived from the `.p8` filename. |
 
+### Uploading without printing secret values
+
 The upload helper validates the files and passes each value to `gh secret set`
 over standard input. It does not print secret values or place them in process
 arguments:

@@ -5,6 +5,12 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [17.2.7] - 2026-08-03
+
+### Added
+
+- Added missing procps/BSD output format specifiers and aliases to the in-process `ps` shell builtin, including support for columns like `tpgid`, `pri`, `flags`, `wchan`, and various user/group/time fields.
+- Updated `ps -j` to include the TPGID column, `ps -l` to display the single-character S column, and the STAT column to support the `+` foreground process group flag.
 
 ## [17.2.6] - 2026-08-03
 

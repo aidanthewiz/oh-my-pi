@@ -266,8 +266,8 @@ export declare function __ompInstallTokioRuntime(): void
  * that the `.node` file on disk is from the same package release as the
  * `index.js` ESM wrapper invoking it.
  *
- * The `js_name` is bumped by `scripts/release.ts` to match the new
- * `Cargo.toml` / `package.json` version on every release. The JS loader
+ * The version integration step bumps `js_name` to match the new `Cargo.toml`
+ * and `package.json` version on every release. The JS loader
  * computes the expected name from `package.json#version` and refuses to use
  * a `.node` that doesn't expose it, turning the silent
  * `<sym> is not a function` crash from a locked-file update (the canonical
@@ -279,7 +279,7 @@ export declare function __ompInstallTokioRuntime(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV17_2_6(): void
+export declare function __piNativesV17_2_7(): void
 
 /**
  * Apply ast-grep rewrite rules to matching files; honors `dryRun` and returns

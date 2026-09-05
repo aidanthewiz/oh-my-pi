@@ -50,9 +50,7 @@ for (const [name, version] of Object.entries(versionMap).sort()) {
 const versions = new Set(Object.values(versionMap));
 if (versions.size > 1) {
 	console.error("\n❌ ERROR: Not all packages have the same version!");
-	console.error("Expected lockstep versioning. Run the release script with the next version:");
-	console.error("  bun scripts/release.ts <version>");
-	console.error("Or update all package versions consistently before running this script.");
+	console.error("Update all package versions consistently before running this script.");
 
 	process.exit(1);
 }

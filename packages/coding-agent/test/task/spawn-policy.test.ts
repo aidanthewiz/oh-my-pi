@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "../../src/config/settings";
 import initAgentPrompt from "../../src/prompts/agents/init.md" with { type: "text" };
 import * as taskDiscovery from "../../src/task/discovery";

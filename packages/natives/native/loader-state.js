@@ -756,8 +756,8 @@ export function initLoaderContext(overrides = {}) {
 
 	// Version sentinel emitted by the Rust addon under a `js_name` that encodes
 	// the package version (`__piNativesV{major}_{minor}_{patch}`).
-	// `scripts/release.ts` bumps the name in `crates/pi-natives/src/lib.rs` in
-	// lock-step with the version, so a `.node` from a different release
+	// The version integration step bumps the name in `crates/pi-natives/src/lib.rs`
+	// in lock-step, so a `.node` from a different release
 	// physically cannot expose the symbol this loader is looking for. That
 	// turns the silent `<sym> is not a function` crash from a Windows
 	// locked-file update into an actionable load-time error.

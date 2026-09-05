@@ -9,6 +9,11 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [17.2.7] - 2026-08-03
+
+### Fixed
+
+- Fixed an issue where setting `thinking-level: off` failed to disable reasoning on direct DeepSeek V4 requests.
 
 ## [17.2.6] - 2026-08-03
 

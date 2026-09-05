@@ -8,7 +8,7 @@
  * Node and edge vocabulary is deliberately semantic (`kind`, `role`, `emphasis`)
  * rather than visual. Callers never choose colors; the skin does.
  */
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 
 /**
  * Node treatment. Semantic, so one skin change restyles every figure.
