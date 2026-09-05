@@ -162,7 +162,6 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				opts.baseOptions.onCleanupDeferred?.(completion);
 			},
 		});
-		if (deferredCleanup) return result;
 		if (opts.mergeMode === "branch" && result.exitCode === 0) {
 			try {
 				const commitResult = await commitToBranch(

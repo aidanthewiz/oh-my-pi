@@ -196,6 +196,77 @@ describe("runIsolatedSubprocess", () => {
 		await Promise.resolve();
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 	});
+
+	it("captures successful work before deferred cleanup removes the isolation", async () => {
+		const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-deferred-"));
+		tempRoots.push(repoRoot);
+		const isolationDir = path.join(repoRoot, "isolated");
+		const artifactsDir = path.join(repoRoot, "artifacts");
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const cleanupGate = Promise.withResolvers<void>();
+		const cleanupFinished = Promise.withResolvers<void>();
+		const baseline = {
+			root: {
+				repoRoot,
+				headCommit: "base",
+				staged: "",
+				unstaged: "",
+				untracked: [],
+				untrackedPatch: "",
+			},
+			nested: [],
+		};
+		const rootPatch = "diff --git a/task.txt b/task.txt\n--- a/task.txt\n+++ b/task.txt\n@@ -1 +1 @@\n-old\n+new\n";
+
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: isolationDir,
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			options.onCleanupDeferred?.(cleanupGate.promise);
+			return result({ id: "DeferredSuccess" });
+		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch,
+			nestedPatches: [],
+		});
+		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
+			cleanupFinished.resolve();
+		});
+
+		const outcome = await runIsolatedSubprocess({
+			baseOptions: {
+				cwd: repoRoot,
+				agent: {
+					name: "task",
+					description: "Task agent",
+					systemPrompt: "test",
+					source: "bundled",
+				},
+				task: "Do work",
+				index: 0,
+				id: "DeferredSuccess",
+			},
+			context: { repoRoot, baseline },
+			preferredBackend: undefined,
+			agentId: "DeferredSuccess",
+			mergeMode: "patch",
+			artifactsDir,
+			buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
+		});
+
+		const patchPath = path.join(artifactsDir, "DeferredSuccess.patch");
+		expect(outcome.patchPath).toBe(patchPath);
+		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
+		expect(captureSpy).toHaveBeenCalledWith(isolationDir, baseline);
+		expect(cleanupSpy).not.toHaveBeenCalled();
+
+		cleanupGate.resolve();
+		await cleanupFinished.promise;
+		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("mergeIsolatedChanges", () => {
