@@ -162,7 +162,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				opts.baseOptions.onCleanupDeferred?.(completion);
 			},
 		});
-		if (opts.mergeMode === "branch" && result.exitCode === 0) {
+		const preserveChanges = result.exitCode === 0 || deferredCleanup !== undefined;
+		if (opts.mergeMode === "branch" && preserveChanges) {
 			try {
 				const commitResult = await commitToBranch(
 					isolationDir,
@@ -201,7 +202,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				}
 			}
 		}
-		if (result.exitCode === 0) {
+		if (preserveChanges) {
 			try {
 				const patchResult = await writeIsolationPatch(isolationDir, taskBaseline, opts.artifactsDir, opts.agentId);
 				return {

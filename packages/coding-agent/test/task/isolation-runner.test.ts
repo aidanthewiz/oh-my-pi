@@ -197,7 +197,7 @@ describe("runIsolatedSubprocess", () => {
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("captures successful work before deferred cleanup removes the isolation", async () => {
+	it("captures completed work when deferred cleanup changes the result to failure", async () => {
 		const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-deferred-"));
 		tempRoots.push(repoRoot);
 		const isolationDir = path.join(repoRoot, "isolated");
@@ -226,7 +226,12 @@ describe("runIsolatedSubprocess", () => {
 		});
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			options.onCleanupDeferred?.(cleanupGate.promise);
-			return result({ id: "DeferredSuccess" });
+			return result({
+				id: "DeferredSuccess",
+				exitCode: 1,
+				aborted: true,
+				error: "cleanup exceeded its deadline",
+			});
 		});
 		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
 			rootPatch,
@@ -256,6 +261,7 @@ describe("runIsolatedSubprocess", () => {
 			artifactsDir,
 			buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
 		});
+		expect(outcome.exitCode).toBe(1);
 
 		const patchPath = path.join(artifactsDir, "DeferredSuccess.patch");
 		expect(outcome.patchPath).toBe(patchPath);
