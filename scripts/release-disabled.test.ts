@@ -41,14 +41,16 @@ test("Coreforce allocates a release tag only after every build succeeds", async 
 	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
 	const prepareStart = workflow.indexOf("  prepare:");
 	const buildStart = workflow.indexOf("  build:", prepareStart);
-	const releaseStart = workflow.indexOf("  release:", buildStart);
+	const verifyAssetsStart = workflow.indexOf("  verify_release_assets:", buildStart);
+	const releaseStart = workflow.indexOf("  release:", verifyAssetsStart);
 	const verifyStart = workflow.indexOf("  verify_release:", releaseStart);
 	const prepareJob = workflow.slice(prepareStart, buildStart);
-	const buildJob = workflow.slice(buildStart, releaseStart);
+	const buildJob = workflow.slice(buildStart, verifyAssetsStart);
 	const releaseJob = workflow.slice(releaseStart, verifyStart);
 
 	expect(prepareStart).toBeGreaterThanOrEqual(0);
 	expect(buildStart).toBeGreaterThan(prepareStart);
+	expect(verifyAssetsStart).toBeGreaterThan(buildStart);
 	expect(releaseStart).toBeGreaterThan(buildStart);
 	expect(verifyStart).toBeGreaterThan(releaseStart);
 	expect(prepareJob).not.toContain("git push origin");
@@ -63,4 +65,31 @@ test("Coreforce allocates a release tag only after every build succeeds", async 
 	expect(tagIndex).toBeGreaterThan(downloadIndex);
 	expect(publishIndex).toBeGreaterThan(tagIndex);
 	expect(releaseJob).toContain('git push origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"');
+});
+
+test("Coreforce pull requests dry-run release assets without publishing", async () => {
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
+	const prepareStart = workflow.indexOf("  prepare:");
+	const buildStart = workflow.indexOf("  build:", prepareStart);
+	const verifyAssetsStart = workflow.indexOf("  verify_release_assets:", buildStart);
+	const releaseStart = workflow.indexOf("  release:", verifyAssetsStart);
+	const verifyReleaseStart = workflow.indexOf("  verify_release:", releaseStart);
+	const prepareJob = workflow.slice(prepareStart, buildStart);
+	const buildJob = workflow.slice(buildStart, verifyAssetsStart);
+	const verifyAssetsJob = workflow.slice(verifyAssetsStart, releaseStart);
+	const releaseJob = workflow.slice(releaseStart, verifyReleaseStart);
+
+	expect(workflow).toContain("  pull_request:\n    branches:\n      - coreforge");
+	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
+	expect(prepareJob).toContain('if [ "$EVENT_NAME" = "pull_request" ]; then');
+	expect(prepareJob).toContain(`echo "release_tag=v\${PKG}.0"`);
+	expect(prepareJob).toContain('echo "publish=false"');
+	expect(prepareJob).toContain('echo "publish=true"');
+	expect(buildJob).toContain("if: needs.prepare.outputs.should_release == 'true'");
+	expect(buildJob).toContain("if: github.event_name == 'push'");
+	expect(verifyAssetsJob).toContain("needs.prepare.outputs.publish != 'true'");
+	expect(verifyAssetsJob).toContain("bun --cwd=packages/browser-relay run build");
+	expect(verifyAssetsJob).toContain("test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip");
+	expect(releaseJob).toContain("permissions:\n      contents: write");
+	expect(releaseJob).toContain("needs.prepare.outputs.publish == 'true'");
 });
