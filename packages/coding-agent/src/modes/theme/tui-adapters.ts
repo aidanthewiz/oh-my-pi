@@ -156,6 +156,7 @@ export function getMarkdownTheme(): MarkdownTheme {
 				const mermaidTheme = {
 					// xychar uses `bg` only to determine dark/light shade polarity.
 					bg: theme.isLight ? "#ffffff" : "#000000",
+					accent: theme.getColorHex("accent"),
 					fg: theme.getColorHex("text"),
 					border: theme.getColorHex("border"),
 					line: theme.getColorHex("muted"),
