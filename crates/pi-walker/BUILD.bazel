@@ -12,7 +12,7 @@ rust_library(
     crate_name = "pi_walker",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    version = "17.1.5",
+    version = "17.2.15",
     deps = all_crate_deps(normal = True),
 )
 
