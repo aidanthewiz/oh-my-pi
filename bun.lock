@@ -137,7 +137,7 @@
     },
     "packages/diagram": {
       "name": "@oh-my-pi/pi-diagram",
-      "version": "17.2.11",
+      "version": "17.2.12",
       "dependencies": {
         "@oh-my-pi/omptype": "catalog:",
         "@oh-my-pi/pi-utils": "catalog:",
