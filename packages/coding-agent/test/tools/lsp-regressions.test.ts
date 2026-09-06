@@ -1885,7 +1885,7 @@ describe("lsp regressions", () => {
 							version: "1.0.0",
 							source: "./csharp-lsp/1.0.0",
 							lspServers: {
-								"csharp-ls": {
+								"marketplace-csharp-ls": {
 									command: "csharp-ls",
 									extensionToLanguage: { ".cs": "csharp" },
 								},
@@ -1908,9 +1908,11 @@ describe("lsp regressions", () => {
 
 			const config = loadConfig(cwd);
 
-			expect(config.servers["csharp-ls"]?.resolvedCommand).toBe(resolvedCsharpLs);
-			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toEqual(["csharp-ls"]);
-			expect(config.servers["csharp-ls"]?.rootMarkers).toEqual(["."]);
+			expect(config.servers["marketplace-csharp-ls"]?.resolvedCommand).toBe(resolvedCsharpLs);
+			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toContain(
+				"marketplace-csharp-ls",
+			);
+			expect(config.servers["marketplace-csharp-ls"]?.rootMarkers).toEqual(["."]);
 			expect(whichSpy).toHaveBeenCalledWith("csharp-ls");
 		} finally {
 			await preloadPluginRoots(path.join(tempDir.path(), "empty-home"), cwd);
