@@ -108,4 +108,28 @@ describe("ModelRegistry runtime source cleanup", () => {
 		expect(getCustomApi("custom-runtime-cleanup-api")).toBeUndefined();
 		expect(registry.find("peer-provider", "peer-model")).toBeDefined();
 	});
+
+	test("retains a custom API shared by another provider from the same source", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		for (const providerName of ["provider-one", "provider-two"]) {
+			registry.registerProvider(
+				providerName,
+				{
+					baseUrl: `https://${providerName}.example.com/v1`,
+					apiKey: `${providerName.toUpperCase().replace("-", "_")}_KEY`,
+					api: "shared-runtime-api",
+					streamSimple,
+					models: [{ ...baseModel, id: `${providerName}-model` }],
+				},
+				sourceId,
+			);
+		}
+
+		registry.unregisterProvider("provider-one", sourceId);
+		expect(getCustomApi("shared-runtime-api")).toBeDefined();
+		expect(registry.find("provider-two", "provider-two-model")).toBeDefined();
+
+		registry.unregisterProvider("provider-two", sourceId);
+		expect(getCustomApi("shared-runtime-api")).toBeUndefined();
+	});
 });

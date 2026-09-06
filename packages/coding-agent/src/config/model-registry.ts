@@ -2671,6 +2671,21 @@ export class ModelRegistry {
 		this.authStorage.removeConfigApiKey(providerName);
 	}
 
+	#unregisterProviderCustomApi(providerName: string, sourceId: string): void {
+		const customApiId = this.#runtimeProviderCustomApiIds.get(providerName);
+		if (!customApiId) return;
+		for (const [otherProviderName, otherCustomApiId] of this.#runtimeProviderCustomApiIds) {
+			if (
+				otherProviderName !== providerName &&
+				otherCustomApiId === customApiId &&
+				this.#runtimeProviderSourceByName.get(otherProviderName) === sourceId
+			) {
+				return;
+			}
+		}
+		unregisterCustomApi(customApiId, sourceId);
+	}
+
 	/**
 	 * Remove custom API/OAuth registrations for a specific extension source.
 	 */
@@ -2707,11 +2722,8 @@ export class ModelRegistry {
 		if (sourceProviders?.size === 0) {
 			this.#runtimeProvidersBySource.delete(registeredSourceId);
 		}
+		this.#unregisterProviderCustomApi(providerName, registeredSourceId);
 		this.#runtimeProviderSourceByName.delete(providerName);
-		const customApiId = this.#runtimeProviderCustomApiIds.get(providerName);
-		if (customApiId) {
-			unregisterCustomApi(customApiId, registeredSourceId);
-		}
 		unregisterOAuthProvider(providerName);
 		this.#ensureFullSnapshot();
 		this.#clearRuntimeProviderState(providerName);
@@ -2759,9 +2771,8 @@ export class ModelRegistry {
 			"runtime-register",
 		);
 		const previousSourceId = this.#runtimeProviderSourceByName.get(providerName);
-		const previousCustomApiId = this.#runtimeProviderCustomApiIds.get(providerName);
-		if (previousSourceId && previousCustomApiId) {
-			unregisterCustomApi(previousCustomApiId, previousSourceId);
+		if (previousSourceId) {
+			this.#unregisterProviderCustomApi(providerName, previousSourceId);
 		}
 
 		if (config.streamSimple && config.api) {
