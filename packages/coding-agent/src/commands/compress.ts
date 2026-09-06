@@ -1,5 +1,6 @@
 import { postmortem } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { compressHelp as commandHelp } from "../cli/command-help";
 import { CliUsageError } from "../cli/usage-error";
 import { runCompressCommand } from "../compress";
@@ -18,11 +19,11 @@ export default class Compress extends Command {
 	};
 
 	static examples = [
-		"omp compress prompts/tools/read.md",
-		"omp compress notes.md -o notes.compressed.md",
-		"omp compress 'src/prompts/**/*.md' -i",
-		"omp compress a.md b.md c.md -i -n 8",
-		"omp compress spec.md -r 5 -m opus",
+		`${CF_COMMAND} compress prompts/tools/read.md`,
+		`${CF_COMMAND} compress notes.md -o notes.compressed.md`,
+		`${CF_COMMAND} compress 'src/prompts/**/*.md' -i`,
+		`${CF_COMMAND} compress a.md b.md c.md -i -n 8`,
+		`${CF_COMMAND} compress spec.md -r 5 -m opus`,
 	];
 
 	async run(): Promise<void> {

@@ -3,9 +3,9 @@
  * immediately runs `/join <link>`.
  */
 
-import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { Args, Command } from "@oh-my-pi/pi-utils/cli";
 import { parseArgs } from "../cli/args";
+import { CF_COMMAND } from "../cli/cf-version";
 import { joinHelp as commandHelp } from "../cli/command-help";
 import { runRootCommand } from "../main";
 import { launchHelp } from "./launch-help";
@@ -33,18 +33,18 @@ export default class Join extends Command {
 		"mcp-providers": launchHelp.flags["mcp-providers"],
 	};
 
-	static examples = [`${APP_NAME} join "relay.example.sh/abc123#key"`];
+	static examples = [`${CF_COMMAND} join "relay.example.sh/abc123#key"`];
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Join);
 		const link = args.link?.trim();
 		if (!link) {
-			process.stderr.write(`Usage: ${APP_NAME} join <link>\n`);
+			process.stderr.write(`Usage: ${CF_COMMAND} join <link>\n`);
 			process.exitCode = 1;
 			return;
 		}
 		if (!process.stdin.isTTY || !process.stdout.isTTY) {
-			process.stderr.write(`${APP_NAME} join requires an interactive terminal\n`);
+			process.stderr.write(`${CF_COMMAND} join requires an interactive terminal\n`);
 			process.exitCode = 1;
 			return;
 		}

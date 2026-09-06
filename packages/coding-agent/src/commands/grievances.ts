@@ -3,6 +3,7 @@
  */
 
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { grievancesHelp as commandHelp } from "../cli/command-help";
 import { cleanGrievances, listGrievances, pushGrievances } from "../cli/grievances-cli";
 
@@ -29,12 +30,12 @@ export default class Grievances extends Command {
 	};
 
 	static examples = [
-		"omp grievances",
-		"omp grievances list --tool find",
-		"omp grievances clean --id 209",
-		"omp grievances clean --tool find",
-		"omp grievances clean --all",
-		"omp grievances push",
+		`${CF_COMMAND} grievances`,
+		`${CF_COMMAND} grievances list --tool find`,
+		`${CF_COMMAND} grievances clean --id 209`,
+		`${CF_COMMAND} grievances clean --tool find`,
+		`${CF_COMMAND} grievances clean --all`,
+		`${CF_COMMAND} grievances push`,
 	];
 
 	async run(): Promise<void> {

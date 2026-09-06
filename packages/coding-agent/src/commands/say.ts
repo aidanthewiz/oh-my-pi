@@ -12,6 +12,7 @@
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { sayHelp as commandHelp } from "../cli/command-help";
 import { Settings, settings } from "../config/settings";
 import { TTS_LOCAL_VOICE_VALUES } from "../tts/models";
@@ -34,9 +35,9 @@ export default class Say extends Command {
 	};
 
 	static examples = [
-		'omp say "hello world"',
-		"omp say --file notes.md --voice bm_fable",
-		'omp say "hello world" --out /tmp/hello.wav',
+		`${CF_COMMAND} say "hello world"`,
+		`${CF_COMMAND} say --file notes.md --voice bm_fable`,
+		`${CF_COMMAND} say "hello world" --out /tmp/hello.wav`,
 	];
 
 	async run(): Promise<void> {
@@ -139,7 +140,7 @@ export default class Say extends Command {
 	#synthesisFailed(model: string): void {
 		process.stderr.write(
 			chalk.red(
-				`error: could not synthesize with local TTS model "${model}". Run \`omp setup speech\` to install it.\n`,
+				`error: could not synthesize with local TTS model "${model}". Run \`${CF_COMMAND} setup speech\` to install it.\n`,
 			),
 		);
 	}

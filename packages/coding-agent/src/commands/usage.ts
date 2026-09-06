@@ -3,6 +3,7 @@
  */
 
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { usageHelp as commandHelp } from "../cli/command-help";
 import { runUsageCommand } from "../cli/usage-cli";
 
@@ -32,13 +33,13 @@ export default class Usage extends Command {
 	};
 
 	static examples = [
-		"# Detailed per-account usage breakdown across all providers\n  omp usage",
-		"# Only Anthropic accounts\n  omp usage --provider anthropic",
-		"# Redact account identifiers for screenshots\n  omp usage --redact",
-		"# Machine-readable output\n  omp usage --json",
-		"# Usage-limit trend over the last 30 days\n  omp usage --history --days 30",
-		"# Invalidate cached usage reports for all providers\n  omp usage invalidate",
-		"# Invalidate cached usage reports for a specific provider\n  omp usage invalidate --provider anthropic",
+		`# Detailed per-account usage breakdown across all providers\n  ${CF_COMMAND} usage`,
+		`# Only Anthropic accounts\n  ${CF_COMMAND} usage --provider anthropic`,
+		`# Redact account identifiers for screenshots\n  ${CF_COMMAND} usage --redact`,
+		`# Machine-readable output\n  ${CF_COMMAND} usage --json`,
+		`# Usage-limit trend over the last 30 days\n  ${CF_COMMAND} usage --history --days 30`,
+		`# Invalidate cached usage reports for all providers\n  ${CF_COMMAND} usage invalidate`,
+		`# Invalidate cached usage reports for a specific provider\n  ${CF_COMMAND} usage invalidate --provider anthropic`,
 	];
 
 	async run(): Promise<void> {
