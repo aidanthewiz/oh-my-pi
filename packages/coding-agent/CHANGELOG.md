@@ -38,6 +38,12 @@
 - Protected credential-marked settings, preserved launcher-enforced telemetry opt-outs through trusted worker re-entry, and removed managed profile values from repository PTYs, direnv, Git hooks, cleanse checkers, and other repository-controlled subprocesses.
 - Initialized managed Coreforge identity before `models` provider discovery so authenticated Claude and Bedrock routes appear in fresh utility-command catalogs.
 - Required an explicit bearer credential for custom `pi-native` provider transports.
+## [17.2.14] - 2026-08-11
+
+### Added
+
+- Added `externalThinking` setting for private scratchpad reasoning via the new `think` tool
+
 ## [17.2.13] - 2026-08-11
 
 ### Added

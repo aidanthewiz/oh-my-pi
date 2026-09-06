@@ -3300,7 +3300,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						});
 					}
 				}
-				return settingsAwareStreamFn(streamModel, context, streamOptions);
+				const externalThinking =
+					settings.get("externalThinking") && agent.state.tools.some(tool => tool.name === "think");
+				return settingsAwareStreamFn(streamModel, context, {
+					...streamOptions,
+					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
+				});
 			},
 			cursorExecHandlers,
 			getCursorTools: () => (toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
@@ -3457,6 +3462,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			createComputerTool: restrictToolNames
 				? undefined
 				: async () => (await BUILTIN_TOOLS.computer(toolSession)) ?? null,
+			createThinkTool: async () => (await HIDDEN_TOOLS.think(toolSession)) ?? null,
 			createInspectImageTool: restrictToolNames
 				? undefined
 				: async () => (await BUILTIN_TOOLS.inspect_image(toolSession)) ?? null,

@@ -1700,6 +1700,7 @@ function mapOptionsForApi<TApi extends Api>(
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 				disableReasoning: options?.disableReasoning,
+				forceReasoningOff: options?.forceReasoningOff,
 				textVerbosity: options?.textVerbosity,
 				promptCache: options?.promptCache,
 				statefulResponses: options?.statefulResponses,
@@ -1714,6 +1715,8 @@ function mapOptionsForApi<TApi extends Api>(
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				promptCache: options?.promptCache,
 				statefulResponses: options?.statefulResponses,
+				disableReasoning: options?.disableReasoning || options?.forceReasoningOff,
+				forceReasoningOff: options?.forceReasoningOff,
 			});
 
 		case "openai-codex-responses":
@@ -1726,6 +1729,7 @@ function mapOptionsForApi<TApi extends Api>(
 				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
+				forceReasoningOff: options?.forceReasoningOff,
 			});
 
 		case "google-generative-ai": {
