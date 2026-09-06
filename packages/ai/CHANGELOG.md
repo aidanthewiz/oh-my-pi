@@ -12,6 +12,13 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [17.2.15] - 2026-08-12
+
+### Fixed
+
+- Fixed an issue where AWS_BEDROCK_SKIP_AUTH failed to expose Amazon Bedrock models when AWS credential files were unavailable.
+- Fixed an issue where forceReasoningOff was ignored by Anthropic and Google transports, which allowed native thinking alongside a caller-supplied external scratchpad.
+
 ## [17.2.14] - 2026-08-11
 
 ### Added

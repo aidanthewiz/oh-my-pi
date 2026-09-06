@@ -199,6 +199,7 @@ import {
 	PROPOSE_DEVICE_NAME,
 	writeDeviceDispatch,
 } from "../tools/resolve";
+import { supportsExternalThinking } from "../tools/think";
 import type { TodoPhase } from "../tools/todo";
 import { ToolError } from "../tools/tool-errors";
 import { parseCommandArgs } from "../utils/command-args";
@@ -5189,10 +5190,7 @@ export class AgentSession {
 			!hasPendingUserDirective &&
 			this.settings.get("externalThinking") &&
 			this.getEnabledToolNames().includes("think") &&
-			activeModel &&
-			(activeModel.api === "openai-responses" ||
-				activeModel.api === "azure-openai-responses" ||
-				activeModel.api === "openai-codex-responses")
+			supportsExternalThinking(activeModel)
 				? buildNamedToolChoice("think", activeModel)
 				: undefined;
 		const eagerTodoPrelude =
@@ -7068,6 +7066,11 @@ export class AgentSession {
 			await this.#tools.reconcileInspectImageAfterModelChange();
 		} catch (error) {
 			logger.warn("inspect_image reconcile after model change failed", { error: String(error) });
+		}
+		try {
+			await this.#tools.reconcileThinkTool();
+		} catch (error) {
+			logger.warn("think tool reconcile after model change failed", { error: String(error) });
 		}
 	}
 

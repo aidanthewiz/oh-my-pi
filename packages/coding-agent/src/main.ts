@@ -1370,6 +1370,11 @@ export async function runRootCommand(
 		settingsInstance.override("mcp.discoveryProviders", parsedArgs.mcpProviders);
 	}
 
+	// Apply --external-thinking CLI flag (ephemeral, not persisted)
+	if (parsedArgs.externalThinking) {
+		settingsInstance.override("externalThinking", true);
+	}
+
 	await logger.time(
 		"initTheme:final",
 		initTheme,

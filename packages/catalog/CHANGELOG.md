@@ -9,6 +9,12 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [17.2.15] - 2026-08-12
+
+### Fixed
+
+- Fixed classification of model IDs with large minor versions (e.g., `claude-opus-5-11`) or three-part versions, ensuring they no longer fall back to stale default configurations.
+
 ## [17.2.13] - 2026-08-11
 
 ### Changed

@@ -5,6 +5,12 @@
 ### Fixed
 
 - Bound managed dotenv mode and child policy to trusted launcher provenance, preserved launcher values that match project dotenv entries, and removed managed profile values from repository-controlled child environments.
+## [17.2.15] - 2026-08-12
+
+### Changed
+
+- Extended parsed Server-Sent Events (SSE) to include optional id and retry fields, enabling reconnecting transports to retain stream cursors and respect server-requested retry intervals.
+
 ## [17.2.13] - 2026-08-11
 
 ### Changed
