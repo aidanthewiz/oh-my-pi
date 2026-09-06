@@ -282,33 +282,39 @@ export class HttpTransport implements MCPTransport {
 		if (resume.lastEventId === null) {
 			throw new SSEResumeError("SSE stream ended without a resumable event ID");
 		}
-		await waitForSSERetry(resume.retryMs, signal);
-		const generated: Record<string, string> = {
-			Accept: "text/event-stream",
-			"Last-Event-ID": resume.lastEventId,
-		};
-		if (this.#sessionId) generated["Mcp-Session-Id"] = this.#sessionId;
-		let response = await this.#fetch({ method: "GET", signal }, generated);
-		if (this.onAuthError && (response.status === 401 || response.status === 403)) {
-			await response.body?.cancel();
-			const newHeaders = await this.onAuthError();
-			if (!newHeaders) {
-				throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: auth refresh failed`);
+		try {
+			await waitForSSERetry(resume.retryMs, signal);
+			const generated: Record<string, string> = {
+				Accept: "text/event-stream",
+				"Last-Event-ID": resume.lastEventId,
+			};
+			if (this.#sessionId) generated["Mcp-Session-Id"] = this.#sessionId;
+			let response = await this.#fetch({ method: "GET", signal }, generated);
+			if (this.onAuthError && (response.status === 401 || response.status === 403)) {
+				await response.body?.cancel();
+				const newHeaders = await this.onAuthError();
+				if (!newHeaders) {
+					throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: auth refresh failed`);
+				}
+				// Persist refreshed headers so subsequent requests use them directly
+				this.config = { ...this.config, headers: newHeaders };
+				response = await this.#fetch({ method: "GET", signal }, generated);
 			}
-			// Persist refreshed headers so subsequent requests use them directly
-			this.config = { ...this.config, headers: newHeaders };
-			response = await this.#fetch({ method: "GET", signal }, generated);
+			if (!response.ok) {
+				const text = await response.text().catch(() => "");
+				throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: ${text}`);
+			}
+			const contentType = response.headers.get("Content-Type") ?? "";
+			if (!contentType.includes("text/event-stream") || !response.body) {
+				await response.body?.cancel();
+				throw new SSEResumeError(`MCP SSE resume returned unsupported Content-Type: ${contentType || "(missing)"}`);
+			}
+			return response;
+		} catch (error) {
+			if (error instanceof SSEResumeError || (error instanceof Error && error.name === "AbortError")) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new SSEResumeError(`Failed to resume MCP SSE stream: ${message}`, { cause: error });
 		}
-		if (!response.ok) {
-			const text = await response.text().catch(() => "");
-			throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: ${text}`);
-		}
-		const contentType = response.headers.get("Content-Type") ?? "";
-		if (!contentType.includes("text/event-stream") || !response.body) {
-			await response.body?.cancel();
-			throw new SSEResumeError(`MCP SSE resume returned unsupported Content-Type: ${contentType || "(missing)"}`);
-		}
-		return response;
 	}
 
 	/** Route an SSE message (or batch) to the appropriate handler. */

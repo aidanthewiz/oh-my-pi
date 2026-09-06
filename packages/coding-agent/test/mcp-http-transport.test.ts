@@ -257,6 +257,48 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		expect(observed.lastEventId).toBe("stream-1");
 	});
 
+	it("does not replay an accepted POST when resume auth refresh throws", async () => {
+		const observed = { posts: 0, gets: 0, authRefreshes: 0 };
+		server = Bun.serve({
+			port: 0,
+			fetch(req) {
+				if (req.method === "POST") {
+					observed.posts++;
+					if (observed.posts === 1) {
+						return new Response("id: stream-1\nretry: 10\ndata:\n\n", {
+							headers: { "Content-Type": "text/event-stream" },
+						});
+					}
+					return Response.json({ jsonrpc: "2.0", id: observed.posts, result: { tools: [] } });
+				}
+				observed.gets++;
+				return new Response("expired", { status: 401 });
+			},
+		});
+		if (!server) throw new Error("Test server was not started");
+		const transport = new HttpTransport({
+			type: "http",
+			url: `http://127.0.0.1:${server.port}/mcp`,
+			timeout: GUARD_TIMEOUT_MS,
+			headers: { Authorization: "Bearer stale" },
+		});
+		transport.onAuthError = async () => {
+			observed.authRefreshes++;
+			if (observed.authRefreshes === 1) {
+				throw Object.assign(new Error("refresh failed"), { status: 401 });
+			}
+			return { Authorization: "Bearer fresh" };
+		};
+		await transport.connect();
+
+		await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).rejects.toThrow(
+			"refresh failed",
+		);
+		expect(observed.posts).toBe(1);
+		expect(observed.gets).toBe(1);
+		expect(observed.authRefreshes).toBe(1);
+	});
+
 	it("resumes after an abrupt stream drop once an event ID exists", async () => {
 		// Bun.serve cannot produce a genuine mid-body transport failure in-process
 		// (stream errors surface as clean EOF client-side), so speak raw HTTP: a
