@@ -104,6 +104,38 @@ describe("extension provider registration rollback", () => {
 		expect(runtime.pendingProviderRegistrations.map(r => r.name)).toEqual(["working-provider"]);
 	});
 
+	test("does not unregister another extension's queued provider", async () => {
+		const runtime = new ExtensionRuntime();
+		const events = new EventBus();
+
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerProvider("working-provider", testProviderConfig);
+			},
+			process.cwd(),
+			events,
+			runtime,
+			"working-extension",
+		);
+		await loadExtensionFromFactory(
+			pi => {
+				pi.unregisterProvider("working-provider");
+			},
+			process.cwd(),
+			events,
+			runtime,
+			"peer-extension",
+		);
+
+		expect(runtime.pendingProviderRegistrations).toEqual([
+			{
+				name: "working-provider",
+				config: testProviderConfig,
+				sourceId: "working-extension",
+			},
+		]);
+	});
+
 	test("restores an earlier registration when unregistering extension fails", async () => {
 		const runtime = new ExtensionRuntime();
 		const events = new EventBus();

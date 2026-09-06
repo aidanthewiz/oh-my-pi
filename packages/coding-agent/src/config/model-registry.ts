@@ -2695,16 +2695,17 @@ export class ModelRegistry {
 	/**
 	 * Remove one extension-registered provider and restore its static models.
 	 */
-	unregisterProvider(providerName: string): void {
-		const sourceId = this.#runtimeProviderSourceByName.get(providerName);
-		if (sourceId) {
-			const sourceProviders = this.#runtimeProvidersBySource.get(sourceId);
-			sourceProviders?.delete(providerName);
-			if (sourceProviders?.size === 0) {
-				this.#runtimeProvidersBySource.delete(sourceId);
-			}
-			this.#runtimeProviderSourceByName.delete(providerName);
+	unregisterProvider(providerName: string, sourceId: string): void {
+		const registeredSourceId = this.#runtimeProviderSourceByName.get(providerName);
+		if (!registeredSourceId || registeredSourceId !== sourceId) {
+			return;
 		}
+		const sourceProviders = this.#runtimeProvidersBySource.get(registeredSourceId);
+		sourceProviders?.delete(providerName);
+		if (sourceProviders?.size === 0) {
+			this.#runtimeProvidersBySource.delete(registeredSourceId);
+		}
+		this.#runtimeProviderSourceByName.delete(providerName);
 		unregisterOAuthProvider(providerName);
 		this.#ensureFullSnapshot();
 		this.#clearRuntimeProviderState(providerName);

@@ -533,8 +533,8 @@ export class ExtensionRunner {
 		this.runtime.registerProvider = (name, config, sourceId) => {
 			this.modelRegistry.registerProvider(name, config, sourceId);
 		};
-		this.runtime.unregisterProvider = name => {
-			this.modelRegistry.unregisterProvider(name);
+		this.runtime.unregisterProvider = (name, sourceId) => {
+			this.modelRegistry.unregisterProvider(name, sourceId);
 		};
 
 		// Context actions (required)

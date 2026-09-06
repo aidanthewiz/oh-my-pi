@@ -94,7 +94,12 @@ describe("ModelRegistry runtime source cleanup", () => {
 		);
 
 		expect(getOAuthProvider("runtime-provider")).toBeDefined();
-		registry.unregisterProvider("runtime-provider");
+		registry.unregisterProvider("runtime-provider", "peer-source");
+		expect(registry.find("runtime-provider", "runtime-model")).toBeDefined();
+		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(true);
+		expect(getOAuthProvider("runtime-provider")).toBeDefined();
+
+		registry.unregisterProvider("runtime-provider", sourceId);
 
 		expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
 		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(false);

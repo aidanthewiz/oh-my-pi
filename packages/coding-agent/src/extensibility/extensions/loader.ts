@@ -77,8 +77,10 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		this.pendingProviderRegistrations.push({ name, config, sourceId });
 	}
 
-	unregisterProvider(name: string): void {
-		const remaining = this.pendingProviderRegistrations.filter(registration => registration.name !== name);
+	unregisterProvider(name: string, sourceId: string): void {
+		const remaining = this.pendingProviderRegistrations.filter(
+			registration => registration.name !== name || registration.sourceId !== sourceId,
+		);
 		this.pendingProviderRegistrations.splice(0, this.pendingProviderRegistrations.length, ...remaining);
 	}
 
