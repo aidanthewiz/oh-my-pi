@@ -303,6 +303,55 @@ describe("lsp regressions", () => {
 		});
 	});
 
+	it("lazily activates TypeScript LSP from a nested project root", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-nested-project-");
+		const projectDir = path.join(tempDir.path(), "repos", "web");
+		const filePath = path.join(projectDir, "src", "app.ts");
+		vi.spyOn(piUtils, "$which").mockImplementation(command =>
+			command === "typescript-language-server" ? process.execPath : null,
+		);
+
+		try {
+			await fs.promises.mkdir(path.join(tempDir.path(), ".git"), { recursive: true });
+			await Bun.write(path.join(projectDir, "package.json"), '{"private":true}\n');
+			await Bun.write(filePath, 'import { value } from "./value";\n');
+
+			const server = installFakeLsp((message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: { capabilities: { codeActionProvider: true } },
+					});
+				} else if (message.method === "textDocument/codeAction") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: [] });
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+
+			const tool = new LspTool(makeLspSession(tempDir.path()));
+			const result = await tool.execute("nested-typescript-code-actions", {
+				action: "code_actions",
+				file: path.relative(tempDir.path(), filePath),
+				line: 1,
+				symbol: "import",
+			});
+
+			expect(textResult(result)).toContain("No code actions available");
+			const initialize = server.received.find(message => message.method === "initialize");
+			expect(initialize?.params).toMatchObject({
+				rootUri: fileToUri(projectDir),
+				rootPath: projectDir,
+			});
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
 	it("uses a custom server languageId for disk and in-memory document opens", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-language-id-");
 		const filePath = path.join(tempDir.path(), "foo.gd");
