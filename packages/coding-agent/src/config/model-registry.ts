@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import * as path from "node:path";
-import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { registerCustomApi, unregisterCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import type {
 	Api,
 	Context,
@@ -880,6 +880,7 @@ export class ModelRegistry {
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
 	#runtimeProviderApiKeys: Map<string, string> = new Map();
+	#runtimeProviderCustomApiIds: Map<string, string> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
 	// Credential-aware model projections registered via
 	// `registerProvider({ oauth: { modifyModels } })`. Persisted for the same
@@ -2661,6 +2662,7 @@ export class ModelRegistry {
 
 	#clearRuntimeProviderState(providerName: string): void {
 		this.#runtimeProviderApiKeys.delete(providerName);
+		this.#runtimeProviderCustomApiIds.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
 		this.#runtimeModelManagers.delete(providerName);
@@ -2706,6 +2708,10 @@ export class ModelRegistry {
 			this.#runtimeProvidersBySource.delete(registeredSourceId);
 		}
 		this.#runtimeProviderSourceByName.delete(providerName);
+		const customApiId = this.#runtimeProviderCustomApiIds.get(providerName);
+		if (customApiId) {
+			unregisterCustomApi(customApiId, registeredSourceId);
+		}
 		unregisterOAuthProvider(providerName);
 		this.#ensureFullSnapshot();
 		this.#clearRuntimeProviderState(providerName);
@@ -2752,6 +2758,11 @@ export class ModelRegistry {
 			},
 			"runtime-register",
 		);
+		const previousSourceId = this.#runtimeProviderSourceByName.get(providerName);
+		const previousCustomApiId = this.#runtimeProviderCustomApiIds.get(providerName);
+		if (previousSourceId && previousCustomApiId) {
+			unregisterCustomApi(previousCustomApiId, previousSourceId);
+		}
 
 		if (config.streamSimple && config.api) {
 			const streamSimple = config.streamSimple;
@@ -2771,7 +2782,6 @@ export class ModelRegistry {
 		let sourceHandoff = false;
 		if (sourceId) {
 			this.#registeredProviderSources.add(sourceId);
-			const previousSourceId = this.#runtimeProviderSourceByName.get(providerName);
 			if (previousSourceId && previousSourceId !== sourceId) {
 				const previousProviders = this.#runtimeProvidersBySource.get(previousSourceId);
 				previousProviders?.delete(providerName);
@@ -2789,6 +2799,11 @@ export class ModelRegistry {
 		if (sourceHandoff) {
 			this.#lastStaticLoadMtime = null;
 			this.#reloadStaticModels();
+		}
+		if (sourceId && config.streamSimple && config.api) {
+			this.#runtimeProviderCustomApiIds.set(providerName, config.api);
+		} else {
+			this.#runtimeProviderCustomApiIds.delete(providerName);
 		}
 
 		this.#ensureFullSnapshot();

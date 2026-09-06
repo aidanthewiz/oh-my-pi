@@ -4,6 +4,7 @@ import {
 	clearCustomApis,
 	getCustomApi,
 	registerCustomApi,
+	unregisterCustomApi,
 	unregisterCustomApis,
 } from "@oh-my-pi/pi-ai/api-registry";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/types";
@@ -29,6 +30,16 @@ describe("custom API registry", () => {
 
 		expect(getCustomApi("custom-a")).toBeUndefined();
 		expect(getCustomApi("custom-b")).toBeDefined();
+	});
+
+	test("unregisterCustomApi removes only the owning source registration", () => {
+		registerCustomApi("custom-a", streamSimple, "ext-a");
+
+		unregisterCustomApi("custom-a", "ext-b");
+		expect(getCustomApi("custom-a")).toBeDefined();
+
+		unregisterCustomApi("custom-a", "ext-a");
+		expect(getCustomApi("custom-a")).toBeUndefined();
 	});
 
 	test("clearCustomApis removes all custom APIs", () => {
