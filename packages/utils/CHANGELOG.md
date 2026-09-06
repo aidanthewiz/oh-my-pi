@@ -5,6 +5,17 @@
 ### Fixed
 
 - Bound managed dotenv mode and child policy to trusted launcher provenance, preserved launcher values that match project dotenv entries, and removed managed profile values from repository-controlled child environments.
+## [17.2.13] - 2026-08-11
+
+### Changed
+
+- Changed stale process-log retention from the newest five files globally to one newest file per completed process and day within the current and previous four local calendar days. This preserves bounded daily diagnostic coverage while continuing to remove one-use audit files.
+- Changed outbound User-Agent consumers to share the versioned `USER_AGENT` constant (`omp/<version>`).
+
+### Fixed
+
+- Fixed Mermaid ASCII state pseudostates rendering empty boxes, miscoloring final-state borders, and inverting rounded corners in bottom-to-top diagrams.
+
 ## [17.2.11] - 2026-08-07
 
 ### Added

@@ -400,6 +400,7 @@ export function resolveUpdateMethodForTest(
 ): UpdateMethod {
 	return resolveUpdateMethod(ompPath, bunBinDir, options);
 }
+/** Resolve the owner of the running install before selecting an update path. */
 async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const bunBinDir = await getBunGlobalBinDir();
 	const npmBinDir = await getNpmGlobalBinDir();
@@ -712,22 +713,29 @@ function resolveOmpPath(): string | undefined {
 }
 
 /**
- * Run the resolved omp binary and check if it reports the expected version.
+ * Run a specific binary and check if it reports the expected version.
  */
-async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
-	const ompPath = resolveOmpPath();
-	if (!ompPath) return { ok: false };
+async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): Promise<InstalledVersionVerification> {
 	try {
-		const result = await $`${ompPath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return { ok: false, path: ompPath };
+		const result = await $`${binaryPath} --version`.quiet().nothrow();
+		if (result.exitCode !== 0) return { ok: false, path: binaryPath };
 		const output = result.text().trim();
 		// Output format: "omp/X.Y.Z" or "omp/X.Y.Z.N" (coreforge channel rolls)
 		const match = output.match(/\/(\d+\.\d+\.\d+(?:\.\d+)?)/);
 		const actual = match?.[1];
-		return { ok: actual === expectedVersion, actual, path: ompPath };
+		return { ok: actual === expectedVersion, actual, path: binaryPath };
 	} catch {
-		return { ok: false, path: ompPath };
+		return { ok: false, path: binaryPath };
 	}
+}
+
+/**
+ * Run the PATH-resolved omp binary and check if it reports the expected version.
+ */
+async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
+	const ompPath = resolveOmpPath();
+	if (!ompPath) return { ok: false };
+	return await verifyBinaryAtPath(ompPath, expectedVersion);
 }
 
 function printVerifiedVersion(expectedVersion: string): void {
@@ -914,29 +922,18 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 // exported build*Args helpers above are retained: their unit tests pin the
 // argv contracts, which keeps rebases onto upstream conflict-free.
 
-/**
- * Download a release binary to a target path, replacing an existing file.
- * [coreforge patch: private-repo assets are fetched through the GitHub asset
- * API with auth - browser_download_url 404s without a session.]
- */
-export async function updateViaBinaryAt(
+async function downloadCoreforgeBinary(
 	targetPath: string,
 	expectedVersion: string,
-	options: {
-		binaryName?: string;
-		fetchImpl?: Fetch;
-		githubToken?: string;
-		verifyInstalledVersion?: typeof verifyInstalledVersion;
-	} = {},
-): Promise<void> {
-	const binaryName = options.binaryName ?? getBinaryName();
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.${Date.now()}.${process.pid}.bak`;
+	binaryName: string,
+	fetchImpl: Fetch | undefined,
+	githubToken: string | undefined,
+): Promise<string> {
 	const requestOptions = {
-		fetchImpl: options.fetchImpl,
-		tokenOverride: options.githubToken === undefined ? undefined : options.githubToken.trim() || null,
+		fetchImpl,
+		tokenOverride: githubToken === undefined ? undefined : githubToken.trim() || null,
 	};
-	if (options.fetchImpl || options.githubToken !== undefined || lastCfRelease?.version !== expectedVersion) {
+	if (fetchImpl || githubToken !== undefined || lastCfRelease?.version !== expectedVersion) {
 		lastCfRelease = await fetchCfLatestRelease(withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS), requestOptions);
 	}
 	if (lastCfRelease.version !== expectedVersion) {
@@ -962,56 +959,41 @@ export async function updateViaBinaryAt(
 	if (!trustedAssetUrl) {
 		throw new Error(`GitHub release asset ${binaryName} has an unexpected download URL`);
 	}
-	const expectedDigest = /^sha256:([0-9a-f]{64})$/i.exec(asset.digest ?? "")?.[1]?.toLowerCase();
-	if (!expectedDigest) {
+	const digest = /^sha256:([0-9a-f]{64})$/i.exec(asset.digest ?? "")?.[1]?.toLowerCase();
+	if (!digest) {
 		throw new Error(`GitHub release asset ${binaryName} has no supported SHA-256 digest`);
 	}
-	console.log(chalk.dim(`Downloading ${binaryName}…`));
-
-	let response: Response;
-	try {
-		response = await fetchCfAsset(asset, withTimeoutSignal(BINARY_DOWNLOAD_TIMEOUT_MS), requestOptions);
-	} catch (err) {
-		if (isTimeoutError(err)) {
-			throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
-		}
-		throw err;
-	}
-	if (!response.body) throw new Error("Download failed: empty response body");
-
-	const hash = createHash("sha256");
-	let downloaded = 0;
-	const verifier = new Transform({
-		transform(chunk, _encoding, callback) {
-			downloaded += chunk.byteLength;
-			if (downloaded > asset.size) {
-				callback(
-					new Error(
-						`Downloaded binary size mismatch: expected ${asset.size} bytes, received at least ${downloaded}`,
-					),
-				);
-				return;
-			}
-			hash.update(chunk);
-			callback(null, chunk);
-		},
+	const expectedDigest = `sha256:${digest}`;
+	await downloadVerifiedBinary({
+		url: asset.url,
+		targetPath,
+		expectedSize: asset.size,
+		expectedDigest,
+		fetchImpl: (_input, init) => fetchCfAsset(asset, init?.signal ?? undefined, requestOptions),
 	});
-	try {
-		await pipeline(response.body, verifier, fs.createWriteStream(tempPath, { mode: 0o600 }));
-		if (downloaded !== asset.size) {
-			throw new Error(`Downloaded binary size mismatch: expected ${asset.size} bytes, received ${downloaded}`);
-		}
-		const actualDigest = hash.digest("hex");
-		if (actualDigest !== expectedDigest) {
-			throw new Error(
-				`Downloaded binary digest mismatch: expected sha256:${expectedDigest}, received sha256:${actualDigest}`,
-			);
-		}
-		await fs.promises.chmod(tempPath, 0o755);
-	} catch (err) {
-		await unlinkIfExists(tempPath);
-		throw err;
-	}
+	return expectedDigest;
+}
+
+/**
+ * Download a release binary to a target path, replacing an existing file.
+ * [coreforge patch: private-repo assets are fetched through the GitHub asset
+ * API with auth - browser_download_url 404s without a session.]
+ */
+export async function updateViaBinaryAt(
+	targetPath: string,
+	expectedVersion: string,
+	options: {
+		binaryName?: string;
+		fetchImpl?: Fetch;
+		githubToken?: string;
+		verifyInstalledVersion?: typeof verifyInstalledVersion;
+	} = {},
+): Promise<void> {
+	const binaryName = options.binaryName ?? getBinaryName();
+	const tempPath = `${targetPath}.new`;
+	const backupPath = `${targetPath}.${Date.now()}.${process.pid}.bak`;
+	console.log(chalk.dim(`Downloading ${binaryName}…`));
+	await downloadCoreforgeBinary(tempPath, expectedVersion, binaryName, options.fetchImpl, options.githubToken);
 
 	console.log(chalk.dim("Installing update..."));
 	await replaceBinaryForUpdate({
@@ -1059,9 +1041,8 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		return;
 	}
 
-	// coreforge channel: the engine is only ever distributed as a compiled
-	// binary from the private mirror's releases. brew/mise/bun would install
-	// UPSTREAM omp over the patched build, so they are hard-disabled here.
+	// Coreforge releases are compiled binaries from the private mirror. Do not
+	// route through upstream package managers or distribution channels.
 	try {
 		const target = await resolveUpdateTarget();
 		if (target.method !== "binary") {

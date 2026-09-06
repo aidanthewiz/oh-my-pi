@@ -118,6 +118,7 @@ const repoScriptTests = [
 	"scripts/cf-release-notes.test.ts",
 	"scripts/ci-release-build-binaries.test.ts",
 	"scripts/ci-release-checksums.test.ts",
+	"scripts/ci-test-ts.test.ts",
 	"scripts/fix-changelogs.test.ts",
 	"scripts/inline-functions.test.ts",
 	"scripts/musl-release.test.ts",
@@ -394,22 +395,26 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 // GITHUB_TOKEN, and Coreforge launches the suite with an active profile and
 // managed DCG state. Strip caller-owned state so ordinary fixtures stay
 // hermetic; focused profile and guard tests install explicit fixtures.
-const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_", "OMP_DCG_", "DCG_"];
+const SCRUBBED_ENV_PREFIXES = ["ANTHROPIC_", "AWS_", "GOOGLE_CLOUD_", "OMP_DCG_", "OMP_MODEL_", "DCG_"];
 const SCRUBBED_ENV_NAMES = new Set([
+	"BUN_OPTIONS",
 	"GITHUB_TOKEN",
 	"GH_TOKEN",
 	"COPILOT_GITHUB_TOKEN",
 	"GOOGLE_APPLICATION_CREDENTIALS",
-	"ANTHROPIC_OAUTH_TOKEN",
-	"XAI_OAUTH_TOKEN",
+	"OMP_NO_ENV_FILE",
+	"OMP_DOTENV_OVERRIDE",
 	"OMP_PROFILE",
+	"OMPPROFILE",
 	"PI_PROFILE",
 	"PI_CODING_AGENT_DIR",
 	"PI_CONFIG_DIR",
-	"OMP_DOTENV_OVERRIDE",
+	"OMP_AGENT_STRIP",
+	"OMPCF_PRODUCT_VERSION",
+	"OMPCF_VERSION",
 ]);
 
-function isScrubbedEnvVar(key: string): boolean {
+export function isScrubbedEnvVar(key: string): boolean {
 	if (SCRUBBED_ENV_NAMES.has(key)) {
 		return true;
 	}

@@ -43,6 +43,18 @@ async function settleUntil(predicate: () => boolean, timeoutMs = 2_000): Promise
 	while (!predicate() && Date.now() < deadline) await Bun.sleep(2);
 }
 
+function promptText(input: string | AgentMessage[]): string {
+	if (typeof input === "string") return input;
+	return input
+		.map(m => {
+			const c = (m as { content?: unknown }).content;
+			if (typeof c === "string") return c;
+			if (Array.isArray(c)) return c.map((b: unknown) => (b as { text?: string }).text ?? "").join("\n");
+			return String(m);
+		})
+		.join("\n");
+}
+
 describe("advisor", () => {
 	describe("advisor system prompt", () => {
 		it("forbids concrete claims about tool arguments hidden from the advisor transcript", () => {
@@ -864,7 +876,7 @@ describe("advisor", () => {
 	});
 
 	describe("AdvisorRuntime", () => {
-		function makeAgent(promptInputs: string[]): AdvisorAgent {
+		function makeAgent(promptInputs: Array<string | AgentMessage[]>): AdvisorAgent {
 			return {
 				prompt: async input => {
 					promptInputs.push(input);
@@ -876,7 +888,7 @@ describe("advisor", () => {
 		}
 
 		it("coalesces multiple onTurnEnd calls while a prompt is in-flight", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstPromptPromise, resolve: finishFirstPrompt } = Promise.withResolvers<void>();
 			const { promise: secondPromptDone, resolve: finishSecondPrompt } = Promise.withResolvers<void>();
 			let promptCalls = 0;
@@ -901,7 +913,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd();
 			await Promise.resolve();
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("first");
+			expect(promptText(promptInputs[0])).toContain("first");
 
 			messages.push({ role: "user", content: "second", timestamp: 2 } as AgentMessage);
 			runtime.onTurnEnd();
@@ -911,7 +923,7 @@ describe("advisor", () => {
 			finishFirstPrompt();
 			await secondPromptDone;
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("second");
+			expect(promptText(promptInputs[1])).toContain("second");
 		});
 
 		it("waits for an in-flight review within the catch-up deadline", async () => {
@@ -974,7 +986,7 @@ describe("advisor", () => {
 		});
 
 		it("preserves the next user turn when an accepted empty stop is pruned", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "synthetic capture", synthetic: true, timestamp: 1 } as AgentMessage,
@@ -1018,14 +1030,14 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await runtime.waitForCatchup(1000, 1);
 
-			const nextTurn = promptInputs.at(-1);
+			const nextTurn = promptText(promptInputs.at(-1) as string | AgentMessage[]);
 			expect(nextTurn).toContain("real user instruction");
 			expect(nextTurn?.match(/real user instruction/g)).toHaveLength(1);
 			expect(nextTurn?.indexOf("real user instruction")).toBeLessThan(nextTurn?.indexOf("checking files") ?? -1);
 		});
 
 		it("coalesces late-arriving deltas into the batch after context maintenance", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstMaintainStarted, resolve: startFirstMaintain } = Promise.withResolvers<void>();
 			const { promise: finishFirstMaintain, resolve: releaseFirstMaintain } = Promise.withResolvers<boolean>();
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
@@ -1066,8 +1078,8 @@ describe("advisor", () => {
 
 			// Both deltas land in a single prompt — late arrival coalesced before agent.prompt().
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("first");
-			expect(promptInputs[0]).toContain("second");
+			expect(promptText(promptInputs[0])).toContain("first");
+			expect(promptText(promptInputs[0])).toContain("second");
 			// The loop re-checked maintenance for the expanded batch.
 			expect(maintainCalls).toBe(2);
 		});
@@ -1076,7 +1088,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstMaintainStarted, resolve: startFirstMaintain } = Promise.withResolvers<void>();
 			const { promise: finishFirstMaintain, resolve: releaseFirstMaintain } = Promise.withResolvers<boolean>();
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
@@ -1118,8 +1130,8 @@ describe("advisor", () => {
 			await promptStarted;
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).not.toContain("TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).not.toContain("TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 
 		it("caps maintainContext calls per drain cycle when arrivals never go stable", async () => {
@@ -1127,7 +1139,7 @@ describe("advisor", () => {
 			// each maintainContext call pushes a new turn (queue never goes stable on its
 			// own). After exactly 3 calls the cap must stop coalescing, dispatch the
 			// budgeted batch, and defer the final-round arrival to the next iteration.
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			let maintainCalls = 0;
 			let runtime!: AdvisorRuntime;
@@ -1174,7 +1186,7 @@ describe("advisor", () => {
 		});
 
 		it("late-arriving delta that triggers reprime: full replay and correct turn accounting", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstMaintainStarted, resolve: startFirstMaintain } = Promise.withResolvers<void>();
 			const { promise: finishFirstMaintain, resolve: releaseFirstMaintain } = Promise.withResolvers<boolean>();
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
@@ -1218,8 +1230,8 @@ describe("advisor", () => {
 
 			// Full replay includes both turns.
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("turn1");
-			expect(promptInputs[0]).toContain("turn2");
+			expect(promptText(promptInputs[0])).toContain("turn1");
+			expect(promptText(promptInputs[0])).toContain("turn2");
 			// Reprime resets the advisor agent.
 			expect(resetCount).toBeGreaterThan(0);
 		});
@@ -1290,7 +1302,7 @@ describe("advisor", () => {
 		});
 
 		it("tags in-progress turns with [in progress] heading", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const updateStates: boolean[] = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			const agent: AdvisorAgent = {
@@ -1314,12 +1326,12 @@ describe("advisor", () => {
 			await promptStarted;
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("[in progress — more steps follow]");
+			expect(promptText(promptInputs[0])).toContain("[in progress — more steps follow]");
 			expect(updateStates).toEqual([true]);
 		});
 
 		it("uses plain heading when willContinue is false or absent", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const updateStates: boolean[] = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			const agent: AdvisorAgent = {
@@ -1343,13 +1355,13 @@ describe("advisor", () => {
 			await promptStarted;
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("### Session update\n");
-			expect(promptInputs[0]).not.toContain("[in progress");
+			expect(promptText(promptInputs[0])).toContain("### Session update\n");
+			expect(promptText(promptInputs[0])).not.toContain("[in progress");
 			expect(updateStates).toEqual([false]);
 		});
 
 		it("sends the batch when context maintenance fails", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -1374,11 +1386,11 @@ describe("advisor", () => {
 			await promptStarted;
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("first");
+			expect(promptText(promptInputs[0])).toContain("first");
 		});
 
 		it("excludes advisor custom messages from the rendered delta", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -1401,15 +1413,15 @@ describe("advisor", () => {
 			runtime.onTurnEnd();
 			await promptStarted;
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("hello");
-			expect(promptInputs[0]).not.toContain("note");
+			expect(promptText(promptInputs[0])).toContain("hello");
+			expect(promptText(promptInputs[0])).not.toContain("note");
 		});
 
 		it("obfuscates session updates before prompting the advisor", async () => {
 			const secret = "ADVISOR_SECRET_TOKEN_123";
 			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 			const placeholder = obfuscator.obfuscate(secret);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [{ role: "user", content: `token ${secret}`, timestamp: 1 } as AgentMessage];
 			const host: AdvisorRuntimeHost = {
@@ -1423,15 +1435,38 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain(placeholder);
-			expect(promptInputs[0]).not.toContain(secret);
+			expect(promptText(promptInputs[0])).toContain(placeholder);
+			expect(promptText(promptInputs[0])).not.toContain(secret);
+		});
+
+		it("falls back to one redacted update when a regex secret spans source messages", async () => {
+			const obfuscator = new SecretObfuscator([{ type: "regex", content: "BEGIN[\\s\\S]*END" }]);
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "BEGIN", timestamp: 1 } as AgentMessage,
+				{ role: "user", content: "sensitive END", timestamp: 2 } as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+			});
+
+			runtime.onTurnEnd(messages);
+			await Promise.resolve();
+
+			expect(promptInputs).toHaveLength(1);
+			expect(typeof promptInputs[0]).toBe("string");
+			expect(promptText(promptInputs[0]!)).not.toContain("BEGIN");
+			expect(promptText(promptInputs[0]!)).not.toContain("sensitive END");
 		});
 
 		it("redacts expanded primary context before XML escaping", async () => {
 			const secret = "ADVISOR&SECRET<TOKEN>123";
 			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 			const placeholder = obfuscator.obfuscate(secret);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{
@@ -1453,16 +1488,16 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain(placeholder);
-			expect(promptInputs[0]).not.toContain(secret);
-			expect(promptInputs[0]).not.toContain("ADVISOR&amp;SECRET&lt;TOKEN&gt;123");
+			expect(promptText(promptInputs[0])).toContain(placeholder);
+			expect(promptText(promptInputs[0])).not.toContain(secret);
+			expect(promptText(promptInputs[0])).not.toContain("ADVISOR&amp;SECRET&lt;TOKEN&gt;123");
 		});
 
 		it("redacts file-mention paths before formatting", async () => {
 			const secret = "MENTION_SECRET_TOKEN_123";
 			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 			const placeholder = obfuscator.obfuscate(secret);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{
@@ -1482,15 +1517,15 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain(placeholder);
-			expect(promptInputs[0]).not.toContain(secret);
+			expect(promptText(promptInputs[0])).toContain(placeholder);
+			expect(promptText(promptInputs[0])).not.toContain(secret);
 		});
 
 		it("redacts nested async-result job labels before formatting", async () => {
 			const secret = "JOB_LABEL_SECRET_TOKEN_123";
 			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 			const placeholder = obfuscator.obfuscate(secret);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{
@@ -1514,15 +1549,15 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain(placeholder);
-			expect(promptInputs[0]).not.toContain(secret);
+			expect(promptText(promptInputs[0])).toContain(placeholder);
+			expect(promptText(promptInputs[0])).not.toContain(secret);
 		});
 
 		it("surfaces edit diff details but redacts secrets inside the diff", async () => {
 			const secret = "DIFF_SECRET_TOKEN_123";
 			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 			const placeholder = obfuscator.obfuscate(secret);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const diff = `--- a/config.ts\n+++ b/config.ts\n@@ -1 +1 @@\n-const token = "old";\n+const token = "${secret}";`;
 			const messages: AgentMessage[] = [
@@ -1552,10 +1587,10 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(1);
 			// The diff is surfaced to the advisor (expandEditDiffs) ...
-			expect(promptInputs[0]).toContain("+const token =");
+			expect(promptText(promptInputs[0])).toContain("+const token =");
 			// ... but a secret living inside details.diff is obfuscated (details now walked).
-			expect(promptInputs[0]).toContain(placeholder);
-			expect(promptInputs[0]).not.toContain(secret);
+			expect(promptText(promptInputs[0])).toContain(placeholder);
+			expect(promptText(promptInputs[0])).not.toContain(secret);
 		});
 
 		it("does not scan tool details omitted from advisor history", async () => {
@@ -1563,7 +1598,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 } as AgentMessage,
@@ -1592,15 +1627,15 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 		it("does not scan advisor-hidden successful tool-result bodies", async () => {
 			const obfuscator = new SecretObfuscator([
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 } as AgentMessage,
@@ -1624,15 +1659,15 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 		it("does not scan tool-call arguments hidden by the primary-argument preview", async () => {
 			const obfuscator = new SecretObfuscator([
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET", timestamp: 1 } as AgentMessage,
@@ -1651,8 +1686,8 @@ describe("advisor", () => {
 			});
 			runtime.onTurnEnd();
 			await runtime.waitForCatchup(1000, 1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 
 		it("does not scan failed tool-result text beyond its visible preview", async () => {
@@ -1660,7 +1695,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET", timestamp: 1 } as AgentMessage,
@@ -1680,8 +1715,8 @@ describe("advisor", () => {
 			});
 			runtime.onTurnEnd();
 			await runtime.waitForCatchup(1000, 1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 
 		it("does not scan advisor-hidden execution output", async () => {
@@ -1689,7 +1724,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 } as AgentMessage,
@@ -1719,15 +1754,15 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 		it("does not scan execution source after the advisor preview cap", async () => {
 			const obfuscator = new SecretObfuscator([
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const hiddenSuffix = `${"x".repeat(120)} tok_abc123`;
 			const messages: AgentMessage[] = [
@@ -1756,8 +1791,8 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 		});
 
 		it("does not scan advisor-hidden file mention content", async () => {
@@ -1765,7 +1800,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const obfuscate = vi.spyOn(obfuscator, "obfuscate");
 			const messages: AgentMessage[] = [
@@ -1787,8 +1822,8 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 			expect(obfuscate).not.toHaveBeenCalledWith("tok_abc123", expect.anything());
 		});
 
@@ -1797,7 +1832,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const obfuscate = vi.spyOn(obfuscator, "obfuscate");
 			const messages: AgentMessage[] = [
@@ -1822,8 +1857,8 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("$$TOKABC123_");
-			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[0])).toContain("$$TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
 			expect(obfuscate).not.toHaveBeenCalledWith("tok_abc123", expect.anything());
 		});
 
@@ -1844,7 +1879,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const diff = `--- a/config.ts\n+++ b/config.ts\n@@ -1 +1 @@\n-const token = "old";\n+const token = "tok_abc123";`;
 			const messages: AgentMessage[] = [
@@ -1874,7 +1909,7 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			const prompt = promptInputs[0]!;
+			const prompt = promptText(promptInputs[0]!);
 			expect(prompt).not.toContain("OTHERSECRET");
 			expect(prompt).not.toContain("tok_abc123");
 			// The friendly prefix is itself a normalized rendering of the
@@ -1895,7 +1930,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [{ role: "user", content: "first tok_abc123", timestamp: 1 } as AgentMessage];
 			const host: AdvisorRuntimeHost = {
@@ -1912,9 +1947,9 @@ describe("advisor", () => {
 			await runtime.waitForCatchup(1000, 1);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[0]).not.toContain("tok_abc123");
-			expect(promptInputs[1]).not.toContain("OTHERSECRET");
-			expect(promptInputs[1]).not.toContain("TOKABC123_");
+			expect(promptText(promptInputs[0])).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[1])).not.toContain("OTHERSECRET");
+			expect(promptText(promptInputs[1])).not.toContain("TOKABC123_");
 		});
 
 		it("scrubs prior advisor prompts when a later replace regex collides with their friendly prefix", async () => {
@@ -1922,14 +1957,17 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const firstStoredPrompt = (): string => {
 				const message = agent.state.messages[0];
-				if (message?.role !== "user" || !("content" in message) || typeof message.content !== "string") {
+				if (message?.role !== "user" || !("content" in message)) {
 					throw new Error("Expected the first advisor history item to be a user prompt");
 				}
-				return message.content;
+				const c = (message as { content?: unknown }).content;
+				if (typeof c === "string") return c;
+				if (Array.isArray(c)) return c.map((b: unknown) => (b as { text?: string }).text ?? "").join("\n");
+				throw new Error("Unexpected content shape");
 			};
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET", timestamp: 1 } as AgentMessage,
@@ -1943,7 +1981,11 @@ describe("advisor", () => {
 
 			runtime.onTurnEnd();
 			await runtime.waitForCatchup(1000, 1);
-			agent.state.messages.push({ role: "user", content: promptInputs[0]!, timestamp: 1 } as AgentMessage);
+			agent.state.messages.push({
+				role: "user",
+				content: promptText(promptInputs[0]!),
+				timestamp: 1,
+			} as AgentMessage);
 			expect(firstStoredPrompt()).toContain("TOKABC123_");
 
 			messages.push({ role: "user", content: "later tok_abc123", timestamp: 2 } as AgentMessage);
@@ -1952,7 +1994,7 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(2);
 			expect(firstStoredPrompt()).not.toContain("TOKABC123_");
-			expect(promptInputs[1]).not.toContain("TOKABC123_");
+			expect(promptText(promptInputs[1])).not.toContain("TOKABC123_");
 		});
 
 		it("redacts secrets inside assistant thinking blocks, honoring the whole-delta friendly-prefix collision set", async () => {
@@ -1968,7 +2010,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const diff = `--- a/config.ts\n+++ b/config.ts\n@@ -1 +1 @@\n-const token = "old";\n+const token = "tok_abc123";`;
 			const messages: AgentMessage[] = [
@@ -2000,7 +2042,7 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			const prompt = promptInputs[0]!;
+			const prompt = promptText(promptInputs[0]!);
 			expect(prompt).toContain("_thinking:_");
 			expect(prompt).not.toContain("OTHERSECRET");
 			expect(prompt).not.toContain("tok_abc123");
@@ -2017,7 +2059,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const staleThinking = obfuscator.obfuscate("OTHERSECRET");
 			agent.state.messages.push({
@@ -2057,7 +2099,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 } as AgentMessage,
@@ -2078,7 +2120,7 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			const prompt = promptInputs[0]!;
+			const prompt = promptText(promptInputs[0]!);
 			expect(prompt).not.toContain("OTHERSECRET");
 			// Because the image bytes were skipped by the collision pre-scan, the
 			// plain secret's friendly-name placeholder needed no collision avoidance.
@@ -2090,7 +2132,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{
@@ -2111,7 +2153,7 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			const prompt = promptInputs[0]!;
+			const prompt = promptText(promptInputs[0]!);
 			expect(prompt).not.toContain("OTHERSECRET");
 			expect(prompt).not.toContain("tok_abc123");
 			expect(prompt).toContain("TOKABC123_");
@@ -2122,7 +2164,7 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 } as AgentMessage,
@@ -2145,14 +2187,14 @@ describe("advisor", () => {
 			await Promise.resolve();
 
 			expect(promptInputs).toHaveLength(1);
-			const prompt = promptInputs[0]!;
+			const prompt = promptText(promptInputs[0]!);
 			expect(prompt).not.toContain("OTHERSECRET");
 			expect(prompt).not.toContain("tok_abc123");
 			expect(prompt).toContain("TOKABC123_");
 		});
 
 		it("expands plan-mode context once, then collapses an unchanged re-injection", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstPromptDone, resolve: finishFirst } = Promise.withResolvers<void>();
 			const { promise: secondPromptDone, resolve: finishSecond } = Promise.withResolvers<void>();
 			let promptCalls = 0;
@@ -2188,8 +2230,8 @@ describe("advisor", () => {
 			await firstPromptDone;
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain('<primary-context kind="plan-mode-context">');
-			expect(promptInputs[0]).toContain("except the single plan file named below");
+			expect(promptText(promptInputs[0])).toContain('<primary-context kind="plan-mode-context">');
+			expect(promptText(promptInputs[0])).toContain("except the single plan file named below");
 
 			// A later turn re-injects the byte-identical rule as a fresh message object.
 			messages.push({
@@ -2208,12 +2250,55 @@ describe("advisor", () => {
 			await secondPromptDone;
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("unchanged — still in effect");
-			expect(promptInputs[1]).not.toContain("except the single plan file named below");
+			expect(promptText(promptInputs[1])).toContain("unchanged — still in effect");
+			expect(promptText(promptInputs[1])).not.toContain("except the single plan file named below");
+		});
+
+		it("re-expands first-time primary context when a failed turn is retried", async () => {
+			// Regression: the failed turn is rolled back, so the advisor history no
+			// longer contains the full plan-mode context; the retry must not collapse
+			// it to "(unchanged — still in effect)" against the pre-failure dedup map.
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					promptCalls++;
+					state.error = promptCalls === 1 ? "transient provider 500" : undefined;
+				},
+				abort: () => {},
+				reset: () => {},
+				state,
+			};
+			const rule =
+				"Plan mode is active. You MUST perform READ-ONLY work only:\n- You NEVER create, edit, or delete files — except the single plan file named below.";
+			const messages: AgentMessage[] = [];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			messages.push({ role: "user", content: "start planning", timestamp: 1 } as AgentMessage);
+			messages.push({
+				role: "custom",
+				customType: "plan-mode-context",
+				content: rule,
+				display: false,
+				timestamp: 2,
+			} as AgentMessage);
+			runtime.onTurnEnd();
+			await settleUntil(() => promptInputs.length >= 2 && runtime.backlog === 0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptText(promptInputs[0])).toContain("except the single plan file named below");
+			expect(promptText(promptInputs[1])).toContain("except the single plan file named below");
+			expect(promptText(promptInputs[1])).not.toContain("unchanged — still in effect");
 		});
 
 		it("renders the watched delta with a heading, watched-role labels, and no inner ## headings", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "do the thing", timestamp: 1 } as AgentMessage,
@@ -2252,7 +2337,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd();
 			await Promise.resolve();
 			expect(promptInputs).toHaveLength(1);
-			const prompt = promptInputs[0];
+			const prompt = promptText(promptInputs[0]);
 			expect(prompt).toContain("### Session update");
 			expect(prompt).toContain("**user**:");
 			expect(prompt).toContain("**agent**:");
@@ -2264,7 +2349,7 @@ describe("advisor", () => {
 		});
 
 		it("handles compaction shrink without prompting", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			let messages: AgentMessage[] = [
 				{ role: "user", content: "a", timestamp: 1 } as AgentMessage,
@@ -2285,7 +2370,7 @@ describe("advisor", () => {
 		});
 
 		it("reset re-primes the advisor with the full current transcript", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: secondPromptDone, resolve: finishSecond } = Promise.withResolvers<void>();
 			let promptCalls = 0;
 			const agent: AdvisorAgent = {
@@ -2307,7 +2392,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd();
 			await Promise.resolve();
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("aaa");
+			expect(promptText(promptInputs[0])).toContain("aaa");
 
 			// Simulate a compaction: transcript replaced, then reset.
 			messages.length = 0;
@@ -2318,11 +2403,11 @@ describe("advisor", () => {
 			await secondPromptDone;
 			// The next turn replays the full post-compaction transcript, not just new tail.
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("summary-bbb");
+			expect(promptText(promptInputs[1])).toContain("summary-bbb");
 		});
 
 		it("clears advisor context without replaying primary history when maintenance requests recovery", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstPromptDone, resolve: finishFirst } = Promise.withResolvers<void>();
 			const { promise: secondPromptDone, resolve: finishSecond } = Promise.withResolvers<void>();
 			let promptCalls = 0;
@@ -2355,7 +2440,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await firstPromptDone;
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("aaa");
+			expect(promptText(promptInputs[0])).toContain("aaa");
 			expect(resetCount).toBe(0);
 
 			shouldResetContext = true;
@@ -2364,13 +2449,13 @@ describe("advisor", () => {
 			await secondPromptDone;
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("bbb");
-			expect(promptInputs[1]).not.toContain("aaa");
+			expect(promptText(promptInputs[1])).toContain("bbb");
+			expect(promptText(promptInputs[1])).not.toContain("aaa");
 			expect(resetCount).toBe(1);
 		});
 
 		it("preserves updates queued while async maintenance resets the advisor context", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let resetCount = 0;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -2406,15 +2491,15 @@ describe("advisor", () => {
 			await runtime.waitForCatchup(1000, 1);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[0]).toContain("bbb");
-			expect(promptInputs[0]).not.toContain("ccc");
-			expect(promptInputs[1]).toContain("ccc");
-			expect(promptInputs[1]).not.toContain("bbb");
+			expect(promptText(promptInputs[0])).toContain("bbb");
+			expect(promptText(promptInputs[0])).not.toContain("ccc");
+			expect(promptText(promptInputs[1])).toContain("ccc");
+			expect(promptText(promptInputs[1])).not.toContain("bbb");
 			expect(resetCount).toBe(1);
 		});
 
 		it("re-expands active primary context when maintenance clears advisor history", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const planRule =
 				"Plan mode is active. You MUST remain read-only except for the approved plan file at local://PLAN.md.";
@@ -2438,7 +2523,7 @@ describe("advisor", () => {
 
 			runtime.onTurnEnd(messages);
 			await runtime.waitForCatchup(1000, 1);
-			expect(promptInputs[0]).toContain(planRule);
+			expect(promptText(promptInputs[0])).toContain(planRule);
 
 			shouldResetContext = true;
 			messages.push({ role: "user", content: "bbb", timestamp: 3 } as AgentMessage);
@@ -2453,15 +2538,15 @@ describe("advisor", () => {
 			await runtime.waitForCatchup(1000, 1);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("bbb");
-			expect(promptInputs[1]).not.toContain("aaa");
-			expect(promptInputs[1]).toContain(planRule);
-			expect(promptInputs[1]).not.toContain("unchanged — still in effect");
+			expect(promptText(promptInputs[1])).toContain("bbb");
+			expect(promptText(promptInputs[1])).not.toContain("aaa");
+			expect(promptText(promptInputs[1])).toContain(planRule);
+			expect(promptText(promptInputs[1])).not.toContain("unchanged — still in effect");
 		});
 
 		it("recovers a provider overflow at the current cursor without replaying primary history", async () => {
 			const overflowMessage = "context_length_exceeded: Your input exceeds the context window of this model.";
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const state: { messages: AgentMessage[]; error?: string } = {
 				messages: [{ role: "user", content: "existing advisor context", timestamp: 1 } as AgentMessage],
 			};
@@ -2502,7 +2587,7 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(2);
 			for (const input of promptInputs) {
-				expect(input).toContain("overflowing-current-update");
+				expect(promptText(input)).toContain("overflowing-current-update");
 				expect(input).not.toContain("ancient-primary-one");
 				expect(input).not.toContain("ancient-primary-two");
 			}
@@ -2513,15 +2598,152 @@ describe("advisor", () => {
 			await settleUntil(() => promptInputs.length >= 3 && runtime.backlog === 0);
 
 			expect(promptInputs).toHaveLength(3);
-			expect(promptInputs[2]).toContain("post-recovery-update");
-			expect(promptInputs[2]).not.toContain("overflowing-current-update");
-			expect(promptInputs[2]).not.toContain("ancient-primary-one");
-			expect(promptInputs[2]).not.toContain("ancient-primary-two");
+			expect(promptText(promptInputs[2])).toContain("post-recovery-update");
+			expect(promptText(promptInputs[2])).not.toContain("overflowing-current-update");
+			expect(promptText(promptInputs[2])).not.toContain("ancient-primary-one");
+			expect(promptText(promptInputs[2])).not.toContain("ancient-primary-two");
 			expect(resetCount).toBe(1);
 		});
 
+		it("re-renders a queued primary context before its maintenance budget after overflow resets advisor context", async () => {
+			const overflowMessage = "context_length_exceeded: Your input exceeds the context window of this model.";
+			const firstOverflowPromptStarted = Promise.withResolvers<void>();
+			const releaseOverflowPrompt = Promise.withResolvers<void>();
+			const fourthMaintenance = Promise.withResolvers<void>();
+			const maintenanceTokens: number[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptCalls++;
+					const content =
+						typeof input === "string"
+							? input
+							: input
+									.map(message => {
+										if (!("content" in message)) return "";
+										if (typeof message.content === "string") return message.content;
+										const textParts: string[] = [];
+										for (const block of message.content) {
+											if (block.type === "text") textParts.push(block.text);
+										}
+										return textParts.join("");
+									})
+									.filter(Boolean)
+									.join("\n\n");
+					state.messages.push({ role: "user", content, timestamp: Date.now() } as AgentMessage);
+					if (promptCalls === 2) {
+						firstOverflowPromptStarted.resolve();
+						await releaseOverflowPrompt.promise;
+						state.error = overflowMessage;
+					} else {
+						state.error = undefined;
+					}
+				},
+				abort: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
+				state,
+			};
+			const planRule = "keep-expanded ".repeat(300);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "seed", timestamp: 1 } as AgentMessage,
+				{
+					role: "custom",
+					customType: "plan-mode-context",
+					content: planRule,
+					display: false,
+					timestamp: 2,
+				} as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					maintainContext: async incomingTokens => {
+						maintenanceTokens.push(incomingTokens);
+						if (maintenanceTokens.length === 4) fourthMaintenance.resolve();
+						return false;
+					},
+				},
+				0,
+			);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptCalls === 1 && runtime.backlog === 0);
+
+			messages.push({ role: "user", content: "overflow", timestamp: 3 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await firstOverflowPromptStarted.promise;
+			messages.push({ role: "user", content: "after overflow", timestamp: 4 } as AgentMessage);
+			messages.push({
+				role: "custom",
+				customType: "plan-mode-context",
+				content: planRule,
+				display: false,
+				timestamp: 5,
+			} as AgentMessage);
+			runtime.onTurnEnd(messages);
+			releaseOverflowPrompt.resolve();
+			await fourthMaintenance.promise;
+
+			expect(maintenanceTokens).toHaveLength(4);
+			expect(maintenanceTokens[3]).toBeGreaterThan(500);
+		});
+
+		it("does not double-fold first-time primary context on overflow-recovery retry", async () => {
+			// Regression: the recovery render previews the retry batch; if it advances
+			// #seenContext, the retry's #prepareBatch re-dedup would collapse first-time
+			// plan-mode-context to "(unchanged — still in effect)" even though the
+			// advisor history was rolled back — the retry would lose the constraints.
+			const overflowMessage = "context_length_exceeded: Your input exceeds the context window of this model.";
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const state: { messages: AgentMessage[]; error?: string } = {
+				messages: [{ role: "user", content: "existing advisor context", timestamp: 1 } as AgentMessage],
+			};
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					promptCalls++;
+					state.error = promptCalls === 1 ? overflowMessage : undefined;
+				},
+				abort: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "seed-primary", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+			runtime.seedTo(messages.length);
+			const rule =
+				"Plan mode is active. You MUST perform READ-ONLY work only:\n- You NEVER create, edit, or delete files — except the single plan file named below.";
+			messages.push({ role: "user", content: "overflowing-current-update", timestamp: 2 } as AgentMessage);
+			messages.push({
+				role: "custom",
+				customType: "plan-mode-context",
+				content: rule,
+				display: false,
+				timestamp: 3,
+			} as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length >= 2 && runtime.backlog === 0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptText(promptInputs[1])).toContain("except the single plan file named below");
+			expect(promptText(promptInputs[1])).not.toContain("unchanged — still in effect");
+		});
+
 		it("classifies structured overflow metadata before rolling back the failed turn", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const state: { messages: AgentMessage[]; error?: string } = {
 				messages: [{ role: "user", content: "existing advisor context", timestamp: 1 } as AgentMessage],
 			};
@@ -2585,7 +2807,7 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(2);
 			for (const input of promptInputs) {
-				expect(input).toContain("structured-current-update");
+				expect(promptText(input)).toContain("structured-current-update");
 				expect(input).not.toContain("ancient-primary");
 			}
 			expect(resetCount).toBe(1);
@@ -2593,7 +2815,7 @@ describe("advisor", () => {
 
 		it("drops only a double-overflowing batch and continues queued and later updates", async () => {
 			const overflowMessage = "context_length_exceeded: Your input exceeds the context window of this model.";
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const secondAttemptStarted = Promise.withResolvers<void>();
 			const finishSecondAttempt = Promise.withResolvers<void>();
@@ -2604,7 +2826,7 @@ describe("advisor", () => {
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
-					if (!input.includes("first-overflow")) {
+					if (!promptText(input).includes("first-overflow")) {
 						state.error = undefined;
 						return;
 					}
@@ -2643,12 +2865,12 @@ describe("advisor", () => {
 			expect(failingAttempts).toBe(2);
 			expect(promptInputs).toHaveLength(3);
 			for (const input of promptInputs.slice(0, 2)) {
-				expect(input).toContain("first-overflow");
-				expect(input).not.toContain("ancient-history");
+				expect(promptText(input)).toContain("first-overflow");
+				expect(promptText(input)).not.toContain("ancient-history");
 			}
-			expect(promptInputs[2]).toContain("queued-small-update");
-			expect(promptInputs[2]).not.toContain("first-overflow");
-			expect(promptInputs[2]).not.toContain("ancient-history");
+			expect(promptText(promptInputs[2])).toContain("queued-small-update");
+			expect(promptText(promptInputs[2])).not.toContain("first-overflow");
+			expect(promptText(promptInputs[2])).not.toContain("ancient-history");
 			expect(failures).toHaveLength(1);
 			expect(runtime.backlog).toBe(0);
 
@@ -2657,11 +2879,11 @@ describe("advisor", () => {
 			await runtime.waitForCatchup(1000, 1);
 
 			expect(promptInputs).toHaveLength(4);
-			expect(promptInputs[3]).toContain("later-small-update");
-			expect(promptInputs[3]).not.toContain("first-overflow");
+			expect(promptText(promptInputs[3])).toContain("later-small-update");
+			expect(promptText(promptInputs[3])).not.toContain("first-overflow");
 		});
 		it("tracks backlog and blocks until caught up", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			const { promise: promptFinish, resolve: finishPrompt } = Promise.withResolvers<void>();
 			const agent: AdvisorAgent = {
@@ -2756,7 +2978,7 @@ describe("advisor", () => {
 		});
 
 		it("retries failed prompts and only decrements backlog on success", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let fail = true;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -2786,7 +3008,7 @@ describe("advisor", () => {
 		});
 
 		it("drops backlog after 3 consecutive failures to prevent permanent stall", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
@@ -2813,7 +3035,7 @@ describe("advisor", () => {
 		});
 
 		it("notifies the host once when consecutive prompt failures make the advisor unavailable", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			let shouldFail = true;
 			const agent: AdvisorAgent = {
@@ -2877,7 +3099,7 @@ describe("advisor", () => {
 			// model outright ("not supported ... (code=invalid_request_error)")
 			// failed 351 turns/hour in a shared daemon, rebuilding heavy context
 			// every cycle. One drop cycle must latch the runtime off.
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -2924,7 +3146,7 @@ describe("advisor", () => {
 		});
 
 		it("halts after three transient drop cycles without an intervening success, but not across successes", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let shouldFail = true;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -3012,7 +3234,7 @@ describe("advisor", () => {
 			// formatter bug) must neither propagate into the primary agent's
 			// turn-end callback nor park it on the catch-up gate — and the
 			// unrendered delta must survive for the next turn.
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
@@ -3054,8 +3276,8 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => promptInputs.length >= 2);
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("bbb-recovered");
-			expect(promptInputs[1]).toContain("ccc");
+			expect(promptText(promptInputs[1])).toContain("bbb-recovered");
+			expect(promptText(promptInputs[1])).toContain("ccc");
 			runtime.dispose();
 		}, 10_000);
 
@@ -3074,13 +3296,17 @@ describe("advisor", () => {
 				) as AgentMessage;
 			};
 
-			const waitForPrompts = async (prompts: string[], count: number, timeoutMs = 10_000): Promise<void> => {
+			const waitForPrompts = async (
+				prompts: Array<string | AgentMessage[]>,
+				count: number,
+				timeoutMs = 10_000,
+			): Promise<void> => {
 				const deadline = Date.now() + timeoutMs;
 				while (prompts.length < count && Date.now() < deadline) await Bun.sleep(5);
 			};
 
 			it("delivers a multi-MB transcript replay completely", async () => {
-				const promptInputs: string[] = [];
+				const promptInputs: Array<string | AgentMessage[]> = [];
 				const agent: AdvisorAgent = {
 					prompt: async input => {
 						promptInputs.push(input);
@@ -3100,13 +3326,13 @@ describe("advisor", () => {
 				await waitForPrompts(promptInputs, 1);
 				expect(promptInputs).toHaveLength(1);
 				// Nothing dropped: first and last transcript messages both rendered.
-				expect(promptInputs[0]).toContain("msg-0 ");
-				expect(promptInputs[0]).toContain("msg-1999 ");
+				expect(promptText(promptInputs[0])).toContain("msg-0 ");
+				expect(promptText(promptInputs[0])).toContain("msg-1999 ");
 				runtime.dispose();
 			}, 20_000);
 
 			it("pairs a toolCall with its non-adjacent toolResult inside one update", async () => {
-				const promptInputs: string[] = [];
+				const promptInputs: Array<string | AgentMessage[]> = [];
 				const agent: AdvisorAgent = {
 					prompt: async input => {
 						promptInputs.push(input);
@@ -3144,16 +3370,16 @@ describe("advisor", () => {
 				runtime.onTurnEnd(messages);
 				await waitForPrompts(promptInputs, 1);
 				expect(promptInputs).toHaveLength(1);
-				expect(promptInputs[0]).toContain("read(");
+				expect(promptText(promptInputs[0])).toContain("read(");
 				// The call+result pair rendered as completed, never as a spurious
 				// in-flight call.
-				expect(promptInputs[0]).toContain("⇒ ok");
-				expect(promptInputs[0]).not.toContain("⇒ pending");
+				expect(promptText(promptInputs[0])).toContain("⇒ ok");
+				expect(promptText(promptInputs[0])).not.toContain("⇒ pending");
 				runtime.dispose();
 			}, 20_000);
 
 			it("delivers a single turn carrying a multi-MB payload", async () => {
-				const promptInputs: string[] = [];
+				const promptInputs: Array<string | AgentMessage[]> = [];
 				const agent: AdvisorAgent = {
 					prompt: async input => {
 						promptInputs.push(input);
@@ -3182,12 +3408,12 @@ describe("advisor", () => {
 				runtime.onTurnEnd(messages);
 				await waitForPrompts(promptInputs, 2);
 				expect(promptInputs).toHaveLength(2);
-				expect(promptInputs[1]).toContain("huge ");
+				expect(promptText(promptInputs[1])).toContain("huge ");
 				runtime.dispose();
 			}, 20_000);
 
 			it("replays the full transcript after a reset lands between renders", async () => {
-				const promptInputs: string[] = [];
+				const promptInputs: Array<string | AgentMessage[]> = [];
 				const agent: AdvisorAgent = {
 					prompt: async input => {
 						promptInputs.push(input);
@@ -3208,13 +3434,15 @@ describe("advisor", () => {
 				await waitForPrompts(promptInputs, 1);
 				// The aborted pre-reset render must not have advanced the cursor:
 				// the post-reset replay carries the whole transcript.
-				const replay = promptInputs.find(input => input.includes("msg-0 ") && input.includes("msg-399 "));
+				const replay = promptInputs.find(
+					input => promptText(input).includes("msg-0 ") && promptText(input).includes("msg-399 "),
+				);
 				expect(replay).toBeDefined();
 				runtime.dispose();
 			}, 20_000);
 
 			it("delivers interleaved turns in order without loss", async () => {
-				const promptInputs: string[] = [];
+				const promptInputs: Array<string | AgentMessage[]> = [];
 				const agent: AdvisorAgent = {
 					prompt: async input => {
 						promptInputs.push(input);
@@ -3234,8 +3462,15 @@ describe("advisor", () => {
 				messages.push({ role: "user", content: "late-arrival tail", timestamp: 300 } as AgentMessage);
 				runtime.onTurnEnd(messages);
 				const deadline = Date.now() + 10_000;
-				while (Date.now() < deadline && !promptInputs.join("\n").includes("late-arrival tail")) await Bun.sleep(5);
-				const combined = promptInputs.join("\n");
+				while (
+					Date.now() < deadline &&
+					!promptInputs
+						.map(i => promptText(i))
+						.join("\n")
+						.includes("late-arrival tail")
+				)
+					await Bun.sleep(5);
+				const combined = promptInputs.map(i => promptText(i)).join("\n");
 				// Every message exactly once, ordering preserved.
 				expect(combined).toContain("msg-0 ");
 				expect(combined).toContain("msg-299 ");
@@ -3253,7 +3488,7 @@ describe("advisor", () => {
 			// OpenRouter ZDR `404 No endpoints available` case from #3635). The runtime
 			// must surface that as a failed turn even though the awaited promise did
 			// not reject.
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			let shouldFail = true;
@@ -3498,7 +3733,7 @@ describe("advisor", () => {
 		});
 
 		it("strips echoed thinking after a classifier refusal and succeeds without a notice", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			let promptCalls = 0;
@@ -3558,14 +3793,14 @@ describe("advisor", () => {
 			await settleUntil(() => runtime.backlog === 0);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[0]).toContain("private reasoning");
-			expect(promptInputs[1]).not.toContain("private reasoning");
-			expect(promptInputs[1]).toContain("answer");
+			expect(promptText(promptInputs[0])).toContain("private reasoning");
+			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
+			expect(promptText(promptInputs[1])).toContain("answer");
 			expect(failures).toEqual([]);
 		});
 
 		it("surfaces a persistent classifier refusal after one stripped resend", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			const agent: AdvisorAgent = {
@@ -3613,13 +3848,13 @@ describe("advisor", () => {
 			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[0]).toContain("private reasoning");
-			expect(promptInputs[1]).not.toContain("private reasoning");
+			expect(promptText(promptInputs[0])).toContain("private reasoning");
+			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
 			expect(failures).toHaveLength(1);
 		});
 
 		it("asks the host to switch models when a refusal outlives the stripped resend", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			// The first model refuses every time; the host's fallback hook swaps in a
@@ -3692,7 +3927,7 @@ describe("advisor", () => {
 		});
 
 		it("starts a fresh fallback cascade after the host declines to switch models", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			let fallbackCalls = 0;
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
@@ -3765,7 +4000,7 @@ describe("advisor", () => {
 		it("walks the whole fallback chain before reporting a refusal", async () => {
 			// Every model refuses. The cascade must reach the last chain entry, then
 			// stop once the host runs out of candidates.
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			let identity = "anthropic/claude-fable-5";
@@ -3828,7 +4063,7 @@ describe("advisor", () => {
 		});
 
 		it("stops a refusal walk that a cyclic chain would loop forever", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			// A chain configured A -> B -> A: the host never runs out of candidates,
@@ -3892,7 +4127,7 @@ describe("advisor", () => {
 		});
 
 		it("degrades on a category-less refusal", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			let promptCalls = 0;
@@ -3952,13 +4187,13 @@ describe("advisor", () => {
 			await settleUntil(() => runtime.backlog === 0);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[0]).toContain("private reasoning");
-			expect(promptInputs[1]).not.toContain("private reasoning");
+			expect(promptText(promptInputs[0])).toContain("private reasoning");
+			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
 			expect(failures).toEqual([]);
 		});
 
 		it("calls onTurnError with state.error before retrying the batch", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const turnErrors: unknown[] = [];
 			const events: string[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
@@ -4000,7 +4235,7 @@ describe("advisor", () => {
 		});
 
 		it("calls onTurnError for each consecutive failure including the dropped third turn", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const turnErrors: unknown[] = [];
 			const failures: unknown[] = [];
 			const events: string[] = [];
@@ -4060,7 +4295,7 @@ describe("advisor", () => {
 		});
 
 		it("continues retrying when onTurnError rejects", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const turnErrors: unknown[] = [];
 			const events: string[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
@@ -4104,7 +4339,7 @@ describe("advisor", () => {
 
 		it("drops a terminal non-retriable assistant failure without retrying", async () => {
 			const errorMessage = "Codex error event: Request blocked. (code=invalid_prompt)";
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const rollbackCalls: number[] = [];
 			const turnErrors: unknown[] = [];
 			const failures: unknown[] = [];
@@ -4251,7 +4486,7 @@ describe("advisor", () => {
 
 		it("resets advisor context after quarantining an unavailable tool response", async () => {
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const lengthsBeforePrompt: number[] = [];
 			let resetCalls = 0;
 			const agent: AdvisorAgent = {
@@ -4312,11 +4547,11 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(2);
 			expect(lengthsBeforePrompt).toEqual([0, 0]);
-			expect(promptInputs[1]).toContain("aaa");
-			expect(promptInputs[1]).toContain("bbb");
+			expect(promptText(promptInputs[1])).toContain("aaa");
+			expect(promptText(promptInputs[1])).toContain("bbb");
 		});
 		it("re-primes queued primary updates after a quarantine reset", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstPromptStarted, resolve: startFirstPrompt } = Promise.withResolvers<void>();
 			const { promise: firstPrompt, reject: rejectFirstPrompt } = Promise.withResolvers<void>();
 			let promptCalls = 0;
@@ -4352,8 +4587,8 @@ describe("advisor", () => {
 			await settleUntil(() => promptInputs.length >= 2 && runtime.backlog === 0);
 
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("aaa");
-			expect(promptInputs[1]).toContain("bbb");
+			expect(promptText(promptInputs[1])).toContain("aaa");
+			expect(promptText(promptInputs[1])).toContain("bbb");
 		});
 
 		it("notifies the host after the advisor persistently quarantines its output (issue #6661)", async () => {
@@ -4427,7 +4662,7 @@ describe("advisor", () => {
 		});
 
 		it("drops the in-flight batch when a reset aborts the advisor prompt", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstPromptStarted, resolve: startFirstPrompt } = Promise.withResolvers<void>();
 			let rejectInFlight: ((err: unknown) => void) | undefined;
 			let promptCalls = 0;
@@ -4459,7 +4694,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await firstPromptStarted;
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("old-conversation");
+			expect(promptText(promptInputs[0])).toContain("old-conversation");
 
 			// Conversation boundary (/new): transcript replaced and the runtime reset
 			// while the advisor prompt is still in flight. The abort that rejects the
@@ -4479,12 +4714,12 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await Bun.sleep(0);
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("new-conversation");
-			expect(promptInputs[1]).not.toContain("old-conversation");
+			expect(promptText(promptInputs[1])).toContain("new-conversation");
+			expect(promptText(promptInputs[1])).not.toContain("old-conversation");
 		});
 
 		it("retries the interrupted batch after a session transition rolls back", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const firstPromptStarted = Promise.withResolvers<void>();
 			let rejectInFlight: ((reason?: unknown) => void) | undefined;
 			const agent: AdvisorAgent = {
@@ -4514,7 +4749,54 @@ describe("advisor", () => {
 			runtime.resumeAfterSessionTransition();
 			await settleUntil(() => runtime.backlog === 0);
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[1]).toContain("keep me");
+			expect(promptText(promptInputs[1])).toContain("keep me");
+		});
+
+		it("re-expands first-time primary context after a session transition pauses before dispatch", async () => {
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const planRule = "Plan mode is active. Keep this first delivery expanded.";
+			const maintenancePaused = Promise.withResolvers<void>();
+			const prompted = Promise.withResolvers<void>();
+			let maintenanceCalls = 0;
+			let runtime: AdvisorRuntime;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					prompted.resolve();
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "start planning", timestamp: 1 } as AgentMessage,
+				{
+					role: "custom",
+					customType: "plan-mode-context",
+					content: planRule,
+					display: false,
+					timestamp: 2,
+				} as AgentMessage,
+			];
+			runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				maintainContext: async () => {
+					if (++maintenanceCalls === 1) {
+						void runtime.pauseForSessionTransition();
+						maintenancePaused.resolve();
+					}
+					return false;
+				},
+			});
+
+			runtime.onTurnEnd(messages);
+			await maintenancePaused.promise;
+			runtime.resumeAfterSessionTransition();
+			await prompted.promise;
+
+			expect(promptText(promptInputs[0]!)).toContain(planRule);
+			expect(promptText(promptInputs[0]!)).not.toContain("unchanged — still in effect");
 		});
 
 		it.each(["success", "error"] as const)(
@@ -4608,7 +4890,7 @@ describe("advisor", () => {
 
 	describe("AdvisorRuntime quota classification", () => {
 		it("pauses on quota/rate-limit errors and notifies the host without retrying", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let quotaNotified = false;
 			let failureNotified = false;
 			const agent: AdvisorAgent = {
@@ -4651,7 +4933,7 @@ describe("advisor", () => {
 		});
 
 		it("treats 'overloaded' as a transient server error, not quota exhaustion", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -4681,7 +4963,7 @@ describe("advisor", () => {
 			expect(failures).toHaveLength(1);
 		});
 		it("retains the failed batch in the pending queue on quota error", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let shouldFail = true;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -4708,7 +4990,7 @@ describe("advisor", () => {
 			expect(runtime.quotaExhausted).toBe(true);
 			expect(runtime.backlog).toBeGreaterThan(0);
 			expect(promptInputs).toHaveLength(1);
-			expect(promptInputs[0]).toContain("quota-turn");
+			expect(promptText(promptInputs[0])).toContain("quota-turn");
 
 			await runtime.pauseForSessionTransition();
 			runtime.resumeAfterSessionTransition();
@@ -4722,7 +5004,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await Bun.sleep(0);
 			await Bun.sleep(0);
-			expect(promptInputs.at(-1)).toContain("quota-turn");
+			expect(promptText(promptInputs.at(-1) as string | AgentMessage[])).toContain("quota-turn");
 		});
 
 		it("resolves waitForCatchup immediately when quota is exhausted", async () => {
@@ -4755,7 +5037,7 @@ describe("advisor", () => {
 			expect(Date.now() - start).toBeLessThan(1000);
 		});
 		it("retries once when onTurnError signals a switched sibling credential", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let firstCall = true;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -4794,7 +5076,7 @@ describe("advisor", () => {
 		});
 
 		it("requeues when a switched retry produces no assistant response", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const state = { messages: [] as AgentMessage[] };
 			let callCount = 0;
 			const agent: AdvisorAgent = {
@@ -4831,7 +5113,7 @@ describe("advisor", () => {
 		});
 
 		it("falls through to quota pause when onTurnError returns false (no sibling)", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
@@ -4863,11 +5145,11 @@ describe("advisor", () => {
 			expect(quotaNotified).toBe(true);
 		});
 		it("drops stale quota handling when reset happens during onTurnError", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
-					if (input.includes("stale-turn")) {
+					if (promptText(input).includes("stale-turn")) {
 						throw new Error("insufficient_quota: you have exceeded your rate limit");
 					}
 				},
@@ -4909,8 +5191,8 @@ describe("advisor", () => {
 
 			expect(hookInvocations).toBe(1);
 			expect(promptInputs).toHaveLength(2);
-			expect(promptInputs[0]).toContain("stale-turn");
-			expect(promptInputs[1]).toContain("fresh-turn");
+			expect(promptText(promptInputs[0])).toContain("stale-turn");
+			expect(promptText(promptInputs[1])).toContain("fresh-turn");
 			expect(maintenanceSignals).toHaveLength(2);
 			expect(maintenanceSignals[0]?.aborted).toBe(true);
 			expect(maintenanceSignals[1]?.aborted).toBe(false);
@@ -4949,7 +5231,7 @@ describe("advisor", () => {
 			expect(recoverySignal.aborted).toBe(true);
 		});
 		it("uses generic failure path when switched retry hits a non-quota error", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let callCount = 0;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -5002,7 +5284,7 @@ describe("advisor", () => {
 		});
 
 		it("marks sibling and pauses when switched retry hits a second quota error", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			let firstCall = true;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -5048,7 +5330,7 @@ describe("advisor", () => {
 		});
 
 		it("keeps rotating while another credential is immediately available", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
