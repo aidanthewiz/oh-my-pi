@@ -1692,6 +1692,150 @@ describe("ModelRegistry", () => {
 			).toBe(true);
 		});
 	});
+
+	describe("route-aware Anthropic availability", () => {
+		test("does not authenticate a custom base URL from stock AWS environment credentials", async () => {
+			const names = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_AWS_API_KEY",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = Object.fromEntries(names.map(name => [name, Bun.env[name]])) as Record<
+				(typeof names)[number],
+				string | undefined
+			>;
+			try {
+				for (const name of names) delete Bun.env[name];
+				Bun.env.ANTHROPIC_AWS_API_KEY = "key-aws";
+				Bun.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
+				writeRawModelsJson({ anthropic: overrideConfig("https://anthropic-proxy.example.com/v1") });
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+
+				expect(model).toBeDefined();
+				expect(model?.baseUrl).toBe("https://anthropic-proxy.example.com/v1");
+				if (!model) throw new Error("Expected bundled Anthropic model");
+				expect(registry.hasConfiguredAuth(model)).toBe(false);
+				expect(registry.getAvailable()).not.toContain(model);
+				expect(await registry.getApiKey(model)).toBeUndefined();
+
+				Bun.env.ANTHROPIC_API_KEY = "key-generic";
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model)).toBe("key-generic");
+			} finally {
+				for (const name of names) {
+					const value = previous[name];
+					if (value === undefined) delete Bun.env[name];
+					else Bun.env[name] = value;
+				}
+			}
+		});
+
+		test("requires AWS route credentials even when stored Anthropic OAuth exists", async () => {
+			const names = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_AWS_API_KEY",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = Object.fromEntries(names.map(name => [name, Bun.env[name]])) as Record<
+				(typeof names)[number],
+				string | undefined
+			>;
+			try {
+				for (const name of names) delete Bun.env[name];
+				await authStorage.set("anthropic", [
+					{
+						type: "oauth",
+						access: "stored-oauth",
+						refresh: "stored-refresh",
+						expires: Date.now() + 60 * 60_000,
+						accountId: "acct_stored",
+					},
+				]);
+				writeRawModelsJson({});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+
+				expect(model).toBeDefined();
+				if (!model) throw new Error("Expected bundled Anthropic model");
+				const sessionId = "aws-route-switch";
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model, sessionId)).toBe("stored-oauth");
+				expect(authStorage.getOAuthAccountId("anthropic", sessionId)).toBe("acct_stored");
+
+				Bun.env.ANTHROPIC_BASE_URL = "https://aws-external-anthropic.us-east-1.api.aws";
+				expect(registry.hasConfiguredAuth(model)).toBe(false);
+				expect(registry.getAvailable()).not.toContain(model);
+				expect(await registry.getApiKey(model, sessionId)).toBeUndefined();
+
+				Bun.env.ANTHROPIC_AWS_API_KEY = "key-aws";
+				Bun.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model, sessionId)).toBe("key-aws");
+				expect(authStorage.getOAuthAccountId("anthropic", sessionId)).toBeUndefined();
+			} finally {
+				for (const name of names) {
+					const value = previous[name];
+					if (value === undefined) delete Bun.env[name];
+					else Bun.env[name] = value;
+				}
+			}
+		});
+
+		test("preserves configured credentials for an explicit Anthropic AWS gateway override", async () => {
+			const names = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_AWS_API_KEY",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = Object.fromEntries(names.map(name => [name, Bun.env[name]])) as Record<
+				(typeof names)[number],
+				string | undefined
+			>;
+			try {
+				for (const name of names) delete Bun.env[name];
+				Bun.env.ANTHROPIC_AWS_API_KEY = "key-environment";
+				Bun.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_environment";
+				writeRawModelsJson({
+					anthropic: {
+						baseUrl: "https://aws-external-anthropic.us-east-1.api.aws",
+						apiKey: "key-model",
+						headers: { "Anthropic-Workspace-Id": "wrkspc_model" },
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+
+				expect(model).toBeDefined();
+				if (!model) throw new Error("Expected bundled Anthropic model");
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model)).toBe("key-model");
+				expect(model.headers?.["Anthropic-Workspace-Id"]).toBe("wrkspc_model");
+			} finally {
+				for (const name of names) {
+					const value = previous[name];
+					if (value === undefined) delete Bun.env[name];
+					else Bun.env[name] = value;
+				}
+			}
+		});
+	});
 	describe("disableStrictTools", () => {
 		let bedrockCustom: ModelRegistry;
 		let anthropicOverride: ModelRegistry;
@@ -1893,6 +2037,7 @@ describe("ModelRegistry", () => {
 		let vertexStale: ModelRegistry;
 		let litellmStaleNamespaceCache: ModelRegistry;
 		let litellmCurrentNamespaceCache: ModelRegistry;
+		let openaiModelsListStaleNamespaceCache: ModelRegistry;
 		const vertexProjectModel = () =>
 			buildModel({
 				id: "zai-org/glm-4.7-maas",
@@ -2118,7 +2263,7 @@ describe("ModelRegistry", () => {
 				{
 					seedCache: dbPath =>
 						writeModelCache(
-							"cached-compact-proxy:openai-models-list-context-v2",
+							"cached-compact-proxy:openai-models-list-context-v3",
 							Date.now(),
 							[
 								buildModel({
@@ -2188,6 +2333,45 @@ describe("ModelRegistry", () => {
 						dbPath,
 					),
 			});
+			openaiModelsListStaleNamespaceCache = readonlyRegistry(
+				{
+					providers: {
+						"stale-openai-proxy": {
+							baseUrl: "https://stale-proxy.example.com/v1",
+							apiKey: "TEST_KEY",
+							api: "openai-completions",
+							discovery: { type: "openai-models-list" },
+							models: [],
+						},
+					},
+				},
+				{
+					// Row under the retired pre-modality namespace; the context-v3
+					// bump must orphan it instead of serving the stale text-only row.
+					seedCache: dbPath =>
+						writeModelCache(
+							"stale-openai-proxy:openai-models-list-context-v2",
+							Date.now(),
+							[
+								buildModel({
+									id: "stale-vlm",
+									name: "Stale VLM",
+									api: "openai-completions",
+									provider: "stale-openai-proxy",
+									baseUrl: "https://stale-proxy.example.com/v1",
+									reasoning: false,
+									input: ["text"],
+									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+									contextWindow: 128_000,
+									maxTokens: 16_384,
+								}),
+							],
+							true,
+							"",
+							dbPath,
+						),
+				},
+			);
 		});
 
 		test("legacy cached discovery sentinels are ignored after nullable limit cutover", () => {
@@ -2238,6 +2422,13 @@ describe("ModelRegistry", () => {
 			const model = litellmCurrentNamespaceCache.find("litellm-proxy", "minimax/minimax-m3");
 			expect(model?.name).toBe("MiniMax-M3");
 			expect(model?.provider).toBe("litellm-proxy");
+		});
+
+		test("ignores openai-models-list rows cached under the retired context-v2 namespace", () => {
+			// PR #7584 added server-advertised input-modality parsing; warm v2 rows
+			// pinned vision-capable ids at text-only and must not load.
+			expect(openaiModelsListStaleNamespaceCache.find("stale-openai-proxy", "stale-vlm")).toBeUndefined();
+			expect(getModelsForProvider(openaiModelsListStaleNamespaceCache, "stale-openai-proxy")).toHaveLength(0);
 		});
 
 		test("replaces bundled google-vertex models with authoritative Vertex project discovery", () => {

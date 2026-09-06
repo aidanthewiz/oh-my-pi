@@ -44,9 +44,14 @@ function wireCellFields(tool: EvalTool): {
 }
 
 describe("eval tool description", () => {
-	it("advertises agent() when spawns are allowed", () => {
+	it("advertises the current agent() contract when spawns are allowed", () => {
 		const text = getEvalToolDescription({ py: true, js: true, spawns: true });
-		expect(text).toContain("agent(prompt");
+		const signatures = text.split("\n").filter(line => line.includes("agent(prompt"));
+		expect(signatures.length).toBeGreaterThan(0);
+		expect(signatures.every(line => line.includes("contextFilePolicy") || line.includes("context_file_policy"))).toBe(
+			true,
+		);
+		expect(signatures.every(line => !line.includes("model"))).toBe(true);
 	});
 
 	it("omits agent() when the session forbids spawning", () => {

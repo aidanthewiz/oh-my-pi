@@ -3,6 +3,7 @@
  */
 
 import { Args, Command } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { readHelp as commandHelp } from "../cli/command-help";
 import { type ReadCommandArgs, runReadCommand } from "../cli/read-cli";
 import { initTheme } from "../modes/theme/theme";
@@ -18,14 +19,14 @@ export default class Read extends Command {
 	};
 
 	static examples = [
-		"omp read src/foo.ts",
-		"omp read src/foo.ts:50-100",
-		"omp read src/foo.ts:raw",
-		"omp read https://example.com",
-		"omp read omp://",
-		"omp read issue://123",
-		"omp read path/to/archive.zip:dir/file.ts",
-		"omp read path/to/db.sqlite:users:42",
+		`${CF_COMMAND} read src/foo.ts`,
+		`${CF_COMMAND} read src/foo.ts:50-100`,
+		`${CF_COMMAND} read src/foo.ts:raw`,
+		`${CF_COMMAND} read https://example.com`,
+		`${CF_COMMAND} read omp://`,
+		`${CF_COMMAND} read issue://123`,
+		`${CF_COMMAND} read path/to/archive.zip:dir/file.ts`,
+		`${CF_COMMAND} read path/to/db.sqlite:users:42`,
 	];
 
 	async run(): Promise<void> {

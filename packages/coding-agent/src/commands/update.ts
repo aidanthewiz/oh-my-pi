@@ -3,6 +3,7 @@
  */
 
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { updateHelp as commandHelp } from "../cli/command-help";
 import * as pluginCli from "../cli/plugin-cli";
 import * as updateCli from "../cli/update-cli";
@@ -17,9 +18,9 @@ export default class Update extends Command {
 	};
 
 	static examples = [
-		"omp update",
-		"omp update --check",
-		"# If GitHub rate-limits release metadata, set GITHUB_TOKEN or GH_TOKEN\n  GITHUB_TOKEN=... omp update",
+		`${CF_COMMAND} update`,
+		`${CF_COMMAND} update --check`,
+		`# If GitHub rate-limits release metadata, set GITHUB_TOKEN or GH_TOKEN\n  GITHUB_TOKEN=... ${CF_COMMAND} update`,
 	];
 
 	async run(): Promise<void> {

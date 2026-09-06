@@ -21,7 +21,14 @@ import {
 import { resolveAwsModelProfile, resolveAwsModelRegion } from "../aws-model-auth";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
-import { anthropicBaseUrlIsAwsGateway, resolveAnthropicAwsWorkspaceId } from "../registry/anthropic-aws-env";
+import {
+	ANTHROPIC_AWS_AUTHENTICATED_SENTINEL,
+	anthropicBaseUrlIsAwsGateway,
+	hasAnthropicAwsGatewayHost,
+	isAnthropicAwsGatewayUrl,
+	resolveAnthropicAwsProviderCredential,
+	resolveAnthropicAwsWorkspaceId,
+} from "../registry/anthropic-aws-env";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
 	AnthropicFallbackContent,
@@ -489,20 +496,21 @@ function getCacheControl(
 	model: Model<"anthropic-messages">,
 	cacheRetention: CacheRetention | undefined,
 	isOAuthToken: boolean,
+	effectiveBaseUrl: string | undefined,
 ): { retention: CacheRetention; cacheControl?: AnthropicCacheControl } {
+	const supportsLongCacheRetention = supportsLongCacheRetentionAtEndpoint(model, effectiveBaseUrl);
 	// OAuth mirrors Claude Code and always defaults to 1h retention. API-key
-	// requests also default to 1h where the endpoint supports it (canonical
-	// Anthropic API, `compat.supportsLongCacheRetention`): agent sessions
-	// routinely idle past 5 minutes waiting on background jobs, and a 5m
-	// breakpoint cold-misses the entire prefix on resume. PI_CACHE_RETENTION
-	// still overrides the API-key default in either direction.
+	// requests also default to 1h where the effective endpoint supports it:
+	// agent sessions routinely idle past 5 minutes waiting on background jobs,
+	// and a 5m breakpoint cold-misses the entire prefix on resume.
+	// PI_CACHE_RETENTION still overrides the API-key default in either direction.
 	const retention = isOAuthToken
 		? (cacheRetention ?? "long")
-		: resolveCacheRetention(cacheRetention, model.compat.supportsLongCacheRetention ? "long" : "short");
+		: resolveCacheRetention(cacheRetention, supportsLongCacheRetention ? "long" : "short");
 	if (retention === "none") {
 		return { retention };
 	}
-	const ttl = retention === "long" && model.compat.supportsLongCacheRetention ? "1h" : undefined;
+	const ttl = retention === "long" && supportsLongCacheRetention ? "1h" : undefined;
 	return {
 		retention,
 		cacheControl: { type: "ephemeral", ...(ttl && { ttl }) },
@@ -653,8 +661,6 @@ export function wrapFetchForCch(base: FetchImpl): FetchImpl {
 // credential chain. Every request also carries a workspace id header and a
 // region-scoped base URL.
 
-/** Sentinel returned by the registry when SigV4 credentials (not an API key) are present. */
-const AUTHENTICATED_API_KEY_SENTINEL = "<authenticated>";
 /** AWS SigV4 service name for the gateway (per docs: `aws:amz:<region>:aws-external-anthropic`). */
 const ANTHROPIC_AWS_SIGV4_SERVICE = "aws-external-anthropic";
 const ANTHROPIC_AWS_DEFAULT_REGION = "us-east-1";
@@ -1309,23 +1315,64 @@ function foundryTlsOptionsCacheKey(): string {
 	]);
 }
 
+function requireSecureAnthropicAwsGatewayUrl(baseUrl: string | undefined): string | undefined {
+	if (hasAnthropicAwsGatewayHost(baseUrl) && !isAnthropicAwsGatewayUrl(baseUrl)) {
+		throw new AIError.ValidationError(
+			"Claude Platform on AWS requires a canonical HTTPS aws-external-anthropic regional base URL",
+		);
+	}
+	return baseUrl;
+}
+
+function stockAnthropicUsesAwsEnvironmentRoute(
+	model: Model<"anthropic-messages">,
+	effectiveBaseUrl: string | undefined,
+): boolean {
+	if (model.provider !== "anthropic") return false;
+	const foundryBaseUrl = isFoundryEnabled() ? normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL) : undefined;
+	if (foundryBaseUrl) return isAnthropicAwsGatewayUrl(effectiveBaseUrl);
+	const configured = normalizeAnthropicBaseUrl(model.baseUrl);
+	if (configured && !isOfficialAnthropicApiUrl(configured)) return false;
+	return isAnthropicAwsGatewayUrl(effectiveBaseUrl);
+}
+
 function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: string): string | undefined {
+	let resolved: string | undefined;
 	if (model.provider === "github-copilot") {
-		return normalizeAnthropicBaseUrl(resolveGitHubCopilotBaseUrl(model.baseUrl, apiKey) ?? model.baseUrl);
+		resolved = normalizeAnthropicBaseUrl(resolveGitHubCopilotBaseUrl(model.baseUrl, apiKey) ?? model.baseUrl);
+	} else if (model.provider === "anthropic" && isFoundryEnabled()) {
+		resolved = normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL);
 	}
-	if (model.provider === "anthropic" && isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL);
-		if (foundryBaseUrl) {
-			return foundryBaseUrl;
-		}
+	if (!resolved && model.provider === "anthropic") {
+		const configured = normalizeAnthropicBaseUrl(model.baseUrl);
+		// An explicitly configured non-official baseUrl (e.g. a models.yml provider
+		// override) is more specific than the generic env fallback and wins.
+		resolved =
+			configured && !isOfficialAnthropicApiUrl(configured)
+				? configured
+				: (normalizeAnthropicBaseUrl($env.ANTHROPIC_BASE_URL) ?? configured ?? "https://api.anthropic.com");
+	} else if (!resolved && model.provider === "anthropic-aws") {
+		resolved = resolveAnthropicAwsBaseUrl(model);
+	} else if (!resolved) {
+		resolved = normalizeAnthropicBaseUrl(model.baseUrl);
 	}
-	if (model.provider === "anthropic") {
-		return normalizeAnthropicBaseUrl(model.baseUrl) ?? "https://api.anthropic.com";
-	}
-	if (model.provider === "anthropic-aws") {
-		return resolveAnthropicAwsBaseUrl(model);
-	}
-	return normalizeAnthropicBaseUrl(model.baseUrl);
+	return requireSecureAnthropicAwsGatewayUrl(resolved);
+}
+
+function supportsLongCacheRetentionAtEndpoint(
+	model: Model<"anthropic-messages">,
+	effectiveBaseUrl: string | undefined,
+): boolean {
+	if (!model.compat.supportsLongCacheRetention) return false;
+	return isOfficialAnthropicApiUrl(effectiveBaseUrl) || !model.compat.officialEndpoint;
+}
+
+function supportsMidConversationSystemAtEndpoint(
+	model: Model<"anthropic-messages">,
+	effectiveBaseUrl: string | undefined,
+): boolean {
+	if (!model.compat.supportsMidConversationSystem) return false;
+	return isOfficialAnthropicApiUrl(effectiveBaseUrl) || !model.compat.officialEndpoint;
 }
 
 function resolveEagerToolInputStreamingSupport(
@@ -1370,22 +1417,25 @@ function parseAnthropicCustomHeaders(rawHeaders: string | undefined): Record<str
  * Returns env-supplied custom headers (`ANTHROPIC_CUSTOM_HEADERS`) when they
  * should be forwarded to the upstream endpoint.
  *
- * Foundry mode forwards them unconditionally. Outside Foundry, they're applied
- * only when the configured base URL is a non-Anthropic host — i.e. an
- * enterprise/corporate gateway that may require its own proprietary auth
- * header. Stock `api.anthropic.com` would reject unknown headers, so they're
- * omitted there.
+ * Foundry mode forwards them unconditionally to its configured endpoint.
+ * Outside Foundry, they're applied only to non-Anthropic enterprise gateways.
+ * The AWS external-Anthropic gateway always uses its own credential family, so
+ * proprietary gateway headers are never forwarded there.
  */
 export function resolveAnthropicCustomHeadersForBaseUrl(
 	baseUrl: string | undefined,
 ): Record<string, string> | undefined {
+	if (hasAnthropicAwsGatewayHost(baseUrl)) return undefined;
 	if (!isFoundryEnabled() && isOfficialAnthropicApiUrl(baseUrl)) return undefined;
 	return parseAnthropicCustomHeaders($env.ANTHROPIC_CUSTOM_HEADERS);
 }
 
-function resolveAnthropicCustomHeaders(model: Model<"anthropic-messages">): Record<string, string> | undefined {
+function resolveAnthropicCustomHeaders(
+	model: Model<"anthropic-messages">,
+	baseUrl: string | undefined,
+): Record<string, string> | undefined {
 	if (model.provider !== "anthropic") return undefined;
-	return resolveAnthropicCustomHeadersForBaseUrl(model.baseUrl);
+	return resolveAnthropicCustomHeadersForBaseUrl(baseUrl);
 }
 
 function looksLikeFilePath(value: string): boolean {
@@ -1643,6 +1693,13 @@ async function* observeDecodedAnthropicSdkEvents(
 const PROVIDER_MAX_RETRIES = 10;
 
 /**
+ * Flat delay between attempts when Copilot 400s a model its own `/models`
+ * catalog advertises. Part of the fleet carries the model and part doesn't, so
+ * the retry is a reroll rather than a wait for capacity to free up.
+ */
+const COPILOT_MODEL_FLAP_RETRY_DELAY_MS = 400;
+
+/**
  * How long `ping` keepalives may keep extending the idle deadline without any
  * semantic stream progress, as a multiple of the idle timeout. Anthropic pings
  * across legitimate generation gaps, so pings count as liveness — but a wedged
@@ -1672,8 +1729,8 @@ function shouldIgnoreAnthropicPreambleEvent(eventType: unknown): boolean {
 /**
  * Whether an Anthropic (or Copilot-over-Anthropic) stream error should be
  * retried. The classification lives in {@link AIError.isProviderRetryableError};
- * this wrapper injects the Copilot-specific `model_not_supported` transient
- * check, which the error module must not import directly.
+ * this wrapper injects the Copilot-specific model-availability transient check,
+ * which the error module must not import directly.
  */
 export function isProviderRetryableError(error: unknown, provider?: string): boolean {
 	return AIError.isProviderRetryableError(error, {
@@ -1919,8 +1976,14 @@ const streamAnthropicOnce = (
 			if (copilotDynamicHeaders?.premiumRequests !== undefined) {
 				output.usage.premiumRequests = copilotDynamicHeaders.premiumRequests;
 			}
-			const apiKey = options?.apiKey ?? getEnvApiKey(model.provider) ?? "";
+			const apiKey =
+				options?.apiKey ?? getEnvApiKey(model.provider, { baseUrl: model.baseUrl, modelId: model.id }) ?? "";
 			const baseUrl = resolveAnthropicBaseUrl(model, apiKey) ?? "https://api.anthropic.com";
+			const routesThroughAnthropicAwsGateway =
+				model.provider === "anthropic-aws" || isAnthropicAwsGatewayUrl(baseUrl);
+			const effectiveCredentialIsOAuth =
+				!routesThroughAnthropicAwsGateway && (options?.isOAuth ?? isAnthropicOAuthToken(apiKey));
+			const supportsMidConversationSystem = supportsMidConversationSystemAtEndpoint(model, baseUrl);
 			const supportsEagerToolInputStreaming = resolveEagerToolInputStreamingSupport(model, baseUrl);
 			const providerSessionState = getAnthropicProviderSessionState(
 				options?.providerSessionState,
@@ -1933,23 +1996,7 @@ const streamAnthropicOnce = (
 			let forceDemoteUnsignedThinking = providerSessionState?.replayUnsignedThinkingDisabled ?? false;
 			const mergedCallerHeaders = mergeHeaders(model.headers, options?.headers);
 			const umansGatewayWebSearchHeader = getUmansWebSearchHeader(model, mergedCallerHeaders);
-			// Keep fallback payloads aligned with the top-level Vertex effort gate:
-			// no nested effort field means the fallback scan cannot re-add its beta.
-			let fallbacks = options?.fallbacks;
-			if (
-				model.provider === "google-vertex" &&
-				fallbacks?.some(entry => entry.output_config?.effort !== undefined)
-			) {
-				fallbacks = fallbacks.map(entry => {
-					const outputConfig = entry.output_config;
-					if (outputConfig?.effort === undefined) return entry;
-					return {
-						...entry,
-						output_config:
-							outputConfig.task_budget === undefined ? undefined : { task_budget: outputConfig.task_budget },
-					};
-				});
-			}
+			const fallbacks = isOfficialAnthropicApiUrl(baseUrl) ? options?.fallbacks : undefined;
 
 			let client: AnthropicMessagesClientLike;
 			let isOAuthToken: boolean;
@@ -1990,7 +2037,7 @@ const streamAnthropicOnce = (
 				) {
 					extraBetas.push(effortBeta);
 				}
-				if (model.compat.supportsMidConversationSystem && !extraBetas.includes(midConversationSystemBeta)) {
+				if (supportsMidConversationSystem && !extraBetas.includes(midConversationSystemBeta)) {
 					// convertAnthropicMessages may upgrade developer turns to the
 					// mid-conversation `system` role on these models; API-key requests
 					// need the beta alongside the role (OAuth agent requests already
@@ -2020,8 +2067,8 @@ const streamAnthropicOnce = (
 				// already carry it in the Claude Code beta list, and utility
 				// requests must not deviate from CC's header fingerprint.
 				if (
-					!(options?.isOAuth ?? isAnthropicOAuthToken(apiKey)) &&
-					getCacheControl(model, options?.cacheRetention, false).cacheControl?.ttl === "1h" &&
+					!effectiveCredentialIsOAuth &&
+					getCacheControl(model, options?.cacheRetention, false, baseUrl).cacheControl?.ttl === "1h" &&
 					!extraBetas.includes(extendedCacheTtlBeta)
 				) {
 					extraBetas.push(extendedCacheTtlBeta);
@@ -2075,6 +2122,7 @@ const streamAnthropicOnce = (
 					useUmansGatewayWebSearch: umansGatewayWebSearchHeader !== undefined,
 					forceDemoteUnsignedThinking,
 					supportsEagerToolInputStreaming,
+					effectiveBaseUrl: baseUrl,
 					fallbacks,
 				});
 				if (disableStrictTools) {
@@ -2820,7 +2868,12 @@ const streamAnthropicOnce = (
 						throw streamFailure;
 					}
 					providerRetryAttempt++;
-					const backoffDelayMs = calculateAnthropicRetryDelayMs(providerRetryAttempt - 1);
+					// Copilot's model-availability 400 is a per-request replica reroll, not
+					// upstream backpressure — the exponential curve would just add dead
+					// time to a coin flip that the next attempt is as likely to win.
+					const backoffDelayMs = AIError.isCopilotTransientModelError(streamFailure)
+						? COPILOT_MODEL_FLAP_RETRY_DELAY_MS
+						: calculateAnthropicRetryDelayMs(providerRetryAttempt - 1);
 					// Honor the server's retry hint (`retry-after-ms`/`retry-after`) on
 					// 429/529-style failures: retrying sooner than the server asked is a
 					// guaranteed failure that just burns the retry budget.
@@ -3015,6 +3068,25 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const compat = model.compat;
 	const disableStrictTools = disableStrictToolsOverride ?? compat.disableStrictTools;
 	const baseUrl = resolveAnthropicBaseUrl(model, apiKey);
+	if (model.provider === "anthropic-aws" && !isAnthropicAwsGatewayUrl(baseUrl)) {
+		throw new AIError.ValidationError(
+			"Claude Platform on AWS requires a canonical HTTPS aws-external-anthropic regional base URL",
+		);
+	}
+	const routesThroughAnthropicAwsGateway = model.provider === "anthropic-aws" || isAnthropicAwsGatewayUrl(baseUrl);
+	const stockAnthropicAwsEnvironmentRoute = stockAnthropicUsesAwsEnvironmentRoute(model, baseUrl);
+	let transportApiKey = apiKey;
+	if (stockAnthropicAwsEnvironmentRoute) {
+		const awsCredential = resolveAnthropicAwsProviderCredential();
+		if (!awsCredential) {
+			throw new AIError.ValidationError(
+				resolveAnthropicAwsWorkspaceId()
+					? "Claude Platform on AWS requires a matching API key or AWS credential chain"
+					: "Claude Platform on AWS requires ANTHROPIC_AWS_WORKSPACE_ID or ANTHROPIC_WORKSPACE_ID",
+			);
+		}
+		transportApiKey = awsCredential;
+	}
 	// Adaptive models (`supportsDisplay`) get native interleaved thinking on the
 	// official API, so only non-official signing routes need the beta (#6717).
 	// Two classifications feed the predicate: the effective URL, because Foundry
@@ -3036,14 +3108,16 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		interleavedThinking &&
 		(!model.thinking?.supportsDisplay ||
 			(!isOfficialAnthropicApiUrl(baseUrl) &&
-				(isAnthropicSigningProxyUrl(baseUrl) || (compat.signingEndpoint && !compat.officialEndpoint)) &&
+				(routesThroughAnthropicAwsGateway ||
+					isAnthropicSigningProxyUrl(baseUrl) ||
+					(compat.signingEndpoint && !compat.officialEndpoint)) &&
 				!isVertexRawPredictUrl(baseUrl ?? "") &&
 				!hostMatchesUrl(baseUrl, "githubCopilot")));
-	const oauthToken = isOAuth ?? isAnthropicOAuthToken(apiKey);
+	const oauthToken = routesThroughAnthropicAwsGateway ? false : (isOAuth ?? isAnthropicOAuthToken(transportApiKey));
 	const supportsEagerToolInputStreaming = resolveEagerToolInputStreamingSupport(model, baseUrl);
 	const needsFineGrainedToolStreamingBeta =
 		hasTools && isOfficialAnthropicApiUrl(baseUrl) && !supportsEagerToolInputStreaming;
-	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model);
+	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model, baseUrl);
 	const tlsFetchOptions = buildCoworkTlsFetchOptions(model, baseUrl);
 	// Disable Bun's native ~300s pre-response fetch timeout (issue #2422).
 	// `AnthropicMessagesClient` already arms its own DEFAULT_TIMEOUT_MS timer
@@ -3095,7 +3169,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	}
 
 	const defaultHeaders = buildAnthropicHeaders({
-		apiKey,
+		apiKey: transportApiKey,
 		baseUrl,
 		isOAuth: oauthToken,
 		extraBetas: betaFeatures,
@@ -3127,22 +3201,34 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
-	// Claude Platform on AWS: inject the mandatory `anthropic-workspace-id` header,
-	// then authenticate with either the API key or, when only AWS credentials are
-	// present, SigV4 request signing. Per the docs the gateway authenticates an API
-	// key as a Bearer token (IAM authorizes it via the
-	// `aws-external-anthropic:CallWithBearerToken` action) — NOT the first-party
-	// `x-api-key` scheme — so drop any `x-api-key`; `buildAnthropicHeaders` already
-	// emitted `Authorization: Bearer <key>` for this non-official base URL.
-	if (model.provider === "anthropic-aws") {
+	// Claude Platform on AWS requires one workspace id and exactly one
+	// credential: Bearer API key or SigV4. Environment-owned routes replace any
+	// colliding caller headers; explicit custom providers retain their own key
+	// and workspace header.
+	if (routesThroughAnthropicAwsGateway) {
 		const awsHeaders = { ...defaultHeaders };
 		deleteHeaderCaseInsensitive(awsHeaders, "x-api-key");
-		const workspaceId = resolveAnthropicAwsWorkspaceId();
-		if (workspaceId) awsHeaders["anthropic-workspace-id"] = workspaceId;
-		const useApiKey = !!apiKey && apiKey !== AUTHENTICATED_API_KEY_SENTINEL;
-		if (useApiKey) {
-			// Keep the `Authorization: Bearer <key>` credential `buildAnthropicHeaders`
-			// built; leave `apiKey` null so the client never re-adds `X-Api-Key`.
+		const environmentOwnsAwsHeaders = model.provider === "anthropic-aws" || stockAnthropicAwsEnvironmentRoute;
+		const workspaceId = environmentOwnsAwsHeaders
+			? resolveAnthropicAwsWorkspaceId()
+			: getHeaderCaseInsensitive(awsHeaders, "anthropic-workspace-id");
+		if (!workspaceId) {
+			throw new AIError.ValidationError(
+				"Claude Platform on AWS requires ANTHROPIC_AWS_WORKSPACE_ID, ANTHROPIC_WORKSPACE_ID, or an anthropic-workspace-id header",
+			);
+		}
+		deleteHeaderCaseInsensitive(awsHeaders, "anthropic-workspace-id");
+		awsHeaders["anthropic-workspace-id"] = workspaceId;
+
+		const usesSigV4 = transportApiKey === ANTHROPIC_AWS_AUTHENTICATED_SENTINEL;
+		if (!transportApiKey) {
+			throw new AIError.ValidationError("Claude Platform on AWS requires an API key or AWS credential chain");
+		}
+		if (!usesSigV4) {
+			if (environmentOwnsAwsHeaders) {
+				deleteHeaderCaseInsensitive(awsHeaders, "authorization");
+				awsHeaders.Authorization = `Bearer ${transportApiKey}`;
+			}
 			return {
 				isOAuthToken: false,
 				apiKey: null,
@@ -3154,9 +3240,8 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 				fetchOptions,
 			};
 		}
-		// SigV4 path: strip the sentinel Bearer so the AWS signature is the sole
-		// credential, then sign per-request with the AWS credential chain. The signing
-		// region must equal the endpoint region, so derive it from the base URL.
+
+		// SigV4 is the sole credential. The signing region must equal the endpoint region.
 		deleteHeaderCaseInsensitive(awsHeaders, "authorization");
 		const region =
 			regionFromAnthropicAwsBaseUrl(baseUrl) ?? resolveAnthropicAwsRegion() ?? ANTHROPIC_AWS_DEFAULT_REGION;
@@ -3199,7 +3284,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	// asked for one.
 	const authorizationHeader = getHeaderCaseInsensitive(defaultHeaders, "Authorization");
 	const shouldSuppressClientApiKey =
-		!oauthToken && !model.compat.officialEndpoint && typeof authorizationHeader === "string";
+		!oauthToken && !isOfficialAnthropicApiUrl(baseUrl) && typeof authorizationHeader === "string";
 
 	return {
 		isOAuthToken: oauthToken,
@@ -3553,24 +3638,25 @@ type AnthropicParamBuildOptions = {
 	useUmansGatewayWebSearch: boolean;
 	forceDemoteUnsignedThinking: boolean;
 	supportsEagerToolInputStreaming: boolean;
-	/** Sanitized server-side fallback entries; defaults to `options?.fallbacks` when omitted. */
-	fallbacks?: AnthropicOptions["fallbacks"];
+	effectiveBaseUrl: string;
+	/** Endpoint-compatible server-side fallback entries selected by the caller. */
+	fallbacks: AnthropicOptions["fallbacks"] | undefined;
 };
 /** Normalize `ANTHROPIC_AWS_INFERENCE_GEO` to a supported value, else undefined. */
 function resolveAnthropicAwsInferenceGeo(): "us" | "global" | undefined {
 	const raw = $env.ANTHROPIC_AWS_INFERENCE_GEO?.trim().toLowerCase();
 	return raw === "us" || raw === "global" ? raw : undefined;
 }
-
 /**
- * Claude Platform on AWS supports pinning inference geography per request via
- * `inference_geo` ("us" — US-only data centers, 1.1x pricing; or "global"). It is
- * accepted on Opus 4.6 / Sonnet 4.6 and later; Opus 4.5, Sonnet 4.5, and Haiku
- * 4.5 reject it with a 400. Apply the env-configured value only to eligible
- * `anthropic-aws` models so the request never 400s on an unsupported model.
+ * Claude Platform on AWS supports pinning inference geography per request.
+ * Apply it to AWS-native models and stock models rerouted through the gateway.
  */
-function applyAnthropicAwsInferenceGeo(params: MessageCreateParamsStreaming, model: Model<"anthropic-messages">): void {
-	if (model.provider !== "anthropic-aws") return;
+function applyAnthropicAwsInferenceGeo(
+	params: MessageCreateParamsStreaming,
+	model: Model<"anthropic-messages">,
+	effectiveBaseUrl: string,
+): void {
+	if (!isAnthropicAwsGatewayUrl(effectiveBaseUrl)) return;
 	const geo = resolveAnthropicAwsInferenceGeo();
 	if (!geo) return;
 	const parsed = parseKnownModel(model.id);
@@ -3590,7 +3676,8 @@ function buildParams(
 		useUmansGatewayWebSearch,
 		forceDemoteUnsignedThinking,
 		supportsEagerToolInputStreaming,
-		fallbacks = options?.fallbacks,
+		effectiveBaseUrl,
+		fallbacks,
 	} = buildOptions;
 	// A session-scoped auto-demote (learned from a live signing 400) clones the
 	// resolved compat with `replayUnsignedThinking: false` so every subsequent
@@ -3600,7 +3687,7 @@ function buildParams(
 		forceDemoteUnsignedThinking && model.compat.replayUnsignedThinking
 			? { ...model, compat: { ...model.compat, replayUnsignedThinking: false } }
 			: model;
-	const { cacheControl } = getCacheControl(model, options?.cacheRetention, isOAuthToken);
+	const { cacheControl } = getCacheControl(model, options?.cacheRetention, isOAuthToken, effectiveBaseUrl);
 
 	// Pre-compute system blocks so they occupy the right slot in the serialized body.
 	const shouldInjectClaudeCodeInstruction = isOAuthToken && !model.id.startsWith("claude-3-5-haiku");
@@ -3733,6 +3820,7 @@ function buildParams(
 		model: options?.requestModelId ?? model.requestModelId ?? model.id,
 		messages: convertAnthropicMessages(context.messages, effectiveModel, isOAuthToken, {
 			serverSideFallbackEnabled: !!fallbacks?.length,
+			effectiveBaseUrl,
 		}),
 		...(systemBlocks && { system: systemBlocks }),
 		...(tools !== undefined && { tools }),
@@ -3804,7 +3892,7 @@ function buildParams(
 	applyPromptCaching(params, cacheControl);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
-	applyAnthropicAwsInferenceGeo(params, model);
+	applyAnthropicAwsInferenceGeo(params, model, effectiveBaseUrl);
 
 	return params;
 }
@@ -3909,7 +3997,7 @@ export function convertAnthropicMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
-	opts?: { serverSideFallbackEnabled?: boolean },
+	opts?: { serverSideFallbackEnabled?: boolean; effectiveBaseUrl?: string },
 ): AnthropicMessageParam[] {
 	// Indices of params emitted from `developer` messages. After the main pass,
 	// the ones whose placement satisfies Anthropic's mid-conversation rules are
@@ -3918,6 +4006,11 @@ export function convertAnthropicMessages(
 	const params: AnthropicMessageParam[] = [];
 
 	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
+
+	const effectiveOfficialEndpoint =
+		opts?.effectiveBaseUrl === undefined
+			? model.compat.officialEndpoint
+			: isOfficialAnthropicApiUrl(opts.effectiveBaseUrl);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
@@ -4008,7 +4101,7 @@ export function convertAnthropicMessages(
 					// block on the wire). `transformMessages` already drops
 					// the block for cross-provider / non-official replays, so
 					// this is defense-in-depth for direct convert calls.
-					if (!opts?.serverSideFallbackEnabled || !model.compat.officialEndpoint) continue;
+					if (!opts?.serverSideFallbackEnabled || !effectiveOfficialEndpoint) continue;
 					blocks.push({
 						type: "fallback",
 						from: block.from,
@@ -4109,7 +4202,10 @@ export function convertAnthropicMessages(
 	// never consecutive. Requiring the next param to be `assistant` (or absent)
 	// covers both the "followed by assistant / last" and "no consecutive system"
 	// constraints. Anything that does not qualify stays a `user` message.
-	if (developerParamIndices.length > 0 && model.compat.supportsMidConversationSystem) {
+	if (
+		developerParamIndices.length > 0 &&
+		supportsMidConversationSystemAtEndpoint(model, opts?.effectiveBaseUrl ?? resolveAnthropicBaseUrl(model))
+	) {
 		for (const idx of developerParamIndices) {
 			const followsUser = idx > 0 && params[idx - 1]?.role === "user";
 			const next = params[idx + 1];

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { type Component, TUI } from "@oh-my-pi/pi-tui";
@@ -33,9 +33,16 @@ function plainBuffer(term: VirtualTerminal): string[] {
 
 describe("ToolExecutionComponent write repaint seam", () => {
 	const components: ToolExecutionComponent[] = [];
+	const originalHerdrEnv = Bun.env.HERDR_ENV;
 
 	beforeAll(async () => {
 		await initTheme();
+		delete Bun.env.HERDR_ENV;
+	});
+
+	afterAll(() => {
+		if (originalHerdrEnv === undefined) delete Bun.env.HERDR_ENV;
+		else Bun.env.HERDR_ENV = originalHerdrEnv;
 	});
 
 	afterEach(() => {

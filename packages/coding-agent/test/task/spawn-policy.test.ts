@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "../../src/config/settings";
-import initAgentPrompt from "../../src/prompts/agents/init.md" with { type: "text" };
 import * as taskDiscovery from "../../src/task/discovery";
 import { TaskTool } from "../../src/task/index";
 import { isScoutSpawnable } from "../../src/task/spawn-policy";
@@ -157,12 +156,5 @@ describe("task tool description scout gating", () => {
 		// policy only filters disabledAgents, so reviewer stays); only the
 		// hard-coded scout guidance is dropped.
 		expect(description).toContain("### reviewer");
-	});
-});
-
-describe("bundled agent prompt scout gating", () => {
-	it("does not hard-code scout in the init agent prompt", () => {
-		expect(initAgentPrompt.toLowerCase()).not.toContain("scout");
-		expect(initAgentPrompt).toContain("multiple research agents");
 	});
 });

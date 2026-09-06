@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import { importRoomKey } from "../../coding-agent/src/collab/crypto";
 import type { CollabFrame } from "../../coding-agent/src/collab/protocol";
 import { BrowserAuthorizationStore, type RelayIdentityVerifier } from "../src/auth";
@@ -10,7 +11,10 @@ import { startRelayServer } from "../src/server";
 import { FileShareStore, type ShareStore, ShareStoreCapacityError } from "../src/share-store";
 
 // Mock the native-backed logger before loading the real CollabSocket protocol client.
-mock.module("@oh-my-pi/pi-utils", () => ({ logger: { debug: () => undefined } }));
+mock.module("@oh-my-pi/pi-utils", () => ({
+	...piUtils,
+	logger: { ...piUtils.logger, debug: () => undefined },
+}));
 const { CollabSocket } = await import("../../coding-agent/src/collab/relay-client");
 
 const ROOM_ID = "abcdefghijklmnop";

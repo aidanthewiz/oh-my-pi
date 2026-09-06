@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { CF_COMMAND } from "@oh-my-pi/pi-coding-agent/cli/cf-version";
 import { buildSpec, type CompletionSpec, generateCompletion } from "@oh-my-pi/pi-coding-agent/cli/completion-gen";
 import type { CliConfig, CommandCtor } from "@oh-my-pi/pi-utils/cli";
 
@@ -188,7 +189,7 @@ describe("buildSpec", () => {
 	});
 });
 
-describe("omp completions (integration / drift)", () => {
+describe("Coreforge completions (integration / drift)", () => {
 	it("emits a zsh script reflecting the live command + flag surface", async () => {
 		const proc = Bun.spawn([process.execPath, cliEntry, "completions", "zsh"], {
 			cwd: repoRoot,
@@ -217,10 +218,10 @@ describe("omp completions (integration / drift)", () => {
 		expect(stdout).toContain("_omp_cmd_commit");
 		expect(stdout).toContain("'completions:");
 		// zsh routes single-value dynamic flags through the _omp_call action, which
-		// itself shells out to `omp __complete $kind`.
+		// itself shells out through the configured runnable command.
 		expect(stdout).toContain("_omp_call models");
 		expect(stdout).toContain("_omp_call sessions");
-		expect(stdout).toContain("command omp __complete $kind");
+		expect(stdout).toContain(`command ${CF_COMMAND} __complete $kind`);
 		// Hidden/default commands must NOT surface as completable subcommands.
 		expect(stdout).not.toContain("_omp_cmd_launch");
 		expect(stdout).not.toContain("_omp_cmd___complete");

@@ -102,6 +102,42 @@ export function validateProviderConfiguration(
 	}
 }
 
+/** Merge an organization-managed model overlay above the user configuration. */
+export function mergeModelsConfig(base: ModelsConfig | undefined, managed: ModelsConfig | undefined): ModelsConfig {
+	const baseProviders = base?.providers ?? {};
+	const managedProviders = managed?.providers ?? {};
+	if (Object.keys(managedProviders).length === 0) return { providers: { ...baseProviders } };
+
+	const providers: NonNullable<ModelsConfig["providers"]> = { ...baseProviders };
+	for (const [name, managedProvider] of Object.entries(managedProviders)) {
+		const baseProvider = baseProviders[name];
+		if (!baseProvider) {
+			providers[name] = managedProvider;
+			continue;
+		}
+		let models = baseProvider.models;
+		if (managedProvider.models && managedProvider.models.length > 0) {
+			const byId = new Map((baseProvider.models ?? []).map(model => [model.id, model]));
+			for (const model of managedProvider.models) byId.set(model.id, model);
+			models = [...byId.values()];
+		}
+		let modelOverrides = baseProvider.modelOverrides;
+		if (managedProvider.modelOverrides) {
+			modelOverrides = { ...(baseProvider.modelOverrides ?? {}) };
+			for (const [id, override] of Object.entries(managedProvider.modelOverrides)) {
+				modelOverrides[id] = { ...(modelOverrides[id] ?? {}), ...override };
+			}
+		}
+		providers[name] = {
+			...baseProvider,
+			...managedProvider,
+			...(models !== undefined ? { models } : {}),
+			...(modelOverrides !== undefined ? { modelOverrides } : {}),
+		};
+	}
+	return { providers };
+}
+
 /**
  * Org-managed models overlay filename, resolved against the agent directory
  * (`<agentDir>/models.managed.yml`). When present it is deep-merged ABOVE the

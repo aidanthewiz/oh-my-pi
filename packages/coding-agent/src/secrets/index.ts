@@ -6,13 +6,10 @@ import { getSecretPlaceholderKeyPath, isEnoent, logger } from "@oh-my-pi/pi-util
 import { YAML } from "bun";
 import type { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
-import {
-	MIN_OBFUSCATE_SECRET_LEN,
-	regexHasUnresolvableShortMatchFallback,
-	type SecretEntry,
-	sanitizeSecretFriendlyName,
-} from "./obfuscator";
+import { type SecretEntry, SecretObfuscator } from "./obfuscator";
+import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName, secretEntriesNeedPlaceholderKey } from "./placeholder";
 import { compileSecretRegex } from "./regex";
+import { regexHasUnresolvableShortMatchFallback } from "./replacement";
 
 const PLACEHOLDER_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
 const cachedPlaceholderKeys = new Map<string, string>();
@@ -159,11 +156,9 @@ export {
 	deobfuscateToolArguments,
 	obfuscateMessages,
 	obfuscateProviderContext,
-	type SecretEntry,
-	SecretObfuscator,
-	secretEntriesNeedPlaceholderKey,
-	secretEntryNeedsPlaceholderKey,
-} from "./obfuscator";
+} from "./message-transform";
+export { type SecretEntry, SecretObfuscator } from "./obfuscator";
+export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from "./placeholder";
 
 /**
  * Load secrets from project-local and global secrets.yml files.
@@ -255,6 +250,57 @@ export function builtinCredentialSecretEntries(): SecretEntry[] {
 			friendlyName: "Credential",
 		},
 	];
+}
+
+/**
+ * Build a secret obfuscator from configured settings, secrets.yml entries,
+ * secret-shaped environment variables, and built-in credential patterns.
+ * Credential-marked settings are always protected because managed configuration
+ * can define them independently of `secrets.enabled`; the toggle controls only
+ * secrets.yml, environment, and built-in pattern collection.
+ *
+ * Only configured entries force startup key creation. Built-in patterns resolve
+ * the key lazily on their first match. A persisted key is itself protected even
+ * when no configured entry is active.
+ *
+ * Set `keepAvailable` for long-lived sessions whose credential settings can
+ * change after construction. This returns an inert obfuscator that callers can
+ * update without replacing every consumer.
+ */
+export async function buildSecretObfuscator(
+	cwd: string,
+	agentDir: string,
+	options: {
+		keyDir?: string;
+		settings?: Pick<Settings, "get">;
+		keepAvailable?: boolean;
+	} = {},
+): Promise<SecretObfuscator | undefined> {
+	const configurableSecretsEnabled = options.settings?.get("secrets.enabled") ?? true;
+	const settingsEntries = options.settings ? collectSettingsSecrets(options.settings) : [];
+	const fileEntries = configurableSecretsEnabled ? await logger.time("loadSecrets", loadSecrets, cwd, agentDir) : [];
+	const envEntries = configurableSecretsEnabled ? collectEnvSecrets() : [];
+	const configuredEntries = [...settingsEntries, ...envEntries, ...fileEntries];
+	// Built-in credential patterns come last so configured entries take precedence.
+	const allEntries = [...configuredEntries, ...(configurableSecretsEnabled ? builtinCredentialSecretEntries() : [])];
+	const needsPlaceholderKey = secretEntriesNeedPlaceholderKey(configuredEntries);
+	const placeholderKey = needsPlaceholderKey
+		? await getSecretPlaceholderKey(options.keyDir)
+		: await getExistingSecretPlaceholderKey(options.keyDir);
+	let obfuscator: SecretObfuscator | undefined;
+	if (allEntries.length > 0) {
+		obfuscator = new SecretObfuscator(
+			allEntries,
+			placeholderKey ?? (() => getSecretPlaceholderKeySync(options.keyDir)),
+		);
+	}
+	if (obfuscator?.hasSecrets() !== true && placeholderKey !== undefined) {
+		obfuscator = new SecretObfuscator([{ type: "plain", mode: "replace", content: placeholderKey }], placeholderKey);
+	}
+	if (!obfuscator && options.keepAvailable) {
+		obfuscator = new SecretObfuscator([], () => getSecretPlaceholderKeySync(options.keyDir));
+	}
+	return obfuscator;
 }
 
 async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {

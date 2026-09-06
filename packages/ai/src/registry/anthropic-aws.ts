@@ -1,9 +1,4 @@
-import { hasAwsModelCredentialChain } from "../aws-model-auth";
-import {
-	anthropicAwsWorkspaceIdIsNativeOnly,
-	resolveAnthropicAwsApiKey,
-	resolveAnthropicAwsWorkspaceId,
-} from "./anthropic-aws-env";
+import { resolveAnthropicAwsProviderCredential } from "./anthropic-aws-env";
 import type { ProviderDefinition } from "./types";
 
 /**
@@ -33,22 +28,5 @@ import type { ProviderDefinition } from "./types";
 export const anthropicAwsProvider = {
 	id: "anthropic-aws",
 	name: "Claude Platform on AWS",
-	envKeys: () => {
-		// Workspace id is mandatory and env-only — without it the provider can't
-		// build a valid request, so don't advertise it as available.
-		if (!resolveAnthropicAwsWorkspaceId()) return undefined;
-		// API-key path: the value is sent verbatim as an `Authorization: Bearer` token.
-		const apiKey = resolveAnthropicAwsApiKey();
-		if (apiKey) return apiKey;
-		// SigV4 path: only for the AWS-scoped opt-in. A native-only workspace id
-		// (ANTHROPIC_WORKSPACE_ID under the gateway) is the console's API-key
-		// onboarding path and must NOT be authenticated by an ambient AWS profile
-		// with no key — that would advertise availability the API-key user lacks.
-		if (anthropicAwsWorkspaceIdIsNativeOnly()) return undefined;
-		// Managed Coreforge identity resolves only through its isolated model
-		// profile; otherwise use the ordinary AWS credential chain.
-		if (hasAwsModelCredentialChain()) {
-			return "<authenticated>";
-		}
-	},
+	envKeys: resolveAnthropicAwsProviderCredential,
 } as const satisfies ProviderDefinition;

@@ -74,17 +74,16 @@ function canCreateFifo() {
 	return process.platform !== "win32" && Boolean(Bun.which("mkfifo"));
 }
 
-async function createFifo(fifoPath: string) {
-	const process = Bun.spawn(["mkfifo", fifoPath], {
-		stdout: "pipe",
+function createFifo(fifoPath: string) {
+	const result = Bun.spawnSync(["mkfifo", fifoPath], {
+		stdout: "ignore",
 		stderr: "pipe",
 	});
-	const exitCode = await process.exited;
-	if (exitCode === 0) {
+	if (result.exitCode === 0) {
 		return;
 	}
 
-	throw new Error(await new Response(process.stderr).text());
+	throw new Error(result.stderr.toString());
 }
 
 describe("pi-natives", () => {
@@ -640,7 +639,16 @@ describe("pi-natives", () => {
 			expect(callbackError).toBeNull();
 			expect(result.exitCode).toBe(0);
 			expect(result.timedOut).toBeFalse();
-			expect(JSON.parse(output.trim())).toEqual(expected);
+			// ConPTY interleaves terminal negotiation with the child's own bytes
+			// (`ESC[6n`, SGR reset, an OSC 0 title set, cursor show), so strip the
+			// escape sequences before parsing the payload. The OSC body match is
+			// non-greedy: `[^\u0007]` also matches ESC, so a greedy run would eat
+			// past an ST (`ESC \`) terminator to the last one in the buffer,
+			// over-stripping everything between two ST-terminated OSCs.
+			const payload = output
+				.replace(/\u001b\][^\u0007]*?(?:\u0007|\u001b\\)|\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+				.trim();
+			expect(JSON.parse(payload)).toEqual(expected);
 		});
 
 		it("can replace the inherited process environment", async () => {
@@ -882,37 +890,17 @@ for (const { label, input } of cases) {
 
 console.log("ok");
 `;
-			const child = Bun.spawn([process.execPath, "--eval", script], {
+			const child = Bun.spawnSync([process.execPath, "--eval", script], {
 				stdout: "pipe",
 				stderr: "pipe",
+				timeout: 25_000,
 			});
-			const pid = child.pid;
-			let watchdogFired = false;
-			// A real deadline is required because the child may hang inside native code and never emit an event.
-			const timer = setTimeout(() => {
-				if (child.exitCode === null) {
-					watchdogFired = true;
-					child.kill("SIGKILL");
-				}
-			}, 25_000);
-			const exited = child.exited.finally(() => clearTimeout(timer));
-			let stdout = "";
-			let stderr = "";
-			let exitCode: number | null = null;
+			const stdout = child.stdout.toString();
+			const stderr = child.stderr.toString();
 
-			try {
-				[stdout, stderr, exitCode] = await Promise.all([
-					new Response(child.stdout).text(),
-					new Response(child.stderr).text(),
-					exited,
-				]);
-			} finally {
-				clearTimeout(timer);
-			}
-
-			if (watchdogFired || exitCode !== 0 || stdout.trim() !== "ok") {
+			if (child.exitCode !== 0 || stdout.trim() !== "ok") {
 				throw new Error(
-					`deep HTML child failed: pid=${pid}, exitCode=${exitCode}, signalCode=${child.signalCode}, watchdogFired=${watchdogFired}, stderr=${stderr}`,
+					`deep HTML child failed: exitCode=${child.exitCode}, signalCode=${child.signalCode}, stderr=${stderr}`,
 				);
 			}
 		}, 30_000);

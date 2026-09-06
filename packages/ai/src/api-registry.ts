@@ -90,6 +90,14 @@ export function getCustomApi(api: string): RegisteredCustomApi | undefined {
 	return customApiRegistry.get(api);
 }
 
+/** Remove one custom API only when it is still owned by the given source. */
+export function unregisterCustomApi(api: string, sourceId: string): void {
+	const entry = customApiRegistry.get(api);
+	if (entry?.sourceId === sourceId) {
+		customApiRegistry.delete(api);
+	}
+}
+
 /**
  * Remove all custom APIs registered by a specific source (e.g., extension path).
  */

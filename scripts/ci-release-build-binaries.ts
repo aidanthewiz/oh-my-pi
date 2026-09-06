@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
 
-interface BinaryTarget {
+export interface BinaryTarget {
 	id: string;
 	platform: string;
 	arch: string;
@@ -28,7 +28,7 @@ if (
 const transformersVersion = transformersManifest.version;
 // Worker threads re-enter the binary's single CLI host entry.
 const isDryRun = process.argv.includes("--dry-run");
-const targets: BinaryTarget[] = [
+export const BINARY_TARGETS: readonly BinaryTarget[] = [
 	{
 		id: "darwin-arm64",
 		platform: "darwin",
@@ -180,11 +180,13 @@ async function resetArtifacts(): Promise<void> {
 
 async function main(): Promise<void> {
 	const requestedTargets = parseRequestedTargets();
-	const selectedTargets = requestedTargets ? targets.filter(target => requestedTargets.has(target.id)) : targets;
+	const selectedTargets = requestedTargets
+		? BINARY_TARGETS.filter(target => requestedTargets.has(target.id))
+		: BINARY_TARGETS;
 
 	if (requestedTargets) {
 		const unknownTargets = [...requestedTargets].filter(
-			requestedTarget => !targets.some(target => target.id === requestedTarget),
+			requestedTarget => !BINARY_TARGETS.some(target => target.id === requestedTarget),
 		);
 		if (unknownTargets.length > 0) {
 			throw new Error(`Unknown release target(s): ${unknownTargets.join(", ")}`);
@@ -208,4 +210,4 @@ async function main(): Promise<void> {
 	}
 }
 
-await main();
+if (import.meta.main) await main();

@@ -142,6 +142,7 @@ const tabs = new Map<string, TabSession>();
 // awaits) cannot interleave and leak a worker + browser refCount.
 const acquireChains = new Map<string, Promise<void>>();
 const GRACE_MS = 750;
+const WORKER_INIT_TIMEOUT_MS = 15_000;
 // Names of tabs the supervisor force-killed (timeout past grace, failed recycle),
 // mapped to the kill reason. Lets the next `run` on that name explain WHY the tab
 // vanished instead of a bare "not alive". Cleared when the name is opened again.
@@ -280,7 +281,11 @@ async function acquireTabImpl(
 	}
 	let info: ReadyInfo;
 	try {
-		info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
+		info = await initializeTabWorker(
+			worker,
+			initPayload,
+			Math.max(WORKER_INIT_TIMEOUT_MS, opts.timeoutMs + GRACE_MS),
+		);
 	} catch (error) {
 		await worker.terminate().catch(() => undefined);
 		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });

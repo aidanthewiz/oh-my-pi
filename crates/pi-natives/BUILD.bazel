@@ -42,12 +42,11 @@ rust_shared_library(
         "//bazel/triples:aarch64-unknown-linux-musl": ["-Ctarget-feature=-crt-static"],
         "//conditions:default": [],
     }),
-    version = "17.1.5",
+    version = "17.2.15",
     deps = all_crate_deps(normal = True) + [
         "//crates/pi-ast",
         "//crates/pi-iso",
         "//crates/pi-shell",
-        "//crates/pi-uutils-ctx",
         "//crates/pi-voice",
         "//crates/pi-walker",
     ],

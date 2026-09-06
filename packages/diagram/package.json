@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-diagram",
-  "version": "17.2.6",
+  "version": "17.2.15",
   "description": "Typed diagram specs rendered to branded, self-contained SVG and to terminal ASCII from one shared layout.",
   "homepage": "https://omp.sh",
   "license": "MIT",
@@ -29,7 +29,7 @@
   },
   "dependencies": {
     "@oh-my-pi/pi-utils": "catalog:",
-    "arktype": "catalog:"
+    "@oh-my-pi/omptype": "catalog:"
   },
   "devDependencies": {
     "@types/bun": "catalog:"

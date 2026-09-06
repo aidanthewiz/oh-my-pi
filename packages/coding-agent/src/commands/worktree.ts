@@ -4,6 +4,7 @@
 
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CF_COMMAND } from "../cli/cf-version";
 import { worktreeHelp as commandHelp } from "../cli/command-help";
 import { clearWorktrees, listWorktrees } from "../cli/worktree-cli";
 import { Settings } from "../config/settings";
@@ -37,11 +38,11 @@ export default class Worktree extends Command {
 	};
 
 	static examples = [
-		"omp worktree",
-		"omp worktree list --json",
-		"omp worktree clear",
-		"omp worktree clear --dry-run",
-		"omp worktree clear --all",
+		`${CF_COMMAND} worktree`,
+		`${CF_COMMAND} worktree list --json`,
+		`${CF_COMMAND} worktree clear`,
+		`${CF_COMMAND} worktree clear --dry-run`,
+		`${CF_COMMAND} worktree clear --all`,
 	];
 
 	async run(): Promise<void> {

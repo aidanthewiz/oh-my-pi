@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type AssistantMessageEventStream, clearCustomApis, getCustomApi } from "@oh-my-pi/pi-ai";
+import { getOAuthProvider } from "@oh-my-pi/pi-ai/oauth";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -62,5 +63,73 @@ describe("ModelRegistry runtime source cleanup", () => {
 		expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
 		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(false);
 		expect(getCustomApi("custom-runtime-cleanup-api")).toBeUndefined();
+	});
+
+	test("unregisterProvider removes only the named provider and its login entry", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.registerProvider(
+			"runtime-provider",
+			{
+				baseUrl: "https://runtime.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "custom-runtime-cleanup-api",
+				streamSimple,
+				models: [baseModel],
+				oauth: {
+					name: "Runtime Provider",
+					login: async () => "runtime-token",
+				},
+			},
+			sourceId,
+		);
+		registry.registerProvider(
+			"peer-provider",
+			{
+				baseUrl: "https://peer.example.com/v1",
+				apiKey: "PEER_KEY",
+				api: "openai-completions",
+				models: [{ ...baseModel, id: "peer-model" }],
+			},
+			sourceId,
+		);
+
+		expect(getOAuthProvider("runtime-provider")).toBeDefined();
+		registry.unregisterProvider("runtime-provider", "peer-source");
+		expect(registry.find("runtime-provider", "runtime-model")).toBeDefined();
+		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(true);
+		expect(getOAuthProvider("runtime-provider")).toBeDefined();
+		expect(getCustomApi("custom-runtime-cleanup-api")).toBeDefined();
+
+		registry.unregisterProvider("runtime-provider", sourceId);
+
+		expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
+		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(false);
+		expect(getOAuthProvider("runtime-provider")).toBeUndefined();
+		expect(getCustomApi("custom-runtime-cleanup-api")).toBeUndefined();
+		expect(registry.find("peer-provider", "peer-model")).toBeDefined();
+	});
+
+	test("retains a custom API shared by another provider from the same source", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		for (const providerName of ["provider-one", "provider-two"]) {
+			registry.registerProvider(
+				providerName,
+				{
+					baseUrl: `https://${providerName}.example.com/v1`,
+					apiKey: `${providerName.toUpperCase().replace("-", "_")}_KEY`,
+					api: "shared-runtime-api",
+					streamSimple,
+					models: [{ ...baseModel, id: `${providerName}-model` }],
+				},
+				sourceId,
+			);
+		}
+
+		registry.unregisterProvider("provider-one", sourceId);
+		expect(getCustomApi("shared-runtime-api")).toBeDefined();
+		expect(registry.find("provider-two", "provider-two-model")).toBeDefined();
+
+		registry.unregisterProvider("provider-two", sourceId);
+		expect(getCustomApi("shared-runtime-api")).toBeUndefined();
 	});
 });

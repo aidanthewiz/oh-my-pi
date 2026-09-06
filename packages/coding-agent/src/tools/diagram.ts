@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -15,7 +16,6 @@ import {
 	SKINS,
 } from "@oh-my-pi/pi-diagram";
 import { getArtifactsDir, prompt } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import diagramDescription from "../prompts/tools/diagram.md" with { type: "text" };
 import { copyToClipboard } from "../utils/clipboard";
 import type { ToolSession } from "./index";

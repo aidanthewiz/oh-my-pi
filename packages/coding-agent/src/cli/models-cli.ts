@@ -14,7 +14,7 @@
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry, type ProviderDiscoveryStatus } from "../config/model-registry";
 import { getAllowedAvailableModels } from "../config/model-resolver";
 import { Settings } from "../config/settings";
