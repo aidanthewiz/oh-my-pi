@@ -5298,8 +5298,18 @@ export class AuthStorage {
 	 * 5. Environment variable
 	 * 6. Stored API key (e.g. a broker-migrated copy) — last resort, so an explicit env var wins
 	 * 7. Fallback resolver (models.yml custom providers, last-resort)
+	 *
+	 * A provider-owned request route can bypass this cascade when its transport
+	 * requires a different credential protocol.
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+		if (options) {
+			const definition = getProviderDefinition(provider);
+			if (definition?.requestEnvironmentOwnsCredential?.(options)) {
+				this.#clearSessionCredential(provider, sessionId);
+				return definition.envKeysForRequest?.(options);
+			}
+		}
 		// Runtime override takes highest priority
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) {
@@ -5336,9 +5346,9 @@ export class AuthStorage {
 		// Past OAuth: the session sticky (if any) is stale — the request authenticates via
 		// env/api_key/fallback, not OAuth, so clear it now so getOAuthAccountId() correctly
 		// suppresses account_uuid for this session.
-		if (sessionId) this.#sessionLastCredential.get(provider)?.delete(sessionId);
+		this.#clearSessionCredential(provider, sessionId);
 
-		const envKey = getEnvApiKey(provider);
+		const envKey = getEnvApiKey(provider, options);
 		if (envKey) return envKey;
 		const apiKeySelection = await this.#selectApiKeyCredential(
 			provider,

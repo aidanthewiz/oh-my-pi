@@ -55,7 +55,7 @@ import {
 	previewWindowRows,
 	replaceTabs,
 } from "./render-utils";
-import { tokenizeShellSegments } from "./shell-tokenize";
+import { extractLeadingCdTarget, tokenizeShellSegments } from "./shell-tokenize";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -688,13 +688,15 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			value?.includes("local:/"),
 		);
 
-		// Extract leading `cd <path> && ...` into cwd when the model ignores the
-		// cwd parameter. Keep multiline scripts intact.
+		// Extract only a bare leading `cd <path> && ...` before interception,
+		// directory validation, DCG evaluation, and approval caching. The scanner
+		// leaves redirects, extra arguments, expansions, and malformed input to
+		// the shell rather than treating shell syntax as a structured cwd.
 		if (!cwd) {
-			const cdMatch = command.match(/^cd[ \t]+((?:[^&\\\n\r]|\\.)+?)[ \t]*&&[ \t]*/);
-			if (cdMatch && !/[$`(]/.test(cdMatch[1])) {
-				cwd = cdMatch[1].trim().replace(/^["']|["']$/g, "");
-				command = command.slice(cdMatch[0].length);
+			const cd = extractLeadingCdTarget(command);
+			if (cd) {
+				cwd = cd.path;
+				command = cd.rest;
 			}
 		}
 		if (input.async === true && !this.#asyncEnabled) {

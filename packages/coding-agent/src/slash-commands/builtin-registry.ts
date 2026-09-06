@@ -47,6 +47,7 @@ import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { resolveResumableSession } from "../session/session-listing";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
+import { refreshAgentDiscovery } from "../task";
 import type { ComputerTool } from "../tools/computer";
 import { computerExposureMode } from "../tools/computer/exposure";
 import { expandTilde, resolveToCwd } from "../tools/path-utils";
@@ -766,10 +767,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (!runtime.session.modelRegistry.hasConfiguredAuth(resolved.model)) {
 				return usage(`No API key for ${resolved.model.provider}/${resolved.model.id}`, runtime);
 			}
-			runtime.session.armPrewalk(resolved.model, resolved.thinkingLevel);
-			await runtime.output(
-				`Prewalk on: switching to ${resolved.model.provider}/${resolved.model.id} at the next edit/write (todo-gated).`,
-			);
+			const armed = runtime.session.armPrewalk(resolved.model, resolved.thinkingLevel);
+			if (armed) {
+				await runtime.output(
+					`Prewalk on: switching to ${resolved.model.provider}/${resolved.model.id} at the next edit/write (todo-gated).`,
+				);
+			}
 			return commandConsumed();
 		},
 	},
@@ -3081,14 +3084,15 @@ export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = 
 
 /**
  * Reload the interactive session's plugin runtime: invalidate fs/plugin-root
- * caches, rediscover skills and file slash commands, reset the capability
- * cache, and reconnect MCP servers (rebinding the session's MCP tools). Shared
- * by `/reload-plugins`'s TUI handler and the `handle`-adapter's `reloadPlugins`
- * hook so both honor the command's documented MCP reload scope (#7189).
+ * caches, rediscover skills, file slash commands, and task agents, reset the
+ * capability cache, and reconnect MCP servers (rebinding the session's MCP
+ * tools). Shared by `/reload-plugins`'s TUI handler and the `handle`-adapter's
+ * `reloadPlugins` hook so both honor the command's documented reload scope.
  */
 async function reloadTuiPluginState(ctx: InteractiveModeContext): Promise<void> {
 	const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
 	clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+	await refreshAgentDiscovery(ctx.sessionManager.getCwd());
 	await ctx.refreshSkillState();
 	await ctx.refreshSlashCommandState();
 	resetCapabilities();

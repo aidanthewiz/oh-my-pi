@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { buildAnthropicCompat } from "../src/compat/anthropic";
+import { buildAnthropicCompat, isAnthropicSigningProxyUrl } from "../src/compat/anthropic";
 import type { ModelSpec } from "../src/types";
 
 /**
@@ -8,8 +8,8 @@ import type { ModelSpec } from "../src/types";
  * Anthropic — a SIGNING endpoint like GitHub Copilot's proxy (#2851). It must NOT
  * be classified `replayUnsignedThinking`: an unsigned/summarized thinking block
  * replayed as `signature: ""` 400s with "Invalid signature in thinking block".
- * Auth is `x-api-key` + `anthropic-workspace-id`, never OAuth, so it is also not
- * the OAuth-official host.
+ * Auth is Bearer API key or SigV4 plus `anthropic-workspace-id`, never OAuth,
+ * so it is also not the OAuth-official host.
  */
 function spec(overrides: Partial<ModelSpec<"anthropic-messages">>): ModelSpec<"anthropic-messages"> {
 	return {
@@ -31,6 +31,10 @@ describe("anthropic compat: aws-external-anthropic is a signing endpoint", () =>
 	it("does NOT replay unsigned thinking for the AWS external gateway", () => {
 		const compat = buildAnthropicCompat(spec({}));
 		expect(compat.replayUnsignedThinking).toBe(false);
+	});
+
+	it("recognizes the effective AWS URL after a canonical model is rerouted", () => {
+		expect(isAnthropicSigningProxyUrl("https://aws-external-anthropic.us-east-1.api.aws")).toBe(true);
 	});
 
 	it("is not treated as the OAuth-official Anthropic host", () => {

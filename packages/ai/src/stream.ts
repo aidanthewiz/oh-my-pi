@@ -61,6 +61,7 @@ import {
 } from "./providers/register-builtins";
 import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
 import { getProviderDefinition, PROVIDER_REGISTRY } from "./registry";
+import type { ProviderCredentialContext } from "./registry/types";
 import type {
 	Api,
 	AssistantMessage,
@@ -112,10 +113,18 @@ function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
  */
 function isLeakedThinkingHealExempt(model: Model<Api>): boolean {
 	switch (model.provider) {
-		case "anthropic":
-			// Mirror resolveAnthropicBaseUrl: Foundry redirects an empty baseUrl to
-			// FOUNDRY_BASE_URL, so exempt only when the effective endpoint is official.
-			return isOfficialAnthropicApiUrl((isFoundryEnabled() && $env.FOUNDRY_BASE_URL?.trim()) || model.baseUrl);
+		case "anthropic": {
+			// Mirror resolveAnthropicBaseUrl's effective endpoint: Foundry redirects
+			// an empty baseUrl to FOUNDRY_BASE_URL; otherwise an explicit non-official
+			// model.baseUrl wins, then the ANTHROPIC_BASE_URL gateway fallback, then
+			// the official default. Exempt only when the effective endpoint is official.
+			if (isFoundryEnabled()) {
+				const foundry = $env.FOUNDRY_BASE_URL?.trim();
+				if (foundry) return isOfficialAnthropicApiUrl(foundry);
+			}
+			if (model.baseUrl && !isOfficialAnthropicApiUrl(model.baseUrl)) return false;
+			return isOfficialAnthropicApiUrl($env.ANTHROPIC_BASE_URL?.trim() || model.baseUrl);
+		}
 		case "openai":
 			return isOfficialOpenAIApiUrl(model.baseUrl);
 		case "openai-codex":
@@ -731,7 +740,11 @@ const serviceProviderMap: Record<string, KeyResolver> = {
  * Will not return API keys for providers that require OAuth tokens.
  * Checks Bun.env, then cwd/.env, then ~/.env.
  */
-export function getEnvApiKey(provider: string): string | undefined {
+export function getEnvApiKey(provider: string, context?: ProviderCredentialContext): string | undefined {
+	if (context) {
+		const requestResolver = getProviderDefinition(provider)?.envKeysForRequest;
+		if (requestResolver) return requestResolver(context);
+	}
 	const resolver = serviceProviderMap[provider];
 	if (typeof resolver === "string") {
 		return $env[resolver];
@@ -824,7 +837,9 @@ function streamDispatch<TApi extends Api>(
 	const prepared = prepareRequest?.(model as Model<Api>, requestOptions as StreamOptions);
 	const providerModel = prepared?.model ?? (model as Model<Api>);
 	const preparedOptions = prepared?.options ?? (requestOptions as StreamOptions);
-	const apiKey = preparedOptions.apiKey || getEnvApiKey(providerModel.provider);
+	const apiKey =
+		preparedOptions.apiKey ||
+		getEnvApiKey(providerModel.provider, { baseUrl: providerModel.baseUrl, modelId: providerModel.id });
 	if (!apiKey) {
 		throw new AIError.MissingApiKeyError(providerModel.provider);
 	}
@@ -1175,7 +1190,8 @@ export function streamSimple<TApi extends Api>(
 	// The resolver form is handled by the wrapper above; only a static string
 	// key reaches this point.
 	const apiKey =
-		(typeof requestOptions?.apiKey === "string" ? requestOptions.apiKey : undefined) || getEnvApiKey(model.provider);
+		(typeof requestOptions?.apiKey === "string" ? requestOptions.apiKey : undefined) ||
+		getEnvApiKey(model.provider, { baseUrl: model.baseUrl, modelId: model.id });
 	if (!apiKey) {
 		throw new AIError.MissingApiKeyError(model.provider);
 	}

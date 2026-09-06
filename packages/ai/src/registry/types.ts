@@ -20,6 +20,11 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "./oauth/types";
  */
 export type KeyResolver = string | (() => string | undefined);
 
+export interface ProviderCredentialContext {
+	readonly baseUrl?: string;
+	readonly modelId?: string;
+}
+
 /** Credentials are resolved by the provider transport rather than used as a bearer string. */
 export const AUTHENTICATED_SENTINEL = "<authenticated>";
 
@@ -64,6 +69,10 @@ export interface ProviderDefinition {
 	readonly showInLoginList?: boolean;
 	// --- env-var fallback (the catalog table's `envVars` supplies plain names; set this only for computed resolvers) ---
 	readonly envKeys?: KeyResolver;
+	/** Model-aware environment fallback for providers whose effective route changes the credential family. */
+	readonly envKeysForRequest?: (context: ProviderCredentialContext) => string | undefined;
+	/** Whether this request route must bypass stored credentials and use `envKeysForRequest`. */
+	readonly requestEnvironmentOwnsCredential?: (context: ProviderCredentialContext) => boolean;
 	/** Provider transport can authenticate without a resolved API-key string. */
 	readonly allowsMissingApiKey?: boolean;
 	/** Provider-owned request shaping applied before generic API dispatch. */

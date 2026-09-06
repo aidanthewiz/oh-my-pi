@@ -1,4 +1,5 @@
 import { $env } from "@oh-my-pi/pi-utils";
+import { hasAwsModelCredentialChain } from "../aws-model-auth";
 
 /**
  * Credential resolution for Claude Platform on AWS (the
@@ -19,21 +20,37 @@ import { $env } from "@oh-my-pi/pi-utils";
  * The AWS-scoped name always wins when both are present (explicit over inferred).
  */
 
+const ANTHROPIC_AWS_GATEWAY_HOST = /^aws-external-anthropic\.[a-z0-9-]+\.api\.aws$/i;
+
+export const ANTHROPIC_AWS_AUTHENTICATED_SENTINEL = "<authenticated>";
+
+function parseAnthropicAwsGatewayUrl(raw: string | undefined): URL | undefined {
+	if (!raw) return undefined;
+	try {
+		const parsed = new URL(raw);
+		return ANTHROPIC_AWS_GATEWAY_HOST.test(parsed.hostname) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** True when a URL uses the AWS external-Anthropic gateway hostname. */
+export function hasAnthropicAwsGatewayHost(raw: string | undefined): boolean {
+	return parseAnthropicAwsGatewayUrl(raw) !== undefined;
+}
+
+/** True when a URL securely targets the AWS external-Anthropic gateway. */
+export function isAnthropicAwsGatewayUrl(raw: string | undefined): boolean {
+	return parseAnthropicAwsGatewayUrl(raw)?.protocol === "https:";
+}
+
 /**
  * True when `ANTHROPIC_BASE_URL` points at the AWS external-Anthropic gateway.
  * Parsed with `URL` and matched on the FULL hostname (not a substring/suffix) so
  * a look-alike like `aws-external-anthropic.us-east-1.api.aws.evil.com` is rejected.
  */
 export function anthropicBaseUrlIsAwsGateway(): boolean {
-	const raw = $env.ANTHROPIC_BASE_URL?.trim();
-	if (!raw) return false;
-	let host: string;
-	try {
-		host = new URL(raw).hostname;
-	} catch {
-		return false;
-	}
-	return /^aws-external-anthropic\.[a-z0-9-]+\.api\.aws$/i.test(host);
+	return isAnthropicAwsGatewayUrl($env.ANTHROPIC_BASE_URL?.trim());
 }
 
 /**
@@ -82,4 +99,18 @@ export function resolveAnthropicAwsApiKey(): string | undefined {
 		return $env.ANTHROPIC_API_KEY?.trim() || undefined;
 	}
 	return undefined;
+}
+
+/**
+ * Credential advertised by both AWS gateway provider ids.
+ *
+ * Returns a Bearer key for a complete key family, the authenticated sentinel
+ * for an AWS-scoped SigV4 setup, or undefined when the route is incomplete.
+ */
+export function resolveAnthropicAwsProviderCredential(): string | undefined {
+	if (!resolveAnthropicAwsWorkspaceId()) return undefined;
+	const apiKey = resolveAnthropicAwsApiKey();
+	if (apiKey) return apiKey;
+	if (anthropicAwsWorkspaceIdIsNativeOnly()) return undefined;
+	return hasAwsModelCredentialChain() ? ANTHROPIC_AWS_AUTHENTICATED_SENTINEL : undefined;
 }

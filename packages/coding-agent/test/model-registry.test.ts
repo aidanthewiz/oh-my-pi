@@ -1692,6 +1692,150 @@ describe("ModelRegistry", () => {
 			).toBe(true);
 		});
 	});
+
+	describe("route-aware Anthropic availability", () => {
+		test("does not authenticate a custom base URL from stock AWS environment credentials", async () => {
+			const names = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_AWS_API_KEY",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = Object.fromEntries(names.map(name => [name, Bun.env[name]])) as Record<
+				(typeof names)[number],
+				string | undefined
+			>;
+			try {
+				for (const name of names) delete Bun.env[name];
+				Bun.env.ANTHROPIC_AWS_API_KEY = "key-aws";
+				Bun.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
+				writeRawModelsJson({ anthropic: overrideConfig("https://anthropic-proxy.example.com/v1") });
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+
+				expect(model).toBeDefined();
+				expect(model?.baseUrl).toBe("https://anthropic-proxy.example.com/v1");
+				if (!model) throw new Error("Expected bundled Anthropic model");
+				expect(registry.hasConfiguredAuth(model)).toBe(false);
+				expect(registry.getAvailable()).not.toContain(model);
+				expect(await registry.getApiKey(model)).toBeUndefined();
+
+				Bun.env.ANTHROPIC_API_KEY = "key-generic";
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model)).toBe("key-generic");
+			} finally {
+				for (const name of names) {
+					const value = previous[name];
+					if (value === undefined) delete Bun.env[name];
+					else Bun.env[name] = value;
+				}
+			}
+		});
+
+		test("requires AWS route credentials even when stored Anthropic OAuth exists", async () => {
+			const names = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_AWS_API_KEY",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = Object.fromEntries(names.map(name => [name, Bun.env[name]])) as Record<
+				(typeof names)[number],
+				string | undefined
+			>;
+			try {
+				for (const name of names) delete Bun.env[name];
+				await authStorage.set("anthropic", [
+					{
+						type: "oauth",
+						access: "stored-oauth",
+						refresh: "stored-refresh",
+						expires: Date.now() + 60 * 60_000,
+						accountId: "acct_stored",
+					},
+				]);
+				writeRawModelsJson({});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+
+				expect(model).toBeDefined();
+				if (!model) throw new Error("Expected bundled Anthropic model");
+				const sessionId = "aws-route-switch";
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model, sessionId)).toBe("stored-oauth");
+				expect(authStorage.getOAuthAccountId("anthropic", sessionId)).toBe("acct_stored");
+
+				Bun.env.ANTHROPIC_BASE_URL = "https://aws-external-anthropic.us-east-1.api.aws";
+				expect(registry.hasConfiguredAuth(model)).toBe(false);
+				expect(registry.getAvailable()).not.toContain(model);
+				expect(await registry.getApiKey(model, sessionId)).toBeUndefined();
+
+				Bun.env.ANTHROPIC_AWS_API_KEY = "key-aws";
+				Bun.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model, sessionId)).toBe("key-aws");
+				expect(authStorage.getOAuthAccountId("anthropic", sessionId)).toBeUndefined();
+			} finally {
+				for (const name of names) {
+					const value = previous[name];
+					if (value === undefined) delete Bun.env[name];
+					else Bun.env[name] = value;
+				}
+			}
+		});
+
+		test("preserves configured credentials for an explicit Anthropic AWS gateway override", async () => {
+			const names = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_AWS_API_KEY",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = Object.fromEntries(names.map(name => [name, Bun.env[name]])) as Record<
+				(typeof names)[number],
+				string | undefined
+			>;
+			try {
+				for (const name of names) delete Bun.env[name];
+				Bun.env.ANTHROPIC_AWS_API_KEY = "key-environment";
+				Bun.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_environment";
+				writeRawModelsJson({
+					anthropic: {
+						baseUrl: "https://aws-external-anthropic.us-east-1.api.aws",
+						apiKey: "key-model",
+						headers: { "Anthropic-Workspace-Id": "wrkspc_model" },
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+
+				expect(model).toBeDefined();
+				if (!model) throw new Error("Expected bundled Anthropic model");
+				expect(registry.hasConfiguredAuth(model)).toBe(true);
+				expect(registry.getAvailable()).toContain(model);
+				expect(await registry.getApiKey(model)).toBe("key-model");
+				expect(model.headers?.["Anthropic-Workspace-Id"]).toBe("wrkspc_model");
+			} finally {
+				for (const name of names) {
+					const value = previous[name];
+					if (value === undefined) delete Bun.env[name];
+					else Bun.env[name] = value;
+				}
+			}
+		});
+	});
 	describe("disableStrictTools", () => {
 		let bedrockCustom: ModelRegistry;
 		let anthropicOverride: ModelRegistry;

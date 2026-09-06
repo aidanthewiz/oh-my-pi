@@ -106,6 +106,7 @@ export function isAnthropicSigningProxyUrl(baseUrl?: string): boolean {
 	return (
 		hostMatchesUrl(baseUrl, "githubCopilot") ||
 		hostMatchesUrl(baseUrl, "zenmux") ||
+		hostMatchesUrl(baseUrl, "anthropicAws") ||
 		isCloudflareAnthropicGateway(baseUrl) ||
 		isVertexAnthropicRoute(baseUrl) ||
 		isBedrockAnthropicRoute(baseUrl) ||

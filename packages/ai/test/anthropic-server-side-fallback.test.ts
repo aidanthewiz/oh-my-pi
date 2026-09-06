@@ -328,6 +328,19 @@ describe("anthropic fallback content-block replay policy", () => {
 		);
 		expect(params[0]?.content).toEqual([{ type: "text", text: "continued" }]);
 	});
+
+	it("drops the fallback block when an official model is rerouted to AWS", () => {
+		const params = convertAnthropicMessages(
+			[priorFallbackAssistant(), { role: "user", content: "next", timestamp: 0 }],
+			fableModel,
+			false,
+			{
+				serverSideFallbackEnabled: true,
+				effectiveBaseUrl: "https://aws-external-anthropic.us-east-1.api.aws",
+			},
+		);
+		expect(params[0]?.content).toEqual([{ type: "text", text: "continued" }]);
+	});
 });
 
 describe("anthropic assistant replay block ordering (tool_use partition)", () => {

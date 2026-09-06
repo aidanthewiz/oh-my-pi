@@ -44,9 +44,11 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 	// assertions don't shrink (and flake) under a short ambient terminal when the
 	// file runs inside the full suite. Restored in afterAll.
 	let originalRowsDescriptor: PropertyDescriptor | undefined;
+	const originalHerdrEnv = Bun.env.HERDR_ENV;
 	beforeAll(() => {
 		originalRowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
 		Object.defineProperty(process.stdout, "rows", { value: 50, configurable: true });
+		delete Bun.env.HERDR_ENV;
 	});
 	afterAll(() => {
 		if (originalRowsDescriptor) {
@@ -54,6 +56,8 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		} else {
 			delete (process.stdout as { rows?: number }).rows;
 		}
+		if (originalHerdrEnv === undefined) delete Bun.env.HERDR_ENV;
+		else Bun.env.HERDR_ENV = originalHerdrEnv;
 	});
 
 	beforeEach(async () => {

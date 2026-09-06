@@ -139,19 +139,13 @@ import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
-	builtinCredentialSecretEntries,
-	collectEnvSecrets,
+	buildSecretObfuscator,
 	collectSettingsSecrets,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
-	getExistingSecretPlaceholderKey,
-	getSecretPlaceholderKey,
-	getSecretPlaceholderKeySync,
-	loadSecrets,
 	obfuscateMessages,
 	obfuscateProviderContext,
-	SecretObfuscator,
-	secretEntriesNeedPlaceholderKey,
+	type SecretObfuscator,
 } from "./secrets";
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
@@ -1064,7 +1058,7 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 					success: event.success,
 					attempt: event.attempt,
 					finalError: event.finalError,
-					recoveredErrors: event.recoveredErrors,
+					retryErrors: event.retryErrors,
 				},
 				ctx,
 			),
@@ -1415,56 +1409,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// key is resolved lazily per request via ModelRegistry.resolver.
 	const hasModelAuth = (candidate: Model): boolean => modelRegistry.hasConfiguredAuth(candidate);
 
-	// Load and create the secret obfuscator early so resumed session state and
-	// prompt warnings reflect actual loaded secrets, not just the setting toggle.
-	// Credential-marked settings are always protected because they can originate
-	// in managed config files that repository tools can read.
-	let obfuscator: SecretObfuscator | undefined;
-	const explicitAgentDir = options.agentDir;
-	const settingsEntries = collectSettingsSecrets(settings);
-	const configurableSecretsEnabled = settings.get("secrets.enabled");
-	if (configurableSecretsEnabled || settingsEntries.length > 0) {
-		const fileEntries = configurableSecretsEnabled
-			? await logger.time("loadSecrets", loadSecrets, cwd, agentDir)
-			: [];
-		const envEntries = configurableSecretsEnabled ? collectEnvSecrets() : [];
-		// Built-in credential-pattern entries come last so configured entries
-		// (settings, environment values, plain literals, and custom regexes) take
-		// precedence in the scan order.
-		const allEntries = [
-			...settingsEntries,
-			...envEntries,
-			...fileEntries,
-			...(configurableSecretsEnabled ? builtinCredentialSecretEntries() : []),
-		];
-		// Only configured entries force startup key creation: an obfuscate-mode
-		// secret — or a default replace-mode regex whose key-derived idempotent
-		// fallback marker needs a stable key across restarts — mints placeholders
-		// as soon as the obfuscator is built. The built-in credential-pattern
-		// entry matches dynamically, so it resolves the persisted key lazily on
-		// first match instead of creating the key file for every enabled session.
-		const needsPlaceholderKey = secretEntriesNeedPlaceholderKey([...settingsEntries, ...envEntries, ...fileEntries]);
-		const placeholderKey = needsPlaceholderKey
-			? await getSecretPlaceholderKey(explicitAgentDir)
-			: await getExistingSecretPlaceholderKey(explicitAgentDir);
-		if (allEntries.length > 0) {
-			obfuscator = new SecretObfuscator(
-				allEntries,
-				placeholderKey ?? (() => getSecretPlaceholderKeySync(explicitAgentDir)),
-			);
-		}
-		if (obfuscator?.hasSecrets() !== true && placeholderKey !== undefined) {
-			// No configured entry produced an active secret, but a persisted key
-			// exists. Redact the key itself from repository tool output.
-			obfuscator = new SecretObfuscator(
-				[{ type: "plain", mode: "replace", content: placeholderKey }],
-				placeholderKey,
-			);
-		}
-	}
-	// Keep an inert obfuscator available so credential settings introduced after
-	// session creation can become protected without replacing every consumer.
-	obfuscator ??= new SecretObfuscator([], () => getSecretPlaceholderKeySync(explicitAgentDir));
+	// Build the obfuscator before loading resumed state. Credential-marked
+	// settings remain protected even when configurable secret scanning is off.
+	const obfuscator: SecretObfuscator | undefined = await buildSecretObfuscator(cwd, agentDir, {
+		keyDir: options.agentDir,
+		settings,
+		keepAvailable: true,
+	});
 	const secretsEnabled = obfuscator?.hasSecrets() === true;
 
 	// An abnormal process exit after a non-terminal message tail is durable

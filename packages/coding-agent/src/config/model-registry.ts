@@ -64,8 +64,8 @@ const RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS = 15_000;
 const BUILT_IN_DISCOVERY_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
 
-import type { ApiKeyResolver, FetchImpl } from "@oh-my-pi/pi-ai";
-import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { type ApiKeyResolver, type FetchImpl, getEnvApiKey } from "@oh-my-pi/pi-ai";
+import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
@@ -2406,23 +2406,39 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Availability predicate with per-provider memoization. Auth lookups
-	 * (`authStorage.hasAuth`) and the disabled-provider set are resolved once
-	 * per provider instead of once per model, which matters when filtering the
-	 * full bundled catalog (thousands of models, ~50 providers).
+	 * Availability predicate with per-provider memoization. Providers with a
+	 * model-aware environment resolver re-evaluate only that environment leg
+	 * per model; disabled, keyless, and stored-credential state stays cached.
 	 */
-	#createProviderAvailabilityCheck(): (provider: string) => boolean {
+	#createModelAvailabilityCheck(): (model: Model<Api>) => boolean {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
-		const byProvider = new Map<string, boolean>();
-		return provider => {
-			let available = byProvider.get(provider);
-			if (available === undefined) {
-				available =
-					!disabledProviders.has(provider) &&
-					(this.#keylessProviders.has(provider) || this.authStorage.hasAuth(provider));
-				byProvider.set(provider, available);
+		const byProvider = new Map<
+			string,
+			{ disabled: boolean; authenticated: boolean; hasRequestEnvironmentResolver: boolean }
+		>();
+		return model => {
+			let state = byProvider.get(model.provider);
+			const definition = getProviderDefinition(model.provider);
+			if (state === undefined) {
+				const hasRequestEnvironmentResolver = definition?.envKeysForRequest !== undefined;
+				state = {
+					disabled: disabledProviders.has(model.provider),
+					authenticated:
+						this.#keylessProviders.has(model.provider) ||
+						(hasRequestEnvironmentResolver
+							? this.authStorage.hasNonEnvCredential(model.provider)
+							: this.authStorage.hasAuth(model.provider)),
+					hasRequestEnvironmentResolver,
+				};
+				byProvider.set(model.provider, state);
 			}
-			return available;
+			if (state.disabled) return false;
+			const context = { baseUrl: model.baseUrl, modelId: model.id };
+			if (definition?.requestEnvironmentOwnsCredential?.(context)) {
+				return definition.envKeysForRequest?.(context) !== undefined;
+			}
+			if (state.authenticated) return true;
+			return state.hasRequestEnvironmentResolver && definition?.envKeysForRequest?.(context) !== undefined;
 		};
 	}
 
@@ -2431,12 +2447,12 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
-		const isProviderAvailable = this.#createProviderAvailabilityCheck();
+		const isModelAvailable = this.#createModelAvailabilityCheck();
 		if (this.#hasFullSnapshot) {
-			return this.#models.filter(model => isProviderAvailable(model.provider));
+			return this.#models.filter(isModelAvailable);
 		}
-		const availableProviders = new Set(this.#knownStaticProviders().filter(isProviderAvailable));
-		return this.#composeStaticModels(availableProviders);
+		const models = this.#composeStaticModels(new Set(this.#knownStaticProviders()));
+		return models.filter(isModelAvailable);
 	}
 
 	/**
@@ -2456,11 +2472,17 @@ export class ModelRegistry {
 	 * {@link ModelRegistry.resolver}.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		const context = { baseUrl: model.baseUrl, modelId: model.id };
+		const definition = getProviderDefinition(model.provider);
+		if (definition?.requestEnvironmentOwnsCredential?.(context)) {
+			return definition.envKeysForRequest?.(context) !== undefined;
+		}
 		const keyConfig = this.#customProviderApiKeys.get(model.provider);
 		return (
 			isCommandConfigValue(keyConfig) ||
 			this.#keylessProviders.has(model.provider) ||
-			this.authStorage.hasAuth(model.provider)
+			this.authStorage.hasNonEnvCredential(model.provider) ||
+			getEnvApiKey(model.provider, context) !== undefined
 		);
 	}
 
@@ -2545,16 +2567,16 @@ export class ModelRegistry {
 		sessionId?: string,
 		options?: { signal?: AbortSignal },
 	): Promise<string | undefined> {
+		const context = { baseUrl: model.baseUrl, modelId: model.id, signal: options?.signal };
+		if (getProviderDefinition(model.provider)?.requestEnvironmentOwnsCredential?.(context)) {
+			return this.authStorage.getApiKey(model.provider, sessionId, context);
+		}
 		const commandKey = this.#resolveCommandBackedApiKey(model.provider);
 		if (commandKey.configured) return commandKey.value;
 		if (this.#keylessProviders.has(model.provider) && !this.authStorage.hasAuth(model.provider)) {
 			return kNoAuth;
 		}
-		return this.authStorage.getApiKey(model.provider, sessionId, {
-			baseUrl: model.baseUrl,
-			modelId: model.id,
-			signal: options?.signal,
-		});
+		return this.authStorage.getApiKey(model.provider, sessionId, context);
 	}
 
 	/** Resolve request authentication through the historical Pi extension facade. */
@@ -2583,17 +2605,21 @@ export class ModelRegistry {
 		sessionId?: string,
 		options?: { baseUrl?: string; modelId?: string; forceRefresh?: boolean; signal?: AbortSignal },
 	): Promise<string | undefined> {
+		const context = {
+			baseUrl: options?.baseUrl,
+			modelId: options?.modelId,
+			forceRefresh: options?.forceRefresh,
+			signal: options?.signal,
+		};
+		if (getProviderDefinition(provider)?.requestEnvironmentOwnsCredential?.(context)) {
+			return this.authStorage.getApiKey(provider, sessionId, context);
+		}
 		const commandKey = this.#resolveCommandBackedApiKey(provider);
 		if (commandKey.configured) return commandKey.value;
 		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
 			return kNoAuth;
 		}
-		return this.authStorage.getApiKey(provider, sessionId, {
-			baseUrl: options?.baseUrl,
-			modelId: options?.modelId,
-			forceRefresh: options?.forceRefresh,
-			signal: options?.signal,
-		});
+		return this.authStorage.getApiKey(provider, sessionId, context);
 	}
 
 	/**
@@ -2662,6 +2688,26 @@ export class ModelRegistry {
 			this.#runtimeProviderSourceByName.delete(providerName);
 			this.#clearRuntimeProviderState(providerName);
 		}
+		this.#lastStaticLoadMtime = null;
+		this.#reloadStaticModels();
+	}
+
+	/**
+	 * Remove one extension-registered provider and restore its static models.
+	 */
+	unregisterProvider(providerName: string): void {
+		const sourceId = this.#runtimeProviderSourceByName.get(providerName);
+		if (sourceId) {
+			const sourceProviders = this.#runtimeProvidersBySource.get(sourceId);
+			sourceProviders?.delete(providerName);
+			if (sourceProviders?.size === 0) {
+				this.#runtimeProvidersBySource.delete(sourceId);
+			}
+			this.#runtimeProviderSourceByName.delete(providerName);
+		}
+		unregisterOAuthProvider(providerName);
+		this.#ensureFullSnapshot();
+		this.#clearRuntimeProviderState(providerName);
 		this.#lastStaticLoadMtime = null;
 		this.#reloadStaticModels();
 	}
