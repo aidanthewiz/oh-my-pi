@@ -5,6 +5,13 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [17.2.10] - 2026-08-06
+
+### Fixed
+
+- Fixed per-window capture failing on Wayland with `InvalidTarget` errors for window IDs returned by `desktop.windows()`.
+- Fixed `desktop.capabilities()` incorrectly reporting `capture: true` on Wayland builds compiled without the `wayland-pipewire` feature.
+
 ## [17.2.9] - 2026-08-05
 
 ### Changed

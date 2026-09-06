@@ -82,9 +82,6 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // Smaller workspace packages stay separate from native/TUI/integration suites so
 // their short TS suites can run together. CI still downloads the Linux x64 native
 // addon before this bucket: shared utility barrels may load native-backed modules.
-// mnemopi is intentionally excluded — its embedding suites depend on a ~270MB
-// fastembed model absent from CI runners, so they flake/time out under the parallel
-// bucket; run `bun --cwd=packages/mnemopi test` locally instead.
 const fastWorkspacePackages = [
 	"packages/hashline",
 	"packages/wire",
@@ -95,6 +92,7 @@ const fastWorkspacePackages = [
 	"packages/snapcompact",
 	"packages/agent",
 	"packages/diagram",
+	"packages/mnemopi",
 ];
 
 // These suites cover the native package, TUI/browser-ish behavior, local servers,
@@ -108,10 +106,8 @@ const nativeAndIntegrationPackages = [
 ];
 
 // Packages the CI buckets deliberately skip but a local full run should still
-// cover. mnemopi's embedding suites need a ~270MB fastembed model absent from CI
-// runners (so it flakes/times out there); robomp-web lives under python/robomp
-// and is outside every CI TS bucket.
-const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
+// cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
+const localOnlyWorkspacePackages = ["python/robomp/web"];
 
 // Repository-level suites cover retained maintenance scripts and the fork-only
 // Coreforge release channel. Workspace test discovery does not include root scripts.
@@ -370,7 +366,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 			];
 		// `local-ts` is the full local TypeScript run that root `bun run test:ts`
 		// drives: every package the old `--workspaces` fan-out covered (the CI
-		// `all` set PLUS mnemopi and robomp-web, which CI omits), routed through
+		// `all` set plus robomp-web, which CI omits), routed through
 		// this one quiet runner so the whole suite shares one progress stream and
 		// one failure report. Repo script tests remain available via `test:scripts`.
 		case "local-ts":

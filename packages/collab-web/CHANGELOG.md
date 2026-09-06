@@ -9,6 +9,12 @@
 ### Changed
 
 - Branded the hosted client as Coreforce Agent Collab with the Coreforce hammer mark, moved public URLs to `agent-collab.internal.somahub.io`, and disabled crawler indexing without exposing the internal Coreforge product name.
+## [17.2.10] - 2026-08-06
+
+### Changed
+
+- Updated the Markdown parsing implementation to use @oh-my-pi/pi-utils.
+
 ## [17.2.2] - 2026-07-31
 
 ### Fixed

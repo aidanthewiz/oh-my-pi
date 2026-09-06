@@ -10,7 +10,15 @@ WORK_DIR="$(mktemp -d)"
 TMP_WORK_DIR="$WORK_DIR/tmp"
 mkdir -p "$TMP_WORK_DIR"
 export TMPDIR="$TMP_WORK_DIR"
-trap 'rm -rf "$WORK_DIR"' EXIT
+
+NATIVES_PACKAGE="$ROOT_DIR/packages/natives/package.json"
+NATIVES_PACKAGE_INITIAL="$WORK_DIR/natives-package.initial.json"
+cp "$NATIVES_PACKAGE" "$NATIVES_PACKAGE_INITIAL"
+restore_workspace() {
+   cp "$NATIVES_PACKAGE_INITIAL" "$NATIVES_PACKAGE"
+   rm -rf "$WORK_DIR"
+}
+trap restore_workspace EXIT
 
 section() {
    echo ""
@@ -30,10 +38,12 @@ smoke_cli() {
    XDG_DATA_HOME="$runtime_dir/xdg" HOME="$runtime_dir/home" "$omp_bin" --smoke-test
 }
 
+
 section "Binary install smoke"
 if [ "${OMP_INSTALL_TEST_SKIP_NATIVE_BUILD:-0}" != "1" ]; then
    bun --cwd=packages/natives run build
 fi
+align_native_manifest
 bun --cwd=packages/coding-agent run build
 
 BINARY_DIR="$WORK_DIR/binary-bin"
@@ -49,6 +59,7 @@ SOURCE_BUN_HOME="$WORK_DIR/bun-source"
    bun --cwd="$ROOT_DIR/packages/coding-agent" link
    smoke_cli "$BUN_INSTALL/bin/omp"
 )
+
 
 echo ""
 echo "Binary and source install smoke tests passed"

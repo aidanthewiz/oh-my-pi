@@ -1,6 +1,6 @@
 import "@oh-my-pi/pi-utils/env";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils/dirs";
-import chalk from "chalk";
 import { CF_COMMAND } from "./cf-version";
 
 export function getExtraHelpText(): string {

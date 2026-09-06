@@ -82,6 +82,7 @@ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
 	$env,
+	APP_NAME,
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
@@ -126,6 +127,7 @@ import type {
 	ToolExecutionEndEvent,
 	ToolExecutionStartEvent,
 	ToolExecutionUpdateEvent,
+	ToolInfo,
 	TreePreparation,
 	TurnEndEvent,
 	TurnStartEvent,
@@ -445,6 +447,7 @@ export class AgentSession {
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
 	#cancelExitRecorder?: () => void;
+	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
@@ -1376,6 +1379,14 @@ export class AgentSession {
 		});
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
 			this.#recordSessionExit(reason);
+		});
+		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
+			const sessionId = this.sessionManager.getSessionId();
+			if (!sessionId || !this.sessionManager.getSessionFile()) return undefined;
+			return {
+				label: this.#agentId ?? (this.#agentKind === "main" ? "Main" : "Agent"),
+				command: `${APP_NAME} --resume ${sessionId}`,
+			};
 		});
 
 		const advisorsHost: SessionAdvisorsHost = {
@@ -3759,6 +3770,8 @@ export class AgentSession {
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
+		this.#cancelFatalRecoveryHint?.();
+		this.#cancelFatalRecoveryHint = undefined;
 		try {
 			await emitSessionShutdownEvent(this.#extensionRunner);
 		} catch (error) {
@@ -4168,6 +4181,11 @@ export class AgentSession {
 	/** Names of every registered tool. */
 	getAllToolNames(): string[] {
 		return this.#tools.getAllToolNames();
+	}
+
+	/** Full metadata for every registered tool, including source provenance (backs `getAllTools()`). */
+	getAllToolInfos(): ToolInfo[] {
+		return this.#tools.getAllToolInfos();
 	}
 
 	/** Installs and activates the ephemeral vibe tool set. */
@@ -6670,9 +6688,10 @@ export class AgentSession {
 	}
 
 	#extractRewindReport(messages: AgentMessage[]): string | undefined {
-		if (!this.#checkpointState) return undefined;
+		const checkpointState = this.#checkpointState;
+		if (!checkpointState) return undefined;
 		if (this.#pendingRewindReport) return this.#pendingRewindReport;
-		for (let i = messages.length - 1; i >= 0; i--) {
+		for (let i = messages.length - 1; i >= checkpointState.checkpointMessageCount; i--) {
 			const message = messages[i];
 			if (message?.role !== "toolResult" || message.isError) continue;
 			const semanticResult = semanticToolResult(message.toolName, message);
