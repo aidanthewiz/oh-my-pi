@@ -6,15 +6,10 @@ import { getSecretPlaceholderKeyPath, isEnoent, logger } from "@oh-my-pi/pi-util
 import { YAML } from "bun";
 import type { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
-import {
-	MIN_OBFUSCATE_SECRET_LEN,
-	regexHasUnresolvableShortMatchFallback,
-	type SecretEntry,
-	SecretObfuscator,
-	sanitizeSecretFriendlyName,
-	secretEntriesNeedPlaceholderKey,
-} from "./obfuscator";
+import { type SecretEntry, SecretObfuscator } from "./obfuscator";
+import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName, secretEntriesNeedPlaceholderKey } from "./placeholder";
 import { compileSecretRegex } from "./regex";
+import { regexHasUnresolvableShortMatchFallback } from "./replacement";
 
 const PLACEHOLDER_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
 const cachedPlaceholderKeys = new Map<string, string>();
@@ -161,11 +156,9 @@ export {
 	deobfuscateToolArguments,
 	obfuscateMessages,
 	obfuscateProviderContext,
-	type SecretEntry,
-	SecretObfuscator,
-	secretEntriesNeedPlaceholderKey,
-	secretEntryNeedsPlaceholderKey,
-} from "./obfuscator";
+} from "./message-transform";
+export { type SecretEntry, SecretObfuscator } from "./obfuscator";
+export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from "./placeholder";
 
 /**
  * Load secrets from project-local and global secrets.yml files.

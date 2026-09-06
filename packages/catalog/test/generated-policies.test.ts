@@ -178,7 +178,7 @@ describe("generated model policies", () => {
 		});
 	});
 
-	it("preserves QwenCloud's mandatory qwen3.8 effort ladder", () => {
+	it("preserves QwenCloud's provider-authored qwen3.8 effort ladders", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({
 				id: "qwen3.8-max-preview",
@@ -190,15 +190,32 @@ describe("generated model policies", () => {
 					requiresEffort: true,
 				},
 			}),
+			createSpec({
+				id: "qwen3.8-max",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				thinking: {
+					mode: "effort",
+					efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+					defaultLevel: Effort.XHigh,
+				},
+			}),
 		];
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models[0]?.thinking).toEqual({
-			mode: "effort",
-			efforts: [Effort.Low, Effort.High, Effort.XHigh],
-			requiresEffort: true,
-		});
+		expect(models.map(model => model.thinking)).toEqual([
+			{
+				mode: "effort",
+				efforts: [Effort.Low, Effort.High, Effort.XHigh],
+				requiresEffort: true,
+			},
+			{
+				mode: "effort",
+				efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+				defaultLevel: Effort.XHigh,
+			},
+		]);
 	});
 
 	it("pins zai glm-5.2 base id to 1M context", () => {
