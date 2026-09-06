@@ -334,6 +334,12 @@ jobs:
         run: |
           bun --cwd=packages/browser-relay run build
           cp packages/browser-relay/dist/coreforge-browser-relay-extension.zip release-assets/
+      - name: Generate release checksums
+        run: |
+          bun scripts/ci-release-checksums.ts release-assets/SHA256SUMS.txt \
+            release-assets/omp-* \
+            release-assets/coreforge-pi-natives-*.tgz \
+            release-assets/coreforge-browser-relay-extension.zip
       - name: Generate release notes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -397,6 +403,19 @@ jobs:
           tar -xzf "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
           test -f package/pi_natives.darwin-arm64.node
           node -e 'require("./package/pi_natives.darwin-arm64.node")'
+      - name: Verify published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "SHA256SUMS.txt"
+          grep -F \
+            -e "  omp-darwin-arm64" \
+            -e "  coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz" \
+            SHA256SUMS.txt > SHA256SUMS.verify
+          test "$(wc -l < SHA256SUMS.verify)" -eq 2
+          shasum -a 256 -c SHA256SUMS.verify
       - name: Verify published macOS arm64 binary
         run: |
           codesign -dvvv ./omp-darwin-arm64

@@ -114,6 +114,7 @@ const localOnlyWorkspacePackages = ["python/robomp/web"];
 const repoScriptTests = [
 	"scripts/cf-release-notes.test.ts",
 	"scripts/ci-release-build-binaries.test.ts",
+	"scripts/ci-release-checksums.test.ts",
 	"scripts/fix-changelogs.test.ts",
 	"scripts/inline-functions.test.ts",
 	"scripts/musl-release.test.ts",

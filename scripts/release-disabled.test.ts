@@ -35,6 +35,9 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(workflow).toContain(`coreforge-pi-natives-\${{ matrix.target }}-\${RELEASE_TAG}.tgz`);
 	expect(workflow).toContain("pattern: native-*");
 	expect(workflow).toContain("node -e 'require(\"./package/pi_natives.darwin-arm64.node\")'");
+	expect(workflow).toContain("bun scripts/ci-release-checksums.ts release-assets/SHA256SUMS.txt");
+	expect(workflow).toContain('--pattern "SHA256SUMS.txt"');
+	expect(workflow).toContain("shasum -a 256 -c SHA256SUMS.verify");
 });
 
 test("Coreforce allocates a release tag only after every build succeeds", async () => {
@@ -57,9 +60,12 @@ test("Coreforce allocates a release tag only after every build succeeds", async 
 	expect(releaseJob).toContain("needs: [prepare, build]");
 
 	const downloadIndex = releaseJob.lastIndexOf("uses: actions/download-artifact@");
+	const checksumIndex = releaseJob.indexOf("- name: Generate release checksums");
 	const tagIndex = releaseJob.indexOf("- name: Create immutable release tag");
 	const publishIndex = releaseJob.indexOf('gh release create "$RELEASE_TAG"');
 	expect(downloadIndex).toBeGreaterThanOrEqual(0);
+	expect(checksumIndex).toBeGreaterThan(downloadIndex);
+	expect(tagIndex).toBeGreaterThan(checksumIndex);
 	expect(tagIndex).toBeGreaterThan(downloadIndex);
 	expect(publishIndex).toBeGreaterThan(tagIndex);
 	expect(releaseJob).toContain('git push origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"');
