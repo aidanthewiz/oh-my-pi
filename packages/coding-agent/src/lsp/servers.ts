@@ -40,7 +40,7 @@ export function getFileLspContext(sessionCwd: string, filePath: string): FileLsp
 		const config = getConfig(candidate);
 		const servers = getServersForFile(config, absolutePath);
 		if (servers.length > 0) return { cwd: candidate, config, servers };
-		if (candidate === sessionRoot) break;
+		if (candidate === sessionRoot) return { cwd: candidate, config, servers };
 		const parent = path.dirname(candidate);
 		if (parent === candidate) break;
 		if (isWithinSession) {
