@@ -38,6 +38,6 @@ export const embeddedAddon = {
 		filePath: archivePath,
 	},
 	files: [
-		{ variant: "default", filename: "pi_natives.darwin-arm64.node", size: 143103168 },
+		{ variant: "default", filename: "pi_natives.darwin-arm64.node", size: 155442832 },
 	],
 };
