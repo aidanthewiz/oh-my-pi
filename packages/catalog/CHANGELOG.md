@@ -9,6 +9,16 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [17.3.1] - 2026-08-13
+
+### Added
+
+- Added dynamic Antigravity and Gemini CLI discovery support for Gemini 3.7 Flash, with low/medium/high thinking-level routing.
+
+### Changed
+
+- Updated model metadata, context windows, pricing, and configurations in the catalog
+
 ## [17.3.0] - 2026-08-13
 
 ### Breaking Changes

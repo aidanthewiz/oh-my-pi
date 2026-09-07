@@ -12,6 +12,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, compareVersions, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
@@ -779,8 +780,8 @@ async function unlinkIfExists(filePath: string): Promise<void> {
  * running process image, so unlinking it fails with EPERM/EACCES until this
  * process exits (issue #845). The replacement and verification already
  * succeeded by the time we get here, so every error is swallowed; the leftover
- * is reclaimed by {@link sweepStaleBackups} on the next update once it is no
- * longer in use. Returns whether the file is gone.
+ * is reclaimed by {@link sweepStaleUpdateArtifacts} on the next update once it
+ * is no longer in use. Returns whether the file is gone.
  */
 async function removeBackupBestEffort(filePath: string): Promise<boolean> {
 	try {
@@ -792,16 +793,21 @@ async function removeBackupBestEffort(filePath: string): Promise<boolean> {
 }
 
 /**
- * Best-effort removal of binary-update backups left by earlier runs.
+ * Best-effort removal of binary-update leftovers from earlier runs.
  *
- * Each self-update moves the previous executable to `<binary>.<timestamp>.<pid>.bak`
- * before swapping the new one in. On Windows that backup cannot be deleted
- * while the updating process is alive, so it is left for a later run to reclaim
- * once its owning process has exited. Also matches the legacy fixed
- * `<binary>.bak` name produced before backups were timestamped, so users
- * upgrading from a buggy release get the orphaned file cleaned up.
+ * Each self-update writes to `<binary>.<timestamp>.<pid>.new` and moves the
+ * previous executable to `<binary>.<timestamp>.<pid>.bak` before swapping the
+ * new one in. On Windows a backup cannot be deleted while the updating process
+ * is alive (it is the running process image), so it is left for a later run to
+ * reclaim once its owning process has exited. A `.new` temp file only survives
+ * a hard kill mid-download; it is reaped once older than the download window,
+ * which a live download cannot exceed without timing out and cleaning up after
+ * itself — so a concurrent run's in-progress temp is never deleted. Legacy
+ * fixed `<binary>.bak` / `<binary>.new` names (from before suffixes were made
+ * unique) are matched too, so users upgrading from a buggy release get the
+ * orphaned files cleaned up.
  */
-export async function sweepStaleBackups(targetPath: string): Promise<void> {
+export async function sweepStaleUpdateArtifacts(targetPath: string): Promise<void> {
 	const dir = path.dirname(targetPath);
 	const base = path.basename(targetPath);
 	let entries: string[];
@@ -810,13 +816,28 @@ export async function sweepStaleBackups(targetPath: string): Promise<void> {
 	} catch {
 		return;
 	}
+	const now = Date.now();
 	for (const entry of entries) {
-		if (!entry.startsWith(`${base}.`) || !entry.endsWith(".bak")) continue;
-		// Legacy "<base>.bak" → empty middle; new "<base>.<timestamp>.<pid>.bak"
-		// → dot-separated numeric run. Anything else is an unrelated *.bak file.
-		const middle = entry.slice(base.length + 1, entry.length - ".bak".length);
+		if (!entry.startsWith(`${base}.`)) continue;
+		const suffix = entry.endsWith(".bak") ? ".bak" : entry.endsWith(".new") ? ".new" : undefined;
+		if (!suffix) continue;
+		// Legacy "<base><suffix>" → empty middle; new "<base>.<timestamp>.<pid><suffix>"
+		// → dot-separated numeric run. Anything else is an unrelated file.
+		const middle = entry.slice(base.length + 1, entry.length - suffix.length);
 		if (middle.length > 0 && !/^\d+(\.\d+)*$/.test(middle)) continue;
-		await removeBackupBestEffort(path.join(dir, entry));
+		const full = path.join(dir, entry);
+		if (suffix === ".new") {
+			// A temp file may belong to a concurrent update still downloading, so
+			// only reap ones older than the download window.
+			let mtimeMs: number;
+			try {
+				mtimeMs = (await fs.promises.stat(full)).mtimeMs;
+			} catch {
+				continue;
+			}
+			if (now - mtimeMs < BINARY_DOWNLOAD_TIMEOUT_MS) continue;
+		}
+		await removeBackupBestEffort(full);
 	}
 }
 
@@ -1005,6 +1026,11 @@ async function downloadCoreforgeBinary(
 	return expectedDigest;
 }
 
+// Monotonic within this process so two updates started in the same millisecond
+// (same pid, same `Date.now()`) still get distinct temp/backup paths. Kept
+// numeric so the artifact sweep's `\d+(\.\d+)*` matcher still reclaims them.
+let updateAttemptSeq = 0;
+
 /**
  * Download a release binary to a target path, replacing an existing file.
  * [coreforge patch: private-repo assets are fetched through the GitHub asset
@@ -1021,25 +1047,44 @@ export async function updateViaBinaryAt(
 	} = {},
 ): Promise<void> {
 	const binaryName = options.binaryName ?? getBinaryName();
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.${Date.now()}.${process.pid}.bak`;
+	// Unique per attempt so two overlapping `omp update` runs never share a temp
+	// or backup path. A fixed temp name (`<binary>.new`) let the second run's
+	// pre-download unlink delete the first run's still-downloading temp file; the
+	// first kept writing to its open fd (size + digest still passed), then chmod
+	// hit the missing path and the update aborted (issue #8434). The backup needs
+	// the same uniqueness: a stale backup from an earlier update may still be
+	// locked (the previous process image on Windows), so a fixed name would force
+	// the move-aside rename to overwrite it. pid, timestamp, and a process-local
+	// counter keep two updates started in the same millisecond from colliding.
+	const attempt = `${Date.now()}.${process.pid}.${updateAttemptSeq++}`;
+	const tempPath = `${targetPath}.${attempt}.new`;
+	const backupPath = `${targetPath}.${attempt}.bak`;
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
 	await downloadCoreforgeBinary(tempPath, expectedVersion, binaryName, options.fetchImpl, options.githubToken);
 
-	console.log(chalk.dim("Installing update..."));
-	await replaceBinaryForUpdate({
-		targetPath,
-		tempPath,
-		backupPath,
-		expectedVersion,
-		verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
+	// Serialize the target swap and stale-artifact sweep per target so two
+	// overlapping `omp update` runs never replace the same binary concurrently
+	// or reclaim each other's live backup/temp files. The download above writes
+	// to a unique temp path and is safe to overlap; only the swap is shared.
+	await withFileLock(targetPath, async () => {
+		console.log(chalk.dim("Installing update..."));
+		await replaceBinaryForUpdate({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion,
+			verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
+		});
+		// Reclaim backups from earlier updates whose owning process has since exited.
+		await sweepStaleUpdateArtifacts(targetPath);
 	});
-	await sweepStaleBackups(targetPath);
+
 	printVerifiedVersion(expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
 /**
+
  * Run the update command.
  */
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {

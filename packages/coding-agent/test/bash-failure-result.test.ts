@@ -1,9 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { Shell } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+afterEach(() => {
+	mock.restore();
+});
 
 let tempDir: TempDir;
 
@@ -63,6 +68,12 @@ describe("BashTool execution results", () => {
 	});
 
 	it("returns a warning-state timeout result with one timeout notice", async () => {
+		// Keep the real native subprocess timeout path, but compress its backend
+		// deadline; BashTool must still report the user-facing one-second timeout.
+		const realRun = Shell.prototype.run;
+		spyOn(Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
+			return realRun.call(this, { ...options, timeoutMs: 20 }, onChunk);
+		});
 		const tool = new BashTool(makeSession());
 		const result = await tool.execute("call-timeout", { command: "sleep 3", timeout: 1 });
 
@@ -73,27 +84,16 @@ describe("BashTool execution results", () => {
 	});
 
 	it("preserves the executor cancellation notice without classifying it as a timeout", async () => {
+		const dispatched = Promise.withResolvers<void>();
+		const realRun = Shell.prototype.run;
+		spyOn(Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
+			dispatched.resolve();
+			return realRun.call(this, options, onChunk);
+		});
 		const tool = new BashTool(makeSession());
 		const controller = new AbortController();
-		let markStarted!: () => void;
-		const started = new Promise<void>(resolve => {
-			markStarted = resolve;
-		});
-		const execution = tool.execute(
-			"call-cancel",
-			{ command: "printf started; sleep 3" },
-			controller.signal,
-			update => {
-				const text = update.content.find(block => block.type === "text")?.text ?? "";
-				if (text.includes("started")) markStarted();
-			},
-		);
-		await Promise.race([
-			started,
-			execution.then(() => {
-				throw new Error("Command completed before emitting its startup output");
-			}),
-		]);
+		const execution = tool.execute("call-cancel", { command: "sleep 3" }, controller.signal);
+		await dispatched.promise;
 		controller.abort();
 
 		const error = await execution.catch(error => error);

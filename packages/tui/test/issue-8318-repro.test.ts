@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, type NativeScrollbackLiveRegion, TUI } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -11,6 +11,25 @@ import { VirtualTerminal } from "./virtual-terminal";
 const OSC66 = "\x1b]66;";
 const ST = "\x1b\\";
 const ERASE_LINE = "\x1b[2K";
+
+const ORIGINAL_RESIZE_ENV = {
+	HERDR_ENV: Bun.env.HERDR_ENV,
+	PI_TUI_RESIZE_IN_PLACE: Bun.env.PI_TUI_RESIZE_IN_PLACE,
+	TERM_PROGRAM: Bun.env.TERM_PROGRAM,
+};
+
+beforeEach(() => {
+	delete Bun.env.HERDR_ENV;
+	delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
+	delete Bun.env.TERM_PROGRAM;
+});
+
+afterEach(() => {
+	for (const [key, value] of Object.entries(ORIGINAL_RESIZE_ENV)) {
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
+	}
+});
 
 class RawLines implements Component {
 	#lines: string[];

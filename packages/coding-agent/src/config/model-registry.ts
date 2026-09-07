@@ -32,7 +32,7 @@ import {
 	resolveOllamaModelCacheProviderId,
 } from "@oh-my-pi/pi-catalog/provider-models";
 import { collapseBuiltModelVariants } from "@oh-my-pi/pi-catalog/variant-collapse";
-import { isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage } from "../session/auth-storage";
@@ -256,13 +256,14 @@ export class ModelRegistry {
 			(isBunTestRuntime()
 				? () => Promise.reject(new Error("network disabled in model-registry runtime test"))
 				: wrapFetchForExtraCa(fetch));
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
+		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
 		// Org-managed overlay lives beside the user models file (same dir), so an
-		// explicit modelsPath relocates it too; undefined keeps its own default
-		// (`<agentDir>/models.managed.yml`). Deep-merged above the user config in
-		// #loadCustomModels; absent file = upstream behaviour.
+		// explicit modelsPath relocates it too. Resolve the default against the
+		// current agent directory to preserve upstream test and profile isolation.
 		this.#managedModelsConfigFile = ManagedModelsConfigFile.relocate(
-			modelsPath ? path.join(path.dirname(modelsPath), MANAGED_MODELS_FILENAME) : undefined,
+			modelsPath
+				? path.join(path.dirname(modelsPath), MANAGED_MODELS_FILENAME)
+				: path.join(getAgentDir(), MANAGED_MODELS_FILENAME),
 		);
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
