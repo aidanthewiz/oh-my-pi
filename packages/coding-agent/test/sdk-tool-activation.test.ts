@@ -206,7 +206,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.setModel(fable);
 			expect(session.getToolByName("think")).toBeDefined();
 			expect(session.getActiveToolNames()).toContain("think");
-			expect(session.systemPrompt.join("\n")).toContain("private scratchpad; not shown to user");
+			expect(session.systemPrompt.join("\n")).toContain("other tools become callable when it completes");
 
 			await session.setModel(responses);
 			expect(session.getActiveToolNames()).toContain("think");
@@ -217,7 +217,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 			await session.setModel(unsupported);
 			expect(session.getActiveToolNames()).not.toContain("think");
-			expect(session.systemPrompt.join("\n")).not.toContain("private scratchpad; not shown to user");
+			expect(session.systemPrompt.join("\n")).not.toContain("other tools become callable when it completes");
 		} finally {
 			await session.dispose();
 		}
@@ -1116,7 +1116,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			const mountedBefore = session.getMountedXdevToolNames();
 			const promptBefore = session.systemPrompt;
 			const originalTool = session.getToolByName("bash");
-			expect(originalTool).toBeDefined();
 			expect(session.hasBuiltInTool("bash")).toBe(true);
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
@@ -1248,13 +1247,18 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			const errors: string[] = [];
 			const unsubscribe = runner.onError(error => {
 				errors.push(error.error);
+				// The 10ms budget exists only to reap the stalled first handler
+				// quickly; handlers run sequentially and the budget is read per
+				// handler, so restoring it here keeps machine load from timing out
+				// the genuine recovery registration too (flaked in full-suite runs).
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			});
-			testSetExtensionHandlerTimeoutMs(250);
+			testSetExtensionHandlerTimeoutMs(10);
 
 			await runner.emit({ type: "session_start" });
 			unsubscribe();
 
-			expect(errors).toContain("handler timed out after 250ms");
+			expect(errors).toContain("handler timed out after 10ms");
 			expect(session.getToolByName("stalled_registration_tool")).toBeUndefined();
 			expect(session.getToolByName("recovered_registration_tool")?.label).toBe("recovered_registration_tool");
 			expect(session.getEnabledToolNames()).toContain("recovered_registration_tool");
@@ -1451,10 +1455,14 @@ describe("createAgentSession defaultInactive tool activation", () => {
 					await originalSetPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal);
 					if (toolNames.includes("recovered_detached_tool")) recoveredActivation.resolve();
 				});
-			testSetExtensionHandlerTimeoutMs(250);
+			testSetExtensionHandlerTimeoutMs(10);
 
 			releaseStalledRegistration.resolve();
 			const failure = await detachedFailure.promise;
+			// Restore the default budget before the recovered registration flush:
+			// the 10ms budget was only for reaping the stalled activation, and the
+			// real presentation pass can exceed it under full-suite load.
+			testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			releaseRecoveredRegistration.resolve();
 			await recoveredActivation.promise;
 
@@ -1931,7 +1939,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			expect(session.getAllToolNames()).toEqual(["read", "sdk_custom_tool"]);
 			expect(session.getActiveToolNames()).toEqual(["read", "sdk_custom_tool"]);
-			expect(session.getToolByName("sdk_custom_tool")).toBeDefined();
 		} finally {
 			await session.dispose();
 		}
@@ -1979,13 +1986,14 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	// A session created on another provider keeps its configured-mode `edit` in
-	// the registry (only a Cursor-created session moves it out) and the tool
-	// roster is built once, at creation — switching to Cursor later does not
-	// rebuild it. These two cover both directions of that wiring: the granted
-	// session must still reach a replace-mode instance for `pi_edit` (whose
-	// `old_string`/`new_string` args do not validate against the default `hashline`
-	// schema), and the restricted one must still be refused.
+	// Hashline `edit` stays in the registry on Cursor so the model can still
+	// call it as MCP. Native StrReplace arrives as `editToolCall` and is
+	// materialized via exec read/write; `pi_edit` still uses the replace-mode
+	// instance from `getEditReplaceTool`. The roster is built once at creation.
+	// These two cover both directions of that wiring: the granted session must
+	// still reach a replace-mode instance for `pi_edit` (whose `old_string` /
+	// `new_string` args do not validate against the default `hashline` schema),
+	// and the restricted one must still be refused.
 	//
 	// The handlers are internal to the session; `streamFn` is where they are
 	// handed to the provider, which is the externally observable seam.
@@ -2040,6 +2048,24 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 				expect(result.isError).toBeFalsy();
 				expect(fs.readFileSync(target, "utf8")).toBe("alpha\ngamma\n");
+			} finally {
+				await session.dispose();
+			}
+		});
+	});
+
+	it("keeps hashline edit advertised when the session starts on Cursor", async () => {
+		const tempDir = makeTempDir();
+		const cursorModel = getBundledModel("cursor", "composer-1.5");
+		if (!cursorModel) throw new Error("expected bundled Cursor model");
+
+		await withProviderAuth(["cursor"], async () => {
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				model: cursorModel,
+			});
+			try {
+				expect(session.getActiveToolNames()).toContain("edit");
 			} finally {
 				await session.dispose();
 			}

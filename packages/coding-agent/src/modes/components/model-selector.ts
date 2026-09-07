@@ -20,6 +20,7 @@ import {
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import {
+	filterModelsByEnabledSettings,
 	getAllowedAvailableModels,
 	getModelMatchPreferences,
 	resolveModelRoleValue,
@@ -309,7 +310,7 @@ export class ModelSelectorComponent extends Container {
 
 	#loadRoleModels(autoCandidateModels?: ReadonlyArray<Model>): void {
 		const nextRoles = {} as Record<string, RoleAssignment | undefined>;
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = filterModelsByEnabledSettings(this.#modelRegistry.getAll(), this.#settings);
 		const matchPreferences = getModelMatchPreferences(this.#settings);
 		const knownRoles = getKnownRoleIds(this.#settings);
 		const configuredRoles = new Set<string>();

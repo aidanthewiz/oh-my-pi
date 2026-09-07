@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	applyEligibleNestedPatches,
@@ -48,26 +49,25 @@ async function seedFooRepo(finalContent: string): Promise<{ repoRoot: string; pa
 	const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-merge-"));
 	tempRoots.push(repoRoot);
 
-	await git(repoRoot, "init");
+	await git(repoRoot, "init", "-q", "-b", "main");
 	await git(repoRoot, "config", "user.email", "repro@example.com");
 	await git(repoRoot, "config", "user.name", "Repro");
-	await Bun.write(path.join(repoRoot, "foo.txt"), "old\n");
+	await Bun.write(path.join(repoRoot, "foo.txt"), finalContent);
 	await git(repoRoot, "add", "foo.txt");
-	await git(repoRoot, "commit", "-m", "base");
-	await Bun.write(path.join(repoRoot, "foo.txt"), "new\n");
-	await git(repoRoot, "commit", "-am", "change to new");
+	await git(repoRoot, "commit", "-q", "-m", "fixture state");
 
+	// The merge contract needs a valid old→new patch, not a second commit and
+	// diff-tree subprocess for every scenario.
 	const patchPath = path.join(repoRoot, "task.patch");
-	const patchText = await git(repoRoot, "diff-tree", "--binary", "--full-index", "--no-commit-id", "-p", "HEAD");
-	await Bun.write(patchPath, patchText);
-
-	if (finalContent !== "new\n") {
-		await git(repoRoot, "reset", "--hard", "HEAD~1");
-		if (finalContent !== "old\n") {
-			await Bun.write(path.join(repoRoot, "foo.txt"), finalContent);
-			await git(repoRoot, "commit", "-am", "diverge");
-		}
-	}
+	await Bun.write(
+		patchPath,
+		"diff --git a/foo.txt b/foo.txt\n" +
+			"--- a/foo.txt\n" +
+			"+++ b/foo.txt\n" +
+			"@@ -1 +1 @@\n" +
+			"-old\n" +
+			"+new\n",
+	);
 	return { repoRoot, patchPath };
 }
 
@@ -282,6 +282,78 @@ describe("runIsolatedSubprocess", () => {
 		cleanupGate.resolve();
 		await cleanupFinished.promise;
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("observes real child usage before fallible isolation cleanup", async () => {
+		const childResult = result({
+			exitCode: 1,
+			error: "agent failed",
+			usage: {
+				input: 9_000,
+				output: 1_234,
+				cacheRead: 8_000,
+				cacheWrite: 7_000,
+				totalTokens: 25_234,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.beginTurnBudget(100_000, true);
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: "/repo/isolated",
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(childResult);
+		vi.spyOn(worktreeModule, "cleanupIsolation").mockRejectedValue(new Error("cleanup failed"));
+		const onSubprocessResult = vi.fn((child: SingleResult) => {
+			sessionManager.recordEvalSubagentOutput(child.usage?.output ?? 0);
+		});
+
+		await expect(
+			runIsolatedSubprocess({
+				baseOptions: {
+					cwd: "/repo",
+					agent: {
+						name: "task",
+						description: "Task agent",
+						systemPrompt: "test",
+						source: "bundled",
+					},
+					task: "Do work",
+					index: 0,
+					id: "UsageAccounting",
+				},
+				context: {
+					repoRoot: "/repo",
+					baseline: {
+						root: {
+							repoRoot: "/repo",
+							headCommit: "base",
+							staged: "",
+							unstaged: "",
+							untracked: [],
+							untrackedPatch: "",
+						},
+						nested: [],
+					},
+				},
+				preferredBackend: undefined,
+				agentId: "UsageAccounting",
+				mergeMode: "patch",
+				artifactsDir: "/artifacts",
+				buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
+				onSubprocessResult,
+			}),
+		).rejects.toThrow("cleanup failed");
+
+		expect(onSubprocessResult).toHaveBeenCalledTimes(1);
+		expect(sessionManager.getTurnBudget()).toEqual({
+			total: 100_000,
+			spent: 1_234,
+			hard: true,
+		});
 	});
 });
 

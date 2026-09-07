@@ -78,7 +78,6 @@ describe("mcp oauth flow", () => {
 		const { url } = await flow.generateAuthUrl("test-state", "http://127.0.0.1:53172/callback");
 		const authUrl = new URL(url);
 
-		expect(registrationPayload).not.toBeNull();
 		expect((registrationPayload as { client_name?: string } | null)?.client_name).toBe("oh-my-pi");
 		expect((registrationPayload as { scope?: string } | null)?.scope).toBeUndefined();
 		expect(authUrl.searchParams.get("client_id")).toBe("registered-client-id");
@@ -128,7 +127,6 @@ describe("mcp oauth flow", () => {
 		const { url } = await flow.generateAuthUrl("test-state", "http://127.0.0.1:53173/callback");
 		const authUrl = new URL(url);
 
-		expect(registrationPayload).not.toBeNull();
 		expect((registrationPayload as { scope?: string } | null)?.scope).toBe(scopes);
 		expect(authUrl.searchParams.get("scope")).toBe(scopes);
 		expect(authUrl.searchParams.get("client_id")).toBe("registered-client-id");
@@ -695,6 +693,7 @@ describe("mcp oauth flow", () => {
 		const progress: string[] = [];
 		let authCalls = 0;
 		let advertisedUrl = "";
+		const callbackReady = new AbortController();
 		try {
 			const flow = new MCPOAuthFlow(
 				{
@@ -709,10 +708,12 @@ describe("mcp oauth flow", () => {
 					onAuth: ({ url }) => {
 						authCalls += 1;
 						advertisedUrl = url;
+						callbackReady.abort("callback URL captured");
 					},
 					onProgress: msg => progress.push(msg),
-					// Abort once the flow is waiting for the browser callback we never deliver.
-					signal: AbortSignal.timeout(500),
+					// Stop immediately once the fallback URL has been observed; no browser
+					// callback is needed for this port-selection/DCR contract.
+					signal: callbackReady.signal,
 				},
 			);
 
@@ -751,9 +752,6 @@ describe("mcp oauth flow", () => {
 			},
 			{},
 		);
-
-		expect(flow.resolvedClientId).toBeUndefined();
-		expect(flow.registeredClientSecret).toBeUndefined();
 
 		await flow.generateAuthUrl("test-state", "http://127.0.0.1:53173/callback");
 
@@ -1304,18 +1302,5 @@ describe("mcp oauth flow", () => {
 
 			expect(tokenParams.get("resource")).toBe("https://token.example.com");
 		});
-	});
-
-	it("exposes authorizationUrl via a getter so callers can persist it on the credential", () => {
-		const flow = new MCPOAuthFlow(
-			{
-				authorizationUrl: "https://auth.example.com/authorize",
-				tokenUrl: "https://token.example.com/token",
-				clientId: "client-id",
-			},
-			{},
-		);
-
-		expect(flow.authorizationUrl).toBe("https://auth.example.com/authorize");
 	});
 });

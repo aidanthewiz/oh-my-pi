@@ -28,7 +28,13 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { ModelRegistry } from "../../config/model-registry";
-import { type ModelRoleLookup, type ResolvedModelRoleValue, resolveModelRoleValue } from "../../config/model-resolver";
+import {
+	filterModelsByEnabledSettings,
+	getAllowedAvailableModels,
+	type ModelRoleLookup,
+	type ResolvedModelRoleValue,
+	resolveModelRoleValue,
+} from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
@@ -198,15 +204,19 @@ export class ModelHubComponent implements Component {
 	#sidebarFollowActive = true;
 	#sidebarHover: number | null = null;
 	/**
-	 * Arrow-key ownership: `scope` (default) hops the sidebar even while the
-	 * search bar holds the caret; `list` navigates rows (browser models or
-	 * role rows). Tab toggles.
+	 * Arrow-key ownership: `scope` (default) hops the sidebar; `list`
+	 * navigates rows (browser models or role rows). Typing anywhere focuses
+	 * the model list; Tab toggles; ←/→ switches between sidebar and list.
 	 */
 	#focus: "scope" | "list" = "scope";
 
 	#rolesRows: RolesRow[] = [];
 	#roleIndex = 0;
 	#roleHover: number | null = null;
+	/** First roles row drawn in the scroll window; follows the cursor and clamps to the list. */
+	#roleScrollStart = 0;
+	/** Roles rows actually drawn this frame; bounds mouse hit-testing to the visible window. */
+	#rolesVisibleCount = 0;
 
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
@@ -299,7 +309,10 @@ export class ModelHubComponent implements Component {
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
 	#reloadRoles(autoCandidates: ReadonlyArray<Model>): void {
-		const allModels = this.#scopedModels.length > 0 ? autoCandidates : this.#registry.getAll();
+		const allModels =
+			this.#scopedModels.length > 0
+				? autoCandidates
+				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
 		this.#roles = resolveRoleAssignments(this.#settings, allModels, autoCandidates);
 	}
 
@@ -314,9 +327,9 @@ export class ModelHubComponent implements Component {
 		} else {
 			const loadError = this.#registry.getError();
 			this.#configError = loadError ? String(loadError) : undefined;
-			allModels = this.#registry.getAll();
+			allModels = filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
 			try {
-				availableModels = this.#registry.getAvailable();
+				availableModels = getAllowedAvailableModels(this.#registry, this.#settings);
 			} catch (error) {
 				this.#configError = error instanceof Error ? error.message : String(error);
 				availableModels = [];
@@ -765,7 +778,9 @@ export class ModelHubComponent implements Component {
 		const roleValue =
 			scope === "project" ? this.#settings.getProjectModelRole(role) : this.#settings.getGlobalModelRole(role);
 		const allModels =
-			this.#scopedModels.length > 0 ? this.#scopedModels.map(scoped => scoped.model) : this.#registry.getAll();
+			this.#scopedModels.length > 0
+				? this.#scopedModels.map(scoped => scoped.model)
+				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
 		const roleLookup: ModelRoleLookup = {
 			getModelRole: scopedRole =>
 				scope === "project"
@@ -1196,8 +1211,7 @@ export class ModelHubComponent implements Component {
 			return;
 		}
 
-		// Arrow ownership: scope mode hops the sidebar even while the search
-		// bar holds the caret; list mode navigates rows.
+		// Arrow ownership: scope mode hops the sidebar; list mode navigates rows.
 		if (this.#focus === "scope") {
 			if (matchesSelectUp(data)) {
 				this.#moveSidebar(-1);
@@ -1210,16 +1224,36 @@ export class ModelHubComponent implements Component {
 		}
 
 		if (rolesView) {
+			const printable = extractPrintableText(data);
+			if (this.#focus === "scope" && printable !== undefined && printable.trim().length > 0) {
+				this.#setActiveEntry("all");
+				this.#focus = "list";
+				this.#browser.handleInput(data);
+				return;
+			}
 			this.#handleRolesViewInput(data);
 			return;
 		}
 		if (lockedView) {
+			const printable = extractPrintableText(data);
+			if (printable !== undefined && printable.trim().length > 0) {
+				this.#setActiveEntry("all");
+				this.#focus = "list";
+				this.#browser.handleInput(data);
+				return;
+			}
 			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
 				this.#requestLogin(entry);
 			}
 			return;
 		}
+
+		const beforeQuery = this.#browser.query;
+		const isPrintable = extractPrintableText(data) !== undefined;
 		this.#browser.handleInput(data);
+		if (isPrintable || this.#browser.query !== beforeQuery) {
+			this.#focus = "list";
+		}
 	}
 
 	#isBrowserView(entry: SidebarEntry): boolean {
@@ -1300,6 +1334,15 @@ export class ModelHubComponent implements Component {
 			case "separator":
 				return;
 		}
+	}
+
+	/** Scroll `#roleScrollStart` just enough to keep `#roleIndex` inside a window of `viewHeight` rows, clamped to the list. */
+	#ensureRoleVisible(viewHeight: number, total: number): number {
+		if (viewHeight <= 0) return 0;
+		let start = this.#roleScrollStart;
+		if (this.#roleIndex < start) start = this.#roleIndex;
+		else if (this.#roleIndex >= start + viewHeight) start = this.#roleIndex - viewHeight + 1;
+		return Math.max(0, Math.min(start, Math.max(0, total - viewHeight)));
 	}
 
 	/** Step the roles cursor by one row, skipping separator rows. Wraps at the ends unless `wrap: false` (then the cursor stays put). */
@@ -1473,7 +1516,8 @@ export class ModelHubComponent implements Component {
 			this.#sidebarHover = overSidebar ? this.#sidebarEntryIndexAt(contentLine) : null;
 			if (overBody && entry.kind === "roles" && this.#assigning === null) {
 				const roleLine = bodyLine - this.#rolesRowStart;
-				this.#roleHover = roleLine >= 0 && roleLine < this.#rolesRowCount ? roleLine : null;
+				this.#roleHover =
+					roleLine >= 0 && roleLine < this.#rolesVisibleCount ? roleLine + this.#roleScrollStart : null;
 			} else {
 				this.#roleHover = null;
 				if (overBody && this.#isBrowserView(entry)) {
@@ -1508,8 +1552,9 @@ export class ModelHubComponent implements Component {
 		if (overBody) {
 			if (entry.kind === "roles" && this.#assigning === null) {
 				this.#focus = "list";
-				const roleLine = bodyLine - this.#rolesRowStart;
-				if (roleLine >= 0 && roleLine < this.#rolesRowCount) {
+				const listLine = bodyLine - this.#rolesRowStart;
+				if (listLine >= 0 && listLine < this.#rolesVisibleCount) {
+					const roleLine = listLine + this.#roleScrollStart;
 					const rowDef = this.#rolesRows[roleLine];
 					if (rowDef && rowDef.kind !== "separator") {
 						if (roleLine === this.#roleIndex) {
@@ -1718,7 +1763,16 @@ export class ModelHubComponent implements Component {
 
 		const cycleOrder = this.#cycleOrder();
 		const listFocused = this.#focus === "list";
-		for (let i = 0; i < this.#rolesRows.length && lines.length < rows - 2; i++) {
+		// Window the list around the cursor so entries past the panel height stay
+		// reachable; the trailing indicator line steals one row when clipped.
+		const total = this.#rolesRows.length;
+		const capacity = Math.max(0, rows - 2 - this.#rolesRowStart);
+		const overflow = total > capacity;
+		const viewHeight = overflow ? Math.max(0, capacity - 1) : capacity;
+		this.#roleScrollStart = this.#ensureRoleVisible(viewHeight, total);
+		const endIndex = Math.min(this.#roleScrollStart + viewHeight, total);
+		this.#rolesVisibleCount = Math.max(0, endIndex - this.#roleScrollStart);
+		for (let i = this.#roleScrollStart; i < endIndex; i++) {
 			const rowDef = this.#rolesRows[i];
 			if (!rowDef) continue;
 			const selected = i === this.#roleIndex;
@@ -1800,6 +1854,15 @@ export class ModelHubComponent implements Component {
 			}
 			line = this.#finishRolesRow(line, width, hovered);
 			lines.push(line);
+		}
+
+		if (overflow) {
+			const hiddenAbove = this.#roleScrollStart;
+			const hiddenBelow = total - endIndex;
+			const parts: string[] = [];
+			if (hiddenAbove > 0) parts.push(`↑ ${hiddenAbove} more`);
+			if (hiddenBelow > 0) parts.push(`↓ ${hiddenBelow} more`);
+			lines.push(truncateToWidth(theme.fg("dim", `   ${parts.join("   ")}`), width));
 		}
 
 		// Live preview of the quick-switch cycle, rendered with the exact

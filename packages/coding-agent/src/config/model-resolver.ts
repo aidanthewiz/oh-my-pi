@@ -22,7 +22,7 @@ import { modelMatchesHost } from "@oh-my-pi/pi-catalog/hosts";
 import { buildModelProviderPriorityRank } from "@oh-my-pi/pi-catalog/identity";
 import { stripThinkingVariantToken } from "@oh-my-pi/pi-catalog/identity/family";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import { type GeneratedProvider, getBundledModels, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
 import { resolveBareVariantAlias, resolveVariantAlias } from "@oh-my-pi/pi-catalog/variant-collapse";
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
@@ -596,6 +596,41 @@ function includeSyntheticAllowedModels(available: Model<Api>[], allowedModels: I
 }
 
 /**
+ * Provider-lock a raw-id cross match.
+ *
+ * A slash-prefixed selector like `anthropic/claude-opus-5` is ambiguous: it is
+ * both the `anthropic` provider's canonical selector and — verbatim — an
+ * OpenRouter aggregator model id. When the named provider genuinely carries
+ * that model id in the bundled catalog but the model is missing from the
+ * candidate set (provider disabled, no credentials, or filtered out), letting
+ * the raw-id fallback re-bind the request onto a different provider's
+ * same-named model is a silent, expensive surprise — typically the aggregator's
+ * copy (OpenRouter bills published per-token Claude prices). Such a reference
+ * is provider-locked: it must fail rather than shadow.
+ *
+ * The lock only applies when the named provider carries the exact id in the
+ * bundled catalog. An aggregator raw id the named provider does NOT carry
+ * (e.g. `openai/gpt-4o:extended` — `openai` bundles `gpt-4o`, not the
+ * `:extended` variant) is legitimately an aggregator id and keeps resolving
+ * through the raw-id fallback, so bare aggregator selectors keep working.
+ */
+function isProviderLockedCrossMatch(pattern: string, matchedModel: Model<Api>): boolean {
+	const slashIdx = pattern.indexOf("/");
+	if (slashIdx <= 0) {
+		return false;
+	}
+	const provider = pattern.slice(0, slashIdx).toLowerCase();
+	const modelId = pattern.slice(slashIdx + 1).toLowerCase();
+	if (matchedModel.provider.toLowerCase() === provider) {
+		return false;
+	}
+	// Case-insensitive on both halves: the surrounding matcher lowercases the
+	// selector before comparing ids, so the lock must not evaporate on case
+	// variance (catalog provider keys are lowercase; model ids may not be).
+	return getBundledModels(provider as GeneratedProvider).some(m => m.id.toLowerCase() === modelId);
+}
+
+/**
  * Find an exact explicit provider/model match.
  */
 function findExactModelReferenceMatch(modelReference: string, availableModels: Model<Api>[]): Model<Api> | undefined {
@@ -644,11 +679,17 @@ function matchModel(
 	// Exact ID match (case-insensitive) — this must happen before provider-scoped
 	// fuzzy matching so raw IDs that contain slashes (for example OpenRouter model
 	// IDs like "openai/gpt-4o:extended") still resolve as IDs instead of being
-	// misread as a provider-qualified selector.
+	// misread as a provider-qualified selector. A provider-qualified pattern
+	// whose named provider carries the id stays locked to that provider when its
+	// only exact-id matches live on a different provider (isProviderLockedCrossMatch).
 	const lowerPattern = modelPattern.toLowerCase();
 	const exactMatches = availableModels.filter(m => m.id.toLowerCase() === lowerPattern);
 	if (exactMatches.length > 0) {
-		return pickPreferredModel(exactMatches, context);
+		const unlockedMatches = exactMatches.filter(m => !isProviderLockedCrossMatch(modelPattern, m));
+		if (unlockedMatches.length > 0) {
+			return pickPreferredModel(unlockedMatches, context);
+		}
+		return undefined;
 	}
 
 	const bedrockInferenceProfile = resolveBedrockInferenceProfileModelId(modelPattern, availableModels);
@@ -926,7 +967,8 @@ function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | 
 	return undefined;
 }
 
-function normalizeModelPatternList(value: string | string[] | undefined): string[] {
+/** Normalize comma-separated or array model selectors into an ordered pattern list. */
+export function normalizeModelPatternList(value: string | string[] | undefined): string[] {
 	if (!value) return [];
 	const patterns = Array.isArray(value) ? value.flatMap(pattern => pattern.split(",")) : value.split(",");
 	return patterns.map(pattern => pattern.trim()).filter(Boolean);
@@ -1192,6 +1234,42 @@ export function resolveAgentPrewalkPattern(options: AgentPrewalkResolutionOption
 	}
 	if (options.agentPrewalk === true) return DEFAULT_PREWALK_TARGET;
 	return agentPattern;
+}
+
+export interface AgentAdvisorResolutionOptions {
+	/** `task.agentAdvisor` settings value for this agent: `"on"`, `"off"`, or a model pattern. */
+	settingsOverride?: string;
+	/** Agent definition `advisor` frontmatter: `true` = default advisor-role model, string = custom model pattern. */
+	agentAdvisor?: boolean | string;
+}
+
+/** Effective advisor for one spawned agent: absent `model` resolves through the `advisor` role. */
+export interface AgentAdvisorSelection {
+	model?: string;
+}
+
+/**
+ * Effective advisor selection for a subagent, or `undefined` when the agent
+ * runs unadvised. The settings override decides enablement first ("off" wins,
+ * "on" enables with the agent's own model pattern or the `advisor` role, any
+ * other value is a custom model pattern); otherwise the agent definition's
+ * `advisor` field applies. A returned pattern lands on the spawned session's
+ * `modelRoles.advisor`, so role aliases and `:level` suffixes resolve there.
+ */
+export function resolveAgentAdvisorSelection(
+	options: AgentAdvisorResolutionOptions,
+): AgentAdvisorSelection | undefined {
+	const agentPattern =
+		typeof options.agentAdvisor === "string" && options.agentAdvisor.trim() ? options.agentAdvisor.trim() : undefined;
+	const override = options.settingsOverride?.trim();
+	if (override) {
+		const lowered = override.toLowerCase();
+		if (lowered === "off" || lowered === "false") return undefined;
+		if (lowered === "on" || lowered === "true") return { model: agentPattern };
+		return { model: override };
+	}
+	if (options.agentAdvisor === true) return {};
+	return agentPattern ? { model: agentPattern } : undefined;
 }
 
 /**
@@ -1660,6 +1738,31 @@ export function filterAvailableModelsByEnabledPatterns(
 
 	return includeSyntheticAllowedModels(available, allowedModels);
 }
+
+/** Apply the effective settings allowlist to any model inventory. */
+export function filterModelsByEnabledSettings(models: Model<Api>[], settings?: Settings): Model<Api>[] {
+	const patterns = settings?.get("enabledModels");
+	if (!patterns || patterns.length === 0) return models;
+	return filterAvailableModelsByEnabledPatterns(models, patterns, settings);
+}
+
+/** Return whether a concrete model is permitted by the effective settings allowlist. */
+export function isModelEnabledBySettings(
+	model: Model<Api>,
+	settings: Settings | undefined,
+	modelRegistry: Pick<ModelRegistry, "getAll">,
+): boolean {
+	const patterns = settings?.get("enabledModels");
+	if (!patterns || patterns.length === 0) return true;
+	const modelKey = formatModelString(model);
+	const registered = modelRegistry.getAll();
+	const inventory = registered.some(candidate => formatModelString(candidate) === modelKey)
+		? registered
+		: [...registered, model];
+	return filterModelsByEnabledSettings(inventory, settings).some(
+		candidate => formatModelString(candidate) === modelKey,
+	);
+}
 function findExactCliModel(
 	selector: string,
 	allModels: Model<Api>[],
@@ -1673,11 +1776,14 @@ function findExactCliModel(
 	// Flat-id (or full-selector-string) matches prefer authenticated providers,
 	// then fall back to catalog order. This covers aggregator-style flat ids
 	// that merely look provider-qualified (e.g. "openai/gpt-oss-120b" hosted on
-	// OpenRouter), where the provider/id decomposition above found nothing.
+	// OpenRouter), where the provider/id decomposition above found nothing. A
+	// provider-qualified selector whose named provider carries the id must not
+	// re-bind onto another provider's same-named flat id
+	// (isProviderLockedCrossMatch); it stays provider-locked and fails instead.
 	const lower = selector.toLowerCase();
 	const isFlatMatch = (model: Model<Api>) =>
 		model.id.toLowerCase() === lower || formatModelString(model).toLowerCase() === lower;
-	const preferred = availableModels.find(isFlatMatch);
+	const preferred = availableModels.find(m => isFlatMatch(m) && !isProviderLockedCrossMatch(selector, m));
 	if (preferred) return preferred;
 	// The unauthenticated catalog fallback is a weak match: a bare id like
 	// `default` collides with the bundled `cursor/default` model, which must not
@@ -1686,7 +1792,9 @@ function findExactCliModel(
 	// role gets a chance first; the deferred fuzzy fallback below still recovers
 	// the catalog id when no role matches.
 	if (options?.catalogFallback === false) return undefined;
-	return availableModels === allModels ? undefined : allModels.find(isFlatMatch);
+	return availableModels === allModels
+		? undefined
+		: allModels.find(m => isFlatMatch(m) && !isProviderLockedCrossMatch(selector, m));
 }
 
 /**
@@ -1707,7 +1815,7 @@ export function getAllowedAvailableModels(
 	const available = modelRegistry.getAvailable();
 	const patterns = settings?.get("enabledModels");
 	if (!patterns || patterns.length === 0) return available;
-	return filterAvailableModelsByEnabledPatterns(available, patterns);
+	return filterAvailableModelsByEnabledPatterns(available, patterns, settings);
 }
 
 export interface ResolveCliModelResult {
@@ -1721,16 +1829,15 @@ export interface ResolveCliModelResult {
 	selector?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	warning: string | undefined;
+	/** True when the selector names a catalog model excluded by enabledModels. */
+	blockedByEnabledModels?: boolean;
 	error: string | undefined;
 }
 
 /**
- * Resolve a single model from CLI flags.
- *
- * Explicit `provider/id` references and authenticated bare ids take precedence
- * over configured role names, which in turn take precedence over an
- * unauthenticated catalog-only id (so a bundled `cursor/default` never shadows a
- * configured `modelRoles.default`).
+ * Resolve one CLI model selector. Exact selectors take precedence over roles,
+ * and roles take precedence over unauthenticated catalog-only IDs. A non-empty
+ * `enabledModels` setting remains authoritative over every CLI form.
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
@@ -1747,8 +1854,8 @@ export function resolveCliModel(options: {
 		return { model: undefined, selector: undefined, warning: undefined, error: undefined };
 	}
 
-	const allModels = modelRegistry.getAll();
-	if (allModels.length === 0) {
+	const catalogModels = modelRegistry.getAll();
+	if (catalogModels.length === 0) {
 		return {
 			model: undefined,
 			selector: undefined,
@@ -1757,9 +1864,10 @@ export function resolveCliModel(options: {
 		};
 	}
 
-	const availableModels = preferredModels ?? modelRegistry.getAvailable();
+	const allModels = filterModelsByEnabledSettings(catalogModels, settings);
+	const availableModels = filterModelsByEnabledSettings(preferredModels ?? modelRegistry.getAvailable(), settings);
 	const providerMap = new Map<string, string>();
-	for (const model of allModels) {
+	for (const model of catalogModels) {
 		providerMap.set(model.provider.toLowerCase(), model.provider);
 	}
 
@@ -1774,6 +1882,22 @@ export function resolveCliModel(options: {
 	}
 
 	const trimmedModel = cliModel.trim();
+	const findInventoryExact = (selector: string, models: Model<Api>[]): Model<Api> | undefined => {
+		const direct = findExactCliModel(selector, models, models, { catalogFallback: false });
+		if (direct) return direct;
+		const { base, level } = splitThinkingSuffix(selector, -1, MAX_THINKING_SUFFIX_OPTIONS);
+		return level ? findExactCliModel(base, models, models, { catalogFallback: false }) : undefined;
+	};
+	const isExcludedCatalogModel = (selector: string): boolean =>
+		findInventoryExact(selector, catalogModels) !== undefined &&
+		findInventoryExact(selector, allModels) === undefined;
+	const blockedResult = (selector: string): ResolveCliModelResult => ({
+		model: undefined,
+		selector: undefined,
+		warning: undefined,
+		error: `Model "${selector}" is excluded by enabledModels.`,
+		blockedByEnabledModels: true,
+	});
 	if (!provider) {
 		const exact = findExactCliModel(trimmedModel, allModels, availableModels, { catalogFallback: false });
 		if (exact) {
@@ -1859,6 +1983,9 @@ export function resolveCliModel(options: {
 			}
 		}
 	}
+	if (!provider && isExcludedCatalogModel(trimmedModel)) {
+		return blockedResult(trimmedModel);
+	}
 
 	let pattern = trimmedModel;
 
@@ -1890,6 +2017,9 @@ export function resolveCliModel(options: {
 				error: undefined,
 			};
 		}
+	}
+	if (provider && isExcludedCatalogModel(`${provider}/${pattern}`)) {
+		return blockedResult(`${provider}/${pattern}`);
 	}
 
 	const candidates = provider ? allModels.filter(model => model.provider === provider) : availableModels;

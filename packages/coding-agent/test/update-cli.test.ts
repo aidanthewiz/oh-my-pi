@@ -21,17 +21,19 @@ import {
 	resolveBunGlobalNodeModulesDirFromLocations,
 	resolveReleaseBinaryAsset,
 	resolveUpdateMethodForTest,
-	sweepStaleBackups,
+	resolveUpdateTargetFromPath,
+	sweepStaleUpdateArtifacts,
 	updateViaBinaryAt,
 } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
 import Update from "@oh-my-pi/pi-coding-agent/commands/update";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { CliConfig } from "@oh-my-pi/pi-utils/cli";
+import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 
 const tempDirs: string[] = [];
 
 async function makeTempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-update-test-"));
+	const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-update-test-")));
 	tempDirs.push(dir);
 	return dir;
 }
@@ -100,6 +102,15 @@ describe("update-cli libc detection", () => {
 });
 
 describe("update-cli install target detection", () => {
+	it("leaves Nix store installations under Nix management", () => {
+		const method = resolveUpdateMethodForTest(
+			"/nix/store/0123456789-omp-17.2.15/bin/omp",
+			"/nix/store/9876543210-bun-1.3.14/bin",
+		);
+
+		expect(method).toBe("nix");
+	});
+
 	it("uses bun update when prioritized omp is inside bun global bin", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.bun/bin/omp", "/Users/test/.bun/bin");
 
@@ -168,6 +179,135 @@ describe("update-cli install target detection", () => {
 		});
 
 		expect(method).toBe("npm");
+	});
+
+	it("updates the standalone binary behind a foreign npm-bin alias without replacing the alias", async () => {
+		const dir = await makeTempDir();
+		const npmBinDir = path.join(dir, ".npm-global", "bin");
+		const standalonePath = path.join(dir, ".local", "bin", "omp");
+		const aliasPath = path.join(npmBinDir, "omp");
+		await fs.mkdir(npmBinDir, { recursive: true });
+		await Bun.write(standalonePath, "binary");
+		await fs.symlink(standalonePath, aliasPath);
+
+		const target = resolveUpdateTargetFromPath(aliasPath, undefined, {
+			allowPackageManagers: true,
+			npmBinDir,
+		});
+
+		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
+		expect(await fs.readlink(aliasPath)).toBe(standalonePath);
+	});
+
+	it("keeps an npm-linked checkout under npm management instead of overwriting its resolved script", async () => {
+		const dir = await makeTempDir();
+		const npmPrefix = path.join(dir, ".npm-global");
+		const npmBinDir = path.join(npmPrefix, "bin");
+		const packagePath = path.join(npmPrefix, "lib", "node_modules", "@oh-my-pi", "pi-coding-agent");
+		const checkoutPath = path.join(dir, "checkout");
+		const checkoutCli = path.join(checkoutPath, "dist", "cli.js");
+		const aliasPath = path.join(npmBinDir, "omp");
+		await fs.mkdir(npmBinDir, { recursive: true });
+		await fs.mkdir(path.dirname(packagePath), { recursive: true });
+		await Bun.write(checkoutCli, "linked checkout");
+		await fs.symlink(checkoutPath, packagePath, "junction");
+		await fs.symlink(path.relative(npmBinDir, path.join(packagePath, "dist", "cli.js")), aliasPath);
+
+		const target = resolveUpdateTargetFromPath(aliasPath, undefined, {
+			allowPackageManagers: true,
+			npmBinDir,
+		});
+
+		expect(await fs.realpath(aliasPath)).toBe(checkoutCli);
+		expect(target).toEqual({ method: "npm", path: aliasPath });
+		expect(await Bun.file(checkoutCli).text()).toBe("linked checkout");
+	});
+
+	it("treats a Bun-bin alias into ~/.bun/custom as foreign", async () => {
+		const dir = await makeTempDir();
+		const bunDir = path.join(dir, ".bun");
+		const bunBinDir = path.join(bunDir, "bin");
+		const standalonePath = path.join(bunDir, "custom", "omp");
+		const aliasPath = path.join(bunBinDir, "omp");
+		await fs.mkdir(bunBinDir, { recursive: true });
+		await Bun.write(standalonePath, "binary");
+		await fs.symlink(path.relative(bunBinDir, standalonePath), aliasPath);
+
+		const target = resolveUpdateTargetFromPath(aliasPath, bunBinDir, {
+			allowPackageManagers: true,
+		});
+
+		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
+	});
+
+	it("resolves a foreign symlink to its real binary on a binary-only release instead of clobbering the launcher", async () => {
+		// Admin shared-install layout: a non-manager symlink in PATH points into
+		// a shared install dir. On a binary-only release the target must still be
+		// the resolved binary, not the launcher — otherwise the update writes
+		// beside a root-owned symlink (EACCES) or replaces it with a split-brain
+		// copy that shadows the shared install (#8732).
+		const dir = await makeTempDir();
+		const sharedBinDir = path.join(dir, "opt", "omp", "bin");
+		const standalonePath = path.join(sharedBinDir, "omp");
+		const launcherDir = path.join(dir, "usr", "local", "bin");
+		const launcherPath = path.join(launcherDir, "omp");
+		await fs.mkdir(sharedBinDir, { recursive: true });
+		await fs.mkdir(launcherDir, { recursive: true });
+		await Bun.write(standalonePath, "binary");
+		await fs.symlink(standalonePath, launcherPath);
+
+		const target = resolveUpdateTargetFromPath(launcherPath, undefined, {
+			allowPackageManagers: false,
+		});
+
+		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
+		expect(await fs.readlink(launcherPath)).toBe(standalonePath);
+	});
+
+	it("takes over a package-manager launcher in place on a binary-only release", async () => {
+		// A bun/npm-managed launcher symlinks into the manager's node_modules.
+		// A forced binary release cannot route through the manager, so the
+		// launcher is deliberately replaced in place, keeping the PATH entry live.
+		const dir = await makeTempDir();
+		const npmPrefix = path.join(dir, ".npm-global");
+		const npmBinDir = path.join(npmPrefix, "bin");
+		const managedBinary = path.join(npmPrefix, "lib", "node_modules", "@oh-my-pi", "pi-coding-agent", "omp");
+		const aliasPath = path.join(npmBinDir, "omp");
+		await fs.mkdir(npmBinDir, { recursive: true });
+		await fs.mkdir(path.dirname(managedBinary), { recursive: true });
+		await Bun.write(managedBinary, "binary");
+		await fs.symlink(managedBinary, aliasPath);
+
+		const target = resolveUpdateTargetFromPath(aliasPath, undefined, {
+			allowPackageManagers: false,
+			npmBinDir,
+		});
+
+		expect(target).toEqual({ method: "binary", path: aliasPath, replacesSymlink: true });
+	});
+
+	it("keeps a split-root Bun-linked checkout under Bun management instead of overwriting its script", async () => {
+		const dir = await makeTempDir();
+		const bunBinDir = path.join(dir, "bun-bin");
+		const bunGlobalDir = path.join(dir, "bun-global");
+		const packagePath = path.join(bunGlobalDir, "node_modules", "@oh-my-pi", "pi-coding-agent");
+		const checkoutPath = path.join(dir, "checkout");
+		const checkoutCli = path.join(checkoutPath, "dist", "cli.js");
+		const aliasPath = path.join(bunBinDir, "omp");
+		await fs.mkdir(bunBinDir, { recursive: true });
+		await fs.mkdir(path.dirname(packagePath), { recursive: true });
+		await Bun.write(checkoutCli, "linked checkout");
+		await fs.symlink(checkoutPath, packagePath, "junction");
+		await fs.symlink(path.relative(bunBinDir, path.join(packagePath, "dist", "cli.js")), aliasPath);
+
+		const target = resolveUpdateTargetFromPath(aliasPath, bunBinDir, {
+			allowPackageManagers: true,
+			bunGlobalDir,
+		});
+
+		expect(await fs.realpath(aliasPath)).toBe(checkoutCli);
+		expect(target).toEqual({ method: "bun", path: aliasPath });
+		expect(await Bun.file(checkoutCli).text()).toBe("linked checkout");
 	});
 
 	it("uses binary update when prioritized omp is outside bun global bin", () => {
@@ -241,6 +381,26 @@ describe("update-cli package manager commands", () => {
 	});
 });
 
+describe("update-cli package argument compatibility", () => {
+	it("installs custom package names in lock-step, with no default-name leftovers in the argv", () => {
+		const packages = { pkg: "@new/omp", natives: "@new/natives" };
+
+		const bunArgs = buildBunInstallArgs("17.0.0", "linux-x64", packages);
+		expect(bunArgs).toContain("@new/omp@17.0.0");
+		expect(bunArgs).toContain("@new/natives@17.0.0");
+		expect(bunArgs).toContain("@new/natives-linux-x64@17.0.0");
+		expect(bunArgs.some(arg => arg.startsWith("@oh-my-pi/"))).toBe(false);
+
+		expect(buildNpmInstallArgs("17.0.0", "linux-x64", packages)).toContain("@new/omp@17.0.0");
+	});
+
+	it("adds --force to npm argv only for rename migrations so the old package's bin can be clobbered", () => {
+		const packages = { pkg: "@new/omp", natives: "@new/natives" };
+		expect(buildNpmInstallArgs("17.0.0", "linux-x64", packages, { force: true })).toContain("--force");
+		expect(buildNpmInstallArgs("16.3.15", "win32-x64")).not.toContain("--force");
+	});
+});
+
 describe("update-cli bun install command", () => {
 	it("pins the official npm registry and bypasses the manifest cache so a stale mirror or snapshot cannot mask a freshly published version", () => {
 		// Regression: omp queries https://registry.npmjs.org/<pkg>/latest directly.
@@ -286,13 +446,23 @@ describe("update-cli bun install command", () => {
 		expect(args.some(arg => arg.startsWith("@oh-my-pi/pi-natives-"))).toBe(false);
 	});
 
-	it("derives global node_modules from supported bun global locations", () => {
-		expect(resolveBunGlobalNodeModulesDirFromLocations(path.join("home", ".bun", "bin"), undefined)).toBe(
-			path.join("home", ".bun", "install", "global", "node_modules"),
-		);
+	it("derives global node_modules from supported Bun locations with the explicit global directory taking precedence", () => {
 		expect(
-			resolveBunGlobalNodeModulesDirFromLocations(undefined, path.join("home", ".bun", "install", "cache")),
+			resolveBunGlobalNodeModulesDirFromLocations({
+				globalBinDir: path.join("home", ".bun", "bin"),
+			}),
 		).toBe(path.join("home", ".bun", "install", "global", "node_modules"));
+		expect(
+			resolveBunGlobalNodeModulesDirFromLocations({
+				cacheDir: path.join("home", ".bun", "install", "cache"),
+			}),
+		).toBe(path.join("home", ".bun", "install", "global", "node_modules"));
+		expect(
+			resolveBunGlobalNodeModulesDirFromLocations({
+				globalDir: path.join("root", "bun-global"),
+				globalBinDir: path.join("root", "bun-bin"),
+			}),
+		).toBe(path.join("root", "bun-global", "node_modules"));
 	});
 });
 
@@ -609,7 +779,8 @@ describe("update-cli release binary integrity", () => {
 		expect(requestAuthorizations).toEqual(["Bearer test-token", "Bearer test-token"]);
 		expect(await Bun.file(targetPath).text()).toBe(installed);
 		expect((await fs.stat(targetPath)).mode & 0o777).toBe(0o755);
-		expect(await Bun.file(`${targetPath}.new`).exists()).toBe(false);
+		const newResidue = (await fs.readdir(dir)).filter(name => name.endsWith(".new"));
+		expect(newResidue).toEqual([]);
 	});
 
 	it("explains how to authenticate when private-channel credentials are unavailable", async () => {
@@ -721,25 +892,164 @@ describe("update-cli binary replacement on locked backups", () => {
 	});
 });
 
-describe("update-cli stale backup sweep", () => {
-	it("reclaims timestamped and legacy backups while leaving unrelated .bak files", async () => {
+describe("update-cli stale update artifact sweep", () => {
+	it("reclaims timestamped and legacy backups and orphaned temps while sparing in-progress temps and unrelated files", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "omp.exe");
 		await Bun.write(targetPath, "current binary");
 		await Bun.write(`${targetPath}.bak`, "legacy backup");
 		await Bun.write(`${targetPath}.1700000000000.4242.bak`, "timestamped backup");
 		await Bun.write(`${targetPath}.1800000000000.99.bak`, "another backup");
-		// Must survive: foreign basename and a non-numeric middle segment.
+		// Orphaned temp files from a hard-killed download: reaped once older than
+		// the download window. Legacy fixed name and timestamped name both count.
+		const stale = new Date(Date.now() - 60 * 60 * 1000);
+		await Bun.write(`${targetPath}.new`, "legacy temp");
+		await fs.utimes(`${targetPath}.new`, stale, stale);
+		await Bun.write(`${targetPath}.1700000000000.4242.new`, "timestamped temp");
+		await fs.utimes(`${targetPath}.1700000000000.4242.new`, stale, stale);
+		// Must survive: a fresh temp still belongs to a concurrent, in-progress
+		// download (unique per attempt), plus foreign basenames and non-numeric
+		// middle segments.
+		await Bun.write(`${targetPath}.9999999999999.7.new`, "in-progress temp");
 		await Bun.write(path.join(dir, "notes.bak"), "keep me");
 		await Bun.write(`${targetPath}.config.bak`, "keep me too");
+		await Bun.write(`${targetPath}.config.new`, "keep me three");
 
-		await sweepStaleBackups(targetPath);
+		await sweepStaleUpdateArtifacts(targetPath);
 
 		expect(await Bun.file(targetPath).exists()).toBe(true);
 		expect(await Bun.file(`${targetPath}.bak`).exists()).toBe(false);
 		expect(await Bun.file(`${targetPath}.1700000000000.4242.bak`).exists()).toBe(false);
 		expect(await Bun.file(`${targetPath}.1800000000000.99.bak`).exists()).toBe(false);
+		expect(await Bun.file(`${targetPath}.new`).exists()).toBe(false);
+		expect(await Bun.file(`${targetPath}.1700000000000.4242.new`).exists()).toBe(false);
+		expect(await Bun.file(`${targetPath}.9999999999999.7.new`).exists()).toBe(true);
 		expect(await Bun.file(path.join(dir, "notes.bak")).exists()).toBe(true);
 		expect(await Bun.file(`${targetPath}.config.bak`).exists()).toBe(true);
+		expect(await Bun.file(`${targetPath}.config.new`).exists()).toBe(true);
+	});
+});
+
+describe("update-cli concurrent binary updates", () => {
+	const version = "999.0.0";
+	const tag = `v${version}`;
+	const binaryName = "omp-linux-x64";
+	const url = `https://github.com/${CF_ENGINE_RELEASE_REPO}/releases/download/${tag}/${binaryName}`;
+	const assetApiUrl = `https://api.github.com/repos/${CF_ENGINE_RELEASE_REPO}/releases/assets/999`;
+	const payload = Buffer.alloc(2048, 0x41);
+	const digest = `sha256:${createHash("sha256").update(payload).digest("hex")}`;
+
+	function metadata(): Response {
+		return Response.json({
+			tag_name: tag,
+			draft: false,
+			prerelease: false,
+			assets: [
+				{
+					name: binaryName,
+					state: "uploaded",
+					url: assetApiUrl,
+					size: payload.byteLength,
+					digest,
+					browser_download_url: url,
+				},
+			],
+		});
+	}
+
+	const fastFetch = async (input: string | URL | Request): Promise<Response> => {
+		const requestUrl = String(input);
+		if (requestUrl.endsWith("/releases/latest")) return metadata();
+		if (requestUrl === assetApiUrl) return new Response(payload);
+		throw new Error(`Unexpected request: ${requestUrl}`);
+	};
+
+	const verify = async () => ({ ok: true, actual: version });
+
+	async function prepare(): Promise<{ dir: string; targetPath: string }> {
+		const loadedTheme = await getThemeByName("dark");
+		if (!loadedTheme) throw new Error("theme unavailable");
+		setThemeInstance(loadedTheme);
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "omp");
+		await Bun.write(targetPath, "old binary");
+		return { dir, targetPath };
+	}
+
+	it("lets an overlapping slow run install after a fast run completes", async () => {
+		const { dir, targetPath } = await prepare();
+		const aWroteFirstChunk = Promise.withResolvers<void>();
+		const letAFinish = Promise.withResolvers<void>();
+		const slowFetch = async (input: string | URL | Request): Promise<Response> => {
+			const requestUrl = String(input);
+			if (requestUrl.endsWith("/releases/latest")) return metadata();
+			if (requestUrl === assetApiUrl) {
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						async start(controller) {
+							controller.enqueue(payload.subarray(0, 1024));
+							aWroteFirstChunk.resolve();
+							await letAFinish.promise;
+							controller.enqueue(payload.subarray(1024));
+							controller.close();
+						},
+					}),
+				);
+			}
+			throw new Error(`Unexpected request: ${requestUrl}`);
+		};
+
+		const runA = updateViaBinaryAt(targetPath, version, {
+			binaryName,
+			fetchImpl: slowFetch,
+			githubToken: "test-token",
+			verifyInstalledVersion: verify,
+		});
+		await aWroteFirstChunk.promise;
+		await updateViaBinaryAt(targetPath, version, {
+			binaryName,
+			fetchImpl: fastFetch,
+			githubToken: "test-token",
+			verifyInstalledVersion: verify,
+		});
+		letAFinish.resolve();
+		await runA;
+
+		expect(await Bun.file(targetPath).bytes()).toEqual(new Uint8Array(payload));
+		const residue = (await fs.readdir(dir)).filter(name => name.endsWith(".new"));
+		expect(residue).toEqual([]);
+	});
+
+	it("rolls back its backup when verification fails while another update runs", async () => {
+		const { dir, targetPath } = await prepare();
+		const enteredVerify = Promise.withResolvers<void>();
+		const releaseVerify = Promise.withResolvers<void>();
+		const failingVerify = async () => {
+			enteredVerify.resolve();
+			await releaseVerify.promise;
+			return { ok: false, actual: "0.0.0", path: targetPath };
+		};
+
+		const runA = updateViaBinaryAt(targetPath, version, {
+			binaryName,
+			fetchImpl: fastFetch,
+			githubToken: "test-token",
+			verifyInstalledVersion: failingVerify,
+		});
+		await enteredVerify.promise;
+		const runB = updateViaBinaryAt(targetPath, version, {
+			binaryName,
+			fetchImpl: fastFetch,
+			githubToken: "test-token",
+			verifyInstalledVersion: verify,
+		});
+		releaseVerify.resolve();
+		await expect(runA).rejects.toThrow(/still reports 0\.0\.0 \(expected 999\.0\.0\)/);
+		await runB;
+
+		expect(await Bun.file(targetPath).bytes()).toEqual(new Uint8Array(payload));
+		const residue = (await fs.readdir(dir)).filter(name => name.endsWith(".bak") || name.endsWith(".new"));
+		expect(residue).toEqual([]);
 	});
 });

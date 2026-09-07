@@ -87,7 +87,6 @@ export function detectCompiledBinary({ embeddedAddon, env, importMetaUrl }) {
 	}
 	return false;
 }
-
 /**
  * @param {{ tag: string; arch: string; variant: "modern" | "baseline" | null | undefined }} input
  * @returns {string[]}
@@ -719,19 +718,13 @@ function installNativeTokioRuntime(bindings) {
 }
 
 
-function buildHelpMessage(ctx) {
+export function buildHelpMessage(ctx) {
 	if (ctx.isCompiledBinary) {
 		const expectedPaths = ctx.addonFilenames.map(filename => `  ${path.join(ctx.versionedDir, filename)}`).join("\n");
-		const downloadHints = ctx.addonFilenames
-			.map(filename => {
-				const downloadUrl = `https://github.com/can1357/oh-my-pi/releases/latest/download/${filename}`;
-				const targetPath = path.join(ctx.versionedDir, filename);
-				return `  curl -fsSL "${downloadUrl}" -o "${targetPath}"`;
-			})
-			.join("\n");
 		return (
 			`The compiled binary should extract one of:\n${expectedPaths}\n\n` +
-			`If missing, delete ${ctx.versionedDir} and re-run, or download manually:\n${downloadHints}`
+			`If missing or stale, delete ${ctx.versionedDir} and re-run. ` +
+			"If extraction still fails, reinstall the compiled binary from the same release channel."
 		);
 	}
 	return (

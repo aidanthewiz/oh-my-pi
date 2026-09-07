@@ -134,4 +134,15 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(s.model?.id).toBe(from.id);
 		expect(getApiKeySpy).not.toHaveBeenCalled();
 	});
+
+	it("rejects model and role switches outside enabledModels", async () => {
+		const from = modelOrThrow("claude-sonnet-4-5");
+		const to = modelOrThrow("claude-sonnet-4-6");
+		const s = makeSession(from, { slow: `${to.provider}/${to.id}` });
+		s.settings.override("enabledModels", [`${from.provider}/${from.id}`]);
+
+		expect(s.resolveRoleModel("slow")).toBeUndefined();
+		await expect(s.setModel(to)).rejects.toThrow(`Model "${to.provider}/${to.id}" is excluded by enabledModels`);
+		expect(s.model?.id).toBe(from.id);
+	});
 });

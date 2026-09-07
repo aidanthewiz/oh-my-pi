@@ -36,7 +36,7 @@ import {
 	type WatchdogConfigDoc,
 } from "../../advisor";
 import type { ModelRegistry } from "../../config/model-registry";
-import { formatModelSelectorValue } from "../../config/model-resolver";
+import { formatModelSelectorValue, getAllowedAvailableModels } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
 import type { PerAdvisorStat } from "../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../session/auth-storage";
@@ -530,7 +530,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			models = this.#scopedModels.map(scoped => scoped.model);
 		} else {
 			try {
-				models = this.#modelRegistry.getAvailable();
+				models = getAllowedAvailableModels(this.#modelRegistry, this.#settings);
 			} catch {
 				models = [];
 			}

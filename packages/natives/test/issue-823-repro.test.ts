@@ -30,6 +30,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	buildHelpMessage,
 	detectCompiledBinary,
 	type EmbeddedAddonFile,
 	extractEmbeddedAddonArchive,
@@ -195,6 +196,20 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(candidates).toEqual(
 			addonFilenames.flatMap(filename => [path.join(nativeDir, filename), path.join(execDir, filename)]),
 		);
+	});
+
+	it("does not direct compiled binaries to upstream native assets", () => {
+		const versionedDir = "/home/u/.omp/natives/17.3.6";
+		const message = buildHelpMessage({
+			isCompiledBinary: true,
+			versionedDir,
+			addonFilenames: ["pi_natives.linux-x64-modern.node"],
+		});
+
+		expect(message).toContain(path.join(versionedDir, "pi_natives.linux-x64-modern.node"));
+		expect(message).toContain("reinstall the compiled binary from the same release channel");
+		expect(message).not.toContain("github.com");
+		expect(message).not.toContain("can1357/oh-my-pi");
 	});
 
 	it("extracts all bundled native variants from one gzip archive and skips current files", async () => {

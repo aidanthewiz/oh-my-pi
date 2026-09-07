@@ -58,6 +58,10 @@ export const grievancesHelp = {
 
 export const identityHelp = { description: "Manage the signed-in Coreforge identity" } satisfies CommandMetadata;
 
+export const imagesHelp = {
+	description: "Inspect, diagnose, probe, and purge image publication backends",
+} satisfies CommandMetadata;
+
 export const installHelp = {
 	description: "Install or link an extension package (alias of `plugin install`/`plugin link`)",
 } satisfies CommandMetadata;
@@ -69,6 +73,10 @@ export const mcpHelp = { description: "Configure MCP server selections" } satisf
 export const modelsHelp = { description: "List, search, and refresh available models" } satisfies CommandMetadata;
 
 export const pluginHelp = { description: "Manage plugins (install, uninstall, list, etc.)" } satisfies CommandMetadata;
+
+export const psHelp = {
+	description: "List and control daemon-supervised background processes (logs, stop, kill, restart)",
+} satisfies CommandMetadata;
 
 export const readHelp = {
 	description: "Show what the read tool will return for a path, URL, or internal URI",

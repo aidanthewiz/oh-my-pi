@@ -19,9 +19,9 @@ interface TemplateProbeResult {
 }
 
 const expectedTemplate: TemplateProbeResult = {
-	chars: 376_324,
-	bytes: 376_480,
-	sha256: "0dd951cd3e5199fce0f0ca045bf55626d92d469b520dd10211c544542764735e",
+	chars: 376_450,
+	bytes: 376_606,
+	sha256: "cd0ba6f0b27084c4fb3fcc580a67491a785b9ed0eb93e086d5c231eddae6ad47",
 	stableCache: true,
 	assetsRemoved: 0,
 };

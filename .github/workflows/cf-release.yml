@@ -204,8 +204,8 @@ jobs:
             "$PKG".*) echo "tag $TAG rolls upstream $PKG - ok" ;;
             *) echo "tag $TAG does not extend package version $PKG"; exit 1 ;;
           esac
-      - name: Reclaim disk for Windows native cross-build
-        if: matrix.target == 'win32-x64'
+      - name: Reclaim disk for large native builds
+        if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL

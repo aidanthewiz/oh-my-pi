@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import {
 	DAEMON_BROKER_PROTOCOL_VERSION,
 	type DaemonOperation,
@@ -97,6 +99,13 @@ describe("launch logs compatibility", () => {
 				operation: { op: "ping" },
 			}),
 		).toThrow(`expected ${DAEMON_BROKER_PROTOCOL_VERSION}`);
+	});
+
+	it("isolates broker state by protocol version", () => {
+		const runtimeRoot = path.join("runtime", "root");
+		expect(daemonBrokerRuntimeDir(runtimeRoot)).toBe(
+			path.join(runtimeRoot, `broker-v${DAEMON_BROKER_PROTOCOL_VERSION}`),
+		);
 	});
 
 	it("decodes raw terminal text from an already-running legacy broker", () => {

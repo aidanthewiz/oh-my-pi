@@ -12,10 +12,16 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, compareVersions, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
 import { theme } from "../modes/theme/theme";
-import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
-import type { CfRelease } from "./cf-channel";
+import {
+	isTimeoutError,
+	isUnsupportedProxyError,
+	unsupportedProxyMessage,
+	withTimeoutSignal,
+} from "../utils/fetch-timeout";
+import type { CfFetchOptions, CfRelease } from "./cf-channel";
 import { CF_ENGINE_RELEASE_REPO, fetchCfAsset, fetchCfLatestRelease } from "./cf-channel";
 import { CF_VERSION, compareCfVersions } from "./cf-version";
 
@@ -24,6 +30,7 @@ import { CF_VERSION, compareCfVersions } from "./cf-version";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
+const NIX_STORE_DIR = "/nix/store";
 /**
  * Official npm registry origin.
  *
@@ -67,6 +74,14 @@ function currentNativeTag(): string {
 	return `${process.platform}-${process.arch}`;
 }
 
+/** npm package names retained for update argument compatibility tests. */
+export interface ReleasePackages {
+	pkg: string;
+	natives: string;
+}
+
+const CURRENT_PACKAGES: ReleasePackages = { pkg: PACKAGE, natives: NATIVES_PACKAGE };
+
 interface ReleaseInfo {
 	tag: string;
 	version: string;
@@ -85,6 +100,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+
  * Select and validate the binary asset from GitHub release metadata.
  */
 export function resolveReleaseBinaryAsset(
@@ -162,6 +178,7 @@ export async function downloadVerifiedBinary(options: VerifiedBinaryDownloadOpti
 		if (isTimeoutError(err)) {
 			throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
 		}
+		if (isUnsupportedProxyError(err)) throw new Error(unsupportedProxyMessage(), { cause: err });
 		throw err;
 	}
 	if (!response.ok || !response.body) {
@@ -201,6 +218,7 @@ export async function downloadVerifiedBinary(options: VerifiedBinaryDownloadOpti
 		if (isTimeoutError(err)) {
 			throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
 		}
+		if (isUnsupportedProxyError(err)) throw new Error(unsupportedProxyMessage(), { cause: err });
 		throw err;
 	}
 }
@@ -316,6 +334,14 @@ function tryRealpath(p: string): string | undefined {
 	}
 }
 
+function isSymlinkPath(p: string): boolean {
+	try {
+		return fs.lstatSync(p).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
 function isPathInDirectoryLexical(filePath: string, directoryPath: string): boolean {
 	const normalizedPath = normalizePathForComparison(path.resolve(filePath));
 	const normalizedDirectory = normalizePathForComparison(path.resolve(directoryPath));
@@ -342,13 +368,36 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateMethod = "brew" | "mise" | "bun" | "npm" | "binary";
+function isPathInManagerRoot(linkTarget: string, nodeModulesDir: string): boolean {
+	if (isPathInDirectoryLexical(linkTarget, nodeModulesDir)) return true;
+	// Resolve only the manager root. Resolving the link target itself would
+	// follow globally linked packages into their checkout and lose ownership.
+	const nodeModulesReal = tryRealpath(path.resolve(nodeModulesDir));
+	return nodeModulesReal !== undefined && isPathInDirectoryLexical(linkTarget, nodeModulesReal);
+}
+
+function resolveNpmGlobalNodeModulesDir(globalBinDir: string | undefined): string | undefined {
+	if (!globalBinDir) return undefined;
+	if (process.platform === "win32") return path.join(globalBinDir, "node_modules");
+	return path.join(path.dirname(globalBinDir), "lib", "node_modules");
+}
+
+function isManagerOwnedBinEntry(linkTarget: string | undefined, nodeModulesDir: string | undefined): boolean {
+	// Non-symlink launchers and unreadable links retain the existing bin-dir
+	// classification. A readable link must point through the manager's exact
+	// global node_modules tree.
+	return linkTarget === undefined || (nodeModulesDir !== undefined && isPathInManagerRoot(linkTarget, nodeModulesDir));
+}
+
+type UpdateMethod = "brew" | "mise" | "nix" | "bun" | "npm" | "binary";
 
 interface UpdateMethodResolutionOptions {
 	homebrewPrefix?: string;
 	miseBinDirs?: readonly string[];
 	miseDataDir?: string;
 	npmBinDir?: string;
+	/** Bun's configured global package directory, independent of its bin directory. */
+	bunGlobalDir?: string;
 	/**
 	 * Whether the resolved omp path is a plain file (the standalone binary)
 	 * rather than a package-manager symlink. Stops a binary install from being
@@ -356,24 +405,48 @@ interface UpdateMethodResolutionOptions {
 	 * target directory.
 	 */
 	ompIsRegularFile?: boolean;
+	/**
+	 * Absolute path named by the bin entry's first symlink hop. This deliberately
+	 * preserves a global package symlink instead of resolving into its checkout.
+	 */
+	ompLinkTarget?: string;
+	/**
+	 * Whether package-manager routing (bun/npm) is permitted. Binary-only
+	 * releases pass `false`: a manager launcher then resolves to `"binary"` and
+	 * is taken over in place rather than reinstalled through its manager. Defaults
+	 * to `true` in {@link resolveUpdateMethod} so callers that only classify need
+	 * not set it.
+	 */
+	allowPackageManagers?: boolean;
 }
 
 type UpdateTarget =
 	| { method: "brew" }
 	| { method: "mise" }
-	| { method: "bun" }
-	| { method: "npm" }
-	| { method: "binary"; path: string };
+	| { method: "nix" }
+	| { method: "bun"; path?: string }
+	| { method: "npm"; path?: string }
+	| { method: "binary"; path: string; replacesSymlink: boolean };
 
 function resolveUpdateMethod(
 	ompPath: string,
 	bunBinDir: string | undefined,
 	options: UpdateMethodResolutionOptions = {},
 ): UpdateMethod {
-	const { homebrewPrefix, miseBinDirs = [], miseDataDir, npmBinDir, ompIsRegularFile = false } = options;
+	const {
+		allowPackageManagers = true,
+		bunGlobalDir,
+		homebrewPrefix,
+		miseBinDirs = [],
+		miseDataDir,
+		npmBinDir,
+		ompIsRegularFile = false,
+		ompLinkTarget,
+	} = options;
 	const launcherExtension = path.extname(ompPath).toLowerCase();
 	const isWindowsScriptLauncher =
 		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
+	if (isPathInDirectory(ompPath, NIX_STORE_DIR)) return "nix";
 	if (homebrewPrefix && isPathInDirectory(ompPath, path.join(homebrewPrefix, "bin"))) return "brew";
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
 	if (miseDataDir && isPathInDirectory(ompPath, path.join(miseDataDir, "shims"))) return "mise";
@@ -387,9 +460,30 @@ function resolveUpdateMethod(
 	// (bun's .exe launcher, npm's .cmd/.ps1), so a regular file is NOT evidence
 	// of a standalone install and the override would hijack managed installs.
 	const isStandaloneRegularFile = ompIsRegularFile && process.platform !== "win32";
-	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir) && !isStandaloneRegularFile) return "bun";
-	if ((npmBinDir && isPathInDirectory(ompPath, npmBinDir) && !isStandaloneRegularFile) || isWindowsScriptLauncher)
+	const bunNodeModulesDir = resolveBunGlobalNodeModulesDirFromLocations({
+		globalDir: bunGlobalDir,
+		globalBinDir: bunBinDir,
+	});
+	if (
+		allowPackageManagers &&
+		bunBinDir &&
+		isPathInDirectory(ompPath, bunBinDir) &&
+		!isStandaloneRegularFile &&
+		isManagerOwnedBinEntry(ompLinkTarget, bunNodeModulesDir)
+	) {
+		return "bun";
+	}
+	const npmNodeModulesDir = resolveNpmGlobalNodeModulesDir(npmBinDir);
+	if (
+		allowPackageManagers &&
+		npmBinDir &&
+		isPathInDirectory(ompPath, npmBinDir) &&
+		!isStandaloneRegularFile &&
+		isManagerOwnedBinEntry(ompLinkTarget, npmNodeModulesDir)
+	) {
 		return "npm";
+	}
+	if (isWindowsScriptLauncher) return "npm";
 	return "binary";
 }
 
@@ -400,35 +494,95 @@ export function resolveUpdateMethodForTest(
 ): UpdateMethod {
 	return resolveUpdateMethod(ompPath, bunBinDir, options);
 }
-/** Resolve the owner of the running install before selecting an update path. */
-async function resolveUpdateTarget(): Promise<UpdateTarget> {
-	const bunBinDir = await getBunGlobalBinDir();
-	const npmBinDir = await getNpmGlobalBinDir();
+
+/** Resolve an update target from the concrete PATH entry selected by the shell. */
+export function resolveUpdateTargetFromPath(
+	ompPath: string,
+	bunBinDir: string | undefined,
+	options: UpdateMethodResolutionOptions & { allowPackageManagers: boolean },
+): UpdateTarget {
+	let ompIsRegularFile = false;
+	let ompIsSymlink = false;
+	let ompLinkTarget: string | undefined;
+	let ompRealpath: string | undefined;
+	try {
+		const stat = fs.lstatSync(ompPath);
+		ompIsRegularFile = stat.isFile() && !stat.isSymbolicLink();
+		ompIsSymlink = stat.isSymbolicLink();
+		if (ompIsSymlink) {
+			const rawTarget = fs.readlinkSync(ompPath);
+			const linkDir = path.dirname(ompPath);
+			ompLinkTarget = path.resolve(tryRealpath(linkDir) ?? linkDir, rawTarget);
+			ompRealpath = tryRealpath(ompPath);
+		}
+	} catch {}
+
+	const method = resolveUpdateMethod(ompPath, bunBinDir, {
+		...options,
+		ompIsRegularFile,
+		ompLinkTarget,
+	});
+	if (method === "binary") {
+		// A symlinked launcher created by bun/npm is taken over in place on a
+		// binary-only release: routing through the manager is impossible, so the
+		// standalone binary replaces the launcher and keeps the PATH entry live.
+		// Every other symlink — a foreign alias, or an admin symlink into a
+		// shared install — is self-healing: update the real binary it resolves
+		// to and leave the launcher untouched, in every distribution channel.
+		// The old channel gate clobbered these foreign launchers on binary-only
+		// releases (EACCES on a root-owned link dir, or a stale split-brain copy
+		// of the binary shadowing the shared install).
+		const managerLauncher =
+			ompIsSymlink &&
+			!options.allowPackageManagers &&
+			resolveUpdateMethod(ompPath, bunBinDir, {
+				...options,
+				allowPackageManagers: true,
+				ompIsRegularFile,
+				ompLinkTarget,
+			}) !== "binary";
+		const binaryPath = ompIsSymlink && !managerLauncher ? (ompRealpath ?? ompPath) : ompPath;
+		return { method, path: binaryPath, replacesSymlink: ompIsSymlink && binaryPath === ompPath };
+	}
+	if (method === "bun" || method === "npm") return { method, path: ompPath };
+	return { method };
+}
+/**
+ * Resolve how the running install should be updated.
+ *
+ * `allowPackageManagers: false` disables bun/npm routing — used for
+ * binary-only releases, where reinstalling through a package manager is never
+ * valid. The `bun pm bin -g` / `npm prefix -g` probes are then skipped unless
+ * the launcher is a symlink, whose bin dirs distinguish a manager launcher
+ * (taken over in place) from a foreign symlink (resolved to its real binary).
+ * Homebrew/mise detection always runs: both managers install GitHub release
+ * binaries and stay valid regardless of how the release is distributed.
+ */
+async function resolveUpdateTarget(options: { allowPackageManagers: boolean }): Promise<UpdateTarget> {
 	const homebrewPrefix = await getHomebrewFormulaPrefix();
 	const miseAvailable = $which("mise") !== undefined;
 	const miseBinDirs = miseAvailable ? await getMiseBinDirs() : [];
 	const miseDataDir = miseAvailable ? getMiseDataDir() : undefined;
 	const ompPath = resolveOmpPath();
 
+	// Binary-only releases skip package-manager routing, but a symlinked
+	// launcher still needs the manager bin dirs to tell a bun/npm launcher
+	// (taken over in place) from a foreign symlink (resolved to its real
+	// binary). A plain-file install never needs the distinction, so the common
+	// case stays probe-free.
+	const probeManagers = options.allowPackageManagers || (ompPath !== undefined && isSymlinkPath(ompPath));
+	const bunBinDir = probeManagers ? await getBunGlobalBinDir() : undefined;
+	const npmBinDir = probeManagers ? await getNpmGlobalBinDir() : undefined;
+
 	if (ompPath) {
-		// Package-manager installs symlink the bin entry into node_modules; the
-		// standalone installer writes a plain executable. When the global bin dir
-		// overlaps the installer's default (~/.local/bin), that file type — not
-		// directory containment — distinguishes a binary install from npm/bun.
-		let ompIsRegularFile = false;
-		try {
-			const stat = fs.lstatSync(ompPath);
-			ompIsRegularFile = stat.isFile() && !stat.isSymbolicLink();
-		} catch {}
-		const method = resolveUpdateMethod(ompPath, bunBinDir, {
+		return resolveUpdateTargetFromPath(ompPath, bunBinDir, {
+			allowPackageManagers: options.allowPackageManagers,
+			bunGlobalDir: probeManagers ? process.env.BUN_INSTALL_GLOBAL_DIR : undefined,
 			homebrewPrefix,
 			miseBinDirs,
 			miseDataDir,
 			npmBinDir,
-			ompIsRegularFile,
 		});
-		if (method === "binary") return { method, path: ompPath };
-		return { method };
 	}
 
 	if (bunBinDir) return { method: "bun" };
@@ -437,21 +591,25 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 }
 
 /**
- * Get the latest release info from the coreforge channel (the private
- * Coreforce-CAD mirror's GitHub Releases). [coreforge patch: upstream
- * queries the npm registry here.]
+ * Get the latest release info from the Coreforge channel.
+ * Release lookups use the private Coreforce-CAD mirror, not npm.
  */
 let lastCfRelease: CfRelease | undefined;
-async function getLatestRelease(): Promise<ReleaseInfo> {
+async function fetchLatestCoreforgeRelease(options?: CfFetchOptions): Promise<CfRelease> {
 	try {
-		lastCfRelease = await fetchCfLatestRelease(withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS));
-		return { tag: lastCfRelease.tag, version: lastCfRelease.version };
+		return await fetchCfLatestRelease(withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS), options);
 	} catch (err) {
 		if (isTimeoutError(err)) {
 			throw new Error("Timed out fetching release info after 30s", { cause: err });
 		}
+		if (isUnsupportedProxyError(err)) throw new Error(unsupportedProxyMessage(), { cause: err });
 		throw err;
 	}
+}
+
+async function getLatestRelease(): Promise<ReleaseInfo> {
+	lastCfRelease = await fetchLatestCoreforgeRelease();
+	return { tag: lastCfRelease.tag, version: lastCfRelease.version };
 }
 
 interface BunInstallCachePruneResult {
@@ -606,10 +764,19 @@ export async function pruneBunInstallCache(
 
 // [coreforge patch] resolveBunInstallCacheDir removed with the bun channel.
 
-export function resolveBunGlobalNodeModulesDirFromLocations(
-	globalBinDir: string | undefined,
-	cacheDir: string | undefined,
-): string | undefined {
+interface BunGlobalInstallLocations {
+	globalDir?: string;
+	globalBinDir?: string;
+	cacheDir?: string;
+}
+
+/** Resolve Bun's global node_modules root from explicit, default, or cache locations. */
+export function resolveBunGlobalNodeModulesDirFromLocations({
+	globalDir,
+	globalBinDir,
+	cacheDir,
+}: BunGlobalInstallLocations): string | undefined {
+	if (globalDir && globalDir.length > 0) return path.join(globalDir, "node_modules");
 	if (globalBinDir && globalBinDir.length > 0) {
 		return path.join(path.dirname(globalBinDir), "install", "global", "node_modules");
 	}
@@ -768,8 +935,8 @@ async function unlinkIfExists(filePath: string): Promise<void> {
  * running process image, so unlinking it fails with EPERM/EACCES until this
  * process exits (issue #845). The replacement and verification already
  * succeeded by the time we get here, so every error is swallowed; the leftover
- * is reclaimed by {@link sweepStaleBackups} on the next update once it is no
- * longer in use. Returns whether the file is gone.
+ * is reclaimed by {@link sweepStaleUpdateArtifacts} on the next update once it
+ * is no longer in use. Returns whether the file is gone.
  */
 async function removeBackupBestEffort(filePath: string): Promise<boolean> {
 	try {
@@ -781,16 +948,21 @@ async function removeBackupBestEffort(filePath: string): Promise<boolean> {
 }
 
 /**
- * Best-effort removal of binary-update backups left by earlier runs.
+ * Best-effort removal of binary-update leftovers from earlier runs.
  *
- * Each self-update moves the previous executable to `<binary>.<timestamp>.<pid>.bak`
- * before swapping the new one in. On Windows that backup cannot be deleted
- * while the updating process is alive, so it is left for a later run to reclaim
- * once its owning process has exited. Also matches the legacy fixed
- * `<binary>.bak` name produced before backups were timestamped, so users
- * upgrading from a buggy release get the orphaned file cleaned up.
+ * Each self-update writes to `<binary>.<timestamp>.<pid>.new` and moves the
+ * previous executable to `<binary>.<timestamp>.<pid>.bak` before swapping the
+ * new one in. On Windows a backup cannot be deleted while the updating process
+ * is alive (it is the running process image), so it is left for a later run to
+ * reclaim once its owning process has exited. A `.new` temp file only survives
+ * a hard kill mid-download; it is reaped once older than the download window,
+ * which a live download cannot exceed without timing out and cleaning up after
+ * itself — so a concurrent run's in-progress temp is never deleted. Legacy
+ * fixed `<binary>.bak` / `<binary>.new` names (from before suffixes were made
+ * unique) are matched too, so users upgrading from a buggy release get the
+ * orphaned files cleaned up.
  */
-export async function sweepStaleBackups(targetPath: string): Promise<void> {
+export async function sweepStaleUpdateArtifacts(targetPath: string): Promise<void> {
 	const dir = path.dirname(targetPath);
 	const base = path.basename(targetPath);
 	let entries: string[];
@@ -799,13 +971,28 @@ export async function sweepStaleBackups(targetPath: string): Promise<void> {
 	} catch {
 		return;
 	}
+	const now = Date.now();
 	for (const entry of entries) {
-		if (!entry.startsWith(`${base}.`) || !entry.endsWith(".bak")) continue;
-		// Legacy "<base>.bak" → empty middle; new "<base>.<timestamp>.<pid>.bak"
-		// → dot-separated numeric run. Anything else is an unrelated *.bak file.
-		const middle = entry.slice(base.length + 1, entry.length - ".bak".length);
+		if (!entry.startsWith(`${base}.`)) continue;
+		const suffix = entry.endsWith(".bak") ? ".bak" : entry.endsWith(".new") ? ".new" : undefined;
+		if (!suffix) continue;
+		// Legacy "<base><suffix>" → empty middle; new "<base>.<timestamp>.<pid><suffix>"
+		// → dot-separated numeric run. Anything else is an unrelated file.
+		const middle = entry.slice(base.length + 1, entry.length - suffix.length);
 		if (middle.length > 0 && !/^\d+(\.\d+)*$/.test(middle)) continue;
-		await removeBackupBestEffort(path.join(dir, entry));
+		const full = path.join(dir, entry);
+		if (suffix === ".new") {
+			// A temp file may belong to a concurrent update still downloading, so
+			// only reap ones older than the download window.
+			let mtimeMs: number;
+			try {
+				mtimeMs = (await fs.promises.stat(full)).mtimeMs;
+			} catch {
+				continue;
+			}
+			if (now - mtimeMs < BINARY_DOWNLOAD_TIMEOUT_MS) continue;
+		}
+		await removeBackupBestEffort(full);
 	}
 }
 
@@ -846,10 +1033,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
-function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: string): string[] {
-	const args = [`${PACKAGE}@${expectedVersion}`, `${NATIVES_PACKAGE}@${expectedVersion}`];
+function buildVersionedPackageInstallArgs(
+	expectedVersion: string,
+	nativeTag: string,
+	packages: ReleasePackages,
+): string[] {
+	const args = [`${packages.pkg}@${expectedVersion}`, `${packages.natives}@${expectedVersion}`];
 	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
-		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
+		args.push(`${packages.natives}-${nativeTag}@${expectedVersion}`);
 	}
 	return args;
 }
@@ -884,25 +1075,41 @@ function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: st
  * the original "no matching version" message instead of `EBADPLATFORM`.
  * See #1824.
  */
-export function buildBunInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
+export function buildBunInstallArgs(
+	expectedVersion: string,
+	nativeTag: string = currentNativeTag(),
+	packages: ReleasePackages = CURRENT_PACKAGES,
+): string[] {
 	return [
 		"install",
 		"-g",
 		"--no-cache",
 		`--registry=${NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
 	];
 }
 
-/** Build the npm argv used to update npm-managed global installs. */
-export function buildNpmInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
-	const args = [
+/**
+ * Build the npm argv used to update npm-managed global installs.
+ *
+ * `force` is set only for rename migrations: npm refuses to write the `omp`
+ * bin while the old package still owns it (`EEXIST`), and the migration
+ * installs the new package BEFORE removing the old one so a failed install
+ * never leaves the user without a working `omp`.
+ */
+export function buildNpmInstallArgs(
+	expectedVersion: string,
+	nativeTag: string = currentNativeTag(),
+	packages: ReleasePackages = CURRENT_PACKAGES,
+	flags: { force?: boolean } = {},
+): string[] {
+	return [
 		"install",
 		"-g",
+		...(flags.force ? ["--force"] : []),
 		`--registry=${NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
 	];
-	return args;
 }
 
 export function buildHomebrewUpdateArgs(force: boolean): string[] {
@@ -934,7 +1141,7 @@ async function downloadCoreforgeBinary(
 		tokenOverride: githubToken === undefined ? undefined : githubToken.trim() || null,
 	};
 	if (fetchImpl || githubToken !== undefined || lastCfRelease?.version !== expectedVersion) {
-		lastCfRelease = await fetchCfLatestRelease(withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS), requestOptions);
+		lastCfRelease = await fetchLatestCoreforgeRelease(requestOptions);
 	}
 	if (lastCfRelease.version !== expectedVersion) {
 		throw new Error(`GitHub release tag mismatch: expected v${expectedVersion}, received ${lastCfRelease.tag}`);
@@ -974,6 +1181,11 @@ async function downloadCoreforgeBinary(
 	return expectedDigest;
 }
 
+// Monotonic within this process so two updates started in the same millisecond
+// (same pid, same `Date.now()`) still get distinct temp/backup paths. Kept
+// numeric so the artifact sweep's `\d+(\.\d+)*` matcher still reclaims them.
+let updateAttemptSeq = 0;
+
 /**
  * Download a release binary to a target path, replacing an existing file.
  * [coreforge patch: private-repo assets are fetched through the GitHub asset
@@ -990,25 +1202,44 @@ export async function updateViaBinaryAt(
 	} = {},
 ): Promise<void> {
 	const binaryName = options.binaryName ?? getBinaryName();
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.${Date.now()}.${process.pid}.bak`;
+	// Unique per attempt so two overlapping `omp update` runs never share a temp
+	// or backup path. A fixed temp name (`<binary>.new`) let the second run's
+	// pre-download unlink delete the first run's still-downloading temp file; the
+	// first kept writing to its open fd (size + digest still passed), then chmod
+	// hit the missing path and the update aborted (issue #8434). The backup needs
+	// the same uniqueness: a stale backup from an earlier update may still be
+	// locked (the previous process image on Windows), so a fixed name would force
+	// the move-aside rename to overwrite it. pid, timestamp, and a process-local
+	// counter keep two updates started in the same millisecond from colliding.
+	const attempt = `${Date.now()}.${process.pid}.${updateAttemptSeq++}`;
+	const tempPath = `${targetPath}.${attempt}.new`;
+	const backupPath = `${targetPath}.${attempt}.bak`;
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
 	await downloadCoreforgeBinary(tempPath, expectedVersion, binaryName, options.fetchImpl, options.githubToken);
 
-	console.log(chalk.dim("Installing update..."));
-	await replaceBinaryForUpdate({
-		targetPath,
-		tempPath,
-		backupPath,
-		expectedVersion,
-		verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
+	// Serialize the target swap and stale-artifact sweep per target so two
+	// overlapping `omp update` runs never replace the same binary concurrently
+	// or reclaim each other's live backup/temp files. The download above writes
+	// to a unique temp path and is safe to overlap; only the swap is shared.
+	await withFileLock(targetPath, async () => {
+		console.log(chalk.dim("Installing update..."));
+		await replaceBinaryForUpdate({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion,
+			verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
+		});
+		// Reclaim backups from earlier updates whose owning process has since exited.
+		await sweepStaleUpdateArtifacts(targetPath);
 	});
-	await sweepStaleBackups(targetPath);
+
 	printVerifiedVersion(expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
 /**
+
  * Run the update command.
  */
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
@@ -1044,7 +1275,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	// Coreforge releases are compiled binaries from the private mirror. Do not
 	// route through upstream package managers or distribution channels.
 	try {
-		const target = await resolveUpdateTarget();
+		const target = await resolveUpdateTarget({ allowPackageManagers: true });
 		if (target.method !== "binary") {
 			throw new Error(
 				`the ${APP_NAME} on PATH was installed via ${target.method} (upstream channel); ` +

@@ -339,7 +339,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 			cwd,
 			eventBus,
 			disableExtensionDiscovery ? undefined : disabledExtensionIds,
-			{ ambient: !disableExtensionDiscovery },
+			{ ambient: !disableExtensionDiscovery, includeAmbientHooks: false },
 		);
 	});
 	const extensionRunner =

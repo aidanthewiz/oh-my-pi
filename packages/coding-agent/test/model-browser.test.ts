@@ -5,6 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildBrowserItems,
 	ModelBrowser,
+	resolveRoleAssignments,
 	sortModelItems,
 } from "@oh-my-pi/pi-coding-agent/modes/components/model-browser";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -61,6 +62,25 @@ describe("ModelBrowser search ranking", () => {
 		browser.setQuery("gpt-5.5");
 
 		expect(browser.getSelected()?.selector).toBe("zenmux/gpt-5.5");
+	});
+});
+
+describe("ModelBrowser role assignments", () => {
+	test("omits configured roles outside enabledModels", () => {
+		const allowed = makeModel("provider", "allowed");
+		const blocked = makeModel("provider", "blocked");
+		const settings = Settings.isolated({
+			enabledModels: ["provider/allowed"],
+			modelRoles: {
+				default: "provider/blocked",
+				smol: "provider/allowed",
+			},
+		});
+
+		const roles = resolveRoleAssignments(settings, [allowed, blocked], [allowed, blocked]);
+
+		expect(roles.default).toBeUndefined();
+		expect(roles.smol?.model.id).toBe("allowed");
 	});
 });
 

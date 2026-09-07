@@ -26,6 +26,7 @@ export interface DetectCompiledBinaryInput {
 
 export function detectCompiledBinary(input: DetectCompiledBinaryInput): boolean;
 
+
 export interface GetAddonFilenamesInput {
 	tag: string;
 	arch: string;
@@ -78,6 +79,10 @@ export interface NativeLoaderContext {
 	isWorkspaceLoad: boolean;
 	nativesDir: string;
 }
+
+export function buildHelpMessage(
+	ctx: Pick<NativeLoaderContext, "isCompiledBinary" | "versionedDir" | "addonFilenames">,
+): string;
 
 export function initLoaderContext(overrides?: InitLoaderContextOverrides): NativeLoaderContext;
 

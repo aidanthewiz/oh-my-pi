@@ -24,7 +24,7 @@ import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
+import { isSilentAbort, isUserInvokedSkillPrompt, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
@@ -141,6 +141,8 @@ export class EventController {
 	// restored when the banner clears at the next `agent_start` (see
 	// #handleMessageEnd / #handleAgentStart).
 	#pinnedErrorComponent: AssistantMessageComponent | undefined = undefined;
+	#pinnedErrorMessage: AssistantMessage | undefined = undefined;
+	#restorePinnedErrorInline = true;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
 	// Set when `auto_retry_start` fires and cleared by `auto_retry_end` (both
@@ -650,6 +652,8 @@ export class EventController {
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
 		this.#pinnedErrorComponent = undefined;
+		this.#pinnedErrorMessage = undefined;
+		this.#restorePinnedErrorInline = true;
 		this.#retryPending = this.ctx.viewSession.isRetrying;
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
@@ -743,10 +747,13 @@ export class EventController {
 		this.#resetReadGroup();
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
-		// Restore the previous turn's inline error in the transcript before dropping
-		// the banner, so the error stays in history once the banner is gone.
-		this.#pinnedErrorComponent?.setErrorPinned(false);
+		// Restore terminal errors in transcript history when their banner clears.
+		// Recoverable empty-output attempts are discarded by session recovery and
+		// must stay hidden rather than resurfacing as a stale inline error.
+		if (this.#restorePinnedErrorInline) this.#pinnedErrorComponent?.setErrorPinned(false);
 		this.#pinnedErrorComponent = undefined;
+		this.#pinnedErrorMessage = undefined;
+		this.#restorePinnedErrorInline = true;
 		this.ctx.clearPinnedError();
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
@@ -771,7 +778,17 @@ export class EventController {
 			}
 			this.#renderedCustomMessages.add(signature);
 			this.#resetReadGroup();
-			this.ctx.addMessageToChat(event.message);
+			if (
+				event.message.role === "custom" &&
+				this.ctx.optimisticSkillMessagePending &&
+				isUserInvokedSkillPrompt(event.message)
+			) {
+				// The optimistic `/skill:` row painted at submit time (issue #8895):
+				// swap it for the canonical message instead of appending a duplicate.
+				this.ctx.reconcileOptimisticSkillMessage(event.message);
+			} else {
+				this.ctx.addMessageToChat(event.message);
+			}
 			// Queued custom-message chips are derived from the agent queue; refresh the
 			// pending bar when the queued custom is consumed so the chip disappears
 			// immediately.
@@ -1320,14 +1337,20 @@ export class EventController {
 			}
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
-			// Pin a turn-ending provider error (e.g. Anthropic content-filter block)
-			// above the editor so it survives transcript scroll. Cleared at the next
-			// turn's agent_start. Suppress the transcript's inline `Error: …` line for
-			// the same message while pinned so the error isn't rendered twice.
+			// Pin a turn-ending provider error above the editor so it survives
+			// transcript scroll and suppress its duplicate inline row. Empty-output
+			// errors are known intermediate attempts: hide them entirely while
+			// session recovery continues, but retain the component so a terminal
+			// retry-cap event can promote its final error into the one banner.
 			if (event.message.stopReason === "error" && event.message.errorMessage && !isSilentAbort(event.message)) {
+				const recoverableEmptyOutput =
+					!event.message.errorMessage.startsWith("Retry budget exhausted") &&
+					AIError.is(AIError.classifyMessage(event.message), AIError.Flag.EmptyResponse);
 				this.#lastAssistantComponent?.setErrorPinned(true);
 				this.#pinnedErrorComponent = this.#lastAssistantComponent;
-				this.ctx.showPinnedError(event.message.errorMessage);
+				this.#pinnedErrorMessage = event.message;
+				this.#restorePinnedErrorInline = !recoverableEmptyOutput;
+				if (!recoverableEmptyOutput) this.ctx.showPinnedError(event.message.errorMessage);
 			}
 			this.ctx.statusLine.invalidate();
 			this.ctx.ui.requestRender();
@@ -1827,13 +1850,15 @@ export class EventController {
 						? "Idle "
 						: "";
 		const actionLabel =
-			event.action === "handoff"
-				? "Auto-handoff"
-				: event.action === "shake"
-					? "Auto-shake"
-					: event.action === "snapcompact"
-						? "Auto-snapcompact"
-						: "Auto context-full maintenance";
+			event.action === "remote"
+				? "Auto server compaction"
+				: event.action === "handoff"
+					? "Auto-handoff"
+					: event.action === "shake"
+						? "Auto-shake"
+						: event.action === "snapcompact"
+							? "Auto-snapcompact"
+							: "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -1855,17 +1880,20 @@ export class EventController {
 			this.ctx.statusContainer.disposeChildren();
 		}
 		const isHandoffAction = event.action === "handoff";
+		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
 				isHandoffAction
 					? "Auto-handoff cancelled"
-					: isShakeAction
-						? "Auto-shake cancelled"
-						: isSnapcompactAction
-							? "Auto-snapcompact cancelled"
-							: "Auto context-full maintenance cancelled",
+					: isRemoteAction
+						? "Auto server compaction cancelled"
+						: isShakeAction
+							? "Auto-shake cancelled"
+							: isSnapcompactAction
+								? "Auto-snapcompact cancelled"
+								: "Auto context-full maintenance cancelled",
 			);
 		} else if (isShakeAction) {
 			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
@@ -1908,7 +1936,7 @@ export class EventController {
 		} else if (isHandoffAction) {
 			this.ctx.clearTransientSessionUi();
 			this.ctx.lastAssistantUsage = undefined;
-			this.ctx.renderInitialMessages();
+			await this.ctx.renderInitialMessages();
 			this.ctx.statusLine.invalidate();
 			await this.ctx.reloadTodos();
 			this.ctx.ui.requestRender(true, { clearScrollback: true });
@@ -1918,6 +1946,8 @@ export class EventController {
 			// to compact yet. Not a failure — suppress the warning.
 		} else if (isSnapcompactAction) {
 			this.ctx.showWarning("Auto-snapcompact maintenance failed; continuing without maintenance");
+		} else if (isRemoteAction) {
+			this.ctx.showWarning("Auto server compaction failed; continuing without maintenance");
 		} else {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}
@@ -1947,6 +1977,8 @@ export class EventController {
 			// restore its inline Error row; just unpin the fixed-region banner so the
 			// retry UI is the visible state.
 			this.#pinnedErrorComponent = undefined;
+			this.#pinnedErrorMessage = undefined;
+			this.#restorePinnedErrorInline = true;
 			this.ctx.clearPinnedError();
 		}
 		const delaySeconds = Math.round(event.delayMs / 1000);
@@ -1968,20 +2000,51 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		const pinnedError = this.#pinnedErrorMessage?.errorMessage;
+		const terminalFailurePinned =
+			!event.success &&
+			this.#pinnedErrorComponent !== undefined &&
+			pinnedError !== undefined &&
+			pinnedError === event.finalError;
+		let stalePinnedErrorCleared = false;
+		if (!event.success && this.#pinnedErrorComponent && !terminalFailurePinned) {
+			this.#pinnedErrorComponent.setErrorPinned(false);
+			this.#pinnedErrorComponent = undefined;
+			this.#pinnedErrorMessage = undefined;
+			this.#restorePinnedErrorInline = true;
+			this.ctx.clearPinnedError();
+			stalePinnedErrorCleared = true;
+		}
 		let appliedRetryUpdate = false;
 		for (const retryError of event.retryErrors ?? []) {
 			const component = this.#takeRetrySupersededAssistantComponent(retryError.persistenceKey);
 			if (!component) continue;
 			component.applyRetryRecovery(retryError.retryRecovery);
-			if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
+			if (!terminalFailurePinned && this.#pinnedErrorComponent === component) {
+				this.#pinnedErrorComponent = undefined;
+				this.#pinnedErrorMessage = undefined;
+				this.#restorePinnedErrorInline = true;
+			}
 			appliedRetryUpdate = true;
 		}
-		if (appliedRetryUpdate || (event.retryErrors?.length ?? 0) > 0) {
+		if (
+			!terminalFailurePinned &&
+			!stalePinnedErrorCleared &&
+			(appliedRetryUpdate || (event.retryErrors?.length ?? 0) > 0)
+		) {
 			this.ctx.clearPinnedError();
 		}
 		this.#clearRetrySupersededAssistantComponents();
 		if (!event.success) {
-			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+			if (terminalFailurePinned) {
+				const terminalError = this.#restorePinnedErrorInline
+					? `Retry failed after ${event.attempt} attempts: ${event.finalError || pinnedError || "Unknown error"}`
+					: (pinnedError ?? event.finalError);
+				if (terminalError) this.ctx.showPinnedError(terminalError);
+				this.#restorePinnedErrorInline = true;
+			} else {
+				this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+			}
 		}
 		this.#ensureWorkingLoaderWhileStreaming();
 		this.ctx.ui.requestRender();

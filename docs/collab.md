@@ -117,6 +117,8 @@ Set `collab.webUrl` when the browser UI is hosted separately from the websocket 
 
 The Coreforce fork includes a protocol-compatible, content-blind Bun service in `packages/relay`. The upstream relay implementation and image are not published, so this service implements the documented client contract directly and is tested with the production `CollabSocket` client. It exposes:
 
+For local protocol development, the upstream tree also includes a WebSocket-only stand-in at [`packages/collab-web/scripts/local-relay.ts`](../packages/collab-web/scripts/local-relay.ts). It implements only `/r/<roomId>` and does not replace the Coreforce relay.
+
 - `GET /` — the static collab-web guest client (target of the `/collab` deep link),
 - `GET /r/<roomId>?role=host|guest` — WebSocket upgrade,
 - `POST /s` / `GET /s/<id>` / `GET /s/<id>/raw` — `/share` blob upload, viewer page, and blob fetch,

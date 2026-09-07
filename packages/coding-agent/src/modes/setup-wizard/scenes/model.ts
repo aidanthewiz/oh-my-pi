@@ -1,5 +1,6 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { SgrMouseEvent } from "@oh-my-pi/pi-tui";
+import { getAllowedAvailableModels } from "../../../config/model-resolver";
 import {
 	buildBrowserItems,
 	ModelBrowser,
@@ -69,7 +70,7 @@ class ModelSceneController implements SetupSceneController {
 
 	#syncModels(): void {
 		const registry = this.host.ctx.session.modelRegistry;
-		const available = registry.getAvailable();
+		const available = getAllowedAvailableModels(registry, this.host.ctx.settings);
 		const roles = resolveRoleAssignments(this.host.ctx.settings, registry.getAll(), available);
 		const storage = this.host.ctx.settings.getStorage();
 		const items = buildBrowserItems(available);

@@ -3,12 +3,16 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { type ApiKey, completeSimple, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { type ApiKey, completeSimple, Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getAgentDbPath, getMemoriesDir, isEnoent, logger, parseJsonlLenient, prompt } from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
+import {
+	filterModelsByEnabledSettings,
+	getModelMatchPreferences,
+	resolveModelRoleValue,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { MemoryBackendSaveInput, MemoryBackendSaveResult } from "../memory-backend/types";
 import consolidationTemplate from "../prompts/memories/consolidation.md" with { type: "text" };
@@ -750,18 +754,20 @@ async function runStage1Job(options: {
 			response_items_json: truncatedItems,
 		});
 
-		const response = await completeSimple(
-			model,
-			{
-				systemPrompt: [stageOneSystemTemplate],
-				messages: [{ role: "user", content: [{ type: "text", text: inputPrompt }], timestamp: Date.now() }],
-			},
-			{
-				apiKey,
-				metadata: options.metadata,
-				maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
-				reasoning: clampThinkingLevelForModel(model, Effort.Low),
-			},
+		const response = await retryTransientCompletion(() =>
+			completeSimple(
+				model,
+				{
+					systemPrompt: [stageOneSystemTemplate],
+					messages: [{ role: "user", content: [{ type: "text", text: inputPrompt }], timestamp: Date.now() }],
+				},
+				{
+					apiKey,
+					metadata: options.metadata,
+					maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
+					reasoning: clampThinkingLevelForModel(model, Effort.Low),
+				},
+			),
 		);
 
 		if (response.stopReason === "error") {
@@ -887,18 +893,20 @@ async function runConsolidationModel(options: {
 		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
 	});
 
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: [consolidationSystemTemplate],
-			messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
-		},
-		{
-			apiKey,
-			metadata: options.metadata,
-			maxTokens: 8192,
-			reasoning: clampThinkingLevelForModel(model, Effort.Medium),
-		},
+	const response = await retryTransientCompletion(() =>
+		completeSimple(
+			model,
+			{
+				systemPrompt: [consolidationSystemTemplate],
+				messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
+			},
+			{
+				apiKey,
+				metadata: options.metadata,
+				maxTokens: 8192,
+				reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+			},
+		),
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");
@@ -1234,15 +1242,16 @@ async function resolveMemoryModel(options: {
 	fallbackRole: string;
 }): Promise<Model | undefined> {
 	const { modelRegistry, session, fallbackRole } = options;
+	const allowedModels = filterModelsByEnabledSettings(modelRegistry.getAll(), session.settings);
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
+		const resolved = resolveModelRoleValue(requestedModel, allowedModels, {
 			settings: session.settings,
 			matchPreferences: getModelMatchPreferences(session.settings),
 		});
 		if (resolved.model) return resolved.model;
 	}
-	return session.model ?? modelRegistry.getAll()[0];
+	return session.model ?? allowedModels[0];
 }
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {

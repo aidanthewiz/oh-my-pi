@@ -15,8 +15,8 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { classifyDifficulty } from "../auto-thinking/classifier";
 import type { ModelRegistry } from "../config/model-registry";
 import {
-	filterAvailableModelsByEnabledPatterns,
 	formatModelStringWithRouting,
+	getAllowedAvailableModels,
 	getModelMatchPreferences,
 	type ResolvedModelRoleValue,
 	resolveModelRoleValue,
@@ -138,6 +138,16 @@ export class ModelControls {
 		return this.#scopedModels;
 	}
 
+	/**
+	 * Replace the Ctrl+P cycle scope. Startup resolves the scope before background
+	 * provider discovery runs; the CLI re-pushes the fuller list here once discovery
+	 * completes so a newly-discovered `enabledModels` model joins the cycle and the
+	 * scoped `/models` picker (issue #9220).
+	 */
+	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void {
+		this.#scopedModels = scopedModels;
+	}
+
 	/** Live per-provider-family service-tier selection. */
 	get serviceTierByFamily(): ServiceTierByFamily {
 		return this.#serviceTierByFamily;
@@ -174,16 +184,15 @@ export class ModelControls {
 		this.#serviceTierByFamily = tiers;
 	}
 	resolveRoleModel(role: string): Model | undefined {
-		return resolveRoleModelFull(this.#host.settings, role, this.#host.modelRegistry.getAvailable(), this.#model)
-			.model;
+		return resolveRoleModelFull(this.#host.settings, role, this.getAvailableModels(), this.#model).model;
 	}
 
 	resolveRoleModelWithThinking(role: string): ResolvedModelRoleValue {
-		return resolveRoleModelFull(this.#host.settings, role, this.#host.modelRegistry.getAvailable(), this.#model);
+		return resolveRoleModelFull(this.#host.settings, role, this.getAvailableModels(), this.#model);
 	}
 
 	resolveTemporaryModelThinkingLevel(model: Model): ConfiguredThinkingLevel | undefined {
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		if (availableModels.length === 0) return undefined;
 
 		const matchPreferences = getModelMatchPreferences(this.#host.settings);
@@ -306,7 +315,7 @@ export class ModelControls {
 	 * still guard on `models.length`).
 	 */
 	getRoleModelCycle(roleOrder: readonly string[]): RoleModelCycle | undefined {
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		if (availableModels.length === 0) return undefined;
 
 		const currentModel = this.#model;
@@ -438,7 +447,7 @@ export class ModelControls {
 
 	async #cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = this.getAvailableModels();
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.#model;
@@ -471,10 +480,7 @@ export class ModelControls {
 	 * See {@link filterAvailableModelsByEnabledPatterns} for supported pattern forms and limitations.
 	 */
 	getAvailableModels(): Model[] {
-		const all = this.#host.modelRegistry.getAvailable();
-		const patterns = this.#host.settings.get("enabledModels");
-		if (!patterns || patterns.length === 0) return all;
-		return filterAvailableModelsByEnabledPatterns(all, patterns, this.#host.settings);
+		return getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings);
 	}
 
 	// =========================================================================

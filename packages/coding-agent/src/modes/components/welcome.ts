@@ -151,6 +151,8 @@ export class WelcomeComponent implements Component {
 
 	constructor(
 		private readonly version: string,
+		private modelName: string,
+		private providerName: string,
 		private recentSessions: RecentSession[] = [],
 		private lspServers: LspServerInfo[] = [],
 	) {}
@@ -195,6 +197,12 @@ export class WelcomeComponent implements Component {
 		}
 		this.#animStart = null;
 		// The settled (resting) frame differs from the last intro frame.
+		this.invalidate();
+	}
+
+	setModel(modelName: string, providerName: string): void {
+		this.modelName = modelName;
+		this.providerName = providerName;
 		this.invalidate();
 	}
 
@@ -243,8 +251,17 @@ export class WelcomeComponent implements Component {
 		const minRightCol = 20;
 		const welcomeText = this.#welcomeText();
 		const versionLabel = `${CF_BRAND} v${this.version}`;
-		const leftMinContentWidth = Math.max(minLeftCol, visibleWidth(welcomeText), visibleWidth(versionLabel));
-		const desiredLeftCol = Math.min(preferredLeftCol, Math.max(minLeftCol, Math.floor(dualContentWidth * 0.35)));
+		const leftMinContentWidth = Math.max(
+			minLeftCol,
+			visibleWidth(welcomeText),
+			visibleWidth(versionLabel),
+			visibleWidth(this.modelName),
+			visibleWidth(this.providerName),
+		);
+		const desiredLeftCol = Math.max(
+			Math.min(preferredLeftCol, Math.max(minLeftCol, Math.floor(dualContentWidth * 0.35))),
+			leftMinContentWidth,
+		);
 		const dualLeftCol =
 			dualContentWidth >= minRightCol + 1
 				? Math.min(desiredLeftCol, dualContentWidth - minRightCol)
@@ -265,6 +282,8 @@ export class WelcomeComponent implements Component {
 			...logoColored.map(l => this.#centerText(l, leftCol)),
 			"",
 			this.#centerText(theme.fg("muted", versionLabel), leftCol),
+			this.#centerText(theme.fg("muted", this.modelName), leftCol),
+			this.#centerText(theme.fg("borderMuted", this.providerName), leftCol),
 		];
 
 		// Right column separator

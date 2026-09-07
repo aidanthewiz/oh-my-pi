@@ -54,6 +54,31 @@ brew install can1357/tap/omp
 bun install -g @oh-my-pi/pi-coding-agent
 ```
 
+**Nix**
+
+```sh
+# Run without installing
+nix run github:Coreforce-CAD/oh-my-pi/coreforge
+
+# Or install into the active profile
+nix profile install github:Coreforce-CAD/oh-my-pi/coreforge
+```
+
+Flake consumers can use `packages.<system>.omp`, `overlays.default`, `nixosModules.default`, or `homeManagerModules.default`. A Home Manager configuration can install OMP and own its settings declaratively:
+
+```nix
+{
+  inputs.omp.url = "github:Coreforce-CAD/oh-my-pi/coreforge";
+
+  # In your Home Manager module:
+  imports = [ inputs.omp.homeManagerModules.default ];
+  programs.omp = {
+    enable = true;
+    settings.startup.quiet = true;
+  };
+}
+```
+
 **Windows (PowerShell)**
 
 ```powershell
@@ -581,6 +606,22 @@ bun dev
 
 `bun setup` installs Bun workspaces and builds `@oh-my-pi/pi-natives`. Re-run `bun run build:native` after changing Rust crates or `packages/natives`.
 
+Nix users get the pinned Bun and Rust toolchains plus all native build dependencies:
+
+```sh
+nix develop
+bun setup
+bun dev
+```
+
+Build and smoke-test the distributable Nix package with `nix build .#omp`. Wayland screencast support is off by default (linking libpipewire adds ~750 MB of runtime closure); enable it with `omp.override { withWaylandScreencast = true; }`. `nix/bun.nix` is generated only when `bun.lock` changes; releases regenerate it automatically. For dependency changes, run:
+
+```sh
+bun run gen:nix
+```
+
+The command uses `bun2nix` from `nix develop` when available, otherwise enters the development shell through Nix, then falls back to the pinned `bunx bun2nix@2.1.2`. Do not edit `nix/bun.nix` manually.
+
 For a non-interactive smoke check:
 
 ```sh
@@ -641,10 +682,16 @@ guidelines on contributing.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+OMP is licensed under the [MIT License](LICENSE).
 
-© 2025 Mario Zechner  
-© 2025-2026 Can Bölük
+Third-party and vendored code, including `crates/vendor/brush-core` and the
+third-party portions identified in `crates/pi-builtins/LICENSE`, remains under
+its respective upstream license. See `THIRD-PARTY-NOTICES.txt` and
+component-local notices for attribution and additional terms.
+
+© 2025 Mario Zechner<br>
+© 2025-2026 Can Bölük<br>
+© 2026 Stencil Labs, Inc.
 
 _made for terminals that stay open_
 

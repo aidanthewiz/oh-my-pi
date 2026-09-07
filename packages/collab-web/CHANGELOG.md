@@ -9,6 +9,12 @@
 ### Changed
 
 - Branded the hosted client as Coreforce Agent Collab with the Coreforce hammer mark, moved public URLs to `agent-collab.internal.somahub.io`, and disabled crawler indexing without exposing the internal Coreforge product name.
+## [17.3.8] - 2026-08-19
+
+### Fixed
+
+- The ask tool card now renders the note the user attached to their answer; previously it was dropped from HTML exports and the collab guest view.
+
 ## [17.2.10] - 2026-08-06
 
 ### Changed

@@ -19,8 +19,8 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(binaryDownloadStep).toContain('gh release download "$RELEASE_TAG"');
 	expect(binaryDownloadStep).toContain('--repo "$GITHUB_REPOSITORY"');
 	expect(binaryDownloadStep).toContain('--pattern "omp-darwin-arm64"');
-	expect(workflow).toContain("Reclaim disk for Windows native cross-build");
-	expect(workflow).toContain("if: matrix.target == 'win32-x64'");
+	expect(workflow).toContain("Reclaim disk for large native builds");
+	expect(workflow).toContain("if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'");
 	expect(workflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
 	for (const target of [
 		"darwin-arm64",
@@ -96,6 +96,9 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).not.toContain("git push origin");
 	expect(verifyWorkflow).not.toContain("gh release create");
 	expect(verifyWorkflow).toContain(`bun scripts/bazel-natives.ts "\${targets[@]}"`);
+	expect(verifyWorkflow).toContain("Reclaim disk for large native builds");
+	expect(verifyWorkflow).toContain("if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'");
+	expect(verifyWorkflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
 	expect(verifyWorkflow).toContain("run: bun run ci:release:build-binaries");
 	expect(verifyWorkflow).toContain("bun --cwd=packages/browser-relay run build");
 	expect(verifyWorkflow).toContain("test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip");
