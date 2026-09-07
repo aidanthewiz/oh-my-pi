@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-diagram",
-  "version": "17.3.8",
+  "version": "17.4.0",
   "description": "Typed diagram specs rendered to branded, self-contained SVG and to terminal ASCII from one shared layout.",
   "homepage": "https://omp.sh",
   "license": "MIT",

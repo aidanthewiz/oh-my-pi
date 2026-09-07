@@ -202,9 +202,24 @@ describe("generated model policies", () => {
 				cacheWrite: 0.5,
 			},
 		});
-		expect(models[1]?.cost).toEqual({ input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 });
+		expect(models[1]?.cost).toMatchObject({ input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 });
 		expect(models[2]?.cost).toEqual(mantleNative);
 		expect(models[3]?.cost).toEqual(stale);
+	});
+
+	it("applies GPT-5.6 long-context pricing to Codex-transport SKUs (openai/codex#32486)", () => {
+		const models: ModelSpec<Api>[] = [
+			createSpec({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
+			createSpec({ id: "gpt-5.6-luna", api: "openai-codex-responses", provider: "openai-codex" }),
+			// Third-party carriers of the same id must not inherit the tier.
+			createSpec({ id: "gpt-5.6-sol", api: "openai-completions", provider: "openrouter" }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.cost.longContext).toMatchObject({ inputThreshold: 272_000, input: 10, output: 45 });
+		expect(models[1]?.cost.longContext).toMatchObject({ inputThreshold: 272_000, input: 0.4, output: 1.8 });
+		expect(models[2]?.cost.longContext).toBeUndefined();
 	});
 
 	it("pins Claude Mythos 5 first-party Anthropic catalog metadata", () => {
