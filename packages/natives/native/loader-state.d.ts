@@ -80,6 +80,10 @@ export interface NativeLoaderContext {
 	nativesDir: string;
 }
 
+export function buildHelpMessage(
+	ctx: Pick<NativeLoaderContext, "isCompiledBinary" | "versionedDir" | "addonFilenames">,
+): string;
+
 export function initLoaderContext(overrides?: InitLoaderContextOverrides): NativeLoaderContext;
 
 export interface CleanupStaleNativeVersionsInput {
