@@ -5,7 +5,7 @@
 	"private": true,
 	"description": "Chrome extension that lets the Coreforge browser tool drive your existing tabs.",
 	"homepage": "https://omp.sh",
-	"author": "Can Boluk",
+	"author": "Stencil Labs, Inc.",
 	"license": "MIT",
 	"repository": {
 		"type": "git",

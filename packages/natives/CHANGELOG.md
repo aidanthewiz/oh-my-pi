@@ -5,6 +5,12 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [17.4.1] - 2026-08-21
+
+### Changed
+
+- `bun run build:native` now builds through the local cargo/napi-rs backend by default, with Bazel available as an opt-in via `OMP_NATIVE_BUILD_BACKEND=bazel` or extra Bazel arguments after `--`.
+
 ## [17.4.0] - 2026-08-20
 
 ### Added

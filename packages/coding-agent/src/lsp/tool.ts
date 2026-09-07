@@ -323,7 +323,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						throwIfAborted(signal);
 						if (serverConfig.createClient) {
 							const linterClient = getLinterClient(serverName, serverConfig, serverCwd);
-							const diagnostics = await linterClient.lint(resolved);
+							const diagnostics = await linterClient.lint(resolved, signal);
 							allDiagnostics.push(...diagnostics);
 							succeededServers++;
 							totalServerSuccesses++;
