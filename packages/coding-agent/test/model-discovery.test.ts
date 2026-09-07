@@ -8,7 +8,7 @@ import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import { resolveModelCacheProviderId, resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import {
 	applyLlamaCppQwenThinking,
@@ -21,6 +21,16 @@ import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings"
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
+const ANTHROPIC_AUTH_ENV_NAMES = [
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_OAUTH_TOKEN",
+	"ANTHROPIC_FOUNDRY_API_KEY",
+	"ANTHROPIC_AWS_API_KEY",
+	"ANTHROPIC_AWS_WORKSPACE_ID",
+	"ANTHROPIC_WORKSPACE_ID",
+	"ANTHROPIC_BASE_URL",
+] as const;
+
 describe("ModelRegistry runtime discovery", () => {
 	let tempDir: string;
 	let modelsJsonPath: string;
@@ -29,18 +39,15 @@ describe("ModelRegistry runtime discovery", () => {
 	let originalOllamaBaseUrl: string | undefined;
 	let originalOllamaHost: string | undefined;
 	let originalOllamaContextLength: string | undefined;
-	let originalAnthropicApiKey: string | undefined;
+	let originalAnthropicAuthEnv: Map<(typeof ANTHROPIC_AUTH_ENV_NAMES)[number], string | undefined>;
 
 	beforeEach(async () => {
 		resetSettingsForTest();
 		originalOllamaBaseUrl = Bun.env.OLLAMA_BASE_URL;
 		originalOllamaHost = Bun.env.OLLAMA_HOST;
 		originalOllamaContextLength = Bun.env.OLLAMA_CONTEXT_LENGTH;
-		originalAnthropicApiKey = Bun.env.ANTHROPIC_API_KEY;
-		delete Bun.env.OLLAMA_BASE_URL;
-		delete Bun.env.OLLAMA_HOST;
-		delete Bun.env.OLLAMA_CONTEXT_LENGTH;
-		delete Bun.env.ANTHROPIC_API_KEY;
+		originalAnthropicAuthEnv = new Map(ANTHROPIC_AUTH_ENV_NAMES.map(name => [name, Bun.env[name]]));
+		for (const name of ANTHROPIC_AUTH_ENV_NAMES) delete Bun.env[name];
 		tempDir = path.join(os.tmpdir(), `pi-test-model-registry-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		modelsJsonPath = path.join(tempDir, "models.json");
@@ -68,10 +75,12 @@ describe("ModelRegistry runtime discovery", () => {
 		} else {
 			Bun.env.OLLAMA_CONTEXT_LENGTH = originalOllamaContextLength;
 		}
-		if (originalAnthropicApiKey === undefined) {
-			delete Bun.env.ANTHROPIC_API_KEY;
-		} else {
-			Bun.env.ANTHROPIC_API_KEY = originalAnthropicApiKey;
+		for (const [name, value] of originalAnthropicAuthEnv) {
+			if (value === undefined) {
+				delete Bun.env[name];
+			} else {
+				Bun.env[name] = value;
+			}
 		}
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
@@ -2562,9 +2571,10 @@ providers:
 		});
 		// Emulate a legacy write: the variant has no same-id static header source,
 		// so it is flagged unrestorable even though its base carries the headers.
-		writeModelCache("github-copilot", Date.now(), [cachedVariant], true, "", cacheDbPath);
+		const cacheProviderId = resolveModelCacheProviderId("github-copilot");
+		writeModelCache(cacheProviderId, Date.now(), [cachedVariant], true, "", cacheDbPath);
 		const db = new Database(cacheDbPath);
-		db.run("UPDATE model_cache SET header_restore_version = 0 WHERE provider_id = ?", ["github-copilot"]);
+		db.run("UPDATE model_cache SET header_restore_version = 0 WHERE provider_id = ?", [cacheProviderId]);
 		db.close();
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
@@ -2585,7 +2595,8 @@ providers:
 			requestModelId: "gpt-5.6-sol",
 			headers: { "X-Tenant-Route": "tenant-a" },
 		});
-		writeModelCache("github-copilot", Date.now(), [cachedAlias], true, "", cacheDbPath, [bundledBase]);
+		const cacheProviderId = resolveModelCacheProviderId("github-copilot");
+		writeModelCache(cacheProviderId, Date.now(), [cachedAlias], true, "", cacheDbPath, [bundledBase]);
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 

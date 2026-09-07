@@ -1,7 +1,7 @@
 import { convertBufferWithMarkit } from "@oh-my-pi/pi-coding-agent/utils/markit";
 import { logger } from "@oh-my-pi/pi-utils";
 
-function warningPdf(): Uint8Array {
+function screenAnnotationPdf(): Uint8Array {
 	const objects: string[] = [];
 	const add = (body: string): void => {
 		objects.push(body);
@@ -36,8 +36,6 @@ function warningPdf(): Uint8Array {
 }
 
 logger.setTransports({ console: false, file: false });
-const events: logger.LogEvent[] = [];
-const dispose = logger.registerLogSink(event => events.push(event));
 const consoleErrors: string[] = [];
 const originalConsoleError = console.error;
 console.error = (...values: unknown[]) => {
@@ -45,9 +43,8 @@ console.error = (...values: unknown[]) => {
 };
 
 try {
-	const result = await convertBufferWithMarkit(warningPdf(), ".pdf", undefined, { useCache: false });
-	process.stdout.write(JSON.stringify({ result, events, consoleErrors }));
+	const result = await convertBufferWithMarkit(screenAnnotationPdf(), ".pdf", undefined, { useCache: false });
+	process.stdout.write(JSON.stringify({ result, consoleErrors }));
 } finally {
 	console.error = originalConsoleError;
-	dispose();
 }
