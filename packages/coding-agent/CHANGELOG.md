@@ -38,6 +38,12 @@
 - Protected credential-marked settings, preserved launcher-enforced telemetry opt-outs through trusted worker re-entry, and removed managed profile values from repository PTYs, direnv, Git hooks, cleanse checkers, and other repository-controlled subprocesses.
 - Initialized managed Coreforge identity before `models` provider discovery so authenticated Claude and Bedrock routes appear in fresh utility-command catalogs.
 - Required an explicit bearer credential for custom `pi-native` provider transports.
+## [17.3.7] - 2026-08-17
+
+### Changed
+
+- Send the `omp/<version>` User-Agent on xAI chat (`xai` and `xai-oauth`) unless the request already set its own ([#8840](https://github.com/can1357/oh-my-pi/pull/8840) by [@Jaaneek](https://github.com/Jaaneek)).
+
 ## [17.3.6] - 2026-08-17
 
 ### Added
