@@ -353,6 +353,27 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
+function isPathInManagerRoot(linkTarget: string, nodeModulesDir: string): boolean {
+	if (isPathInDirectoryLexical(linkTarget, nodeModulesDir)) return true;
+	// Resolve only the manager root. Resolving the link target itself would
+	// follow globally linked packages into their checkout and lose ownership.
+	const nodeModulesReal = tryRealpath(path.resolve(nodeModulesDir));
+	return nodeModulesReal !== undefined && isPathInDirectoryLexical(linkTarget, nodeModulesReal);
+}
+
+function resolveNpmGlobalNodeModulesDir(globalBinDir: string | undefined): string | undefined {
+	if (!globalBinDir) return undefined;
+	if (process.platform === "win32") return path.join(globalBinDir, "node_modules");
+	return path.join(path.dirname(globalBinDir), "lib", "node_modules");
+}
+
+function isManagerOwnedBinEntry(linkTarget: string | undefined, nodeModulesDir: string | undefined): boolean {
+	// Non-symlink launchers and unreadable links retain the existing bin-dir
+	// classification. A readable link must point through the manager's exact
+	// global node_modules tree.
+	return linkTarget === undefined || (nodeModulesDir !== undefined && isPathInManagerRoot(linkTarget, nodeModulesDir));
+}
+
 type UpdateMethod = "brew" | "mise" | "nix" | "bun" | "npm" | "binary";
 
 interface UpdateMethodResolutionOptions {
@@ -360,6 +381,8 @@ interface UpdateMethodResolutionOptions {
 	miseBinDirs?: readonly string[];
 	miseDataDir?: string;
 	npmBinDir?: string;
+	/** Bun's configured global package directory, independent of its bin directory. */
+	bunGlobalDir?: string;
 	/**
 	 * Whether the resolved omp path is a plain file (the standalone binary)
 	 * rather than a package-manager symlink. Stops a binary install from being
@@ -367,22 +390,35 @@ interface UpdateMethodResolutionOptions {
 	 * target directory.
 	 */
 	ompIsRegularFile?: boolean;
+	/**
+	 * Absolute path named by the bin entry's first symlink hop. This deliberately
+	 * preserves a global package symlink instead of resolving into its checkout.
+	 */
+	ompLinkTarget?: string;
 }
 
 type UpdateTarget =
 	| { method: "brew" }
 	| { method: "mise" }
 	| { method: "nix" }
-	| { method: "bun" }
-	| { method: "npm" }
-	| { method: "binary"; path: string };
+	| { method: "bun"; path?: string }
+	| { method: "npm"; path?: string }
+	| { method: "binary"; path: string; replacesSymlink: boolean };
 
 function resolveUpdateMethod(
 	ompPath: string,
 	bunBinDir: string | undefined,
 	options: UpdateMethodResolutionOptions = {},
 ): UpdateMethod {
-	const { homebrewPrefix, miseBinDirs = [], miseDataDir, npmBinDir, ompIsRegularFile = false } = options;
+	const {
+		bunGlobalDir,
+		homebrewPrefix,
+		miseBinDirs = [],
+		miseDataDir,
+		npmBinDir,
+		ompIsRegularFile = false,
+		ompLinkTarget,
+	} = options;
 	const launcherExtension = path.extname(ompPath).toLowerCase();
 	const isWindowsScriptLauncher =
 		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
@@ -400,9 +436,28 @@ function resolveUpdateMethod(
 	// (bun's .exe launcher, npm's .cmd/.ps1), so a regular file is NOT evidence
 	// of a standalone install and the override would hijack managed installs.
 	const isStandaloneRegularFile = ompIsRegularFile && process.platform !== "win32";
-	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir) && !isStandaloneRegularFile) return "bun";
-	if ((npmBinDir && isPathInDirectory(ompPath, npmBinDir) && !isStandaloneRegularFile) || isWindowsScriptLauncher)
+	const bunNodeModulesDir = resolveBunGlobalNodeModulesDirFromLocations({
+		globalDir: bunGlobalDir,
+		globalBinDir: bunBinDir,
+	});
+	if (
+		bunBinDir &&
+		isPathInDirectory(ompPath, bunBinDir) &&
+		!isStandaloneRegularFile &&
+		isManagerOwnedBinEntry(ompLinkTarget, bunNodeModulesDir)
+	) {
+		return "bun";
+	}
+	const npmNodeModulesDir = resolveNpmGlobalNodeModulesDir(npmBinDir);
+	if (
+		npmBinDir &&
+		isPathInDirectory(ompPath, npmBinDir) &&
+		!isStandaloneRegularFile &&
+		isManagerOwnedBinEntry(ompLinkTarget, npmNodeModulesDir)
+	) {
 		return "npm";
+	}
+	if (isWindowsScriptLauncher) return "npm";
 	return "binary";
 }
 
@@ -413,10 +468,56 @@ export function resolveUpdateMethodForTest(
 ): UpdateMethod {
 	return resolveUpdateMethod(ompPath, bunBinDir, options);
 }
-/** Resolve the owner of the running install before selecting an update path. */
-async function resolveUpdateTarget(): Promise<UpdateTarget> {
-	const bunBinDir = await getBunGlobalBinDir();
-	const npmBinDir = await getNpmGlobalBinDir();
+
+/** Resolve an update target from the concrete PATH entry selected by the shell. */
+export function resolveUpdateTargetFromPath(
+	ompPath: string,
+	bunBinDir: string | undefined,
+	options: UpdateMethodResolutionOptions & { allowPackageManagers: boolean },
+): UpdateTarget {
+	let ompIsRegularFile = false;
+	let ompIsSymlink = false;
+	let ompLinkTarget: string | undefined;
+	let ompRealpath: string | undefined;
+	try {
+		const stat = fs.lstatSync(ompPath);
+		ompIsRegularFile = stat.isFile() && !stat.isSymbolicLink();
+		ompIsSymlink = stat.isSymbolicLink();
+		if (ompIsSymlink) {
+			const rawTarget = fs.readlinkSync(ompPath);
+			const linkDir = path.dirname(ompPath);
+			ompLinkTarget = path.resolve(tryRealpath(linkDir) ?? linkDir, rawTarget);
+			ompRealpath = tryRealpath(ompPath);
+		}
+	} catch {}
+
+	const method = resolveUpdateMethod(ompPath, bunBinDir, {
+		...options,
+		ompIsRegularFile,
+		ompLinkTarget,
+	});
+	if (method === "binary") {
+		// A package-manager-enabled update follows a foreign alias to replace
+		// its standalone binary. Binary-only releases intentionally replace the
+		// selected manager launcher in place.
+		const binaryPath = options.allowPackageManagers && ompIsSymlink ? (ompRealpath ?? ompPath) : ompPath;
+		return { method, path: binaryPath, replacesSymlink: ompIsSymlink && binaryPath === ompPath };
+	}
+	if (method === "bun" || method === "npm") return { method, path: ompPath };
+	return { method };
+}
+/**
+ * Resolve how the running install should be updated.
+ *
+ * `allowPackageManagers: false` skips the `bun pm bin -g` / `npm prefix -g`
+ * probes entirely — used for binary-only releases, where routing through a
+ * package manager is never valid and the probes would be wasted subprocesses.
+ * Homebrew/mise detection always runs: both managers install GitHub release
+ * binaries and stay valid regardless of how the release is distributed.
+ */
+async function resolveUpdateTarget(options: { allowPackageManagers: boolean }): Promise<UpdateTarget> {
+	const bunBinDir = options.allowPackageManagers ? await getBunGlobalBinDir() : undefined;
+	const npmBinDir = options.allowPackageManagers ? await getNpmGlobalBinDir() : undefined;
 	const homebrewPrefix = await getHomebrewFormulaPrefix();
 	const miseAvailable = $which("mise") !== undefined;
 	const miseBinDirs = miseAvailable ? await getMiseBinDirs() : [];
@@ -424,24 +525,14 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const ompPath = resolveOmpPath();
 
 	if (ompPath) {
-		// Package-manager installs symlink the bin entry into node_modules; the
-		// standalone installer writes a plain executable. When the global bin dir
-		// overlaps the installer's default (~/.local/bin), that file type — not
-		// directory containment — distinguishes a binary install from npm/bun.
-		let ompIsRegularFile = false;
-		try {
-			const stat = fs.lstatSync(ompPath);
-			ompIsRegularFile = stat.isFile() && !stat.isSymbolicLink();
-		} catch {}
-		const method = resolveUpdateMethod(ompPath, bunBinDir, {
+		return resolveUpdateTargetFromPath(ompPath, bunBinDir, {
+			allowPackageManagers: options.allowPackageManagers,
+			bunGlobalDir: options.allowPackageManagers ? process.env.BUN_INSTALL_GLOBAL_DIR : undefined,
 			homebrewPrefix,
 			miseBinDirs,
 			miseDataDir,
 			npmBinDir,
-			ompIsRegularFile,
 		});
-		if (method === "binary") return { method, path: ompPath };
-		return { method };
 	}
 
 	if (bunBinDir) return { method: "bun" };
@@ -618,10 +709,19 @@ export async function pruneBunInstallCache(
 
 // [coreforge patch] resolveBunInstallCacheDir removed with the bun channel.
 
-export function resolveBunGlobalNodeModulesDirFromLocations(
-	globalBinDir: string | undefined,
-	cacheDir: string | undefined,
-): string | undefined {
+interface BunGlobalInstallLocations {
+	globalDir?: string;
+	globalBinDir?: string;
+	cacheDir?: string;
+}
+
+/** Resolve Bun's global node_modules root from explicit, default, or cache locations. */
+export function resolveBunGlobalNodeModulesDirFromLocations({
+	globalDir,
+	globalBinDir,
+	cacheDir,
+}: BunGlobalInstallLocations): string | undefined {
+	if (globalDir && globalDir.length > 0) return path.join(globalDir, "node_modules");
 	if (globalBinDir && globalBinDir.length > 0) {
 		return path.join(path.dirname(globalBinDir), "install", "global", "node_modules");
 	}
@@ -1120,7 +1220,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	// Coreforge releases are compiled binaries from the private mirror. Do not
 	// route through upstream package managers or distribution channels.
 	try {
-		const target = await resolveUpdateTarget();
+		const target = await resolveUpdateTarget({ allowPackageManagers: true });
 		if (target.method !== "binary") {
 			throw new Error(
 				`the ${APP_NAME} on PATH was installed via ${target.method} (upstream channel); ` +
