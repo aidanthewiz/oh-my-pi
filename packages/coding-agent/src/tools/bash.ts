@@ -193,7 +193,8 @@ export const CRITICAL_BASH_PATTERNS = [
 ] as const;
 
 const FALLBACK_DESTRUCTIVE_BASH_PATTERNS = [
-	/\brm\s+-[a-z]*[rRfF][a-z]*\s+\//i,
+	/\brm\s+(?:-\S+\s+)*(?:-[a-z]*[rRfF][a-z]*|--recursive|--force)\s+(?:-\S+\s+)*\//i,
+	/\brm\s+(?:-\S+\s+)*--no-preserve-root\b/i,
 	/\bsudo\s+rm\b/i,
 	/\bchmod\s+-R\s+[0-7]+\s+\//i,
 	/\bchmod\s+-R\s+[ugoa+\-=rwxXst,]+\s+\//,

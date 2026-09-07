@@ -15,6 +15,7 @@
  *
  * Priority: 55 (tool-specific provider)
  */
+import * as os from "node:os";
 import * as path from "node:path";
 import { isRecord, logger, parseFrontmatter } from "@oh-my-pi/pi-utils";
 import { JSONC } from "bun";
@@ -29,10 +30,12 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { settings } from "../config/settings";
 
+import { realpathIfExists, resolveContainedPath } from "./contained-path";
 import {
 	buildExtensionModuleItems,
 	createSourceMeta,
 	discoverExtensionModulePaths,
+	environmentForConfigLevel,
 	expandEnvVarsDeepForConfigLevel,
 	getProjectPath,
 	getUserPath,
@@ -56,6 +59,8 @@ interface OpenCodeConfigSource {
 
 async function loadJsonConfig(
 	configPath: string,
+	level: OpenCodeConfigSource["level"],
+	projectRoot: string,
 	onInvalid: (configPath: string) => void,
 ): Promise<Record<string, unknown> | null> {
 	const content = await readFile(configPath);
@@ -63,7 +68,7 @@ async function loadJsonConfig(
 
 	let parsed: unknown;
 	try {
-		parsed = JSONC.parse(content);
+		parsed = JSONC.parse(await substituteConfigVars(content, configPath, level, projectRoot));
 	} catch {
 		onInvalid(configPath);
 		return null;
@@ -73,6 +78,96 @@ async function loadJsonConfig(
 		return null;
 	}
 	return parsed;
+}
+
+/**
+ * Apply OpenCode's config variable substitution to raw config text.
+ *
+ * OpenCode expands `{env:VAR}` (the env value, or an empty string when unset)
+ * and `{file:path}` (file contents, trimmed and JSON-escaped) at load time,
+ * before the JSON is parsed — see opencode `packages/opencode/src/config/variable.ts`.
+ * OMP loads the same config files, so it MUST honor the same syntax; the generic
+ * `${VAR}` expansion used elsewhere never matches, leaving a header like
+ * `Bearer {env:MCP_KEY}` to reach the MCP server verbatim and 401 (#8778).
+ *
+ * User `{file:path}` references may use relative, home-relative, or absolute
+ * paths. Project references stay inside the filesystem-resolved project root,
+ * and project `{env:VAR}` references use the same non-secret allowlist as other
+ * imported project configuration. Comment-line tokens remain untouched. A
+ * missing or blocked value expands to an empty string.
+ */
+async function substituteConfigVars(
+	text: string,
+	configPath: string,
+	level: OpenCodeConfigSource["level"],
+	projectRoot: string,
+): Promise<string> {
+	const environment = environmentForConfigLevel(level);
+	const envExpanded = text.replace(/\{env:([^}]+)\}/g, (_, name: string) => environment[name] ?? "");
+
+	const fileMatches = [...envExpanded.matchAll(/\{file:[^}]+\}/g)];
+	if (fileMatches.length === 0) return envExpanded;
+
+	const configDir = path.dirname(configPath);
+	const lexicalProjectRoot = path.resolve(projectRoot);
+	const realProjectRoot = level === "project" ? await realpathIfExists(lexicalProjectRoot) : null;
+	let out = "";
+	let cursor = 0;
+	for (const match of fileMatches) {
+		const token = match[0];
+		const index = match.index ?? 0;
+		out += envExpanded.slice(cursor, index);
+		cursor = index + token.length;
+
+		// A `{file:...}` sitting on a JSONC comment line is not a real reference.
+		const lineStart = envExpanded.lastIndexOf("\n", index - 1) + 1;
+		if (envExpanded.slice(lineStart, index).trimStart().startsWith("//")) {
+			out += token;
+			continue;
+		}
+
+		let filePath = token.slice("{file:".length, -1);
+		if (filePath.startsWith("~/")) filePath = path.join(os.homedir(), filePath.slice(2));
+		let resolved = path.isAbsolute(filePath) ? filePath : path.resolve(configDir, filePath);
+		if (level === "project") {
+			const relative = path.relative(lexicalProjectRoot, resolved);
+			if (
+				realProjectRoot === null ||
+				relative === ".." ||
+				relative.startsWith(`..${path.sep}`) ||
+				path.isAbsolute(relative)
+			) {
+				logger.warn("OpenCode project config references a file outside the project", {
+					configPath,
+					path: resolved,
+				});
+				continue;
+			}
+			const contained = await resolveContainedPath(realProjectRoot, path.resolve(realProjectRoot, relative));
+			if (contained.status === "outside") {
+				logger.warn("OpenCode project config references a file outside the project", {
+					configPath,
+					path: resolved,
+				});
+				continue;
+			}
+			if (contained.status === "missing") {
+				logger.warn("OpenCode config references a missing file", { configPath, path: resolved });
+				continue;
+			}
+			resolved = contained.realPath;
+		}
+
+		const fileContent = await readFile(resolved);
+		if (fileContent === null) {
+			logger.warn("OpenCode config references a missing file", { configPath, path: resolved });
+			continue;
+		}
+		// JSON-escape so multi-line/quoted contents stay valid inside the string literal.
+		out += JSON.stringify(fileContent.trim()).slice(1, -1);
+	}
+	out += envExpanded.slice(cursor);
+	return out;
 }
 
 /**
@@ -196,7 +291,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	const sourceByName = new Map<string, OpenCodeConfigSource>();
 
 	for (const source of getConfigSources(ctx)) {
-		const config = await loadJsonConfig(source.path, configPath => {
+		const config = await loadJsonConfig(source.path, source.level, ctx.cwd, configPath => {
 			logger.warn("Failed to parse OpenCode config", { path: configPath });
 		});
 		if (!config || !isRecord(config.mcp)) continue;
@@ -395,7 +490,7 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const warnings: string[] = [];
 
 	for (const source of getConfigSources(ctx)) {
-		const parsed = await loadJsonConfig(source.path, configPath => {
+		const parsed = await loadJsonConfig(source.path, source.level, ctx.cwd, configPath => {
 			warnings.push(`Invalid JSON in ${configPath}`);
 		});
 		if (!parsed) continue;

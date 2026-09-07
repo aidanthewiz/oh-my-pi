@@ -34,4 +34,36 @@ describe("runUpdateCommand fetch cancellation", () => {
 
 		expect(requestSignal).toBeInstanceOf(AbortSignal);
 	});
+
+	it("translates unsupported proxy failures into actionable guidance", async () => {
+		const priorToken = process.env.OMP_UPDATE_GITHUB_TOKEN;
+		process.env.OMP_UPDATE_GITHUB_TOKEN = "test-token";
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("process.exit(1)");
+		}) as typeof process.exit);
+		const fetchStub = Object.assign(
+			async () => {
+				throw new Error(
+					'UnsupportedProxyProtocol fetching "https://api.github.com". ' +
+						"For more information, pass `verbose: true` in the second argument to fetch()",
+				);
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+
+		try {
+			await expect(runUpdateCommand({ force: false, check: true })).rejects.toThrow("process.exit(1)");
+			const message = consoleError.mock.calls.flat().join(" ");
+			expect(message).not.toContain("verbose: true");
+			expect(message).not.toContain("fetch()");
+			expect(message).toMatch(/SOCKS/i);
+			expect(message).toMatch(/https?:\/\//i);
+		} finally {
+			if (priorToken === undefined) delete process.env.OMP_UPDATE_GITHUB_TOKEN;
+			else process.env.OMP_UPDATE_GITHUB_TOKEN = priorToken;
+		}
+	});
 });
