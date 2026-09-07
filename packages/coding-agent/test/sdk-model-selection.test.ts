@@ -145,6 +145,20 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("rejects deferred modelPattern outside enabledModels", async () => {
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-model"),
+			settings: Settings.isolated({ enabledModels: ["runtime-provider/runtime-fallback-model"] }),
+		});
+
+		try {
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toContain('Model "runtime-provider/runtime-model" not found');
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("resolves explicit dynamic-only modelPattern from fresh runtime cache", async () => {
 		const authStorage = createInMemoryAuthStorage();
 		authStoragesToClose.push(authStorage);
@@ -1045,6 +1059,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				skipPythonPreflight: true,
 				rules: [],
 				preloadedCustomToolPaths: [],
+
 				toolNames: ["read"],
 			});
 
@@ -1057,6 +1072,67 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			}
 		} finally {
 			getApiKeySpy.mockRestore();
+		}
+	});
+	test("does not restore a saved model outside enabledModels", async () => {
+		const savedModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const allowedModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!savedModel || !allowedModel) throw new Error("Expected bundled restore models");
+
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey(savedModel.provider, "saved-key");
+		authStorage.setRuntimeApiKey(allowedModel.provider, "allowed-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const settings = Settings.isolated({
+			enabledModels: [`${allowedModel.provider}/${allowedModel.id}`],
+			modelRoles: { default: `${allowedModel.provider}/${allowedModel.id}` },
+		});
+		const targetSessionFile = path.join(tempDir, "resume-disallowed-model.jsonl");
+		const timestamp = "2026-06-01T00:00:00.000Z";
+		await Bun.write(
+			targetSessionFile,
+			`${[
+				{ type: "session", version: 3, id: "resume-disallowed", timestamp, cwd: tempDir },
+				{
+					type: "model_change",
+					id: "saved-model",
+					parentId: null,
+					timestamp,
+					model: `${savedModel.provider}/${savedModel.id}`,
+					role: "default",
+				},
+			]
+				.map(entry => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const sessionManager = await SessionManager.open(targetSessionFile, path.join(tempDir, "resume-policy-sessions"));
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			sessionManager,
+			settings,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			preloadedCustomToolPaths: [],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.model?.provider).toBe(allowedModel.provider);
+			expect(session.model?.id).toBe(allowedModel.id);
+		} finally {
+			await session.dispose();
 		}
 	});
 

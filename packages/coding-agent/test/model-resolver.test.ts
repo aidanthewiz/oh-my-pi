@@ -1168,6 +1168,23 @@ describe("resolveCliModel", () => {
 		expect(result.model?.id).toBe("gpt-4o");
 	});
 
+	test("rejects --model selectors outside enabledModels", () => {
+		const catalog = [...allModels, ...openaiGpt55Models];
+		const registry = { getAll: () => catalog, getAvailable: () => catalog } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
+		const settings = Settings.isolated({ enabledModels: ["openai/gpt-4o"] });
+
+		const result = resolveCliModel({
+			cliModel: "openai-codex/gpt-5.5",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain('Model "openai-codex/gpt-5.5" is excluded by enabledModels');
+	});
+
 	test("prefers an authenticated provider for an unqualified exact model id", () => {
 		const availableModels = openaiGpt55Models.filter(model => model.provider === "openai-codex");
 		const registry = { getAll: () => openaiGpt55Models, getAvailable: () => openaiGpt55Models };

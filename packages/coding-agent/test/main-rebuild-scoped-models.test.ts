@@ -134,6 +134,18 @@ describe("rebuildScopedModelsAfterDiscovery", () => {
 		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a", "b"]);
 	});
 
+	it("keeps discovered --models selections inside enabledModels", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a"] });
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+
+		expect(session.setCalls).toBe(0);
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a"]);
+	});
+
 	it("skips the rebuild once the session is disposed", async () => {
 		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
 		const registry = new FakeRegistry([model("a")]);
@@ -159,6 +171,15 @@ describe("resolveScopedModels", () => {
 
 		expect(registry.refreshCalls).toBe(1);
 		expect(scoped.map(entry => entry.model.id)).toEqual(["b"]);
+	});
+
+	it("narrows explicit --models selections to enabledModels", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a"] });
+		const registry = new FakeRegistry([model("a"), model("b")]);
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+
+		expect(scoped.map(entry => entry.model.id)).toEqual(["a"]);
 	});
 });
 

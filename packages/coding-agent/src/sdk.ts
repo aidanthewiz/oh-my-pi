@@ -57,6 +57,7 @@ import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
+	filterModelsByEnabledSettings,
 	formatModelSelectorValue,
 	formatModelString,
 	formatModelStringWithRouting,
@@ -1475,7 +1476,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			matchPreferences: modelMatchPreferences,
 		}),
 	);
-	let model = options.model;
+	let model =
+		options.model && filterModelsByEnabledSettings([options.model], settings).length > 0 ? options.model : undefined;
 	let modelFallbackMessage: string | undefined;
 	let initialRetryFallback: InitialRetryFallbackState | undefined;
 	// Identify session model strings to restore in fallback order. We do an
@@ -1504,8 +1506,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					continue;
 				}
 
-				const restoredModel = modelRegistry.find(parsedModel.provider, parsedModel.id);
-				if (restoredModel && hasModelAuth(restoredModel)) {
+				const restoredModel = allowedModels.find(
+					candidate => candidate.provider === parsedModel.provider && candidate.id === parsedModel.id,
+				);
+				if (restoredModel) {
 					model = restoredModel;
 					restoredSessionModelIndex = i;
 					restoredSessionThinkingLevel = parsedModel.thinkingLevel;
@@ -2159,6 +2163,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// downstream fallback filling `model`). Reclaim it here so resume
 		// honors the last active role in either case.
 		const sessionRetryLimit = restoredSessionModelIndex >= 0 ? restoredSessionModelIndex : sessionModelStrings.length;
+		const refreshedAllowedModels = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
 		if (!hasExplicitModel && sessionRetryLimit > 0) {
 			for (let i = 0; i < sessionRetryLimit; i++) {
 				const sessionModelStr = sessionModelStrings[i];
@@ -2168,8 +2173,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) continue;
-				const restoredModel = modelRegistry.find(parsedModel.provider, parsedModel.id);
-				if (restoredModel && hasModelAuth(restoredModel)) {
+				const restoredModel = refreshedAllowedModels.find(
+					candidate => candidate.provider === parsedModel.provider && candidate.id === parsedModel.id,
+				);
+				if (restoredModel) {
 					model = restoredModel;
 					modelFallbackMessage = undefined;
 					restoredSessionModelIndex = i;
@@ -2233,8 +2240,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allModels = modelRegistry.getAll();
-			const availableModels = modelRegistry.getAvailable();
+			const allModels = filterModelsByEnabledSettings(modelRegistry.getAll(), settings);
+			const availableModels = await resolveAllowedModels(modelRegistry, settings, matchPreferences);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -2303,6 +2310,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							},
 						];
 					}
+					if (resolved.blockedByEnabledModels) return [];
 					return resolveConfiguredModelPatterns([trimmedSelector], settings).map(pattern => ({
 						pattern,
 						retryFallback: undefined,

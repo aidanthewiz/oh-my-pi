@@ -1738,6 +1738,13 @@ export function filterAvailableModelsByEnabledPatterns(
 
 	return includeSyntheticAllowedModels(available, allowedModels);
 }
+
+/** Apply the effective settings allowlist to any model inventory. */
+export function filterModelsByEnabledSettings(models: Model<Api>[], settings?: Settings): Model<Api>[] {
+	const patterns = settings?.get("enabledModels");
+	if (!patterns || patterns.length === 0) return models;
+	return filterAvailableModelsByEnabledPatterns(models, patterns, settings);
+}
 function findExactCliModel(
 	selector: string,
 	allModels: Model<Api>[],
@@ -1804,16 +1811,15 @@ export interface ResolveCliModelResult {
 	selector?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	warning: string | undefined;
+	/** True when the selector names a catalog model excluded by enabledModels. */
+	blockedByEnabledModels?: boolean;
 	error: string | undefined;
 }
 
 /**
- * Resolve a single model from CLI flags.
- *
- * Explicit `provider/id` references and authenticated bare ids take precedence
- * over configured role names, which in turn take precedence over an
- * unauthenticated catalog-only id (so a bundled `cursor/default` never shadows a
- * configured `modelRoles.default`).
+ * Resolve one CLI model selector. Exact selectors take precedence over roles,
+ * and roles take precedence over unauthenticated catalog-only IDs. A non-empty
+ * `enabledModels` setting remains authoritative over every CLI form.
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
@@ -1830,8 +1836,8 @@ export function resolveCliModel(options: {
 		return { model: undefined, selector: undefined, warning: undefined, error: undefined };
 	}
 
-	const allModels = modelRegistry.getAll();
-	if (allModels.length === 0) {
+	const catalogModels = modelRegistry.getAll();
+	if (catalogModels.length === 0) {
 		return {
 			model: undefined,
 			selector: undefined,
@@ -1840,9 +1846,10 @@ export function resolveCliModel(options: {
 		};
 	}
 
-	const availableModels = preferredModels ?? modelRegistry.getAvailable();
+	const allModels = filterModelsByEnabledSettings(catalogModels, settings);
+	const availableModels = filterModelsByEnabledSettings(preferredModels ?? modelRegistry.getAvailable(), settings);
 	const providerMap = new Map<string, string>();
-	for (const model of allModels) {
+	for (const model of catalogModels) {
 		providerMap.set(model.provider.toLowerCase(), model.provider);
 	}
 
@@ -1857,6 +1864,22 @@ export function resolveCliModel(options: {
 	}
 
 	const trimmedModel = cliModel.trim();
+	const findInventoryExact = (selector: string, models: Model<Api>[]): Model<Api> | undefined => {
+		const direct = findExactCliModel(selector, models, models, { catalogFallback: false });
+		if (direct) return direct;
+		const { base, level } = splitThinkingSuffix(selector, -1, MAX_THINKING_SUFFIX_OPTIONS);
+		return level ? findExactCliModel(base, models, models, { catalogFallback: false }) : undefined;
+	};
+	const isExcludedCatalogModel = (selector: string): boolean =>
+		findInventoryExact(selector, catalogModels) !== undefined &&
+		findInventoryExact(selector, allModels) === undefined;
+	const blockedResult = (selector: string): ResolveCliModelResult => ({
+		model: undefined,
+		selector: undefined,
+		warning: undefined,
+		error: `Model "${selector}" is excluded by enabledModels.`,
+		blockedByEnabledModels: true,
+	});
 	if (!provider) {
 		const exact = findExactCliModel(trimmedModel, allModels, availableModels, { catalogFallback: false });
 		if (exact) {
@@ -1942,6 +1965,9 @@ export function resolveCliModel(options: {
 			}
 		}
 	}
+	if (!provider && isExcludedCatalogModel(trimmedModel)) {
+		return blockedResult(trimmedModel);
+	}
 
 	let pattern = trimmedModel;
 
@@ -1973,6 +1999,9 @@ export function resolveCliModel(options: {
 				error: undefined,
 			};
 		}
+	}
+	if (provider && isExcludedCatalogModel(`${provider}/${pattern}`)) {
+		return blockedResult(`${provider}/${pattern}`);
 	}
 
 	const candidates = provider ? allModels.filter(model => model.provider === provider) : availableModels;

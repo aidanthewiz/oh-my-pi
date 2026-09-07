@@ -734,35 +734,49 @@ async function switchToResumedProject(
 	return cwd;
 }
 
+async function resolveEffectiveModelScope(
+	parsed: Args,
+	modelRegistry: Pick<ModelRegistry, "getAvailable">,
+	activeSettings: Settings,
+): Promise<ScopedModel[]> {
+	const requestedPatterns = parsed.models ?? activeSettings.get("enabledModels");
+	if (!requestedPatterns || requestedPatterns.length === 0) return [];
+
+	const preferences = getModelMatchPreferences(activeSettings);
+	const requested = await resolveModelScope(requestedPatterns, modelRegistry, preferences, activeSettings);
+	const enabledPatterns = activeSettings.get("enabledModels");
+	if (!parsed.models || enabledPatterns.length === 0) return requested;
+
+	const enabled = await resolveModelScope(enabledPatterns, modelRegistry, preferences, activeSettings);
+	const enabledKeys = new Set(enabled.map(entry => `${entry.model.provider}/${entry.model.id}`));
+	return requested.filter(entry => enabledKeys.has(`${entry.model.provider}/${entry.model.id}`));
+}
+
 /**
- * Resolve the effective model allow-list from an explicit `--models` scope or,
- * failing that, the active project's `enabledModels`. A totally collapsed scope
- * gets one cache-aware discovery pass before session construction: otherwise an
- * all-discovery `--models` launch can select an unrelated static model before the
- * later background rebuild activates the requested scope. The pass only helps
- * providers already known to be discoverable (models.yml `discovery:`, runtime
- * managers); a scope naming only extension-supplied models stays empty here
- * because those providers register during `createAgentSession` — that case is
- * covered by deferring to the SDK's `modelPattern` resolution in
- * {@link buildSessionOptions}. Re-run after a resume switches projects so the
- * destination project's settings-derived scope wins over the launch directory's.
+ * Resolve the effective model allowlist from the active project's
+ * `enabledModels`, optionally narrowed by an explicit `--models` scope. A
+ * totally collapsed scope gets one cache-aware discovery pass before session
+ * construction: otherwise an all-discovery `--models` launch can select an
+ * unrelated static model before the later background rebuild activates the
+ * requested scope. The pass only helps providers already known to be
+ * discoverable (models.yml `discovery:`, runtime managers); a scope naming only
+ * extension-supplied models stays empty here because those providers register
+ * during `createAgentSession` — that case is covered by deferring to the SDK's
+ * `modelPattern` resolution in {@link buildSessionOptions}. Re-run after a
+ * resume switches projects so the destination project's settings-derived scope
+ * wins over the launch directory's.
  */
 export async function resolveScopedModels(
 	parsed: Args,
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refresh">,
 	activeSettings: Settings,
 ): Promise<ScopedModel[]> {
-	const modelPatterns = parsed.models ?? activeSettings.get("enabledModels");
-	if (!modelPatterns || modelPatterns.length === 0) {
-		return [];
-	}
-	const preferences = getModelMatchPreferences(activeSettings);
-	const scopedModels = await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
+	const scopedModels = await resolveEffectiveModelScope(parsed, modelRegistry, activeSettings);
 	if (scopedModels.length > 0 || modelRegistry.getDiscoverableProviders().length === 0) {
 		return scopedModels;
 	}
 	await modelRegistry.refresh("online-if-uncached");
-	return await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
+	return await resolveEffectiveModelScope(parsed, modelRegistry, activeSettings);
 }
 
 /**
@@ -824,12 +838,7 @@ export async function rebuildScopedModelsAfterDiscovery(
 	if (!patterns || patterns.length === 0) return;
 	await modelRegistry.awaitBackgroundRefresh();
 	if (session.isDisposed) return;
-	const rebuilt = await resolveModelScope(
-		patterns,
-		modelRegistry,
-		getModelMatchPreferences(activeSettings),
-		activeSettings,
-	);
+	const rebuilt = await resolveEffectiveModelScope(parsed, modelRegistry, activeSettings);
 	const mapped = toSessionScopedModels(rebuilt, activeSettings);
 	if (mapped.length === 0 || sameScopedModelSet(session.scopedModels, mapped)) return;
 	session.setScopedModels(mapped);
@@ -1096,7 +1105,11 @@ export async function buildSessionOptions(
 			// Extensions may register an earlier configured role candidate.
 			options.modelPattern = parsed.model;
 		} else if (resolved.error) {
-			if (!parsed.provider && ((resolved.configuredPatterns?.length ?? 0) > 0 || !parsed.model.includes(":"))) {
+			if (
+				!resolved.blockedByEnabledModels &&
+				!parsed.provider &&
+				((resolved.configuredPatterns?.length ?? 0) > 0 || !parsed.model.includes(":"))
+			) {
 				// Model not found in built-in registry — defer resolution to after extensions load
 				// (extensions may register additional providers/models via registerProvider)
 				options.modelPattern = parsed.model;
