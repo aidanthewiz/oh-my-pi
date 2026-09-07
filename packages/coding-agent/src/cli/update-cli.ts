@@ -24,6 +24,7 @@ import { CF_VERSION, compareCfVersions } from "./cf-version";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
+const NIX_STORE_DIR = "/nix/store";
 /**
  * Official npm registry origin.
  *
@@ -67,6 +68,14 @@ function currentNativeTag(): string {
 	return `${process.platform}-${process.arch}`;
 }
 
+/** npm package names retained for update argument compatibility tests. */
+export interface ReleasePackages {
+	pkg: string;
+	natives: string;
+}
+
+const CURRENT_PACKAGES: ReleasePackages = { pkg: PACKAGE, natives: NATIVES_PACKAGE };
+
 interface ReleaseInfo {
 	tag: string;
 	version: string;
@@ -85,6 +94,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+
  * Select and validate the binary asset from GitHub release metadata.
  */
 export function resolveReleaseBinaryAsset(
@@ -342,7 +352,7 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateMethod = "brew" | "mise" | "bun" | "npm" | "binary";
+type UpdateMethod = "brew" | "mise" | "nix" | "bun" | "npm" | "binary";
 
 interface UpdateMethodResolutionOptions {
 	homebrewPrefix?: string;
@@ -361,6 +371,7 @@ interface UpdateMethodResolutionOptions {
 type UpdateTarget =
 	| { method: "brew" }
 	| { method: "mise" }
+	| { method: "nix" }
 	| { method: "bun" }
 	| { method: "npm" }
 	| { method: "binary"; path: string };
@@ -374,6 +385,7 @@ function resolveUpdateMethod(
 	const launcherExtension = path.extname(ompPath).toLowerCase();
 	const isWindowsScriptLauncher =
 		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
+	if (isPathInDirectory(ompPath, NIX_STORE_DIR)) return "nix";
 	if (homebrewPrefix && isPathInDirectory(ompPath, path.join(homebrewPrefix, "bin"))) return "brew";
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
 	if (miseDataDir && isPathInDirectory(ompPath, path.join(miseDataDir, "shims"))) return "mise";
@@ -437,9 +449,8 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 }
 
 /**
- * Get the latest release info from the coreforge channel (the private
- * Coreforce-CAD mirror's GitHub Releases). [coreforge patch: upstream
- * queries the npm registry here.]
+ * Get the latest release info from the Coreforge channel.
+ * Release lookups use the private Coreforce-CAD mirror, not npm.
  */
 let lastCfRelease: CfRelease | undefined;
 async function getLatestRelease(): Promise<ReleaseInfo> {
@@ -846,10 +857,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
-function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: string): string[] {
-	const args = [`${PACKAGE}@${expectedVersion}`, `${NATIVES_PACKAGE}@${expectedVersion}`];
+function buildVersionedPackageInstallArgs(
+	expectedVersion: string,
+	nativeTag: string,
+	packages: ReleasePackages,
+): string[] {
+	const args = [`${packages.pkg}@${expectedVersion}`, `${packages.natives}@${expectedVersion}`];
 	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
-		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
+		args.push(`${packages.natives}-${nativeTag}@${expectedVersion}`);
 	}
 	return args;
 }
@@ -884,25 +899,41 @@ function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: st
  * the original "no matching version" message instead of `EBADPLATFORM`.
  * See #1824.
  */
-export function buildBunInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
+export function buildBunInstallArgs(
+	expectedVersion: string,
+	nativeTag: string = currentNativeTag(),
+	packages: ReleasePackages = CURRENT_PACKAGES,
+): string[] {
 	return [
 		"install",
 		"-g",
 		"--no-cache",
 		`--registry=${NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
 	];
 }
 
-/** Build the npm argv used to update npm-managed global installs. */
-export function buildNpmInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
-	const args = [
+/**
+ * Build the npm argv used to update npm-managed global installs.
+ *
+ * `force` is set only for rename migrations: npm refuses to write the `omp`
+ * bin while the old package still owns it (`EEXIST`), and the migration
+ * installs the new package BEFORE removing the old one so a failed install
+ * never leaves the user without a working `omp`.
+ */
+export function buildNpmInstallArgs(
+	expectedVersion: string,
+	nativeTag: string = currentNativeTag(),
+	packages: ReleasePackages = CURRENT_PACKAGES,
+	flags: { force?: boolean } = {},
+): string[] {
+	return [
 		"install",
 		"-g",
+		...(flags.force ? ["--force"] : []),
 		`--registry=${NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
 	];
-	return args;
 }
 
 export function buildHomebrewUpdateArgs(force: boolean): string[] {
