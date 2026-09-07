@@ -32,6 +32,7 @@ import { YAML } from "bun";
 import { getConfigDirs } from "../../config";
 import type { ModelRegistry } from "../../config/model-registry";
 import {
+	getAllowedAvailableModels,
 	resolveAgentAdvisorSelection,
 	resolveAgentModelPatterns,
 	resolveAgentPrewalkPattern,
@@ -641,7 +642,7 @@ export class AgentsHubComponent implements Component {
 
 	#startAssign(agent: HubAgent, property: PropertyKind): void {
 		const registry = this.#modelContext.modelRegistry;
-		const models = registry?.getAvailable() ?? [];
+		const models = registry ? getAllowedAvailableModels(registry, this.#settings) : [];
 		const items = buildBrowserItems(models);
 		sortModelItems(items, { mruOrder: this.#settings.getStorage()?.getModelUsageOrder() ?? [] });
 		this.#assigning = { agent, property };
@@ -737,7 +738,7 @@ export class AgentsHubComponent implements Component {
 			this.#settings,
 		);
 		const { model } = resolveModelOverride(modelPatterns, modelRegistry, this.#settings);
-		const selectedModel = model ?? modelRegistry.getAvailable()[0];
+		const selectedModel = model ?? getAllowedAvailableModels(modelRegistry, this.#settings)[0];
 		if (!selectedModel) {
 			throw new Error("No available model to generate agent specification.");
 		}

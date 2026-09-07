@@ -305,6 +305,48 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
+	it("skips retry fallback models outside enabledModels", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const hiddenFallback = getBundledModel("openai", "gpt-4o-mini");
+		const allowedFallback = getBundledModel("openai", "gpt-4o");
+		if (!primaryModel || !hiddenFallback || !allowedFallback) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels);
+		const settings = Settings.isolated({
+			enabledModels: [
+				`${primaryModel.provider}/${primaryModel.id}`,
+				`${allowedFallback.provider}/${allowedFallback.id}`,
+			],
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				default: [
+					`${hiddenFallback.provider}/${hiddenFallback.id}`,
+					`${allowedFallback.provider}/${allowedFallback.id}`,
+				],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("Skip the hidden fallback");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${allowedFallback.provider}/${allowedFallback.id}`,
+		]);
+		expect(session.model?.id).toBe(allowedFallback.id);
+	});
+
 	it("hops to the chain owned by a fallback that is the last entry of the chain it came from", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const firstFallback = getBundledModel("openai", "gpt-4o-mini");

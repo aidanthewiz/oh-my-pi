@@ -8,7 +8,11 @@ import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking"
 import { getAgentDbPath, getMemoriesDir, isEnoent, logger, parseJsonlLenient, prompt } from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
+import {
+	filterModelsByEnabledSettings,
+	getModelMatchPreferences,
+	resolveModelRoleValue,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { MemoryBackendSaveInput, MemoryBackendSaveResult } from "../memory-backend/types";
 import consolidationTemplate from "../prompts/memories/consolidation.md" with { type: "text" };
@@ -1238,15 +1242,16 @@ async function resolveMemoryModel(options: {
 	fallbackRole: string;
 }): Promise<Model | undefined> {
 	const { modelRegistry, session, fallbackRole } = options;
+	const allowedModels = filterModelsByEnabledSettings(modelRegistry.getAll(), session.settings);
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
+		const resolved = resolveModelRoleValue(requestedModel, allowedModels, {
 			settings: session.settings,
 			matchPreferences: getModelMatchPreferences(session.settings),
 		});
 		if (resolved.model) return resolved.model;
 	}
-	return session.model ?? modelRegistry.getAll()[0];
+	return session.model ?? allowedModels[0];
 }
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {

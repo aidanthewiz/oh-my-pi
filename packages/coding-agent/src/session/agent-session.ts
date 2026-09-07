@@ -101,7 +101,11 @@ import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCos
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
-import { getAllowedAvailableModels, type ResolvedModelRoleValue } from "../config/model-resolver";
+import {
+	getAllowedAvailableModels,
+	isModelEnabledBySettings,
+	type ResolvedModelRoleValue,
+} from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -7469,6 +7473,9 @@ export class AgentSession {
 	}
 
 	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
+		if (!isModelEnabledBySettings(model, this.settings, this.#modelRegistry)) {
+			throw new Error(`Model "${model.provider}/${model.id}" is excluded by enabledModels.`);
+		}
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
 		const codeModeChanged = this.#tools.codeModeChangesBetween(currentModel, model);

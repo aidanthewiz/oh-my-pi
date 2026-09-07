@@ -1745,6 +1745,24 @@ export function filterModelsByEnabledSettings(models: Model<Api>[], settings?: S
 	if (!patterns || patterns.length === 0) return models;
 	return filterAvailableModelsByEnabledPatterns(models, patterns, settings);
 }
+
+/** Return whether a concrete model is permitted by the effective settings allowlist. */
+export function isModelEnabledBySettings(
+	model: Model<Api>,
+	settings: Settings | undefined,
+	modelRegistry: Pick<ModelRegistry, "getAll">,
+): boolean {
+	const patterns = settings?.get("enabledModels");
+	if (!patterns || patterns.length === 0) return true;
+	const modelKey = formatModelString(model);
+	const registered = modelRegistry.getAll();
+	const inventory = registered.some(candidate => formatModelString(candidate) === modelKey)
+		? registered
+		: [...registered, model];
+	return filterModelsByEnabledSettings(inventory, settings).some(
+		candidate => formatModelString(candidate) === modelKey,
+	);
+}
 function findExactCliModel(
 	selector: string,
 	allModels: Model<Api>[],
@@ -1797,7 +1815,7 @@ export function getAllowedAvailableModels(
 	const available = modelRegistry.getAvailable();
 	const patterns = settings?.get("enabledModels");
 	if (!patterns || patterns.length === 0) return available;
-	return filterAvailableModelsByEnabledPatterns(available, patterns);
+	return filterAvailableModelsByEnabledPatterns(available, patterns, settings);
 }
 
 export interface ResolveCliModelResult {

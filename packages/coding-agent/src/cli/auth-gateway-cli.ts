@@ -35,6 +35,8 @@ import { type GeneratedProvider, getBundledModels } from "@oh-my-pi/pi-catalog/m
 import { getConfigRootDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
+import { filterModelsByEnabledSettings } from "../config/model-resolver";
+import { Settings } from "../config/settings";
 import { type AuthBrokerClientConfig, resolveAuthBrokerConfig } from "../session/auth-broker-config";
 
 export type AuthGatewayAction = "serve" | "token" | "status" | "check";
@@ -156,11 +158,12 @@ const CATALOG_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
  * credentials for, since only those are routable.
  */
 export function indexModelsByRequestId(
-	models: readonly Model<Api>[],
+	models: Model<Api>[],
 	providersWithCreds: ReadonlySet<string>,
+	settings?: Settings,
 ): Map<string, Model<Api>> {
 	const modelById = new Map<string, Model<Api>>();
-	for (const model of models) {
+	for (const model of filterModelsByEnabledSettings(models, settings)) {
 		if (!providersWithCreds.has(model.provider)) continue;
 		modelById.set(`${model.provider}/${model.id}`, model);
 		if (!modelById.has(model.id)) modelById.set(model.id, model);
@@ -176,6 +179,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		);
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
+	const settings = await Settings.init({ cwd: process.cwd() });
 	const gatewayToken = flags.noAuth ? null : await ensureToken();
 
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
@@ -213,7 +217,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	for (const entry of snapshot.credentials) providersWithCreds.add(entry.provider);
 	const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true });
 	await registry.refresh();
-	let modelById = indexModelsByRequestId(registry.getAll(), providersWithCreds);
+	let modelById = indexModelsByRequestId(registry.getAll(), providersWithCreds, settings);
 
 	const handle = startAuthGateway({
 		storage,
@@ -239,7 +243,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		void registry
 			.refresh()
 			.then(() => {
-				modelById = indexModelsByRequestId(registry.getAll(), providersWithCreds);
+				modelById = indexModelsByRequestId(registry.getAll(), providersWithCreds, settings);
 			})
 			.catch(error => {
 				logger.warn("auth-gateway catalog refresh failed", {
@@ -454,10 +458,10 @@ const RETRYABLE_MODEL_ERROR_RE =
  * pi-native transport (would loop through the gateway), and placeholder /
  * router entries with negative/missing cost.
  */
-function pickProbeCandidates(provider: string): Model<Api>[] {
+function pickProbeCandidates(provider: string, settings: Settings): Model<Api>[] {
 	const bundled = getBundledModels(provider as GeneratedProvider);
 	if (bundled.length === 0) return [];
-	const candidates = bundled.filter(model => {
+	const candidates = filterModelsByEnabledSettings(bundled, settings).filter(model => {
 		if (model.transport === "pi-native") return false;
 		if (STRICT_PROBE_SKIPPED_APIS.has(model.api)) return false;
 		if (!model.input.includes("text")) return false;
@@ -534,9 +538,9 @@ async function probeOneModel(
  * Stops as soon as one model returns a successful response (the credential
  * authenticated against at least one model in the catalog).
  */
-function createStrictCompletionProbe(): CompletionProbe {
+function createStrictCompletionProbe(settings: Settings): CompletionProbe {
 	return async (input: CompletionProbeInput): Promise<CredentialCompletionResult> => {
-		const candidates = pickProbeCandidates(input.provider).slice(0, STRICT_PROBE_MAX_CANDIDATES);
+		const candidates = pickProbeCandidates(input.provider, settings).slice(0, STRICT_PROBE_MAX_CANDIDATES);
 		if (candidates.length === 0) {
 			return { ok: null, reason: `no bearer-compatible probe model bundled for provider ${input.provider}` };
 		}
@@ -595,6 +599,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		);
 	}
 
+	const settings = flags.strict ? await Settings.init({ cwd: process.cwd() }) : undefined;
 	const accountPool = await loadAuthBrokerAccountPool();
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
@@ -607,8 +612,11 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	try {
 		await storage.reload();
 		const results = await storage.checkCredentials(
-			flags.strict
-				? { completionProbe: createStrictCompletionProbe(), completionTimeoutMs: STRICT_PROBE_OVERALL_TIMEOUT_MS }
+			settings
+				? {
+						completionProbe: createStrictCompletionProbe(settings),
+						completionTimeoutMs: STRICT_PROBE_OVERALL_TIMEOUT_MS,
+					}
 				: undefined,
 		);
 

@@ -63,6 +63,8 @@ import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	formatModelStringWithRouting,
+	getAllowedAvailableModels,
+	isModelEnabledBySettings,
 	resolveAdvisorRoleSelection,
 	resolveModelOverride,
 } from "../config/model-resolver";
@@ -629,7 +631,10 @@ export class SessionAdvisors {
 					continue;
 				}
 			} else {
-				const sel = resolveAdvisorRoleSelection(this.#host.settings, this.#host.modelRegistry.getAvailable());
+				const sel = resolveAdvisorRoleSelection(
+					this.#host.settings,
+					getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings),
+				);
 				if (!sel) {
 					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
 					if (emitWarnings) {
@@ -1153,6 +1158,9 @@ export class SessionAdvisors {
 
 	/** Switch one advisor model while preserving its context and effort invariants. */
 	#setAdvisorModel(advisor: ActiveAdvisor, model: Model, requestedThinkingLevel: ThinkingLevel): ThinkingLevel {
+		if (!isModelEnabledBySettings(model, this.#host.settings, this.#host.modelRegistry)) {
+			throw new Error(`Advisor model "${model.provider}/${model.id}" is excluded by enabledModels.`);
+		}
 		const resolvedThinkingLevel = resolveThinkingLevelForModel(model, requestedThinkingLevel);
 		const nextThinkingLevel = resolvedThinkingLevel ?? ThinkingLevel.Inherit;
 		advisor.agent.setModel(model);
@@ -1190,8 +1198,12 @@ export class SessionAdvisors {
 			this.#host.modelRegistry,
 			this.#host.settings,
 		);
+		const directPrimary = this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		const primaryModel =
-			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
+			resolvedPrimary.model ??
+			(directPrimary && isModelEnabledBySettings(directPrimary, this.#host.settings, this.#host.modelRegistry)
+				? directPrimary
+				: undefined);
 		if (!primaryModel) return;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
 		if (!apiKey) return;
@@ -1295,7 +1307,13 @@ export class SessionAdvisors {
 			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				const directCandidate = this.#host.modelRegistry.find(selector.provider, selector.id);
+				const candidate =
+					resolved.model ??
+					(directCandidate &&
+					isModelEnabledBySettings(directCandidate, this.#host.settings, this.#host.modelRegistry)
+						? directCandidate
+						: undefined);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
 				if (!apiKey) continue;
@@ -1440,7 +1458,7 @@ export class SessionAdvisors {
 			} satisfies SessionMessageEntry;
 		});
 
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings);
 		const candidates = this.#host.resolveCompactionModelCandidates(advisorModel, availableModels);
 		if (candidates.length === 0) {
 			// No compaction candidates, fallback to re-prime
@@ -1732,7 +1750,10 @@ export class SessionAdvisors {
 		if (this.#advisors.length > 0) {
 			return this.#advisors.some(a => this.#host.modelRegistry.isUsingOAuth(a.model));
 		}
-		const sel = resolveAdvisorRoleSelection(this.#host.settings, this.#host.modelRegistry.getAvailable());
+		const sel = resolveAdvisorRoleSelection(
+			this.#host.settings,
+			getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings),
+		);
 		return sel ? this.#host.modelRegistry.isUsingOAuth(sel.model) : false;
 	}
 	/**

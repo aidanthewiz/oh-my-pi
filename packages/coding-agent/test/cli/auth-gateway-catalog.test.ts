@@ -4,6 +4,7 @@ import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { indexModelsByRequestId } from "../../src/cli/auth-gateway-cli";
 import { ModelRegistry } from "../../src/config/model-registry";
+import { Settings } from "../../src/config/settings";
 
 function stubAuthStorage(configKeys?: string[]): AuthStorage {
 	const stub = {
@@ -107,5 +108,23 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 
 		expect(index.get(`anthropic/${anthropicModel.id}`)).toBeDefined();
 		expect(index.get(`${foreignModel.provider}/${foreignModel.id}`)).toBeUndefined();
+	});
+
+	test("excludes models outside enabledModels from gateway routes", () => {
+		const registry = new ModelRegistry(stubAuthStorage());
+		const all = registry.getAll();
+		const allowed = all.find(model => model.provider === "anthropic");
+		const blocked = all.find(model => model.provider === allowed?.provider && model.id !== allowed.id);
+		if (!allowed || !blocked) throw new Error("expected two bundled Anthropic models");
+		const settings = Settings.isolated({
+			enabledModels: [`${allowed.provider}/${allowed.id}`],
+		});
+
+		const index = indexModelsByRequestId(all, new Set([allowed.provider]), settings);
+
+		expect(index.get(`${allowed.provider}/${allowed.id}`)).toBe(allowed);
+		expect(index.get(allowed.id)).toBe(allowed);
+		expect(index.get(`${blocked.provider}/${blocked.id}`)).toBeUndefined();
+		expect(index.get(blocked.id)).toBeUndefined();
 	});
 });

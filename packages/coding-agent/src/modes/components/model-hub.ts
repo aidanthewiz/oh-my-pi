@@ -28,7 +28,13 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { ModelRegistry } from "../../config/model-registry";
-import { type ModelRoleLookup, type ResolvedModelRoleValue, resolveModelRoleValue } from "../../config/model-resolver";
+import {
+	filterModelsByEnabledSettings,
+	getAllowedAvailableModels,
+	type ModelRoleLookup,
+	type ResolvedModelRoleValue,
+	resolveModelRoleValue,
+} from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
@@ -303,7 +309,10 @@ export class ModelHubComponent implements Component {
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
 	#reloadRoles(autoCandidates: ReadonlyArray<Model>): void {
-		const allModels = this.#scopedModels.length > 0 ? autoCandidates : this.#registry.getAll();
+		const allModels =
+			this.#scopedModels.length > 0
+				? autoCandidates
+				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
 		this.#roles = resolveRoleAssignments(this.#settings, allModels, autoCandidates);
 	}
 
@@ -318,9 +327,9 @@ export class ModelHubComponent implements Component {
 		} else {
 			const loadError = this.#registry.getError();
 			this.#configError = loadError ? String(loadError) : undefined;
-			allModels = this.#registry.getAll();
+			allModels = filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
 			try {
-				availableModels = this.#registry.getAvailable();
+				availableModels = getAllowedAvailableModels(this.#registry, this.#settings);
 			} catch (error) {
 				this.#configError = error instanceof Error ? error.message : String(error);
 				availableModels = [];
@@ -769,7 +778,9 @@ export class ModelHubComponent implements Component {
 		const roleValue =
 			scope === "project" ? this.#settings.getProjectModelRole(role) : this.#settings.getGlobalModelRole(role);
 		const allModels =
-			this.#scopedModels.length > 0 ? this.#scopedModels.map(scoped => scoped.model) : this.#registry.getAll();
+			this.#scopedModels.length > 0
+				? this.#scopedModels.map(scoped => scoped.model)
+				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
 		const roleLookup: ModelRoleLookup = {
 			getModelRole: scopedRole =>
 				scope === "project"

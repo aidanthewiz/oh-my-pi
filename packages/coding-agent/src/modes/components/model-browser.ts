@@ -22,7 +22,11 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
-import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
+import {
+	filterModelsByEnabledSettings,
+	getModelMatchPreferences,
+	resolveModelRoleValue,
+} from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
 import type { ModelPerfStats } from "../../session/agent-storage";
@@ -85,7 +89,7 @@ export function resolveRoleAssignments(
 	const matchPreferences = getModelMatchPreferences(settings);
 	const knownRoles = getKnownRoleIds(settings);
 	const configuredRoles = new Set<string>();
-	const catalog = [...allModels];
+	const catalog = filterModelsByEnabledSettings([...allModels], settings);
 
 	for (const role of knownRoles) {
 		const roleValue = settings.getModelRole(role);
@@ -102,7 +106,7 @@ export function resolveRoleAssignments(
 	}
 
 	if (autoCandidates.length > 0) {
-		const candidates = [...autoCandidates];
+		const candidates = filterModelsByEnabledSettings([...autoCandidates], settings);
 		for (const role of knownRoles) {
 			if (configuredRoles.has(role)) continue;
 			const resolved = resolveModelRoleValue(`pi/${role}`, candidates, { settings, matchPreferences });

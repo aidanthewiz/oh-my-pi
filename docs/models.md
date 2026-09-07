@@ -407,8 +407,11 @@ Related settings:
 - `providers.kimiApiFormat` (`openai` or `anthropic` request format)
 - `providers.openaiWebsockets` (`auto|off|on` websocket preference for OpenAI Codex transport)
 
-`modelRoles` stores model selectors such as `provider/modelId`; `enabledModels` and CLI `--models`
-accept exact selectors, globs, and fuzzy matches.
+`modelRoles` stores selectors such as `provider/modelId`. `enabledModels` accepts
+exact selectors, globs, and fuzzy matches. When non-empty, it is the authoritative
+ceiling for initial selection, role and temporary switches, retry fallbacks,
+secondary agents, compaction, memory processing, and restored sessions. CLI
+`--models` narrows that set; it never expands it.
 
 Global `enabledModels` and `disabledProviders` entries may also be scoped to a path prefix:
 

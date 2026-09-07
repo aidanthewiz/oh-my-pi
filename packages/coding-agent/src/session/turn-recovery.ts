@@ -24,7 +24,7 @@ import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-cat
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { extractRetryHint, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
+import { formatModelStringWithRouting, isModelEnabledBySettings, resolveModelOverride } from "../config/model-resolver";
 
 import type { Settings } from "../config/settings";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
@@ -1430,7 +1430,13 @@ export class TurnRecovery {
 			for (const candidate of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
 				const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
+				const directCandidate = this.#host.modelRegistry.find(candidate.provider, candidate.id);
+				const candidateModel =
+					resolved.model ??
+					(directCandidate &&
+					isModelEnabledBySettings(directCandidate, this.#host.settings, this.#host.modelRegistry)
+						? directCandidate
+						: undefined);
 				if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
 				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 				// A usage fallback must also fit: skip a candidate whose window cannot
@@ -1538,7 +1544,12 @@ export class TurnRecovery {
 		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal },
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+		const directCandidate = this.#host.modelRegistry.find(selector.provider, selector.id);
+		const candidate =
+			resolved.model ??
+			(directCandidate && isModelEnabledBySettings(directCandidate, this.#host.settings, this.#host.modelRegistry)
+				? directCandidate
+				: undefined);
 		if (!candidate) {
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
@@ -1623,7 +1634,13 @@ export class TurnRecovery {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector)) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				const directCandidate = this.#host.modelRegistry.find(selector.provider, selector.id);
+				const candidate =
+					resolved.model ??
+					(directCandidate &&
+					isModelEnabledBySettings(directCandidate, this.#host.settings, this.#host.modelRegistry)
+						? directCandidate
+						: undefined);
 				if (!candidate) continue;
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. A same-provider
@@ -1691,7 +1708,8 @@ export class TurnRecovery {
 		// A thinking loop is a same-model resample signal, not a router fault, so a
 		// base-model swap would abandon the loop-guard redirect (issue #8760).
 		if (AIError.is(id, AIError.Flag.ThinkingLoop)) return false;
-		return this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id)) !== undefined;
+		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
+		return Boolean(baseModel && isModelEnabledBySettings(baseModel, this.#host.settings, this.#host.modelRegistry));
 	}
 
 	/**
@@ -1739,7 +1757,8 @@ export class TurnRecovery {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
-		if (!baseModel) return false;
+		if (!baseModel || !isModelEnabledBySettings(baseModel, this.#host.settings, this.#host.modelRegistry))
+			return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
@@ -1795,8 +1814,12 @@ export class TurnRecovery {
 			this.#host.modelRegistry,
 			this.#host.settings,
 		);
+		const directPrimary = this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		const primaryModel =
-			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
+			resolvedPrimary.model ??
+			(directPrimary && isModelEnabledBySettings(directPrimary, this.#host.settings, this.#host.modelRegistry)
+				? directPrimary
+				: undefined);
 		if (!primaryModel) return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
 		if (!apiKey) return false;

@@ -54,6 +54,7 @@ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import type { ModelRegistry } from "../config/model-registry";
+import { getAllowedAvailableModels } from "../config/model-resolver";
 import { MODEL_ROLE_IDS } from "../config/model-roles";
 import type { CompactionSettings as ConfiguredCompactionSettings, Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
@@ -731,7 +732,7 @@ export class SessionMaintenance {
 			}
 
 			const effectiveSettings = resolveMethodSettings(compactionSettings, selectedMethod);
-			const availableModels = this.#host.modelRegistry.getAvailable();
+			const availableModels = getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings);
 			const requireProviderRemote = selectedMethod === "remote" && !effectiveSettings.remoteEndpoint;
 			const compactionCandidates = this.#getCompactionModelCandidates(
 				availableModels,
@@ -1280,7 +1281,7 @@ export class SessionMaintenance {
 			// the guard just narrows the union.
 			if (compactionPrep.kind === "fromHook") return clear();
 			const candidates = this.#getCompactionModelCandidates(
-				this.#host.modelRegistry.getAvailable(),
+				getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings),
 				method === "remote" && !effectiveSettings.remoteEndpoint
 					? candidate =>
 							candidate.provider === model.provider &&
@@ -1765,7 +1766,10 @@ export class SessionMaintenance {
 			const failedModel = this.#host.modelRegistry.find(assistantMessage.provider, assistantMessage.model);
 			const failedWindow = failedModel?.contextWindow ?? 0;
 			const promotionTarget = failedModel
-				? resolveContextPromotionConfiguredTarget(failedModel, this.#host.modelRegistry.getAvailable())
+				? resolveContextPromotionConfiguredTarget(
+						failedModel,
+						getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings),
+					)
 				: undefined;
 			if (
 				failedModel &&
@@ -1978,7 +1982,7 @@ export class SessionMaintenance {
 		contextWindow: number,
 		signal?: AbortSignal,
 	): Promise<Model | undefined> {
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings);
 		if (availableModels.length === 0) return undefined;
 
 		const candidate = resolveContextPromotionConfiguredTarget(currentModel, availableModels);
@@ -2056,7 +2060,8 @@ export class SessionMaintenance {
 		precomputedCandidates?: Model[],
 	): Promise<CompactionResult> {
 		const candidates =
-			precomputedCandidates ?? this.#getCompactionModelCandidates(this.#host.modelRegistry.getAvailable());
+			precomputedCandidates ??
+			this.#getCompactionModelCandidates(getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings));
 		const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
 		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 
@@ -2904,7 +2909,7 @@ export class SessionMaintenance {
 				return COMPACTION_CHECK_NONE;
 			}
 
-			const availableModels = this.#host.modelRegistry.getAvailable();
+			const availableModels = getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings);
 			if (availableModels.length === 0) {
 				await this.#emitLifecycleEvent(
 					{

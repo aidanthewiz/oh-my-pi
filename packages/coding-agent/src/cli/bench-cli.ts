@@ -21,6 +21,7 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { ApiKeyResolverModel } from "../config/api-key-resolver";
 import { ModelRegistry } from "../config/model-registry";
 import {
+	filterModelsByEnabledSettings,
 	formatModelSelectorValue,
 	formatModelString,
 	getModelMatchPreferences,
@@ -662,6 +663,7 @@ function resolveAuthenticatedAlternative(
 	selector: string,
 	model: Model<Api>,
 	modelRegistry: BenchModelRegistry,
+	settings: Settings | undefined,
 	providerOrder?: readonly string[],
 ): Model<Api> | undefined {
 	if (!modelRegistry.hasConfiguredAuth) return undefined;
@@ -678,7 +680,7 @@ function resolveAuthenticatedAlternative(
 		if (modelRegistry.hasConfiguredAuth?.(candidate)) authenticated.push(candidate);
 	};
 	// Same-id fallback for equivalent entries under providers with configured auth.
-	for (const candidate of modelRegistry.getAll()) {
+	for (const candidate of filterModelsByEnabledSettings(modelRegistry.getAll(), settings)) {
 		if (candidate.id === model.id) consider(candidate);
 	}
 	return pickHighestPriorityProvider(authenticated, providerOrder);
@@ -720,6 +722,7 @@ function resolveBenchModels(
 			authSelector,
 			model,
 			modelRegistry,
+			settings,
 			preferences.providerOrder,
 		);
 		if (authenticated) {

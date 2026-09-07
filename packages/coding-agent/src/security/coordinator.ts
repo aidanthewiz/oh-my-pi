@@ -4,6 +4,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { ModelRegistry } from "../config/model-registry";
+import { isModelEnabledBySettings } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { ToolDefinition } from "../extensibility/extensions";
 import securityReviewerPrompt from "../prompts/agents/security-reviewer.md" with { type: "text" };
@@ -579,6 +580,9 @@ export class SecurityCoordinator {
 					: this.#host.modelRegistry.find(plan.model.provider, plan.model.modelId);
 			if (!model)
 				throw new Error(`Security scan model is unavailable: ${plan.model.provider}/${plan.model.modelId}`);
+			if (!isModelEnabledBySettings(model, this.#host.settings, this.#host.modelRegistry)) {
+				throw new Error(`Security scan model is excluded by enabledModels: ${model.provider}/${model.id}`);
+			}
 			const sessionsDirectory = path.join(store.projectDirectory, "sessions");
 			await fs.mkdir(sessionsDirectory, { recursive: true, mode: 0o700 });
 			const sessionManager = SessionManager.create(executionTarget.cwd, sessionsDirectory);
