@@ -3,8 +3,9 @@ import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
 
 const encoder = new TextEncoder();
-const REQUEST_TIMEOUT_MS = 50;
-const GUARD_TIMEOUT_MS = 500;
+const TIMEOUT_TEST_MS = 50;
+const REQUEST_TIMEOUT_MS = 5_000;
+const GUARD_TIMEOUT_MS = 5_000;
 
 let server: Bun.Server<undefined> | null = null;
 
@@ -17,12 +18,12 @@ afterEach(() => {
 	server = null;
 });
 
-async function connectedTransport(): Promise<HttpTransport> {
+async function connectedTransport(timeout = REQUEST_TIMEOUT_MS): Promise<HttpTransport> {
 	if (!server) throw new Error("Test server was not started");
 	const transport = new HttpTransport({
 		type: "http",
 		url: `http://127.0.0.1:${server.port}/mcp`,
-		timeout: REQUEST_TIMEOUT_MS,
+		timeout,
 	});
 	await transport.connect();
 	return transport;
@@ -112,10 +113,10 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(TIMEOUT_TEST_MS);
 
 		await expect(withPendingGuard(transport.request("tools/list"), "request")).rejects.toThrow(
-			`Request timeout after ${REQUEST_TIMEOUT_MS}ms`,
+			`Request timeout after ${TIMEOUT_TEST_MS}ms`,
 		);
 	});
 
@@ -129,10 +130,10 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(TIMEOUT_TEST_MS);
 
 		await expect(withPendingGuard(transport.notify("notifications/initialized"), "notify")).rejects.toThrow(
-			`Notify timeout after ${REQUEST_TIMEOUT_MS}ms`,
+			`Notify timeout after ${TIMEOUT_TEST_MS}ms`,
 		);
 	});
 

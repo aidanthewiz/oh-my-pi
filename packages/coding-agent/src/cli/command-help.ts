@@ -58,6 +58,10 @@ export const grievancesHelp = {
 
 export const identityHelp = { description: "Manage the signed-in Coreforge identity" } satisfies CommandMetadata;
 
+export const imagesHelp = {
+	description: "Inspect, diagnose, probe, and purge image publication backends",
+} satisfies CommandMetadata;
+
 export const installHelp = {
 	description: "Install or link an extension package (alias of `plugin install`/`plugin link`)",
 } satisfies CommandMetadata;
