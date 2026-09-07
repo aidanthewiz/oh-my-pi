@@ -20,6 +20,7 @@ import { ANTIGRAVITY_PRIMARY_ENDPOINT, fetchAntigravityDiscoveryModels } from ".
 import { buildGitLabDuoWorkflowFallbackModel } from "../src/discovery/gitlab-duo-workflow";
 import { createModelManager } from "../src/model-manager";
 import prevModelsJson from "../src/models.json" with { type: "json" };
+import { resolveOpenAIDaybreakStandardCost } from "../src/openai-pricing";
 import { toModelSpec } from "../src/provider-models/bundled-references";
 import {
 	allowsUnauthenticatedCatalogDiscovery,
@@ -286,7 +287,7 @@ function applyCodexPricingFallback(models: readonly ModelSpec[]): ModelSpec[] {
 			return model;
 		}
 
-		const openAICost = openAIModels.get(model.id);
+		const openAICost = openAIModels.get(model.id) ?? resolveOpenAIDaybreakStandardCost(model.id);
 		if (!openAICost) {
 			return model;
 		}
@@ -561,6 +562,24 @@ async function generateModels() {
 	// tracks anthropic pricing/context automatically. The policy pass re-bakes
 	// `thinking` per id; the compat layer classifies the gateway as a signing host.
 	allModels.push(...deriveAnthropicAwsModels(allModels));
+	// Seed GLM-5.3 on the z.AI provider. GLM-5.3 is live on the Anthropic and
+	// coding endpoints but not yet advertised in `/v1/models` (which still tops
+	// out at glm-5.2), so endpoint discovery misses it. The zai provider is not
+	// authoritative, so the seed survives regeneration; thinking metadata
+	// (low/high/max uniform ladder, mandatory reasoning, defaultLevel=max) is
+	// derived by rebakeModelThinking from the identity classifiers.
+	allModels.push({
+		id: "glm-5.3",
+		name: "GLM-5.3",
+		api: "anthropic-messages",
+		provider: "zai",
+		baseUrl: "https://api.z.ai/api/anthropic",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+	} as ModelSpec<"anthropic-messages">);
 	// Seed Meta's documented Muse model so first-run selection does not depend on
 	// credentials or live discovery.
 	allModels.push(...META_MUSE_STATIC_MODELS);

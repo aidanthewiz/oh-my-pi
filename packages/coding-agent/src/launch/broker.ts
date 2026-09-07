@@ -16,7 +16,7 @@ import {
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
 import { daemonBrokerEndpoint } from "./paths";
-import { hasLiveDaemonProjectPresence } from "./presence";
+import { hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs } from "./presence";
 import {
 	DAEMON_BROKER_PROTOCOL_VERSION,
 	DAEMON_IDLE_GRACE_ENV,
@@ -1398,6 +1398,13 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 	const lease = await acquireBrokerLease(runtimeDir);
 	if (!lease) return;
 	setProcessName("omp daemon broker");
+	// Reclaim sibling daemon scopes left behind by dead brokers (issue #8674).
+	// Detached and non-throwing so it never delays clients connecting to us.
+	void pruneDeadDaemonRuntimeDirs(runtimeDir).catch(error => {
+		logger.warn("Daemon runtime prune failed", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	});
 	const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
 	if (!token) throw new Error("Daemon broker token is empty");
 	const broker = new DaemonBroker(projectDir, runtimeDir, token, idleGraceMs, restartBackoffBaseMs);

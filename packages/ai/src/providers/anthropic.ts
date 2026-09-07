@@ -89,7 +89,7 @@ import {
 	type Usage as AnthropicWireUsage,
 	type ContentBlockParam,
 	type FallbackParam,
-	isAnthropicWebSearchHistoryBlock,
+	isAnthropicServerToolHistoryBlock,
 	type MessageCreateParams,
 	type MessageCreateParamsStreaming,
 	type MessageParam,
@@ -2547,7 +2547,7 @@ const streamAnthropicOnce = (
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
 									type: "thinking",
-									thinking: "",
+									thinking: event.content_block.thinking ?? "",
 									thinkingSignature: "",
 									[kStreamingBlockIndex]: event.index,
 								};
@@ -2559,6 +2559,14 @@ const streamAnthropicOnce = (
 									contentIndex,
 									partial: output,
 								});
+								if (block.thinking) {
+									stream.push({
+										type: "thinking_delta",
+										contentIndex,
+										delta: block.thinking,
+										partial: output,
+									});
+								}
 							} else if (event.content_block.type === "redacted_thinking") {
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
@@ -2572,8 +2580,11 @@ const streamAnthropicOnce = (
 									kind: "redactedThinking",
 								});
 							} else if (
-								isAnthropicWebSearchHistoryBlock(event.content_block) &&
-								umansGatewayWebSearchHeader === undefined
+								isAnthropicServerToolHistoryBlock(event.content_block) &&
+								(umansGatewayWebSearchHeader === undefined ||
+									(event.content_block.type === "server_tool_use"
+										? event.content_block.name !== "web_search"
+										: event.content_block.type !== "web_search_tool_result"))
 							) {
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
