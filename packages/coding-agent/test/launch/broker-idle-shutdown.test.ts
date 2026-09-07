@@ -9,8 +9,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
-import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import { createDaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
 
 function restoreEnv(name: string, value: string | undefined): void {

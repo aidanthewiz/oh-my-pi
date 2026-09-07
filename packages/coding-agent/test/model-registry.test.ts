@@ -1455,7 +1455,6 @@ describe("ModelRegistry", () => {
 			expect(error?.message).toContain("apiKey is required when transport is pi-native");
 		});
 
-
 		test("model override can change cost fields partially without dropping long-context pricing", () => {
 			const gpt56 = getModelsForProvider(costPartial, "openai").find(m => m.id === "gpt-5.6");
 			expect(gpt56?.cost.input).toBe(99);
