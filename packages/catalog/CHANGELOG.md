@@ -9,6 +9,17 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [18.0.5] - 2026-08-25
+
+### Added
+
+- Added built-in DeepInfra provider support (`deepinfra`, `DEEPINFRA_API_KEY`) with live model discovery, including chat models, context windows, pricing, cache-read pricing, vision input, and reasoning-effort capabilities.
+- Added built-in Yolo-Auto provider support with the flat-rate `deepseek-flash-v4` model and live model discovery.
+
+### Fixed
+
+- Fixed the Synthetic provider’s default model to use `hf:zai-org/GLM-5.2` instead of the retired `hf:zai-org/GLM-5.1`.
+
 ## [18.0.4] - 2026-08-24
 
 ### Fixed

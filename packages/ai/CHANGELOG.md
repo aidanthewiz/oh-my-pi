@@ -12,6 +12,27 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.0.5] - 2026-08-25
+
+### Breaking Changes
+
+- Renamed the exported stream-retry helper from `withEmptyCompletionRetry` to `withReplaySafeStreamRetry` and added retry policy options for empty completions and provider errors. Consumers using the old helper must migrate.
+
+### Added
+
+- Added browser-based Sign in with OpenRouter using OAuth PKCE, while retaining support for pasted OpenRouter API keys and redirect URLs for remote sessions.
+- Added `/login` API-key authentication for DeepInfra and Yolo-Auto, including validation against each provider before the credentials are accepted.
+
+### Fixed
+
+- Fixed DeepSeek vision models from losing image input while keeping image parts stripped for text-only DeepSeek endpoints.
+- Fixed OpenAI-compatible gateways that report uppercase completion reasons such as `STOP` or `MAX_TOKENS`; these are now classified correctly, including mapping `MAX_TOKENS` to a length limit.
+- Fixed provider message-count limit errors being treated as unrecoverable payload errors instead of recoverable context overflows.
+- Improved Codex WebSocket continuations so rate limits, throttling, and compatible mode changes preserve valid response continuations instead of unnecessarily replaying the full context.
+- Fixed Codex WebSocket cleanup failures caused by already-closed sockets.
+- Added safe retries for transient mid-stream socket closures across OpenAI Responses, Chat Completions, Azure OpenAI Responses, and Codex SSE when no replay-unsafe output has been emitted.
+- Fixed usage and cost reporting for OpenAI-compatible gateways backed by Vertex AI or Gemini by recognizing cached prompt tokens reported through `cachedContentTokenCount`.
+
 ## [18.0.4] - 2026-08-24
 
 ### Fixed

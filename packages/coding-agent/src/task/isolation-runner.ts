@@ -208,6 +208,9 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		});
 		opts.onSubprocessResult?.(result);
 		const preserveChanges = result.exitCode === 0 || deferredCleanup !== undefined;
+		if (deferredCleanup && preserveChanges) {
+			await deferredCleanup;
+		}
 		if (opts.mergeMode === "branch" && preserveChanges) {
 			try {
 				const commitResult = await commitToBranch(

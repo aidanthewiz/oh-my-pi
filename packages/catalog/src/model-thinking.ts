@@ -339,6 +339,14 @@ function getModelDefinedEfforts<TApi extends Api>(
 	if (isBedrockNova2Lite(spec)) {
 		return LOW_MEDIUM_HIGH_REASONING_EFFORTS;
 	}
+	if (
+		isOpenAICompatReasoningApi(spec.api) &&
+		isChatTemplateThinkingFormat(compat) &&
+		spec.thinking?.mode === "effort" &&
+		spec.thinking.efforts.length > 0
+	) {
+		return spec.thinking.efforts;
+	}
 	if (isGlm53ReasoningEffortModelId(spec.id)) {
 		// GLM-5.3+ exposes a uniform wire-exact low/high/max ladder on every
 		// host — unlike GLM-5.2, whose reasoning_effort dialect is
@@ -533,6 +541,9 @@ function isQwenTemplateReasoningEffortCompat(compat: CompatOf<Api>): boolean {
 	return (
 		compat !== undefined && "qwenTemplateReasoningEffort" in compat && compat.qwenTemplateReasoningEffort === true
 	);
+}
+function isChatTemplateThinkingFormat(compat: CompatOf<Api>): boolean {
+	return compat !== undefined && "thinkingFormat" in compat && compat.thinkingFormat === "chat-template";
 }
 
 function inferDetectedEffortMap<TApi extends Api>(

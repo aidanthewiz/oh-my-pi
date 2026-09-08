@@ -1380,16 +1380,16 @@ describe("executeBash :async: background retention", () => {
 				});
 				expect(res.cancelled).toBe(false);
 
-				// This integration test waits on an OS child process, so fake timers cannot drive readiness.
+				let observedPid = Number.NaN;
 				await pollUntil(() => {
-					try {
-						return Number.isInteger(Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10));
-					} catch {
-						return false;
-					}
+					if (!fs.existsSync(pidFile)) return false;
+					observedPid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+					return Number.isInteger(observedPid);
 				}, Date.now() + 4000);
-				pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
-				expect(Number.isInteger(pid)).toBe(true);
+				if (!Number.isInteger(observedPid)) {
+					throw new Error(`Timed out waiting for a valid PID in ${pidFile}`);
+				}
+				pid = observedPid;
 
 				// A later turn on a different per-job shell must not have killed it.
 				await executeBash("true", { sessionKey: "reparent-probe:async:job2", cwd: tmp });

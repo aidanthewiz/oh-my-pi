@@ -4440,6 +4440,7 @@ describe("advisor", () => {
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
 			const rollbackCalls: number[] = [];
 			const lengthsBeforePrompt: number[] = [];
+			let abandonedTurns = 0;
 			let shouldFail = true;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -4480,6 +4481,9 @@ describe("advisor", () => {
 			const host: AdvisorRuntimeHost = {
 				snapshotMessages: () => messages,
 				enqueueAdvice: () => {},
+				onTurnAbandoned: () => {
+					abandonedTurns++;
+				},
 			};
 			const runtime = new AdvisorRuntime(agent, host, 0);
 
@@ -4492,6 +4496,7 @@ describe("advisor", () => {
 			// saw a clean state.messages instead of stacked failed turns.
 			expect(lengthsBeforePrompt).toEqual([0, 0, 0]);
 			expect(rollbackCalls).toEqual([0, 0, 0]);
+			expect(abandonedTurns).toBe(1);
 			// The drop-after-3 path also left state.messages empty — no orphan failed
 			// turns leak into the next successful run's context.
 			expect(state.messages).toHaveLength(0);
@@ -4506,6 +4511,7 @@ describe("advisor", () => {
 
 			expect(lengthsBeforePrompt[lengthsBeforePrompt.length - 1]).toBe(0);
 			expect(rollbackCalls).toHaveLength(3);
+			expect(abandonedTurns).toBe(1);
 
 			expect(state.messages).toHaveLength(2);
 		});

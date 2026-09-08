@@ -242,7 +242,7 @@ describe("runIsolatedSubprocess", () => {
 		});
 		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 
-		const outcome = await runIsolatedSubprocess({
+		const run = runIsolatedSubprocess({
 			baseOptions: {
 				cwd: "/repo",
 				agent: {
@@ -276,10 +276,12 @@ describe("runIsolatedSubprocess", () => {
 			buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
 		});
 
-		expect(outcome.exitCode).toBe(1);
+		await Promise.resolve();
 		expect(cleanupSpy).not.toHaveBeenCalled();
 		cleanupGate.resolve();
-		await cleanupGate.promise;
+		const outcome = await run;
+
+		expect(outcome.exitCode).toBe(1);
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
@@ -293,6 +295,8 @@ describe("runIsolatedSubprocess", () => {
 		await fs.mkdir(artifactsDir, { recursive: true });
 		const cleanupGate = Promise.withResolvers<void>();
 		const cleanupFinished = Promise.withResolvers<void>();
+		const subprocessStarted = Promise.withResolvers<void>();
+		const subprocessResult = Promise.withResolvers<SingleResult>();
 		const baseline = {
 			root: {
 				repoRoot,
@@ -312,14 +316,10 @@ describe("runIsolatedSubprocess", () => {
 			fellBack: false,
 			fallbackReason: null,
 		});
-		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(options => {
 			options.onCleanupDeferred?.(cleanupGate.promise);
-			return result({
-				id: "DeferredSuccess",
-				exitCode: 1,
-				aborted: true,
-				error: "cleanup exceeded its deadline",
-			});
+			subprocessStarted.resolve();
+			return subprocessResult.promise;
 		});
 		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
 			rootPatch,
@@ -329,7 +329,7 @@ describe("runIsolatedSubprocess", () => {
 			cleanupFinished.resolve();
 		});
 
-		const outcome = await runIsolatedSubprocess({
+		const run = runIsolatedSubprocess({
 			baseOptions: {
 				cwd: repoRoot,
 				agent: {
@@ -349,16 +349,99 @@ describe("runIsolatedSubprocess", () => {
 			artifactsDir,
 			buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
 		});
-		expect(outcome.exitCode).toBe(1);
+		await subprocessStarted.promise;
+		subprocessResult.resolve(
+			result({
+				id: "DeferredSuccess",
+				exitCode: 1,
+				aborted: true,
+				error: "cleanup exceeded its deadline",
+			}),
+		);
+		await Promise.resolve();
+		expect(captureSpy).not.toHaveBeenCalled();
+		expect(cleanupSpy).not.toHaveBeenCalled();
+		cleanupGate.resolve();
+		const outcome = await run;
 
 		const patchPath = path.join(artifactsDir, "DeferredSuccess.patch");
+		expect(outcome.exitCode).toBe(1);
 		expect(outcome.patchPath).toBe(patchPath);
 		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
 		expect(captureSpy).toHaveBeenCalledWith(isolationDir, baseline);
-		expect(cleanupSpy).not.toHaveBeenCalled();
-
-		cleanupGate.resolve();
 		await cleanupFinished.promise;
+		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("captures a successful yield's patch when child cleanup is deferred (issue #9670)", async () => {
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-defer-ok-"));
+		tempRoots.push(artifactsDir);
+		const rootPatch = "diff --git a/task.txt b/task.txt\n--- a/task.txt\n+++ b/task.txt\n@@ -1 +1 @@\n-old\n+new\n";
+		const cleanupGate = Promise.withResolvers<void>();
+		const subprocessStarted = Promise.withResolvers<void>();
+		const subprocessResult = Promise.withResolvers<SingleResult>();
+		const baseline = {
+			root: {
+				repoRoot: "/repo",
+				headCommit: "base",
+				staged: "",
+				unstaged: "",
+				untracked: [],
+				untrackedPatch: "",
+			},
+			nested: [],
+		};
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: "/repo/isolated",
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		// A successful yield whose teardown drains past the grace window returns
+		// exitCode 0 with a pending deferred cleanup.
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(options => {
+			options.onCleanupDeferred?.(cleanupGate.promise);
+			subprocessStarted.resolve();
+			return subprocessResult.promise;
+		});
+		const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch,
+			nestedPatches: [],
+		});
+		const cleanupSpy = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+
+		const run = runIsolatedSubprocess({
+			baseOptions: {
+				cwd: "/repo",
+				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
+				task: "Do work",
+				index: 0,
+				id: "DeferredSuccess",
+			},
+			context: { repoRoot: "/repo", baseline },
+			preferredBackend: undefined,
+			agentId: "DeferredSuccess",
+			mergeMode: "patch",
+			artifactsDir,
+			buildFailureResult: err => result({ exitCode: 1, error: String(err) }),
+		});
+
+		// Capture waits until every deferred writer has settled.
+		await subprocessStarted.promise;
+		subprocessResult.resolve(result({ id: "DeferredSuccess", exitCode: 0 }));
+		await Promise.resolve();
+		expect(captureSpy).not.toHaveBeenCalled();
+		expect(cleanupSpy).not.toHaveBeenCalled();
+		cleanupGate.resolve();
+		const outcome = await run;
+
+		const patchPath = path.join(artifactsDir, "DeferredSuccess.patch");
+		expect(outcome.exitCode).toBe(0);
+		expect(outcome.patchPath).toBe(patchPath);
+		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
+		expect(captureSpy).toHaveBeenCalledWith("/repo/isolated", baseline);
+		await Promise.resolve();
+		await Promise.resolve();
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 	});
 

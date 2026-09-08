@@ -12,8 +12,10 @@ const PROVIDERS: OAuthProviderInfo[] = [
 	provider("openai-codex"),
 	provider("openai-codex-device", "openai-codex"),
 	provider("openrouter"),
+	provider("deepinfra"),
 	provider("perplexity"), // no bundled catalog models: search key
 	provider("tavily"), // no bundled catalog models: search key
+	provider("yolo-auto"),
 ];
 
 async function initSettings(enabledModels: string[]): Promise<void> {
