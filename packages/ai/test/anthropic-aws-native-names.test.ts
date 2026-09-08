@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { buildAnthropicClientOptions } from "@oh-my-pi/pi-ai/providers/anthropic";
-import { anthropicProvider } from "@oh-my-pi/pi-ai/registry/anthropic";
-import { anthropicAwsProvider } from "@oh-my-pi/pi-ai/registry/anthropic-aws";
 import {
 	anthropicBaseUrlIsAwsGateway,
 	resolveAnthropicAwsApiKey,
@@ -163,24 +161,24 @@ describe("anthropic-aws availability gate (envKeys)", () => {
 		// The gate's return value becomes the apiKey the transport sends as
 		// `Authorization: Bearer <key>`, so returning the native key here is what
 		// makes an AWS-onboarded machine work with no extra env.
-		expect(anthropicAwsProvider.envKeys()).toBe("key-native");
+		expect(getEnvApiKey("anthropic-aws")).toBe("key-native");
 	});
 
 	it("is unavailable when only native names are set WITHOUT the gateway URL", () => {
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
 		process.env.ANTHROPIC_API_KEY = "key-native";
-		expect(anthropicAwsProvider.envKeys()).toBeUndefined();
+		expect(getEnvApiKey("anthropic-aws")).toBeUndefined();
 	});
 
 	it("is unavailable with no workspace id even when an API key is present", () => {
 		process.env.ANTHROPIC_AWS_API_KEY = "key-aws";
-		expect(anthropicAwsProvider.envKeys()).toBeUndefined();
+		expect(getEnvApiKey("anthropic-aws")).toBeUndefined();
 	});
 
 	it("reports the SigV4 sentinel when a workspace id + AWS_PROFILE are set (no API key)", () => {
 		process.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
 		process.env.AWS_PROFILE = "somaprod";
-		expect(anthropicAwsProvider.envKeys()).toBe("<authenticated>");
+		expect(getEnvApiKey("anthropic-aws")).toBe("<authenticated>");
 	});
 
 	it("is unavailable for a native workspace + gateway + AWS_PROFILE but no native API key", () => {
@@ -190,7 +188,7 @@ describe("anthropic-aws availability gate (envKeys)", () => {
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.AWS_PROFILE = "somaprod";
-		expect(anthropicAwsProvider.envKeys()).toBeUndefined();
+		expect(getEnvApiKey("anthropic-aws")).toBeUndefined();
 	});
 
 	it("does not cross families: native workspace is not authenticated by the AWS-scoped key", () => {
@@ -200,7 +198,7 @@ describe("anthropic-aws availability gate (envKeys)", () => {
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.ANTHROPIC_AWS_API_KEY = "key-aws";
-		expect(anthropicAwsProvider.envKeys()).toBeUndefined();
+		expect(getEnvApiKey("anthropic-aws")).toBeUndefined();
 	});
 
 	it("is unavailable when the AWS-scoped workspace wins but only a native key is set", () => {
@@ -211,10 +209,10 @@ describe("anthropic-aws availability gate (envKeys)", () => {
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.ANTHROPIC_API_KEY = "key-native";
-		expect(anthropicAwsProvider.envKeys()).toBeUndefined();
+		expect(getEnvApiKey("anthropic-aws")).toBeUndefined();
 		// The AWS-scoped key (same family as the winning workspace id) completes it.
 		process.env.ANTHROPIC_AWS_API_KEY = "key-aws";
-		expect(anthropicAwsProvider.envKeys()).toBe("key-aws");
+		expect(getEnvApiKey("anthropic-aws")).toBe("key-aws");
 	});
 });
 
@@ -223,20 +221,20 @@ describe("stock anthropic availability on an AWS gateway route", () => {
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
 		process.env.ANTHROPIC_API_KEY = "key-native";
-		expect(anthropicProvider.envKeys()).toBe("key-native");
+		expect(getEnvApiKey("anthropic")).toBe("key-native");
 	});
 
 	it("uses the AWS-scoped SigV4 credential family", () => {
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
 		process.env.AWS_PROFILE = "somaprod";
-		expect(anthropicProvider.envKeys()).toBe("<authenticated>");
+		expect(getEnvApiKey("anthropic")).toBe("<authenticated>");
 	});
 
 	it("does not advertise an incomplete AWS route from a plain Anthropic key", () => {
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.ANTHROPIC_API_KEY = "key-native";
-		expect(anthropicProvider.envKeys()).toBeUndefined();
+		expect(getEnvApiKey("anthropic")).toBeUndefined();
 	});
 
 	it("uses the AWS credential family when an enabled Foundry route has no base URL", () => {
@@ -244,7 +242,7 @@ describe("stock anthropic availability on an AWS gateway route", () => {
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
 		process.env.ANTHROPIC_AWS_API_KEY = "key-aws";
-		expect(anthropicProvider.envKeys()).toBe("key-aws");
+		expect(getEnvApiKey("anthropic")).toBe("key-aws");
 	});
 
 	it("uses the AWS credential family for a Foundry AWS base URL", () => {
@@ -253,7 +251,7 @@ describe("stock anthropic availability on an AWS gateway route", () => {
 		process.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_aws";
 		process.env.ANTHROPIC_AWS_API_KEY = "key-aws";
 		process.env.ANTHROPIC_API_KEY = "key-generic";
-		expect(anthropicProvider.envKeys()).toBe("key-aws");
+		expect(getEnvApiKey("anthropic")).toBe("key-aws");
 	});
 
 	it("does not apply stock AWS credentials to an explicit non-AWS base URL", () => {

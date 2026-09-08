@@ -83,17 +83,6 @@ export function applyAntigravityPricingFallback(models: readonly ModelSpec[]): M
 }
 
 /**
- * OpenAI pricing published 30 Jul 2026. Codex uses the same rates as
- * subscription-credit shadow prices. The native Bedrock Mantle seed owns its
- * distinct AWS pricing.
- */
-const GPT_5_6_PRICING = {
-	luna: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
-	terra: { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
-	sol: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
-} as const;
-
-/**
  * Apply upstream metadata corrections to a mutable array of models, then
  * re-bake canonical thinking metadata so generated catalogs always carry the
  * deriver's output for the post-policy spec.
@@ -286,13 +275,4 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 	if (model.provider === "ollama-cloud") {
 		model.omitMaxOutputTokens = true;
 	}
-
-}
-
-function applyGpt56Pricing(model: ModelSpec<Api>): void {
-	if (model.provider !== "openai" && model.provider !== "openai-codex") return;
-	const id = model.id.toLowerCase();
-	const sku = (["luna", "terra", "sol"] as const).find(candidate => id.includes(`gpt-5.6-${candidate}`));
-	if (!sku) return;
-	Object.assign(model.cost, GPT_5_6_PRICING[sku]);
 }

@@ -1983,7 +1983,7 @@ export class ModelRegistry {
 			const status: ProviderDiscoveryStatus = authoritativeDiscoveryUnavailable
 				? "unavailable"
 				: result.source === "cache" ||
-						(result.source === "bundled" &&
+					  (result.source === "bundled" &&
 							result.stale &&
 							models.length > 0 &&
 							options.fetchDynamicModels !== undefined)

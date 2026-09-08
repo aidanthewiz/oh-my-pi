@@ -56,7 +56,7 @@ test("Coreforce saves native caches before fallible packaging steps", async () =
 		expect(workflow.slice(restoreIndex, buildIndex)).toContain("uses: actions/cache/restore@");
 		expect(saveStep).toContain("uses: actions/cache/save@");
 		expect(saveStep).toContain("if: steps.bazel-cache.outputs.cache-hit != 'true'");
-		expect(saveStep).toContain("key: ${{ steps.bazel-cache.outputs.cache-primary-key }}");
+		expect(saveStep).toContain(`key: \${{ steps.bazel-cache.outputs.cache-primary-key }}`);
 	}
 });
 

@@ -15,7 +15,6 @@ import type { Api, Model, ModelSpec } from "./types";
  */
 type ApiModel<TApi extends Api = Api> = ModelSpec<TApi> | Model<TApi>;
 
-
 /**
  * Returns the supported thinking efforts declared on the model metadata.
  * Empty for non-reasoning models and for reasoning models without a

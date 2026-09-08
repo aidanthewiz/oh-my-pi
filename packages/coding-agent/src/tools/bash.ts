@@ -29,6 +29,7 @@ import type {
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
@@ -36,6 +37,7 @@ import type { ToolSession } from ".";
 import { type RuntimeToolApprovalRequest, truncateForPrompt } from "./approval";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
+import { rewriteGitWorktreeAdd } from "./bash-worktree-rewrite";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import {
@@ -701,6 +703,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				command = cd.rest;
 			}
 		}
+		if (this.session.settings.get("worktree.clone")) {
+			command = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
+		}
 		if (input.async === true && !this.#asyncEnabled) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
@@ -718,8 +723,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		const internalUrlOptions: InternalUrlExpansionOptions = {
 			skills: this.session.skills ?? [],
+			attachments: this.session.getImageAttachments?.() ?? [],
 			internalRouter: InternalUrlRouter.instance(),
 			cwd: this.session.cwd,
+			sessionFile: this.session.getSessionFile() ?? undefined,
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
 				getSessionId: this.session.getSessionId,

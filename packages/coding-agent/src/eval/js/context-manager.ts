@@ -1,4 +1,4 @@
-import { filterChildShellEnv, logger, postmortem, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import { createWorkerHandle, createWorkerSubprocess, resolveWorkerSpawnCmd } from "../../subprocess/worker-client";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
@@ -7,7 +7,6 @@ import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout
 import { attachSessionOwner, resolveOwnerScopedSessionKey, type SessionOwners } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
-import { WorkerCore } from "./worker-core";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
@@ -15,7 +14,6 @@ import type {
 	RunErrorPayload,
 	SessionSnapshot,
 	WorkerInbound,
-	Transport,
 	WorkerOutbound,
 } from "./worker-protocol";
 
@@ -786,66 +784,4 @@ function errorFromWorkerEvent(event: ErrorEvent): Error {
 	if (event.error instanceof Error) return event.error;
 	if (event.message) return new Error(event.message);
 	return new Error("Unknown JS eval worker error");
-}
-
-/**
- * Inline fallback for environments where Bun cannot spawn the worker entry
- * (e.g. some test runners). Preserves behavior but cannot interrupt synchronous
- * infinite loops because user code runs on the main thread.
- */
-function spawnInlineWorker(): WorkerHandle {
-	const hostListeners = new Set<(message: WorkerOutbound) => void>();
-	const workerListeners = new Set<(message: WorkerInbound) => void>();
-	const workerTransport: Transport = {
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of hostListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			workerListeners.add(handler);
-			return () => workerListeners.delete(handler);
-		},
-		close: () => {},
-	};
-	const core = new WorkerCore(workerTransport, {
-		mode: "inline",
-		interceptUnhandledRejections: postmortem.interceptUnhandledRejections,
-	});
-	return {
-		mode: "inline",
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of workerListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			hostListeners.add(handler);
-			return () => hostListeners.delete(handler);
-		},
-		onError: () => () => {},
-		async close() {
-			const { promise: closed, resolve } = Promise.withResolvers<boolean>();
-			let settled = false;
-			let unsubscribe = (): void => {};
-			const finish = (value: boolean): void => {
-				if (settled) return;
-				settled = true;
-				if (timeout) clearTimeout(timeout);
-				unsubscribe();
-				hostListeners.clear();
-				workerListeners.clear();
-				resolve(value);
-			};
-			unsubscribe = this.onMessage(msg => {
-				if (msg.type === "closed") finish(true);
-			});
-			this.send({ type: "close" });
-			const timeout = setTimeout(() => finish(false), workerCloseTimeoutMs);
-			return await closed;
-		},
-		async terminate() {
-			hostListeners.clear();
-			workerListeners.clear();
-			core.dispose();
-		},
-	};
 }

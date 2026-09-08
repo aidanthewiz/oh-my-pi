@@ -866,16 +866,16 @@ describe("/mcp auth commands", () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
 
 		let authorizationUrl = "";
-		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async function (
-			this: oauthFlow.MCPOAuthFlow,
-		) {
-			authorizationUrl = (await this.generateAuthUrl("state", "http://localhost:53193/callback")).url;
-			return {
-				access: "fresh-access",
-				refresh: "fresh-refresh",
-				expires: Date.now() + 3_600_000,
-			};
-		});
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(
+			async function (this: oauthFlow.MCPOAuthFlow) {
+				authorizationUrl = (await this.generateAuthUrl("state", "http://localhost:53193/callback")).url;
+				return {
+					access: "fresh-access",
+					refresh: "fresh-refresh",
+					expires: Date.now() + 3_600_000,
+				};
+			},
+		);
 		const { controller, showError } = createController(authStorage);
 
 		await controller.handle("/mcp reauth envserver");

@@ -158,7 +158,9 @@ async function checkForNewVersion(productVersion: string | undefined): Promise<s
 // Todo settings are caller-controlled in protocol modes. Do not host-default them:
 // embedders need project-level opt-outs for reminder/prelude prompt injection.
 const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
-	"task.isolation.mode",
+	"task.isolation.enabled",
+	"isolation.backend",
+	"worktree.clone",
 	"task.isolation.apply",
 	"task.isolation.merge",
 	"task.isolation.commits",

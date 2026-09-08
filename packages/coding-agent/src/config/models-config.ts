@@ -125,9 +125,9 @@ export function mergeModelsConfig(base: ModelsConfig | undefined, managed: Model
 		}
 		let modelOverrides = baseProvider.modelOverrides;
 		if (managedProvider.modelOverrides) {
-			modelOverrides = { ...(baseProvider.modelOverrides ?? {}) };
+			modelOverrides = { ...baseProvider.modelOverrides };
 			for (const [id, override] of Object.entries(managedProvider.modelOverrides)) {
-				modelOverrides[id] = { ...(modelOverrides[id] ?? {}), ...override };
+				modelOverrides[id] = { ...modelOverrides[id], ...override };
 			}
 		}
 		providers[name] = {

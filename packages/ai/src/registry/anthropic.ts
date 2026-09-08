@@ -6,8 +6,8 @@ import {
 	isAnthropicAwsGatewayUrl,
 	resolveAnthropicAwsProviderCredential,
 } from "./anthropic-aws-env";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "./oauth/types";
-import type { ProviderCredentialContext, ProviderDefinition } from "./types";
+import type { ProviderTransport } from "./build";
+import type { ProviderCredentialContext } from "./types";
 
 function anthropicRequestEnvironmentOwnsCredential(context: ProviderCredentialContext): boolean {
 	const foundryBaseUrl = isFoundryEnabled() ? $env.FOUNDRY_BASE_URL?.trim() : undefined;
@@ -17,7 +17,7 @@ function anthropicRequestEnvironmentOwnsCredential(context: ProviderCredentialCo
 	return anthropicBaseUrlIsAwsGateway();
 }
 
-function resolveAnthropicEnvironmentCredential(context?: ProviderCredentialContext): string | undefined {
+export function resolveAnthropicEnvironmentCredential(context?: ProviderCredentialContext): string | undefined {
 	if (anthropicRequestEnvironmentOwnsCredential(context ?? {})) {
 		return resolveAnthropicAwsProviderCredential();
 	}
@@ -37,22 +37,7 @@ function resolveAnthropicEnvironmentCredential(context?: ProviderCredentialConte
 	return $pickenv("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY");
 }
 
-export const anthropicProvider = {
-	id: "anthropic",
+export const anthropicTransport = {
 	requestEnvironmentOwnsCredential: anthropicRequestEnvironmentOwnsCredential,
-	name: "Anthropic (Claude Pro/Max)",
-	envKeys: () => resolveAnthropicEnvironmentCredential(),
 	envKeysForRequest: resolveAnthropicEnvironmentCredential,
-	login: async (cb: OAuthLoginCallbacks) => {
-		// Lazy import: keep heavy OAuth flow modules out of the eager registry graph.
-		const { loginAnthropic } = await import("./oauth/anthropic");
-		return loginAnthropic(cb);
-	},
-	refreshToken: async (credentials: OAuthCredentials) => {
-		// Lazy import: keep heavy OAuth flow modules out of the eager registry graph.
-		const { refreshAnthropicToken } = await import("./oauth/anthropic");
-		return refreshAnthropicToken(credentials.refresh);
-	},
-	callbackPort: 54545,
-	pasteCodeFlow: true,
-} as const satisfies ProviderDefinition;
+} as const satisfies ProviderTransport;
