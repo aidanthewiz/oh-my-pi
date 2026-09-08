@@ -9,6 +9,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { resolveAgentModelSelection } from "../config/model-resolver";
+import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -42,6 +43,7 @@ import {
 	type SingleResult,
 	type StructuredSubagentOutput,
 } from "./types";
+import type { WorkPoolYieldItem } from "./workpool-yield";
 import { type NestedRepoPatch, parseIsolationBackend } from "./worktree";
 
 /** Validation behavior requested for an effective output schema. */
@@ -115,6 +117,10 @@ export interface StructuredSubagentRequest {
 	enableIrc?: boolean;
 	/** `0` disables executor wall-clock timeout. Undefined inherits settings. */
 	maxRuntimeMs?: number;
+	/** Kernel-defined tools explicitly exposed to this child. */
+	customTools?: CustomTool[];
+	/** Workpool items accepted by the child yield tool during this turn. */
+	workPoolYieldItems?: WorkPoolYieldItem[];
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 }
@@ -203,6 +209,9 @@ function createPlanModeAgent(agent: AgentDefinition): AgentDefinition {
 
 function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode: boolean): void {
 	if (!planMode) return;
+	if (request.customTools?.length) {
+		throw new StructuredSubagentError("preflight", "Eval-defined tools are unavailable in plan mode.");
+	}
 	const isolation = request.isolation;
 	if (
 		isolation &&
@@ -437,6 +446,8 @@ function buildExecutorOptions(
 		settings: session.settings,
 		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
 		enableMCP,
+		customTools: request.customTools,
+		workPoolYieldItems: request.workPoolYieldItems,
 		contextFiles: request.contextFilePolicy === "none" ? [] : session.contextFiles,
 		skills,
 		autoloadSkills,

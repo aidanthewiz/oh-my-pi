@@ -172,12 +172,17 @@ jobs:
             cross: "1"
             binary: omp-windows-x64.exe
             native_targets: win32-x64-baseline
+          - target: win32-arm64
+            os: windows-11-arm
+            windows: "1"
+            binary: omp-windows-arm64.exe
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.release_sha }}
       - name: Guard release commit is the coreforge branch tip
+        if: matrix.windows != '1'
         env:
           RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
@@ -193,10 +198,28 @@ jobs:
             exit 1
           fi
           echo "release commit $RELEASE_SHA is the coreforge tip - ok"
+      - name: Guard release commit is the coreforge branch tip (Windows)
+        if: matrix.windows == '1'
+        shell: pwsh
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          git fetch origin +coreforge:refs/remotes/origin/coreforge --quiet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $headCommit = (git rev-parse HEAD).Trim()
+          $tip = (git rev-parse refs/remotes/origin/coreforge).Trim()
+          if ($headCommit -ne $env:RELEASE_SHA) {
+            throw "checkout $headCommit does not match prepared commit $env:RELEASE_SHA"
+          }
+          if ($env:RELEASE_SHA -ne $tip) {
+            throw "prepared commit $env:RELEASE_SHA is not the coreforge tip ($tip) - refusing to release"
+          }
+          Write-Host "release commit $env:RELEASE_SHA is the coreforge tip - ok"
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: "1.4.0"
       - name: Guard tag against package version
+        if: matrix.windows != '1'
         run: |
           TAG="${RELEASE_TAG#v}"
           PKG="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
@@ -204,6 +227,16 @@ jobs:
             "$PKG".*) echo "tag $TAG rolls upstream $PKG - ok" ;;
             *) echo "tag $TAG does not extend package version $PKG"; exit 1 ;;
           esac
+      - name: Guard tag against package version (Windows)
+        if: matrix.windows == '1'
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG.Substring(1)
+          $pkg = (bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)').Trim()
+          if (-not $tag.StartsWith("$pkg.")) {
+            throw "tag $tag does not extend package version $pkg"
+          }
+          Write-Host "tag $tag rolls upstream $pkg - ok"
       - name: Reclaim disk for large native builds
         if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'
         run: |
@@ -212,6 +245,7 @@ jobs:
           df -h /
       - run: bun install --frozen-lockfile
       - name: Restore Bazel native build cache
+        if: matrix.windows != '1'
         id: bazel-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -222,6 +256,7 @@ jobs:
           restore-keys: |
             coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Build native addon from Coreforge sources
+        if: matrix.windows != '1'
         env:
           NATIVE_TARGETS: ${{ matrix.native_targets }}
         run: |
@@ -237,8 +272,13 @@ jobs:
           read -r -a targets <<< "$NATIVE_TARGETS"
           bun scripts/bazel-natives.ts "${targets[@]}"
           ls packages/natives/native/*.node
+      - name: Build native addon from Coreforge sources (Windows ARM64)
+        if: matrix.windows == '1'
+        env:
+          OMP_NATIVE_CARGO_PROFILE: ci
+        run: bun scripts/bazel-natives.ts host --dest packages/natives/native
       - name: Save Bazel native build cache
-        if: steps.bazel-cache.outputs.cache-hit != 'true'
+        if: matrix.windows != '1' && steps.bazel-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -246,6 +286,7 @@ jobs:
             ~/.cache/omp-bazel-repo
           key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
       - name: Package source-built native addon
+        if: matrix.windows != '1'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -261,8 +302,28 @@ jobs:
           cp "${addons[@]}" release-assets/package/
           tar -czf "release-assets/coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz" \
             -C release-assets package
+      - name: Package source-built native addon (Windows ARM64)
+        if: matrix.windows == '1'
+        shell: pwsh
+        run: |
+          $addons = @(Get-ChildItem "packages/natives/native/pi_natives.win32-arm64*.node")
+          if ($addons.Count -ne 1) {
+            throw "expected 1 native file for ${{ matrix.target }}, found $($addons.Count)"
+          }
+          New-Item -ItemType Directory -Force -Path release-assets/package | Out-Null
+          Copy-Item $addons[0].FullName release-assets/package/
+          $archive = "release-assets/coreforge-pi-natives-${{ matrix.target }}-$env:RELEASE_TAG.tgz"
+          tar -czf $archive -C release-assets package
+          if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
+            throw "native archive was not created: $archive"
+          }
       - name: Inject channel version
+        if: matrix.windows != '1'
         run: bun scripts/set-cf-version.ts "${RELEASE_TAG#v}"
+      - name: Inject channel version (Windows)
+        if: matrix.windows == '1'
+        shell: pwsh
+        run: bun scripts/set-cf-version.ts ($env:RELEASE_TAG.Substring(1))
       - name: Build binary
         env:
           RELEASE_TARGETS: ${{ matrix.target }}
@@ -286,7 +347,7 @@ jobs:
         # default, overridable for white-label), so assert the VERSION suffix
         # rather than a hard-coded `omp/` prefix -- the stamped version is what
         # this step exists to verify.
-        if: matrix.cross != '1'
+        if: matrix.windows != '1' && matrix.cross != '1'
         run: |
           OUT="$(./packages/coding-agent/binaries/${{ matrix.binary }} --version)"
           echo "reported: $OUT"
@@ -295,6 +356,20 @@ jobs:
             */"$VERSION") echo "version OK: $OUT" ;;
             *) echo "::error::expected */$VERSION, got $OUT"; exit 1 ;;
           esac
+      - name: Smoke binary (Windows ARM64)
+        if: matrix.windows == '1'
+        shell: pwsh
+        run: |
+          $binaryPath = (Resolve-Path "packages/coding-agent/binaries/${{ matrix.binary }}").Path
+          $out = (& $binaryPath --version).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "reported: $out"
+          $version = $env:RELEASE_TAG.Substring(1)
+          if (-not $out.EndsWith("/$version")) {
+            throw "expected */$version, got $out"
+          }
+          & $binaryPath --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-${{ matrix.target }}

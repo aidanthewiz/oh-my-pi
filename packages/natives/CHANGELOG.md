@@ -5,6 +5,12 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [18.1.7] - 2026-09-03
+
+### Added
+
+- Added Windows ARM64 native addon support, including platform-specific npm packages.
+
 ## [18.1.6] - 2026-09-03
 
 ### Breaking Changes

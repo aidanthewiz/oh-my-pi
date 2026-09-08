@@ -203,8 +203,8 @@ it("does not defer external aborts for a completion bridge call", async () => {
 
 it("hands the tool bridge the unshielded signal so a deferred phase still cancels subagents", async () => {
 	// Regression: the bridge used to receive the kernel shield, so `agent()`
-	// fan-outs from a Python/Ruby/Julia cell survived a turn cancel and kept
-	// running until they finished on their own.
+	// fan-outs from an eval cell survived a turn cancel and kept running until
+	// they finished on their own.
 	const abortController = new AbortController();
 	const entered = Promise.withResolvers<void>();
 	const observedKernelAbort = Promise.withResolvers<boolean>();
@@ -346,8 +346,8 @@ it("holds the cell open through a deferred phase while still aborting the tool a
 it("expires the wall-clock timeout through the shield so blocked bridge calls unwind instead of the kernel dying", async () => {
 	// Regression: the cell timeout used to arm only a kernel-internal timer.
 	// SIGINT then raised KeyboardInterrupt in the runner's main thread while
-	// `parallel()` worker threads stayed parked in blocking urllib bridge calls
-	// nobody rejected; the runner wedged in the pool's shutdown(wait=True),
+	// a runner worker thread stayed parked in a blocking urllib bridge call
+	// nobody rejected; the runner wedged waiting for that thread,
 	// never emitted `done`, and the 5s escalation killed the kernel with all
 	// session state. The timeout must abort the same signals a turn cancel
 	// does: the bridge's raced signal (rejecting in-flight calls) and the
@@ -391,7 +391,7 @@ it("expires the wall-clock timeout through the shield so blocked bridge calls un
 
 	const result = await executeWithKernelBase({
 		kernel,
-		code: "parallel([lambda: tool.parked({})])",
+		code: "import asyncio, threading\nt = threading.Thread(target=lambda: asyncio.run(tool.parked({})))\nt.start()\nt.join()",
 		options: { timeoutMs: 100, toolSession, bridgeSessionId },
 		runIdPrefix: "test",
 		errorLogLabel: "test",

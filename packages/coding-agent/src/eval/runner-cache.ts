@@ -1,10 +1,10 @@
 /**
  * Shared on-disk staging for subprocess kernel runner scripts.
  *
- * Each language kernel (Python/Julia/Ruby) ships its runner as a compiled-in
- * text asset, then stages it under `os.tmpdir()` so the interpreter can load it
- * as a normal file. Staging is cached per language directory so repeated kernel
- * starts within a process avoid redundant writes.
+ * The Python kernel ships its runner as a compiled-in text asset, then stages
+ * it under `os.tmpdir()` so the interpreter can load it as a normal file.
+ * Staging is cached per language directory so repeated kernel starts within a
+ * process avoid redundant writes.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -23,7 +23,7 @@ const stagedPaths = new Map<string, string>();
  * instead of handing back a path to a missing file (issue #8140).
  *
  * @param dirName Cache subdirectory under the OS temp dir (unique per language).
- * @param ext Runner file extension without the dot (e.g. `py`, `jl`, `rb`).
+ * @param ext Runner file extension without the dot (e.g. `py`).
  * @param script Runner source, hashed to key the cached file per version.
  */
 export async function stageRunnerScript(dirName: string, ext: string, script: string): Promise<string> {

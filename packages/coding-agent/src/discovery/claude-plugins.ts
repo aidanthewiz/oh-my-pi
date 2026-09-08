@@ -46,7 +46,9 @@ async function allowedRoots(
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const { roots, warnings } = await listClaudePluginRoots(ctx.home, ctx.cwd);
 	const userEnabled = isUserSourceEnabled("claude-plugins", ctx) || isUserSourceEnabled("claude", ctx);
-	const scopedRoots = userEnabled ? roots : roots.filter(r => r.scope === "project" || r.persistent === false);
+	const scopedRoots = userEnabled
+		? roots
+		: roots.filter(root => root.scope === "project" || root.persistent === false || root.origin !== "claude");
 	const flags = await Promise.all(scopedRoots.map(root => legacyProviderAllowed(root.path, surface)));
 	return { roots: scopedRoots.filter((_, i) => flags[i]), warnings };
 }
