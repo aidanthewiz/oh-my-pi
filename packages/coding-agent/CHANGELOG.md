@@ -38,6 +38,12 @@
 - Protected credential-marked settings, preserved launcher-enforced telemetry opt-outs through trusted worker re-entry, and removed managed profile values from repository PTYs, direnv, Git hooks, cleanse checkers, and other repository-controlled subprocesses.
 - Initialized managed Coreforge identity before `models` provider discovery so authenticated Claude and Bedrock routes appear in fresh utility-command catalogs.
 - Required an explicit bearer credential for custom `pi-native` provider transports.
+## [17.4.3] - 2026-08-21
+
+### Fixed
+
+- Fixed the edit tool rejecting payloads containing a glued `«»` line: after MATCH it now reads as the mistyped `»` separator, elsewhere as a stray terminator to drop.
+
 ## [17.4.2] - 2026-08-21
 
 ### Added
