@@ -1131,7 +1131,7 @@ describe("model cache spec round trip", () => {
 			// Authoritative for the cycle (drives downstream pruning) yet not pinned
 			// into the cache as authoritative (keeps the short retry interval).
 			expect(empty.stale).toBe(false);
-			expect(empty.fetchedAt).toBe(currentTime);
+			expect(empty.updatedAt).toBe(currentTime);
 			expect(fetches).toBe(1);
 
 			const db = new Database(dbPath, { readonly: true });
@@ -1151,7 +1151,7 @@ describe("model cache spec round trip", () => {
 			const recovered = await resolveProviderModels(options, "online-if-uncached");
 			expect(recovered.models.map(model => model.id)).toEqual([recoveredModel.id]);
 			expect(recovered.stale).toBe(false);
-			expect(recovered.fetchedAt).toBe(currentTime);
+			expect(recovered.updatedAt).toBe(currentTime);
 			const recoveredAt = currentTime;
 			expect(fetches).toBe(2);
 
@@ -1159,8 +1159,8 @@ describe("model cache spec round trip", () => {
 			const cached = await resolveProviderModels(options, "online-if-uncached");
 			expect(cached.models.map(model => model.id)).toEqual([recoveredModel.id]);
 			expect(cached.stale).toBe(false);
-			expect(cached.fetchedAt).toBe(recoveredAt);
-			expect(cached.fetchedAt).not.toBe(currentTime);
+			expect(cached.updatedAt).toBe(recoveredAt);
+			expect(cached.updatedAt).not.toBe(currentTime);
 			expect(fetches).toBe(2);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });

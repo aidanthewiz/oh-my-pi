@@ -12,6 +12,20 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.0.7] - 2026-08-26
+
+### Added
+
+- Added application-level usage attribution for billing and usage reporting, with per-application aggregation and automatic client identification. Applications can set their label with `OMP_APP_NAME` (default: `omp`); update the broker before clients to support the new usage reports.
+
+### Fixed
+
+- Fixed Anthropic Claude subscription OAuth requests being rejected by the upstream service ([#9801](https://github.com/can1357/oh-my-pi/pull/9801)).
+- Fixed OpenAI-compatible streaming errors being reported as empty successful completions, enabling retries and model fallback when queue admission fails.
+- Fixed multimodal tool results in OpenAI Responses requests so inline, remote, and OpenAI file-backed images are preserved correctly.
+- Fixed resumed and forked Cursor sessions failing when their history came from a Responses-based provider such as Codex ([#9754](https://github.com/can1357/oh-my-pi/issues/9754)).
+- Fixed Cursor `composer-2.5` selections using the Fast variant instead of the Standard tier ([#9012](https://github.com/can1357/oh-my-pi/issues/9012)).
+
 ## [18.0.6] - 2026-08-26
 
 ### Added

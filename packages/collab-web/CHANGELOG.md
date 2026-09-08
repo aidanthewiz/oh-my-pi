@@ -9,6 +9,9 @@
 ### Changed
 
 - Branded the hosted client as Coreforce Agent Collab with the Coreforce hammer mark, moved public URLs to `agent-collab.internal.somahub.io`, and disabled crawler indexing without exposing the internal Coreforge product name.
+- Transcript Markdown now renders LaTeX: `$…$` and `\(…\)` inline, `$$…$$` and `\[…\]` in display mode, plus own-line `$$`/`\[` blocks. Currency ("$5 and $10"), escaped dollars, and code spans stay literal, and half-streamed delimiters stay visible until the equation closes.
+- Note: parity with the TUI covers these delimited forms only. Bare `\begin{…}…\end{…}` environments without `$$`/`\[` fences remain literal here (the TUI typesets them); web support is a follow-up.
+
 ## [17.3.8] - 2026-08-19
 
 ### Fixed

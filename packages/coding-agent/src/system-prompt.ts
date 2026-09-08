@@ -666,6 +666,8 @@ export interface BuildSystemPromptOptions {
 	xdevDocs?: string;
 	/** Whether this session can hand tool failures to interactive Coreforge `/report`. */
 	coreforgeReportEnabled?: boolean;
+	/** Whether active `write` is restricted to xd:// dispatch and the plan artifact sandbox. */
+	writeTransportOnly?: boolean;
 }
 
 /** Result of building provider-facing system prompt messages. */
@@ -724,6 +726,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevTools = [],
 		xdevDocs = "",
 		coreforgeReportEnabled = false,
+		writeTransportOnly = false,
 		activeRepoContext: providedActiveRepoContext,
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
@@ -1017,6 +1020,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		hasDynamicXdevTools: xdevTools.some(mounted => mounted.dynamic === true),
 		xdevDocs,
 		coreforgeReportEnabled,
+		writeTransportOnly,
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];

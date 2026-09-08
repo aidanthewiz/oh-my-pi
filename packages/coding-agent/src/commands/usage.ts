@@ -13,7 +13,7 @@ export default class Usage extends Command {
 		action: Args.string({
 			description: "Optional subcommand to execute",
 			required: false,
-			options: ["invalidate"],
+			options: ["invalidate", "clients"],
 		}),
 	};
 
@@ -29,7 +29,7 @@ export default class Usage extends Command {
 			description: "Show recorded usage-limit history (hourly snapshots) instead of a live snapshot",
 			default: false,
 		}),
-		days: Flags.integer({ char: "d", description: "History window in days (with --history)", default: 7 }),
+		days: Flags.integer({ char: "d", description: "History window in days (with --history or clients)", default: 7 }),
 	};
 
 	static examples = [
@@ -38,6 +38,7 @@ export default class Usage extends Command {
 		`# Redact account identifiers for screenshots\n  ${CF_COMMAND} usage --redact`,
 		`# Machine-readable output\n  ${CF_COMMAND} usage --json`,
 		`# Usage-limit trend over the last 30 days\n  ${CF_COMMAND} usage --history --days 30`,
+		`# Per-client token burn (which machine/app spent what) over the last 30 days\n  ${CF_COMMAND} usage clients --days 30`,
 		`# Invalidate cached usage reports for all providers\n  ${CF_COMMAND} usage invalidate`,
 		`# Invalidate cached usage reports for a specific provider\n  ${CF_COMMAND} usage invalidate --provider anthropic`,
 	];
