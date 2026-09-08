@@ -341,7 +341,22 @@ function isSymlinkPath(p: string): boolean {
 		return false;
 	}
 }
+/** Windows script shims (npm's launchers) that a native executable cannot overwrite. */
+function isWindowsScriptLauncherPath(launcherPath: string): boolean {
+	const extension = path.extname(launcherPath).toLowerCase();
+	return extension === ".cmd" || extension === ".ps1" || extension === ".bat";
+}
 
+/**
+ * Path of bun's Windows launcher metadata sidecar for `launcherPath`.
+ *
+ * `bun install -g` writes a `<name>.bunx` / `<name>.exe` pair: the `.exe` is a
+ * generic shim and the `.bunx` names the package entrypoint it launches.
+ */
+function bunShimMarkerPath(launcherPath: string): string {
+	const base = path.basename(launcherPath, path.extname(launcherPath));
+	return path.join(path.dirname(launcherPath), `${base}.bunx`);
+}
 function isPathInDirectoryLexical(filePath: string, directoryPath: string): boolean {
 	const normalizedPath = normalizePathForComparison(path.resolve(filePath));
 	const normalizedDirectory = normalizePathForComparison(path.resolve(directoryPath));
@@ -411,6 +426,13 @@ interface UpdateMethodResolutionOptions {
 	 */
 	ompLinkTarget?: string;
 	/**
+	 * Whether bun's launcher metadata (`<name>.bunx`) sits beside the resolved
+	 * launcher. Bun writes that sidecar next to every `.exe` shim it installs, so
+	 * its presence is what makes a regular-file launcher in bun's bin dir
+	 * bun-managed rather than a standalone binary that took the launcher over.
+	 */
+	bunShimMarker?: boolean;
+	/**
 	 * Whether package-manager routing (bun/npm) is permitted. Binary-only
 	 * releases pass `false`: a manager launcher then resolves to `"binary"` and
 	 * is taken over in place rather than reinstalled through its manager. Defaults
@@ -436,6 +458,7 @@ function resolveUpdateMethod(
 	const {
 		allowPackageManagers = true,
 		bunGlobalDir,
+		bunShimMarker = false,
 		homebrewPrefix,
 		miseBinDirs = [],
 		miseDataDir,
@@ -444,8 +467,7 @@ function resolveUpdateMethod(
 		ompLinkTarget,
 	} = options;
 	const launcherExtension = path.extname(ompPath).toLowerCase();
-	const isWindowsScriptLauncher =
-		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
+	const isWindowsScriptLauncher = isWindowsScriptLauncherPath(ompPath);
 	if (isPathInDirectory(ompPath, NIX_STORE_DIR)) return "nix";
 	if (homebrewPrefix && isPathInDirectory(ompPath, path.join(homebrewPrefix, "bin"))) return "brew";
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
@@ -456,10 +478,16 @@ function resolveUpdateMethod(
 	// installer's default (~/.local/bin), classifying by directory alone routes
 	// a binary install through npm/bun, whose reinstall then collides with the
 	// existing file (npm EEXIST). Fall through to binary replacement instead.
-	// Windows is excluded: there package managers write regular-file shims
-	// (bun's .exe launcher, npm's .cmd/.ps1), so a regular file is NOT evidence
-	// of a standalone install and the override would hijack managed installs.
-	const isStandaloneRegularFile = ompIsRegularFile && process.platform !== "win32";
+	// On Windows every launcher is a regular file, so ownership keys off the
+	// manager's own artifacts instead: npm's script shims (`omp`, `omp.cmd`,
+	// `omp.ps1`) and bun's `omp.bunx` sidecar. A bare `.exe` with neither is the
+	// standalone binary a binary-only release installed over the launcher —
+	// routing that back through bun reinstalls a package which no longer owns
+	// the launcher, and bun silently tolerates failing to overwrite the running
+	// `.exe` (EBUSY), so the install would stay pinned to the old version.
+	const isWindowsManagedLauncher =
+		process.platform === "win32" && (isWindowsScriptLauncher || launcherExtension === "" || bunShimMarker);
+	const isStandaloneRegularFile = ompIsRegularFile && !isWindowsManagedLauncher;
 	const bunNodeModulesDir = resolveBunGlobalNodeModulesDirFromLocations({
 		globalDir: bunGlobalDir,
 		globalBinDir: bunBinDir,
@@ -505,6 +533,7 @@ export function resolveUpdateTargetFromPath(
 	let ompIsSymlink = false;
 	let ompLinkTarget: string | undefined;
 	let ompRealpath: string | undefined;
+	const bunShimMarker = process.platform === "win32" && fs.existsSync(bunShimMarkerPath(ompPath));
 	try {
 		const stat = fs.lstatSync(ompPath);
 		ompIsRegularFile = stat.isFile() && !stat.isSymbolicLink();
@@ -519,6 +548,7 @@ export function resolveUpdateTargetFromPath(
 
 	const method = resolveUpdateMethod(ompPath, bunBinDir, {
 		...options,
+		bunShimMarker,
 		ompIsRegularFile,
 		ompLinkTarget,
 	});
@@ -538,6 +568,7 @@ export function resolveUpdateTargetFromPath(
 			resolveUpdateMethod(ompPath, bunBinDir, {
 				...options,
 				allowPackageManagers: true,
+				bunShimMarker,
 				ompIsRegularFile,
 				ompLinkTarget,
 			}) !== "binary";
@@ -906,7 +937,8 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 }
 
 function printVerifiedVersion(expectedVersion: string): void {
-	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
+	const icon = theme?.status?.success ?? "✔";
+	console.log(chalk.green(`\n${icon} Updated to ${expectedVersion}`));
 }
 
 function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
@@ -1006,8 +1038,16 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		// never has to overwrite — or unlink — a possibly-locked leftover from an
 		// earlier run. Renaming the running executable itself is permitted on
 		// Windows; only deleting its still-mapped image is not.
-		await fs.promises.rename(options.targetPath, options.backupPath);
-		backupReady = true;
+		// A missing target is tolerated: repairing a launcher that a failed
+		// package-manager reinstall removed installs the binary at a vacant
+		// path. There is then nothing to restore, so a verification failure
+		// leaves the new binary in place rather than the previous nothing.
+		try {
+			await fs.promises.rename(options.targetPath, options.backupPath);
+			backupReady = true;
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+		}
 		await fs.promises.rename(options.tempPath, options.targetPath);
 
 		const verification = await options.verifyInstalledVersion(options.expectedVersion);
@@ -1230,6 +1270,16 @@ export async function updateViaBinaryAt(
 			expectedVersion,
 			verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
 		});
+		// The launcher is no longer bun-managed: drop bun's metadata sidecar so
+		// the next update classifies this install as a standalone binary instead
+		// of reinstalling a package that can no longer own the launcher (bun
+		// tolerates failing to overwrite the running `.exe`, so that reinstall
+		// would leave the install pinned to the old version). Done after the
+		// verified swap, so a rollback still restores a working bun shim, and
+		// best effort: a leftover sidecar only costs one misrouted classification.
+		try {
+			await unlinkIfExists(bunShimMarkerPath(targetPath));
+		} catch {}
 		// Reclaim backups from earlier updates whose owning process has since exited.
 		await sweepStaleUpdateArtifacts(targetPath);
 	});
@@ -1257,7 +1307,8 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	const comparison = compareCfVersions(release.version, CF_VERSION);
 
 	if (comparison <= 0 && !opts.force) {
-		console.log(chalk.green(`${theme.status.success} Already up to date`));
+		const icon = theme?.status?.success ?? "✔";
+		console.log(chalk.green(`${icon} Already up to date`));
 		return;
 	}
 

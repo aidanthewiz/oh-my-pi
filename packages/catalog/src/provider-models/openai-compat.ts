@@ -2842,6 +2842,7 @@ function mapOpenRouterThinking(entry: OpenAICompatibleModelRecord): ThinkingConf
 		mode: "effort",
 		efforts,
 		...(defaultLevel !== undefined && efforts.includes(defaultLevel) ? { defaultLevel } : {}),
+		...(reasoning.mandatory === true ? { requiresEffort: true } : {}),
 	};
 }
 
