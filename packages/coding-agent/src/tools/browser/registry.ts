@@ -22,6 +22,7 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
+import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
 import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
@@ -480,6 +481,11 @@ async function openSharedHeadlessHandle(
 				: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		// Attaching to the shared daemon is the natural point to sweep targets
+		// left behind by omp processes that died without teardown — bounds
+		// accumulation without a background timer. Best-effort and detached so a
+		// slow reap never delays the open (issue #10022).
+		void reapOrphanSharedTargets(browser, { projectDir: shared.projectDir, daemonName: shared.daemonName });
 		return {
 			key: browserKey(kind),
 			kind,

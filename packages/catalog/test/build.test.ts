@@ -120,6 +120,39 @@ describe("buildModel", () => {
 		expect(model.compat.strictResponsesPairing).toBe(false);
 		expect(model.compat.openRouterRouting).toEqual({ only: ["anthropic"], order: ["anthropic"] });
 	});
+	it("materializes glyph-tokenization eligibility for Anthropic-compatible wire models", () => {
+		const anthropic = buildModel({
+			id: "claude-opus-4-8",
+			name: "Some Model",
+			api: "anthropic-messages",
+			provider: "anthropic-compatible",
+			baseUrl: "https://api.example.com/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+
+		expect(anthropic.requiresGlyphTokenization).toBe(true);
+		expect(buildModel(completionsSpec()).requiresGlyphTokenization).toBe(false);
+		expect(buildModel({ ...completionsSpec(), id: "claude-opus-4-8" }).requiresGlyphTokenization).toBe(true);
+		expect(
+			buildModel({
+				id: "other-model",
+				name: "Other Model",
+				api: "anthropic-messages",
+				provider: "anthropic-compatible",
+				baseUrl: "https://api.example.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 8_192,
+			}).requiresGlyphTokenization,
+		).toBe(false);
+		expect(getBundledModel("anthropic", "claude-opus-4-8").requiresGlyphTokenization).toBe(true);
+	});
 
 	it("loads bundled OpenRouter models with resolved compat", () => {
 		const model = getBundledModel<"openrouter">("openrouter", "anthropic/claude-sonnet-4");
@@ -756,7 +789,7 @@ describe("OpenRouter model discovery", () => {
 		}
 	});
 
-	it("maps OpenRouter's advertised reasoning effort ladder and default", async () => {
+	it("maps OpenRouter's advertised reasoning effort ladder, default, and mandatory state", async () => {
 		const options = openrouterModelManagerOptions({
 			fetch: async () =>
 				Response.json({
@@ -768,6 +801,7 @@ describe("OpenRouter model discovery", () => {
 							reasoning: {
 								supported_efforts: ["max", "high", "low"],
 								default_effort: "high",
+								mandatory: true,
 							},
 						},
 					],
@@ -781,6 +815,7 @@ describe("OpenRouter model discovery", () => {
 			mode: "effort",
 			efforts: [Effort.Low, Effort.High, Effort.Max],
 			defaultLevel: Effort.High,
+			requiresEffort: true,
 		});
 	});
 
@@ -1096,7 +1131,7 @@ describe("model cache spec round trip", () => {
 			// Authoritative for the cycle (drives downstream pruning) yet not pinned
 			// into the cache as authoritative (keeps the short retry interval).
 			expect(empty.stale).toBe(false);
-			expect(empty.fetchedAt).toBe(currentTime);
+			expect(empty.updatedAt).toBe(currentTime);
 			expect(fetches).toBe(1);
 
 			const db = new Database(dbPath, { readonly: true });
@@ -1116,7 +1151,7 @@ describe("model cache spec round trip", () => {
 			const recovered = await resolveProviderModels(options, "online-if-uncached");
 			expect(recovered.models.map(model => model.id)).toEqual([recoveredModel.id]);
 			expect(recovered.stale).toBe(false);
-			expect(recovered.fetchedAt).toBe(currentTime);
+			expect(recovered.updatedAt).toBe(currentTime);
 			const recoveredAt = currentTime;
 			expect(fetches).toBe(2);
 
@@ -1124,8 +1159,8 @@ describe("model cache spec round trip", () => {
 			const cached = await resolveProviderModels(options, "online-if-uncached");
 			expect(cached.models.map(model => model.id)).toEqual([recoveredModel.id]);
 			expect(cached.stale).toBe(false);
-			expect(cached.fetchedAt).toBe(recoveredAt);
-			expect(cached.fetchedAt).not.toBe(currentTime);
+			expect(cached.updatedAt).toBe(recoveredAt);
+			expect(cached.updatedAt).not.toBe(currentTime);
 			expect(fetches).toBe(2);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });

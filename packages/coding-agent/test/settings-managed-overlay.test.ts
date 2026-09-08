@@ -36,7 +36,7 @@ describe("Settings managed overlay", () => {
 	});
 
 	afterEach(async () => {
-		AgentStorage.resetInstance();
+		AgentStorage.close();
 		restoreSettingsTestState(settingsState);
 		settingsState = undefined;
 		delete Bun.env[MANAGED_CONFIG_FILE_ENV];

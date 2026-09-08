@@ -7,7 +7,9 @@ The companion relay server lives in the Coreforge CLI (`coreforge browser-relay`
 ## Setup
 
 1. `coreforge browser-relay install` — creates a machine-local relay token, writes the bundled extension with that token, and saves it to `~/.omp/browser-relay/extension`; then load it via `chrome://extensions` → Developer mode → *Load unpacked*. (Or get `coreforge-browser-relay-extension.zip` from GitHub releases and set the token in the extension options.)
-2. `coreforge config set browser.relay true` — routes the browser tool through the relay. Per-call `app.relay: true` works without the setting.
+2. Opt in, one of two ways:
+   - **Per call** — pass `app.relay: true` on the `browser open` that needs your real browser. Works without any setting and persists nothing: the configured default for every other call and session stays whatever it already was.
+   - **As the default** — `coreforge config set browser.relay true` makes the relay the default for **every session using this profile, in every project** (project-level settings, `PI_BROWSER_RELAY`, and an explicit `app` choice still take precedence). Any session's ordinary browser call will then drive your real browser — including background sessions you aren't watching; without `app.target` such a call adopts the currently visible tab, and if it carries a `url` it navigates that tab away from what you were reading.
 
 The relay server and extension share the token in `~/.omp/browser-relay/token`. The token file uses mode `0600`; its parent directory uses mode `0700`. Automatic relay startup uses this token. `coreforge browser-relay --token <secret>` replaces it only after the server binds successfully. After changing it, either set the same extension override, or clear the override, rerun `install`, and reload the extension.
 

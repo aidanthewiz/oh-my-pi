@@ -15,6 +15,7 @@ import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
 import {
 	type ApprovalMode,
+	denyError,
 	formatApprovalPrompt,
 	type RuntimeApprovalCapableTool,
 	resolveApproval,
@@ -204,10 +205,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;
 		const preResolved = resolveApproval(this.tool, approvalArgs(params, context), approvalMode, userPolicies);
 		if (preResolved.policy === "deny") {
-			throw new Error(
-				`Tool "${preResolved.policyKey ?? this.tool.name}" is blocked by user policy.\n` +
-					`To allow: remove "tools.approval.${preResolved.policyKey ?? this.tool.name}: deny" from config.`,
-			);
+			throw denyError(preResolved, this.tool.name);
 		}
 
 		// 1. Emit tool_call event first - extensions can block execution or revise the input the tool
@@ -268,10 +266,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
-			throw new Error(
-				`Tool "${resolved.policyKey ?? this.tool.name}" is blocked by user policy.\n` +
-					`To allow: remove "tools.approval.${resolved.policyKey ?? this.tool.name}: deny" from config.`,
-			);
+			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
 		// An xd:// device dispatch already cleared the write tool's outer gate at
