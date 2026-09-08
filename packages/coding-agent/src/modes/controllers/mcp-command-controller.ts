@@ -850,7 +850,7 @@ export class MCPCommandController {
 			);
 		}
 
-		const resolvedClientId = clientId.trim() || parsedAuthUrl.searchParams.get("client_id") || undefined;
+		const resolvedClientId = clientId.trim() || parsedAuthUrl.searchParams.get("client_id")?.trim() || undefined;
 		const resolvedClientSecret = clientSecret.trim() || undefined;
 
 		const manualInput = this.ctx.oauthManualInput;
@@ -994,7 +994,7 @@ export class MCPCommandController {
 				type: "oauth",
 				...credentials,
 				tokenUrl,
-				clientId: flow.resolvedClientId ?? resolvedClientId,
+				clientId: flow.resolvedClientId?.trim() || resolvedClientId,
 				clientSecret: flow.registeredClientSecret ?? resolvedClientSecret,
 				resource: flow.resource,
 				authorizationUrl: flow.authorizationUrl,
@@ -1053,10 +1053,12 @@ export class MCPCommandController {
 			resource?: string;
 			stripSameOriginResource?: boolean;
 			clientId?: string;
+			persistOAuthClientId?: boolean;
 			userClientSecret?: string;
 		},
 	): MCPServerConfig {
-		const clientId = result.clientId ?? opts.clientId ?? config.oauth?.clientId;
+		const clientId = result.clientId?.trim() || opts.clientId?.trim() || config.oauth?.clientId?.trim();
+		const oauthClientId = opts.persistOAuthClientId === false ? undefined : clientId;
 		const resource =
 			result.resource ?? (opts.stripSameOriginResource ? undefined : opts.resource) ?? config.auth?.resource;
 		return {
@@ -1071,7 +1073,7 @@ export class MCPCommandController {
 			},
 			oauth: {
 				...config.oauth,
-				clientId,
+				clientId: oauthClientId,
 			},
 		};
 	}
@@ -1998,25 +2000,46 @@ export class MCPCommandController {
 			);
 			const serverUrl =
 				runtimeBaseConfig.type === "http" || runtimeBaseConfig.type === "sse" ? runtimeBaseConfig.url : undefined;
+			// Client credentials drive the token exchange, so they must come from the
+			// trust-level-aware runtime config. DCR secrets remain in the stored
+			// credential and are never echoed into config files.
 			const runtimeAuth = currentAuth ? expandEnvVarsDeepForConfigLevel(currentAuth, configLevel) : undefined;
 			const ephemeralCallback = runtimeBaseConfig.oauth?.callbackPort === 0;
-			const configuredClientId = runtimeBaseConfig.oauth?.clientId ?? runtimeAuth?.clientId;
+			const configuredClientId = runtimeBaseConfig.oauth?.clientId?.trim() || undefined;
+			const configuredClientSecret = runtimeBaseConfig.oauth?.clientSecret;
 			const existingCredential = (
 				configLevel === "project"
 					? lookupProjectMcpOAuthCredential(authStorage, runtimeBaseConfig)
 					: lookupMcpOAuthCredentialForServer(authStorage, currentAuth, serverUrl)
 			)?.credential;
+			const persistedClientId = runtimeAuth?.clientId?.trim() || undefined;
+			const storedClientId = existingCredential?.clientId?.trim() || undefined;
+			const discoveredClientId = oauth.clientId?.trim() || undefined;
+			// A metadata-advertised client is only a fallback. Prefer DCR when the
+			// authorization server explicitly offers it. An ephemeral callback also
+			// requires new registration unless metadata supplies a reusable client.
 			const flowClientId =
-				oauth.clientId ?? (ephemeralCallback ? "" : (configuredClientId ?? existingCredential?.clientId ?? ""));
-			const storedClientSecret =
-				existingCredential?.clientId === flowClientId ? existingCredential.clientSecret : undefined;
-			const flowClientSecret =
-				ephemeralCallback && !oauth.clientId
+				ephemeralCallback && !discoveredClientId
 					? ""
-					: (runtimeBaseConfig.oauth?.clientSecret ?? runtimeAuth?.clientSecret ?? storedClientSecret ?? "");
+					: (configuredClientId ??
+						persistedClientId ??
+						storedClientId ??
+						(oauth.registrationUrl ? undefined : discoveredClientId) ??
+						"");
+			const storedClientSecret = storedClientId === flowClientId ? existingCredential?.clientSecret : undefined;
+			const flowClientSecret =
+				ephemeralCallback && !discoveredClientId
+					? ""
+					: ((configuredClientId === flowClientId ? configuredClientSecret : undefined) ??
+						(persistedClientId === flowClientId ? runtimeAuth?.clientSecret : undefined) ??
+						storedClientSecret ??
+						"");
 			// Persisted separately below: keep the raw `${...}` placeholder in the file
 			// rather than writing the resolved secret back to (possibly shared) config.
-			const userClientSecret = found.config.oauth?.clientSecret ?? currentAuth?.clientSecret;
+			const userClientSecret =
+				(configuredClientId === flowClientId ? found.config.oauth?.clientSecret : undefined) ??
+				(persistedClientId === flowClientId ? currentAuth?.clientSecret : undefined);
+			const hasConfiguredOnlySecret = configuredClientId === undefined && configuredClientSecret !== undefined;
 
 			if (!options.silent) {
 				this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));
@@ -2032,7 +2055,7 @@ export class MCPCommandController {
 				oauth.tokenUrl,
 				flowClientId,
 				flowClientSecret,
-				oauth.scopes ?? "",
+				oauth.scopes || runtimeBaseConfig.oauth?.scope || "",
 				{
 					clientName: runtimeBaseConfig.oauth?.clientName,
 					callbackPort: runtimeBaseConfig.oauth?.callbackPort,
@@ -2068,7 +2091,10 @@ export class MCPCommandController {
 			const updatedConfig = shouldPersist
 				? this.#persistOAuthResult(baseConfig, oauthResult, {
 						tokenUrl: oauth.tokenUrl,
+						// Do not turn a configured-only secret into a persisted oauth
+						// client pair by echoing the discovered client id.
 						clientId: oauth.clientId,
+						persistOAuthClientId: !hasConfiguredOnlySecret,
 						userClientSecret,
 						resource: oauthResource,
 						stripSameOriginResource: oauthResourceIsFallback,

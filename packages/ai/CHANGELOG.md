@@ -12,6 +12,14 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.0.9] - 2026-08-28
+
+### Fixed
+
+- Improved OAuth sign-in flows, including a fallback message when the browser cannot automatically close the OAuth success tab.
+- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
+- Fixed Codex OAuth quota handling so chat and Spark usage remain independent, legacy shared quota limits continue to work, and incomplete usage reports are not incorrectly treated as unlimited.
+
 ## [18.0.8] - 2026-08-27
 
 ### Added
