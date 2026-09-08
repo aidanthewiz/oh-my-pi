@@ -12,6 +12,16 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.0.6] - 2026-08-26
+
+### Added
+
+- Added the `backgroundIdleMs` option to customize how long background auth-broker activity remains active before automatically parking.
+
+### Fixed
+
+- Fixed auth-broker background activity keeping processes alive unnecessarily, so unused broker-backed auth storage now parks automatically and no longer prevents CLI exit.
+
 ## [18.0.5] - 2026-08-25
 
 ### Breaking Changes

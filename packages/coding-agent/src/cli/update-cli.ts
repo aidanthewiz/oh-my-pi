@@ -102,11 +102,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
 
  * Select and validate the binary asset from GitHub release metadata.
+ *
+ * Draft releases are always rejected. Prereleases are rejected unless
+ * `options.allowPrerelease` is set, which the canary channel passes: canary
+ * GitHub releases are published as prereleases, and the exact-tag match below
+ * still pins the download to the specific requested version.
  */
 export function resolveReleaseBinaryAsset(
 	release: unknown,
 	expectedTag: string,
 	binaryName: string,
+	options: { allowPrerelease?: boolean } = {},
 ): ReleaseBinaryAsset {
 	if (!isRecord(release)) {
 		throw new Error("Invalid GitHub release metadata");
@@ -114,8 +120,11 @@ export function resolveReleaseBinaryAsset(
 	if (release.tag_name !== expectedTag) {
 		throw new Error(`GitHub release tag mismatch: expected ${expectedTag}`);
 	}
-	if (release.draft !== false || release.prerelease !== false) {
-		throw new Error(`GitHub release ${expectedTag} is not a published stable release`);
+	if (release.draft !== false) {
+		throw new Error(`GitHub release ${expectedTag} is a draft, not a published release`);
+	}
+	if (release.prerelease !== false && !options.allowPrerelease) {
+		throw new Error(`GitHub release ${expectedTag} is a prerelease; only canary updates install prerelease assets`);
 	}
 	if (!Array.isArray(release.assets)) {
 		throw new Error(`GitHub release ${expectedTag} has no asset list`);
@@ -911,16 +920,23 @@ function resolveOmpPath(): string | undefined {
 }
 
 /**
+ * Parse the version a launcher reports from product version output.
+ *
+ * Supports three-segment upstream versions, four-segment Coreforge release
+ * rolls, and prerelease suffixes without truncating the reported identity.
+ */
+export function parseReportedVersion(output: string): string | undefined {
+	return output.match(/\/(\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)/)?.[1];
+}
+
+/**
  * Run a specific binary and check if it reports the expected version.
  */
 async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): Promise<InstalledVersionVerification> {
 	try {
 		const result = await $`${binaryPath} --version`.quiet().nothrow();
 		if (result.exitCode !== 0) return { ok: false, path: binaryPath };
-		const output = result.text().trim();
-		// Output format: "omp/X.Y.Z" or "omp/X.Y.Z.N" (coreforge channel rolls)
-		const match = output.match(/\/(\d+\.\d+\.\d+(?:\.\d+)?)/);
-		const actual = match?.[1];
+		const actual = parseReportedVersion(result.text().trim());
 		return { ok: actual === expectedVersion, actual, path: binaryPath };
 	} catch {
 		return { ok: false, path: binaryPath };
@@ -1238,6 +1254,7 @@ export async function updateViaBinaryAt(
 		binaryName?: string;
 		fetchImpl?: Fetch;
 		githubToken?: string;
+		allowPrerelease?: boolean;
 		verifyInstalledVersion?: typeof verifyInstalledVersion;
 	} = {},
 ): Promise<void> {

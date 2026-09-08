@@ -5,6 +5,12 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [18.0.6] - 2026-08-26
+
+### Fixed
+
+- Improved TypeScript and TSX syntax highlighting, including correct handling of type annotations and template literals.
+
 ## [18.0.5] - 2026-08-25
 
 ### Added
