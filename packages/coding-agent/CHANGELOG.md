@@ -20,6 +20,7 @@
 - Kept `coreforge stats --json` and `omp-stats --json` machine-readable by sending sync progress to stderr and suppressing human completion summaries.
 - Resolved file-targeted LSP actions from the nearest nested project root, so language servers activate when a session starts above the target repository or package.
 
+- Preserved original MCP server and operation identities on extension tool events, including `xd://` dispatches whose provider-facing names require truncation.
 - Fixed managed AWS authentication expiring during an open Coreforge conversation by re-authenticating in place and retrying the interrupted model request without requiring a restart.
 - Accepted AWS STS relay proofs when the optional Identity Center store ARN claim is absent, while still rejecting a mismatched ARN when AWS emits one.
 - Fixed the signed relay image publisher to stage the integrity-checked Linux native addon in its isolated build job.

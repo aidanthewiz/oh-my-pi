@@ -22,7 +22,7 @@ import {
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
-import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
+import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
@@ -222,6 +222,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						type: "tool_call",
 						toolName: this.tool.name,
 						toolCallId,
+						...mcpToolEventIdentity(this.tool, toolEventArgs(params, context)),
 						input: normalizeToolEventInput(
 							this.tool.name,
 							resolveToolEventInput(this.tool, toolEventArgs(params, context)),
@@ -422,6 +423,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				type: "tool_result",
 				toolName: this.tool.name,
 				toolCallId,
+				...mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context)),
 				input: normalizeToolEventInput(
 					this.tool.name,
 					resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),

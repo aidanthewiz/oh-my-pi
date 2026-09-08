@@ -913,7 +913,14 @@ export interface ToolApprovalResolvedEvent {
 	reason?: string;
 }
 
-interface ToolCallEventBase {
+interface McpToolEventIdentity {
+	/** Original MCP server name before public tool-name normalization. */
+	mcpServerName?: string;
+	/** Original MCP operation name before public tool-name normalization. */
+	mcpToolName?: string;
+}
+
+interface ToolCallEventBase extends McpToolEventIdentity {
 	type: "tool_call";
 	toolCallId: string;
 }
@@ -963,7 +970,7 @@ export type ToolCallEvent =
 	| GlobToolCallEvent
 	| CustomToolCallEvent;
 
-interface ToolResultEventBase {
+interface ToolResultEventBase extends McpToolEventIdentity {
 	type: "tool_result";
 	toolCallId: string;
 	input: Record<string, unknown>;

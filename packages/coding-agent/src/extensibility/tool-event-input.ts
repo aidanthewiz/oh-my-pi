@@ -1,9 +1,42 @@
+import { parseXdUrl } from "../internal-urls/xd-protocol";
+
 const HASHLINE_FILE_PREFIX = "¶";
 const HASHLINE_FILE_TAG_RE = /#[0-9a-fA-F]{4}$/u;
 
 interface ToolEventInputResolver {
 	name: string;
 	resolveEventInput?: (input: string) => string;
+}
+
+interface McpToolIdentitySource {
+	name: string;
+	mcpServerName?: unknown;
+	mcpToolName?: unknown;
+}
+
+export interface McpToolEventIdentity {
+	mcpServerName?: string;
+	mcpToolName?: string;
+}
+
+/**
+ * Preserve an MCP tool's original server and operation names on extension
+ * events. For `write xd://<tool>`, resolve the mounted inner tool because the
+ * outer transport itself carries no MCP identity.
+ */
+export function mcpToolEventIdentity(
+	tool: McpToolIdentitySource,
+	input: Record<string, unknown>,
+	resolveToolByName?: (name: string) => McpToolIdentitySource | undefined,
+): McpToolEventIdentity {
+	let source = tool;
+	if (tool.name === "write" && typeof input.path === "string" && resolveToolByName) {
+		const target = parseXdUrl(input.path);
+		if (target?.name) source = resolveToolByName(target.name) ?? source;
+	}
+	return typeof source.mcpServerName === "string" && typeof source.mcpToolName === "string"
+		? { mcpServerName: source.mcpServerName, mcpToolName: source.mcpToolName }
+		: {};
 }
 
 /** Resolves mode-specific textual tool input before extension/hook event normalization. */
