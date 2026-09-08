@@ -312,6 +312,12 @@ export class MCPOAuthCancelledError extends Error {
 export interface MCPToolCallResult {
 	content: MCPContent[];
 	isError?: boolean;
+	/**
+	 * Machine-readable payload channel (MCP spec 2025-06-18, Tools → Structured
+	 * Content). Servers may return their data here while keeping `content`
+	 * minimal; the bridge surfaces it so it reaches the model.
+	 */
+	structuredContent?: Record<string, unknown>;
 	_meta?: Record<string, unknown>;
 }
 
