@@ -157,6 +157,7 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 				},
 				{
 					apiKey: deps.registry.resolver(model, deps.sessionId),
+					sessionId: deps.sessionId,
 					maxTokens,
 					disableReasoning: true,
 					metadata,

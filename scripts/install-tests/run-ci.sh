@@ -43,7 +43,6 @@ section "Binary install smoke"
 if [ "${OMP_INSTALL_TEST_SKIP_NATIVE_BUILD:-0}" != "1" ]; then
    bun --cwd=packages/natives run build
 fi
-align_native_manifest
 bun --cwd=packages/coding-agent run build
 
 BINARY_DIR="$WORK_DIR/binary-bin"
@@ -59,6 +58,7 @@ SOURCE_BUN_HOME="$WORK_DIR/bun-source"
    bun --cwd="$ROOT_DIR/packages/coding-agent" link
    smoke_cli "$BUN_INSTALL/bin/omp"
 )
+
 
 
 echo ""

@@ -589,6 +589,7 @@ async function resolveMnemopiProviderOptions(
 						},
 						{
 							apiKey: modelRegistry.resolver(model, sessionId),
+							sessionId,
 							maxTokens: opts?.maxTokens,
 							temperature: opts?.temperature,
 						},
