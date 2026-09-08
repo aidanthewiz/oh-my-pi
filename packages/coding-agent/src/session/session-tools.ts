@@ -533,7 +533,9 @@ export class SessionTools {
 	#wrapRuntimeTool(tool: AgentTool): AgentTool {
 		const wrapped = wrapToolWithMetaNotice(tool);
 		const extensionRunner = this.#host.extensionRunner();
-		return extensionRunner ? new ExtensionToolWrapper(wrapped, extensionRunner) : wrapped;
+		return extensionRunner
+			? new ExtensionToolWrapper(wrapped, extensionRunner, name => this.#toolRegistry.get(name))
+			: wrapped;
 	}
 
 	/** Installs and activates the ephemeral vibe tool set. */
@@ -1693,7 +1695,11 @@ export class SessionTools {
 		const extensionRunner = this.#host.extensionRunner();
 		const managerTools = deduplicateMCPToolsByName(mcpTools).map(customTool => {
 			const wrapped = wrapToolWithMetaNotice(CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool);
-			return (extensionRunner ? new ExtensionToolWrapper(wrapped, extensionRunner) : wrapped) as AgentTool;
+			return (
+				extensionRunner
+					? new ExtensionToolWrapper(wrapped, extensionRunner, name => this.#toolRegistry.get(name))
+					: wrapped
+			) as AgentTool;
 		});
 		const managerToolSet = new Set(managerTools);
 		const reconciledTools = deduplicateMCPToolsByName([...this.#extensionMcpTools.values(), ...managerTools]);
@@ -1764,7 +1770,9 @@ export class SessionTools {
 		for (const tool of rpcTools) {
 			const metaWrapped = wrapToolWithMetaNotice(tool);
 			const finalTool = (
-				extensionRunner ? new ExtensionToolWrapper(metaWrapped, extensionRunner) : metaWrapped
+				extensionRunner
+					? new ExtensionToolWrapper(metaWrapped, extensionRunner, name => this.#toolRegistry.get(name))
+					: metaWrapped
 			) as AgentTool;
 			this.#toolRegistry.set(finalTool.name, finalTool);
 			this.#rpcHostToolNames.add(finalTool.name);

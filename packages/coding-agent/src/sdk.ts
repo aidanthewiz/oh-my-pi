@@ -2766,7 +2766,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// call site, regardless of whether any user extensions are loaded. See the runner-construction
 		// comment above for the safety invariant this enforces.
 		for (const tool of toolRegistry.values()) {
-			toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
+			toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner, name => toolRegistry.get(name)));
 		}
 		// Hashline `edit` stays in the registry so Cursor can call it as MCP.
 		// Native StrReplace arrives as `editToolCall` and materializes through
@@ -2808,7 +2808,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const writeTool = await logger.time("createTools:write:session", BUILTIN_TOOLS.write, toolSession);
 				if (!writeTool || toolRegistry.has("write")) return builtInRegistryToolNames.has("write");
 				const nativeWrite = wrapToolWithMetaNotice(writeTool);
-				toolRegistry.set(writeTool.name, new ExtensionToolWrapper(nativeWrite, extensionRunner) as Tool);
+				toolRegistry.set(
+					writeTool.name,
+					new ExtensionToolWrapper(nativeWrite, extensionRunner, name => toolRegistry.get(name)) as Tool,
+				);
 				builtInRegistryToolNames.add(writeTool.name);
 				nativeToolsByName.set(writeTool.name, nativeWrite);
 				return true;
@@ -3472,7 +3475,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// first, matching the registry's wrap order.
 		const advisorTools: Tool[] = built
 			.filter((tool): tool is Tool => tool != null)
-			.map(tool => new ExtensionToolWrapper(wrapToolWithMetaNotice(tool), extensionRunner) as Tool);
+			.map(
+				tool =>
+					new ExtensionToolWrapper(wrapToolWithMetaNotice(tool), extensionRunner, name =>
+						toolRegistry.get(name),
+					) as Tool,
+			);
 
 		const advisorWatchdogPrompts = [...watchdogFiles];
 		if (initialActiveRepoContext) {
@@ -3617,7 +3625,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const [wrapped] = wrapRegisteredTools([registered], extensionRunner);
 			if (!wrapped) return Promise.resolve();
 			const name = registered.definition.name;
-			const liveTool = new ExtensionToolWrapper(wrapToolWithMetaNotice(wrapped), extensionRunner);
+			const liveTool = new ExtensionToolWrapper(wrapToolWithMetaNotice(wrapped), extensionRunner, name =>
+				toolRegistry.get(name),
+			);
 			// Capture ordinary extension precedence while the listener observes this exact registration.
 			// A later same-name registration may replace the extension map before serialized activation runs.
 			const isEffectiveRegistrant = extensionRunner.getRegisteredTool(name) === registered;

@@ -166,6 +166,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
+		private resolveToolByName?: (name: string) => AgentTool | undefined,
 	) {
 		applyToolProxy(tool, this);
 	}
@@ -222,7 +223,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						type: "tool_call",
 						toolName: this.tool.name,
 						toolCallId,
-						...mcpToolEventIdentity(this.tool, toolEventArgs(params, context)),
+						...mcpToolEventIdentity(this.tool, toolEventArgs(params, context), this.resolveToolByName),
 						input: normalizeToolEventInput(
 							this.tool.name,
 							resolveToolEventInput(this.tool, toolEventArgs(params, context)),
@@ -423,7 +424,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				type: "tool_result",
 				toolName: this.tool.name,
 				toolCallId,
-				...mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context)),
+				...mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context), this.resolveToolByName),
 				input: normalizeToolEventInput(
 					this.tool.name,
 					resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),

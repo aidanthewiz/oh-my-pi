@@ -3140,6 +3140,14 @@ describe("ExtensionRunner", () => {
 
 			const wrapped = new ExtensionToolWrapper(mcpTool, runner);
 			await wrapped.execute("mcp-identity-call", { command: "inspect" });
+			const writeTool = Object.assign(createRecordingTool(executionPath), { name: "write" });
+			const wrappedWrite = new ExtensionToolWrapper(writeTool, runner, name =>
+				name === cappedName ? mcpTool : undefined,
+			);
+			await wrappedWrite.execute("xdev-mcp-identity-call", {
+				path: `xd://${cappedName}`,
+				content: "{}",
+			});
 			const events = fs
 				.readFileSync(eventsPath, "utf8")
 				.trim()
@@ -3148,6 +3156,8 @@ describe("ExtensionRunner", () => {
 			expect(events).toEqual([
 				{ type: "tool_call", toolName: cappedName, ...identity },
 				{ type: "tool_result", toolName: cappedName, ...identity },
+				{ type: "tool_call", toolName: "write", ...identity },
+				{ type: "tool_result", toolName: "write", ...identity },
 			]);
 		});
 
