@@ -307,16 +307,39 @@ function filterChildShellEnvInternal(
 	const result = filterProcessEnv(env);
 	scrubChildCredentials(result, protectedValues, policy);
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
-	const nodeEnvName = `.env.${env.NODE_ENV || "development"}`;
+	const launchNodeEnv = launchEnvValues ? launchEnvValues.get("NODE_ENV") : env.NODE_ENV;
+	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;
 	const modeEnv = parseEnvFile(path.join(cwd, nodeEnvName));
 	const localEnv = parseEnvFile(path.join(cwd, ".env.local"));
-	const launchEnv = { ...projectEnv, ...modeEnv, ...localEnv };
+	const modeLocalEnv = parseEnvFile(path.join(cwd, `${nodeEnvName}.local`));
+	const launchEnv = { ...projectEnv, ...modeEnv, ...localEnv, ...modeLocalEnv };
 	const expandedLaunchEnv = {
 		...expandDotenvValues(projectEnv, result),
 		...expandDotenvValues(modeEnv, result),
 		...expandDotenvValues(localEnv, result),
+		...expandDotenvValues(modeLocalEnv, result),
 	};
-	for (const key in launchEnv) {
+	let fallbackLaunchEnv: Record<string, string> | undefined;
+	let expandedFallbackLaunchEnv: Record<string, string> | undefined;
+	if (!launchEnvValues && nodeEnvName !== ".env.development") {
+		const fallbackModeEnv = parseEnvFile(path.join(cwd, ".env.development"));
+		const fallbackModeLocalEnv = parseEnvFile(path.join(cwd, ".env.development.local"));
+		const candidate = { ...projectEnv, ...fallbackModeEnv, ...localEnv, ...fallbackModeLocalEnv };
+		const expandedCandidate = {
+			...expandDotenvValues(projectEnv, result),
+			...expandDotenvValues(fallbackModeEnv, result),
+			...expandDotenvValues(localEnv, result),
+			...expandDotenvValues(fallbackModeLocalEnv, result),
+		};
+		if (candidate.NODE_ENV === env.NODE_ENV || expandedCandidate.NODE_ENV === env.NODE_ENV) {
+			// Without a launch snapshot, NODE_ENV may itself have come from dotenv.
+			// Bun chose the default mode before loading it, so retain both candidates.
+			fallbackLaunchEnv = candidate;
+			expandedFallbackLaunchEnv = expandedCandidate;
+		}
+	}
+	const allLaunchEnv = fallbackLaunchEnv ? { ...launchEnv, ...fallbackLaunchEnv } : launchEnv;
+	for (const key in allLaunchEnv) {
 		const normalized = managedEnvName(key);
 		const trustedOperationalValue =
 			policy.preserveOperationalAws &&
@@ -330,7 +353,10 @@ function filterChildShellEnvInternal(
 			// value whenever what survived is exactly what the dotenv file defines.
 			if (
 				result[key] !== launchValue &&
-				(result[key] === launchEnv[key] || result[key] === expandedLaunchEnv[key])
+				(result[key] === launchEnv[key] ||
+					result[key] === expandedLaunchEnv[key] ||
+					result[key] === fallbackLaunchEnv?.[key] ||
+					result[key] === expandedFallbackLaunchEnv?.[key])
 			) {
 				result[key] = launchValue;
 			}
@@ -341,7 +367,12 @@ function filterChildShellEnvInternal(
 			// absent from it, or OMP itself injected the value — either way it came
 			// from a project dotenv file, not the parent shell.
 			delete result[key];
-		} else if (result[key] === launchEnv[key] || result[key] === expandedLaunchEnv[key]) {
+		} else if (
+			result[key] === launchEnv[key] ||
+			result[key] === expandedLaunchEnv[key] ||
+			result[key] === fallbackLaunchEnv?.[key] ||
+			result[key] === expandedFallbackLaunchEnv?.[key]
+		) {
 			// No launch-env snapshot (dotenv autoloaded without procfs): best-effort
 			// value match against the Bun-parsed dotenv.
 			delete result[key];

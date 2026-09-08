@@ -6,6 +6,7 @@ import {
 	filterChildShellEnv,
 	filterGitChildShellEnv,
 	hasFsCode,
+	isEacces,
 	isEisdir,
 	isEnoent,
 	isEnotdir,
@@ -720,6 +721,10 @@ async function writeTempPatch(content: string): Promise<string> {
 
 type EntryType = "directory" | "file";
 
+function isPermissionError(err: unknown): boolean {
+	return isEacces(err) || hasFsCode(err, "EPERM");
+}
+
 function shouldRetry(err: unknown, n: number) {
 	if (isEnoent(err) || isEisdir(err) || isEnotdir(err) || hasFsCode(err, "ENFILE") || hasFsCode(err, "EMFILE"))
 		return false;
@@ -732,8 +737,8 @@ function shouldRetry(err: unknown, n: number) {
  * Bounded retry for synchronous I/O against `EINTR`. POSIX permits short syscalls
  * to be interrupted by signals; when that happens libc traditionally retries.
  * Node's sync wrappers surface the raw `EINTR` so we replicate the retry locally.
- * Any other error (and persistent EINTR after `EINTR_MAX_RETRIES`) is rethrown
- * for the caller's normal "optional metadata" classifier to handle.
+ * Path absence, path-type mismatches, descriptor exhaustion, and exhausted
+ * `EINTR` retries return `null`. Other errors are rethrown.
  */
 const EINTR_MAX_RETRIES = 3;
 function retryOnEintrSync<T>(op: () => T): T | null {
@@ -887,8 +892,13 @@ function resolveRepositorySync(startDir: string): GitRepository | null {
 		const gitEntryPath = path.join(current, ".git");
 		const entryType = getEntryTypeSync(gitEntryPath);
 		if (entryType) {
-			const repository = resolveRepoFromEntrySync(current, gitEntryPath, entryType);
-			if (repository) return repository;
+			try {
+				const repository = resolveRepoFromEntrySync(current, gitEntryPath, entryType);
+				if (repository) return repository;
+			} catch (err) {
+				if (entryType === "file" && isPermissionError(err)) return null;
+				throw err;
+			}
 		}
 		const parent = path.dirname(current);
 		if (parent === current) return null;
@@ -902,8 +912,13 @@ async function resolveRepository(startDir: string): Promise<GitRepository | null
 		const gitEntryPath = path.join(current, ".git");
 		const entryType = await getEntryType(gitEntryPath);
 		if (entryType) {
-			const repository = await resolveRepoFromEntry(current, gitEntryPath, entryType);
-			if (repository) return repository;
+			try {
+				const repository = await resolveRepoFromEntry(current, gitEntryPath, entryType);
+				if (repository) return repository;
+			} catch (err) {
+				if (entryType === "file" && isPermissionError(err)) return null;
+				throw err;
+			}
 		}
 		const parent = path.dirname(current);
 		if (parent === current) return null;

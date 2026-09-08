@@ -149,14 +149,6 @@ export class WelcomeComponent implements Component {
 	// Bypassed while the intro animation runs (every frame differs).
 	#cachedWidth = -1;
 	#cachedLines: string[] | undefined;
-	// Width-independent mutation counter for the TUI's multiplexer width-epoch
-	// leading-stability check: the welcome box precedes the transcript as a root
-	// child, and without a revision the engine falls back to comparing
-	// width-dependent row counts — which conflates reflow with mutation and
-	// fails resolution on every width change. Bumped by invalidate(), the funnel
-	// every content mutation (setModel/setRecentSessions/setLspServers/animation
-	// settle) already goes through.
-	#widthEpochRevision = 0;
 
 	constructor(
 		private version: string,
@@ -179,11 +171,10 @@ export class WelcomeComponent implements Component {
 	invalidate(): void {
 		this.#cachedWidth = -1;
 		this.#cachedLines = undefined;
-		this.#widthEpochRevision++;
 	}
-
-	getNativeScrollbackWidthEpochRevision(): number {
-		return this.#widthEpochRevision;
+	/** The intro keeps the welcome block mutable; settling lets it retire to history. */
+	isTranscriptBlockFinalized(): boolean {
+		return this.#animTimer == null;
 	}
 
 	/**
@@ -315,7 +306,6 @@ export class WelcomeComponent implements Component {
 			this.#centerText(theme.bold(welcomeText), leftCol),
 			"",
 			...logoColored.map(l => this.#centerText(l, leftCol)),
-			"",
 			this.#centerText(theme.fg("muted", versionLabel), leftCol),
 			this.#centerText(theme.fg("muted", this.modelName), leftCol),
 			this.#centerText(theme.fg("borderMuted", this.providerName), leftCol),
