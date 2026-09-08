@@ -211,8 +211,9 @@ jobs:
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           df -h /
       - run: bun install --frozen-lockfile
-      - name: Cache Bazel native builds
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Restore Bazel native build cache
+        id: bazel-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
@@ -236,6 +237,14 @@ jobs:
           read -r -a targets <<< "$NATIVE_TARGETS"
           bun scripts/bazel-natives.ts "${targets[@]}"
           ls packages/natives/native/*.node
+      - name: Save Bazel native build cache
+        if: steps.bazel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cache/omp-bazel-disk
+            ~/.cache/omp-bazel-repo
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
       - name: Package source-built native addon
         run: |
           set -euo pipefail

@@ -40,6 +40,26 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(workflow).toContain("shasum -a 256 -c SHA256SUMS.verify");
 });
 
+test("Coreforce saves native caches before fallible packaging steps", async () => {
+	for (const workflowName of ["cf-release.yml", "cf-verify.yml"]) {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", workflowName)).text();
+		const restoreIndex = workflow.indexOf("- name: Restore Bazel native build cache");
+		const buildIndex = workflow.indexOf("- name: Build native addon from Coreforge sources", restoreIndex);
+		const saveIndex = workflow.indexOf("- name: Save Bazel native build cache", buildIndex);
+		const packageIndex = workflow.indexOf("- name: Package source-built native addon", saveIndex);
+		const saveStep = workflow.slice(saveIndex, packageIndex);
+
+		expect(restoreIndex).toBeGreaterThanOrEqual(0);
+		expect(buildIndex).toBeGreaterThan(restoreIndex);
+		expect(saveIndex).toBeGreaterThan(buildIndex);
+		expect(packageIndex).toBeGreaterThan(saveIndex);
+		expect(workflow.slice(restoreIndex, buildIndex)).toContain("uses: actions/cache/restore@");
+		expect(saveStep).toContain("uses: actions/cache/save@");
+		expect(saveStep).toContain("if: steps.bazel-cache.outputs.cache-hit != 'true'");
+		expect(saveStep).toContain("key: ${{ steps.bazel-cache.outputs.cache-primary-key }}");
+	}
+});
+
 test("Coreforce allocates a release tag only after every build succeeds", async () => {
 	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
 	const prepareStart = workflow.indexOf("  prepare:");
