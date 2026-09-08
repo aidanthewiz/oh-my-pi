@@ -105,3 +105,17 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(releaseWorkflow.slice(0, releaseWorkflow.indexOf("jobs:"))).not.toContain("pull_request:");
 	expect(releaseWorkflow).toContain("permissions:\n      contents: write");
 });
+
+test("Coreforce workflows use the root packageManager Bun version", async () => {
+	const root = path.join(import.meta.dir, "..");
+	const manifest = (await Bun.file(path.join(root, "package.json")).json()) as { packageManager?: string };
+	const bunVersion = manifest.packageManager?.match(/^bun@(.+)$/)?.[1];
+	expect(bunVersion).toBeDefined();
+
+	for (const workflowName of ["cf-release.yml", "cf-verify.yml", "relay.yml"]) {
+		const workflow = await Bun.file(path.join(root, ".github", "workflows", workflowName)).text();
+		const configuredVersions = [...workflow.matchAll(/bun-version:\s*"([^"]+)"/g)].map(match => match[1]);
+		expect(configuredVersions.length).toBeGreaterThan(0);
+		expect(configuredVersions.every(version => version === bunVersion)).toBe(true);
+	}
+});

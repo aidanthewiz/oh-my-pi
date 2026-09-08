@@ -57,6 +57,7 @@ function showCollabLink(ctx: InteractiveModeContext, host: CollabHost, heading: 
 export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "advisor",
+		icon: "advisor",
 		description: "Toggle the advisor (a second model that reviews each turn and injects notes)",
 		acpDescription: "Toggle advisor",
 		acpInputHint: "[on|off|status|dump [raw]|configure]",
@@ -173,6 +174,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "export",
+		icon: "export",
 		description: "Export session to HTML file",
 		inlineHint: "[--themes] [path]",
 		allowArgs: true,
@@ -196,6 +198,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "dump",
+		icon: "clipboard",
 		description: "Copy session transcript to clipboard (and write LLM request JSON to tmp)",
 		acpDescription: "Return full transcript as plain text, with LLM request JSON path",
 		allowArgs: true,
@@ -228,6 +231,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "share",
+		icon: "share",
 		description: "Share session via an encrypted link (share server or secret gist)",
 		handle: async (_command, runtime) => {
 			try {
@@ -256,6 +260,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "collab",
+		icon: "broadcast",
 		description: "Share this session live via a relay",
 		inlineHint: "[start|view|stop|status] [relayUrl]",
 		subcommands: [
@@ -342,6 +347,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "join",
+		icon: "signIn",
 		description: "Join a shared collab session",
 		inlineHint: "<link>",
 		allowArgs: true,
@@ -370,6 +376,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "leave",
+		icon: "signOut",
 		description: "Leave the collab session",
 		getTuiAutocompleteDescription: runtime => {
 			if (runtime.ctx.collabHost) return "Leave collab: hosting";
@@ -393,6 +400,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "browser",
+		icon: "globe",
 		description: "Toggle browser headless vs visible mode",
 		acpInputHint: "[headless|visible]",
 		subcommands: [
@@ -468,6 +476,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 	},
 	{
 		name: "copy",
+		icon: "copy",
 		description: "Pick text or code from the conversation to copy",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {

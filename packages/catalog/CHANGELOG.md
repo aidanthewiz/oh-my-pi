@@ -9,6 +9,12 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [18.0.0] - 2026-08-22
+
+### Added
+
+- Added model capability metadata for reversible private-use glyph tokenization on Claude-compatible models, so provider request handling can apply the compatibility layer without inferring from transport details.
+
 ## [17.4.2] - 2026-08-21
 
 ### Added

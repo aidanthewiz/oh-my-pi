@@ -12,6 +12,12 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.0.0] - 2026-08-22
+
+### Added
+
+- Added reversible private-use glyph tokenization for Claude-compatible provider requests, including prompt notices, streamed response decoding, and safe handling of unresolved model-authored glyph tokens.
+
 ## [17.4.3] - 2026-08-21
 
 ### Fixed
