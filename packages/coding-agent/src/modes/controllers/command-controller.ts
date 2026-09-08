@@ -30,7 +30,7 @@ import {
 } from "../../hindsight";
 import { createRelayIdentityTokenProvider } from "../../identity/relay";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memory-backend";
-import { BashExecutionComponent } from "../../modes/components/bash-execution";
+import { BashExecutionComponent, bashPtyViewport } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
 import { EvalExecutionComponent } from "../../modes/components/eval-execution";
@@ -1167,7 +1167,16 @@ export class CommandController {
 						this.ctx.bashComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext, useUserShell: true },
+				{
+					excludeFromContext,
+					useUserShell: true,
+					// User-shell zsh/fish `!` commands run on a headless PTY; raw
+					// bytes render through the component's vterm replay (color-safe).
+					pty: {
+						...bashPtyViewport(this.ctx.ui),
+						onChunk: chunk => this.ctx.bashComponent?.appendPtyChunk(chunk),
+					},
+				},
 			);
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();

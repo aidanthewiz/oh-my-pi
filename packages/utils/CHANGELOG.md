@@ -5,6 +5,7 @@
 ### Fixed
 
 - Bound managed dotenv mode and child policy to trusted launcher provenance, preserved launcher values that match project dotenv entries, and removed managed profile values from repository-controlled child environments.
+
 ## [18.0.1] - 2026-08-23
 
 ### Fixed
