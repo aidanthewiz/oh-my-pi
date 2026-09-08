@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir, refreshDirsFromEnv } from "./dirs";
+import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
 
 export * from "./worker-host";
 
@@ -529,7 +529,7 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 const homeEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(os.homedir(), ".env"));
 const piEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(process.cwd(), ".env"));
+const projectEnv = skipOmpDotenvFiles ? {} : parseEnvFile(path.join(getProjectDir(), ".env"));
 
 // Scrub ambient entries that can't be forwarded to a native execve spawn
 // (bad names, NUL values) or are macOS malloc toggles we never propagate.

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.0.8] - 2026-08-27
+
 ### Added
 
 - Added one-time browser authorization and session-token reuse for authenticated Coreforce relay rooms.

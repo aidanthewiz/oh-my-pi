@@ -292,7 +292,7 @@ async function acquireTabImpl(
 							timeoutMs: opts.timeoutMs,
 							signal: opts.signal,
 						},
-						{ cwd: process.cwd() },
+						{ cwd: getProjectDir() },
 					);
 				}
 				return { tab: tabs.get(name)!, created: false };
