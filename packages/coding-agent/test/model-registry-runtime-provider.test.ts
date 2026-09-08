@@ -24,6 +24,7 @@ describe("ModelRegistry runtime provider registration", () => {
 	let modelsJsonPath: string;
 	let authStorage: AuthStorage;
 	let registry: ModelRegistry;
+	let fetchRequests: string[];
 
 	const sourceIds = ["ext://atomic", "ext://runtime", "ext://oauth"];
 
@@ -31,9 +32,13 @@ describe("ModelRegistry runtime provider registration", () => {
 	// online discovery path with deterministic, instant failures instead of real
 	// network. Provider fetches (dynamic + stencil.so) are caught and swallowed,
 	// leaving the registry with its bundled catalog plus runtime overlays.
-	const offlineFetch: FetchImpl = () => Promise.reject(new Error("network disabled in model-registry runtime test"));
+	const offlineFetch: FetchImpl = input => {
+		fetchRequests.push(String(input));
+		return Promise.reject(new Error("network disabled in model-registry runtime test"));
+	};
 
 	beforeEach(async () => {
+		fetchRequests = [];
 		tempDir = path.join(os.tmpdir(), `pi-test-model-registry-runtime-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		modelsJsonPath = path.join(tempDir, "models.json");
@@ -120,6 +125,18 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(registry.find(providerName, modelId)?.baseUrl).toBe(baseUrl);
 		expect(registry.find(providerName, modelId)?.headers?.[headerName]).toBe(headerValue);
 	}
+
+	test("does not discover ClinePass without credentials", async () => {
+		const peek = vi.spyOn(authStorage, "peekApiKey").mockResolvedValue(undefined);
+		try {
+			await registry.refresh("online");
+		} finally {
+			peek.mockRestore();
+		}
+
+		expect(fetchRequests).not.toContain("https://api.cline.bot/api/v1/ai/cline/recommended-models");
+		expect(registry.find("cline-pass", "kimi-k3")).toBeDefined();
+	});
 
 	test("validates provider config before mutating custom API state", () => {
 		const beforeAnthropicCount = registry.getAll().filter(model => model.provider === "anthropic").length;
@@ -215,7 +232,7 @@ describe("ModelRegistry runtime provider registration", () => {
 		modelHeaders["X-Model-Turn-ID"] = "model-turn-2";
 
 		const model = registry.find("runtime-provider", "runtime-model");
-		expect({ ...(model?.headers ?? {}) }).toEqual({
+		expect({ ...model?.headers }).toEqual({
 			"X-Request-ID": "request-2",
 			"X-Turn-ID": "turn-2",
 			"X-Message-ID": "message-2",
