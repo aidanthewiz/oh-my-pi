@@ -2,6 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { detectHostArchitecture } from "./host-detect";
 
 describe("detectHostArchitecture", () => {
+	test("uses the GitHub runner architecture under runtime emulation", () => {
+		expect(
+			detectHostArchitecture("win32", "x64", {
+				RUNNER_ARCH: "ARM64",
+				PROCESSOR_ARCHITECTURE: "AMD64",
+			}),
+		).toBe("arm64");
+	});
+
 	test("uses the native Windows architecture under runtime emulation", () => {
 		expect(
 			detectHostArchitecture("win32", "x64", {
