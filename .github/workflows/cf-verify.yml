@@ -16,7 +16,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare:
+    name: classify native inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      native_changed: ${{ steps.native.outputs.changed }}
+      release_tag: ${{ steps.native.outputs.tag }}
+    steps:
+      - name: List Coreforce releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 200 \
+            --exclude-drafts \
+            --json tagName,isDraft \
+            > "$RUNNER_TEMP/coreforce-releases.json"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.4.0"
+      - name: Select native verification source
+        id: native
+        env:
+          RELEASE_LIST: ${{ runner.temp }}/coreforce-releases.json
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          RELEASE_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG_VERSION" "$RELEASE_LIST")"
+          VERIFY_SHA="$(git rev-parse HEAD)"
+          CHANGED=true
+          if [ -n "$RELEASE_TAG" ] && git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "$VERIFY_SHA"; then
+            CHANGED="$(bun scripts/ci-released-native.ts changed "${RELEASE_TAG}^{commit}" "$VERIFY_SHA")"
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          if [ "$CHANGED" = true ]; then
+            echo "Native inputs differ from the latest published addon; build every target from this pull request."
+          else
+            echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            echo "Native inputs match $RELEASE_TAG; use its verified Coreforce addons."
+          fi
+
   build:
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -48,9 +95,34 @@ jobs:
             windows: "1"
             binary: omp-windows-arm64.exe
     steps:
+      - name: Download released native addon
+        if: needs.prepare.outputs.native_changed != 'true' && matrix.windows != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          ASSET_NAME: coreforge-pi-natives-${{ matrix.target }}-${{ needs.prepare.outputs.release_tag }}.tgz
+        run: |
+          mkdir -p "$RUNNER_TEMP/released-native"
+          gh release download \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET_NAME" \
+            --pattern SHA256SUMS.txt \
+            --dir "$RUNNER_TEMP/released-native" \
+            -- "$RELEASE_TAG"
+      - name: Download released native addon (Windows ARM64)
+        if: needs.prepare.outputs.native_changed != 'true' && matrix.windows == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          ASSET_NAME: coreforge-pi-natives-${{ matrix.target }}-${{ needs.prepare.outputs.release_tag }}.tgz
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP "released-native"
+          New-Item -ItemType Directory -Force $download | Out-Null
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --pattern SHA256SUMS.txt --dir $download -- $env:RELEASE_TAG
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: 0
+          persist-credentials: false
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: "1.4.0"
@@ -66,25 +138,27 @@ jobs:
           $pkg = (bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)').Trim()
           "VERIFY_VERSION=$pkg.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Reclaim disk for large native builds
-        if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'
+        if: needs.prepare.outputs.native_changed == 'true' && (matrix.target == 'win32-x64' || matrix.target == 'linux-x64')
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           df -h /
       - run: bun install --frozen-lockfile
+      # Pull requests can restore trusted base-branch release caches, but never
+      # save multi-gigabyte merge-ref caches that sibling pull requests cannot use.
       - name: Restore Bazel native build cache
-        if: matrix.windows != '1'
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         id: bazel-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
-          key: coreforge-verify-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          key: coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
           restore-keys: |
-            coreforge-verify-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
+            coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Build native addon from Coreforge sources
-        if: matrix.windows != '1'
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         env:
           NATIVE_TARGETS: ${{ matrix.native_targets }}
         run: |
@@ -101,20 +175,15 @@ jobs:
           bun scripts/bazel-natives.ts "${targets[@]}"
           ls packages/natives/native/*.node
       - name: Build native addon from Coreforge sources (Windows ARM64)
-        if: matrix.windows == '1'
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows == '1'
         env:
           OMP_NATIVE_CARGO_PROFILE: ci
         run: bun scripts/bazel-natives.ts host --dest packages/natives/native
-      - name: Save Bazel native build cache
-        if: matrix.windows != '1' && steps.bazel-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cache/omp-bazel-disk
-            ~/.cache/omp-bazel-repo
-          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+      - name: Install verified released native addon
+        if: needs.prepare.outputs.native_changed != 'true'
+        run: bun scripts/ci-released-native.ts install "${{ needs.prepare.outputs.release_tag }}" "${{ matrix.target }}" packages/natives/native "${{ runner.temp }}/released-native"
       - name: Package source-built native addon
-        if: matrix.windows != '1'
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -132,19 +201,19 @@ jobs:
           tar -czf "$archive" -C release-assets package
           test -s "$archive"
       - name: Package source-built native addon (Windows ARM64)
-        if: matrix.windows == '1'
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows == '1'
         shell: pwsh
         run: |
           $addons = @(Get-ChildItem "packages/natives/native/pi_natives.win32-arm64*.node")
           if ($addons.Count -ne 1) {
-            throw "expected 1 native file for ${{ matrix.target }}, found $($addons.Count)"
+            throw "expected 1 native file for win32-arm64, found $($addons.Count)"
           }
-          New-Item -ItemType Directory -Force -Path release-assets/package | Out-Null
+          New-Item -ItemType Directory -Force release-assets/package | Out-Null
           Copy-Item $addons[0].FullName release-assets/package/
-          $archive = "release-assets/coreforge-pi-natives-${{ matrix.target }}-verify.tgz"
+          $archive = "release-assets/coreforge-pi-natives-win32-arm64-verify.tgz"
           tar -czf $archive -C release-assets package
           if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
-            throw "native archive was not created: $archive"
+            throw "native archive is missing: $archive"
           }
       - name: Inject verification channel version
         if: matrix.windows != '1'
@@ -163,8 +232,8 @@ jobs:
           OUT="$(./packages/coding-agent/binaries/${{ matrix.binary }} --version)"
           echo "reported: $OUT"
           case "$OUT" in
-            */"$VERIFY_VERSION") echo "version OK: $OUT" ;;
-            *) echo "::error::expected */$VERIFY_VERSION, got $OUT"; exit 1 ;;
+            */"$VERIFY_VERSION") echo "version verified: $OUT" ;;
+            *) echo "expected */$VERIFY_VERSION, got $OUT" >&2; exit 1 ;;
           esac
       - name: Smoke binary (Windows ARM64)
         if: matrix.windows == '1'
@@ -188,13 +257,15 @@ jobs:
         run: |
           $binaryPath = "packages/coding-agent/binaries/${{ matrix.binary }}"
           if (-not (Test-Path $binaryPath) -or (Get-Item $binaryPath).Length -eq 0) {
-            throw "binary asset is missing or empty: $binaryPath"
+            throw "binary asset is missing: $binaryPath"
           }
 
   browser_relay:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: "1.4.0"
