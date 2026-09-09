@@ -44,6 +44,14 @@ export interface LoadContext {
 	 * sessions carry their value explicitly (or via the invocation scope).
 	 */
 	extensionRoots?: EffectiveExtensionRoots;
+	/** Provider IDs explicitly requested by caller in LoadOptions */
+	explicitProviders?: Set<string>;
+	/**
+	 * Scan foreign `~/` sources even when not opted in. Set for
+	 * `includeDisabled` (dashboard) loads so opted-out items are listed
+	 * and can be switched on.
+	 */
+	includeOptOutUserSources?: boolean;
 }
 
 /**
@@ -139,6 +147,14 @@ export interface SourceMeta {
 	level: "user" | "project" | "native";
 	/** SHA-256 of the exact source bytes parsed, when the provider records content integrity */
 	contentSha256?: string;
+	/**
+	 * Registry or CLI source that supplied a plugin root, when the provider
+	 * tracks it (currently `claude-plugins`: `"claude"` for `~/.claude/plugins`,
+	 * `"omp"` for Coreforge's own registry, `"plugin-dir"` for `--plugin-dir`).
+	 * This lets user-scope gating distinguish Coreforge installs from the
+	 * foreign Claude tree. See `isSourceEnabled` in `extensibility/skills.ts`.
+	 */
+	origin?: string;
 }
 
 /**

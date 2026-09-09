@@ -22,8 +22,9 @@
  * (packages/natives/scripts/build-bindings.ts) by default — no bazel needed
  * for plain host iteration. Bazel is opt-in for host via
  * `OMP_NATIVE_BUILD_BACKEND=bazel` or by passing extra bazel args after `--`;
- * explicit //:natives-* targets and aggregates always build through bazel
- * (the CI path, which runs bazelisk).
+ * explicit //:natives-* targets and aggregates always build through bazel.
+ * Release CI uses that path except for Windows ARM64, which builds `host`
+ * natively on its GitHub-hosted runner.
  *
  * Windows hosts: the msvc cc toolchain in bazel/toolchains/msvc only supports
  * linux/mac exec hosts (its clang-cl+xwin wrappers replace the MSVC a Windows
@@ -37,7 +38,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { detectHostAvx2Support, resolveLocalHostAddon } from "./host-detect";
+import { detectHostArchitecture, detectHostAvx2Support, resolveLocalHostAddon } from "./host-detect";
 
 const repoRoot = path.join(import.meta.dir, "..");
 
@@ -244,7 +245,11 @@ async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<voi
 
 async function main(): Promise<void> {
 	const options = parseCliArgs(process.argv.slice(2));
-	const host: HostInfo = { platform: process.platform, arch: process.arch, avx2: detectHostAvx2Support() };
+	const host: HostInfo = {
+		platform: process.platform,
+		arch: detectHostArchitecture(),
+		avx2: detectHostAvx2Support(),
+	};
 	const destDir = options.dest ? path.resolve(options.dest) : path.join(repoRoot, "packages/natives/native");
 
 	const backend = Bun.env.OMP_NATIVE_BUILD_BACKEND?.trim();

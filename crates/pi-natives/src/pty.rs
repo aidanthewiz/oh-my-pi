@@ -984,7 +984,7 @@ mod reader_queue_tests {
 	#[test]
 	fn drain_does_not_treat_queued_backpressure_as_stuck_slave() {
 		let (pump_tx, pump_rx) = flume::bounded(1);
-		let reader = std::thread::spawn(|| std::thread::park());
+		let reader = std::thread::spawn(std::thread::park);
 		let (queued, _rx) = flume::bounded::<ReaderEvent>(READER_QUEUE_CHUNKS);
 		queued
 			.send(ReaderEvent::Chunk("x".into()))
@@ -1005,7 +1005,7 @@ mod reader_queue_tests {
 	#[test]
 	fn drain_does_not_treat_in_flight_callback_as_stuck_slave() {
 		let (pump_tx, pump_rx) = flume::bounded(1);
-		let reader = std::thread::spawn(|| std::thread::park());
+		let reader = std::thread::spawn(std::thread::park);
 		let (queued, _) = flume::bounded::<ReaderEvent>(READER_QUEUE_CHUNKS);
 		let in_js = Arc::new(AtomicBool::new(true));
 		let in_js_flag = Arc::clone(&in_js);
@@ -1025,7 +1025,7 @@ mod reader_queue_tests {
 	#[test]
 	fn drain_cancel_does_not_wait_for_slow_js() {
 		let (_pump_tx, pump_rx) = flume::bounded::<()>(1);
-		let reader = std::thread::spawn(|| std::thread::park());
+		let reader = std::thread::spawn(std::thread::park);
 		let (queued, _) = flume::bounded::<ReaderEvent>(READER_QUEUE_CHUNKS);
 		let in_js = AtomicBool::new(true);
 		let stopped = AtomicBool::new(false);
@@ -1044,7 +1044,7 @@ mod reader_queue_tests {
 	#[test]
 	fn drain_cancel_returns_once_pump_observes_stop() {
 		let (pump_tx, pump_rx) = flume::bounded::<()>(1);
-		let reader = std::thread::spawn(|| std::thread::park());
+		let reader = std::thread::spawn(std::thread::park);
 		let (queued, _) = flume::bounded::<ReaderEvent>(READER_QUEUE_CHUNKS);
 		let in_js = AtomicBool::new(true);
 		let start = Instant::now();

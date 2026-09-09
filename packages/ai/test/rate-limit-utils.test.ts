@@ -42,6 +42,20 @@ describe("parseRateLimitReason", () => {
 		).toBe("QUOTA_EXHAUSTED");
 	});
 
+	// ClinePass subscription windows and free-tier caps are account-local quota
+	// exhaustion (markers from Cline's own error classifier), not rate limiting.
+	it("classifies ClinePass subscription-window limits as QUOTA_EXHAUSTED", () => {
+		expect(parseRateLimitReason("clinepass limit reached for this window. please try again later.")).toBe(
+			"QUOTA_EXHAUSTED",
+		);
+	});
+
+	it("classifies Cline free-tier model caps as QUOTA_EXHAUSTED", () => {
+		expect(
+			parseRateLimitReason("free limit reached on model deepseek/deepseek-v4-flash. try again in 42 minutes"),
+		).toBe("QUOTA_EXHAUSTED");
+	});
+
 	// "Resource has been exhausted (e.g. check quota)" is a quota/daily-limit error — long wait.
 	// Only the literal phrase "resource exhausted" (gRPC status name) is MODEL_CAPACITY.
 	it("classifies 'Resource has been exhausted (e.g. check quota)' as QUOTA_EXHAUSTED", () => {
@@ -382,12 +396,20 @@ describe("isUsageLimit", () => {
 	});
 
 	it("detects structured provider usage codes without quota wording", () => {
-		expect(isUsageLimit(new ProviderHttpError("Generic provider failure", 429, { code: "insufficient_quota" }))).toBe(
-			true,
-		);
-		expect(isUsageLimit(new ProviderHttpError("Generic provider failure", 429, { code: "rate_limit_error" }))).toBe(
-			false,
-		);
+		expect(
+			isUsageLimit(
+				new ProviderHttpError("Generic provider failure", 429, {
+					code: "insufficient_quota",
+				}),
+			),
+		).toBe(true);
+		expect(
+			isUsageLimit(
+				new ProviderHttpError("Generic provider failure", 429, {
+					code: "rate_limit_error",
+				}),
+			),
+		).toBe(false);
 		expect(isUsageLimit(new ProviderHttpError("Payment Required", 402))).toBe(true);
 		expect(isUsageLimit(new ProviderHttpError("A subscription is required for this endpoint", 402))).toBe(false);
 	});
@@ -416,6 +438,14 @@ describe("isUsageLimitOutcome", () => {
 		for (const message of ["insufficient_quota", "usage_limit_exceeded", "usage_limit_reached"]) {
 			expect(isUsageLimitOutcome(429, message)).toBe(true);
 		}
+	});
+
+	it("rotates on ClinePass limit markers regardless of status", () => {
+		expect(isUsageLimitOutcome(429, "clinepass limit reached for this window. please try again later.")).toBe(true);
+		expect(isUsageLimitOutcome(undefined, "clinepass limit reached for this window. please try again later.")).toBe(
+			true,
+		);
+		expect(isUsageLimitOutcome(undefined, "free limit reached on model x/y. try again in 5 minutes")).toBe(true);
 	});
 
 	it("keeps informative transient 429s in the upstream-backoff lane", () => {
@@ -514,6 +544,19 @@ describe("isUsageLimitOutcome", () => {
 		expect(isUsageLimitOutcome(403, message)).toBe(true);
 		expect(isUsageLimitOutcome(undefined, message)).toBe(true);
 		expect(isUsageLimitOutcome(429, message)).toBe(true);
+	});
+
+	it("rotates on Anthropic 402 in-flight credit exhaustion instead of surfacing the retry hint", () => {
+		const message =
+			"402 This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits. retry-after-ms=120000";
+		expect(parseRateLimitReason(message)).toBe("QUOTA_EXHAUSTED");
+		expect(is402BillingCapBody(message)).toBe(true);
+		expect(isUsageLimitOutcome(402, message)).toBe(true);
+		expect(isUsageLimit(message)).toBe(true);
+		// OpenRouter's prepaid wording is the same account-local cap.
+		expect(
+			isUsageLimitOutcome(402, "Insufficient credits. Add more using https://openrouter.ai/settings/credits"),
+		).toBe(true);
 	});
 
 	it("rotates only account-scoped cap 403s and statusless trailers", () => {

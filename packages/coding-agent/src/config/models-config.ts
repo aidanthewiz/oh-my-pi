@@ -29,6 +29,7 @@ export interface ProviderValidationConfig {
 	remoteCompaction?: unknown;
 	disableStrictTools?: boolean;
 	guardrailIdentifier?: string;
+	requestMetadata?: Record<string, string>;
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
 }
@@ -52,12 +53,13 @@ export function validateProviderConfiguration(
 				config.auth !== "none" &&
 				!config.disableStrictTools &&
 				!config.guardrailIdentifier &&
+				!config.requestMetadata &&
 				!config.remoteCompaction &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "auth: none", "compat", "disableStrictTools", "guardrailIdentifier", "remoteCompaction", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "auth: none", "compat", "disableStrictTools", "guardrailIdentifier", "requestMetadata", "remoteCompaction", "modelOverrides", "discovery", or "models"`,
 				);
 			}
 		}
@@ -125,9 +127,9 @@ export function mergeModelsConfig(base: ModelsConfig | undefined, managed: Model
 		}
 		let modelOverrides = baseProvider.modelOverrides;
 		if (managedProvider.modelOverrides) {
-			modelOverrides = { ...(baseProvider.modelOverrides ?? {}) };
+			modelOverrides = { ...baseProvider.modelOverrides };
 			for (const [id, override] of Object.entries(managedProvider.modelOverrides)) {
-				modelOverrides[id] = { ...(modelOverrides[id] ?? {}), ...override };
+				modelOverrides[id] = { ...modelOverrides[id], ...override };
 			}
 		}
 		providers[name] = {
@@ -169,6 +171,7 @@ const validateModelsConfig = (config: ModelsConfig): void => {
 				remoteCompaction: providerConfig.remoteCompaction,
 				disableStrictTools: providerConfig.disableStrictTools,
 				guardrailIdentifier: providerConfig.guardrailIdentifier,
+				requestMetadata: providerConfig.requestMetadata,
 				modelOverrides: providerConfig.modelOverrides,
 				models: (providerConfig.models ?? []) as ProviderValidationModel[],
 			},

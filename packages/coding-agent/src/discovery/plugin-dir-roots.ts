@@ -8,6 +8,7 @@ export interface PluginDirRoot {
 	version: string;
 	path: string;
 	scope: "user" | "project";
+	origin: "plugin-dir";
 	persistent: false;
 }
 
@@ -26,5 +27,6 @@ export function buildPluginDirRoot(resolvedPath: string, manifestName?: string):
 		path: resolvedPath,
 		persistent: false,
 		scope: "user",
+		origin: "plugin-dir",
 	};
 }

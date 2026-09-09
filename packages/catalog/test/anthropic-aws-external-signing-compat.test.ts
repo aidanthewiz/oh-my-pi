@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { buildAnthropicCompat, isAnthropicSigningProxyUrl } from "../src/compat/anthropic";
+import { isAnthropicSigningProxyUrl } from "../src/compat/anthropic";
+import { resolveModelPolicy } from "../src/compat/resolve";
 import type { ModelSpec } from "../src/types";
 
 /**
@@ -29,7 +30,7 @@ function spec(overrides: Partial<ModelSpec<"anthropic-messages">>): ModelSpec<"a
 
 describe("anthropic compat: aws-external-anthropic is a signing endpoint", () => {
 	it("does NOT replay unsigned thinking for the AWS external gateway", () => {
-		const compat = buildAnthropicCompat(spec({}));
+		const compat = resolveModelPolicy(spec({})).compat;
 		expect(compat.replayUnsignedThinking).toBe(false);
 	});
 
@@ -38,12 +39,14 @@ describe("anthropic compat: aws-external-anthropic is a signing endpoint", () =>
 	});
 
 	it("is not treated as the OAuth-official Anthropic host", () => {
-		const compat = buildAnthropicCompat(spec({}));
+		const compat = resolveModelPolicy(spec({})).compat;
 		expect(compat.officialEndpoint).toBe(false);
 	});
 
 	it("still replays unsigned thinking for generic non-official reasoning endpoints (#2005, no regression)", () => {
-		const compat = buildAnthropicCompat(spec({ provider: "custom", baseUrl: "https://llm.example.com/anthropic" }));
+		const compat = resolveModelPolicy(
+			spec({ provider: "custom", baseUrl: "https://llm.example.com/anthropic" }),
+		).compat;
 		expect(compat.replayUnsignedThinking).toBe(true);
 	});
 });

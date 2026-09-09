@@ -8,6 +8,8 @@ import {
 	loadSystemPromptFiles,
 	type SystemPromptToolMetadata,
 } from "@oh-my-pi/pi-coding-agent/system-prompt";
+import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function escapeRegExp(text: string): string {
@@ -290,5 +292,74 @@ describe("SYSTEM.md prompt assembly", () => {
 		const promptText = systemPrompt.join("\n\n");
 		const matches = promptText.match(new RegExp(escapeRegExp(sharedContent), "g")) ?? [];
 		expect(matches).toHaveLength(1);
+	});
+
+	it("places global context before farther and nearer project instructions", async () => {
+		const profileAgentDir = path.join(tempHomeDir, "profile", "agent");
+		const projectRoot = path.join(tempDir, "repo");
+		const projectCwd = path.join(projectRoot, "packages", "app");
+		const originalAgentDir = getAgentDir();
+
+		try {
+			setAgentDir(profileAgentDir);
+			fs.mkdirSync(projectCwd, { recursive: true });
+			fs.mkdirSync(profileAgentDir, { recursive: true });
+			fs.mkdirSync(path.join(projectCwd, ".claude"), { recursive: true });
+			fs.writeFileSync(path.join(profileAgentDir, "AGENTS.md"), "global baseline\n");
+			fs.writeFileSync(path.join(projectRoot, "AGENTS.md"), "repo baseline\n");
+			fs.writeFileSync(path.join(projectCwd, ".claude", "CLAUDE.md"), "package override\n");
+			clearFsCache();
+
+			const files = await loadProjectContextFiles({ cwd: projectCwd });
+
+			expect(files.map(file => file.content)).toEqual([
+				"global baseline\n",
+				"repo baseline\n",
+				"package override\n",
+			]);
+		} finally {
+			setAgentDir(originalAgentDir);
+			clearFsCache();
+		}
+	});
+
+	it("renders explicit local-over-global precedence for default and custom prompts", async () => {
+		const contextFiles = [
+			{ path: "/profile/AGENTS.md", content: "Global baseline." },
+			{ path: "/repo/AGENTS.md", content: "Repository override.", depth: 1 },
+			{ path: "/repo/pkg/.claude/CLAUDE.md", content: "Package override.", depth: 0 },
+		];
+		const workspaceTree = {
+			rootPath: "/repo/pkg",
+			rendered: "",
+			truncated: false,
+			totalLines: 0,
+			agentsMdFiles: [],
+		};
+
+		for (const customPrompt of [undefined, "Custom system prompt."]) {
+			const { systemPrompt } = await buildSystemPrompt({
+				cwd: "/repo/pkg",
+				customPrompt,
+				contextFiles,
+				skills: [],
+				rules: [],
+				toolNames: [],
+				workspaceTree,
+				activeRepoContext: null,
+			});
+			const rendered = systemPrompt.join("\n");
+
+			expect(rendered).toContain(
+				"A clear conflict in a later, more local file overrides an earlier instruction; no marker or configuration flag is required.",
+			);
+			expect(rendered).toContain('path="/profile/AGENTS.md"');
+			expect(rendered).toContain('path="/repo/AGENTS.md"');
+			expect(rendered).toContain('path="/repo/pkg/.claude/CLAUDE.md"');
+			expect(rendered.indexOf('path="/profile/AGENTS.md"')).toBeLessThan(rendered.indexOf('path="/repo/AGENTS.md"'));
+			expect(rendered.indexOf('path="/repo/AGENTS.md"')).toBeLessThan(
+				rendered.indexOf('path="/repo/pkg/.claude/CLAUDE.md"'),
+			);
+		}
 	});
 });

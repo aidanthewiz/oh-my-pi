@@ -1,0 +1,4 @@
+auth "anthropic-aws" {
+	name "Claude Platform on AWS"
+	env hook="anthropic-aws"
+}

@@ -69,7 +69,7 @@ enabled = false
 		expect(item?.enabled).toBe(false);
 
 		// Runtime loading (what MCPManager connects) must skip it entirely.
-		const { configs } = await loadAllMCPConfigs(projectDir);
+		const { configs } = await loadAllMCPConfigs(projectDir, { discoveryProviders: ["codex"] });
 		expect(configs["computer-use"]).toBeUndefined();
 	});
 
@@ -87,7 +87,7 @@ enabled = true
 		expect(servers.find(s => s.name === "node-repl")?.enabled).toBeUndefined();
 
 		clearFsCache();
-		const { configs } = await loadAllMCPConfigs(projectDir);
+		const { configs } = await loadAllMCPConfigs(projectDir, { discoveryProviders: ["codex"] });
 		expect(configs["node-repl"]).toBeDefined();
 	});
 
@@ -106,7 +106,7 @@ command = "plain-server"
 		expect(item?.enabled).toBeUndefined();
 
 		clearFsCache();
-		const { configs } = await loadAllMCPConfigs(projectDir);
+		const { configs } = await loadAllMCPConfigs(projectDir, { discoveryProviders: ["codex"] });
 		expect(configs.plain).toBeDefined();
 	});
 });

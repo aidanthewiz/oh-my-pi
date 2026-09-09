@@ -11,6 +11,7 @@ export type McpConnectionFailure = {
 
 export type McpConnectionStatusEvent =
 	| { type: "connecting"; serverNames: string[] }
+	| { type: "reconnecting"; serverName: string }
 	| { type: "connected"; serverName: string }
 	| { type: "cancelled"; serverName: string }
 	| ({ type: "failed" } & McpConnectionFailure);
@@ -116,6 +117,8 @@ export function isMcpConnectionStatusEvent(data: unknown): data is McpConnection
 	switch (data.type) {
 		case "connecting":
 			return isStringArray(data.serverNames);
+		case "reconnecting":
+			return typeof data.serverName === "string";
 		case "connected":
 		case "cancelled":
 			return typeof data.serverName === "string";
