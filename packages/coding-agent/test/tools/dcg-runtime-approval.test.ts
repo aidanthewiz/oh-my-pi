@@ -1,9 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -81,73 +82,141 @@ process.exit(1);
 		removeSyncWithRetries(tempDir);
 	});
 
-	function runner(input: (prompt: string) => string | undefined): ExtensionRunner {
+	function runner(select: (prompt: string, options: string[]) => string | undefined): ExtensionRunner {
 		return {
 			sessionId: "dcg-runtime-test",
 			runScoped: <T>(fn: () => T): T => fn(),
 			hasHandlers: () => false,
 			hasUI: () => true,
 			consumeToolCallEmitted: () => false,
-			getUIContext: () => ({ input: async (prompt: string) => input(prompt) }),
+			getUIContext: () => ({
+				select: async (prompt: string, options: string[]) => select(prompt, options),
+			}),
 		} as unknown as ExtensionRunner;
 	}
 
-	it("shows the exact expanded execution and defers filesystem writes until confirmation", async () => {
+	it("uses the native approval selector, notifies the terminal, and executes only after approval", async () => {
 		const args: BashToolInput = {
 			command: "printf runtime-approved > local://nested/result.txt",
 			cwd: tempDir,
 			timeout: 30,
 		};
 		const resultPath = path.join(tempDir, "artifacts", "local", "nested", "result.txt");
+		const events: string[] = [];
+		const sendNotification = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {
+			events.push("notification");
+		});
 		let review = "";
 		const wrapped = new ExtensionToolWrapper(
 			tool as unknown as AgentTool,
-			runner(prompt => {
+			runner((prompt, options) => {
+				events.push("selector");
 				review = prompt;
+				expect(options).toEqual(["Deny", "Approve once"]);
 				expect(fs.existsSync(path.dirname(resultPath))).toBeFalse();
-				return prompt.match(/Type (RUN \d{4}) to execute/u)?.[1];
+				return "Approve once";
 			}),
 		);
 
-		await wrapped.execute("approved-call", args, undefined, undefined, {
-			settings,
-		} as AgentToolContext);
-		expect(fs.readFileSync(resultPath, "utf8")).toBe("runtime-approved");
-		expect(review).toContain("strict_git:worktree-remove");
-		expect(review).toContain("git worktree remove deletes a linked working tree.");
-		expect(review).toContain(JSON.stringify(tempDir));
-		expect(review).toContain(JSON.stringify(`printf runtime-approved > '${resultPath}'`));
-		expect(review).toContain("newlines and control characters are escaped");
+		try {
+			await wrapped.execute("approved-call", args, undefined, undefined, {
+				settings,
+			} as AgentToolContext);
+			expect(events).toEqual(["notification", "selector"]);
+			expect(sendNotification).toHaveBeenCalledWith({
+				title: "Oh My Pi",
+				body: "Tool approval required",
+				type: "approval",
+				urgency: "normal",
+				actions: "focus",
+			});
+			expect(fs.readFileSync(resultPath, "utf8")).toBe("runtime-approved");
+			expect(review).toContain("strict_git:worktree-remove");
+			expect(review).toContain("git worktree remove deletes a linked working tree.");
+			expect(review).toContain(JSON.stringify(tempDir));
+			expect(review).toContain(JSON.stringify(`printf runtime-approved > '${resultPath}'`));
+			expect(review).toContain("newlines and control characters are escaped");
 
-		await expect(tool.execute("approved-call", args)).rejects.toThrow(/requires interactive approval/u);
+			await expect(tool.execute("approved-call", args)).rejects.toThrow(/requires interactive approval/u);
+		} finally {
+			sendNotification.mockRestore();
+		}
 	});
 
 	it("invalidates approval when the execution input changes during review", async () => {
+		const sendNotification = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		const args: BashToolInput = { command: "printf original-command", cwd: tempDir };
 		const wrapped = new ExtensionToolWrapper(
 			tool as unknown as AgentTool,
-			runner(prompt => {
+			runner(() => {
 				args.command = "printf changed-command";
-				return prompt.match(/Type (RUN \d{4}) to execute/u)?.[1];
+				return "Approve once";
 			}),
 		);
 
-		await expect(
-			wrapped.execute("changed-call", args, undefined, undefined, { settings } as AgentToolContext),
-		).rejects.toThrow(/requires interactive approval/u);
+		try {
+			await expect(
+				wrapped.execute("changed-call", args, undefined, undefined, { settings } as AgentToolContext),
+			).rejects.toThrow(/requires interactive approval/u);
+		} finally {
+			sendNotification.mockRestore();
+		}
 	});
 
-	it("does not execute after a missing or incorrect confirmation challenge", async () => {
-		const args: BashToolInput = { command: "printf must-not-run", cwd: tempDir };
+	it("does not execute after a denied or cancelled native approval", async () => {
+		const sendNotification = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		try {
+			for (const selection of ["Deny", undefined]) {
+				const args: BashToolInput = { command: "printf must-not-run", cwd: tempDir };
+				const wrapped = new ExtensionToolWrapper(
+					tool as unknown as AgentTool,
+					runner(() => selection),
+				);
+
+				await expect(
+					wrapped.execute(`denied-call-${String(selection)}`, args, undefined, undefined, {
+						settings,
+					} as AgentToolContext),
+				).rejects.toThrow(/denied by user/u);
+				await expect(tool.execute(`denied-call-${String(selection)}`, args)).rejects.toThrow(
+					/requires interactive approval/u,
+				);
+			}
+		} finally {
+			sendNotification.mockRestore();
+		}
+	});
+
+	it("honors disabled approval notifications without skipping the review", async () => {
+		const silentSettings = Settings.isolated({
+			"approval.notify": "off",
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bashInterceptor.enabled": false,
+			"tools.approvalMode": "yolo",
+		});
+		const sendNotification = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		let prompted = false;
 		const wrapped = new ExtensionToolWrapper(
 			tool as unknown as AgentTool,
-			runner(() => "RUN 0000"),
+			runner((_prompt, options) => {
+				prompted = true;
+				expect(options).toEqual(["Deny", "Approve once"]);
+				return "Deny";
+			}),
 		);
 
-		await expect(
-			wrapped.execute("denied-call", args, undefined, undefined, { settings } as AgentToolContext),
-		).rejects.toThrow(/denied by user/u);
-		await expect(tool.execute("denied-call", args)).rejects.toThrow(/requires interactive approval/u);
+		try {
+			await expect(
+				wrapped.execute("silent-call", { command: "printf must-not-run", cwd: tempDir }, undefined, undefined, {
+					settings: silentSettings,
+				} as AgentToolContext),
+			).rejects.toThrow(/denied by user/u);
+			expect(prompted).toBeTrue();
+			expect(sendNotification).not.toHaveBeenCalled();
+		} finally {
+			sendNotification.mockRestore();
+		}
 	});
 
 	it("fails closed when runtime approval has no interactive UI", async () => {

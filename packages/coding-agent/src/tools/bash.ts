@@ -25,6 +25,7 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import dcgApprovalPrompt from "../prompts/tools/dcg-approval.md" with { type: "text" };
 import type {
 	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
@@ -380,23 +381,17 @@ function formatDcgRuntimeApproval(
 	decision: DcgAskDecision,
 ): RuntimeToolApprovalRequest {
 	const rule = decision.ruleId ?? "unknown rule";
-	const environment = prepared.resolvedEnv ? JSON.stringify(prepared.resolvedEnv) : "{}";
 	return {
 		reason: `Destructive Command Guard requires review (${rule})`,
-		prompt: [
-			"Destructive Command Guard requires explicit review.",
-			`Rule: ${rule}`,
-			`Reason: ${decision.reason}`,
-			`Working directory (exact JSON string): ${JSON.stringify(prepared.commandCwd)}`,
-			`Additional environment (exact JSON object): ${environment}`,
-			`Execution mode: ${input.async === true ? "background" : input.pty === true ? "interactive PTY" : "foreground"}`,
-			`Requested timeout seconds: ${input.timeout ?? 300}`,
-			"",
-			"Command (exact JSON string; newlines and control characters are escaped):",
-			JSON.stringify(prepared.command),
-			"",
-			"Review the entire command before entering the confirmation challenge.",
-		].join("\n"),
+		prompt: prompt.render(dcgApprovalPrompt, {
+			rule,
+			reason: decision.reason,
+			workingDirectory: JSON.stringify(prepared.commandCwd),
+			environment: prepared.resolvedEnv ? JSON.stringify(prepared.resolvedEnv) : "{}",
+			executionMode: input.async === true ? "background" : input.pty === true ? "interactive PTY" : "foreground",
+			timeoutSeconds: input.timeout ?? 300,
+			command: JSON.stringify(prepared.command),
+		}),
 	};
 }
 

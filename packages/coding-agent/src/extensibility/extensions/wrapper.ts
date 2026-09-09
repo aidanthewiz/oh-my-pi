@@ -1,7 +1,6 @@
 /**
  * Tool wrappers for extensions.
  */
-import { randomInt } from "node:crypto";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -10,6 +9,7 @@ import type {
 	ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
+import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
@@ -144,10 +144,6 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
 		const value = check.message || check.code || check.id;
 		return `${index + 1}. ${approvalData(value)}`;
 	});
-}
-
-function runtimeApprovalChallenge(): string {
-	return `RUN ${randomInt(1000, 10_000)}`;
 }
 
 /**
@@ -349,21 +345,29 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
+			if (settings?.get("approval.notify") === "on") {
+				const sessionName = context?.sessionManager?.getSessionName();
+				TERMINAL.sendNotification({
+					title: sessionName || "Oh My Pi",
+					body: "Tool approval required",
+					type: "approval",
+					urgency: "normal",
+					actions: "focus",
+				});
+			}
 			let approved: boolean;
-			let denialReason = "denied by user";
+			const denialReason = "denied by user";
 			try {
 				if (runtimeApproval) {
-					const challenge = runtimeApprovalChallenge();
 					const safetySuffix =
 						pendingSafetyChecks.length > 0
 							? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 							: "";
-					const response = await uiContext.input(
-						`${runtimeApproval.prompt}${safetySuffix}\n\nType ${challenge} to execute this exact command once.`,
-						`Type ${challenge}`,
-					);
-					approved = response?.trim() === challenge;
-					if (response !== undefined && !approved) denialReason = "confirmation challenge did not match";
+					const choice = await uiContext.select(`${runtimeApproval.prompt}${safetySuffix}`, [
+						"Deny",
+						"Approve once",
+					]);
+					approved = choice === "Approve once";
 				} else {
 					const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
 					const safetyPrompt =
