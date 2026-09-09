@@ -14,8 +14,10 @@ import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { $ } from "bun";
-import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
+import { detectHostArchitecture, detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { generateEnumExports } from "./gen-enums";
+
+const hostArch = detectHostArchitecture();
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
 // static build so the local addon never retains host Homebrew paths.
@@ -29,7 +31,7 @@ process.env.PCRE2_SYS_STATIC ??= "1";
 // CMake/Ninja dirs, keeping any user-provided tools ahead.
 if (process.platform === "win32" && (!Bun.which("cmake") || !Bun.which("ninja"))) {
 	const vcToolsComponent =
-		process.arch === "arm64"
+		hostArch === "arm64"
 			? "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
 			: "Microsoft.VisualStudio.Component.VC.Tools.x86.x64";
 	const vswhere = path.join(
@@ -61,7 +63,7 @@ const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
 const localAddon = resolveLocalHostAddon({
 	platform: process.platform,
-	arch: process.arch,
+	arch: hostArch,
 	avx2: detectHostAvx2Support(),
 });
 const effectiveVariant = localAddon.x64Variant;
@@ -144,7 +146,7 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 	}
 
 	const generatedCandidates = entries.filter(
-		entry => entry.startsWith(`pi_natives.${process.platform}-${process.arch}`) && entry.endsWith(".node"),
+		entry => entry.startsWith(`pi_natives.${process.platform}-${hostArch}`) && entry.endsWith(".node"),
 	);
 
 	if (generatedCandidates.length === 1) {
@@ -153,13 +155,13 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 
 	if (generatedCandidates.length === 0) {
 		throw new Error(
-			`napi build succeeded but did not emit a native addon for ${process.platform}-${process.arch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
+			`napi build succeeded but did not emit a native addon for ${process.platform}-${hostArch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
 		);
 	}
 
 	const formattedCandidates = generatedCandidates.map(candidate => `  - ${candidate}`).join("\n");
 	throw new Error(
-		`napi build emitted multiple unrecognized native addons for ${process.platform}-${process.arch}:\n${formattedCandidates}`,
+		`napi build emitted multiple unrecognized native addons for ${process.platform}-${hostArch}:\n${formattedCandidates}`,
 	);
 }
 
@@ -177,13 +179,13 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 const canonicalAddonFilename = localAddon.filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
-console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
+console.log(`Building pi-natives bindings for ${process.platform}-${hostArch}${variantSuffix} (local)…`);
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);
 await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
 const buildOutputDir = await fs.mkdtemp(
-	path.join(nativeDir, ".build", `${process.platform}-${process.arch}-${effectiveVariant ?? "default"}-local-`),
+	path.join(nativeDir, ".build", `${process.platform}-${hostArch}-${effectiveVariant ?? "default"}-local-`),
 );
 
 // Resolve the CLI's JS entry from the package manifest rather than the
@@ -228,6 +230,9 @@ const napiArgs = [
 	"--profile",
 	cargoProfile,
 ];
+if (process.platform === "win32" && hostArch === "arm64") {
+	napiArgs.push("--target", "aarch64-pc-windows-msvc");
+}
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.

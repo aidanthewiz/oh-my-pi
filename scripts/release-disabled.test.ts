@@ -44,6 +44,19 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(workflow).toContain("shasum -a 256 -c SHA256SUMS.verify");
 });
 
+test("relay image copies only existing root build inputs", async () => {
+	const root = path.join(import.meta.dir, "..");
+	const dockerfile = await Bun.file(path.join(root, "Dockerfile.relay")).text();
+	const rootCopy = dockerfile.split("\n").find(line => line.startsWith("COPY ") && line.endsWith(" ./"));
+	expect(rootCopy).toBeDefined();
+
+	const sources = rootCopy?.slice("COPY ".length, -" ./".length).trim().split(/\s+/) ?? [];
+	expect(sources.length).toBeGreaterThan(0);
+	for (const source of sources) {
+		expect(await Bun.file(path.join(root, source)).exists()).toBe(true);
+	}
+});
+
 test("Coreforce saves native caches before fallible packaging steps", async () => {
 	for (const workflowName of ["cf-release.yml", "cf-verify.yml"]) {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", workflowName)).text();

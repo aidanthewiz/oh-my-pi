@@ -38,7 +38,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { detectHostAvx2Support, resolveLocalHostAddon } from "./host-detect";
+import { detectHostArchitecture, detectHostAvx2Support, resolveLocalHostAddon } from "./host-detect";
 
 const repoRoot = path.join(import.meta.dir, "..");
 
@@ -245,7 +245,11 @@ async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<voi
 
 async function main(): Promise<void> {
 	const options = parseCliArgs(process.argv.slice(2));
-	const host: HostInfo = { platform: process.platform, arch: process.arch, avx2: detectHostAvx2Support() };
+	const host: HostInfo = {
+		platform: process.platform,
+		arch: detectHostArchitecture(),
+		avx2: detectHostAvx2Support(),
+	};
 	const destDir = options.dest ? path.resolve(options.dest) : path.join(repoRoot, "packages/natives/native");
 
 	const backend = Bun.env.OMP_NATIVE_BUILD_BACKEND?.trim();
