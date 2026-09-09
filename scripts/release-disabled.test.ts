@@ -87,6 +87,37 @@ test("Coreforce restores trusted release caches without pull request cache write
 	expect(verifyWorkflow).toContain("needs.prepare.outputs.native_changed == 'true'");
 });
 
+test("Coreforce keeps pull request credentials isolated from checked-out code", async () => {
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-verify.yml")).text();
+	const prepareStart = workflow.indexOf("  prepare:");
+	const buildStart = workflow.indexOf("  build:", prepareStart);
+	const browserRelayStart = workflow.indexOf("  browser_relay:", buildStart);
+	const prepareJob = workflow.slice(prepareStart, buildStart);
+	const buildJob = workflow.slice(buildStart, browserRelayStart);
+
+	const releaseListIndex = prepareJob.indexOf("- name: List Coreforce releases");
+	const prepareCheckoutIndex = prepareJob.indexOf("- uses: actions/checkout@");
+	const nativeSelectorIndex = prepareJob.indexOf("- name: Select native verification source");
+	expect(releaseListIndex).toBeGreaterThanOrEqual(0);
+	expect(prepareCheckoutIndex).toBeGreaterThan(releaseListIndex);
+	expect(nativeSelectorIndex).toBeGreaterThan(prepareCheckoutIndex);
+	expect(prepareJob.slice(releaseListIndex, prepareCheckoutIndex)).toContain("GH_TOKEN:");
+	expect(prepareJob.slice(releaseListIndex, prepareCheckoutIndex)).not.toContain("bun ");
+	expect(prepareJob.slice(prepareCheckoutIndex)).not.toContain("GH_TOKEN:");
+
+	const downloadIndex = buildJob.indexOf("- name: Download released native addon");
+	const windowsDownloadIndex = buildJob.indexOf("- name: Download released native addon (Windows ARM64)");
+	const buildCheckoutIndex = buildJob.indexOf("- uses: actions/checkout@");
+	const installIndex = buildJob.indexOf("- name: Install verified released native addon");
+	expect(downloadIndex).toBeGreaterThanOrEqual(0);
+	expect(windowsDownloadIndex).toBeGreaterThan(downloadIndex);
+	expect(buildCheckoutIndex).toBeGreaterThan(windowsDownloadIndex);
+	expect(installIndex).toBeGreaterThan(buildCheckoutIndex);
+	expect(buildJob.slice(downloadIndex, buildCheckoutIndex)).toContain("GH_TOKEN:");
+	expect(buildJob.slice(downloadIndex, buildCheckoutIndex)).not.toContain("bun ");
+	expect(buildJob.slice(buildCheckoutIndex)).not.toContain("GH_TOKEN:");
+});
+
 test("Coreforce allocates a release tag only after every build succeeds", async () => {
 	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
 	const prepareStart = workflow.indexOf("  prepare:");
@@ -143,12 +174,14 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).not.toContain("git push origin");
 	expect(verifyWorkflow).not.toContain("gh release create");
 	expect(verifyWorkflow).toContain("Select native verification source");
-	expect(verifyWorkflow).toContain('ci-released-native.ts resolve-optional "$PKG_VERSION"');
+	expect(verifyWorkflow).toContain('ci-released-native.ts resolve-optional "$PKG_VERSION" "$RELEASE_LIST"');
 	expect(verifyWorkflow).toContain(`git merge-base --is-ancestor "\${RELEASE_TAG}^{commit}" "$VERIFY_SHA"`);
 	expect(verifyWorkflow).toContain(`ci-released-native.ts changed "\${RELEASE_TAG}^{commit}" "$VERIFY_SHA"`);
 	expect(verifyWorkflow).toContain("fetch-tags: true");
 	expect(verifyWorkflow).toContain("Install verified released native addon");
-	expect(verifyWorkflow).toContain("bun scripts/ci-released-native.ts install");
+	expect(verifyWorkflow).toContain(
+		`bun scripts/ci-released-native.ts install "\${{ needs.prepare.outputs.release_tag }}"`,
+	);
 	expect(verifyWorkflow).toContain(`bun scripts/bazel-natives.ts "\${targets[@]}"`);
 	expect(verifyWorkflow).toContain("needs.prepare.outputs.native_changed == 'true'");
 	expect(verifyWorkflow).toContain("run: bun run ci:release:build-binaries");

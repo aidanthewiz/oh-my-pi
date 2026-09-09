@@ -23,6 +23,16 @@ jobs:
       native_changed: ${{ steps.native.outputs.changed }}
       release_tag: ${{ steps.native.outputs.tag }}
     steps:
+      - name: List Coreforce releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 200 \
+            --exclude-drafts \
+            --json tagName,isDraft \
+            > "$RUNNER_TEMP/coreforce-releases.json"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
@@ -33,11 +43,11 @@ jobs:
       - name: Select native verification source
         id: native
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_LIST: ${{ runner.temp }}/coreforce-releases.json
         run: |
           set -euo pipefail
           PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
-          RELEASE_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG_VERSION")"
+          RELEASE_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG_VERSION" "$RELEASE_LIST")"
           VERIFY_SHA="$(git rev-parse HEAD)"
           CHANGED=true
           if [ -n "$RELEASE_TAG" ] && git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "$VERIFY_SHA"; then
@@ -84,6 +94,31 @@ jobs:
             windows: "1"
             binary: omp-windows-arm64.exe
     steps:
+      - name: Download released native addon
+        if: needs.prepare.outputs.native_changed != 'true' && matrix.windows != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          ASSET_NAME: coreforge-pi-natives-${{ matrix.target }}-${{ needs.prepare.outputs.release_tag }}.tgz
+        run: |
+          mkdir -p "$RUNNER_TEMP/released-native"
+          gh release download \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET_NAME" \
+            --pattern SHA256SUMS.txt \
+            --dir "$RUNNER_TEMP/released-native" \
+            -- "$RELEASE_TAG"
+      - name: Download released native addon (Windows ARM64)
+        if: needs.prepare.outputs.native_changed != 'true' && matrix.windows == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          ASSET_NAME: coreforge-pi-natives-${{ matrix.target }}-${{ needs.prepare.outputs.release_tag }}.tgz
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP "released-native"
+          New-Item -ItemType Directory -Force $download | Out-Null
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --pattern SHA256SUMS.txt --dir $download -- $env:RELEASE_TAG
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
@@ -143,9 +178,7 @@ jobs:
         run: bun scripts/bazel-natives.ts host --dest packages/natives/native
       - name: Install verified released native addon
         if: needs.prepare.outputs.native_changed != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bun scripts/ci-released-native.ts install "${{ needs.prepare.outputs.release_tag }}" "${{ matrix.target }}" packages/natives/native
+        run: bun scripts/ci-released-native.ts install "${{ needs.prepare.outputs.release_tag }}" "${{ matrix.target }}" packages/natives/native "${{ runner.temp }}/released-native"
       - name: Package source-built native addon
         if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         run: |
