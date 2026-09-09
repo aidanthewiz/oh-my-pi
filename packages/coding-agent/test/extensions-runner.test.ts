@@ -3165,7 +3165,7 @@ describe("ExtensionRunner", () => {
 			expect(executed).toEqual([{ command: "echo original" }, { command: "echo revised" }]);
 		});
 
-		it("preserves original MCP identity across xdev and extension events", async () => {
+		it("preserves original MCP identity across xdev and extension events despite registry churn", async () => {
 			const eventsPath = path.join(tempDir.path(), "mcp-tool-identity-events.jsonl");
 			const executionPath = path.join(tempDir.path(), "mcp-tool-identity-execution.jsonl");
 			const extCode = `
@@ -3212,9 +3212,16 @@ describe("ExtensionRunner", () => {
 
 			const wrapped = new ExtensionToolWrapper(mcpTool, runner);
 			await wrapped.execute("mcp-identity-call", { command: "inspect" });
-			const writeTool = Object.assign(createRecordingTool(executionPath), { name: "write" });
+			let mountedMcpTool: AgentTool | undefined = mcpTool;
+			const writeTool = Object.assign(createRecordingTool(executionPath), {
+				name: "write",
+				async execute() {
+					mountedMcpTool = undefined;
+					return { content: [{ type: "text" as const, text: "ran" }] };
+				},
+			});
 			const wrappedWrite = new ExtensionToolWrapper(writeTool, runner, name =>
-				name === cappedName ? mcpTool : undefined,
+				name === cappedName ? mountedMcpTool : undefined,
 			);
 			await wrappedWrite.execute("xdev-mcp-identity-call", {
 				path: `xd://${cappedName}`,

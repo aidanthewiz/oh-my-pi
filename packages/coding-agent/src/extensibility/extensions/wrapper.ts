@@ -392,6 +392,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
+		// Registry entries can change while the tool runs; preserve the identity selected for this execution.
+		const resultMcpIdentity = this.runner.hasHandlers("tool_result")
+			? mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context), this.resolveToolByName)
+			: null;
+
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
@@ -415,12 +420,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status
-		if (this.runner.hasHandlers("tool_result")) {
+		if (resultMcpIdentity) {
 			const resultResult = await this.runner.emitToolResult({
 				type: "tool_result",
 				toolName: this.tool.name,
 				toolCallId,
-				...mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context), this.resolveToolByName),
+				...resultMcpIdentity,
 				input: normalizeToolEventInput(
 					this.tool.name,
 					resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
