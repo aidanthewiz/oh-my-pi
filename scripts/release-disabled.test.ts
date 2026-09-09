@@ -89,6 +89,10 @@ test("Coreforce restores trusted release caches without pull request cache write
 
 test("Coreforce keeps pull request credentials isolated from checked-out code", async () => {
 	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-verify.yml")).text();
+	const checkoutCount = [...workflow.matchAll(/uses: actions\/checkout@/g)].length;
+	const nonPersistentCheckoutCount = [...workflow.matchAll(/persist-credentials: false/g)].length;
+	expect(checkoutCount).toBe(3);
+	expect(nonPersistentCheckoutCount).toBe(checkoutCount);
 	const prepareStart = workflow.indexOf("  prepare:");
 	const buildStart = workflow.indexOf("  build:", prepareStart);
 	const browserRelayStart = workflow.indexOf("  browser_relay:", buildStart);
