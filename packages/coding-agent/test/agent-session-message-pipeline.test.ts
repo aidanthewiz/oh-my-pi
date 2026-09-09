@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import {
 	Agent,
 	type AgentMessage,
@@ -26,7 +27,12 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/types";
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
-import { createAgentSession, type ExtensionContext, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
+import {
+	createAgentSession,
+	type CustomTool,
+	type ExtensionContext,
+	type ExtensionFactory,
+} from "@oh-my-pi/pi-coding-agent/sdk";
 import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -1113,6 +1119,129 @@ describe("AgentSession message pipeline", () => {
 			const text = toolResult?.content.find(block => block.type === "text")?.text ?? "";
 			expect(text).toContain("revised");
 			expect(text).not.toContain("original");
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+	it("preserves mounted MCP identity through the provider-dispatched write pipeline", async () => {
+		using tempDir = TempDir.createSync("@pi-mcp-event-identity-");
+		const api = "test-mcp-event-identity";
+		const cappedName = "mcp__coreforge_zendesk_mcp_zendesk_check_engineering_re_1s1l4a1y";
+		const identity = {
+			mcpServerName: "coreforge-zendesk-mcp",
+			mcpToolName: "zendesk_check_engineering_review_access",
+		};
+		let requests = 0;
+		registerCustomApi(api, () => {
+			requests++;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (requests === 1) {
+					const message = createAssistantMessage("");
+					const toolCall = {
+						type: "toolCall",
+						id: "call-mcp-identity-1",
+						name: "write",
+						arguments: { path: `xd://${cappedName}`, content: "{}" },
+					} as const;
+					message.content = [toolCall];
+					message.stopReason = "toolUse";
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: toolCall as never, partial: message });
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					const message = createAssistantMessage("done");
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "local-mcp-event-identity-model",
+			name: "Local MCP Event Identity Model",
+			api,
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		let executions = 0;
+		const mcpTool = {
+			name: cappedName,
+			label: "coreforge-zendesk-mcp/zendesk_check_engineering_review_access",
+			description: "Check Engineering Review access.",
+			parameters: type({}),
+			loadMode: "discoverable",
+			...identity,
+			async execute() {
+				executions++;
+				return { content: [{ type: "text" as const, text: "access checked" }] };
+			},
+		} satisfies CustomTool;
+		const events: Array<{
+			type: "tool_call" | "tool_result";
+			toolName: string;
+			mcpServerName?: string;
+			mcpToolName?: string;
+		}> = [];
+		const captureIdentity: ExtensionFactory = pi => {
+			const record = (event: (typeof events)[number]) => {
+				if (event.toolName !== "write" && event.toolName !== cappedName) return;
+				events.push({
+					type: event.type,
+					toolName: event.toolName,
+					mcpServerName: event.mcpServerName,
+					mcpToolName: event.mcpToolName,
+				});
+			};
+			pi.on("tool_call", event => record(event));
+			pi.on("tool_result", event => record(event));
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			disableExtensionDiscovery: true,
+			extensions: [captureIdentity],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			workspaceTree: {
+				rootPath: tempDir.path(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+		try {
+			await session.refreshMCPTools([mcpTool]);
+			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain(cappedName);
+
+			await session.sendUserMessage("check access");
+
+			expect(executions).toBe(1);
+			expect(events).toEqual([
+				{ type: "tool_call", toolName: "write", ...identity },
+				{ type: "tool_call", toolName: cappedName, ...identity },
+				{ type: "tool_result", toolName: cappedName, ...identity },
+				{ type: "tool_result", toolName: "write", ...identity },
+			]);
 		} finally {
 			await session.dispose();
 			authStorage.close();
