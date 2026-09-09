@@ -29,6 +29,12 @@ describe("Coreforce release versions", () => {
 		expect(selectCoreforceRangeBase("v17.0.2.3", "17.0.9")).toBe("v17.0.9");
 		expect(selectCoreforceRangeBase("v17.0.9.1", "17.0.9")).toBe("v17.0.9.1");
 	});
+	it("keeps canceled rolls in the next published release range", () => {
+		const previousPublished = selectPreviousCoreforceTag(["v18.1.15.1"], "v18.1.15.3");
+
+		expect(previousPublished).toBe("v18.1.15.1");
+		expect(selectCoreforceRangeBase(previousPublished, "18.1.15")).toBe("v18.1.15.1");
+	});
 });
 
 describe("Coreforce change grouping", () => {
