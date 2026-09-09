@@ -29,6 +29,7 @@ import type {
 	ProviderModelConfig,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import { mcpToolEventIdentity } from "@oh-my-pi/pi-coding-agent/extensibility/tool-event-input";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -3162,6 +3163,81 @@ describe("ExtensionRunner", () => {
 				.split("\n")
 				.map(line => JSON.parse(line));
 			expect(executed).toEqual([{ command: "echo original" }, { command: "echo revised" }]);
+		});
+
+		it("preserves original MCP identity across xdev and extension events despite registry churn", async () => {
+			const eventsPath = path.join(tempDir.path(), "mcp-tool-identity-events.jsonl");
+			const executionPath = path.join(tempDir.path(), "mcp-tool-identity-execution.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+				export default function(pi) {
+					const record = event => {
+						const entry = {
+							type: event.type,
+							toolName: event.toolName,
+							mcpServerName: event.mcpServerName,
+							mcpToolName: event.mcpToolName,
+						};
+						fs.appendFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(entry) + "\\n");
+					};
+					pi.on("tool_call", record);
+					pi.on("tool_result", record);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "mcp-tool-identity.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const cappedName = "mcp__coreforge_zendesk_mcp_zendesk_check_engineering_re_1s1l4a1y";
+			const mcpTool = Object.assign(createRecordingTool(executionPath), {
+				name: cappedName,
+				mcpServerName: "coreforge-zendesk-mcp",
+				mcpToolName: "zendesk_check_engineering_review_access",
+			});
+			const identity = {
+				mcpServerName: mcpTool.mcpServerName,
+				mcpToolName: mcpTool.mcpToolName,
+			};
+			expect(
+				mcpToolEventIdentity({ name: "write" }, { path: `xd://${cappedName}`, content: "{}" }, name =>
+					name === cappedName ? mcpTool : undefined,
+				),
+			).toEqual(identity);
+
+			const wrapped = new ExtensionToolWrapper(mcpTool, runner);
+			await wrapped.execute("mcp-identity-call", { command: "inspect" });
+			let mountedMcpTool: AgentTool | undefined = mcpTool;
+			const writeTool = Object.assign(createRecordingTool(executionPath), {
+				name: "write",
+				async execute() {
+					mountedMcpTool = undefined;
+					return { content: [{ type: "text" as const, text: "ran" }] };
+				},
+			});
+			const wrappedWrite = new ExtensionToolWrapper(writeTool, runner, name =>
+				name === cappedName ? mountedMcpTool : undefined,
+			);
+			await wrappedWrite.execute("xdev-mcp-identity-call", {
+				path: `xd://${cappedName}`,
+				content: "{}",
+			});
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([
+				{ type: "tool_call", toolName: cappedName, ...identity },
+				{ type: "tool_result", toolName: cappedName, ...identity },
+				{ type: "tool_call", toolName: "write", ...identity },
+				{ type: "tool_result", toolName: "write", ...identity },
+			]);
 		});
 
 		it("forfeits the xdevApproved prompt bypass when a handler revises the input", async () => {

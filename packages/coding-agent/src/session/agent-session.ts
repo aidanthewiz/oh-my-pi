@@ -153,7 +153,11 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
-import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
+import {
+	mcpToolEventIdentity,
+	normalizeToolEventInput,
+	resolveToolEventInput,
+} from "../extensibility/tool-event-input";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -3971,12 +3975,14 @@ export class AgentSession {
 		const eventArgs = computer
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
+		const mcpIdentity = mcpToolEventIdentity(ctx.tool, eventArgs, name => this.#tools.getToolByName(name));
 		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
 		const callResult = await runner.emitToolCall(
 			{
 				type: "tool_call",
 				toolName: ctx.tool.name,
 				toolCallId: ctx.toolCall.id,
+				...mcpIdentity,
 				input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
 			},
 			signal,
