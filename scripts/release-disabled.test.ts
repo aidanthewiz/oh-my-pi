@@ -57,24 +57,69 @@ test("relay image copies only existing root build inputs", async () => {
 	}
 });
 
-test("Coreforce saves native caches before fallible packaging steps", async () => {
-	for (const workflowName of ["cf-release.yml", "cf-verify.yml"]) {
-		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", workflowName)).text();
-		const restoreIndex = workflow.indexOf("- name: Restore Bazel native build cache");
-		const buildIndex = workflow.indexOf("- name: Build native addon from Coreforge sources", restoreIndex);
-		const saveIndex = workflow.indexOf("- name: Save Bazel native build cache", buildIndex);
-		const packageIndex = workflow.indexOf("- name: Package source-built native addon", saveIndex);
-		const saveStep = workflow.slice(saveIndex, packageIndex);
+test("Coreforce restores trusted release caches without pull request cache writes", async () => {
+	const root = path.join(import.meta.dir, "..");
+	const releaseWorkflow = await Bun.file(path.join(root, ".github", "workflows", "cf-release.yml")).text();
+	const verifyWorkflow = await Bun.file(path.join(root, ".github", "workflows", "cf-verify.yml")).text();
 
-		expect(restoreIndex).toBeGreaterThanOrEqual(0);
-		expect(buildIndex).toBeGreaterThan(restoreIndex);
-		expect(saveIndex).toBeGreaterThan(buildIndex);
-		expect(packageIndex).toBeGreaterThan(saveIndex);
-		expect(workflow.slice(restoreIndex, buildIndex)).toContain("uses: actions/cache/restore@");
-		expect(saveStep).toContain("uses: actions/cache/save@");
-		expect(saveStep).toContain("if: matrix.windows != '1' && steps.bazel-cache.outputs.cache-hit != 'true'");
-		expect(saveStep).toContain(`key: \${{ steps.bazel-cache.outputs.cache-primary-key }}`);
-	}
+	const releaseRestoreIndex = releaseWorkflow.indexOf("- name: Restore Bazel native build cache");
+	const releaseBuildIndex = releaseWorkflow.indexOf(
+		"- name: Build native addon from Coreforge sources",
+		releaseRestoreIndex,
+	);
+	const releaseSaveIndex = releaseWorkflow.indexOf("- name: Save Bazel native build cache", releaseBuildIndex);
+	const releasePackageIndex = releaseWorkflow.indexOf("- name: Package source-built native addon", releaseSaveIndex);
+	expect(releaseRestoreIndex).toBeGreaterThanOrEqual(0);
+	expect(releaseBuildIndex).toBeGreaterThan(releaseRestoreIndex);
+	expect(releaseSaveIndex).toBeGreaterThan(releaseBuildIndex);
+	expect(releasePackageIndex).toBeGreaterThan(releaseSaveIndex);
+
+	const verifyRestoreIndex = verifyWorkflow.indexOf("- name: Restore Bazel native build cache");
+	const verifyBuildIndex = verifyWorkflow.indexOf(
+		"- name: Build native addon from Coreforge sources",
+		verifyRestoreIndex,
+	);
+	expect(verifyRestoreIndex).toBeGreaterThanOrEqual(0);
+	expect(verifyBuildIndex).toBeGreaterThan(verifyRestoreIndex);
+	expect(verifyWorkflow).not.toContain("- name: Save Bazel native build cache");
+	expect(verifyWorkflow).not.toContain("coreforge-verify-bazel-");
+	expect(verifyWorkflow).toContain("key: coreforge-bazel-v1-");
+	expect(verifyWorkflow).toContain("needs.prepare.outputs.native_changed == 'true'");
+});
+
+test("Coreforce keeps pull request credentials isolated from checked-out code", async () => {
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-verify.yml")).text();
+	const checkoutCount = [...workflow.matchAll(/uses: actions\/checkout@/g)].length;
+	const nonPersistentCheckoutCount = [...workflow.matchAll(/persist-credentials: false/g)].length;
+	expect(checkoutCount).toBe(3);
+	expect(nonPersistentCheckoutCount).toBe(checkoutCount);
+	const prepareStart = workflow.indexOf("  prepare:");
+	const buildStart = workflow.indexOf("  build:", prepareStart);
+	const browserRelayStart = workflow.indexOf("  browser_relay:", buildStart);
+	const prepareJob = workflow.slice(prepareStart, buildStart);
+	const buildJob = workflow.slice(buildStart, browserRelayStart);
+
+	const releaseListIndex = prepareJob.indexOf("- name: List Coreforce releases");
+	const prepareCheckoutIndex = prepareJob.indexOf("- uses: actions/checkout@");
+	const nativeSelectorIndex = prepareJob.indexOf("- name: Select native verification source");
+	expect(releaseListIndex).toBeGreaterThanOrEqual(0);
+	expect(prepareCheckoutIndex).toBeGreaterThan(releaseListIndex);
+	expect(nativeSelectorIndex).toBeGreaterThan(prepareCheckoutIndex);
+	expect(prepareJob.slice(releaseListIndex, prepareCheckoutIndex)).toContain("GH_TOKEN:");
+	expect(prepareJob.slice(releaseListIndex, prepareCheckoutIndex)).not.toContain("bun ");
+	expect(prepareJob.slice(prepareCheckoutIndex)).not.toContain("GH_TOKEN:");
+
+	const downloadIndex = buildJob.indexOf("- name: Download released native addon");
+	const windowsDownloadIndex = buildJob.indexOf("- name: Download released native addon (Windows ARM64)");
+	const buildCheckoutIndex = buildJob.indexOf("- uses: actions/checkout@");
+	const installIndex = buildJob.indexOf("- name: Install verified released native addon");
+	expect(downloadIndex).toBeGreaterThanOrEqual(0);
+	expect(windowsDownloadIndex).toBeGreaterThan(downloadIndex);
+	expect(buildCheckoutIndex).toBeGreaterThan(windowsDownloadIndex);
+	expect(installIndex).toBeGreaterThan(buildCheckoutIndex);
+	expect(buildJob.slice(downloadIndex, buildCheckoutIndex)).toContain("GH_TOKEN:");
+	expect(buildJob.slice(downloadIndex, buildCheckoutIndex)).not.toContain("bun ");
+	expect(buildJob.slice(buildCheckoutIndex)).not.toContain("GH_TOKEN:");
 });
 
 test("Coreforce allocates a release tag only after every build succeeds", async () => {
@@ -132,15 +177,23 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).not.toMatch(/^\s+contents: write$/m);
 	expect(verifyWorkflow).not.toContain("git push origin");
 	expect(verifyWorkflow).not.toContain("gh release create");
+	expect(verifyWorkflow).toContain("Select native verification source");
+	expect(verifyWorkflow).toContain('ci-released-native.ts resolve-optional "$PKG_VERSION" "$RELEASE_LIST"');
+	expect(verifyWorkflow).toContain(`git merge-base --is-ancestor "\${RELEASE_TAG}^{commit}" "$VERIFY_SHA"`);
+	expect(verifyWorkflow).toContain(`ci-released-native.ts changed "\${RELEASE_TAG}^{commit}" "$VERIFY_SHA"`);
+	expect(verifyWorkflow).toContain("fetch-tags: true");
+	expect(verifyWorkflow).toContain("Install verified released native addon");
+	expect(verifyWorkflow).toContain(
+		`bun scripts/ci-released-native.ts install "\${{ needs.prepare.outputs.release_tag }}"`,
+	);
 	expect(verifyWorkflow).toContain(`bun scripts/bazel-natives.ts "\${targets[@]}"`);
-	expect(verifyWorkflow).toContain("Reclaim disk for large native builds");
-	expect(verifyWorkflow).toContain("if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'");
-	expect(verifyWorkflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
+	expect(verifyWorkflow).toContain("needs.prepare.outputs.native_changed == 'true'");
 	expect(verifyWorkflow).toContain("run: bun run ci:release:build-binaries");
-	expect(verifyWorkflow).toContain("bun --cwd=packages/browser-relay run build");
 	expect(verifyWorkflow).toContain("os: windows-11-arm");
 	expect(verifyWorkflow).toContain("bun scripts/bazel-natives.ts host --dest packages/natives/native");
 	expect(verifyWorkflow).toContain("Smoke binary (Windows ARM64)");
+	expect(verifyWorkflow).toContain("  browser_relay:");
+	expect(verifyWorkflow).toContain("bun --cwd=packages/browser-relay run build");
 	expect(verifyWorkflow).toContain("test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip");
 	expect(releaseWorkflow.slice(0, releaseWorkflow.indexOf("jobs:"))).not.toContain("pull_request:");
 	expect(releaseWorkflow).toContain("permissions:\n      contents: write");
