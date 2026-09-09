@@ -1,11 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
+	extractCoreforceReleaseSubjects,
 	groupCoreforceCommitSubjects,
 	parseCoreforceVersion,
 	RELEASE_BODY_BUDGET,
 	renderCoreforceReleaseNotes,
 	selectCoreforceRangeBase,
 	selectPreviousCoreforceTag,
+	selectPreviousPublishedCoreforceTag,
 } from "./cf-release-notes";
 
 describe("Coreforce release versions", () => {
@@ -29,6 +31,36 @@ describe("Coreforce release versions", () => {
 		expect(selectCoreforceRangeBase("v17.0.2.3", "17.0.9")).toBe("v17.0.9");
 		expect(selectCoreforceRangeBase("v17.0.9.1", "17.0.9")).toBe("v17.0.9.1");
 	});
+
+	it("keeps canceled candidates in the next published release range", () => {
+		const previousPublished = selectPreviousPublishedCoreforceTag(
+			[
+				{ tagName: "v18.1.15.1", isDraft: false, isPrerelease: false },
+				{ tagName: "v18.1.15.3", isDraft: true, isPrerelease: false },
+				{ tagName: "v18.1.15.4", isDraft: false, isPrerelease: true },
+			],
+			"v18.1.15.5",
+		);
+
+		expect(previousPublished).toBe("v18.1.15.1");
+		expect(selectCoreforceRangeBase(previousPublished, "18.1.15")).toBe("v18.1.15.1");
+	});
+});
+
+it("includes every merged pull request after the last published release", () => {
+	const subjects = extractCoreforceReleaseSubjects(
+		[
+			"Merge pull request #76 from Coreforce-CAD/fix/align-pr-native-ci\n\nfix(ci): avoid cold native builds on ordinary PRs",
+			"Merge pull request #72 from Coreforce-CAD/fix/l3-mcp-event-identity\n\nfix(mcp): preserve extension event identity",
+			"fix(ci): cancel superseded release builds",
+		].join("\0"),
+	);
+
+	expect(groupCoreforceCommitSubjects(subjects).Fixed).toEqual([
+		"Avoid cold native builds on ordinary PRs ([#76](https://github.com/Coreforce-CAD/oh-my-pi/pull/76))",
+		"Preserve extension event identity ([#72](https://github.com/Coreforce-CAD/oh-my-pi/pull/72))",
+		"Cancel superseded release builds",
+	]);
 });
 
 describe("Coreforce change grouping", () => {

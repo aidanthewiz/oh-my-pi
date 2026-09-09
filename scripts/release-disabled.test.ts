@@ -153,6 +153,28 @@ test("Coreforce allocates a release tag only after every build succeeds", async 
 	expect(releaseJob).toContain('git push origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"');
 });
 
+test("Coreforce cancels superseded builds without interrupting publication", async () => {
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml")).text();
+	const jobsStart = workflow.indexOf("jobs:");
+	const buildStart = workflow.indexOf("  build:", jobsStart);
+	const releaseStart = workflow.indexOf("  release:", buildStart);
+	const verifyStart = workflow.indexOf("  verify_release:", releaseStart);
+	const workflowHeader = workflow.slice(0, jobsStart);
+	const buildJob = workflow.slice(buildStart, releaseStart);
+	const releaseJob = workflow.slice(releaseStart, verifyStart);
+
+	expect(jobsStart).toBeGreaterThanOrEqual(0);
+	expect(buildStart).toBeGreaterThan(jobsStart);
+	expect(releaseStart).toBeGreaterThan(buildStart);
+	expect(verifyStart).toBeGreaterThan(releaseStart);
+	expect(workflowHeader).not.toContain("concurrency:");
+	expect(buildJob).toContain(`group: cf-release-build-\${{ matrix.target }}`);
+	expect(buildJob).toContain("cancel-in-progress: true");
+	expect(releaseJob).toContain("group: cf-release-publish");
+	expect(releaseJob).toContain("cancel-in-progress: false");
+	expect(releaseJob).toContain("coreforge advanced from $RELEASE_SHA to $TIP before publication");
+});
+
 test("Coreforce pull requests dry-run release assets without write permissions", async () => {
 	const releaseWorkflow = await Bun.file(
 		path.join(import.meta.dir, "..", ".github", "workflows", "cf-release.yml"),
