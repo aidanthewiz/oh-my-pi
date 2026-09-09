@@ -14,8 +14,10 @@ import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { $ } from "bun";
-import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
+import { detectHostArchitecture, detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { generateEnumExports } from "./gen-enums";
+
+const hostArch = detectHostArchitecture();
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
 // static build so the local addon never retains host Homebrew paths.
@@ -28,6 +30,10 @@ process.env.PCRE2_SYS_STATIC ??= "1";
 // "cmake not found". Resolve the VS install via vswhere and append its
 // CMake/Ninja dirs, keeping any user-provided tools ahead.
 if (process.platform === "win32" && (!Bun.which("cmake") || !Bun.which("ninja"))) {
+	const vcToolsComponent =
+		hostArch === "arm64"
+			? "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+			: "Microsoft.VisualStudio.Component.VC.Tools.x86.x64";
 	const vswhere = path.join(
 		process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)",
 		"Microsoft Visual Studio",
@@ -35,16 +41,7 @@ if (process.platform === "win32" && (!Bun.which("cmake") || !Bun.which("ninja"))
 		"vswhere.exe",
 	);
 	const probe = Bun.spawnSync(
-		[
-			vswhere,
-			"-latest",
-			"-products",
-			"*",
-			"-requires",
-			"Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-			"-property",
-			"installationPath",
-		],
+		[vswhere, "-latest", "-products", "*", "-requires", vcToolsComponent, "-property", "installationPath"],
 		{ stdout: "pipe", stderr: "pipe" },
 	);
 	const vsRoot = probe.exitCode === 0 ? probe.stdout.toString("utf-8").trim() : "";
@@ -66,7 +63,7 @@ const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
 const localAddon = resolveLocalHostAddon({
 	platform: process.platform,
-	arch: process.arch,
+	arch: hostArch,
 	avx2: detectHostAvx2Support(),
 });
 const effectiveVariant = localAddon.x64Variant;
@@ -76,12 +73,20 @@ const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 // instead of inheriting the host CPU when RUSTFLAGS is unset. Non-x64 builds keep
 // the target's default CPU features: `-C target-cpu=native` would bake the build
 // host's CPU features into the addon and trips ring 0.17's aarch64-apple
-// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES).
+// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES). Shipping Windows addons
+// also link the MSVC CRT statically so clean systems need no VC++ Redistributable.
 if (!Bun.env.RUSTFLAGS) {
+	const rustFlags: string[] = [];
+	if (process.platform === "win32") {
+		rustFlags.push("-C", "target-feature=+crt-static");
+	}
 	if (effectiveVariant === "modern") {
-		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
+		rustFlags.push("-C", "target-cpu=x86-64-v3");
 	} else if (effectiveVariant === "baseline") {
-		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v2";
+		rustFlags.push("-C", "target-cpu=x86-64-v2");
+	}
+	if (rustFlags.length > 0) {
+		Bun.env.RUSTFLAGS = rustFlags.join(" ");
 	}
 }
 
@@ -141,7 +146,7 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 	}
 
 	const generatedCandidates = entries.filter(
-		entry => entry.startsWith(`pi_natives.${process.platform}-${process.arch}`) && entry.endsWith(".node"),
+		entry => entry.startsWith(`pi_natives.${process.platform}-${hostArch}`) && entry.endsWith(".node"),
 	);
 
 	if (generatedCandidates.length === 1) {
@@ -150,13 +155,13 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 
 	if (generatedCandidates.length === 0) {
 		throw new Error(
-			`napi build succeeded but did not emit a native addon for ${process.platform}-${process.arch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
+			`napi build succeeded but did not emit a native addon for ${process.platform}-${hostArch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
 		);
 	}
 
 	const formattedCandidates = generatedCandidates.map(candidate => `  - ${candidate}`).join("\n");
 	throw new Error(
-		`napi build emitted multiple unrecognized native addons for ${process.platform}-${process.arch}:\n${formattedCandidates}`,
+		`napi build emitted multiple unrecognized native addons for ${process.platform}-${hostArch}:\n${formattedCandidates}`,
 	);
 }
 
@@ -174,13 +179,13 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 const canonicalAddonFilename = localAddon.filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
-console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
+console.log(`Building pi-natives bindings for ${process.platform}-${hostArch}${variantSuffix} (local)…`);
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);
 await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
 const buildOutputDir = await fs.mkdtemp(
-	path.join(nativeDir, ".build", `${process.platform}-${process.arch}-${effectiveVariant ?? "default"}-local-`),
+	path.join(nativeDir, ".build", `${process.platform}-${hostArch}-${effectiveVariant ?? "default"}-local-`),
 );
 
 // Resolve the CLI's JS entry from the package manifest rather than the
@@ -225,6 +230,9 @@ const napiArgs = [
 	"--profile",
 	cargoProfile,
 ];
+if (process.platform === "win32" && hostArch === "arm64") {
+	napiArgs.push("--target", "aarch64-pc-windows-msvc");
+}
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.

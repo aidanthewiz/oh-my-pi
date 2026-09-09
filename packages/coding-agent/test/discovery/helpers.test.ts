@@ -161,8 +161,7 @@ describe("configuration environment expansion", () => {
 		Bun.env[secretName] = "managed-test-secret";
 		try {
 			const input = {
-				// biome-ignore lint/suspicious/noTemplateCurlyInString: literal config placeholder under test
-				home: "${HOME}",
+				home: `\${HOME}`,
 				secret: `\${${secretName}}`,
 			};
 			expect(expandEnvVarsDeepForConfigLevel(input, "project")).toEqual({
@@ -182,8 +181,7 @@ describe("configuration environment expansion", () => {
 		delete Bun.env.PATH;
 		Bun.env.Path = "C:\\Coreforge\\bin";
 		try {
-			// biome-ignore lint/suspicious/noTemplateCurlyInString: literal config placeholders under test
-			expect(expandEnvVarsDeepForConfigLevel({ upper: "${PATH}", mixed: "${Path}" }, "project")).toEqual({
+			expect(expandEnvVarsDeepForConfigLevel({ upper: `\${PATH}`, mixed: `\${Path}` }, "project")).toEqual({
 				upper: "C:\\Coreforge\\bin",
 				mixed: "C:\\Coreforge\\bin",
 			});

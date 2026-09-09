@@ -10,6 +10,17 @@ function runCommand(command: string, args: string[]): string | null {
 		return null;
 	}
 }
+
+/** Resolve the native host architecture when Windows runs the runtime under emulation. */
+export function detectHostArchitecture(
+	platform: string = process.platform,
+	runtimeArch: string = process.arch,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+	if (platform !== "win32") return runtimeArch;
+	const nativeArchitectures = [env.RUNNER_ARCH, env.PROCESSOR_ARCHITEW6432, env.PROCESSOR_ARCHITECTURE];
+	return nativeArchitectures.some(arch => arch?.toLowerCase() === "arm64") ? "arm64" : runtimeArch;
+}
 /** Local N-API addon identity derived from a host platform and ISA. */
 export interface LocalHostAddon {
 	readonly filename: string;

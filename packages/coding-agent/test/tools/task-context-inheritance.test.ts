@@ -32,7 +32,7 @@ function createSession(batch: boolean): ToolSession {
 	const settings = Settings.isolated({
 		"async.enabled": false,
 		"task.batch": batch,
-		"task.isolation.mode": "none",
+		"task.isolation.enabled": false,
 	});
 	return {
 		cwd: "/tmp",

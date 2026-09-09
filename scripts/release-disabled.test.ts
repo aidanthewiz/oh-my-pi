@@ -22,6 +22,9 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(workflow).toContain("Reclaim disk for large native builds");
 	expect(workflow).toContain("if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'");
 	expect(workflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
+	expect(workflow).toContain("os: windows-11-arm");
+	expect(workflow).toContain("bun scripts/bazel-natives.ts host --dest packages/natives/native");
+	expect(workflow).toContain("Smoke binary (Windows ARM64)");
 	for (const target of [
 		"darwin-arm64",
 		"darwin-x64-baseline",
@@ -29,6 +32,7 @@ test("Coreforce releases build native addons from fork sources", async () => {
 		"linux-x64-modern",
 		"linux-arm64",
 		"win32-x64-baseline",
+		"win32-arm64",
 	]) {
 		expect(workflow).toContain(target);
 	}
@@ -38,6 +42,39 @@ test("Coreforce releases build native addons from fork sources", async () => {
 	expect(workflow).toContain("bun scripts/ci-release-checksums.ts release-assets/SHA256SUMS.txt");
 	expect(workflow).toContain('--pattern "SHA256SUMS.txt"');
 	expect(workflow).toContain("shasum -a 256 -c SHA256SUMS.verify");
+});
+
+test("relay image copies only existing root build inputs", async () => {
+	const root = path.join(import.meta.dir, "..");
+	const dockerfile = await Bun.file(path.join(root, "Dockerfile.relay")).text();
+	const rootCopy = dockerfile.split("\n").find(line => line.startsWith("COPY ") && line.endsWith(" ./"));
+	expect(rootCopy).toBeDefined();
+
+	const sources = rootCopy?.slice("COPY ".length, -" ./".length).trim().split(/\s+/) ?? [];
+	expect(sources.length).toBeGreaterThan(0);
+	for (const source of sources) {
+		expect(await Bun.file(path.join(root, source)).exists()).toBe(true);
+	}
+});
+
+test("Coreforce saves native caches before fallible packaging steps", async () => {
+	for (const workflowName of ["cf-release.yml", "cf-verify.yml"]) {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", workflowName)).text();
+		const restoreIndex = workflow.indexOf("- name: Restore Bazel native build cache");
+		const buildIndex = workflow.indexOf("- name: Build native addon from Coreforge sources", restoreIndex);
+		const saveIndex = workflow.indexOf("- name: Save Bazel native build cache", buildIndex);
+		const packageIndex = workflow.indexOf("- name: Package source-built native addon", saveIndex);
+		const saveStep = workflow.slice(saveIndex, packageIndex);
+
+		expect(restoreIndex).toBeGreaterThanOrEqual(0);
+		expect(buildIndex).toBeGreaterThan(restoreIndex);
+		expect(saveIndex).toBeGreaterThan(buildIndex);
+		expect(packageIndex).toBeGreaterThan(saveIndex);
+		expect(workflow.slice(restoreIndex, buildIndex)).toContain("uses: actions/cache/restore@");
+		expect(saveStep).toContain("uses: actions/cache/save@");
+		expect(saveStep).toContain("if: matrix.windows != '1' && steps.bazel-cache.outputs.cache-hit != 'true'");
+		expect(saveStep).toContain(`key: \${{ steps.bazel-cache.outputs.cache-primary-key }}`);
+	}
 });
 
 test("Coreforce allocates a release tag only after every build succeeds", async () => {
@@ -101,7 +138,24 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
 	expect(verifyWorkflow).toContain("run: bun run ci:release:build-binaries");
 	expect(verifyWorkflow).toContain("bun --cwd=packages/browser-relay run build");
+	expect(verifyWorkflow).toContain("os: windows-11-arm");
+	expect(verifyWorkflow).toContain("bun scripts/bazel-natives.ts host --dest packages/natives/native");
+	expect(verifyWorkflow).toContain("Smoke binary (Windows ARM64)");
 	expect(verifyWorkflow).toContain("test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip");
 	expect(releaseWorkflow.slice(0, releaseWorkflow.indexOf("jobs:"))).not.toContain("pull_request:");
 	expect(releaseWorkflow).toContain("permissions:\n      contents: write");
+});
+
+test("Coreforce workflows use the root packageManager Bun version", async () => {
+	const root = path.join(import.meta.dir, "..");
+	const manifest = (await Bun.file(path.join(root, "package.json")).json()) as { packageManager?: string };
+	const bunVersion = manifest.packageManager?.match(/^bun@(.+)$/)?.[1];
+	expect(bunVersion).toBeDefined();
+
+	for (const workflowName of ["cf-release.yml", "cf-verify.yml", "relay.yml"]) {
+		const workflow = await Bun.file(path.join(root, ".github", "workflows", workflowName)).text();
+		const configuredVersions = [...workflow.matchAll(/bun-version:\s*"([^"]+)"/g)].map(match => match[1]);
+		expect(configuredVersions.length).toBeGreaterThan(0);
+		expect(configuredVersions.every(version => version === bunVersion)).toBe(true);
+	}
 });

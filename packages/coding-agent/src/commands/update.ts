@@ -29,7 +29,10 @@ export default class Update extends Command {
 		if (flags.plugins) {
 			await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: {} });
 		} else {
-			await updateCli.runUpdateCommand({ force: flags.force, check: flags.check });
+			await updateCli.runUpdateCommand({
+				force: flags.force,
+				check: flags.check,
+			});
 		}
 	}
 }

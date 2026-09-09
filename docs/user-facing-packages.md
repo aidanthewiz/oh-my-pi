@@ -72,9 +72,11 @@ Sources: [`packages/metaharness/README.md`](../packages/metaharness/README.md), 
 
 Sources: [`packages/browser-relay/README.md`](../packages/browser-relay/README.md), [`packages/browser-relay/package.json`](../packages/browser-relay/package.json), [`packages/coding-agent/src/tools/browser/relay/`](../packages/coding-agent/src/tools/browser/relay/).
 
-- Package: private `@oh-my-pi/browser-relay`; user command: `omp browser-relay`.
-- Setup: run `omp browser-relay install`, load the unpacked extension from
-  `~/.omp/browser-relay/extension`, then set `browser.relay` or use `app.relay: true`.
+- Package: private `@oh-my-pi/browser-relay`; user command: `coreforge browser-relay`.
+- Setup: run `coreforge browser-relay install`, load the unpacked extension from
+  `~/.omp/browser-relay/extension`, then opt in per call with `app.relay: true` — or set
+  `browser.relay`, which makes the relay the profile-wide default across projects (scope
+  details in the package README).
 - Behavior: the relay auto-starts through the global daemon broker; `app.target` selects a tab by
   URL/title substring, otherwise the visible tab is adopted.
 - Security/limits: it binds loopback; use `--token` when local processes are untrusted. Chrome

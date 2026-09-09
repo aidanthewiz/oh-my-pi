@@ -93,6 +93,9 @@
         "clientSecret": {
           "type": "string"
         },
+        "scope": {
+          "type": "string"
+        },
         "redirectUri": {
           "type": "string"
         },

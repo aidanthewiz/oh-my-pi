@@ -7,6 +7,8 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AsyncJobType } from "../../async";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
+import type { StructuredSubagentOutput } from "../../task/types";
+import type { ConfiguredThinkingLevel } from "../../thinking";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
 
 /**
@@ -40,6 +42,21 @@ export interface HubPeerInfo {
 	activity?: string;
 }
 
+/** Status values `op:"list"` can filter on. Advisor is a kind, not a status. */
+export type HubListStatus = "running" | "idle" | "parked";
+/** Model-facing roster bounds shared by the hub schema and executor. */
+export const DEFAULT_HUB_LIST_LIMIT = 32;
+export const MAX_HUB_LIST_LIMIT = 100;
+
+/** Addressable roster tallies always returned by `op:"list"`. */
+export interface HubRosterCounts {
+	running: number;
+	idle: number;
+	parked: number;
+	shown: number;
+	truncated: number;
+}
+
 /** Background-job row surfaced by `wait`/`cancel`/`jobs` results. */
 export interface JobSnapshot {
 	id: string;
@@ -49,8 +66,21 @@ export interface JobSnapshot {
 	durationMs: number;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */
 	resolvedModel?: string;
+	/** Provider/id including routing, with no added thinking suffix. */
+	resolvedModelIdentity?: string;
+	/** Explicit thinking metadata, independent of the model identity. */
+	resolvedThinkingLevel?: ConfiguredThinkingLevel;
+	/** True when the task progress reports an attached live advisor. */
+	advisor?: boolean;
 	resultText?: string;
 	errorText?: string;
+	structured?: StructuredSubagentOutput;
+	/**
+	 * `agent://<id>` handle backing this job's artifacts — the job-row's
+	 * registry `agentId` when the manager disambiguated a requested job id
+	 * on collision, else the job id itself. See {@link AsyncJob.agentId}.
+	 */
+	agentUrlId?: string;
 }
 
 export type CancelStatus = "cancelled" | "not_found" | "already_completed";
@@ -93,6 +123,8 @@ export interface CoordinationDetails {
 	waited?: IrcMessage | null;
 	inbox?: IrcMessage[];
 	peers?: HubPeerInfo[];
+	/** Present on `op:"list"`: addressable running/idle/parked plus page size. */
+	counts?: HubRosterCounts;
 	jobs?: JobSnapshot[];
 	cancelled?: { id: string; status: CancelStatus }[];
 	/** Running subagents not represented by a job row in this result. */

@@ -83,6 +83,8 @@ process.exit(1);
 
 	function runner(input: (prompt: string) => string | undefined): ExtensionRunner {
 		return {
+			sessionId: "dcg-runtime-test",
+			runScoped: <T>(fn: () => T): T => fn(),
 			hasHandlers: () => false,
 			hasUI: () => true,
 			consumeToolCallEmitted: () => false,

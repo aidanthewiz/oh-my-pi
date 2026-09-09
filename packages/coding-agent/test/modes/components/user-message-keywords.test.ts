@@ -5,7 +5,8 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CustomEditor } from "@oh-my-pi/pi-coding-agent/modes/components/custom-editor";
 import { UserMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/user-message";
-import { chipLabel } from "@oh-my-pi/pi-coding-agent/modes/image-references";
+import { chipLabel } from "@oh-my-pi/pi-coding-agent/modes/composer-attachments";
+import { imageReferenceHyperlink } from "@oh-my-pi/pi-coding-agent/modes/image-references";
 import { getEditorTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
@@ -97,8 +98,21 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(raw).toContain(imageUri);
 	});
 
+	it("renders a video marker as a video chip linked to its source", () => {
+		const videoPath = path.resolve("/tmp/omp-video.mp4");
+		const videoUri = url.pathToFileURL(videoPath).href;
+		const raw = new UserMessageComponent("please inspect [Video #1, 960x480]", false, [videoPath])
+			.render(80)
+			.join("\n");
+		expect(Bun.stripANSI(raw)).toContain(chipLabel("video", 1));
+		expect(Bun.stripANSI(raw)).not.toContain("[Video #1");
+		expect(raw).toContain("\x1b]8;id=");
+		expect(raw).toContain(videoUri);
+	});
+
 	it("wraps draft editor image references in file hyperlinks when a blob path is available", () => {
 		const editor = new CustomEditor(getEditorTheme());
+		editor.imageReferenceHyperlink = imageReferenceHyperlink;
 		const imagePath = path.resolve("/tmp/omp-image.png");
 		const imageUri = url.pathToFileURL(path.resolve(imagePath)).href;
 		editor.imageLinks = [imagePath];
@@ -162,6 +176,7 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 
 	it("hyperlinks the metadata-bearing image marker format", () => {
 		const editor = new CustomEditor(getEditorTheme());
+		editor.imageReferenceHyperlink = imageReferenceHyperlink;
 		const imagePath = path.resolve("/tmp/omp-image.png");
 		const imageUri = url.pathToFileURL(path.resolve(imagePath)).href;
 		editor.imageLinks = [imagePath];
