@@ -57,24 +57,34 @@ test("relay image copies only existing root build inputs", async () => {
 	}
 });
 
-test("Coreforce saves native caches before fallible packaging steps", async () => {
-	for (const workflowName of ["cf-release.yml", "cf-verify.yml"]) {
-		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", workflowName)).text();
-		const restoreIndex = workflow.indexOf("- name: Restore Bazel native build cache");
-		const buildIndex = workflow.indexOf("- name: Build native addon from Coreforge sources", restoreIndex);
-		const saveIndex = workflow.indexOf("- name: Save Bazel native build cache", buildIndex);
-		const packageIndex = workflow.indexOf("- name: Package source-built native addon", saveIndex);
-		const saveStep = workflow.slice(saveIndex, packageIndex);
+test("Coreforce keeps pull request caches reusable across branches", async () => {
+	const root = path.join(import.meta.dir, "..");
+	const releaseWorkflow = await Bun.file(path.join(root, ".github", "workflows", "cf-release.yml")).text();
+	const verifyWorkflow = await Bun.file(path.join(root, ".github", "workflows", "cf-verify.yml")).text();
 
-		expect(restoreIndex).toBeGreaterThanOrEqual(0);
-		expect(buildIndex).toBeGreaterThan(restoreIndex);
-		expect(saveIndex).toBeGreaterThan(buildIndex);
-		expect(packageIndex).toBeGreaterThan(saveIndex);
-		expect(workflow.slice(restoreIndex, buildIndex)).toContain("uses: actions/cache/restore@");
-		expect(saveStep).toContain("uses: actions/cache/save@");
-		expect(saveStep).toContain("if: matrix.windows != '1' && steps.bazel-cache.outputs.cache-hit != 'true'");
-		expect(saveStep).toContain(`key: \${{ steps.bazel-cache.outputs.cache-primary-key }}`);
-	}
+	const releaseRestoreIndex = releaseWorkflow.indexOf("- name: Restore Bazel native build cache");
+	const releaseBuildIndex = releaseWorkflow.indexOf(
+		"- name: Build native addon from Coreforge sources",
+		releaseRestoreIndex,
+	);
+	const releaseSaveIndex = releaseWorkflow.indexOf("- name: Save Bazel native build cache", releaseBuildIndex);
+	const releasePackageIndex = releaseWorkflow.indexOf("- name: Package source-built native addon", releaseSaveIndex);
+	expect(releaseRestoreIndex).toBeGreaterThanOrEqual(0);
+	expect(releaseBuildIndex).toBeGreaterThan(releaseRestoreIndex);
+	expect(releaseSaveIndex).toBeGreaterThan(releaseBuildIndex);
+	expect(releasePackageIndex).toBeGreaterThan(releaseSaveIndex);
+
+	const verifyRestoreIndex = verifyWorkflow.indexOf("- name: Restore Bazel native build cache");
+	const verifyBuildIndex = verifyWorkflow.indexOf(
+		"- name: Build native addon from Coreforge sources",
+		verifyRestoreIndex,
+	);
+	expect(verifyRestoreIndex).toBeGreaterThanOrEqual(0);
+	expect(verifyBuildIndex).toBeGreaterThan(verifyRestoreIndex);
+	expect(verifyWorkflow).not.toContain("- name: Save Bazel native build cache");
+	expect(verifyWorkflow).not.toContain("coreforge-verify-bazel-");
+	expect(verifyWorkflow).toContain("key: coreforge-bazel-v1-");
+	expect(verifyWorkflow).toContain("needs.prepare.outputs.native_changed == 'true'");
 });
 
 test("Coreforce allocates a release tag only after every build succeeds", async () => {
@@ -132,16 +142,16 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).not.toMatch(/^\s+contents: write$/m);
 	expect(verifyWorkflow).not.toContain("git push origin");
 	expect(verifyWorkflow).not.toContain("gh release create");
+	expect(verifyWorkflow).toContain("Detect native source changes");
+	expect(verifyWorkflow).toContain("ci-released-native.ts changed");
+	expect(verifyWorkflow).toContain("Install verified released native addon");
+	expect(verifyWorkflow).toContain("bun scripts/ci-released-native.ts install");
 	expect(verifyWorkflow).toContain(`bun scripts/bazel-natives.ts "\${targets[@]}"`);
-	expect(verifyWorkflow).toContain("Reclaim disk for large native builds");
-	expect(verifyWorkflow).toContain("if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'");
-	expect(verifyWorkflow).toContain("sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL");
+	expect(verifyWorkflow).toContain("needs.prepare.outputs.native_changed == 'true'");
 	expect(verifyWorkflow).toContain("run: bun run ci:release:build-binaries");
-	expect(verifyWorkflow).toContain("bun --cwd=packages/browser-relay run build");
 	expect(verifyWorkflow).toContain("os: windows-11-arm");
 	expect(verifyWorkflow).toContain("bun scripts/bazel-natives.ts host --dest packages/natives/native");
 	expect(verifyWorkflow).toContain("Smoke binary (Windows ARM64)");
-	expect(verifyWorkflow).toContain("test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip");
 	expect(releaseWorkflow.slice(0, releaseWorkflow.indexOf("jobs:"))).not.toContain("pull_request:");
 	expect(releaseWorkflow).toContain("permissions:\n      contents: write");
 });
