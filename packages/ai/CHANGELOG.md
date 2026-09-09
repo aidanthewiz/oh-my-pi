@@ -12,6 +12,12 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.1.11] - 2026-09-05
+
+### Fixed
+
+- GitHub Copilot sign-in now requests only basic profile access, restoring login for Enterprise organizations that reject repository, gist, and Codespaces permissions ([#10656](https://github.com/can1357/oh-my-pi/issues/10656)).
+
 ## [18.1.9] - 2026-09-04
 
 ### Added
@@ -37,6 +43,7 @@
 ### Fixed
 
 - Fixed DeepSeek-family Responses replay (e.g. opencode-go) rejecting a resumed thinking-mode turn with `400 The reasoning_text in the thinking mode must be passed back to the API` when compaction dropped the turn's reasoning; a non-empty placeholder is now synthesized instead of an empty `reasoning_text` ([#10690](https://github.com/can1357/oh-my-pi/issues/10690)).
+- Fixed pi-native streams treating a connection that closed before its terminal event as a successful empty response; incomplete streams and namespaced gateway 5xx failures now remain retryable.
 
 ## [18.1.6] - 2026-09-03
 
@@ -60,6 +67,7 @@
 - Anthropic and OpenRouter credit-exhaustion errors now automatically switch to a sibling account instead of stopping the turn with a retry hint.
 - Fixed OpenCode Go and Zen requests by including the required stable per-conversation session identification.
 - Improved Anthropic prompt caching so explicit cache breakpoints preserve reusable tools and system prompts when the message tail changes.
+- Anthropic and OpenRouter 402 credit-exhaustion errors ("would exceed your available credits", "Insufficient credits") now switch to a sibling account instead of stopping the turn with a retry hint.
 
 ## [18.1.5] - 2026-09-03
 

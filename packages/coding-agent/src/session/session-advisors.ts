@@ -1463,6 +1463,7 @@ export class SessionAdvisors {
 				advisor.providerSessionId,
 				{
 					retryAfterMs,
+					providerTimed: retryAfterMs !== undefined,
 					baseUrl: currentModel.baseUrl,
 					modelId: currentModel.id,
 					signal,
