@@ -24,6 +24,12 @@ export interface ReleaseNoteGroups {
 	Maintenance: string[];
 }
 
+interface GitHubReleaseSummary {
+	tagName?: unknown;
+	isDraft?: unknown;
+	isPrerelease?: unknown;
+}
+
 const GROUP_ORDER = ["Breaking Changes", "Security", "Added", "Changed", "Fixed", "Maintenance"] as const;
 const UPSTREAM_HIGHLIGHT_CATEGORY_ORDER = ["Breaking Changes", "Added", "Changed", "Fixed", "Removed"] as const;
 const COREFORCE_HIGHLIGHT_WEIGHTS = [
@@ -65,9 +71,40 @@ export function selectPreviousCoreforceTag(tags: string[], currentTag: string): 
 	);
 }
 
+export function selectPreviousPublishedCoreforceTag(
+	releases: readonly GitHubReleaseSummary[],
+	currentTag: string,
+): string | null {
+	return selectPreviousCoreforceTag(
+		releases
+			.filter(release => release.isDraft === false && release.isPrerelease === false)
+			.map(release => (typeof release.tagName === "string" ? release.tagName : "")),
+		currentTag,
+	);
+}
+
 export function selectCoreforceRangeBase(previousTag: string | null, currentUpstream: string): string {
 	const previous = previousTag ? parseCoreforceVersion(previousTag) : null;
 	return previous?.upstream === currentUpstream ? previous.tag : `v${currentUpstream}`;
+}
+
+export function extractCoreforceReleaseSubjects(log: string): string[] {
+	const subjects: string[] = [];
+	for (const message of log.split("\0")) {
+		const lines = message.trim().split(/\r?\n/);
+		const subject = lines[0]?.trim();
+		if (!subject) continue;
+
+		const pullRequest = subject.match(/^Merge pull request #(\d+)\b/i);
+		if (!pullRequest) {
+			subjects.push(subject);
+			continue;
+		}
+
+		const title = lines.slice(1).find(line => line.trim().length > 0);
+		subjects.push(title ? `${title.trim()} (#${pullRequest[1]})` : subject);
+	}
+	return subjects;
 }
 
 export function groupCoreforceCommitSubjects(subjects: string[], repository = DEFAULT_REPOSITORY): ReleaseNoteGroups {
@@ -299,18 +336,14 @@ async function generateUpstreamNotes(floorExclusive: string | null, targetInclus
 }
 
 async function resolvePreviousReleaseTag(currentTag: string, repository: string): Promise<string | null> {
-	const result =
-		await $`gh release list --repo ${repository} --limit 200 --exclude-drafts --exclude-pre-releases --json tagName,isDraft,isPrerelease`
-			.quiet()
-			.nothrow();
+	const result = await $`gh release list --repo ${repository} --limit 200 --json tagName,isDraft,isPrerelease`
+		.quiet()
+		.nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`gh release list failed: ${result.stderr.toString().trim() || "no error output"}`);
 	}
-	const releases = JSON.parse(result.stdout.toString()) as Array<{ tagName?: unknown }>;
-	return selectPreviousCoreforceTag(
-		releases.map(release => (typeof release.tagName === "string" ? release.tagName : "")),
-		currentTag,
-	);
+	const releases = JSON.parse(result.stdout.toString()) as GitHubReleaseSummary[];
+	return selectPreviousPublishedCoreforceTag(releases, currentTag);
 }
 
 async function main(): Promise<void> {
@@ -324,12 +357,12 @@ async function main(): Promise<void> {
 	const previous = previousTag ? parseCoreforceVersion(previousTag) : null;
 	const rangeBase = selectCoreforceRangeBase(previousTag, current.upstream);
 	const range = `${rangeBase}..HEAD`;
-	const log = await $`git log --first-parent --format=%s ${range}`.quiet().nothrow();
+	const log = await $`git log --first-parent --format=%B%x00 ${range}`.quiet().nothrow();
 	if (log.exitCode !== 0) {
 		throw new Error(`git log ${range} failed: ${log.stderr.toString().trim() || "no error output"}`);
 	}
 	const sha = (await $`git rev-parse HEAD`.text()).trim();
-	const groups = groupCoreforceCommitSubjects(log.stdout.toString().split("\n"), repository);
+	const groups = groupCoreforceCommitSubjects(extractCoreforceReleaseSubjects(log.stdout.toString()), repository);
 	const upstreamNotes = await generateUpstreamNotes(previous?.upstream ?? null, current.upstream);
 	const body = renderCoreforceReleaseNotes({
 		currentTag: current.tag,
