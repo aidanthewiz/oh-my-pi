@@ -19,6 +19,10 @@ test("classifies only native build inputs as source-build changes", () => {
 		"Cargo.lock",
 		"MODULE.bazel",
 		"scripts/bazel-natives.ts",
+		"packages/natives/package.json",
+		"packages/natives/scripts/build-bindings.ts",
+		"packages/natives/scripts/gen-enums.ts",
+		"scripts/host-detect.ts",
 		"bazel/native.bzl",
 		"crates/pi-natives/src/lib.rs",
 	]) {
@@ -33,6 +37,7 @@ test("classifies only native build inputs as source-build changes", () => {
 		expect(isNativeBuildPath(relativePath)).toBe(false);
 	}
 });
+
 test("returns no tag when the engine version has no published Coreforce roll", () => {
 	expect(selectLatestCoreforceRelease("18.1.15", [{ tagName: "v18.1.14.9" }])).toBeUndefined();
 });

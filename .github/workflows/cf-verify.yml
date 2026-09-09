@@ -21,37 +21,35 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       native_changed: ${{ steps.native.outputs.changed }}
-      release_tag: ${{ steps.release.outputs.tag }}
+      release_tag: ${{ steps.native.outputs.tag }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          fetch-tags: true
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: "1.4.0"
-      - name: Detect native source changes
+      - name: Select native verification source
         id: native
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          CHANGED="$(bun scripts/ci-released-native.ts changed "$BASE_SHA" "$HEAD_SHA")"
-          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
-          if [ "$CHANGED" = true ]; then
-            echo "Native build inputs changed; build every release target from this pull request."
-          else
-            echo "Native build inputs are unchanged; use the verified Coreforce release addons."
-          fi
-      - name: Resolve released native addon version
-        id: release
-        if: steps.native.outputs.changed != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
-          RELEASE_TAG="$(bun scripts/ci-released-native.ts resolve "$PKG_VERSION")"
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "Using native addons from $RELEASE_TAG."
+          RELEASE_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG_VERSION")"
+          VERIFY_SHA="$(git rev-parse HEAD)"
+          CHANGED=true
+          if [ -n "$RELEASE_TAG" ] && git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "$VERIFY_SHA"; then
+            CHANGED="$(bun scripts/ci-released-native.ts changed "${RELEASE_TAG}^{commit}" "$VERIFY_SHA")"
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          if [ "$CHANGED" = true ]; then
+            echo "Native inputs differ from the latest published addon; build every target from this pull request."
+          else
+            echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            echo "Native inputs match $RELEASE_TAG; use its verified Coreforce addons."
+          fi
 
   build:
     needs: prepare
@@ -225,3 +223,16 @@ jobs:
           if (-not (Test-Path $binaryPath) -or (Get-Item $binaryPath).Length -eq 0) {
             throw "binary asset is missing: $binaryPath"
           }
+
+  browser_relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.4.0"
+      - run: bun install --frozen-lockfile
+      - name: Build Coreforge Browser Relay extension
+        run: |
+          bun --cwd=packages/browser-relay run build
+          test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip

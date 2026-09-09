@@ -19,8 +19,12 @@ const NATIVE_INPUT_FILES = new Set([
 	"MODULE.bazel",
 	"MODULE.bazel.lock",
 	"rust-toolchain.toml",
+	"packages/natives/package.json",
+	"packages/natives/scripts/build-bindings.ts",
+	"packages/natives/scripts/gen-enums.ts",
 	"rustfmt.toml",
 	"scripts/bazel-natives.ts",
+	"scripts/host-detect.ts",
 ]);
 
 export function isNativeBuildPath(relativePath: string): boolean {
@@ -82,7 +86,7 @@ async function detectNativeChanges(base: string, head: string): Promise<void> {
 	console.log(changed ? "true" : "false");
 }
 
-async function resolveRelease(packageVersion: string): Promise<void> {
+async function resolveRelease(packageVersion: string, optional: boolean): Promise<void> {
 	const repository = process.env.GITHUB_REPOSITORY;
 	if (!repository) throw new Error("GITHUB_REPOSITORY is required");
 	const output = await run([
@@ -99,7 +103,10 @@ async function resolveRelease(packageVersion: string): Promise<void> {
 	]);
 	const releases = JSON.parse(output) as Release[];
 	const tag = selectLatestCoreforceRelease(packageVersion, releases);
-	if (!tag) throw new Error(`no published Coreforce release extends v${packageVersion}`);
+	if (!tag) {
+		if (optional) return;
+		throw new Error(`no published Coreforce release extends v${packageVersion}`);
+	}
 	console.log(tag);
 }
 
@@ -171,7 +178,11 @@ async function main(): Promise<void> {
 		return;
 	}
 	if (operation === "resolve" && args.length === 1) {
-		await resolveRelease(args[0]);
+		await resolveRelease(args[0], false);
+		return;
+	}
+	if (operation === "resolve-optional" && args.length === 1) {
+		await resolveRelease(args[0], true);
 		return;
 	}
 	if (operation === "install" && args.length === 3) {
@@ -179,7 +190,7 @@ async function main(): Promise<void> {
 		return;
 	}
 	throw new Error(
-		"usage: ci-released-native.ts changed <base> <head> | resolve <package-version> | install <tag> <target> <destination>",
+		"usage: ci-released-native.ts changed <base> <head> | resolve <package-version> | resolve-optional <package-version> | install <tag> <target> <destination>",
 	);
 }
 

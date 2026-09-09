@@ -57,7 +57,7 @@ test("relay image copies only existing root build inputs", async () => {
 	}
 });
 
-test("Coreforce keeps pull request caches reusable across branches", async () => {
+test("Coreforce restores trusted release caches without pull request cache writes", async () => {
 	const root = path.join(import.meta.dir, "..");
 	const releaseWorkflow = await Bun.file(path.join(root, ".github", "workflows", "cf-release.yml")).text();
 	const verifyWorkflow = await Bun.file(path.join(root, ".github", "workflows", "cf-verify.yml")).text();
@@ -142,8 +142,11 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).not.toMatch(/^\s+contents: write$/m);
 	expect(verifyWorkflow).not.toContain("git push origin");
 	expect(verifyWorkflow).not.toContain("gh release create");
-	expect(verifyWorkflow).toContain("Detect native source changes");
-	expect(verifyWorkflow).toContain("ci-released-native.ts changed");
+	expect(verifyWorkflow).toContain("Select native verification source");
+	expect(verifyWorkflow).toContain('ci-released-native.ts resolve-optional "$PKG_VERSION"');
+	expect(verifyWorkflow).toContain(`git merge-base --is-ancestor "\${RELEASE_TAG}^{commit}" "$VERIFY_SHA"`);
+	expect(verifyWorkflow).toContain(`ci-released-native.ts changed "\${RELEASE_TAG}^{commit}" "$VERIFY_SHA"`);
+	expect(verifyWorkflow).toContain("fetch-tags: true");
 	expect(verifyWorkflow).toContain("Install verified released native addon");
 	expect(verifyWorkflow).toContain("bun scripts/ci-released-native.ts install");
 	expect(verifyWorkflow).toContain(`bun scripts/bazel-natives.ts "\${targets[@]}"`);
@@ -152,6 +155,9 @@ test("Coreforce pull requests dry-run release assets without write permissions",
 	expect(verifyWorkflow).toContain("os: windows-11-arm");
 	expect(verifyWorkflow).toContain("bun scripts/bazel-natives.ts host --dest packages/natives/native");
 	expect(verifyWorkflow).toContain("Smoke binary (Windows ARM64)");
+	expect(verifyWorkflow).toContain("  browser_relay:");
+	expect(verifyWorkflow).toContain("bun --cwd=packages/browser-relay run build");
+	expect(verifyWorkflow).toContain("test -s packages/browser-relay/dist/coreforge-browser-relay-extension.zip");
 	expect(releaseWorkflow.slice(0, releaseWorkflow.indexOf("jobs:"))).not.toContain("pull_request:");
 	expect(releaseWorkflow).toContain("permissions:\n      contents: write");
 });
