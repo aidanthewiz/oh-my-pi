@@ -11,7 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
+import { isCmdShell, isPosixShell, isPowerShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -47,6 +47,7 @@ import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-ski
 import {
 	type DcgAskDecision,
 	type DcgDecision,
+	type DcgShellDialect,
 	enforceDestructiveCommandGuard,
 	isDestructiveCommandGuardConfigured,
 } from "./destructive-command-guard";
@@ -769,6 +770,20 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		this.parameters = this.#asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
 	}
 
+	#resolveDcgShellDialect(input: BashToolInput, ctx?: AgentToolContext): DcgShellDialect {
+		if (input.async === true) return "posix";
+		const clientBridge = this.session.getClientBridge?.();
+		const usesExternalShell =
+			(input.pty === true && canUseInteractiveBashPty(true, ctx)) ||
+			(input.pty !== true && Boolean(clientBridge?.capabilities.terminal && clientBridge.createTerminal));
+		if (!usesExternalShell) return "posix";
+
+		const shell = this.session.settings.getShellConfig().shell;
+		if (isCmdShell(shell)) return "cmd";
+		if (isPowerShell(shell)) return "ps";
+		return "posix";
+	}
+
 	async #prepareExecution(
 		input: BashToolInput,
 		signal?: AbortSignal,
@@ -857,7 +872,12 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
 
-		const dcgDecision = await enforceDestructiveCommandGuard(command, commandCwd, signal);
+		const dcgDecision = await enforceDestructiveCommandGuard(
+			command,
+			commandCwd,
+			this.#resolveDcgShellDialect(input, ctx),
+			signal,
+		);
 		return { command, commandCwd, dcgDecision, hasLocalUrls, resolvedEnv };
 	}
 

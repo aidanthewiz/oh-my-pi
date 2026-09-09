@@ -31,16 +31,23 @@ describe.skipIf(process.platform === "win32")("DCG runtime approval", () => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-dcg-runtime-"));
 		const dcgPath = path.join(tempDir, "dcg-ask.ts");
 		const dcgProgram = `#!/usr/bin/env bun
-const command = process.argv.slice(4).join(" ");
+const command = await Bun.stdin.text();
+const expectedDialect = command.includes("expected-cmd")
+	? "cmd"
+	: command.includes("expected-ps") ? "ps" : "posix";
+const expectedArgs = [
+	"--robot", "test", "--stdin", "--agent", "omp", "--dialect", expectedDialect,
+	"--format", "json", "--omp-bridge-output",
+];
+const actualArgs = process.argv.slice(2);
+if (JSON.stringify(actualArgs) !== JSON.stringify(expectedArgs)) {
+	console.error(\`unexpected arguments: \${JSON.stringify(actualArgs)}\`);
+	process.exit(3);
+}
 console.log(JSON.stringify({
-	schema_version: 1,
-	dcg_version: "0.6.7",
-	robot_mode: true,
-	command,
 	decision: "ask",
 	rule_id: "strict_git:worktree-remove",
 	reason: "git worktree remove deletes a linked working tree.",
-	agent: { detected: "pi" },
 }));
 process.exit(1);
 `;
@@ -94,6 +101,40 @@ process.exit(1);
 			}),
 		} as unknown as ExtensionRunner;
 	}
+
+	it("selects the configured shell dialect for local PTY execution", async () => {
+		for (const [shellName, dialect] of [
+			["cmd.exe", "cmd"],
+			["pwsh", "ps"],
+		] as const) {
+			const shellPath = path.join(tempDir, shellName);
+			fs.writeFileSync(shellPath, "#!/bin/sh\n", { mode: 0o755 });
+			const routeSettings = Settings.isolated({
+				"async.enabled": false,
+				"bash.autoBackground.enabled": false,
+				"bashInterceptor.enabled": false,
+				shellPath,
+				"tools.approvalMode": "yolo",
+			});
+			const routeSession = {
+				cwd: tempDir,
+				hasUI: true,
+				settings: routeSettings,
+				skills: [],
+				getSessionFile: () => null,
+				getSessionId: () => `dcg-${dialect}-test`,
+				getArtifactsDir: () => path.join(tempDir, "artifacts"),
+			} as unknown as ToolSession;
+			const routeTool = new BashTool(routeSession);
+			const approval = await routeTool.prepareRuntimeApproval(
+				`dcg-${dialect}-call`,
+				{ command: `printf expected-${dialect}`, cwd: tempDir, pty: true },
+				undefined,
+				{ hasUI: true, ui: {} } as AgentToolContext,
+			);
+			expect(approval?.prompt).toContain("strict_git:worktree-remove");
+		}
+	});
 
 	it("uses the native approval selector, notifies the terminal, and executes only after approval", async () => {
 		const args: BashToolInput = {

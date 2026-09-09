@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard asks use the native selector, default to denial, and grant only the reviewed command once.
+- Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once.
 
 ## [18.1.15] - 2026-09-08
 
