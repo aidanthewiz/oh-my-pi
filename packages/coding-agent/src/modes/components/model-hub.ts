@@ -38,6 +38,7 @@ import {
 import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
+import { thinkingLevelGlyph } from "../../tools/render-utils";
 import { theme } from "../theme/theme";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
 import {
@@ -47,7 +48,6 @@ import {
 	type RoleAssignments,
 	resolveRoleAssignments,
 	sortModelItems,
-	thinkingLevelGlyph,
 } from "./model-browser";
 import { bottomBorder, dividerSplit, row, splitBodyWidth, splitRow, topBorderSplit } from "./overlay-box";
 import { renderSegmentTrack } from "./segment-track";
@@ -966,7 +966,7 @@ export class ModelHubComponent implements Component {
 				: (this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit);
 		const chips: StripChip[] = options.map(level => {
 			const label = getConfiguredThinkingLevelMetadata(level).label;
-			const glyph = thinkingLevelGlyph(level);
+			const glyph = thinkingLevelGlyph(level, theme);
 			return {
 				label,
 				styled: glyph ? `${theme.fg("accent", glyph)} ${label}` : label,
@@ -1893,7 +1893,7 @@ export class ModelHubComponent implements Component {
 				dot = theme.fg(info.color ?? "muted", theme.status.enabled);
 				tagStyled = theme.fg(info.color ?? "muted", tag);
 				value = `${theme.fg("dim", `${assignment.model.provider}/`)}${selected ? theme.fg("accent", assignment.model.id) : assignment.model.id}`;
-				const glyph = thinkingLevelGlyph(assignment.thinkingLevel);
+				const glyph = thinkingLevelGlyph(assignment.thinkingLevel, theme);
 				const label = getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label;
 				if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
 					levelStyled = theme.fg("dim", glyph ? `${glyph} ${label}` : label);
