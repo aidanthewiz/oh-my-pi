@@ -316,10 +316,11 @@ function filterChildShellEnvInternal(
 	for (const [key, value] of Object.entries(env)) {
 		if (value && hasCredentialValue(key)) protectedValues.add(value);
 	}
+	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);
 	scrubChildCredentials(result, protectedValues, policy);
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
-	const launchNodeEnv = launchEnvValues ? launchEnvValues.get("NODE_ENV") : env.NODE_ENV;
+	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;
 	const modeEnv = parseEnvFile(path.join(cwd, nodeEnvName));
 	const localEnv = parseEnvFile(path.join(cwd, ".env.local"));
@@ -333,7 +334,7 @@ function filterChildShellEnvInternal(
 	};
 	let fallbackLaunchEnv: Record<string, string> | undefined;
 	let expandedFallbackLaunchEnv: Record<string, string> | undefined;
-	if (!launchEnvValues && nodeEnvName !== ".env.development") {
+	if (!runtimeLaunchEnvValues && nodeEnvName !== ".env.development") {
 		const fallbackModeEnv = parseEnvFile(path.join(cwd, ".env.development"));
 		const fallbackModeLocalEnv = parseEnvFile(path.join(cwd, ".env.development.local"));
 		const candidate = { ...projectEnv, ...fallbackModeEnv, ...localEnv, ...fallbackModeLocalEnv };
@@ -358,7 +359,7 @@ function filterChildShellEnvInternal(
 			operationalAwsEnvNames.has(normalized) &&
 			trustedOperationalAwsValues.get(normalized) === result[key];
 		if (trustedOperationalValue) continue;
-		const launchValue = launchEnvValues?.get(normalized);
+		const launchValue = runtimeLaunchEnvValues?.get(normalized);
 		if (launchValue !== undefined) {
 			// Launcher-owned name: it keeps the launcher's own value. Bun overwrites
 			// an empty launcher value with the dotenv one, so restore the launcher
@@ -374,7 +375,7 @@ function filterChildShellEnvInternal(
 			}
 			continue;
 		}
-		if (launchEnvValues || projectEnvNamesLoadedByOmp.has(key)) {
+		if (runtimeLaunchEnvValues || projectEnvNamesLoadedByOmp.has(key)) {
 			// Strong provenance: the launch environment is known and this name is
 			// absent from it, or OMP itself injected the value — either way it came
 			// from a project dotenv file, not the parent shell.
