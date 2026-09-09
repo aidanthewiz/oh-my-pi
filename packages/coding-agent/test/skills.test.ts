@@ -27,14 +27,9 @@ const expectedFixtureSkillOrder: string[] = [
 	"unknown-field",
 	"valid-skill",
 ];
-
 /**
- * Disable every named built-in skill source. Used by `loadSkills` option tests
- * that need to isolate a custom directory or assert "no built-in leakage". Tests
- * MUST spread this in: the discovery surface only ignores `~/.<dir>/skills/*` if
- * every provider toggle resolves to false, otherwise stray skills from the
- * developer's real `$HOME` (e.g. `~/.agents/skills/<name>/SKILL.md`) leak into
- * the assertion.
+ * Disable every named directory skill source. Installed OMP plugin skills use a
+ * separate provider and intentionally remain available.
  */
 const DISABLE_ALL_BUILTIN_SKILLS = {
 	enableCodexUser: false,
@@ -172,17 +167,14 @@ describe("skills", () => {
 				customDirectories: [fixturesDir],
 			});
 		});
-		it("should load from customDirectories only when built-ins disabled", async () => {
-			const { skills } = customDirectorySkills;
-			expect(skills.length).toBeGreaterThan(0);
-			// Custom directory skills have source "custom:user"
-			expect(skills.every(s => s.source.startsWith("custom"))).toBe(true);
+		it("should load customDirectories when named built-ins are disabled", async () => {
+			const customSkills = customDirectorySkills.skills.filter(skill => skill.source.startsWith("custom"));
+			expect(customSkills).toHaveLength(expectedFixtureSkillOrder.length);
 		});
 
 		it("should return customDirectory skills sorted by name (case-insensitive)", async () => {
-			const { skills } = customDirectorySkills;
-
-			expect(skills.map(s => s.name)).toEqual(expectedFixtureSkillOrder);
+			const customSkills = customDirectorySkills.skills.filter(skill => skill.source.startsWith("custom"));
+			expect(customSkills.map(skill => skill.name)).toEqual(expectedFixtureSkillOrder);
 		});
 
 		it("should keep user Claude skills when project .claude/skills is missing", async () => {
@@ -504,8 +496,8 @@ description: Skill loaded from a tilde-expanded custom directory.
 		}
 	});
 
-	it("should return empty when all sources disabled and no custom dirs", async () => {
-		const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS });
+	it("should return empty when skills are disabled", async () => {
+		const { skills } = await loadSkills({ enabled: false });
 		expect(skills).toHaveLength(0);
 	});
 

@@ -18,7 +18,7 @@ import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { legacyProviderAllowed } from "./agent-plugin-format";
 import {
-	buildRuleFromMarkdown,
+	discoverRuleFromMarkdown,
 	type ClaudePluginRoot,
 	createSourceMeta,
 	expandEnvVarsDeepForConfigLevel,
@@ -234,6 +234,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 						providerId: PROVIDER_ID,
 						level: root.scope,
 						includeSelf: true,
+						origin: root.origin,
 					}),
 				),
 			);
@@ -267,7 +268,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 			loadFilesFromDir<Rule>(ctx, path.join(root.path, "rules"), PROVIDER_ID, root.scope, {
 				extensions: ["md", "mdc"],
 				transform: (name, content, filePath, source) =>
-					buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ }),
+					discoverRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ }),
 			}),
 		),
 	);

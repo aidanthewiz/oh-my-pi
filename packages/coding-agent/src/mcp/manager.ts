@@ -28,6 +28,8 @@ import {
 	unsubscribeFromResources,
 } from "./client";
 import {
+	isBrowserMCPServer,
+	type LoadMCPConfigsOptions,
 	type LoadMCPConfigsResult,
 	loadAllMCPConfigs,
 	resolveMCPChildCredentialPolicy,
@@ -63,6 +65,8 @@ import type {
 } from "./types";
 import { MCPNotificationMethods, MCPOAuthCancelledError } from "./types";
 export type McpCatalogChangeEvent = { serverName: string; kind: "resources" | "prompts" };
+
+export type MCPConfigLoader = (cwd: string, options?: LoadMCPConfigsOptions) => Promise<LoadMCPConfigsResult>;
 
 type ToolLoadResult = {
 	connection: MCPServerConnection;
@@ -214,7 +218,7 @@ export interface MCPDiscoverOptions {
 	discoveryProviders?: string[];
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
-	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
+	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
 	extensionRoots?: EffectiveExtensionRoots;
@@ -290,6 +294,8 @@ export class MCPManager {
 	#pendingReconnections = new Map<string, Promise<MCPServerConnection | null>>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
+	#discoverOptions: MCPDiscoverOptions | undefined;
+	#browserFilterMutationTail: Promise<void> = Promise.resolve();
 	/**
 	 * Timestamps of recent reconnectServer invocations per server, used by the
 	 * crash-storm circuit breaker (see {@link RECONNECT_BURST_LIMIT}).
@@ -301,6 +307,7 @@ export class MCPManager {
 	constructor(
 		private cwd: string,
 		private toolCache: MCPToolCache | null = null,
+		private loadConfigs: MCPConfigLoader = loadAllMCPConfigs,
 	) {}
 
 	/**
@@ -629,9 +636,10 @@ export class MCPManager {
 	 * Returns tools and any connection errors.
 	 */
 	async discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
+		this.#discoverOptions = options ? { ...options } : undefined;
 		let loadedConfigs: LoadMCPConfigsResult;
 		try {
-			loadedConfigs = await loadAllMCPConfigs(this.cwd, {
+			loadedConfigs = await this.loadConfigs(this.cwd, {
 				enableProjectConfig: options?.enableProjectConfig,
 				requestProjectTrust: options?.requestProjectTrust,
 				discoveryProviders: options?.discoveryProviders,
@@ -649,6 +657,50 @@ export class MCPManager {
 		const result = await this.connectServers(configs, sources, options?.onStatus);
 		result.exaApiKeys = exaApiKeys;
 		return result;
+	}
+
+	/**
+	 * Reconcile browser-automation MCP servers with the built-in browser prelude.
+	 * Calls are serialized so rapid setting toggles cannot reconnect a server
+	 * after a newer enable has filtered it again.
+	 */
+	reconcileBrowserFilter(enabled: boolean): Promise<void> {
+		const reconcile = this.#browserFilterMutationTail.then(() => this.#applyBrowserFilter(enabled));
+		this.#browserFilterMutationTail = reconcile.catch(() => undefined);
+		return reconcile;
+	}
+
+	async #applyBrowserFilter(enabled: boolean): Promise<void> {
+		const options = this.#discoverOptions;
+		const loaded = await this.loadConfigs(this.cwd, {
+			enableProjectConfig: options?.enableProjectConfig,
+			filterExa: options?.filterExa,
+			filterBrowser: false,
+			extensionRoots: options?.extensionRoots,
+		});
+		const browserConfigs: Record<string, MCPServerConfig> = {};
+		const browserSources: Record<string, SourceMeta> = {};
+		for (const name in loaded.configs) {
+			const config = loaded.configs[name];
+			if (!config || !isBrowserMCPServer(name, config)) continue;
+			browserConfigs[name] = config;
+			const source = loaded.sources[name];
+			if (source) browserSources[name] = source;
+		}
+
+		if (!enabled) {
+			await this.connectServers(browserConfigs, browserSources, options?.onStatus);
+			this.#discoverOptions = { ...options, filterBrowser: false };
+			return;
+		}
+
+		const names = new Set<string>();
+		for (const name in browserConfigs) names.add(name);
+		for (const [name, config] of this.#serverConfigs) {
+			if (isBrowserMCPServer(name, config)) names.add(name);
+		}
+		await Promise.all([...names].map(name => this.disconnectServer(name)));
+		this.#discoverOptions = { ...options, filterBrowser: true };
 	}
 
 	/**

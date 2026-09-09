@@ -74,7 +74,7 @@ async function runInstall(dirOverride: string | undefined): Promise<void> {
 	console.log(`  2. Click "Load unpacked" and select: ${dir}`);
 	console.log(`  3. Enable the mode:  ${CF_COMMAND} config set browser.relay true`);
 	console.log("");
-	console.log(`${CF_BRAND} starts the relay automatically when the browser tool needs it;`);
+	console.log(`${CF_BRAND} starts the relay automatically when the browser prelude needs it;`);
 	console.log(`run \`${CF_COMMAND} browser-relay\` yourself only for --token or --no-group.`);
 	console.log("The extension badge shows 'on' once it reaches a relay.");
 }
@@ -124,7 +124,7 @@ async function runServe(args: BrowserRelayCommandArgs): Promise<void> {
 	const readiness = setInterval(() => {
 		if (runningRelay.bridge.ready && !announced) {
 			announced = true;
-			console.log(`Extension connected. The ${CF_BRAND} browser tool can now drive your tabs.`);
+			console.log(`Extension connected. The ${CF_BRAND} browser prelude can now drive your tabs.`);
 		} else if (!runningRelay.bridge.ready && announced) {
 			announced = false;
 			console.log("Extension disconnected; waiting for it to reconnect...");
