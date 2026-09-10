@@ -468,6 +468,93 @@ describe("experimental context management", () => {
 		expect(second.manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 	});
 
+	it("retries an acknowledged rollover on the next prompt when cancellation wins the first commit race", async () => {
+		const tempDir = TempDir.createSync("@pi-experimental-retry-");
+		const enteredHook = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled model");
+			const manager = SessionManager.inMemory(tempDir.path());
+			const history = [
+				user("old task"),
+				assistant("old result ".repeat(512)),
+				user("middle task"),
+				assistant("middle result ".repeat(64)),
+			];
+			for (const message of history) manager.appendMessage(message);
+			const settings = Settings.isolated({
+				"compaction.experimentalContextManagement": true,
+				"compaction.keepRecentTokens": 512,
+			});
+			const { tools } = createRolloverTools(manager, settings);
+			let hookCalls = 0;
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async () => {
+						hookCalls++;
+						if (hookCalls === 1) {
+							enteredHook.resolve();
+							await releaseHook.promise;
+						}
+						return {};
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"experimental-retry",
+			);
+			const extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), manager, modelRegistry);
+			let providerCalls = 0;
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["test"], tools, messages: history },
+				convertToLlm,
+				streamFn: () => {
+					providerCalls++;
+					const reason = providerCalls === 1 ? "toolUse" : "stop";
+					const message = assistant(reason === "toolUse" ? "Rollover acknowledged." : "Resumed after rollover.");
+					message.stopReason = reason;
+					if (reason === "toolUse") {
+						message.content = [{ type: "toolCall", id: "rollover-retry", name: "new_context", arguments: {} }];
+					}
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason, message });
+					});
+					return stream;
+				},
+			});
+			session = new AgentSession({
+				agent,
+				sessionManager: manager,
+				settings,
+				modelRegistry,
+				toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+				builtInToolNames: BUILTIN_TOOL_NAMES,
+				extensionRunner,
+			});
+
+			const firstPrompt = session.prompt("request a clean context");
+			await enteredHook.promise;
+			const abort = session.abort();
+			releaseHook.resolve();
+			await abort;
+			await firstPrompt;
+			expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+
+			await session.prompt("continue after cancellation");
+			await session.waitForIdle();
+			expect(hookCalls).toBe(2);
+			expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(1);
+		} finally {
+			releaseHook.resolve();
+			tempDir.removeSync();
+		}
+	});
 	function createRolloverTools(manager: SessionManager, settings: Settings) {
 		const toolSession: ToolSession = {
 			cwd: process.cwd(),

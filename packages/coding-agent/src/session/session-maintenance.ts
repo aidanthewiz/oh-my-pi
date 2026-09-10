@@ -380,6 +380,8 @@ export class SessionMaintenance {
 	 * persisted turn, but a new agent loop still gets its own live-array guard.
 	 */
 	#midTurnDeadEndPendingPrePrompt = false;
+	/** Initial turn context retained until its acknowledged explicit rollover commits. */
+	#pendingExperimentalContextRollover: AgentTurnEndContext | undefined;
 	/** In-flight or armed background speculative compaction, if any. */
 	#speculation: SpeculationRun | undefined;
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined;
@@ -1455,24 +1457,28 @@ export class SessionMaintenance {
 					await this.#host.sessionManager.rewriteEntries();
 				}
 				this.#host.emitNotice("warning", warning, "compaction");
-				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+				return { ...COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION, historyRewritten: true };
 			}
+			let continuationScheduled: boolean;
 			if (willRetry) {
 				this.#host.scheduleAgentContinue({
 					source: "experimental-context-rollover-retry",
 					delayMs: 100,
 					generation,
 				});
-				return COMPACTION_CHECK_CONTINUATION;
+				continuationScheduled = true;
+			} else {
+				continuationScheduled = this.#host.scheduleCompactionContinuation({
+					generation,
+					autoContinue: shouldAutoContinue,
+					terminalTextAnswer,
+					suppressContinuation,
+				});
 			}
-			return this.#host.scheduleCompactionContinuation({
-				generation,
-				autoContinue: shouldAutoContinue,
-				terminalTextAnswer,
-				suppressContinuation,
-			})
-				? COMPACTION_CHECK_CONTINUATION
-				: COMPACTION_CHECK_NONE;
+			return {
+				...(continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE),
+				historyRewritten: true,
+			};
 		} catch (error) {
 			await this.#emitLifecycleEvent(
 				{
@@ -1976,12 +1982,60 @@ export class SessionMaintenance {
 		return tokens;
 	}
 
+	async #runPendingExperimentalContextRollover(
+		signal: AbortSignal | undefined,
+		activeMessages: AgentMessage[] | undefined,
+		phase: "pre_turn" | "mid_turn",
+		barrierContext?: AgentTurnEndContext,
+	): Promise<boolean> {
+		const context = this.#pendingExperimentalContextRollover;
+		if (!context) return false;
+		if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return true;
+		if (signal?.aborted || this.#host.isDisposed()) return true;
+		if (
+			barrierContext &&
+			barrierContext !== context &&
+			!(await this.#host.persistTurnMessagesForMidRunCompaction(barrierContext))
+		) {
+			return true;
+		}
+		if (signal?.aborted || this.#host.isDisposed()) return true;
+
+		const result = await this.runAutoCompaction("threshold", false, false, false, {
+			autoContinue: false,
+			suppressContinuation: true,
+			phase,
+			detachPostCommit: phase === "mid_turn",
+			explicitNewContextRequest: true,
+		});
+		if (result.automaticContinuationBlocked && activeMessages) {
+			this.#midTurnCompactionDeadEnds.add(activeMessages);
+			this.#midTurnDeadEndPendingPrePrompt = true;
+		}
+		if (!result.historyRewritten) {
+			if (this.#pendingExperimentalContextRollover === context && !this.#usesExperimentalContextManagement()) {
+				this.#pendingExperimentalContextRollover = undefined;
+			}
+			return true;
+		}
+		if (this.#pendingExperimentalContextRollover === context) {
+			this.#pendingExperimentalContextRollover = undefined;
+		}
+		if (signal?.aborted || !activeMessages) return true;
+		const compactedMessages = this.#host.agent.state.messages;
+		if (compactedMessages !== activeMessages) {
+			activeMessages.splice(0, activeMessages.length, ...compactedMessages);
+		}
+		return true;
+	}
+
 	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.#host.settings.getGroup("compaction");
+		if (await this.#runPendingExperimentalContextRollover(undefined, undefined, "pre_turn")) return;
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
 		const pendingMidTurnDeadEnd = this.#midTurnDeadEndPendingPrePrompt;
 		this.#midTurnDeadEndPendingPrePrompt = false;
@@ -2052,6 +2106,15 @@ export class SessionMaintenance {
 		context: AgentTurnEndContext | undefined,
 	): Promise<void> {
 		if (
+			!this.#pendingExperimentalContextRollover &&
+			context &&
+			this.#usesExperimentalContextManagement() &&
+			this.#host.takeExperimentalContextRolloverRequest(context)
+		) {
+			this.#pendingExperimentalContextRollover = context;
+		}
+
+		if (
 			signal?.aborted ||
 			this.#host.isDisposed() ||
 			this.isCompacting ||
@@ -2064,8 +2127,7 @@ export class SessionMaintenance {
 		const contextWindow = model?.contextWindow ?? 0;
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.#host.settings.getGroup("compaction");
-		const experimentalNewContextRequest =
-			this.#usesExperimentalContextManagement() && this.#host.takeExperimentalContextRolloverRequest(context);
+		const experimentalNewContextRequest = this.#pendingExperimentalContextRollover !== undefined;
 
 		// An explicit model-requested rollover bypasses the Auto-Compact toggle:
 		// `new_context` already acknowledged the request, so silently dropping it
@@ -2079,27 +2141,7 @@ export class SessionMaintenance {
 			return;
 		}
 		if (experimentalNewContextRequest) {
-			if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;
-			// An abort or disposal that raced the awaited persistence barrier must
-			// not commit a boundary the interrupted turn never observed.
-			if (signal?.aborted || this.#host.isDisposed()) return;
-			const result = await this.runAutoCompaction("threshold", false, false, false, {
-				autoContinue: false,
-				suppressContinuation: true,
-				phase: "mid_turn",
-				detachPostCommit: true,
-				explicitNewContextRequest: true,
-			});
-
-			if (result.automaticContinuationBlocked) {
-				this.#midTurnCompactionDeadEnds.add(activeMessages);
-				this.#midTurnDeadEndPendingPrePrompt = true;
-			}
-			if (signal?.aborted) return;
-			const compactedMessages = this.#host.agent.state.messages;
-			if (compactedMessages !== activeMessages) {
-				activeMessages.splice(0, activeMessages.length, ...compactedMessages);
-			}
+			await this.#runPendingExperimentalContextRollover(signal, activeMessages, "mid_turn", context);
 			return;
 		}
 
