@@ -3,9 +3,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ToolAbortError, ToolError } from "./tool-errors";
 
-const DCG_TIMEOUT_MS = 3_000;
+const DCG_PROCESS_TIMEOUT_MS = 30_000;
+const DCG_PIPE_DRAIN_GRACE_MS = 250;
+const DCG_OBSERVATION_GRACE_MS = DCG_PIPE_DRAIN_GRACE_MS * 2;
 const DCG_MAX_OUTPUT_BYTES = 64 * 1024;
-const DCG_TERMINATION_GRACE_MS = 250;
+const DCG_STDIN_CHUNK_CODE_UNITS = DCG_MAX_OUTPUT_BYTES / 4;
 
 const REQUIRED_ENV_KEYS = [
 	"OMP_DCG_PATH",
@@ -42,31 +44,29 @@ export interface DcgProcessResult {
 	stderr: string;
 }
 
+export type DcgShellDialect = "posix" | "cmd" | "ps";
+
 export type DcgProcessRunner = (options: {
 	binaryPath: string;
 	command: string;
 	cwd: string;
+	dialect: DcgShellDialect;
 	env: Record<string, string>;
 	signal?: AbortSignal;
+	timeoutMs: number;
 }) => Promise<DcgProcessResult>;
 
 export interface DestructiveCommandGuardRuntime {
 	env?: GuardEnvironment;
 	run?: DcgProcessRunner;
 	required?: boolean;
+	timeoutMs?: number;
 }
 
 interface DcgTestOutput {
-	schema_version?: unknown;
-	dcg_version?: unknown;
-	robot_mode?: unknown;
-	command?: unknown;
 	decision?: unknown;
 	rule_id?: unknown;
 	reason?: unknown;
-	explanation?: unknown;
-	allowlist?: unknown;
-	agent?: { detected?: unknown };
 }
 
 export interface DcgAskDecision {
@@ -79,7 +79,6 @@ export type DcgDecision = { decision: "allow" } | DcgAskDecision;
 
 interface DcgConfiguration {
 	binaryPath: string;
-	version: string;
 	configPath: string;
 	binarySha256: string;
 	configSha256: string;
@@ -101,13 +100,7 @@ function resolveConfiguration(env: GuardEnvironment, required: boolean): DcgConf
 		throw safetyFailure(`incomplete managed configuration (missing ${missing.join(", ")})`);
 	}
 
-	const [binaryPath, version, binarySha256, configPath, configSha256] = values as [
-		string,
-		string,
-		string,
-		string,
-		string,
-	];
+	const [binaryPath, , binarySha256, configPath, configSha256] = values as [string, string, string, string, string];
 	if (!path.isAbsolute(binaryPath)) throw safetyFailure("OMP_DCG_PATH must be absolute");
 	if (!path.isAbsolute(configPath)) throw safetyFailure("OMP_DCG_CONFIG must be absolute");
 	for (const [key, value] of [
@@ -118,7 +111,6 @@ function resolveConfiguration(env: GuardEnvironment, required: boolean): DcgConf
 	}
 	return {
 		binaryPath,
-		version,
 		binarySha256: binarySha256.toLowerCase(),
 		configPath,
 		configSha256: configSha256.toLowerCase(),
@@ -152,27 +144,67 @@ function buildChildEnvironment(env: GuardEnvironment, configPath: string): Recor
 	childEnv.DCG_ALLOWLIST_SYSTEM_PATH = "";
 	childEnv.DCG_HISTORY_DISABLED = "1";
 	childEnv.DCG_ROBOT = "1";
-	childEnv.PI_CODING_AGENT = "true";
 	childEnv.XDG_CONFIG_HOME = path.join(path.dirname(configPath), ".dcg-runtime");
 	return childEnv;
 }
 
-async function readBounded(stream: ReadableStream<Uint8Array>, label: string): Promise<string> {
+function commandStdin(command: string): Uint8Array | ReadableStream<Uint8Array> {
+	if (command.length <= DCG_STDIN_CHUNK_CODE_UNITS) return new TextEncoder().encode(command);
+
+	let offset = 0;
+	const text = new ReadableStream<string>({
+		pull(controller): void {
+			if (offset >= command.length) {
+				controller.close();
+				return;
+			}
+			let end = Math.min(offset + DCG_STDIN_CHUNK_CODE_UNITS, command.length);
+			if (
+				end < command.length &&
+				command.charCodeAt(end - 1) >= 0xd800 &&
+				command.charCodeAt(end - 1) <= 0xdbff &&
+				command.charCodeAt(end) >= 0xdc00 &&
+				command.charCodeAt(end) <= 0xdfff
+			) {
+				end++;
+			}
+			controller.enqueue(command.slice(offset, end));
+			offset = end;
+		},
+	});
+	return text.pipeThrough(new TextEncoderStream());
+}
+
+async function readBounded(stream: ReadableStream<Uint8Array>, label: string, signal: AbortSignal): Promise<string> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
 	let total = 0;
 	let output = "";
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		total += value.byteLength;
-		if (total > DCG_MAX_OUTPUT_BYTES) throw safetyFailure(`${label} exceeded ${DCG_MAX_OUTPUT_BYTES} bytes`);
-		output += decoder.decode(value, { stream: true });
+	const cancel = () => {
+		try {
+			void reader.cancel().catch(() => undefined);
+		} catch {
+			// The observation deadline still bounds standards-compliant streams.
+		}
+	};
+	if (signal.aborted) cancel();
+	else signal.addEventListener("abort", cancel, { once: true });
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > DCG_MAX_OUTPUT_BYTES) throw safetyFailure(`${label} exceeded ${DCG_MAX_OUTPUT_BYTES} bytes`);
+			output += decoder.decode(value, { stream: true });
+		}
+		return output + decoder.decode();
+	} finally {
+		signal.removeEventListener("abort", cancel);
+		reader.releaseLock();
 	}
-	return output + decoder.decode();
 }
 
-async function terminateDcgProcess(process: Bun.Subprocess<"ignore", "pipe", "pipe">): Promise<void> {
+async function terminateDcgProcess(process: Bun.ReadableSubprocess): Promise<void> {
 	try {
 		process.kill("SIGKILL");
 	} catch {
@@ -183,63 +215,121 @@ async function terminateDcgProcess(process: Bun.Subprocess<"ignore", "pipe", "pi
 			() => undefined,
 			() => undefined,
 		),
-		Bun.sleep(DCG_TERMINATION_GRACE_MS),
+		Bun.sleep(DCG_PIPE_DRAIN_GRACE_MS),
 	]);
 	process.unref();
 }
 
-const runDcgProcess: DcgProcessRunner = async ({ binaryPath, command, cwd, env, signal }) => {
+const runDcgProcess: DcgProcessRunner = async ({ binaryPath, command, cwd, dialect, env, signal, timeoutMs }) => {
 	if (signal?.aborted) throw new ToolAbortError("Command aborted");
 
-	let process: Bun.Subprocess<"ignore", "pipe", "pipe">;
+	let process: Bun.ReadableSubprocess;
 	try {
-		process = Bun.spawn([binaryPath, "--robot", "test", command], {
-			cwd,
-			env,
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		process = Bun.spawn(
+			[
+				binaryPath,
+				"--robot",
+				"test",
+				"--stdin",
+				"--agent",
+				"omp",
+				"--dialect",
+				dialect,
+				"--format",
+				"json",
+				"--omp-bridge-output",
+			],
+			{
+				cwd,
+				env,
+				stdin: commandStdin(command),
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: timeoutMs,
+				killSignal: "SIGKILL",
+			},
+		);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw safetyFailure(`failed to start dcg (${detail})`);
 	}
 
-	let aborted = false;
+	const observationAbort = new AbortController();
+	const output = Promise.all([
+		readBounded(process.stdout, "dcg stdout", observationAbort.signal),
+		readBounded(process.stderr, "dcg stderr", observationAbort.signal),
+	]);
+	const outputOutcome = output.then(
+		value => ({ kind: "output" as const, value }),
+		error => ({ kind: "output-error" as const, error }),
+	);
+	const exitOutcome = process.exited.then(
+		exitCode => ({ kind: "exit" as const, exitCode }),
+		error => ({ kind: "exit-error" as const, error }),
+	);
+	const aborted = Promise.withResolvers<{ kind: "abort" }>();
 	const onAbort = () => {
-		aborted = true;
 		try {
 			process.kill("SIGKILL");
 		} catch {
 			// The process may already have exited.
 		}
+		aborted.resolve({ kind: "abort" });
 	};
 	signal?.addEventListener("abort", onAbort, { once: true });
 	if (signal?.aborted) onAbort();
 
-	const output = Promise.all([readBounded(process.stdout, "dcg stdout"), readBounded(process.stderr, "dcg stderr")]);
-	const completion = output.then(
-		async ([stdout, stderr]) => ({
-			kind: "exit" as const,
-			exitCode: await process.exited,
-			stdout,
-			stderr,
-		}),
-		error => ({ kind: "output-error" as const, error }),
-	);
+	const observationTimeoutMs = timeoutMs + DCG_OBSERVATION_GRACE_MS;
 	let timeoutId: NodeJS.Timeout | undefined;
 	const deadline = new Promise<{ kind: "timeout" }>(resolve => {
-		timeoutId = setTimeout(() => resolve({ kind: "timeout" }), DCG_TIMEOUT_MS);
+		timeoutId = setTimeout(() => resolve({ kind: "timeout" }), observationTimeoutMs);
 	});
+
 	try {
-		const outcome = await Promise.race([completion, deadline]);
-		if (outcome.kind === "timeout") {
-			throw safetyFailure(`dcg exceeded the ${DCG_TIMEOUT_MS}ms decision deadline`);
+		const first = await Promise.race([outputOutcome, exitOutcome, aborted.promise, deadline]);
+		if (first.kind === "abort") throw new ToolAbortError("Command aborted");
+		if (first.kind === "timeout") {
+			throw safetyFailure(`dcg exceeded the ${observationTimeoutMs}ms observation deadline`);
 		}
-		if (outcome.kind === "output-error") throw outcome.error;
-		if (aborted || signal?.aborted) throw new ToolAbortError("Command aborted");
-		return { exitCode: outcome.exitCode, stdout: outcome.stdout, stderr: outcome.stderr };
+		if (first.kind === "output-error") throw first.error;
+
+		let exitCode: number;
+		let streams: [string, string];
+		if (first.kind === "output") {
+			streams = first.value;
+			const exit = await Promise.race([exitOutcome, aborted.promise, deadline]);
+			if (exit.kind === "abort") throw new ToolAbortError("Command aborted");
+			if (exit.kind === "timeout") {
+				throw safetyFailure(`dcg exceeded the ${observationTimeoutMs}ms observation deadline`);
+			}
+			if (exit.kind === "exit-error") throw safetyFailure("dcg exit status could not be observed");
+			exitCode = exit.exitCode;
+		} else {
+			if (first.kind === "exit-error") throw safetyFailure("dcg exit status could not be observed");
+			exitCode = first.exitCode;
+			const drain = await Promise.race([
+				outputOutcome,
+				Bun.sleep(DCG_PIPE_DRAIN_GRACE_MS).then(() => ({ kind: "pipe-timeout" as const })),
+				aborted.promise,
+				deadline,
+			]);
+			if (drain.kind === "abort") throw new ToolAbortError("Command aborted");
+			if (drain.kind === "timeout") {
+				throw safetyFailure(`dcg exceeded the ${observationTimeoutMs}ms observation deadline`);
+			}
+			if (drain.kind === "pipe-timeout") {
+				throw safetyFailure(`dcg pipes exceeded the ${DCG_PIPE_DRAIN_GRACE_MS}ms post-exit drain grace`);
+			}
+			if (drain.kind === "output-error") throw drain.error;
+			streams = drain.value;
+		}
+
+		if (process.signalCode !== null) {
+			throw safetyFailure(`dcg terminated by signal ${String(process.signalCode)}`);
+		}
+		return { exitCode, stdout: streams[0], stderr: streams[1] };
 	} catch (error) {
+		observationAbort.abort();
 		await terminateDcgProcess(process);
 		throw error;
 	} finally {
@@ -248,23 +338,15 @@ const runDcgProcess: DcgProcessRunner = async ({ binaryPath, command, cwd, env, 
 	}
 };
 
-function parseOutput(result: DcgProcessResult, config: DcgConfiguration, command: string): DcgTestOutput {
+function parseOutput(result: DcgProcessResult): DcgTestOutput {
 	let output: DcgTestOutput;
 	try {
-		output = JSON.parse(result.stdout) as DcgTestOutput;
+		const parsed = JSON.parse(result.stdout) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("invalid shape");
+		output = parsed as DcgTestOutput;
 	} catch {
 		const stderr = result.stderr.trim();
 		throw safetyFailure(`dcg returned invalid JSON${stderr ? ` (${stderr.slice(0, 500)})` : ""}`);
-	}
-
-	if (
-		output.schema_version !== 1 ||
-		output.dcg_version !== config.version ||
-		output.robot_mode !== true ||
-		output.command !== command ||
-		output.agent?.detected !== "pi"
-	) {
-		throw safetyFailure("dcg returned an unexpected protocol, version, command, or agent identity");
 	}
 	return output;
 }
@@ -272,6 +354,7 @@ function parseOutput(result: DcgProcessResult, config: DcgConfiguration, command
 export async function enforceDestructiveCommandGuard(
 	command: string,
 	cwd: string,
+	dialect: DcgShellDialect,
 	signal?: AbortSignal,
 	runtime: DestructiveCommandGuardRuntime = {},
 ): Promise<DcgDecision> {
@@ -289,12 +372,18 @@ export async function enforceDestructiveCommandGuard(
 		binaryPath: config.binaryPath,
 		command,
 		cwd,
+		dialect,
 		env: buildChildEnvironment(env, config.configPath),
 		signal,
+		timeoutMs: Math.max(1, runtime.timeoutMs ?? DCG_PROCESS_TIMEOUT_MS),
 	});
-	const output = parseOutput(result, config, command);
+	const stderr = result.stderr.trim();
+	if (stderr) {
+		throw safetyFailure(`dcg wrote unexpected stderr (${stderr.slice(0, 500)})`);
+	}
+	const output = parseOutput(result);
 
-	if (result.exitCode === 0 && output.decision === "allow" && output.allowlist === undefined) {
+	if (result.exitCode === 0 && output.decision === "allow") {
 		return { decision: "allow" };
 	}
 	if (result.exitCode === 1 && (output.decision === "ask" || output.decision === "deny")) {
@@ -302,11 +391,9 @@ export async function enforceDestructiveCommandGuard(
 		const reason =
 			typeof output.reason === "string"
 				? output.reason
-				: typeof output.explanation === "string"
-					? output.explanation
-					: output.decision === "ask"
-						? "explicit approval required"
-						: "destructive command detected";
+				: output.decision === "ask"
+					? "explicit approval required"
+					: "destructive command detected";
 		if (output.decision === "ask") {
 			return {
 				decision: "ask",
@@ -316,6 +403,11 @@ export async function enforceDestructiveCommandGuard(
 		}
 		const rule = ruleId ? ` (${ruleId})` : "";
 		throw new ToolError(`Command blocked by Destructive Command Guard${rule}: ${reason}`);
+	}
+	if (result.exitCode === 1 && output.decision === "indeterminate") {
+		const reason =
+			typeof output.reason === "string" ? output.reason : "safety evaluation did not complete within its budget";
+		throw safetyFailure(reason);
 	}
 
 	throw safetyFailure(`dcg returned inconsistent decision '${String(output.decision)}' with exit ${result.exitCode}`);

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runInteractiveBashPty } from "@oh-my-pi/pi-coding-agent/tools/bash-interactive";
 
 function headlessUi(): NonNullable<AgentToolContext["ui"]> {
@@ -25,8 +26,10 @@ test("interactive PTY commands receive only the filtered replacement environment
 	const original = Bun.env.MANAGED_PROFILE_SECRET;
 	try {
 		Bun.env.MANAGED_PROFILE_SECRET = "parent-secret";
+		const shell = (await Settings.init()).getShellConfig().shell;
 		const result = await runInteractiveBashPty(headlessUi(), {
 			command: `printf "%s|%s" "\${MANAGED_PROFILE_SECRET-unset}" "\${EXPLICIT_SAFE-unset}"`,
+			shell,
 			cwd: process.cwd(),
 			env: {
 				MANAGED_PROFILE_SECRET: "caller-secret",

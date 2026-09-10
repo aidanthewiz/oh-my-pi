@@ -11,7 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
+import { isCmdShell, isPosixShell, isPowerShell, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -25,7 +25,9 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import dcgApprovalPrompt from "../prompts/tools/dcg-approval.md" with { type: "text" };
 import type {
+	ClientBridge,
 	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
@@ -46,6 +48,7 @@ import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-ski
 import {
 	type DcgAskDecision,
 	type DcgDecision,
+	type DcgShellDialect,
 	enforceDestructiveCommandGuard,
 	isDestructiveCommandGuardConfigured,
 } from "./destructive-command-guard";
@@ -366,12 +369,78 @@ export interface BashToolDetails {
 
 export interface BashToolOptions {}
 
+interface PreparedShellConfig {
+	shell: string;
+	args: string[];
+	prefix: string | undefined;
+}
+
+type PreparedBashBackend =
+	| { kind: "local" }
+	| {
+			kind: "client-terminal";
+			bridge: ClientBridge;
+			createTerminal: NonNullable<ClientBridge["createTerminal"]>;
+			shellConfig: PreparedShellConfig;
+	  }
+	| {
+			kind: "local-pty";
+			ui: NonNullable<AgentToolContext["ui"]>;
+			shellConfig: PreparedShellConfig;
+	  };
+
 interface PreparedBashExecution {
 	command: string;
 	commandCwd: string;
 	dcgDecision: DcgDecision;
 	hasLocalUrls: boolean;
 	resolvedEnv: Record<string, string> | undefined;
+	backend: PreparedBashBackend;
+}
+
+function snapshotShellConfig(settings: Settings): PreparedShellConfig {
+	const config: ShellConfig = settings.getShellConfig();
+	return {
+		shell: config.shell,
+		args: [...config.args],
+		prefix: config.prefix,
+	};
+}
+
+function sameShellConfig(left: PreparedShellConfig, right: PreparedShellConfig): boolean {
+	return (
+		left.shell === right.shell &&
+		left.prefix === right.prefix &&
+		left.args.length === right.args.length &&
+		left.args.every((arg, index) => arg === right.args[index])
+	);
+}
+
+function sameBashBackend(left: PreparedBashBackend, right: PreparedBashBackend): boolean {
+	if (left.kind !== right.kind) return false;
+	switch (left.kind) {
+		case "local":
+			return true;
+		case "client-terminal":
+			return (
+				right.kind === "client-terminal" &&
+				left.bridge === right.bridge &&
+				left.createTerminal === right.createTerminal &&
+				sameShellConfig(left.shellConfig, right.shellConfig)
+			);
+		case "local-pty":
+			return (
+				right.kind === "local-pty" && left.ui === right.ui && sameShellConfig(left.shellConfig, right.shellConfig)
+			);
+	}
+}
+
+function dcgDialectForBackend(backend: PreparedBashBackend): DcgShellDialect {
+	if (backend.kind === "local") return "posix";
+	const shell = backend.shellConfig.shell;
+	if (isCmdShell(shell)) return "cmd";
+	if (isPowerShell(shell)) return "ps";
+	return "posix";
 }
 
 function formatDcgRuntimeApproval(
@@ -380,23 +449,17 @@ function formatDcgRuntimeApproval(
 	decision: DcgAskDecision,
 ): RuntimeToolApprovalRequest {
 	const rule = decision.ruleId ?? "unknown rule";
-	const environment = prepared.resolvedEnv ? JSON.stringify(prepared.resolvedEnv) : "{}";
 	return {
 		reason: `Destructive Command Guard requires review (${rule})`,
-		prompt: [
-			"Destructive Command Guard requires explicit review.",
-			`Rule: ${rule}`,
-			`Reason: ${decision.reason}`,
-			`Working directory (exact JSON string): ${JSON.stringify(prepared.commandCwd)}`,
-			`Additional environment (exact JSON object): ${environment}`,
-			`Execution mode: ${input.async === true ? "background" : input.pty === true ? "interactive PTY" : "foreground"}`,
-			`Requested timeout seconds: ${input.timeout ?? 300}`,
-			"",
-			"Command (exact JSON string; newlines and control characters are escaped):",
-			JSON.stringify(prepared.command),
-			"",
-			"Review the entire command before entering the confirmation challenge.",
-		].join("\n"),
+		prompt: prompt.render(dcgApprovalPrompt, {
+			rule,
+			reason: decision.reason,
+			workingDirectory: JSON.stringify(prepared.commandCwd),
+			environment: prepared.resolvedEnv ? JSON.stringify(prepared.resolvedEnv) : "{}",
+			executionMode: input.async === true ? "background" : input.pty === true ? "interactive PTY" : "foreground",
+			timeoutSeconds: input.timeout ?? 300,
+			command: JSON.stringify(prepared.command),
+		}),
 	};
 }
 
@@ -774,6 +837,28 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		this.parameters = this.#asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
 	}
 
+	#resolveExecutionBackend(input: BashToolInput, ctx?: AgentToolContext): PreparedBashBackend {
+		if (input.async === true) return { kind: "local" };
+		if (input.pty === true) {
+			const ui = canUseInteractiveBashPty(true, ctx) ? ctx?.ui : undefined;
+			return ui
+				? { kind: "local-pty", ui, shellConfig: snapshotShellConfig(this.session.settings) }
+				: { kind: "local" };
+		}
+
+		const bridge = this.session.getClientBridge?.();
+		const createTerminal = bridge?.createTerminal;
+		if (bridge?.capabilities.terminal && createTerminal) {
+			return {
+				kind: "client-terminal",
+				bridge,
+				createTerminal,
+				shellConfig: snapshotShellConfig(this.session.settings),
+			};
+		}
+		return { kind: "local" };
+	}
+
 	async #prepareExecution(
 		input: BashToolInput,
 		signal?: AbortSignal,
@@ -862,8 +947,14 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
 
-		const dcgDecision = await enforceDestructiveCommandGuard(command, commandCwd, signal);
-		return { command, commandCwd, dcgDecision, hasLocalUrls, resolvedEnv };
+		const backend = this.#resolveExecutionBackend(input, ctx);
+		const dcgDecision = await enforceDestructiveCommandGuard(
+			command,
+			commandCwd,
+			dcgDialectForBackend(backend),
+			signal,
+		);
+		return { command, commandCwd, dcgDecision, hasLocalUrls, resolvedEnv, backend };
 	}
 
 	async prepareRuntimeApproval(
@@ -1188,17 +1279,27 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const cacheMatches = cached?.toolCallId === toolCallId && cached.inputFingerprint === bashInputFingerprint(input);
 		let runtimeApproved = cacheMatches === true && cached.approved;
 		let prepared = cacheMatches ? cached.execution : await this.#prepareExecution(input, signal, ctx);
+		if (cacheMatches) {
+			const currentBackend = this.#resolveExecutionBackend(input, ctx);
+			if (!sameBashBackend(prepared.backend, currentBackend)) {
+				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
+			}
+		}
 		if (cacheMatches && prepared.hasLocalUrls) {
 			const materialized = await this.#prepareExecution(input, signal, ctx);
 			const commandChanged =
 				materialized.command !== prepared.command ||
 				materialized.commandCwd !== prepared.commandCwd ||
 				JSON.stringify(materialized.resolvedEnv) !== JSON.stringify(prepared.resolvedEnv);
+			const backendChanged = !sameBashBackend(prepared.backend, materialized.backend);
 			const approvalChanged =
 				materialized.dcgDecision.decision === "ask" &&
 				(prepared.dcgDecision.decision !== "ask" ||
 					materialized.dcgDecision.ruleId !== prepared.dcgDecision.ruleId ||
 					materialized.dcgDecision.reason !== prepared.dcgDecision.reason);
+			if (backendChanged) {
+				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
+			}
 			if (commandChanged) {
 				throw new ToolError("Bash command expansion changed after approval; review the command again.");
 			}
@@ -1212,7 +1313,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			);
 		}
 
-		const { command, commandCwd, resolvedEnv } = prepared;
+		const { command, commandCwd, resolvedEnv, backend } = prepared;
 		const asyncRequested = input.async ?? false;
 		const pty = input.pty ?? false;
 		const requestedTimeoutSec = input.timeout ?? 300;
@@ -1257,10 +1358,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// The client-bridge terminal provides a live terminal card in the editor;
 		// when available it wins over auto-backgrounding (both are opt-in, and
 		// auto-background would otherwise silently disable the terminal route).
-		const clientBridge = this.session.getClientBridge?.();
-		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
-		);
+		const bridgeTerminalAvailable = backend.kind === "client-terminal";
 
 		const autoBgManager = this.session.asyncJobManager;
 		// At the running-job cap, fall through to direct foreground execution
@@ -1337,8 +1435,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// (the backend's own timeout is installed only after this await), matching
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
 		const backendPreflight =
-			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
-			canUseInteractiveBashPty(pty, ctx)
+			backend.kind === "client-terminal" || backend.kind === "local-pty"
 				? await applyDirenvPreflight(command, commandCwd, {
 						callerEnv: resolvedEnv,
 						signal,
@@ -1348,9 +1445,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					})
 				: undefined;
 
-		// Route through the client terminal when the client advertises the terminal capability.
-		// Skip when pty=true (PTY needs the local terminal UI).
-		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
+		// Route through the exact client terminal selected during safety review.
+		if (backend.kind === "client-terminal") {
 			// Invariant (ACP terminal bridge): createTerminal has no signal in its
 			// contract; allocation cannot be cancelled retroactively. Guard before
 			// allocation. Shared timeout helper / pure AbortSignal fusion rejected:
@@ -1414,8 +1510,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				// env; falls back to the raw command/env when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
 				const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
-				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
-				const createP = clientBridge.createTerminal({
+				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, backend.shellConfig);
+				const createP = backend.createTerminal.call(backend.bridge, {
 					command: shellSpawn.command,
 					args: shellSpawn.args,
 					cwd: commandCwd,
@@ -1617,38 +1713,38 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 
-		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
-		if (pty && !interactiveUi) {
+		if (pty && backend.kind !== "local-pty") {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
 		const wallTimeStart = performance.now();
-		const result: BashResult | BashInteractiveResult = interactiveUi
-			? await runInteractiveBashPty(interactiveUi, {
-					// PTY bypasses executeBash, so feed it the direnv-transformed
-					// command + merged env (backendPreflight is defined whenever this
-					// branch runs, since both gate on canUseInteractiveBashPty).
-					command: backendPreflight?.command ?? command,
-					cwd: commandCwd,
-					timeoutMs,
-					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
-					artifactPath,
-					artifactId,
-				})
-			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
-				// applied twice.
-				await executeBash(command, {
-					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
-					timeout: timeoutMs ?? 0,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
-				});
+		const result: BashResult | BashInteractiveResult =
+			backend.kind === "local-pty"
+				? await runInteractiveBashPty(backend.ui, {
+						// PTY bypasses executeBash, so feed it the direnv-transformed
+						// command + merged env and the shell retained during safety review.
+						command: backendPreflight?.command ?? command,
+						cwd: commandCwd,
+						timeoutMs,
+						signal,
+						env: backendPreflight?.env ?? resolvedEnv,
+						artifactPath,
+						artifactId,
+						shell: backend.shellConfig.shell,
+					})
+				: // executeBash runs its OWN direnv preflight internally — pass the RAW
+					// command + resolvedEnv here so the unset prefix / env merge is not
+					// applied twice.
+					await executeBash(command, {
+						cwd: commandCwd,
+						sessionKey: this.session.getSessionId?.() ?? undefined,
+						timeout: timeoutMs ?? 0,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+						onChunk: streamTailUpdates(tailBuffer, onUpdate),
+						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					});
 		const wallTimeMs = performance.now() - wallTimeStart;
 		if (result.cancelled) {
 			// A cancelled result is either a timeout (the command's deadline fired)
