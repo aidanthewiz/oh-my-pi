@@ -6,6 +6,7 @@ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
@@ -2391,6 +2392,142 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("keeps a cancelled bare rename from updating or settling its successor", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const inferences = [
+			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<string | null>() },
+			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<string | null>() },
+		];
+		const titleSignals: Array<AbortSignal | undefined> = [];
+		let inferenceIndex = 0;
+		try {
+			await session.sessionManager.setSessionName("Original title", "user");
+			session.sessionManager.appendMessage({
+				role: "user",
+				content: "Investigate why cancelling a generated session title interrupts the next rename request.",
+				timestamp: Date.now(),
+			});
+			Object.assign(session, {
+				messages: session.sessionManager.buildSessionContext().messages,
+				titleGenerationSignal: new AbortController().signal,
+				notifyTitleGenerationStart: () => undefined,
+				generateTitle: (_context: string, _systemPrompt?: string, signal?: AbortSignal) => {
+					const inference = inferences[inferenceIndex++];
+					titleSignals.push(signal);
+					inference.started.resolve();
+					// Deliberately ignore abort so a cancelled inference can return late.
+					return inference.title.promise;
+				},
+			});
+
+			const firstPrompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/rename" }],
+			});
+			await Promise.race([inferences[0].started.promise, firstPrompt]);
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await firstPrompt).stopReason).toBe("cancelled");
+			expect(titleSignals[0]?.aborted).toBe(true);
+
+			const secondPrompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/rename" }],
+			});
+			await Promise.race([inferences[1].started.promise, secondPrompt]);
+			expect(titleSignals[1]?.aborted).toBe(false);
+			const beforeLateResult = harness.updates.length;
+
+			inferences[0].title.resolve("Cancelled title");
+			const settledByOldRename = await Promise.race([secondPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
+			expect(settledByOldRename).toBe(false);
+			expect(session.sessionManager.getSessionName()).toBe("Original title");
+			expect(
+				harness.updates
+					.slice(beforeLateResult)
+					.filter(
+						update =>
+							update.sessionId === created.sessionId &&
+							(update.update.sessionUpdate === "session_info_update" ||
+								update.update.sessionUpdate === "agent_message_chunk"),
+					),
+			).toEqual([]);
+
+			inferences[1].title.resolve("Rename cancellation isolation");
+			expect((await secondPrompt).stopReason).toBe("end_turn");
+			expect(session.sessionManager.getSessionName()).toBe("Rename cancellation isolation");
+			expect(harness.updates.slice(beforeLateResult)).toContainEqual({
+				sessionId: created.sessionId,
+				update: {
+					sessionUpdate: "session_info_update",
+					title: "Rename cancellation isolation",
+					updatedAt: expect.any(String),
+				},
+			});
+		} finally {
+			for (const inference of inferences) {
+				inference.started.resolve();
+				inference.title.resolve(null);
+			}
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("waits for cancelled persistent memory work before settling the prompt", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let receivedSignal: AbortSignal | undefined;
+		let mutated = false;
+		const backend: memoryBackend.MemoryBackend = {
+			id: "local",
+			start() {},
+			async buildDeveloperInstructions() {
+				return undefined;
+			},
+			async clear(_agentDir, _cwd, _session, signal) {
+				receivedSignal = signal;
+				started.resolve();
+				await release.promise;
+				signal?.throwIfAborted();
+				mutated = true;
+			},
+			async enqueue() {},
+		};
+		const resolveSpy = spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(backend);
+		try {
+			const beforeCancelUpdates = harness.updates.length;
+			const prompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/memory clear" }],
+			});
+			await started.promise;
+
+			const cancellation = harness.agent.cancel({ sessionId: created.sessionId });
+			expect(receivedSignal?.aborted).toBe(true);
+			const returnedBeforeOperation = await Promise.race([prompt.then(() => true), Bun.sleep(0).then(() => false)]);
+			expect(returnedBeforeOperation).toBe(false);
+			release.resolve();
+			await cancellation;
+			expect((await prompt).stopReason).toBe("cancelled");
+
+			expect(mutated).toBe(false);
+			expect(
+				harness.updates
+					.slice(beforeCancelUpdates)
+					.some(update => JSON.stringify(update).includes("Memory cleared.")),
+			).toBe(false);
+		} finally {
+			release.resolve();
+			resolveSpy.mockRestore();
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
 	});
 
 	it("closes the ACP session when cancel cleanup times out", async () => {

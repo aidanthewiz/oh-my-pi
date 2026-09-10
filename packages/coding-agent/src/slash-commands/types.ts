@@ -62,6 +62,15 @@ export interface SlashCommandRuntime {
 	sessionManager: SessionManager;
 	settings: Settings;
 	cwd: string;
+	/** Cancellation of the host prompt/request, when supported. */
+	signal?: AbortSignal;
+	/**
+	 * Keep cancellation cleanup open until a persistent operation settles.
+	 *
+	 * ACP uses this to prevent a cancelled command and its successor from
+	 * mutating the same state concurrently. Other hosts may execute directly.
+	 */
+	runCancellationBarrier?: <T>(operation: () => Promise<T>) => Promise<T>;
 	/** Emit text to the operator. TUI maps to `ctx.showStatus`, ACP to `sessionUpdate`. */
 	output: (text: string) => Promise<void> | void;
 	/** Re-advertise the available command list (no-op outside ACP). */

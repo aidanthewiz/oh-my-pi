@@ -109,6 +109,16 @@ describe("parseReportedVersion", () => {
 		expect(parseReportedVersion("omp/18.0.5")).toBe("18.0.5");
 		expect(parseReportedVersion("not a version")).toBeUndefined();
 	});
+
+	it("rejects version output from a different executable", () => {
+		expect(parseReportedVersion("node/18.0.5")).toBeUndefined();
+		expect(parseReportedVersion("codex/18.0.5")).toBeUndefined();
+	});
+
+	it("requires Coreforge provenance when validating a foreign update target", () => {
+		expect(parseReportedVersion("coreforge/18.1.15.4", "coreforge")).toBe("18.1.15.4");
+		expect(parseReportedVersion("omp/18.1.16", "coreforge")).toBeUndefined();
+	});
 });
 
 describe("update-cli libc detection", () => {
@@ -238,7 +248,12 @@ describe("update-cli install target detection", () => {
 			npmBinDir,
 		});
 
-		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
+		expect(target).toEqual({
+			method: "binary",
+			path: standalonePath,
+			replacesSymlink: false,
+			validateExistingTarget: true,
+		});
 		expect(await fs.readlink(aliasPath)).toBe(standalonePath);
 	});
 
@@ -280,7 +295,12 @@ describe("update-cli install target detection", () => {
 			allowPackageManagers: true,
 		});
 
-		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
+		expect(target).toEqual({
+			method: "binary",
+			path: standalonePath,
+			replacesSymlink: false,
+			validateExistingTarget: true,
+		});
 	});
 
 	it("resolves a foreign symlink to its real binary on a binary-only release instead of clobbering the launcher", async () => {
@@ -303,9 +323,66 @@ describe("update-cli install target detection", () => {
 			allowPackageManagers: false,
 		});
 
-		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
+		expect(target).toEqual({
+			method: "binary",
+			path: standalonePath,
+			replacesSymlink: false,
+			validateExistingTarget: true,
+		});
 		expect(await fs.readlink(launcherPath)).toBe(standalonePath);
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"refuses to overwrite a shared shebang dispatcher behind a foreign symlink",
+		async () => {
+			const dir = await makeTempDir();
+			const dispatcherPath = path.join(dir, "launch");
+			const aliasPath = path.join(dir, "omp");
+			const dispatcher = "#!/bin/sh\necho dispatcher\n";
+			await Bun.write(dispatcherPath, dispatcher);
+			await fs.chmod(dispatcherPath, 0o755);
+			await fs.symlink("launch", aliasPath);
+			const fetchImpl = vi.fn(async () => new Response());
+
+			const target = resolveUpdateTargetFromPath(aliasPath, undefined, {
+				allowPackageManagers: true,
+			});
+			if (target.method !== "binary") throw new Error("Expected binary update target");
+
+			await expect(
+				updateViaBinaryAt(target.path, "18.1.13", {
+					binaryName: "omp-linux-x64",
+					fetchImpl,
+					validateExistingTarget: target.validateExistingTarget,
+				}),
+			).rejects.toThrow(`Refusing to replace ${dispatcherPath}`);
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(await Bun.file(dispatcherPath).text()).toBe(dispatcher);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a foreign native target that does not report an OMP version",
+		async () => {
+			const dir = await makeTempDir();
+			const aliasPath = path.join(dir, "omp");
+			await fs.symlink(process.execPath, aliasPath);
+			const fetchImpl = vi.fn(async () => new Response());
+			const target = resolveUpdateTargetFromPath(aliasPath, undefined, {
+				allowPackageManagers: true,
+			});
+			if (target.method !== "binary") throw new Error("Expected binary update target");
+
+			await expect(
+				updateViaBinaryAt(target.path, "18.1.13", {
+					binaryName: "omp-linux-x64",
+					fetchImpl,
+					validateExistingTarget: target.validateExistingTarget,
+				}),
+			).rejects.toThrow("does not report a Coreforge version when run directly");
+			expect(fetchImpl).not.toHaveBeenCalled();
+		},
+	);
 
 	it("takes over a package-manager launcher in place on a binary-only release", async () => {
 		// A bun/npm-managed launcher symlinks into the manager's node_modules.
@@ -326,7 +403,12 @@ describe("update-cli install target detection", () => {
 			npmBinDir,
 		});
 
-		expect(target).toEqual({ method: "binary", path: aliasPath, replacesSymlink: true });
+		expect(target).toEqual({
+			method: "binary",
+			path: aliasPath,
+			replacesSymlink: true,
+			validateExistingTarget: false,
+		});
 	});
 
 	it("keeps a split-root Bun-linked checkout under Bun management instead of overwriting its script", async () => {
@@ -859,6 +941,39 @@ describe("update-cli release binary integrity", () => {
 		).rejects.toThrow("set GITHUB_TOKEN or run `gh auth login`");
 		expect(fetchCalls).toBe(0);
 		expect(await Bun.file(targetPath).exists()).toBe(false);
+	});
+
+	it("revalidates a foreign target under its replacement lock after download", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, binaryName);
+		await Bun.write(targetPath, "owned Coreforge binary");
+		let validations = 0;
+		const validateExistingTarget = async (pathToValidate: string) => {
+			validations++;
+			if ((await Bun.file(pathToValidate).text()) !== "owned Coreforge binary") {
+				throw new Error("target ownership changed");
+			}
+		};
+		const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
+			const requestUrl = String(input);
+			if (requestUrl.endsWith("/releases/latest")) return Response.json(releaseAsset());
+			if (requestUrl === assetApiUrl) {
+				await Bun.write(targetPath, "foreign replacement");
+				return new Response(content);
+			}
+			throw new Error(`Unexpected request: ${requestUrl}`);
+		};
+
+		await expect(
+			updateViaBinaryAt(targetPath, "17.1.2", {
+				binaryName,
+				fetchImpl,
+				validateExistingTarget,
+			}),
+		).rejects.toThrow("target ownership changed");
+		expect(validations).toBe(2);
+		expect(await Bun.file(targetPath).text()).toBe("foreign replacement");
+		expect((await fs.readdir(dir)).filter(name => name.endsWith(".new") || name.endsWith(".bak"))).toEqual([]);
 	});
 });
 

@@ -300,13 +300,16 @@ export async function buildMemoryToolDeveloperInstructions(
 /**
  * Clear all persisted memory state and generated artifacts.
  */
-export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
+export async function clearMemoryData(agentDir: string, cwd: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	try {
+		signal?.throwIfAborted();
 		clearMemoryDataInDb(db);
 	} finally {
 		closeMemoryDb(db);
 	}
+	signal?.throwIfAborted();
 	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
 }
 

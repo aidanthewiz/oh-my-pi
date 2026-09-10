@@ -10,6 +10,7 @@ import type {
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -22,6 +23,7 @@ interface FakeAcpBuiltinSession {
 	sessionFile: string | undefined;
 	sessionId: string;
 	sessionName: string;
+	titleGenerationSignal: AbortSignal;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	_switchedTo: string | undefined;
 	_movedFromEmptySessionFile: string | undefined;
@@ -77,6 +79,7 @@ function createRuntime() {
 		sessionFile: undefined,
 		sessionId: "fake-session-id",
 		sessionName: "Fake Session",
+		titleGenerationSignal: new AbortController().signal,
 		_todoPhases: [],
 		_switchedTo: undefined,
 		_movedFromEmptySessionFile: undefined,
@@ -244,6 +247,17 @@ function createRuntime() {
 }
 
 describe("ACP builtin slash commands", () => {
+	it("does not dispatch a builtin after its ACP prompt is cancelled", async () => {
+		const { runtime } = createRuntime();
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			executeAcpBuiltinSlashCommand("/extended-context on", { ...runtime, signal: controller.signal }),
+		).rejects.toThrow();
+		expect(runtime.settings.get("extendedContext")).toBe(false);
+	});
+
 	it("consumes fast status without returning prompt text", async () => {
 		const { output, runtime } = createRuntime();
 
@@ -1087,6 +1101,50 @@ describe("wave 3 commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/memory stats", runtime);
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toBe("Memory stats is not available for the local backend.");
+	});
+
+	it("forwards ACP cancellation to persistent memory operations", async () => {
+		for (const [command, operation] of [
+			["/memory clear", "clear"],
+			["/memory sync", "enqueue"],
+		] as const) {
+			const { runtime } = createRuntime();
+			const controller = new AbortController();
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let mutated = false;
+			const operationImpl = async (signal?: AbortSignal): Promise<void> => {
+				started.resolve();
+				await release.promise;
+				signal?.throwIfAborted();
+				mutated = true;
+			};
+			const backend: memoryBackend.MemoryBackend = {
+				id: "local",
+				start() {},
+				async buildDeveloperInstructions() {
+					return undefined;
+				},
+				async clear(_agentDir, _cwd, _session, signal) {
+					if (operation === "clear") await operationImpl(signal);
+				},
+				async enqueue(_agentDir, _cwd, _session, signal) {
+					if (operation === "enqueue") await operationImpl(signal);
+				},
+			};
+			const resolveSpy = spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(backend);
+			try {
+				const execution = executeAcpBuiltinSlashCommand(command, { ...runtime, signal: controller.signal });
+				await started.promise;
+				controller.abort();
+				release.resolve();
+
+				await expect(execution).rejects.toThrow();
+				expect(mutated).toBe(false);
+			} finally {
+				resolveSpy.mockRestore();
+			}
+		}
 	});
 
 	// /todo start fuzzy match

@@ -46,6 +46,25 @@ function makeBrowser(
 	return browser;
 }
 
+describe("resolveRoleAssignments", () => {
+	test("shows configured smol for an unconfigured tiny role", () => {
+		const smol = makeModel("demo", "custom-smol");
+		const priorityHead = makeModel("demo", "gemini-3.8-flash");
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: "demo/default",
+				smol: "demo/custom-smol",
+			},
+		});
+
+		const roles = resolveRoleAssignments(settings, [smol, priorityHead], [smol, priorityHead]);
+
+		expect(roles.smol?.model).toBe(smol);
+		expect(roles.tiny?.model).toBe(smol);
+		expect(roles.tiny?.autoSelected).toBe(true);
+	});
+});
+
 describe("ModelBrowser search ranking", () => {
 	test("an exact query match outranks the MRU model", () => {
 		// Regression: with gpt-5.6-sol as the active (MRU) model, typing

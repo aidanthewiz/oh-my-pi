@@ -684,13 +684,17 @@ export class MnemopiSessionState {
 	 *  automatic-retention setting.
 	 */
 	async consolidate(
-		options: { full?: boolean; extract?: boolean; sleep?: boolean; retain?: boolean } = {},
+		options: { full?: boolean; extract?: boolean; sleep?: boolean; retain?: boolean; signal?: AbortSignal } = {},
 	): Promise<void> {
+		options.signal?.throwIfAborted();
 		if (options.retain !== false) {
 			await this.forceRetainCurrentSession({ extract: options.extract });
+			options.signal?.throwIfAborted();
 		}
 		for (const memory of this.scoped.owned) {
+			options.signal?.throwIfAborted();
 			await memory.flushExtractions();
+			options.signal?.throwIfAborted();
 			if (options.sleep === false) continue;
 			if (options.full) {
 				memory.sleepAllSessions(false);

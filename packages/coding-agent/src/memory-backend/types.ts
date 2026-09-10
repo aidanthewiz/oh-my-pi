@@ -115,10 +115,10 @@ export interface MemoryBackend {
 	): Promise<string | undefined>;
 
 	/** Wipe all persisted state for this backend (slash `/memory clear`). */
-	clear(agentDir: string, cwd: string, session?: AgentSession): Promise<void>;
+	clear(agentDir: string, cwd: string, session?: AgentSession, signal?: AbortSignal): Promise<void>;
 
 	/** Force consolidation/retain to happen now (slash `/memory enqueue`). */
-	enqueue(agentDir: string, cwd: string, session?: AgentSession): Promise<void>;
+	enqueue(agentDir: string, cwd: string, session?: AgentSession, signal?: AbortSignal): Promise<void>;
 
 	/** Structured state for UI, slash commands, and extensions. */
 	status?(context: MemoryBackendOperationContext): Promise<MemoryBackendStatus>;
