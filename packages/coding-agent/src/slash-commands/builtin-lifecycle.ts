@@ -589,6 +589,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
 			const backend = await resolveMemoryBackend(runtime.settings);
+			runtime.signal?.throwIfAborted();
 			switch (verb) {
 				case "view": {
 					const payload = await backend.buildDeveloperInstructions(
@@ -601,14 +602,17 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				}
 				case "clear":
 				case "reset": {
-					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
+					runtime.signal?.throwIfAborted();
 					await runtime.session.refreshBaseSystemPrompt();
+					runtime.signal?.throwIfAborted();
 					await runtime.output("Memory cleared.");
 					return commandConsumed();
 				}
 				case "enqueue":
 				case "rebuild": {
-					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
+					runtime.signal?.throwIfAborted();
 					await runtime.output("Memory consolidation enqueued.");
 					return commandConsumed();
 				}
@@ -622,7 +626,8 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					return commandConsumed();
 				}
 				case "sync": {
-					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
+					runtime.signal?.throwIfAborted();
 					await runtime.output("Memory consolidation ran.");
 					return commandConsumed();
 				}

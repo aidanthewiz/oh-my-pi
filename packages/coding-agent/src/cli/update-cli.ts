@@ -28,6 +28,7 @@ import { CF_COMMAND, CF_VERSION, compareCfVersions } from "./cf-version";
 // [coreforge patch] REPO removed - release lookups/downloads go through
 // cf-channel.ts (Coreforce-CAD/oh-my-pi releases) instead of upstream GitHub.
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
+const COREFORGE_VERSION_PRODUCT = "coreforge";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
 const NIX_STORE_DIR = "/nix/store";
@@ -931,19 +932,24 @@ function resolveOmpPath(): string | undefined {
  * Supports three-segment upstream versions, four-segment Coreforge release
  * rolls, and prerelease suffixes without truncating the reported identity.
  */
-export function parseReportedVersion(output: string): string | undefined {
+export function parseReportedVersion(output: string, requiredProduct?: string): string | undefined {
 	const separator = output.indexOf("/");
 	if (separator < 1) return undefined;
 	const product = output.slice(0, separator);
-	if (product !== APP_NAME && product !== CF_COMMAND) return undefined;
+	if (requiredProduct ? product !== requiredProduct : product !== APP_NAME && product !== CF_COMMAND) return undefined;
 	return output.slice(separator + 1).match(/^(\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)$/)?.[1];
 }
 
-async function reportedVersionAtPath(binaryPath: string): Promise<string | undefined> {
+async function reportedVersionAtPath(binaryPath: string, requiredProduct?: string): Promise<string | undefined> {
 	try {
-		const result = await $`${binaryPath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return undefined;
-		return parseReportedVersion(result.text().trim());
+		const child = Bun.spawn([binaryPath, "--version"], {
+			env: requiredProduct ? { ...process.env, OMP_COMMAND: requiredProduct } : process.env,
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+		if (exitCode !== 0) return undefined;
+		return parseReportedVersion(output.trim(), requiredProduct);
 	} catch {
 		return undefined;
 	}
@@ -963,13 +969,13 @@ async function validateExistingUpdateTarget(targetPath: string): Promise<void> {
 		hasShebang = (await Bun.file(targetPath).slice(0, 2).text()) === "#!";
 	} catch {}
 
-	if (!hasShebang && (await reportedVersionAtPath(targetPath)) !== undefined) return;
+	if (!hasShebang && (await reportedVersionAtPath(targetPath, COREFORGE_VERSION_PRODUCT)) !== undefined) return;
 
 	const reason = hasShebang
-		? "is a shebang script, not an OMP binary"
-		: "does not report an OMP version when run directly";
+		? "is a shebang script, not a Coreforge binary"
+		: "does not report a Coreforge version when run directly";
 	throw new Error(
-		`Refusing to replace ${targetPath}: the resolved foreign symlink target ${reason}. Point PATH directly at the OMP binary you want to update, or reinstall through the Coreforge installer.`,
+		`Refusing to replace ${targetPath}: the resolved foreign symlink target ${reason}. Point PATH directly at the Coreforge binary you want to update, or reinstall through the Coreforge installer.`,
 	);
 }
 

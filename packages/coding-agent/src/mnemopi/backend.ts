@@ -150,12 +150,15 @@ export const mnemopiBackend: MemoryBackend = {
 		return await state?.beforeAgentStartPrompt(promptText);
 	},
 
-	async clear(agentDir, _cwd, session): Promise<void> {
+	async clear(agentDir, _cwd, session, signal): Promise<void> {
+		signal?.throwIfAborted();
 		const previous = session ? setMnemopiSessionState(session, undefined) : undefined;
 		await previous?.dispose({ consolidate: false });
+		signal?.throwIfAborted();
 		const config = previous?.config ?? (session ? loadMnemopiConfig(session.settings, agentDir) : undefined);
 		if (!config) return;
 		await loadMnemopiCore();
+		signal?.throwIfAborted();
 		// Close the cached default Mnemopi instance so its SQLite handle doesn't
 		// keep the DB files locked on Windows when removeDbFiles tries to delete.
 		// Use the core module (already awaited via loadMnemopiCore above):
@@ -164,18 +167,24 @@ export const mnemopiBackend: MemoryBackend = {
 		// taskDepth > 0). resetMemoryForTests is re-exported identically from core.
 		requireMnemopiCore().resetMemoryForTests();
 		await Bun.sleep(0);
+		signal?.throwIfAborted();
 		await removeDbFiles(getMnemopiScopedDbPaths(config));
+		signal?.throwIfAborted();
 		if (!session?.sessionId || previous?.aliasOf || session.settings.get("memory.backend") !== "mnemopi") return;
 		try {
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
+			signal?.throwIfAborted();
 			await installMnemopiState(session, config);
+			signal?.throwIfAborted();
 		} catch (error) {
+			signal?.throwIfAborted();
 			logger.warn("Mnemopi: clear rehydrate failed; memory backend inert.", { error: String(error) });
 		}
 	},
 
-	async enqueue(agentDir, _cwd, session): Promise<void> {
+	async enqueue(agentDir, _cwd, session, signal): Promise<void> {
 		try {
+			signal?.throwIfAborted();
 			let state = getMnemopiSessionState(session);
 			if (!state && session?.sessionId) {
 				const config = await loadMnemopiConfigWithProviders(
@@ -184,11 +193,15 @@ export const mnemopiBackend: MemoryBackend = {
 					session.modelRegistry,
 					session.sessionId,
 				);
+				signal?.throwIfAborted();
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
+				signal?.throwIfAborted();
 				state = await installMnemopiState(session, config);
 			}
-			await state?.consolidate({ full: true, retain: true });
+			await state?.consolidate({ full: true, retain: true, signal });
+			signal?.throwIfAborted();
 		} catch (error) {
+			signal?.throwIfAborted();
 			logger.warn("Mnemopi: enqueue failed.", { error: String(error) });
 		}
 	},

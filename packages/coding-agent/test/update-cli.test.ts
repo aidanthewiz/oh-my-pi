@@ -114,6 +114,11 @@ describe("parseReportedVersion", () => {
 		expect(parseReportedVersion("node/18.0.5")).toBeUndefined();
 		expect(parseReportedVersion("codex/18.0.5")).toBeUndefined();
 	});
+
+	it("requires Coreforge provenance when validating a foreign update target", () => {
+		expect(parseReportedVersion("coreforge/18.1.15.4", "coreforge")).toBe("18.1.15.4");
+		expect(parseReportedVersion("omp/18.1.16", "coreforge")).toBeUndefined();
+	});
 });
 
 describe("update-cli libc detection", () => {
@@ -374,7 +379,7 @@ describe("update-cli install target detection", () => {
 					fetchImpl,
 					validateExistingTarget: target.validateExistingTarget,
 				}),
-			).rejects.toThrow("does not report an OMP version when run directly");
+			).rejects.toThrow("does not report a Coreforge version when run directly");
 			expect(fetchImpl).not.toHaveBeenCalled();
 		},
 	);

@@ -125,11 +125,14 @@ export const sharpshooterBackend: MemoryBackend = {
 		return truncateApproxTokens(parts.join("\n\n"), settings.get("sharpshooter.injectionTokenLimit"));
 	},
 
-	async clear(agentDir, cwd): Promise<void> {
+	async clear(agentDir, cwd, _session, signal): Promise<void> {
+		signal?.throwIfAborted();
 		await rm(sharpshooterBankDir(agentDir, cwd), { recursive: true, force: true });
+		signal?.throwIfAborted();
 	},
 
-	async enqueue(agentDir, cwd, session): Promise<void> {
+	async enqueue(agentDir, cwd, session, signal): Promise<void> {
+		signal?.throwIfAborted();
 		if (!session) {
 			logger.debug("Sharpshooter: consolidation skipped without an active session.");
 			return;
@@ -141,7 +144,9 @@ export const sharpshooterBackend: MemoryBackend = {
 			modelRegistry: session.modelRegistry,
 			sessionId: session.sessionId,
 			force: true,
+			signal,
 		});
+		signal?.throwIfAborted();
 	},
 
 	async status({ agentDir, cwd }): Promise<MemoryBackendStatus> {

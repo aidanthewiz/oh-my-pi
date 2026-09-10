@@ -24,11 +24,14 @@ export const localBackend: MemoryBackend = {
 	async buildDeveloperInstructions(agentDir, settings, session) {
 		return buildMemoryToolDeveloperInstructions(agentDir, settings, session);
 	},
-	async clear(agentDir, cwd, session) {
+	async clear(agentDir, cwd, session, signal) {
+		signal?.throwIfAborted();
 		clearMemoryToolDeveloperInstructionsCache(session);
 		await clearMemoryData(agentDir, cwd);
+		signal?.throwIfAborted();
 	},
-	async enqueue(agentDir, cwd) {
+	async enqueue(agentDir, cwd, _session, signal) {
+		signal?.throwIfAborted();
 		enqueueMemoryConsolidation(agentDir, cwd);
 	},
 	async save(context, input) {

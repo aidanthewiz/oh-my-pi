@@ -6,6 +6,7 @@ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
@@ -2471,6 +2472,57 @@ describe("ACP agent", () => {
 				inference.started.resolve();
 				inference.title.resolve(null);
 			}
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("cancels persistent memory work before it can mutate state", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let receivedSignal: AbortSignal | undefined;
+		let mutated = false;
+		const backend: memoryBackend.MemoryBackend = {
+			id: "local",
+			start() {},
+			async buildDeveloperInstructions() {
+				return undefined;
+			},
+			async clear(_agentDir, _cwd, _session, signal) {
+				receivedSignal = signal;
+				started.resolve();
+				await release.promise;
+				signal?.throwIfAborted();
+				mutated = true;
+			},
+			async enqueue() {},
+		};
+		const resolveSpy = spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(backend);
+		try {
+			const beforeCancelUpdates = harness.updates.length;
+			const prompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/memory clear" }],
+			});
+			await started.promise;
+
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await prompt).stopReason).toBe("cancelled");
+			expect(receivedSignal?.aborted).toBe(true);
+			release.resolve();
+			await Bun.sleep(0);
+
+			expect(mutated).toBe(false);
+			expect(
+				harness.updates
+					.slice(beforeCancelUpdates)
+					.some(update => JSON.stringify(update).includes("Memory cleared.")),
+			).toBe(false);
+		} finally {
+			release.resolve();
+			resolveSpy.mockRestore();
 			harness.abortController.abort();
 			await Bun.sleep(0);
 		}

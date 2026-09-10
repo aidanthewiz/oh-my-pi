@@ -108,13 +108,15 @@ export const hindsightBackend: MemoryBackend = {
 		return await state.beforeAgentStartPrompt(promptText);
 	},
 
-	async clear(_agentDir, _cwd, session): Promise<void> {
+	async clear(_agentDir, _cwd, session, signal): Promise<void> {
+		signal?.throwIfAborted();
 		// Hindsight memory is server-side. The local cache is what we can wipe —
 		// operators who want to delete the upstream bank should use the Hindsight
 		// UI / `deleteBank` directly. Drain pending tool-initiated retains first
 		// so we don't lose them.
 		const state = session?.getHindsightSessionState();
 		if (state) await state.flushRetainQueue();
+		signal?.throwIfAborted();
 		const previous = session?.setHindsightSessionState(undefined);
 		previous?.dispose();
 		logger.warn(
@@ -123,12 +125,15 @@ export const hindsightBackend: MemoryBackend = {
 		);
 	},
 
-	async enqueue(_agentDir, _cwd, session): Promise<void> {
+	async enqueue(_agentDir, _cwd, session, signal): Promise<void> {
+		signal?.throwIfAborted();
 		const state = session?.getHindsightSessionState();
 		const primary = state?.aliasOf ? undefined : state;
 		if (!primary) return;
 		await primary.flushRetainQueue();
+		signal?.throwIfAborted();
 		await primary.forceRetainCurrentSession();
+		signal?.throwIfAborted();
 	},
 
 	async preCompactionContext(

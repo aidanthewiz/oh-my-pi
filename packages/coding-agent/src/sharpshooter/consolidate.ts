@@ -85,25 +85,31 @@ export async function runSharpshooterConsolidation(options: {
 	modelRegistry: ModelRegistry;
 	sessionId: string;
 	force?: boolean;
+	signal?: AbortSignal;
 }): Promise<SharpshooterConsolidationResult> {
+	options.signal?.throwIfAborted();
 	const bankDir = sharpshooterBankDir(options.agentDir, options.cwd);
 	try {
 		await fs.mkdir(bankDir, { recursive: true });
 	} catch (error) {
+		options.signal?.throwIfAborted();
 		return { ran: false, reason: "error", error: errorMessage(error) };
 	}
 
+	options.signal?.throwIfAborted();
 	let acquired = false;
 	try {
 		return await withFileLock(
 			sharpshooterLockPath(options.agentDir, options.cwd),
 			async () => {
 				acquired = true;
+				options.signal?.throwIfAborted();
 				return await consolidateLocked(options, bankDir);
 			},
 			{ retries: 1, retryDelayMs: 1 },
 		);
 	} catch (error) {
+		options.signal?.throwIfAborted();
 		if (!acquired) return { ran: false, reason: "locked" };
 		return { ran: false, reason: "error", error: errorMessage(error) };
 	}
@@ -117,10 +123,13 @@ async function consolidateLocked(
 		modelRegistry: ModelRegistry;
 		sessionId: string;
 		force?: boolean;
+		signal?: AbortSignal;
 	},
 	bankDir: string,
 ): Promise<SharpshooterConsolidationResult> {
+	options.signal?.throwIfAborted();
 	const state = await readSharpshooterState(options.agentDir, options.cwd);
+	options.signal?.throwIfAborted();
 	try {
 		const intervalMinutes = options.settings.get("sharpshooter.intervalMinutes") ?? DEFAULT_INTERVAL_MINUTES;
 		if (!options.force && Date.now() - state.lastConsolidatedAt < intervalMinutes * 60_000) {
@@ -128,19 +137,23 @@ async function consolidateLocked(
 		}
 
 		const groups = await listSharpshooterDeltas(options.agentDir, options.cwd);
+		options.signal?.throwIfAborted();
 		if (groups.length === 0) {
 			await writeSharpshooterState(options.agentDir, options.cwd, {
 				...state,
 				lastConsolidatedAt: Date.now(),
 			});
+			options.signal?.throwIfAborted();
 			return { ran: false, reason: "empty" };
 		}
 
 		const model = await resolveSharpshooterModel(options.settings, options.modelRegistry);
+		options.signal?.throwIfAborted();
 		if (!model) return { ran: false, reason: "no_model" };
 
 		const currentFiles = await readCurrentMemoryFiles(options.agentDir, options.cwd);
 		const projectDocs = await readProjectDocs(options.cwd);
+		options.signal?.throwIfAborted();
 		const sessions = renderSharpshooterSessions(groups);
 		const input = prompt.render(consolidateInputTemplate, {
 			architecture: currentFiles["architecture.md"],
@@ -167,19 +180,24 @@ async function consolidateLocked(
 					maxTokens: 8192,
 					reasoning: clampThinkingLevelForModel(model, Effort.Medium),
 					toolChoice: "required",
+					signal: options.signal,
 				},
 			),
 		);
+		options.signal?.throwIfAborted();
 		if (response.stopReason === "error") {
 			throw new Error(response.errorMessage || "sharpshooter consolidation model error");
 		}
 
 		const files = parseReplacementFiles(response.content, currentFiles);
+		options.signal?.throwIfAborted();
 		await applyReplacementFiles(bankDir, files);
+		options.signal?.throwIfAborted();
 
 		const consumedFiles = groups.flatMap(group => group.deltas.map(item => item.file));
 		const deltaCount = consumedFiles.length;
 		await consumeSharpshooterDeltas(consumedFiles);
+		options.signal?.throwIfAborted();
 		const at = Date.now();
 		await writeSharpshooterState(options.agentDir, options.cwd, {
 			v: 1,
@@ -191,8 +209,10 @@ async function consolidateLocked(
 				model: model.id,
 			},
 		});
+		options.signal?.throwIfAborted();
 		return { ran: true, sessions: groups.length, deltas: deltaCount };
 	} catch (error) {
+		options.signal?.throwIfAborted();
 		const message = errorMessage(error);
 		await recordConsolidationError(options.agentDir, options.cwd, state, message);
 		return { ran: false, reason: "error", error: message };
