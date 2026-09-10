@@ -23,7 +23,7 @@ import {
 } from "../utils/fetch-timeout";
 import type { CfFetchOptions, CfRelease } from "./cf-channel";
 import { CF_ENGINE_RELEASE_REPO, fetchCfAsset, fetchCfLatestRelease } from "./cf-channel";
-import { CF_VERSION, compareCfVersions } from "./cf-version";
+import { CF_COMMAND, CF_VERSION, compareCfVersions } from "./cf-version";
 
 // [coreforge patch] REPO removed - release lookups/downloads go through
 // cf-channel.ts (Coreforce-CAD/oh-my-pi releases) instead of upstream GitHub.
@@ -458,7 +458,7 @@ type UpdateTarget =
 	| { method: "nix" }
 	| { method: "bun"; path?: string }
 	| { method: "npm"; path?: string }
-	| { method: "binary"; path: string; replacesSymlink: boolean };
+	| { method: "binary"; path: string; replacesSymlink: boolean; validateExistingTarget: boolean };
 
 function resolveUpdateMethod(
 	ompPath: string,
@@ -583,7 +583,12 @@ export function resolveUpdateTargetFromPath(
 				ompLinkTarget,
 			}) !== "binary";
 		const binaryPath = ompIsSymlink && !managerLauncher ? (ompRealpath ?? ompPath) : ompPath;
-		return { method, path: binaryPath, replacesSymlink: ompIsSymlink && binaryPath === ompPath };
+		return {
+			method,
+			path: binaryPath,
+			replacesSymlink: ompIsSymlink && binaryPath === ompPath,
+			validateExistingTarget: ompIsSymlink && !managerLauncher,
+		};
 	}
 	if (method === "bun" || method === "npm") return { method, path: ompPath };
 	return { method };
@@ -927,21 +932,45 @@ function resolveOmpPath(): string | undefined {
  * rolls, and prerelease suffixes without truncating the reported identity.
  */
 export function parseReportedVersion(output: string): string | undefined {
-	return output.match(/\/(\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)/)?.[1];
+	const separator = output.indexOf("/");
+	if (separator < 1) return undefined;
+	const product = output.slice(0, separator);
+	if (product !== APP_NAME && product !== CF_COMMAND) return undefined;
+	return output.slice(separator + 1).match(/^(\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)$/)?.[1];
+}
+
+async function reportedVersionAtPath(binaryPath: string): Promise<string | undefined> {
+	try {
+		const result = await $`${binaryPath} --version`.quiet().nothrow();
+		if (result.exitCode !== 0) return undefined;
+		return parseReportedVersion(result.text().trim());
+	} catch {
+		return undefined;
+	}
 }
 
 /**
  * Run a specific binary and check if it reports the expected version.
  */
 async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): Promise<InstalledVersionVerification> {
+	const actual = await reportedVersionAtPath(binaryPath);
+	return { ok: actual === expectedVersion, actual, path: binaryPath };
+}
+
+async function validateExistingUpdateTarget(targetPath: string): Promise<void> {
+	let hasShebang = false;
 	try {
-		const result = await $`${binaryPath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return { ok: false, path: binaryPath };
-		const actual = parseReportedVersion(result.text().trim());
-		return { ok: actual === expectedVersion, actual, path: binaryPath };
-	} catch {
-		return { ok: false, path: binaryPath };
-	}
+		hasShebang = (await Bun.file(targetPath).slice(0, 2).text()) === "#!";
+	} catch {}
+
+	if (!hasShebang && (await reportedVersionAtPath(targetPath)) !== undefined) return;
+
+	const reason = hasShebang
+		? "is a shebang script, not an OMP binary"
+		: "does not report an OMP version when run directly";
+	throw new Error(
+		`Refusing to replace ${targetPath}: the resolved foreign symlink target ${reason}. Point PATH directly at the OMP binary you want to update, or reinstall through the Coreforge installer.`,
+	);
 }
 
 /**
@@ -950,12 +979,14 @@ async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): 
 async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
 	const ompPath = resolveOmpPath();
 	if (!ompPath) return { ok: false };
-	return await verifyBinaryAtPath(ompPath, expectedVersion);
+	const binaryPath = tryRealpath(ompPath) ?? ompPath;
+	return await verifyBinaryAtPath(binaryPath, expectedVersion);
 }
 
-function printVerifiedVersion(expectedVersion: string): void {
+function printVerifiedVersion(expectedVersion: string, binaryPath?: string): void {
 	const icon = theme?.status?.success ?? "✔";
-	console.log(chalk.green(`\n${icon} Updated to ${expectedVersion}`));
+	const location = binaryPath ? ` at ${binaryPath}` : "";
+	console.log(chalk.green(`\n${icon} Updated to ${expectedVersion}${location}`));
 }
 
 function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
@@ -1256,9 +1287,12 @@ export async function updateViaBinaryAt(
 		fetchImpl?: Fetch;
 		githubToken?: string;
 		allowPrerelease?: boolean;
+		/** Refuse replacement unless the existing path is a non-script OMP executable. */
+		validateExistingTarget?: boolean;
 		verifyInstalledVersion?: typeof verifyInstalledVersion;
 	} = {},
 ): Promise<void> {
+	if (options.validateExistingTarget) await validateExistingUpdateTarget(targetPath);
 	const binaryName = options.binaryName ?? getBinaryName();
 	// Unique per attempt so two overlapping `omp update` runs never share a temp
 	// or backup path. A fixed temp name (`<binary>.new`) let the second run's
@@ -1279,14 +1313,14 @@ export async function updateViaBinaryAt(
 	// overlapping `omp update` runs never replace the same binary concurrently
 	// or reclaim each other's live backup/temp files. The download above writes
 	// to a unique temp path and is safe to overlap; only the swap is shared.
-	await withFileLock(targetPath, async () => {
+	const verification = await withFileLock(targetPath, async () => {
 		console.log(chalk.dim("Installing update..."));
-		await replaceBinaryForUpdate({
+		const result = await replaceBinaryForUpdate({
 			targetPath,
 			tempPath,
 			backupPath,
 			expectedVersion,
-			verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
+			verifyInstalledVersion: options.verifyInstalledVersion ?? (version => verifyBinaryAtPath(targetPath, version)),
 		});
 		// The launcher is no longer bun-managed: drop bun's metadata sidecar so
 		// the next update classifies this install as a standalone binary instead
@@ -1300,9 +1334,9 @@ export async function updateViaBinaryAt(
 		} catch {}
 		// Reclaim backups from earlier updates whose owning process has since exited.
 		await sweepStaleUpdateArtifacts(targetPath);
+		return result;
 	});
-
-	printVerifiedVersion(expectedVersion);
+	printVerifiedVersion(expectedVersion, verification.path ?? targetPath);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
@@ -1351,7 +1385,9 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 					"coreforge updates only manage the compiled binary - reinstall via the coreforge installer",
 			);
 		}
-		await updateViaBinaryAt(target.path, release.version);
+		await updateViaBinaryAt(target.path, release.version, {
+			validateExistingTarget: target.validateExistingTarget,
+		});
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
 		process.exit(1);

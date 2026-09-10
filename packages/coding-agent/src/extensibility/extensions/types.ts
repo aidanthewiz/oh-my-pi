@@ -485,6 +485,14 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/**
+	 * Whether the current project/workspace is trusted. OMP performs no
+	 * project-trust gating — project-level settings and extensions load
+	 * unconditionally — so this always returns `true`. Exposed for
+	 * compatibility with extensions authored against upstream Pi, whose
+	 * `SettingsManager` accepts a `projectTrusted` flag.
+	 */
+	isProjectTrusted(): boolean;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
 	/** Structured memory runtime for status/search/save across the configured backend. */
@@ -522,21 +530,6 @@ export interface ExtensionContext {
 		params: Record<string, unknown>,
 		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
 	): Promise<AgentToolResult<TDetails>>;
-
-	/**
-	 * Whether project-local inputs for the current working directory (extensions, settings,
-	 * skills, resources) are trusted. Upstream `@earendil-works/pi-coding-agent` (>=0.79) asks the
-	 * user once per directory before loading project-local inputs and exposes the saved decision
-	 * here; extensions written against that API (e.g. Plannotator) feature-detect this method to
-	 * decide whether project-local config is safe to load, and warn when it is absent.
-	 *
-	 * OMP has no equivalent per-directory trust gate: `.omp/extensions`, `.omp/config.yml`, and
-	 * other project-local inputs are already discovered and loaded unconditionally (see
-	 * `docs/extension-loading.md`). This method exists for compatibility with that upstream surface
-	 * and always returns `true`, truthfully reflecting that OMP already trusts project-local inputs
-	 * by default -- it does not narrow or widen OMP's own security model.
-	 */
-	isProjectTrusted(): boolean;
 }
 
 /**
