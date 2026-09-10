@@ -248,6 +248,7 @@ export interface BinaryReplacementOptions {
 	backupPath: string;
 	expectedVersion: string;
 	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+	validateExistingTarget?: () => Promise<void>;
 }
 
 /**
@@ -1088,6 +1089,7 @@ export async function sweepStaleUpdateArtifacts(targetPath: string): Promise<voi
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
 	let backupReady = false;
 	try {
+		await options.validateExistingTarget?.();
 		// `backupPath` is unique per attempt (see updateViaBinaryAt), so this rename
 		// never has to overwrite — or unlink — a possibly-locked leftover from an
 		// earlier run. Renaming the running executable itself is permitted on
@@ -1293,12 +1295,19 @@ export async function updateViaBinaryAt(
 		fetchImpl?: Fetch;
 		githubToken?: string;
 		allowPrerelease?: boolean;
-		/** Refuse replacement unless the existing path is a non-script OMP executable. */
-		validateExistingTarget?: boolean;
+		/** Refuse replacement unless the existing path passes Coreforge ownership validation. */
+		validateExistingTarget?: boolean | ((targetPath: string) => Promise<void>);
 		verifyInstalledVersion?: typeof verifyInstalledVersion;
 	} = {},
 ): Promise<void> {
-	if (options.validateExistingTarget) await validateExistingUpdateTarget(targetPath);
+	const requestedValidator = options.validateExistingTarget;
+	const validateExistingTarget =
+		typeof requestedValidator === "function"
+			? () => requestedValidator(targetPath)
+			: requestedValidator
+				? () => validateExistingUpdateTarget(targetPath)
+				: undefined;
+	await validateExistingTarget?.();
 	const binaryName = options.binaryName ?? getBinaryName();
 	// Unique per attempt so two overlapping `omp update` runs never share a temp
 	// or backup path. A fixed temp name (`<binary>.new`) let the second run's
@@ -1326,6 +1335,7 @@ export async function updateViaBinaryAt(
 			tempPath,
 			backupPath,
 			expectedVersion,
+			validateExistingTarget,
 			verifyInstalledVersion: options.verifyInstalledVersion ?? (version => verifyBinaryAtPath(targetPath, version)),
 		});
 		// The launcher is no longer bun-managed: drop bun's metadata sidecar so

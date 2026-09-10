@@ -942,6 +942,39 @@ describe("update-cli release binary integrity", () => {
 		expect(fetchCalls).toBe(0);
 		expect(await Bun.file(targetPath).exists()).toBe(false);
 	});
+
+	it("revalidates a foreign target under its replacement lock after download", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, binaryName);
+		await Bun.write(targetPath, "owned Coreforge binary");
+		let validations = 0;
+		const validateExistingTarget = async (pathToValidate: string) => {
+			validations++;
+			if ((await Bun.file(pathToValidate).text()) !== "owned Coreforge binary") {
+				throw new Error("target ownership changed");
+			}
+		};
+		const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
+			const requestUrl = String(input);
+			if (requestUrl.endsWith("/releases/latest")) return Response.json(releaseAsset());
+			if (requestUrl === assetApiUrl) {
+				await Bun.write(targetPath, "foreign replacement");
+				return new Response(content);
+			}
+			throw new Error(`Unexpected request: ${requestUrl}`);
+		};
+
+		await expect(
+			updateViaBinaryAt(targetPath, "17.1.2", {
+				binaryName,
+				fetchImpl,
+				validateExistingTarget,
+			}),
+		).rejects.toThrow("target ownership changed");
+		expect(validations).toBe(2);
+		expect(await Bun.file(targetPath).text()).toBe("foreign replacement");
+		expect((await fs.readdir(dir)).filter(name => name.endsWith(".new") || name.endsWith(".bak"))).toEqual([]);
+	});
 });
 
 describe("update-cli binary replacement", () => {
