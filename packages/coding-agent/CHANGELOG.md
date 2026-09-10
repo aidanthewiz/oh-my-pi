@@ -5,6 +5,7 @@
 ### Fixed
 
 - Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once. Bash retains the reviewed execution route and shell through startup, and route or shell changes require a fresh safety review.
+- Destructive Command Guard now fails closed on unexpected stderr and on child processes that keep output pipes open past the bounded post-exit drain window.
 
 ## [18.1.15] - 2026-09-08
 
