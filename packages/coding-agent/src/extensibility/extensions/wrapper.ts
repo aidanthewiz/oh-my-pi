@@ -23,7 +23,7 @@ import {
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
-import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
+import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
@@ -164,6 +164,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
+		private resolveToolByName?: (name: string) => AgentTool | undefined,
 	) {
 		applyToolProxy(tool, this);
 	}
@@ -217,6 +218,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						type: "tool_call",
 						toolName: this.tool.name,
 						toolCallId,
+						...mcpToolEventIdentity(this.tool, toolEventArgs(params, context), this.resolveToolByName),
 						input: normalizeToolEventInput(
 							this.tool.name,
 							resolveToolEventInput(this.tool, toolEventArgs(params, context)),
@@ -394,6 +396,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
+		// Registry entries can change while the tool runs; preserve the identity selected for this execution.
+		const resultMcpIdentity = this.runner.hasHandlers("tool_result")
+			? mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context), this.resolveToolByName)
+			: null;
+
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
@@ -417,11 +424,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status
-		if (this.runner.hasHandlers("tool_result")) {
+		if (resultMcpIdentity) {
 			const resultResult = await this.runner.emitToolResult({
 				type: "tool_result",
 				toolName: this.tool.name,
 				toolCallId,
+				...resultMcpIdentity,
 				input: normalizeToolEventInput(
 					this.tool.name,
 					resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),

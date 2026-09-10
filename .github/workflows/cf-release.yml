@@ -4,8 +4,9 @@
 # packages/coding-agent/src/cli/cf-channel.ts) pulls from these releases.
 # Coreforge appliances install the exact release selected by `engine.lock`.
 #
-# Trigger: a coreforge branch update associated with a merged pull request
-# allocates the next `v<upstream>.<roll>` tag and publishes that exact commit.
+# Trigger: coreforge branch updates associated with merged pull requests build
+# the latest tip. Newer merges cancel superseded per-target builds before the
+# winning run allocates the next `v<upstream>.<roll>` tag and publishes it.
 # Direct branch updates do not publish; a manually pushed four-segment tag
 # remains the recovery path. The first three segments MUST match
 # packages/coding-agent/package.json; the fourth is the Coreforge patch roll.
@@ -39,9 +40,8 @@ permissions:
   contents: read
   pull-requests: read
 
-concurrency:
-  group: cf-release
-  cancel-in-progress: false
+# Cancel superseded builds per target. Serialize publication so a later merge
+# cannot interrupt tag creation or asset upload.
 
 jobs:
   prepare:
@@ -143,6 +143,9 @@ jobs:
   build:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
+    concurrency:
+      group: cf-release-build-${{ matrix.target }}
+      cancel-in-progress: true
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
@@ -386,6 +389,9 @@ jobs:
       contents: write
     needs: [prepare, build]
     if: needs.prepare.outputs.should_release == 'true'
+    concurrency:
+      group: cf-release-publish
+      cancel-in-progress: false
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     runs-on: ubuntu-24.04
@@ -425,6 +431,7 @@ jobs:
             release-assets/coreforge-pi-natives-*.tgz \
             release-assets/coreforge-browser-relay-extension.zip
       - name: Generate release notes
+        # Floor at the latest published release so canceled candidates remain in the combined notes.
         env:
           GH_TOKEN: ${{ github.token }}
         run: bun scripts/cf-release-notes.ts "$RELEASE_TAG" release-notes.md
