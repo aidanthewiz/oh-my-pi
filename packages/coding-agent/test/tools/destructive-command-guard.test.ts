@@ -115,6 +115,7 @@ describe("Destructive Command Guard enforcement", () => {
 			{ exitCode: 0, stdout: output("ask"), stderr: "" },
 			{ exitCode: 1, stdout: output("allow"), stderr: "" },
 			{ exitCode: 0, stdout: "[]", stderr: "" },
+			{ exitCode: 0, stdout: output("allow"), stderr: "unexpected diagnostic" },
 		];
 
 		for (const result of cases) {
@@ -183,6 +184,30 @@ describe("Destructive Command Guard enforcement", () => {
 					timeoutMs: 100,
 				}),
 			).rejects.toThrow(/Command blocked because Destructive Command Guard could not verify safety/u);
+			expect(Date.now() - startedAt).toBeLessThan(1_500);
+		},
+		3_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"fails closed without waiting for inherited pipes after DCG exits",
+		async () => {
+			const script = `#!/bin/sh
+(sleep 5) &
+printf '%s\\n' '{"decision":"allow"}'
+exit 0
+`;
+			fs.writeFileSync(env.OMP_DCG_PATH, script, { mode: 0o755 });
+			fs.chmodSync(env.OMP_DCG_PATH, 0o755);
+			env.OMP_DCG_BINARY_SHA256 = createHash("sha256").update(script).digest("hex");
+
+			const startedAt = Date.now();
+			await expect(
+				enforceDestructiveCommandGuard("git status", tempDir, "posix", undefined, {
+					env,
+					timeoutMs: 5_000,
+				}),
+			).rejects.toThrow("dcg pipes exceeded the 250ms post-exit drain grace");
 			expect(Date.now() - startedAt).toBeLessThan(1_500);
 		},
 		3_000,

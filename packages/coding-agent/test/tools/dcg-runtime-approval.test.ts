@@ -8,6 +8,7 @@ import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
@@ -102,6 +103,24 @@ process.exit(1);
 		} as unknown as ExtensionRunner;
 	}
 
+	function headlessUi(): NonNullable<AgentToolContext["ui"]> {
+		return {
+			custom<T>(factory: (...args: unknown[]) => unknown): Promise<T> {
+				return new Promise<T>(resolve => {
+					factory(
+						{
+							terminal: { columns: 80, rows: 24 },
+							requestRender() {},
+						},
+						{},
+						{},
+						resolve,
+					);
+				});
+			},
+		} as unknown as NonNullable<AgentToolContext["ui"]>;
+	}
+
 	it("selects the configured shell dialect for local PTY execution", async () => {
 		for (const [shellName, dialect] of [
 			["cmd.exe", "cmd"],
@@ -134,6 +153,133 @@ process.exit(1);
 			);
 			expect(approval?.prompt).toContain("strict_git:worktree-remove");
 		}
+	});
+
+	it("invalidates approval when the client terminal route changes before execution", async () => {
+		const shellDir = path.join(tempDir, "route-change-shell");
+		fs.mkdirSync(shellDir);
+		const shellPath = path.join(shellDir, "cmd.exe");
+		fs.writeFileSync(shellPath, "#!/bin/sh\n", { mode: 0o755 });
+		const routeSettings = Settings.isolated({
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bashInterceptor.enabled": false,
+			shellPath,
+			"tools.approvalMode": "yolo",
+		});
+		let clientBridge: ClientBridge | undefined = {
+			capabilities: { terminal: true },
+			createTerminal: async () => {
+				throw new Error("reviewed client terminal must not be reached after its route changes");
+			},
+		};
+		const marker = path.join(tempDir, "route-change-executed");
+		const routeSession = {
+			cwd: tempDir,
+			hasUI: false,
+			settings: routeSettings,
+			skills: [],
+			getClientBridge: () => clientBridge,
+			getSessionFile: () => null,
+			getSessionId: () => "dcg-route-change-test",
+			getArtifactsDir: () => path.join(tempDir, "artifacts"),
+		} as unknown as ToolSession;
+		const routeTool = new BashTool(routeSession);
+		const args: BashToolInput = {
+			command: `printf expected-cmd > '${marker}'`,
+			cwd: tempDir,
+		};
+		const toolCallId = "dcg-route-change-call";
+
+		const approval = await routeTool.prepareRuntimeApproval(toolCallId, args);
+		expect(approval?.prompt).toContain("strict_git:worktree-remove");
+		routeTool.approveRuntimeApproval(toolCallId, args);
+		clientBridge = undefined;
+
+		await expect(routeTool.execute(toolCallId, args)).rejects.toThrow(
+			"Bash execution route or shell changed after safety review",
+		);
+		expect(fs.existsSync(marker)).toBeFalse();
+	});
+
+	it("invalidates approval when the client terminal shell changes before execution", async () => {
+		const shellDir = path.join(tempDir, "settings-change-shell");
+		fs.mkdirSync(shellDir);
+		const cmdPath = path.join(shellDir, "cmd.exe");
+		const psPath = path.join(shellDir, "pwsh");
+		fs.writeFileSync(cmdPath, "#!/bin/sh\n", { mode: 0o755 });
+		fs.writeFileSync(psPath, "#!/bin/sh\n", { mode: 0o755 });
+		const routeSettings = Settings.isolated({
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bashInterceptor.enabled": false,
+			shellPath: cmdPath,
+			"tools.approvalMode": "yolo",
+		});
+		const clientBridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => {
+				throw new Error("reviewed client terminal must not start with a different shell");
+			},
+		};
+		const routeSession = {
+			cwd: tempDir,
+			hasUI: false,
+			settings: routeSettings,
+			skills: [],
+			getClientBridge: () => clientBridge,
+			getSessionFile: () => null,
+			getSessionId: () => "dcg-shell-change-test",
+			getArtifactsDir: () => path.join(tempDir, "artifacts"),
+		} as unknown as ToolSession;
+		const routeTool = new BashTool(routeSession);
+		const args: BashToolInput = { command: "printf expected-cmd", cwd: tempDir };
+		const toolCallId = "dcg-shell-change-call";
+
+		const approval = await routeTool.prepareRuntimeApproval(toolCallId, args);
+		expect(approval?.prompt).toContain("strict_git:worktree-remove");
+		routeTool.approveRuntimeApproval(toolCallId, args);
+		routeSettings.override("shellPath", psPath);
+
+		await expect(routeTool.execute(toolCallId, args)).rejects.toThrow(
+			"Bash execution route or shell changed after safety review",
+		);
+	});
+
+	it("starts a local PTY with the isolated session shell reviewed by DCG", async () => {
+		const marker = path.join(tempDir, "prepared-pty-shell");
+		const shellDir = path.join(tempDir, "isolated-pty-shell");
+		fs.mkdirSync(shellDir);
+		const shellPath = path.join(shellDir, "pwsh");
+		fs.writeFileSync(shellPath, `#!/bin/sh\nprintf prepared > '${marker}'\nexit 0\n`, { mode: 0o755 });
+		const routeSettings = Settings.isolated({
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bashInterceptor.enabled": false,
+			shellPath,
+			"tools.approvalMode": "yolo",
+		});
+		const routeSession = {
+			cwd: tempDir,
+			hasUI: true,
+			settings: routeSettings,
+			skills: [],
+			getSessionFile: () => null,
+			getSessionId: () => "dcg-isolated-pty-test",
+			getArtifactsDir: () => path.join(tempDir, "artifacts"),
+		} as unknown as ToolSession;
+		const routeTool = new BashTool(routeSession);
+		const ui = headlessUi();
+		const context = { hasUI: true, ui } as AgentToolContext;
+		const args: BashToolInput = { command: "printf expected-ps", cwd: tempDir, pty: true };
+		const toolCallId = "dcg-isolated-pty-call";
+
+		const approval = await routeTool.prepareRuntimeApproval(toolCallId, args, undefined, context);
+		expect(approval?.prompt).toContain("strict_git:worktree-remove");
+		routeTool.approveRuntimeApproval(toolCallId, args);
+		await routeTool.execute(toolCallId, args, undefined, undefined, context);
+
+		expect(fs.readFileSync(marker, "utf8")).toBe("prepared");
 	});
 
 	it("uses the native approval selector, notifies the terminal, and executes only after approval", async () => {

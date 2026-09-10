@@ -377,6 +377,10 @@ export async function enforceDestructiveCommandGuard(
 		signal,
 		timeoutMs: Math.max(1, runtime.timeoutMs ?? DCG_PROCESS_TIMEOUT_MS),
 	});
+	const stderr = result.stderr.trim();
+	if (stderr) {
+		throw safetyFailure(`dcg wrote unexpected stderr (${stderr.slice(0, 500)})`);
+	}
 	const output = parseOutput(result);
 
 	if (result.exitCode === 0 && output.decision === "allow") {

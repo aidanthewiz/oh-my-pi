@@ -322,6 +322,7 @@ export async function runInteractiveBashPty(
 	options: {
 		command: string;
 		cwd: string;
+		shell: string;
 		timeoutMs?: number;
 		signal?: AbortSignal;
 		env?: Record<string, string>;
@@ -332,7 +333,7 @@ export async function runInteractiveBashPty(
 	const settings = await Settings.init();
 	// Load the xterm Terminal ctor here (async boundary) — the ui.custom factory below is sync.
 	const XtermTerminal = await loadXtermTerminal();
-	const { shell: resolvedShell } = settings.getShellConfig();
+	const resolvedShell = options.shell;
 	const graphics = new TerminalGraphicsDecoder();
 	const sink = new OutputSink({
 		artifactPath: options.artifactPath,
