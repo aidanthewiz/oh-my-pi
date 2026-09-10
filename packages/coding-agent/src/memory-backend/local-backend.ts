@@ -27,8 +27,7 @@ export const localBackend: MemoryBackend = {
 	async clear(agentDir, cwd, session, signal) {
 		signal?.throwIfAborted();
 		clearMemoryToolDeveloperInstructionsCache(session);
-		await clearMemoryData(agentDir, cwd);
-		signal?.throwIfAborted();
+		await clearMemoryData(agentDir, cwd, signal);
 	},
 	async enqueue(agentDir, cwd, _session, signal) {
 		signal?.throwIfAborted();

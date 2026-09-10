@@ -2477,7 +2477,7 @@ describe("ACP agent", () => {
 		}
 	});
 
-	it("cancels persistent memory work before it can mutate state", async () => {
+	it("waits for cancelled persistent memory work before settling the prompt", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const started = Promise.withResolvers<void>();
@@ -2508,11 +2508,13 @@ describe("ACP agent", () => {
 			});
 			await started.promise;
 
-			await harness.agent.cancel({ sessionId: created.sessionId });
-			expect((await prompt).stopReason).toBe("cancelled");
+			const cancellation = harness.agent.cancel({ sessionId: created.sessionId });
 			expect(receivedSignal?.aborted).toBe(true);
+			const returnedBeforeOperation = await Promise.race([prompt.then(() => true), Bun.sleep(0).then(() => false)]);
+			expect(returnedBeforeOperation).toBe(false);
 			release.resolve();
-			await Bun.sleep(0);
+			await cancellation;
+			expect((await prompt).stopReason).toBe("cancelled");
 
 			expect(mutated).toBe(false);
 			expect(

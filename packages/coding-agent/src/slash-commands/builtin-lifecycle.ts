@@ -90,6 +90,10 @@ async function fatalMoveFailure(text: string, runtime: SlashCommandRuntime): Pro
 	return commandConsumed();
 }
 
+function runCancellationBarrier<T>(runtime: SlashCommandRuntime, operation: () => Promise<T>): Promise<T> {
+	return runtime.runCancellationBarrier?.(operation) ?? operation();
+}
+
 /**
  * Relocate the headless session to `resolvedPath` (an existing directory):
  * flush settings, move the session file, re-scope the process, rolling back
@@ -601,21 +605,20 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					return commandConsumed();
 				}
 				case "clear":
-				case "reset": {
-					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
-					runtime.signal?.throwIfAborted();
-					await runtime.session.refreshBaseSystemPrompt();
-					runtime.signal?.throwIfAborted();
-					await runtime.output("Memory cleared.");
-					return commandConsumed();
-				}
+				case "reset":
+					return runCancellationBarrier(runtime, async () => {
+						await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
+						await runtime.session.refreshBaseSystemPrompt();
+						await runtime.output("Memory cleared.");
+						return commandConsumed();
+					});
 				case "enqueue":
-				case "rebuild": {
-					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
-					runtime.signal?.throwIfAborted();
-					await runtime.output("Memory consolidation enqueued.");
-					return commandConsumed();
-				}
+				case "rebuild":
+					return runCancellationBarrier(runtime, async () => {
+						await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
+						await runtime.output("Memory consolidation enqueued.");
+						return commandConsumed();
+					});
 				case "queue": {
 					const payload = await backend.queuePreview?.({
 						agentDir: runtime.settings.getAgentDir(),
@@ -625,12 +628,12 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					await runtime.output(payload ?? `Memory queue is not available for the ${backend.id} backend.`);
 					return commandConsumed();
 				}
-				case "sync": {
-					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
-					runtime.signal?.throwIfAborted();
-					await runtime.output("Memory consolidation ran.");
-					return commandConsumed();
-				}
+				case "sync":
+					return runCancellationBarrier(runtime, async () => {
+						await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session, runtime.signal);
+						await runtime.output("Memory consolidation ran.");
+						return commandConsumed();
+					});
 				case "stats":
 				case "diagnose": {
 					const hook = verb === "stats" ? backend.stats : backend.diagnose;

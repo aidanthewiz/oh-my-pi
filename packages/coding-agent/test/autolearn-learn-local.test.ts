@@ -198,6 +198,19 @@ describe("learned-lesson read-back", () => {
 		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session)).toBeUndefined();
 	});
 
+	it("preserves local memory when clear is cancelled before its destructive phase", async () => {
+		const settings = Settings.isolated({ "memory.backend": "local" });
+		const session = sessionWithFile("session-cancel-clear.jsonl");
+		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Preserved lesson" });
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			localBackend.clear(agentDir, settings.getCwd(), session as unknown as AgentSession, controller.signal),
+		).rejects.toThrow();
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session)).toContain("Preserved lesson");
+	});
+
 	it("uses the pre-session learned snapshot when startup refresh has no session cache yet", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Prior-session lesson" });

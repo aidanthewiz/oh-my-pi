@@ -147,6 +147,8 @@ type PromptTurnState = {
 	 * "turn in flight" predicate (`isPromptTurnInFlight`) every consumer gates on.
 	 */
 	cleanup: Promise<void> | undefined;
+	/** Persistent builtin work that cancellation must not outlive. */
+	cancellationBarrier: Promise<void> | undefined;
 	usageBaseline: UsageStatistics;
 	unsubscribe: (() => void) | undefined;
 	resolve: (value: PromptResponse) => void;
@@ -859,14 +861,16 @@ export class AcpAgent implements Agent {
 				settled: false,
 				errorTextDelivery: undefined,
 				cleanup: undefined,
+				cancellationBarrier: undefined,
 				usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 				unsubscribe: undefined,
 				resolve: pendingPrompt.resolve,
 				reject: pendingPrompt.reject,
 				promise: pendingPrompt.promise,
 			};
+			const promptTurn = record.promptTurn;
 
-			record.promptTurn.unsubscribe = record.session.subscribe(event => {
+			promptTurn.unsubscribe = record.session.subscribe(event => {
 				this.#trackPromptEvent(record, event);
 			});
 
@@ -875,6 +879,7 @@ export class AcpAgent implements Agent {
 			// guard. Type that failure for the wire instead of letting transport.ts wrap
 			// it as a generic -32603 internal error.
 			this.#runPromptOrCommand(record, converted.text, converted.images).catch((error: unknown) => {
+				if (promptTurn.cancelRequested) return;
 				this.#finishPrompt(
 					record,
 					undefined,
@@ -966,6 +971,7 @@ export class AcpAgent implements Agent {
 		if (skillResult || promptTurn?.cancelRequested) {
 			return;
 		}
+		let persistentOperationCompleted = false;
 
 		const builtinResult = await executeAcpBuiltinSlashCommand(text, {
 			session: record.session,
@@ -973,6 +979,23 @@ export class AcpAgent implements Agent {
 			settings: record.session.settings,
 			cwd: record.session.sessionManager.getCwd(),
 			signal: promptTurn?.abortController.signal,
+			runCancellationBarrier: async operation => {
+				const task = operation();
+				const barrier = task.then(
+					() => undefined,
+					() => undefined,
+				);
+				if (promptTurn) promptTurn.cancellationBarrier = barrier;
+				try {
+					const result = await task;
+					persistentOperationCompleted = true;
+					return result;
+				} finally {
+					if (promptTurn?.cancellationBarrier === barrier) {
+						promptTurn.cancellationBarrier = undefined;
+					}
+				}
+			},
 			output: output => this.#emitCommandOutput(record, output),
 			refreshCommands: () => this.#emitAvailableCommandsUpdate(record),
 			reloadPlugins: () => this.#reloadPluginState(record),
@@ -1000,9 +1023,10 @@ export class AcpAgent implements Agent {
 				await this.#pushConfigOptionUpdate(record);
 			},
 		});
-		if (promptTurn?.cancelRequested) return;
+		if (promptTurn?.cancelRequested && !persistentOperationCompleted) return;
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
+				if (promptTurn?.cancelRequested) return;
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
 				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, { images });
 				// A residual prompt can itself resolve locally (extension command,
@@ -1028,6 +1052,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
+		if (promptTurn?.cancelRequested) return;
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
 		const agentInvoked = await record.session.prompt(text, { images });
 		// Extension and custom-TS commands are handled locally inside session.prompt().
@@ -1084,11 +1109,10 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Transition a still-running turn into cancellation: mark intent, drop the live-event
-	 * subscription, start the bounded `abort()` race, and resolve the ACP prompt response
-	 * with `stopReason: "cancelled"` so the client sees acceptance immediately. The
-	 * returned promise is the cleanup barrier — it resolves when `abort()` completes and
-	 * rejects when the timeout fires. Idempotent: a second call returns the same barrier.
+	 * Transition a still-running turn into cancellation. Ordinary model turns
+	 * report cancellation immediately while their bounded abort cleanup keeps
+	 * the turn slot occupied. Persistent builtins report only after their
+	 * operation settles, so a successor cannot race late state mutation.
 	 */
 	#beginCancelCleanup(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<void> {
 		if (promptTurn.cleanup) {
@@ -1097,30 +1121,43 @@ export class AcpAgent implements Agent {
 		promptTurn.cancelRequested = true;
 		promptTurn.abortController.abort();
 		promptTurn.unsubscribe?.();
-		const cleanup = this.#runCancelCleanup(record, promptTurn);
-		promptTurn.cleanup = cleanup;
-		this.#finishPrompt(record, {
-			stopReason: "cancelled",
-			usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-		});
-		return cleanup;
-	}
-
-	async #runCancelCleanup(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<void> {
-		let timer: NodeJS.Timeout | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new Error("ACP cancel cleanup timed out")), this.#cancelCleanupTimeoutMs);
-		});
-		try {
-			await Promise.race([record.session.abort({ reason: USER_INTERRUPT_LABEL }), timeout]);
-		} finally {
-			if (timer) clearTimeout(timer);
-			// Order matters: clear `cleanup` before evicting the slot so the slot-eviction
-			// branch matches what `#finishPrompt` saw if it ran first.
+		const cancellationBarrier = promptTurn.cancellationBarrier;
+		const cleanup = this.#runCancelCleanup(record, cancellationBarrier).finally(() => {
+			if (!promptTurn.settled) {
+				this.#finishPrompt(record, {
+					stopReason: "cancelled",
+					usage: this.#buildTurnUsage(
+						promptTurn.usageBaseline,
+						record.session.sessionManager.getUsageStatistics(),
+					),
+				});
+			}
 			promptTurn.cleanup = undefined;
 			if (promptTurn.settled && record.promptTurn === promptTurn) {
 				record.promptTurn = undefined;
 			}
+		});
+		promptTurn.cleanup = cleanup;
+		if (!cancellationBarrier) {
+			this.#finishPrompt(record, {
+				stopReason: "cancelled",
+				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+			});
+		}
+		return cleanup;
+	}
+
+	async #runCancelCleanup(record: ManagedSessionRecord, cancellationBarrier?: Promise<void>): Promise<void> {
+		let timer: NodeJS.Timeout | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new Error("ACP cancel cleanup timed out")), this.#cancelCleanupTimeoutMs);
+		});
+		const abort = record.session.abort({ reason: USER_INTERRUPT_LABEL });
+		const settled = cancellationBarrier ? Promise.all([abort, cancellationBarrier]) : abort;
+		try {
+			await Promise.race([settled, timeout]);
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
@@ -1625,8 +1662,7 @@ export class AcpAgent implements Agent {
 		}
 		promptTurn.settled = true;
 		promptTurn.unsubscribe?.();
-		// Keep the slot occupied until cancel cleanup finishes — `#runCancelCleanup`
-		// evicts the slot in its finally block once both flags say it's safe.
+		// Keep the slot occupied until the cancel cleanup finalizer evicts it.
 		if (!promptTurn.cleanup && record.promptTurn === promptTurn) {
 			record.promptTurn = undefined;
 		}
