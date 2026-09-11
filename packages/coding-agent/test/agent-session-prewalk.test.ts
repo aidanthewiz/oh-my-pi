@@ -760,6 +760,13 @@ describe("AgentSession prewalk", () => {
 		settings.setModelRole("smol", `${primary.provider}/${primary.id}:medium`);
 		expect(await executeBuiltinSlashCommand("/prewalk", runtime)).toBe(true);
 		expect(showStatus).toHaveBeenCalledTimes(1);
+
+		const armPrewalk = vi.spyOn(session, "armPrewalk");
+		settings.set("disabledModels", [`${target.provider}/${target.id}`]);
+		settings.setModelRole("smol", `${target.provider}/${target.id}:medium`);
+		expect(await executeBuiltinSlashCommand("/prewalk", runtime)).toBe(true);
+		expect(armPrewalk).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenLastCalledWith(expect.stringContaining("enabledModels/disabledModels"));
 	});
 
 	it("requires a fresh todo before a later explicit prewalk can hand off", async () => {

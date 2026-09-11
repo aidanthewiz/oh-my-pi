@@ -624,6 +624,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				cliModel: rolePattern,
 				modelRegistry: runtime.session.modelRegistry,
 				preferences: getModelMatchPreferences(runtime.settings),
+				settings: runtime.settings,
 			});
 			if (resolved.error || !resolved.model) {
 				return usage(resolved.error ?? `Model "${rolePattern}" not found`, runtime);
