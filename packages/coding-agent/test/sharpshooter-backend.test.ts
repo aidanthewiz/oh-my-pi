@@ -64,11 +64,13 @@ describe("sharpshooter memory backend", () => {
 		const output: string[] = [];
 		const queuePreview = spyOn(sharpshooterBackend, "queuePreview").mockResolvedValue("Pending delta");
 		const enqueue = spyOn(sharpshooterBackend, "enqueue").mockResolvedValue(undefined);
+		const controller = new AbortController();
 		const runtime = {
 			session,
 			sessionManager: {} as SessionManager,
 			settings,
 			cwd,
+			signal: controller.signal,
 			output: (text: string) => {
 				output.push(text);
 			},
@@ -80,7 +82,7 @@ describe("sharpshooter memory backend", () => {
 		await executeAcpBuiltinSlashCommand("/memory sync", runtime);
 
 		expect(queuePreview).toHaveBeenCalledWith({ agentDir: settings.getAgentDir(), cwd, session });
-		expect(enqueue).toHaveBeenCalledWith(settings.getAgentDir(), cwd, session);
+		expect(enqueue).toHaveBeenCalledWith(settings.getAgentDir(), cwd, session, controller.signal);
 		expect(output).toEqual(["Pending delta", "Memory consolidation ran."]);
 	});
 });

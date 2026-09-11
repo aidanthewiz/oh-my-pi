@@ -12,9 +12,11 @@
  * forces the network (`online`).
  */
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
+import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import type { ConfigError } from "../config/config-file";
 import { ModelRegistry, type ProviderDiscoveryStatus } from "../config/model-registry";
 import { getAllowedAvailableModels } from "../config/model-resolver";
 import { Settings } from "../config/settings";
@@ -179,15 +181,24 @@ function boxTable(columns: BoxColumn[], rows: string[][]): string[] {
 	return lines;
 }
 
+/**
+ * The two registry reads the listing performs. Structural so the renderer can be
+ * exercised without booting a full {@link ModelRegistry}.
+ */
+export interface ModelsListingSource {
+	getAvailable(): Model<Api>[];
+	getError(): ConfigError | undefined;
+	getProviderDiscoveryStates?(): Array<{ provider: string; status: ProviderDiscoveryStatus; stale: boolean }>;
+}
+
 /** `omp models ls`/`find`: provider-grouped listing (one box table per provider). */
-function renderProviderModels(
-	modelRegistry: ModelRegistry,
-	settings: Settings | undefined,
+export function renderProviderModels(
+	source: ModelsListingSource,
 	action: ModelsAction,
 	pattern: string | undefined,
 	json: boolean,
 ): void {
-	const available = getAllowedAvailableModels(modelRegistry, settings);
+	const available = source.getAvailable();
 	const needle = pattern?.toLowerCase();
 	let filtered = available;
 
@@ -211,7 +222,10 @@ function renderProviderModels(
 		}
 	}
 
-	const configError = modelRegistry.getError();
+	const configError = source.getError();
+	const providerDiscovery = (source.getProviderDiscoveryStates?.() ?? []).map(
+		({ provider, status, stale }): ProviderDiscoveryJson => ({ provider, status, stale }),
+	);
 
 	if (json) {
 		if (configError) {
@@ -219,9 +233,6 @@ function renderProviderModels(
 				`Warning: models.yml validation failed — custom providers disabled\n${configError.message}\n`,
 			);
 		}
-		const providerDiscovery = modelRegistry
-			.getProviderDiscoveryStates()
-			.map(({ provider, status, stale }): ProviderDiscoveryJson => ({ provider, status, stale }));
 		const output: ModelsJson = {
 			models: filtered.slice().sort(byProviderThenId).map(toModelJson),
 			providerDiscovery,
@@ -233,7 +244,7 @@ function renderProviderModels(
 	if (configError) {
 		writeModelsConfigError(configError);
 	}
-	for (const { provider, status, stale } of modelRegistry.getProviderDiscoveryStates()) {
+	for (const { provider, status, stale } of providerDiscovery) {
 		if (!stale) continue;
 		const detail = status === "unavailable" ? "unavailable" : "using stale cached data";
 		writeLine(chalk.yellow(`Warning: model discovery for "${provider}" is ${detail}.`));
@@ -269,7 +280,9 @@ function renderProviderModels(
 			formatLimit(model.contextWindow),
 			formatLimit(model.maxTokens),
 			model.thinking ? getSupportedEfforts(model).join(",") : model.reasoning ? "yes" : "-",
-			model.input.includes("image") ? "yes" : "no",
+			// Wire truth, not the declared `input`: the transport drops image parts for
+			// models the catalog marks text-only (`compat.stripImageInput`, #9697).
+			sendsImageInputOnWire(model) ? "yes" : "no",
 		]);
 		for (const line of boxTable(
 			[
@@ -371,7 +384,16 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		// Discover runtime (extension) provider catalogs now that they are registered.
 		await modelRegistry.refreshRuntimeProviders(action === "refresh" ? "online" : "online-if-uncached");
 
-		renderProviderModels(modelRegistry, settings, action, pattern, json);
+		renderProviderModels(
+			{
+				getAvailable: () => getAllowedAvailableModels(modelRegistry, settings),
+				getError: () => modelRegistry.getError(),
+				getProviderDiscoveryStates: () => modelRegistry.getProviderDiscoveryStates(),
+			},
+			action,
+			pattern,
+			json,
+		);
 	} finally {
 		await emitSessionShutdownEvent(extensionRunner);
 	}
