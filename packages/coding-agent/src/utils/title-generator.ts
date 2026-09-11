@@ -117,7 +117,12 @@ function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel
 	const titleModel = resolveRoleSelection(["tiny", "commit", "smol"], settings, availableModels)?.model;
 	if (titleModel) return titleModel;
 
-	if (currentModel) return currentModel;
+	if (
+		currentModel &&
+		availableModels.some(model => model.provider === currentModel.provider && model.id === currentModel.id)
+	) {
+		return currentModel;
+	}
 
 	return undefined;
 }

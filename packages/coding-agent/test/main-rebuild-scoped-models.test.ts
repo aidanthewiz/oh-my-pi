@@ -195,6 +195,15 @@ describe("resolveScopedModels", () => {
 		expect(scoped.map(entry => entry.model.id)).toEqual(["a"]);
 	});
 
+	it("does not let a reduced --models inventory fuzzy-expand enabledModels", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/abc"] });
+		const registry = new FakeRegistry([model("abc"), model("abcd")]);
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "prov/abcd"]), registry, settings);
+
+		expect(scoped).toEqual([]);
+	});
+
 	it("does not create a cycle scope for disabledModels alone", async () => {
 		const settings = Settings.isolated({ disabledModels: ["prov/b"] });
 		const registry = new FakeRegistry([model("a"), model("b")]);

@@ -846,18 +846,18 @@ async function resolveEffectiveModelScope(
 	const preferences = getModelMatchPreferences(activeSettings);
 	const requested = await resolveModelScope(requestedPatterns, modelRegistry, preferences, activeSettings);
 	const allowedKeys = new Set(
-		filterModelsByConfiguredScope(
-			requested.map(entry => entry.model),
-			activeSettings,
-		).map(model => `${model.provider}/${model.id}`),
+		filterModelsByConfiguredScope(modelRegistry.getAvailable(), activeSettings).map(
+			model => `${model.provider}/${model.id}`,
+		),
 	);
 	return requested.filter(entry => allowedKeys.has(`${entry.model.provider}/${entry.model.id}`));
 }
 
 /**
- * Resolve an explicit CLI or configured model scope. `disabledModels` subtracts
- * matches after `enabledModels` or `--models` establishes the cycle scope. A
- * totally collapsed scope gets one cache-aware discovery pass before session
+ * Resolve an explicit CLI or configured model scope. The active
+ * `enabledModels`/`disabledModels` policy resolves against the full available
+ * inventory, then `--models` may only narrow those concrete results. A totally
+ * collapsed scope gets one cache-aware discovery pass before session
  * construction; otherwise an all-discovery launch can select an unrelated
  * static model before the background rebuild. The pass helps only discoverable
  * providers. A scope naming only extension-supplied models remains empty until
