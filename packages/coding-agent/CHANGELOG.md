@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `disabledModels`, a path-scoped exact/glob deny-list applied after `enabledModels` across model selection and execution. Exact entries never fuzzy-match nearby models.
+
 ### Fixed
 
 - Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once. Bash retains the reviewed execution route and shell through startup, and route or shell changes require a fresh safety review.
