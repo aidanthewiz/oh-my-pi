@@ -7,6 +7,7 @@ import {
 	expandRoleAlias,
 	extractExplicitThinkingSelector,
 	filterAvailableModelsByEnabledPatterns,
+	filterModelsByConfiguredScope,
 	parseModelPattern,
 	parseModelString,
 	pickDefaultAvailableModel,
@@ -326,6 +327,14 @@ const openaiGpt55Models: Model<Api>[] = [
 		contextWindow: 400000,
 		maxTokens: 128000,
 	}),
+];
+
+const codexPolicyModels: Model<Api>[] = [
+	openaiGpt55Models[1],
+	{ ...openaiGpt55Models[1], id: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+	{ ...openaiGpt55Models[1], id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+	{ ...openaiGpt55Models[1], id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+	{ ...openaiGpt55Models[1], id: "gpt-6-astra", name: "GPT-6 Astra" },
 ];
 
 function createBedrockDefaultModel(
@@ -1290,7 +1299,7 @@ describe("resolveCliModel", () => {
 		});
 
 		expect(result.model).toBeUndefined();
-		expect(result.error).toContain('Model "openai-codex/gpt-5.5" is excluded by enabledModels');
+		expect(result.error).toContain('Model "openai-codex/gpt-5.5" is excluded by model policy');
 	});
 
 	test("prefers an authenticated provider for an unqualified exact model id", () => {
@@ -2206,7 +2215,7 @@ describe("provider routing selector (@upstream)", () => {
 	});
 });
 
-describe("filterAvailableModelsByEnabledPatterns", () => {
+describe("model scope filters", () => {
 	const models = mockModels as Model[];
 	test("returns all models when patterns is empty", () => {
 		expect(filterAvailableModelsByEnabledPatterns(models, [])).toEqual(models);
@@ -2320,6 +2329,74 @@ describe("filterAvailableModelsByEnabledPatterns", () => {
 		expect(result).toHaveLength(1);
 		expect(result[0].provider).toBe("openai");
 		expect(result[0].id).toBe("gpt-5.5");
+	});
+
+	test("applies disabledModels after an enabledModels provider wildcard", () => {
+		const settings = Settings.isolated({
+			enabledModels: ["openai-codex/*"],
+			disabledModels: ["openai-codex/gpt-5.5"],
+		});
+
+		expect(filterModelsByConfiguredScope(codexPolicyModels, settings).map(model => model.id)).toEqual([
+			"gpt-5.6-luna",
+			"gpt-5.6-sol",
+			"gpt-5.6-terra",
+			"gpt-6-astra",
+		]);
+	});
+
+	test("applies disabledModels without requiring enabledModels", async () => {
+		const settings = Settings.isolated({ disabledModels: ["openai-codex/gpt-5.5"] });
+
+		const result = await resolveAllowedModels({ getAvailable: () => codexPolicyModels }, settings);
+
+		expect(result.map(model => model.id)).toEqual(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"]);
+	});
+
+	test("supports disabledModels globs", () => {
+		const settings = Settings.isolated({ disabledModels: ["openai-codex/gpt-5.6-*"] });
+
+		expect(filterModelsByConfiguredScope(codexPolicyModels, settings).map(model => model.id)).toEqual([
+			"gpt-5.5",
+			"gpt-6-astra",
+		]);
+	});
+
+	test("applies an exact bare-id deny entry across providers", () => {
+		const settings = Settings.isolated({ disabledModels: ["gpt-5.5"] });
+
+		expect(filterModelsByConfiguredScope(openaiGpt55Models, settings)).toEqual([]);
+	});
+
+	test("does not fuzzy-match a missing disabledModels selector", () => {
+		const discovered = codexPolicyModels.filter(model => model.id !== "gpt-5.5");
+		const settings = Settings.isolated({
+			enabledModels: ["openai-codex/*"],
+			disabledModels: ["openai-codex/gpt-5.5"],
+		});
+
+		expect(filterModelsByConfiguredScope(discovered, settings)).toEqual(discovered);
+	});
+
+	test("rejects an explicit CLI model matched by disabledModels", () => {
+		const settings = Settings.isolated({
+			enabledModels: ["openai-codex/*"],
+			disabledModels: ["openai-codex/gpt-5.5"],
+		});
+		const registry = {
+			getAll: () => codexPolicyModels,
+			getAvailable: () => codexPolicyModels,
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliModel: "openai-codex/gpt-5.5",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.blockedByModelPolicy).toBe(true);
+		expect(result.error).toContain("enabledModels/disabledModels");
 	});
 });
 

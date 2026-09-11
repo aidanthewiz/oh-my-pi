@@ -44,6 +44,7 @@ import { ModelRegistry } from "./config/model-registry";
 import {
 	DEFAULT_PREWALK_TARGET,
 	expandRoleAlias,
+	filterModelsByConfiguredScope,
 	formatModelSelectorValue,
 	getModelMatchPreferences,
 	resolveCliModel,
@@ -838,32 +839,30 @@ async function resolveEffectiveModelScope(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 	activeSettings: Settings,
 ): Promise<ScopedModel[]> {
-	const requestedPatterns = parsed.models ?? activeSettings.get("enabledModels");
-	if (!requestedPatterns || requestedPatterns.length === 0) return [];
+	const enabledPatterns = activeSettings.get("enabledModels");
+	const requestedPatterns = parsed.models ?? enabledPatterns;
+	if (requestedPatterns.length === 0) return [];
 
 	const preferences = getModelMatchPreferences(activeSettings);
 	const requested = await resolveModelScope(requestedPatterns, modelRegistry, preferences, activeSettings);
-	const enabledPatterns = activeSettings.get("enabledModels");
-	if (!parsed.models || enabledPatterns.length === 0) return requested;
-
-	const enabled = await resolveModelScope(enabledPatterns, modelRegistry, preferences, activeSettings);
-	const enabledKeys = new Set(enabled.map(entry => `${entry.model.provider}/${entry.model.id}`));
-	return requested.filter(entry => enabledKeys.has(`${entry.model.provider}/${entry.model.id}`));
+	const allowedKeys = new Set(
+		filterModelsByConfiguredScope(
+			requested.map(entry => entry.model),
+			activeSettings,
+		).map(model => `${model.provider}/${model.id}`),
+	);
+	return requested.filter(entry => allowedKeys.has(`${entry.model.provider}/${entry.model.id}`));
 }
 
 /**
- * Resolve the effective model allowlist from the active project's
- * `enabledModels`, optionally narrowed by an explicit `--models` scope. A
+ * Resolve an explicit CLI or configured model scope. `disabledModels` subtracts
+ * matches after `enabledModels` or `--models` establishes the cycle scope. A
  * totally collapsed scope gets one cache-aware discovery pass before session
- * construction: otherwise an all-discovery `--models` launch can select an
- * unrelated static model before the later background rebuild activates the
- * requested scope. The pass only helps providers already known to be
- * discoverable (models.yml `discovery:`, runtime managers); a scope naming only
- * extension-supplied models stays empty here because those providers register
- * during `createAgentSession` — that case is covered by deferring to the SDK's
- * `modelPattern` resolution in {@link buildSessionOptions}. Re-run after a
- * resume switches projects so the destination project's settings-derived scope
- * wins over the launch directory's.
+ * construction; otherwise an all-discovery launch can select an unrelated
+ * static model before the background rebuild. The pass helps only discoverable
+ * providers. A scope naming only extension-supplied models remains empty until
+ * `createAgentSession`, where the SDK resolves it after extension registration.
+ * Re-run after a resume switches projects so the destination policy wins.
  */
 export async function resolveScopedModels(
 	parsed: Args,
@@ -914,18 +913,11 @@ export interface ScopedModelSink {
 }
 
 /**
- * Startup resolves the `--models`/`enabledModels` scope from the model registry
- * before background provider discovery runs — `createSession` fires
- * `refreshInBackground()` only after the session is built — so a scoped selector
- * whose model first materializes through runtime discovery (e.g.
- * `opencode-go/ox-alpha-free` on a fresh launch with no cache row) is absent from
- * the frozen scoped `/models` list even though it is in `enabledModels`, invokable
- * via `--model`, and listed by `omp models find`. Once the initial refresh settles,
- * re-resolve the scope and, when the set changed, push the fuller list into the
- * session so the scoped picker and Ctrl+P cycle include it. A scope that resolved
- * to zero models may become active here when the startup discovery pass returned
- * no models but the background pass succeeded. Fire-and-forget — never blocks the
- * prompt on background discovery latency. Issue #9220.
+ * Startup resolves an explicit model scope before background provider discovery.
+ * A newly discovered allowed model can therefore be absent from the frozen
+ * picker. After discovery settles, re-resolve the scope and update the session
+ * when its allowed set changes. Fire-and-forget; discovery must not delay the
+ * prompt. Issue #9220.
  */
 export async function rebuildScopedModelsAfterDiscovery(
 	session: ScopedModelSink,
@@ -933,8 +925,8 @@ export async function rebuildScopedModelsAfterDiscovery(
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "awaitBackgroundRefresh">,
 	activeSettings: Settings,
 ): Promise<void> {
-	const patterns = parsed.models ?? activeSettings.get("enabledModels");
-	if (!patterns || patterns.length === 0) return;
+	const requestedPatterns = parsed.models ?? activeSettings.get("enabledModels");
+	if (requestedPatterns.length === 0) return;
 	await modelRegistry.awaitBackgroundRefresh();
 	if (session.isDisposed) return;
 	const rebuilt = await resolveEffectiveModelScope(parsed, modelRegistry, activeSettings);
@@ -1205,7 +1197,7 @@ export async function buildSessionOptions(
 			options.modelPattern = parsed.model;
 		} else if (resolved.error) {
 			if (
-				!resolved.blockedByEnabledModels &&
+				!resolved.blockedByModelPolicy &&
 				!parsed.provider &&
 				((resolved.configuredPatterns?.length ?? 0) > 0 || !parsed.model.includes(":"))
 			) {
@@ -1266,11 +1258,11 @@ export async function buildSessionOptions(
 		// here and the session would run on an unrelated in-scope provider without
 		// any error. Leaving `options.model` unset lets createAgentSession's
 		// post-extension default-role resolution reclaim it against the fully
-		// registered, still enabledModels-scoped catalog (issue #6694).
+		// registered catalog under the configured model policy (issue #6694).
 		// Defer ONLY for a settings-derived scope: createAgentSession re-resolves
-		// against `settings.enabledModels` and never sees CLI `--models`, so
-		// deferring under an explicit CLI scope would let the saved default
-		// escape it — keep pinning the first scoped model there.
+		// configured settings but never sees CLI `--models`, so deferring under an
+		// explicit CLI scope would let the saved default escape it.
+		// Keep pinning the first scoped model for explicit CLI scopes.
 		deferredDefaultRole = !options.model && Boolean(remembered) && !((parsed.models?.length ?? 0) > 0);
 		if (!options.model && !deferredDefaultRole) {
 			options.model = scopedModels[0].model;
@@ -1794,9 +1786,9 @@ export async function runRootCommand(
 				// applyStartupCwd persists an explicit --cwd in parsedArgs; once resume
 				// switches projects, keep session construction on the destination too.
 				parsedArgs.cwd = cwd;
-				// Destination project may scope a different `enabledModels`; re-resolve
-				// so the model UI and session options reflect it (explicit `--models`
-				// stays fixed inside resolveScopedModels).
+				// Destination project may scope a different model policy; re-resolve
+				// so the model UI and session options reflect it. Explicit `--models`
+				// stays fixed inside resolveScopedModels.
 				scopedModels = await resolveScopedModels(parsedArgs, modelRegistry, settingsInstance);
 			}
 		}
@@ -2082,12 +2074,9 @@ export async function runRootCommand(
 				authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 			}
 
-			// Runtime provider discovery (opencode-go, models.yml `discovery:`, proxies)
-			// populates the registry AFTER the scope was snapshotted at startup; re-resolve
-			// once it settles so newly-discovered configured models join the scoped
-			// /models list and Ctrl+P cycle, including scopes that initially resolved
-			// empty (issue #9220). Fire-and-forget: the prompt must never block on the
-			// background pass.
+			// Runtime provider discovery populates the registry after startup scope
+			// resolution. Re-apply the configured scope and denylist when it settles
+			// so newly discovered models enter only when policy permits (issue #9220).
 			const configuredScope = parsedArgs.models ?? settingsInstance.get("enabledModels");
 			if (isInteractive && configuredScope.length > 0) {
 				void rebuildScopedModelsAfterDiscovery(session, parsedArgs, modelRegistry, settingsInstance).catch(error =>

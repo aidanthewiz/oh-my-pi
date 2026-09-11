@@ -8488,7 +8488,7 @@ export class AgentSession {
 
 	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
 		if (!isModelEnabledBySettings(model, this.settings, this.#modelRegistry)) {
-			throw new Error(`Model "${model.provider}/${model.id}" is excluded by enabledModels.`);
+			throw new Error(`Model "${model.provider}/${model.id}" is excluded by model policy.`);
 		}
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);

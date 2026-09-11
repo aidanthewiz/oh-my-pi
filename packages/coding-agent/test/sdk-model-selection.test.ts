@@ -1413,6 +1413,46 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("does not let a denied default role constrain startup fallback providers", async () => {
+		const denied = getBundledModel("openai-codex", "gpt-5.5");
+		if (!denied) throw new Error("Expected bundled Codex GPT-5.5 default");
+
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey("openai-codex", "codex-oauth-token");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const settings = Settings.isolated({
+			modelRoles: { default: "openai-codex/gpt-5.5" },
+			disabledModels: ["openai-codex/gpt-5.5"],
+		});
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			settings,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			preloadedCustomToolPaths: [],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(`${session.model?.provider}/${session.model?.id}`).not.toBe("openai-codex/gpt-5.5");
+		} finally {
+			await session.dispose();
+		}
+	});
 	test("prefers Codex OAuth over plain OpenAI for the shared startup default", async () => {
 		const openaiDefault = getBundledModel("openai", "gpt-5.5");
 		const codexDefault = getBundledModel("openai-codex", "gpt-5.5");

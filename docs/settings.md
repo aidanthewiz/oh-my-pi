@@ -233,7 +233,7 @@ disabledProviders:
   - groq # project array REPLACES the global array
 ```
 
-Array replacement is the most common surprise: the project's `disabledProviders` does not extend the global list — it becomes the entire list for that project. The same applies to `enabledModels`, `cycleOrder`, `extensions`, and every other array-typed setting.
+Array replacement is the most common surprise: the project's `disabledProviders` does not extend the global list — it becomes the entire list for that project. The same applies to `enabledModels`, `disabledModels`, `cycleOrder`, `extensions`, and every other array-typed setting.
 
 ## Project-local config
 
@@ -278,7 +278,7 @@ Overlay paths are resolved relative to the process working directory (and `~` is
 
 ## Path-scoped arrays
 
-Three array settings — `enabledModels`, `enabledProviders`, and `disabledProviders` — accept path-scoped entries in addition to bare strings, so a single global config can behave differently per directory:
+Four array settings — `enabledModels`, `disabledModels`, `enabledProviders`, and `disabledProviders` — accept path-scoped entries in addition to bare strings, so a single global config can behave differently per directory:
 
 ```yaml
 enabledModels:
@@ -286,6 +286,12 @@ enabledModels:
   - path: ~/work/high-context
     models:
       - anthropic/claude-opus-4-5
+
+disabledModels:
+  - gpt-4o # applies everywhere
+  - path: ~/work/high-context
+    models:
+      - anthropic/claude-haiku-4-5
 
 disabledProviders:
   - ollama # applies everywhere
@@ -303,7 +309,7 @@ Accepted **path** keys (any of them, combined): `path`, `paths`, `pathPrefix`, `
 
 Accepted **value** keys:
 
-- `models` (for `enabledModels`) or `providers` (for `enabledProviders` and `disabledProviders`)
+- `models` (for `enabledModels` and `disabledModels`) or `providers` (for `enabledProviders` and `disabledProviders`)
 - `values` or `items` (for any setting)
 
 Only string values are kept; malformed scoped entries are ignored. Path scoping is resolved **after** the layer merge, so it reads the final effective array.
@@ -364,6 +370,8 @@ modelProviderOrder:
 
 enabledModels:
   - claude-sonnet-4-5
+disabledModels:
+  - openai/gpt-4o
 ```
 
 | Key                    | Type    | Default                     | Notes                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -374,6 +382,7 @@ enabledModels:
 | `modelProviderOrder`   | array   | `[]`                        | Preferred provider order when a model id is ambiguous.                                                                                                                                                                                                                                                                                                                                                           |
 | `cycleOrder`           | array   | `["smol","default","slow"]` | Roles cycled by the model switcher.                                                                                                                                                                                                                                                                                                                                                                              |
 | `enabledModels`        | array   | `[]`                        | Allow-list of models; supports [path-scoped entries](#path-scoped-arrays). Empty means all available models.                                                                                                                                                                                                                                                                                                     |
+| `disabledModels`       | array   | `[]`                        | Deny-list applied after `enabledModels`; supports exact selectors, globs, and [path-scoped entries](#path-scoped-arrays). Exact entries never fuzzy-match nearby models.                                                                                                                                                                                                                                               |
 | `enabledProviders`     | array   | `[]`                        | Foreign user-level discovery sources to load; supports path-scoped entries. See [above](#provider-and-source-disabling).                                                                                                                                                                                                                                                                                          |
 | `disabledProviders`    | array   | `[]`                        | Disabled model/discovery providers; supports path-scoped entries. See [above](#provider-and-source-disabling).                                                                                                                                                                                                                                                                                                   |
 | `includeModelInPrompt` | boolean | `true`                      | Include the active model name in the system prompt.                                                                                                                                                                                                                                                                                                                                                              |
@@ -837,7 +846,7 @@ Applied whenever raw settings are loaded (global, project, overlays, and runtime
 
 ### A global array disappeared in a project
 
-Arrays replace; they do not append. If a project sets `disabledProviders`, `enabledModels`, `cycleOrder`, `extensions`, or any other array, include the **complete** desired value in the project layer — the global array is fully replaced.
+Arrays replace; they do not append. If a project sets `disabledProviders`, `enabledModels`, `disabledModels`, `cycleOrder`, `extensions`, or any other array, include the **complete** desired value in the project layer — the global array is fully replaced.
 
 ### A provider is still available after editing config
 

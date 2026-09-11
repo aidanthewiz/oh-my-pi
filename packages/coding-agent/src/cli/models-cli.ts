@@ -307,7 +307,7 @@ export function renderProviderModels(
  */
 export interface RunModelsListingOptions {
 	modelRegistry: ModelRegistry;
-	/** Settings context for the `enabledModels` allowlist (path-scoped vs `cwd`). */
+	/** Settings context for the path-scoped model policy. */
 	settings?: Settings;
 	cwd: string;
 	action?: ModelsAction;

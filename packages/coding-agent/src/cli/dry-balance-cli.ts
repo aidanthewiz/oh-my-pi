@@ -565,9 +565,7 @@ async function resolveDryBalanceModel(
 
 	const allowedModels = await resolveAllowedModels(modelRegistry, settings, preferences);
 	if (allowedModels.length === 0) {
-		throw new Error(
-			"No models available. Use --model to select a model or configure enabledModels/default model settings.",
-		);
+		throw new Error("No models available. Use --model or adjust model policy and default role settings.");
 	}
 
 	const defaultRoleSpec = resolveModelRoleValue(settings?.getModelRole("default"), allowedModels, {

@@ -71,12 +71,10 @@ function createSelector(
 	return { selector, backgroundRefresh };
 }
 
-// The org-config allowlist (`enabledModels`) must bind every model surface.
-// `session.getAvailableModels()` already filters; the picker used to read the
-// registry directly and offered models the allowlist scoped out whenever a
-// matching credential existed in the environment (e.g. a stray
-// ANTHROPIC_API_KEY exposing first-party anthropic/* beside anthropic-aws/*).
-describe("ModelSelector honors the enabledModels allowlist", () => {
+// The org model policy must bind every model surface. `session.getAvailableModels()`
+// already filters; the picker used to read the registry directly and offered
+// excluded models whenever matching credentials existed in the environment.
+describe("ModelSelector honors configured model policy", () => {
 	beforeAll(async () => {
 		testTheme = await getThemeByName("dark");
 		if (!testTheme) {
@@ -104,6 +102,23 @@ describe("ModelSelector honors the enabledModels allowlist", () => {
 		expect(rendered).not.toMatch(/ANTHROPIC(?! AWS)\b/);
 	});
 
+	test("models in disabledModels never render in the picker", async () => {
+		installTestTheme();
+		const allowed = makeModel("openai-codex", "gpt-6-astra");
+		const denied = makeModel("openai-codex", "gpt-5.5");
+		const settings = Settings.isolated({
+			enabledModels: ["openai-codex/*"],
+			disabledModels: ["openai-codex/gpt-5.5"],
+		});
+
+		const { selector, backgroundRefresh } = createSelector([allowed, denied], settings);
+		await backgroundRefresh;
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("openai-codex/gpt-6-astra");
+		expect(rendered).not.toContain("openai-codex/gpt-5.5");
+	});
 	test("empty enabledModels leaves the picker unfiltered (upstream default)", async () => {
 		installTestTheme();
 		const a = makeModel("anthropic-aws", "claude-opus-4-8");

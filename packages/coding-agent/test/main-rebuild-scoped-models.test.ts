@@ -146,6 +146,19 @@ describe("rebuildScopedModelsAfterDiscovery", () => {
 		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a"]);
 	});
 
+	it("keeps disabledModels out of the scope after discovery", async () => {
+		const settings = Settings.isolated({
+			enabledModels: ["prov/*"],
+			disabledModels: ["prov/b"],
+		});
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a"], registry, settings));
+
+		registry.available = [model("a"), model("b"), model("c")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs([]), registry, settings);
+
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a", "c"]);
+	});
 	it("skips the rebuild once the session is disposed", async () => {
 		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
 		const registry = new FakeRegistry([model("a")]);
@@ -175,6 +188,24 @@ describe("resolveScopedModels", () => {
 
 	it("narrows explicit --models selections to enabledModels", async () => {
 		const settings = Settings.isolated({ enabledModels: ["prov/a"] });
+		const registry = new FakeRegistry([model("a"), model("b")]);
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+
+		expect(scoped.map(entry => entry.model.id)).toEqual(["a"]);
+	});
+
+	it("does not create a cycle scope for disabledModels alone", async () => {
+		const settings = Settings.isolated({ disabledModels: ["prov/b"] });
+		const registry = new FakeRegistry([model("a"), model("b")]);
+
+		const scoped = await resolveScopedModels(parseArgs([]), registry, settings);
+
+		expect(scoped).toEqual([]);
+	});
+
+	it("keeps explicit --models selections inside disabledModels", async () => {
+		const settings = Settings.isolated({ disabledModels: ["prov/b"] });
 		const registry = new FakeRegistry([model("a"), model("b")]);
 
 		const scoped = await resolveScopedModels(parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
