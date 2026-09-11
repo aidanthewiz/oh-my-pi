@@ -1807,16 +1807,13 @@ export async function resolveModelScope(
 }
 
 /**
- * Resolve the set of models a session is allowed to use, given the active
- * settings. Starts from `modelRegistry.getAvailable()` (so disabled providers
- * and providers without credentials are already filtered out) and, when
- * `enabledModels` is configured for the current path scope, further restricts
- * the result to models matching those patterns.
+ * Resolve the set of models a session may use under the active model policy.
+ * `enabledModels` narrows the available inventory when configured, then
+ * `disabledModels` removes matching entries from that result.
  *
- * Returns the unfiltered available list when `enabledModels` is empty.
- * Returns an empty list when `enabledModels` is configured but no model matches
- * any pattern — callers MUST treat this as "no usable model" rather than
- * falling back to the global default (see issue #1022).
+ * An empty `enabledModels` list starts from every available model. A configured
+ * allowlist that matches nothing stays empty rather than falling back globally
+ * (issue #1022).
  */
 export async function resolveAllowedModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
@@ -1824,18 +1821,19 @@ export async function resolveAllowedModels(
 	preferences?: ModelMatchPreferences,
 ): Promise<Model<Api>[]> {
 	const available = modelRegistry.getAvailable();
-	const patterns = settings?.get("enabledModels");
-	if (!patterns || patterns.length === 0) {
-		return available;
+	const enabledPatterns = settings?.get("enabledModels") ?? [];
+	let allowed = available;
+	if (enabledPatterns.length > 0) {
+		const scoped = await resolveModelScope(enabledPatterns, modelRegistry, preferences, settings);
+		allowed =
+			scoped.length === 0
+				? []
+				: includeSyntheticAllowedModels(
+						available,
+						scoped.map(entry => entry.model),
+					);
 	}
-	const scoped = await resolveModelScope(patterns, modelRegistry, preferences, settings);
-	if (scoped.length === 0) {
-		return [];
-	}
-	return includeSyntheticAllowedModels(
-		available,
-		scoped.map(entry => entry.model),
-	);
+	return excludeModelsByDisabledPatterns(allowed, settings?.get("disabledModels") ?? []);
 }
 
 /**
@@ -1891,27 +1889,49 @@ export function filterAvailableModelsByEnabledPatterns(
 	return includeSyntheticAllowedModels(available, allowedModels);
 }
 
-/** Apply the effective settings allowlist to any model inventory. */
-export function filterModelsByEnabledSettings(models: Model<Api>[], settings?: Settings): Model<Api>[] {
-	const patterns = settings?.get("enabledModels");
-	if (!patterns || patterns.length === 0) return models;
-	return filterAvailableModelsByEnabledPatterns(models, patterns, settings);
+function excludeModelsByDisabledPatterns(models: Model<Api>[], patterns: readonly string[]): Model<Api>[] {
+	if (patterns.length === 0 || models.length === 0) return models;
+	const excludedKeys = new Set<string>();
+	for (const pattern of patterns) {
+		const trimmed = pattern.trim();
+		if (!trimmed) continue;
+		const normalized = trimmed.toLowerCase();
+		const matches =
+			trimmed.includes("*") || trimmed.includes("?") || trimmed.includes("[")
+				? matchingGlobModels(trimmed, models)
+				: models.filter(
+						model =>
+							formatModelString(model).toLowerCase() === normalized || model.id.toLowerCase() === normalized,
+					);
+		for (const model of matches) excludedKeys.add(formatModelString(model));
+	}
+	if (excludedKeys.size === 0) return models;
+	return models.filter(model => !excludedKeys.has(formatModelString(model)));
 }
 
-/** Return whether a concrete model is permitted by the effective settings allowlist. */
+/** Apply the effective allowlist and denylist to any model inventory. */
+export function filterModelsByConfiguredScope(models: Model<Api>[], settings?: Settings): Model<Api>[] {
+	const enabledPatterns = settings?.get("enabledModels") ?? [];
+	const allowed =
+		enabledPatterns.length === 0 ? models : filterAvailableModelsByEnabledPatterns(models, enabledPatterns, settings);
+	return excludeModelsByDisabledPatterns(allowed, settings?.get("disabledModels") ?? []);
+}
+
+/** Return whether a concrete model is permitted by the effective model policy. */
 export function isModelEnabledBySettings(
 	model: Model<Api>,
 	settings: Settings | undefined,
 	modelRegistry: Pick<ModelRegistry, "getAll">,
 ): boolean {
-	const patterns = settings?.get("enabledModels");
-	if (!patterns || patterns.length === 0) return true;
+	const enabledPatterns = settings?.get("enabledModels") ?? [];
+	const disabledPatterns = settings?.get("disabledModels") ?? [];
+	if (enabledPatterns.length === 0 && disabledPatterns.length === 0) return true;
 	const modelKey = formatModelString(model);
 	const registered = modelRegistry.getAll();
 	const inventory = registered.some(candidate => formatModelString(candidate) === modelKey)
 		? registered
 		: [...registered, model];
-	return filterModelsByEnabledSettings(inventory, settings).some(
+	return filterModelsByConfiguredScope(inventory, settings).some(
 		candidate => formatModelString(candidate) === modelKey,
 	);
 }
@@ -1950,24 +1970,18 @@ function findExactCliModel(
 }
 
 /**
- * Settings-scoped sync companion to {@link resolveAllowedModels}: registry
- * availability narrowed by the `enabledModels` allowlist resolved from the
- * GIVEN settings instance, so path-scoped configs resolve against that
- * instance's cwd. Model-selection/execution sites that hold a scoped
- * `Settings` should use this instead of raw `modelRegistry.getAvailable()`
- * (which knows nothing about the caller's path scope).
+ * Settings-scoped sync companion to {@link resolveAllowedModels}. It applies
+ * `enabledModels` and `disabledModels` from the given settings instance, so
+ * path-scoped model policy follows the caller's working directory.
  *
- * Note: `disabledProviders` is still applied inside `getAvailable()` through
- * the global settings context; only the `enabledModels` layer is scoped here.
+ * `disabledProviders` remains applied inside `getAvailable()` through the
+ * global settings context.
  */
 export function getAllowedAvailableModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 	settings: Settings | undefined,
 ): Model<Api>[] {
-	const available = modelRegistry.getAvailable();
-	const patterns = settings?.get("enabledModels");
-	if (!patterns || patterns.length === 0) return available;
-	return filterAvailableModelsByEnabledPatterns(available, patterns, settings);
+	return filterModelsByConfiguredScope(modelRegistry.getAvailable(), settings);
 }
 
 export interface ResolveCliModelResult {
@@ -1981,15 +1995,15 @@ export interface ResolveCliModelResult {
 	selector?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	warning: string | undefined;
-	/** True when the selector names a catalog model excluded by enabledModels. */
-	blockedByEnabledModels?: boolean;
+	/** True when the selector names a catalog model excluded by model policy. */
+	blockedByModelPolicy?: boolean;
 	error: string | undefined;
 }
 
 /**
  * Resolve one CLI model selector. Exact selectors take precedence over roles,
- * and roles take precedence over unauthenticated catalog-only IDs. A non-empty
- * `enabledModels` setting remains authoritative over every CLI form.
+ * and roles take precedence over unauthenticated catalog-only IDs. The active
+ * `enabledModels` and `disabledModels` policy remains authoritative.
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
@@ -2016,8 +2030,8 @@ export function resolveCliModel(options: {
 		};
 	}
 
-	const allModels = filterModelsByEnabledSettings(catalogModels, settings);
-	const availableModels = filterModelsByEnabledSettings(preferredModels ?? modelRegistry.getAvailable(), settings);
+	const allModels = filterModelsByConfiguredScope(catalogModels, settings);
+	const availableModels = filterModelsByConfiguredScope(preferredModels ?? modelRegistry.getAvailable(), settings);
 	const providerMap = new Map<string, string>();
 	for (const model of catalogModels) {
 		providerMap.set(model.provider.toLowerCase(), model.provider);
@@ -2047,8 +2061,8 @@ export function resolveCliModel(options: {
 		model: undefined,
 		selector: undefined,
 		warning: undefined,
-		error: `Model "${selector}" is excluded by enabledModels.`,
-		blockedByEnabledModels: true,
+		error: `Model "${selector}" is excluded by model policy (enabledModels/disabledModels).`,
+		blockedByModelPolicy: true,
 	});
 	if (!provider) {
 		const exact = findExactCliModel(trimmedModel, allModels, availableModels, { catalogFallback: false });

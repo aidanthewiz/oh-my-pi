@@ -416,7 +416,7 @@ Resolution precedence for exact selectors:
 3. retired effort-tier variant alias (collapsed catalog entries, e.g. `X`/`X-thinking` twins)
 4. provider-scoped fuzzy match, then substring matching with an alias-vs-dated pick
 
-Glob scope patterns (used by `enabledModels` and CLI `--models`) run separately over concrete models after exact matching.
+Glob scope patterns used by `enabledModels`, `disabledModels`, and CLI `--models` run separately over concrete models after exact matching.
 
 When a bare id matches models from multiple providers, preference order is:
 
@@ -451,24 +451,30 @@ Related settings:
 
 - `modelRoles` (record)
 - `enabledModels` (scoped pattern list)
+- `disabledModels` (scoped pattern list)
 - `modelProviderOrder` (provider precedence when equivalent concrete choices share an id)
 - `providers.kimiApiFormat` (`openai` or `anthropic` request format)
 - `providers.openaiWebsockets` (`auto|off|on` websocket preference for OpenAI Codex transport)
 
 `modelRoles` stores selectors such as `provider/modelId`. `enabledModels` accepts
-exact selectors, globs, and fuzzy matches. When non-empty, it is the authoritative
-ceiling for initial selection, role and temporary switches, retry fallbacks,
-secondary agents, compaction, memory processing, and restored sessions. CLI
-`--models` narrows that set; it never expands it.
+exact selectors, globs, and fuzzy matches. `disabledModels` accepts exact
+`provider/modelId` or bare-id selectors and globs; exact deny entries never
+fuzzy-match a nearby model. A non-empty allowlist first limits every model
+surface; the denylist then removes matching models. The policy applies to
+initial selection, role and temporary switches, retry fallbacks, secondary
+agents, compaction, memory processing, and restored sessions. CLI `--models`
+can narrow the allowed set but cannot override either configured list.
 
-Global `enabledModels` and `disabledProviders` entries may also be scoped to a path prefix:
+Global `enabledModels`, `disabledModels`, and `disabledProviders` entries may also be scoped to a path prefix:
 
 ```yaml
 enabledModels:
-  - claude-sonnet-4-5
+  - openai/*
   - path: ~/work
     models:
       - anthropic/claude-opus-4-5
+disabledModels:
+  - openai/gpt-4o
 disabledProviders:
   - ollama
   - path: ~/private
@@ -476,7 +482,7 @@ disabledProviders:
       - anthropic
 ```
 
-String entries apply everywhere. Scoped entries apply when the current working directory is the configured path or one of its subdirectories. Use `path`, `paths`, `pathPrefix`, or `pathPrefixes`; use `models` for `enabledModels`, `providers` for `disabledProviders`, or `values` for either.
+String entries apply everywhere. Scoped entries apply when the current working directory is the configured path or one of its subdirectories. Use `path`, `paths`, `pathPrefix`, or `pathPrefixes`; use `models` for `enabledModels` and `disabledModels`, `providers` for `disabledProviders`, or `values` for any of them.
 
 ## `/model` and `omp models`
 

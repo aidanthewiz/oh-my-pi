@@ -140,9 +140,8 @@ export class ModelControls {
 
 	/**
 	 * Replace the Ctrl+P cycle scope. Startup resolves the scope before background
-	 * provider discovery runs; the CLI re-pushes the fuller list here once discovery
-	 * completes so a newly-discovered `enabledModels` model joins the cycle and the
-	 * scoped `/models` picker (issue #9220).
+	 * provider discovery runs. The CLI re-applies policy after discovery so allowed
+	 * new models join the cycle and excluded models stay out (issue #9220).
 	 */
 	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void {
 		this.#scopedModels = scopedModels;
@@ -475,10 +474,7 @@ export class ModelControls {
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
 
-	/**
-	 * Get all available models with valid API keys, filtered by `enabledModels` when configured.
-	 * See {@link filterAvailableModelsByEnabledPatterns} for supported pattern forms and limitations.
-	 */
+	/** Get available authenticated models allowed by configured model policy. */
 	getAvailableModels(): Model[] {
 		return getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings);
 	}

@@ -142,7 +142,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		s.settings.override("enabledModels", [`${from.provider}/${from.id}`]);
 
 		expect(s.resolveRoleModel("slow")).toBeUndefined();
-		await expect(s.setModel(to)).rejects.toThrow(`Model "${to.provider}/${to.id}" is excluded by enabledModels`);
+		await expect(s.setModel(to)).rejects.toThrow(`Model "${to.provider}/${to.id}" is excluded by model policy`);
 		expect(s.model?.id).toBe(from.id);
 	});
 });

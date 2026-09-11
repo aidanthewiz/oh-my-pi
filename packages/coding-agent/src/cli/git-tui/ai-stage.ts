@@ -22,7 +22,7 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { parseFileDiffs, parseFileHunks } from "../../commit/git/diff";
 import type { FileDiff } from "../../commit/types";
 import { ModelRegistry } from "../../config/model-registry";
-import { resolveRoleSelection } from "../../config/model-resolver";
+import { getAllowedAvailableModels, resolveRoleSelection } from "../../config/model-resolver";
 import { Settings } from "../../config/settings";
 import filesPromptTemplate from "../../prompts/system/git-ai-stage-files.md" with { type: "text" };
 import hunkPromptTemplate from "../../prompts/system/git-ai-stage-hunk.md" with { type: "text" };
@@ -84,7 +84,11 @@ export async function aiStage(options: AiStageOptions): Promise<AiStageOutcome> 
 		const registry = new ModelRegistry(authStorage);
 		await registry.refresh();
 		await loadCliExtensionProviders(registry, settings, cwd);
-		const model = resolveRoleSelection(["tiny", "smol"], settings, registry.getAvailable())?.model;
+		const model = resolveRoleSelection(
+			["tiny", "smol"],
+			settings,
+			getAllowedAvailableModels(registry, settings),
+		)?.model;
 		if (!model) throw new Error("No tiny/smol model available for AI staging");
 		const sessionId = Bun.randomUUIDv7();
 		if (!(await registry.getApiKey(model, sessionId)))

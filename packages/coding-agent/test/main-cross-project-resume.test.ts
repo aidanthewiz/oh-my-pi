@@ -365,9 +365,9 @@ describe("runRootCommand — cross-project --resume", () => {
 	it("re-resolves the model scope from the resumed project's enabledModels after the switch", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
-		// enabledModels scoped only to the resumed project: the launch scope
-		// yields no patterns, so any resolveModelScope call proves the recompute
-		// ran against the destination settings rather than the launch directory.
+		// enabledModels is scoped only to the resumed project. The launch scope
+		// yields no patterns; the destination scope collapses because the mocked
+		// model is absent from the full inventory, then gets one discovery retry.
 		const settings = Settings.isolated({
 			"marketplace.autoUpdate": "off",
 			enabledModels: [{ paths: [resumedProject], models: ["model-resumed"] }],
@@ -401,10 +401,10 @@ describe("runRootCommand — cross-project --resume", () => {
 			await resumedManager?.close();
 		}
 
-		// Launch scope had no patterns, so the only resolution is the post-switch
-		// one; the pre-fix code never recomputed and would not call it at all.
-		expect(resolveModelScope).toHaveBeenCalledTimes(1);
-		expect(resolveModelScope.mock.calls[0]?.[0]).toEqual(["model-resumed"]);
+		// Both calls must use the destination policy. The first resolves the
+		// destination scope; the second is the collapsed-scope discovery retry.
+		expect(resolveModelScope).toHaveBeenCalledTimes(2);
+		expect(resolveModelScope.mock.calls.map(call => call[0])).toEqual([["model-resumed"], ["model-resumed"]]);
 	}, 15_000);
 });
 

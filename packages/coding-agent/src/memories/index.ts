@@ -9,7 +9,7 @@ import { getAgentDbPath, getMemoriesDir, isEnoent, logger, parseJsonlLenient, pr
 
 import type { ModelRegistry } from "../config/model-registry";
 import {
-	filterModelsByEnabledSettings,
+	filterModelsByConfiguredScope,
 	getModelMatchPreferences,
 	resolveModelRoleValue,
 } from "../config/model-resolver";
@@ -1251,7 +1251,7 @@ async function resolveMemoryModel(options: {
 	fallbackRole: string;
 }): Promise<Model | undefined> {
 	const { modelRegistry, session, fallbackRole } = options;
-	const allowedModels = filterModelsByEnabledSettings(modelRegistry.getAll(), session.settings);
+	const allowedModels = filterModelsByConfiguredScope(modelRegistry.getAll(), session.settings);
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
 		const resolved = resolveModelRoleValue(requestedModel, allowedModels, {

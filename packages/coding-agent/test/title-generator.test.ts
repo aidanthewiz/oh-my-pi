@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	disposeTerminalTitleState,
 	generateSessionTitle,
@@ -76,6 +77,28 @@ describe("title generator", () => {
 		expect(request?.tools).toBeUndefined();
 		expect(options?.toolChoice).toBeUndefined();
 		expect(options?.disableReasoning).toBe(true);
+	});
+
+	it("does not use a current model excluded by disabledModels", async () => {
+		const denied = getModelOrThrow("claude-haiku-4-5");
+		const allowed = getModelOrThrow("claude-sonnet-4-5");
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple");
+		const registry = {
+			getAvailable: () => [allowed, denied],
+			getApiKey: async () => "test-key",
+			getApiKeyForProvider: async () => "test-key",
+			authStorage: { rotateSessionCredential: async () => false },
+			resolver: () => async () => "test-key",
+		} as never;
+		const settings = Settings.isolated({
+			enabledModels: ["anthropic/*"],
+			disabledModels: [`${denied.provider}/${denied.id}`],
+		});
+
+		const title = await generateSessionTitle("Investigate the resolver", registry, settings, "title-session", denied);
+
+		expect(title).toBeNull();
+		expect(completeSimpleMock).not.toHaveBeenCalled();
 	});
 
 	it.each([

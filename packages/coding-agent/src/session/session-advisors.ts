@@ -1366,7 +1366,7 @@ export class SessionAdvisors {
 	/** Switch one advisor model while preserving its context and effort invariants. */
 	#setAdvisorModel(advisor: ActiveAdvisor, model: Model, requestedThinkingLevel: ThinkingLevel): ThinkingLevel {
 		if (!isModelEnabledBySettings(model, this.#host.settings, this.#host.modelRegistry)) {
-			throw new Error(`Advisor model "${model.provider}/${model.id}" is excluded by enabledModels.`);
+			throw new Error(`Advisor model "${model.provider}/${model.id}" is excluded by model policy.`);
 		}
 		const resolvedThinkingLevel = resolveThinkingLevelForModel(model, requestedThinkingLevel);
 		const nextThinkingLevel = resolvedThinkingLevel ?? ThinkingLevel.Inherit;
