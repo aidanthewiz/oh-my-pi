@@ -16,6 +16,7 @@ import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { AUTHENTICATED_SENTINEL } from "@oh-my-pi/pi-ai/registry";
 import { runModelsListing } from "@oh-my-pi/pi-coding-agent/cli/models-cli";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { logger, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
@@ -429,6 +430,50 @@ describe("ModelRegistry runtime provider registration", () => {
 		} finally {
 			nowSpy.mockRestore();
 		}
+	});
+
+	test("JSON listing honors the enabledModels allowlist", async () => {
+		const providerName = "allowlisted-configured-provider";
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[providerName]: {
+						baseUrl: "https://runtime.example.com/v1",
+						api: "openai-completions",
+						auth: "none",
+						models: [
+							{ ...baseModel, id: "allowed-model" },
+							{ ...baseModel, id: "blocked-model" },
+						],
+					},
+				},
+			}),
+		);
+		const configuredRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: offlineFetch });
+		const settings = Settings.isolated({ enabledModels: [`${providerName}/allowed-model`] });
+		const captured: string[] = [];
+		const originalWrite = process.stdout.write;
+		Reflect.set(process.stdout, "write", (chunk: string | Uint8Array) => {
+			captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			await runModelsListing({
+				modelRegistry: configuredRegistry,
+				settings,
+				cwd: tempDir,
+				action: "ls",
+				pattern: providerName,
+				json: true,
+				disableExtensionDiscovery: true,
+			});
+		} finally {
+			process.stdout.write = originalWrite;
+		}
+
+		const payload = JSON.parse(captured.join("")) as { models: Array<{ id: string }> };
+		expect(payload.models.map(model => model.id)).toEqual(["allowed-model"]);
 	});
 
 	test("JSON listing reports failed configured discovery as stale", async () => {
