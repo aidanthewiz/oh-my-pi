@@ -7,7 +7,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import { addKeyAliases, type Component, canonicalKeyId, type KeyId, parseKey, type TUI } from "@oh-my-pi/pi-tui";
 import type { ModelRegistry } from "../../config/model-registry";
-import { filterModelsByEnabledSettings, getAllowedAvailableModels } from "../../config/model-resolver";
+import { filterModelsByConfiguredScope, getAllowedAvailableModels } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
 import type { ResolvedRoleModel } from "../../session/agent-session";
 import { type ThemeColor, theme } from "../theme/theme";
@@ -186,7 +186,7 @@ export class ModelPickerComponent implements Component {
 		const allModels =
 			this.#scopedModels.length > 0
 				? models
-				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
+				: filterModelsByConfiguredScope(this.#registry.getAll(), this.#settings);
 		const roles = resolveRoleAssignments(this.#settings, allModels, models);
 		const storage = this.#settings.getStorage();
 		const mruOrder = storage?.getModelUsageOrder() ?? [];

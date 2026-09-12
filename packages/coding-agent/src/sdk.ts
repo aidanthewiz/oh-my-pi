@@ -66,7 +66,7 @@ import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
-	filterModelsByEnabledSettings,
+	filterModelsByConfiguredScope,
 	formatModelSelectorValue,
 	formatModelString,
 	formatModelStringWithRouting,
@@ -1543,7 +1543,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const modelMatchPreferences = getModelMatchPreferences(settings);
 	const defaultRoleValue = settings.getModelRole("default");
 	let explicitDefaultProviders: Set<string> | undefined;
-	if ((settings.get("enabledModels")?.length ?? 0) === 0) {
+	if (settings.get("enabledModels").length === 0 && settings.get("disabledModels").length === 0) {
 		const patterns = resolveConfiguredModelPatterns(defaultRoleValue, settings);
 		if (patterns && patterns.length > 0) {
 			const providers = new Set<string>();
@@ -1571,7 +1571,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}),
 	);
 	let model =
-		options.model && filterModelsByEnabledSettings([options.model], settings).length > 0 ? options.model : undefined;
+		options.model && filterModelsByConfiguredScope([options.model], settings).length > 0 ? options.model : undefined;
 	let modelFallbackMessage: string | undefined;
 	let initialRetryFallback: InitialRetryFallbackState | undefined;
 	// Identify session model strings to restore in fallback order. We do an
@@ -2453,7 +2453,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allModels = filterModelsByEnabledSettings(modelRegistry.getAll(), settings);
+			const allModels = filterModelsByConfiguredScope(modelRegistry.getAll(), settings);
 			const availableModels = await resolveAllowedModels(modelRegistry, settings, matchPreferences);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
@@ -2523,7 +2523,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							},
 						];
 					}
-					if (resolved.blockedByEnabledModels) return [];
+					if (resolved.blockedByModelPolicy) return [];
 					return resolveConfiguredModelPatterns([trimmedSelector], settings).map(pattern => ({
 						pattern,
 						retryFallback: undefined,
@@ -2801,10 +2801,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 				}
 			} else {
-				const patterns = settings.get("enabledModels");
+				const enabledPatterns = settings.get("enabledModels");
+				const disabledPatterns = settings.get("disabledModels");
+				const modelPolicy = [
+					enabledPatterns.length > 0 ? `enabledModels (${enabledPatterns.join(", ")})` : undefined,
+					disabledPatterns.length > 0 ? `disabledModels (${disabledPatterns.join(", ")})` : undefined,
+				]
+					.filter((value): value is string => value !== undefined)
+					.join("; ");
 				modelFallbackMessage =
-					patterns && patterns.length > 0
-						? `No model available matching enabledModels (${patterns.join(", ")}) with usable credentials. Configure auth for an allowed provider or adjust enabledModels.`
+					modelPolicy.length > 0
+						? `No model available under ${modelPolicy} with usable credentials. Configure auth for an allowed provider or adjust the model policy.`
 						: "No models available. Use /login or set an API key environment variable. Then use /model to select a model.";
 			}
 		}

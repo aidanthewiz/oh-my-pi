@@ -29,7 +29,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import type { ModelRegistry } from "../../config/model-registry";
 import {
-	filterModelsByEnabledSettings,
+	filterModelsByConfiguredScope,
 	getAllowedAvailableModels,
 	type ModelRoleLookup,
 	type ResolvedModelRoleValue,
@@ -322,7 +322,7 @@ export class ModelHubComponent implements Component {
 		const allModels =
 			this.#scopedModels.length > 0
 				? autoCandidates
-				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
+				: filterModelsByConfiguredScope(this.#registry.getAll(), this.#settings);
 		this.#roles = resolveRoleAssignments(this.#settings, allModels, autoCandidates);
 	}
 
@@ -341,7 +341,7 @@ export class ModelHubComponent implements Component {
 		} else {
 			const loadError = this.#registry.getError();
 			this.#configError = loadError ? String(loadError) : undefined;
-			allModels = filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
+			allModels = filterModelsByConfiguredScope(this.#registry.getAll(), this.#settings);
 			try {
 				availableModels = getAllowedAvailableModels(this.#registry, this.#settings);
 			} catch (error) {
@@ -847,7 +847,7 @@ export class ModelHubComponent implements Component {
 		const allModels =
 			this.#scopedModels.length > 0
 				? this.#scopedModels.map(scoped => scoped.model)
-				: filterModelsByEnabledSettings(this.#registry.getAll(), this.#settings);
+				: filterModelsByConfiguredScope(this.#registry.getAll(), this.#settings);
 		const roleLookup: ModelRoleLookup = {
 			getModelRole: scopedRole =>
 				scope === "project"

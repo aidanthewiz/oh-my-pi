@@ -24,7 +24,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { formatNumber, sanitizeText } from "@oh-my-pi/pi-utils";
 import {
-	filterModelsByEnabledSettings,
+	filterModelsByConfiguredScope,
 	getModelMatchPreferences,
 	resolveModelRoleValue,
 } from "../../config/model-resolver";
@@ -91,7 +91,7 @@ export function resolveRoleAssignments(
 	const matchPreferences = getModelMatchPreferences(settings);
 	const knownRoles = getKnownRoleIds(settings);
 	const configuredRoles = new Set<string>();
-	const catalog = filterModelsByEnabledSettings([...allModels], settings);
+	const catalog = filterModelsByConfiguredScope([...allModels], settings);
 
 	for (const role of knownRoles) {
 		const roleValue = settings.getModelRole(role);
@@ -108,7 +108,7 @@ export function resolveRoleAssignments(
 	}
 
 	if (autoCandidates.length > 0) {
-		const candidates = filterModelsByEnabledSettings([...autoCandidates], settings);
+		const candidates = filterModelsByConfiguredScope([...autoCandidates], settings);
 		for (const role of knownRoles) {
 			if (configuredRoles.has(role)) continue;
 			const resolved = resolveModelRoleValue(`pi/${role}`, candidates, { settings, matchPreferences });

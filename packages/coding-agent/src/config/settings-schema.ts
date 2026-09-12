@@ -647,6 +647,8 @@ export const SETTINGS_SCHEMA = {
 
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 
+	disabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
+
 	enabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },

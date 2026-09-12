@@ -16,7 +16,7 @@
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { diffLineRuns, editDiffString, summarizeCode } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
-import { resolveRoleSelection } from "../config/model-resolver";
+import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
 import type { ToolSession } from "../tools";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
@@ -291,7 +291,11 @@ export async function attemptEditAutoRepair(options: {
 	if (!session.settings.get("edit.autoRepair.enabled")) return undefined;
 	const registry = session.modelRegistry;
 	if (!registry) return undefined;
-	const model = resolveRoleSelection(["smol"], session.settings, registry.getAvailable())?.model;
+	const model = resolveRoleSelection(
+		["smol"],
+		session.settings,
+		getAllowedAvailableModels(registry, session.settings),
+	)?.model;
 	if (!model) return undefined;
 	const sessionId = session.getSessionId?.() ?? undefined;
 	// Resolve the key eagerly so the session-sticky credential is recorded and

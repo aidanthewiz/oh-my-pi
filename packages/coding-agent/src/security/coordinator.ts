@@ -592,7 +592,7 @@ export class SecurityCoordinator {
 			if (!model)
 				throw new Error(`Security scan model is unavailable: ${plan.model.provider}/${plan.model.modelId}`);
 			if (!isModelEnabledBySettings(model, this.#host.settings, this.#host.modelRegistry)) {
-				throw new Error(`Security scan model is excluded by enabledModels: ${model.provider}/${model.id}`);
+				throw new Error(`Security scan model is excluded by model policy: ${model.provider}/${model.id}`);
 			}
 			const sessionsDirectory = path.join(store.projectDirectory, "sessions");
 			await fs.mkdir(sessionsDirectory, { recursive: true, mode: 0o700 });

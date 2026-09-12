@@ -20,7 +20,7 @@ import {
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import {
-	filterModelsByEnabledSettings,
+	filterModelsByConfiguredScope,
 	getAllowedAvailableModels,
 	getModelMatchPreferences,
 	resolveModelRoleValue,
@@ -310,7 +310,7 @@ export class ModelSelectorComponent extends Container {
 
 	#loadRoleModels(autoCandidateModels?: ReadonlyArray<Model>): void {
 		const nextRoles = {} as Record<string, RoleAssignment | undefined>;
-		const allModels = filterModelsByEnabledSettings(this.#modelRegistry.getAll(), this.#settings);
+		const allModels = filterModelsByConfiguredScope(this.#modelRegistry.getAll(), this.#settings);
 		const matchPreferences = getModelMatchPreferences(this.#settings);
 		const knownRoles = getKnownRoleIds(this.#settings);
 		const configuredRoles = new Set<string>();
@@ -442,10 +442,8 @@ export class ModelSelectorComponent extends Container {
 			}
 
 			try {
-				// Same allowlist the session applies (`enabledModels`), resolved against
-				// this component's settings instance (path scope): the picker must not
-				// offer models org config has scoped out, even when a matching
-				// credential is present in the environment.
+				// Apply the session's path-scoped model policy. The picker must not
+				// offer excluded models even when a matching credential exists.
 				const availableModels = getAllowedAvailableModels(this.#modelRegistry, this.#settings);
 				models = availableModels.map((model: Model) => ({
 					kind: "provider",

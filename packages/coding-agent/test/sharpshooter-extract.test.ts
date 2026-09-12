@@ -7,11 +7,12 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
 	buildSharpshooterEnvelope,
 	maybeStartSharpshooterExtraction,
+	resolveSharpshooterModel,
 } from "@oh-my-pi/pi-coding-agent/sharpshooter/extract";
 import { listSharpshooterDeltas } from "@oh-my-pi/pi-coding-agent/sharpshooter/queue";
 
@@ -116,6 +117,41 @@ describe("buildSharpshooterEnvelope", () => {
 		expect(
 			buildSharpshooterEnvelope([message("assistant", [{ type: "text", text: "No user yet" }])]),
 		).toBeUndefined();
+	});
+});
+
+describe("resolveSharpshooterModel", () => {
+	it("does not use a denied configured extraction model", async () => {
+		const denied = getBundledModel("anthropic", "claude-haiku-4-5");
+		const allowed = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!denied || !allowed) throw new Error("Expected bundled Anthropic models");
+		const settings = Settings.isolated({
+			"sharpshooter.model": `${denied.provider}/${denied.id}`,
+			modelRoles: { smol: `${allowed.provider}/${allowed.id}:low` },
+			enabledModels: ["anthropic/*"],
+			disabledModels: [`${denied.provider}/${denied.id}`],
+		});
+		const registry = {
+			getAll: () => [denied, allowed],
+			getAvailable: () => [denied, allowed],
+		} as unknown as ModelRegistry;
+
+		expect(await resolveSharpshooterModel(settings, registry)).toBe(allowed);
+	});
+
+	it("does not use a denied smol fallback", async () => {
+		const denied = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!denied) throw new Error("Expected bundled Claude Haiku model");
+		const settings = Settings.isolated({
+			modelRoles: { smol: `${denied.provider}/${denied.id}:low` },
+			disabledModels: [`${denied.provider}/${denied.id}`],
+		});
+		const registry = {
+			getAll: () => [denied],
+			getAvailable: () => [denied],
+		} as unknown as ModelRegistry;
+
+		expect(await resolveSharpshooterModel(settings, registry)).toBeUndefined();
 	});
 });
 

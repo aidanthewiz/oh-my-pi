@@ -290,7 +290,7 @@ For the example above:
 - `anthropic` and `openai` are additionally disabled under `~/projects/sensitive`.
 - `openrouter` is additionally disabled under `~/work/client-a` and `~/work/client-b`.
 
-Path scopes are resolved **after** the settings merge. Because a higher-precedence layer replaces the whole array, a project-level `disabledProviders` array drops any scoped entries that only existed in the global array. `enabledModels` is the only other setting that supports the same path-scoped form. See [Settings](./settings.md) for details.
+Path scopes are resolved **after** the settings merge. Because a higher-precedence layer replaces the whole array, a project-level `disabledProviders` array drops any scoped entries that only existed in the global array. `enabledModels` and `disabledModels` support the same path-scoped form. See [Settings](./settings.md) for details.
 
 ## Provider IDs vs discovery provider IDs
 

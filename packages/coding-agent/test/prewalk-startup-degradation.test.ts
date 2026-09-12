@@ -65,6 +65,41 @@ describe("prewalk startup degradation", () => {
 		expect(options.prewalk?.target.id).toBe(model.id);
 	});
 
+	test("leaves prewalk unarmed when its role target is disabled by model policy", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("expected claude-sonnet-4-5 to be bundled");
+		const settings = Settings.isolated({
+			disabledModels: [`${model.provider}/${model.id}`],
+		});
+		settings.set("prewalk.enabled", true);
+		settings.setModelRole("smol", `${model.provider}/${model.id}`);
+		authStorage.setRuntimeApiKey(model.provider, "test-key");
+
+		const options = await buildSessionOptions(parseArgs([]), [], SessionManager.inMemory(), modelRegistry, settings);
+
+		expect(options.prewalk).toBeUndefined();
+	});
+
+	test("rejects plan-yolo when its role target is disabled by model policy", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("expected claude-sonnet-4-5 to be bundled");
+		const settings = Settings.isolated({
+			disabledModels: [`${model.provider}/${model.id}`],
+		});
+		settings.setModelRole("smol", `${model.provider}/${model.id}`);
+		authStorage.setRuntimeApiKey(model.provider, "test-key");
+
+		await expect(
+			buildSessionOptions(
+				parseArgs(["--plan-yolo", "--plan-yolo-into", "@smol"]),
+				[],
+				SessionManager.inMemory(),
+				modelRegistry,
+				settings,
+			),
+		).rejects.toThrow("enabledModels/disabledModels");
+	});
+
 	test("does not implicitly re-arm configured prewalk while restoring a session", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected claude-sonnet-4-5 to be bundled");

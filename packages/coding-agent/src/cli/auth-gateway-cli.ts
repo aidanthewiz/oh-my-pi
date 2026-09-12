@@ -35,7 +35,7 @@ import { type GeneratedProvider, getBundledModels } from "@oh-my-pi/pi-catalog/m
 import { getConfigRootDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
-import { filterModelsByEnabledSettings } from "../config/model-resolver";
+import { filterModelsByConfiguredScope } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { type AuthBrokerClientConfig, resolveAuthBrokerConfig } from "../session/auth-broker-config";
 
@@ -163,7 +163,7 @@ export function indexModelsByRequestId(
 	settings?: Settings,
 ): Map<string, Model<Api>> {
 	const modelById = new Map<string, Model<Api>>();
-	for (const model of filterModelsByEnabledSettings(models, settings)) {
+	for (const model of filterModelsByConfiguredScope(models, settings)) {
 		if (!providersWithCreds.has(model.provider)) continue;
 		modelById.set(`${model.provider}/${model.id}`, model);
 		if (!modelById.has(model.id)) modelById.set(model.id, model);
@@ -461,7 +461,7 @@ const RETRYABLE_MODEL_ERROR_RE =
 function pickProbeCandidates(provider: string, settings: Settings): Model<Api>[] {
 	const bundled = getBundledModels(provider as GeneratedProvider);
 	if (bundled.length === 0) return [];
-	const candidates = filterModelsByEnabledSettings(bundled, settings).filter(model => {
+	const candidates = filterModelsByConfiguredScope(bundled, settings).filter(model => {
 		if (model.transport === "pi-native") return false;
 		if (STRICT_PROBE_SKIPPED_APIS.has(model.api)) return false;
 		if (!model.input.includes("text")) return false;

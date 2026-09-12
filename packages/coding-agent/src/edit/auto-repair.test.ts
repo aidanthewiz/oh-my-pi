@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { summarizeCode } from "@oh-my-pi/pi-natives";
-import { computeRepairRegion, repairParseRegression } from "./auto-repair";
+import type { ModelRegistry } from "../config/model-registry";
+import { Settings } from "../config/settings";
+import type { ToolSession } from "../tools";
+import { attemptEditAutoRepair, computeRepairRegion, repairParseRegression } from "./auto-repair";
 
 const PATH = "/repo/src/sample.ts";
 
@@ -140,5 +144,34 @@ describe("repairParseRegression", () => {
 			async () => "const doubled = (b * 2; // still broken",
 		);
 		expect(repair).toBeUndefined();
+	});
+});
+
+describe("attemptEditAutoRepair", () => {
+	test("does not request credentials for a denied smol model", async () => {
+		const denied = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!denied) throw new Error("Expected bundled Claude Haiku model");
+		const settings = Settings.isolated({
+			"edit.autoRepair.enabled": true,
+			modelRoles: { smol: `${denied.provider}/${denied.id}:low` },
+			disabledModels: [`${denied.provider}/${denied.id}`],
+		});
+		let credentialRequests = 0;
+		const registry = {
+			getAvailable: () => [denied],
+			getApiKey: async () => {
+				credentialRequests += 1;
+				return "test-key";
+			},
+		} as unknown as ModelRegistry;
+		const session = { settings, modelRegistry: registry } as unknown as ToolSession;
+
+		await attemptEditAutoRepair({
+			session,
+			snapshot: {} as never,
+			writethrough: (() => undefined) as never,
+		});
+
+		expect(credentialRequests).toBe(0);
 	});
 });
