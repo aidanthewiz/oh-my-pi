@@ -333,11 +333,13 @@ process.exit(1);
 				actions: "focus",
 			});
 			expect(fs.readFileSync(resultPath, "utf8")).toBe("runtime-approved");
+			expect(review).toContain("WARNING: This command requires explicit review before execution.");
 			expect(review).toContain("strict_git:worktree-remove");
 			expect(review).toContain("git worktree remove deletes a linked working tree.");
 			expect(review).toContain(JSON.stringify(tempDir));
 			expect(review).toContain(JSON.stringify(`printf runtime-approved > '${resultPath}'`));
 			expect(review).toContain("newlines and control characters are escaped");
+			expect(review).toContain("Only choose Approve once if this exact command is intended.");
 
 			await expect(tool.execute("approved-call", args)).rejects.toThrow(/requires interactive approval/u);
 		} finally {

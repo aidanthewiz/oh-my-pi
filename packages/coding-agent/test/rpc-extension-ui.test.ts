@@ -40,6 +40,27 @@ describe("RPC extension UI", () => {
 		expect(await result).toBe("Keep");
 	});
 
+	it("retains the complete destructive title in the text-only RPC request", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const title =
+			'Destructive Command Guard\nWARNING: This command requires explicit review before execution.\nCommand: "rm -rf /tmp/tree"';
+		const result = requestRpcSelect(pendingRequests, output, title, ["Deny", "Approve once"], {
+			tuiStyle: "destructive",
+		});
+		const frame = output.mock.calls[0]?.[0];
+		const request = requireRequest(frame);
+
+		expect(frame).toMatchObject({
+			method: "select",
+			title,
+			options: ["Deny", "Approve once"],
+		});
+
+		resolveSelection(pendingRequests, request.id, "Deny");
+		expect(await result).toBe("Deny");
+	});
+
 	it("emits aligned descriptions and resolves with the selected label", async () => {
 		const pendingRequests = new Map<string, PendingExtensionRequest>();
 		const output = vi.fn<(frame: object) => void>();

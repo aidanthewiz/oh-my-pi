@@ -86,6 +86,29 @@ Only choose Approve once if this exact command is intended.`,
 		expect(rendered).toContain(
 			theme.fg("warning", theme.bold("Only choose Approve once if this exact command is intended.")),
 		);
+		const content = component.renderContent(116).map(line => Bun.stripANSI(line));
+		const commandHeaderIndex = content.findIndex(line => line.trim() === commandHeader);
+		const boundaryIndex = content.findIndex(
+			line => line.trim() === "Only choose Approve once if this exact command is intended.",
+		);
+		expect(content[commandHeaderIndex - 1]?.trim()).toBe("");
+		expect(content[boundaryIndex - 1]?.trim()).toBe("");
+	});
+
+	it("removes terminal control sequences from destructive details", () => {
+		const hyperlink = "\x1b]8;;https://evil.invalid\x07details\x1b]8;;\x07";
+		const component = new HookSelectorComponent(
+			`Destructive Command Guard
+Reason: review ${hyperlink}`,
+			["Deny", "Approve once"],
+			() => {},
+			() => {},
+			{ titleStyle: "destructive" },
+		);
+
+		const rendered = component.render(80).join("\n");
+		expect(rendered).not.toContain("evil.invalid");
+		expect(Bun.stripANSI(rendered)).toContain("Reason: review details");
 	});
 
 	it("wraps outlined option text without omitting the tail", () => {

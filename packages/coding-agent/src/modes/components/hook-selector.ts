@@ -242,7 +242,13 @@ export class HookSelectorComponent extends OverlayPanel {
 		}
 
 		for (const line of titleLines.slice(1)) {
-			this.addChild(new Text(destructiveTitle ? renderDestructiveTitleLine(line) : theme.fg("accent", line), 0, 0));
+			if (line.length === 0) {
+				this.addChild(new Spacer(1));
+			} else {
+				this.addChild(
+					new Text(destructiveTitle ? renderDestructiveTitleLine(line) : theme.fg("accent", line), 0, 0),
+				);
+			}
 		}
 		this.addChild(new Spacer(1));
 
