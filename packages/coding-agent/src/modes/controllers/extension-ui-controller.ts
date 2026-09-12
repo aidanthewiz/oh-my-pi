@@ -963,6 +963,7 @@ export class ExtensionUiController {
 					onTimeoutStart: dialogOptions?.onTimeoutStart,
 					onTimeoutReset: dialogOptions?.onTimeoutReset,
 					tui: this.ctx.ui,
+					style: dialogOptions?.style,
 					outline: dialogOptions?.outline,
 					disabledIndices: dialogOptions?.disabledIndices,
 					selectionMarker: dialogOptions?.selectionMarker,

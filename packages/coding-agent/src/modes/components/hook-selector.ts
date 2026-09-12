@@ -19,6 +19,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, type ThemeColor, theme } from "../../modes/theme/theme";
 import {
 	matchesAppExternalEditor,
@@ -68,6 +69,8 @@ export interface HookSelectorOptions {
 	onLeft?: () => void;
 	onRight?: () => void;
 	onExternalEditor?: () => void;
+	/** Select-dialog presentation style for security-sensitive flows. */
+	style?: "default" | "destructive";
 	helpText?: string;
 	slider?: HookSelectorSlider;
 	/** Indices into the original options that cannot be selected: they render
@@ -159,6 +162,22 @@ class OutlinedList extends Container {
  *  disabled-index lookups survive fuzzy filtering and reordering. */
 type FilteredOption = { option: HookSelectorOption; index: number };
 
+function renderDestructiveTitleLine(line: string): string {
+	const normalized = replaceTabs(sanitizeText(line));
+	if (normalized.length === 0) return normalized;
+	if (normalized.startsWith("WARNING:")) return theme.fg("warning", theme.bold(normalized));
+	if (normalized.startsWith("Command (")) return theme.fg("warning", theme.bold(normalized));
+	if (normalized.startsWith("Only choose Approve once")) return theme.fg("warning", theme.bold(normalized));
+	if (normalized.startsWith('"')) return theme.fg("error", theme.bold(normalized));
+	const colonIndex = normalized.indexOf(":");
+	if (colonIndex > 0) {
+		const label = normalized.slice(0, colonIndex + 1);
+		const value = normalized.slice(colonIndex + 1);
+		return `${theme.fg("accent", theme.bold(label))}${theme.fg("text", value)}`;
+	}
+	return theme.fg("muted", normalized);
+}
+
 export class HookSelectorComponent extends OverlayPanel {
 	#options: HookSelectorOption[];
 	#filteredOptions: FilteredOption[];
@@ -174,6 +193,7 @@ export class HookSelectorComponent extends OverlayPanel {
 	#onSelectCallback: (option: string) => void;
 	#onCancelCallback: () => void;
 	#baseTitle: string;
+	#titleStyle: "default" | "destructive";
 	#countdown: CountdownTimer | undefined;
 	#onLeftCallback: (() => void) | undefined;
 	#onRightCallback: (() => void) | undefined;
@@ -190,7 +210,10 @@ export class HookSelectorComponent extends OverlayPanel {
 		onCancel: () => void,
 		opts?: HookSelectorOptions,
 	) {
-		super(title.split(/\r?\n/, 1)[0] ?? "");
+		const safeTitle = sanitizeText(title);
+		const titleLines = safeTitle.split(/\r?\n/);
+		super(titleLines[0] ?? "");
+		this.#titleStyle = opts?.style ?? "default";
 
 		this.#options = options.map(normalizeHookSelectorOption);
 		this.#filteredOptions = this.#options.map((option, index) => ({ option, index }));
@@ -220,9 +243,14 @@ export class HookSelectorComponent extends OverlayPanel {
 			this.#sliderIndex = Math.max(0, Math.min(opts.slider.index, opts.slider.segments.length - 1));
 		}
 
-		this.addChild(new Spacer(1));
-		for (const line of title.split(/\r?\n/).slice(1)) {
-			this.addChild(new Text(theme.fg("accent", line), 0, 0));
+		for (const line of titleLines.slice(1)) {
+			this.addChild(
+				new Text(
+					this.#titleStyle === "destructive" ? renderDestructiveTitleLine(line) : theme.fg("accent", line),
+					0,
+					0,
+				),
+			);
 		}
 		this.addChild(new Spacer(1));
 

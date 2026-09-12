@@ -451,6 +451,7 @@ function formatDcgRuntimeApproval(
 	const rule = decision.ruleId ?? "unknown rule";
 	return {
 		reason: `Destructive Command Guard requires review (${rule})`,
+		style: "destructive",
 		prompt: prompt.render(dcgApprovalPrompt, {
 			rule,
 			reason: decision.reason,

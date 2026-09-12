@@ -44,6 +44,36 @@ describe("HookSelectorComponent", () => {
 		expect(lines[0]).toContain("Delete session?");
 		expect(lines.some(line => line.includes("session-2026-08-20"))).toBe(true);
 	});
+	it("uses semantic colors for destructive approval details", () => {
+		const warning = "WARNING: This command requires explicit review before execution.";
+		const commandHeader = "Command (exact JSON string; newlines and control characters are escaped):";
+		const command = JSON.stringify("git worktree remove /tmp/tree");
+		const component = new HookSelectorComponent(
+			`Destructive Command Guard
+${warning}
+Rule: strict_git:worktree-remove
+Reason: linked working tree will be deleted.
+
+${commandHeader}
+${command}
+
+Only choose Approve once if this exact command is intended.`,
+			["Deny", "Approve once"],
+			() => {},
+			() => {},
+			{ style: "destructive" },
+		);
+
+		const rendered = component.render(120).join("\n");
+		expect(rendered).toContain(theme.fg("warning", theme.bold(warning)));
+		expect(rendered).toContain(
+			`${theme.fg("accent", theme.bold("Rule:"))}${theme.fg("text", " strict_git:worktree-remove")}`,
+		);
+		expect(rendered).toContain(theme.fg("error", theme.bold(command)));
+		expect(rendered).toContain(
+			theme.fg("warning", theme.bold("Only choose Approve once if this exact command is intended.")),
+		);
+	});
 
 	it("wraps outlined option text without omitting the tail", () => {
 		const options = [

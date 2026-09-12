@@ -16,6 +16,8 @@ export type ApprovalMode = "always-ask" | "write" | "yolo";
 export interface RuntimeToolApprovalRequest {
 	reason: string;
 	prompt: string;
+	/** Select-dialog presentation style for this runtime approval. */
+	style?: "default" | "destructive";
 }
 
 export interface RuntimeApprovalCapableTool {

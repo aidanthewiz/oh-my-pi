@@ -6,7 +6,11 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type {
+	ExtensionRunner,
+	ExtensionUIDialogOptions,
+	ExtensionUISelectItem,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -90,7 +94,13 @@ process.exit(1);
 		removeSyncWithRetries(tempDir);
 	});
 
-	function runner(select: (prompt: string, options: string[]) => string | undefined): ExtensionRunner {
+	function runner(
+		select: (
+			prompt: string,
+			options: ExtensionUISelectItem[],
+			dialogOptions?: ExtensionUIDialogOptions,
+		) => string | undefined,
+	): ExtensionRunner {
 		return {
 			sessionId: "dcg-runtime-test",
 			runScoped: <T>(fn: () => T): T => fn(),
@@ -98,7 +108,11 @@ process.exit(1);
 			hasUI: () => true,
 			consumeToolCallEmitted: () => false,
 			getUIContext: () => ({
-				select: async (prompt: string, options: string[]) => select(prompt, options),
+				select: async (
+					prompt: string,
+					options: ExtensionUISelectItem[],
+					dialogOptions?: ExtensionUIDialogOptions,
+				) => select(prompt, options, dialogOptions),
 			}),
 		} as unknown as ExtensionRunner;
 	}
@@ -296,10 +310,11 @@ process.exit(1);
 		let review = "";
 		const wrapped = new ExtensionToolWrapper(
 			tool as unknown as AgentTool,
-			runner((prompt, options) => {
+			runner((prompt, options, dialogOptions) => {
 				events.push("selector");
 				review = prompt;
 				expect(options).toEqual(["Deny", "Approve once"]);
+				expect(dialogOptions?.style).toBe("destructive");
 				expect(fs.existsSync(path.dirname(resultPath))).toBeFalse();
 				return "Approve once";
 			}),

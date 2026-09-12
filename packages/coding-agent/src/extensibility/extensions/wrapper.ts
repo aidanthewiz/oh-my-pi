@@ -365,10 +365,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						pendingSafetyChecks.length > 0
 							? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 							: "";
-					const choice = await uiContext.select(`${runtimeApproval.prompt}${safetySuffix}`, [
-						"Deny",
-						"Approve once",
-					]);
+					const choice = await uiContext.select(
+						`${runtimeApproval.prompt}${safetySuffix}`,
+						["Deny", "Approve once"],
+						{ style: runtimeApproval.style },
+					);
 					approved = choice === "Approve once";
 				} else {
 					const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
