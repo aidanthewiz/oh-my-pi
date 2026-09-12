@@ -44,6 +44,19 @@ describe("HookSelectorComponent", () => {
 		expect(lines[0]).toContain("Delete session?");
 		expect(lines.some(line => line.includes("session-2026-08-20"))).toBe(true);
 	});
+
+	it("preserves caller styling in ordinary selector details", () => {
+		const styledDetail = theme.fg("success", "styled detail");
+		const component = new HookSelectorComponent(
+			`Ordinary selector
+${styledDetail}`,
+			["Continue"],
+			() => {},
+			() => {},
+		);
+
+		expect(component.render(80).join("\n")).toContain(styledDetail);
+	});
 	it("uses semantic colors for destructive approval details", () => {
 		const warning = "WARNING: This command requires explicit review before execution.";
 		const commandHeader = "Command (exact JSON string; newlines and control characters are escaped):";
@@ -61,7 +74,7 @@ Only choose Approve once if this exact command is intended.`,
 			["Deny", "Approve once"],
 			() => {},
 			() => {},
-			{ style: "destructive" },
+			{ titleStyle: "destructive" },
 		);
 
 		const rendered = component.render(120).join("\n");

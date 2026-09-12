@@ -69,8 +69,8 @@ export interface HookSelectorOptions {
 	onLeft?: () => void;
 	onRight?: () => void;
 	onExternalEditor?: () => void;
-	/** Select-dialog presentation style for security-sensitive flows. */
-	style?: "default" | "destructive";
+	/** Title and detail styling for destructive approval flows. */
+	titleStyle?: "destructive";
 	helpText?: string;
 	slider?: HookSelectorSlider;
 	/** Indices into the original options that cannot be selected: they render
@@ -193,7 +193,6 @@ export class HookSelectorComponent extends OverlayPanel {
 	#onSelectCallback: (option: string) => void;
 	#onCancelCallback: () => void;
 	#baseTitle: string;
-	#titleStyle: "default" | "destructive";
 	#countdown: CountdownTimer | undefined;
 	#onLeftCallback: (() => void) | undefined;
 	#onRightCallback: (() => void) | undefined;
@@ -210,10 +209,9 @@ export class HookSelectorComponent extends OverlayPanel {
 		onCancel: () => void,
 		opts?: HookSelectorOptions,
 	) {
-		const safeTitle = sanitizeText(title);
-		const titleLines = safeTitle.split(/\r?\n/);
+		const destructiveTitle = opts?.titleStyle === "destructive";
+		const titleLines = (destructiveTitle ? sanitizeText(title) : title).split(/\r?\n/);
 		super(titleLines[0] ?? "");
-		this.#titleStyle = opts?.style ?? "default";
 
 		this.#options = options.map(normalizeHookSelectorOption);
 		this.#filteredOptions = this.#options.map((option, index) => ({ option, index }));
@@ -244,13 +242,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		}
 
 		for (const line of titleLines.slice(1)) {
-			this.addChild(
-				new Text(
-					this.#titleStyle === "destructive" ? renderDestructiveTitleLine(line) : theme.fg("accent", line),
-					0,
-					0,
-				),
-			);
+			this.addChild(new Text(destructiveTitle ? renderDestructiveTitleLine(line) : theme.fg("accent", line), 0, 0));
 		}
 		this.addChild(new Spacer(1));
 

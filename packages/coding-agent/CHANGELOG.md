@@ -9,7 +9,7 @@
 
 ### Changed
 
-- DCG approval dialogs now use a warning header, semantic field colors, and a highlighted command value so the reviewed action is clear.
+- Interactive DCG approval dialogs now use a warning header, semantic field colors, and a highlighted command value so the reviewed action is clear.
 
 ## [18.1.17] - 2026-09-10
 

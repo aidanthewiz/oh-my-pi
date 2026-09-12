@@ -312,6 +312,7 @@ export type CollabUiRequestDraft =
 			checkedIndices?: number[];
 			markableCount?: number;
 			helpText?: string;
+			tuiStyle?: "destructive";
 	  }
 	| {
 			kind: "editor";

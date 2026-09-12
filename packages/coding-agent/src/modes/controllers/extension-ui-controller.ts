@@ -594,6 +594,7 @@ export class ExtensionUiController {
 			checkedIndices: dialogOptions?.checkedIndices ? [...dialogOptions.checkedIndices] : undefined,
 			markableCount: dialogOptions?.markableCount,
 			helpText: dialogOptions?.helpText,
+			tuiStyle: dialogOptions?.tuiStyle,
 		};
 		return this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
 			this.showHookSelector(title, options, { ...dialogOptions, signal }, extra),
@@ -963,7 +964,7 @@ export class ExtensionUiController {
 					onTimeoutStart: dialogOptions?.onTimeoutStart,
 					onTimeoutReset: dialogOptions?.onTimeoutReset,
 					tui: this.ctx.ui,
-					style: dialogOptions?.style,
+					titleStyle: dialogOptions?.tuiStyle,
 					outline: dialogOptions?.outline,
 					disabledIndices: dialogOptions?.disabledIndices,
 					selectionMarker: dialogOptions?.selectionMarker,

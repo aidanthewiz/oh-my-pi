@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:t
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { HookEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/hook-editor";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { CURSOR_MARKER, isFocusable, setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
 
@@ -562,9 +562,25 @@ describe("ExtensionUiController dialog serialization", () => {
 		showHookSelector: (
 			title: string,
 			options: string[],
-			dialogOptions?: { signal?: AbortSignal },
+			dialogOptions?: { signal?: AbortSignal; tuiStyle?: "destructive" },
 		) => Promise<string | undefined>;
 	};
+
+	it("forwards destructive TUI styling into the selector", async () => {
+		const { ctx } = createControllerContext();
+		const controller = new ExtensionUiController(ctx) as unknown as SelectorController;
+		const abort = new AbortController();
+		const warning = "WARNING: This command requires explicit review before execution.";
+
+		const result = controller.showHookSelector(`Destructive Command Guard\n${warning}`, ["Deny"], {
+			signal: abort.signal,
+			tuiStyle: "destructive",
+		});
+
+		expect(ctx.hookSelector?.render(120).join("\n")).toContain(theme.fg("warning", theme.bold(warning)));
+		abort.abort();
+		expect(await result).toBeUndefined();
+	});
 
 	it("queues a second selector instead of clobbering the open one", async () => {
 		const { ctx, editor, editorContainer } = createControllerContext();

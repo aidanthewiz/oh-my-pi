@@ -684,6 +684,7 @@ export class CollabGuestLink {
 						checkedIndices: request.checkedIndices,
 						markableCount: request.markableCount,
 						helpText: request.helpText,
+						tuiStyle: request.tuiStyle,
 					})
 				: this.#ctx.showHookEditor(request.title, request.prefill, { signal: abort.signal });
 		dialog

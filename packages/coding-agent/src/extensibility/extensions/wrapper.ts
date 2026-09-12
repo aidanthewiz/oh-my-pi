@@ -368,7 +368,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					const choice = await uiContext.select(
 						`${runtimeApproval.prompt}${safetySuffix}`,
 						["Deny", "Approve once"],
-						{ style: runtimeApproval.style },
+						{ tuiStyle: runtimeApproval.tuiStyle },
 					);
 					approved = choice === "Approve once";
 				} else {

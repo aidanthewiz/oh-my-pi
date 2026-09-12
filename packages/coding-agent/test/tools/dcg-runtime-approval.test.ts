@@ -314,7 +314,7 @@ process.exit(1);
 				events.push("selector");
 				review = prompt;
 				expect(options).toEqual(["Deny", "Approve once"]);
-				expect(dialogOptions?.style).toBe("destructive");
+				expect(dialogOptions?.tuiStyle).toBe("destructive");
 				expect(fs.existsSync(path.dirname(resultPath))).toBeFalse();
 				return "Approve once";
 			}),

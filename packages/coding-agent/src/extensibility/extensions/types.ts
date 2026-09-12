@@ -201,8 +201,8 @@ export interface ExtensionUIDialogOptions {
 	onRight?: () => void;
 	/** Invoked when user presses the external editor shortcut in select dialogs */
 	onExternalEditor?: () => void;
-	/** Select-dialog presentation style for security-sensitive flows. */
-	style?: "default" | "destructive";
+	/** Interactive TUI style. RPC and ACP clients receive the unchanged title text. */
+	tuiStyle?: "destructive";
 	/** Optional footer hint text rendered by interactive selector */
 	helpText?: string;
 	/** Render a leading radio/checkbox marker before each markable option in
