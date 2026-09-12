@@ -3168,15 +3168,17 @@ describe("ACP agent", () => {
 				action: "accept",
 				content: { value: "second" },
 			}));
+			const title =
+				'Destructive Command Guard\nWARNING: This command requires explicit review before execution.\nCommand: "rm -rf /tmp/tree"';
 			const ctx = createAcpExtensionUiContext(connection, () => "session-select", FORM_CAPABILITIES);
 
-			const result = await ctx.select("Pick one", ["first", "second", "third"]);
+			const result = await ctx.select(title, ["first", "second", "third"], { tuiStyle: "destructive" });
 
 			expect(result).toBe("second");
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			expect(request.mode).toBe("form");
-			expect(request.message).toBe("Pick one");
+			expect(request.message).toBe(title);
 			if (!isFormElicitation(request) || !("sessionId" in request)) {
 				throw new Error("expected session-scoped form elicitation");
 			}

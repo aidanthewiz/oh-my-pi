@@ -313,6 +313,7 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 				checkedIndices: [0],
 				markableCount: 2,
 				helpText: "pick one",
+				tuiStyle: "destructive",
 			},
 		});
 
@@ -325,6 +326,7 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 		expect(dialog.dialogOptions?.checkedIndices).toEqual([0]);
 		expect(dialog.dialogOptions?.markableCount).toBe(2);
 		expect(dialog.dialogOptions?.helpText).toBe("pick one");
+		expect(dialog.dialogOptions?.tuiStyle).toBe("destructive");
 
 		dialog.settle("Yes");
 		expect(await h.nextUiResponse()).toEqual({ reqId: 1, value: "Yes" });
@@ -660,7 +662,7 @@ describe("collab host dialog vs teardown (#4049 follow-up)", () => {
 		const welcome = await guest.nextFrame();
 		if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
 
-		const result = controller.showCollabAwareSelector("Deploy?", ["Yes", "No"]);
+		const result = controller.showCollabAwareSelector("Deploy?", ["Yes", "No"], { tuiStyle: "destructive" });
 		const requestFrame = await guest.nextFrame();
 		if (requestFrame.t !== "ui-request") throw new Error(`expected ui-request, got ${requestFrame.t}`);
 		const dialog = controller.localDialogs[0];
@@ -707,6 +709,18 @@ describe("collab host dialog vs teardown (#4049 follow-up)", () => {
 		} finally {
 			guest?.socket.close();
 			await host.stop("test done");
+		}
+	});
+
+	it("carries destructive TUI styling to writable guests", async () => {
+		const race = await openRace();
+		try {
+			if (race.requestFrame.request.kind !== "select") throw new Error("expected select ui-request");
+			expect(race.requestFrame.request.tuiStyle).toBe("destructive");
+			race.dialog.settle("style-checked");
+			expect(await race.result).toBe("style-checked");
+		} finally {
+			await race.cleanup();
 		}
 	});
 

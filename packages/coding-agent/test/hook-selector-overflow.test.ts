@@ -45,6 +45,72 @@ describe("HookSelectorComponent", () => {
 		expect(lines.some(line => line.includes("session-2026-08-20"))).toBe(true);
 	});
 
+	it("preserves caller styling in ordinary selector details", () => {
+		const styledDetail = theme.fg("success", "styled detail");
+		const component = new HookSelectorComponent(
+			`Ordinary selector
+${styledDetail}`,
+			["Continue"],
+			() => {},
+			() => {},
+		);
+
+		expect(component.render(80).join("\n")).toContain(styledDetail);
+	});
+	it("uses semantic colors for destructive approval details", () => {
+		const warning = "WARNING: This command requires explicit review before execution.";
+		const commandHeader = "Command (exact JSON string; newlines and control characters are escaped):";
+		const command = JSON.stringify("git worktree remove /tmp/tree");
+		const component = new HookSelectorComponent(
+			`Destructive Command Guard
+${warning}
+Rule: strict_git:worktree-remove
+Reason: linked working tree will be deleted.
+
+${commandHeader}
+${command}
+
+Only choose Approve once if this exact command is intended.`,
+			["Deny", "Approve once"],
+			() => {},
+			() => {},
+			{ titleStyle: "destructive" },
+		);
+
+		const rendered = component.render(120).join("\n");
+		expect(rendered).toContain(theme.fg("warning", theme.bold(warning)));
+		expect(rendered).toContain(
+			`${theme.fg("accent", theme.bold("Rule:"))}${theme.fg("text", " strict_git:worktree-remove")}`,
+		);
+		expect(rendered).toContain(theme.fg("error", theme.bold(command)));
+		expect(rendered).toContain(
+			theme.fg("warning", theme.bold("Only choose Approve once if this exact command is intended.")),
+		);
+		const content = component.renderContent(116).map(line => Bun.stripANSI(line));
+		const commandHeaderIndex = content.findIndex(line => line.trim() === commandHeader);
+		const boundaryIndex = content.findIndex(
+			line => line.trim() === "Only choose Approve once if this exact command is intended.",
+		);
+		expect(content[commandHeaderIndex - 1]?.trim()).toBe("");
+		expect(content[boundaryIndex - 1]?.trim()).toBe("");
+	});
+
+	it("removes terminal control sequences from destructive details", () => {
+		const hyperlink = "\x1b]8;;https://evil.invalid\x07details\x1b]8;;\x07";
+		const component = new HookSelectorComponent(
+			`Destructive Command Guard
+Reason: review ${hyperlink}`,
+			["Deny", "Approve once"],
+			() => {},
+			() => {},
+			{ titleStyle: "destructive" },
+		);
+
+		const rendered = component.render(80).join("\n");
+		expect(rendered).not.toContain("evil.invalid");
+		expect(Bun.stripANSI(rendered)).toContain("Reason: review details");
+	});
+
 	it("wraps outlined option text without omitting the tail", () => {
 		const options = [
 			"Option A: Move to OMP-native only by migrating reusable shared AI instructions into .omp/AGENTS.md, .omp/rules, .omp/skills, and .omp/agents while deliberately not creating a root .github directory.",
