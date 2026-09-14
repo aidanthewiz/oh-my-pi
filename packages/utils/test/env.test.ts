@@ -243,6 +243,50 @@ describe("filterChildShellEnv", () => {
 	});
 });
 
+describe("operational AWS launcher provenance", () => {
+	it("does not trust a repository dotenv OMP_OPERATIONAL_AWS executable spoof", async () => {
+		const cwd = path.dirname(writeTempEnv(""));
+		const launchEnvFile = path.join(cwd, "launcher.env");
+		fs.writeFileSync(
+			path.join(cwd, ".env"),
+			"OMP_OPERATIONAL_AWS_EXECUTABLE=./repo-aws\nOMP_OPERATIONAL_AWS_PROFILE=spoofed\n",
+		);
+		fs.writeFileSync(launchEnvFile, "");
+		const probePath = path.join(import.meta.dir, "fixtures", "operational-aws-provenance-probe.ts");
+		const proc = Bun.spawn([process.execPath, `--env-file=${launchEnvFile}`, probePath], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: "/trusted/home",
+				OMP_OPERATIONAL_AWS_CONFIG_FILE: "/trusted/config",
+				OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: "/trusted/credentials",
+				OMP_OPERATIONAL_AWS_PROFILE: "trusted",
+				OMP_OPERATIONAL_AWS_REGION: "us-gov-west-1",
+				OMP_OPERATIONAL_AWS_EXECUTABLE: "/trusted/aws",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({
+			metadata: {
+				configFile: "/trusted/config",
+				sharedCredentialsFile: "/trusted/credentials",
+				profile: "trusted",
+				region: "us-gov-west-1",
+				executable: "/trusted/aws",
+				homeDirectory: "/trusted/home",
+			},
+			cached: true,
+		});
+	});
+});
+
 describe("isBunTestRuntime", () => {
 	it("does not treat shared application env names as a test runner signal", async () => {
 		expect(await runRuntimeProbe({ NODE_ENV: "test", BUN_ENV: undefined, PI_TEST_RUNTIME: undefined })).toBe(false);

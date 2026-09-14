@@ -266,6 +266,15 @@ export class MCPManager {
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
+	#connectionAbortControllers = new Map<string, AbortController>();
+	#pendingFirstUseConnections = new Map<string, Promise<MCPServerConnection | null>>();
+	/**
+	 * A 401 during background discovery records an auth challenge but never
+	 * opens a browser. Deferred cached tools consume it on their first use.
+	 */
+	#pendingAuthChallenges = new Map<string, MCPAuthChallenge>();
+	/** A declined first-use authorization remains declined until manual retry. */
+	#declinedAuthServers = new Set<string>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
 	#authHandler?: MCPAuthHandler;
@@ -717,7 +726,12 @@ export class MCPManager {
 		sources: Record<string, SourceMeta>,
 		onStatus?: (event: McpConnectionStatusEvent) => void,
 	): Promise<MCPLoadResult> {
+		const reportedFailureStatuses = new Set<string>();
 		const notify = (event: McpConnectionStatusEvent) => {
+			if (event.type === "failed") {
+				if (reportedFailureStatuses.has(event.serverName)) return;
+				reportedFailureStatuses.add(event.serverName);
+			}
 			onStatus?.(event);
 			this.#emitConnectionStatus(event);
 		};
@@ -761,8 +775,6 @@ export class MCPManager {
 				continue;
 			}
 
-			statusServerNames.push(name);
-
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
@@ -776,15 +788,31 @@ export class MCPManager {
 			// Save config early so reconnection works even if the initial connect times out
 			// and falls back to cached/deferred tools.
 			this.#serverConfigs.set(name, config);
-			const connectionEpoch = this.#epoch;
+			const cached = await this.toolCache?.get(name, config);
+			if (cached && cached.length > 0 && config.enabled !== false) {
+				const source = this.#sources.get(name);
+				const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+					this.#reconnectServerForTool(name, options);
+				this.#replaceServerTools(
+					name,
+					DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
+				);
+				void this.#onToolsChanged?.(this.#tools);
+				continue;
+			}
 
-			// Resolve auth config before connecting, but do so per-server in parallel.
-			let connectionConfig = config;
+			statusServerNames.push(name);
+			const connectionEpoch = this.#epoch;
+			const connectionAbortController = new AbortController();
+			this.#connectionAbortControllers.set(name, connectionAbortController);
+
+			const connectionConfig = config;
 			const source = sources[name];
 			const sourceLevel = source?.level;
 			const connectWithConfig = async (candidateConfig: MCPServerConfig): Promise<MCPServerConnection> => {
 				const resolvedConfig = await this.#resolveAuthConfig(candidateConfig, { sourceLevel });
 				return connectToServer(name, resolvedConfig, {
+					signal: connectionAbortController.signal,
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
 					},
@@ -799,14 +827,12 @@ export class MCPManager {
 					return await connectWithConfig(connectionConfig);
 				} catch (error) {
 					const authChallenge = getInitialAuthChallenge(error, connectionConfig);
-					if (!authChallenge) throw error;
-
-					const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
-					if (!refreshedConfig) throw error;
-
-					connectionConfig = refreshedConfig;
-					this.#serverConfigs.set(name, refreshedConfig);
-					return connectWithConfig(refreshedConfig);
+					if (authChallenge) {
+						// Startup must remain non-interactive. Remember the challenge
+						// for a cached/deferred tool's first actual invocation.
+						this.#pendingAuthChallenges.set(name, authChallenge);
+					}
+					throw error;
 				}
 			})().then(
 				connection => {
@@ -827,6 +853,8 @@ export class MCPManager {
 					this.#pendingConnections.delete(name);
 					this.#connections.set(name, connection);
 					this.#serverConfigs.set(name, connectionConfig);
+					this.#pendingAuthChallenges.delete(name);
+					this.#declinedAuthServers.delete(name);
 
 					// Wire auth refresh for HTTP-like transports so 401s trigger token refresh.
 					// Gate on a resolvable managed credential, not on the auth block:
@@ -869,7 +897,7 @@ export class MCPManager {
 
 			const toolsPromise = connectionPromise.then(async connection => {
 				try {
-					const serverTools = await listTools(connection);
+					const serverTools = await listTools(connection, { signal: connectionAbortController.signal });
 					return { connection, serverTools };
 				} catch (error) {
 					// Detach and delete synchronously, then close in the background:
@@ -883,6 +911,18 @@ export class MCPManager {
 				}
 			});
 			this.#pendingToolLoads.set(name, toolsPromise);
+			void toolsPromise.then(
+				() => {
+					if (this.#connectionAbortControllers.get(name) === connectionAbortController) {
+						this.#connectionAbortControllers.delete(name);
+					}
+				},
+				() => {
+					if (this.#connectionAbortControllers.get(name) === connectionAbortController) {
+						this.#connectionAbortControllers.delete(name);
+					}
+				},
+			);
 
 			const tracked = trackPromise(toolsPromise);
 			connectionTasks.push({ name, config, tracked, toolsPromise });
@@ -892,7 +932,7 @@ export class MCPManager {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
 					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
-						this.reconnectServer(name, options);
+						this.#reconnectServerForTool(name, options);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					void this.#onToolsChanged?.(this.#tools);
@@ -918,7 +958,8 @@ export class MCPManager {
 						const stopForwarding = onStatus
 							? this.addConnectionStatusListener(event => {
 									if ((event.type === "connected" || event.type === "failed") && event.serverName === name) {
-										onStatus(event);
+										if (event.type === "failed") notify(event);
+										else onStatus(event);
 									}
 								})
 							: undefined;
@@ -944,11 +985,14 @@ export class MCPManager {
 			]);
 
 			const cachedTools = new Map<string, MCPToolDefinition[]>();
-			const pendingTasks = connectionTasks.filter(task => task.tracked.status === "pending");
+			const deferredTasks = connectionTasks.filter(task => task.tracked.status !== "fulfilled");
 
-			if (pendingTasks.length > 0 && this.toolCache) {
+			// Cached tool definitions are a static catalog for servers that cannot
+			// complete background setup. They remain deferred: the transport and
+			// any browser authorization start only when a caller invokes a tool.
+			if (deferredTasks.length > 0 && this.toolCache) {
 				await Promise.all(
-					pendingTasks.map(async task => {
+					deferredTasks.map(async task => {
 						const cached = await this.toolCache?.get(task.name, task.config);
 						if (cached) {
 							cachedTools.set(task.name, cached);
@@ -972,24 +1016,28 @@ export class MCPManager {
 					if (!value) continue;
 					const { connection, serverTools } = value;
 					connectedServers.add(name);
-					const reconnect = () => this.reconnectServer(name);
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+						this.#reconnectServerForTool(name, options);
 					this.#replaceServerTools(name, MCPTool.fromTools(connection, serverTools, reconnect));
 				} else if (task.tracked.status === "rejected") {
 					if (task.tracked.reason instanceof MCPOAuthCancelledError) continue;
-					const message =
-						task.tracked.reason instanceof Error ? task.tracked.reason.message : String(task.tracked.reason);
+					const authHint = this.#pendingAuthChallenges.has(name)
+						? ` Run \`/mcp reauth ${name}\` to authenticate this server.`
+						: "";
+					const message = `${task.tracked.reason instanceof Error ? task.tracked.reason.message : String(task.tracked.reason)}${authHint}`;
 					errors.set(name, message);
 					reportedErrors.add(name);
-				} else {
-					const cached = cachedTools.get(name);
-					if (cached) {
-						const source = this.#sources.get(name);
-						const reconnect = () => this.reconnectServer(name);
-						this.#replaceServerTools(
-							name,
-							DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
-						);
-					}
+				}
+
+				const cached = cachedTools.get(name);
+				if (cached) {
+					const source = this.#sources.get(name);
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+						this.#reconnectServerForTool(name, options);
+					this.#replaceServerTools(
+						name,
+						DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
+					);
 				}
 			}
 		}
@@ -1141,17 +1189,12 @@ export class MCPManager {
 	 */
 	getConnectionStatus(name: string): "connected" | "connecting" | "disconnected" {
 		if (this.#connections.has(name)) return "connected";
-		if (
-			this.#pendingConnections.has(name) ||
-			this.#pendingToolLoads.has(name) ||
-			this.#pendingReconnections.has(name)
-		)
-			return "connecting";
+		if (this.#pendingConnections.has(name) || this.#pendingReconnections.has(name)) return "connecting";
 		return "disconnected";
 	}
 
 	/**
-	 * Get the source metadata for a server.
+	 * Get source metadata for a server.
 	 */
 	getSource(name: string): SourceMeta | undefined {
 		return this.#sources.get(name) ?? this.#connections.get(name)?._source;
@@ -1169,6 +1212,46 @@ export class MCPManager {
 	}
 
 	/**
+	 * Resolve a deferred tool's server on its first use. A startup challenge is
+	 * authorized here, after the tool call has passed its normal approval gate.
+	 */
+	async #reconnectServerForTool(
+		name: string,
+		options?: { authChallenge?: MCPAuthChallenge },
+	): Promise<MCPServerConnection | null> {
+		const existing = this.#pendingFirstUseConnections.get(name);
+		if (existing) return await existing;
+		const pending = this.#reconnectServerForToolInternal(name, options);
+		this.#pendingFirstUseConnections.set(name, pending);
+		try {
+			return await pending;
+		} finally {
+			if (this.#pendingFirstUseConnections.get(name) === pending) this.#pendingFirstUseConnections.delete(name);
+		}
+	}
+
+	async #reconnectServerForToolInternal(
+		name: string,
+		options?: { authChallenge?: MCPAuthChallenge },
+	): Promise<MCPServerConnection | null> {
+		if (this.#declinedAuthServers.has(name)) return null;
+		const authChallenge = options?.authChallenge ?? this.#pendingAuthChallenges.get(name);
+		if (!authChallenge) return this.reconnectServer(name);
+
+		try {
+			const authorizedConfig = await this.#runAuthHandler(name, authChallenge);
+			if (!authorizedConfig) {
+				this.#declinedAuthServers.add(name);
+				return null;
+			}
+			return this.reconnectServer(name, { authorizedConfig });
+		} catch (error) {
+			this.#declinedAuthServers.add(name);
+			throw error;
+		}
+	}
+
+	/**
 	 * Wait for a connection to complete (or fail).
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
@@ -1176,12 +1259,13 @@ export class MCPManager {
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
 		if (pending) return pending;
-		// If a reconnection is in flight, wait for it to complete
 		const reconnecting = this.#pendingReconnections.get(name);
 		if (reconnecting) {
 			const result = await reconnecting;
 			if (result) return result;
 		}
+		const reconnected = await this.#reconnectServerForTool(name);
+		if (reconnected) return reconnected;
 		throw new Error(`MCP server not connected: ${name}`);
 	}
 
@@ -1209,7 +1293,12 @@ export class MCPManager {
 	 */
 	getAllServerNames(): string[] {
 		return Array.from(
-			new Set([...this.#sources.keys(), ...this.#connections.keys(), ...this.#pendingConnections.keys()]),
+			new Set([
+				...this.#sources.keys(),
+				...this.#connections.keys(),
+				...this.#pendingConnections.keys(),
+				...this.#serverConfigs.keys(),
+			]),
 		);
 	}
 
@@ -1245,9 +1334,14 @@ export class MCPManager {
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
+		this.#connectionAbortControllers.get(name)?.abort("MCP server disconnected");
+		this.#connectionAbortControllers.delete(name);
 		this.#pendingConnections.delete(name);
 		this.#pendingToolLoads.delete(name);
+		this.#pendingFirstUseConnections.delete(name);
 		this.#pendingReconnections.delete(name);
+		this.#pendingAuthChallenges.delete(name);
+		this.#declinedAuthServers.delete(name);
 		this.#sources.delete(name);
 		this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
@@ -1265,12 +1359,10 @@ export class MCPManager {
 			await this.#discardConnection(name, connection);
 		}
 
-		// Remove tools from this server and notify consumers
 		const hadTools = this.#tools.some(t => t.mcpServerName === name);
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
 		if (hadTools) void this.#onToolsChanged?.(this.#tools);
 
-		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
 	}
 
@@ -1279,16 +1371,21 @@ export class MCPManager {
 	 */
 	async disconnectAll(): Promise<void> {
 		this.#cancelAuthQueue();
-		// Invalidate any in-flight reconnection attempts that outlive this call.
-		// They captured the old epoch; after increment they'll detect staleness.
+		for (const controller of this.#connectionAbortControllers.values()) {
+			controller.abort("MCP manager disconnected");
+		}
+		this.#connectionAbortControllers.clear();
 		this.#epoch++;
 		const promises = Array.from(this.#connections, ([name, connection]) => this.#discardConnection(name, connection));
 		await Promise.allSettled(promises);
 
 		this.#pendingConnections.clear();
 		this.#pendingToolLoads.clear();
+		this.#pendingFirstUseConnections.clear();
 		this.#pendingReconnections.clear();
 		this.#pendingResourceRefresh.clear();
+		this.#pendingAuthChallenges.clear();
+		this.#declinedAuthServers.clear();
 		this.#sources.clear();
 		this.#serverConfigs.clear();
 		this.#tools = [];
@@ -1311,10 +1408,12 @@ export class MCPManager {
 	 */
 	async reconnectServer(
 		name: string,
-		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge },
+		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge; authorizedConfig?: MCPServerConfig },
 	): Promise<MCPServerConnection | null> {
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
+			this.#pendingAuthChallenges.delete(name);
+			this.#declinedAuthServers.delete(name);
 		}
 
 		const pending = this.#pendingReconnections.get(name);
@@ -1324,7 +1423,7 @@ export class MCPManager {
 			return null;
 		}
 
-		const attempt = this.#doReconnect(name, options?.authChallenge);
+		const attempt = this.#doReconnect(name, options?.authChallenge, options?.authorizedConfig);
 		this.#pendingReconnections.set(name, attempt);
 		return attempt.finally(() => {
 			if (this.#pendingReconnections.get(name) === attempt) {
@@ -1376,26 +1475,43 @@ export class MCPManager {
 		return false;
 	}
 
-	async #doReconnect(name: string, authChallenge?: MCPAuthChallenge): Promise<MCPServerConnection | null> {
+	async #doReconnect(
+		name: string,
+		authChallenge?: MCPAuthChallenge,
+		authorizedConfig?: MCPServerConfig,
+	): Promise<MCPServerConnection | null> {
 		const oldConnection = this.#connections.get(name);
 		let config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
 
-		if (authChallenge) {
+		if (authorizedConfig) {
+			config = authorizedConfig;
+			this.#serverConfigs.set(name, config);
+			this.#pendingAuthChallenges.delete(name);
+			this.#declinedAuthServers.delete(name);
+		} else if (authChallenge) {
 			if (!this.#authHandler) {
-				logger.error("MCP auth challenge cannot be handled; no auth handler is configured", {
+				logger.debug("MCP auth challenge deferred until an interactive integration use", {
 					path: `mcp:${name}`,
 				});
 				return null;
 			}
 			try {
 				const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
-				if (!refreshedConfig) return null;
+				if (!refreshedConfig) {
+					this.#declinedAuthServers.add(name);
+					return null;
+				}
 				config = refreshedConfig;
 				this.#serverConfigs.set(name, config);
+				this.#pendingAuthChallenges.delete(name);
+				this.#declinedAuthServers.delete(name);
 			} catch (error) {
-				if (error instanceof MCPOAuthCancelledError) return null;
+				if (error instanceof MCPOAuthCancelledError) {
+					this.#declinedAuthServers.add(name);
+					return null;
+				}
 				logger.error("MCP auth challenge handling failed", { path: `mcp:${name}`, error });
 				return null;
 			}

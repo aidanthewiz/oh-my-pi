@@ -5,15 +5,18 @@
 ### Added
 
 - Added `disabledModels`, a path-scoped exact/glob deny-list applied after `enabledModels` across model selection and execution. Exact entries never fuzzy-match nearby models.
+- Added a structured native `aws` tool with explicit local profiles, sovereign-partition routing, isolated credentials, verified mutation identity, and Destructive Command Guard enforcement.
 
 ### Fixed
 
 - Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once. Bash retains the reviewed execution route and shell through startup, and route or shell changes require a fresh safety review.
 - Destructive Command Guard now fails closed on unexpected stderr and on child processes that keep output pipes open past the bounded post-exit drain window.
+- AWS recovery now bounds inherited output pipes and terminates the process tree when sign-in times out.
 
 ### Changed
 
 - Interactive DCG approval dialogs now use a warning header, semantic field colors, and a highlighted command value so the reviewed action is clear.
+- Interactive prompt readiness no longer waits for MCP connections or managed identity validation. Authentication occurs on first use; shared AWS SSO groups offer one sign-in and retry the original operation once.
 
 ## [18.1.17] - 2026-09-10
 

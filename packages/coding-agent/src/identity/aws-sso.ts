@@ -1,3 +1,4 @@
+import { getOperationalAwsLaunchMetadata } from "@oh-my-pi/pi-utils";
 import { AWS_PROFILE_PATTERN, AWS_REGION_PATTERN, CONTROL_CHARACTER_PATTERN } from "./aws-patterns";
 import {
 	type CoreforgeAwsSsoConstants,
@@ -70,7 +71,8 @@ export async function ensureCoreforgeAwsSso(
 	deps: CoreforgeAwsDependencies = {},
 ): Promise<CoreforgeAwsIdentity> {
 	const normalized = validateAwsSpawnConfig(config);
-	const executable = deps.findAws ? deps.findAws() : Bun.which("aws");
+	const launch = getOperationalAwsLaunchMetadata();
+	const executable = deps.findAws ? deps.findAws() : launch ? launch.executable : Bun.which("aws");
 	if (!executable) throw new Error("AWS CLI v2 is required for Coreforge AWS sign-in");
 	const run = deps.run ?? runAwsCommand;
 	const identityCommand = [

@@ -183,6 +183,115 @@ it("does not let explicit server env reopen managed dotenv loading", async () =>
 	}
 });
 
+it("passes immutable AWS metadata only to the managed proxy after runtime cleanup", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-managed-aws-stdio-"));
+	const managedOutput = path.join(root, "managed.json");
+	const genericOutput = path.join(root, "generic.json");
+	const transportUrl = new URL("../../../src/mcp/transports/stdio.ts", import.meta.url).href;
+	const captureChildEnvironment = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify(process.env));";
+	const trusted = {
+		configFile: path.join(root, "trusted-config"),
+		sharedCredentialsFile: path.join(root, "trusted-credentials"),
+		profile: "trusted-profile",
+		region: "us-gov-west-1",
+		executable: path.join(root, "trusted-aws"),
+	};
+	const untrusted = {
+		OMP_OPERATIONAL_AWS_CONFIG_FILE: path.join(root, "project-config"),
+		OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "project-credentials"),
+		OMP_OPERATIONAL_AWS_PROFILE: "project-profile",
+		OMP_OPERATIONAL_AWS_REGION: "eu-west-1",
+		OMP_OPERATIONAL_AWS_EXECUTABLE: path.join(root, "project-aws"),
+		OMP_OPERATIONAL_AWS_HOME_DIRECTORY: path.join(root, "project-home"),
+		AWS_ACCESS_KEY_ID: "config-access-key",
+		AWS_SECRET_ACCESS_KEY: "config-secret-key",
+	};
+	await Bun.write(
+		path.join(root, ".env"),
+		`${Object.entries(untrusted)
+			.map(([key, value]) => `${key}=${value}`)
+			.join("\n")}\n`,
+	);
+	// The spawned transport has no readiness protocol. This integration probe waits for its actual output file.
+	const script = [
+		`const { StdioTransport } = await import(${JSON.stringify(transportUrl)});`,
+		`const capture = ${JSON.stringify(captureChildEnvironment)};`,
+		`const managedOutput = ${JSON.stringify(managedOutput)};`,
+		`const genericOutput = ${JSON.stringify(genericOutput)};`,
+		`const untrusted = ${JSON.stringify(untrusted)};`,
+		"for (const key of Object.keys(process.env)) { if (key.startsWith('OMP_OPERATIONAL_AWS_')) delete process.env[key]; }",
+		"const waitFor = async output => { for (let attempt = 0; attempt < 100 && !(await Bun.file(output).exists()); attempt++) await Bun.sleep(10); if (!(await Bun.file(output).exists())) throw new Error('child did not capture its environment'); };",
+		"const managed = new StdioTransport({ command: process.execPath, args: ['-e', capture, managedOutput], cwd: process.cwd(), env: untrusted }, { preserveOperationalAws: true });",
+		"await managed.connect(); await waitFor(managedOutput); await managed.close();",
+		"const generic = new StdioTransport({ command: process.execPath, args: ['-e', capture, genericOutput], cwd: process.cwd(), env: untrusted });",
+		"await generic.connect(); await waitFor(genericOutput); await generic.close();",
+		"process.stdout.write(JSON.stringify({ managed: JSON.parse(await Bun.file(managedOutput).text()), generic: JSON.parse(await Bun.file(genericOutput).text()) }));",
+	].join("\n");
+	const proc = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+		cwd: root,
+		env: {
+			...process.env,
+			HOME: root,
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: trusted.configFile,
+			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: trusted.sharedCredentialsFile,
+			OMP_OPERATIONAL_AWS_PROFILE: trusted.profile,
+			OMP_OPERATIONAL_AWS_REGION: trusted.region,
+			OMP_OPERATIONAL_AWS_EXECUTABLE: trusted.executable,
+			AWS_ACCESS_KEY_ID: "ambient-access-key",
+			AWS_SECRET_ACCESS_KEY: "ambient-secret-key",
+			AWS_SESSION_TOKEN: "ambient-session-token",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	try {
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		const result = JSON.parse(stdout) as {
+			managed: Record<string, string | undefined>;
+			generic: Record<string, string | undefined>;
+		};
+		expect(result.managed).toMatchObject({
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: trusted.configFile,
+			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: trusted.sharedCredentialsFile,
+			OMP_OPERATIONAL_AWS_PROFILE: trusted.profile,
+			OMP_OPERATIONAL_AWS_REGION: trusted.region,
+			OMP_OPERATIONAL_AWS_EXECUTABLE: trusted.executable,
+			OMP_OPERATIONAL_AWS_HOME_DIRECTORY: root,
+		});
+		for (const key of [
+			"AWS_ACCESS_KEY_ID",
+			"AWS_SECRET_ACCESS_KEY",
+			"AWS_SESSION_TOKEN",
+			"AWS_PROFILE",
+			"AWS_REGION",
+		]) {
+			expect(result.managed[key]).toBeUndefined();
+		}
+		for (const key of [
+			"OMP_OPERATIONAL_AWS_CONFIG_FILE",
+			"OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE",
+			"OMP_OPERATIONAL_AWS_PROFILE",
+			"OMP_OPERATIONAL_AWS_REGION",
+			"OMP_OPERATIONAL_AWS_EXECUTABLE",
+			"OMP_OPERATIONAL_AWS_HOME_DIRECTORY",
+			"AWS_ACCESS_KEY_ID",
+			"AWS_SECRET_ACCESS_KEY",
+			"AWS_SESSION_TOKEN",
+			"AWS_PROFILE",
+			"AWS_REGION",
+		]) {
+			expect(result.generic[key]).toBeUndefined();
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 // Regression for #3945: request() awaited stdin.write/flush, so a child that
 // stops draining stdin would park the async fn past the timeout timer and past
 // `return promise`, orphaning the deferred rejection and hanging the caller

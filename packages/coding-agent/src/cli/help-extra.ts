@@ -70,6 +70,7 @@ export function getExtraHelpText(): string {
 ${chalk.bold("Available Tools (default-enabled unless noted):")}
   read          - Read file contents
   bash          - Execute bash commands
+  aws           - Run structured AWS CLI operations with an explicit local profile
   edit          - Edit files with find/replace
   write         - Write files (creates/overwrites)
   grep          - Search file contents

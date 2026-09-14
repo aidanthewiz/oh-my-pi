@@ -1,17 +1,11 @@
 /**
- * Regression coverage for automatic OAuth on initial HTTP MCP connections.
- *
- * Interactive sessions already install the MCP auth handler before deferred
- * discovery starts. A 401 during initialize must use that handler, retry once,
- * and serialize concurrent flows because OAuth callbacks share a local port.
+ * MCP startup must remain non-interactive. A signed-out integration records its
+ * challenge during discovery and authorizes only when that integration is used.
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import {
-	type MCPAuthChallenge,
-	type MCPHttpServerConfig,
-	MCPOAuthCancelledError,
-} from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { MCPHttpServerConfig, MCPToolDefinition } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { MCPToolCache } from "@oh-my-pi/pi-coding-agent/mcp/tool-cache";
 
 type RequestRecord = {
 	url: string;
@@ -88,118 +82,107 @@ describe("MCP startup OAuth", () => {
 		vi.restoreAllMocks();
 	});
 
-	test("reauthorizes an enabled HTTP server after an initialize 401", async () => {
+	test("does not open browser authorization during a signed-out server's background discovery", async () => {
 		const manager = new MCPManager(process.cwd());
 		const config = httpConfig(SENTRY_URL);
-		const refreshedConfig: MCPHttpServerConfig = {
-			...config,
-			headers: { Authorization: "Bearer fresh-token" },
-		};
 		const { requests } = installMcpFetch(
 			new Set([SENTRY_URL]),
 			new Map([[SENTRY_URL, 'Bearer realm="https://auth.test"']]),
 		);
-		const challenges: MCPAuthChallenge[] = [];
-		manager.setAuthHandler(async (_name, challenge) => {
-			challenges.push(challenge);
-			return refreshedConfig;
-		});
+		const handler = vi.fn(async () => ({
+			...config,
+			headers: { Authorization: "Bearer fresh-token" },
+		}));
+		manager.setAuthHandler(handler);
 
 		try {
 			const result = await manager.connectServers({ sentry: config }, {});
 
-			expect(result.errors).toEqual(new Map());
-			expect(result.connectedServers).toEqual(["sentry"]);
-			expect(challenges).toEqual([{ wwwAuthenticate: ['Bearer realm="https://auth.test"'] }]);
-
-			const initializeRequests = requests.filter(
-				request => request.url === SENTRY_URL && request.body.method === "initialize",
-			);
-			expect(initializeRequests).toHaveLength(2);
-			expect(initializeRequests[1]?.headers.get("Authorization")).toBe("Bearer fresh-token");
+			expect(result.errors.get("sentry")).toContain("HTTP 401");
+			expect(result.errors.get("sentry")).toContain("/mcp reauth sentry");
+			expect(handler).not.toHaveBeenCalled();
+			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(1);
 		} finally {
 			await manager.disconnectAll();
 		}
 	});
 
-	test("serializes concurrent startup OAuth flows", async () => {
-		const manager = new MCPManager(process.cwd());
-		const rootlyConfig = httpConfig(ROOTLY_URL);
-		const sentryConfig = httpConfig(SENTRY_URL);
-		installMcpFetch(new Set([ROOTLY_URL, SENTRY_URL]));
-
-		let activeFlows = 0;
-		let maximumConcurrentFlows = 0;
-		const firstFlowStarted = Promise.withResolvers<void>();
-		const releaseFirstFlow = Promise.withResolvers<void>();
-		const handler = vi.fn(async (name: string, _challenge: MCPAuthChallenge) => {
-			activeFlows++;
-			maximumConcurrentFlows = Math.max(maximumConcurrentFlows, activeFlows);
-			if (name === "rootly") {
-				firstFlowStarted.resolve();
-				await releaseFirstFlow.promise;
-			}
-			activeFlows--;
-			return name === "rootly" ? rootlyConfig : sentryConfig;
-		});
-		manager.setAuthHandler(handler);
+	test("surfaces cached static tools when signed-out discovery fails", async () => {
+		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
+		const toolCache = {
+			get: async () => cachedTools,
+			set: async () => {},
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), toolCache);
+		const config = httpConfig(SENTRY_URL);
+		const { requests } = installMcpFetch(new Set([SENTRY_URL]));
 
 		try {
-			const resultPromise = manager.connectServers({ rootly: rootlyConfig, sentry: sentryConfig }, {});
-			await firstFlowStarted.promise;
-			expect(handler).toHaveBeenCalledTimes(1);
+			const result = await manager.connectServers({ sentry: config }, {});
 
-			releaseFirstFlow.resolve();
-			const result = await resultPromise;
-			expect(handler).toHaveBeenCalledTimes(2);
-			expect(maximumConcurrentFlows).toBe(1);
-			expect(result.connectedServers).toEqual(["rootly", "sentry"]);
+			expect(result.errors.has("sentry")).toBe(false);
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__sentry_lookup"]);
+			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(0);
 		} finally {
-			releaseFirstFlow.resolve();
 			await manager.disconnectAll();
 		}
 	});
 
-	test("cancels the active OAuth flow and every queued flow", async () => {
+	test("authorizes only when an affected integration first needs its server", async () => {
 		const manager = new MCPManager(process.cwd());
-		const rootlyConfig = httpConfig(ROOTLY_URL);
-		const sentryConfig = httpConfig(SENTRY_URL);
-		installMcpFetch(new Set([ROOTLY_URL, SENTRY_URL]));
-
-		const firstFlowStarted = Promise.withResolvers<void>();
-		const queueEvents: Array<{ type: string; serverName: string; queue: readonly string[] }> = [];
-		const statuses: Array<{ type: string; serverName?: string }> = [];
-		const handler = vi.fn(async (name: string, _challenge: MCPAuthChallenge, context?: { signal: AbortSignal }) => {
-			firstFlowStarted.resolve();
-			await new Promise<void>((_resolve, reject) => {
-				context?.signal.addEventListener("abort", () => reject(new MCPOAuthCancelledError()), { once: true });
-			});
-			return name === "rootly" ? rootlyConfig : sentryConfig;
-		});
+		const config = httpConfig(ROOTLY_URL);
+		installMcpFetch(new Set([ROOTLY_URL]));
+		const refreshedConfig: MCPHttpServerConfig = {
+			...config,
+			headers: { Authorization: "Bearer fresh-token" },
+		};
+		const handler = vi.fn(async () => refreshedConfig);
 		manager.setAuthHandler(handler);
-		manager.setAuthQueueHandler(event => queueEvents.push(event));
 
 		try {
-			const resultPromise = manager.connectServers({ rootly: rootlyConfig, sentry: sentryConfig }, {}, event =>
-				statuses.push(event),
-			);
-			await firstFlowStarted.promise;
-			manager.cancelAuthQueue();
-			const result = await resultPromise;
+			await manager.connectServers({ rootly: config }, {});
+			expect(handler).not.toHaveBeenCalled();
 
+			await Promise.all([manager.waitForConnection("rootly"), manager.waitForConnection("rootly")]);
 			expect(handler).toHaveBeenCalledTimes(1);
-			expect(result.connectedServers).toEqual([]);
-			expect(result.errors).toEqual(new Map());
-			expect(queueEvents.filter(event => event.type === "cancelled").map(event => event.serverName)).toEqual([
-				"rootly",
-				"sentry",
-			]);
-			expect(
-				statuses
-					.filter(event => event.type === "cancelled")
-					.map(event => event.serverName)
-					.sort(),
-			).toEqual(["rootly", "sentry"]);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
+
+	test("does not re-prompt after the first-use authorization is declined", async () => {
+		const manager = new MCPManager(process.cwd());
+		const config = httpConfig(SENTRY_URL);
+		installMcpFetch(new Set([SENTRY_URL]));
+		const handler = vi.fn(async () => undefined);
+		manager.setAuthHandler(handler);
+
+		try {
+			await manager.connectServers({ sentry: config }, {});
+
+			await expect(manager.waitForConnection("sentry")).rejects.toThrow("MCP server not connected: sentry");
+			await expect(manager.waitForConnection("sentry")).rejects.toThrow("MCP server not connected: sentry");
+			expect(handler).toHaveBeenCalledTimes(1);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
+
+	test("does not retry a failed first-use authorization until manual reconnect", async () => {
+		const manager = new MCPManager(process.cwd());
+		const config = httpConfig(SENTRY_URL);
+		installMcpFetch(new Set([SENTRY_URL]));
+		const handler = vi.fn(async () => {
+			throw new Error("browser authorization unavailable");
+		});
+		manager.setAuthHandler(handler);
+
+		try {
+			await manager.connectServers({ sentry: config }, {});
+
+			await expect(manager.waitForConnection("sentry")).rejects.toThrow("browser authorization unavailable");
+			await expect(manager.waitForConnection("sentry")).rejects.toThrow("MCP server not connected: sentry");
+			expect(handler).toHaveBeenCalledTimes(1);
 		} finally {
 			await manager.disconnectAll();
 		}

@@ -381,6 +381,10 @@ export interface MCPServerConnection {
 	capabilities: MCPServerCapabilities;
 	/** Cached tools (populated on demand) */
 	tools?: MCPToolDefinition[];
+	/** Exact operational profiles supplied to the managed AWS proxy. */
+	operationalAwsProfiles?: readonly string[];
+	/** Local selectors stripped only for a proxy bound to one explicit profile. */
+	awsProfileBindings?: Map<string, string>;
 	/** Source metadata (for display) */
 	_source?: SourceMeta;
 	/** Cached resources (populated on demand) */

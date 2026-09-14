@@ -296,7 +296,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(result.removedManagedAwsProfile).toBe(true);
 	});
 
-	it("restores the full launcher-captured AWS chain and removes every alias", () => {
+	it("rejects forged operational aliases without adopting them as model credentials", () => {
 		const env: Record<string, string | undefined> = {
 			AWS_PROFILE: "managed-model-profile",
 			AWS_REGION: "managed-model-region",
@@ -309,15 +309,15 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		restoreCoreforgeOperationalAwsEnvironment(env);
 
 		for (const key of OPERATIONAL_AWS_ENV_NAMES) {
-			expect(env[key]).toBe(`launcher-${key}`);
+			expect(env[key]).toBeUndefined();
 			expect(env[`OMP_OPERATIONAL_${key}_SET`]).toBeUndefined();
 			expect(env[`OMP_OPERATIONAL_${key}`]).toBeUndefined();
 		}
-		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("managed-model-profile");
-		expect(env[AWS_MODEL_REGION_ENV]).toBe("managed-model-region");
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
+		expect(env[AWS_MODEL_REGION_ENV]).toBeUndefined();
 	});
 
-	it("clears ambient model-auth envs while preserving the operational AWS chain", () => {
+	it("clears ambient model authentication and operational credentials", () => {
 		const settings = identitySettings();
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-ant-stale",
@@ -345,16 +345,15 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		expect(result.clearedKeys).toContain("OPENAI_API_KEY");
 
-		expect(env.AWS_PROFILE).toBe("user-profile");
-		expect(env.AWS_ACCESS_KEY_ID).toBe("AKIASTALE");
-		expect(env.AWS_SECRET_ACCESS_KEY).toBe("secretstale");
-		expect(env.AWS_CONFIG_FILE).toBe("/home/dev/.aws/other-config");
-		expect(env.AWS_SHARED_CREDENTIALS_FILE).toBe("/home/dev/.aws/other-creds");
-		expect(result.clearedKeys).not.toContain("AWS_ACCESS_KEY_ID");
+		expect(env.AWS_PROFILE).toBeUndefined();
+		expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+		expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+		expect(env.AWS_CONFIG_FILE).toBeUndefined();
+		expect(env.AWS_SHARED_CREDENTIALS_FILE).toBeUndefined();
 		expect(env.PERPLEXITY_API_KEY).toBe("pplx-keep");
 	});
 
-	it("blocks ambient model auth before sign-in without changing operational AWS credentials", () => {
+	it("blocks ambient model and operational authentication before sign-in", () => {
 		const settings = identitySettings();
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-ant-stale",
@@ -371,11 +370,11 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
-		expect(env.AWS_PROFILE).toBe("user-profile");
+		expect(env.AWS_PROFILE).toBeUndefined();
 		expect(env.GITHUB_TOKEN).toBe("ghp-keep");
 	});
 
-	it("is a no-op that leaves ambient envs untouched when Entra is unprovisioned", () => {
+	it("preserves unrelated model keys but removes operational selectors when Entra is unprovisioned", () => {
 		const settings = identitySettings({
 			"identity.entra.tenantId": undefined,
 			"identity.entra.clientId": undefined,
@@ -386,7 +385,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(result.clearedKeys).toEqual([]);
 		expect(result.appliedKeys).toEqual([]);
 		expect(env.ANTHROPIC_API_KEY).toBe("sk-keep");
-		expect(env.AWS_PROFILE).toBe("keep");
+		expect(env.AWS_PROFILE).toBeUndefined();
 	});
 
 	it("is a no-op when Entra is disabled entirely", () => {
@@ -411,7 +410,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
-		expect(env.AWS_PROFILE).toBe("user-profile");
+		expect(env.AWS_PROFILE).toBeUndefined();
 		expect(result.configError).toContain("Invalid managed Claude Platform on AWS URL");
 	});
 });

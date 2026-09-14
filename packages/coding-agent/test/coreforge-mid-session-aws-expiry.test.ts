@@ -16,13 +16,11 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { installCoreforgeAwsRecovery } from "@oh-my-pi/pi-coding-agent/identity/aws-recovery";
 import { CoreforgeIdentityStore } from "@oh-my-pi/pi-coding-agent/identity/coreforge-store";
 import { ensureCoreforgeIdentityAtStartup } from "@oh-my-pi/pi-coding-agent/identity/startup";
+import { ptree } from "@oh-my-pi/pi-utils";
 
-// An AWS IAM Identity Center session that expires *during* a conversation. The
-// managed profile is validated at startup only, so the mid-session expiry used
-// to surface as `Connection error.` on every attempt (the SigV4 fetch wrapper
-// throws while resolving credentials, and the Anthropic client wrapped that
-// throw as a network fault) until the user opened a new window. The same open
-// conversation must instead re-authenticate once and complete its request.
+// AWS identity proof is deferred until a managed model request needs credentials.
+// A recovery then retries an expired SSO session without converting the auth
+// failure into an opaque provider connection error.
 
 const TENANT_ID = "11111111-2222-4333-8444-555555555555";
 const SSO_START_URL = "https://d-example.awsapps.com/start";
@@ -269,23 +267,25 @@ describe("mid-session AWS session expiry", () => {
 			interactive: true,
 			isTty: () => true,
 			createStore: openStore,
-			ensureAwsSso: async config => {
-				awsChecks += 1;
-				if (awsChecks > 1) {
-					reauthentications += 1;
-					await writeSsoToken(Date.now() + 3_600_000);
-				}
-				return {
-					profile: config.profile,
-					region: config.region,
-					accountId: "891455110252",
-					roleArn: "arn:aws:sts::891455110252:assumed-role/CoreforgeModelAccess/aidan",
-					validatedAt: Date.now(),
-				};
-			},
+			installAwsRecovery: options =>
+				installCoreforgeAwsRecovery({
+					...options,
+					ensureAwsSso: async config => {
+						awsChecks += 1;
+						reauthentications += 1;
+						await writeSsoToken(Date.now() + 3_600_000);
+						return {
+							profile: config.profile,
+							region: config.region,
+							accountId: "891455110252",
+							roleArn: "arn:aws:sts::891455110252:assumed-role/CoreforgeModelAccess/aidan",
+							validatedAt: Date.now(),
+						};
+					},
+				}),
 		});
 		expect(startup.notices.some(notice => notice.includes("sign-in"))).toBe(false);
-		expect(awsChecks).toBe(1);
+		expect(awsChecks).toBe(0);
 		expect(reauthentications).toBe(0);
 
 		await writeSsoToken(Date.now() - 60_000);
@@ -302,7 +302,7 @@ describe("mid-session AWS session expiry", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toHaveLength(1);
 		expect(result.content[0]).toMatchObject({ type: "text", text: "still here" });
-		expect(awsChecks).toBe(2);
+		expect(awsChecks).toBe(1);
 		expect(reauthentications).toBe(1);
 		expect(traffic.gatewayCalls).toBe(1);
 		expect(traffic.ssoRoleCredentialCalls).toBe(1);
@@ -317,20 +317,17 @@ describe("mid-session AWS session expiry", () => {
 			interactive: true,
 			isTty: () => true,
 			createStore: openStore,
-			ensureAwsSso: async config => {
-				awsChecks += 1;
-				if (awsChecks > 1) throw new Error("AWS SSO sign-in failed for profile coreforge");
-				return {
-					profile: config.profile,
-					region: config.region,
-					accountId: "891455110252",
-					roleArn: "arn:aws:sts::891455110252:assumed-role/CoreforgeModelAccess/aidan",
-					validatedAt: Date.now(),
-				};
-			},
+			installAwsRecovery: options =>
+				installCoreforgeAwsRecovery({
+					...options,
+					ensureAwsSso: async () => {
+						awsChecks += 1;
+						throw new Error("AWS SSO sign-in failed for profile coreforge");
+					},
+				}),
 		});
 		expect(startup.notices.some(notice => notice.includes("sign-in"))).toBe(false);
-		expect(awsChecks).toBe(1);
+		expect(awsChecks).toBe(0);
 
 		await writeSsoToken(Date.now() - 60_000);
 		clearAwsCredentialCache();
@@ -345,7 +342,7 @@ describe("mid-session AWS session expiry", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("has expired");
 		expect(result.errorMessage).not.toContain("Connection error");
-		expect(awsChecks).toBe(2);
+		expect(awsChecks).toBe(1);
 		expect(traffic.gatewayCalls).toBe(0);
 	});
 
@@ -360,26 +357,41 @@ describe("mid-session AWS session expiry", () => {
 			},
 		});
 		expect(startup.notices.some(notice => notice.startsWith("AWS sign-in failed:"))).toBe(false);
-		expect(installs).toBe(0);
+		expect(installs).toBe(1);
 	});
-	it("does not arm mid-session recovery when startup validation fails", async () => {
+
+	it("does not open managed SSO recovery without an interactive surface", async () => {
+		let handler: AwsCredentialRecoveryHandler | undefined;
+		let signIns = 0;
+		installCoreforgeAwsRecovery({
+			awsConfig: { profile: AWS_PROFILE, region: "us-east-1" },
+			canPrompt: false,
+			ensureAwsSso: async () => {
+				signIns += 1;
+				throw new Error("unexpected sign-in");
+			},
+			setHandler: value => {
+				handler = value;
+			},
+		});
+		if (!handler) throw new Error("Recovery handler was not installed");
+
+		expect(await handler(expiredRecoveryRequest())).toBe(false);
+		expect(signIns).toBe(0);
+	});
+	it("arms managed-model recovery without validating AWS at startup", async () => {
 		seedSignedInProfile();
 		let installs = 0;
 		const startup = await ensureCoreforgeIdentityAtStartup(identitySettings(), {
 			interactive: true,
 			isTty: () => true,
 			createStore: openStore,
-			ensureAwsSso: async () => {
-				throw new Error("AWS SSO sign-in failed for profile coreforge");
-			},
 			installAwsRecovery: () => {
 				installs += 1;
 			},
 		});
-		expect(startup.notices).toContain(
-			"AWS sign-in failed: AWS SSO sign-in failed for profile coreforge. Retry with `coreforge identity login`.",
-		);
-		expect(installs).toBe(0);
+		expect(startup.notices.some(notice => notice.startsWith("AWS sign-in failed:"))).toBe(false);
+		expect(installs).toBe(1);
 	});
 	it("ignores recovery requests for profiles outside the managed identity", async () => {
 		let handler: AwsCredentialRecoveryHandler | undefined;
@@ -401,32 +413,52 @@ describe("mid-session AWS session expiry", () => {
 		expect(signIns).toBe(0);
 	});
 
-	it("stops waiting when an AWS CLI child ignores graceful termination", async () => {
+	it("stops waiting when a recovery descendant retains inherited pipes after its parent exits", async () => {
 		let handler: AwsCredentialRecoveryHandler | undefined;
+		let failure: unknown;
+		const pidFile = path.join(home, "recovery-descendant.pid");
 		installCoreforgeAwsRecovery({
 			awsConfig: { profile: AWS_PROFILE, region: "us-east-1" },
-			recoveryTimeoutMs: 25,
+			recoveryTimeoutMs: 500,
 			terminationGraceMs: 25,
 			ensureAwsSso: async (_config, _constants, _onProgress, dependencies) => {
 				const run = dependencies?.run;
 				if (!run) throw new Error("AWS command runner was not installed");
-				await run(
-					[
-						process.execPath,
-						"-e",
-						'process.on("SIGTERM", () => {}); require("node:net").createServer().listen(0);',
-					],
-					true,
-				);
+				try {
+					await run(
+						[
+							process.execPath,
+							"-e",
+							`const child = Bun.spawn([process.execPath, "-e", 'setInterval(() => {}, 1000)'], { stdout: "inherit", stderr: "inherit" }); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(child.pid)); child.unref(); process.exit(0);`,
+						],
+						true,
+					);
+				} catch (error) {
+					failure = error;
+					throw error;
+				}
 				throw new Error("AWS command runner unexpectedly completed");
 			},
 			setHandler: value => {
 				handler = value;
 			},
 		});
-		expect(handler).toBeDefined();
 		if (!handler) throw new Error("Recovery handler was not installed");
-
-		await expect(handler(expiredRecoveryRequest())).rejects.toThrow(/timed out/);
+		// The descendant and OS pipe deadline cannot use the test process's fake clock.
+		const deadline = Promise.withResolvers<string>();
+		const watchdog = setTimeout(() => deadline.resolve("still waiting"), 2000);
+		try {
+			const result = await Promise.race([handler(expiredRecoveryRequest()), deadline.promise]);
+			expect(result).toBe(false);
+			expect(failure).toBeInstanceOf(ptree.TimeoutError);
+		} finally {
+			clearTimeout(watchdog);
+			if (fs.existsSync(pidFile)) {
+				const pid = Number(fs.readFileSync(pidFile, "utf8"));
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+		}
 	});
 });

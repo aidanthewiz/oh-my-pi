@@ -77,6 +77,25 @@ describe("MCPManager initial connection ownership", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 	});
 
+	it("aborts an unresolved background initialization during manager disposal", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connectStarted = Promise.withResolvers<void>();
+		const abortObserved = Promise.withResolvers<void>();
+		const pending = Promise.withResolvers<MCPServerConnection>();
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation((_name, _config, options) => {
+			connectStarted.resolve();
+			options?.signal?.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+			return pending.promise;
+		});
+
+		const loading = manager.connectServers({ server: CONFIG }, {});
+		await connectStarted.promise;
+		await manager.disconnectAll();
+		await abortObserved.promise;
+		pending.reject(new Error("aborted"));
+		await loading;
+	});
+
 	it("closes and forgets a connection whose initial tools/list fails", async () => {
 		const manager = new MCPManager(process.cwd());
 		const failed = fakeConnection("server");

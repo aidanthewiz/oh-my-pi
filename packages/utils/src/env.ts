@@ -161,8 +161,80 @@ export const OPERATIONAL_AWS_ENV_NAMES = [
 	"AMAZON_SECRET_ACCESS_KEY",
 	"AMAZON_SESSION_TOKEN",
 ] as const;
+
+/**
+ * Operational AWS metadata names captured before managed setup and repository
+ * dotenv processing. Values are never credentials.
+ */
+export const OPERATIONAL_AWS_LAUNCH_ENV_NAMES = [
+	"OMP_OPERATIONAL_AWS_CONFIG_FILE",
+	"OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE",
+	"OMP_OPERATIONAL_AWS_PROFILE",
+	"OMP_OPERATIONAL_AWS_REGION",
+	"OMP_OPERATIONAL_AWS_EXECUTABLE",
+	"OMP_OPERATIONAL_AWS_HOME_DIRECTORY",
+	"OMP_OPERATIONAL_AWS_RESERVED_PROFILES",
+] as const;
+
+export interface OperationalAwsLaunchMetadata {
+	configFile?: string;
+	sharedCredentialsFile?: string;
+	profile?: string;
+	region?: string;
+	executable?: string;
+	homeDirectory: string;
+}
+
+let reservedManagedAwsProfiles: readonly string[] = Object.freeze(["coreforge"]);
+
+export function reserveManagedAwsProfile(profile: string): void {
+	if (profile && !reservedManagedAwsProfiles.includes(profile)) {
+		reservedManagedAwsProfiles = Object.freeze([...reservedManagedAwsProfiles, profile]);
+	}
+}
+
+export function getReservedManagedAwsProfiles(): readonly string[] {
+	return reservedManagedAwsProfiles;
+}
+
+function launchValue(name: (typeof OPERATIONAL_AWS_LAUNCH_ENV_NAMES)[number]): string | undefined {
+	const value = launchEnvValues?.get(managedEnvName(name))?.trim();
+	return value || undefined;
+}
+
+/**
+ * Return immutable launch provenance for operational AWS routes.
+ *
+ * Deliberately consults the process-launch snapshot rather than `Bun.env`:
+ * repository dotenv files can otherwise manufacture an `OMP_OPERATIONAL_*`
+ * value after launch and redirect a privileged native invocation.
+ */
+const operationalAwsLaunchMetadata: Readonly<OperationalAwsLaunchMetadata> | undefined = (() => {
+	if (!launchEnvValues) return undefined;
+	const homeDirectory =
+		launchValue("OMP_OPERATIONAL_AWS_HOME_DIRECTORY") ||
+		(process.platform === "win32"
+			? launchEnvValues.get(managedEnvName("USERPROFILE"))?.trim() ||
+				launchEnvValues.get(managedEnvName("HOME"))?.trim()
+			: launchEnvValues.get(managedEnvName("HOME"))?.trim() ||
+				launchEnvValues.get(managedEnvName("USERPROFILE"))?.trim()) ||
+		os.userInfo().homedir;
+	const awsDir = path.join(homeDirectory, ".aws");
+	return Object.freeze({
+		configFile: launchValue("OMP_OPERATIONAL_AWS_CONFIG_FILE") ?? path.join(awsDir, "config"),
+		sharedCredentialsFile:
+			launchValue("OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE") ?? path.join(awsDir, "credentials"),
+		profile: launchValue("OMP_OPERATIONAL_AWS_PROFILE"),
+		region: launchValue("OMP_OPERATIONAL_AWS_REGION"),
+		executable: launchValue("OMP_OPERATIONAL_AWS_EXECUTABLE"),
+		homeDirectory,
+	});
+})();
+
+export function getOperationalAwsLaunchMetadata(): Readonly<OperationalAwsLaunchMetadata> | undefined {
+	return operationalAwsLaunchMetadata;
+}
 const operationalAwsEnvNames = new Set<string>(OPERATIONAL_AWS_ENV_NAMES.map(managedEnvName));
-const trustedOperationalAwsValues = new Map<string, string>();
 const CREDENTIAL_ENV_NAMES = new Set(
 	[
 		"ANTHROPIC_CUSTOM_HEADERS",
@@ -225,20 +297,6 @@ export function registerChildEnvRedactions(names: Iterable<string>, values: Iter
 	}
 }
 
-/**
- * Record exact launcher-captured AWS values. Trusted child modes may preserve
- * only these values when a repository dotenv assignment is indistinguishable
- * from Bun's preloaded environment on platforms without launch provenance.
- */
-export function registerOperationalAwsEnvProvenance(entries: Iterable<readonly [string, string | undefined]>): void {
-	for (const [name, value] of entries) {
-		const normalized = managedEnvName(name);
-		if (!operationalAwsEnvNames.has(normalized)) continue;
-		if (value) trustedOperationalAwsValues.set(normalized, value);
-		else trustedOperationalAwsValues.delete(normalized);
-	}
-}
-
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
 	const expanded: Record<string, string> = {};
 	for (const key in values) {
@@ -258,7 +316,6 @@ function expandDotenvValues(values: Record<string, string>, env: Record<string, 
 interface ChildEnvPolicy {
 	preserveExplicitCredentials: boolean;
 	preserveGitCredentials: boolean;
-	preserveOperationalAws: boolean;
 }
 
 function scrubChildCredentials(
@@ -274,8 +331,6 @@ function scrubChildCredentials(
 
 		const credentialName = isCredentialEnvName(key);
 		const protectedValue = protectedValues.has(result[key]);
-		const trustedAws =
-			policy.preserveOperationalAws && operationalAwsEnvNames.has(normalized) && !managedName && !managedValue;
 		const trustedGitCredential =
 			policy.preserveGitCredentials &&
 			GIT_CREDENTIAL_ENV_NAMES[normalized] === true &&
@@ -290,8 +345,8 @@ function scrubChildCredentials(
 		if (
 			managedName ||
 			managedValue ||
-			(credentialName && !trustedAws && !trustedGitCredential && !explicitCredential) ||
-			(protectedValue && !trustedAws && !trustedGitCredential && !explicitCredential)
+			(credentialName && !trustedGitCredential && !explicitCredential) ||
+			(protectedValue && !trustedGitCredential && !explicitCredential)
 		) {
 			delete result[key];
 		}
@@ -354,11 +409,6 @@ function filterChildShellEnvInternal(
 	const allLaunchEnv = fallbackLaunchEnv ? { ...launchEnv, ...fallbackLaunchEnv } : launchEnv;
 	for (const key in allLaunchEnv) {
 		const normalized = managedEnvName(key);
-		const trustedOperationalValue =
-			policy.preserveOperationalAws &&
-			operationalAwsEnvNames.has(normalized) &&
-			trustedOperationalAwsValues.get(normalized) === result[key];
-		if (trustedOperationalValue) continue;
 		const launchValue = runtimeLaunchEnvValues?.get(normalized);
 		if (launchValue !== undefined) {
 			// Launcher-owned name: it keeps the launcher's own value. Bun overwrites
@@ -409,7 +459,7 @@ function filterChildShellEnvInternal(
 				name !== managedEnvName("AWS_REGION") &&
 				name !== managedEnvName("AWS_DEFAULT_REGION"),
 		);
-	if (!policy.preserveOperationalAws && !hasExplicitAwsCredentials) {
+	if (!hasExplicitAwsCredentials) {
 		result.AWS_CONFIG_FILE = os.devNull;
 		result.AWS_SHARED_CREDENTIALS_FILE = os.devNull;
 		result.AWS_EC2_METADATA_DISABLED = "true";
@@ -432,21 +482,7 @@ export function filterChildShellEnv(
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
-		{ preserveExplicitCredentials: false, preserveGitCredentials: false, preserveOperationalAws: false },
-		env,
-		cwd,
-		overlays,
-	);
-}
-
-/** Preserves ambient operational AWS selectors for repository shell commands. */
-export function filterTrustedChildShellEnv(
-	env: Record<string, string | undefined>,
-	cwd: string = process.cwd(),
-	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
-): Record<string, string> {
-	return filterChildShellEnvInternal(
-		{ preserveExplicitCredentials: false, preserveGitCredentials: false, preserveOperationalAws: true },
+		{ preserveExplicitCredentials: false, preserveGitCredentials: false },
 		env,
 		cwd,
 		overlays,
@@ -460,7 +496,7 @@ export function filterUserMcpChildEnv(
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
-		{ preserveExplicitCredentials: true, preserveGitCredentials: false, preserveOperationalAws: false },
+		{ preserveExplicitCredentials: true, preserveGitCredentials: false },
 		env,
 		cwd,
 		overlays,
@@ -474,7 +510,7 @@ export function filterGitChildShellEnv(
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
-		{ preserveExplicitCredentials: false, preserveGitCredentials: true, preserveOperationalAws: false },
+		{ preserveExplicitCredentials: false, preserveGitCredentials: true },
 		env,
 		cwd,
 		overlays,

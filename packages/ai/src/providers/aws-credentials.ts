@@ -18,7 +18,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { $env, getOperationalAwsLaunchMetadata, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { allowAmbientAwsModelCredentials } from "../aws-model-auth";
 import * as AIError from "../error";
 import type { FetchImpl } from "../types";
@@ -452,7 +452,8 @@ async function readSsoCredentialsViaAwsCli(
 	allowAmbientCredentials: boolean,
 	signal: AbortSignal | undefined,
 ): Promise<ResolvedCredentials | undefined> {
-	const executable = Bun.which("aws", { PATH: $env.PATH });
+	const launch = getOperationalAwsLaunchMetadata();
+	const executable = launch ? launch.executable : Bun.which("aws", { PATH: $env.PATH });
 	if (!executable) return undefined;
 	try {
 		return await runCredentialCommand(

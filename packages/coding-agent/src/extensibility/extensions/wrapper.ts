@@ -327,6 +327,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			if (!this.runner.hasUI()) {
 				const reason = "no interactive UI available";
 				await emitApprovalResolved(false, reason);
+				runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
 				if (runtimeApproval) {
 					throw new Error(
 						`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
@@ -385,6 +386,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw err;
 			}
 			await emitApprovalResolved(approved, approved ? undefined : denialReason);
+			if (!approved && runtimeApproval) runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
 			if (!approved) {
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
 			}
