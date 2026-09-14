@@ -6,11 +6,13 @@ import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
 import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection } from "../../src/mcp/types";
 import { ToolError } from "../../src/tools/tool-errors";
-import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { reserveManagedAwsProfile } from "@oh-my-pi/pi-utils";
 import { ensureCoreforgeAwsSso } from "../../src/identity/aws-sso";
 import { restoreCoreforgeOperationalAwsEnvironment } from "../../src/identity/runtime";
 import { resolveAwsCredentials } from "@oh-my-pi/pi-ai/providers/aws-credentials";
+import { ExtensionToolWrapper } from "../../src/extensibility/extensions/wrapper";
+import type { ExtensionRunner } from "../../src/extensibility/extensions";
 
 const root = process.env.HOME!;
 const repository = path.join(root, "repository");
@@ -140,10 +142,41 @@ await tool.execute("login", login);
 await tool.execute("retry", { ...read, profile: "expired" });
 await tool.execute("shared", { ...read, profile: "expired-peer" });
 assert.equal((await calls()).filter(call => call.argv.includes("login")).length, 1);
-const declined = { ...login, profile: "declined" };
-await tool.prepareRuntimeApproval("declined", declined);
-tool.denyRuntimeApproval("declined", declined);
-await assert.rejects(() => tool.prepareRuntimeApproval("declined-again", declined), /declined/);
+for (const [profile, failure] of [
+	["declined", "selector"],
+	["resolution-declined", "resolution"],
+] as const) {
+	const declined = { ...login, profile };
+	const wrapped = new ExtensionToolWrapper(
+		tool as unknown as AgentTool,
+		{
+			hasHandlers: (event: string) => failure === "resolution" && event === "tool_approval_resolved",
+			hasUI: () => true,
+			consumeToolCallEmitted: () => false,
+			runScoped: <T>(fn: () => T): T => fn(),
+			getUIContext: () => ({
+				select: async () => {
+					if (failure === "selector") throw new Error("approval interrupted");
+					return "Approve once";
+				},
+			}),
+			emit: async (event: { type: string }) => {
+				if (event.type === "tool_approval_resolved") throw new Error("approval interrupted");
+			},
+		} as unknown as ExtensionRunner,
+	);
+	await assert.rejects(
+		() => wrapped.execute(profile, declined, undefined, undefined, { settings } as AgentToolContext),
+		/approval interrupted/,
+	);
+	tool.approveRuntimeApproval(profile, declined);
+	await assert.rejects(
+		() => tool.execute(profile, declined),
+		/approval|declined/i,
+		`${profile} reused an interrupted approval`,
+	);
+	await assert.rejects(() => tool.prepareRuntimeApproval(`${profile}-again`, declined), /declined/);
+}
 assert.equal((await calls()).filter(call => call.argv.includes("login")).length, 1);
 let confirmations = 0;
 const context = {

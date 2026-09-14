@@ -31,7 +31,7 @@ import type { OutputMeta } from "../tools/output-meta";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
-import { callTool, isAuthenticatedAwsTool } from "./client";
+import { callTool, isAuthenticatedAwsTool, listTools } from "./client";
 import { formatMCPToolFailure, MCPTransportError } from "./errors";
 import { renderMCPCall, renderMCPResult } from "./render";
 import type {
@@ -375,7 +375,12 @@ async function isAwsAuthenticationFailure(
 	try {
 		const result = await probe.execute(
 			"aws-mcp-authentication-check",
-			{ profile, service: "sts", operation: "get-caller-identity", timeout: 15 },
+			{
+				profile,
+				service: "sts",
+				operation: "get-caller-identity",
+				timeout: 15,
+			},
 			signal,
 		);
 		if (result.details?.code === "AUTH_REQUIRED") return true;
@@ -463,7 +468,9 @@ async function callToolWithAuthRetry(
 
 	let newConnection: MCPServerConnection | null;
 	try {
-		newConnection = await reconnectWithAbort(reconnect, signal, { authChallenge });
+		newConnection = await reconnectWithAbort(reconnect, signal, {
+			authChallenge,
+		});
 	} catch (error) {
 		rethrowIfAborted(error, signal);
 		return { connection, error };
@@ -589,7 +596,11 @@ export function deduplicateMCPToolsByName<T extends MCPToolOriginSource>(tools: 
 		}
 		const existing = registered.get(tool.name);
 		if (!existing) {
-			registered.set(tool.name, { tool, originKey, index: deduplicated.length });
+			registered.set(tool.name, {
+				tool,
+				originKey,
+				index: deduplicated.length,
+			});
 			deduplicated.push(tool);
 			continue;
 		}
@@ -636,10 +647,31 @@ export function parseMCPToolName(name: string): { serverName: string; toolName: 
 	};
 }
 
+function addDeferredAwsProfileRequirement(serverName: string, tool: MCPToolDefinition): MCPToolDefinition {
+	if (!isAuthenticatedAwsTool(serverName, tool.name) || tool.inputSchema.properties?.aws_profile) return tool;
+	return {
+		...tool,
+		inputSchema: {
+			...tool.inputSchema,
+			properties: {
+				...tool.inputSchema.properties,
+				aws_profile: {
+					type: "string",
+					description: "Explicit AWS profile validated against the active managed proxy.",
+				},
+			},
+			required: tool.inputSchema.required?.includes("aws_profile")
+				? tool.inputSchema.required
+				: [...(tool.inputSchema.required ?? []), "aws_profile"],
+		},
+	};
+}
+
 async function validateManagedAwsProfile(
 	serverName: string,
 	tool: MCPToolDefinition,
 	args: MCPToolArgs,
+	options?: { checkExposedProfile?: boolean },
 ): Promise<void> {
 	if (!isAuthenticatedAwsTool(serverName, tool.name)) return;
 	const selected = args.aws_profile;
@@ -651,12 +683,24 @@ async function validateManagedAwsProfile(
 	if (profile.partition !== "aws") {
 		throw new Error("WRONG_PARTITION: use the native structured aws tool for this profile.");
 	}
+	if (options?.checkExposedProfile === false) return;
 	const selector = tool.inputSchema.properties?.aws_profile as { enum?: unknown[] } | undefined;
 	if (!selector?.enum?.includes(selected)) {
 		throw new Error(
 			"PROFILE_NOT_FOUND: the selected profile is not exposed by this managed AWS proxy. Use the native aws tool.",
 		);
 	}
+}
+
+async function getLiveManagedAwsTool(
+	connection: MCPServerConnection,
+	tool: MCPToolDefinition,
+): Promise<MCPToolDefinition> {
+	if (!isAuthenticatedAwsTool(connection.name, tool.name)) return tool;
+	const liveTool = (await listTools(connection)).find(candidate => candidate.name === tool.name);
+	if (!liveTool)
+		throw new Error("PROFILE_NOT_FOUND: this authenticated AWS tool is not exposed by the managed proxy.");
+	return liveTool;
 }
 
 function describeMCPTool(serverName: string, tool: MCPToolDefinition): string {
@@ -804,7 +848,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly label: string;
 	readonly description: string;
 	readonly parameters: TSchema;
-	/** Original MCP tool name (before normalization) */
+	private readonly tool: MCPToolDefinition;
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
@@ -816,6 +860,10 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 
 	readonly #fallbackProvider: string | undefined;
 	readonly #fallbackProviderName: string | undefined;
+	#liveAwsTool?: {
+		connection: MCPServerConnection;
+		definition: Promise<MCPToolDefinition>;
+	};
 
 	/** Create DeferredMCPTool instances for all tools from an MCP server */
 	static fromTools(
@@ -830,15 +878,16 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 
 	constructor(
 		private readonly serverName: string,
-		private readonly tool: MCPToolDefinition,
+		tool: MCPToolDefinition,
 		private readonly getConnection: () => Promise<MCPServerConnection>,
 		source?: SourceMeta,
 		private readonly reconnect?: MCPReconnect,
 	) {
-		this.name = createMCPToolName(serverName, tool.name);
-		this.label = `${serverName}/${tool.name}`;
-		this.description = describeMCPTool(serverName, tool);
-		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
+		this.tool = addDeferredAwsProfileRequirement(serverName, tool);
+		this.name = createMCPToolName(serverName, this.tool.name);
+		this.label = `${serverName}/${this.tool.name}`;
+		this.description = describeMCPTool(serverName, this.tool);
+		this.parameters = normalizeSchemaForMCP(this.tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = serverName;
 		this.#fallbackProvider = source?.provider;
@@ -851,6 +900,18 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 
 	renderResult(result: CustomToolResult<MCPToolDetails>, options: RenderResultOptions, theme: Theme, args?: unknown) {
 		return renderMCPResult(result, options, theme, normalizeToolArgs(args));
+	}
+
+	async #validateLiveManagedAwsProfile(connection: MCPServerConnection, args: MCPToolArgs): Promise<void> {
+		if (!isAuthenticatedAwsTool(this.serverName, this.tool.name)) return;
+		if (this.#liveAwsTool?.connection !== connection) {
+			const definition = getLiveManagedAwsTool(connection, this.tool);
+			this.#liveAwsTool = { connection, definition };
+			void definition.catch(() => {
+				if (this.#liveAwsTool?.definition === definition) this.#liveAwsTool = undefined;
+			});
+		}
+		await validateManagedAwsProfile(this.serverName, await this.#liveAwsTool.definition, args);
 	}
 
 	async execute(
@@ -866,7 +927,10 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.#fallbackProviderName;
 
 		try {
-			await validateManagedAwsProfile(this.serverName, this.tool, args);
+			const selector = this.tool.inputSchema.properties?.aws_profile as { enum?: unknown[] } | undefined;
+			await validateManagedAwsProfile(this.serverName, this.tool, args, {
+				checkExposedProfile: selector?.enum !== undefined,
+			});
 		} catch (error) {
 			return buildErrorResult(error, this.serverName, this.tool.name, provider, providerName);
 		}
@@ -874,6 +938,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			const connection = await untilAborted(signal, () => this.getConnection());
 			throwIfAborted(signal);
 			try {
+				await untilAborted(signal, () => this.#validateLiveManagedAwsProfile(connection, args));
 				const attempt = await callToolWithAuthRetry(connection, this.tool.name, args, this.reconnect, signal, _ctx);
 				if (attempt.error !== undefined) {
 					return buildErrorResult(
@@ -908,6 +973,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 						const retryProvider = newConn._source?.provider ?? provider;
 						const retryProviderName = newConn._source?.providerName ?? providerName;
 						try {
+							await untilAborted(signal, () => this.#validateLiveManagedAwsProfile(newConn, args));
 							const result = await callProfileAwareTool(newConn, this.tool.name, args, signal, _ctx);
 							return buildResult(result, this.serverName, this.tool.name, retryProvider, retryProviderName);
 						} catch (retryError) {
@@ -933,6 +999,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				const newConn = await reconnectWithAbort(this.reconnect, signal);
 				if (newConn) {
 					try {
+						await this.#validateLiveManagedAwsProfile(newConn, args);
 						const result = await callProfileAwareTool(newConn, this.tool.name, args, signal, _ctx);
 						return buildResult(
 							result,

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 // Launch provenance is captured at module import, so the bridge runs in a separate process.
-test("managed AWS rejects missing and sovereign profiles before connecting or invoking", async () => {
+test("managed AWS validates deferred legacy schemas against live profile bindings", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-aws-routing-"));
 	try {
 		const config = path.join(root, "config");
@@ -13,23 +13,22 @@ test("managed AWS rejects missing and sovereign profiles before connecting or in
 			"[profile commercial]\nregion = us-east-1\nsso_session = shared\n[sso-session shared]\nsso_start_url = https://example.invalid/start\nsso_region = us-east-1\n[profile other]\nregion = eu-central-1\n[profile government]\nregion = us-gov-west-1\n[profile coreforge]\nregion = us-east-1\n",
 		);
 		const bridge = path.resolve(import.meta.dir, "../src/mcp/tool-bridge.ts");
-		const client = path.resolve(import.meta.dir, "../src/mcp/client.ts");
 		const script = `
 import { MCPTool, DeferredMCPTool } from ${JSON.stringify(bridge)};
-import { listTools } from ${JSON.stringify(client)};
 const requests = [];
 let connects = 0;
 let reconnects = 0;
 let expired = false;
+const definition = { name: "aws___run_script", inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["commercial", "other", "government", "coreforge"] }, code: { type: "string" } } } };
 const connection = {
- name: "coreforge-aws-agent-toolkit", config: { command: "unused" },
+ name: "coreforge-aws-agent-toolkit", config: { command: "unused" }, capabilities: { tools: {} },
  transport: { request: async (method, params) => {
+  if (method === "tools/list") return { tools: [definition] };
   requests.push(params.arguments?.aws_profile ?? "knowledge");
   if (expired) return { isError: true, content: [{ type: "text", text: "SSO token expired: login required" }] };
   return { content: [{ type: "text", text: JSON.stringify({ profile: params.arguments?.aws_profile }) }] };
  } },
 };
-const definition = { name: "aws___run_script", inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["commercial", "other", "government", "coreforge"] }, code: { type: "string" } } } };
 const deferred = new DeferredMCPTool(connection.name, definition, async () => { connects++; return connection; }, undefined, async () => { reconnects++; return connection; });
 const context = {};
 const rejected = [];
@@ -47,27 +46,27 @@ await knowledge.execute("knowledge", {}, undefined, context);
 expired = true;
 const authResult = await direct.execute("expired", { aws_profile: "commercial", code: "result = {}\\nresult" }, undefined, context);
 const boundCalls = [];
+const legacyCachedDefinition = {
+ name: "aws___run_script",
+ inputSchema: { type: "object", properties: { code: { type: "string" } }, required: ["code"], additionalProperties: false },
+};
 const boundConnection = {
  name: connection.name, config: connection.config, capabilities: { tools: {} }, operationalAwsProfiles: ["commercial"],
  transport: { request: async (method, params) => {
-  if (method === "tools/list") return { tools: [
-   { name: "aws___run_script", inputSchema: { type: "object", properties: { code: { type: "string" } }, required: ["code"], additionalProperties: false } },
-   { name: "aws___list_regions", inputSchema: { type: "object", properties: {} } },
-  ] };
+  if (method === "tools/list") return { tools: [legacyCachedDefinition] };
   if ("aws_profile" in params.arguments) throw new Error("Upstream single-profile schema rejects aws_profile");
   boundCalls.push(params.arguments.code);
   return { content: [{ type: "text", text: "bound-commercial identity" }] };
  } },
 };
-const boundDefinitions = await listTools(boundConnection);
-const cachedDefinition = JSON.parse(JSON.stringify(boundDefinitions[0]));
-const boundTool = new DeferredMCPTool(connection.name, cachedDefinition, async () => boundConnection);
-const boundMissing = await boundTool.execute("bound-missing", { code: "read" }, undefined, context);
-const boundWrong = await boundTool.execute("bound-wrong", { aws_profile: "other", code: "read" }, undefined, context);
-const boundAllowed = await boundTool.execute("bound-allowed", { aws_profile: "commercial", code: "read" }, undefined, context);
-boundConnection.awsProfileBindings.set("aws___run_script", "other");
-const boundChanged = await boundTool.execute("bound-changed", { aws_profile: "commercial", code: "read" }, undefined, context);
-console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, reconnects, boundCalls, boundMissing, boundWrong, boundAllowed, boundChanged, knowledgeSchema: boundDefinitions[1].inputSchema }));
+const legacyTool = new DeferredMCPTool(connection.name, legacyCachedDefinition, async () => boundConnection);
+const legacySchema = legacyTool.parameters;
+const legacyMissing = await legacyTool.execute("legacy-missing", { code: "read" }, undefined, context);
+const legacyAllowed = await legacyTool.execute("legacy-allowed", { aws_profile: "commercial", code: "read" }, undefined, context);
+const legacyWrong = await legacyTool.execute("legacy-wrong", { aws_profile: "other", code: "read" }, undefined, context);
+boundConnection.awsProfileBindings?.set("aws___run_script", "other");
+const legacyChanged = await legacyTool.execute("legacy-changed", { aws_profile: "commercial", code: "read" }, undefined, context);
+console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, reconnects, boundCalls, legacyMissing, legacyWrong, legacyAllowed, legacyChanged, legacySchema }));
 `;
 		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
 			cwd: root,
@@ -89,7 +88,11 @@ console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, re
 		]);
 		expect(exit, stderr).toBe(0);
 		const result = JSON.parse(stdout);
-		expect(result.afterRejections).toEqual({ connects: 0, reconnects: 0, requests: 0 });
+		expect(result.afterRejections).toEqual({
+			connects: 0,
+			reconnects: 0,
+			requests: 0,
+		});
 		expect(result.rejected.map((entry: { error: boolean }) => entry.error)).toEqual([true, true, true, true]);
 		expect(result.rejected[0].text).toContain("PROFILE_NOT_FOUND");
 		expect(result.rejected[1].text).toContain("WRONG_PARTITION");
@@ -98,13 +101,18 @@ console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, re
 		expect(result.authResult.content[0].text).toContain("AUTH_REQUIRED");
 		expect(result.authResult.content[0].text).toContain("commercial");
 		expect(result.reconnects).toBe(0);
-		expect(result.boundMissing.isError).toBe(true);
-		expect(result.boundWrong.isError).toBe(true);
-		expect(result.boundAllowed.isError).not.toBe(true);
-		expect(result.boundAllowed.content[0].text).toContain("bound-commercial identity");
-		expect(result.boundChanged.isError).toBe(true);
+		expect(result.legacyMissing.isError).toBe(true);
+		expect(result.legacyWrong.isError).toBe(true);
+		expect(result.legacyAllowed.isError, result.legacyAllowed.content[0].text).not.toBe(true);
+		expect(result.legacyAllowed.content[0].text).toContain("bound-commercial identity");
+		expect(result.legacyChanged.isError).toBe(true);
+		expect(result.legacyWrong.content[0].text).toContain("PROFILE_NOT_FOUND");
 		expect(result.boundCalls).toEqual(["read"]);
-		expect(result.knowledgeSchema.properties.aws_profile).toBeUndefined();
+		expect(result.legacyChanged.content[0].text).toContain("PROFILE_NOT_FOUND");
+		expect(result.legacySchema.required).toContain("aws_profile");
+		expect(result.legacySchema.properties.aws_profile).toMatchObject({
+			type: "string",
+		});
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}

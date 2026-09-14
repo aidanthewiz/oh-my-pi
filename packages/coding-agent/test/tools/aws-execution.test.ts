@@ -33,6 +33,7 @@ test("native AWS enforces process, account approval, and authentication boundari
 			["failed-login", "failed-login", "us-east-1"],
 			["still-expired", "still-expired", "us-east-1"],
 			["firstuse-declined", "firstuse-declined", "us-east-1"],
+			["resolution-declined", "resolution-declined", "us-east-1"],
 			["government-expired", "government-expired", "us-gov-west-1"],
 			["mutating-expired", "mutating-expired", "us-east-1"],
 			["mutating-changed", "mutating-changed", "us-east-1"],

@@ -61,7 +61,11 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 			this.renderResult = (result: any, options: any, theme: any, args?: any) =>
 				registeredTool.definition.renderResult!(
 					result,
-					{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
+					{
+						expanded: options.expanded,
+						isPartial: options.isPartial,
+						spinnerFrame: options.spinnerFrame,
+					},
 					theme as Theme,
 					args,
 				);
@@ -287,115 +291,118 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		};
 
 		if (approvalCheck.required) {
-			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
-			if (
-				scheduledCall?.id === toolCallId &&
-				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
-			) {
-				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
-			}
+			try {
+				const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+				if (
+					scheduledCall?.id === toolCallId &&
+					(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
+				) {
+					await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
+				}
 
-			const hasApprovalHandlers =
-				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-			const sessionId = context?.sessionManager?.getSessionId() ?? "";
-			if (hasApprovalHandlers) {
-				await this.runner.emit({
-					type: "tool_approval_requested",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-					approvalMode,
-				});
-			}
+				const hasApprovalHandlers =
+					this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
+				const sessionId = context?.sessionManager?.getSessionId() ?? "";
+				if (hasApprovalHandlers) {
+					await this.runner.emit({
+						type: "tool_approval_requested",
+						sessionId,
+						toolName: this.tool.name,
+						toolCallId,
+						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+						approvalMode,
+					});
+				}
 
-			const emitApprovalResolved = async (approved: boolean, reason?: string) => {
-				if (!hasApprovalHandlers) return;
-				await this.runner.emit({
-					type: "tool_approval_resolved",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					approved,
-					...(reason ? { reason } : {}),
-				});
-			};
+				const emitApprovalResolved = async (approved: boolean, reason?: string) => {
+					if (!hasApprovalHandlers) return;
+					await this.runner.emit({
+						type: "tool_approval_resolved",
+						sessionId,
+						toolName: this.tool.name,
+						toolCallId,
+						approved,
+						...(reason ? { reason } : {}),
+					});
+				};
 
-			// Runtime and provider safety approvals fail closed without an interactive
-			// prompt. Unlike ordinary tier approval, no setting or yolo mode may bypass
-			// either gate.
-			if (!this.runner.hasUI()) {
-				const reason = "no interactive UI available";
-				await emitApprovalResolved(false, reason);
-				runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
-				if (runtimeApproval) {
+				// Runtime and provider safety approvals fail closed without an interactive
+				// prompt. Unlike ordinary tier approval, no setting or yolo mode may bypass
+				// either gate.
+				if (!this.runner.hasUI()) {
+					const reason = "no interactive UI available";
+					await emitApprovalResolved(false, reason);
+					if (runtimeApproval) {
+						throw new Error(
+							`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
+						);
+					}
+					if (pendingSafetyChecks.length > 0) {
+						throw new Error(
+							`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+						);
+					}
 					throw new Error(
-						`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
+						`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+							`Options:\n` +
+							`  1. Set tools.approvalMode: yolo in /settings\n` +
+							`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
+							`  3. Use an interactive UI to approve the tool call`,
 					);
+				}
+
+				const uiContext = this.runner.getUIContext();
+				if (settings?.get("approval.notify") === "on") {
+					const sessionName = context?.sessionManager?.getSessionName();
+					TERMINAL.sendNotification({
+						title: sessionName || "Oh My Pi",
+						body: "Tool approval required",
+						type: "approval",
+						urgency: "normal",
+						actions: "focus",
+					});
+				}
+				let approved: boolean;
+				const denialReason = "denied by user";
+				try {
+					if (runtimeApproval) {
+						const safetySuffix =
+							pendingSafetyChecks.length > 0
+								? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+								: "";
+						const choice = await uiContext.select(
+							`${runtimeApproval.prompt}${safetySuffix}`,
+							["Deny", "Approve once"],
+							{ tuiStyle: runtimeApproval.tuiStyle },
+						);
+						approved = choice === "Approve once";
+					} else {
+						const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+						const safetyPrompt =
+							pendingSafetyChecks.length > 0
+								? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+								: basePrompt;
+						const choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+						approved = choice === "Approve";
+					}
+				} catch (err) {
+					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+					throw err;
+				}
+				await emitApprovalResolved(approved, approved ? undefined : denialReason);
+				if (!approved) {
+					throw new Error(`Tool call denied by user: ${this.tool.name}`);
+				}
+				if (runtimeApproval) {
+					runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
 				}
 				if (pendingSafetyChecks.length > 0) {
-					throw new Error(
-						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
-					);
+					if (!context) throw new Error("Provider safety approval context is unavailable");
+					context.providerSafetyApproved = true;
 				}
-				throw new Error(
-					`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
-						`Options:\n` +
-						`  1. Set tools.approvalMode: yolo in /settings\n` +
-						`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
-						`  3. Use an interactive UI to approve the tool call`,
-				);
-			}
-
-			const uiContext = this.runner.getUIContext();
-			if (settings?.get("approval.notify") === "on") {
-				const sessionName = context?.sessionManager?.getSessionName();
-				TERMINAL.sendNotification({
-					title: sessionName || "Oh My Pi",
-					body: "Tool approval required",
-					type: "approval",
-					urgency: "normal",
-					actions: "focus",
-				});
-			}
-			let approved: boolean;
-			const denialReason = "denied by user";
-			try {
-				if (runtimeApproval) {
-					const safetySuffix =
-						pendingSafetyChecks.length > 0
-							? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-							: "";
-					const choice = await uiContext.select(
-						`${runtimeApproval.prompt}${safetySuffix}`,
-						["Deny", "Approve once"],
-						{ tuiStyle: runtimeApproval.tuiStyle },
-					);
-					approved = choice === "Approve once";
-				} else {
-					const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-					const safetyPrompt =
-						pendingSafetyChecks.length > 0
-							? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-							: basePrompt;
-					const choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
-					approved = choice === "Approve";
-				}
-			} catch (err) {
-				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
-				throw err;
-			}
-			await emitApprovalResolved(approved, approved ? undefined : denialReason);
-			if (!approved && runtimeApproval) runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
-			if (!approved) {
-				throw new Error(`Tool call denied by user: ${this.tool.name}`);
-			}
-			if (runtimeApproval) {
-				runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
-			}
-			if (pendingSafetyChecks.length > 0) {
-				if (!context) throw new Error("Provider safety approval context is unavailable");
-				context.providerSafetyApproved = true;
+			} catch (error) {
+				runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
+				throw error;
 			}
 		}
 
