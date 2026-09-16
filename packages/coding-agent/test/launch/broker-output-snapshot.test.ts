@@ -195,10 +195,17 @@ process.stdout.write("READY\\n");
 			const fragmentWrite = await client.request({ op: "send", name: names[0], data: fragment });
 			if (fragmentWrite.op !== "send") throw new Error("unexpected send result");
 			expect(fragmentWrite.bytesWritten).toBe(canonicalLimit - 1);
+			await client.request({ op: "send", name: names[0], data: "\u007f" });
+			await client.request({ op: "send", name: names[0], data: "x" });
 			await expect(client.request({ op: "send", name: names[0], data: "x" })).rejects.toThrow(
 				`${canonicalLimit}-byte canonical line limit`,
 			);
-			await client.request({ op: "send", name: names[0], data: "\n" });
+			await client.request({ op: "send", name: names[0], data: "\u0017" });
+			await client.request({ op: "send", name: names[0], data: fragment });
+			await expect(client.request({ op: "send", name: names[0], data: "x" })).rejects.toThrow(
+				`${canonicalLimit}-byte canonical line limit`,
+			);
+			await client.request({ op: "send", name: names[0], data: "\u0017" });
 
 			const shortWrite = await client.request({ op: "send", name: names[0], data: "short\n" });
 			if (shortWrite.op !== "send") throw new Error("unexpected send result");
