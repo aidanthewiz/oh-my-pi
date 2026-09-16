@@ -72,6 +72,18 @@ const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 	SIGKILL: os.constants.signals.SIGKILL,
 };
 
+function ptyCanonicalLineLimitBytes(): number | undefined {
+	if (process.platform === "darwin") return 1_024;
+	if (process.platform === "linux") return 4_096;
+	return undefined;
+}
+
+function oversizedPtyLineBytes(data: string, limit: number): number | undefined {
+	let largest = 0;
+	for (const line of data.split(/[\r\n]/u)) largest = Math.max(largest, Buffer.byteLength(line));
+	return largest >= limit ? largest : undefined;
+}
+
 interface ManagedProcess {
 	pid: number;
 	exited: Promise<number>;
@@ -1144,6 +1156,18 @@ class DaemonBroker {
 		if (operation.data === undefined && operation.signal === undefined) {
 			throw new Error("send requires data or signal");
 		}
+		const bytesWritten = operation.data === undefined ? 0 : Buffer.byteLength(operation.data);
+		const transport = record.pty ? "pty" : "pipe";
+		const canonicalLineLimit = record.pty ? ptyCanonicalLineLimitBytes() : undefined;
+		if (operation.data !== undefined && canonicalLineLimit !== undefined) {
+			const oversizedLine = oversizedPtyLineBytes(operation.data, canonicalLineLimit);
+			if (oversizedLine !== undefined) {
+				throw new Error(
+					`Daemon ${operation.name} uses a PTY with a ${canonicalLineLimit}-byte canonical line limit; ` +
+						`refusing a ${oversizedLine}-byte input line before write. Start machine protocols with pty:false.`,
+				);
+			}
+		}
 		if (operation.data !== undefined) {
 			if (record.pty) record.pty.write(operation.data);
 			else if (record.input) {
@@ -1161,7 +1185,14 @@ class DaemonBroker {
 				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
 			}
 		}
-		return { op: "send", daemon: record.snapshot };
+		return {
+			op: "send",
+			daemon: record.snapshot,
+			bytesWritten,
+			transport,
+			...(canonicalLineLimit === undefined ? {} : { canonicalLineLimit }),
+			delivery: "broker_write_only",
+		};
 	}
 
 	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {

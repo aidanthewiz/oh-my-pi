@@ -31,7 +31,7 @@ import {
 } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AgentSession } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
@@ -47,6 +47,7 @@ import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } f
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
+	RpcControlEventFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcExtensionUISelectOptionDetail,
@@ -59,6 +60,7 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcResponse,
+	RpcEventSubscriptionLevel,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
@@ -114,6 +116,62 @@ export type RpcSessionChangeResult =
 	| { type: "new_session"; data: { cancelled: boolean } }
 	| { type: "switch_session"; data: { cancelled: boolean } }
 	| { type: "branch"; data: { text: string; cancelled: boolean } };
+export function rpcControlEventFrame(event: AgentSessionEvent): RpcControlEventFrame | null {
+	switch (event.type) {
+		case "agent_start":
+			return { type: "rpc_control", event: "agent_start" };
+		case "agent_end":
+			return { type: "rpc_control", event: "agent_end", terminal: event.isTerminal !== false };
+		case "tool_execution_start":
+			return {
+				type: "rpc_control",
+				event: "tool_execution_start",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				...(event.intent ? { intent: event.intent } : {}),
+			};
+		case "tool_execution_end":
+			return {
+				type: "rpc_control",
+				event: "tool_execution_end",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				failed: event.isError === true,
+			};
+		case "auto_compaction_start":
+			return {
+				type: "rpc_control",
+				event: "auto_compaction_start",
+				action: event.action,
+				reason: event.reason,
+			};
+		case "auto_compaction_end":
+			return {
+				type: "rpc_control",
+				event: "auto_compaction_end",
+				action: event.action,
+				aborted: event.aborted,
+				willRetry: event.willRetry,
+			};
+		case "auto_retry_start":
+			return {
+				type: "rpc_control",
+				event: "auto_retry_start",
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+				delayMs: event.delayMs,
+			};
+		case "auto_retry_end":
+			return {
+				type: "rpc_control",
+				event: "auto_retry_end",
+				attempt: event.attempt,
+				success: event.success,
+			};
+		default:
+			return null;
+	}
+}
 
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch">;
 
@@ -829,6 +887,7 @@ export async function runRpcMode(
 	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
+	let eventSubscription: RpcEventSubscriptionLevel = "full";
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -1047,9 +1106,15 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
+	// Protocol v1 keeps the full event stream for compatibility. Protocol v2
+	// defaults to bounded control frames; typed clients explicitly opt into full events.
 	session.subscribe(event => {
-		output(event);
+		if (eventSubscription === "full") {
+			output(event);
+			return;
+		}
+		const frame = rpcControlEventFrame(event);
+		if (frame) output(frame);
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -1083,7 +1148,15 @@ export async function runRpcMode(
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
+				eventSubscription = "control";
 				return success(id, "negotiate_protocol", { protocolVersion: 2 });
+			}
+			case "set_event_subscription": {
+				if (command.level !== "control" && command.level !== "full") {
+					return error(id, "set_event_subscription", "Event subscription level must be control or full");
+				}
+				eventSubscription = command.level;
+				return success(id, "set_event_subscription", { level: eventSubscription });
 			}
 
 			// =================================================================

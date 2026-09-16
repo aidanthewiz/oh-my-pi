@@ -32,6 +32,7 @@ import type {
 	RpcHostToolResult,
 	RpcHostToolUpdate,
 	RpcResponse,
+	RpcEventSubscriptionLevel,
 	RpcSessionState,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
@@ -456,6 +457,14 @@ export class RpcClient {
 				)
 					throw new Error("RPC protocol v2 negotiation failed");
 				this.#protocolVersion = 2;
+				const eventResponse = await this.#send({ type: "set_event_subscription", level: "full" });
+				if (
+					!eventResponse.success ||
+					eventResponse.command !== "set_event_subscription" ||
+					!isRecord(eventResponse.data) ||
+					eventResponse.data.level !== "full"
+				)
+					throw new Error("RPC full-event subscription failed");
 			}
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
@@ -655,6 +664,13 @@ export class RpcClient {
 	async setFastMode(enabled: boolean): Promise<{ enabled: boolean; active: boolean }> {
 		const response = await this.#send({ type: "set_fast_mode", enabled });
 		return this.#getData(response);
+	}
+	/**
+	 * Select bounded lifecycle control frames or the complete session event stream.
+	 */
+	async setEventSubscription(level: RpcEventSubscriptionLevel): Promise<RpcEventSubscriptionLevel> {
+		const response = await this.#send({ type: "set_event_subscription", level });
+		return this.#getData<{ level: RpcEventSubscriptionLevel }>(response).level;
 	}
 
 	/**

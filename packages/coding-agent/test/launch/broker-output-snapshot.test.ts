@@ -131,6 +131,122 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 		}
 	}, 20_000);
 
+	it("rejects unsafe PTY lines before write and reports pipe writes honestly", async () => {
+		const canonicalLimit = process.platform === "darwin" ? 1_024 : process.platform === "linux" ? 4_096 : undefined;
+		if (canonicalLimit === undefined) return;
+
+		using tempDir = TempDir.createSync("@omp-launch-input-boundary-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const scriptPath = path.join(projectDir, "line-reader.ts");
+		await Bun.write(
+			scriptPath,
+			`process.stdin.setEncoding("utf8");
+let input = "";
+process.stdin.on("data", chunk => {
+	input += chunk;
+	for (;;) {
+		const newline = input.indexOf("\\n");
+		if (newline < 0) return;
+		const line = input.slice(0, newline).replace(/\\r$/, "");
+		input = input.slice(newline + 1);
+		process.stdout.write("LINE:" + Buffer.byteLength(line) + "\\n");
+	}
+});
+process.stdout.write("READY\\n");
+`,
+		);
+
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = startBroker(projectDir, runtimeDir);
+		const names = ["canonical-pty", "machine-pipe"];
+		try {
+			for (const [name, usePty] of [
+				[names[0], true],
+				[names[1], false],
+			] as const) {
+				const started = await client.request({
+					op: "start",
+					spec: {
+						name,
+						application: process.execPath,
+						args: [scriptPath],
+						env: {},
+						cwd: projectDir,
+						pty: usePty,
+						ready: { log: "READY", timeoutMs: 5_000 },
+						restart: "no",
+						persist: false,
+						detached: false,
+					},
+				});
+				if (started.op !== "start") throw new Error("unexpected start result");
+				expect(started.readyTimedOut).toBeFalse();
+			}
+
+			const oversized = `${"x".repeat(canonicalLimit)}\n`;
+			await expect(client.request({ op: "send", name: names[0], data: oversized })).rejects.toThrow(
+				`${canonicalLimit}-byte canonical line limit`,
+			);
+
+			const shortWrite = await client.request({ op: "send", name: names[0], data: "short\n" });
+			if (shortWrite.op !== "send") throw new Error("unexpected send result");
+			expect(shortWrite).toMatchObject({
+				bytesWritten: 6,
+				transport: "pty",
+				canonicalLineLimit: canonicalLimit,
+				delivery: "broker_write_only",
+			});
+			const shortObserved = await client.request({
+				op: "wait",
+				name: names[0],
+				for: "exit",
+				pattern: "LINE:5",
+				timeoutMs: 2_000,
+			});
+			if (shortObserved.op !== "wait") throw new Error("unexpected wait result");
+			expect(shortObserved.timedOut).toBeFalse();
+
+			const ptyLogs = await client.request({
+				op: "logs",
+				name: names[0],
+				lines: 20,
+				head: false,
+				follow: false,
+				timeoutMs: 1_000,
+			});
+			if (ptyLogs.op !== "logs") throw new Error("unexpected logs result");
+			expect(ptyLogs.text).not.toContain("x".repeat(20));
+
+			const pipeWrite = await client.request({ op: "send", name: names[1], data: oversized });
+			if (pipeWrite.op !== "send") throw new Error("unexpected send result");
+			expect(pipeWrite).toMatchObject({
+				bytesWritten: canonicalLimit + 1,
+				transport: "pipe",
+				delivery: "broker_write_only",
+			});
+			expect(pipeWrite.canonicalLineLimit).toBeUndefined();
+			const pipeObserved = await client.request({
+				op: "wait",
+				name: names[1],
+				for: "exit",
+				pattern: `LINE:${canonicalLimit}`,
+				timeoutMs: 2_000,
+			});
+			if (pipeObserved.op !== "wait") throw new Error("unexpected wait result");
+			expect(pipeObserved.timedOut).toBeFalse();
+		} finally {
+			for (const name of names) {
+				await client.request({ op: "stop", name, timeoutMs: 2_000 }).catch(() => undefined);
+			}
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
+			setProcessName(previousTitle);
+		}
+	}, 20_000);
 	// A supervised program that probes the terminal (cursor position here) blocks
 	// on the reply; nothing behind the broker's PTY answered, so it hung until its
 	// own timeout. The broker now replies, and the reply bytes reach the program's

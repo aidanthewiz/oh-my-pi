@@ -1,11 +1,42 @@
 import { readLines } from "@oh-my-pi/pi-utils";
+export interface RpcInputTerminal {
+	isTTY?: boolean;
+	isRaw?: boolean;
+	setRawMode?: (mode: boolean) => unknown;
+}
+
+/**
+ * Disable terminal canonical input buffering for RPC transports. Canonical
+ * PTYs cap one line before the process can read it, which can truncate a
+ * valid JSON frame before the protocol's own size limit applies.
+ */
+export function configureRpcInputTerminal(stdin: RpcInputTerminal = process.stdin): () => void {
+	if (!stdin.isTTY || typeof stdin.setRawMode !== "function" || stdin.isRaw) {
+		return () => {};
+	}
+	stdin.setRawMode(true);
+	let restored = false;
+	return () => {
+		if (restored) return;
+		restored = true;
+		stdin.setRawMode?.(false);
+	};
+}
 
 /**
  * Claims Bun's singleton stdin reader immediately and exposes a separately readable stream.
  * RPC startup uses this before extension discovery so in-process modules cannot steal protocol input.
  */
 export function claimRpcInput(): ReadableStream<Uint8Array> {
-	const reader = Bun.stdin.stream().getReader();
+	const restoreTerminal = configureRpcInputTerminal();
+	const reader = (() => {
+		try {
+			return Bun.stdin.stream().getReader();
+		} catch (error) {
+			restoreTerminal();
+			throw error;
+		}
+	})();
 	let released = false;
 	const release = () => {
 		if (released) return;
@@ -13,6 +44,7 @@ export function claimRpcInput(): ReadableStream<Uint8Array> {
 		try {
 			reader.releaseLock();
 		} catch {}
+		restoreTerminal();
 	};
 	return new ReadableStream({
 		async pull(controller) {

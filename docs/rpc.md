@@ -33,6 +33,10 @@ Behavior notes:
 
 Protocol v1 stdout frames are a single JSON object followed by `\n`. The server caps each physical stdout frame at 1 MiB. Inbound commands are always one unchunked JSONL object; clients SHOULD keep them within the advertised physical-frame limit.
 
+When stdin is a TTY, RPC mode disables canonical input buffering while it owns stdin. This prevents the terminal driver from truncating a valid JSONL command before the protocol limit applies. Pipes are unchanged, and the prior terminal mode is restored when RPC releases stdin.
+
+The `hub start` tool therefore defaults `--mode rpc` and `--mode rpc-ui` processes to pipes. An explicit `pty: true` overrides the default and remains subject to the platform canonical-line safety limit.
+
 The initial ready frame uses protocol v1 and advertises the opt-in lossless transport:
 
 ```json
@@ -120,6 +124,7 @@ Important edge behavior from runtime:
 ### Protocol
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "set_event_subscription", level: "control" | "full" }`
 
 ### State
 
@@ -470,9 +475,22 @@ store. RPC hosts cannot register or shadow that scheme.
 
 ## Event Stream Schema
 
-RPC mode forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
+Protocol v1 retains the complete `AgentSessionEvent` stream for compatibility. After protocol v2 negotiation, raw clients default to the bounded `"control"` subscription. Send `set_event_subscription` with `"full"` only when the client needs transcripts, streaming deltas, tool arguments, or provider payloads. The bundled TypeScript `RpcClient` selects `"full"` to preserve its typed event API.
 
-Common event types:
+The `"control"` subscription emits `rpc_control` frames for:
+
+- `agent_start`
+- `agent_end`, with `terminal`
+- `tool_execution_start`, with `toolCallId`, `toolName`, and optional `intent`
+- `tool_execution_end`, with `toolCallId`, `toolName`, and `failed`
+- `auto_compaction_start` and `auto_compaction_end`
+- `auto_retry_start` and `auto_retry_end`
+
+Control frames exclude message content, tool arguments and results, transcripts, and provider payloads. This keeps orchestration logs bounded and suitable for terminal classification.
+
+The `"full"` subscription forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
+
+Common full event types:
 
 - `agent_start`, `agent_end`
 - `turn_start`, `turn_end`
@@ -497,9 +515,9 @@ Extension runner errors are emitted separately as:
 }
 ```
 
-`message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
+In the full stream, `message_update` includes streaming deltas in `assistantMessageEvent`.
 
-`agent_end` has this session-level shape (in addition to optional telemetry fields):
+Full-stream `agent_end` has this session-level shape, in addition to optional telemetry fields:
 
 ```ts
 {
@@ -509,10 +527,7 @@ Extension runner errors are emitted separately as:
 }
 ```
 
-`isTerminal: false` means maintenance or async delivery has scheduled more work,
-so the session will resume before its true final settle. Treat an `agent_end` as
-run completion only when `isTerminal !== false`; the field is optional so frames
-from older runtimes, where it is absent, remain terminal-compatible.
+`isTerminal: false` means maintenance or async delivery has scheduled more work. Treat an `agent_end` as run completion only when `isTerminal !== false`; an omitted field from an older runtime remains terminal-compatible.
 
 ### Available commands
 

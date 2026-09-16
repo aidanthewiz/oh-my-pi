@@ -115,6 +115,44 @@ describe("launch logs compatibility", () => {
 	});
 });
 
+describe("launch send acknowledgement", () => {
+	const sendOperation: Extract<DaemonOperation, { op: "send" }> = {
+		op: "send",
+		name: "web",
+		data: "status\r",
+	};
+
+	it("preserves the transport boundary and canonical limit", () => {
+		expect(
+			parseDaemonRpcResult(sendOperation, {
+				daemon: baseSnapshot,
+				bytesWritten: 7,
+				transport: "pty",
+				canonicalLineLimit: 1_024,
+				delivery: "broker_write_only",
+			}),
+		).toEqual({
+			op: "send",
+			daemon: baseSnapshot,
+			bytesWritten: 7,
+			transport: "pty",
+			canonicalLineLimit: 1_024,
+			delivery: "broker_write_only",
+		});
+	});
+
+	it("rejects an unknown delivery claim", () => {
+		expect(() =>
+			parseDaemonRpcResult(sendOperation, {
+				daemon: baseSnapshot,
+				bytesWritten: 7,
+				transport: "pty",
+				delivery: "application_delivered",
+			}),
+		).toThrow("result.delivery must be broker_write_only");
+	});
+});
+
 describe("regex-derived protocol fields", () => {
 	it("preserves an empty readiness match", () => {
 		expect(parseDaemonSnapshot({ ...baseSnapshot, readyMatch: "" }).readyMatch).toBe("");

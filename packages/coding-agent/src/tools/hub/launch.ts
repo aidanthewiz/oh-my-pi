@@ -167,6 +167,14 @@ export interface LaunchToolDetails {
 	terminalRows?: string[];
 	/** wait: output line that satisfied the pattern. */
 	matched?: string;
+	/** send: bytes accepted by the broker transport, not an application acknowledgement. */
+	bytesWritten?: number;
+	/** send: stdin transport used by the daemon. */
+	transport?: "pty" | "pipe";
+	/** send: platform canonical line limit enforced for PTY input. */
+	canonicalLineLimit?: number;
+	/** send: acknowledgement boundary. */
+	delivery?: "broker_write_only";
 	/** describe: immutable launch spec backing the command/cwd detail lines. */
 	spec?: DaemonSpec;
 }
@@ -181,11 +189,21 @@ function timeoutMs(value: number | undefined, fallbackSeconds: number): number {
 	return Math.round(seconds * 1_000);
 }
 
+function usesRpcStdio(args: string[]): boolean {
+	return args.some(
+		(arg, index) =>
+			arg === "--mode=rpc" ||
+			arg === "--mode=rpc-ui" ||
+			(arg === "--mode" && (args[index + 1] === "rpc" || args[index + 1] === "rpc-ui")),
+	);
+}
+
 function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	const name = requiredName(params);
 	if (!params.application) throw new ToolError("start requires application");
 	const ready = params.ready;
 	const detached = params.detached ?? false;
+	const args = params.args ?? [];
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535)) {
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
 	}
@@ -193,10 +211,10 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	return {
 		name,
 		application: params.application,
-		args: params.args ?? [],
+		args,
 		env: params.env ?? {},
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
-		pty: detached ? false : (params.pty ?? true),
+		pty: detached ? false : (params.pty ?? !usesRpcStdio(args)),
 		ready: ready
 			? {
 					log: ready.log,
@@ -332,8 +350,12 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 			}
 			return lines.join("\n");
 		}
-		case "send":
-			return `Sent input to ${daemonLabel(result.daemon)}`;
+		case "send": {
+			const signal = params.signal ? `; requested ${params.signal}` : "";
+			const canonical =
+				result.canonicalLineLimit === undefined ? "" : `; canonical line limit ${result.canonicalLineLimit} bytes`;
+			return `Broker wrote ${result.bytesWritten} bytes via ${result.transport}${signal}${canonical}; application delivery is unconfirmed. ${daemonLabel(result.daemon)}`;
+		}
 		case "stop":
 			return `Stopped ${daemonLabel(result.daemon)}`;
 		case "restart":
@@ -378,7 +400,14 @@ async function toolDetails(result: DaemonRpcResult, params: LaunchParams): Promi
 		case "wait":
 			return { op: "wait", daemon: result.daemon, timedOut: result.timedOut, matched: result.matched };
 		case "send":
-			return { op: "send", daemon: result.daemon };
+			return {
+				op: "send",
+				daemon: result.daemon,
+				bytesWritten: result.bytesWritten,
+				transport: result.transport,
+				canonicalLineLimit: result.canonicalLineLimit,
+				delivery: result.delivery,
+			};
 		case "stop":
 			return { op: "stop", daemon: result.daemon };
 		case "restart":

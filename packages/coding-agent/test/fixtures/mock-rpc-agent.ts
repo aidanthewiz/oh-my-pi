@@ -105,6 +105,16 @@ for await (const raw of console) {
 				protocolV2Enabled = true;
 				continue;
 			}
+			if (frame.type === "set_event_subscription") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { level: frame.level },
+				});
+				continue;
+			}
 			if (frame.type === "get_messages_page") {
 				if (Bun.env.MOCK_RPC_PAGE_BUSY === "1") {
 					writeFrame({
