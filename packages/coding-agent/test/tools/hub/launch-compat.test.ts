@@ -108,7 +108,6 @@ describe("launch broker protocol compatibility", () => {
 					},
 					bytesWritten: 7,
 					transport: "pty",
-					canonicalLineLimit: 1_024,
 					delivery: "broker_write_only",
 				}) as const,
 			close() {},
@@ -125,15 +124,12 @@ describe("launch broker protocol compatibility", () => {
 		expect(result.content).toEqual([
 			{
 				type: "text",
-				text: expect.stringContaining(
-					"Broker wrote 7 bytes via pty; canonical line limit 1024 bytes; application delivery is unconfirmed.",
-				),
+				text: expect.stringContaining("Broker wrote 7 bytes via pty; application delivery is unconfirmed."),
 			},
 		]);
 		expect(result.details).toMatchObject({
 			bytesWritten: 7,
 			transport: "pty",
-			canonicalLineLimit: 1_024,
 			delivery: "broker_write_only",
 		});
 	});
@@ -379,14 +375,16 @@ describe("launch broker protocol compatibility", () => {
 		});
 		expect(requests[0]).toMatchObject({ op: "start", spec: { pty: false } });
 
-		await executeLaunch(session, {
-			op: "start",
-			name: "rpc-explicit",
-			application: process.execPath,
-			args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode=rpc-ui"],
-			pty: true,
-		});
-		expect(requests[1]).toMatchObject({ op: "start", spec: { pty: true } });
+		await expect(
+			executeLaunch(session, {
+				op: "start",
+				name: "rpc-explicit",
+				application: process.execPath,
+				args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode=rpc-ui"],
+				pty: true,
+			}),
+		).rejects.toThrow("Coreforge/OMP RPC modes require pipe stdin");
+		expect(requests).toHaveLength(1);
 
 		await executeLaunch(session, {
 			op: "start",
@@ -394,7 +392,7 @@ describe("launch broker protocol compatibility", () => {
 			application: process.execPath,
 			args: ["unrelated.ts", "--mode", "rpc"],
 		});
-		expect(requests[2]).toMatchObject({ op: "start", spec: { pty: true } });
+		expect(requests[1]).toMatchObject({ op: "start", spec: { pty: true } });
 
 		await executeLaunch(session, {
 			op: "start",
@@ -402,7 +400,7 @@ describe("launch broker protocol compatibility", () => {
 			application: "omp",
 			args: ["--", "--mode=rpc"],
 		});
-		expect(requests[3]).toMatchObject({ op: "start", spec: { pty: true } });
+		expect(requests[2]).toMatchObject({ op: "start", spec: { pty: true } });
 	});
 
 	it("routes a broker completion and releases its sink on session change", async () => {

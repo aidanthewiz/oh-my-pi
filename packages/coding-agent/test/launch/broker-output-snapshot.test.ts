@@ -131,10 +131,7 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 		}
 	}, 20_000);
 
-	it("rejects unsafe PTY lines before write and reports pipe writes honestly", async () => {
-		const canonicalLimit = process.platform === "darwin" ? 1_024 : process.platform === "linux" ? 4_096 : undefined;
-		if (canonicalLimit === undefined) return;
-
+	it("reports PTY and pipe writes without claiming application delivery", async () => {
 		using tempDir = TempDir.createSync("@omp-launch-input-boundary-");
 		const projectDir = path.join(tempDir.path(), "project");
 		const runtimeDir = path.join(tempDir.path(), "runtime");
@@ -161,7 +158,7 @@ process.stdout.write("READY\\n");
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 		const previousTitle = process.title;
 		const broker = startBroker(projectDir, runtimeDir);
-		const names = ["canonical-pty", "machine-pipe"];
+		const names = ["interactive-pty", "machine-pipe"];
 		try {
 			for (const [name, usePty] of [
 				[names[0], true],
@@ -186,33 +183,11 @@ process.stdout.write("READY\\n");
 				expect(started.readyTimedOut).toBeFalse();
 			}
 
-			const oversized = `${"x".repeat(canonicalLimit)}\n`;
-			await expect(client.request({ op: "send", name: names[0], data: oversized })).rejects.toThrow(
-				`${canonicalLimit}-byte canonical line limit`,
-			);
-
-			const fragment = "x".repeat(canonicalLimit - 1);
-			const fragmentWrite = await client.request({ op: "send", name: names[0], data: fragment });
-			if (fragmentWrite.op !== "send") throw new Error("unexpected send result");
-			expect(fragmentWrite.bytesWritten).toBe(canonicalLimit - 1);
-			await client.request({ op: "send", name: names[0], data: "\u007f" });
-			await client.request({ op: "send", name: names[0], data: "x" });
-			await expect(client.request({ op: "send", name: names[0], data: "x" })).rejects.toThrow(
-				`${canonicalLimit}-byte canonical line limit`,
-			);
-			await client.request({ op: "send", name: names[0], data: "\u0017" });
-			await client.request({ op: "send", name: names[0], data: fragment });
-			await expect(client.request({ op: "send", name: names[0], data: "x" })).rejects.toThrow(
-				`${canonicalLimit}-byte canonical line limit`,
-			);
-			await client.request({ op: "send", name: names[0], data: "\u0017" });
-
 			const shortWrite = await client.request({ op: "send", name: names[0], data: "short\n" });
 			if (shortWrite.op !== "send") throw new Error("unexpected send result");
 			expect(shortWrite).toMatchObject({
 				bytesWritten: 6,
 				transport: "pty",
-				canonicalLineLimit: canonicalLimit,
 				delivery: "broker_write_only",
 			});
 			const shortObserved = await client.request({
@@ -225,30 +200,20 @@ process.stdout.write("READY\\n");
 			if (shortObserved.op !== "wait") throw new Error("unexpected wait result");
 			expect(shortObserved.timedOut).toBeFalse();
 
-			const ptyLogs = await client.request({
-				op: "logs",
-				name: names[0],
-				lines: 20,
-				head: false,
-				follow: false,
-				timeoutMs: 1_000,
-			});
-			if (ptyLogs.op !== "logs") throw new Error("unexpected logs result");
-			expect(ptyLogs.text).not.toContain("x".repeat(canonicalLimit));
-
-			const pipeWrite = await client.request({ op: "send", name: names[1], data: oversized });
+			const largeLineBytes = 8 * 1_024;
+			const largeLine = `${"x".repeat(largeLineBytes)}\n`;
+			const pipeWrite = await client.request({ op: "send", name: names[1], data: largeLine });
 			if (pipeWrite.op !== "send") throw new Error("unexpected send result");
 			expect(pipeWrite).toMatchObject({
-				bytesWritten: canonicalLimit + 1,
+				bytesWritten: largeLineBytes + 1,
 				transport: "pipe",
 				delivery: "broker_write_only",
 			});
-			expect(pipeWrite.canonicalLineLimit).toBeUndefined();
 			const pipeObserved = await client.request({
 				op: "wait",
 				name: names[1],
 				for: "exit",
-				pattern: `LINE:${canonicalLimit}`,
+				pattern: `LINE:${largeLineBytes}`,
 				timeoutMs: 2_000,
 			});
 			if (pipeObserved.op !== "wait") throw new Error("unexpected wait result");

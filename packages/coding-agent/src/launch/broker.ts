@@ -72,46 +72,6 @@ const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 	SIGKILL: os.constants.signals.SIGKILL,
 };
 
-function ptyCanonicalLineLimitBytes(): number | undefined {
-	if (process.platform === "darwin") return 1_024;
-	if (process.platform === "linux") return 4_096;
-	return undefined;
-}
-
-function inspectPtyInput(
-	data: string,
-	limit: number,
-	trailingInput: readonly number[],
-): { trailingInput: number[]; oversizedLine?: number } {
-	const pending = [...trailingInput];
-	for (const byte of Buffer.from(data)) {
-		if (
-			byte === 0x03 ||
-			byte === 0x04 ||
-			byte === 0x0a ||
-			byte === 0x0d ||
-			byte === 0x15 ||
-			byte === 0x1a ||
-			byte === 0x1c
-		) {
-			pending.length = 0;
-		} else if (byte === 0x7f) {
-			pending.pop();
-		} else if (byte === 0x17) {
-			while (pending.at(-1) === 0x09 || pending.at(-1) === 0x20) pending.pop();
-			while (pending.length > 0 && pending.at(-1) !== 0x09 && pending.at(-1) !== 0x20) {
-				pending.pop();
-			}
-		} else {
-			pending.push(byte);
-			if (pending.length >= limit) {
-				return { trailingInput: pending, oversizedLine: pending.length };
-			}
-		}
-	}
-	return { trailingInput: pending };
-}
-
 interface ManagedProcess {
 	pid: number;
 	exited: Promise<number>;
@@ -131,7 +91,6 @@ interface ManagedDaemon {
 	logReady: boolean;
 	portReady: boolean;
 	readinessBuffer: string;
-	canonicalInput: number[];
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
@@ -708,7 +667,6 @@ class DaemonBroker {
 				logReady: !spec.ready?.log,
 				portReady: spec.ready?.port === undefined,
 				readinessBuffer: "",
-				canonicalInput: [],
 				outputOffset: 0,
 				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 				consecutiveFailures: 0,
@@ -757,7 +715,6 @@ class DaemonBroker {
 		record.portReady = record.spec.ready?.port === undefined;
 		syncReadyPending(record);
 		record.readinessBuffer = "";
-		record.canonicalInput = [];
 		record.outputOffset = 0;
 		this.#persist(record);
 		try {
@@ -1178,23 +1135,9 @@ class DaemonBroker {
 		return { op: "wait", daemon: record.snapshot, matched, timedOut };
 	}
 
-	#writePty(record: ManagedDaemon, data: string): number | undefined {
+	#writePty(record: ManagedDaemon, data: string): void {
 		if (!record.pty) throw new Error(`Daemon ${record.spec.name} PTY stdin is unavailable`);
-		const canonicalLineLimit = ptyCanonicalLineLimitBytes();
-		if (canonicalLineLimit !== undefined) {
-			const inspected = inspectPtyInput(data, canonicalLineLimit, record.canonicalInput);
-			if (inspected.oversizedLine !== undefined) {
-				throw new Error(
-					`Daemon ${record.spec.name} uses a PTY with a ${canonicalLineLimit}-byte canonical line limit; ` +
-						`refusing a ${inspected.oversizedLine}-byte input line before write. Start machine protocols with pty:false.`,
-				);
-			}
-			record.pty.write(data);
-			record.canonicalInput = inspected.trailingInput;
-			return canonicalLineLimit;
-		}
 		record.pty.write(data);
-		return undefined;
 	}
 
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {
@@ -1208,9 +1151,8 @@ class DaemonBroker {
 		}
 		const bytesWritten = operation.data === undefined ? 0 : Buffer.byteLength(operation.data);
 		const transport = record.pty ? "pty" : "pipe";
-		let canonicalLineLimit = record.pty ? ptyCanonicalLineLimitBytes() : undefined;
 		if (operation.data !== undefined) {
-			if (record.pty) canonicalLineLimit = this.#writePty(record, operation.data);
+			if (record.pty) this.#writePty(record, operation.data);
 			else if (record.input) {
 				record.input.write(operation.data);
 				await record.input.flush();
@@ -1231,7 +1173,6 @@ class DaemonBroker {
 			daemon: record.snapshot,
 			bytesWritten,
 			transport,
-			...(canonicalLineLimit === undefined ? {} : { canonicalLineLimit }),
 			delivery: "broker_write_only",
 		};
 	}
@@ -1381,7 +1322,6 @@ class DaemonBroker {
 					logReady: detached && (!spec.ready?.log || snapshot.state === "ready"),
 					portReady: detached && (spec.ready?.port === undefined || snapshot.state === "ready"),
 					readinessBuffer: "",
-					canonicalInput: [],
 					outputOffset: detached ? snapshot.outputBytes : 0,
 					readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 					consecutiveFailures: 0,

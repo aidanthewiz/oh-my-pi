@@ -11,7 +11,7 @@
 
 - Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once. Bash retains the reviewed execution route and shell through startup, and route or shell changes require a fresh safety review.
 - Destructive Command Guard now fails closed on unexpected stderr and on child processes that keep output pipes open past the bounded post-exit drain window.
-- RPC mode now disables canonical TTY input buffering while it owns stdin, preventing valid JSONL commands from being truncated by the terminal driver. The daemon broker rejects unsafe canonical PTY lines before writing them, reports transport byte counts without claiming application delivery, and defaults supervised RPC processes to pipes.
+- RPC mode now disables canonical TTY input buffering while it owns stdin, preventing valid JSONL commands from being truncated by the terminal driver. Hub rejects known supervised RPC launches that explicitly request a PTY and defaults those processes to pipes. Broker send acknowledgements report transport byte counts without claiming application delivery.
 
 ### Changed
 

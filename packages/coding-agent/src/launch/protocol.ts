@@ -126,7 +126,6 @@ export type DaemonRpcResult =
 			daemon: DaemonSnapshot;
 			bytesWritten: number;
 			transport: DaemonInputTransport;
-			canonicalLineLimit?: number;
 			delivery: DaemonInputDelivery;
 	  }
 	| { op: "stop"; daemon: DaemonSnapshot }
@@ -475,7 +474,6 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 					}
 					return transport;
 				})(),
-				canonicalLineLimit: optionalNumber(source.canonicalLineLimit, "result.canonicalLineLimit"),
 				delivery:
 					source.delivery === "broker_write_only"
 						? "broker_write_only"

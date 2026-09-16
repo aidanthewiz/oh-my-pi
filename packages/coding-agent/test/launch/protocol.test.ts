@@ -122,13 +122,12 @@ describe("launch send acknowledgement", () => {
 		data: "status\r",
 	};
 
-	it("preserves the transport boundary and canonical limit", () => {
+	it("preserves the transport and acknowledgement boundary", () => {
 		expect(
 			parseDaemonRpcResult(sendOperation, {
 				daemon: baseSnapshot,
 				bytesWritten: 7,
 				transport: "pty",
-				canonicalLineLimit: 1_024,
 				delivery: "broker_write_only",
 			}),
 		).toEqual({
@@ -136,7 +135,6 @@ describe("launch send acknowledgement", () => {
 			daemon: baseSnapshot,
 			bytesWritten: 7,
 			transport: "pty",
-			canonicalLineLimit: 1_024,
 			delivery: "broker_write_only",
 		});
 	});

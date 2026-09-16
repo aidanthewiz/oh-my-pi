@@ -171,8 +171,6 @@ export interface LaunchToolDetails {
 	bytesWritten?: number;
 	/** send: stdin transport used by the daemon. */
 	transport?: "pty" | "pipe";
-	/** send: platform canonical line limit enforced for PTY input. */
-	canonicalLineLimit?: number;
 	/** send: acknowledgement boundary. */
 	delivery?: "broker_write_only";
 	/** describe: immutable launch spec backing the command/cwd detail lines. */
@@ -228,6 +226,10 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	const ready = params.ready;
 	const detached = params.detached ?? false;
 	const args = params.args ?? [];
+	const rpcStdio = usesRpcStdio(params.application, args);
+	if (!detached && rpcStdio && params.pty === true) {
+		throw new ToolError("Coreforge/OMP RPC modes require pipe stdin; omit pty or set pty:false");
+	}
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535)) {
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
 	}
@@ -238,7 +240,7 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 		args,
 		env: params.env ?? {},
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
-		pty: detached ? false : (params.pty ?? !usesRpcStdio(params.application, args)),
+		pty: detached || rpcStdio ? false : (params.pty ?? true),
 		ready: ready
 			? {
 					log: ready.log,
@@ -376,9 +378,7 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 		}
 		case "send": {
 			const signal = params.signal ? `; requested ${params.signal}` : "";
-			const canonical =
-				result.canonicalLineLimit === undefined ? "" : `; canonical line limit ${result.canonicalLineLimit} bytes`;
-			return `Broker wrote ${result.bytesWritten} bytes via ${result.transport}${signal}${canonical}; application delivery is unconfirmed. ${daemonLabel(result.daemon)}`;
+			return `Broker wrote ${result.bytesWritten} bytes via ${result.transport}${signal}; application delivery is unconfirmed. ${daemonLabel(result.daemon)}`;
 		}
 		case "stop":
 			return `Stopped ${daemonLabel(result.daemon)}`;
@@ -429,7 +429,6 @@ async function toolDetails(result: DaemonRpcResult, params: LaunchParams): Promi
 				daemon: result.daemon,
 				bytesWritten: result.bytesWritten,
 				transport: result.transport,
-				canonicalLineLimit: result.canonicalLineLimit,
 				delivery: result.delivery,
 			};
 		case "stop":
