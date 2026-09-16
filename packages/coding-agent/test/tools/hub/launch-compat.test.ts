@@ -375,6 +375,14 @@ describe("launch broker protocol compatibility", () => {
 		});
 		expect(requests[0]).toMatchObject({ op: "start", spec: { pty: false } });
 
+		await executeLaunch(session, {
+			op: "start",
+			name: "bundled-rpc",
+			application: "bun",
+			args: ["dist/cli.js", "--mode", "rpc"],
+		});
+		expect(requests[1]).toMatchObject({ op: "start", spec: { pty: false } });
+
 		await expect(
 			executeLaunch(session, {
 				op: "start",
@@ -384,7 +392,7 @@ describe("launch broker protocol compatibility", () => {
 				pty: true,
 			}),
 		).rejects.toThrow("Coreforge/OMP RPC modes require pipe stdin");
-		expect(requests).toHaveLength(1);
+		expect(requests).toHaveLength(2);
 
 		await executeLaunch(session, {
 			op: "start",
@@ -392,7 +400,7 @@ describe("launch broker protocol compatibility", () => {
 			application: process.execPath,
 			args: ["unrelated.ts", "--mode", "rpc"],
 		});
-		expect(requests[1]).toMatchObject({ op: "start", spec: { pty: true } });
+		expect(requests[2]).toMatchObject({ op: "start", spec: { pty: true } });
 
 		await executeLaunch(session, {
 			op: "start",
@@ -400,7 +408,7 @@ describe("launch broker protocol compatibility", () => {
 			application: "omp",
 			args: ["--", "--mode=rpc"],
 		});
-		expect(requests[2]).toMatchObject({ op: "start", spec: { pty: true } });
+		expect(requests[3]).toMatchObject({ op: "start", spec: { pty: true } });
 	});
 
 	it("routes a broker completion and releases its sink on session change", async () => {

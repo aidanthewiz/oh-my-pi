@@ -192,10 +192,16 @@ function usesRpcStdio(application: string, args: string[]): boolean {
 	let optionStart = 0;
 	if (executable === "bun" || executable === "bun.exe" || executable === "node" || executable === "node.exe") {
 		const scriptIndex = args[0] === "run" ? 1 : 0;
-		const script = args[scriptIndex]?.replaceAll("\\", "/");
+		const script = args[scriptIndex]?.replaceAll("\\", "/").replace(/^\.\/+/, "");
 		if (
-			!script?.endsWith("/packages/coding-agent/src/cli.ts") &&
-			!script?.endsWith("/packages/coding-agent/src/cli.js")
+			!script ||
+			(script !== "dist/cli.js" &&
+				script !== "packages/coding-agent/src/cli.ts" &&
+				script !== "packages/coding-agent/src/cli.js" &&
+				!script.endsWith("/packages/coding-agent/src/cli.ts") &&
+				!script.endsWith("/packages/coding-agent/src/cli.js") &&
+				!script.endsWith("/packages/coding-agent/dist/cli.js") &&
+				!script.endsWith("/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"))
 		) {
 			return false;
 		}
