@@ -169,7 +169,7 @@ export type RpcEventSubscriptionLevel = "control" | "full";
 export type RpcControlEvent =
 	| { event: "agent_start" }
 	| { event: "agent_end"; terminal: boolean }
-	| { event: "tool_execution_start"; toolCallId: string; toolName: string; intent?: string }
+	| { event: "tool_execution_start"; toolCallId: string; toolName: string }
 	| { event: "tool_execution_end"; toolCallId: string; toolName: string; failed: boolean }
 	| { event: "auto_compaction_start"; action: string; reason: string }
 	| { event: "auto_compaction_end"; action: string; aborted: boolean; willRetry: boolean }

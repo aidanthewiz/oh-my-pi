@@ -189,12 +189,36 @@ function timeoutMs(value: number | undefined, fallbackSeconds: number): number {
 	return Math.round(seconds * 1_000);
 }
 
-function usesRpcStdio(args: string[]): boolean {
-	return args.some(
+function usesRpcStdio(application: string, args: string[]): boolean {
+	const executable = application.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
+	let optionStart = 0;
+	if (executable === "bun" || executable === "bun.exe" || executable === "node" || executable === "node.exe") {
+		const scriptIndex = args[0] === "run" ? 1 : 0;
+		const script = args[scriptIndex]?.replaceAll("\\", "/");
+		if (
+			!script?.endsWith("/packages/coding-agent/src/cli.ts") &&
+			!script?.endsWith("/packages/coding-agent/src/cli.js")
+		) {
+			return false;
+		}
+		optionStart = scriptIndex + 1;
+	} else if (
+		executable !== "omp" &&
+		executable !== "omp.exe" &&
+		executable !== "omp-coreforge" &&
+		executable !== "omp-coreforge.exe" &&
+		executable !== "coreforge" &&
+		executable !== "coreforge.exe"
+	) {
+		return false;
+	}
+	const delimiter = args.indexOf("--", optionStart);
+	const options = args.slice(optionStart, delimiter < 0 ? undefined : delimiter);
+	return options.some(
 		(arg, index) =>
 			arg === "--mode=rpc" ||
 			arg === "--mode=rpc-ui" ||
-			(arg === "--mode" && (args[index + 1] === "rpc" || args[index + 1] === "rpc-ui")),
+			(arg === "--mode" && (options[index + 1] === "rpc" || options[index + 1] === "rpc-ui")),
 	);
 }
 
@@ -214,7 +238,7 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 		args,
 		env: params.env ?? {},
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
-		pty: detached ? false : (params.pty ?? !usesRpcStdio(args)),
+		pty: detached ? false : (params.pty ?? !usesRpcStdio(params.application, args)),
 		ready: ready
 			? {
 					log: ready.log,

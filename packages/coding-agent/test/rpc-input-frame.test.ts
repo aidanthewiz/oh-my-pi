@@ -81,7 +81,7 @@ describe("rpcControlEventFrame", () => {
 		expect(JSON.stringify(frame).length).toBeLessThan(100);
 	});
 
-	test("omits cumulative message updates and tool arguments", () => {
+	test("omits cumulative messages, tool arguments, and model-authored intent", () => {
 		expect(
 			rpcControlEventFrame({
 				type: "message_update",
@@ -89,21 +89,20 @@ describe("rpcControlEventFrame", () => {
 				assistantMessageEvent: { type: "text_delta", delta: "private" },
 			} as never),
 		).toBeNull();
-		expect(
-			rpcControlEventFrame({
-				type: "tool_execution_start",
-				toolCallId: "call-1",
-				toolName: "write",
-				args: { token: "private" },
-				intent: "Writing result",
-			} as never),
-		).toEqual({
+		const frame = rpcControlEventFrame({
+			type: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "write",
+			args: { token: "private" },
+			intent: "private".repeat(1_000_000),
+		} as never);
+		expect(frame).toEqual({
 			type: "rpc_control",
 			event: "tool_execution_start",
 			toolCallId: "call-1",
 			toolName: "write",
-			intent: "Writing result",
 		});
+		expect(JSON.stringify(frame).length).toBeLessThan(128);
 	});
 });
 

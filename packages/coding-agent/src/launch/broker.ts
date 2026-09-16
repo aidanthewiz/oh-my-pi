@@ -78,10 +78,23 @@ function ptyCanonicalLineLimitBytes(): number | undefined {
 	return undefined;
 }
 
-function oversizedPtyLineBytes(data: string, limit: number): number | undefined {
-	let largest = 0;
-	for (const line of data.split(/[\r\n]/u)) largest = Math.max(largest, Buffer.byteLength(line));
-	return largest >= limit ? largest : undefined;
+function inspectPtyInput(
+	data: string,
+	limit: number,
+	trailingBytes: number,
+): { trailingBytes: number; oversizedLine?: number } {
+	const segments = data.split(/[\r\n\u0003\u0015]/u);
+	let largest = trailingBytes + Buffer.byteLength(segments[0] ?? "");
+	for (let index = 1; index < segments.length; index++) {
+		largest = Math.max(largest, Buffer.byteLength(segments[index] ?? ""));
+	}
+	return {
+		trailingBytes:
+			segments.length === 1
+				? trailingBytes + Buffer.byteLength(segments[0] ?? "")
+				: Buffer.byteLength(segments.at(-1) ?? ""),
+		...(largest >= limit ? { oversizedLine: largest } : {}),
+	};
 }
 
 interface ManagedProcess {
@@ -103,6 +116,7 @@ interface ManagedDaemon {
 	logReady: boolean;
 	portReady: boolean;
 	readinessBuffer: string;
+	canonicalInputBytes: number;
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
@@ -679,6 +693,7 @@ class DaemonBroker {
 				logReady: !spec.ready?.log,
 				portReady: spec.ready?.port === undefined,
 				readinessBuffer: "",
+				canonicalInputBytes: 0,
 				outputOffset: 0,
 				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 				consecutiveFailures: 0,
@@ -727,6 +742,7 @@ class DaemonBroker {
 		record.portReady = record.spec.ready?.port === undefined;
 		syncReadyPending(record);
 		record.readinessBuffer = "";
+		record.canonicalInputBytes = 0;
 		record.outputOffset = 0;
 		this.#persist(record);
 		try {
@@ -763,7 +779,7 @@ class DaemonBroker {
 			const reply = responder.feed(chunk);
 			if (reply) {
 				try {
-					session.write(reply);
+					this.#writePty(record, reply);
 				} catch {
 					// The PTY may exit between emitting its final output and receiving the reply.
 				}
@@ -1147,6 +1163,25 @@ class DaemonBroker {
 		return { op: "wait", daemon: record.snapshot, matched, timedOut };
 	}
 
+	#writePty(record: ManagedDaemon, data: string): number | undefined {
+		if (!record.pty) throw new Error(`Daemon ${record.spec.name} PTY stdin is unavailable`);
+		const canonicalLineLimit = ptyCanonicalLineLimitBytes();
+		if (canonicalLineLimit !== undefined) {
+			const inspected = inspectPtyInput(data, canonicalLineLimit, record.canonicalInputBytes);
+			if (inspected.oversizedLine !== undefined) {
+				throw new Error(
+					`Daemon ${record.spec.name} uses a PTY with a ${canonicalLineLimit}-byte canonical line limit; ` +
+						`refusing a ${inspected.oversizedLine}-byte input line before write. Start machine protocols with pty:false.`,
+				);
+			}
+			record.pty.write(data);
+			record.canonicalInputBytes = inspected.trailingBytes;
+			return canonicalLineLimit;
+		}
+		record.pty.write(data);
+		return undefined;
+	}
+
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
 		await this.#refreshDetached(record);
@@ -1158,18 +1193,9 @@ class DaemonBroker {
 		}
 		const bytesWritten = operation.data === undefined ? 0 : Buffer.byteLength(operation.data);
 		const transport = record.pty ? "pty" : "pipe";
-		const canonicalLineLimit = record.pty ? ptyCanonicalLineLimitBytes() : undefined;
-		if (operation.data !== undefined && canonicalLineLimit !== undefined) {
-			const oversizedLine = oversizedPtyLineBytes(operation.data, canonicalLineLimit);
-			if (oversizedLine !== undefined) {
-				throw new Error(
-					`Daemon ${operation.name} uses a PTY with a ${canonicalLineLimit}-byte canonical line limit; ` +
-						`refusing a ${oversizedLine}-byte input line before write. Start machine protocols with pty:false.`,
-				);
-			}
-		}
+		let canonicalLineLimit = record.pty ? ptyCanonicalLineLimitBytes() : undefined;
 		if (operation.data !== undefined) {
-			if (record.pty) record.pty.write(operation.data);
+			if (record.pty) canonicalLineLimit = this.#writePty(record, operation.data);
 			else if (record.input) {
 				record.input.write(operation.data);
 				await record.input.flush();
@@ -1177,7 +1203,7 @@ class DaemonBroker {
 		}
 		if (operation.signal) {
 			if (process.platform === "win32" && record.pty) {
-				if (operation.signal === "SIGINT") record.pty.write("\u0003");
+				if (operation.signal === "SIGINT") this.#writePty(record, "\u0003");
 				else record.pty.kill();
 			} else {
 				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
@@ -1340,6 +1366,7 @@ class DaemonBroker {
 					logReady: detached && (!spec.ready?.log || snapshot.state === "ready"),
 					portReady: detached && (spec.ready?.port === undefined || snapshot.state === "ready"),
 					readinessBuffer: "",
+					canonicalInputBytes: 0,
 					outputOffset: detached ? snapshot.outputBytes : 0,
 					readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 					consecutiveFailures: 0,

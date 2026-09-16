@@ -191,6 +191,15 @@ process.stdout.write("READY\\n");
 				`${canonicalLimit}-byte canonical line limit`,
 			);
 
+			const fragment = "x".repeat(canonicalLimit - 1);
+			const fragmentWrite = await client.request({ op: "send", name: names[0], data: fragment });
+			if (fragmentWrite.op !== "send") throw new Error("unexpected send result");
+			expect(fragmentWrite.bytesWritten).toBe(canonicalLimit - 1);
+			await expect(client.request({ op: "send", name: names[0], data: "x" })).rejects.toThrow(
+				`${canonicalLimit}-byte canonical line limit`,
+			);
+			await client.request({ op: "send", name: names[0], data: "\n" });
+
 			const shortWrite = await client.request({ op: "send", name: names[0], data: "short\n" });
 			if (shortWrite.op !== "send") throw new Error("unexpected send result");
 			expect(shortWrite).toMatchObject({
@@ -218,7 +227,7 @@ process.stdout.write("READY\\n");
 				timeoutMs: 1_000,
 			});
 			if (ptyLogs.op !== "logs") throw new Error("unexpected logs result");
-			expect(ptyLogs.text).not.toContain("x".repeat(20));
+			expect(ptyLogs.text).not.toContain("x".repeat(canonicalLimit));
 
 			const pipeWrite = await client.request({ op: "send", name: names[1], data: oversized });
 			if (pipeWrite.op !== "send") throw new Error("unexpected send result");

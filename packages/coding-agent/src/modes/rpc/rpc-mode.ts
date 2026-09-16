@@ -128,7 +128,6 @@ export function rpcControlEventFrame(event: AgentSessionEvent): RpcControlEventF
 				event: "tool_execution_start",
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
-				...(event.intent ? { intent: event.intent } : {}),
 			};
 		case "tool_execution_end":
 			return {

@@ -481,7 +481,7 @@ The `"control"` subscription emits `rpc_control` frames for:
 
 - `agent_start`
 - `agent_end`, with `terminal`
-- `tool_execution_start`, with `toolCallId`, `toolName`, and optional `intent`
+- `tool_execution_start`, with `toolCallId` and `toolName`
 - `tool_execution_end`, with `toolCallId`, `toolName`, and `failed`
 - `auto_compaction_start` and `auto_compaction_end`
 - `auto_retry_start` and `auto_retry_end`

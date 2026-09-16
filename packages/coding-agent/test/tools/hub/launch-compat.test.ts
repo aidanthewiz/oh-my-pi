@@ -337,7 +337,7 @@ describe("launch broker protocol compatibility", () => {
 		expect(preservedPending).toBe(true);
 	});
 
-	it("defaults RPC stdio processes to pipes unless a PTY is explicit", async () => {
+	it("defaults known RPC entrypoints to pipes without matching unrelated argv", async () => {
 		const projectDir = process.cwd();
 		const requests: DaemonOperation[] = [];
 		const client = {
@@ -375,7 +375,7 @@ describe("launch broker protocol compatibility", () => {
 			op: "start",
 			name: "rpc",
 			application: process.execPath,
-			args: ["agent.ts", "--mode", "rpc"],
+			args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode", "rpc"],
 		});
 		expect(requests[0]).toMatchObject({ op: "start", spec: { pty: false } });
 
@@ -383,10 +383,26 @@ describe("launch broker protocol compatibility", () => {
 			op: "start",
 			name: "rpc-explicit",
 			application: process.execPath,
-			args: ["agent.ts", "--mode=rpc-ui"],
+			args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode=rpc-ui"],
 			pty: true,
 		});
 		expect(requests[1]).toMatchObject({ op: "start", spec: { pty: true } });
+
+		await executeLaunch(session, {
+			op: "start",
+			name: "unrelated",
+			application: process.execPath,
+			args: ["unrelated.ts", "--mode", "rpc"],
+		});
+		expect(requests[2]).toMatchObject({ op: "start", spec: { pty: true } });
+
+		await executeLaunch(session, {
+			op: "start",
+			name: "delimiter",
+			application: "omp",
+			args: ["--", "--mode=rpc"],
+		});
+		expect(requests[3]).toMatchObject({ op: "start", spec: { pty: true } });
 	});
 
 	it("routes a broker completion and releases its sink on session change", async () => {
