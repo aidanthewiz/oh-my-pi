@@ -35,7 +35,7 @@ Protocol v1 stdout frames are a single JSON object followed by `\n`. The server 
 
 When stdin is a TTY, RPC mode disables canonical input buffering while it owns stdin. This prevents the terminal driver from truncating a valid JSONL command before the protocol limit applies. Pipes are unchanged, and the prior terminal mode is restored when RPC releases stdin.
 
-For recognized Coreforge/OMP `--mode rpc` and `--mode rpc-ui` entrypoints, `hub start` defaults to pipe stdin and rejects explicit `pty: true`. Direct TTY launches remain supported through the raw input mode above.
+When `hub start` launches this CLI with `--mode rpc` or `--mode rpc-ui`, it defaults to pipe stdin and rejects explicit `pty: true`. Direct TTY launches remain supported through the raw input mode above.
 
 The initial ready frame uses protocol v1 and advertises the opt-in lossless transport:
 

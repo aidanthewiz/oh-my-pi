@@ -234,7 +234,7 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	const args = params.args ?? [];
 	const rpcStdio = usesRpcStdio(params.application, args);
 	if (!detached && rpcStdio && params.pty === true) {
-		throw new ToolError("Coreforge/OMP RPC modes require pipe stdin; omit pty or set pty:false");
+		throw new ToolError("RPC launches for this CLI require pipe stdin; omit pty or set pty:false");
 	}
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535)) {
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
