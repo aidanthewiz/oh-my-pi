@@ -15,6 +15,7 @@ if (Bun.env.MOCK_RPC_IGNORE_SIGTERM === "1") {
 }
 
 const supportsProtocolV2 = Bun.env.MOCK_RPC_V2 === "1";
+const supportsEventSubscriptions = Bun.env.MOCK_RPC_EVENT_SUBSCRIPTIONS === "1";
 const legacyState = {
 	thinkingLevel: "off",
 	isStreaming: false,
@@ -51,6 +52,7 @@ process.stdout.write(
 					supportedProtocolVersions: [1, 2],
 					maxFrameBytes: 1024 * 1024,
 					maxReassembledFrameBytes: 64 * 1024 * 1024,
+					...(supportsEventSubscriptions ? { supportedEventSubscriptionLevels: ["control", "full"] } : {}),
 				}
 			: { type: "ready" },
 	)}\n`,
@@ -103,6 +105,19 @@ for await (const raw of console) {
 					data: { protocolVersion: 2 },
 				});
 				protocolV2Enabled = true;
+				continue;
+			}
+			if (supportsEventSubscriptions && frame.type === "set_event_subscription") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { level: frame.level },
+				});
+				if (frame.level === "control") {
+					writeFrame({ type: "rpc_control", event: "agent_start" });
+				}
 				continue;
 			}
 			if (frame.type === "get_messages_page") {

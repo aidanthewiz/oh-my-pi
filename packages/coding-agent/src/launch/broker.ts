@@ -751,7 +751,7 @@ class DaemonBroker {
 			const reply = responder.feed(chunk);
 			if (reply) {
 				try {
-					session.write(reply);
+					this.#writePty(record, reply);
 				} catch {
 					// The PTY may exit between emitting its final output and receiving the reply.
 				}
@@ -1135,6 +1135,11 @@ class DaemonBroker {
 		return { op: "wait", daemon: record.snapshot, matched, timedOut };
 	}
 
+	#writePty(record: ManagedDaemon, data: string): void {
+		if (!record.pty) throw new Error(`Daemon ${record.spec.name} PTY stdin is unavailable`);
+		record.pty.write(data);
+	}
+
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
 		await this.#refreshDetached(record);
@@ -1144,8 +1149,10 @@ class DaemonBroker {
 		if (operation.data === undefined && operation.signal === undefined) {
 			throw new Error("send requires data or signal");
 		}
+		let bytesWritten = operation.data === undefined ? 0 : Buffer.byteLength(operation.data);
+		const transport = record.pty ? "pty" : "pipe";
 		if (operation.data !== undefined) {
-			if (record.pty) record.pty.write(operation.data);
+			if (record.pty) this.#writePty(record, operation.data);
 			else if (record.input) {
 				record.input.write(operation.data);
 				await record.input.flush();
@@ -1153,15 +1160,24 @@ class DaemonBroker {
 		}
 		if (operation.signal) {
 			if (process.platform === "win32" && record.pty) {
-				if (operation.signal === "SIGINT") record.pty.write("\u0003");
-				else record.pty.kill();
+				if (operation.signal === "SIGINT") {
+					const interrupt = "\u0003";
+					this.#writePty(record, interrupt);
+					bytesWritten += Buffer.byteLength(interrupt);
+				} else record.pty.kill();
 			} else {
 				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
 				if (!processRef) throw new Error(`Daemon ${operation.name} process is unavailable`);
 				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
 			}
 		}
-		return { op: "send", daemon: record.snapshot };
+		return {
+			op: "send",
+			daemon: record.snapshot,
+			bytesWritten,
+			transport,
+			delivery: "broker_write_only",
+		};
 	}
 
 	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {

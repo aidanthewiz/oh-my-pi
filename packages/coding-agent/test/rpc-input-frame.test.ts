@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { configureRpcInputTerminal } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-input";
 import { RpcHostToolBridge } from "@oh-my-pi/pi-coding-agent/modes/rpc/host-tools";
 import {
 	dispatchRpcInputFrame,
 	type PendingExtensionRequest,
 	RpcInputDispatcher,
 	type RpcInputFrameDeps,
+	rpcControlEventFrame,
 	RpcPendingExtensionRequests,
 	RpcShutdownCoordinator,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
@@ -44,6 +46,65 @@ const makeDeps = (
 };
 
 const flushMicrotasks = () => new Promise<void>(resolve => setImmediate(resolve));
+describe("configureRpcInputTerminal", () => {
+	test("disables canonical PTY buffering and restores the prior mode once", () => {
+		const modes: boolean[] = [];
+		const restore = configureRpcInputTerminal({
+			isTTY: true,
+			isRaw: false,
+			setRawMode: mode => modes.push(mode),
+		});
+
+		expect(modes).toEqual([true]);
+		restore();
+		restore();
+		expect(modes).toEqual([true, false]);
+	});
+
+	test("leaves pipes and already-raw terminals unchanged", () => {
+		const modes: boolean[] = [];
+		configureRpcInputTerminal({ isTTY: false, setRawMode: mode => modes.push(mode) })();
+		configureRpcInputTerminal({ isTTY: true, isRaw: true, setRawMode: mode => modes.push(mode) })();
+		expect(modes).toEqual([]);
+	});
+});
+
+describe("rpcControlEventFrame", () => {
+	test("emits terminal state without transcript or provider payloads", () => {
+		const frame = rpcControlEventFrame({
+			type: "agent_end",
+			isTerminal: true,
+			messages: [{ role: "assistant", content: "private".repeat(100_000) }],
+		} as never);
+
+		expect(frame).toEqual({ type: "rpc_control", event: "agent_end", terminal: true });
+		expect(JSON.stringify(frame).length).toBeLessThan(100);
+	});
+
+	test("omits cumulative messages, tool arguments, and model-authored intent", () => {
+		expect(
+			rpcControlEventFrame({
+				type: "message_update",
+				message: { role: "assistant", content: "private" },
+				assistantMessageEvent: { type: "text_delta", delta: "private" },
+			} as never),
+		).toBeNull();
+		const frame = rpcControlEventFrame({
+			type: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "write",
+			args: { token: "private" },
+			intent: "private".repeat(1_000_000),
+		} as never);
+		expect(frame).toEqual({
+			type: "rpc_control",
+			event: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "write",
+		});
+		expect(JSON.stringify(frame).length).toBeLessThan(128);
+	});
+});
 
 const requestExtensionInput = (deps: RpcInputFrameDeps, id: string, message: string) => {
 	const response = Promise.withResolvers<RpcExtensionUIResponse>();

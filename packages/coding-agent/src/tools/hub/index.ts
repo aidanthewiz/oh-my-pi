@@ -98,7 +98,9 @@ const hubSchema = type({
 	"args?": type("string[]").describe("start: argv passed directly to the application"),
 	"env?": type({ "[string]": "string" }).describe("start: extra environment variables"),
 	"cwd?": type("string").describe("start: working directory; defaults to the session directory"),
-	"pty?": type("boolean").describe("start: allocate an interactive PTY; default true"),
+	"pty?": type("boolean").describe(
+		"start: allocate an interactive PTY; hub-supervised rpc/rpc-ui launches of this CLI use pipes; default true otherwise",
+	),
 	"ready?": type({
 		"log?": type("string > 0").describe("regex matched against output"),
 		"port?": type("number").describe("TCP port that must accept connections"),

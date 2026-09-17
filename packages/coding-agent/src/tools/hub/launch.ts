@@ -167,6 +167,12 @@ export interface LaunchToolDetails {
 	terminalRows?: string[];
 	/** wait: output line that satisfied the pattern. */
 	matched?: string;
+	/** send: bytes accepted by the broker transport, not an application acknowledgement. */
+	bytesWritten?: number;
+	/** send: stdin transport used by the daemon. */
+	transport?: "pty" | "pipe";
+	/** send: acknowledgement boundary. */
+	delivery?: "broker_write_only";
 	/** describe: immutable launch spec backing the command/cwd detail lines. */
 	spec?: DaemonSpec;
 }
@@ -181,11 +187,55 @@ function timeoutMs(value: number | undefined, fallbackSeconds: number): number {
 	return Math.round(seconds * 1_000);
 }
 
+function usesCodingAgentRpcStdio(application: string, args: string[]): boolean {
+	const executable = application.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
+	let optionStart = 0;
+	if (executable === "bun" || executable === "bun.exe" || executable === "node" || executable === "node.exe") {
+		const scriptIndex = args[0] === "run" ? 1 : 0;
+		const script = args[scriptIndex]?.replaceAll("\\", "/").replace(/^\.\/+/, "");
+		if (
+			!script ||
+			(script !== "dist/cli.js" &&
+				script !== "packages/coding-agent/src/cli.ts" &&
+				script !== "packages/coding-agent/src/cli.js" &&
+				!script.endsWith("/packages/coding-agent/src/cli.ts") &&
+				!script.endsWith("/packages/coding-agent/src/cli.js") &&
+				!script.endsWith("/packages/coding-agent/dist/cli.js") &&
+				!script.endsWith("/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"))
+		) {
+			return false;
+		}
+		optionStart = scriptIndex + 1;
+	} else if (
+		executable !== "omp" &&
+		executable !== "omp.exe" &&
+		executable !== "omp-coreforge" &&
+		executable !== "omp-coreforge.exe" &&
+		executable !== "coreforge" &&
+		executable !== "coreforge.exe"
+	) {
+		return false;
+	}
+	const delimiter = args.indexOf("--", optionStart);
+	const options = args.slice(optionStart, delimiter < 0 ? undefined : delimiter);
+	return options.some(
+		(arg, index) =>
+			arg === "--mode=rpc" ||
+			arg === "--mode=rpc-ui" ||
+			(arg === "--mode" && (options[index + 1] === "rpc" || options[index + 1] === "rpc-ui")),
+	);
+}
+
 function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	const name = requiredName(params);
 	if (!params.application) throw new ToolError("start requires application");
 	const ready = params.ready;
 	const detached = params.detached ?? false;
+	const args = params.args ?? [];
+	const rpcStdio = usesCodingAgentRpcStdio(params.application, args);
+	if (!detached && rpcStdio && params.pty === true) {
+		throw new ToolError("Hub-supervised RPC launches for this CLI require pipe stdin; omit pty or set pty:false");
+	}
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535)) {
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
 	}
@@ -193,10 +243,10 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	return {
 		name,
 		application: params.application,
-		args: params.args ?? [],
+		args,
 		env: params.env ?? {},
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
-		pty: detached ? false : (params.pty ?? true),
+		pty: detached || rpcStdio ? false : (params.pty ?? true),
 		ready: ready
 			? {
 					log: ready.log,
@@ -332,8 +382,10 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 			}
 			return lines.join("\n");
 		}
-		case "send":
-			return `Sent input to ${daemonLabel(result.daemon)}`;
+		case "send": {
+			const signal = params.signal ? `; requested ${params.signal}` : "";
+			return `Broker wrote ${result.bytesWritten} bytes via ${result.transport}${signal}; application delivery is unconfirmed. ${daemonLabel(result.daemon)}`;
+		}
 		case "stop":
 			return `Stopped ${daemonLabel(result.daemon)}`;
 		case "restart":
@@ -378,7 +430,13 @@ async function toolDetails(result: DaemonRpcResult, params: LaunchParams): Promi
 		case "wait":
 			return { op: "wait", daemon: result.daemon, timedOut: result.timedOut, matched: result.matched };
 		case "send":
-			return { op: "send", daemon: result.daemon };
+			return {
+				op: "send",
+				daemon: result.daemon,
+				bytesWritten: result.bytesWritten,
+				transport: result.transport,
+				delivery: result.delivery,
+			};
 		case "stop":
 			return { op: "stop", daemon: result.daemon };
 		case "restart":

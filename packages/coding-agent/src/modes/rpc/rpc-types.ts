@@ -28,6 +28,7 @@ import type { RpcMessagesPage } from "./rpc-messages";
 export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	| { id?: string; type: "set_event_subscription"; level: RpcEventSubscriptionLevel }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -145,6 +146,7 @@ export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
+	supportedEventSubscriptionLevels: ["control", "full"];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
 }
@@ -163,6 +165,20 @@ export interface RpcHandoffResult {
 }
 
 export type RpcSubagentSubscriptionLevel = "off" | "progress" | "events";
+export type RpcEventSubscriptionLevel = "control" | "full";
+
+export type RpcControlEvent =
+	| { event: "agent_start" }
+	| { event: "agent_end"; terminal: boolean }
+	| { event: "tool_execution_start"; toolCallId: string; toolName: string }
+	| { event: "tool_execution_end"; toolCallId: string; toolName: string; failed: boolean }
+	| { event: "auto_compaction_start"; action: string; reason: string }
+	| { event: "auto_compaction_end"; action: string; aborted: boolean; willRetry: boolean }
+	| { event: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number }
+	| { event: "auto_retry_end"; attempt: number; success: boolean };
+
+/** Payload-reduced lifecycle session event for external RPC supervisors. */
+export type RpcControlEventFrame = { type: "rpc_control" } & RpcControlEvent;
 
 export interface RpcSubagentSnapshot {
 	id: string;
@@ -213,6 +229,13 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_event_subscription";
+			success: true;
+			data: { level: RpcEventSubscriptionLevel };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -362,7 +385,7 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame | RpcControlEventFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)

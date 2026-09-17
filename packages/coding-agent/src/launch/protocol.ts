@@ -5,7 +5,7 @@
  * Wire and runtime namespace version. Increment for any compatibility or
  * security-boundary change that must not reuse brokers from older engines.
  */
-export const DAEMON_BROKER_PROTOCOL_VERSION = 2;
+export const DAEMON_BROKER_PROTOCOL_VERSION = 3;
 /** Hidden CLI selector used to re-enter the daemon broker worker. */
 export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
 
@@ -75,6 +75,10 @@ export interface DaemonSnapshot {
 /** Signals accepted by daemon input operations. */
 export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKILL";
 
+/** Transport and acknowledgement boundary for daemon stdin writes. */
+export type DaemonInputTransport = "pty" | "pipe";
+export type DaemonInputDelivery = "broker_write_only";
+
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
@@ -117,7 +121,13 @@ export type DaemonRpcResult =
 			state: DaemonState;
 	  }
 	| { op: "wait"; daemon: DaemonSnapshot; matched?: string; timedOut: boolean }
-	| { op: "send"; daemon: DaemonSnapshot }
+	| {
+			op: "send";
+			daemon: DaemonSnapshot;
+			bytesWritten: number;
+			transport: DaemonInputTransport;
+			delivery: DaemonInputDelivery;
+	  }
 	| { op: "stop"; daemon: DaemonSnapshot }
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
@@ -453,7 +463,24 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				timedOut: booleanValue(source.timedOut, "result.timedOut"),
 			};
 		case "send":
-			return { op: "send", daemon: parseDaemonSnapshot(source.daemon) };
+			return {
+				op: "send",
+				daemon: parseDaemonSnapshot(source.daemon),
+				bytesWritten: numberValue(source.bytesWritten, "result.bytesWritten"),
+				transport: (() => {
+					const transport = stringValue(source.transport, "result.transport");
+					if (transport !== "pty" && transport !== "pipe") {
+						throw new Error("result.transport must be pty or pipe");
+					}
+					return transport;
+				})(),
+				delivery:
+					source.delivery === "broker_write_only"
+						? "broker_write_only"
+						: (() => {
+								throw new Error("result.delivery must be broker_write_only");
+							})(),
+			};
 		case "stop":
 			return { op: "stop", daemon: parseDaemonSnapshot(source.daemon) };
 		case "restart":
