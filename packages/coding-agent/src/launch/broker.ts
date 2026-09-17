@@ -1149,7 +1149,7 @@ class DaemonBroker {
 		if (operation.data === undefined && operation.signal === undefined) {
 			throw new Error("send requires data or signal");
 		}
-		const bytesWritten = operation.data === undefined ? 0 : Buffer.byteLength(operation.data);
+		let bytesWritten = operation.data === undefined ? 0 : Buffer.byteLength(operation.data);
 		const transport = record.pty ? "pty" : "pipe";
 		if (operation.data !== undefined) {
 			if (record.pty) this.#writePty(record, operation.data);
@@ -1160,8 +1160,11 @@ class DaemonBroker {
 		}
 		if (operation.signal) {
 			if (process.platform === "win32" && record.pty) {
-				if (operation.signal === "SIGINT") this.#writePty(record, "\u0003");
-				else record.pty.kill();
+				if (operation.signal === "SIGINT") {
+					const interrupt = "\u0003";
+					this.#writePty(record, interrupt);
+					bytesWritten += Buffer.byteLength(interrupt);
+				} else record.pty.kill();
 			} else {
 				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
 				if (!processRef) throw new Error(`Daemon ${operation.name} process is unavailable`);

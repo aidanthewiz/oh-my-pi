@@ -140,6 +140,7 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 		await Bun.write(
 			scriptPath,
 			`process.stdin.setEncoding("utf8");
+if (process.stdin.isTTY) process.stdin.setRawMode(true);
 let input = "";
 process.stdin.on("data", chunk => {
 	input += chunk;
@@ -199,6 +200,32 @@ process.stdout.write("READY\\n");
 			});
 			if (shortObserved.op !== "wait") throw new Error("unexpected wait result");
 			expect(shortObserved.timedOut).toBeFalse();
+
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			try {
+				const signalWrite = await client.request({ op: "send", name: names[0], signal: "SIGINT" });
+				if (signalWrite.op !== "send") throw new Error("unexpected send result");
+				expect(signalWrite).toMatchObject({
+					bytesWritten: 1,
+					transport: "pty",
+					delivery: "broker_write_only",
+				});
+				const combinedWrite = await client.request({
+					op: "send",
+					name: names[0],
+					data: "abc",
+					signal: "SIGINT",
+				});
+				if (combinedWrite.op !== "send") throw new Error("unexpected send result");
+				expect(combinedWrite).toMatchObject({
+					bytesWritten: 4,
+					transport: "pty",
+					delivery: "broker_write_only",
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+			}
 
 			const largeLineBytes = 8 * 1_024;
 			const largeLine = `${"x".repeat(largeLineBytes)}\n`;
