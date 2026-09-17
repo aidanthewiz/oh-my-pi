@@ -99,7 +99,7 @@ const hubSchema = type({
 	"env?": type({ "[string]": "string" }).describe("start: extra environment variables"),
 	"cwd?": type("string").describe("start: working directory; defaults to the session directory"),
 	"pty?": type("boolean").describe(
-		"start: allocate an interactive PTY; defaults false for rpc/rpc-ui modes and true otherwise",
+		"start: allocate an interactive PTY; recognized Coreforge/OMP rpc/rpc-ui entrypoints require pipes; default true otherwise",
 	),
 	"ready?": type({
 		"log?": type("string > 0").describe("regex matched against output"),
@@ -119,7 +119,7 @@ const hubSchema = type({
 	"cursor?": type("number >= 0").describe("logs: output cursor returned by an earlier call"),
 	"for?": type("'ready' | 'exit'").describe("wait with name: lifecycle condition; default exit"),
 	"pattern?": type("string > 0").describe("wait with name: output regex; takes precedence over for"),
-	"text?": type("string > 0").describe("send with name: stdin text; oversized PTY lines are rejected before write"),
+	"text?": type("string > 0").describe("send with name: stdin text"),
 	"enter?": type("boolean").describe("send with name: append Enter after text; default true"),
 	"keys?": type("string[]").describe("send with name: terminal keys after text"),
 	"signal?": type("'SIGINT' | 'SIGTERM' | 'SIGHUP' | 'SIGQUIT' | 'SIGKILL'").describe(
