@@ -391,7 +391,7 @@ describe("launch broker protocol compatibility", () => {
 				args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode=rpc-ui"],
 				pty: true,
 			}),
-		).rejects.toThrow("RPC launches for this CLI require pipe stdin");
+		).rejects.toThrow("Hub-supervised RPC launches for this CLI require pipe stdin");
 		expect(requests).toHaveLength(2);
 
 		await executeLaunch(session, {

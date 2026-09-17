@@ -70,7 +70,7 @@ describe("configureRpcInputTerminal", () => {
 });
 
 describe("rpcControlEventFrame", () => {
-	test("emits bounded terminal state without transcript or provider payloads", () => {
+	test("emits terminal state without transcript or provider payloads", () => {
 		const frame = rpcControlEventFrame({
 			type: "agent_end",
 			isTerminal: true,

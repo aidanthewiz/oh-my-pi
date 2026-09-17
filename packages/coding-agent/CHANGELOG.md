@@ -5,7 +5,7 @@
 ### Added
 
 - Added `disabledModels`, a path-scoped exact/glob deny-list applied after `enabledModels` across model selection and execution. Exact entries never fuzzy-match nearby models.
-- Added a bounded RPC control event subscription for agent, tool, compaction, and retry lifecycle frames. Raw protocol-v2 clients default to this private-payload-free stream; typed clients explicitly retain full events.
+- Added an opt-in, payload-reduced RPC control event subscription for agent, tool, compaction, and retry lifecycle frames. The complete event stream remains the protocol-v1 and protocol-v2 default for compatibility.
 
 ### Fixed
 

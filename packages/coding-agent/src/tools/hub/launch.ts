@@ -187,7 +187,7 @@ function timeoutMs(value: number | undefined, fallbackSeconds: number): number {
 	return Math.round(seconds * 1_000);
 }
 
-function usesRpcStdio(application: string, args: string[]): boolean {
+function usesCodingAgentRpcStdio(application: string, args: string[]): boolean {
 	const executable = application.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
 	let optionStart = 0;
 	if (executable === "bun" || executable === "bun.exe" || executable === "node" || executable === "node.exe") {
@@ -232,9 +232,9 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 	const ready = params.ready;
 	const detached = params.detached ?? false;
 	const args = params.args ?? [];
-	const rpcStdio = usesRpcStdio(params.application, args);
+	const rpcStdio = usesCodingAgentRpcStdio(params.application, args);
 	if (!detached && rpcStdio && params.pty === true) {
-		throw new ToolError("RPC launches for this CLI require pipe stdin; omit pty or set pty:false");
+		throw new ToolError("Hub-supervised RPC launches for this CLI require pipe stdin; omit pty or set pty:false");
 	}
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535)) {
 		throw new ToolError("ready.port must be an integer from 1 to 65535");

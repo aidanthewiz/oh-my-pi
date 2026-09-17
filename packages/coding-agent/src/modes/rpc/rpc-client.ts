@@ -23,6 +23,7 @@ import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCommand,
+	RpcControlEventFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
@@ -96,6 +97,7 @@ export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reaso
 
 export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
+export type RpcControlEventListener = (event: RpcControlEventFrame) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
@@ -179,6 +181,11 @@ function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
 		value.maxFrameBytes === MAX_RPC_FRAME_BYTES &&
 		value.maxReassembledFrameBytes === MAX_RPC_REASSEMBLED_BYTES
 	);
+}
+
+function supportsRpcEventSubscriptions(value: Record<string, unknown>): boolean {
+	const levels = value.supportedEventSubscriptionLevels;
+	return Array.isArray(levels) && levels.includes("control") && levels.includes("full");
 }
 
 function isAgentEvent(value: unknown): value is AgentEvent {
@@ -274,6 +281,7 @@ export class RpcClient {
 	#reaping: Promise<void> | null = null;
 	#eventListeners: RpcEventListener[] = [];
 	#sessionEventListeners: RpcSessionEventListener[] = [];
+	#controlEventListeners = new Set<RpcControlEventListener>();
 	#subagentLifecycleListeners = new Set<RpcSubagentLifecycleListener>();
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
@@ -344,6 +352,7 @@ export class RpcClient {
 		let readySettled = false;
 		let protocolV2Supported = false;
 		let protocolV2Enabled = false;
+		let eventSubscriptionsSupported = false;
 		const frameDecoder = new RpcFrameDecoder();
 
 		const reapAfterOutputFailure = async (error: Error) => {
@@ -371,6 +380,7 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					eventSubscriptionsSupported = supportsRpcEventSubscriptions(line);
 					readySettled = true;
 					readyResolve();
 					continue;
@@ -457,14 +467,16 @@ export class RpcClient {
 				)
 					throw new Error("RPC protocol v2 negotiation failed");
 				this.#protocolVersion = 2;
-				const eventResponse = await this.#send({ type: "set_event_subscription", level: "full" });
-				if (
-					!eventResponse.success ||
-					eventResponse.command !== "set_event_subscription" ||
-					!isRecord(eventResponse.data) ||
-					eventResponse.data.level !== "full"
-				)
-					throw new Error("RPC full-event subscription failed");
+				if (eventSubscriptionsSupported) {
+					const eventResponse = await this.#send({ type: "set_event_subscription", level: "full" });
+					if (
+						!eventResponse.success ||
+						eventResponse.command !== "set_event_subscription" ||
+						!isRecord(eventResponse.data) ||
+						eventResponse.data.level !== "full"
+					)
+						throw new Error("RPC full-event subscription failed");
+				}
 			}
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
@@ -543,6 +555,14 @@ export class RpcClient {
 				this.#sessionEventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Subscribe to payload-reduced lifecycle frames after setEventSubscription("control").
+	 */
+	onControlEvent(listener: RpcControlEventListener): () => void {
+		this.#controlEventListeners.add(listener);
+		return () => this.#controlEventListeners.delete(listener);
 	}
 
 	/**
@@ -666,7 +686,7 @@ export class RpcClient {
 		return this.#getData(response);
 	}
 	/**
-	 * Select bounded lifecycle control frames or the complete session event stream.
+	 * Select payload-reduced lifecycle control frames or the complete session event stream.
 	 */
 	async setEventSubscription(level: RpcEventSubscriptionLevel): Promise<RpcEventSubscriptionLevel> {
 		const response = await this.#send({ type: "set_event_subscription", level });
@@ -1123,6 +1143,13 @@ export class RpcClient {
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
+			}
+			return;
+		}
+
+		if (isRecord(data) && data.type === "rpc_control" && typeof data.event === "string") {
+			for (const listener of this.#controlEventListeners) {
+				listener(data as RpcControlEventFrame);
 			}
 			return;
 		}

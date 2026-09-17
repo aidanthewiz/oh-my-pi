@@ -859,6 +859,7 @@ export async function runRpcMode(
 			type: "ready",
 			protocolVersion: 1,
 			supportedProtocolVersions: [1, 2],
+			supportedEventSubscriptionLevels: ["control", "full"],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 		}),
@@ -1105,8 +1106,8 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Protocol v1 keeps the full event stream for compatibility. Protocol v2
-	// defaults to bounded control frames; typed clients explicitly opt into full events.
+	// Protocol v1 and v2 keep the full event stream for compatibility. Clients
+	// may opt into payload-reduced control frames after checking the ready capability.
 	session.subscribe(event => {
 		if (eventSubscription === "full") {
 			output(event);
@@ -1147,7 +1148,6 @@ export async function runRpcMode(
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
-				eventSubscription = "control";
 				return success(id, "negotiate_protocol", { protocolVersion: 2 });
 			}
 			case "set_event_subscription": {

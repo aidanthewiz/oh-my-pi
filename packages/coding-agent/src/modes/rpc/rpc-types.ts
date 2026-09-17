@@ -146,6 +146,7 @@ export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
+	supportedEventSubscriptionLevels: ["control", "full"];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
 }
@@ -176,7 +177,7 @@ export type RpcControlEvent =
 	| { event: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number }
 	| { event: "auto_retry_end"; attempt: number; success: boolean };
 
-/** Bounded lifecycle-only session event for external RPC supervisors. */
+/** Payload-reduced lifecycle session event for external RPC supervisors. */
 export type RpcControlEventFrame = { type: "rpc_control" } & RpcControlEvent;
 
 export interface RpcSubagentSnapshot {

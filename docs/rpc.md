@@ -44,6 +44,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "type": "ready",
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
+  "supportedEventSubscriptionLevels": ["control", "full"],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864
 }
@@ -475,7 +476,7 @@ store. RPC hosts cannot register or shadow that scheme.
 
 ## Event Stream Schema
 
-Protocol v1 retains the complete `AgentSessionEvent` stream for compatibility. After protocol v2 negotiation, raw clients default to the bounded `"control"` subscription. Send `set_event_subscription` with `"full"` only when the client needs transcripts, streaming deltas, tool arguments, or provider payloads. The bundled TypeScript `RpcClient` selects `"full"` to preserve its typed event API.
+The complete `AgentSessionEvent` stream remains the default in protocol v1 and v2 for compatibility. Servers that advertise `supportedEventSubscriptionLevels` accept `set_event_subscription`. Send `"control"` when a client needs only lifecycle classification, or `"full"` for transcripts, streaming deltas, tool arguments, and provider payloads. The bundled TypeScript `RpcClient` requests `"full"` only when the ready frame advertises this capability, so it remains compatible with older protocol-v2 servers.
 
 The `"control"` subscription emits `rpc_control` frames for:
 
@@ -486,7 +487,7 @@ The `"control"` subscription emits `rpc_control` frames for:
 - `auto_compaction_start` and `auto_compaction_end`
 - `auto_retry_start` and `auto_retry_end`
 
-Control frames exclude message content, tool arguments and results, transcripts, and provider payloads. This keeps orchestration logs bounded and suitable for terminal classification.
+Control frames exclude message content, tool arguments and results, transcripts, and provider payloads. They provide a payload-reduced lifecycle view; the standard protocol frame limits still apply.
 
 The `"full"` subscription forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
 
