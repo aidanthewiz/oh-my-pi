@@ -53,6 +53,7 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			});
 		}
 	};
+	trackPromiseMethods(Promise, ["all", "race", "any", "allSettled"]);
 	const hasScheme = path => typeof path === "string" && /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path);
 	const shouldDelegateRead = path => hasScheme(path) && !path.toLowerCase().startsWith("local://");
 	const withReadLineSelector = (path, options) => {

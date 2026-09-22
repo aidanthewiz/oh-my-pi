@@ -179,6 +179,7 @@ ${scenario}
 				new Response(proc.stderr).text(),
 				proc.exited,
 			]);
+			if (!stdout.trim()) throw new Error(`Rejection probe exited ${exitCode}: ${stderr}`);
 			return { output: JSON.parse(stdout.trim()), stderr, exitCode };
 		} finally {
 			clearTimeout(watchdog);
@@ -656,6 +657,46 @@ describe("WorkerCore", () => {
 		}
 	});
 
+	it("fails a tool invocation with a floated read rejection before displaying success", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");
+send({
+	type: "run", runId: "register-tools", snapshot,
+	code: 'tool(() => { void read("local://package.json:raw"); return "floated"; }, { name: "floatedRead" });' +
+		'tool(async () => { try { await read("local://package.json:raw"); } catch { return "caught"; } }, { name: "caughtRead" });' +
+		'tool(async () => { await read("package.json"); return "awaited"; }, { name: "awaitedRead" });',
+	filename: "[register-tools].js",
+});
+await registered;
+const results = {};
+for (const name of ["floatedRead", "caughtRead", "awaitedRead"]) {
+	const pending = waitForMessage(message => message.type === "result" && message.runId === name);
+	send({ type: "tool", runId: name, op: "call", name, args: {} });
+	results[name] = await pending;
+}
+const result = {
+	floatedFailed: results.floatedRead.ok === false &&
+		results.floatedRead.error?.message.includes("Unhandled rejection (missing await?)"),
+	floatedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "floatedRead"),
+	caughtValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "caughtRead")?.output.data.value,
+	awaitedValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "awaitedRead")?.output.data.value,
+	caughtOk: results.caughtRead.ok,
+	awaitedOk: results.awaitedRead.ok,
+};
+await finish(result, result.floatedFailed && !result.floatedDisplayed && result.caughtOk && result.awaitedOk);
+`);
+		expect(output).toEqual({
+			floatedFailed: true,
+			floatedDisplayed: false,
+			caughtValue: "caught",
+			awaitedValue: "awaited",
+			caughtOk: true,
+			awaitedOk: true,
+		});
+		expect(exitCode).toBe(0);
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+	});
+
 	it("keeps a delayed helper rejection with its finished run while another run is live", async () => {
 		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
 globalThis.__omp_late_read_release = false;
@@ -759,6 +800,53 @@ const expectedMessage = "Unhandled rejection (missing await?): cross-cell contin
 const result = {
 	ownerOk: owner.ok,
 	attacherFailed: !live.ok && live.error?.message === expectedMessage,
+	ownerWarning,
+};
+await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWarning);
+`);
+
+		expect(exitCode).toBe(0);
+		expect(output).toEqual({ ownerOk: true, attacherFailed: true, ownerWarning: false });
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("[Uncaught Exception]");
+	});
+
+	it("assigns a cross-cell rejected aggregate to the cell that floats it", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const missingPath = process.cwd() + "/omp-aggregate-missing-" + crypto.randomUUID();
+const ownerResult = waitForMessage(message => message.type === "result" && message.runId === "aggregate-owner");
+send({
+	type: "run",
+	runId: "aggregate-owner",
+	code: 'globalThis.__omp_aggregate_root = read(' + JSON.stringify(missingPath) + ');' +
+		'try { await globalThis.__omp_aggregate_root; } catch {}' +
+		'"stored";',
+	filename: "[aggregate-owner].js",
+	snapshot,
+});
+const owner = await ownerResult;
+
+const aggregateResult = waitForMessage(message => message.type === "result" && message.runId === "aggregate-attacher");
+send({
+	type: "run",
+	runId: "aggregate-attacher",
+	code: 'void Promise.all([globalThis.__omp_aggregate_root]); "aggregate";',
+	filename: "[aggregate-attacher].js",
+	snapshot,
+});
+await waitForRejection();
+const aggregate = await aggregateResult;
+const ownerWarning = outbound.some(message =>
+	message.type === "log" &&
+	message.msg === "Unhandled rejection from a finished eval cell (missing await?)" &&
+	message.meta?.runId === "aggregate-owner"
+);
+
+delete globalThis.__omp_aggregate_root;
+const result = {
+	ownerOk: owner.ok,
+	attacherFailed:
+		!aggregate.ok && aggregate.error?.message.startsWith("Unhandled rejection (missing await?):"),
 	ownerWarning,
 };
 await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWarning);

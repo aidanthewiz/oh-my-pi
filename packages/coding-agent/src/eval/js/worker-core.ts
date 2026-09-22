@@ -363,6 +363,8 @@ export class WorkerCore {
 			callTool: (name, args) => this.#callTool(active, name, args),
 		};
 
+		let result: RunResult;
+		let envelope: Record<string, unknown> | undefined;
 		try {
 			const runtime = this.#runtime;
 			if (!runtime) throw new ToolError("JavaScript kernel is not running");
@@ -374,7 +376,6 @@ export class WorkerCore {
 				}
 			}
 
-			let envelope: Record<string, unknown>;
 			if (msg.op === "describe") {
 				const names = msg.names.length > 0 ? msg.names : [...tools.keys()];
 				envelope = {
@@ -397,13 +398,22 @@ export class WorkerCore {
 				}
 				envelope = { ok: true, value: cloneable };
 			}
-			this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
-			this.#transport.send({ type: "result", runId: msg.runId, ok: true });
+			result = { type: "result", runId: msg.runId, ok: true };
 		} catch (error) {
-			this.#transport.send({ type: "result", runId: msg.runId, ok: false, error: errorPayload(error) });
+			result = { type: "result", runId: msg.runId, ok: false, error: errorPayload(error) };
+		}
+		try {
+			// Match cell runs: allow rejection callbacks from floated tool work to
+			// settle before exposing a successful invocation envelope.
+			await Bun.sleep(0);
+			result = foldFloatingRejections(active, result, hooks);
+			if (result.ok && envelope) {
+				this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
+			}
 		} finally {
 			this.#runs.delete(msg.runId);
 			this.#rememberCell(msg.runId, active.filename);
+			this.#transport.send(result);
 		}
 	}
 

@@ -4,6 +4,7 @@ import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/prelu
 import { executeJs } from "@oh-my-pi/pi-coding-agent/eval/js/executor";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
+import { JsRuntime, type RuntimeHooks } from "@oh-my-pi/pi-coding-agent/eval/js/shared/runtime";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const IMAGE_DATA = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString("base64");
@@ -143,5 +144,66 @@ describe("eval prelude runtime", () => {
 		const missing = await executePython("await _omp_prelude('missing', {})", options);
 		expect(missing.exitCode).toBe(1);
 		expect(missing.output).toContain('Eval prelude "missing" is not enabled');
+	});
+
+	it("tracks Promise aggregates without changing their native receiver or settlement semantics", async () => {
+		const runtime = new JsRuntime({
+			initialCwd: process.cwd(),
+			sessionId: `prelude-runtime-aggregates-${crypto.randomUUID()}`,
+		});
+		const hooks: RuntimeHooks = {
+			onText: () => {},
+			onDisplay: () => {},
+			callTool: async () => undefined,
+		};
+		try {
+			await runtime.run(
+				'globalThis.rejectedRead = read("missing-prelude-aggregate-file"); void globalThis.rejectedRead.catch(() => {});',
+				undefined,
+				hooks,
+				{ runId: "aggregate-root" },
+			);
+			await runtime.run(
+				"globalThis.aggregate = Promise.all([globalThis.rejectedRead]); void globalThis.aggregate.catch(() => {});",
+				undefined,
+				hooks,
+				{ runId: "aggregate-attacher" },
+			);
+			expect(runtime.promiseRunOwner(runtime.getGlobal("aggregate") as Promise<unknown>)).toBe("aggregate-attacher");
+
+			const result = await executeJs(
+				[
+					"class SubPromise extends Promise {}",
+					"const rejectMessage = async promise => { try { await promise; return null; } catch (error) { return error instanceof AggregateError ? error.errors.map(reason => reason.message) : error.message; } };",
+					"const iteratorFailure = { [Symbol.iterator]() { throw new Error('iteration'); } };",
+					"const subclassAggregate = Promise.all.call(SubPromise, [1]);",
+					"const result = {",
+					"  subclass: subclassAggregate instanceof SubPromise,",
+					"  all: await rejectMessage(Promise.all([Promise.reject(new Error('all'))])),",
+					"  race: await rejectMessage(Promise.race([Promise.reject(new Error('race'))])),",
+					"  any: await rejectMessage(Promise.any([Promise.reject(new Error('any'))])),",
+					"  iteration: await rejectMessage(Promise.allSettled(iteratorFailure)),",
+					"  settled: await Promise.allSettled([Promise.reject('settled')]),",
+					"};",
+					"return JSON.stringify(result);",
+				].join("\n"),
+				{
+					cwd: process.cwd(),
+					sessionId: `prelude-runtime-aggregate-semantics-${crypto.randomUUID()}`,
+					session: session(() => []),
+				},
+			);
+			expect(result.exitCode).toBe(0);
+			expect(JSON.parse(result.output)).toEqual({
+				subclass: true,
+				all: "all",
+				race: "race",
+				any: ["any"],
+				iteration: "iteration",
+				settled: [{ status: "rejected", reason: "settled" }],
+			});
+		} finally {
+			runtime.dispose();
+		}
 	});
 });
