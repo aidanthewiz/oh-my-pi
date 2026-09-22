@@ -40,32 +40,39 @@ const utf8Encoder = new TextEncoder();
 
 export function createHelpers(ctx: HelperContext): HelperBundle {
 	return {
-		read: async (rawPath, options = {}) => {
-			const { filePath, file, size } = await resolveRegularFile(ctx, rawPath);
-			let text = await file.text();
-			const offset = typeof options.offset === "number" ? options.offset : 1;
-			const limit = typeof options.limit === "number" ? options.limit : undefined;
-			if (offset > 1 || limit !== undefined) {
-				const lines = text.split(/\r?\n/);
-				const start = Math.max(0, offset - 1);
-				const end = limit !== undefined ? start + limit : lines.length;
-				text = lines.slice(start, end).join("\n");
+		read: (rawPath, options = {}) => {
+			if (INTERNAL_URL_RE.test(rawPath) && rawPath.toLowerCase().endsWith(":raw")) {
+				throw new ToolError("Eval read() already returns raw text; remove the ':raw' suffix");
 			}
-			ctx.emitStatus({ op: "read", path: filePath, bytes: size, chars: text.length });
-			return text;
+			return (async () => {
+				const { filePath, file, size } = await resolveRegularFile(ctx, rawPath);
+				let text = await file.text();
+				const offset = typeof options.offset === "number" ? options.offset : 1;
+				const limit = typeof options.limit === "number" ? options.limit : undefined;
+				if (offset > 1 || limit !== undefined) {
+					const lines = text.split(/\r?\n/);
+					const start = Math.max(0, offset - 1);
+					const end = limit !== undefined ? start + limit : lines.length;
+					text = lines.slice(start, end).join("\n");
+				}
+				ctx.emitStatus({ op: "read", path: filePath, bytes: size, chars: text.length });
+				return text;
+			})();
 		},
-		writeFile: async (rawPath, data) => {
+		writeFile: (rawPath, data) => {
 			if (!isWriteData(data)) {
 				throw new ToolError("write() expects string, Blob, ArrayBuffer, or TypedArray data");
 			}
-			const filePath = resolveHelperPath(ctx, rawPath, "write");
-			if (typeof data === "string" || data instanceof Blob || data instanceof ArrayBuffer) {
-				await Bun.write(filePath, data);
-			} else {
-				await Bun.write(filePath, new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-			}
-			ctx.emitStatus({ op: "write", path: filePath, bytes: getDataSize(data) });
-			return filePath;
+			return (async () => {
+				const filePath = resolveHelperPath(ctx, rawPath, "write");
+				if (typeof data === "string" || data instanceof Blob || data instanceof ArrayBuffer) {
+					await Bun.write(filePath, data);
+				} else {
+					await Bun.write(filePath, new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+				}
+				ctx.emitStatus({ op: "write", path: filePath, bytes: getDataSize(data) });
+				return filePath;
+			})();
 		},
 		env: (key, value) => {
 			if (!key) {

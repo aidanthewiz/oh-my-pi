@@ -44,6 +44,16 @@ describe("eval js helpers internal-url resolution", () => {
 		await expect(helpers.read("https://example.com/page")).rejects.toThrow(/not supported/i);
 	});
 
+	it("rejects read-tool selectors synchronously", async () => {
+		using tmp = TempDir.createSync("@eval-helpers-errors-");
+		const helpers = createHelpers(makeCtx(tmp.path(), { local: path.join(tmp.path(), "local") }));
+
+		expect(() => helpers.read("local://missing.txt:raw")).toThrow(
+			"Eval read() already returns raw text; remove the ':raw' suffix",
+		);
+		await expect(helpers.read("local://missing.txt")).rejects.toBeInstanceOf(Error);
+	});
+
 	it("leaves plain relative and absolute paths resolving against the cwd", async () => {
 		using tmp = TempDir.createSync("@eval-helpers-plain-");
 		const helpers = createHelpers(makeCtx(tmp.path(), {}));

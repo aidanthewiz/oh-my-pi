@@ -12,13 +12,14 @@ import type {
 interface PendingTool {
 	runId: string;
 	resolve(value: unknown): void;
-	reject(error: Error): void;
+	reject(error: unknown): void;
 }
 
 interface ActiveRun {
 	runId: string;
 	filename: string;
 	pendingTools: Map<string, PendingTool>;
+	toolDrain?: PromiseWithResolvers<void>;
 	/** Rejections floated by this run's cell code, captured before its result was sent. */
 	floatingRejections: unknown[];
 }
@@ -43,7 +44,7 @@ function isKernelToolSpec(value: unknown): value is KernelToolSpec {
 
 type RunResult = Extract<WorkerOutbound, { type: "result" }>;
 
-export type RejectionInterceptor = (handler: (reason: unknown) => boolean) => () => void;
+export type RejectionInterceptor = (handler: (reason: unknown, promise: Promise<unknown>) => boolean) => () => void;
 
 export type WorkerCoreOptions =
 	| {
@@ -64,8 +65,8 @@ export type WorkerCoreOptions =
 			interceptUnhandledRejections: RejectionInterceptor;
 	  };
 
-/** Finished-cell filenames retained for attributing rejections that surface after the run settled. */
-const RECENT_CELL_FILES_MAX = 256;
+/** Finished eval runs retained for attributing rejections that surface after the run settled. */
+const RECENT_CELL_RUNS_MAX = 256;
 
 function errorPayload(error: unknown): RunErrorPayload {
 	if (error instanceof Error) {
@@ -116,7 +117,7 @@ export class WorkerCore {
 	#transport: Transport;
 	#runtime: JsRuntime | null = null;
 	#runs = new Map<string, ActiveRun>();
-	#recentCellFiles = new Set<string>();
+	#recentCells = new Map<string, string>();
 	#unsubscribe: () => void;
 	#uninstallRejectionGuard: () => void;
 	#options: WorkerCoreOptions;
@@ -138,10 +139,12 @@ export class WorkerCore {
 	 */
 	#installRejectionGuard(): () => void {
 		if (this.#options.interceptUnhandledRejections) {
-			return this.#options.interceptUnhandledRejections(reason => this.#consumeRejection(reason));
+			return this.#options.interceptUnhandledRejections((reason, promise) =>
+				this.#consumeRejection(reason, promise),
+			);
 		}
-		const onRejection = (reason: unknown): void => {
-			if (this.#consumeRejection(reason)) return;
+		const onRejection = (reason: unknown, promise: Promise<unknown>): void => {
+			if (this.#consumeRejection(reason, promise)) return;
 			// Not cell-attributable: restore default fatality. Rethrowing from a
 			// timer surfaces it as an uncaught exception, which reaches the host
 			// as a worker `error` event exactly like an unhandled rejection did
@@ -162,7 +165,25 @@ export class WorkerCore {
 	 * downgrade to a host-side warn log. Returns false when the rejection is not
 	 * cell activity and must keep the default fatal path.
 	 */
-	#consumeRejection(reason: unknown): boolean {
+	#consumeRejection(reason: unknown, promise?: Promise<unknown>): boolean {
+		const promiseRunId = this.#runtime?.promiseRunOwner(promise);
+		if (promiseRunId) {
+			const owner = this.#runs.get(promiseRunId);
+			if (owner) {
+				owner.floatingRejections.push(reason);
+				return true;
+			}
+			const filename = this.#recentCells.get(promiseRunId);
+			this.#transport.send({
+				type: "log",
+				level: "warn",
+				msg: filename
+					? "Unhandled rejection from a finished eval cell (missing await?)"
+					: "Unhandled rejection from an unknown finished eval cell",
+				meta: { runId: promiseRunId, filename, error: errorPayload(reason) },
+			});
+			return true;
+		}
 		const stack = reason instanceof Error && typeof reason.stack === "string" ? reason.stack : undefined;
 		if (stack) {
 			// The stack can name several cells (helper defined by an earlier cell,
@@ -183,7 +204,7 @@ export class WorkerCore {
 			}
 			let recent: string | undefined;
 			let recentIndex = -1;
-			for (const filename of this.#recentCellFiles) {
+			for (const filename of this.#recentCells.values()) {
 				const index = stack.lastIndexOf(filename);
 				if (index > recentIndex) {
 					recentIndex = index;
@@ -317,14 +338,11 @@ export class WorkerCore {
 			result = { type: "result", runId, ok: false, error: errorPayload(error) };
 		}
 		try {
-			// One event-loop turn so rejections the cell already floated surface
-			// while this run can still own them (rejection callbacks run before
-			// timers fire).
-			await Bun.sleep(0);
+			await this.#drainTools(active);
 			result = foldFloatingRejections(active, result, hooks);
 		} finally {
 			this.#runs.delete(runId);
-			this.#rememberCellFile(filename);
+			this.#rememberCell(runId, active.filename);
 			this.#transport.send(result);
 		}
 	}
@@ -343,6 +361,8 @@ export class WorkerCore {
 			callTool: (name, args) => this.#callTool(active, name, args),
 		};
 
+		let result: RunResult;
+		let envelope: Record<string, unknown> | undefined;
 		try {
 			const runtime = this.#runtime;
 			if (!runtime) throw new ToolError("JavaScript kernel is not running");
@@ -354,7 +374,6 @@ export class WorkerCore {
 				}
 			}
 
-			let envelope: Record<string, unknown>;
 			if (msg.op === "describe") {
 				const names = msg.names.length > 0 ? msg.names : [...tools.keys()];
 				envelope = {
@@ -377,22 +396,46 @@ export class WorkerCore {
 				}
 				envelope = { ok: true, value: cloneable };
 			}
-			this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
-			this.#transport.send({ type: "result", runId: msg.runId, ok: true });
+			result = { type: "result", runId: msg.runId, ok: true };
 		} catch (error) {
-			this.#transport.send({ type: "result", runId: msg.runId, ok: false, error: errorPayload(error) });
+			result = { type: "result", runId: msg.runId, ok: false, error: errorPayload(error) };
+		}
+		try {
+			await this.#drainTools(active);
+			result = foldFloatingRejections(active, result, hooks);
+			if (result.ok && envelope) {
+				this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
+			}
 		} finally {
 			this.#runs.delete(msg.runId);
-			this.#rememberCellFile(active.filename);
+			this.#rememberCell(msg.runId, active.filename);
+			this.#transport.send(result);
 		}
 	}
 
-	#rememberCellFile(filename: string): void {
-		this.#recentCellFiles.delete(filename);
-		this.#recentCellFiles.add(filename);
-		if (this.#recentCellFiles.size > RECENT_CELL_FILES_MAX) {
-			const oldest = this.#recentCellFiles.values().next().value;
-			if (oldest !== undefined) this.#recentCellFiles.delete(oldest);
+	async #drainTools(active: ActiveRun): Promise<void> {
+		do {
+			if (active.pendingTools.size > 0) {
+				active.toolDrain ??= Promise.withResolvers<void>();
+				await active.toolDrain.promise;
+			}
+			// Reply continuations can start more calls or float rejections.
+			await Bun.sleep(0);
+		} while (active.pendingTools.size > 0);
+	}
+
+	#notifyToolDrain(active: ActiveRun): void {
+		if (active.pendingTools.size > 0) return;
+		active.toolDrain?.resolve();
+		active.toolDrain = undefined;
+	}
+
+	#rememberCell(runId: string, filename: string): void {
+		this.#recentCells.delete(runId);
+		this.#recentCells.set(runId, filename);
+		if (this.#recentCells.size > RECENT_CELL_RUNS_MAX) {
+			const oldest = this.#recentCells.keys().next().value;
+			if (oldest !== undefined) this.#recentCells.delete(oldest);
 		}
 	}
 
@@ -408,6 +451,7 @@ export class WorkerCore {
 			// pending entry until close.
 			active.pendingTools.delete(id);
 			reject(error);
+			this.#notifyToolDrain(active);
 		}
 		return await promise;
 	}
@@ -419,6 +463,7 @@ export class WorkerCore {
 			active.pendingTools.delete(id);
 			if (reply.ok) pending.resolve(reply.value);
 			else pending.reject(errorFromPayload(reply.error));
+			this.#notifyToolDrain(active);
 			return;
 		}
 	}
@@ -429,6 +474,7 @@ export class WorkerCore {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
+			this.#notifyToolDrain(active);
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();
@@ -445,6 +491,7 @@ export class WorkerCore {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
+			this.#notifyToolDrain(active);
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();
