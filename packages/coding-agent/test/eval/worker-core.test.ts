@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { WorkerCore } from "@oh-my-pi/pi-coding-agent/eval/js/worker-core";
+import { type RejectionInterceptor, WorkerCore } from "@oh-my-pi/pi-coding-agent/eval/js/worker-core";
 import type {
 	SessionSnapshot,
 	Transport,
@@ -17,7 +17,10 @@ interface WorkerHarness {
 	onMessage(handler: (message: WorkerOutbound) => void): () => void;
 }
 
-function createWorkerHarness(): WorkerHarness {
+function createWorkerHarness(
+	mode: "inline" | "isolated" = "inline",
+	interceptUnhandledRejections: RejectionInterceptor = postmortem.interceptUnhandledRejections,
+): WorkerHarness {
 	const hostListeners = new Set<(message: WorkerOutbound) => void>();
 	const workerListeners = new Set<(message: WorkerInbound) => void>();
 	const transport: Transport = {
@@ -32,10 +35,10 @@ function createWorkerHarness(): WorkerHarness {
 		},
 		close: () => {},
 	};
-	new WorkerCore(transport, {
-		mode: "inline",
-		interceptUnhandledRejections: postmortem.interceptUnhandledRejections,
-	});
+	new WorkerCore(
+		transport,
+		mode === "inline" ? { mode, interceptUnhandledRejections } : { mode, interceptUnhandledRejections },
+	);
 	return {
 		send(message) {
 			queueMicrotask(() => {
@@ -89,6 +92,101 @@ function installFatalCapture(): {
 			process.off("uncaughtException", onUncaught);
 		},
 	};
+}
+
+async function runWorkerCoreRejectionProbe(
+	scenario: string,
+): Promise<{ output: unknown; stderr: string; exitCode: number }> {
+	const workerCoreUrl = pathToFileURL(path.resolve(import.meta.dir, "../../src/eval/js/worker-core.ts")).href;
+	const postmortemUrl = pathToFileURL(path.resolve(import.meta.dir, "../../../utils/src/postmortem.ts")).href;
+	const probe = `const { WorkerCore } = await import(${JSON.stringify(workerCoreUrl)});
+const postmortem = await import(${JSON.stringify(postmortemUrl)});
+
+const outbound = [];
+const inbound = new Set();
+const waiters = new Set();
+const transport = {
+	send(message) {
+		outbound.push(message);
+		for (const waiter of [...waiters]) {
+			if (!waiter.predicate(message)) continue;
+			waiters.delete(waiter);
+			waiter.resolve(message);
+		}
+	},
+	onMessage(handler) {
+		inbound.add(handler);
+		return () => inbound.delete(handler);
+	},
+	close() {},
+};
+const send = message => queueMicrotask(() => {
+	for (const handler of inbound) handler(message);
+});
+const waitForMessage = predicate => {
+	const deferred = Promise.withResolvers();
+	waiters.add({ predicate, resolve: deferred.resolve });
+	return deferred.promise;
+};
+let rejectionSeen = Promise.withResolvers();
+const waitForRejection = () => rejectionSeen.promise;
+const resetRejection = () => {
+	rejectionSeen = Promise.withResolvers();
+};
+const core = new WorkerCore(transport, {
+	mode: "isolated",
+	interceptUnhandledRejections(handler) {
+		return postmortem.interceptUnhandledRejections((reason, promise) => {
+			const consumed = handler(reason, promise);
+			rejectionSeen.resolve();
+			return consumed;
+		});
+	},
+});
+const snapshot = { cwd: process.cwd(), sessionId: "eval-rejection-ownership", localRoots: {} };
+const ready = waitForMessage(message => message.type === "ready");
+send({ type: "init", snapshot });
+await ready;
+const finish = async (result, success) => {
+	const closed = waitForMessage(message => message.type === "closed");
+	send({ type: "close" });
+	await closed;
+	console.log(JSON.stringify(result));
+	process.exit(success ? 0 : 1);
+};
+
+${scenario}
+`;
+
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rejection-ownership-"));
+	const probePath = path.join(root, "probe.ts");
+	try {
+		await Bun.write(probePath, probe);
+		const proc = Bun.spawn([process.execPath, probePath], {
+			cwd: process.cwd(),
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env },
+		});
+		const watchdog = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {}
+		}, 5000);
+		try {
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			if (!stdout.trim()) throw new Error(`Rejection probe exited ${exitCode}: ${stderr}`);
+			return { output: JSON.parse(stdout.trim()), stderr, exitCode };
+		} finally {
+			clearTimeout(watchdog);
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
 }
 
 describe("WorkerCore", () => {
@@ -462,6 +560,394 @@ describe("WorkerCore", () => {
 			await fs.rm(dirA, { recursive: true, force: true });
 			await fs.rm(dirB, { recursive: true, force: true });
 		}
+	});
+
+	it("attributes a reused error to the run that rejects its promise", async () => {
+		let rejectionHandler: ((reason: unknown, promise: Promise<unknown>) => boolean) | undefined;
+		const harness = createWorkerHarness("isolated", handler => {
+			rejectionHandler = handler;
+			return () => {
+				rejectionHandler = undefined;
+			};
+		});
+		const snapshot = { cwd: process.cwd(), sessionId: "eval-reused-error", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+
+		try {
+			const storeCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.runId === "store-error-run",
+			);
+			const storeResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "store-error-run",
+			);
+			harness.send({
+				type: "run",
+				runId: "store-error-run",
+				code: `try {
+					await tool.fail({});
+				} catch (error) {
+					globalThis.__omp_reused_error = error;
+				}
+				"stored";`,
+				filename: "[store-error-run].js",
+				snapshot,
+			});
+			const failedToolCall = await storeCall;
+			if (failedToolCall.type !== "tool-call") throw new Error("expected tool call");
+			harness.send({
+				type: "tool-reply",
+				id: failedToolCall.id,
+				reply: {
+					ok: false,
+					error: {
+						name: "ToolError",
+						message: "stored tool failure",
+						isToolError: true,
+					},
+				},
+			});
+			expect(await storeResult).toMatchObject({
+				type: "result",
+				runId: "store-error-run",
+				ok: true,
+			});
+
+			const reuseCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.runId === "reuse-error-run",
+			);
+			const reuseResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "reuse-error-run",
+			);
+			harness.send({
+				type: "run",
+				runId: "reuse-error-run",
+				code: `await tool.capture({
+					promise: Promise.reject(globalThis.__omp_reused_error),
+				});
+				"done";`,
+				filename: "[reuse-error-run].js",
+				snapshot,
+			});
+			const captureCall = await reuseCall;
+			if (captureCall.type !== "tool-call") throw new Error("expected tool call");
+			const rejectedPromise = Reflect.get(captureCall.args as object, "promise");
+			expect(rejectedPromise).toBeInstanceOf(Promise);
+			let reason: unknown;
+			await (rejectedPromise as Promise<unknown>).catch(error => {
+				reason = error;
+			});
+			expect(rejectionHandler?.(reason, rejectedPromise as Promise<unknown>)).toBe(true);
+			harness.send({
+				type: "tool-reply",
+				id: captureCall.id,
+				reply: { ok: true, value: "captured" },
+			});
+			expect(await reuseResult).toMatchObject({
+				type: "result",
+				runId: "reuse-error-run",
+				ok: false,
+				error: { message: "Unhandled rejection (missing await?): stored tool failure" },
+			});
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("keeps cells and tool invocations alive for delayed bridge failures", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const registered = waitForMessage(message => message.type === "result" && message.runId === "register-delayed");
+send({
+	type: "run", runId: "register-delayed", snapshot, filename: "[register-delayed].js",
+	code: 'tool(() => { void tool.remote({}); return "success"; }, { name: "delayed" });',
+});
+await registered;
+const outcomes = [];
+for (const mode of ["cell", "invocation"]) {
+	const runId = "delayed-" + mode;
+	const called = waitForMessage(message => message.type === "tool-call" && message.runId === runId);
+	const completed = waitForMessage(message => message.type === "result" && message.runId === runId);
+	send(mode === "cell"
+		? { type: "run", runId, snapshot, filename: "[delayed-cell].js", code: "void tool.remote({});" }
+		: { type: "tool", runId, op: "call", name: "delayed", args: {} });
+	const call = await called;
+	const barrierId = runId + "-barrier";
+	const barrier = waitForMessage(message => message.type === "result" && message.runId === barrierId);
+	send({ type: "run", runId: barrierId, snapshot, filename: "[barrier].js", code: "undefined;" });
+	await barrier;
+	const premature = outbound.some(message => message.runId === runId &&
+		(message.type === "result" || (message.type === "display" && message.output.type === "json")));
+	send({ type: "tool-reply", id: call.id, reply: { ok: false, error: { message: "delayed host failure" } } });
+	const result = await completed;
+	outcomes.push({
+		mode, premature, ok: result.ok, error: result.error?.message,
+		successDisplay: outbound.some(message => message.runId === runId &&
+			message.type === "display" && message.output.type === "json"),
+	});
+}
+await finish(outcomes, outcomes.every(result => !result.premature && !result.ok && !result.successDisplay));
+`);
+		expect(output).toEqual(
+			["cell", "invocation"].map(mode => ({
+				mode,
+				premature: false,
+				ok: false,
+				error: "Unhandled rejection (missing await?): delayed host failure",
+				successDisplay: false,
+			})),
+		);
+		expect(exitCode).toBe(0);
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+	});
+
+	it("drains bridge calls started by reply continuations before completing", async () => {
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "chained-bridge-drain", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+		const messages: WorkerOutbound[] = [];
+		const unsubscribe = harness.onMessage(message => messages.push(message));
+		try {
+			const firstCall = waitForMessage(harness, message => message.type === "tool-call" && message.name === "first");
+			const secondCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.name === "second",
+			);
+			const completed = waitForMessage(harness, message => message.type === "result" && message.runId === "chain");
+			harness.send({
+				type: "run",
+				runId: "chain",
+				snapshot,
+				filename: "[chain].js",
+				code: 'void tool.first({}).then(() => tool.second({})).catch(() => display("recovered"));',
+			});
+			const first = await firstCall;
+			if (first.type !== "tool-call") throw new Error("expected first tool call");
+			harness.send({ type: "tool-reply", id: first.id, reply: { ok: true, value: null } });
+			const second = await secondCall;
+			if (second.type !== "tool-call") throw new Error("expected second tool call");
+			const barrier = waitForMessage(harness, message => message.type === "result" && message.runId === "barrier");
+			harness.send({ type: "run", runId: "barrier", snapshot, filename: "[barrier].js", code: "undefined;" });
+			await barrier;
+			expect(messages.some(message => message.type === "result" && message.runId === "chain")).toBe(false);
+			harness.send({
+				type: "tool-reply",
+				id: second.id,
+				reply: { ok: false, error: { message: "handled failure" } },
+			});
+			expect(await completed).toMatchObject({ type: "result", runId: "chain", ok: true });
+			expect(messages).toContainEqual({
+				type: "text",
+				runId: "chain",
+				chunk: "recovered\n",
+			});
+		} finally {
+			unsubscribe();
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("fails a tool invocation with a floated read rejection before displaying success", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");
+send({
+	type: "run", runId: "register-tools", snapshot,
+	code: 'tool(() => { void read("local://package.json:raw"); return "floated"; }, { name: "floatedRead" });' +
+		'tool(async () => { try { await read("local://package.json:raw"); } catch { return "caught"; } }, { name: "caughtRead" });' +
+		'tool(async () => { await read("package.json"); return "awaited"; }, { name: "awaitedRead" });',
+	filename: "[register-tools].js",
+});
+await registered;
+const results = {};
+for (const name of ["floatedRead", "caughtRead", "awaitedRead"]) {
+	const pending = waitForMessage(message => message.type === "result" && message.runId === name);
+	send({ type: "tool", runId: name, op: "call", name, args: {} });
+	results[name] = await pending;
+}
+const result = {
+	floatedFailed: results.floatedRead.ok === false &&
+		results.floatedRead.error?.message.includes("Unhandled rejection (missing await?)"),
+	floatedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "floatedRead"),
+	caughtValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "caughtRead")?.output.data.value,
+	awaitedValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "awaitedRead")?.output.data.value,
+	caughtOk: results.caughtRead.ok,
+	awaitedOk: results.awaitedRead.ok,
+};
+await finish(result, result.floatedFailed && !result.floatedDisplayed && result.caughtOk && result.awaitedOk);
+`);
+		expect(output).toEqual({
+			floatedFailed: true,
+			floatedDisplayed: false,
+			caughtValue: "caught",
+			awaitedValue: "awaited",
+			caughtOk: true,
+			awaitedOk: true,
+		});
+		expect(exitCode).toBe(0);
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+	});
+
+	it("keeps a delayed helper rejection with its finished run while another run is live", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+globalThis.__omp_late_read_release = false;
+const liveRelease = Promise.withResolvers();
+const liveEntered = Promise.withResolvers();
+globalThis.__omp_live_run = { entered: () => liveEntered.resolve(), release: liveRelease.promise };
+
+const ownerResult = waitForMessage(message => message.type === "result" && message.runId === "delayed-owner");
+const missingPath = process.cwd() + "/omp-missing-" + crypto.randomUUID();
+send({
+	type: "run",
+	runId: "delayed-owner",
+	code: 'globalThis.__omp_late_read_timer = setInterval(() => {' +
+		'if (!globalThis.__omp_late_read_release) return;' +
+		'clearInterval(globalThis.__omp_late_read_timer);' +
+		'void read(' + JSON.stringify(missingPath) + ');' +
+		'}, 1); "scheduled";',
+	filename: "[delayed-owner].js",
+	snapshot,
+});
+const owner = await ownerResult;
+
+const liveResult = waitForMessage(message => message.type === "result" && message.runId === "unrelated-live-run");
+send({
+	type: "run",
+	runId: "unrelated-live-run",
+	code: 'globalThis.__omp_live_run.entered();' +
+		'globalThis.__omp_late_read_release = true;' +
+		'await globalThis.__omp_live_run.release;' +
+		'"unrelated";',
+	filename: "[unrelated-live-run].js",
+	snapshot,
+});
+await liveEntered.promise;
+await waitForRejection();
+liveRelease.resolve();
+const live = await liveResult;
+const warning = outbound.find(message =>
+	message.type === "log" &&
+	message.msg === "Unhandled rejection from a finished eval cell (missing await?)" &&
+	message.meta?.runId === "delayed-owner"
+);
+
+clearInterval(globalThis.__omp_late_read_timer);
+delete globalThis.__omp_late_read_release;
+delete globalThis.__omp_late_read_timer;
+delete globalThis.__omp_live_run;
+const result = { ownerOk: owner.ok, liveOk: live.ok, warning: Boolean(warning) };
+await finish(result, result.ownerOk && result.liveOk && result.warning);
+`);
+
+		expect(exitCode).toBe(0);
+		expect(output).toEqual({ ownerOk: true, liveOk: true, warning: true });
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("[Uncaught Exception]");
+	});
+
+	it("assigns a cross-cell continuation to the run that attaches it", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const ownerResult = waitForMessage(message => message.type === "result" && message.runId === "continuation-owner");
+send({
+	type: "run",
+	runId: "continuation-owner",
+	code: 'globalThis.__omp_cross_cell_root = read("package.json");' +
+		'await globalThis.__omp_cross_cell_root;' +
+		'"stored";',
+	filename: "[continuation-owner].js",
+	snapshot,
+});
+const owner = await ownerResult;
+
+const liveRelease = Promise.withResolvers();
+const liveEntered = Promise.withResolvers();
+globalThis.__omp_continuation_live = { entered: () => liveEntered.resolve(), release: liveRelease.promise };
+const liveResult = waitForMessage(message => message.type === "result" && message.runId === "continuation-attacher");
+send({
+	type: "run",
+	runId: "continuation-attacher",
+	code: 'globalThis.__omp_continuation_live.entered();' +
+		'void globalThis.__omp_cross_cell_root.then(() => {' +
+			'throw new Error("cross-cell continuation");' +
+		'});' +
+		'await globalThis.__omp_continuation_live.release;' +
+		'"unrelated";',
+	filename: "[continuation-attacher].js",
+	snapshot,
+});
+await liveEntered.promise;
+await waitForRejection();
+liveRelease.resolve();
+const live = await liveResult;
+const ownerWarning = outbound.some(message =>
+	message.type === "log" &&
+	message.msg === "Unhandled rejection from a finished eval cell (missing await?)" &&
+	message.meta?.runId === "continuation-owner"
+);
+
+delete globalThis.__omp_cross_cell_root;
+delete globalThis.__omp_continuation_live;
+const expectedMessage = "Unhandled rejection (missing await?): cross-cell continuation";
+const result = {
+	ownerOk: owner.ok,
+	attacherFailed: !live.ok && live.error?.message === expectedMessage,
+	ownerWarning,
+};
+await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWarning);
+`);
+
+		expect(exitCode).toBe(0);
+		expect(output).toEqual({ ownerOk: true, attacherFailed: true, ownerWarning: false });
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("[Uncaught Exception]");
+	});
+
+	it("assigns a cross-cell rejected aggregate to the cell that floats it", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const missingPath = process.cwd() + "/omp-aggregate-missing-" + crypto.randomUUID();
+const ownerResult = waitForMessage(message => message.type === "result" && message.runId === "aggregate-owner");
+send({
+	type: "run",
+	runId: "aggregate-owner",
+	code: 'globalThis.__omp_aggregate_root = read(' + JSON.stringify(missingPath) + ');' +
+		'try { await globalThis.__omp_aggregate_root; } catch {}' +
+		'"stored";',
+	filename: "[aggregate-owner].js",
+	snapshot,
+});
+const owner = await ownerResult;
+
+const aggregateResult = waitForMessage(message => message.type === "result" && message.runId === "aggregate-attacher");
+send({
+	type: "run",
+	runId: "aggregate-attacher",
+	code: 'void Promise.all([globalThis.__omp_aggregate_root]); "aggregate";',
+	filename: "[aggregate-attacher].js",
+	snapshot,
+});
+await waitForRejection();
+const aggregate = await aggregateResult;
+const ownerWarning = outbound.some(message =>
+	message.type === "log" &&
+	message.msg === "Unhandled rejection from a finished eval cell (missing await?)" &&
+	message.meta?.runId === "aggregate-owner"
+);
+
+delete globalThis.__omp_aggregate_root;
+const result = {
+	ownerOk: owner.ok,
+	attacherFailed:
+		!aggregate.ok && aggregate.error?.message.startsWith("Unhandled rejection (missing await?):"),
+	ownerWarning,
+};
+await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWarning);
+`);
+
+		expect(exitCode).toBe(0);
+		expect(output).toEqual({ ownerOk: true, attacherFailed: true, ownerWarning: false });
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("[Uncaught Exception]");
 	});
 
 	it("survives concurrent same-realm setCwd in a child process with postmortem loaded", async () => {

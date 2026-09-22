@@ -12,6 +12,9 @@
 - Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once. Bash retains the reviewed execution route and shell through startup, and route or shell changes require a fresh safety review.
 - Destructive Command Guard now fails closed on unexpected stderr and on child processes that keep output pipes open past the bounded post-exit drain window.
 - RPC mode now disables canonical TTY input buffering while it owns stdin, preventing valid JSONL commands from being truncated by the terminal driver. Hub rejects known supervised RPC launches that explicitly request a PTY and defaults those processes to pipes. Broker send acknowledgements report transport byte counts without claiming application delivery.
+- Read loop hints now use the dispatch-resolved selector. Raw reads remain byte-for-byte verbatim, while zero-valued video selectors and literal colon filenames retain their native dispatch.
+- JavaScript Eval now uses explicit Bun-compatible ownership for run-scoped bridge promises. Delayed root failures remain with the originating run, while cross-cell continuations belong to the run that attaches them; ownership no longer falls onto an unrelated live cell or persists on reusable Error objects. Eval file reads reject Read-tool `:raw` suffixes with a direct usage error.
+- JavaScript cells and Eval-defined tools now wait for pending host-tool replies and their bridge continuations, then drain owned floating rejections before reporting success. Promise aggregates belong to the cell that creates them, including cross-cell `all`, `race`, `any`, and `allSettled` calls.
 
 ### Changed
 

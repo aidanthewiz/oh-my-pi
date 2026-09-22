@@ -660,6 +660,9 @@ export interface ReadToolDetails {
 	displayReadTargets?: string[];
 }
 type ReadParams = ReadToolInput;
+interface ReadDispatchState {
+	verbatim: boolean;
+}
 
 /** Identical reads tolerated before the loop hint is appended. */
 const REPEAT_READ_HINT_THRESHOLD = 3;
@@ -1258,14 +1261,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		const result = await this.#executeInner(toolCallId, params, signal, onUpdate, toolContext);
-		appendRepeatReadHint(this.session, params.path, result);
+		const dispatch: ReadDispatchState = { verbatim: false };
+		const result = await this.#executeInner(toolCallId, params, dispatch, signal, onUpdate, toolContext);
+		if (!dispatch.verbatim) {
+			appendRepeatReadHint(this.session, params.path, result);
+		}
 		return result;
 	}
 
 	async #executeInner(
 		_toolCallId: string,
 		params: ReadParams,
+		dispatch: ReadDispatchState,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		_toolContext?: AgentToolContext,
@@ -1310,6 +1317,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 			const urlSel = parsedUrlTarget.sel;
 			const urlRaw = isRawSelector(urlSel);
+			dispatch.verbatim = urlRaw;
 			if (urlSel.kind === "lines" || urlSel.kind === "tail") {
 				const entry = await fetchReadUrl(this.session, { path: parsedUrlTarget.path, raw: urlRaw }, signal, {
 					ensureArtifact: true,
@@ -1336,6 +1344,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (internalRouter.canResolve(readPath)) {
 			const internalTarget = splitInternalUrlSel(readPath);
 			const parsed = parseSel(internalTarget.sel);
+			dispatch.verbatim = isRawSelector(parsed);
 			if (internalTarget.sel !== undefined && parsed.kind === "none") {
 				throw new ToolError(
 					`Invalid selector ':${internalTarget.sel}' on '${internalTarget.path}'. Use :N, :N-M, :N+K, :N- (open-ended), :-N (last N lines), a comma-separated list of ranges, :raw, :img for SVG rendering, or a range combined with raw (e.g. :raw:50-100).`,
@@ -1398,6 +1407,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						? splitPathAndSel(archivePath.archiveSubPath)
 						: { path: archivePath.archiveSubPath, sel: promotedSelector };
 				const archiveParsed = parseSel(archiveSubPath.sel);
+				dispatch.verbatim = isRawSelector(archiveParsed);
 				return readArchive(
 					this.session,
 					readPath,
@@ -1430,6 +1440,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			(localTarget.sel === undefined || parseVideoSelector(localTarget.sel) !== null)
 				? { kind: "none" as const }
 				: parseSel(localTarget.sel);
+		dispatch.verbatim = isRawSelector(parsed);
 
 		let absolutePath = resolveReadPath(localReadPath, this.session.cwd);
 		let suffixResolution: { from: string; to: string } | undefined;
