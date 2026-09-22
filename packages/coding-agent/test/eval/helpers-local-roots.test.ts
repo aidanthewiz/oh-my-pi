@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils/temp";
-import { createHelpers, type HelperContext } from "../../src/eval/js/shared/helpers";
+import { createHelpers, evalRunOwner, type HelperContext } from "../../src/eval/js/shared/helpers";
 
 /**
  * The eval helpers (`read`/`write`) must substitute injected on-disk
@@ -13,6 +13,7 @@ import { createHelpers, type HelperContext } from "../../src/eval/js/shared/help
 function makeCtx(cwd: string, roots: Record<string, string>): HelperContext {
 	return {
 		cwd: () => cwd,
+		runId: () => "helper-test-run",
 		env: new Map(),
 		localRoots: () => roots,
 		emitStatus: () => {},
@@ -42,6 +43,24 @@ describe("eval js helpers internal-url resolution", () => {
 		await expect(helpers.writeFile("local://../escape.md", "x")).rejects.toThrow(/traversal|escapes/i);
 		await expect(helpers.writeFile("memory://x.md", "x")).rejects.toThrow(/not supported/i);
 		await expect(helpers.read("https://example.com/page")).rejects.toThrow(/not supported/i);
+	});
+
+	it("rejects read-tool selectors synchronously and owns asynchronous failures", async () => {
+		using tmp = TempDir.createSync("@eval-helpers-errors-");
+		const helpers = createHelpers(makeCtx(tmp.path(), { local: path.join(tmp.path(), "local") }));
+
+		expect(() => helpers.read("local://missing.txt:raw")).toThrow(
+			"Eval read() already returns raw text; remove the ':raw' suffix",
+		);
+
+		let reason: unknown;
+		try {
+			await helpers.read("local://missing.txt");
+		} catch (error) {
+			reason = error;
+		}
+		expect(reason).toBeInstanceOf(Error);
+		expect(evalRunOwner(reason)).toBe("helper-test-run");
 	});
 
 	it("leaves plain relative and absolute paths resolving against the cwd", async () => {

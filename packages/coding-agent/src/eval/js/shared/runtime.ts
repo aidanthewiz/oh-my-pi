@@ -213,6 +213,7 @@ export class JsRuntime {
 		this.#localRoots = opts.localRoots ?? {};
 		this.helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
+			runId: () => this.#als.getStore()?.runId,
 			env: this.#env,
 			localRoots: () => this.#localRoots,
 			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),

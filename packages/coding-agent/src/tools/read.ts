@@ -1259,7 +1259,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const result = await this.#executeInner(toolCallId, params, signal, onUpdate, toolContext);
-		appendRepeatReadHint(this.session, params.path, result);
+		const internalTarget = splitInternalUrlSel(params.path);
+		const selector = internalTarget.sel ?? splitPathAndSel(params.path).sel;
+		if (!isRawSelector(parseSel(selector))) {
+			appendRepeatReadHint(this.session, params.path, result);
+		}
 		return result;
 	}
 

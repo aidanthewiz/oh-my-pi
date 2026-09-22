@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { WorkerCore } from "@oh-my-pi/pi-coding-agent/eval/js/worker-core";
+import { type RejectionInterceptor, WorkerCore } from "@oh-my-pi/pi-coding-agent/eval/js/worker-core";
+import { markEvalRunError } from "@oh-my-pi/pi-coding-agent/eval/js/shared/helpers";
 import type {
 	SessionSnapshot,
 	Transport,
@@ -17,7 +18,10 @@ interface WorkerHarness {
 	onMessage(handler: (message: WorkerOutbound) => void): () => void;
 }
 
-function createWorkerHarness(): WorkerHarness {
+function createWorkerHarness(
+	mode: "inline" | "isolated" = "inline",
+	interceptUnhandledRejections: RejectionInterceptor = postmortem.interceptUnhandledRejections,
+): WorkerHarness {
 	const hostListeners = new Set<(message: WorkerOutbound) => void>();
 	const workerListeners = new Set<(message: WorkerInbound) => void>();
 	const transport: Transport = {
@@ -32,10 +36,10 @@ function createWorkerHarness(): WorkerHarness {
 		},
 		close: () => {},
 	};
-	new WorkerCore(transport, {
-		mode: "inline",
-		interceptUnhandledRejections: postmortem.interceptUnhandledRejections,
-	});
+	new WorkerCore(
+		transport,
+		mode === "inline" ? { mode, interceptUnhandledRejections } : { mode, interceptUnhandledRejections },
+	);
 	return {
 		send(message) {
 			queueMicrotask(() => {
@@ -461,6 +465,113 @@ describe("WorkerCore", () => {
 			harness.send({ type: "close" });
 			await fs.rm(dirA, { recursive: true, force: true });
 			await fs.rm(dirB, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a finished cell's owned rejection away from another live run", async () => {
+		let rejectionHandler: ((reason: unknown) => boolean) | undefined;
+		const harness = createWorkerHarness("isolated", handler => {
+			rejectionHandler = handler;
+			return () => {
+				rejectionHandler = undefined;
+			};
+		});
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-eval-owner-"));
+		const snapshot = { cwd, sessionId: "eval-owner", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+
+		try {
+			const heldCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.runId === "held-run",
+			);
+			const heldResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "held-run",
+			);
+			harness.send({
+				type: "run",
+				runId: "held-run",
+				code: 'await tool.hold({}); "released";',
+				filename: "[held-run].js",
+				snapshot,
+			});
+			const toolCall = await heldCall;
+			expect(toolCall.type).toBe("tool-call");
+
+			const lateResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "late-read-run",
+			);
+			const missingPath = path.join(cwd, "missing.txt");
+			harness.send({
+				type: "run",
+				runId: "late-read-run",
+				code: `globalThis.__omp_late_owner = (async () => {
+					await Bun.sleep(20);
+					try {
+						await read(${JSON.stringify(missingPath)});
+					} catch (error) {
+						return error[Symbol.for("omp.eval.runOwner")];
+					}
+				})(); "scheduled";`,
+				filename: "[late-read-run].js",
+				snapshot,
+			});
+			expect(await lateResult).toMatchObject({
+				type: "result",
+				runId: "late-read-run",
+				ok: true,
+			});
+
+			const ownerText = waitForMessage(
+				harness,
+				message => message.type === "text" && message.runId === "inspect-late-owner",
+			);
+			const ownerResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "inspect-late-owner",
+			);
+			harness.send({
+				type: "run",
+				runId: "inspect-late-owner",
+				code: "await globalThis.__omp_late_owner;",
+				filename: "[inspect-late-owner].js",
+				snapshot,
+			});
+			expect(await ownerText).toMatchObject({ type: "text", chunk: "late-read-run\n" });
+			expect(await ownerResult).toMatchObject({
+				type: "result",
+				runId: "inspect-late-owner",
+				ok: true,
+			});
+
+			const finishedRejection = waitForMessage(
+				harness,
+				message =>
+					message.type === "log" &&
+					message.msg === "Unhandled rejection from a finished eval cell (missing await?)",
+			);
+			expect(rejectionHandler?.(markEvalRunError(new Error("late failure"), "late-read-run"))).toBe(true);
+			expect(await finishedRejection).toMatchObject({
+				type: "log",
+				meta: { runId: "late-read-run", filename: "[late-read-run].js" },
+			});
+
+			if (toolCall.type !== "tool-call") throw new Error("expected tool call");
+			harness.send({
+				type: "tool-reply",
+				id: toolCall.id,
+				reply: { ok: true, value: "released" },
+			});
+			expect(await heldResult).toMatchObject({
+				type: "result",
+				runId: "held-run",
+				ok: true,
+			});
+		} finally {
+			harness.send({ type: "close" });
+			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
 
