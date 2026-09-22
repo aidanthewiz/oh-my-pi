@@ -15,7 +15,6 @@ export interface HelperOptions {
  */
 export interface HelperContext {
 	cwd(): string;
-	runId(): string | undefined;
 	env: Map<string, string>;
 	/**
 	 * On-disk roots for internal-URL schemes the helpers accept (e.g.
@@ -38,39 +37,12 @@ export interface HelperBundle {
 }
 
 const utf8Encoder = new TextEncoder();
-const kEvalRunOwner = Symbol.for("omp.eval.runOwner");
-
-export function evalRunOwner(reason: unknown): string | undefined {
-	if (reason === null || (typeof reason !== "object" && typeof reason !== "function")) return undefined;
-	try {
-		const owner = Reflect.get(reason, kEvalRunOwner);
-		return typeof owner === "string" && owner.length > 0 ? owner : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-export function markEvalRunError<T>(error: T, runId: string | undefined): T {
-	if (!runId || error === null || (typeof error !== "object" && typeof error !== "function") || evalRunOwner(error)) {
-		return error;
-	}
-	try {
-		Object.defineProperty(error, kEvalRunOwner, { value: runId, configurable: true });
-	} catch {
-		// Frozen foreign errors still retain their normal stack-based attribution.
-	}
-	return error;
-}
 
 export function createHelpers(ctx: HelperContext): HelperBundle {
 	return {
 		read: (rawPath, options = {}) => {
-			const runId = ctx.runId();
 			if (INTERNAL_URL_RE.test(rawPath) && rawPath.toLowerCase().endsWith(":raw")) {
-				throw markEvalRunError(
-					new ToolError("Eval read() already returns raw text; remove the ':raw' suffix"),
-					runId,
-				);
+				throw new ToolError("Eval read() already returns raw text; remove the ':raw' suffix");
 			}
 			return (async () => {
 				const { filePath, file, size } = await resolveRegularFile(ctx, rawPath);
@@ -85,17 +57,11 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 				}
 				ctx.emitStatus({ op: "read", path: filePath, bytes: size, chars: text.length });
 				return text;
-			})().catch(error => {
-				throw markEvalRunError(error, runId);
-			});
+			})();
 		},
 		writeFile: (rawPath, data) => {
-			const runId = ctx.runId();
 			if (!isWriteData(data)) {
-				throw markEvalRunError(
-					new ToolError("write() expects string, Blob, ArrayBuffer, or TypedArray data"),
-					runId,
-				);
+				throw new ToolError("write() expects string, Blob, ArrayBuffer, or TypedArray data");
 			}
 			return (async () => {
 				const filePath = resolveHelperPath(ctx, rawPath, "write");
@@ -106,9 +72,7 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 				}
 				ctx.emitStatus({ op: "write", path: filePath, bytes: getDataSize(data) });
 				return filePath;
-			})().catch(error => {
-				throw markEvalRunError(error, runId);
-			});
+			})();
 		},
 		env: (key, value) => {
 			if (!key) {

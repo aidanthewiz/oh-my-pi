@@ -343,13 +343,15 @@ export function isExpectedCleanupError(reason: unknown): boolean {
 }
 
 /** Interceptors consulted by the global `unhandledRejection` handler before the fatal path. */
-const rejectionInterceptors = new Set<(reason: unknown) => boolean>();
+const rejectionInterceptors = new Set<(reason: unknown, promise: Promise<unknown>) => boolean>();
 
 /**
  * Register an interceptor consulted before an unhandled rejection tears the
  * process down. A consuming interceptor owns reporting and keeps the process alive.
  */
-export function interceptUnhandledRejections(interceptor: (reason: unknown) => boolean): () => void {
+export function interceptUnhandledRejections(
+	interceptor: (reason: unknown, promise: Promise<unknown>) => boolean,
+): () => void {
 	rejectionInterceptors.add(interceptor);
 	return () => rejectionInterceptors.delete(interceptor);
 }
@@ -485,7 +487,7 @@ if (isMainThread) {
 				Reason.UNCAUGHT_EXCEPTION,
 			);
 		})
-		.on("unhandledRejection", async reason => {
+		.on("unhandledRejection", async (reason, promise) => {
 			const err = reason instanceof Error ? reason : new Error(String(reason));
 			const brokenPipeSource = classifyBrokenPipe(err);
 			// EPIPE from an IPC `send()` (`syscall: "send"`) originates from a
@@ -512,7 +514,7 @@ if (isMainThread) {
 			}
 			for (const interceptor of rejectionInterceptors) {
 				try {
-					if (interceptor(reason)) return;
+					if (interceptor(reason, promise)) return;
 				} catch (interceptorErr) {
 					logger.warn("Unhandled-rejection interceptor threw; continuing with fatal path", {
 						err: interceptorErr,

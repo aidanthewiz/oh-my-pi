@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type RejectionInterceptor, WorkerCore } from "@oh-my-pi/pi-coding-agent/eval/js/worker-core";
-import { markEvalRunError } from "@oh-my-pi/pi-coding-agent/eval/js/shared/helpers";
 import type {
 	SessionSnapshot,
 	Transport,
@@ -468,110 +467,98 @@ describe("WorkerCore", () => {
 		}
 	});
 
-	it("keeps a finished cell's owned rejection away from another live run", async () => {
-		let rejectionHandler: ((reason: unknown) => boolean) | undefined;
+	it("attributes a reused error to the run that rejects its promise", async () => {
+		let rejectionHandler: ((reason: unknown, promise: Promise<unknown>) => boolean) | undefined;
 		const harness = createWorkerHarness("isolated", handler => {
 			rejectionHandler = handler;
 			return () => {
 				rejectionHandler = undefined;
 			};
 		});
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-eval-owner-"));
-		const snapshot = { cwd, sessionId: "eval-owner", localRoots: {} };
+		const snapshot = { cwd: process.cwd(), sessionId: "eval-reused-error", localRoots: {} };
 		await initializeWorker(harness, snapshot);
 
 		try {
-			const heldCall = waitForMessage(
+			const storeCall = waitForMessage(
 				harness,
-				message => message.type === "tool-call" && message.runId === "held-run",
+				message => message.type === "tool-call" && message.runId === "store-error-run",
 			);
-			const heldResult = waitForMessage(
+			const storeResult = waitForMessage(
 				harness,
-				message => message.type === "result" && message.runId === "held-run",
-			);
-			harness.send({
-				type: "run",
-				runId: "held-run",
-				code: 'await tool.hold({}); "released";',
-				filename: "[held-run].js",
-				snapshot,
-			});
-			const toolCall = await heldCall;
-			expect(toolCall.type).toBe("tool-call");
-
-			const lateResult = waitForMessage(
-				harness,
-				message => message.type === "result" && message.runId === "late-read-run",
-			);
-			const missingPath = path.join(cwd, "missing.txt");
-			harness.send({
-				type: "run",
-				runId: "late-read-run",
-				code: `globalThis.__omp_late_owner = (async () => {
-					await Bun.sleep(20);
-					try {
-						await read(${JSON.stringify(missingPath)});
-					} catch (error) {
-						return error[Symbol.for("omp.eval.runOwner")];
-					}
-				})(); "scheduled";`,
-				filename: "[late-read-run].js",
-				snapshot,
-			});
-			expect(await lateResult).toMatchObject({
-				type: "result",
-				runId: "late-read-run",
-				ok: true,
-			});
-
-			const ownerText = waitForMessage(
-				harness,
-				message => message.type === "text" && message.runId === "inspect-late-owner",
-			);
-			const ownerResult = waitForMessage(
-				harness,
-				message => message.type === "result" && message.runId === "inspect-late-owner",
+				message => message.type === "result" && message.runId === "store-error-run",
 			);
 			harness.send({
 				type: "run",
-				runId: "inspect-late-owner",
-				code: "await globalThis.__omp_late_owner;",
-				filename: "[inspect-late-owner].js",
+				runId: "store-error-run",
+				code: `try {
+					await tool.fail({});
+				} catch (error) {
+					globalThis.__omp_reused_error = error;
+				}
+				"stored";`,
+				filename: "[store-error-run].js",
 				snapshot,
 			});
-			expect(await ownerText).toMatchObject({ type: "text", chunk: "late-read-run\n" });
-			expect(await ownerResult).toMatchObject({
-				type: "result",
-				runId: "inspect-late-owner",
-				ok: true,
-			});
-
-			const finishedRejection = waitForMessage(
-				harness,
-				message =>
-					message.type === "log" &&
-					message.msg === "Unhandled rejection from a finished eval cell (missing await?)",
-			);
-			expect(rejectionHandler?.(markEvalRunError(new Error("late failure"), "late-read-run"))).toBe(true);
-			expect(await finishedRejection).toMatchObject({
-				type: "log",
-				meta: { runId: "late-read-run", filename: "[late-read-run].js" },
-			});
-
-			if (toolCall.type !== "tool-call") throw new Error("expected tool call");
+			const failedToolCall = await storeCall;
+			if (failedToolCall.type !== "tool-call") throw new Error("expected tool call");
 			harness.send({
 				type: "tool-reply",
-				id: toolCall.id,
-				reply: { ok: true, value: "released" },
+				id: failedToolCall.id,
+				reply: {
+					ok: false,
+					error: {
+						name: "ToolError",
+						message: "stored tool failure",
+						isToolError: true,
+					},
+				},
 			});
-			expect(await heldResult).toMatchObject({
+			expect(await storeResult).toMatchObject({
 				type: "result",
-				runId: "held-run",
+				runId: "store-error-run",
 				ok: true,
+			});
+
+			const reuseCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.runId === "reuse-error-run",
+			);
+			const reuseResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "reuse-error-run",
+			);
+			harness.send({
+				type: "run",
+				runId: "reuse-error-run",
+				code: `await tool.capture({
+					promise: Promise.reject(globalThis.__omp_reused_error),
+				});
+				"done";`,
+				filename: "[reuse-error-run].js",
+				snapshot,
+			});
+			const captureCall = await reuseCall;
+			if (captureCall.type !== "tool-call") throw new Error("expected tool call");
+			const rejectedPromise = Reflect.get(captureCall.args as object, "promise");
+			expect(rejectedPromise).toBeInstanceOf(Promise);
+			let reason: unknown;
+			await (rejectedPromise as Promise<unknown>).catch(error => {
+				reason = error;
+			});
+			expect(rejectionHandler?.(reason, rejectedPromise as Promise<unknown>)).toBe(true);
+			harness.send({
+				type: "tool-reply",
+				id: captureCall.id,
+				reply: { ok: true, value: "captured" },
+			});
+			expect(await reuseResult).toMatchObject({
+				type: "result",
+				runId: "reuse-error-run",
+				ok: false,
+				error: { message: "Unhandled rejection (missing await?): stored tool failure" },
 			});
 		} finally {
 			harness.send({ type: "close" });
-			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
 

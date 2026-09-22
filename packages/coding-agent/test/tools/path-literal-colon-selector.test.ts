@@ -147,6 +147,16 @@ describe("literal colon filename resolution (issue #4618)", () => {
 			expect(output).not.toMatch(/not found/i);
 		});
 
+		it("reads a literal file whose name ends in a zero selector", async () => {
+			const literal = path.join(tmpDir, "literal:0");
+			await Bun.write(literal, "zero suffix is literal\n");
+
+			const tool = new ReadTool(createSession());
+			const result = await tool.execute("read-literal-zero", { path: literal });
+
+			expect(getText(result)).toContain("zero suffix is literal");
+		});
+
 		it("reads a shell-escaped literal file whose name ends in a selector-shaped suffix", async () => {
 			await fs.mkdir(path.join(tmpDir, "dir"), { recursive: true });
 			await Bun.write(path.join(tmpDir, "dir", "a b:1-2"), "escaped literal read\n");

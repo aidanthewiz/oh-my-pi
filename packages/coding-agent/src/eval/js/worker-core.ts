@@ -1,5 +1,4 @@
 import { ToolError } from "../../tools/tool-errors";
-import { evalRunOwner, markEvalRunError } from "./shared/helpers";
 import { JsRuntime, type RuntimeHooks } from "./shared/runtime";
 import type {
 	RunErrorPayload,
@@ -44,7 +43,7 @@ function isKernelToolSpec(value: unknown): value is KernelToolSpec {
 
 type RunResult = Extract<WorkerOutbound, { type: "result" }>;
 
-export type RejectionInterceptor = (handler: (reason: unknown) => boolean) => () => void;
+export type RejectionInterceptor = (handler: (reason: unknown, promise: Promise<unknown>) => boolean) => () => void;
 
 export type WorkerCoreOptions =
 	| {
@@ -139,10 +138,12 @@ export class WorkerCore {
 	 */
 	#installRejectionGuard(): () => void {
 		if (this.#options.interceptUnhandledRejections) {
-			return this.#options.interceptUnhandledRejections(reason => this.#consumeRejection(reason));
+			return this.#options.interceptUnhandledRejections((reason, promise) =>
+				this.#consumeRejection(reason, promise),
+			);
 		}
-		const onRejection = (reason: unknown): void => {
-			if (this.#consumeRejection(reason)) return;
+		const onRejection = (reason: unknown, promise: Promise<unknown>): void => {
+			if (this.#consumeRejection(reason, promise)) return;
 			// Not cell-attributable: restore default fatality. Rethrowing from a
 			// timer surfaces it as an uncaught exception, which reaches the host
 			// as a worker `error` event exactly like an unhandled rejection did
@@ -163,22 +164,22 @@ export class WorkerCore {
 	 * downgrade to a host-side warn log. Returns false when the rejection is not
 	 * cell activity and must keep the default fatal path.
 	 */
-	#consumeRejection(reason: unknown): boolean {
-		const markedRunId = evalRunOwner(reason);
-		if (markedRunId) {
-			const owner = this.#runs.get(markedRunId);
+	#consumeRejection(reason: unknown, promise?: Promise<unknown>): boolean {
+		const promiseRunId = this.#runtime?.promiseRunOwner(promise);
+		if (promiseRunId) {
+			const owner = this.#runs.get(promiseRunId);
 			if (owner) {
 				owner.floatingRejections.push(reason);
 				return true;
 			}
-			const filename = this.#recentCells.get(markedRunId);
+			const filename = this.#recentCells.get(promiseRunId);
 			this.#transport.send({
 				type: "log",
 				level: "warn",
 				msg: filename
 					? "Unhandled rejection from a finished eval cell (missing await?)"
 					: "Unhandled rejection from an unknown finished eval cell",
-				meta: { runId: markedRunId, filename, error: errorPayload(reason) },
+				meta: { runId: promiseRunId, filename, error: errorPayload(reason) },
 			});
 			return true;
 		}
@@ -426,7 +427,7 @@ export class WorkerCore {
 			// No reply will ever arrive; fail this call instead of stranding a
 			// pending entry until close.
 			active.pendingTools.delete(id);
-			reject(markEvalRunError(error, active.runId));
+			reject(error);
 		}
 		return await promise;
 	}
@@ -437,7 +438,7 @@ export class WorkerCore {
 			if (!pending) continue;
 			active.pendingTools.delete(id);
 			if (reply.ok) pending.resolve(reply.value);
-			else pending.reject(markEvalRunError(errorFromPayload(reply.error), pending.runId));
+			else pending.reject(errorFromPayload(reply.error));
 			return;
 		}
 	}
@@ -445,7 +446,7 @@ export class WorkerCore {
 	#close(): void {
 		for (const active of this.#runs.values()) {
 			for (const pending of active.pendingTools.values()) {
-				pending.reject(markEvalRunError(new ToolError("JS worker closed"), pending.runId));
+				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
 		}
@@ -461,7 +462,7 @@ export class WorkerCore {
 	dispose(): void {
 		for (const active of this.#runs.values()) {
 			for (const pending of active.pendingTools.values()) {
-				pending.reject(markEvalRunError(new ToolError("JS worker closed"), pending.runId));
+				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
 		}

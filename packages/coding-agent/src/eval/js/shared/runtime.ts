@@ -1,4 +1,4 @@
-import { AsyncLocalStorage } from "node:async_hooks";
+import { type AsyncHook, AsyncLocalStorage, createHook } from "node:async_hooks";
 import { Console } from "node:console";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
@@ -201,6 +201,8 @@ export class JsRuntime {
 	readonly sessionId: string;
 	#env: Map<string, string>;
 	#als = new AsyncLocalStorage<RunContext>();
+	#promiseOwners = new WeakMap<Promise<unknown>, string>();
+	#promiseOwnershipHook: AsyncHook;
 	#moduleLoader: LocalModuleLoader;
 	#localRoots: Record<string, string>;
 
@@ -211,18 +213,29 @@ export class JsRuntime {
 		this.#env = new Map();
 		this.#moduleLoader = new LocalModuleLoader(this.sessionId);
 		this.#localRoots = opts.localRoots ?? {};
+		this.#promiseOwnershipHook = createHook({
+			init: (_asyncId, type, _triggerAsyncId, resource) => {
+				if (type !== "PROMISE" || !(resource instanceof Promise)) return;
+				const runId = this.#als.getStore()?.runId;
+				if (runId) this.#promiseOwners.set(resource, runId);
+			},
+		});
 		this.helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
-			runId: () => this.#als.getStore()?.runId,
 			env: this.#env,
 			localRoots: () => this.#localRoots,
 			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),
 		});
 		this.#install(opts.extraGlobals);
+		this.#promiseOwnershipHook.enable();
 	}
 
 	get cwd(): string {
 		return this.#cwd;
+	}
+
+	promiseRunOwner(promise: Promise<unknown> | undefined): string | undefined {
+		return promise ? this.#promiseOwners.get(promise) : undefined;
 	}
 
 	setCwd(cwd: string): void {
@@ -546,6 +559,7 @@ export class JsRuntime {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#promiseOwnershipHook.disable();
 		RUN_HOOK_RESOLVERS.delete(this.#runHookResolver);
 		for (const key of this.#ownedGlobalKeys) releaseGlobalKey(key, this.#globalOwner);
 		this.#ownedGlobalKeys.clear();
