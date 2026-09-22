@@ -657,6 +657,98 @@ describe("WorkerCore", () => {
 		}
 	});
 
+	it("keeps cells and tool invocations alive for delayed bridge failures", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const registered = waitForMessage(message => message.type === "result" && message.runId === "register-delayed");
+send({
+	type: "run", runId: "register-delayed", snapshot, filename: "[register-delayed].js",
+	code: 'tool(() => { void tool.remote({}); return "success"; }, { name: "delayed" });',
+});
+await registered;
+const outcomes = [];
+for (const mode of ["cell", "invocation"]) {
+	const runId = "delayed-" + mode;
+	const called = waitForMessage(message => message.type === "tool-call" && message.runId === runId);
+	const completed = waitForMessage(message => message.type === "result" && message.runId === runId);
+	send(mode === "cell"
+		? { type: "run", runId, snapshot, filename: "[delayed-cell].js", code: "void tool.remote({});" }
+		: { type: "tool", runId, op: "call", name: "delayed", args: {} });
+	const call = await called;
+	const barrierId = runId + "-barrier";
+	const barrier = waitForMessage(message => message.type === "result" && message.runId === barrierId);
+	send({ type: "run", runId: barrierId, snapshot, filename: "[barrier].js", code: "undefined;" });
+	await barrier;
+	const premature = outbound.some(message => message.runId === runId &&
+		(message.type === "result" || (message.type === "display" && message.output.type === "json")));
+	send({ type: "tool-reply", id: call.id, reply: { ok: false, error: { message: "delayed host failure" } } });
+	const result = await completed;
+	outcomes.push({
+		mode, premature, ok: result.ok, error: result.error?.message,
+		successDisplay: outbound.some(message => message.runId === runId &&
+			message.type === "display" && message.output.type === "json"),
+	});
+}
+await finish(outcomes, outcomes.every(result => !result.premature && !result.ok && !result.successDisplay));
+`);
+		expect(output).toEqual(
+			["cell", "invocation"].map(mode => ({
+				mode,
+				premature: false,
+				ok: false,
+				error: "Unhandled rejection (missing await?): delayed host failure",
+				successDisplay: false,
+			})),
+		);
+		expect(exitCode).toBe(0);
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+	});
+
+	it("drains bridge calls started by reply continuations before completing", async () => {
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "chained-bridge-drain", localRoots: {} };
+		await initializeWorker(harness, snapshot);
+		const messages: WorkerOutbound[] = [];
+		const unsubscribe = harness.onMessage(message => messages.push(message));
+		try {
+			const firstCall = waitForMessage(harness, message => message.type === "tool-call" && message.name === "first");
+			const secondCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.name === "second",
+			);
+			const completed = waitForMessage(harness, message => message.type === "result" && message.runId === "chain");
+			harness.send({
+				type: "run",
+				runId: "chain",
+				snapshot,
+				filename: "[chain].js",
+				code: 'void tool.first({}).then(() => tool.second({})).catch(() => display("recovered"));',
+			});
+			const first = await firstCall;
+			if (first.type !== "tool-call") throw new Error("expected first tool call");
+			harness.send({ type: "tool-reply", id: first.id, reply: { ok: true, value: null } });
+			const second = await secondCall;
+			if (second.type !== "tool-call") throw new Error("expected second tool call");
+			const barrier = waitForMessage(harness, message => message.type === "result" && message.runId === "barrier");
+			harness.send({ type: "run", runId: "barrier", snapshot, filename: "[barrier].js", code: "undefined;" });
+			await barrier;
+			expect(messages.some(message => message.type === "result" && message.runId === "chain")).toBe(false);
+			harness.send({
+				type: "tool-reply",
+				id: second.id,
+				reply: { ok: false, error: { message: "handled failure" } },
+			});
+			expect(await completed).toMatchObject({ type: "result", runId: "chain", ok: true });
+			expect(messages).toContainEqual({
+				type: "text",
+				runId: "chain",
+				chunk: "recovered\n",
+			});
+		} finally {
+			unsubscribe();
+			harness.send({ type: "close" });
+		}
+	});
+
 	it("fails a tool invocation with a floated read rejection before displaying success", async () => {
 		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
 const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");

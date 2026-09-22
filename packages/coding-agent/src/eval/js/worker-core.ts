@@ -19,6 +19,7 @@ interface ActiveRun {
 	runId: string;
 	filename: string;
 	pendingTools: Map<string, PendingTool>;
+	toolDrain?: PromiseWithResolvers<void>;
 	/** Rejections floated by this run's cell code, captured before its result was sent. */
 	floatingRejections: unknown[];
 }
@@ -337,10 +338,7 @@ export class WorkerCore {
 			result = { type: "result", runId, ok: false, error: errorPayload(error) };
 		}
 		try {
-			// One event-loop turn so rejections the cell already floated surface
-			// while this run can still own them (rejection callbacks run before
-			// timers fire).
-			await Bun.sleep(0);
+			await this.#drainTools(active);
 			result = foldFloatingRejections(active, result, hooks);
 		} finally {
 			this.#runs.delete(runId);
@@ -403,9 +401,7 @@ export class WorkerCore {
 			result = { type: "result", runId: msg.runId, ok: false, error: errorPayload(error) };
 		}
 		try {
-			// Match cell runs: allow rejection callbacks from floated tool work to
-			// settle before exposing a successful invocation envelope.
-			await Bun.sleep(0);
+			await this.#drainTools(active);
 			result = foldFloatingRejections(active, result, hooks);
 			if (result.ok && envelope) {
 				this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
@@ -415,6 +411,23 @@ export class WorkerCore {
 			this.#rememberCell(msg.runId, active.filename);
 			this.#transport.send(result);
 		}
+	}
+
+	async #drainTools(active: ActiveRun): Promise<void> {
+		do {
+			if (active.pendingTools.size > 0) {
+				active.toolDrain ??= Promise.withResolvers<void>();
+				await active.toolDrain.promise;
+			}
+			// Reply continuations can start more calls or float rejections.
+			await Bun.sleep(0);
+		} while (active.pendingTools.size > 0);
+	}
+
+	#notifyToolDrain(active: ActiveRun): void {
+		if (active.pendingTools.size > 0) return;
+		active.toolDrain?.resolve();
+		active.toolDrain = undefined;
 	}
 
 	#rememberCell(runId: string, filename: string): void {
@@ -438,6 +451,7 @@ export class WorkerCore {
 			// pending entry until close.
 			active.pendingTools.delete(id);
 			reject(error);
+			this.#notifyToolDrain(active);
 		}
 		return await promise;
 	}
@@ -449,6 +463,7 @@ export class WorkerCore {
 			active.pendingTools.delete(id);
 			if (reply.ok) pending.resolve(reply.value);
 			else pending.reject(errorFromPayload(reply.error));
+			this.#notifyToolDrain(active);
 			return;
 		}
 	}
@@ -459,6 +474,7 @@ export class WorkerCore {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
+			this.#notifyToolDrain(active);
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();
@@ -475,6 +491,7 @@ export class WorkerCore {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
+			this.#notifyToolDrain(active);
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();
