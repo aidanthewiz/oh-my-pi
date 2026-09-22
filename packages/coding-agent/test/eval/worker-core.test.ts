@@ -94,6 +94,100 @@ function installFatalCapture(): {
 	};
 }
 
+async function runWorkerCoreRejectionProbe(
+	scenario: string,
+): Promise<{ output: unknown; stderr: string; exitCode: number }> {
+	const workerCoreUrl = pathToFileURL(path.resolve(import.meta.dir, "../../src/eval/js/worker-core.ts")).href;
+	const postmortemUrl = pathToFileURL(path.resolve(import.meta.dir, "../../../utils/src/postmortem.ts")).href;
+	const probe = `const { WorkerCore } = await import(${JSON.stringify(workerCoreUrl)});
+const postmortem = await import(${JSON.stringify(postmortemUrl)});
+
+const outbound = [];
+const inbound = new Set();
+const waiters = new Set();
+const transport = {
+	send(message) {
+		outbound.push(message);
+		for (const waiter of [...waiters]) {
+			if (!waiter.predicate(message)) continue;
+			waiters.delete(waiter);
+			waiter.resolve(message);
+		}
+	},
+	onMessage(handler) {
+		inbound.add(handler);
+		return () => inbound.delete(handler);
+	},
+	close() {},
+};
+const send = message => queueMicrotask(() => {
+	for (const handler of inbound) handler(message);
+});
+const waitForMessage = predicate => {
+	const deferred = Promise.withResolvers();
+	waiters.add({ predicate, resolve: deferred.resolve });
+	return deferred.promise;
+};
+let rejectionSeen = Promise.withResolvers();
+const waitForRejection = () => rejectionSeen.promise;
+const resetRejection = () => {
+	rejectionSeen = Promise.withResolvers();
+};
+const core = new WorkerCore(transport, {
+	mode: "isolated",
+	interceptUnhandledRejections(handler) {
+		return postmortem.interceptUnhandledRejections((reason, promise) => {
+			const consumed = handler(reason, promise);
+			rejectionSeen.resolve();
+			return consumed;
+		});
+	},
+});
+const snapshot = { cwd: process.cwd(), sessionId: "eval-rejection-ownership", localRoots: {} };
+const ready = waitForMessage(message => message.type === "ready");
+send({ type: "init", snapshot });
+await ready;
+const finish = async (result, success) => {
+	const closed = waitForMessage(message => message.type === "closed");
+	send({ type: "close" });
+	await closed;
+	console.log(JSON.stringify(result));
+	process.exit(success ? 0 : 1);
+};
+
+${scenario}
+`;
+
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rejection-ownership-"));
+	const probePath = path.join(root, "probe.ts");
+	try {
+		await Bun.write(probePath, probe);
+		const proc = Bun.spawn([process.execPath, probePath], {
+			cwd: process.cwd(),
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env },
+		});
+		const watchdog = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {}
+		}, 5000);
+		try {
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			return { output: JSON.parse(stdout.trim()), stderr, exitCode };
+		} finally {
+			clearTimeout(watchdog);
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}
+
 describe("WorkerCore", () => {
 	it("reports same-realm cwd conflicts through the worker protocol", async () => {
 		const first = createWorkerHarness();
@@ -563,53 +657,7 @@ describe("WorkerCore", () => {
 	});
 
 	it("keeps a delayed helper rejection with its finished run while another run is live", async () => {
-		const workerCoreUrl = pathToFileURL(path.resolve(import.meta.dir, "../../src/eval/js/worker-core.ts")).href;
-		const postmortemUrl = pathToFileURL(path.resolve(import.meta.dir, "../../../utils/src/postmortem.ts")).href;
-		const probe = `const { WorkerCore } = await import(${JSON.stringify(workerCoreUrl)});
-const postmortem = await import(${JSON.stringify(postmortemUrl)});
-
-const outbound = [];
-const inbound = new Set();
-const waiters = new Set();
-const transport = {
-	send(message) {
-		outbound.push(message);
-		for (const waiter of [...waiters]) {
-			if (!waiter.predicate(message)) continue;
-			waiters.delete(waiter);
-			waiter.resolve(message);
-		}
-	},
-	onMessage(handler) {
-		inbound.add(handler);
-		return () => inbound.delete(handler);
-	},
-	close() {},
-};
-const send = message => queueMicrotask(() => {
-	for (const handler of inbound) handler(message);
-});
-const waitForMessage = predicate => {
-	const deferred = Promise.withResolvers();
-	waiters.add({ predicate, resolve: deferred.resolve });
-	return deferred.promise;
-};
-const rejectionSeen = Promise.withResolvers();
-const core = new WorkerCore(transport, {
-	mode: "isolated",
-	interceptUnhandledRejections(handler) {
-		return postmortem.interceptUnhandledRejections((reason, promise) => {
-			const consumed = handler(reason, promise);
-			rejectionSeen.resolve();
-			return consumed;
-		});
-	},
-});
-const snapshot = { cwd: process.cwd(), sessionId: "eval-delayed-rejection", localRoots: {} };
-const ready = waitForMessage(message => message.type === "ready");
-send({ type: "init", snapshot });
-await ready;
-
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
 globalThis.__omp_late_read_release = false;
 const liveRelease = Promise.withResolvers();
 const liveEntered = Promise.withResolvers();
@@ -642,7 +690,7 @@ send({
 	snapshot,
 });
 await liveEntered.promise;
-await rejectionSeen.promise;
+await waitForRejection();
 liveRelease.resolve();
 const live = await liveResult;
 const warning = outbound.find(message =>
@@ -651,49 +699,75 @@ const warning = outbound.find(message =>
 	message.meta?.runId === "delayed-owner"
 );
 
-const closed = waitForMessage(message => message.type === "closed");
-send({ type: "close" });
-await closed;
 clearInterval(globalThis.__omp_late_read_timer);
 delete globalThis.__omp_late_read_release;
 delete globalThis.__omp_late_read_timer;
 delete globalThis.__omp_live_run;
 const result = { ownerOk: owner.ok, liveOk: live.ok, warning: Boolean(warning) };
-console.log(JSON.stringify(result));
-process.exit(result.ownerOk && result.liveOk && result.warning ? 0 : 1);
-`;
+await finish(result, result.ownerOk && result.liveOk && result.warning);
+`);
 
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-delayed-rejection-"));
-		const probePath = path.join(root, "probe.ts");
-		try {
-			await Bun.write(probePath, probe);
-			const proc = Bun.spawn([process.execPath, probePath], {
-				cwd: process.cwd(),
-				stdout: "pipe",
-				stderr: "pipe",
-				env: { ...process.env },
-			});
-			const watchdog = setTimeout(() => {
-				try {
-					proc.kill("SIGKILL");
-				} catch {}
-			}, 5000);
-			try {
-				const [stdout, stderr, exitCode] = await Promise.all([
-					new Response(proc.stdout).text(),
-					new Response(proc.stderr).text(),
-					proc.exited,
-				]);
-				expect(exitCode).toBe(0);
-				expect(JSON.parse(stdout.trim())).toEqual({ ownerOk: true, liveOk: true, warning: true });
-				expect(stderr).not.toContain("[Unhandled Rejection]");
-				expect(stderr).not.toContain("[Uncaught Exception]");
-			} finally {
-				clearTimeout(watchdog);
-			}
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		expect(exitCode).toBe(0);
+		expect(output).toEqual({ ownerOk: true, liveOk: true, warning: true });
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("[Uncaught Exception]");
+	});
+
+	it("assigns a cross-cell continuation to the run that attaches it", async () => {
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const ownerResult = waitForMessage(message => message.type === "result" && message.runId === "continuation-owner");
+send({
+	type: "run",
+	runId: "continuation-owner",
+	code: 'globalThis.__omp_cross_cell_root = read("package.json");' +
+		'await globalThis.__omp_cross_cell_root;' +
+		'"stored";',
+	filename: "[continuation-owner].js",
+	snapshot,
+});
+const owner = await ownerResult;
+
+const liveRelease = Promise.withResolvers();
+const liveEntered = Promise.withResolvers();
+globalThis.__omp_continuation_live = { entered: () => liveEntered.resolve(), release: liveRelease.promise };
+const liveResult = waitForMessage(message => message.type === "result" && message.runId === "continuation-attacher");
+send({
+	type: "run",
+	runId: "continuation-attacher",
+	code: 'globalThis.__omp_continuation_live.entered();' +
+		'void globalThis.__omp_cross_cell_root.then(() => {' +
+			'throw new Error("cross-cell continuation");' +
+		'});' +
+		'await globalThis.__omp_continuation_live.release;' +
+		'"unrelated";',
+	filename: "[continuation-attacher].js",
+	snapshot,
+});
+await liveEntered.promise;
+await waitForRejection();
+liveRelease.resolve();
+const live = await liveResult;
+const ownerWarning = outbound.some(message =>
+	message.type === "log" &&
+	message.msg === "Unhandled rejection from a finished eval cell (missing await?)" &&
+	message.meta?.runId === "continuation-owner"
+);
+
+delete globalThis.__omp_cross_cell_root;
+delete globalThis.__omp_continuation_live;
+const expectedMessage = "Unhandled rejection (missing await?): cross-cell continuation";
+const result = {
+	ownerOk: owner.ok,
+	attacherFailed: !live.ok && live.error?.message === expectedMessage,
+	ownerWarning,
+};
+await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWarning);
+`);
+
+		expect(exitCode).toBe(0);
+		expect(output).toEqual({ ownerOk: true, attacherFailed: true, ownerWarning: false });
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("[Uncaught Exception]");
 	});
 
 	it("survives concurrent same-realm setCwd in a child process with postmortem loaded", async () => {

@@ -239,7 +239,7 @@ export class JsRuntime {
 		const originalCatch = tracked.catch.bind(promise);
 		const originalFinally = tracked.finally.bind(promise);
 		const trackContinuation = (method: PromiseMethod, args: unknown[]): Promise<unknown> =>
-			this.#trackPromise(method(...args), runId);
+			this.#trackPromise(method(...args), this.#als.getStore()?.runId ?? runId);
 		Object.defineProperties(promise, {
 			// oxlint-disable-next-line unicorn/no-thenable -- native Promise continuation override preserves run ownership
 			then: {
