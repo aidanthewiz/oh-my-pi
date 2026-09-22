@@ -562,6 +562,140 @@ describe("WorkerCore", () => {
 		}
 	});
 
+	it("keeps a delayed helper rejection with its finished run while another run is live", async () => {
+		const workerCoreUrl = pathToFileURL(path.resolve(import.meta.dir, "../../src/eval/js/worker-core.ts")).href;
+		const postmortemUrl = pathToFileURL(path.resolve(import.meta.dir, "../../../utils/src/postmortem.ts")).href;
+		const probe = `const { WorkerCore } = await import(${JSON.stringify(workerCoreUrl)});
+const postmortem = await import(${JSON.stringify(postmortemUrl)});
+
+const outbound = [];
+const inbound = new Set();
+const waiters = new Set();
+const transport = {
+	send(message) {
+		outbound.push(message);
+		for (const waiter of [...waiters]) {
+			if (!waiter.predicate(message)) continue;
+			waiters.delete(waiter);
+			waiter.resolve(message);
+		}
+	},
+	onMessage(handler) {
+		inbound.add(handler);
+		return () => inbound.delete(handler);
+	},
+	close() {},
+};
+const send = message => queueMicrotask(() => {
+	for (const handler of inbound) handler(message);
+});
+const waitForMessage = predicate => {
+	const deferred = Promise.withResolvers();
+	waiters.add({ predicate, resolve: deferred.resolve });
+	return deferred.promise;
+};
+const rejectionSeen = Promise.withResolvers();
+const core = new WorkerCore(transport, {
+	mode: "isolated",
+	interceptUnhandledRejections(handler) {
+		return postmortem.interceptUnhandledRejections((reason, promise) => {
+			const consumed = handler(reason, promise);
+			rejectionSeen.resolve();
+			return consumed;
+		});
+	},
+});
+const snapshot = { cwd: process.cwd(), sessionId: "eval-delayed-rejection", localRoots: {} };
+const ready = waitForMessage(message => message.type === "ready");
+send({ type: "init", snapshot });
+await ready;
+
+globalThis.__omp_late_read_release = false;
+const liveRelease = Promise.withResolvers();
+const liveEntered = Promise.withResolvers();
+globalThis.__omp_live_run = { entered: () => liveEntered.resolve(), release: liveRelease.promise };
+
+const ownerResult = waitForMessage(message => message.type === "result" && message.runId === "delayed-owner");
+const missingPath = process.cwd() + "/omp-missing-" + crypto.randomUUID();
+send({
+	type: "run",
+	runId: "delayed-owner",
+	code: 'globalThis.__omp_late_read_timer = setInterval(() => {' +
+		'if (!globalThis.__omp_late_read_release) return;' +
+		'clearInterval(globalThis.__omp_late_read_timer);' +
+		'void read(' + JSON.stringify(missingPath) + ');' +
+		'}, 1); "scheduled";',
+	filename: "[delayed-owner].js",
+	snapshot,
+});
+const owner = await ownerResult;
+
+const liveResult = waitForMessage(message => message.type === "result" && message.runId === "unrelated-live-run");
+send({
+	type: "run",
+	runId: "unrelated-live-run",
+	code: 'globalThis.__omp_live_run.entered();' +
+		'globalThis.__omp_late_read_release = true;' +
+		'await globalThis.__omp_live_run.release;' +
+		'"unrelated";',
+	filename: "[unrelated-live-run].js",
+	snapshot,
+});
+await liveEntered.promise;
+await rejectionSeen.promise;
+liveRelease.resolve();
+const live = await liveResult;
+const warning = outbound.find(message =>
+	message.type === "log" &&
+	message.msg === "Unhandled rejection from a finished eval cell (missing await?)" &&
+	message.meta?.runId === "delayed-owner"
+);
+
+const closed = waitForMessage(message => message.type === "closed");
+send({ type: "close" });
+await closed;
+clearInterval(globalThis.__omp_late_read_timer);
+delete globalThis.__omp_late_read_release;
+delete globalThis.__omp_late_read_timer;
+delete globalThis.__omp_live_run;
+const result = { ownerOk: owner.ok, liveOk: live.ok, warning: Boolean(warning) };
+console.log(JSON.stringify(result));
+process.exit(result.ownerOk && result.liveOk && result.warning ? 0 : 1);
+`;
+
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-delayed-rejection-"));
+		const probePath = path.join(root, "probe.ts");
+		try {
+			await Bun.write(probePath, probe);
+			const proc = Bun.spawn([process.execPath, probePath], {
+				cwd: process.cwd(),
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env },
+			});
+			const watchdog = setTimeout(() => {
+				try {
+					proc.kill("SIGKILL");
+				} catch {}
+			}, 5000);
+			try {
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				expect(exitCode).toBe(0);
+				expect(JSON.parse(stdout.trim())).toEqual({ ownerOk: true, liveOk: true, warning: true });
+				expect(stderr).not.toContain("[Unhandled Rejection]");
+				expect(stderr).not.toContain("[Uncaught Exception]");
+			} finally {
+				clearTimeout(watchdog);
+			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("survives concurrent same-realm setCwd in a child process with postmortem loaded", async () => {
 		// Process-level oracle: the production crash was postmortem killing the process
 		// after an unhandled rejection from concurrent inline setCwd. This must stay green

@@ -1,4 +1,4 @@
-import { type AsyncHook, AsyncLocalStorage, createHook } from "node:async_hooks";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Console } from "node:console";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
@@ -202,7 +202,6 @@ export class JsRuntime {
 	#env: Map<string, string>;
 	#als = new AsyncLocalStorage<RunContext>();
 	#promiseOwners = new WeakMap<Promise<unknown>, string>();
-	#promiseOwnershipHook: AsyncHook;
 	#moduleLoader: LocalModuleLoader;
 	#localRoots: Record<string, string>;
 
@@ -213,13 +212,6 @@ export class JsRuntime {
 		this.#env = new Map();
 		this.#moduleLoader = new LocalModuleLoader(this.sessionId);
 		this.#localRoots = opts.localRoots ?? {};
-		this.#promiseOwnershipHook = createHook({
-			init: (_asyncId, type, _triggerAsyncId, resource) => {
-				if (type !== "PROMISE" || !(resource instanceof Promise)) return;
-				const runId = this.#als.getStore()?.runId;
-				if (runId) this.#promiseOwners.set(resource, runId);
-			},
-		});
 		this.helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
 			env: this.#env,
@@ -227,7 +219,6 @@ export class JsRuntime {
 			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),
 		});
 		this.#install(opts.extraGlobals);
-		this.#promiseOwnershipHook.enable();
 	}
 
 	get cwd(): string {
@@ -236,6 +227,38 @@ export class JsRuntime {
 
 	promiseRunOwner(promise: Promise<unknown> | undefined): string | undefined {
 		return promise ? this.#promiseOwners.get(promise) : undefined;
+	}
+
+	#trackPromise<T>(promise: Promise<T>, runId = this.#als.getStore()?.runId): Promise<T> {
+		if (!runId || this.#promiseOwners.has(promise)) return promise;
+		this.#promiseOwners.set(promise, runId);
+
+		type PromiseMethod = (...args: unknown[]) => Promise<unknown>;
+		const tracked = promise as unknown as Record<"then" | "catch" | "finally", PromiseMethod>;
+		const originalThen = tracked.then.bind(promise);
+		const originalCatch = tracked.catch.bind(promise);
+		const originalFinally = tracked.finally.bind(promise);
+		const trackContinuation = (method: PromiseMethod, args: unknown[]): Promise<unknown> =>
+			this.#trackPromise(method(...args), runId);
+		Object.defineProperties(promise, {
+			// oxlint-disable-next-line unicorn/no-thenable -- native Promise continuation override preserves run ownership
+			then: {
+				configurable: true,
+				writable: true,
+				value: (...args: unknown[]) => trackContinuation(originalThen, args),
+			},
+			catch: {
+				configurable: true,
+				writable: true,
+				value: (...args: unknown[]) => trackContinuation(originalCatch, args),
+			},
+			finally: {
+				configurable: true,
+				writable: true,
+				value: (...args: unknown[]) => trackContinuation(originalFinally, args),
+			},
+		});
+		return promise;
 	}
 
 	setCwd(cwd: string): void {
@@ -468,29 +491,42 @@ export class JsRuntime {
 		const injected: Record<string, unknown> = {
 			__omp_session__: this.#session,
 			__omp_helpers__: this.helpers,
-			__omp_call_tool__: async (name: string, args: unknown) => {
-				const hooks = this.#activeHooks("tool");
-				if (!hooks) return undefined;
-				return surfaceBridgedToolImages(await hooks.callTool(name, args), hooks);
-			},
-			__omp_prelude__: async (name: string, parameters: unknown) => {
-				const hooks = this.#activeHooks("prelude");
-				if (!hooks) return undefined;
-				const payload = { name, parameters };
-				return surfaceBridgedToolImages(await hooks.callTool("__prelude__", payload), hooks);
-			},
-			__omp_import__: async (source: string, options?: ImportCallOptions) => {
-				const resolved = await this.#moduleLoader.resolveForRun(this.#activeCwd(), source);
-				if (resolved.mode === "local") return resolved.value;
-				const target = resolved.target;
-				return options !== undefined ? await import(target, options) : await import(target);
-			},
-			__omp_import_from__: async (moduleUrl: string, source: string, options?: ImportCallOptions) => {
-				const resolved = await this.#moduleLoader.resolveForModule(moduleUrl, source, this.#activeCwd());
-				if (resolved.mode === "local") return resolved.value;
-				const target = resolved.target;
-				return options !== undefined ? await import(target, options) : await import(target);
-			},
+			__omp_track_promise__: (promise: Promise<unknown>) => this.#trackPromise(promise),
+			__omp_call_tool__: (name: string, args: unknown) =>
+				this.#trackPromise(
+					(async () => {
+						const hooks = this.#activeHooks("tool");
+						if (!hooks) return undefined;
+						return surfaceBridgedToolImages(await hooks.callTool(name, args), hooks);
+					})(),
+				),
+			__omp_prelude__: (name: string, parameters: unknown) =>
+				this.#trackPromise(
+					(async () => {
+						const hooks = this.#activeHooks("prelude");
+						if (!hooks) return undefined;
+						const payload = { name, parameters };
+						return surfaceBridgedToolImages(await hooks.callTool("__prelude__", payload), hooks);
+					})(),
+				),
+			__omp_import__: (source: string, options?: ImportCallOptions) =>
+				this.#trackPromise(
+					(async () => {
+						const resolved = await this.#moduleLoader.resolveForRun(this.#activeCwd(), source);
+						if (resolved.mode === "local") return resolved.value;
+						const target = resolved.target;
+						return options !== undefined ? await import(target, options) : await import(target);
+					})(),
+				),
+			__omp_import_from__: (moduleUrl: string, source: string, options?: ImportCallOptions) =>
+				this.#trackPromise(
+					(async () => {
+						const resolved = await this.#moduleLoader.resolveForModule(moduleUrl, source, this.#activeCwd());
+						if (resolved.mode === "local") return resolved.value;
+						const target = resolved.target;
+						return options !== undefined ? await import(target, options) : await import(target);
+					})(),
+				),
 			__omp_get_require__: (moduleUrl?: string) => this.#activeRequire(moduleUrl),
 			__omp_get_filename__: (moduleUrl?: string) => this.#moduleFilename(moduleUrl),
 			__omp_get_dirname__: (moduleUrl?: string) => this.#moduleDirname(moduleUrl),
@@ -559,7 +595,6 @@ export class JsRuntime {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#promiseOwnershipHook.disable();
 		RUN_HOOK_RESOLVERS.delete(this.#runHookResolver);
 		for (const key of this.#ownedGlobalKeys) releaseGlobalKey(key, this.#globalOwner);
 		this.#ownedGlobalKeys.clear();
