@@ -1,8 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import { isRecord, readJsonl } from "@oh-my-pi/pi-utils";
+import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 
 async function expectRpcOwnsStdin(): Promise<void> {
+	using tempDir = TempDir.createSync("@omp-rpc-stdin-lock-");
+	const env: Record<string, string | undefined> = {
+		...Bun.env,
+		HOME: tempDir.join("home"),
+		PI_CODING_AGENT_DIR: tempDir.join("agent"),
+		PI_NO_TITLE: "1",
+		XDG_CACHE_HOME: tempDir.join("xdg-cache"),
+		XDG_CONFIG_HOME: tempDir.join("xdg-config"),
+		XDG_DATA_HOME: tempDir.join("xdg-data"),
+		XDG_STATE_HOME: tempDir.join("xdg-state"),
+	};
+	for (const key of ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CONFIG_FILES"]) {
+		delete env[key];
+	}
 	const cliPath = path.join(import.meta.dir, "..", "src", "cli.ts");
 	const extensionPath = path.join(import.meta.dir, "fixtures", "locked-stdin-reader.ts");
 	const child = Bun.spawn(
@@ -20,7 +34,7 @@ async function expectRpcOwnsStdin(): Promise<void> {
 		],
 		{
 			cwd: path.join(import.meta.dir, ".."),
-			env: { ...Bun.env, PI_NO_TITLE: "1" },
+			env,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
