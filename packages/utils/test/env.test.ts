@@ -241,6 +241,45 @@ describe("filterChildShellEnv", () => {
 			nodeEnv: "production",
 		});
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"keeps filtering after the process working directory is deleted",
+		async () => {
+			const cwd = path.dirname(writeTempEnv(""));
+			const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+			const dirsModulePath = path.join(import.meta.dir, "..", "src", "dirs.ts");
+			const script = [
+				'import * as fs from "node:fs";',
+				`import { filterChildShellEnv } from ${JSON.stringify(envModulePath)};`,
+				`import { getProjectDir } from ${JSON.stringify(dirsModulePath)};`,
+				"getProjectDir();",
+				"fs.rmSync(process.cwd(), { recursive: true });",
+				'const child = filterChildShellEnv({ UNCHANGED: "parent-value" });',
+				"process.stdout.write(JSON.stringify(child));",
+			].join("\n");
+			const proc = Bun.spawn([process.execPath, "--no-install", "--eval", script], {
+				cwd,
+				env: { PATH: process.env.PATH },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+
+			expect(exitCode, stderr).toBe(0);
+			expect(JSON.parse(stdout)).toEqual({
+				UNCHANGED: "parent-value",
+				AWS_CONFIG_FILE: os.devNull,
+				AWS_SHARED_CREDENTIALS_FILE: os.devNull,
+				AWS_EC2_METADATA_DISABLED: "true",
+				BUN_OPTIONS: "--no-env-file",
+				OMP_NO_ENV_FILE: "1",
+			});
+		},
+	);
 });
 
 describe("isBunTestRuntime", () => {
