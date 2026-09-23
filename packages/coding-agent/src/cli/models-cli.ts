@@ -2,8 +2,8 @@
  * `omp models` — list, search, and refresh available models.
  *
  * Subcommands:
- * - `ls` (default): list every available model grouped by provider.
- * - `find <substring>`: list models whose provider, id, or name contains the substring.
+ * - `ls` (default): list available chat models grouped by provider.
+ * - `find <substring>`: list models of the selected kind whose provider, id, or name contains the substring.
  * - `refresh`: force an online catalog re-fetch (ignoring the model cache TTL),
  *   then list. This is the supported replacement for `rm -rf ~/.omp/models.db`
  *   when a provider ships a new model that the 24h cache has not picked up yet.
@@ -14,11 +14,12 @@
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { ConfigError } from "../config/config-file";
 import { ModelRegistry, type ProviderDiscoveryStatus } from "../config/model-registry";
-import { getAllowedAvailableModels } from "../config/model-resolver";
+import { filterModelsByConfiguredScope } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
 import {
@@ -39,6 +40,8 @@ export interface ModelsCommandArgs {
 	pattern?: string;
 	flags: {
 		json?: boolean;
+		/** Catalog kind to list; defaults to chat models. */
+		kind?: ModelKind | "all";
 		/** CLI `-e <path>` extension paths to load before listing (issue #905). */
 		extensions?: string[];
 		/** Skip extension discovery; only load explicit `extensions`. */
@@ -74,6 +77,7 @@ export function resolveModelsArgs(
 
 interface ModelJson {
 	provider: string;
+	kind: ModelKind;
 	id: string;
 	selector: string;
 	name: string;
@@ -122,6 +126,7 @@ function byProviderThenId(left: Model<Api>, right: Model<Api>): number {
 function toModelJson(model: Model<Api>): ModelJson {
 	return {
 		provider: model.provider,
+		kind: modelKind(model),
 		id: model.id,
 		selector: `${model.provider}/${model.id}`,
 		name: model.name,
@@ -186,19 +191,24 @@ function boxTable(columns: BoxColumn[], rows: string[][]): string[] {
  * exercised without booting a full {@link ModelRegistry}.
  */
 export interface ModelsListingSource {
-	getAvailable(): Model<Api>[];
+	/** Return models available for the selected catalog kind, or every kind for `all`. */
+	getAvailable(kind?: ModelKind | "all"): Model<Api>[];
 	getError(): ConfigError | undefined;
 	getProviderDiscoveryStates?(): Array<{ provider: string; status: ProviderDiscoveryStatus; stale: boolean }>;
 }
 
-/** `omp models ls`/`find`: provider-grouped listing (one box table per provider). */
+/**
+ * Render `omp models ls`/`find` as one box table per provider, selecting chat
+ * models by default or the caller-requested catalog kind.
+ */
 export function renderProviderModels(
 	source: ModelsListingSource,
 	action: ModelsAction,
 	pattern: string | undefined,
 	json: boolean,
+	kind: ModelKind | "all" = "chat",
 ): void {
-	const available = source.getAvailable();
+	const available = source.getAvailable(kind);
 	const needle = pattern?.toLowerCase();
 	let filtered = available;
 
@@ -313,6 +323,8 @@ export interface RunModelsListingOptions {
 	action?: ModelsAction;
 	pattern?: string;
 	json?: boolean;
+	/** Catalog kind to list; defaults to chat models. */
+	kind?: ModelKind | "all";
 	/** CLI-supplied extension paths (e.g. from `-e <path>`). */
 	additionalExtensionPaths?: string[];
 	/** Extension paths configured under `extensions:` in user settings. */
@@ -331,6 +343,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		action = "ls",
 		pattern,
 		json = false,
+		kind = "chat",
 		additionalExtensionPaths = [],
 		settingsExtensions = [],
 		disabledExtensionIds = [],
@@ -386,13 +399,15 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 
 		renderProviderModels(
 			{
-				getAvailable: () => getAllowedAvailableModels(modelRegistry, settings),
+				getAvailable: selectedKind =>
+					filterModelsByConfiguredScope(modelRegistry.getAvailable(selectedKind), settings),
 				getError: () => modelRegistry.getError(),
 				getProviderDiscoveryStates: () => modelRegistry.getProviderDiscoveryStates(),
 			},
 			action,
 			pattern,
 			json,
+			kind,
 		);
 	} finally {
 		await emitSessionShutdownEvent(extensionRunner);
@@ -407,6 +422,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 export async function runModelsCommand(command: ModelsCommandArgs): Promise<void> {
 	const { action, pattern } = command;
 	const json = command.flags.json ?? false;
+	const kind = command.flags.kind ?? "chat";
 
 	if (action === "find" && (!pattern || pattern.trim().length === 0)) {
 		process.stderr.write("`omp models find` requires a search substring, e.g. `omp models find minimax`\n");
@@ -440,6 +456,7 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			action,
 			pattern,
 			json,
+			kind,
 			additionalExtensionPaths: cliExtensionPaths,
 			settingsExtensions: settings.get("extensions") ?? [],
 			disabledExtensionIds: settings.get("disabledExtensions") ?? [],

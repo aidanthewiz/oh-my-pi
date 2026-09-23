@@ -64,7 +64,6 @@ import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
 import { formatKeyHint, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
-import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import {
 	isSettingsInitialized,
 	onModelRolesChanged,
@@ -137,7 +136,6 @@ import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-pro
 import { labelEchoesHandle } from "../task/label";
 import { agentTypeBadge, formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { tinyTitleClient } from "../tiny/title-client";
 import { isMCPToolName } from "../tools/builtin-names";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
@@ -220,6 +218,8 @@ import { stopSharedSpinnerTicker, type ToolExecutionHandle } from "@oh-my-pi/pi-
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import type { LspServerInfo as WelcomeLspServerInfo } from "@oh-my-pi/pi-tui/prompt/welcome";
 import { Composer, PINNED_HUD_TOGGLE_ID, type ComposerStatusSnapshot } from "@oh-my-pi/pi-tui/prompt/composer";
+import { setMagicKeywords } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
+import { MAGIC_KEYWORDS } from "./magic-keywords";
 import { writeComposerStatusCache, writeComposerWelcomeCache } from "@oh-my-pi/pi-tui/prompt/composer-cache";
 import { BtwController } from "./controllers/btw-controller";
 import { CleanseCommandController } from "./controllers/cleanse-command-controller";
@@ -269,6 +269,7 @@ import {
 	onTerminalAppearanceChange,
 	onThemeChange,
 	setMarkdownMermaidRendering,
+	setSymbolPreset,
 	startMacOSAppearanceReprobeFallback,
 	theme,
 } from "@oh-my-pi/pi-tui/theme";
@@ -1163,6 +1164,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			spellingAutocorrect: settings.get("spelling.autocorrect"),
 		};
 		const wasStarted = composer?.started ?? false;
+		setMagicKeywords(MAGIC_KEYWORDS);
 		this.composer =
 			composer ??
 			new Composer({
@@ -1689,7 +1691,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// spawn syscall never lands in the same loop turn ahead of the first paint.
 		setImmediate(() => {
 			if (!$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
-				tinyTitleClient.prewarm(this.settings.get("providers.tinyModel"));
+				this.#inputController.prewarmTinyTitleModel();
 			}
 		});
 
@@ -1799,6 +1801,19 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.ui.requestRender(true, { clearScrollback: true });
 			}),
 		);
+		// A confirmed Glyph Protocol handshake means omp's own icons render in
+		// this terminal without a Nerd Font, so the default `unicode` preset is
+		// upgraded to `nerd` for this session. The persisted setting is left
+		// alone: it travels to terminals (ssh, tmux) where the upgrade would
+		// show tofu. Explicit `ascii`/`nerd` choices are never touched.
+		this.ui.terminal.onGlyphProtocolReport?.(supported => {
+			if (!supported || settings.get("symbolPreset") !== "unicode" || theme.getSymbolPreset() !== "unicode") return;
+			void setSymbolPreset("nerd").then(() => {
+				this.statusLine.invalidate();
+				this.ui.invalidate();
+				this.ui.requestRender();
+			});
+		});
 
 		// Subscribe to terminal dark/light appearance changes.
 		// The terminal queries background color via OSC 11 at startup and on
@@ -2001,11 +2016,6 @@ export class InteractiveMode implements InteractiveModeContext {
 				// before the move commits so the next prompt cannot recall or
 				// retain against the source project's memory.
 				await rebindMemoryBackendForCwd(this.session);
-				// Reapply provider preferences from the newly-loaded settings so the
-				// module-level search/image provider state reflects the destination
-				// project's configuration. Without this, the previous project's
-				// exclusions leak and newly-excluded providers are still used.
-				applyProviderGlobalsFromSettings(settings);
 			}
 			// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
 			// the next prompt sees everything scoped to the new project directory.
@@ -2025,7 +2035,6 @@ export class InteractiveMode implements InteractiveModeContext {
 				if (isSettingsInitialized()) {
 					await settings.reloadForCwd(previousCwd);
 					await rebindMemoryBackendForCwd(this.session);
-					applyProviderGlobalsFromSettings(settings);
 				}
 				clearClaudePluginRootsCache();
 				await this.refreshTitleSystemPrompt(previousCwd);
@@ -2039,7 +2048,6 @@ export class InteractiveMode implements InteractiveModeContext {
 					if (isSettingsInitialized()) {
 						await settings.reloadForCwd(actual);
 						await rebindMemoryBackendForCwd(this.session);
-						applyProviderGlobalsFromSettings(settings);
 					}
 					clearClaudePluginRootsCache();
 					await this.refreshTitleSystemPrompt(actual);
@@ -6440,7 +6448,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#sttController.toggle(this.editor, {
 			showWarning: (msg: string) => this.showWarning(msg),
 			showStatus: (msg: string) => this.showStatus(msg),
-			requestRender: () => this.ui.requestRender(),
 			onStateChange: (state: SttState) => {
 				// Duck assistant speech while the user is talking (push-to-talk); restore after.
 				if (state === "recording") vocalizer.duck();

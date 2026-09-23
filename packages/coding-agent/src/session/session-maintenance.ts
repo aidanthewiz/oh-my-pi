@@ -65,7 +65,7 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
 import type { ModelRegistry } from "../config/model-registry";
 import { getAllowedAvailableModels } from "../config/model-resolver";
-import { MODEL_ROLE_IDS } from "../config/model-roles";
+import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { CompactionSettings as ConfiguredCompactionSettings, Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -3241,7 +3241,7 @@ export class SessionMaintenance {
 			addCandidate(resolveCompactionConfiguredTarget(preferredModel, availableModels));
 		}
 		addCandidate(preferredModel ?? undefined);
-		for (const role of MODEL_ROLE_IDS) {
+		for (const role of CHAT_MODEL_ROLE_IDS) {
 			addCandidate(
 				resolveRoleModelFull(this.#host.settings, role, availableModels, preferredModel ?? undefined).model,
 			);
