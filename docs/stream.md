@@ -78,6 +78,28 @@ Known plain values are also matched by prefix (6+ characters) so a partially typ
 
 Redaction cannot know about secrets it has never seen: a token pasted from elsewhere that matches no shape and no configured value is shown. Use `stream.redactPatterns` or `secrets.yml` for anything unusual, and prefer pausing: viewers of a paused pane see a `BRB` card.
 
+## Recording
+
+`/record` in any interactive session captures that one session's screen through the same pipeline — normalized, redacted rows, viewport patches, scrollback commits — into a local file instead of a socket. No account or streamer is needed, and it works alongside a live stream. The footer shows `● REC` while recording; `/record` again stops it and prints the path.
+
+Recordings are written to `<tmpdir>/omp-recordings/<utc-time>-<session>.ompcast`, a JSON Lines file similar to asciicast: a header line `{"ompcast":1,"cols":…,"rows":…,"title":…,"createdAt":…}`, then one `[ms, frame]` line per screen frame (`reset`, `history`, `resize`, `viewport`, `patch`).
+
+```
+coreforge play                      # newest recording
+coreforge play <file> -s 2 -i 1     # 2× speed, pauses capped at 1s
+```
+
+Playback runs on the normal screen: the recorded viewport occupies the bottom of the terminal and recorded scrollback scrolls into your terminal's scrollback, so the output stays after playback ends. Space pauses/resumes; `q`, Esc, or Ctrl-C quits.
+
+### Clips
+
+```
+coreforge clip                                          # newest recording
+coreforge clip <file> -t "Streaming the lexer" -d "…"   # title and description
+```
+
+`coreforge clip` uploads a recording to the configured stream server with the same Stencil credential as `coreforge stream` and prints its public page URL. The page plays the clip in the live viewer's terminal pane, with the title, description, and a comment thread underneath; signing in with Stencil lets viewers comment and the owner edit the title and description. Rows were already redacted when recorded; nothing is re-read from your machine at upload time.
+
 ## Server
 
 `live.omp.sh` is the upstream public service and remains available only through explicit `--server https://live.omp.sh` or `stream.serverUrl` configuration. It provides a channel directory, identity-derived host sockets, viewer sockets, chat, and the web UI. Wire shapes live in `@oh-my-pi/pi-wire/stream`.

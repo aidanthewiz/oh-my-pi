@@ -12,6 +12,10 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+### Fixed
+
+- Fixed Claude Opus 5.5 ignoring a mid-session switch to high effort when the session started without an explicit effort; the change is now sent as a cache-preserving per-message effort control ([#12909](https://github.com/can1357/oh-my-pi/pull/12909) by [@h4vc](https://github.com/h4vc)).
+
 ## [18.2.9] - 2026-09-22
 
 ### Added
