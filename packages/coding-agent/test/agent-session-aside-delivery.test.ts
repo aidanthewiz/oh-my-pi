@@ -767,7 +767,7 @@ describe("AgentSession aside delivery", () => {
 		expect(contexts).toHaveLength(0);
 	});
 
-	it("IrcBridge.restorePending merges a rolled-back snapshot ahead of records queued during the rollback instead of discarding them", () => {
+	it("IrcBridge restores rollback snapshots and reports only committed discards", () => {
 		// Regression: restorePending used to overwrite the queues wholesale, silently dropping any
 		// record queued between clearPending() and restorePending() (e.g. an in-flight IRC
 		// auto-reply appending while a rolled-back switchSession's async load/hooks were still
@@ -782,6 +782,7 @@ describe("AgentSession aside delivery", () => {
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
+			onDiscardPending: () => {},
 			runEphemeralTurn: async () => ({ replyText: "" }),
 		};
 		const irc = new IrcBridge(host);
@@ -793,8 +794,11 @@ describe("AgentSession aside delivery", () => {
 			timestamp: Date.now(),
 		};
 		irc.queueAside([original]);
+		const discarded: AgentMessage[] = [];
+		host.onDiscardPending = records => discarded.push(...records);
 		const snapshot = irc.clearPending();
 		expect(irc.hasPending()).toBe(false);
+		expect(discarded).toEqual([]);
 
 		// Simulates a record arriving while the rolled-back transition's async work was in flight.
 		const duringRollback: AgentMessage = {
@@ -811,6 +815,10 @@ describe("AgentSession aside delivery", () => {
 		expect(drained).toHaveLength(2);
 		expect(drained[0]).toBe(original);
 		expect(drained[1]).toBe(duringRollback);
+		expect(discarded).toEqual([]);
+		irc.queueAside([original]);
+		irc.discardPending(irc.clearPending());
+		expect(discarded).toEqual([original]);
 	});
 	it("IrcBridge boundary snapshots carry deferred wakes with the other queues", () => {
 		// A parked wake must not survive a session switch while ordinary asides
@@ -826,6 +834,7 @@ describe("AgentSession aside delivery", () => {
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
+			onDiscardPending: () => {},
 			runEphemeralTurn: async () => ({ replyText: "" }),
 		};
 		const irc = new IrcBridge(host);
@@ -862,6 +871,7 @@ describe("AgentSession aside delivery", () => {
 			planModeEnabled: () => false,
 			emitSessionEvent: async () => {},
 			wakeForIrc: () => {},
+			onDiscardPending: () => {},
 			runEphemeralTurn: async () => ({ replyText: "" }),
 		};
 		const irc = new IrcBridge(host);

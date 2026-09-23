@@ -1367,6 +1367,7 @@ export class AgentSession {
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			wakeForIrc: records => this.#wakeForIrc(records),
+			onDiscardPending: records => this.#releaseTtsrReservations(records),
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
 		};
 		this.#irc = new IrcBridge(ircHost);
@@ -5069,6 +5070,7 @@ export class AgentSession {
 	/** Releases deferred TTSR deliveries discarded by a session reset. */
 	#releaseQueuedTtsrReservations(): void {
 		this.#releaseTtsrReservations([...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()]);
+		this.#irc.discardPending(this.#irc.clearPending());
 	}
 
 	#releaseTtsrReservations(messages: AgentMessage[]): void {
@@ -8472,7 +8474,7 @@ export class AgentSession {
 			// the first ordinary prompt's IrcBridge.flushPending(). Bump #sessionGeneration in
 			// the same breath so an aside-queueing call still awaiting normalization for the
 			// outgoing session also drops its record instead of landing in this new one.
-			this.#irc.clearPending();
+			this.#irc.discardPending(this.#irc.clearPending());
 			this.#sessionGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
@@ -9844,6 +9846,7 @@ export class AgentSession {
 			// so the snapshotted old queues can no longer be restored.
 			this.#releaseTtsrReservations(previousSteeringMessages);
 			this.#releaseTtsrReservations(previousFollowUpMessages);
+			this.#irc.discardPending(previousIrcPending);
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
 			}

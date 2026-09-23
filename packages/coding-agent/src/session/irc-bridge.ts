@@ -21,6 +21,7 @@ export interface IrcBridgeHost {
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: AgentMessage[]): void;
+	onDiscardPending(records: AgentMessage[]): void;
 	runEphemeralTurn(args: { promptText: string }): Promise<{ replyText: string }>;
 }
 
@@ -89,6 +90,15 @@ export class IrcBridge {
 		this.#asides = [];
 		this.#deferredWakes = [];
 		return snapshot;
+	}
+
+	/** Finalizes a cleared snapshot after its session transition commits. */
+	discardPending(snapshot: {
+		interrupts: AgentMessage[];
+		asides: AgentMessage[];
+		deferredWakes: AgentMessage[];
+	}): void {
+		this.#host.onDiscardPending([...snapshot.interrupts, ...snapshot.asides, ...snapshot.deferredWakes]);
 	}
 
 	/** Restores a snapshot taken by `clearPending`, for a rolled-back session transition. Merges
