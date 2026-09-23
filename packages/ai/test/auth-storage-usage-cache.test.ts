@@ -445,8 +445,13 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect((await storage.fetchUsageReports())?.[0]?.limits[0]?.amount.used).toBe(100);
 
 			const outcome = await storage.redeemResetCredit({
-				target: { credentialId: 1, accountId: "account-reset", email: "reset@example.com" },
-				creditId: "credit-reset",
+				target: {
+					provider: "openai-codex",
+					credentialId: 1,
+					creditId: "credit-reset",
+					accountId: "account-reset",
+					email: "reset@example.com",
+				},
 			});
 
 			expect(outcome.ok).toBe(true);

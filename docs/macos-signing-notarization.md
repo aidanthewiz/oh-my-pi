@@ -13,8 +13,8 @@ credentials. Calling the script directly without every credential is an error.
 
 ## Release flow
 
-1. `ci:release:build-binaries` builds and ad-hoc signs the binary so it runs on
-   the build host.
+1. `ci:release:build-binaries` builds and ad-hoc signs the binary with the
+   required entitlements so it runs on the build host.
 2. `scripts/ci-macos-sign.sh`:
    - imports the Developer ID certificate into a temporary keychain;
    - signs with the hardened runtime, secure timestamp, and
@@ -30,13 +30,14 @@ workflow. They add no end-user telemetry or background network path.
 
 ## Required entitlements
 
-The release is a Bun single-file executable. Its hardened-runtime signature
-requires these entitlements:
+The release is a Bun single-file executable that also launches Xcode's MCP
+bridge. Its hardened-runtime signature requires these entitlements:
 
 | Entitlement | Reason |
 | --- | --- |
 | `com.apple.security.cs.allow-jit` | JavaScriptCore generates executable code at runtime. |
 | `com.apple.security.cs.allow-unsigned-executable-memory` | JavaScriptCore uses executable memory pages. |
+| `com.apple.security.automation.apple-events` | The Xcode MCP bridge uses Apple Events and must receive the normal macOS Automation permission prompt. |
 | `com.apple.security.cs.disable-library-validation` | The binary extracts native addons and optional dynamic libraries at runtime. Those files do not share the main binary's Team ID. |
 
 Without `disable-library-validation`, signing and notarization can succeed while
