@@ -9,6 +9,12 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [18.2.4] - 2026-09-17
+
+### Added
+
+- Added `typesafe` authentication for TypeSafe System One judgments via the `TYPESAFE_API_KEY` configuration and API-key validation against the TypeSafe models endpoint.
+
 ## [18.2.3] - 2026-09-17
 
 ### Added

@@ -7,6 +7,7 @@ export * from "./auth-retry";
 export * from "./auth-storage";
 export * from "./aws-model-auth";
 export * from "./error/rate-limit";
+export * from "./judgment";
 export * from "./oneshot-retry";
 export * from "./provider-details";
 export * from "./provider-session-state";
