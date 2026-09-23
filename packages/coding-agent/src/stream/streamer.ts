@@ -17,6 +17,7 @@ import { encodeStreamFrame, STREAM_LOCAL_PROTO, type StreamSessionFrame, type St
 import { streamSocketEndpoint } from "./paths";
 import { runStreamTui, type StreamTuiInfo } from "./console-tui";
 import { StreamServerClient, type StreamServerFatalError } from "./server-client";
+import type { StreamRedactor } from "./redactor";
 
 const MAX_LOCAL_LINE_BYTES = 4 * 1024 * 1024;
 
@@ -63,6 +64,7 @@ interface StreamConnectionOptions {
 	token: () => Promise<string | null>;
 	/** Test seam; production uses the server client's normal retry policy. */
 	reconnectDelay?: (attempt: number) => number;
+	redactor: StreamRedactor;
 }
 
 export interface StreamMuxHostOptions extends StreamConnectionOptions {
@@ -115,10 +117,10 @@ export class StreamMuxHost {
 	constructor(options: StreamMuxHostOptions) {
 		this.#options = options;
 		this.#onEvent = options.onEvent;
-		this.#title = options.title;
+		this.#title = options.redactor.redactText(options.title);
 		this.#client = new StreamServerClient({
 			url: options.hostUrl,
-			title: options.title,
+			title: this.#title,
 			token: options.token,
 			replay: () => this.#replayFrames(),
 			onFrame: frame => this.#handleServerFrame(frame),
@@ -178,7 +180,7 @@ export class StreamMuxHost {
 			this.setTitle(title);
 			return;
 		}
-		this.#client.send({ t: "chat", text: trimmed.slice(0, STREAM_CHAT_TEXT_MAX) });
+		this.#client.send({ t: "chat", text: this.#options.redactor.redactText(trimmed).slice(0, STREAM_CHAT_TEXT_MAX) });
 	}
 
 	setTitle(title: string): void {
@@ -188,7 +190,7 @@ export class StreamMuxHost {
 			this.#onEvent({ t: "error", message: `title must be at most ${STREAM_TITLE_MAX} characters` });
 			return;
 		}
-		this.#title = trimmed;
+		this.#title = this.#options.redactor.redactText(trimmed);
 		this.#client.setTitle(this.#title);
 		this.#onEvent({ t: "title", title: this.#title });
 	}

@@ -4,6 +4,7 @@ import { CliUsageError, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { streamHelp as commandHelp } from "../cli/command-help";
 import { Settings } from "../config/settings";
 import { StreamCredential } from "../stream/auth";
+import { StreamRedactor } from "../stream/redactor";
 import { resolveStreamUrls, runStreamConsole, type StreamUrls } from "../stream/streamer";
 
 export default class Stream extends Command {
@@ -49,6 +50,7 @@ export default class Stream extends Command {
 				projectDir: cwd,
 				title,
 				hostUrl: urls.hostUrl,
+				redactor: await StreamRedactor.load(cwd, settings.get("stream.redactPatterns")),
 				token: () => credential.resolve(),
 				noTui: flags["no-tui"],
 			});

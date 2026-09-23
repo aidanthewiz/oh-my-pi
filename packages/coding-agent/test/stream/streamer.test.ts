@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { STREAM_HISTORY_LIMIT, STREAM_PROTO, type StreamHostFrame, type StreamServerToHost } from "@oh-my-pi/pi-wire";
 import { STREAM_LOCAL_PROTO, type StreamStreamerFrame } from "../../src/stream/protocol";
+import { StreamRedactor } from "../../src/stream/redactor";
 import { resolveStreamUrls, StreamMuxHost, type StreamConsoleEvent } from "../../src/stream/streamer";
 
 type HostSocketData = Record<string, never>;
@@ -167,6 +168,7 @@ describe("StreamMuxHost", () => {
 			title: "Contract test",
 			hostUrl: `ws://127.0.0.1:${port}/ws/host`,
 			token: () => Promise.resolve("contract-token"),
+			redactor: new StreamRedactor([], []),
 			onEvent: event => events.push(event),
 			reconnectDelay: () => 10,
 		});
@@ -257,5 +259,38 @@ describe("StreamMuxHost", () => {
 			{ t: "viewport", pane: 1, rows: [] },
 			{ t: "paused", pane: 1, paused: true },
 		]);
+	});
+	it("redacts titles and chat before public transmission", async () => {
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stream-redaction-test-"));
+		projectDirs.push(projectDir);
+		const server = startFakeStreamServer();
+		const host = new StreamMuxHost({
+			projectDir,
+			title: "Title contract-secret",
+			hostUrl: `ws://127.0.0.1:${server.port}/ws/host`,
+			token: () => Promise.resolve("contract-token"),
+			redactor: new StreamRedactor([/contract-secret/g], []),
+			onEvent: () => {},
+		});
+		hosts.push(host);
+		await host.start();
+
+		expect(await server.waitForFrame(frame => frame.t === "hello")).toEqual({
+			t: "hello",
+			proto: STREAM_PROTO,
+			title: "Title ••••••",
+		});
+
+		host.sendChat("message contract-secret");
+		expect(await server.waitForFrame(frame => frame.t === "chat")).toEqual({
+			t: "chat",
+			text: "message ••••••",
+		});
+
+		host.setTitle("Renamed contract-secret");
+		expect(await server.waitForFrame(frame => frame.t === "title")).toEqual({
+			t: "title",
+			title: "Renamed ••••••",
+		});
 	});
 });

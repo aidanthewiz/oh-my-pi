@@ -67,7 +67,12 @@ export class StreamRedactor {
 
 	/** Redact one ANSI terminal row, dropping styling whenever any sensitive span is found. */
 	redactRow(row: string): string {
-		const plain = Bun.stripANSI(row);
+		return this.redactText(row);
+	}
+
+	/** Redact one public text field, dropping styling whenever any sensitive span is found. */
+	redactText(text: string): string {
+		const plain = Bun.stripANSI(text);
 		const spans: number[] = [];
 
 		for (const pattern of this.#patterns) {
@@ -115,7 +120,7 @@ export class StreamRedactor {
 			}
 		}
 
-		if (spans.length === 0) return row;
+		if (spans.length === 0) return text;
 
 		for (let index = 2; index < spans.length; index += 2) {
 			const start = spans[index];
