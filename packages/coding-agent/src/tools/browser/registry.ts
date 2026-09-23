@@ -9,8 +9,9 @@ import {
 } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { CF_BRAND, CF_COMMAND } from "../../cli/cf-version";
-import { ToolAbortError, ToolError } from "../tool-errors";
+import { ToolAbortError } from "../tool-errors";
 import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
@@ -25,6 +26,7 @@ import {
 import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
+import { waitForRelayExtension } from "./relay/probe";
 import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
 import { ensureSharedBrowser } from "./shared-daemon";
 
@@ -44,12 +46,7 @@ export type BrowserKindTag = BrowserKind["kind"];
  * forever (issue #5260), so we cap the wait and force-kill on timeout.
  */
 const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
-/**
- * How long a relay open waits for the extension handshake (503 → 200). A
- * reaped extension service worker is revived by its 30s keepalive alarm, so
- * the wait must cover one full alarm period plus the dial.
- */
-const RELAY_EXTENSION_WAIT_MS = 35_000;
+const RELAY_VERSION_TIMEOUT_MS = 2_000;
 
 interface BrowserHandleCommon {
 	key: string;
@@ -187,7 +184,7 @@ async function relayBrowserWSEndpoint(
 			`The ${CF_BRAND} browser relay requires a token. Add ?token=... to the configured relay URL or use a loopback relay.`,
 		);
 	}
-	const timeout = AbortSignal.timeout(RELAY_EXTENSION_WAIT_MS);
+	const timeout = AbortSignal.timeout(RELAY_VERSION_TIMEOUT_MS);
 	const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	const response = await fetch(`${cdpUrl}/json/version`, { signal: fetchSignal });
 	if (!response.ok) {
@@ -271,22 +268,21 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		// on demand (the extension dials in on its own). Hosts without a CLI
 		// worker entry (bun test, SDK embedding) never spawn brokers. Remote
 		// relay URLs must already be serving.
-		let autoStarted = false;
 		if (loopback && (isCompiledBinary() || workerHostEntry() !== null)) {
-			autoStarted = await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
+			await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
 		}
-		// The relay answers /json/version with 503 until its extension dials in.
-		// A freshly revived extension service worker can take up to ~30s (its
-		// keepalive alarm) to reconnect, so give the handshake that long.
-		try {
-			await waitForCdp(cdpUrl, RELAY_EXTENSION_WAIT_MS, opts.signal);
-		} catch (err) {
-			if (err instanceof ToolAbortError) throw err;
-			if (err instanceof Error && err.name === "AbortError") throw err;
+		// The relay answers /json/version with 503 until its extension dials in;
+		// the wait fails fast when nothing serves the port or the server has
+		// already outlived the window an installed extension needs to connect.
+		const outcome = await waitForRelayExtension(cdpUrl, opts.signal);
+		if (outcome === "unreachable") {
 			throw new ToolError(
-				autoStarted
-					? `${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`
-					: `${CF_BRAND} browser relay is not reachable at ${cdpUrl}. Start it with \`${CF_COMMAND} browser-relay\` (or check the endpoint), and make sure the ${CF_BRAND} Browser Relay extension is loaded in Chrome.`,
+				`${CF_BRAND} browser relay is not reachable at ${cdpUrl}. Start it with \`${CF_COMMAND} browser-relay\` (or check the endpoint), and make sure the ${CF_BRAND} Browser Relay extension is loaded in Chrome.`,
+			);
+		}
+		if (outcome === "no-extension") {
+			throw new ToolError(
+				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`,
 			);
 		}
 		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);

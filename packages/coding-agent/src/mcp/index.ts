@@ -28,3 +28,11 @@ export * from "./transports/http";
 export * from "./transports/stdio";
 // Types
 export * from "./types";
+
+export type {
+	MCPToolDetails,
+	MCPTextContent,
+	MCPImageContent,
+	MCPResourceContent,
+	MCPContent,
+} from "@oh-my-pi/pi-tui/tools/mcp";

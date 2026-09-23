@@ -1,6 +1,6 @@
 import { Args, type CommandMetadata, Flags } from "@oh-my-pi/pi-utils/cli";
+import { CLI_THINKING_LEVELS } from "@oh-my-pi/pi-tui/thinking";
 import { CF_BRAND, CF_COMMAND } from "../cli/cf-version";
-import { CLI_THINKING_LEVELS } from "../cli/thinking-levels";
 import { SERVICE_TIER_OPENAI_VALUES } from "../config/service-tier";
 
 export const launchHelp = {

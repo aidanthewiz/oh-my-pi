@@ -354,6 +354,7 @@ function filterChildShellEnvInternal(
 	env: Record<string, string | undefined>,
 	cwd: string,
 	overlays: Array<Readonly<Record<string, string | undefined>> | undefined>,
+	onDotenvValue?: (value: string) => void,
 ): Record<string, string> {
 	const protectedValues = new Set(managedAgentEnvValues);
 	for (const [key, value] of Object.entries(env)) {
@@ -395,6 +396,12 @@ function filterChildShellEnvInternal(
 		}
 	}
 	const allLaunchEnv = fallbackLaunchEnv ? { ...launchEnv, ...fallbackLaunchEnv } : launchEnv;
+	if (onDotenvValue) {
+		// Every value the project's dotenv files define is dotenv-sourced, whether
+		// or not this process loaded it (a `--cwd` launch never did).
+		for (const key in allLaunchEnv) onDotenvValue(allLaunchEnv[key]!);
+		for (const key in expandedLaunchEnv) onDotenvValue(expandedLaunchEnv[key]!);
+	}
 	for (const key in allLaunchEnv) {
 		const normalized = managedEnvName(key);
 		const trustedOperationalValue =
@@ -422,6 +429,8 @@ function filterChildShellEnvInternal(
 			// Strong provenance: the launch environment is known and this name is
 			// absent from it, or OMP itself injected the value — either way it came
 			// from a project dotenv file, not the parent shell.
+			const value = result[key];
+			if (value !== undefined) onDotenvValue?.(value);
 			delete result[key];
 		} else if (
 			result[key] === launchEnv[key] ||
@@ -431,6 +440,8 @@ function filterChildShellEnvInternal(
 		) {
 			// No launch-env snapshot (dotenv autoloaded without procfs): best-effort
 			// value match against the Bun-parsed dotenv.
+			const value = result[key];
+			if (value !== undefined) onDotenvValue?.(value);
 			delete result[key];
 		}
 	}
@@ -474,7 +485,7 @@ function filterChildShellEnvInternal(
 /** Builds a minimal environment for repository-controlled child processes. */
 export function filterChildShellEnv(
 	env: Record<string, string | undefined>,
-	cwd: string = process.cwd(),
+	cwd: string = getProjectDir(),
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
@@ -488,7 +499,7 @@ export function filterChildShellEnv(
 /** Preserves ambient operational AWS selectors for repository shell commands. */
 export function filterTrustedChildShellEnv(
 	env: Record<string, string | undefined>,
-	cwd: string = process.cwd(),
+	cwd: string = getProjectDir(),
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
@@ -502,7 +513,7 @@ export function filterTrustedChildShellEnv(
 /** Permits credentials explicitly configured by trusted user-level MCP config. */
 export function filterUserMcpChildEnv(
 	env: Record<string, string | undefined>,
-	cwd: string = process.cwd(),
+	cwd: string = getProjectDir(),
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
@@ -516,7 +527,7 @@ export function filterUserMcpChildEnv(
 /** Preserves credential-agent paths used by authenticated Git commands. */
 export function filterGitChildShellEnv(
 	env: Record<string, string | undefined>,
-	cwd: string = process.cwd(),
+	cwd: string = getProjectDir(),
 	...overlays: Array<Readonly<Record<string, string | undefined>> | undefined>
 ): Record<string, string> {
 	return filterChildShellEnvInternal(
@@ -525,6 +536,22 @@ export function filterGitChildShellEnv(
 		cwd,
 		overlays,
 	);
+}
+
+/** Return every value defined by `cwd`'s dotenv files, plus environment values that came from them. */
+export function getDotenvEnvValues(
+	cwd: string = getProjectDir(),
+	env: Record<string, string | undefined> = process.env,
+): string[] {
+	const values = new Set<string>();
+	filterChildShellEnvInternal(
+		{ preserveExplicitCredentials: false, preserveGitCredentials: false, preserveOperationalAws: false },
+		env,
+		cwd,
+		[],
+		value => values.add(value),
+	);
+	return [...values];
 }
 
 /**

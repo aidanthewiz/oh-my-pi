@@ -14,8 +14,14 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
-import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
+import {
+	truncateHead,
+	truncateHeadBytes,
+	truncateTail,
+	truncateTailBytes,
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { daemonBrokerEndpoint, writeDaemonScopeMeta } from "./paths";
+import type { DaemonReadySpec, DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/hub";
 import { hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs } from "./presence";
 import {
 	DAEMON_BROKER_PROTOCOL_VERSION,
@@ -26,11 +32,8 @@ import {
 	DAEMON_RUNTIME_DIR_ENV,
 	type DaemonCompletionNotification,
 	type DaemonOperation,
-	type DaemonReadySpec,
 	type DaemonRpcResult,
 	type DaemonSignal,
-	type DaemonSnapshot,
-	type DaemonSpec,
 	type DaemonWireRequest,
 	parseDaemonSnapshot,
 	parseDaemonSpec,

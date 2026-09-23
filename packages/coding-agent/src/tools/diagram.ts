@@ -21,7 +21,7 @@ import { copyToClipboard } from "../utils/clipboard";
 import type { ToolSession } from "./index";
 import { formatPathRelativeToCwd } from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
-import { ToolError } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const diagramSchema = type({
 	"spec?": type("object").describe("typed diagram spec object; renderDiagram validates its exact shape"),

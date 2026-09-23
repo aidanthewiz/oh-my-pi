@@ -106,7 +106,7 @@ export class GuestClient {
 	#phase: ConnectionPhase = "connecting";
 	#endedReason: string | null = null;
 	#header: SessionHeader | null = null;
-	#entries: readonly SessionEntry[] = [];
+	#entries: SessionEntry[] = [];
 	#state: SessionState | null = null;
 	#agents: readonly AgentSnapshot[] = [];
 	#progress: ReadonlyMap<string, SubagentProgressPayload> = new Map();
@@ -120,6 +120,14 @@ export class GuestClient {
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
 	#snapshot: GuestSnapshot;
+	/**
+	 * Published entries array, cached across commits: rebuilt only when
+	 * `#entries` is mutated (welcome/snapshot-chunk/entry frames). Every
+	 * other frame (streaming message_update, state, bus, agents) reuses the
+	 * same reference, so entry-identity consumers (Transcript memo,
+	 * useSyncExternalStore) skip their O(n) scans per token.
+	 */
+	#publishedEntries: readonly SessionEntry[] = [];
 
 	/** @throws Error when the link does not parse. */
 	constructor(link: string, displayName: string, getAuthToken?: RelayAuthTokenProvider) {
@@ -292,6 +300,7 @@ export class GuestClient {
 				// supersedes any partially-streamed snapshot from the prior session.
 				this.#header = frame.header;
 				this.#entries = [];
+				this.#publishedEntries = [];
 				this.#state = frame.state;
 				this.#agents = [...frame.agents];
 				this.#stream = null;
@@ -316,7 +325,8 @@ export class GuestClient {
 				// Stream transcript fragments into the live snapshot. The host
 				// always closes the train with `final: true`; that flip is what
 				// moves the guest from "waiting" to "live".
-				this.#entries = [...this.#entries, ...frame.entries];
+				this.#entries.push(...frame.entries);
+				this.#publishedEntries = [...this.#entries];
 				if (frame.final) {
 					this.#clearSnapshotProgressTimer();
 					this.#phase = "live";
@@ -326,7 +336,8 @@ export class GuestClient {
 				break;
 			}
 			case "entry":
-				this.#entries = [...this.#entries, frame.entry];
+				this.#entries.push(frame.entry);
+				this.#publishedEntries = [...this.#entries];
 				if (this.#streamDone && frame.entry.type === "message" && frame.entry.message.role === "assistant") {
 					this.#stream = null;
 					this.#streamDone = false;
@@ -511,7 +522,11 @@ export class GuestClient {
 			phase: this.#phase,
 			endedReason: this.#endedReason,
 			header: this.#header,
-			entries: this.#entries,
+			// Publish the cached array: identical reference until an
+			// entry-mutating frame replaces it, so non-entry frames
+			// (streaming updates, state, bus) don't invalidate entry-identity
+			// consumers per token.
+			entries: this.#publishedEntries,
 			state: this.#state,
 			agents: this.#agents,
 			progress: this.#progress,

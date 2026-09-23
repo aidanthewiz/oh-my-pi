@@ -13,9 +13,9 @@ import {
 	listCollabHosts,
 	resolveCollabHostLink,
 } from "../collab/registry";
+import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { CF_COMMAND } from "./cf-version";
-import { sanitizeDisplayLine } from "../modes/components/extensions/display-text";
-import { shortenPath } from "../tools/render-utils";
 
 export interface CollabListCommandArgs {
 	/** Emit deterministic machine-readable JSON. */
