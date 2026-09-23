@@ -235,7 +235,7 @@
     },
     "packages/relay": {
       "name": "@oh-my-pi/relay",
-      "version": "0.2.4",
+      "version": "0.2.5",
       "dependencies": {
         "@oh-my-pi/pi-wire": "catalog:",
       },

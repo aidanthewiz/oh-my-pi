@@ -10,6 +10,7 @@ on:
       - "Dockerfile.relay.dockerignore"
       - "bun.lock"
       - "package.json"
+      - "scripts/ci-released-native.ts"
       - "packages/collab-web/**"
       - "packages/coding-agent/scripts/generate-share-viewer.ts"
       - "packages/coding-agent/src/cli-commands.ts"
@@ -32,41 +33,115 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: validate
+  prepare:
+    name: classify native inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
+    outputs:
+      native_changed: ${{ steps.native.outputs.changed }}
+      release_tag: ${{ steps.native.outputs.tag }}
     steps:
+      - name: List Coreforce releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 200 \
+            --exclude-drafts \
+            --json tagName,isDraft \
+            > "$RUNNER_TEMP/coreforce-releases.json"
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+        with:
+          bun-version: "1.4.2"
+      - name: Select native verification source
+        id: native
+        env:
+          RELEASE_LIST: ${{ runner.temp }}/coreforce-releases.json
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          RELEASE_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG_VERSION" "$RELEASE_LIST")"
+          VERIFY_SHA="$(git rev-parse HEAD)"
+          CHANGED=true
+          if [ -n "$RELEASE_TAG" ] && git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "$VERIFY_SHA"; then
+            CHANGED="$(bun scripts/ci-released-native.ts changed "${RELEASE_TAG}^{commit}" "$VERIFY_SHA")"
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          if [ "$CHANGED" = false ]; then
+            echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    name: validate
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Download released Coreforce native addon
+        if: needs.prepare.outputs.native_changed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          ASSET_NAME: coreforge-pi-natives-linux-x64-${{ needs.prepare.outputs.release_tag }}.tgz
+        run: |
+          mkdir -p "$RUNNER_TEMP/released-native"
+          gh release download \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET_NAME" \
+            --pattern SHA256SUMS.txt \
+            --dir "$RUNNER_TEMP/released-native" \
+            -- "$RELEASE_TAG"
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Fetch prebuilt native addon for coding-agent tests
-        # Relay validation does not cover native source paths. Use the
-        # integrity-checked addon published for this exact upstream version.
+      - name: Install verified Coreforce native addon
+        if: needs.prepare.outputs.native_changed != 'true'
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: bun scripts/ci-released-native.ts install "$RELEASE_TAG" linux-x64 packages/natives/native "$RUNNER_TEMP/released-native"
+
+      - name: Restore Bazel native build cache
+        if: needs.prepare.outputs.native_changed == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cache/omp-bazel-disk
+            ~/.cache/omp-bazel-repo
+          key: coreforge-bazel-v1-linux-x64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          restore-keys: |
+            coreforge-bazel-v1-linux-x64-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build native addon from Coreforge sources
+        if: needs.prepare.outputs.native_changed == 'true'
         run: |
-          PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
-          META="$(npm view "@oh-my-pi/pi-natives-linux-x64@${PKG_VERSION}" dist.tarball dist.integrity --json)"
-          URL="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.tarball"])')"
-          INTEGRITY="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.integrity"])')"
-          curl -fsSL "$URL" -o /tmp/natives.tgz
-          NATIVES_INTEGRITY="$INTEGRITY" bun -e '
-            const [algorithm, expected] = process.env.NATIVES_INTEGRITY.split("-", 2);
-            if (algorithm !== "sha512" || !expected) throw new Error("npm did not publish a sha512 integrity value");
-            const archive = new Uint8Array(await Bun.file("/tmp/natives.tgz").arrayBuffer());
-            const actual = new Bun.CryptoHasher("sha512").update(archive).digest("base64");
-            if (actual !== expected) throw new Error("native addon archive failed npm integrity verification");
-          '
-          tar -xzf /tmp/natives.tgz -C /tmp
-          cp /tmp/package/*.node packages/natives/native/
-          ls packages/natives/native/*.node
+          set -euo pipefail
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          mkdir -p "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
+          {
+            echo "common --config=ci"
+            echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
+            echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
+          } > "$RUNNER_TEMP/coreforge-bazel.rc"
+          export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
+          bun scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern
 
       - name: Check relay clients
         run: |
@@ -102,6 +177,14 @@ jobs:
           push: false
           platforms: linux/amd64
 
+      - name: Retain validated native addons for publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: relay-native-linux-x64
+          path: packages/natives/native/pi_natives.linux-x64*.node
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: publish
     if: startsWith(github.ref, 'refs/tags/relay/v')
@@ -118,14 +201,16 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Guard tag and package version
         id: version
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch origin +coreforge:refs/remotes/origin/coreforge --quiet
           tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
-          tip="$(git rev-parse refs/remotes/origin/coreforge)"
+          tip="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/coreforge" --jq .object.sha)"
           if [ "${tag_commit}" != "${tip}" ]; then
             echo "tag commit ${tag_commit} is not the coreforge tip ${tip}" >&2
             exit 1
@@ -139,30 +224,11 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+      - name: Download validated Coreforce native addons
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          bun-version: ">=1.4"
-
-      - name: Fetch prebuilt native addon for relay image
-        # The publish job has a separate checkout from validate. Populate the
-        # native addon before Docker snapshots its build context.
-        run: |
-          PKG_VERSION="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
-          META="$(npm view "@oh-my-pi/pi-natives-linux-x64@${PKG_VERSION}" dist.tarball dist.integrity --json)"
-          URL="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.tarball"])')"
-          INTEGRITY="$(META="$META" bun -e 'console.log(JSON.parse(process.env.META)["dist.integrity"])')"
-          curl -fsSL "$URL" -o /tmp/natives.tgz
-          NATIVES_INTEGRITY="$INTEGRITY" bun -e '
-            const [algorithm, expected] = process.env.NATIVES_INTEGRITY.split("-", 2);
-            if (algorithm !== "sha512" || !expected) throw new Error("npm did not publish a sha512 integrity value");
-            const archive = new Uint8Array(await Bun.file("/tmp/natives.tgz").arrayBuffer());
-            const actual = new Bun.CryptoHasher("sha512").update(archive).digest("base64");
-            if (actual !== expected) throw new Error("native addon archive failed npm integrity verification");
-          '
-          tar -xzf /tmp/natives.tgz -C /tmp
-          cp /tmp/package/*.node packages/natives/native/
-          ls packages/natives/native/*.node
+          name: relay-native-linux-x64
+          path: packages/natives/native
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
