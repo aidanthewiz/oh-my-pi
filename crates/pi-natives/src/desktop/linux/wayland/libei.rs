@@ -580,7 +580,13 @@ fn char_stroke(device: &mut EiDevice, character: char) -> CoreResult<KeyStroke> 
 			layout.active_group()
 		)));
 	}
-	if let Some((keycode, shift)) = evdev_char(character) {
+	no_layout_char_stroke(character)
+}
+
+fn no_layout_char_stroke(character: char) -> CoreResult<KeyStroke> {
+	if character.is_control()
+		&& let Some((keycode, shift)) = evdev_char(character)
+	{
 		return Ok(KeyStroke { keycode, modifiers: if shift { vec![42] } else { Vec::new() } });
 	}
 	Err(DesktopError::input_failed(format!(
@@ -706,5 +712,19 @@ mod tests {
 
 		assert!(!targets.is_complete(false, true));
 		assert!(targets.is_complete(true, true));
+	}
+
+	#[test]
+	fn no_layout_refuses_printable_characters() {
+		let error = no_layout_char_stroke('a').expect_err("printable text needs a usable keymap");
+		assert_eq!(error.code.as_str(), "InputFailed");
+		assert_eq!(
+			error.message,
+			"libei cannot type character 'a': no usable XKB keymap was announced"
+		);
+		assert_eq!(
+			no_layout_char_stroke('\n').expect("control keys remain layout-independent"),
+			KeyStroke { keycode: 28, modifiers: Vec::new() },
+		);
 	}
 }
