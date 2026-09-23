@@ -75,6 +75,8 @@ export class CollabSocket {
 	#authenticated = false;
 	#backpressureDrainTimer: NodeJS.Timeout | undefined;
 	#attempt = 0;
+	/** Invalidates authentication continuations from closed or superseded connection attempts. */
+	#openingGeneration = 0;
 	/** Terminal state: intentional close or fatal failure. Cleared by connect(). */
 	#closed = false;
 	/** Allows a previously joined guest to outlive room recreation races. */
@@ -425,6 +427,7 @@ export class CollabSocket {
 		this.#clearRetry();
 		const wasClosed = this.#closed;
 		this.#closed = true;
+		this.#openingGeneration++;
 		this.#opening = false;
 		this.#authenticated = false;
 		this.#retryMissingRoom = false;
@@ -451,6 +454,7 @@ export class CollabSocket {
 	}
 
 	#openSocket(): void {
+		const openingGeneration = ++this.#openingGeneration;
 		const getAuthToken = this.#opts.getAuthToken;
 		if (!getAuthToken) {
 			this.#createSocket();
@@ -459,11 +463,12 @@ export class CollabSocket {
 		this.#opening = true;
 		void getAuthToken()
 			.then(token => {
-				if (this.#closed) return;
+				if (this.#closed || openingGeneration !== this.#openingGeneration) return;
 				this.#opening = false;
 				this.#createSocket(token);
 			})
 			.catch((error: unknown) => {
+				if (this.#closed || openingGeneration !== this.#openingGeneration) return;
 				this.#opening = false;
 				this.#failFatal(`relay authentication failed: ${error instanceof Error ? error.message : String(error)}`);
 			});

@@ -13,6 +13,7 @@ class ScriptedWebSocket {
 	readonly url: string;
 	binaryType = "arraybuffer";
 	bufferedAmount = 0;
+	sent: unknown[] = [];
 	onclose: ((event: CloseEvent) => void) | null = null;
 	onerror: ((event: Event) => void) | null = null;
 	onmessage: ((event: MessageEvent) => void) | null = null;
@@ -24,11 +25,16 @@ class ScriptedWebSocket {
 		ScriptedWebSocket.instances.push(this);
 	}
 
-	send(_data: unknown): void {}
+	send(data: unknown): void {
+		this.sent.push(data);
+	}
 
 	open(): void {
 		this.readyState = ScriptedWebSocket.OPEN;
 		this.onopen?.(new Event("open"));
+	}
+	relayMessage(data: string): void {
+		this.onmessage?.(new MessageEvent("message", { data }));
 	}
 
 	relayClose(code: number, reason: string): void {
@@ -117,5 +123,72 @@ describe("CollabSocket guest room recovery", () => {
 		expect(closes).toEqual([{ reason: "no such room", willReconnect: false }]);
 		vi.advanceTimersByTime(30_000);
 		expect(ScriptedWebSocket.instances).toHaveLength(1);
+	});
+
+	it("ignores a rejected authentication attempt after close and reconnect", async () => {
+		installScriptedWebSocket();
+		const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+		const stale = Promise.withResolvers<string>();
+		const current = Promise.withResolvers<string>();
+		let authAttempt = 0;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/auth-reconnect-room",
+			role: "guest",
+			key,
+			getAuthToken: () => (++authAttempt === 1 ? stale.promise : current.promise),
+		});
+		const closes: string[] = [];
+		socket.onClose = reason => closes.push(reason);
+
+		try {
+			socket.connect();
+			socket.close();
+			closes.length = 0;
+			socket.connect();
+			current.resolve("current-token");
+			await current.promise;
+			instance(0).open();
+			expect(instance(0).sent).toEqual([JSON.stringify({ t: "auth", token: "current-token" })]);
+			instance(0).relayMessage(JSON.stringify({ t: "auth-ok" }));
+			expect(socket.isOpen).toBe(true);
+
+			stale.reject(new Error("stale authentication"));
+			await stale.promise.catch(() => undefined);
+			expect(socket.isOpen).toBe(true);
+			expect(closes).toEqual([]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("ignores a fulfilled authentication attempt after close and reconnect", async () => {
+		installScriptedWebSocket();
+		const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+		const stale = Promise.withResolvers<string>();
+		const current = Promise.withResolvers<string>();
+		let authAttempt = 0;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/auth-reconnect-room",
+			role: "guest",
+			key,
+			getAuthToken: () => (++authAttempt === 1 ? stale.promise : current.promise),
+		});
+
+		try {
+			socket.connect();
+			socket.close();
+			socket.connect();
+			current.resolve("current-token");
+			await current.promise;
+			expect(ScriptedWebSocket.instances).toHaveLength(1);
+
+			stale.resolve("stale-token");
+			await stale.promise;
+			expect(ScriptedWebSocket.instances).toHaveLength(1);
+			instance(0).open();
+			expect(instance(0).sent).toEqual([JSON.stringify({ t: "auth", token: "current-token" })]);
+		} finally {
+			socket.close();
+		}
 	});
 });
