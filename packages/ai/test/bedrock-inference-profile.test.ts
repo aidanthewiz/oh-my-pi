@@ -203,13 +203,16 @@ describe("Bedrock inference profile ARNs", () => {
 	});
 });
 
-function bedrockModel(id: string): Model<"bedrock-converse-stream"> {
+function bedrockModel(
+	id: string,
+	baseUrl = "https://bedrock-runtime.us-east-1.amazonaws.com",
+): Model<"bedrock-converse-stream"> {
 	return buildModel({
 		id,
 		name: id,
 		api: "bedrock-converse-stream",
 		provider: "amazon-bedrock",
-		baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+		baseUrl,
 		reasoning: true,
 		input: ["text", "image"],
 		cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
@@ -222,7 +225,14 @@ async function capturedRequestHost(
 	model: Model<"bedrock-converse-stream">,
 	options: { region?: string; profile?: string; guardrailIdentifier?: string } = {},
 ): Promise<string> {
-	let host: string | undefined;
+	return new URL(await capturedRequestUrl(model, options)).host;
+}
+
+async function capturedRequestUrl(
+	model: Model<"bedrock-converse-stream">,
+	options: { region?: string; profile?: string; guardrailIdentifier?: string } = {},
+): Promise<string> {
+	let requestUrl: string | undefined;
 	await withEnv(
 		{
 			OMP_MODEL_AWS_AUTH_MODE: undefined,
@@ -231,13 +241,10 @@ async function capturedRequestHost(
 		},
 		async () => {
 			const calls: string[] = [];
-			const customFetch: FetchImpl = Object.assign(
-				async (input: string | URL | Request, _init?: RequestInit) => {
-					calls.push(String(input instanceof Request ? input.url : input));
-					return new Response("nope", { status: 418 });
-				},
-				{ preconnect: fetch.preconnect },
-			);
+			const customFetch: FetchImpl = Object.assign(async (input: string | URL | Request, _init?: RequestInit) => {
+				calls.push(String(input instanceof Request ? input.url : input));
+				return new Response("nope", { status: 418 });
+			});
 			const result = await streamBedrock(model, userContext(), {
 				bearerToken: "test-token",
 				fetch: customFetch,
@@ -246,11 +253,11 @@ async function capturedRequestHost(
 			}).result();
 			expect(result.stopReason).toBe("error");
 			expect(calls).toHaveLength(1);
-			host = new URL(calls[0]).host;
+			requestUrl = calls[0];
 		},
 	);
-	if (!host) throw new Error("Bedrock request was not captured");
-	return host;
+	if (!requestUrl) throw new Error("Bedrock request was not captured");
+	return requestUrl;
 }
 
 describe("Bedrock cross-region inference-profile geo routing", () => {
@@ -418,6 +425,59 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 				).toBe("bedrock-runtime.us-west-2.amazonaws.com");
 			},
 		);
+	});
+});
+
+describe("Bedrock custom baseUrl", () => {
+	const NO_AMBIENT = { AWS_REGION: undefined, AWS_DEFAULT_REGION: undefined } as const;
+
+	test("re-points AWS's own regional host at the resolved region", async () => {
+		await withEnv({ AWS_REGION: "eu-central-1", AWS_DEFAULT_REGION: undefined }, async () => {
+			expect(await capturedRequestUrl(bedrockModel("global.anthropic.claude-opus-4-8"))).toBe(
+				"https://bedrock-runtime.eu-central-1.amazonaws.com/model/global.anthropic.claude-opus-4-8/converse-stream",
+			);
+		});
+	});
+
+	// Closest near-miss to the regional host: one `-fips` segment apart.
+	test("keeps a FIPS host instead of re-deriving it", async () => {
+		await withEnv({ AWS_REGION: "us-west-2", AWS_DEFAULT_REGION: undefined }, async () => {
+			const fips = "https://bedrock-runtime-fips.us-west-2.amazonaws.com";
+			expect(await capturedRequestUrl(bedrockModel("anthropic.claude-opus-4-8", fips))).toBe(
+				`${fips}/model/anthropic.claude-opus-4-8/converse-stream`,
+			);
+		});
+	});
+
+	test("sends to a configured host verbatim instead of the regional one", async () => {
+		await withEnv(NO_AMBIENT, async () => {
+			const vpce = "https://vpce-0123456789abcdef0.bedrock-runtime.us-east-1.vpce.amazonaws.com";
+			expect(await capturedRequestUrl(bedrockModel("anthropic.claude-opus-4-8", vpce))).toBe(
+				`${vpce}/model/anthropic.claude-opus-4-8/converse-stream`,
+			);
+		});
+	});
+
+	// Gateway under a path: prefix survives, no doubled slash from the trailing one.
+	test("preserves a baseUrl path prefix and strips its trailing slash", async () => {
+		await withEnv(NO_AMBIENT, async () => {
+			expect(
+				await capturedRequestUrl(
+					bedrockModel("anthropic.claude-opus-4-8", "https://gateway.example.com/bedrock/team/"),
+				),
+			).toBe("https://gateway.example.com/bedrock/team/model/anthropic.claude-opus-4-8/converse-stream");
+		});
+	});
+
+	// A gateway authenticated via a query parameter: dropping the query would
+	// silently send an unauthenticated (or misrouted) request.
+	test("preserves a baseUrl query string used for gateway authentication", async () => {
+		await withEnv(NO_AMBIENT, async () => {
+			const gateway = "https://gateway.example.com/bedrock?code=secret-token";
+			expect(await capturedRequestUrl(bedrockModel("anthropic.claude-opus-4-8", gateway))).toBe(
+				"https://gateway.example.com/bedrock/model/anthropic.claude-opus-4-8/converse-stream?code=secret-token",
+			);
+		});
 	});
 });
 
