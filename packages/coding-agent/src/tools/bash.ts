@@ -55,6 +55,8 @@ import {
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import {
+	formatArtifactErrorNotice,
+	formatOutputNotice,
 	formatStyledTruncationWarning,
 	type OutputMeta,
 	resolveInlineByteCapBudget,
@@ -700,6 +702,8 @@ function stripBackgroundNotice(text: string, async: BashToolDetails["async"] | u
  */
 export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSchemaWithAsync, BashToolDetails> {
 	readonly name = "bash";
+	/** Bash resolves `skill://` URIs in commands and working directories. */
+	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
@@ -805,6 +809,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			hasGrep: isToolActive("grep", this.session.settings.get("grep.enabled")),
 			hasGlob: isToolActive("glob", this.session.settings.get("glob.enabled")),
 			hasRead: isToolActive("read", true),
+			hasSkills:
+				// `skillful: false` removes the system-prompt catalog and must also
+				// strip the provider-side `skill://` hint, matching sdk.ts:3186.
+				this.session.settings.get("skillful") && (this.session.skills?.length ?? 0) > 0,
 			hasLaunch: isToolActive("hub", this.session.settings.get("launch.enabled")),
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
@@ -909,6 +917,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			internalRouter: InternalUrlRouter.instance(),
 			cwd: this.session.cwd,
 			sessionFile: this.session.getSessionFile() ?? undefined,
+			sessionId: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+			agentRegistry: this.session.agentRegistry,
+			rules: this.session.activeRules,
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
 				getSessionId: this.session.getSessionId,
@@ -931,7 +942,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			: undefined;
 
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
-			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
+			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true, skillUrlForDirectory: true });
 		}
 
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
@@ -1014,22 +1025,23 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		timeoutSec: number | undefined,
 		outputText: string,
 	): void {
+		const captureNotice = result.artifactError ? `\n\n[${formatArtifactErrorNotice(result.artifactError)}]` : "";
 		if (result.cancelled) {
 			// Local executor output already carries a leading `[Command cancelled]`
 			// notice from the sink; PTY/bridge output does not, so annotate only
 			// the latter.
 			const out = normalizeResultOutput(result);
 			const annotated = out.startsWith("[Command cancelled]") ? out : out ? `${out}\n\n[Command aborted]` : out;
-			throw new ToolError(annotated || "Command aborted");
+			throw new ToolError(`${annotated || "Command aborted"}${captureNotice}`);
 		}
 		if (result.timedOut === true) {
 			const out = normalizeResultOutput(result);
 			const message =
 				timeoutSec === undefined ? "Command timed out" : `Command timed out after ${timeoutSec} seconds`;
-			throw new ToolError(out ? `${out}\n\n[${message}]` : message);
+			throw new ToolError(`${out ? `${out}\n\n[${message}]` : message}${captureNotice}`);
 		}
 		if (result.exitCode === undefined) {
-			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status`);
+			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status${captureNotice}`);
 		}
 	}
 
@@ -1091,7 +1103,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// `[raw output: artifact://N]` footer and the truncation notice agree.
 		const inlineCap = {
 			maxBytes: resolveInlineByteCapBudget(this.session.settings),
-			saveArtifact: (full: string) => result.artifactId ?? saveBashOriginalArtifact(this.session, full),
+			saveArtifact: result.artifactError
+				? undefined
+				: (full: string) => result.artifactId ?? saveBashOriginalArtifact(this.session, full),
 		};
 
 		if (isTimeout) {
@@ -1157,7 +1171,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	}
 
 	#extractTextResult(result: AgentToolResult<BashToolDetails>): string {
-		return result.content.find(block => block.type === "text")?.text ?? "";
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+		return text + formatOutputNotice(result.details?.meta);
 	}
 
 	#startManagedBashJob(options: {
@@ -1206,6 +1221,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
+					if (result.artifactError) latestProgressDetails = { meta: { artifactError: result.artifactError } };
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -1319,7 +1335,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const pty = input.pty ?? false;
 		const requestedTimeoutSec = input.timeout ?? 300;
 
-		// Invalidate only after every execution gate has allowed the command.
+		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
+		// number touched by a mutating `gh` subcommand inside this bash call so
+		// subsequent issue:// / pr:// reads pick up the post-mutation state
+		// instead of the cached pre-mutation snapshot.
 		invalidateGithubCacheForBashCommand(command);
 
 		// A timeout of 0 is an explicit long-running-command contract: the user
@@ -1759,11 +1778,12 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				const out = normalizeResultOutput(result);
 				// The local executor already prepends `[Command cancelled]`; PTY
 				// output does not, so preserve one cancellation notice in either case.
-				const message = out.startsWith("[Command cancelled]")
+				let message = out.startsWith("[Command cancelled]")
 					? out
 					: out
 						? `${out}\n\n[Command aborted]`
 						: "Command aborted";
+				if (result.artifactError) message += `\n\n[${formatArtifactErrorNotice(result.artifactError)}]`;
 				if (signal?.aborted) {
 					throw new ToolAbortError(message);
 				}
@@ -2013,7 +2033,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 								)
 							: undefined;
 					let warningLine: string | undefined;
-					if (details?.meta?.truncation && !showingFullOutput) {
+					if (details?.meta?.artifactError || (details?.meta?.truncation && !showingFullOutput)) {
 						warningLine = formatStyledTruncationWarning(details.meta, uiTheme) ?? undefined;
 					}
 

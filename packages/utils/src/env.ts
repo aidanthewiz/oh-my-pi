@@ -69,6 +69,48 @@ function managedEnvName(name: string): string {
 	return process.platform === "win32" ? name.toUpperCase() : name;
 }
 
+/**
+ * Git variables that pin a repository location. They describe the checkout the
+ * agent process itself was launched from (git hooks, `git --git-dir` wrappers),
+ * so forwarding them to a child shell makes `git` ignore the command's `cwd`
+ * and mutate the wrong worktree or index. Stripped from child shell envs so git
+ * rediscovers the repository from the working directory. Mirrors the
+ * `env_remove` list in `crates/pi-vcs/src/git/cli.rs`.
+ */
+const GIT_REPO_LOCATION_ENV_NAMES = [
+	"GIT_DIR",
+	"GIT_COMMON_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+] as const;
+
+/**
+ * Removes {@link GIT_REPO_LOCATION_ENV_NAMES} from a copied child env in place.
+ *
+ * Windows environment lookups are case-insensitive, so a block that spells a
+ * variable `git_dir` is just as binding there; match case-insensitively on
+ * win32 and exactly elsewhere (POSIX env names are case-sensitive).
+ */
+export function stripGitRepoLocationEnv(
+	env: Record<string, string>,
+	platform: NodeJS.Platform = process.platform,
+): void {
+	if (platform !== "win32") {
+		for (const name of GIT_REPO_LOCATION_ENV_NAMES) {
+			delete env[name];
+		}
+		return;
+	}
+	const folded = new Set<string>(GIT_REPO_LOCATION_ENV_NAMES.map(name => name.toLowerCase()));
+	for (const key of Object.keys(env)) {
+		if (folded.has(key.toLowerCase())) {
+			delete env[key];
+		}
+	}
+}
+
 // Bun autoloads the project's dotenv files into `process.env` before user code
 // runs — including inside `bun build --compile` binaries. Linux keeps the
 // original exec environment in procfs. Other platforms may use Bun.env only
@@ -423,6 +465,9 @@ function filterChildShellEnvInternal(
 		result.BUN_OPTIONS = bunOptions ? `${bunOptions} ${BUN_NO_ENV_FILE_OPTION}` : BUN_NO_ENV_FILE_OPTION;
 	}
 	result.OMP_NO_ENV_FILE = "1";
+	// Last, after dotenv merging: no source (inherited, launcher, or dotenv) may
+	// pin the child shell to the agent's own repository.
+	stripGitRepoLocationEnv(result);
 	return result;
 }
 

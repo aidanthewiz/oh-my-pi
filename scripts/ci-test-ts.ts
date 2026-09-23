@@ -409,8 +409,8 @@ const SCRUBBED_ENV_NAMES = new Set([
 	"PI_CODING_AGENT_DIR",
 	"PI_CONFIG_DIR",
 	"OMP_AGENT_STRIP",
-	"OMPCF_PRODUCT_VERSION",
-	"OMPCF_VERSION",
+	"OMP_CF_PRODUCT_VERSION",
+	"OMP_CF_VERSION",
 ]);
 
 export function isScrubbedEnvVar(key: string): boolean {

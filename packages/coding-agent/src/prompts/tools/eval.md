@@ -29,6 +29,8 @@ wait(handles, timeout?=None, raise_errors?=True) → list
 workpool(agent?=None, name?=None, context?=None{{#if evalTools}}, tools?=None{{/if}}) → WorkPool
     {{#if eagerDelegation}}Default for 2+ independent items.{{else}}Keep-alive worker pool for a batch of independent items.{{/if}} `.push(*items)`; `.status()`; `.peek()`; `.close()`. Pool name = async job id; results auto-deliver, or poll outside eval with `hub wait` and `ids:[pool.name]`. `eval.workpool.freshAgents=true` uses a new agent per item.
 {{/if}}
+wait(handles, timeout?=None, raise_errors?=True) → list
+    Barrier over agent/completion handles, results in input order. `raise_errors=False` keeps the error in its slot.{{#if js}} JS: wait(handles, { timeout, raiseErrors }).{{/if}}
 {{#if evalTools}}{{#if py}}@tool / tool(fn, name=None, description=None){{/if}}{{#if js}}tool(fn, { name?, description?, parameters? }){{/if}}
     Define a tool that runs in this kernel{{#if py}} (schema inferred from type hints){{/if}}; reference by name in `task` items' `tools`{{#if spawns}}, `agent(tools=…)`, `workpool(tools=…)`{{/if}}. `tool.defined()`, `tool.undefine(name)`.
 {{/if}}

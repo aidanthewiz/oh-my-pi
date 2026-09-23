@@ -9,7 +9,7 @@ import { type MinimizerOptions, PtySession, Shell, type ShellRunResult } from "@
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
-import { OutputSink, type OutputSummary } from "../session/streaming-output";
+import { type OutputArtifactError, OutputSink, type OutputSummary } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
@@ -60,6 +60,13 @@ export interface BashResult extends OutputSummary {
 	cancelled: boolean;
 	/** True when the command was killed by its timeout deadline (not a user abort). */
 	timedOut?: boolean;
+	truncated: boolean;
+	totalLines: number;
+	totalBytes: number;
+	outputLines: number;
+	outputBytes: number;
+	artifactId?: string;
+	artifactError?: OutputArtifactError;
 	workingDir?: string;
 	/** Terminal graphics extracted from raw stdout before sanitization or truncation. */
 	images?: ImageContent[];
