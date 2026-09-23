@@ -12,6 +12,13 @@
 - Isolated managed Coreforge model credentials from the standard AWS credential chain so model requests cannot consume an employee's operational profile, keys, or Region, while still honoring an explicitly supplied model bearer token.
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
+## [18.2.3] - 2026-09-17
+
+### Added
+
+- `stream()` and `streamSimple()` support asynchronous model header resolution for each request attempt, including authentication retries and cancellation.
+- Provider login prompts can request masked entry with `secret: true`.
+
 ## [18.2.2] - 2026-09-16
 
 ### Added

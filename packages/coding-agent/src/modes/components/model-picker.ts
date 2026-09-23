@@ -7,17 +7,10 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import { addKeyAliases, type Component, canonicalKeyId, type KeyId, parseKey, type TUI } from "@oh-my-pi/pi-tui";
 import type { ModelRegistry } from "../../config/model-registry";
-import { filterModelsByConfiguredScope, getAllowedAvailableModels } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
 import type { ResolvedRoleModel } from "../../session/agent-session";
 import { type ThemeColor, theme } from "../theme/theme";
-import {
-	buildBrowserItems,
-	ModelBrowser,
-	type ModelBrowserItem,
-	resolveRoleAssignments,
-	sortModelItems,
-} from "./model-browser";
+import { buildSessionModelScope, ModelBrowser, type ModelBrowserItem } from "./model-browser";
 import type { ScopedModelItem } from "./model-hub";
 import { bottomBorder, row, topBorder } from "./overlay-box";
 import { resolveSegmentPalette } from "./segment-track";
@@ -168,33 +161,16 @@ export class ModelPickerComponent implements Component {
 
 	/** Rebuild model items and role chips from the registry's in-memory state. */
 	#syncFromRegistryState(): void {
-		let models: ReadonlyArray<Model>;
-		if (this.#scopedModels.length > 0) {
-			models = this.#scopedModels.map(scoped => scoped.model);
-			this.#configError = undefined;
-		} else {
-			const loadError = this.#registry.getError();
-			this.#configError = loadError ? String(loadError) : undefined;
-			try {
-				models = getAllowedAvailableModels(this.#registry, this.#settings);
-			} catch (error) {
-				this.#configError = error instanceof Error ? error.message : String(error);
-				models = [];
-			}
-		}
-
-		const allModels =
-			this.#scopedModels.length > 0
-				? models
-				: filterModelsByConfiguredScope(this.#registry.getAll(), this.#settings);
-		const roles = resolveRoleAssignments(this.#settings, allModels, models);
-		const storage = this.#settings.getStorage();
-		const mruOrder = storage?.getModelUsageOrder() ?? [];
-		this.#modelItems = buildBrowserItems(models);
-		sortModelItems(this.#modelItems, { roles, mruOrder });
-		this.#browser.setRoles(roles);
-		this.#browser.setMruOrder(mruOrder);
-		this.#browser.setPerfStats(storage?.getModelPerf() ?? new Map());
+		const scope = buildSessionModelScope(
+			this.#settings,
+			this.#registry,
+			this.#scopedModels.map(s => s.model),
+		);
+		this.#configError = scope.error;
+		this.#modelItems = scope.items;
+		this.#browser.setRoles(scope.roles);
+		this.#browser.setMruOrder(scope.mruOrder);
+		this.#browser.setPerfStats(this.#settings.getStorage()?.getModelPerf() ?? new Map());
 		this.#syncItemsForQuery(this.#browser.query, true);
 	}
 

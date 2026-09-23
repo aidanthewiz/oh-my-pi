@@ -9,6 +9,12 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [18.2.3] - 2026-09-17
+
+### Added
+
+- Models can carry deferred request-header resolvers, and model managers can reconstruct omitted cached headers from authoritative local configuration without persisting credentials.
+
 ## [18.2.2] - 2026-09-16
 
 ### Added

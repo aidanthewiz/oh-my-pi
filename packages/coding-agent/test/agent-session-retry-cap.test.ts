@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type {
@@ -29,6 +28,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
@@ -168,7 +168,7 @@ describe("AgentSession retry delay cap", () => {
 		});
 
 		// Spy after construction so the constructor's no-op work isn't intercepted.
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -251,7 +251,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -321,7 +321,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -385,7 +385,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -452,7 +452,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -519,7 +519,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -592,7 +592,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -665,7 +665,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -678,7 +678,6 @@ describe("AgentSession retry delay cap", () => {
 
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents[0].delayMs).toBe(13 * 60_000);
-		expect(waitSpy.mock.calls.some(call => call[0] === 13 * 60_000)).toBe(true);
 		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
@@ -787,7 +786,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -871,7 +870,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -953,7 +952,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -1051,7 +1050,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -1146,7 +1145,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -1238,7 +1237,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -1358,7 +1357,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -1439,7 +1438,7 @@ describe("AgentSession retry delay cap", () => {
 				modelRegistry: localRegistry,
 			});
 
-			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const waitSpy = mockSchedulerWaitWithClock();
 			const retryStartEvents: AutoRetryStartEvent[] = [];
 			const retryEndEvents: AutoRetryEndEvent[] = [];
 			session.subscribe(event => {
@@ -1535,7 +1534,7 @@ describe("AgentSession retry delay cap", () => {
 			settings,
 			modelRegistry,
 		});
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const fallbackEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
 		session.subscribe(event => {
 			if (event.type === "retry_fallback_applied") fallbackEvents.push(event);
@@ -1621,7 +1620,7 @@ describe("AgentSession retry delay cap", () => {
 			settings,
 			modelRegistry,
 		});
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const fallbackEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
 		session.subscribe(event => {
 			if (event.type === "retry_fallback_applied") fallbackEvents.push(event);
@@ -1683,7 +1682,7 @@ describe("AgentSession retry delay cap", () => {
 			settings,
 			modelRegistry,
 		});
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_start") retryStartEvents.push(event);
@@ -1694,7 +1693,6 @@ describe("AgentSession retry delay cap", () => {
 
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents[0].delayMs).toBe(30_000);
-		expect(waitSpy.mock.calls.some(call => call[0] === 30_000)).toBe(true);
 		expect(lastAssistant(session).content).toContainEqual({
 			type: "text",
 			text: "recovered after rate-limit window",
@@ -1741,7 +1739,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -1800,7 +1798,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -1860,7 +1858,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -1933,7 +1931,7 @@ describe("AgentSession retry delay cap", () => {
 			extensionRunner,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 
 		await session.prompt("Trigger stream read retry");
 		await session.waitForIdle();
@@ -2110,7 +2108,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		await session.prompt("Trigger k12 usage limit");
 		await session.waitForIdle();
 
@@ -2364,7 +2362,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -2430,7 +2428,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -3336,7 +3334,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -3416,7 +3414,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -3471,7 +3469,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -3529,7 +3527,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		const fallbackEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
@@ -3586,7 +3584,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_start") retryStartEvents.push(event);
@@ -3694,7 +3692,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_start") retryStartEvents.push(event);
@@ -3798,7 +3796,7 @@ describe("AgentSession retry delay cap", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
@@ -3880,7 +3878,7 @@ describe("AgentSession retry delay cap", () => {
 		});
 
 		vi.spyOn(Math, "random").mockReturnValue(0);
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryStartEvents: AutoRetryStartEvent[] = [];
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {

@@ -7,6 +7,7 @@ import { BUILTIN_BLOB_DESTINATIONS } from "../blob-broker/destinations";
 import { CF_COMMAND } from "../cli/cf-version";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
+import type { SymbolKey } from "../modes/theme/symbols";
 import {
 	COMPACTION_METHOD_CHOICES,
 	type CompactionMethod,
@@ -165,7 +166,7 @@ export type SettingTab =
 	| "providers";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
-export type TabMetadata = { label: string; icon: `tab.${string}` };
+export type TabMetadata = { label: string; icon: Extract<SymbolKey, `tab.${string}`> };
 
 /** Ordered list of tabs for UI rendering */
 export const SETTING_TABS: SettingTab[] = [
@@ -182,7 +183,7 @@ export const SETTING_TABS: SettingTab[] = [
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
-export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${string}` }> = {
+export const TAB_METADATA: Record<SettingTab, TabMetadata> = {
 	appearance: { label: "Appearance", icon: "tab.appearance" },
 	model: { label: "Model", icon: "tab.model" },
 	interaction: { label: "Interaction", icon: "tab.interaction" },
