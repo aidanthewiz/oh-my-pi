@@ -3502,6 +3502,28 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"ttsr.judge": {
+		type: "enum",
+		values: ["auto", "on", "off"] as const,
+		default: "auto",
+		ui: {
+			tab: "context",
+			group: "Rules (TTSR)",
+			label: "Judged Rules",
+			description:
+				"Ask the judge model role each `question` rule about completed replies, reasoning, and tool calls; a yes injects the rule as a warning",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Judge only when the judge role resolves to a native TypeSafe jev model",
+				},
+				{ value: "on", label: "On", description: "Always judge, whichever model the judge role resolves to" },
+				{ value: "off", label: "Off", description: "Never judge; question rules stay inactive" },
+			],
+		},
+	},
+
 	"ttsr.contextMode": {
 		type: "enum",
 		values: ["discard", "keep"] as const,
@@ -6314,6 +6336,8 @@ export interface CommitSettings {
 
 export interface TtsrSettings {
 	enabled: boolean;
+	/** When judged (`question`) rules run: read by the session, not the TtsrManager. */
+	judge?: "auto" | "on" | "off";
 	contextMode: "discard" | "keep";
 	interruptMode: "never" | "prose-only" | "tool-only" | "always";
 	repeatMode: "once" | "after-gap";

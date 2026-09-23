@@ -370,12 +370,14 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${firstFallback.provider}/${firstFallback.id}`,
 				role: "default",
+				reason: expect.stringContaining("overloaded_error: provider returned error 503"),
 			},
 			{
 				type: "retry_fallback_applied",
 				from: `${firstFallback.provider}/${firstFallback.id}`,
 				to: `${secondFallback.provider}/${secondFallback.id}`,
 				role: "default",
+				reason: expect.stringContaining("service unavailable: 503 overloaded"),
 			},
 		]);
 		expect(retryEndEvents).toHaveLength(1);
@@ -579,12 +581,14 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${firstFallback.provider}/${firstFallback.id}`,
 				role: "default",
+				reason: expect.stringContaining("overloaded_error: provider returned error 503"),
 			},
 			{
 				type: "retry_fallback_applied",
 				from: `${firstFallback.provider}/${firstFallback.id}`,
 				to: `${secondFallback.provider}/${secondFallback.id}`,
 				role: `${firstFallback.provider}/${firstFallback.id}`,
+				reason: expect.stringContaining("503 Hosted inference is temporarily unavailable"),
 			},
 		]);
 	});
@@ -640,6 +644,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${liveModel.provider}/${liveModel.id}`,
 				to: `${rolePrimary.provider}/${rolePrimary.id}`,
 				role: "default",
+				reason: expect.stringContaining("429 rate_limit_error retry-after-ms=11180001"),
 			},
 		]);
 		expect(requestedModels).toEqual([
@@ -1780,6 +1785,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${firstFallback.provider}/${firstFallback.id}`,
 				to: `${secondFallback.provider}/${secondFallback.id}`,
 				role: "slow",
+				reason: expect.stringContaining("overloaded_error: provider returned error 503"),
 			},
 		]);
 		// Nothing had served when the chain advanced, so there was no earlier work
@@ -1904,6 +1910,7 @@ describe("AgentSession retry fallback", () => {
 				from: advisorRoleSelector,
 				to: advisorFallbackSelector,
 				role: "advisor",
+				reason: expect.stringContaining("daily usage quota has been exhausted"),
 			},
 		]);
 		expect(fallbackSucceededEvents).toEqual([
@@ -2344,12 +2351,14 @@ describe("AgentSession retry fallback", () => {
 				from: advisorRoleSelector,
 				to: advisorFallbackSelector,
 				role: "advisor",
+				reason: expect.stringContaining("overloaded_error: provider returned error 503"),
 			},
 			{
 				type: "retry_fallback_applied",
 				from: `${advisorFallbackSelector}:high`,
 				to: secondFallbackSelector,
 				role: advisorFallbackSelector,
+				reason: expect.stringContaining("overloaded_error: provider returned error 503"),
 			},
 		]);
 	});
@@ -2472,6 +2481,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: `${primaryModel.provider}/${primaryModel.id}`,
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -2524,6 +2534,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${modelKeyFallback.provider}/${modelKeyFallback.id}`,
 				role: `${primaryModel.provider}/${primaryModel.id}`,
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -2858,6 +2869,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: "anthropic/*",
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -2929,6 +2941,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: "anthropic/*",
+				reason: expect.stringContaining("unrecoverable model quirk"),
 			},
 		]);
 		expect(session.model?.provider).toBe(fallbackModel.provider);
@@ -3271,6 +3284,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `google-vertex/${primaryModel.id}`,
 				role: "google/*",
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -3325,6 +3339,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `openrouter/google/${primaryModel.id}`,
 				role: "google/*",
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -3379,6 +3394,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `google-vertex/${fallbackModel.id}`,
 				role: "openrouter/google/*",
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -3432,6 +3448,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: "default",
+				reason: expect.any(String),
 			},
 		]);
 	});
@@ -3523,6 +3540,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: "default",
+				reason: expect.stringContaining("Classifier declined this turn."),
 			},
 		]);
 		expect(fallbackSucceededEvents).toEqual([
@@ -3790,6 +3808,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${firstFallback.provider}/${firstFallback.id}`,
 				role: "default",
+				reason: expect.stringContaining("overloaded_error: provider returned error 503"),
 			},
 		]);
 		expect(retryEndEvents).toHaveLength(1);
@@ -4550,6 +4569,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primaryModel.provider}/${primaryModel.id}`,
 				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: "default",
+				reason: expect.stringContaining("content_block_delta before terminal stop signal"),
 			},
 		]);
 		// The fallback fails with the same hard error and the chain is exhausted:
@@ -6530,7 +6550,17 @@ describe("AgentSession retry fallback", () => {
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
 		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async provider =>
 			provider === primaryModel.provider
-				? { state: "depleted", accounts: [{ credentialId: 1, credentialType: "oauth", state: "depleted" }] }
+				? {
+						state: "depleted",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "depleted",
+								resetsAt: Date.parse("2030-01-02T03:04:05Z"),
+							},
+						],
+					}
 				: { state: "healthy", accounts: [] },
 		);
 
@@ -6540,12 +6570,19 @@ describe("AgentSession retry fallback", () => {
 			settings,
 			modelRegistry,
 		});
+		const fallbackEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackEvents.push(event);
+		});
 
 		await session.prompt("Work on the healthy model");
 		await session.waitForIdle();
 
 		// Proactive: the primary was never requested, so no retry saga ran.
 		expect(requestedModels).toEqual([`${fallbackModel.provider}/${fallbackModel.id}`]);
+		expect(fallbackEvents).toHaveLength(1);
+		expect(fallbackEvents[0].reason).toMatch(/preflight/i);
+		expect(fallbackEvents[0].reason).toMatch(/no request.*source model/i);
 		expect(session.servingModel).toEqual({
 			selector: `${fallbackModel.provider}/${fallbackModel.id}`,
 			modelIdentity: `${fallbackModel.provider}/${fallbackModel.id}`,

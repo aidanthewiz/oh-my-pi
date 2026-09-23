@@ -5,9 +5,11 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [18.2.11] - 2026-09-23
+
 ### Changed
 
-- `warmHighlighter()` now also prepares TypeScript, TSX, JavaScript, bash, Python, Rust, and Markdown highlighting in the background, so their first highlight no longer blocks the caller ([#12908](https://github.com/can1357/oh-my-pi/pull/12908) by [@H4vC](https://github.com/H4vC)).
+- Improved `warmHighlighter()` so it prepares TypeScript, TSX, JavaScript, Bash, Python, Rust, and Markdown highlighting in the background, reducing delays on the first highlight for these languages.
 
 ## [18.2.9] - 2026-09-22
 

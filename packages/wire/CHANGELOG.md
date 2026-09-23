@@ -9,6 +9,7 @@
 ### Changed
 
 - Changed the default collaboration and encrypted-share endpoints to `agent-collab.internal.somahub.io`.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added
