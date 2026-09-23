@@ -23,11 +23,12 @@ Drive real Chromium tabs from JavaScript or Python Eval with the global `browser
 - Raw request interception lasts only for the current `tab.run`.
 
 Application modes:
-- `app.path`: spawn the specified browser or Electron executable. NEVER tamper with a real desktop application or apply stealth patches to it.
+- Omit `app` for default automation; no executable path required. Managed Chromium installs automatically on first use.
+- `app.path`: launch the specified browser or Electron executable. Chromium-family browsers use a Coreforge-owned profile unless `args` supplies `--user-data-dir`. NEVER tamper with a real desktop application or apply stealth patches to it.
 - `app.cdp_url`: attach to an existing CDP endpoint.
 - `app.relay: true`: drive the user's Chrome through the Coreforge relay. `app.target` selects a tab by URL/title substring; without it, the visible tab is adopted. Opening with `url` navigates that adopted tab.
 - Relay can also engage when the `browser.relay` setting is on. Relay sessions are the user's real logged-in browser, and sites attribute actions to the user. Name a target or create a dedicated tab. NEVER navigate the visible tab or take consequential action without authorization.
-- Closing releases the managed tab. It never closes relay/CDP-attached pages. Spawned browsers remain open unless `kill: true`.
+- Closing releases the managed tab. It never closes relay/CDP-attached pages. `kill: true` terminates only applications spawned by this process, never reused browser processes.
 - Idle tabs auto-freeze at turn settle (animated pages stop burning CPU/GPU) and unfreeze on next use; tabs idle past the idle-close timeout are closed. Pass `persist: true` on `open` to keep a tab live across turns (e.g. multi-step login); `browser.close` still releases explicitly.
 </instruction>
 
