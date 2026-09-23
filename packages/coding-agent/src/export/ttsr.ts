@@ -583,15 +583,9 @@ export class TtsrManager {
 			: false;
 	}
 
-	/**
-	 * Claim judged verdicts for delivery: drop rules another verdict already
-	 * claimed or that cannot repeat yet, and mark the rest injected so
-	 * concurrent judgments cannot deliver them twice.
-	 */
-	claim(rules: readonly Rule[]): Rule[] {
-		const claimed = rules.filter(rule => this.#canTrigger(rule.name));
-		this.markInjected(claimed);
-		return claimed;
+	/** Rechecks judged verdicts against the repeat gate before delivery. */
+	filterTriggerable(rules: readonly Rule[]): Rule[] {
+		return rules.filter(rule => this.#canTrigger(rule.name));
 	}
 
 	#matchBuffer(buffer: string, context: TtsrMatchContext): Rule[] {

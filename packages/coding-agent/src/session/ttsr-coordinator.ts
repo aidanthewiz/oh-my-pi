@@ -50,8 +50,8 @@ export interface TtsrCoordinatorHost {
 	promptGeneration(): number;
 	/** Judge for `question` rules, or `undefined` while judged rules are off (`ttsr.judge`). */
 	ruleJudge(): Judge | undefined;
-	/** Delivers a judged-rule warning without interrupting the run. */
-	deliverRuleWarning(content: string, ruleNames: string[]): Promise<void>;
+	/** Queues a judged-rule warning and reports whether this session accepted it. */
+	deliverRuleWarning(content: string, ruleNames: string[], deliveryId: number): Promise<boolean>;
 	/** Changes when the session is replaced; verdicts from an older generation are dropped. */
 	sessionGeneration(): number;
 }
@@ -468,9 +468,8 @@ export class TtsrCoordinator {
 		if (!judge) return;
 		const flagged = await judgeRules(judge, output, candidates);
 		if (flagged.length === 0 || this.#host.sessionGeneration() !== generation) return;
-		const rules = manager.claim(flagged);
+		const rules = manager.filterTriggerable(flagged).filter(rule => !this.#deferredReservations.has(rule.name));
 		if (rules.length === 0) return;
-		this.#host.emitSessionEvent({ type: "ttsr_triggered", rules }).catch(() => {});
 		const warning = rules
 			.map(rule =>
 				prompt.render(ttsrWarningTemplate, {
@@ -481,10 +480,18 @@ export class TtsrCoordinator {
 				}),
 			)
 			.join("\n\n");
-		await this.#host.deliverRuleWarning(
-			warning,
-			rules.map(rule => rule.name),
-		);
+		const ruleNames = rules.map(rule => rule.name);
+		const deliveryId = this.#reserveDeferredInjection(rules);
+		try {
+			if (!(await this.#host.deliverRuleWarning(warning, ruleNames, deliveryId))) {
+				this.#releaseDeferredReservation(deliveryId, ruleNames);
+				return;
+			}
+		} catch (error) {
+			this.#releaseDeferredReservation(deliveryId, ruleNames);
+			throw error;
+		}
+		this.#host.emitSessionEvent({ type: "ttsr_triggered", rules }).catch(() => {});
 	}
 
 	#getStreamingToolCallBlock(message: AgentMessage, contentIndex: number): ToolCall | undefined {

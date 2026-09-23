@@ -1736,7 +1736,8 @@ export class AgentSession {
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			promptGeneration: () => this.#promptGeneration,
 			ruleJudge: () => this.ruleJudge(),
-			deliverRuleWarning: (content, ruleNames) => this.#deliverRuleWarning(content, ruleNames),
+			deliverRuleWarning: (content, ruleNames, deliveryId) =>
+				this.#deliverRuleWarning(content, ruleNames, deliveryId),
 			sessionGeneration: () => this.#sessionGeneration,
 		};
 		this.#ttsr = new TtsrCoordinator(ttsrHost, config.ttsrManager);
@@ -2480,13 +2481,23 @@ export class AgentSession {
 	 * Non-interrupting delivery: mid-run the warning joins the next step; an idle
 	 * session starts a turn so the agent can act on it. Persisting the message
 	 * records the rules as injected (see #persistMessageEnd).
+	 *
+	 * Returns false when a session boundary drops the warning before admission.
 	 */
-	async #deliverRuleWarning(content: string, ruleNames: string[]): Promise<void> {
-		if (this.#isDisposed) return;
+	async #deliverRuleWarning(content: string, ruleNames: string[], deliveryId: number): Promise<boolean> {
+		if (this.#isDisposed) return false;
+		const generation = this.#sessionGeneration;
 		await this.sendCustomMessage(
-			{ customType: "ttsr-injection", content, display: false, details: { rules: ruleNames }, attribution: "agent" },
+			{
+				customType: "ttsr-injection",
+				content,
+				display: false,
+				details: { rules: ruleNames, deliveryId },
+				attribution: "agent",
+			},
 			{ deliverAs: "aside" },
 		);
+		return !this.#isDisposed && this.#sessionGeneration === generation;
 	}
 
 	async #formatAsyncResultForFollowUp(result: string, meta?: OutputMeta): Promise<string> {

@@ -35,7 +35,11 @@ function fakeJudge(verdicts: Record<string, number>, gate?: Promise<void>) {
 	return { judge, requests };
 }
 
-function setup(rules: Rule[], judge: Judge) {
+function setup(
+	rules: Rule[],
+	judge: Judge,
+	deliver: (content: string, ruleNames: string[]) => Promise<boolean> = async () => true,
+) {
 	const manager = new TtsrManager({
 		enabled: true,
 		contextMode: "discard",
@@ -56,13 +60,17 @@ function setup(rules: Rule[], judge: Judge) {
 		scheduleAgentContinue: vi.fn(),
 		promptGeneration: () => 0,
 		ruleJudge: () => judge,
-		deliverRuleWarning: async (content: string, ruleNames: string[]) => {
+		deliverRuleWarning: async (content: string, ruleNames: string[], deliveryId: number) => {
+			if (!(await deliver(content, ruleNames))) return false;
 			warnings.push({ content, rules: ruleNames });
+			coordinator.markInjectedFromDetails({ rules: ruleNames, deliveryId });
+			return true;
 		},
 		sessionGeneration: () => generation,
 	} satisfies TtsrCoordinatorHost;
+	const coordinator = new TtsrCoordinator(host, manager);
 	return {
-		coordinator: new TtsrCoordinator(host, manager),
+		coordinator,
 		abort,
 		warnings,
 		replaceSession: () => generation++,
@@ -110,6 +118,31 @@ describe("TTSR judged rules", () => {
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0].rules).toEqual(["honest-tests"]);
 		expect(warnings[0].content).toContain("honest-tests guidance");
+	});
+
+	it("releases dropped and failed warning reservations so a once-only rule can retry", async () => {
+		const { judge } = fakeJudge({ [PROMISES_TESTS]: 1 });
+		let deliveries = 0;
+		const { coordinator, warnings } = setup(
+			[judgedRule("honest-tests", { question: PROMISES_TESTS, scope: ["text"] })],
+			judge,
+			async () => {
+				deliveries++;
+				if (deliveries === 1) return false;
+				if (deliveries === 2) throw new Error("aside delivery failed");
+				return true;
+			},
+		);
+		const message = assistant([{ type: "text", text: "All tests pass." }]);
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			coordinator.onAssistantMessageEnd(message);
+			await coordinator.settleJudgments();
+		}
+
+		expect(deliveries).toBe(3);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].rules).toEqual(["honest-tests"]);
 	});
 
 	it("asks only when the condition prefilter matches and ignores low-probability verdicts", async () => {
