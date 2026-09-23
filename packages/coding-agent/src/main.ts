@@ -6,22 +6,20 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
-import { createInterface } from "node:readline/promises";
-import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
+import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
-	$env,
 	directoryIsMissing,
 	getLogPath,
 	getProjectDir,
-	isBunTestRuntime,
-	logger,
 	normalizePathForComparison,
-	postmortem,
-	setInteractiveHost,
 	setProjectDir,
 	VERSION,
-} from "@oh-my-pi/pi-utils";
+} from "@oh-my-pi/pi-utils/dirs";
+import { $env, isBunTestRuntime, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
+import * as logger from "@oh-my-pi/pi-utils/logger";
+import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
@@ -37,7 +35,7 @@ import {
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
-import { selectSession } from "./cli/session-picker";
+import type { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
@@ -74,7 +72,7 @@ import { ensureCoreforgeIdentityAtStartup } from "./identity/startup";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
-import { InteractiveMode } from "./modes/interactive-mode";
+import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
@@ -111,7 +109,6 @@ import {
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
-import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
@@ -131,6 +128,26 @@ type RunRpcMode = (
 	subagentEventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
+
+/** Interactive-only graph boundary; login dialogs and overlays load on first real use. */
+async function loadInteractiveModeConstructor() {
+	return (await import("./modes/interactive-mode")).InteractiveMode;
+}
+
+/** Resume/import-only graph boundary; ordinary launches never construct a picker. */
+async function loadSessionPicker(): Promise<typeof selectSession> {
+	return (await import("./cli/session-picker")).selectSession;
+}
+
+/** Join-only graph boundary; the full built-in slash-command registry is otherwise unnecessary at startup. */
+async function loadBuiltinSlashCommandExecutor() {
+	return (await import("./slash-commands/builtin-registry")).executeBuiltinSlashCommand;
+}
+
+/** Missing-session-directory prompt boundary; ordinary launches do not need node:readline. */
+async function loadReadlineInterface() {
+	return (await import("node:readline/promises")).createInterface;
+}
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -538,9 +555,10 @@ async function runInteractiveMode(
 	startBackgroundModelDiscovery?: () => Promise<void>,
 	startupLease?: ComposerLease,
 ): Promise<void> {
+	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
 	try {
-		mode = new InteractiveMode(
+		mode = new InteractiveModeConstructor(
 			session,
 			version,
 			startupChangelog,
@@ -642,6 +660,7 @@ async function runInteractiveMode(
 		// `omp join <link>`: dispatch through the same builtin path as a typed
 		// `/join` so collab guards and error rendering stay in one place.
 		if (joinLink !== undefined) {
+			const executeBuiltinSlashCommand = await loadBuiltinSlashCommandExecutor();
 			await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
 			// Join failure returns to the local session; success still needs the
 			// controller observing its eventual restoration without hosting replicas.
@@ -705,6 +724,7 @@ async function promptMoveSession(session: SessionInfo): Promise<SessionPromptRes
 	}
 	const message = `Session's directory no longer exists (${session.cwd}). Move (re-root) it into the current directory? [Y/n] `;
 	pauseStartupWatchdog();
+	const createInterface = await loadReadlineInterface();
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	try {
 		const answer = (await rl.question(message)).trim().toLowerCase();
@@ -1746,19 +1766,15 @@ export async function runRootCommand(
 				pauseStartupWatchdog();
 				let selected: SessionInfo | null;
 				try {
-					selected = await logger.time(
-						`select${sourceName}Session`,
-						deps.selectSession ?? selectSession,
-						choices,
-						{
-							title: `Import ${sourceName} Session`,
-							scopeLabel: false,
-							showCwd: true,
-							allowDelete: false,
-							allowGlobalScope: false,
-							historySearch: false,
-						},
-					);
+					const selectSessionImpl = deps.selectSession ?? (await loadSessionPicker());
+					selected = await logger.time(`select${sourceName}Session`, selectSessionImpl, choices, {
+						title: `Import ${sourceName} Session`,
+						scopeLabel: false,
+						showCwd: true,
+						allowDelete: false,
+						allowGlobalScope: false,
+						historySearch: false,
+					});
 				} finally {
 					resumeStartupWatchdog();
 				}
@@ -1858,7 +1874,8 @@ export async function runRootCommand(
 				}
 			}
 			pauseStartupWatchdog();
-			const selected = await logger.time("selectSession", deps.selectSession ?? selectSession, folderSessions, {
+			const selectSessionImpl = deps.selectSession ?? (await loadSessionPicker());
+			const selected = await logger.time("selectSession", selectSessionImpl, folderSessions, {
 				allSessions: preloadedAllSessions,
 			});
 			resumeStartupWatchdog();

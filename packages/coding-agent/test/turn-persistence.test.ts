@@ -16,7 +16,11 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { planTurnPersistence, sessionMessagePersistenceKey } from "@oh-my-pi/pi-coding-agent/session/turn-persistence";
+import {
+	planTurnPersistence,
+	sameMessageContent,
+	sessionMessagePersistenceKey,
+} from "@oh-my-pi/pi-coding-agent/session/turn-persistence";
 
 function assistant(overrides: Partial<Extract<AgentMessage, { role: "assistant" }>> = {}) {
 	return {
@@ -113,6 +117,25 @@ describe("sessionMessagePersistenceKey", () => {
 		// must return `undefined` rather than fabricating a key for those.
 		const customLike = { role: "hookMessage", timestamp: 1 } as unknown as AgentMessage;
 		expect(sessionMessagePersistenceKey(customLike)).toBeUndefined();
+	});
+});
+
+describe("sameMessageContent", () => {
+	test("distinguishes empty assistant errors emitted in the same millisecond", () => {
+		const retried = assistant({
+			content: [],
+			stopReason: "error",
+			errorMessage: "503 service unavailable",
+		});
+		const exhausted = assistant({
+			content: [],
+			stopReason: "error",
+			errorMessage: "Retry budget exhausted after 1 retry: 503 service unavailable",
+		});
+
+		expect(sessionMessagePersistenceKey(retried)).toBe(sessionMessagePersistenceKey(exhausted));
+		expect(sameMessageContent(retried, exhausted)).toBe(false);
+		expect(sameMessageContent(retried, { ...retried })).toBe(true);
 	});
 });
 

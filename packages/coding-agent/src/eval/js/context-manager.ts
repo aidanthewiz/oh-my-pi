@@ -40,13 +40,20 @@ export interface VmRunState {
 	onDisplay?: (output: JsDisplayOutput) => void;
 }
 
-interface WorkerHandle {
-	mode: "process" | "worker" | "inline";
+/** Isolated runtime transport used by the context manager and startup regression fixtures. */
+export interface JsEvalWorkerHandle {
+	mode: "process" | "worker";
 	send(msg: WorkerInbound): void;
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
 	close(): Promise<boolean>;
 	terminate(): Promise<void>;
+}
+
+/** Startup dependencies overridden by tests to exercise process-to-Worker recovery. */
+export interface JsEvalWorkerFactories {
+	spawnProcess(cwd: string): JsEvalWorkerHandle;
+	spawnWorker(cwd: string): JsEvalWorkerHandle;
 }
 
 interface PendingRun {
@@ -84,7 +91,7 @@ interface JsSession {
 	sessionKey: string;
 	sessionId: string;
 	cwd: string;
-	worker: WorkerHandle;
+	worker: JsEvalWorkerHandle;
 	state: "alive" | "dead";
 	pending: Map<string, PendingRun>;
 	pendingSnapshots: Map<string, PromiseWithResolvers<Extract<WorkerOutbound, { type: "shadow-snapshot" }>>>;
@@ -109,29 +116,31 @@ const resettingSessions = new Map<string, Promise<void>>();
 const WORKER_INIT_TIMEOUT_MS = 15_000;
 const WORKER_CLOSE_TIMEOUT_MS = 1_000;
 const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
-// Active graceful-close grace period before a worker that ack'd `close` but never
-// emitted its `close` event is force-terminated. Defaults to the production floor;
-// tests override it (and restore it) to exercise the close-timeout -> terminate
-// path without a real wall-clock wait.
-let workerCloseTimeoutMs: number = WORKER_CLOSE_TIMEOUT_MS;
+const productionWorkerFactories: JsEvalWorkerFactories = {
+	spawnProcess: spawnJsProcess,
+	spawnWorker: spawnBunWorker,
+};
+let workerFactories = productionWorkerFactories;
 let useWorkerThreadForTests = false;
 
-/**
- * Test-only seam: override the graceful-close grace period (ms). Returns the
- * previous value so callers can restore it. Production always uses
- * {@link WORKER_CLOSE_TIMEOUT_MS}; never call this outside tests.
- */
-export function setWorkerCloseTimeoutMsForTests(ms: number): number {
-	const previous = workerCloseTimeoutMs;
-	workerCloseTimeoutMs = ms;
-	return previous;
+/** Force the real Bun Worker path in credential-boundary tests. */
+export function setJsEvalWorkerThreadForTests(enabled: boolean): void {
+	useWorkerThreadForTests = enabled;
 }
 
-/** Test-only seam for the legacy Worker lifecycle mocks. */
-export function setJsEvalWorkerThreadForTests(enabled: boolean): boolean {
-	const previous = useWorkerThreadForTests;
-	useWorkerThreadForTests = enabled;
-	return previous;
+/**
+ * Test-only seam for exercising isolated-runtime startup transitions. Returns
+ * an idempotent restore callback so tests cannot strand a process-wide factory.
+ */
+export function setJsEvalWorkerFactoriesForTests(factories: JsEvalWorkerFactories): () => void {
+	const previous = workerFactories;
+	workerFactories = factories;
+	let restored = false;
+	return () => {
+		if (restored) return;
+		restored = true;
+		if (workerFactories === factories) workerFactories = previous;
+	};
 }
 
 export async function executeInVmContext(options: {
@@ -611,15 +620,23 @@ async function acquireSession(
 				await initWorker(session, snapshot, readyTimeoutMs);
 				break;
 			} catch (error) {
-				// Process startup can fall back only to a Worker with an isolated
-				// environment. Never run repository-provided eval code inline.
+				// Runtime crash/load failures surface asynchronously via the runtime's
+				// error callback, after the synchronous spawn try/catch has returned.
+				// Recover once from the subprocess into a Bun Worker. A second isolated
+				// runtime failure must surface; running the cell on this host thread
+				// would make synchronous user code impossible to cancel.
 				const failed = session.worker;
 				await failed.terminate().catch(() => undefined);
-				if (failed.mode !== "process") throw error;
-				logger.warn("JS eval subprocess init failed; retrying with an isolated Bun Worker", {
+				if (failed.mode === "worker") {
+					throw new Error(
+						`Failed to initialize isolated JS eval worker: ${error instanceof Error ? error.message : String(error)}`,
+						{ cause: error },
+					);
+				}
+				logger.warn("JS eval subprocess init failed; retrying with a Bun Worker", {
 					error: error instanceof Error ? error.message : String(error),
 				});
-				session.worker = spawnBunWorker(snapshot.cwd);
+				session.worker = workerFactories.spawnWorker(snapshot.cwd);
 				session.state = "alive";
 			}
 		}
@@ -683,7 +700,7 @@ async function initWorker(session: JsSession, snapshot: SessionSnapshot, timeout
 	} catch (error) {
 		// Handshake failed (timeout, init-failed, or worker error): drop both listeners
 		// so the abandoned worker can't keep routing messages into a session the caller
-		// is about to discard or retry on the inline fallback.
+		// is about to discard or retry on the isolated Worker fallback.
 		unsubscribeMessage();
 		unsubscribeError();
 		throw error;
@@ -908,31 +925,40 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function spawnJsWorker(cwd: string): WorkerHandle {
-	if (useWorkerThreadForTests) return spawnBunWorker(cwd);
+function spawnJsWorker(cwd: string): JsEvalWorkerHandle {
+	if (useWorkerThreadForTests) return workerFactories.spawnWorker(cwd);
 	try {
-		return spawnJsProcess(cwd);
-	} catch (err) {
-		logger.warn("JS eval subprocess spawn failed; falling back to an isolated Bun Worker", {
-			error: err instanceof Error ? err.message : String(err),
+		return workerFactories.spawnProcess(cwd);
+	} catch (error) {
+		// A worker thread remains isolated and can interrupt synchronous user code
+		// via terminate(), so it is the only safe recovery from subprocess spawn.
+		logger.warn("JS eval subprocess spawn failed; falling back to a Bun Worker", {
+			error: error instanceof Error ? error.message : String(error),
 		});
-		return spawnBunWorker(cwd);
+	}
+	return workerFactories.spawnWorker(cwd);
+}
+
+function spawnBunWorker(cwd: string): JsEvalWorkerHandle {
+	try {
+		const options: WorkerOptions = {
+			type: "module",
+			env: filterChildShellEnv(Bun.env, cwd),
+		};
+		const hostEntry = workerHostEntry();
+		const worker = hostEntry
+			? new Worker(hostEntry, { ...options, argv: ["__omp_worker_js_eval"] })
+			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, options);
+		return wrapBunWorker(worker);
+	} catch (error) {
+		throw new Error(
+			`Failed to start isolated JS eval worker: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
 	}
 }
 
-function spawnBunWorker(cwd: string): WorkerHandle {
-	const options: WorkerOptions = {
-		type: "module",
-		env: filterChildShellEnv(Bun.env, cwd),
-	};
-	const hostEntry = workerHostEntry();
-	const worker = hostEntry
-		? new Worker(hostEntry, { ...options, argv: ["__omp_worker_js_eval"] })
-		: new Worker(new URL("./worker-entry.ts", import.meta.url).href, options);
-	return wrapBunWorker(worker);
-}
-
-function spawnJsProcess(cwd: string): WorkerHandle {
+function spawnJsProcess(cwd: string): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
 		env: filterChildShellEnv(Bun.env, cwd),
@@ -964,7 +990,7 @@ function spawnJsProcess(cwd: string): WorkerHandle {
 				if (message.type !== "closed") return;
 				void base.terminate().finally(() => finish(true));
 			});
-			const timeout = setTimeout(() => finish(false), workerCloseTimeoutMs);
+			const timeout = setTimeout(() => finish(false), WORKER_CLOSE_TIMEOUT_MS);
 			base.send({ type: "close" });
 			return await promise;
 		},
@@ -972,7 +998,7 @@ function spawnJsProcess(cwd: string): WorkerHandle {
 	};
 }
 
-function wrapBunWorker(worker: Worker): WorkerHandle {
+function wrapBunWorker(worker: Worker): JsEvalWorkerHandle {
 	return {
 		mode: "worker",
 		send(msg) {
@@ -1024,7 +1050,7 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 				finishIfClosed();
 			});
 			worker.addEventListener("close", onClose);
-			const timeout = setTimeout(() => finish(false), workerCloseTimeoutMs);
+			const timeout = setTimeout(() => finish(false), WORKER_CLOSE_TIMEOUT_MS);
 			worker.postMessage({ type: "close" } satisfies WorkerInbound);
 			return await closed;
 		},

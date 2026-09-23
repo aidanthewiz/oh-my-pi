@@ -1,6 +1,9 @@
 // Claude Platform on AWS exposes Anthropic model ids with provider-specific effort ladders.
 
 provider "anthropic-aws" {
+	default-model "claude-opus-4-8"
+	env "ANTHROPIC_AWS_API_KEY"
+
 	models "claude-fable-5" "claude-opus-4-7" "claude-opus-4-8" "claude-sonnet-5" {
 		thinking-effort-map {
 			minimal "low"

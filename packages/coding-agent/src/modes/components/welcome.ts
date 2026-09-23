@@ -1,12 +1,6 @@
-import {
-	type Component,
-	padding,
-	replaceTabs,
-	TERMINAL,
-	truncateToWidth,
-	visibleWidth,
-	wrapTextWithAnsi,
-} from "@oh-my-pi/pi-tui";
+import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import type { Component } from "@oh-my-pi/pi-tui/tui";
+import { padding, replaceTabs, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui/utils";
 import { CF_BRAND } from "../../cli/cf-version";
 import { getCoreforgeGreetingName } from "../../identity/greeting";
 import { theme } from "../../modes/theme/theme";

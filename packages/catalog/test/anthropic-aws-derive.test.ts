@@ -1,9 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import {
-	ANTHROPIC_AWS_PLATFORM_MODEL_IDS,
-	ANTHROPIC_CURATED_FALLBACK_MODELS,
-	deriveAnthropicAwsModels,
-} from "../src/provider-models/openai-compat";
+import { providerEntry, seedModels } from "../src/compat/providers";
+import { getBundledModel } from "../src/models";
+import { ANTHROPIC_AWS_PLATFORM_MODEL_IDS, deriveAnthropicAwsModels } from "../src/provider-models/openai-compat";
 import type { Api, ModelSpec } from "../src/types";
 
 /**
@@ -52,7 +50,7 @@ describe("deriveAnthropicAwsModels", () => {
 	});
 
 	it("derives Opus 5 with authoritative pricing and token limits", () => {
-		const opus = deriveAnthropicAwsModels(ANTHROPIC_CURATED_FALLBACK_MODELS).find(m => m.id === "claude-opus-5");
+		const opus = deriveAnthropicAwsModels(seedModels("anthropic")).find(m => m.id === "claude-opus-5");
 
 		expect(opus).toMatchObject({
 			name: "Claude Opus 5",
@@ -82,5 +80,15 @@ describe("deriveAnthropicAwsModels", () => {
 	it("includes the provider's default model in the platform list", () => {
 		// The anthropic-aws catalog entry's defaultModel must be derivable.
 		expect(ANTHROPIC_AWS_PLATFORM_MODEL_IDS).toContain("claude-opus-4-8");
+	});
+
+	it("bundles the configured default model", () => {
+		const defaultModel = providerEntry("anthropic-aws")?.defaultModel;
+		expect(defaultModel).toBe("claude-opus-4-8");
+		expect(getBundledModel("anthropic-aws", defaultModel!)).toMatchObject({
+			id: defaultModel,
+			provider: "anthropic-aws",
+			baseUrl: "https://aws-external-anthropic.us-east-1.api.aws",
+		});
 	});
 });

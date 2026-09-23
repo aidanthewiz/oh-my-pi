@@ -79,6 +79,8 @@ export function sessionMessagePersistenceKey(message: AgentMessage): string | un
 export function sameMessageContent(left: AgentMessage, right: AgentMessage): boolean {
 	if (left === right) return true;
 	if (left.role !== right.role) return false;
+	if (left.role === "assistant" && right.role === "assistant" && left.errorMessage !== right.errorMessage)
+		return false;
 	// `JSON.stringify` is the slow-path serializer here on purpose: nothing on
 	// the hot persistence-check path reaches it (key lookup short-circuits
 	// first), so a stable lexicographic compare beats hand-rolling structural
