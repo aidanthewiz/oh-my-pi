@@ -12,12 +12,15 @@
  * - agent://<id>/<path> - JSON extraction: each segment is an object key, or
  *   an array index when the current value is an array
  *   (`agent://Parent.Child/reports/0/data`)
+ * - agent://<id>?q=<query> - JSON extraction with jq-style field syntax
+ *   (`agent://Parent.Child?q=.reports[0].data`)
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
+import { applyQuery } from "./json-query";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
@@ -55,7 +58,12 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		}
 
 		const urlPath = url.pathname;
+		const queryParam = url.searchParams.get("q");
 		const hasPathExtraction = urlPath && urlPath !== "/" && urlPath !== "";
+		const hasQueryExtraction = queryParam !== null && queryParam !== "";
+		if (hasPathExtraction && hasQueryExtraction) {
+			throw new Error("agent:// URL cannot combine path extraction with ?q=");
+		}
 
 		const registry = AgentRegistry.global();
 		const rootSessionFile = context?.sessionFile
@@ -100,7 +108,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		let contentType: InternalResource["contentType"] = "text/markdown";
 
 		let extractedFrom = scan.foundPath;
-		if (hasPathExtraction) {
+		if (hasPathExtraction || hasQueryExtraction) {
 			let jsonValue: unknown;
 			let parsed = false;
 			if (scan.jsonPath) {
@@ -121,7 +129,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 				}
 			}
 
-			const extracted = extractJsonPath(jsonValue, decodedSegments);
+			const extracted = hasQueryExtraction
+				? applyQuery(jsonValue, queryParam!)
+				: extractJsonPath(jsonValue, decodedSegments);
 			if (typeof extracted === "string") {
 				// A string field (e.g. a scout's markdown `report`) reads as prose,
 				// not as a JSON-escaped single line.
@@ -134,7 +144,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 				}
 				contentType = "application/json";
 			}
-			notes.push(`Extracted: /${decodedSegments.join("/")}`);
+			notes.push(`Extracted: ${hasQueryExtraction ? queryParam : `/${decodedSegments.join("/")}`}`);
 			if (parsed) notes.push(`Source: ${path.basename(extractedFrom!)}`);
 		}
 

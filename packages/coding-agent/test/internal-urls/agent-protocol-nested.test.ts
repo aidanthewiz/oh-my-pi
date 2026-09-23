@@ -143,9 +143,16 @@ it("agent:// path form extracts JSON by key and array index", async () => {
 	const indexed = await handler.resolve(new URL("agent://Worker/reports/0/data") as never);
 	expect(indexed.contentType).toBe("text/markdown");
 	expect(indexed.content).toBe("first report");
+	const queried = await handler.resolve(new URL("agent://Worker?q=.reports[0].data") as never);
+	expect(queried.contentType).toBe("text/markdown");
+	expect(queried.content).toBe("first report");
+	expect(queried.notes).toContain("Extracted: .reports[0].data");
 	// A missing key yields `undefined`, not a crash or the whole document.
 	const missing = await handler.resolve(new URL("agent://Worker/reports/5/data") as never);
 	expect(missing.content).toBe("null");
+	await expect(handler.resolve(new URL("agent://Worker/reports?q=.result") as never)).rejects.toThrow(
+		/cannot combine path extraction with \?q=/,
+	);
 });
 
 it("agent:// path extraction prefers the <id>.json sidecar over the markdown body", async () => {

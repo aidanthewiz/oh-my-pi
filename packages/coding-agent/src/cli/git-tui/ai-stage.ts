@@ -46,6 +46,16 @@ export interface AiStageOptions {
 	onProgress?: (message: string) => void;
 }
 
+/** Whole-file fallback requires unanimous successful rejection of every hunk. */
+export function shouldStageWholePickedFiles(
+	fileScopeAuthoritative: boolean,
+	totalHunks: number,
+	stagedHunks: number,
+	failedHunks: number,
+): boolean {
+	return fileScopeAuthoritative && totalHunks > 0 && stagedHunks === 0 && failedHunks === 0;
+}
+
 /**
  * Filter the unstaged tree against `instruction` with the resolved judge and
  * stage the matching hunks. Called by the git TUI's unstaged-header wand pill.
@@ -139,7 +149,7 @@ export async function aiStage(options: AiStageOptions): Promise<AiStageOutcome> 
 			}
 		}
 		let hunksJudged = 0;
-		const hunkVerdicts = await judgeAll(jobs, async job => {
+		const { verdicts: hunkVerdicts, failures: hunkFailures } = await judgeAll(jobs, async job => {
 			const { answers } = await judge.judge(
 				{
 					state: { instruction, path: job.path, changed_lines: bound(job.changed, HUNK_CHARS) },
@@ -159,7 +169,12 @@ export async function aiStage(options: AiStageOptions): Promise<AiStageOutcome> 
 		// discriminate within files" and stage the picked files whole. Kind
 		// instructions ("comment changes") accept at least one hunk somewhere,
 		// which keeps the per-hunk selection authoritative.
-		const wholeFileScope = fileScopeAuthoritative && jobs.length > 0 && stagedHunks === 0;
+		const wholeFileScope = shouldStageWholePickedFiles(
+			fileScopeAuthoritative,
+			jobs.length,
+			stagedHunks,
+			hunkFailures,
+		);
 		const indicesByPath = new Map<string, number[]>();
 		jobs.forEach((job, index) => {
 			if (!hunkVerdicts[index]) return;
@@ -204,7 +219,10 @@ export async function aiStage(options: AiStageOptions): Promise<AiStageOutcome> 
  * one flaky request cannot sink the run — unless every item failed, which
  * means the backend is broken and the first error surfaces.
  */
-async function judgeAll<T>(items: readonly T[], run: (item: T) => Promise<boolean>): Promise<boolean[]> {
+async function judgeAll<T>(
+	items: readonly T[],
+	run: (item: T) => Promise<boolean>,
+): Promise<{ verdicts: boolean[]; failures: number }> {
 	let failures = 0;
 	let firstError: unknown;
 	const verdicts = await Promise.all(
@@ -224,7 +242,7 @@ async function judgeAll<T>(items: readonly T[], run: (item: T) => Promise<boolea
 	if (items.length > 0 && failures === items.length) {
 		throw firstError instanceof Error ? firstError : new Error(String(firstError));
 	}
-	return verdicts;
+	return { verdicts, failures };
 }
 
 /** File-list detail: change kind plus +/− counts when the diff is parsed. */
