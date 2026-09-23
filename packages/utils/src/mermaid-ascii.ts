@@ -1,4 +1,5 @@
-import { type MermaidRenderOptions, renderMermaidAscii } from "@oh-my-pi/pi-natives";
+import { renderMermaidAscii } from "@oh-my-pi/pi-natives/mermaid";
+import type { MermaidRenderOptions } from "@oh-my-pi/pi-natives/mermaid";
 import { layoutPositionedGraph } from "./vendor/mermaid-ascii";
 
 export type {

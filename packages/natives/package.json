@@ -83,6 +83,11 @@
       "import": "./native/clipboard.js",
       "default": "./native/clipboard.js"
     },
+    "./mermaid": {
+      "types": "./native/mermaid.d.ts",
+      "import": "./native/mermaid.js",
+      "default": "./native/mermaid.js"
+    },
     "./vcs": {
       "types": "./native/vcs.d.ts",
       "import": "./native/vcs.js",
