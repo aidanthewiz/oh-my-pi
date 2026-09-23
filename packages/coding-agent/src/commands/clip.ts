@@ -8,6 +8,7 @@ import { Settings } from "../config/settings";
 import { StencilCredential } from "../stencil/credential";
 import { uploadClip } from "../stream/clip-upload";
 import { latestRecording, recordingsDir } from "../stream/recording";
+import { StreamRedactor } from "../stream/redactor";
 
 export default class Clip extends Command {
 	static description = commandHelp.description;
@@ -51,6 +52,7 @@ export default class Clip extends Command {
 		if (!serverUrl) {
 			throw new CliUsageError("clip server required: use --server <url> or configure stream.serverUrl");
 		}
+		const redactor = await StreamRedactor.load(process.cwd(), settings.get("stream.redactPatterns"));
 		const credential = new StencilCredential();
 		try {
 			const token = await credential.resolve();
@@ -63,6 +65,7 @@ export default class Clip extends Command {
 				serverUrl,
 				token,
 				recording,
+				redactor,
 				title: flags.title,
 				description: flags.description,
 			});

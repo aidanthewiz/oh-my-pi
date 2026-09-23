@@ -1,5 +1,6 @@
 import { type ClipUploadResponse, STREAM_ROUTES } from "@oh-my-pi/pi-wire";
 import { parseRecording, type RecordingHeader } from "./recording";
+import type { StreamRedactor } from "./redactor";
 
 export interface ClipUploadOptions {
 	/** Stream server base URL (`stream.serverUrl`), e.g. https://live.omp.sh. */
@@ -8,6 +9,8 @@ export interface ClipUploadOptions {
 	token: string;
 	/** `.ompcast` file contents. */
 	recording: string;
+	/** Redacts all public metadata before transmission. */
+	redactor: StreamRedactor;
 	/** Replaces the recording's title. */
 	title?: string;
 	description?: string;
@@ -27,10 +30,11 @@ export async function uploadClip(options: ClipUploadOptions): Promise<ClipUpload
 		throw new Error(`clip server URL must use http or https: ${options.serverUrl}`);
 	}
 	const { header } = parseRecording(options.recording);
+	const description = options.description ?? header.description;
 	const stamped: RecordingHeader = {
 		...header,
-		...(options.title !== undefined && { title: options.title }),
-		...(options.description !== undefined && { description: options.description }),
+		title: options.redactor.redactText(options.title ?? header.title),
+		...(description !== undefined && { description: options.redactor.redactText(description) }),
 	};
 	const body = JSON.stringify(stamped) + options.recording.slice(options.recording.indexOf("\n"));
 	const response = await fetch(`${base.origin}${base.pathname.replace(/\/+$/, "")}${STREAM_ROUTES.clips}`, {

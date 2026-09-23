@@ -162,7 +162,7 @@ export class SessionRecorder {
 			ompcast: RECORDING_VERSION,
 			cols: size.columns,
 			rows: size.rows,
-			title: options.title,
+			title: options.redactor.redactText(options.title),
 			createdAt: new Date().toISOString(),
 		};
 		this.#writer.write(`${JSON.stringify(header)}\n`);
