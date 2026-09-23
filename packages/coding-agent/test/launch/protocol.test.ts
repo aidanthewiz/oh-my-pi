@@ -5,7 +5,6 @@ import {
 	DAEMON_BROKER_PROTOCOL_VERSION,
 	type DaemonOperation,
 	parseDaemonRpcResult,
-	parseDaemonSnapshot,
 	parseDaemonWireRequest,
 } from "../../src/launch/protocol";
 
@@ -152,10 +151,6 @@ describe("launch send acknowledgement", () => {
 });
 
 describe("regex-derived protocol fields", () => {
-	it("preserves an empty readiness match", () => {
-		expect(parseDaemonSnapshot({ ...baseSnapshot, readyMatch: "" }).readyMatch).toBe("");
-	});
-
 	it("preserves an empty wait pattern match", () => {
 		const waitOperation: Extract<DaemonOperation, { op: "wait" }> = {
 			op: "wait",

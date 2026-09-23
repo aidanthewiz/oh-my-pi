@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ToolAbortError, ToolError } from "./tool-errors";
+import { ToolAbortError } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const DCG_PROCESS_TIMEOUT_MS = 30_000;
 const DCG_PIPE_DRAIN_GRACE_MS = 250;

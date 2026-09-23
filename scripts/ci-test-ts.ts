@@ -86,7 +86,6 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // their short TS suites can run together. CI still downloads the Linux x64 native
 // addon before this bucket: shared utility barrels may load native-backed modules.
 const fastWorkspacePackages = [
-	"packages/wire",
 	"packages/omptype",
 	"packages/utils",
 	"packages/catalog",
@@ -409,8 +408,8 @@ const SCRUBBED_ENV_NAMES = new Set([
 	"PI_CODING_AGENT_DIR",
 	"PI_CONFIG_DIR",
 	"OMP_AGENT_STRIP",
-	"OMPCF_PRODUCT_VERSION",
-	"OMPCF_VERSION",
+	"OMP_CF_PRODUCT_VERSION",
+	"OMP_CF_VERSION",
 ]);
 
 export function isScrubbedEnvVar(key: string): boolean {

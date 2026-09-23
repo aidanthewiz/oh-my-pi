@@ -27,16 +27,16 @@ import {
 } from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS, MODEL_ROLES } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
-import { type ThemeColor, theme } from "../../modes/theme/theme";
-import { matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
+import { type ThemeColor, theme } from "@oh-my-pi/pi-tui/theme";
+import { matchesSelectDown, matchesSelectUp } from "@oh-my-pi/pi-tui/keybinding-matchers";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	getConfiguredThinkingLevelMetadata,
 	parseConfiguredThinkingLevel,
-} from "../../thinking";
-import { getTabBarTheme } from "../shared";
-import { DynamicBorder } from "./dynamic-border";
+} from "@oh-my-pi/pi-tui/thinking";
+import { getTabBarTheme } from "@oh-my-pi/pi-tui/chrome/shared";
+import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
 
 function makeInvertedBadge(label: string, color: ThemeColor): string {
 	const fgAnsi = theme.getFgAnsi(color);

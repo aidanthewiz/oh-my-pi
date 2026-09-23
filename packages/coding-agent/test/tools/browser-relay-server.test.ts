@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { findFreeCdpPort } from "../../src/tools/browser/attach";
-import { type RelayServer, startRelayServer } from "../../src/tools/browser/relay/server";
+import { type RelayServer, type RelayUnavailableInfo, startRelayServer } from "../../src/tools/browser/relay/server";
 
 const relays: RelayServer[] = [];
 afterEach(() => {
@@ -158,5 +158,54 @@ describe("browser relay authentication", () => {
 	it("rejects an empty server token", async () => {
 		const port = await findFreeCdpPort();
 		expect(() => startRelayServer({ port, token: " " })).toThrow("Browser relay token must be nonempty");
+	});
+
+	it("reports 503 with extensionSeen=false before an extension handshake", async () => {
+		const port = await findFreeCdpPort();
+		const relay = startRelayServer({ port, token: "test-token" });
+		relays.push(relay);
+		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		expect(response.status).toBe(503);
+		const info = (await response.json()) as RelayUnavailableInfo;
+		expect(info.extensionSeen).toBeFalse();
+		expect(info.uptimeMs).toBeGreaterThanOrEqual(0);
+	});
+
+	it("keeps extensionSeen=true after an authenticated extension disconnect", async () => {
+		const port = await findFreeCdpPort();
+		const connected = Promise.withResolvers<void>();
+		const relay = startRelayServer({
+			port,
+			token: "test-token",
+			log: message => {
+				if (message === "extension connected") connected.resolve();
+			},
+		});
+		relays.push(relay);
+		const extension = new WebSocket(`ws://127.0.0.1:${port}/ext?token=test-token`);
+		await new Promise<void>((resolve, reject) => {
+			extension.addEventListener("open", () => resolve(), { once: true });
+			extension.addEventListener("error", () => reject(new Error("extension websocket failed to open")), {
+				once: true,
+			});
+		});
+		extension.send(
+			JSON.stringify({
+				t: "hello",
+				userAgent: "test",
+				browserVersion: "Chrome/test",
+				tabs: [],
+				attachedTabIds: [],
+			}),
+		);
+		await connected.promise;
+		extension.close();
+		const deadline = Date.now() + 1_000;
+		let response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		while (response.status !== 503 && Date.now() < deadline) {
+			response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		}
+		expect(response.status).toBe(503);
+		expect(((await response.json()) as RelayUnavailableInfo).extensionSeen).toBeTrue();
 	});
 });

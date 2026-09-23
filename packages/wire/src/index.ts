@@ -454,3 +454,5 @@ export type RelayControlToGuest = { t: "room-closed" };
 /** Relay → any authenticated client. */
 export type RelayControlToClient = RelayAuthAccepted;
 export type RelayControlMessage = RelayControlToHost | RelayControlToGuest | RelayControlToClient;
+
+export * from "./stream";

@@ -15,10 +15,10 @@ import {
 	resolveBenchTargets,
 	type StreamSimpleFn,
 } from "../cli/bench-runtime";
+import type { LiveBoardOutput } from "@oh-my-pi/pi-tui/chrome/live-board";
 import { CF_COMMAND } from "../cli/cf-version";
-import type { LiveBoardOutput } from "../cli/live-board";
 import { initialArray } from "./actions";
-import { createIfBenchBoard, formatIfBenchScoreboard } from "./board";
+import { createIfBenchBoard, formatIfBenchScoreboard } from "@oh-my-pi/pi-tui/apps/if-bench-board";
 import { DEFAULT_NYA_MAX } from "./protocol";
 import { type IfBenchSummary, runIfBench } from "./runner";
 
@@ -107,7 +107,7 @@ export async function runIfBenchCommand(
 
 	const runtime = await (deps.createRuntime ?? createDefaultBenchRuntime)();
 	try {
-		const targets = resolveBenchTargets(command.models, runtime.modelRegistry, runtime.settings, writeStderr);
+		const targets = await resolveBenchTargets(command.models, runtime.modelRegistry, runtime.settings, writeStderr);
 		board?.log(
 			chalk.dim(
 				`if-bench · ${targets.length} model${targets.length === 1 ? "" : "s"} · up to ${maxTurns} turns · array ${arrayLength} · nya{1,${nyaMax}} · temperature 0`,
