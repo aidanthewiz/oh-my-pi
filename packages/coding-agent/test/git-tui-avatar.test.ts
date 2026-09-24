@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { identiconLines } from "@oh-my-pi/pi-coding-agent/cli/git-tui/avatar";
+import { identiconLines } from "@oh-my-pi/pi-tui/apps/git/avatar";
 
 const originalFetch = globalThis.fetch;
 

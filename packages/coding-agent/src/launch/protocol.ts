@@ -1,3 +1,10 @@
+import {
+	type DaemonState,
+	type DaemonRestartPolicy,
+	type DaemonReadySpec,
+	type DaemonSpec,
+	type DaemonSnapshot,
+} from "@oh-my-pi/pi-tui/tools/hub";
 /**
  * Cross-process daemon broker protocol shared by the tool, client, and broker.
  */
@@ -5,9 +12,8 @@
  * Wire and runtime namespace version. Increment for any compatibility or
  * security-boundary change that must not reuse brokers from older engines.
  */
-export const DAEMON_BROKER_PROTOCOL_VERSION = 2;
-/** Hidden CLI selector used to re-enter the daemon broker worker. */
-export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
+export const DAEMON_BROKER_PROTOCOL_VERSION = 3;
+export { DAEMON_BROKER_WORKER_ARG } from "../cli/worker-selectors";
 
 /** Fixed dimensions negotiated with every supervised PTY. */
 export const DAEMON_PTY_COLUMNS = 120;
@@ -22,58 +28,12 @@ export const DAEMON_RUNTIME_DIR_ENV = "OMP_DAEMON_RUNTIME_DIR";
 /** Optional environment key overriding last-client shutdown grace. */
 export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 
-/** Stable lifecycle states exposed by the launch tool. */
-export type DaemonState = "starting" | "running" | "ready" | "restarting" | "stopping" | "exited" | "failed";
-
-/** Restart behavior applied after an unexpected daemon exit. */
-export type DaemonRestartPolicy = "no" | "on-failure" | "always";
-
-/** Readiness conditions; every configured condition must pass. */
-export interface DaemonReadySpec {
-	log?: string;
-	port?: number;
-	host?: string;
-	timeoutMs: number;
-}
-
-/** Immutable launch specification retained for restart and inspection. */
-export interface DaemonSpec {
-	name: string;
-	application: string;
-	args: string[];
-	env: Record<string, string>;
-	cwd: string;
-	pty: boolean;
-	ready?: DaemonReadySpec;
-	restart: DaemonRestartPolicy;
-	persist: boolean;
-	detached: boolean;
-}
-
-/** Serializable daemon state visible to every client in one broker scope. */
-export interface DaemonSnapshot {
-	name: string;
-	id: string;
-	state: DaemonState;
-	pid?: number;
-	createdAt: number;
-	startedAt: number;
-	readyAt?: number;
-	exitedAt?: number;
-	exitCode?: number;
-	exitReason?: string;
-	restartCount: number;
-	outputBytes: number;
-	owner?: string;
-	readyMatch?: string;
-	/** Readiness conditions still unmet while `state` is `starting`; absent once ready or without a ready spec. */
-	readyPending?: ("log" | "port")[];
-	persist: boolean;
-	detached: boolean;
-}
-
 /** Signals accepted by daemon input operations. */
 export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKILL";
+
+/** Transport and acknowledgement boundary for daemon stdin writes. */
+export type DaemonInputTransport = "pty" | "pipe";
+export type DaemonInputDelivery = "broker_write_only";
 
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
@@ -117,7 +77,13 @@ export type DaemonRpcResult =
 			state: DaemonState;
 	  }
 	| { op: "wait"; daemon: DaemonSnapshot; matched?: string; timedOut: boolean }
-	| { op: "send"; daemon: DaemonSnapshot }
+	| {
+			op: "send";
+			daemon: DaemonSnapshot;
+			bytesWritten: number;
+			transport: DaemonInputTransport;
+			delivery: DaemonInputDelivery;
+	  }
 	| { op: "stop"; daemon: DaemonSnapshot }
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
@@ -453,7 +419,24 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				timedOut: booleanValue(source.timedOut, "result.timedOut"),
 			};
 		case "send":
-			return { op: "send", daemon: parseDaemonSnapshot(source.daemon) };
+			return {
+				op: "send",
+				daemon: parseDaemonSnapshot(source.daemon),
+				bytesWritten: numberValue(source.bytesWritten, "result.bytesWritten"),
+				transport: (() => {
+					const transport = stringValue(source.transport, "result.transport");
+					if (transport !== "pty" && transport !== "pipe") {
+						throw new Error("result.transport must be pty or pipe");
+					}
+					return transport;
+				})(),
+				delivery:
+					source.delivery === "broker_write_only"
+						? "broker_write_only"
+						: (() => {
+								throw new Error("result.delivery must be broker_write_only");
+							})(),
+			};
 		case "stop":
 			return { op: "stop", daemon: parseDaemonSnapshot(source.daemon) };
 		case "restart":

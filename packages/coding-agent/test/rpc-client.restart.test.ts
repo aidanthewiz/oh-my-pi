@@ -15,7 +15,7 @@ function isProcessAlive(pid: number): boolean {
 }
 
 describe("RpcClient lifecycle (issue #4079 B)", () => {
-	test("auto-negotiates protocol v2 and reassembles an oversized response", async () => {
+	test("auto-negotiates protocol v2 with a server that predates event subscriptions", async () => {
 		using client = new RpcClient({
 			cliPath: MOCK_AGENT,
 			env: { MOCK_RPC_V2: "1" },
@@ -28,6 +28,19 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 			{ role: "user", content: "first", timestamp: 1 },
 			{ role: "assistant", content: [{ type: "text", text: "second" }], timestamp: 2 },
 		]);
+	}, 20_000);
+
+	test("negotiates advertised event subscriptions and delivers control frames", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_V2: "1", MOCK_RPC_EVENT_SUBSCRIPTIONS: "1" },
+		});
+		const observed = Promise.withResolvers<unknown>();
+		client.onControlEvent(event => observed.resolve(event));
+
+		await client.start();
+		expect(await client.setEventSubscription("control")).toBe("control");
+		expect(await observed.promise).toEqual({ type: "rpc_control", event: "agent_start" });
 	}, 20_000);
 
 	test("normalizes omitted state fields and a runtime-invalid tokensPerSecond", async () => {

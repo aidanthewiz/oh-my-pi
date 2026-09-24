@@ -161,6 +161,16 @@ describe.skipIf(!hasFfmpeg)("read video", () => {
 		expect(result.content.find(c => c.type === "image")).toBeDefined();
 	});
 
+	it("accepts zero-valued frame and timestamp selectors", async () => {
+		const tool = new ReadTool(makeSession(testDir));
+
+		for (const selector of ["0", "00:00"]) {
+			const result = await tool.execute(`read-video-${selector}`, { path: `${clipPath}:${selector}` });
+			expect(textOf(result)).toContain("Video frame");
+			expect(result.content.find(c => c.type === "image")).toBeDefined();
+		}
+	});
+
 	it("rejects line-range selectors with a video-specific hint", async () => {
 		const tool = new ReadTool(makeSession(testDir));
 

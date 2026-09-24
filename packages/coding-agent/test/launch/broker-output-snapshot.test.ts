@@ -131,6 +131,130 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 		}
 	}, 20_000);
 
+	it("reports PTY and pipe writes without claiming application delivery", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-input-boundary-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const scriptPath = path.join(projectDir, "line-reader.ts");
+		await Bun.write(
+			scriptPath,
+			`process.stdin.setEncoding("utf8");
+if (process.stdin.isTTY) process.stdin.setRawMode(true);
+let input = "";
+process.stdin.on("data", chunk => {
+	input += chunk;
+	for (;;) {
+		const newline = input.indexOf("\\n");
+		if (newline < 0) return;
+		const line = input.slice(0, newline).replace(/\\r$/, "");
+		input = input.slice(newline + 1);
+		process.stdout.write("LINE:" + Buffer.byteLength(line) + "\\n");
+	}
+});
+process.stdout.write("READY\\n");
+`,
+		);
+
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = startBroker(projectDir, runtimeDir);
+		const names = ["interactive-pty", "machine-pipe"];
+		try {
+			for (const [name, usePty] of [
+				[names[0], true],
+				[names[1], false],
+			] as const) {
+				const started = await client.request({
+					op: "start",
+					spec: {
+						name,
+						application: process.execPath,
+						args: [scriptPath],
+						env: {},
+						cwd: projectDir,
+						pty: usePty,
+						ready: { log: "READY", timeoutMs: 5_000 },
+						restart: "no",
+						persist: false,
+						detached: false,
+					},
+				});
+				if (started.op !== "start") throw new Error("unexpected start result");
+				expect(started.readyTimedOut).toBeFalse();
+			}
+
+			const shortWrite = await client.request({ op: "send", name: names[0], data: "short\n" });
+			if (shortWrite.op !== "send") throw new Error("unexpected send result");
+			expect(shortWrite).toMatchObject({
+				bytesWritten: 6,
+				transport: "pty",
+				delivery: "broker_write_only",
+			});
+			const shortObserved = await client.request({
+				op: "wait",
+				name: names[0],
+				for: "exit",
+				pattern: "LINE:5",
+				timeoutMs: 2_000,
+			});
+			if (shortObserved.op !== "wait") throw new Error("unexpected wait result");
+			expect(shortObserved.timedOut).toBeFalse();
+
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			try {
+				const signalWrite = await client.request({ op: "send", name: names[0], signal: "SIGINT" });
+				if (signalWrite.op !== "send") throw new Error("unexpected send result");
+				expect(signalWrite).toMatchObject({
+					bytesWritten: 1,
+					transport: "pty",
+					delivery: "broker_write_only",
+				});
+				const combinedWrite = await client.request({
+					op: "send",
+					name: names[0],
+					data: "abc",
+					signal: "SIGINT",
+				});
+				if (combinedWrite.op !== "send") throw new Error("unexpected send result");
+				expect(combinedWrite).toMatchObject({
+					bytesWritten: 4,
+					transport: "pty",
+					delivery: "broker_write_only",
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+			}
+
+			const largeLineBytes = 8 * 1_024;
+			const largeLine = `${"x".repeat(largeLineBytes)}\n`;
+			const pipeWrite = await client.request({ op: "send", name: names[1], data: largeLine });
+			if (pipeWrite.op !== "send") throw new Error("unexpected send result");
+			expect(pipeWrite).toMatchObject({
+				bytesWritten: largeLineBytes + 1,
+				transport: "pipe",
+				delivery: "broker_write_only",
+			});
+			const pipeObserved = await client.request({
+				op: "wait",
+				name: names[1],
+				for: "exit",
+				pattern: `LINE:${largeLineBytes}`,
+				timeoutMs: 2_000,
+			});
+			if (pipeObserved.op !== "wait") throw new Error("unexpected wait result");
+			expect(pipeObserved.timedOut).toBeFalse();
+		} finally {
+			for (const name of names) {
+				await client.request({ op: "stop", name, timeoutMs: 2_000 }).catch(() => undefined);
+			}
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
+			setProcessName(previousTitle);
+		}
+	}, 20_000);
 	// A supervised program that probes the terminal (cursor position here) blocks
 	// on the reply; nothing behind the broker's PTY answered, so it hung until its
 	// own timeout. The broker now replies, and the reply bytes reach the program's

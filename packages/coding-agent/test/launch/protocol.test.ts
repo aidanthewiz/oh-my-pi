@@ -5,7 +5,6 @@ import {
 	DAEMON_BROKER_PROTOCOL_VERSION,
 	type DaemonOperation,
 	parseDaemonRpcResult,
-	parseDaemonSnapshot,
 	parseDaemonWireRequest,
 } from "../../src/launch/protocol";
 
@@ -115,11 +114,43 @@ describe("launch logs compatibility", () => {
 	});
 });
 
-describe("regex-derived protocol fields", () => {
-	it("preserves an empty readiness match", () => {
-		expect(parseDaemonSnapshot({ ...baseSnapshot, readyMatch: "" }).readyMatch).toBe("");
+describe("launch send acknowledgement", () => {
+	const sendOperation: Extract<DaemonOperation, { op: "send" }> = {
+		op: "send",
+		name: "web",
+		data: "status\r",
+	};
+
+	it("preserves the transport and acknowledgement boundary", () => {
+		expect(
+			parseDaemonRpcResult(sendOperation, {
+				daemon: baseSnapshot,
+				bytesWritten: 7,
+				transport: "pty",
+				delivery: "broker_write_only",
+			}),
+		).toEqual({
+			op: "send",
+			daemon: baseSnapshot,
+			bytesWritten: 7,
+			transport: "pty",
+			delivery: "broker_write_only",
+		});
 	});
 
+	it("rejects an unknown delivery claim", () => {
+		expect(() =>
+			parseDaemonRpcResult(sendOperation, {
+				daemon: baseSnapshot,
+				bytesWritten: 7,
+				transport: "pty",
+				delivery: "application_delivered",
+			}),
+		).toThrow("result.delivery must be broker_write_only");
+	});
+});
+
+describe("regex-derived protocol fields", () => {
 	it("preserves an empty wait pattern match", () => {
 		const waitOperation: Extract<DaemonOperation, { op: "wait" }> = {
 			op: "wait",

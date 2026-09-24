@@ -9,9 +9,10 @@ import {
 } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { CF_BRAND, CF_COMMAND } from "../../cli/cf-version";
-import { ToolAbortError, ToolError } from "../tool-errors";
-import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, waitForCdp } from "./attach";
+import { ToolAbortError } from "../tool-errors";
+import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import {
@@ -25,12 +26,20 @@ import {
 import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
+import { waitForRelayExtension } from "./relay/probe";
 import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
 import { ensureSharedBrowser } from "./shared-daemon";
 
 export type PuppeteerBrowserKind =
-	| { kind: "headless"; headless: boolean }
-	| { kind: "spawned"; path: string }
+	| {
+			kind: "headless";
+			headless: boolean;
+			/** Process-local launch flag; shared browsers use the tab-scoped CDP override instead. */
+			ignoreHttpsErrors?: boolean;
+			/** Process-local file access launch flag, unsupported by an already-running shared browser. */
+			allowFileAccess?: boolean;
+	  }
+	| { kind: "spawned"; path: string; args?: string[] }
 	| { kind: "connected"; cdpUrl: string }
 	| RelayKind;
 
@@ -44,12 +53,7 @@ export type BrowserKindTag = BrowserKind["kind"];
  * forever (issue #5260), so we cap the wait and force-kill on timeout.
  */
 const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
-/**
- * How long a relay open waits for the extension handshake (503 → 200). A
- * reaped extension service worker is revived by its 30s keepalive alarm, so
- * the wait must cover one full alarm period plus the dial.
- */
-const RELAY_EXTENSION_WAIT_MS = 35_000;
+const RELAY_VERSION_TIMEOUT_MS = 2_000;
 
 interface BrowserHandleCommon {
 	key: string;
@@ -89,12 +93,12 @@ const browsers = new Map<string, BrowserHandle>();
 /** In-flight opens by browser key, so concurrent acquisitions share one launch instead of storming Chromium. */
 const pendingOpens = new Map<string, Promise<BrowserHandle>>();
 
-function browserKey(kind: BrowserKind): string {
+export function browserKey(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
-			return `headless:${kind.headless ? "1" : "0"}`;
+			return `headless:${kind.headless ? "1" : "0"}:${kind.ignoreHttpsErrors ? "tls" : ""}:${kind.allowFileAccess ? "file" : ""}`;
 		case "spawned":
-			return `spawned:${kind.path}`;
+			return `spawned:${JSON.stringify([kind.path, kind.args ?? []])}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
 		case "relay":
@@ -107,11 +111,11 @@ function browserKey(kind: BrowserKind): string {
 export interface AcquireBrowserOptions {
 	cwd: string;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
-	appArgs?: string[];
 	signal?: AbortSignal;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
+	if (kind.kind === "spawned") kind = { ...kind, args: resolveSpawnArgs(kind.path, kind.args, opts.cwd) };
 	const key = browserKey(kind);
 	for (;;) {
 		const existing = browsers.get(key);
@@ -187,7 +191,7 @@ async function relayBrowserWSEndpoint(
 			`The ${CF_BRAND} browser relay requires a token. Add ?token=... to the configured relay URL or use a loopback relay.`,
 		);
 	}
-	const timeout = AbortSignal.timeout(RELAY_EXTENSION_WAIT_MS);
+	const timeout = AbortSignal.timeout(RELAY_VERSION_TIMEOUT_MS);
 	const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	const response = await fetch(`${cdpUrl}/json/version`, { signal: fetchSignal });
 	if (!response.ok) {
@@ -230,6 +234,8 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		const { browser, userDataDir } = await launchHeadlessBrowser({
 			headless: kind.headless,
 			viewport: opts.viewport,
+			ignoreHttpsErrors: kind.ignoreHttpsErrors,
+			allowFileAccess: kind.allowFileAccess,
 		});
 		return {
 			key: browserKey(kind),
@@ -271,22 +277,21 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		// on demand (the extension dials in on its own). Hosts without a CLI
 		// worker entry (bun test, SDK embedding) never spawn brokers. Remote
 		// relay URLs must already be serving.
-		let autoStarted = false;
 		if (loopback && (isCompiledBinary() || workerHostEntry() !== null)) {
-			autoStarted = await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
+			await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
 		}
-		// The relay answers /json/version with 503 until its extension dials in.
-		// A freshly revived extension service worker can take up to ~30s (its
-		// keepalive alarm) to reconnect, so give the handshake that long.
-		try {
-			await waitForCdp(cdpUrl, RELAY_EXTENSION_WAIT_MS, opts.signal);
-		} catch (err) {
-			if (err instanceof ToolAbortError) throw err;
-			if (err instanceof Error && err.name === "AbortError") throw err;
+		// The relay answers /json/version with 503 until its extension dials in;
+		// the wait fails fast when nothing serves the port or the server has
+		// already outlived the window an installed extension needs to connect.
+		const outcome = await waitForRelayExtension(cdpUrl, opts.signal);
+		if (outcome === "unreachable") {
 			throw new ToolError(
-				autoStarted
-					? `${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`
-					: `${CF_BRAND} browser relay is not reachable at ${cdpUrl}. Start it with \`${CF_COMMAND} browser-relay\` (or check the endpoint), and make sure the ${CF_BRAND} Browser Relay extension is loaded in Chrome.`,
+				`${CF_BRAND} browser relay is not reachable at ${cdpUrl}. Start it with \`${CF_COMMAND} browser-relay\` (or check the endpoint), and make sure the ${CF_BRAND} Browser Relay extension is loaded in Chrome.`,
+			);
+		}
+		if (outcome === "no-extension") {
+			throw new ToolError(
+				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`,
 			);
 		}
 		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);
@@ -312,10 +317,8 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			`app.path must be absolute (got ${JSON.stringify(exe)}). Pass the binary inside Foo.app/Contents/MacOS/, not the .app bundle.`,
 		);
 	}
-	const reused = await findReusableCdp(exe, {
-		signal: opts.signal,
-		appArgs: opts.appArgs,
-	});
+	const appArgs = kind.args ?? [];
+	const reused = await findReusableCdp(exe, { signal: opts.signal, appArgs });
 	let cdpUrl: string;
 	let pid: number;
 	let subprocess: Subprocess | undefined;
@@ -325,9 +328,10 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		pid = reused.pid;
 	} else {
 		const port = await findFreeCdpPort();
-		const launchArgs = [...(opts.appArgs ?? []), `--remote-debugging-port=${port}`];
+		const launchArgs = [...appArgs, `--remote-debugging-port=${port}`];
 		const child = Bun.spawn([exe, ...launchArgs], {
 			env: filterChildShellEnv(Bun.env, getProjectDir()),
+			cwd: opts.cwd,
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -444,7 +448,10 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 			logger.debug("Failed to disconnect from spawned browser", { error: (err as Error).message });
 		}
 	}
-	if (opts.kill && handle.pid !== undefined) await gracefulKillTreeOnce(handle.pid);
+	// A discovered CDP PID is borrowed, not ours to kill on close or abort.
+	if (opts.kill && handle.subprocess && handle.subprocess.exitCode === null) {
+		await gracefulKillTreeOnce(handle.subprocess.pid);
+	}
 }
 
 /**
@@ -457,6 +464,11 @@ async function openSharedHeadlessHandle(
 	kind: Extract<PuppeteerBrowserKind, { kind: "headless" }>,
 	opts: AcquireBrowserOptions,
 ): Promise<PuppeteerBrowserHandle> {
+	if (kind.allowFileAccess) {
+		throw new ToolError(
+			"browser.open({ allow_file_access:true }) requires a process-local Chromium launch and cannot be applied to the project-shared browser. Use app.path to launch a dedicated browser.",
+		);
+	}
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
 	try {
 		const shared = await ensureSharedBrowser({

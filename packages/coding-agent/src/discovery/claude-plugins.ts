@@ -273,6 +273,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		roots.map(root =>
 			loadFilesFromDir<Rule>(ctx, path.join(root.path, "rules"), PROVIDER_ID, root.scope, {
 				extensions: ["md", "mdc"],
+				origin: root.origin,
 				transform: (name, content, filePath, source) =>
 					discoverRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ }),
 			}),
@@ -320,7 +321,7 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 										path: dir,
 										content,
 										level: root.scope,
-										_source: createSourceMeta(PROVIDER_ID, dir, root.scope),
+										_source: createSourceMeta(PROVIDER_ID, dir, root.scope, root.origin),
 									},
 								],
 								warnings: [],
@@ -331,6 +332,7 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 					}
 					return loadFilesFromDir<SlashCommand>(ctx, dir, PROVIDER_ID, root.scope, {
 						extensions: ["md"],
+						origin: root.origin,
 						transform: (name, content, filePath, source) => {
 							const cmdName = name.replace(/\.md$/, "");
 							return {
@@ -383,6 +385,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 		loadTasks.map(async ({ root, hookType }) => {
 			const hooksDir = path.join(root.path, "hooks", hookType);
 			return loadFilesFromDir<Hook>(ctx, hooksDir, PROVIDER_ID, root.scope, {
+				origin: root.origin,
 				transform: (name, _content, filePath, source) => {
 					const toolName = name.replace(/\.(sh|bash|zsh|fish)$/, "");
 					return {
@@ -422,6 +425,7 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 			const toolsDir = path.join(root.path, "tools");
 			return loadFilesFromDir<CustomTool>(ctx, toolsDir, PROVIDER_ID, root.scope, {
 				extensions: ["ts", "js"],
+				origin: root.origin,
 				transform: (name, _content, filePath, source) => {
 					const toolName = name.replace(/\.(ts|js)$/, "");
 					return {
@@ -682,7 +686,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				...(raw.auth !== undefined && { auth: raw.auth }),
 				...(raw.oauth !== undefined && { oauth: raw.oauth }),
 				...(raw.type !== undefined && { transport: raw.type as MCPServer["transport"] }),
-				_source: createSourceMeta(PROVIDER_ID, sourcePath, root.scope),
+				_source: createSourceMeta(PROVIDER_ID, sourcePath, root.scope, root.origin),
 			};
 			items.push(server);
 		}

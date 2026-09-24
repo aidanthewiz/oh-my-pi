@@ -102,10 +102,9 @@ describe("native AWS argument boundary", () => {
 	});
 
 	it("preserves acronym word boundaries in AWS CLI parameter flags", () => {
-		expect(buildAwsParameterArgv({ DBInstanceIdentifier: "db-example", VPCSecurityGroupIds: ["sg-example"] })).toEqual([
-			"--db-instance-identifier=db-example",
-			'--vpc-security-group-ids=["sg-example"]',
-		]);
+		expect(
+			buildAwsParameterArgv({ DBInstanceIdentifier: "db-example", VPCSecurityGroupIds: ["sg-example"] }),
+		).toEqual(["--db-instance-identifier=db-example", '--vpc-security-group-ids=["sg-example"]']);
 	});
 
 	it("does not infer commercial partition for unknown regions", () => {

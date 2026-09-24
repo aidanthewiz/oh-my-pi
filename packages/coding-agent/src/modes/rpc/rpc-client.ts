@@ -12,6 +12,7 @@ import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
@@ -23,6 +24,7 @@ import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCommand,
+	RpcControlEventFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
@@ -32,6 +34,7 @@ import type {
 	RpcHostToolResult,
 	RpcHostToolUpdate,
 	RpcResponse,
+	RpcEventSubscriptionLevel,
 	RpcSessionState,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
@@ -95,6 +98,7 @@ export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reaso
 
 export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
+export type RpcControlEventListener = (event: RpcControlEventFrame) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
@@ -178,6 +182,11 @@ function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
 		value.maxFrameBytes === MAX_RPC_FRAME_BYTES &&
 		value.maxReassembledFrameBytes === MAX_RPC_REASSEMBLED_BYTES
 	);
+}
+
+function supportsRpcEventSubscriptions(value: Record<string, unknown>): boolean {
+	const levels = value.supportedEventSubscriptionLevels;
+	return Array.isArray(levels) && levels.includes("control") && levels.includes("full");
 }
 
 function isAgentEvent(value: unknown): value is AgentEvent {
@@ -273,6 +282,7 @@ export class RpcClient {
 	#reaping: Promise<void> | null = null;
 	#eventListeners: RpcEventListener[] = [];
 	#sessionEventListeners: RpcSessionEventListener[] = [];
+	#controlEventListeners = new Set<RpcControlEventListener>();
 	#subagentLifecycleListeners = new Set<RpcSubagentLifecycleListener>();
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
@@ -343,6 +353,7 @@ export class RpcClient {
 		let readySettled = false;
 		let protocolV2Supported = false;
 		let protocolV2Enabled = false;
+		let eventSubscriptionsSupported = false;
 		const frameDecoder = new RpcFrameDecoder();
 
 		const reapAfterOutputFailure = async (error: Error) => {
@@ -370,6 +381,7 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					eventSubscriptionsSupported = supportsRpcEventSubscriptions(line);
 					readySettled = true;
 					readyResolve();
 					continue;
@@ -456,6 +468,16 @@ export class RpcClient {
 				)
 					throw new Error("RPC protocol v2 negotiation failed");
 				this.#protocolVersion = 2;
+				if (eventSubscriptionsSupported) {
+					const eventResponse = await this.#send({ type: "set_event_subscription", level: "full" });
+					if (
+						!eventResponse.success ||
+						eventResponse.command !== "set_event_subscription" ||
+						!isRecord(eventResponse.data) ||
+						eventResponse.data.level !== "full"
+					)
+						throw new Error("RPC full-event subscription failed");
+				}
 			}
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
@@ -534,6 +556,14 @@ export class RpcClient {
 				this.#sessionEventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Subscribe to payload-reduced lifecycle frames after setEventSubscription("control").
+	 */
+	onControlEvent(listener: RpcControlEventListener): () => void {
+		this.#controlEventListeners.add(listener);
+		return () => this.#controlEventListeners.delete(listener);
 	}
 
 	/**
@@ -656,6 +686,13 @@ export class RpcClient {
 		const response = await this.#send({ type: "set_fast_mode", enabled });
 		return this.#getData(response);
 	}
+	/**
+	 * Select payload-reduced lifecycle control frames or the complete session event stream.
+	 */
+	async setEventSubscription(level: RpcEventSubscriptionLevel): Promise<RpcEventSubscriptionLevel> {
+		const response = await this.#send({ type: "set_event_subscription", level });
+		return this.#getData<{ level: RpcEventSubscriptionLevel }>(response).level;
+	}
 
 	/**
 	 * Configure subagent frames emitted by the RPC server. Servers default to "off".
@@ -725,6 +762,33 @@ export class RpcClient {
 	async getAvailableCommands(): Promise<RpcAvailableSlashCommand[]> {
 		const response = await this.#send({ type: "get_available_commands" });
 		return this.#getData<{ commands: RpcAvailableSlashCommand[] }>(response).commands;
+	}
+
+	/**
+	 * Pi-compatible append-history read. Delegates to the canonical
+	 * `SessionManager` on the server: no `since` returns all entries in append
+	 * order, `since` returns entries strictly after the matching durable entry.
+	 */
+	async getEntries(since?: string): Promise<{ entries: SessionEntry[]; leafId: string | null }> {
+		const response = await this.#send({ type: "get_entries", since });
+		return this.#getData<{ entries: SessionEntry[]; leafId: string | null }>(response);
+	}
+
+	/**
+	 * Pi-compatible raw session tree plus the current leaf id.
+	 */
+	async getTree(): Promise<{ tree: SessionTreeNode[]; leafId: string | null }> {
+		const response = await this.#send({ type: "get_tree" });
+		return this.#getData<{ tree: SessionTreeNode[]; leafId: string | null }>(response);
+	}
+
+	/**
+	 * Selectable thinking levels for the live model, with `off` first.
+	 * OMP-only `auto`/`inherit` selectors are omitted from discovery.
+	 */
+	async getAvailableThinkingLevels(): Promise<ThinkingLevel[]> {
+		const response = await this.#send({ type: "get_available_thinking_levels" });
+		return this.#getData<{ levels: ThinkingLevel[] }>(response).levels;
 	}
 
 	/**
@@ -809,7 +873,7 @@ export class RpcClient {
 	}
 
 	/**
-	 * Hand off session context to a new session.
+	 * Summarize the session into a handoff document and compact it in place.
 	 */
 	async handoff(customInstructions?: string): Promise<RpcHandoffResult | null> {
 		const response = await this.#send({ type: "handoff", customInstructions });
@@ -981,6 +1045,7 @@ export class RpcClient {
 			parameters: tool.parameters,
 			hidden: tool.hidden,
 			loadMode: tool.loadMode,
+			readsSkillUris: tool.readsSkillUris,
 		}));
 		const response = await this.#send({ type: "set_host_tools", tools: definitions });
 		return this.#getData<{ toolNames: string[] }>(response).toolNames;
@@ -1107,6 +1172,13 @@ export class RpcClient {
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
+			}
+			return;
+		}
+
+		if (isRecord(data) && data.type === "rpc_control" && typeof data.event === "string") {
+			for (const listener of this.#controlEventListeners) {
+				listener(data as RpcControlEventFrame);
 			}
 			return;
 		}

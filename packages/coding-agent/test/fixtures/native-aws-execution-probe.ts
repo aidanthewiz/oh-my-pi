@@ -5,7 +5,7 @@ import { Settings } from "../../src/config/settings";
 import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
 import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection } from "../../src/mcp/types";
-import { ToolError } from "../../src/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { reserveManagedAwsProfile } from "@oh-my-pi/pi-utils";
 import { ensureCoreforgeAwsSso } from "../../src/identity/aws-sso";

@@ -23,11 +23,11 @@ import type { ToolSession } from ".";
 import awsDescription from "../prompts/tools/aws.md" with { type: "text" };
 import { enforceDestructiveCommandGuard, type DcgDecision } from "./destructive-command-guard";
 import { type RuntimeToolApprovalRequest, truncateForPrompt } from "./approval";
-import { ToolError } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 import { readShellWord } from "./shell-tokenize";
-import { OutputSink } from "../session/streaming-output";
+import { OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 const MAX_AWS_OUTPUT_BYTES = 1024 * 1024;
 
 const PROFILE_CONTROL_RE = /[\u0000-\u001f\u007f]/u;

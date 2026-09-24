@@ -1,5 +1,5 @@
-import { parseXdUrl } from "../internal-urls/xd-protocol";
-import { HL_FILE_PREFIX, HL_FILE_SUFFIX } from "../tools/hashline-format";
+import { HL_FILE_PREFIX, HL_FILE_SUFFIX } from "@oh-my-pi/pi-tui/tools/hashline-format";
+import { parseXdUrl } from "@oh-my-pi/pi-tui/tools/xd-url";
 
 const LEGACY_HASHLINE_FILE_PREFIX = "¶";
 const HASHLINE_FILE_TAG_RE = /#[0-9a-fA-F]{4}$/u;

@@ -26,12 +26,16 @@ Behavior notes:
 - RPC/ACP host defaults cover task isolation/execution, memory, advisor, tier, async-job, and bash auto-background settings. They are applied only when a path is not explicitly configured; project/global config, `--config`, and isolated settings remain authoritative. Todo settings are not host-defaulted.
 - The process claims stdin before extension discovery, then parses it one non-empty JSONL line at a time. Malformed JSON emits a recoverable `command: "parse"` failure and does not terminate the loop.
 - At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
-- When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, and the process exits with code `0`.
+- When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, pending stdout is delivered, and the process exits with code `0`.
 - Responses/events are written as one JSON object per line.
 
 ## Transport and Framing
 
 Protocol v1 stdout frames are a single JSON object followed by `\n`. The server caps each physical stdout frame at 1 MiB. Inbound commands are always one unchunked JSONL object; clients SHOULD keep them within the advertised physical-frame limit.
+
+When stdin is a TTY, RPC mode disables canonical input buffering while it owns stdin. This prevents the terminal driver from truncating a valid JSONL command before the protocol limit applies. Pipes are unchanged, and the prior terminal mode is restored when RPC releases stdin.
+
+When `hub start` launches this CLI with `--mode rpc` or `--mode rpc-ui`, it defaults to pipe stdin and rejects explicit `pty: true`. Direct TTY launches remain supported through the raw input mode above.
 
 The initial ready frame uses protocol v1 and advertises the opt-in lossless transport:
 
@@ -40,6 +44,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "type": "ready",
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
+  "supportedEventSubscriptionLevels": ["control", "full"],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864
 }
@@ -67,6 +72,10 @@ After the success response, oversized stdout objects are emitted losslessly as a
 Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises it.
 
 Legacy clients may ignore the added ready fields and remain on v1. V1 retains its bounded fallback behavior for oversized output. Frames above the v2 reassembly ceiling still fail explicitly; large history APIs should use pagination rather than depending on arbitrarily large logical frames.
+
+Output goes directly to stdout while the reader keeps up. Under backpressure, the server spills pending bytes to a private temporary file and drains it in 64 KiB blocks, preserving frame order. This limits queued output memory at the cost of disk I/O and temporary disk usage, which can grow until the reader catches up. The file is removed when the backlog drains or the process shuts down. Output or spool failures are logged, dispose the session, and exit with code `1`.
+
+Clients MUST continue reading stdout after closing stdin. Normal EOF and extension-requested shutdown wait for pending output delivery; a client that keeps its stdout pipe open without reading can delay exit indefinitely.
 
 ### Outbound frame categories (stdout)
 
@@ -98,7 +107,7 @@ All commands accept optional `id?: string`.
 
 Important edge behavior from runtime:
 
-- Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
+- Unknown command responses echo the request `id` when one was provided.
 - Malformed JSON and synchronous dispatch failures emit `command: "parse"` with `id: undefined`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
@@ -120,12 +129,15 @@ Important edge behavior from runtime:
 ### Protocol
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "set_event_subscription", level: "control" | "full" }`
 
 ### State
 
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
+- `{ id?, type: "get_entries", since?: string }`
+- `{ id?, type: "get_tree" }`
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
@@ -143,6 +155,7 @@ Important edge behavior from runtime:
 
 - `{ id?, type: "set_thinking_level", level: ThinkingLevel }`
 - `{ id?, type: "cycle_thinking_level" }`
+- `{ id?, type: "get_available_thinking_levels" }`
 
 ### Queue modes
 
@@ -196,6 +209,11 @@ The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messa
 
 - `{ id?, type: "get_login_providers" }`
 - `{ id?, type: "login", providerId: string }`
+
+Login forwards ordinary OAuth input prompts only after the provider emits an
+authorization URL. Prompts marked `secret: true` are always rejected with a
+failed `login` response directing the user to the terminal UI; no ordinary
+`input` request is emitted. RPC does not negotiate secret-input support.
 
 ## Response Schema
 
@@ -470,9 +488,22 @@ store. RPC hosts cannot register or shadow that scheme.
 
 ## Event Stream Schema
 
-RPC mode forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
+The complete `AgentSessionEvent` stream remains the default in protocol v1 and v2 for compatibility. Servers that advertise `supportedEventSubscriptionLevels` accept `set_event_subscription`. Send `"control"` when a client needs only lifecycle classification, or `"full"` for transcripts, streaming deltas, tool arguments, and provider payloads. The bundled TypeScript `RpcClient` requests `"full"` only when the ready frame advertises this capability, so it remains compatible with older protocol-v2 servers.
 
-Common event types:
+The `"control"` subscription emits `rpc_control` frames for:
+
+- `agent_start`
+- `agent_end`, with `terminal`
+- `tool_execution_start`, with `toolCallId` and `toolName`
+- `tool_execution_end`, with `toolCallId`, `toolName`, and `failed`
+- `auto_compaction_start` and `auto_compaction_end`
+- `auto_retry_start` and `auto_retry_end`
+
+Control frames exclude message content, tool arguments and results, transcripts, and provider payloads. They provide a payload-reduced lifecycle view; the standard protocol frame limits still apply.
+
+The `"full"` subscription forwards `AgentSessionEvent` objects from `AgentSession.subscribe(...)`.
+
+Common full event types:
 
 - `agent_start`, `agent_end`
 - `turn_start`, `turn_end`
@@ -497,9 +528,9 @@ Extension runner errors are emitted separately as:
 }
 ```
 
-`message_update` includes streaming deltas in `assistantMessageEvent` (text/thinking/toolcall deltas).
+In the full stream, `message_update` includes streaming deltas in `assistantMessageEvent`.
 
-`agent_end` has this session-level shape (in addition to optional telemetry fields):
+Full-stream `agent_end` has this session-level shape, in addition to optional telemetry fields:
 
 ```ts
 {
@@ -509,10 +540,7 @@ Extension runner errors are emitted separately as:
 }
 ```
 
-`isTerminal: false` means maintenance or async delivery has scheduled more work,
-so the session will resume before its true final settle. Treat an `agent_end` as
-run completion only when `isTerminal !== false`; the field is optional so frames
-from older runtimes, where it is absent, remain terminal-compatible.
+`isTerminal: false` means maintenance or async delivery has scheduled more work. Treat an `agent_end` as run completion only when `isTerminal !== false`; an omitted field from an older runtime remains terminal-compatible.
 
 ### Available commands
 
@@ -520,6 +548,41 @@ from older runtimes, where it is absent, remain terminal-compatible.
 in `available_commands_update` frames at startup and after command metadata
 changes. Each command has `name`, `source`, and optional `aliases`,
 `description`, `input.hint`, and `subcommands`.
+
+Command discovery is intentionally a Coreforge dialect: Pi's `get_commands` (a
+`RpcSlashCommand[]` projection over extensions → prompt templates → skills) is
+not served because Coreforge's richer catalog (builtins/custom/MCP/file commands,
+broader `source` enum, no Pi `sourceInfo`) is not wire-compatible with it.
+
+### Pi-compatible history/tree commands with Coreforge-native entry payloads
+
+The commands and reconciliation semantics below are Pi-compatible, but the
+returned `SessionEntry` payload union is Coreforge-native, not wire-identical to
+Pi. Concretely: Pi `model_change` carries `provider` + `modelId` while Coreforge
+carries a combined `model` plus role/fallback metadata; Pi uses a `usage`
+entry where Coreforge uses `model_usage`; and Coreforge has additional entry types (for
+example service-tier, title, mode, credential, and reset records). A
+permissive client that consumes the common structural subset
+(`id`/`parentId` plus message entries) can share one durable-history
+algorithm across both, while a strict Pi `SessionEntry` decoder cannot assume
+identical payloads.
+
+`get_entries` reads the canonical append-history (not the active branch only)
+and returns `{ entries, leafId }`. Without `since` it returns all entries in
+append order; with `since` it returns entries strictly after the matching
+durable entry id. An unknown `since` fails explicitly with
+`code: "unknown_since"`. `get_tree` returns the raw session tree as
+`{ tree, leafId }` straight from `SessionManager`, not a UI projection.
+
+`get_available_thinking_levels` returns `{ levels }`: the selectable levels
+for the live model with `"off"` first (it is accepted by
+`set_thinking_level` but excluded from the effort-only model helper). Coreforge-only
+`auto`/`inherit` selectors are intentionally omitted from discovery.
+
+Lifecycle stays Coreforge: terminal settle is `agent_end` with
+`isTerminal !== false`, not Pi's `agent_settled`; `prompt_result`/
+`agentInvoked`, `ready`, negotiation, chunking, host tools, and subagents are
+Coreforge extensions a Pi-family adapter must dialect around.
 
 ### Subagent subscriptions
 

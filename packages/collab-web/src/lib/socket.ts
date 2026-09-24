@@ -2,10 +2,8 @@
  * Browser WebSocket wrapper for collab live-session sharing (vendored mirror
  * of `@oh-my-pi/pi-coding-agent/src/collab/relay-client.ts` semantics).
  *
- * Connects to a relay room, seals/opens AES-GCM frames in strict order, and
- * reconnects with exponential backoff on transient drops. Fatal relay close
- * codes (room gone, host conflict, room full) and decryption failures never
- * reconnect.
+ * Connects to a relay room, seals/opens AES-GCM frames, and reconnects with
+ * exponential backoff. Guests survive host-drop teardown while the host recreates the room.
  */
 
 import type { GuestFrame, HostFrame, RelayControlMessage } from "@oh-my-pi/pi-wire";
@@ -13,7 +11,7 @@ import { open, seal } from "./codec";
 import { packEnvelope, unpackEnvelope } from "./link";
 import { type RelayAuthTokenProvider, RetryableRelayAuthorizationError } from "./relay-auth";
 
-const FATAL_CLOSE_REASONS: Record<number, string> = {
+const RELAY_CLOSE_REASONS: Record<number, string> = {
 	4001: "room closed",
 	4004: "no such room",
 	4009: "a host is already connected for this room",
@@ -64,7 +62,7 @@ export class CollabSocket {
 	onOpen?: () => void;
 	onFrame?: (frame: HostFrame, fromPeer: number) => void;
 	onControl?: (msg: RelayControlMessage) => void;
-	/** Fires once per terminal close (intentional, fatal code, or bad key). willReconnect=true for transient drops that will retry. */
+	/** Fires on each close; `willReconnect` distinguishes retries from terminal shutdown. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
 
 	readonly #opts: CollabSocketOptions;
@@ -77,6 +75,8 @@ export class CollabSocket {
 	#attempt = 0;
 	/** Terminal state: intentional close or fatal failure. Cleared by connect(). */
 	#closed = false;
+	/** Allows a previously joined guest to outlive room recreation races. */
+	#retryMissingRoom = false;
 	/** Serializes seal() so frames hit the wire in send() order. */
 	#sendChain: Promise<void> = Promise.resolve();
 	/** Serializes open() so frames are delivered in arrival order. */
@@ -95,6 +95,7 @@ export class CollabSocket {
 	connect(): void {
 		if (this.#ws || this.#retryTimer || this.#connecting) return;
 		this.#closed = false;
+		this.#retryMissingRoom = false;
 		this.#attempt = 0;
 		void this.#openSocket();
 	}
@@ -129,6 +130,7 @@ export class CollabSocket {
 		this.#connectionGeneration++;
 		this.#authController?.abort();
 		this.#authController = null;
+		this.#retryMissingRoom = false;
 		this.#pendingSends.length = 0;
 		const ws = this.#ws;
 		this.#ws = null;
@@ -235,6 +237,8 @@ export class CollabSocket {
 					return;
 				}
 				if (this.#ws !== ws) return;
+				this.#retryMissingRoom = false;
+				this.#attempt = 0;
 				this.onFrame?.(frame, envelope.peerId);
 			})
 			.catch(() => {
@@ -245,7 +249,7 @@ export class CollabSocket {
 	#finishOpen(ws: WebSocket): void {
 		if (this.#ws !== ws || this.#authenticated) return;
 		this.#authenticated = true;
-		this.#attempt = 0;
+		if (!this.#retryMissingRoom) this.#attempt = 0;
 		for (const envelope of this.#pendingSends) ws.send(envelope);
 		this.#pendingSends.length = 0;
 		this.onOpen?.();
@@ -253,7 +257,15 @@ export class CollabSocket {
 
 	#handleClose(code: number, reason: string): void {
 		if (this.#closed) return;
-		const fatalReason = FATAL_CLOSE_REASONS[code];
+		const fatalReason = RELAY_CLOSE_REASONS[code];
+		const closeReason = fatalReason ?? (reason || `connection lost (code ${code})`);
+		const retryRoom = this.#opts.role === "guest" && (code === 4001 || (code === 4004 && this.#retryMissingRoom));
+		if (retryRoom) {
+			this.#retryMissingRoom = true;
+			this.onClose?.(closeReason, true);
+			this.#scheduleRetry();
+			return;
+		}
 		if (fatalReason !== undefined) {
 			this.#closed = true;
 			this.#authenticated = false;
@@ -261,7 +273,7 @@ export class CollabSocket {
 			this.onClose?.(fatalReason, false);
 			return;
 		}
-		this.onClose?.(reason || `connection lost (code ${code})`, true);
+		this.onClose?.(closeReason, true);
 		this.#scheduleRetry();
 	}
 

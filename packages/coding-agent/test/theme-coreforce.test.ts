@@ -1,15 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { getSeriesColor } from "../../utils/src/vendor/mermaid-ascii/xychart/colors";
-import { defaultThemes } from "../src/modes/theme/defaults";
-import coreforceTheme from "../src/modes/theme/defaults/coreforce.json" with { type: "json" };
+import { defaultThemes } from "@oh-my-pi/pi-tui/theme/defaults";
+import coreforceTheme from "../../tui/src/theme/defaults/coreforce.json" with { type: "json" };
 import {
 	getMarkdownTheme,
 	getThemeByName,
 	setMarkdownMermaidRendering,
 	setThemeInstance,
-} from "../src/modes/theme/theme";
-import themeSchema from "../src/modes/theme/theme-schema.json" with { type: "json" };
+} from "@oh-my-pi/pi-tui/theme";
+import themeSchema from "../../tui/src/theme/theme-schema.json" with { type: "json" };
 
 const requiredColorKeys = themeSchema.properties.colors.required as string[];
 const colorSchema = Object.fromEntries(requiredColorKeys.map(key => [key, "string | number"]));

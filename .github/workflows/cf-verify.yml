@@ -33,14 +33,14 @@ jobs:
             --exclude-drafts \
             --json tagName,isDraft \
             > "$RUNNER_TEMP/coreforce-releases.json"
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.0"
+          bun-version: ">=1.4"
       - name: Select native verification source
         id: native
         env:
@@ -120,12 +120,12 @@ jobs:
           $download = Join-Path $env:RUNNER_TEMP "released-native"
           New-Item -ItemType Directory -Force $download | Out-Null
           gh release download --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --pattern SHA256SUMS.txt --dir $download -- $env:RELEASE_TAG
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.0"
+          bun-version: ">=1.4"
       - name: Resolve verification version
         if: matrix.windows != '1'
         run: |
@@ -149,7 +149,7 @@ jobs:
       - name: Restore Bazel native build cache
         if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         id: bazel-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
@@ -263,12 +263,12 @@ jobs:
   browser_relay:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.0"
+          bun-version: ">=1.4"
       - run: bun install --frozen-lockfile
       - name: Build Coreforge Browser Relay extension
         run: |

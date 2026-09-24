@@ -58,3 +58,35 @@ describe("read attachment URLs", () => {
 		);
 	});
 });
+
+describe("read text output contracts", () => {
+	let testDir: string;
+	let textPath: string;
+
+	beforeEach(() => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "read-text-"));
+		textPath = path.join(testDir, "notes.txt");
+		fs.writeFileSync(textPath, "alpha\nbeta\n");
+	});
+
+	afterEach(() => {
+		removeSyncWithRetries(testDir);
+	});
+
+	it("keeps repeated raw reads verbatim while retaining hints for formatted reads", async () => {
+		const rawTool = new ReadTool(createSession(testDir, textPath));
+		for (let index = 0; index < 3; index++) {
+			const result = await rawTool.execute(`read-raw-${index}`, { path: `${textPath}:raw` });
+			expect(result.content).toEqual([{ type: "text", text: "alpha\nbeta\n" }]);
+		}
+
+		const formattedTool = new ReadTool(createSession(testDir, textPath));
+		let formattedText = "";
+		for (let index = 0; index < 3; index++) {
+			const result = await formattedTool.execute(`read-formatted-${index}`, { path: textPath });
+			const block = result.content.find(entry => entry.type === "text");
+			formattedText = block?.type === "text" ? block.text : "";
+		}
+		expect(formattedText).toContain("You have received this identical output 3 times");
+	});
+});

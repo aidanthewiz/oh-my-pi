@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { DaemonBrokerClient } from "../../../src/launch/client";
 import * as daemonClient from "../../../src/launch/client";
-import type { DaemonCompletionNotification, DaemonRpcResult } from "../../../src/launch/protocol";
+import type { DaemonCompletionNotification, DaemonOperation, DaemonRpcResult } from "../../../src/launch/protocol";
 import type { ToolSession } from "../../../src/tools";
 import { executeLaunch } from "../../../src/tools/hub/launch";
 
@@ -86,6 +86,52 @@ describe("launch broker protocol compatibility", () => {
 			}
 		}
 		expect(Object.getOwnPropertyDescriptor(globalThis, "Worker")).toEqual(originalWorkerDescriptor);
+	});
+
+	it("reports broker write scope instead of claiming application delivery", async () => {
+		const projectDir = process.cwd();
+		const client = {
+			projectDir,
+			request: async () =>
+				({
+					op: "send",
+					daemon: {
+						name: "rpc",
+						id: "daemon-id",
+						state: "ready",
+						createdAt: 1,
+						startedAt: 1,
+						restartCount: 0,
+						outputBytes: 0,
+						persist: false,
+						detached: false,
+					},
+					bytesWritten: 7,
+					transport: "pty",
+					delivery: "broker_write_only",
+				}) as const,
+			close() {},
+			onCompletion: () => () => {},
+		} satisfies DaemonBrokerClient;
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+
+		const result = await executeLaunch({ cwd: projectDir } as ToolSession, {
+			op: "send",
+			name: "rpc",
+			text: "status",
+		});
+
+		expect(result.content).toEqual([
+			{
+				type: "text",
+				text: expect.stringContaining("Broker wrote 7 bytes via pty; application delivery is unconfirmed."),
+			},
+		]);
+		expect(result.details).toMatchObject({
+			bytesWritten: 7,
+			transport: "pty",
+			delivery: "broker_write_only",
+		});
 	});
 
 	it("restores a completion sink when a resumed session lists its live daemon", async () => {
@@ -285,6 +331,84 @@ describe("launch broker protocol compatibility", () => {
 		);
 
 		expect(preservedPending).toBe(true);
+	});
+
+	it("defaults known RPC entrypoints to pipes without matching unrelated argv", async () => {
+		const projectDir = process.cwd();
+		const requests: DaemonOperation[] = [];
+		const client = {
+			projectDir,
+			onCompletion: () => () => {},
+			request: async (operation: DaemonOperation) => {
+				requests.push(operation);
+				return {
+					op: "start",
+					daemon: {
+						name: "rpc",
+						id: "daemon-id",
+						state: "running",
+						createdAt: 1,
+						startedAt: 1,
+						restartCount: 0,
+						outputBytes: 0,
+						persist: false,
+						detached: false,
+					},
+					readyTimedOut: false,
+				} as const;
+			},
+			close() {},
+		} satisfies DaemonBrokerClient;
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+		const session = {
+			cwd: projectDir,
+			getSessionId: () => "owner-session",
+			isDisposed: () => false,
+			queueLaunchCompletion: () => {},
+		} as unknown as ToolSession;
+
+		await executeLaunch(session, {
+			op: "start",
+			name: "rpc",
+			application: process.execPath,
+			args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode", "rpc"],
+		});
+		expect(requests[0]).toMatchObject({ op: "start", spec: { pty: false } });
+
+		await executeLaunch(session, {
+			op: "start",
+			name: "bundled-rpc",
+			application: "bun",
+			args: ["dist/cli.js", "--mode", "rpc"],
+		});
+		expect(requests[1]).toMatchObject({ op: "start", spec: { pty: false } });
+
+		await expect(
+			executeLaunch(session, {
+				op: "start",
+				name: "rpc-explicit",
+				application: process.execPath,
+				args: [`${projectDir}/packages/coding-agent/src/cli.ts`, "--mode=rpc-ui"],
+				pty: true,
+			}),
+		).rejects.toThrow("Hub-supervised RPC launches for this CLI require pipe stdin");
+		expect(requests).toHaveLength(2);
+
+		await executeLaunch(session, {
+			op: "start",
+			name: "unrelated",
+			application: process.execPath,
+			args: ["unrelated.ts", "--mode", "rpc"],
+		});
+		expect(requests[2]).toMatchObject({ op: "start", spec: { pty: true } });
+
+		await executeLaunch(session, {
+			op: "start",
+			name: "delimiter",
+			application: "omp",
+			args: ["--", "--mode=rpc"],
+		});
+		expect(requests[3]).toMatchObject({ op: "start", spec: { pty: true } });
 	});
 
 	it("routes a broker completion and releases its sink on session change", async () => {

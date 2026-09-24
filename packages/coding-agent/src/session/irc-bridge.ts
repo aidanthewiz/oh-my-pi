@@ -1,7 +1,8 @@
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import { IrcBus, type IrcMessage } from "../irc/bus";
+import { IrcBus } from "../irc/bus";
+import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/hub";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircAutoReplyTemplate from "../prompts/system/irc-autoreply.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
@@ -20,6 +21,7 @@ export interface IrcBridgeHost {
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: AgentMessage[]): void;
+	onDiscardPending(records: AgentMessage[]): void;
 	runEphemeralTurn(args: { promptText: string }): Promise<{ replyText: string }>;
 }
 
@@ -88,6 +90,15 @@ export class IrcBridge {
 		this.#asides = [];
 		this.#deferredWakes = [];
 		return snapshot;
+	}
+
+	/** Finalizes a cleared snapshot after its session transition commits. */
+	discardPending(snapshot: {
+		interrupts: AgentMessage[];
+		asides: AgentMessage[];
+		deferredWakes: AgentMessage[];
+	}): void {
+		this.#host.onDiscardPending([...snapshot.interrupts, ...snapshot.asides, ...snapshot.deferredWakes]);
 	}
 
 	/** Restores a snapshot taken by `clearPending`, for a rolled-back session transition. Merges
