@@ -144,6 +144,18 @@ describe("MCP lost remote server retry schedule", () => {
 		expect(manager.getConnectionStatus("flaky")).toBe("connected");
 	});
 
+	it("stops background reconnects after a lost server requires interactive authentication", async () => {
+		const { manager, flaky, statuses } = await connected(FAST);
+		flaky.setDown(true);
+		await until(() => statuses.includes("failed"), "the reconnect ladder to fail");
+		flaky.setUnauthorized(true);
+		flaky.setDown(false);
+		await until(() => flaky.authRefusals > 0, "the background reconnect to find the auth challenge");
+		await Bun.sleep(QUIET_MS);
+		expect(flaky.authRefusals).toBe(1);
+		expect(manager.getConnectionStatus("flaky")).not.toBe("connected");
+	});
+
 	it("does not schedule a server that never connected", async () => {
 		workDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-mcp-lost-remote-"));
 		flaky = startFlakyHttpMcpServer();

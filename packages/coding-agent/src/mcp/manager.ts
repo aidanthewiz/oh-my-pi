@@ -1519,8 +1519,8 @@ export class MCPManager {
 
 	/**
 	 * Register an in-flight reconnect so concurrent callers share it, and
-	 * settle the lost-server schedule on its outcome: a new connection ends the
-	 * schedule, a failure while the server is still lost arms the next attempt.
+	 * settle the lost-server schedule on its outcome: a new connection or an
+	 * interactive auth challenge ends the schedule; other failures retry.
 	 */
 	#trackReconnect(name: string, attempt: Promise<MCPServerConnection | null>): Promise<MCPServerConnection | null> {
 		this.#pendingReconnections.set(name, attempt);
@@ -1532,7 +1532,7 @@ export class MCPManager {
 			})
 			.then(
 				connection => {
-					if (connection) this.#forgetLostServer(name);
+					if (connection || this.#pendingAuthChallenges.has(name)) this.#forgetLostServer(name);
 					else if (this.#lostRemoteServers.has(name)) this.#scheduleLostServerRetry(name);
 					return connection;
 				},

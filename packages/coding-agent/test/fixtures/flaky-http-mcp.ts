@@ -22,9 +22,11 @@ export interface FlakyHttpMcpServer {
 	readonly initializes: number;
 	/** Number of POST requests (one per connection attempt) refused with 503 while down. */
 	readonly refusals: number;
+	readonly authRefusals: number;
 	/** Text the `ping` tool answers with for the current generation. */
 	readonly pong: string;
 	setDown(down: boolean): void;
+	setUnauthorized(unauthorized: boolean): void;
 	stop(): void;
 }
 
@@ -32,7 +34,7 @@ export function startFlakyHttpMcpServer(
 	options: { port?: number; log?: (line: string) => void } = {},
 ): FlakyHttpMcpServer {
 	const log = options.log ?? (() => {});
-	const state = { down: false, generation: 1, initializes: 0, refusals: 0 };
+	const state = { down: false, unauthorized: false, generation: 1, initializes: 0, refusals: 0, authRefusals: 0 };
 	const closeStream = new Set<() => void>();
 
 	const server = Bun.serve({
@@ -54,6 +56,13 @@ export function startFlakyHttpMcpServer(
 			if (state.down) {
 				if (request.method === "POST") state.refusals += 1;
 				return new Response("restarting", { status: 503 });
+			}
+			if (state.unauthorized && request.method === "POST") {
+				state.authRefusals += 1;
+				return new Response("authentication required", {
+					status: 401,
+					headers: { "WWW-Authenticate": 'Bearer realm="https://auth.example.com"' },
+				});
 			}
 			if (request.method === "GET") {
 				let close = () => {};
@@ -141,10 +150,16 @@ export function startFlakyHttpMcpServer(
 		get refusals() {
 			return state.refusals;
 		},
+		get authRefusals() {
+			return state.authRefusals;
+		},
 		get pong() {
 			return pong();
 		},
 		setDown,
+		setUnauthorized: unauthorized => {
+			state.unauthorized = unauthorized;
+		},
 		stop: () => {
 			for (const close of closeStream) close();
 			closeStream.clear();
