@@ -66,7 +66,23 @@ const legacyAllowed = await legacyTool.execute("legacy-allowed", { aws_profile: 
 const legacyWrong = await legacyTool.execute("legacy-wrong", { aws_profile: "other", code: "read" }, undefined, context);
 boundConnection.awsProfileBindings?.set("aws___run_script", "other");
 const legacyChanged = await legacyTool.execute("legacy-changed", { aws_profile: "commercial", code: "read" }, undefined, context);
-console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, reconnects, boundCalls, legacyMissing, legacyWrong, legacyAllowed, legacyChanged, legacySchema }));
+let staleConnects = 0;
+const staleDefinition = {
+ name: "aws___run_script",
+ inputSchema: { type: "object", properties: { code: { type: "string" }, aws_profile: { type: "string", enum: ["commercial"] } }, required: ["code", "aws_profile"] },
+};
+const freshConnection = {
+ name: connection.name, config: connection.config, capabilities: { tools: {} }, operationalAwsProfiles: ["other"],
+ transport: { request: async (method, params) => {
+  if (method === "tools/list") return { tools: [{ name: "aws___run_script", inputSchema: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } }] };
+  if ("aws_profile" in params.arguments) throw new Error("Single-profile proxy rejected aws_profile");
+  return { content: [{ type: "text", text: "current-other identity" }] };
+ } },
+};
+const staleTool = new DeferredMCPTool(connection.name, staleDefinition, async () => { staleConnects++; return freshConnection; });
+const staleAllowed = await staleTool.execute("stale", { aws_profile: "other", code: "read" }, undefined, context);
+const staleResult = { connects: staleConnects, error: staleAllowed.isError, text: staleAllowed.content[0].text };
+console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, reconnects, boundCalls, legacyMissing, legacyWrong, legacyAllowed, legacyChanged, legacySchema, staleResult }));
 `;
 		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
 			cwd: root,
@@ -110,6 +126,7 @@ console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, re
 		expect(result.boundCalls).toEqual(["read"]);
 		expect(result.legacyChanged.content[0].text).toContain("PROFILE_NOT_FOUND");
 		expect(result.legacySchema.required).toContain("aws_profile");
+		expect(result.staleResult).toEqual({ connects: 1, text: "current-other identity" });
 		expect(result.legacySchema.properties.aws_profile).toMatchObject({
 			type: "string",
 		});

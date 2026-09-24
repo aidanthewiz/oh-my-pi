@@ -21,7 +21,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 	});
 }
 
-function installMcpFetch(authUrls: Set<string>, authHeaders = new Map<string, string>()) {
+function installMcpFetch(authUrls: Set<string>, authHeaders = new Map<string, string>(), requireAuthHeader = false) {
 	const requests: RequestRecord[] = [];
 	const failedInitializations = new Set<string>();
 	const fetchImpl = Object.assign(
@@ -36,7 +36,13 @@ function installMcpFetch(authUrls: Set<string>, authHeaders = new Map<string, st
 				body,
 			});
 
-			if (body.method === "initialize" && authUrls.has(url) && !failedInitializations.has(url)) {
+			if (
+				body.method === "initialize" &&
+				authUrls.has(url) &&
+				(requireAuthHeader
+					? new Headers(init?.headers).get("authorization") !== "Bearer fresh-token"
+					: !failedInitializations.has(url))
+			) {
 				failedInitializations.add(url);
 				const wwwAuthenticate = authHeaders.get(url);
 				return new Response(JSON.stringify({ error: "invalid_token" }), {
@@ -127,6 +133,36 @@ describe("MCP startup OAuth", () => {
 			await manager.disconnectAll();
 		}
 	});
+
+	test("authorizes cached tools on first use when the server still requires credentials", async () => {
+		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
+		const toolCache = {
+			get: async () => cachedTools,
+			set: async () => {},
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), toolCache);
+		const config = httpConfig(SENTRY_URL);
+		const { requests } = installMcpFetch(new Set([SENTRY_URL]), new Map(), true);
+		const handler = vi.fn(async () => ({
+			...config,
+			headers: { Authorization: "Bearer fresh-token" },
+		}));
+		manager.setAuthHandler(handler);
+
+		try {
+			await manager.connectServers({ sentry: config }, {});
+			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(0);
+			expect(handler).not.toHaveBeenCalled();
+
+			await manager.waitForConnection("sentry");
+			expect(handler).toHaveBeenCalledTimes(1);
+			const initializations = requests.filter(request => request.body.method === "initialize");
+			expect(initializations).toHaveLength(2);
+			expect(initializations[1].headers.get("authorization")).toBe("Bearer fresh-token");
+		} finally {
+			await manager.disconnectAll();
+		}
+	}, 15_000);
 
 	test("authorizes only when an affected integration first needs its server", async () => {
 		const manager = new MCPManager(process.cwd());

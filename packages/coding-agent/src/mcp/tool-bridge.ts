@@ -927,9 +927,8 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.#fallbackProviderName;
 
 		try {
-			const selector = this.tool.inputSchema.properties?.aws_profile as { enum?: unknown[] } | undefined;
 			await validateManagedAwsProfile(this.serverName, this.tool, args, {
-				checkExposedProfile: selector?.enum !== undefined,
+				checkExposedProfile: false,
 			});
 		} catch (error) {
 			return buildErrorResult(error, this.serverName, this.tool.name, provider, providerName);

@@ -1235,8 +1235,13 @@ export class MCPManager {
 		options?: { authChallenge?: MCPAuthChallenge },
 	): Promise<MCPServerConnection | null> {
 		if (this.#declinedAuthServers.has(name)) return null;
-		const authChallenge = options?.authChallenge ?? this.#pendingAuthChallenges.get(name);
-		if (!authChallenge) return this.reconnectServer(name);
+		let authChallenge = options?.authChallenge ?? this.#pendingAuthChallenges.get(name);
+		if (!authChallenge) {
+			const connection = await this.reconnectServer(name);
+			if (connection) return connection;
+			authChallenge = this.#pendingAuthChallenges.get(name);
+			if (!authChallenge) return null;
+		}
 
 		try {
 			const authorizedConfig = await this.#runAuthHandler(name, authChallenge);
@@ -1544,6 +1549,7 @@ export class MCPManager {
 			}
 			try {
 				const connection = await this.#connectAndWireServer(name, config, source, reconnectEpoch);
+				this.#pendingAuthChallenges.delete(name);
 				logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
 				this.#emitConnectionStatus({ type: "connected", serverName: name });
 				return connection;
@@ -1558,6 +1564,12 @@ export class MCPManager {
 				}
 
 				const msg = error instanceof Error ? error.message : String(error);
+				const challenge = getInitialAuthChallenge(error, config);
+				if (challenge) {
+					this.#pendingAuthChallenges.set(name, challenge);
+					this.#emitConnectionStatus({ type: "failed", serverName: name, error: msg });
+					return null;
+				}
 				if (attempt < delays.length) {
 					logger.debug("MCP reconnect attempt failed, retrying", {
 						path: `mcp:${name}`,

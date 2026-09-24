@@ -89,6 +89,9 @@ describe("native AWS argument boundary", () => {
 		expect(() => buildAwsParameterArgv({ endpointUrl: "https://attacker.invalid" })).toThrow("INVALID_OPERATION");
 		expect(() => buildAwsParameterArgv({ PolicyDocument: "file:///tmp/policy.json" })).toThrow("INVALID_OPERATION");
 		expect(() => buildAwsParameterArgv({ Payload: "fileb:///tmp/payload.bin" })).toThrow("INVALID_OPERATION");
+		expect(() => buildAwsParameterArgv({ Filters: "Name=tag:Name,Values@=file:///tmp/sentinel" })).toThrow(
+			"INVALID_OPERATION",
+		);
 		expect(() => buildAwsParameterArgv({ verifySsl: false })).toThrow("INVALID_OPERATION");
 		expect(() => buildAwsParameterArgv({ signRequest: false })).toThrow("INVALID_OPERATION");
 		expect(() => buildAwsParameterArgv({ verify: false })).toThrow("INVALID_OPERATION");
@@ -96,6 +99,13 @@ describe("native AWS argument boundary", () => {
 
 	it("encodes AWS CLI booleans as switches", () => {
 		expect(buildAwsParameterArgv({ DryRun: true, Force: false })).toEqual(["--dry-run", "--no-force"]);
+	});
+
+	it("preserves acronym word boundaries in AWS CLI parameter flags", () => {
+		expect(buildAwsParameterArgv({ DBInstanceIdentifier: "db-example", VPCSecurityGroupIds: ["sg-example"] })).toEqual([
+			"--db-instance-identifier=db-example",
+			'--vpc-security-group-ids=["sg-example"]',
+		]);
 	});
 
 	it("does not infer commercial partition for unknown regions", () => {

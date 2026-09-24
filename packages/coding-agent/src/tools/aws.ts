@@ -33,7 +33,7 @@ const MAX_AWS_OUTPUT_BYTES = 1024 * 1024;
 const PROFILE_CONTROL_RE = /[\u0000-\u001f\u007f]/u;
 const COMMAND_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const REGION_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d+$/;
-const FILE_VALUE_RE = /^fileb?:\/\//iu;
+const FILE_VALUE_RE = /(?:^|@=)\s*fileb?:\/\//iu;
 const BLOCKED_PARAMETER_NAMES = [
 	"profile",
 	"region",
@@ -377,6 +377,7 @@ function partitionFromArn(arn: string): AwsPartition | undefined {
 
 function camelToFlag(key: string): string {
 	return key
+		.replace(/([A-Z])([A-Z][a-z])/gu, "$1-$2")
 		.replace(/([a-z0-9])([A-Z])/gu, "$1-$2")
 		.replace(/_/gu, "-")
 		.toLowerCase();
