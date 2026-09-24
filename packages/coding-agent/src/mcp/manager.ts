@@ -822,6 +822,7 @@ export class MCPManager {
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
+				statusServerNames.push(name);
 				const message = validationErrors.join("; ");
 				errors.set(name, message);
 				validationFailures.push({ name, message });
