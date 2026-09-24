@@ -867,12 +867,25 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		const observed = { posts: 0, lastEventId: null as string | null };
 		const sseChunk = (payload: string): string =>
 			`HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n${payload.length.toString(16)}\r\n${payload}\r\n`;
+		const incoming = new WeakMap<object, string>();
 		const listener = Bun.listen({
 			hostname: "127.0.0.1",
 			port: 0,
 			socket: {
 				data(socket, data) {
-					const request = new TextDecoder().decode(data);
+					// Finish the request body before closing; otherwise the peer can reset an unread POST.
+					const request = (incoming.get(socket) ?? "") + new TextDecoder().decode(data);
+					const headerEnd = request.indexOf("\r\n\r\n");
+					if (headerEnd < 0) {
+						incoming.set(socket, request);
+						return;
+					}
+					const contentLength = Number(/^content-length:\s*(\d+)/im.exec(request.slice(0, headerEnd))?.[1] ?? "0");
+					if (request.length - headerEnd - 4 < contentLength) {
+						incoming.set(socket, request);
+						return;
+					}
+					incoming.delete(socket);
 					if (request.startsWith("POST")) {
 						observed.posts++;
 						// Priming event, then close without the terminal 0-chunk.
