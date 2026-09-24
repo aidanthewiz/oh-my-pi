@@ -837,7 +837,7 @@ export class MCPManager {
 			const cached = await this.toolCache?.get(name, config);
 			if (cached && cached.length > 0 && config.enabled !== false) {
 				const source = this.#sources.get(name);
-				const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+				const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 					this.#reconnectServerForTool(name, options);
 				this.#replaceServerTools(
 					name,
@@ -857,6 +857,7 @@ export class MCPManager {
 			const sourceLevel = source?.level;
 			const connectWithConfig = async (candidateConfig: MCPServerConfig): Promise<MCPServerConnection> => {
 				const resolvedConfig = await this.#resolveAuthConfig(candidateConfig, { sourceLevel });
+				const policy = resolveMCPChildCredentialPolicy(name, resolvedConfig, source);
 				return connectToServer(name, resolvedConfig, {
 					signal: connectionAbortController.signal,
 					onNotification: (method, params) => {
@@ -865,7 +866,8 @@ export class MCPManager {
 					onRequest: (method, params) => {
 						return this.#handleServerRequest(method, params);
 					},
-					...resolveMCPChildCredentialPolicy(name, resolvedConfig, source),
+					...policy,
+					awsAnonymousBootstrap: policy.preserveOperationalAws,
 				});
 			};
 			const connectionPromise = (async () => {
@@ -977,7 +979,7 @@ export class MCPManager {
 				.then(async ({ connection, serverTools }) => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 						this.#reconnectServerForTool(name, options);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
@@ -1062,7 +1064,7 @@ export class MCPManager {
 					if (!value) continue;
 					const { connection, serverTools } = value;
 					connectedServers.add(name);
-					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 						this.#reconnectServerForTool(name, options);
 					this.#replaceServerTools(name, MCPTool.fromTools(connection, serverTools, reconnect));
 				} else if (task.tracked.status === "rejected") {
@@ -1078,7 +1080,7 @@ export class MCPManager {
 				const cached = cachedTools.get(name);
 				if (cached) {
 					const source = this.#sources.get(name);
-					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 						this.#reconnectServerForTool(name, options);
 					this.#replaceServerTools(
 						name,
@@ -1263,7 +1265,7 @@ export class MCPManager {
 	 */
 	async #reconnectServerForTool(
 		name: string,
-		options?: { authChallenge?: MCPAuthChallenge },
+		options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string },
 	): Promise<MCPServerConnection | null> {
 		const existing = this.#pendingFirstUseConnections.get(name);
 		if (existing) return await existing;
@@ -1278,9 +1280,10 @@ export class MCPManager {
 
 	async #reconnectServerForToolInternal(
 		name: string,
-		options?: { authChallenge?: MCPAuthChallenge },
+		options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string },
 	): Promise<MCPServerConnection | null> {
 		if (this.#declinedAuthServers.has(name)) return null;
+		if (options?.awsProfile) return this.reconnectServer(name, { awsProfile: options.awsProfile });
 		let authChallenge = options?.authChallenge ?? this.#pendingAuthChallenges.get(name);
 		if (!authChallenge) {
 			const connection = await this.reconnectServer(name);
@@ -1493,7 +1496,12 @@ export class MCPManager {
 	 */
 	async reconnectServer(
 		name: string,
-		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge; authorizedConfig?: MCPServerConfig },
+		options?: {
+			manual?: boolean;
+			authChallenge?: MCPAuthChallenge;
+			authorizedConfig?: MCPServerConfig;
+			awsProfile?: string;
+		},
 	): Promise<MCPServerConnection | null> {
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
@@ -1513,6 +1521,7 @@ export class MCPManager {
 			this.#doReconnect(name, {
 				authChallenge: options?.authChallenge,
 				authorizedConfig: options?.authorizedConfig,
+				awsProfile: options?.awsProfile,
 			}),
 		);
 	}
@@ -1618,7 +1627,12 @@ export class MCPManager {
 
 	async #doReconnect(
 		name: string,
-		options: { authChallenge?: MCPAuthChallenge; authorizedConfig?: MCPServerConfig; scheduled?: boolean },
+		options: {
+			authChallenge?: MCPAuthChallenge;
+			authorizedConfig?: MCPServerConfig;
+			scheduled?: boolean;
+			awsProfile?: string;
+		},
 	): Promise<MCPServerConnection | null> {
 		const { authChallenge, authorizedConfig, scheduled = false } = options;
 		const oldConnection = this.#connections.get(name);
@@ -1693,7 +1707,13 @@ export class MCPManager {
 				return null;
 			}
 			try {
-				const connection = await this.#connectAndWireServer(name, config, source, reconnectEpoch);
+				const connection = await this.#connectAndWireServer(
+					name,
+					config,
+					source,
+					reconnectEpoch,
+					options.awsProfile ?? oldConnection?.awsPreferredProfile,
+				);
 				this.#pendingAuthChallenges.delete(name);
 				logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
 				this.#emitConnectionStatus({ type: "connected", serverName: name });
@@ -1744,8 +1764,10 @@ export class MCPManager {
 		config: MCPServerConfig,
 		source: SourceMeta | undefined,
 		reconnectEpoch: number,
+		awsPreferredProfile?: string,
 	): Promise<MCPServerConnection> {
 		const resolvedConfig = await this.#resolveAuthConfig(config, { sourceLevel: source?.level });
+		const policy = resolveMCPChildCredentialPolicy(name, resolvedConfig, source);
 		const connection = await connectToServer(name, resolvedConfig, {
 			onNotification: (method, params) => {
 				this.#handleServerNotification(name, method, params);
@@ -1753,7 +1775,9 @@ export class MCPManager {
 			onRequest: (method, params) => {
 				return this.#handleServerRequest(method, params);
 			},
-			...resolveMCPChildCredentialPolicy(name, resolvedConfig, source),
+			...policy,
+			awsAnonymousBootstrap: policy.preserveOperationalAws && !awsPreferredProfile,
+			awsPreferredProfile,
 		});
 
 		connection.config = config;

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Managed AWS MCP tool discovery no longer fails when the first operational profile has expired SSO credentials; signed calls connect with the selected profile after approved sign-in ([PO-688](https://getsoma.atlassian.net/browse/PO-688)).
+
 ## [18.2.11] - 2026-09-23
 
 ### Fixed

@@ -362,6 +362,12 @@ export interface MCPServerConnection {
 	operationalAwsProfiles?: readonly string[];
 	/** Local selectors stripped only for a proxy bound to one explicit profile. */
 	awsProfileBindings?: Map<string, string>;
+	/** Profiles eligible for signed calls while this connection discovers tools anonymously. */
+	awsAvailableProfiles?: readonly string[];
+	/** The unsigned bootstrap must never forward an authenticated tool call. */
+	awsAnonymousBootstrap?: boolean;
+	/** Profile selected for the signed proxy's default connection. */
+	awsPreferredProfile?: string;
 	/** Source metadata (for display) */
 	_source?: SourceMeta;
 	/** Cached resources (populated on demand) */

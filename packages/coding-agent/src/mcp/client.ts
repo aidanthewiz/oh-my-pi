@@ -176,12 +176,15 @@ export async function connectToServer(
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 		preserveExplicitCredentials?: boolean;
 		preserveOperationalAws?: boolean;
+		awsAnonymousBootstrap?: boolean;
+		awsPreferredProfile?: string;
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
 	const timeoutError = new MCPConnectionTimeoutError(name, timeoutMs);
 	let transport: MCPTransport | undefined;
 
+	let availableAwsProfiles: string[] | undefined;
 	let operationalAwsProfiles: string[] | undefined;
 	if (options?.preserveOperationalAws) {
 		const available = (await listTrustedAwsProfiles())
@@ -189,16 +192,28 @@ export async function connectToServer(
 			.map(profile => profile.name);
 		const explicit =
 			("env" in config ? config.env?.AWS_MCP_PROXY_PROFILES : undefined) ?? Bun.env.AWS_MCP_PROXY_PROFILES;
-		operationalAwsProfiles = explicit?.trim()
-			? [
-					...new Set(
-						explicit
-							.split(",")
-							.map(profile => profile.trim())
-							.filter(profile => available.includes(profile)),
-					),
-				]
-			: available;
+		availableAwsProfiles =
+			explicit !== undefined
+				? [
+						...new Set(
+							explicit
+								.split(",")
+								.map(profile => profile.trim())
+								.filter(profile => available.includes(profile)),
+						),
+					]
+				: available;
+		if (options.awsPreferredProfile && !availableAwsProfiles.includes(options.awsPreferredProfile)) {
+			throw new Error("PROFILE_NOT_FOUND: selected profile is not eligible for this managed AWS proxy.");
+		}
+		operationalAwsProfiles = options.awsAnonymousBootstrap
+			? []
+			: options.awsPreferredProfile
+				? [
+						options.awsPreferredProfile,
+						...availableAwsProfiles.filter(profile => profile !== options.awsPreferredProfile),
+					]
+				: availableAwsProfiles;
 	}
 	const connect = async (): Promise<MCPServerConnection> => {
 		transport = await createTransport(config, {
@@ -232,6 +247,9 @@ export async function connectToServer(
 				config,
 				transport,
 				operationalAwsProfiles,
+				awsAvailableProfiles: availableAwsProfiles,
+				awsAnonymousBootstrap: options?.preserveOperationalAws && options.awsAnonymousBootstrap === true,
+				awsPreferredProfile: options?.awsPreferredProfile,
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
 				instructions: initResult.instructions,
@@ -287,6 +305,29 @@ export async function listTools(
 		allTools.push(...result.tools);
 		cursor = result.nextCursor;
 	} while (cursor);
+	if (connection.awsAnonymousBootstrap) {
+		const available = connection.awsAvailableProfiles ?? [];
+		for (let index = allTools.length - 1; index >= 0; index--) {
+			const tool = allTools[index];
+			if (!isAuthenticatedAwsTool(connection.name, tool.name)) continue;
+			if (available.length === 0) {
+				allTools.splice(index, 1);
+				continue;
+			}
+			tool.inputSchema = {
+				...tool.inputSchema,
+				properties: {
+					...tool.inputSchema.properties,
+					aws_profile: {
+						type: "string",
+						enum: available,
+						description: "Explicit commercial AWS profile for the signed first-use connection",
+					},
+				},
+				required: [...new Set([...(tool.inputSchema.required ?? []), "aws_profile"])],
+			};
+		}
+	}
 
 	if (connection.operationalAwsProfiles?.length === 1) {
 		const profile = connection.operationalAwsProfiles[0];
@@ -322,6 +363,9 @@ export async function callTool(
 	args: Record<string, unknown> = {},
 	options?: MCPRequestOptions,
 ): Promise<MCPToolCallResult> {
+	if (connection.awsAnonymousBootstrap && isAuthenticatedAwsTool(connection.name, toolName)) {
+		throw new Error("AUTH_REQUIRED: authenticated AWS calls require a signed proxy connection.");
+	}
 	const boundProfile = connection.awsProfileBindings?.get(toolName);
 	if (boundProfile !== undefined) {
 		if (args.aws_profile !== boundProfile)

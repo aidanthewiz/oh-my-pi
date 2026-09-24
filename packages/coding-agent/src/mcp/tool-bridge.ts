@@ -44,7 +44,10 @@ import type {
 import type { MCPContent } from "@oh-my-pi/pi-tui/tools/mcp";
 
 /** Reconnect callback: tears down a stale connection, optionally authorizing first. */
-export type MCPReconnect = (options?: { authChallenge?: MCPAuthChallenge }) => Promise<MCPServerConnection | null>;
+export type MCPReconnect = (options?: {
+	authChallenge?: MCPAuthChallenge;
+	awsProfile?: string;
+}) => Promise<MCPServerConnection | null>;
 
 /**
  * Network-level and stale-session errors that warrant a reconnect + single retry.
@@ -479,7 +482,7 @@ function rethrowIfAborted(error: unknown, signal?: AbortSignal): void {
 async function reconnectWithAbort(
 	reconnect: MCPReconnect,
 	signal?: AbortSignal,
-	options?: { authChallenge?: MCPAuthChallenge },
+	options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string },
 ): Promise<MCPServerConnection | null> {
 	try {
 		return await untilAborted(signal, () => reconnect(options));
@@ -819,6 +822,44 @@ async function getLiveManagedAwsTool(
 		throw new Error("PROFILE_NOT_FOUND: this authenticated AWS tool is not exposed by the managed proxy.");
 	return liveTool;
 }
+async function connectSignedAwsProxy(
+	connection: MCPServerConnection,
+	toolName: string,
+	args: MCPToolArgs,
+	reconnect: MCPReconnect | undefined,
+	signal?: AbortSignal,
+	context?: AgentToolContext,
+): Promise<MCPServerConnection> {
+	if (!connection.awsAnonymousBootstrap || !isAuthenticatedAwsTool(connection.name, toolName)) return connection;
+	if (!reconnect) throw new Error("AUTH_REQUIRED: no signed AWS MCP connection is available.");
+	const profile = String(args.aws_profile);
+	const probe = new AwsTool({
+		cwd: os.tmpdir(),
+		hasUI: context?.hasUI ?? false,
+		settings: context?.settings ?? Settings.isolated(),
+		getSessionFile: () => null,
+		getSessionSpawns: () => null,
+	});
+	const identity = await probe.execute(
+		"aws-mcp-first-use-identity",
+		{ profile, service: "sts", operation: "get-caller-identity", timeout: 15 },
+		signal,
+		undefined,
+		context,
+	);
+	if (identity.isError) {
+		throw new Error(
+			identity.content
+				.filter((item): item is TextContent => item.type === "text")
+				.map(item => item.text)
+				.join("\n"),
+		);
+	}
+	const signed = await untilAborted(signal, () => reconnect({ awsProfile: profile }));
+	if (!signed || signed.awsAnonymousBootstrap)
+		throw new Error("AUTH_REQUIRED: the selected AWS profile could not open a signed MCP connection.");
+	return signed;
+}
 
 function describeMCPTool(serverName: string, tool: MCPToolDefinition): string {
 	const description = tool.description ?? `MCP tool from ${serverName}`;
@@ -907,7 +948,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			return buildErrorResult(error, this.connection.name, this.tool.name, provider, providerName);
 		}
 		try {
-			const attempt = await callToolWithAuthRetry(
+			const connection = await connectSignedAwsProxy(
 				this.connection,
 				this.tool.name,
 				args,
@@ -915,6 +956,12 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				signal,
 				_ctx,
 			);
+			if (connection !== this.connection) {
+				const liveTool = await getLiveManagedAwsTool(connection, this.tool);
+				await validateManagedAwsProfile(connection.name, liveTool, args);
+				this.connection = connection;
+			}
+			const attempt = await callToolWithAuthRetry(connection, this.tool.name, args, this.reconnect, signal, _ctx);
 			if (attempt.error !== undefined) {
 				return buildErrorResult(attempt.error, this.connection.name, this.tool.name, provider, providerName);
 			}
@@ -938,15 +985,30 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		} catch (error) {
 			rethrowIfAborted(error, signal);
 			if (this.reconnect && isRetriableConnectionError(error)) {
-				const newConn = await reconnectWithAbort(this.reconnect, signal);
+				const newConn = await reconnectWithAbort(
+					this.reconnect,
+					signal,
+					isAuthenticatedAwsTool(this.connection.name, this.tool.name)
+						? { awsProfile: String(args.aws_profile) }
+						: undefined,
+				);
 				if (newConn) {
 					// Rebind so subsequent calls on this instance use the fresh connection
 					this.connection = newConn;
 					const retryProvider = newConn._source?.provider ?? provider;
 					const retryProviderName = newConn._source?.providerName ?? providerName;
 					try {
-						const result = await callProfileAwareTool(newConn, this.tool.name, args, signal, _ctx);
-						return buildResult(result, newConn.name, this.tool.name, retryProvider, retryProviderName);
+						const readyConnection = await connectSignedAwsProxy(
+							newConn,
+							this.tool.name,
+							args,
+							this.reconnect,
+							signal,
+							_ctx,
+						);
+						this.connection = readyConnection;
+						const result = await callProfileAwareTool(readyConnection, this.tool.name, args, signal, _ctx);
+						return buildResult(result, readyConnection.name, this.tool.name, retryProvider, retryProviderName);
 					} catch (retryError) {
 						rethrowIfAborted(retryError, signal);
 						return buildErrorResult(
@@ -1061,8 +1123,9 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			return buildErrorResult(error, this.serverName, this.tool.name, provider, providerName);
 		}
 		try {
-			const connection = await untilAborted(signal, () => this.getConnection());
+			const discovered = await untilAborted(signal, () => this.getConnection());
 			throwIfAborted(signal);
+			const connection = await connectSignedAwsProxy(discovered, this.tool.name, args, this.reconnect, signal, _ctx);
 			try {
 				await untilAborted(signal, () => this.#validateLiveManagedAwsProfile(connection, args));
 				const attempt = await callToolWithAuthRetry(connection, this.tool.name, args, this.reconnect, signal, _ctx);
@@ -1094,13 +1157,27 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			} catch (callError) {
 				rethrowIfAborted(callError, signal);
 				if (this.reconnect && isRetriableConnectionError(callError)) {
-					const newConn = await reconnectWithAbort(this.reconnect, signal);
+					const newConn = await reconnectWithAbort(
+						this.reconnect,
+						signal,
+						isAuthenticatedAwsTool(this.serverName, this.tool.name)
+							? { awsProfile: String(args.aws_profile) }
+							: undefined,
+					);
 					if (newConn) {
 						const retryProvider = newConn._source?.provider ?? provider;
 						const retryProviderName = newConn._source?.providerName ?? providerName;
 						try {
-							await untilAborted(signal, () => this.#validateLiveManagedAwsProfile(newConn, args));
-							const result = await callProfileAwareTool(newConn, this.tool.name, args, signal, _ctx);
+							const readyConnection = await connectSignedAwsProxy(
+								newConn,
+								this.tool.name,
+								args,
+								this.reconnect,
+								signal,
+								_ctx,
+							);
+							await untilAborted(signal, () => this.#validateLiveManagedAwsProfile(readyConnection, args));
+							const result = await callProfileAwareTool(readyConnection, this.tool.name, args, signal, _ctx);
 							return buildResult(result, this.serverName, this.tool.name, retryProvider, retryProviderName);
 						} catch (retryError) {
 							rethrowIfAborted(retryError, signal);
@@ -1122,11 +1199,25 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			// error ("MCP server not connected") isn't a network error from callTool.
 			rethrowIfAborted(connError, signal);
 			if (this.reconnect) {
-				const newConn = await reconnectWithAbort(this.reconnect, signal);
+				const newConn = await reconnectWithAbort(
+					this.reconnect,
+					signal,
+					isAuthenticatedAwsTool(this.serverName, this.tool.name)
+						? { awsProfile: String(args.aws_profile) }
+						: undefined,
+				);
 				if (newConn) {
 					try {
-						await this.#validateLiveManagedAwsProfile(newConn, args);
-						const result = await callProfileAwareTool(newConn, this.tool.name, args, signal, _ctx);
+						const readyConnection = await connectSignedAwsProxy(
+							newConn,
+							this.tool.name,
+							args,
+							this.reconnect,
+							signal,
+							_ctx,
+						);
+						await this.#validateLiveManagedAwsProfile(readyConnection, args);
+						const result = await callProfileAwareTool(readyConnection, this.tool.name, args, signal, _ctx);
 						return buildResult(
 							result,
 							this.serverName,

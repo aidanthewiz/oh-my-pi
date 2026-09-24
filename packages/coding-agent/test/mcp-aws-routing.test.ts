@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -134,3 +135,152 @@ console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, re
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);
+
+test("managed AWS discovers anonymously and signs with the selected profile on first use", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-aws-first-use-"));
+	try {
+		const config = path.join(root, "config");
+		await fs.writeFile(
+			config,
+			"[profile expired]\nregion = us-east-1\nsso_session = first\n[sso-session first]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n[profile healthy]\nregion = us-east-1\n",
+		);
+		const aws = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");
+		const fixture = path.resolve(import.meta.dir, "fixtures/recording-aws.ts");
+		if (process.platform === "win32") {
+			const build = Bun.spawn([process.execPath, "build", "--compile", fixture, "--outfile", aws], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [error, exit] = await Promise.all([new Response(build.stderr).text(), build.exited]);
+			expect(exit, error).toBe(0);
+		} else {
+			await fs.writeFile(aws, `#!${process.execPath}\n${await fs.readFile(fixture, "utf8")}`, { mode: 0o755 });
+		}
+		const proxy = path.join(root, "proxy.ts");
+		await fs.writeFile(
+			proxy,
+			`import { appendFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+const profiles = (Bun.env.OMP_OPERATIONAL_AWS_PROFILES ?? "").split("\\n").filter(Boolean);
+appendFileSync(join(Bun.env.HOME!, "proxy.starts"), JSON.stringify(profiles) + "\\n");
+for await (const line of createInterface({ input: process.stdin })) {
+ const request = JSON.parse(line);
+ if (!request.id) continue;
+ let result;
+ let error;
+ if (request.method === "initialize") {
+  if (profiles[0] === "expired" && !existsSync(join(Bun.env.HOME!, "authenticated-expired")))
+   error = { code: -32000, message: "SSOTokenLoadError: first profile expired" };
+  else result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fake-aws", version: "1" } };
+ } else if (request.method === "tools/list") {
+  result = { tools: [
+   { name: "aws___list_regions", inputSchema: { type: "object", properties: {} } },
+   { name: "aws___run_script", inputSchema: { type: "object",
+     properties: { code: { type: "string" }, ...(profiles.length > 1 ? { aws_profile: { type: "string", enum: profiles } } : {}) },
+     required: ["code"] } },
+  ] };
+ } else if (request.method === "tools/call") {
+  result = { content: [{ type: "text", text: JSON.stringify({ profiles, args: request.params.arguments }) }] };
+ } else result = {};
+ console.log(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...(error ? { error } : { result }) }));
+}`,
+		);
+		const script = `
+import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { connectToServer, disconnectServer, listTools } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/client.ts"))};
+import { MCPTool } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/tool-bridge.ts"))};
+import { Settings } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/config/settings.ts"))};
+const config = { command: process.execPath, args: ["--no-env-file", ${JSON.stringify(proxy)}] };
+const options = { preserveOperationalAws: true, awsAnonymousBootstrap: true };
+let connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
+const tools = await listTools(connection);
+assert.deepEqual(connection.operationalAwsProfiles, []);
+assert.deepEqual(tools.find(t => t.name === "aws___run_script").inputSchema.properties.aws_profile.enum, ["expired", "healthy"]);
+assert.equal(readFileSync(join(process.env.HOME, "proxy.starts"), "utf8").trim(), "[]");
+assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim(), "");
+const context = { hasUI: true, settings: Settings.isolated(), sessionManager: { getCwd: () => process.env.HOME },
+ ui: { confirm: async () => true, notify: () => {} } };
+const reconnect = async ({ awsProfile } = {}) => {
+ await disconnectServer(connection);
+ connection = await connectToServer("coreforge-aws-agent-toolkit", config, { preserveOperationalAws: true, awsPreferredProfile: awsProfile });
+ return connection;
+};
+const knowledge = new MCPTool(connection, tools.find(t => t.name === "aws___list_regions"));
+const knowledgeResult = await knowledge.execute("knowledge", {}, undefined, context);
+assert.notEqual(knowledgeResult.isError, true, knowledgeResult.content[0]?.text);
+const run = new MCPTool(connection, tools.find(t => t.name === "aws___run_script"), reconnect);
+const healthy = await run.execute("healthy", { aws_profile: "healthy", code: "result = 1" }, undefined, context);
+assert.notEqual(healthy.isError, true, healthy.content[0]?.text);
+assert.deepEqual(JSON.parse(healthy.content[0].text).profiles, ["healthy", "expired"]);
+assert.equal(JSON.parse(healthy.content[0].text).args.aws_profile, "healthy");
+assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").length, 1);
+await disconnectServer(connection);
+const afterDrop = await run.execute("reconnect", { aws_profile: "healthy", code: "result = 4" }, undefined, context);
+assert.notEqual(afterDrop.isError, true, afterDrop.content[0]?.text);
+assert.deepEqual(JSON.parse(afterDrop.content[0].text).profiles, ["healthy", "expired"]);
+await disconnectServer(connection);
+connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
+const expiredRun = new MCPTool(connection, (await listTools(connection)).find(t => t.name === "aws___run_script"), reconnect);
+const recovered = await expiredRun.execute("expired", { aws_profile: "expired", code: "result = 2" }, undefined, context);
+assert.notEqual(recovered.isError, true, recovered.content[0]?.text);
+assert.deepEqual(JSON.parse(recovered.content[0].text).profiles, ["expired", "healthy"]);
+assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").filter(x => x.includes('"login"')).length, 1);
+await disconnectServer(connection);
+const singleConfig = { ...config, env: { AWS_MCP_PROXY_PROFILES: "healthy" } };
+let single = await connectToServer("coreforge-aws-agent-toolkit", singleConfig, options);
+const singleTools = await listTools(single);
+assert.deepEqual(singleTools.find(t => t.name === "aws___run_script").inputSchema.properties.aws_profile.enum, ["healthy"]);
+const singleRun = new MCPTool(single, singleTools.find(t => t.name === "aws___run_script"), async ({ awsProfile } = {}) => {
+ await disconnectServer(single);
+ single = await connectToServer("coreforge-aws-agent-toolkit", singleConfig, { preserveOperationalAws: true, awsPreferredProfile: awsProfile });
+ return single;
+});
+const only = await singleRun.execute("single", { aws_profile: "healthy", code: "result = 3" }, undefined, context);
+assert.notEqual(only.isError, true, only.content[0]?.text);
+assert.deepEqual(JSON.parse(only.content[0].text).profiles, ["healthy"]);
+assert.equal(JSON.parse(only.content[0].text).args.aws_profile, undefined);
+await disconnectServer(single);
+const empty = await connectToServer("coreforge-aws-agent-toolkit", { ...config, env: { AWS_MCP_PROXY_PROFILES: "" } }, options);
+assert.deepEqual((await listTools(empty)).map(t => t.name), ["aws___list_regions"]);
+await disconnectServer(empty);
+console.log("first-use routing passed");
+`;
+		await fs.writeFile(path.join(root, "aws.calls"), "");
+		const policy = path.join(root, "dcg-policy");
+		await fs.writeFile(policy, "fixture");
+		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+			cwd: root,
+			signal: AbortSignal.timeout(35_000),
+			env: {
+				HOME: root,
+				USERPROFILE: root,
+				PATH: process.env.PATH ?? "",
+				...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+				OMP_OPERATIONAL_AWS_CONFIG_FILE: config,
+				OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "credentials"),
+				OMP_OPERATIONAL_AWS_EXECUTABLE: aws,
+				OMP_DCG_PATH: aws,
+				OMP_DCG_VERSION: "fixture",
+				OMP_DCG_BINARY_SHA256: createHash("sha256")
+					.update(await fs.readFile(aws))
+					.digest("hex"),
+				OMP_DCG_CONFIG: policy,
+				OMP_DCG_CONFIG_SHA256: createHash("sha256").update("fixture").digest("hex"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exit] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(exit, `${stdout}\n${stderr}`).toBe(0);
+		expect(stdout).toContain("first-use routing passed");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 45_000);
