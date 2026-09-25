@@ -858,6 +858,10 @@ async function connectSignedAwsProxy(
 	const signed = await untilAborted(signal, () => reconnect({ awsProfile: profile }));
 	if (!signed || signed.awsAnonymousBootstrap)
 		throw new Error("AUTH_REQUIRED: the selected AWS profile could not open a signed MCP connection.");
+	if (signed.awsPreferredProfile !== profile)
+		throw new Error(
+			"PROFILE_CONFLICT: the signed AWS MCP connection opened for a different profile. Retry the call.",
+		);
 	return signed;
 }
 

@@ -229,6 +229,23 @@ assert.notEqual(recovered.isError, true, recovered.content[0]?.text);
 assert.deepEqual(JSON.parse(recovered.content[0].text).profiles, ["expired", "healthy"]);
 assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").filter(x => x.includes('"login"')).length, 1);
 await disconnectServer(connection);
+connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
+let sharedReconnect;
+const reconnectTogether = async () => sharedReconnect ??= (async () => {
+ await disconnectServer(connection);
+ connection = await connectToServer("coreforge-aws-agent-toolkit", config, { preserveOperationalAws: true, awsPreferredProfile: "healthy" });
+ return connection;
+})();
+const firstCaller = new MCPTool(connection, tools.find(t => t.name === "aws___run_script"), reconnectTogether);
+const secondCaller = new MCPTool(connection, tools.find(t => t.name === "aws___run_script"), reconnectTogether);
+const [firstResult, secondResult] = await Promise.all([
+ firstCaller.execute("first", { aws_profile: "healthy", code: "result = 5" }, undefined, context),
+ secondCaller.execute("second", { aws_profile: "expired", code: "result = 6" }, undefined, context),
+]);
+assert.notEqual(firstResult.isError, true, firstResult.content[0]?.text);
+assert.equal(secondResult.isError, true);
+assert.match(secondResult.content[0].text, /PROFILE_CONFLICT/);
+await disconnectServer(connection);
 const singleConfig = { ...config, env: { AWS_MCP_PROXY_PROFILES: "healthy" } };
 let single = await connectToServer("coreforge-aws-agent-toolkit", singleConfig, options);
 const singleTools = await listTools(single);
