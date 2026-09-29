@@ -278,19 +278,6 @@ export function getOperationalAwsLaunchMetadata(): Readonly<OperationalAwsLaunch
 	return operationalAwsLaunchMetadata;
 }
 const operationalAwsEnvNames = new Set<string>(OPERATIONAL_AWS_ENV_NAMES.map(managedEnvName));
-/** Launcher-owned AWS chain, captured before Bun or OMP load repository dotenv files. */
-const operationalAwsLaunchEnv: Readonly<Record<string, string>> = Object.freeze(
-	Object.fromEntries(
-		OPERATIONAL_AWS_ENV_NAMES.flatMap(name => {
-			const value = launchEnvValues?.get(managedEnvName(name));
-			return value === undefined ? [] : [[name, value]];
-		}),
-	),
-);
-
-export function getOperationalAwsLaunchEnv(): Readonly<Record<string, string>> {
-	return operationalAwsLaunchEnv;
-}
 const trustedOperationalAwsValues = new Map<string, string>();
 const CREDENTIAL_ENV_NAMES = new Set(
 	[

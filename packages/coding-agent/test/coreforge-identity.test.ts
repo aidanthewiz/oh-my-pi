@@ -380,29 +380,50 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env.GITHUB_TOKEN).toBe("ghp-keep");
 	});
 
-	it("preserves unrelated model keys but removes operational selectors when Entra is unprovisioned", () => {
+	it("preserves classic AWS credentials and selectors when Entra is unprovisioned", () => {
 		const settings = identitySettings({
 			"identity.entra.tenantId": undefined,
 			"identity.entra.clientId": undefined,
 		});
-		const env: Record<string, string | undefined> = { ANTHROPIC_API_KEY: "sk-keep", AWS_PROFILE: "keep" };
+		const env: Record<string, string | undefined> = {
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "keep",
+			AWS_REGION: "us-west-2",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(false);
-		expect(result.clearedKeys).toEqual([]);
-		expect(result.appliedKeys).toEqual([]);
-		expect(env.ANTHROPIC_API_KEY).toBe("sk-keep");
-		expect(env.AWS_PROFILE).toBeUndefined();
+		expect(env).toEqual({
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "keep",
+			AWS_REGION: "us-west-2",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		});
 	});
 
 	it("is a no-op when Entra is disabled entirely", () => {
 		const settings = identitySettings({ "identity.entra.enabled": false });
-		const env: Record<string, string | undefined> = { ANTHROPIC_API_KEY: "sk-keep" };
+		const env: Record<string, string | undefined> = {
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "caller-profile",
+			AWS_REGION: "us-east-1",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(false);
-		expect(env.ANTHROPIC_API_KEY).toBe("sk-keep");
+		expect(env).toEqual({
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "caller-profile",
+			AWS_REGION: "us-east-1",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		});
 	});
 
-	it("preserves only launcher-owned classic AWS credentials and never passes them to repository children", async () => {
+	it("preserves classic caller AWS state without exposing credentials to repository children", async () => {
 		const script = `
 			import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 			import { clearAwsCredentialCache, resolveAwsCredentials } from "@oh-my-pi/pi-ai/providers/aws-credentials";
@@ -416,30 +437,31 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 			const snapshot = () => {
 				const child = filterChildShellEnv(Bun.env);
 				return {
-					accessIsLaunch: Bun.env.AWS_ACCESS_KEY_ID === "trusted-access",
-					secretIsLaunch: Bun.env.AWS_SECRET_ACCESS_KEY === "trusted-secret",
-					sessionIsLaunch: Bun.env.AWS_SESSION_TOKEN === "trusted-session",
+					accessIsCaller: Bun.env.AWS_ACCESS_KEY_ID === "caller-access",
+					secretIsCaller: Bun.env.AWS_SECRET_ACCESS_KEY === "caller-secret",
+					sessionIsCaller: Bun.env.AWS_SESSION_TOKEN === "caller-session",
+					profileIsCaller: Bun.env.AWS_PROFILE === "caller-profile",
+					regionIsCaller: Bun.env.AWS_REGION === "us-west-2",
 					defaultProfileIsLaunch: Bun.env.AWS_DEFAULT_PROFILE === "employee",
 					childSafe: child.AWS_ACCESS_KEY_ID === undefined && child.AWS_SECRET_ACCESS_KEY === undefined &&
-						child.AWS_SESSION_TOKEN === undefined,
+						child.AWS_SESSION_TOKEN === undefined && child.OMP_OPERATIONAL_AWS_PROFILE === undefined,
 				};
 			};
-			Bun.env.AWS_ACCESS_KEY_ID = "dotenv-access";
-			Bun.env.AWS_SECRET_ACCESS_KEY = "dotenv-secret";
-			Bun.env.AWS_SESSION_TOKEN = "dotenv-session";
+			Bun.env.AWS_ACCESS_KEY_ID = "caller-access";
+			Bun.env.AWS_SECRET_ACCESS_KEY = "caller-secret";
+			Bun.env.AWS_SESSION_TOKEN = "caller-session";
+			Bun.env.AWS_PROFILE = "caller-profile";
+			Bun.env.AWS_REGION = "us-west-2";
 			await ensureCoreforgeIdentityAtStartup(settings(false), { interactive: false });
 			const disabled = snapshot();
-			disabled.modelAccessIsLaunch = (await resolveAwsCredentials({ region: "us-east-1" })).accessKeyId === "trusted-access";
-			Bun.env.AWS_ACCESS_KEY_ID = "dotenv-access";
-			Bun.env.AWS_SECRET_ACCESS_KEY = "dotenv-secret";
-			Bun.env.AWS_SESSION_TOKEN = "dotenv-session";
+			disabled.modelAccessIsCaller = (await resolveAwsCredentials({ region: "us-west-2" })).accessKeyId === "caller-access";
+			clearAwsCredentialCache();
 			await ensureCoreforgeIdentityAtStartup(settings(true), {
 				interactive: false,
 				createStore: () => { throw Error("store unavailable"); },
 			});
 			const unprovisioned = snapshot();
-			clearAwsCredentialCache();
-			unprovisioned.modelAccessIsLaunch = (await resolveAwsCredentials({ region: "us-east-1" })).accessKeyId === "trusted-access";
+			unprovisioned.modelAccessIsCaller = (await resolveAwsCredentials({ region: "us-west-2" })).accessKeyId === "caller-access";
 			await ensureCoreforgeIdentityAtStartup(settings(true, "not-a-uuid", "also-not-a-uuid"), {
 				interactive: false,
 				createStore: () => { throw Error("store unavailable"); },
@@ -447,45 +469,51 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 			const managed = snapshot();
 			process.stdout.write(JSON.stringify({ disabled, unprovisioned, managed }));
 		`;
-		const proc = Bun.spawn([process.execPath, "-e", script], {
-			cwd: path.resolve(import.meta.dir, "../../.."),
-			env: {
-				PATH: Bun.env.PATH,
-				HOME: Bun.env.HOME,
-				BUN_OPTIONS: "--no-env-file",
-				OMP_NO_ENV_FILE: "1",
-				AWS_ACCESS_KEY_ID: "trusted-access",
-				AWS_SECRET_ACCESS_KEY: "trusted-secret",
-				AWS_SESSION_TOKEN: "trusted-session",
-				AWS_DEFAULT_PROFILE: "employee",
-			},
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		expect(exitCode, stderr).toBe(0);
 		const classic = {
-			accessIsLaunch: true,
-			secretIsLaunch: true,
-			sessionIsLaunch: true,
+			accessIsCaller: true,
+			secretIsCaller: true,
+			sessionIsCaller: true,
+			profileIsCaller: true,
+			regionIsCaller: true,
 			defaultProfileIsLaunch: true,
-			modelAccessIsLaunch: true,
+			modelAccessIsCaller: true,
 			childSafe: true,
 		};
-		const result = JSON.parse(stdout);
-		expect(result.disabled).toEqual(classic);
-		expect(result.unprovisioned).toEqual(classic);
-		expect(result.managed).toEqual({
-			accessIsLaunch: false,
-			secretIsLaunch: false,
-			sessionIsLaunch: false,
-			defaultProfileIsLaunch: false,
-			childSafe: true,
-		});
+		for (const controlledDotenv of [false, true]) {
+			const proc = Bun.spawn([process.execPath, "-e", script], {
+				cwd: path.resolve(import.meta.dir, "../../.."),
+				env: {
+					PATH: Bun.env.PATH,
+					HOME: Bun.env.HOME,
+					...(controlledDotenv ? { BUN_OPTIONS: "--no-env-file", OMP_NO_ENV_FILE: "1" } : {}),
+					AWS_ACCESS_KEY_ID: "trusted-access",
+					AWS_SECRET_ACCESS_KEY: "trusted-secret",
+					AWS_SESSION_TOKEN: "trusted-session",
+					AWS_DEFAULT_PROFILE: "employee",
+					OMP_OPERATIONAL_AWS_PROFILE: "employee",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			const result = JSON.parse(stdout);
+			expect(result.disabled).toEqual(classic);
+			expect(result.unprovisioned).toEqual(classic);
+			expect(result.managed).toEqual({
+				accessIsCaller: false,
+				secretIsCaller: false,
+				sessionIsCaller: false,
+				profileIsCaller: false,
+				regionIsCaller: false,
+				defaultProfileIsLaunch: false,
+				childSafe: true,
+			});
+		}
 	});
 
 	it("still blocks ambient model auth when a signed-in identity hits a malformed managed value", () => {

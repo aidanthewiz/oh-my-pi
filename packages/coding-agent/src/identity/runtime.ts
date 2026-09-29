@@ -6,7 +6,6 @@ import {
 	MANAGED_AWS_MODEL_AUTH_MODE,
 } from "@oh-my-pi/pi-ai";
 import {
-	getOperationalAwsLaunchEnv,
 	getOperationalAwsLaunchMetadata,
 	OPERATIONAL_AWS_LAUNCH_ENV_NAMES,
 	OPERATIONAL_AWS_ENV_NAMES,
@@ -134,16 +133,23 @@ const MODEL_AUTH_ENV_VARS: readonly string[] = [
 	AWS_MODEL_REGION_ENV,
 ];
 
-/**
- * Restore launcher-owned operational AWS routes. Managed model setup removes
- * ambient credentials; classic mode retains only the pre-dotenv launch chain.
- */
-export function restoreCoreforgeOperationalAwsEnvironment(
-	env: EnvironmentLike = Bun.env,
-	preserveLaunchCredentials = true,
-): string | undefined {
+export function protectCoreforgeOperationalAwsChildEnvironment(): void {
 	const metadata = getOperationalAwsLaunchMetadata();
-	const profileBeforeRestore = metadata?.profile;
+	registerChildEnvRedactions(OPERATIONAL_AWS_LAUNCH_ENV_NAMES, [
+		metadata?.configFile,
+		metadata?.sharedCredentialsFile,
+		metadata?.profile,
+		metadata?.region,
+		metadata?.executable,
+	]);
+}
+
+/**
+ * Clear ambient AWS credentials for managed models, retaining trusted
+ * operational routing metadata.
+ */
+export function restoreCoreforgeOperationalAwsEnvironment(env: EnvironmentLike = Bun.env): void {
+	const metadata = getOperationalAwsLaunchMetadata();
 
 	for (const key of OPERATIONAL_AWS_ENV_NAMES) {
 		delete env[key];
@@ -154,25 +160,11 @@ export function restoreCoreforgeOperationalAwsEnvironment(
 	if (metadata?.sharedCredentialsFile) env.AWS_SHARED_CREDENTIALS_FILE = metadata.sharedCredentialsFile;
 	if (metadata?.profile) env.AWS_PROFILE = metadata.profile;
 	if (metadata?.region) env.AWS_REGION = metadata.region;
-	if (preserveLaunchCredentials && (env === Bun.env || env === process.env)) {
-		for (const [name, value] of Object.entries(getOperationalAwsLaunchEnv())) {
-			if (name !== "AWS_PROFILE" && name !== "AWS_REGION") env[name] = value;
-		}
-	}
 
-	if (env === Bun.env) {
-		registerChildEnvRedactions(OPERATIONAL_AWS_LAUNCH_ENV_NAMES, [
-			metadata?.configFile,
-			metadata?.sharedCredentialsFile,
-			metadata?.profile,
-			metadata?.region,
-			metadata?.executable,
-		]);
-	}
+	if (env === Bun.env) protectCoreforgeOperationalAwsChildEnvironment();
 	for (const key of Object.keys(env)) {
 		if (key.startsWith("OMP_OPERATIONAL_AWS_")) delete env[key];
 	}
-	return profileBeforeRestore;
 }
 
 /**
@@ -203,11 +195,8 @@ export function applyCoreforgeIdentityProviderDefaults(
 		settings.get("identity.entra.enabled") === true &&
 		hasValue(settings.get("identity.entra.tenantId")) &&
 		hasValue(settings.get("identity.entra.clientId"));
-	const profilesBeforeOperationalRestore = [env.AWS_PROFILE?.trim(), env.AWS_DEFAULT_PROFILE?.trim()].filter(
-		(profile): profile is string => Boolean(profile),
-	);
-	restoreCoreforgeOperationalAwsEnvironment(env, !entraProvisioned);
 	if (!entraProvisioned) {
+		if (env === Bun.env) protectCoreforgeOperationalAwsChildEnvironment();
 		return {
 			entraProvisioned: false,
 			identityAvailable: false,
@@ -216,6 +205,10 @@ export function applyCoreforgeIdentityProviderDefaults(
 			removedManagedAwsProfile: false,
 		};
 	}
+	const profilesBeforeOperationalRestore = [env.AWS_PROFILE?.trim(), env.AWS_DEFAULT_PROFILE?.trim()].filter(
+		(profile): profile is string => Boolean(profile),
+	);
+	restoreCoreforgeOperationalAwsEnvironment(env);
 	// Managed model routing is injected after dotenv initialization. Register
 	// those names explicitly so repository children cannot inherit the injected
 	// profile, Region, workspace, endpoint, or future provider credentials.

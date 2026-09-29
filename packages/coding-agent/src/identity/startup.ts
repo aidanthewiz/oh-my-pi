@@ -5,10 +5,10 @@ import { CoreforgeIdentityStore, coreforgeIdentityFirstName } from "./coreforge-
 import type { CoreforgeEntraConfig } from "./entra";
 import {
 	applyCoreforgeIdentityProviderDefaults,
+	protectCoreforgeOperationalAwsChildEnvironment,
 	resolveCoreforgeAwsConfig,
 	resolveCoreforgeAwsSsoConstants,
 	resolveCoreforgeEntraConfig,
-	restoreCoreforgeOperationalAwsEnvironment,
 } from "./runtime";
 
 export interface CoreforgeStartupIdentity {
@@ -30,7 +30,7 @@ export async function ensureCoreforgeIdentityAtStartup(
 	},
 ): Promise<CoreforgeStartupIdentity> {
 	if (!settings.get("identity.entra.enabled")) {
-		restoreCoreforgeOperationalAwsEnvironment(Bun.env);
+		protectCoreforgeOperationalAwsChildEnvironment();
 		return { notices: [] };
 	}
 	const notices: string[] = [];
@@ -86,9 +86,7 @@ export async function ensureCoreforgeIdentityAtStartup(
 			return { firstName: coreforgeIdentityFirstName(profile), notices };
 		}
 		if (!entraConfig) {
-			restoreCoreforgeOperationalAwsEnvironment(Bun.env);
-			// Entra unprovisioned: the classic chain retains only launcher-owned AWS
-			// credentials and selectors, never repository dotenv replacements.
+			protectCoreforgeOperationalAwsChildEnvironment();
 			return { firstName: coreforgeIdentityFirstName(profile), notices };
 		}
 		// Entra provisioned: managed identity is the SOLE AWS-model auth path.
