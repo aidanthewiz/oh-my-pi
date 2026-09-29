@@ -87,8 +87,8 @@ export async function ensureCoreforgeIdentityAtStartup(
 		}
 		if (!entraConfig) {
 			restoreCoreforgeOperationalAwsEnvironment(Bun.env);
-			// Entra unprovisioned: the classic env-credential path remains
-			// authoritative after restoring the shell-owned AWS selectors.
+			// Entra unprovisioned: the classic chain retains only launcher-owned AWS
+			// credentials and selectors, never repository dotenv replacements.
 			return { firstName: coreforgeIdentityFirstName(profile), notices };
 		}
 		// Entra provisioned: managed identity is the SOLE AWS-model auth path.

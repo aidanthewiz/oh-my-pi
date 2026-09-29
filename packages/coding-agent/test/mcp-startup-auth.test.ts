@@ -1,6 +1,6 @@
 /**
- * MCP startup must remain non-interactive. A signed-out integration records its
- * challenge during discovery and authorizes only when that integration is used.
+ * MCP startup remains non-interactive while cached tools are available before
+ * background discovery populates the remaining server catalogs.
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -21,7 +21,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 	});
 }
 
-function installMcpFetch(authUrls: Set<string>, authHeaders = new Map<string, string>(), requireAuthHeader = false) {
+function installMcpFetch(
+	authUrls: Set<string>,
+	authHeaders = new Map<string, string>(),
+	requireAuthHeader = false,
+	options?: { initialize?: Promise<void>; catalogs?: boolean; failTools?: boolean },
+) {
 	const requests: RequestRecord[] = [];
 	const failedInitializations = new Set<string>();
 	const fetchImpl = Object.assign(
@@ -55,18 +60,40 @@ function installMcpFetch(authUrls: Set<string>, authHeaders = new Map<string, st
 			}
 
 			if (body.method === "initialize") {
+				await options?.initialize;
 				return jsonResponse({
 					jsonrpc: "2.0",
 					id: body.id,
 					result: {
 						protocolVersion: "2025-03-26",
-						capabilities: { tools: {} },
+						capabilities: options?.catalogs ? { tools: {}, resources: {}, prompts: {} } : { tools: {} },
 						serverInfo: { name: url, version: "test" },
+						...(options?.catalogs ? { instructions: "catalog guidance" } : {}),
 					},
 				});
 			}
 			if (body.method === "tools/list") {
+				if (options?.failTools) {
+					return jsonResponse({
+						jsonrpc: "2.0",
+						id: body.id,
+						error: { code: -32603, message: "tool catalog unavailable" },
+					});
+				}
 				return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+			}
+			if (body.method === "resources/list") {
+				return jsonResponse({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { resources: [{ uri: "test://guide", name: "guide" }] },
+				});
+			}
+			if (body.method === "resources/templates/list") {
+				return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { resourceTemplates: [] } });
+			}
+			if (body.method === "prompts/list") {
+				return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { prompts: [{ name: "review" }] } });
 			}
 			return new Response(null, { status: 202 });
 		},
@@ -113,7 +140,7 @@ describe("MCP startup OAuth", () => {
 		}
 	});
 
-	test("surfaces cached static tools when signed-out discovery fails", async () => {
+	test("keeps cached tools when signed-out background discovery fails without opening authorization", async () => {
 		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
 		const toolCache = {
 			get: async () => cachedTools,
@@ -122,13 +149,71 @@ describe("MCP startup OAuth", () => {
 		const manager = new MCPManager(process.cwd(), toolCache);
 		const config = httpConfig(SENTRY_URL);
 		const { requests } = installMcpFetch(new Set([SENTRY_URL]));
+		const handler = vi.fn(async () => ({ ...config, headers: { Authorization: "Bearer fresh-token" } }));
+		manager.setAuthHandler(handler);
 
 		try {
 			const result = await manager.connectServers({ sentry: config }, {});
-
 			expect(result.errors.has("sentry")).toBe(false);
 			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__sentry_lookup"]);
-			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(0);
+			await manager.waitForPendingConnections();
+			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(1);
+			expect(handler).not.toHaveBeenCalled();
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__sentry_lookup"]);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
+
+	test("loads prompts and resources behind cached tools without waiting for initialization", async () => {
+		const gate = Promise.withResolvers<void>();
+		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
+		const toolCache = {
+			get: async () => cachedTools,
+			set: async () => {},
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), toolCache);
+		installMcpFetch(new Set(), new Map(), false, { initialize: gate.promise, catalogs: true });
+		const kinds = new Set<string>();
+		const catalogsReady = Promise.withResolvers<void>();
+		manager.addCatalogChangeListener(event => {
+			kinds.add(event.kind);
+			if (kinds.has("resources") && kinds.has("prompts")) catalogsReady.resolve();
+		});
+
+		try {
+			const result = await manager.connectServers({ catalog: httpConfig(SENTRY_URL) }, {});
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__catalog_lookup"]);
+			expect(manager.getServerResources("catalog")).toBeUndefined();
+			expect(manager.getServerPrompts("catalog")).toBeUndefined();
+
+			gate.resolve();
+			await catalogsReady.promise;
+			expect(manager.getConnection("catalog")?.instructions).toBe("catalog guidance");
+			expect(manager.getServerResources("catalog")?.resources.map(item => item.uri)).toEqual(["test://guide"]);
+			expect(manager.getServerPrompts("catalog")?.map(item => item.name)).toEqual(["review"]);
+		} finally {
+			gate.resolve();
+			await manager.disconnectAll();
+		}
+	}, 15_000);
+
+	test("retains cached tools when background tools/list fails", async () => {
+		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
+		const toolCache = {
+			get: async () => cachedTools,
+			set: async () => {},
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), toolCache);
+		const { requests } = installMcpFetch(new Set(), new Map(), false, { failTools: true });
+
+		try {
+			const result = await manager.connectServers({ catalog: httpConfig(SENTRY_URL) }, {});
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__catalog_lookup"]);
+			await manager.waitForPendingConnections();
+			expect(requests.some(request => request.body.method === "tools/list")).toBe(true);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__catalog_lookup"]);
+			expect(manager.getServerPrompts("catalog")).toBeUndefined();
 		} finally {
 			await manager.disconnectAll();
 		}
@@ -151,7 +236,8 @@ describe("MCP startup OAuth", () => {
 
 		try {
 			await manager.connectServers({ sentry: config }, {});
-			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(0);
+			await manager.waitForPendingConnections();
+			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(1);
 			expect(handler).not.toHaveBeenCalled();
 
 			await manager.waitForConnection("sentry");

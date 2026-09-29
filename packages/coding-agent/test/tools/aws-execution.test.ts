@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 
-test("native AWS enforces process, account approval, and authentication boundaries", async () => {
+test("native AWS enforces process, account approval, authentication, and output boundaries", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "native-aws-execution-"));
 	try {
 		const executable = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");

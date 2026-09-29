@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_AUTH_MODE_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
@@ -48,6 +49,7 @@ const cleanAwsEnv = {
 	AWS_DEFAULT_REGION: undefined,
 	AWS_EC2_METADATA_DISABLED: "true",
 	[AWS_MODEL_AUTH_MODE_ENV]: undefined,
+	[AWS_MODEL_ACCOUNT_ID_ENV]: undefined,
 	[AWS_MODEL_PROFILE_ENV]: undefined,
 	[AWS_MODEL_REGION_ENV]: undefined,
 };
@@ -62,6 +64,12 @@ interface Capture {
 function captureFetch(capture: Capture): FetchImpl {
 	return Object.assign(
 		async (input: string | URL | Request, init?: RequestInit) => {
+			if (String(input instanceof Request ? input.url : input).startsWith("https://sts.")) {
+				expect(new Headers(init?.headers).get("authorization")).toContain("Credential=MODELKEY/");
+				return new Response(
+					"<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111122223333</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+				);
+			}
 			capture.url = String(input instanceof Request ? input.url : input);
 			const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
 			capture.authorization = headers.get("authorization");
@@ -243,6 +251,7 @@ describe("Bedrock Mantle authentication", () => {
 				[AWS_MODEL_AUTH_MODE_ENV]: MANAGED_AWS_MODEL_AUTH_MODE,
 				[AWS_MODEL_PROFILE_ENV]: "model-inference",
 				[AWS_MODEL_REGION_ENV]: "us-east-1",
+				[AWS_MODEL_ACCOUNT_ID_ENV]: "111122223333",
 				AWS_BEARER_TOKEN_BEDROCK: "ambient-bearer",
 				AWS_ACCESS_KEY_ID: "AMBIENTKEY",
 				AWS_SECRET_ACCESS_KEY: "ambient-secret",

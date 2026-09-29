@@ -377,6 +377,18 @@ for (const profile of ["repository-helper", "script-helper"]) {
 }
 await assert.rejects(() => tool.execute("reserved-alias", { ...read, profile: "adopted-alias" }), /PROFILE_NOT_FOUND/);
 assert.equal((await calls()).length, beforeRejectedHelpers);
+for (const prefix of ["malformed-json", "prefixed-json", "truncated-json"]) {
+	const result = await tool.execute(prefix, { ...read, parameters: { Prefix: prefix } });
+	const output = text(result);
+	const savedOutput = await fs.readFile(path.join(root, `artifact-${artifact}.txt`), "utf8").catch(error => {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+		throw error;
+	});
+	assert.ok(!output.includes("fixture-secret-compound"), `${prefix} leaked in result`);
+	assert.ok(!savedOutput.includes("fixture-secret-compound"), `${prefix} leaked in artifact`);
+	assert.ok(!savedOutput.includes("SecretString"), `${prefix} preserved sensitive JSON`);
+	assert.match(output, /withheld/);
+}
 await tool.execute("large", { ...read, parameters: { Prefix: "large" } });
 const artifacts = await fs.readdir(root);
 const saved = await Promise.all(
@@ -394,7 +406,23 @@ try {
 		path.join(root, ".aws", "config"),
 		"[profile coreforge]\nsso_session = managed\nsso_account_id = 123456789012\nsso_role_name = Model\n[sso-session managed]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n",
 	);
-	const modelCredentials = await resolveAwsCredentials({ signal: AbortSignal.timeout(5000) });
+	Bun.env.OMP_MODEL_AWS_ACCOUNT_ID = managedIdentity.accountId;
+	let verifiedAccount = false;
+	const modelCredentials = await resolveAwsCredentials({
+		signal: AbortSignal.timeout(5000),
+		fetch: Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				verifiedAccount = true;
+				assert.equal(String(input), "https://sts.us-east-1.amazonaws.com/");
+				assert.match(new Headers(init?.headers).get("authorization") ?? "", /Credential=fixture-model-access\//);
+				return new Response(
+					`<GetCallerIdentityResponse><GetCallerIdentityResult><Account>${managedIdentity.accountId}</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`,
+				);
+			},
+			{ preconnect: fetch.preconnect },
+		),
+	});
+	assert.equal(verifiedAccount, true);
 	assert.equal(modelCredentials.accessKeyId, "fixture-model-access");
 } finally {
 	Bun.env.PATH = originalPath;

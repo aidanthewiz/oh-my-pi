@@ -465,14 +465,19 @@ function redactAwsJson(value: unknown): unknown {
 	return value;
 }
 
-export function redactAwsOutput(value: string): string {
+export function redactAwsOutput(value: string, jsonOnly = false): string {
+	const withheld = "AWS output withheld: invalid or truncated JSON";
+	if (value.length > MAX_AWS_OUTPUT_BYTES || Buffer.byteLength(value, "utf8") > MAX_AWS_OUTPUT_BYTES) return withheld;
 	try {
 		return JSON.stringify(redactAwsJson(JSON.parse(value)));
 	} catch {
+		let start = 0;
+		while (start < value.length && (/\s/u.test(value[start]!) || value.charCodeAt(start) === 0xfeff)) start++;
+		if (jsonOnly || value[start] === "{" || value[start] === "[") return withheld;
 		return value
 			.replace(/\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b/gu, "[redacted]")
 			.replace(
-				/((?:["']?)(?:secret|password|token|private[_-]?key|access[_-]?key)(?:["']?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'[^']*(?:'|$)|[^\s,}\]]+)/giu,
+				/((?:["']?)[\w-]*(?:secret|password|token|private[_-]?key|access[_-]?key)[\w-]*(?:["']?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'[^']*(?:'|$)|[^\s,}\]]+)/giu,
 				"$1[redacted]",
 			)
 			.replace(/(Authorization:\s*(?:AWS4-HMAC-SHA256|Bearer)\s+)[^\s]+/giu, "$1[redacted]");
@@ -1317,7 +1322,12 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup);
 				}
 			}
-			sink.push(redactAwsOutput(result.stdout));
+			if (result.stdout)
+				sink.push(
+					result.stdoutTruncated
+						? "AWS output withheld: truncated response"
+						: redactAwsOutput(result.stdout, true),
+				);
 			if (result.stderr) sink.push(redactAwsOutput(result.stderr));
 			const timedOut = result.exitError instanceof ptree.TimeoutError;
 			const output = await sink.dump(

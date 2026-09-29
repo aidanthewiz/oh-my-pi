@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_AUTH_MODE_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
@@ -18,9 +19,15 @@ import { ensureCoreforgeIdentityAtStartup } from "@oh-my-pi/pi-coding-agent/iden
 // here bricks every managed install with a read-only home dir or full disk.
 
 const TENANT_ID = "11111111-2222-4333-8444-555555555555";
-const MANAGED_MODEL_ENV_KEYS = [AWS_MODEL_AUTH_MODE_ENV, AWS_MODEL_PROFILE_ENV, AWS_MODEL_REGION_ENV] as const;
+const MANAGED_MODEL_ENV_KEYS = [
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_ACCOUNT_ID_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
+] as const;
 const initialManagedModelEnv: Record<string, string | undefined> = {
 	[AWS_MODEL_AUTH_MODE_ENV]: Bun.env[AWS_MODEL_AUTH_MODE_ENV],
+	[AWS_MODEL_ACCOUNT_ID_ENV]: Bun.env[AWS_MODEL_ACCOUNT_ID_ENV],
 	[AWS_MODEL_PROFILE_ENV]: Bun.env[AWS_MODEL_PROFILE_ENV],
 	[AWS_MODEL_REGION_ENV]: Bun.env[AWS_MODEL_REGION_ENV],
 };
@@ -268,6 +275,7 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 				"identity.entra.authorityHost": "login.microsoftonline.com",
 				"identity.aws.profile": "model-inference",
 				"identity.aws.region": "us-east-1",
+				"identity.aws.ssoAccountId": "891455110252",
 				"identity.claude.workspaceId": "wrkspc_test",
 				"identity.claude.baseUrl": "https://aws-external-anthropic.us-east-1.api.aws",
 			});
@@ -278,6 +286,7 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 			expect(Bun.env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
 			expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("adopted-model-inference");
 			expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
+			expect(Bun.env[AWS_MODEL_ACCOUNT_ID_ENV]).toBe("891455110252");
 			expect(Bun.env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 			// Stale ambient Bedrock bearer credentials cannot bypass the managed
 			// profile, but their removal is not surfaced as a startup warning.

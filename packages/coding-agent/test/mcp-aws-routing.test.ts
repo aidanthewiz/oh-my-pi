@@ -142,7 +142,7 @@ test("managed AWS discovers anonymously and signs with the selected profile on f
 		const config = path.join(root, "config");
 		await fs.writeFile(
 			config,
-			"[profile expired]\nregion = us-east-1\nsso_session = first\n[sso-session first]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n[profile healthy]\nregion = us-east-1\n",
+			"[profile expired]\nregion = us-east-1\nsso_session = first\n[sso-session first]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n[profile healthy]\nregion = us-east-1\n[profile still-expired]\nregion = us-east-1\n",
 		);
 		const aws = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");
 		const fixture = path.resolve(import.meta.dir, "fixtures/recording-aws.ts");
@@ -159,7 +159,7 @@ test("managed AWS discovers anonymously and signs with the selected profile on f
 		const proxy = path.join(root, "proxy.ts");
 		await fs.writeFile(
 			proxy,
-			`import { appendFileSync, existsSync } from "node:fs";
+			`import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 const profiles = (Bun.env.OMP_OPERATIONAL_AWS_PROFILES ?? "").split("\\n").filter(Boolean);
@@ -181,7 +181,11 @@ for await (const line of createInterface({ input: process.stdin })) {
      required: ["code"] } },
   ] };
  } else if (request.method === "tools/call") {
-  result = { content: [{ type: "text", text: JSON.stringify({ profiles, args: request.params.arguments }) }] };
+  appendFileSync(join(Bun.env.HOME!, "proxy.calls"), JSON.stringify(request.params.arguments) + "\\n");
+  if (request.params.arguments?.code === "challenge" && !existsSync(join(Bun.env.HOME!, "challenge-seen"))) {
+   writeFileSync(join(Bun.env.HOME!, "challenge-seen"), "yes");
+   result = { isError: true, content: [{ type: "text", text: "challenge" }], _meta: { "mcp/www_authenticate": ["Bearer realm=\\"fixture\\""] } };
+  } else result = { content: [{ type: "text", text: JSON.stringify({ profiles, args: request.params.arguments }) }] };
  } else result = {};
  console.log(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...(error ? { error } : { result }) }));
 }`,
@@ -198,9 +202,11 @@ const options = { preserveOperationalAws: true, awsAnonymousBootstrap: true };
 let connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
 const tools = await listTools(connection);
 assert.deepEqual(connection.operationalAwsProfiles, []);
-assert.deepEqual(tools.find(t => t.name === "aws___run_script").inputSchema.properties.aws_profile.enum, ["expired", "healthy"]);
+assert.deepEqual(tools.find(t => t.name === "aws___run_script").inputSchema.properties.aws_profile.enum, ["expired", "healthy", "still-expired"]);
 assert.equal(readFileSync(join(process.env.HOME, "proxy.starts"), "utf8").trim(), "[]");
 assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim(), "");
+const awsCalls = () => readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse);
+const proxyCalls = () => readFileSync(join(process.env.HOME, "proxy.calls"), "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse);
 const context = { hasUI: true, settings: Settings.isolated(), sessionManager: { getCwd: () => process.env.HOME },
  ui: { confirm: async () => true, notify: () => {} } };
 const reconnect = async ({ awsProfile } = {}) => {
@@ -214,19 +220,49 @@ assert.notEqual(knowledgeResult.isError, true, knowledgeResult.content[0]?.text)
 const run = new MCPTool(connection, tools.find(t => t.name === "aws___run_script"), reconnect);
 const healthy = await run.execute("healthy", { aws_profile: "healthy", code: "result = 1" }, undefined, context);
 assert.notEqual(healthy.isError, true, healthy.content[0]?.text);
-assert.deepEqual(JSON.parse(healthy.content[0].text).profiles, ["healthy", "expired"]);
+assert.deepEqual(JSON.parse(healthy.content[0].text).profiles, ["healthy", "expired", "still-expired"]);
 assert.equal(JSON.parse(healthy.content[0].text).args.aws_profile, "healthy");
 assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").length, 1);
+const firstCalls = awsCalls().length;
+const repeated = await run.execute("repeat", { aws_profile: "healthy", code: "result = 1" }, undefined, context);
+assert.notEqual(repeated.isError, true, repeated.content[0]?.text);
+assert.equal(awsCalls().length, firstCalls);
+const beforeBlocked = proxyCalls().length;
+const blocked = await run.execute("blocked", { aws_profile: "still-expired", code: "result = 2" }, undefined, { ...context, hasUI: false });
+assert.equal(blocked.isError, true);
+assert.match(blocked.content[0].text, /AUTH_REQUIRED/);
+assert.equal(proxyCalls().length, beforeBlocked);
+assert.equal(awsCalls().at(-1).argv.includes("still-expired"), true);
+const selected = await run.execute("selected", { aws_profile: "expired", code: "result = 3" }, undefined, context);
+assert.notEqual(selected.isError, true, selected.content[0]?.text);
+assert.equal(JSON.parse(selected.content[0].text).args.aws_profile, "expired");
+assert.equal(proxyCalls().length, beforeBlocked + 1);
+const afterSelected = awsCalls().length;
+const selectedAgain = await run.execute("selected-again", { aws_profile: "expired", code: "result = 3" }, undefined, context);
+assert.notEqual(selectedAgain.isError, true, selectedAgain.content[0]?.text);
+assert.equal(awsCalls().length, afterSelected);
 await disconnectServer(connection);
 const afterDrop = await run.execute("reconnect", { aws_profile: "healthy", code: "result = 4" }, undefined, context);
 assert.notEqual(afterDrop.isError, true, afterDrop.content[0]?.text);
-assert.deepEqual(JSON.parse(afterDrop.content[0].text).profiles, ["healthy", "expired"]);
+assert.deepEqual(JSON.parse(afterDrop.content[0].text).profiles, ["healthy", "expired", "still-expired"]);
+assert.equal(awsCalls().length, afterSelected + 1);
+const beforeChallenge = awsCalls().length;
+const beforeChallengeForward = proxyCalls().length;
+const retried = await run.execute("challenge", { aws_profile: "expired", code: "challenge" }, undefined, context);
+assert.notEqual(retried.isError, true, retried.content[0]?.text);
+assert.equal(JSON.parse(retried.content[0].text).args.aws_profile, "expired");
+assert.equal(awsCalls().length, beforeChallenge + 2);
+assert.equal(proxyCalls().length, beforeChallengeForward + 2);
+const afterChallenge = awsCalls().length;
+const retriedAgain = await run.execute("after-challenge", { aws_profile: "expired", code: "result = 3" }, undefined, context);
+assert.notEqual(retriedAgain.isError, true, retriedAgain.content[0]?.text);
+assert.equal(awsCalls().length, afterChallenge);
 await disconnectServer(connection);
 connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
 const expiredRun = new MCPTool(connection, (await listTools(connection)).find(t => t.name === "aws___run_script"), reconnect);
 const recovered = await expiredRun.execute("expired", { aws_profile: "expired", code: "result = 2" }, undefined, context);
 assert.notEqual(recovered.isError, true, recovered.content[0]?.text);
-assert.deepEqual(JSON.parse(recovered.content[0].text).profiles, ["expired", "healthy"]);
+assert.deepEqual(JSON.parse(recovered.content[0].text).profiles, ["expired", "healthy", "still-expired"]);
 assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").filter(x => x.includes('"login"')).length, 1);
 await disconnectServer(connection);
 connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
@@ -266,6 +302,7 @@ await disconnectServer(empty);
 console.log("first-use routing passed");
 `;
 		await fs.writeFile(path.join(root, "aws.calls"), "");
+		await fs.writeFile(path.join(root, "proxy.calls"), "");
 		const policy = path.join(root, "dcg-policy");
 		await fs.writeFile(policy, "fixture");
 		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {

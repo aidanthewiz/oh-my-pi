@@ -169,6 +169,7 @@ function assistantSseResponse(text: string): Response {
 
 interface WireTraffic {
 	ssoRoleCredentialCalls: number;
+	accountProofCalls: number;
 	gatewayCalls: number;
 	fetch: FetchImpl;
 }
@@ -180,6 +181,7 @@ interface WireTraffic {
 function wireTraffic(): WireTraffic {
 	const traffic: WireTraffic = {
 		ssoRoleCredentialCalls: 0,
+		accountProofCalls: 0,
 		gatewayCalls: 0,
 		fetch: async (input, init) => {
 			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -196,6 +198,13 @@ function wireTraffic(): WireTraffic {
 						},
 					}),
 					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			if (url.startsWith("https://sts.")) {
+				traffic.accountProofCalls += 1;
+				return new Response(
+					"<GetCallerIdentityResponse><GetCallerIdentityResult><Account>891455110252</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+					{ status: 200, headers: { "content-type": "text/xml" } },
 				);
 			}
 			traffic.gatewayCalls += 1;
@@ -306,6 +315,7 @@ describe("mid-session AWS session expiry", () => {
 		expect(reauthentications).toBe(1);
 		expect(traffic.gatewayCalls).toBe(1);
 		expect(traffic.ssoRoleCredentialCalls).toBe(1);
+		expect(traffic.accountProofCalls).toBe(1);
 		const store = openStore();
 		expect(store.getProfile()?.aws?.profile).toBe(AWS_PROFILE);
 		store.close();
@@ -344,6 +354,7 @@ describe("mid-session AWS session expiry", () => {
 		expect(result.errorMessage).not.toContain("Connection error");
 		expect(awsChecks).toBe(1);
 		expect(traffic.gatewayCalls).toBe(0);
+		expect(traffic.accountProofCalls).toBe(0);
 	});
 
 	it("does not open an AWS sign-in flow for non-interactive callers", async () => {

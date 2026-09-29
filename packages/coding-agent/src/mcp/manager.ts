@@ -781,9 +781,8 @@ export class MCPManager {
 		};
 		type ConnectionTask = {
 			name: string;
-			config: MCPServerConfig;
+			cached?: MCPToolDefinition[];
 			tracked: TrackedPromise<ToolLoadResult>;
-			toolsPromise: Promise<ToolLoadResult>;
 		};
 
 		const errors = new Map<string, string>();
@@ -835,8 +834,8 @@ export class MCPManager {
 			// retry schedule still trying to bring back the old one.
 			this.#forgetLostServer(name);
 			this.#serverConfigs.set(name, config);
-			const cached = await this.toolCache?.get(name, config);
-			if (cached && cached.length > 0 && config.enabled !== false) {
+			const cached = config.enabled === false ? undefined : await this.toolCache?.get(name, config);
+			if (cached?.length) {
 				const source = this.#sources.get(name);
 				const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 					this.#reconnectServerForTool(name, options);
@@ -845,7 +844,6 @@ export class MCPManager {
 					DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
 				);
 				void this.#onToolsChanged?.(this.#tools);
-				continue;
 			}
 
 			statusServerNames.push(name);
@@ -974,7 +972,7 @@ export class MCPManager {
 			);
 
 			const tracked = trackPromise(toolsPromise);
-			connectionTasks.push({ name, config, tracked, toolsPromise });
+			connectionTasks.push({ name, cached: cached ?? undefined, tracked });
 
 			void toolsPromise
 				.then(async ({ connection, serverTools }) => {
@@ -1027,29 +1025,15 @@ export class MCPManager {
 			}
 		}
 
-		if (connectionTasks.length > 0) {
+		const startupTasks = connectionTasks.filter(task => !task.cached?.length);
+		if (startupTasks.length > 0) {
 			await Promise.race([
-				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)),
+				Promise.allSettled(startupTasks.map(task => task.tracked.promise)),
 				delay(STARTUP_TIMEOUT_MS),
 			]);
+		}
 
-			const cachedTools = new Map<string, MCPToolDefinition[]>();
-			const deferredTasks = connectionTasks.filter(task => task.tracked.status !== "fulfilled");
-
-			// Cached tool definitions are a static catalog for servers that cannot
-			// complete background setup. They remain deferred: the transport and
-			// any browser authorization start only when a caller invokes a tool.
-			if (deferredTasks.length > 0 && this.toolCache) {
-				await Promise.all(
-					deferredTasks.map(async task => {
-						const cached = await this.toolCache?.get(task.name, task.config);
-						if (cached) {
-							cachedTools.set(task.name, cached);
-						}
-					}),
-				);
-			}
-
+		if (connectionTasks.length > 0) {
 			// Pending tasks without cached tools used to be awaited synchronously here,
 			// which gated the entire UI on the slowest server's per-request timeout
 			// (issue #2100: a single unresponsive MCP server blocked startup for the
@@ -1068,7 +1052,7 @@ export class MCPManager {
 					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 						this.#reconnectServerForTool(name, options);
 					this.#replaceServerTools(name, MCPTool.fromTools(connection, serverTools, reconnect));
-				} else if (task.tracked.status === "rejected") {
+				} else if (task.tracked.status === "rejected" && !task.cached?.length) {
 					if (task.tracked.reason instanceof MCPOAuthCancelledError) continue;
 					const authHint = this.#pendingAuthChallenges.has(name)
 						? ` Run \`/mcp reauth ${name}\` to authenticate this server.`
@@ -1076,17 +1060,6 @@ export class MCPManager {
 					const message = `${task.tracked.reason instanceof Error ? task.tracked.reason.message : String(task.tracked.reason)}${authHint}`;
 					errors.set(name, message);
 					reportedErrors.add(name);
-				}
-
-				const cached = cachedTools.get(name);
-				if (cached) {
-					const source = this.#sources.get(name);
-					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
-						this.#reconnectServerForTool(name, options);
-					this.#replaceServerTools(
-						name,
-						DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
-					);
 				}
 			}
 		}
@@ -1313,7 +1286,15 @@ export class MCPManager {
 		const connection = this.#connections.get(name);
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
-		if (pending) return pending;
+		if (pending) {
+			try {
+				return await pending;
+			} catch {
+				// A deferred tool may recover interactively after non-interactive discovery fails.
+			}
+		}
+		const recovered = this.#connections.get(name);
+		if (recovered) return recovered;
 		const reconnecting = this.#pendingReconnections.get(name);
 		if (reconnecting) {
 			const result = await reconnecting;

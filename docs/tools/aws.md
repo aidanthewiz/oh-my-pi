@@ -30,6 +30,12 @@ For example, `{"profile":"employee-gov","service":"sts","operation":"get-caller-
 
 ## Results and limits
 
-The response includes redacted AWS output and details such as profile, service, operation, Region, exit code, and failure code. Large output is capped at 1 MiB and may be available as an output artifact. Authentication, access denial, wrong partition, and unavailable profile have distinct errors. This route uses the employee's IAM permissions and AWS audit logs; MCP-specific IAM condition keys do not apply to direct CLI calls. Do not put secrets in `parameters` or rely on output redaction as a credential store.
+The result includes redacted AWS output, profile, operation, Region, exit code, and failure code.
+Valid JSON up to 1 MiB may also produce a redacted artifact.
+Invalid, oversized, or truncated JSON is withheld from both the result and artifact.
+
+This route uses the employee's IAM permissions and AWS audit logs.
+Direct CLI calls do not carry MCP-specific IAM condition keys.
+Do not put secrets in `parameters` or rely on output redaction as a credential store.
 
 The managed AWS Agent Toolkit is a separate route for compatible commercial profiles. It discovers knowledge tools without signing in, then requires `aws_profile` and opens a signed connection on the first authenticated call. Use the native `aws` tool for GovCloud, other partitions, or when managed MCP is unavailable.

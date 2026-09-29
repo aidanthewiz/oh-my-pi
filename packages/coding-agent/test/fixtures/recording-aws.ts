@@ -87,6 +87,12 @@ if (argv.includes("--fixture-child")) {
 			{ env: process.env, stdout: "inherit", stderr: "inherit" },
 		);
 		setInterval(() => {}, 1000);
+	} else if (argv.includes("--prefix=malformed-json")) {
+		console.log('{"SecretString":"fixture-secret-compound","partial":');
+	} else if (argv.includes("--prefix=prefixed-json")) {
+		console.log('notice: {"SecretString":"fixture-secret-compound","partial":');
+	} else if (argv.includes("--prefix=truncated-json")) {
+		console.log(`{"SecretString":"fixture-secret-compound","rows":"${"x".repeat(1024 * 1024)}"}`);
 	} else {
 		console.log(
 			JSON.stringify({

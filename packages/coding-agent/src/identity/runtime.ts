@@ -1,10 +1,12 @@
 import {
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_AUTH_MODE_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
 	MANAGED_AWS_MODEL_AUTH_MODE,
 } from "@oh-my-pi/pi-ai";
 import {
+	getOperationalAwsLaunchEnv,
 	getOperationalAwsLaunchMetadata,
 	OPERATIONAL_AWS_LAUNCH_ENV_NAMES,
 	OPERATIONAL_AWS_ENV_NAMES,
@@ -119,6 +121,7 @@ export function resolveCoreforgeClaudeConfig(settings: Settings): CoreforgeClaud
  */
 const MODEL_AUTH_ENV_VARS: readonly string[] = [
 	"OPENAI_API_KEY",
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	"AWS_BEARER_TOKEN_BEDROCK",
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_WORKSPACE_ID",
@@ -132,13 +135,13 @@ const MODEL_AUTH_ENV_VARS: readonly string[] = [
 ];
 
 /**
- * Restore only the launcher-captured operational selectors after managed setup.
- *
- * The launcher snapshot is immutable launch provenance, not an environment
- * convention: repository dotenv values with the same names cannot influence
- * this restore. Credentials intentionally never cross this boundary.
+ * Restore launcher-owned operational AWS routes. Managed model setup removes
+ * ambient credentials; classic mode retains only the pre-dotenv launch chain.
  */
-export function restoreCoreforgeOperationalAwsEnvironment(env: EnvironmentLike = Bun.env): string | undefined {
+export function restoreCoreforgeOperationalAwsEnvironment(
+	env: EnvironmentLike = Bun.env,
+	preserveLaunchCredentials = true,
+): string | undefined {
 	const metadata = getOperationalAwsLaunchMetadata();
 	const profileBeforeRestore = metadata?.profile;
 
@@ -151,6 +154,11 @@ export function restoreCoreforgeOperationalAwsEnvironment(env: EnvironmentLike =
 	if (metadata?.sharedCredentialsFile) env.AWS_SHARED_CREDENTIALS_FILE = metadata.sharedCredentialsFile;
 	if (metadata?.profile) env.AWS_PROFILE = metadata.profile;
 	if (metadata?.region) env.AWS_REGION = metadata.region;
+	if (preserveLaunchCredentials && (env === Bun.env || env === process.env)) {
+		for (const [name, value] of Object.entries(getOperationalAwsLaunchEnv())) {
+			if (name !== "AWS_PROFILE" && name !== "AWS_REGION") env[name] = value;
+		}
+	}
 
 	if (env === Bun.env) {
 		registerChildEnvRedactions(OPERATIONAL_AWS_LAUNCH_ENV_NAMES, [
@@ -186,10 +194,6 @@ export function applyCoreforgeIdentityProviderDefaults(
 	env: EnvironmentLike = Bun.env,
 	loadIdentity: typeof loadCoreforgeIdentityProfile = loadCoreforgeIdentityProfile,
 ): AppliedCoreforgeDefaults {
-	const profilesBeforeOperationalRestore = [env.AWS_PROFILE?.trim(), env.AWS_DEFAULT_PROFILE?.trim()].filter(
-		(profile): profile is string => Boolean(profile),
-	);
-	restoreCoreforgeOperationalAwsEnvironment(env);
 	// Provisioning = raw tenant+client ID presence, NOT the validating resolve:
 	// IDs present-but-malformed is still provisioning INTENT, and must trigger
 	// the clear (a bad UUID must not let ambient envs authenticate AWS models).
@@ -199,6 +203,10 @@ export function applyCoreforgeIdentityProviderDefaults(
 		settings.get("identity.entra.enabled") === true &&
 		hasValue(settings.get("identity.entra.tenantId")) &&
 		hasValue(settings.get("identity.entra.clientId"));
+	const profilesBeforeOperationalRestore = [env.AWS_PROFILE?.trim(), env.AWS_DEFAULT_PROFILE?.trim()].filter(
+		(profile): profile is string => Boolean(profile),
+	);
+	restoreCoreforgeOperationalAwsEnvironment(env, !entraProvisioned);
 	if (!entraProvisioned) {
 		return {
 			entraProvisioned: false,
@@ -240,6 +248,7 @@ export function applyCoreforgeIdentityProviderDefaults(
 					[AWS_MODEL_AUTH_MODE_ENV]: MANAGED_AWS_MODEL_AUTH_MODE,
 					[AWS_MODEL_PROFILE_ENV]: modelProfile,
 					[AWS_MODEL_REGION_ENV]: aws.region,
+					[AWS_MODEL_ACCOUNT_ID_ENV]: settings.get("identity.aws.ssoAccountId")?.trim(),
 					ANTHROPIC_AWS_WORKSPACE_ID: claude.workspaceId,
 					ANTHROPIC_BASE_URL: claude.baseUrl,
 					ANTHROPIC_AWS_INFERENCE_GEO: claude.inferenceGeo,

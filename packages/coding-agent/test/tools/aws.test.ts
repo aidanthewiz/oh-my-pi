@@ -117,10 +117,11 @@ describe("native AWS argument boundary", () => {
 describe("native AWS output redaction", () => {
 	it("removes credential sentinels from JSON stdout and textual stderr before artifact output", () => {
 		const stdout = redactAwsOutput(
-			'{"SecretAccessKey":"stdout-secret","SessionToken":"stdout-token","RoleId":"AROAEXAMPLE"}',
+			'{"SecretAccessKey":"stdout-secret","SecretString":"customer-secret","SessionToken":"stdout-token","RoleId":"AROAEXAMPLE"}',
 		);
 		const stderr = redactAwsOutput("SecretAccessKey: stderr-secret SessionToken=stderr-token");
 		expect(stdout).not.toContain("stdout-secret");
+		expect(stdout).not.toContain("customer-secret");
 		expect(stdout).not.toContain("stdout-token");
 		expect(stderr).not.toContain("stderr-secret");
 		expect(stderr).not.toContain("stderr-token");
@@ -131,6 +132,25 @@ describe("native AWS output redaction", () => {
 		const truncated = '{"PrivateKey":"secret material with \\"quoted\\" bytes\\';
 		expect(redactAwsOutput(truncated)).not.toContain("secret material");
 		expect(redactAwsOutput(truncated)).not.toContain("quoted");
+	});
+
+	it("withholds malformed JSON with compound sensitive fields rather than applying text redaction", () => {
+		for (const output of [
+			'{"SecretString":"customer-secret","partial":',
+			' \ufeff[{"SecretBinary":"customer-secret"},',
+			'{"SecretString":"customer-secret"}'.repeat(100_000),
+		]) {
+			const redacted = redactAwsOutput(output);
+			expect(redacted).not.toContain("customer-secret");
+			expect(redacted).not.toContain("SecretString");
+			expect(redacted).not.toContain("SecretBinary");
+		}
+	});
+
+	it("preserves useful AWS error text while removing credentials", () => {
+		const stderr = redactAwsOutput("An error occurred (AccessDeniedException): SecretAccessKey=customer-secret");
+		expect(stderr).toContain("AccessDeniedException");
+		expect(stderr).not.toContain("customer-secret");
 	});
 });
 
