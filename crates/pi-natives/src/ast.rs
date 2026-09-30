@@ -1223,10 +1223,25 @@ mod tests {
 	use std::{
 		fs,
 		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
 	use super::*;
+
+	static NEXT_TEMP_TREE: AtomicU64 = AtomicU64::new(0);
+
+	fn temp_tree_root(prefix: &str) -> PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("system time should be after UNIX_EPOCH")
+			.as_nanos();
+		std::env::temp_dir().join(format!(
+			"{prefix}-{}-{nanos}-{}",
+			std::process::id(),
+			NEXT_TEMP_TREE.fetch_add(1, Ordering::Relaxed)
+		))
+	}
 
 	struct TempTree {
 		root: PathBuf,
@@ -1239,11 +1254,7 @@ mod tests {
 	}
 
 	fn make_temp_tree() -> TempTree {
-		let unique = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("system time should be after UNIX_EPOCH")
-			.as_nanos();
-		let root = std::env::temp_dir().join(format!("pi-ast-glob-test-{unique}"));
+		let root = temp_tree_root("pi-ast-glob-test");
 		fs::create_dir_all(root.join("nested")).expect("temp nested dir should be created");
 		fs::write(root.join("a.ts"), "const a = 1;\n").expect("temp file a.ts should be written");
 		fs::write(root.join("nested").join("b.ts"), "const b = 2;\n")
@@ -1329,11 +1340,7 @@ mod tests {
 	}
 
 	fn make_mixed_temp_tree() -> TempTree {
-		let unique = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("system time should be after UNIX_EPOCH")
-			.as_nanos();
-		let root = std::env::temp_dir().join(format!("pi-ast-mixed-lang-test-{unique}"));
+		let root = temp_tree_root("pi-ast-mixed-lang-test");
 		fs::create_dir_all(&root).expect("temp mixed-lang dir should be created");
 		fs::write(root.join("a.ts"), "const f = (x) => x;\n")
 			.expect("temp file a.ts should be written");
