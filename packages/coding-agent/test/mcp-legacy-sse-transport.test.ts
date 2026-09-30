@@ -14,6 +14,7 @@ afterEach(() => {
 describe("legacy MCP HTTP+SSE transport", () => {
 	it("classifies a missing endpoint event as a retryable startup timeout", async () => {
 		server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			fetch() {
 				return new Response(new ReadableStream<Uint8Array>(), {

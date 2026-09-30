@@ -96,24 +96,16 @@ export async function resolveXAIHttpTransport(
  * Resolve xAI credentials for HTTP tool calls.
  *
  * Credential priority:
- *   1. xai-oauth — only when a *dedicated* xai-oauth source exists. Composed
- *      of two checks against the registry layer:
- *        a. `authStorage.hasNonEnvCredential("xai-oauth")` covers stored
- *           credentials (OAuth or api_key), runtime overrides (CLI
- *           `--api-key` for xai-oauth), config overrides (models.yml
- *           `providers.xai-oauth.apiKey`), and fallback resolvers.
- *        b. `$env.XAI_OAUTH_TOKEN` covers the xai-oauth-specific env var.
- *      `XAI_API_KEY` is intentionally NOT a signal here, even though the
- *      env-fallback map (`stream.ts: "xai-oauth"`) lets xai-oauth borrow it
- *      as a back-compat convenience: the borrow lets API-key-only setups
- *      satisfy the xai-oauth branch and then resolve baseUrl under
- *      xai-oauth instead of xai, silently bypassing `providers.xai.baseUrl`
- *      overrides for image/TTS traffic. The gate routes the borrow case to
- *      step 2 while preserving every dedicated xai-oauth path.
- *   2. xai (plain API key). Delegates to ModelRegistry.getApiKeyForProvider
- *      which runs AuthStorage.getApiKey's full cascade: runtime override →
- *      models.yml config override → stored api_key credential → OAuth
- *      resolution → XAI_API_KEY env var → custom fallback resolver.
+ *   1. xai-oauth — only when a dedicated xai-oauth source exists.
+ *      `authStorage.keys.source("xai-oauth", { env: "none" })` covers stored
+ *      OAuth/API keys, runtime keys, and configured keys (including
+ *      command-backed models.yml and registered-provider keys).
+ *      `XAI_OAUTH_TOKEN` is the dedicated environment source.
+ *      `XAI_API_KEY` is not a routing signal here, although an explicitly
+ *      selected xai-oauth model may borrow it. An API-key-only setup must
+ *      keep the xai provider's base URL and headers for image/TTS tools.
+ *   2. xai (plain API key). ModelRegistry resolves its runtime, config,
+ *      stored, then environment credential through AuthStorage.keys.get.
  *
  * baseURL: see `resolveXAIBaseURL` above. Resolved AFTER the credential
  * decision so the scoped (provider, id) lookup is unambiguous. `modelId`
@@ -128,7 +120,8 @@ export async function resolveXAIHttpCredentials(
 	modelId?: string,
 ): Promise<XAICredentials | null> {
 	const hasDedicatedXaiOAuth =
-		modelRegistry.authStorage.hasNonEnvCredential("xai-oauth") || Boolean($env.XAI_OAUTH_TOKEN);
+		modelRegistry.authStorage.keys.source("xai-oauth", { env: "none" }) !== undefined ||
+		Boolean($env.XAI_OAUTH_TOKEN);
 	if (hasDedicatedXaiOAuth) {
 		const oauthKey = await modelRegistry.getApiKeyForProvider("xai-oauth");
 		if (oauthKey) {

@@ -20,9 +20,18 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
+import { executeSend, isIrcEnabled } from "../irc/messaging";
 import { applyQuery } from "./json-query";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
+import type {
+	InternalResource,
+	InternalWriteResult,
+	InternalUrl,
+	ProtocolHandler,
+	ResolveContext,
+	UrlCompletion,
+	WriteContext,
+} from "./types";
 
 /**
  * Walk `segments` into a JSON value: object segments index by key, array
@@ -51,8 +60,42 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	readonly scheme = "agent";
 	readonly immutable = true;
 
+	async write(url: InternalUrl, content: string, context?: WriteContext): Promise<InternalWriteResult> {
+		const session = context?.session;
+		if (!session) throw new Error("agent:// messaging requires a tool session");
+		const registry = session.agentRegistry;
+		const senderId = session.getAgentId?.();
+		if (
+			!registry ||
+			!senderId ||
+			session.enableIrc === false ||
+			!isIrcEnabled(session.settings, session.taskDepth ?? 0)
+		) {
+			throw new Error("Peer messaging is unavailable in this session.");
+		}
+		const to = url.rawHost || url.hostname;
+		if (!to) throw new Error("agent:// URL requires a recipient: agent://<id>");
+		if (url.pathname !== "" && url.pathname !== "/") {
+			throw new Error("agent:// message target cannot have a JSON-path suffix.");
+		}
+		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
+		const deliverySignal = context?.signal
+			? AbortSignal.any([context.signal, AbortSignal.timeout(120_000)])
+			: AbortSignal.timeout(120_000);
+		const result = await executeSend(
+			{ registry, senderId, sessionFileHint: session.getSessionFile?.(), signal: deliverySignal },
+			{ to, message: content },
+		);
+		return {
+			text: result.content.find(item => item.type === "text")?.text ?? "Message delivery failed.",
+			details: { message: result.details },
+			isError: result.isError,
+		};
+	}
+
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const outputId = url.rawHost || url.hostname;
+		if (outputId === "all") throw new Error("agent://all is write-only; use it to broadcast a message.");
 		if (!outputId) {
 			throw new Error("agent:// URL requires an output ID: agent://<id>");
 		}

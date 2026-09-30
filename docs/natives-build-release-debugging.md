@@ -67,6 +67,8 @@ This mirrors the old cargo `ci` profile. Because the profile lives **in the tran
 
 Per-target codegen that is not part of the transition lives in `crates/pi-natives/BUILD.bazel` `rustc_flags` selects: `-Ctarget-cpu=x86-64-v2` (baseline) / `x86-64-v3` (modern) via `//bazel/variants`, the napi link args (`-Wl,-undefined,dynamic_lookup` on macOS, `-Wl,-z,nodelete` on linux — `build.rs`/`napi_build::setup()` is deliberately not wired in), `-Ctarget-feature=-crt-static` for musl, and `-Ctarget-feature=+crt-static` for win32-x64 msvc (paired with the `static_link_msvcrt` cc feature enabled in the `native_addon` transition so the C deps compile `/MT` in lock-step — the shipped `.node` then imports no `VCRUNTIME140.dll` from the VC++ Redistributable). The Cargo host path applies the same `+crt-static` policy to Windows ARM64 in `build-bindings.ts`.
 
+`pi-natives` embeds the Jev rank tables from `data/jev_*.bin.zst`; Bazel includes them through `compile_data` and Cargo through `include_bytes!`. On Darwin, the Bazel `applefm_bridge` rule and Cargo `build.rs` use the same `src/applefm/build-bridge.sh`: Swift requires Swift 6.4+/macOS 27 SDK on Apple silicon, and other targets build an explicit C stub. The `@applefm_swift` toolchain fingerprint prevents cache reuse across Swift SDKs. The Darwin ARM64 verify and release legs request GitHub's `xcode-27` preview runner and fail before building if bridge toolchain detection fails; Darwin x64 intentionally uses the stub. Verify runner availability and the complete source build before allowing release publication.
+
 ### 3) Platforms and toolchains
 
 | Target family          | cc toolchain                                                               | Notes                                                                                                 |
@@ -137,9 +139,11 @@ Remote-cache endpoints and credentials must remain in the user-specific file; th
 
 ## Coreforge CI
 
-`.github/workflows/cf-verify.yml` and `.github/workflows/cf-release.yml` build each shipped binary with its source-built addon. Linux, Darwin, and Windows x64 use the Bazel targets above. Windows ARM64 runs `bun scripts/bazel-natives.ts host` on `windows-11-arm`, then packages and smoke-tests the addon and binary on that runner.
+`.github/workflows/cf-release.yml` builds every shipped binary with a native addon from the same fork tree. `.github/workflows/cf-verify.yml` source-builds addons when native inputs differ from the latest ancestor Coreforce release; otherwise it checks and installs that release's authenticated addon. Linux, Darwin, and Windows x64 use the Bazel targets above. Windows ARM64 runs `bun scripts/bazel-natives.ts host` on `windows-11-arm`, then packages and smoke-tests the addon and binary on that runner.
 
-The Windows ARM64 leg skips Bazel cache steps. Other legs save their native cache before packaging, so packaging failures do not discard completed native work.
+The Windows ARM64 leg skips Bazel cache steps. Other legs save their native cache before packaging, so packaging failures do not discard completed native work. Pull requests build native addons from the resolved fork source when native inputs change; only an unchanged, ancestor Coreforce release can provide verified native assets. Neither the upstream `ci.yml` nor its public npm native leaves are release inputs.
+
+The eight binary targets are `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `win32-x64`, and `win32-arm64`. Each release target has a matching `coreforge-pi-natives-<target>-<tag>.tgz`; Linux musl archives deliberately contain canonical `pi_natives.linux-<arch>*.node` names but never substitute glibc addons. Linux x64 carries both baseline and modern; musl x64 carries baseline only. The executable names are `omp-<target>` except the Windows `omp-windows-<arch>.exe` binaries.
 
 ## Debugging playbook
 

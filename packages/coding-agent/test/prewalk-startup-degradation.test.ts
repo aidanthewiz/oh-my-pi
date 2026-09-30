@@ -57,7 +57,7 @@ describe("prewalk startup degradation", () => {
 		const settings = Settings.isolated();
 		settings.set("prewalk.enabled", true);
 		settings.setModelRole("smol", `${model.provider}/${model.id}`);
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 
 		const options = await buildSessionOptions(parseArgs([]), [], SessionManager.inMemory(), modelRegistry, settings);
 
@@ -73,7 +73,7 @@ describe("prewalk startup degradation", () => {
 		});
 		settings.set("prewalk.enabled", true);
 		settings.setModelRole("smol", `${model.provider}/${model.id}`);
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 
 		const options = await buildSessionOptions(parseArgs([]), [], SessionManager.inMemory(), modelRegistry, settings);
 
@@ -87,7 +87,7 @@ describe("prewalk startup degradation", () => {
 			disabledModels: [`${model.provider}/${model.id}`],
 		});
 		settings.setModelRole("smol", `${model.provider}/${model.id}`);
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 
 		await expect(
 			buildSessionOptions(
@@ -106,7 +106,7 @@ describe("prewalk startup degradation", () => {
 		const settings = Settings.isolated();
 		settings.set("prewalk.enabled", true);
 		settings.setModelRole("smol", `${model.provider}/${model.id}`);
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 
 		for (const args of [parseArgs(["--continue"]), parseArgs(["--resume=session.jsonl"])]) {
 			const options = await buildSessionOptions(args, [], SessionManager.inMemory(), modelRegistry, settings);
@@ -119,7 +119,7 @@ describe("prewalk startup degradation", () => {
 		if (!model) throw new Error("expected claude-sonnet-4-5 to be bundled");
 		const settings = Settings.isolated();
 		settings.setModelRole("smol", `${model.provider}/${model.id}`);
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 
 		const options = await buildSessionOptions(
 			parseArgs(["--continue", "--prewalk"]),

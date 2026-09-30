@@ -24,6 +24,7 @@ import { findConfigFile } from "./config";
 import type { Personality, SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { expandAtImports } from "./discovery/at-imports";
+import { SkillDescriptionCatalog } from "./extensibility/skill-descriptions";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import { hasObsidian } from "./internal-urls/vault-protocol";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
@@ -193,8 +194,6 @@ async function runGpuProbe(cmd: string[]): Promise<string | null> {
 			stderr: "ignore",
 			stdin: "ignore",
 			timeout: GPU_PROBE_TIMEOUT_MS,
-			// SIGKILL so a probe ignoring SIGTERM (PATH wrapper, wedged WMI) still
-			// dies at the deadline and lets getCachedGpu reach the null-cache write.
 			killSignal: "SIGKILL",
 		});
 		const stdoutReader = proc.stdout.getReader();
@@ -209,9 +208,7 @@ async function runGpuProbe(cmd: string[]): Promise<string | null> {
 			stdout += decoder.decode();
 		})();
 		const exitCode = await proc.exited;
-		// Even on exit 0, a probe wrapper can leave a descendant holding stdout open.
-		// Bound the EOF wait so getCachedGpu cannot outlive the probe in either path;
-		// keep whatever bytes the reader already captured before cancelling.
+		// A descendant can keep the pipe open after the probe exits.
 		const drained = await Promise.race([
 			stdoutDone.then(() => "ok" as const).catch(() => "err" as const),
 			Bun.sleep(GPU_PROBE_STDOUT_DRAIN_MS).then(() => "timeout" as const),
@@ -241,9 +238,7 @@ async function getGpuModel(): Promise<string | null> {
 				const parts = line.split(":");
 				const name = parts.length > 1 ? parts.slice(1).join(":").trim() : line.trim();
 				const nameLower = name.toLowerCase();
-				// Skip BMC/server management adapters
 				if (/aspeed|matrox g200|mgag200/i.test(name)) continue;
-				// Prioritize discrete GPUs
 				let priority = 0;
 				if (
 					nameLower.includes("nvidia") ||
@@ -276,30 +271,19 @@ function getTerminalName(): string | undefined {
 	if (termProgram) {
 		return termProgramVersion ? `${termProgram} ${termProgramVersion}` : termProgram;
 	}
-
 	if (Bun.env.WT_SESSION) return "Windows Terminal";
-
-	const term = firstNonEmpty(Bun.env.TERM, Bun.env.COLORTERM, Bun.env.TERMINAL_EMULATOR);
-	return term ?? undefined;
+	return firstNonEmpty(Bun.env.TERM, Bun.env.COLORTERM, Bun.env.TERMINAL_EMULATOR) ?? undefined;
 }
 
-/**
- * On-disk cache schema version. Bumped when detection logic changes so stored
- * selections from an older parser are rejected and re-probed instead of served
- * indefinitely — e.g. the Windows virtual-adapter filtering added for #9675,
- * which would otherwise keep returning a cached virtual GPU after upgrade.
- */
 const GPU_CACHE_VERSION = 1;
 
-/** Cached GPU probe result. */
 interface GpuCache {
 	gpu: string | null;
 }
 
 async function loadGpuCache(): Promise<GpuCache | null> {
 	try {
-		const cachePath = getGpuCachePath();
-		const content = await Bun.file(cachePath).json();
+		const content = await Bun.file(getGpuCachePath()).json();
 		if (content && typeof content === "object" && content.version === GPU_CACHE_VERSION && "gpu" in content) {
 			const gpu = content.gpu;
 			return { gpu: typeof gpu === "string" ? gpu : null };
@@ -312,10 +296,9 @@ async function loadGpuCache(): Promise<GpuCache | null> {
 
 async function saveGpuCache(info: GpuCache): Promise<void> {
 	try {
-		const cachePath = getGpuCachePath();
-		await Bun.write(cachePath, JSON.stringify({ version: GPU_CACHE_VERSION, gpu: info.gpu }, null, "\t"));
+		await Bun.write(getGpuCachePath(), JSON.stringify({ version: GPU_CACHE_VERSION, gpu: info.gpu }, null, "\t"));
 	} catch {
-		// Silently ignore cache write failures
+		// GPU detection remains best-effort if the cache is unwritable.
 	}
 }
 
@@ -341,14 +324,6 @@ async function getCpuModel(): Promise<string | undefined> {
 	}
 }
 
-/**
- * Kernel identity for the workstation block. Prefers the uname build string
- * from `os.version()`, but Bun on macOS 15+ (Darwin 24/25) returns the literal
- * `"unknown"` when `uv_os_uname()`'s `version` field is empty — which surfaces
- * `Kernel: unknown` in the system prompt and makes the model misidentify the
- * host as Windows (#4141). Fall back to `<type> <release>` (uname -s + -r) so
- * macOS is always tagged as `Darwin <release>` and Linux keeps its build info.
- */
 function getKernelIdentity(): string {
 	const version = os.version()?.trim();
 	if (version && version.toLowerCase() !== "unknown") return version;
@@ -368,7 +343,7 @@ function getEnvironmentInfo(
 		{ label: "GPU", value: gpu },
 		{ label: "Terminal", value: getTerminalName() },
 	];
-	return entries.filter((e): e is { label: string; value: string } => !!e.value);
+	return entries.filter((entry): entry is { label: string; value: string } => !!entry.value);
 }
 
 /** Discover TITLE_SYSTEM.md file for automatic session-title prompt overrides */
@@ -681,6 +656,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
 	skills?: readonly Skill[];
+	/** Session-scoped description snapshot; background cache writes apply only to the next session. */
+	skillDescriptions?: SkillDescriptionCatalog;
 	/** Pre-loaded rulebook rules (descriptions, excluding TTSR and always-apply). */
 	rules?: Array<{ name: string; description?: string; path: string; globs?: string[] }>;
 	/** Intent field name injected into every tool schema. If set, explains the field in the prompt. */
@@ -1093,7 +1070,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			: toolNames.some(name => toolReadsSkillUris(tools.get(name))) ||
 				xdevTools.some(entry => toolReadsSkillUris(tools.get(entry.name)));
 	const hasSkillUriAccess = hasSkillReader && skills.length > 0;
-	const filteredSkills = hasSkillReader ? skills.filter(skill => skill.hide !== true) : [];
+	const filteredSkills = (options.skillDescriptions ?? new SkillDescriptionCatalog()).render(
+		hasSkillReader ? skills.filter(skill => skill.hide !== true) : [],
+	);
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,

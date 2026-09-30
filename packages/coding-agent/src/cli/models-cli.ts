@@ -431,13 +431,13 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 	}
 
 	const cwd = getProjectDir();
-	const authStorage = await discoverAuthStorage();
+	const settings = await Settings.init({ cwd, configFiles: command.flags.config });
+	const identity = await ensureCoreforgeIdentityAtStartup(settings, { interactive: false });
+	for (const notice of identity.notices) {
+		process.stderr.write(`${notice}\n`);
+	}
+	const authStorage = await discoverAuthStorage(undefined, { settings });
 	try {
-		const settings = await Settings.init({ cwd, configFiles: command.flags.config });
-		const identity = await ensureCoreforgeIdentityAtStartup(settings, { interactive: false });
-		for (const notice of identity.notices) {
-			process.stderr.write(`${notice}\n`);
-		}
 		const modelRegistry = new ModelRegistry(authStorage);
 
 		if (action === "refresh" && !json && process.stderr.isTTY) {

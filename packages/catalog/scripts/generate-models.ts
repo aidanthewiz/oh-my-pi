@@ -171,16 +171,16 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 	try {
 		const authStorage = await discoverAuthStorage();
 		try {
-			const storedApiKey = await authStorage.getApiKey(providerId);
+			const storedApiKey = await authStorage.keys.get(providerId);
 			if (storedApiKey) {
 				return storedApiKey;
 			}
 			if (catalog.oauthProvider) {
-				// AuthStorage.getApiKey refreshes through the broker-aware
+				// AuthStorage.keys.get refreshes through the broker-aware
 				// single-flighted machinery, so a build-time invocation no
 				// longer silently falls back to bundled models when an
 				// expired-but-refreshable OAuth credential is on disk.
-				const oauthKey = await authStorage.getApiKey(catalog.oauthProvider);
+				const oauthKey = await authStorage.keys.get(catalog.oauthProvider);
 				if (oauthKey) {
 					return oauthKey;
 				}
@@ -456,13 +456,13 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
 	try {
 		const authStorage = await discoverAuthStorage();
 		try {
-			// `getOAuthAccess` runs the full AuthStorage refresh pipeline so an
+			// AuthStorage.oauth.access refreshes through the broker-aware path, so an
 			// expired-but-refreshable credential gets rotated before discovery,
 			// and identity metadata (accountId/projectId/email) flows through
 			// for Codex/Antigravity downstream calls.
-			let access = await authStorage.getOAuthAccess(provider);
+			let access = await authStorage.oauth.access(provider);
 			if (!access && provider === "google-antigravity") {
-				access = await authStorage.getOAuthAccess("google-gemini-cli");
+				access = await authStorage.oauth.access("google-gemini-cli");
 			}
 			return access ?? null;
 		} finally {
@@ -522,7 +522,7 @@ async function fetchCodexDiscoveryModels(): Promise<ModelSpec<"openai-codex-resp
 	try {
 		const authStorage = await discoverAuthStorage();
 		try {
-			const accesses = await authStorage.getOAuthAccesses("openai-codex");
+			const accesses = await authStorage.oauth.accessAll("openai-codex");
 			for (const access of accesses) {
 				if (!access.ok) {
 					console.warn(`Codex account failed to resolve (${access.error}), keeping previous models.`);

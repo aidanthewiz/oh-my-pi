@@ -12,8 +12,8 @@
  * as an error from `drain()`.
  *
  * Each batch registers as an async job under its id so completion auto-delivers
- * a summary to the agent and `hub wait ids:[id]` / `hub cancel` address it. The
- * batch survives kernel resets (`attach(id)`) until `close()` or its owner
+ * a summary to the agent. Its handle remains readable at `agent://<id>`.
+ * The batch survives kernel resets (`attach(id)`) until `close()` or its owner
  * session releases it.
  */
 import type { JudgmentState, Question } from "@oh-my-pi/pi-ai";
@@ -196,7 +196,7 @@ export class JudgmentBatch {
 	/**
 	 * Kick off the fan-out and register the async job; returns once registered,
 	 * not once done. Without a job manager (or at the running-job limit) the run
-	 * still proceeds — only auto-delivery and `hub` addressing are lost.
+	 * still proceeds without automatic delivery or a job snapshot.
 	 */
 	start(): void {
 		this.#emitProgressEvent();

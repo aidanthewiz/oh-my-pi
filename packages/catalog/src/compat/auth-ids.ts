@@ -10,6 +10,7 @@ export type AuthProviderId =
 	| "amazon-bedrock"
 	| "anthropic"
 	| "anthropic-aws"
+	| "apple"
 	| "azure"
 	| "baseten"
 	| "bedrock-mantle"

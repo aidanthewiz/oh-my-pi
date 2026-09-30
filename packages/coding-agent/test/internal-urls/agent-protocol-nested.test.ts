@@ -2,15 +2,20 @@ import { afterAll, afterEach, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { Settings } from "../../src/config/settings";
+import { IrcBus } from "../../src/irc/bus";
+import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
 import { resetRegisteredArtifactDirsForTests } from "../../src/internal-urls/registry-helpers";
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { AgentSession } from "../../src/session/agent-session";
+import type { ToolSession } from "../../src/tools";
 import { ArtifactManager } from "../../src/session/artifacts";
 
 const tempDir = TempDir.createSync("omp-nested-agent-repro-");
 afterEach(() => {
 	AgentRegistry.resetGlobalForTests();
+	IrcBus.resetGlobalForTests();
 	resetRegisteredArtifactDirsForTests();
 });
 afterAll(() => {
@@ -191,4 +196,41 @@ it("agent:// path extraction prefers the <id>.json sidecar over the markdown bod
 	// A corrupt sidecar falls back to <id>.md instead of surfacing its own parse error.
 	await fs.writeFile(path.join(rootArtifactsDir, "Worker.json"), "{not json");
 	await expect(handler.resolve(new URL("agent://Worker/count") as never)).rejects.toThrow(/Worker is not valid JSON/);
+});
+
+it("agent:// writes deliver peer messages but reject JSON paths and disabled IRC", async () => {
+	IrcBus.resetGlobalForTests();
+	const registry = AgentRegistry.global();
+	const delivered: string[] = [];
+	registry.register({
+		id: "Worker",
+		displayName: "worker",
+		kind: "sub",
+		session: {
+			deliverIrcMessage: async (message: { body: string }) => {
+				delivered.push(message.body);
+				return "woken";
+			},
+		} as unknown as AgentSession,
+	});
+	const session = {
+		agentRegistry: registry,
+		getAgentId: () => "Main",
+		settings: Settings.isolated(),
+		taskDepth: 0,
+	} as unknown as ToolSession;
+	const handler = new AgentProtocolHandler();
+	const context = { session } as never;
+	const receipt = await handler.write(parseInternalUrl("agent://Worker"), "Check context", context);
+	expect(receipt.isError).toBe(false);
+	expect(delivered).toEqual(["Check context"]);
+
+	await expect(handler.write(parseInternalUrl("agent://Worker/result"), "overwrite", context)).rejects.toThrow(
+		/JSON-path suffix/,
+	);
+	session.enableIrc = false;
+	await expect(handler.write(parseInternalUrl("agent://Worker"), "blocked", context)).rejects.toThrow(
+		/Peer messaging is unavailable/,
+	);
+	expect(delivered).toEqual(["Check context"]);
 });

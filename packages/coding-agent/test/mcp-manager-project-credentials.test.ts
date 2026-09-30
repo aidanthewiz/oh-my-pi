@@ -22,7 +22,7 @@ describe("MCP project credential boundary", () => {
 	beforeEach(async () => {
 		store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		authStorage = new AuthStorage(store);
-		await authStorage.reload();
+		await authStorage.credentials.reload();
 		manager = new MCPManager(process.cwd());
 		manager.setAuthStorage(authStorage);
 		Bun.env[secretName] = "managed-parent-secret";
@@ -129,7 +129,7 @@ describe("MCP project credential boundary", () => {
 	test("allows only an OAuth credential bound to the exact project endpoint", async () => {
 		const url = "https://oauth.example.test/mcp";
 		const unrelatedId = "mcp_oauth_unrelated_project_test";
-		await authStorage.set(unrelatedId, {
+		await authStorage.credentials.set(unrelatedId, {
 			type: "oauth",
 			refresh: "unrelated-refresh-token",
 			access: "unrelated-access-token",
@@ -144,7 +144,7 @@ describe("MCP project credential boundary", () => {
 		const unrelated = await manager.prepareConfig(config, { sourceLevel: "project" });
 		expect(unrelated.type === "http" && unrelated.headers?.Authorization).toBeUndefined();
 
-		await authStorage.set(mcpOAuthCredentialId(url), {
+		await authStorage.credentials.set(mcpOAuthCredentialId(url), {
 			type: "oauth",
 			refresh: "endpoint-bound-refresh-token",
 			access: "endpoint-bound-access-token",
@@ -158,7 +158,7 @@ describe("MCP project credential boundary", () => {
 
 	test("never refreshes a legacy endpoint credential through a project-supplied token URL", async () => {
 		const url = "https://oauth.example.test/mcp";
-		await authStorage.set(mcpOAuthCredentialId(url), {
+		await authStorage.credentials.set(mcpOAuthCredentialId(url), {
 			type: "oauth",
 			refresh: "legacy-refresh-token",
 			access: "legacy-access-token",

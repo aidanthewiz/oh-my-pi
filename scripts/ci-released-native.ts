@@ -106,7 +106,9 @@ async function installRelease(
 	downloadDirectory: string,
 ): Promise<void> {
 	if (!/^v\d+\.\d+\.\d+\.[1-9]\d*$/.test(tag)) throw new Error(`invalid Coreforce release tag: ${tag}`);
-	if (!/^(darwin|linux|win32)-(arm64|x64)$/.test(target)) throw new Error(`unsupported native target: ${target}`);
+	if (!/^(darwin|linux|linux-musl|win32)-(arm64|x64)$/.test(target)) {
+		throw new Error(`unsupported native target: ${target}`);
+	}
 
 	const assetName = `coreforge-pi-natives-${target}-${tag}.tgz`;
 	const assetPath = path.join(downloadDirectory, assetName);
@@ -117,11 +119,13 @@ async function installRelease(
 
 	const extractDirectory = await mkdtemp(path.join(tmpdir(), "coreforge-native-"));
 	try {
+		const addonTarget = target.replace(/^linux-musl-/, "linux-");
 		await run(["tar", "-xzf", assetPath, "-C", extractDirectory]);
 		const packageDirectory = path.join(extractDirectory, "package");
 		const nativeFiles = (await readdir(packageDirectory, { withFileTypes: true }))
 			.filter(
-				entry => entry.isFile() && entry.name.startsWith(`pi_natives.${target}`) && entry.name.endsWith(".node"),
+				entry =>
+					entry.isFile() && entry.name.startsWith(`pi_natives.${addonTarget}`) && entry.name.endsWith(".node"),
 			)
 			.map(entry => entry.name)
 			.sort();

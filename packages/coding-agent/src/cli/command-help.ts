@@ -78,6 +78,9 @@ export const grievancesHelp = {
 } satisfies CommandMetadata;
 
 export const identityHelp = { description: "Manage the signed-in Coreforge identity" } satisfies CommandMetadata;
+export const loginHelp = {
+	description: "Log in to a model provider (terminal counterpart of /login)",
+} satisfies CommandMetadata;
 
 export const imagesHelp = {
 	description: "Inspect, diagnose, probe, and purge image publication backends",
@@ -141,6 +144,10 @@ export const tinyModelsHelp = {
 } satisfies CommandMetadata;
 
 export const tokenHelp = { description: "Get the API key or OAuth token for a provider" } satisfies CommandMetadata;
+
+export const toksHelp = {
+	description: "Count a file or text with every embedded offline tokenizer (OpenAI, Claude, Qwen, …)",
+} satisfies CommandMetadata;
 
 export const ttsrHelp = {
 	description: "Inspect and test Time-Traveling Stream Rules (TTSR)",

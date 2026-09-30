@@ -14,6 +14,8 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { stopService } from "@oh-my-pi/pi-coding-agent/launch/services";
 import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -29,6 +31,7 @@ describe.skipIf(process.platform === "win32")("DCG runtime approval", () => {
 	let tempDir: string;
 	let settings: Settings;
 	let tool: BashTool;
+	let session: ToolSession;
 	let previousEnv: Record<string, string | undefined>;
 
 	beforeAll(() => {
@@ -48,6 +51,14 @@ const actualArgs = process.argv.slice(2);
 if (JSON.stringify(actualArgs) !== JSON.stringify(expectedArgs)) {
 	console.error(\`unexpected arguments: \${JSON.stringify(actualArgs)}\`);
 	process.exit(3);
+}
+if (command.includes("svc-deny")) {
+	console.log(JSON.stringify({ decision: "deny", rule_id: "strict_service:deny", reason: "blocked service" }));
+	process.exit(1);
+}
+if (command.includes("svc-allow")) {
+	console.log(JSON.stringify({ decision: "allow" }));
+	process.exit(0);
 }
 console.log(JSON.stringify({
 	decision: "ask",
@@ -74,7 +85,7 @@ process.exit(1);
 			"bashInterceptor.enabled": false,
 			"tools.approvalMode": "yolo",
 		});
-		const session = {
+		session = {
 			cwd: tempDir,
 			hasUI: true,
 			settings,
@@ -435,5 +446,140 @@ process.exit(1);
 		await expect(
 			wrapped.execute("headless-call", args, undefined, undefined, { settings } as AgentToolContext),
 		).rejects.toThrow(/runtime approval but no interactive UI/u);
+	});
+	it("blocks a denied named service before the broker can launch it", async () => {
+		const marker = path.join(tempDir, "denied-service-started");
+		const args: BashToolInput = {
+			command: `printf svc-deny > '${marker}'`,
+			cwd: tempDir,
+			name: "denied-service",
+			pty: false,
+		};
+
+		await expect(tool.prepareRuntimeApproval("service-deny", args)).rejects.toThrow(
+			"Command blocked by Destructive Command Guard (strict_service:deny)",
+		);
+		await expect(tool.execute("service-deny", args)).rejects.toThrow(
+			"Command blocked by Destructive Command Guard (strict_service:deny)",
+		);
+		expect(fs.existsSync(marker)).toBeFalse();
+	});
+
+	it("requires exact approval for named services and supervises an approved process", async () => {
+		const args: BashToolInput = {
+			command: "printf svc-ask; sleep 20",
+			cwd: tempDir,
+			name: "approved-service",
+			pty: false,
+			ready: { log: "svc-ask", timeout: 5 },
+		};
+		const approval = await tool.prepareRuntimeApproval("service-ask", args);
+		expect(approval?.prompt).toContain("named service");
+		expect(approval?.prompt).toContain("svc-ask");
+		await expect(tool.execute("service-ask", args)).rejects.toThrow(/requires interactive approval/u);
+
+		const reviewed = await tool.prepareRuntimeApproval("service-ask-approved", args);
+		expect(reviewed?.prompt).toContain("strict_git:worktree-remove");
+		tool.approveRuntimeApproval("service-ask-approved", args);
+		try {
+			const result = await tool.execute("service-ask-approved", args);
+			expect(result.details?.service).toMatchObject({ name: "approved-service", ready: true, timedOut: false });
+			expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("svc-ask") });
+		} finally {
+			await stopService(session, "approved-service").catch(() => undefined);
+			await closeDaemonClients();
+		}
+	});
+
+	it("invalidates a service approval when its name, environment, or readiness changes", async () => {
+		const marker = path.join(tempDir, "changed-service-started");
+		const mutations: Array<(args: BashToolInput) => void> = [
+			args => {
+				args.name = "changed-service-name";
+			},
+			args => {
+				args.env!.FEATURE = "changed";
+			},
+			args => {
+				args.ready!.log = "changed";
+			},
+		];
+		for (const [index, mutate] of mutations.entries()) {
+			const args: BashToolInput = {
+				command: `printf svc-ask > '${marker}'`,
+				cwd: tempDir,
+				name: "reviewed-service",
+				pty: false,
+				env: { FEATURE: "original" },
+				ready: { log: "svc-ask" },
+			};
+			const id = `service-fingerprint-${index}`;
+			expect(await tool.prepareRuntimeApproval(id, args)).toBeDefined();
+			tool.approveRuntimeApproval(id, args);
+			mutate(args);
+			await expect(tool.execute(id, args)).rejects.toThrow(/requires interactive approval/u);
+			expect(fs.existsSync(marker)).toBeFalse();
+		}
+	});
+
+	it("rejects shell and language preloads in a named service environment", async () => {
+		const marker = path.join(tempDir, "preloaded-service-started");
+		const environments: Record<string, string>[] = [
+			{ BASH_ENV: marker },
+			{ NODE_OPTIONS: `--require=${marker}` },
+			{ "BASH_FUNC_printf%%": "() { command printf injected; }" },
+		];
+		for (const env of environments) {
+			const args: BashToolInput = {
+				command: `printf svc-allow > '${marker}'`,
+				cwd: tempDir,
+				name: "preloaded-service",
+				pty: false,
+				env,
+			};
+			await expect(tool.execute("service-preload", args)).rejects.toThrow(
+				/Service env cannot set shell startup or preload variable/u,
+			);
+			expect(fs.existsSync(marker)).toBeFalse();
+		}
+	});
+
+	it("applies custom bash interceptor rules to named services", async () => {
+		const interceptorSettings = Settings.isolated({
+			"launch.enabled": true,
+			"bashInterceptor.enabled": true,
+			"bashInterceptor.patterns": [{ pattern: "^printf svc-allow", tool: "bash", message: "Custom service block" }],
+		});
+		const interceptorSession = { ...session, settings: interceptorSettings } as ToolSession;
+		const interceptorTool = new BashTool(interceptorSession);
+		const args: BashToolInput = { command: "printf svc-allow", cwd: tempDir, name: "blocked-service", pty: false };
+		try {
+			await expect(
+				interceptorTool.execute("service-interceptor", args, undefined, undefined, {
+					toolNames: ["bash"],
+				} as AgentToolContext),
+			).rejects.toThrow("Custom service block");
+		} finally {
+			await stopService(interceptorSession, "blocked-service").catch(() => undefined);
+			await closeDaemonClients();
+		}
+	});
+
+	it("starts a DCG-allowed service and reports its readiness and output", async () => {
+		const args: BashToolInput = {
+			command: "printf svc-allow; sleep 20",
+			cwd: tempDir,
+			name: "allowed-service",
+			pty: false,
+			ready: { log: "svc-allow", timeout: 5 },
+		};
+		try {
+			const result = await tool.execute("service-allow", args);
+			expect(result.details?.service).toMatchObject({ name: "allowed-service", ready: true, timedOut: false });
+			expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("svc-allow") });
+		} finally {
+			await stopService(session, "allowed-service").catch(() => undefined);
+			await closeDaemonClients();
+		}
 	});
 });
