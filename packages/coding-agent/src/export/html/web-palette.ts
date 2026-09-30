@@ -153,3 +153,13 @@ export function webExportThemeVars(scheme: WebExportScheme): string {
 		.map(([key, value]) => `${key}: ${value};`)
 		.join(" ");
 }
+
+export function webExportThemeStyles(): string {
+	const dark = webExportThemeVars("dark");
+	const light = webExportThemeVars("light");
+	return [
+		`:root, :root[data-theme="dark"] { color-scheme: dark; ${dark} }`,
+		`:root[data-theme="light"] { color-scheme: light; ${light} }`,
+		`@media (prefers-color-scheme: light) { :root:not([data-theme]) { color-scheme: light; ${light} } }`,
+	].join("\n");
+}

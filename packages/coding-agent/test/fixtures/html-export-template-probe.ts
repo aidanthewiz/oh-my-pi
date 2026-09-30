@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getTemplate } from "../../src/export/html/index";
+import { getTemplate } from "../../src/export/html/template-assets";
 
 const first = getTemplate();
 const removeAssets = process.argv.includes("--remove-assets-after-first-use");

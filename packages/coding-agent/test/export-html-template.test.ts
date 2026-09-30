@@ -2,8 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { BunPlugin } from "bun";
-import { getTemplate, resolveBundledHtmlAssetPath } from "../src/export/html/index";
+import { getTemplate, resolveBundledHtmlAssetPath } from "../src/export/html/template-assets";
 
 interface HeapProbeResult {
 	retainedAssetStrings: number;
@@ -28,30 +27,6 @@ const unrelatedCwd = path.join(tempRoot, "unrelated-cwd");
 const bundleDir = path.join(tempRoot, "bundle");
 const compiledPath = path.join(tempRoot, "compiled-template-probe");
 let bundlePath: string;
-const bundledDependencyStubs: Record<string, string> = {
-	"@oh-my-pi/pi-utils": 'export const APP_NAME = "omp"; export const isEnoent = () => false;',
-	"@oh-my-pi/pi-tui/theme":
-		"export const getResolvedThemeColors = async () => ({}); export const getThemeExportColors = async () => ({});",
-	"../../session/session-loader": "export const loadEntriesFromFile = async () => [];",
-	"../../session/session-manager":
-		"export class SessionManager { static async open() { return new SessionManager(); } }",
-	"./args": "export const parseExportArgs = () => undefined;",
-	"./web-palette": 'export const webExportThemeVars = () => "";',
-};
-const focusedBundlePlugin: BunPlugin = {
-	name: "html-template-focused-bundle",
-	setup(build) {
-		build.onResolve({ filter: /.*/ }, args =>
-			bundledDependencyStubs[args.path] === undefined
-				? undefined
-				: { path: args.path, namespace: "html-template-test-stub" },
-		);
-		build.onLoad({ filter: /.*/, namespace: "html-template-test-stub" }, args => ({
-			contents: bundledDependencyStubs[args.path]!,
-			loader: "js",
-		}));
-	},
-};
 
 function composeExpectedTemplate(): string {
 	const templateHtml = fs.readFileSync(new URL("template.html", assetDir), "utf8");
@@ -105,7 +80,6 @@ beforeAll(async () => {
 		entrypoints: [templateProbePath],
 		outdir: bundleDir,
 		target: "bun",
-		plugins: [focusedBundlePlugin],
 	});
 	expect(bundle.success, bundle.logs.map(log => log.message).join("\n")).toBe(true);
 	const entrypoint = bundle.outputs.find(output => output.kind === "entry-point");
@@ -115,7 +89,6 @@ beforeAll(async () => {
 	const compiled = await Bun.build({
 		entrypoints: [templateProbePath],
 		target: "bun",
-		plugins: [focusedBundlePlugin],
 		compile: { outfile: compiledPath },
 	});
 	expect(compiled.success, compiled.logs.map(log => log.message).join("\n")).toBe(true);
