@@ -871,10 +871,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			if (!stat.isDirectory()) throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
-		const hostCwd = virtualCwd
-			? await router.locate(virtualCwd, sessionResolveContext(this.session, { signal }), { directory: true })
-			: null;
-		if (virtualCwd && hostCwd === null && isDestructiveCommandGuardConfigured()) {
+		const guardConfigured = isDestructiveCommandGuardConfigured();
+		const hostCwd =
+			virtualCwd && guardConfigured
+				? await router.locate(virtualCwd, sessionResolveContext(this.session, { signal }), { directory: true })
+				: null;
+		if (virtualCwd && guardConfigured && hostCwd === null) {
 			throw new ToolError(
 				`Destructive Command Guard cannot verify a working directory without host backing: ${virtualCwd}`,
 			);
