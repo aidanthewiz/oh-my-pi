@@ -133,10 +133,7 @@ rust_shared_library(
         "//conditions:default": [],
     }),
     version = "18.3.0",
-    deps = all_crate_deps(normal = True) + select({
-        "@platforms//os:macos": [":applefm_bridge_lib"],
-        "//conditions:default": [],
-    }) + [
+    deps = all_crate_deps(normal = True) + [
         "//crates/pi-ast",
         "//crates/pi-diff",
         "//crates/pi-edit",
@@ -146,6 +143,10 @@ rust_shared_library(
         "//crates/pi-voice",
         "//crates/pi-walker",
     ],
+    link_deps = select({
+        "@platforms//os:macos": [":applefm_bridge_lib"],
+        "//conditions:default": [],
+    }),
 )
 
 rust_test(

@@ -41,7 +41,7 @@ export interface AppleFoundationModelsOptions extends StreamOptions {
 /** Usability of the on-device model, as reported by the bridge. */
 export interface AppleFoundationModelsAvailability {
 	available: boolean;
-	/** Why the model is unusable: `device_not_eligible`, `apple_intelligence_not_enabled`, `model_not_ready`, `unsupported_os`, `not_built`, `unsupported_platform`. */
+	/** Unavailable reason; `unsupported_framework` means required SDK symbols are absent. */
 	reason?: string;
 	/** Context window in tokens. */
 	contextSize?: number;
