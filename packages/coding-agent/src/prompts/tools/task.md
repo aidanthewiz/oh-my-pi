@@ -17,9 +17,9 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
 - `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`). Omit only when the default (`{{defaultAgent}}`) fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
 - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-- `complexity`: Why the task is simple or complex, ≤12 words (`one-line rename, no callers`; `cross-module race, no repro`); sets child thinking depth.
+- `solutionSpace`: Describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `single-flight cache load; races easy to miss`; `deadlock cause open, no repro`)
 {{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
-{{/if}}{{#if effortEnabled}}- `effort`: `"lo"`|`"med"`|`"hi"` by complexity.
+{{/if}}{{#if effortEnabled}}- `effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
 {{/if}}- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
 - `contextFilePolicy`: `"inherit"` (default) forwards ordered instruction files; `"none"` omits them, but still inherits managed settings and tool policy.

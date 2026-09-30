@@ -111,8 +111,8 @@ export interface StructuredSubagentRequest {
 	contextFilePolicy?: ContextFilePolicy;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
-	/** Caller's terse difficulty rationale; steers the child's `auto` thinking classification. */
-	complexity?: string;
+	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
+	solutionSpace?: string;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -504,7 +504,7 @@ function buildExecutorOptions(
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
-		complexity: request.complexity?.trim() || undefined,
+		solutionSpace: request.solutionSpace?.trim() || undefined,
 		...(policy.schema.source === "none"
 			? {}
 			: {

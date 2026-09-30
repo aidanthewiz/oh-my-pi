@@ -5,6 +5,13 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+
+## [18.3.4] - 2026-09-27
+
+### Fixed
+
+- Fixed the native addon keeping every `bun test --isolate`/`--parallel` test file's global object and module graph alive, which grew each test worker by ~15 MB per file until the run was OOM-killed.
+
 ## [18.3.3] - 2026-09-27
 
 ### Added

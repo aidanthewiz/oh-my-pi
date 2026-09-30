@@ -44,17 +44,19 @@ describe("task spawn policy surfaces", () => {
 
 	it("uses the first allowed spawn as the schema default", () => {
 		const schema = getTaskSchema({ isolationEnabled: false, batchEnabled: false, defaultAgent: "fact-finder" });
-		const parsed = schema({ task: "check", complexity: "c" });
+		const parsed = schema({ task: "check", solutionSpace: "c" });
 
-		expect(parsed).toEqual({ agent: "fact-finder", task: "check", complexity: "c" });
+		expect(parsed).toEqual({ agent: "fact-finder", task: "check", solutionSpace: "c" });
 	});
 
-	it("accepts per-spawn context inheritance policy in flat and batch schemas", () => {
+	it("keeps solution-space and context inheritance policy in flat and batch schemas, not legacy complexity", () => {
 		const flat = getTaskSchema({ isolationEnabled: false, batchEnabled: false });
-		expect(flat({ task: "start fresh", complexity: "no inherited context", contextFilePolicy: "none" })).toEqual({
+		expect(
+			flat({ task: "start fresh", solutionSpace: "one fix: exact replacement given", contextFilePolicy: "none" }),
+		).toEqual({
 			agent: "task",
 			task: "start fresh",
-			complexity: "no inherited context",
+			solutionSpace: "one fix: exact replacement given",
 			contextFilePolicy: "none",
 		});
 
@@ -63,20 +65,49 @@ describe("task spawn policy surfaces", () => {
 			batch({
 				context: "shared",
 				tasks: [
-					{ task: "inherit", complexity: "ordinary child", contextFilePolicy: "inherit" },
-					{ task: "fresh", complexity: "no inherited context", contextFilePolicy: "none" },
+					{ task: "inherit", solutionSpace: "one fix: input and output given", contextFilePolicy: "inherit" },
+					{ task: "fresh", solutionSpace: "several designs open; no reproducer", contextFilePolicy: "none" },
 				],
 			}),
 		).toEqual({
 			context: "shared",
 			tasks: [
-				{ agent: "task", task: "inherit", complexity: "ordinary child", contextFilePolicy: "inherit" },
-				{ agent: "task", task: "fresh", complexity: "no inherited context", contextFilePolicy: "none" },
+				{
+					agent: "task",
+					task: "inherit",
+					solutionSpace: "one fix: input and output given",
+					contextFilePolicy: "inherit",
+				},
+				{
+					agent: "task",
+					task: "fresh",
+					solutionSpace: "several designs open; no reproducer",
+					contextFilePolicy: "none",
+				},
 			],
 		});
-		expect(flat({ task: "invalid", complexity: "bad policy", contextFilePolicy: "sometimes" })).toBeInstanceOf(
+		expect(flat({ task: "invalid", solutionSpace: "one fix: given", contextFilePolicy: "sometimes" })).toBeInstanceOf(
 			type.errors,
 		);
+		expect(flat({ task: "obsolete", complexity: "old field", contextFilePolicy: "none" })).toBeInstanceOf(
+			type.errors,
+		);
+		expect(
+			batch({
+				context: "shared",
+				tasks: [{ task: "obsolete", complexity: "old field", contextFilePolicy: "none" }],
+			}),
+		).toBeInstanceOf(type.errors);
+		const oldFlat = flat({ task: "no alias", solutionSpace: "one fix: given", complexity: "old field" });
+		expect(oldFlat).toEqual({ agent: "task", task: "no alias", solutionSpace: "one fix: given" });
+		const oldBatch = batch({
+			context: "shared",
+			tasks: [{ task: "no alias", solutionSpace: "one fix: given", complexity: "old field" }],
+		});
+		expect(oldBatch).toEqual({
+			context: "shared",
+			tasks: [{ agent: "task", task: "no alias", solutionSpace: "one fix: given" }],
+		});
 	});
 
 	it("filters the agent list to the restricted spawn policy in the description", async () => {

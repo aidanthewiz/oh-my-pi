@@ -134,7 +134,7 @@ rust_shared_library(
         "//bazel/triples:aarch64-pc-windows-msvc": ["-Ctarget-feature=+crt-static"],
         "//conditions:default": [],
     }),
-    version = "18.3.3",
+    version = "18.3.4",
     deps = all_crate_deps(normal = True) + [
         "//crates/pi-ast",
         "//crates/pi-diff",
@@ -146,6 +146,7 @@ rust_shared_library(
         "//crates/pi-vfs",
         "//crates/pi-voice",
         "//crates/pi-walker",
+        "//crates/vendor/napi",
     ],
     link_deps = select({
         "@platforms//os:macos": [":applefm_bridge_lib"],
