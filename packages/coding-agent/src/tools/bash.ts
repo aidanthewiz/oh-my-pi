@@ -431,6 +431,7 @@ type PreparedBashBackend =
 interface PreparedBashExecution {
 	command: string;
 	commandCwd: string;
+	guardCwd: string;
 	dcgDecision: DcgDecision;
 	backend: PreparedBashBackend;
 	preflight: { command: string; env: Record<string, string> | undefined };
@@ -870,6 +871,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			if (!stat.isDirectory()) throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
+		const hostCwd = virtualCwd
+			? await router.locate(virtualCwd, sessionResolveContext(this.session, { signal }), { directory: true })
+			: null;
+		if (virtualCwd && hostCwd === null && isDestructiveCommandGuardConfigured()) {
+			throw new ToolError(
+				`Destructive Command Guard cannot verify a working directory without host backing: ${virtualCwd}`,
+			);
+		}
+		const guardCwd = hostCwd ?? (virtualCwd ? this.session.cwd : commandCwd);
 		if (backend.kind === "service") assertSafeServiceEnv(input.env);
 		if (backend.kind !== "local" && INTERNAL_BASH_URL_RE.test(command)) {
 			throw new ToolError(
@@ -889,11 +899,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		});
 		if (backend.kind === "service") assertSafeServiceEnv(preflight.env);
 		const dialect = dcgDialectForBackend(backend);
-		const originalDecision = await enforceDestructiveCommandGuard(command, commandCwd, dialect, signal);
+		const originalDecision = await enforceDestructiveCommandGuard(command, guardCwd, dialect, signal);
 		const finalDecision =
 			preflight.command === command
 				? originalDecision
-				: await enforceDestructiveCommandGuard(preflight.command, commandCwd, dialect, signal);
+				: await enforceDestructiveCommandGuard(preflight.command, guardCwd, dialect, signal);
 		if (
 			originalDecision.decision === "ask" &&
 			finalDecision.decision === "ask" &&
@@ -904,7 +914,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			);
 		}
 		const dcgDecision = finalDecision.decision === "ask" ? finalDecision : originalDecision;
-		return { command: preflight.command, commandCwd, dcgDecision, backend, preflight };
+		return { command: preflight.command, commandCwd, guardCwd, dcgDecision, backend, preflight };
 	}
 
 	async prepareRuntimeApproval(
@@ -1251,7 +1261,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (!sameBashBackend(prepared.backend, materialized.backend)) {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
-			if (materialized.command !== prepared.command || materialized.commandCwd !== prepared.commandCwd) {
+			if (
+				materialized.command !== prepared.command ||
+				materialized.commandCwd !== prepared.commandCwd ||
+				materialized.guardCwd !== prepared.guardCwd
+			) {
 				throw new ToolError(
 					"Bash command or working directory changed after safety review; review the command again.",
 				);

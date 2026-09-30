@@ -646,7 +646,7 @@ export class Settings {
 		assertKnownSettingPaths(layer);
 		for (const setting of allSettings()) {
 			const value = getByPath(layer, setting.segments);
-			if (value !== undefined && this.#parent && this.#parent.#managedValue(setting) !== undefined) {
+			if (value !== undefined && this.#overridesManagedValue(setting, value)) {
 				throw new Error(`Child settings cannot override managed setting "${setting.id}"`);
 			}
 			if (value === undefined || value === null) continue;
@@ -751,7 +751,12 @@ export class Settings {
 	#applyParentChange(setting: AnySetting): void {
 		this.#syncParent();
 		const own = getByPath(this.#mergeOwnLayers(this.#ownLayers()), setting.segments);
-		if (own !== undefined && (typeof own !== "object" || own === null || Array.isArray(own))) return;
+		if (
+			own !== undefined &&
+			(typeof own !== "object" || own === null || Array.isArray(own)) &&
+			(this.#parent === undefined || this.#parent.#managedValue(setting) === undefined)
+		)
+			return;
 		this.#notifyChange(setting);
 	}
 
@@ -831,6 +836,17 @@ export class Settings {
 		return getByPath(this.#managed, setting.segments) ?? (this.#parent && this.#parent.#managedValue(setting));
 	}
 
+	/** Child model roles may add keys, but cannot replace a parent-managed role. */
+	#overridesManagedValue(setting: AnySetting, value: unknown): boolean {
+		const parent = this.#parent;
+		if (!parent) return false;
+		const managed = parent.#managedValue(setting);
+		if (managed === undefined) return false;
+		if (setting !== cfgModelRoles || !isRecord(managed) || !isRecord(value)) return true;
+		const inherited = parent.getModelRoles();
+		return Object.keys(managed).some(role => Object.hasOwn(value, role) && value[role] !== inherited[role]);
+	}
+
 	/**
 	 * Registry plumbing behind `Setting.set` / `Setting.override`: writes `value` for `setting` to the
 	 * global layer (persisted in the background; releases a soft pin, see {@link pinDefaultValue}) or
@@ -841,7 +857,7 @@ export class Settings {
 	 */
 	writeValue(setting: AnySetting, value: unknown, layer: "global" | "override"): void {
 		setting.assertWritable(value);
-		if (this.#parent && this.#parent.#managedValue(setting) !== undefined) {
+		if (this.#overridesManagedValue(setting, value)) {
 			throw new Error(`Child settings cannot override managed setting "${setting.id}"`);
 		}
 		if (layer === "override" && setting === cfgModelRoles) {
@@ -1227,7 +1243,7 @@ export class Settings {
 				this.#readExistingMainYaml(false),
 				this.#readProjectSettings(false, { rejectNewWarnings: keepLastGood }),
 				this.#readConfigOverlays(false),
-				this.#loadManagedOverlay(),
+				this.#loadManagedOverlay(true),
 			]);
 			if (mutationGeneration !== this.#persistedMutationGeneration) continue;
 			for (const result of [globalResult, projectResult, overlayResult, managedResult]) {
@@ -1694,8 +1710,10 @@ export class Settings {
 	 * tombstone.
 	 */
 	getModelRoleProvenance(role: ModelRole | string): SettingProvenance {
-		if (this.#parent && this.#parent.#managedValue(cfgModelRoles) !== undefined)
-			return this.#parent.getModelRoleProvenance(role);
+		const parent = this.#parent;
+		const managedRoles = parent ? parent.#managedValue(cfgModelRoles) : undefined;
+		if (parent && isRecord(managedRoles) && Object.hasOwn(managedRoles, role))
+			return parent.getModelRoleProvenance(role);
 		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
 		if (this.#modelRoleLayerOwns(this.#managed, role)) return "managed";
 		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
@@ -2312,16 +2330,18 @@ export class Settings {
 	/**
 	 * Load the org-managed overlay (`<agentDir>/config.managed.yml`) when
 	 * present. Missing file = empty layer (the common, unmanaged case). Unlike
-	 * `--config` overlays the file is not user-supplied on the command line, so
-	 * a malformed managed file must not brick startup: it is logged and treated
-	 * as empty rather than thrown (mirrors `#loadYaml` tolerance). Distribution
-	 * tooling validates the file before shipping it.
+	 * `--config` overlays the file is not user-supplied on the command line.
+	 * Startup tolerates a malformed file, but reloads reject it so the last
+	 * valid managed policy remains effective.
 	 */
-	async #loadManagedOverlay(): Promise<RawSettings> {
+	async #loadManagedOverlay(rejectLoadErrors = false): Promise<RawSettings> {
 		if (!this.#managedPath) return {};
-		const loaded = await this.#loadYamlIfPresent(this.#managedPath);
+		const loaded = await this.#loadYamlIfPresent(this.#managedPath, !rejectLoadErrors);
 		if (loaded.kind === "loaded") return loaded.settings;
 		if (loaded.kind !== "missing") {
+			if (rejectLoadErrors) {
+				throw new Error(`Failed to load managed overlay ${this.#managedPath}: ${String(loaded.error)}`);
+			}
 			logger.warn("Settings: managed overlay unavailable; ignoring", {
 				path: this.#managedPath,
 				error: String(loaded.error),
@@ -3695,12 +3715,21 @@ export class Settings {
 	/** `own` merged over an overlay parent's current view (itself for a root instance). */
 	#mergeOverParent(own: RawSettings): RawSettings {
 		if (!this.#parent) return own;
-		const merged = this.#deepMerge(this.#parent.#mergedView(), own);
-		// A child may be alive when the managed file is reloaded. Its older local overrides
-		// cannot continue to shadow newly managed values; retain the parent's runtime precedence.
+		const parent = this.#parent.#mergedView();
+		const merged = this.#deepMerge(parent, own);
+		// A live child cannot shadow newly managed values, but its own model roles
+		// remain available when the parent manages other role names.
 		for (const setting of allSettings()) {
-			if (this.#parent.#managedValue(setting) === undefined) continue;
-			setByPath(merged, setting.segments, getByPath(this.#parent.#mergedView(), setting.segments));
+			const managed = this.#parent.#managedValue(setting);
+			if (managed === undefined) continue;
+			if (setting === cfgModelRoles && isRecord(managed)) {
+				const inherited = getByPath(parent, setting.segments);
+				for (const role of Object.keys(managed)) {
+					setByPath(merged, [...setting.segments, role], isRecord(inherited) ? inherited[role] : undefined);
+				}
+				continue;
+			}
+			setByPath(merged, setting.segments, getByPath(parent, setting.segments));
 		}
 		return merged;
 	}

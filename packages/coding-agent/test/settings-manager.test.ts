@@ -69,7 +69,11 @@ import {
 	cfgTaskEnableEffort,
 	cfgTaskAgentModelOverrides,
 } from "@oh-my-pi/pi-coding-agent/task/settings";
-import { cfgMnemopiDbPath, cfgMnemopiScoping } from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
+import {
+	cfgMnemopiDbPath,
+	cfgMnemopiEmbeddingApiKey,
+	cfgMnemopiScoping,
+} from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
 import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
 import { cfgHindsightBankId, cfgHindsightScoping } from "@oh-my-pi/pi-coding-agent/hindsight/settings";
 import { cfgEditMode } from "@oh-my-pi/pi-coding-agent/edit/settings";
@@ -1455,6 +1459,71 @@ describe("Settings", () => {
 			expect(cfgIdentityAwsProfile.get(child)).toBe("org-b");
 			expect(cfgIdentityAwsProfile.provenance(child)).toBe("managed");
 			expect(cfgIdentityAwsProfile.get(await settings.cloneForCwd(tempDir.join("other-project")))).toBe("org-b");
+		});
+
+		it("keeps managed provider policy when the managed file becomes malformed", async () => {
+			const managedPath = path.join(agentDir, "config.managed.yml");
+			Bun.env.OMP_MANAGED_CONFIG_FILE = managedPath;
+			await Bun.write(managedPath, YAML.stringify({ disabledProviders: ["openai"] }));
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+
+			await Bun.write(managedPath, "disabledProviders: [unterminated\n");
+			await expect(settings.reloadFromDisk()).rejects.toThrow(/managed overlay/);
+			expect(cfgDisabledProviders.get(settings)).toEqual(["openai"]);
+			expect(cfgDisabledProviders.provenance(settings)).toBe("managed");
+
+			await Bun.write(managedPath, YAML.stringify({ disabledProviders: ["anthropic"] }));
+			await settings.reloadFromDisk();
+			expect(cfgDisabledProviders.get(settings)).toEqual(["anthropic"]);
+		});
+
+		it("keeps child-local retry roles without changing managed model roles", async () => {
+			const managedPath = path.join(agentDir, "config.managed.yml");
+			Bun.env.OMP_MANAGED_CONFIG_FILE = managedPath;
+			await Bun.write(managedPath, YAML.stringify({ modelRoles: { default: "anthropic-aws/org-a" } }));
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			const child = settings.overlay();
+
+			cfgModelRoles.override(child, {
+				...settings.getModelRoles(),
+				"subagent:probe": "anthropic-aws/fallback",
+			});
+			expect(child.getModelRole("subagent:probe")).toBe("anthropic-aws/fallback");
+			expect(child.getModelRoleProvenance("subagent:probe")).toBe("runtime");
+			expect(() => cfgModelRoles.override(child, { default: "openai/unmanaged" })).toThrow(/managed setting/);
+
+			await Bun.write(managedPath, YAML.stringify({ modelRoles: { default: "anthropic-aws/org-b" } }));
+			await settings.reloadFromDisk();
+			expect(child.getModelRole("default")).toBe("anthropic-aws/org-b");
+			expect(child.getModelRole("subagent:probe")).toBe("anthropic-aws/fallback");
+			expect(settings.getModelRole("subagent:probe")).toBeUndefined();
+
+			await Bun.write(
+				managedPath,
+				YAML.stringify({
+					modelRoles: { default: "anthropic-aws/org-b", "subagent:probe": "anthropic-aws/org-only" },
+				}),
+			);
+			await settings.reloadFromDisk();
+			expect(child.getModelRole("subagent:probe")).toBe("anthropic-aws/org-only");
+			expect(child.getModelRoleProvenance("subagent:probe")).toBe("managed");
+		});
+
+		it("notifies child credential listeners when managed policy replaces a local override", async () => {
+			const managedPath = path.join(agentDir, "config.managed.yml");
+			Bun.env.OMP_MANAGED_CONFIG_FILE = managedPath;
+			const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			const child = settings.overlay({ "mnemopi.embeddingApiKey": "synthetic-child-secret" });
+			const observed: string[] = [];
+			const unsubscribe = child.onEffectiveChange([cfgMnemopiEmbeddingApiKey], () => {
+				observed.push(cfgMnemopiEmbeddingApiKey.get(child) ?? "");
+			});
+
+			await Bun.write(managedPath, YAML.stringify({ mnemopi: { embeddingApiKey: "synthetic-managed-secret" } }));
+			await settings.reloadFromDisk();
+			expect(cfgMnemopiEmbeddingApiKey.get(child)).toBe("synthetic-managed-secret");
+			expect(observed).toEqual(["synthetic-managed-secret"]);
+			unsubscribe();
 		});
 
 		it("migrates legacy snapcompact system prompt booleans to scoped modes", async () => {

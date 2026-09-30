@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { cfgShellPath } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import type {
 	ExtensionRunner,
@@ -52,6 +53,14 @@ const actualArgs = process.argv.slice(2);
 if (JSON.stringify(actualArgs) !== JSON.stringify(expectedArgs)) {
 	console.error(\`unexpected arguments: \${JSON.stringify(actualArgs)}\`);
 	process.exit(3);
+}
+if (command.includes("guard-virtual-cwd")) {
+	if (!process.cwd().endsWith("/work")) {
+		console.log(JSON.stringify({ decision: "deny", reason: "guard did not inspect the virtual directory's host path" }));
+		process.exit(1);
+	}
+	console.log(JSON.stringify({ decision: "allow" }));
+	process.exit(0);
 }
 if (command.includes("svc-deny")) {
 	console.log(JSON.stringify({ decision: "deny", rule_id: "strict_service:deny", reason: "blocked service" }));
@@ -179,6 +188,28 @@ process.exit(1);
 			);
 			expect(approval?.prompt).toContain("strict_git:worktree-remove");
 		}
+	});
+
+	it("guards a URL working directory from its backed host path before executing", async () => {
+		const localRoot = resolveLocalRoot({
+			getArtifactsDir: () => path.join(tempDir, "artifacts"),
+			getSessionId: () => "dcg-runtime-test",
+		});
+		fs.mkdirSync(path.join(localRoot, "work"), { recursive: true });
+
+		const result = await tool.execute("virtual-cwd", {
+			command: "printf guard-virtual-cwd",
+			cwd: "local://work",
+			pty: false,
+		});
+		expect(result.isError).toBeUndefined();
+		expect(result.content.find(item => item.type === "text")?.text).toContain("guard-virtual-cwd");
+	});
+
+	it("refuses an unbacked virtual cwd when DCG cannot evaluate relative paths", async () => {
+		await expect(
+			tool.execute("virtual-cwd-unbacked", { command: "printf guard-virtual-cwd", cwd: "omp://", pty: false }),
+		).rejects.toThrow("Destructive Command Guard cannot verify a working directory without host backing");
 	});
 
 	it("invalidates approval when the client terminal route changes before execution", async () => {
