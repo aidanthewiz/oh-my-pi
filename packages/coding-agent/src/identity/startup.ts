@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { cfgIdentityEntraEnabled } from "../config/model-settings";
 import { installCoreforgeAwsRecovery } from "./aws-recovery";
 import { ensureManagedCoreforgeAwsSso } from "./aws-sso";
 import { CoreforgeIdentityStore, coreforgeIdentityFirstName } from "./coreforge-store";
@@ -47,7 +48,7 @@ export async function ensureCoreforgeIdentityAtStartup(
 		installAwsRecovery?: typeof installCoreforgeAwsRecovery;
 	},
 ): Promise<CoreforgeStartupIdentity> {
-	if (!settings.get("identity.entra.enabled")) {
+	if (!cfgIdentityEntraEnabled.get(settings)) {
 		restoreCoreforgeOperationalAwsEnvironment(Bun.env);
 		return { notices: [] };
 	}

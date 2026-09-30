@@ -7,6 +7,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"ask",
 	"debug",
 	"diagram",
+	"ida",
 	"eval",
 	"github",
 	"glob",

@@ -19,6 +19,8 @@ import { customMessageContentText } from "../session/checkpoint-entries";
 import { appendSharpshooterDelta } from "./queue";
 import type { SharpshooterDelta, SharpshooterDeltaKind, SharpshooterDeltaSource, SharpshooterFriction } from "./types";
 
+import { cfgSharpshooterModel } from "./settings";
+
 const SHARPSHOOTER_DELTA_KINDS = {
 	architecture_decision: true,
 	product_decision: true,
@@ -159,7 +161,7 @@ export async function resolveSharpshooterModel(
 	settings: Settings,
 	modelRegistry: ModelRegistry,
 ): Promise<Model | undefined> {
-	const selector = settings.get("sharpshooter.model");
+	const selector = cfgSharpshooterModel.get(settings);
 	if (selector) {
 		const resolved = resolveModelRoleValue(
 			selector,

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type DiagramParams, DiagramTool, type DiagramToolDetails } from "@oh-my-pi/pi-coding-agent/tools/diagram";
 import { getAgentDir, getArtifactsDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -22,7 +23,7 @@ const spec = {
 };
 
 function createSession(cwd: string, overrides: Partial<Record<string, unknown>> = {}): ToolSession {
-	const settings = { get: (_path: string): boolean => false } as unknown as ToolSession["settings"];
+	const settings = Settings.isolated();
 	return {
 		cwd,
 		hasUI: false,

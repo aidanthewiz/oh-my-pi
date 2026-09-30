@@ -9,6 +9,8 @@ import { clampTimeout } from "../tools/tool-timeouts";
 import type { BashExecutionMessage } from "./messages";
 import type { SessionManager } from "./session-manager";
 
+import { cfgToolsMaxTimeout } from "../tools/settings";
+
 /** Destination that owns a bash result after a session or branch transition. */
 export type BashAppendDestination =
 	| { kind: "current"; manager: SessionManager }
@@ -112,11 +114,12 @@ export class BashRunner {
 			let result: BashResult;
 			try {
 				result = await executeBashCommand(command, {
+					settings: this.#host.settings,
 					onChunk,
 					signal: abortController.signal,
 					sessionKey: target.sessionId,
 					cwd,
-					timeout: clampTimeout("bash", undefined, this.#host.settings.get("tools.maxTimeout")) * 1000,
+					timeout: clampTimeout("bash", undefined, cfgToolsMaxTimeout.get(this.#host.settings)) * 1000,
 					onMinimizedSave: originalText => this.#saveOriginalArtifact(target, originalText),
 					env: shellEnv,
 					useUserShell: options?.useUserShell,

@@ -10,6 +10,21 @@ import {
 	registerOperationalAwsEnvProvenance,
 } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import {
+	cfgIdentityAwsProfile,
+	cfgIdentityAwsRegion,
+	cfgIdentityAwsSsoAccountId,
+	cfgIdentityAwsSsoRegion,
+	cfgIdentityAwsSsoRoleName,
+	cfgIdentityAwsSsoStartUrl,
+	cfgIdentityClaudeBaseUrl,
+	cfgIdentityClaudeInferenceGeo,
+	cfgIdentityClaudeWorkspaceId,
+	cfgIdentityEntraAuthorityHost,
+	cfgIdentityEntraClientId,
+	cfgIdentityEntraEnabled,
+	cfgIdentityEntraTenantId,
+} from "../config/model-settings";
 import type { CoreforgeAwsSsoConstants } from "./aws-profile";
 import type { CoreforgeAwsConfig } from "./aws-sso";
 import { validateCoreforgeAwsConfig } from "./aws-sso";
@@ -63,21 +78,21 @@ function isAnthropicAwsGateway(value: string | undefined): boolean {
  * no startup prompt, no error.
  */
 export function resolveCoreforgeEntraConfig(settings: Settings): CoreforgeEntraConfig | undefined {
-	if (!settings.get("identity.entra.enabled")) return undefined;
-	const tenantId = settings.get("identity.entra.tenantId")?.trim();
-	const clientId = settings.get("identity.entra.clientId")?.trim();
+	if (!cfgIdentityEntraEnabled.get(settings)) return undefined;
+	const tenantId = cfgIdentityEntraTenantId.get(settings)?.trim();
+	const clientId = cfgIdentityEntraClientId.get(settings)?.trim();
 	if (!tenantId || !clientId) return undefined;
 	return validateCoreforgeEntraConfig({
 		tenantId,
 		clientId,
-		authorityHost: settings.get("identity.entra.authorityHost") ?? "",
+		authorityHost: cfgIdentityEntraAuthorityHost.get(settings) ?? "",
 	});
 }
 
 export function resolveCoreforgeAwsConfig(settings: Settings): CoreforgeAwsConfig | undefined {
-	const profile = settings.get("identity.aws.profile");
+	const profile = cfgIdentityAwsProfile.get(settings);
 	if (!profile) return undefined;
-	return validateCoreforgeAwsConfig({ profile, region: settings.get("identity.aws.region") ?? "" });
+	return validateCoreforgeAwsConfig({ profile, region: cfgIdentityAwsRegion.get(settings) ?? "" });
 }
 
 /**
@@ -89,20 +104,20 @@ export function resolveCoreforgeAwsConfig(settings: Settings): CoreforgeAwsConfi
 export function resolveCoreforgeAwsSsoConstants(settings: Settings): CoreforgeAwsSsoConstants | undefined {
 	const aws = resolveCoreforgeAwsConfig(settings);
 	if (!aws) return undefined;
-	const ssoStartUrl = settings.get("identity.aws.ssoStartUrl")?.trim();
-	const ssoRegion = settings.get("identity.aws.ssoRegion")?.trim();
-	const ssoAccountId = settings.get("identity.aws.ssoAccountId")?.trim();
-	const ssoRoleName = settings.get("identity.aws.ssoRoleName")?.trim();
+	const ssoStartUrl = cfgIdentityAwsSsoStartUrl.get(settings)?.trim();
+	const ssoRegion = cfgIdentityAwsSsoRegion.get(settings)?.trim();
+	const ssoAccountId = cfgIdentityAwsSsoAccountId.get(settings)?.trim();
+	const ssoRoleName = cfgIdentityAwsSsoRoleName.get(settings)?.trim();
 	if (!ssoStartUrl || !ssoRegion || !ssoAccountId || !ssoRoleName) return undefined;
 	return { ...aws, ssoStartUrl, ssoRegion, ssoAccountId, ssoRoleName };
 }
 
 export function resolveCoreforgeClaudeConfig(settings: Settings): CoreforgeClaudeConfig | undefined {
-	const workspaceId = settings.get("identity.claude.workspaceId")?.trim();
+	const workspaceId = cfgIdentityClaudeWorkspaceId.get(settings)?.trim();
 	if (!workspaceId) return undefined;
-	const baseUrl = settings.get("identity.claude.baseUrl")?.trim() ?? "";
+	const baseUrl = cfgIdentityClaudeBaseUrl.get(settings)?.trim() ?? "";
 	if (!isAnthropicAwsGateway(baseUrl)) throw new Error(`Invalid managed Claude Platform on AWS URL: ${baseUrl}`);
-	const inferenceGeo = settings.get("identity.claude.inferenceGeo")?.trim().toLowerCase();
+	const inferenceGeo = cfgIdentityClaudeInferenceGeo.get(settings)?.trim().toLowerCase();
 	if (inferenceGeo && inferenceGeo !== "us" && inferenceGeo !== "global") {
 		throw new Error(`Invalid managed Claude inference geography: ${inferenceGeo}`);
 	}
@@ -203,9 +218,9 @@ export function applyCoreforgeIdentityProviderDefaults(
 	// resolveCoreforgeEntraConfig would throw on malformed IDs; reading the raw
 	// settings never does.
 	const entraProvisioned =
-		settings.get("identity.entra.enabled") === true &&
-		hasValue(settings.get("identity.entra.tenantId")) &&
-		hasValue(settings.get("identity.entra.clientId"));
+		cfgIdentityEntraEnabled.get(settings) === true &&
+		hasValue(cfgIdentityEntraTenantId.get(settings)) &&
+		hasValue(cfgIdentityEntraClientId.get(settings));
 	if (!entraProvisioned) {
 		return {
 			entraProvisioned: false,
@@ -234,7 +249,7 @@ export function applyCoreforgeIdentityProviderDefaults(
 	let managed: Record<string, string | undefined> = {
 		[AWS_MODEL_AUTH_MODE_ENV]: MANAGED_AWS_MODEL_AUTH_MODE,
 	};
-	let reservedModelProfile = identity?.aws?.profile ?? settings.get("identity.aws.profile")?.trim();
+	let reservedModelProfile = identity?.aws?.profile ?? cfgIdentityAwsProfile.get(settings)?.trim();
 	let configError: string | undefined;
 	if (identityAvailable) {
 		try {

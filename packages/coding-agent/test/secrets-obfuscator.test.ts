@@ -23,6 +23,7 @@ import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { isJsonSchemaValueValid } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
+	buildSecretObfuscator,
 	builtinCredentialSecretEntries,
 	collectEnvSecrets,
 	collectSettingsSecrets,
@@ -283,6 +284,59 @@ describe("collectSettingsSecrets", () => {
 		expect(providerView).not.toContain(shortPassword);
 		expect(providerView).toContain("endpoint=https://search.example.test");
 		expect(deobfuscateToolArguments(obfuscator, { old_string: providerView }).old_string).toContain(brokerToken);
+	});
+	it("keeps configured credentials private when optional secret scanning is disabled live", () => {
+		const credential = "configured-private-credential";
+		const optionalSecret = "optional-secret-from-file";
+		const obfuscator = new SecretObfuscator(
+			[
+				...collectSettingsSecrets(Settings.isolated({ "auth.broker.token": credential })),
+				{ type: "plain", content: optionalSecret },
+			],
+			"K".repeat(43),
+		);
+		const earlierPlaceholder = obfuscator.obfuscate(credential);
+
+		obfuscator.setObfuscating(false);
+		const providerView = obfuscator.obfuscate(`${credential} ${optionalSecret}`);
+		expect(providerView).not.toContain(credential);
+		expect(providerView).toContain(optionalSecret);
+		expect(obfuscator.deobfuscate(earlierPlaceholder)).toBe(credential);
+	});
+	it("preloads optional file and regex secrets for a live switch without losing earlier placeholders", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-live-secret-policy-"));
+		const credential = "credential-from-managed-settings";
+		const fileSecret = "file-secret-for-live-switch";
+		const regexSecret = "live-secret-12345";
+		try {
+			await fs.mkdir(path.join(dir, ".omp"));
+			await fs.writeFile(
+				path.join(dir, ".omp", "secrets.yml"),
+				`- type: plain\n  content: ${fileSecret}\n- type: regex\n  content: 'live-secret-[0-9]+'\n`,
+			);
+			const settings = Settings.isolated({ "auth.broker.token": credential, "secrets.enabled": false });
+			const obfuscator = await buildSecretObfuscator(dir, dir, { keyDir: dir, settings, keepAvailable: true });
+			if (!obfuscator) throw new Error("Expected session obfuscator");
+			const before = obfuscator.obfuscate(`${credential} ${fileSecret} ${regexSecret}`);
+			expect(before).not.toContain(credential);
+			expect(before).toContain(fileSecret);
+			expect(before).toContain(regexSecret);
+
+			obfuscator.setObfuscating(true);
+			const during = obfuscator.obfuscate(`${credential} ${fileSecret} ${regexSecret}`);
+			expect(during).not.toContain(credential);
+			expect(during).not.toContain(fileSecret);
+			expect(during).not.toContain(regexSecret);
+
+			obfuscator.setObfuscating(false);
+			const after = obfuscator.obfuscate(`${credential} ${fileSecret} ${regexSecret}`);
+			expect(after).not.toContain(credential);
+			expect(after).toContain(fileSecret);
+			expect(after).toContain(regexSecret);
+			expect(obfuscator.deobfuscate(during)).toBe(`${credential} ${fileSecret} ${regexSecret}`);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 

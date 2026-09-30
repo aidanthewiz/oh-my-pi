@@ -16,6 +16,8 @@ import { buildSecretObfuscator } from "../secrets";
 import { resolveResumableSession } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
 
+import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "./settings";
+
 export default class Share extends Command {
 	static description = commandHelp.description;
 	static args = {
@@ -60,13 +62,13 @@ export default class Share extends Command {
 		// Same leak boundary as /share: a share blob leaves the machine, so honor
 		// share.redactSecrets with the full obfuscator built against the session's
 		// own project directory (its secrets.yml, not the invoking cwd's).
-		const obfuscator = settings.get("share.redactSecrets")
+		const obfuscator = cfgShareRedactSecrets.get(settings)
 			? await buildSecretObfuscator(sm.getCwd(), getAgentDir(), { settings })
 			: undefined;
 
 		const result = await shareSession(sm, {
-			serverUrl: settings.get("share.serverUrl"),
-			store: flags.gist ? "gist" : settings.get("share.store"),
+			serverUrl: cfgShareServerUrl.get(settings),
+			store: flags.gist ? "gist" : cfgShareStore.get(settings),
 			obfuscator,
 		});
 		const lines = [`Share URL: ${result.url}`];

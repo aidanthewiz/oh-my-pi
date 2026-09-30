@@ -32,6 +32,13 @@ import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
 import { EventBus } from "../utils/event-bus";
 
+import {
+	cfgDisabledExtensions,
+	cfgExtensions,
+	cfgPluginsPersistentAllowlist,
+	cfgPluginsPersistentPolicy,
+} from "../extensibility/settings";
+
 export type ModelsAction = "ls" | "find" | "refresh";
 
 export interface ModelsCommandArgs {
@@ -350,8 +357,8 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		disableExtensionDiscovery = false,
 	} = options;
 	const policy = createPersistentPluginPolicy(
-		settings?.get("plugins.persistentPolicy") ?? "open",
-		settings?.get("plugins.persistentAllowlist") ?? [],
+		settings ? cfgPluginsPersistentPolicy.get(settings) : "open",
+		settings ? cfgPluginsPersistentAllowlist.get(settings) : [],
 	);
 
 	const eventBus = new EventBus();
@@ -458,8 +465,8 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			json,
 			kind,
 			additionalExtensionPaths: cliExtensionPaths,
-			settingsExtensions: settings.get("extensions") ?? [],
-			disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+			settingsExtensions: cfgExtensions.get(settings),
+			disabledExtensionIds: cfgDisabledExtensions.get(settings),
 			disableExtensionDiscovery: Boolean(command.flags.noExtensions),
 		});
 	} finally {

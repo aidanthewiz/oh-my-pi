@@ -4,6 +4,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -139,7 +140,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		const from = modelOrThrow("claude-sonnet-4-5");
 		const to = modelOrThrow("claude-sonnet-4-6");
 		const s = makeSession(from, { slow: `${to.provider}/${to.id}` });
-		s.settings.override("enabledModels", [`${from.provider}/${from.id}`]);
+		cfgEnabledModels.override(s.settings, [`${from.provider}/${from.id}`]);
 
 		expect(s.resolveRoleModel("slow")).toBeUndefined();
 		await expect(s.setModel(to)).rejects.toThrow(`Model "${to.provider}/${to.id}" is excluded by model policy`);

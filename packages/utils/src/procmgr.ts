@@ -20,8 +20,10 @@ export interface ShellConfigOptions {
 	/** File path or runtime layer that supplied the active shell setting. */
 	configSource?: string;
 }
-let cachedShellConfig: ShellConfig | null = null;
-let cachedShellIsCustom = false;
+/** Auto-resolved shell (no custom path); stable for the process lifetime. */
+let cachedDefaultShellConfig: ShellConfig | null = null;
+/** Config for the most recent custom `shellPath`; never served once the path is cleared. */
+let cachedCustomShellConfig: ShellConfig | null = null;
 
 /**
  * Build the spawn environment (cached).
@@ -89,8 +91,7 @@ function getShellPrefix(): string | undefined {
 /**
  * Build full shell config from a shell path.
  */
-function buildConfig(shell: string, isCustom = false): ShellConfig {
-	cachedShellIsCustom = isCustom;
+function buildConfig(shell: string): ShellConfig {
 	return {
 		shell,
 		args: getShellArgs(shell),
@@ -178,6 +179,9 @@ export function resolveWindowsShell(env: Record<string, string | undefined> = Bu
  *    {@link resolveWindowsShell}) — never fails
  * 3. On Unix: $SHELL if bash/zsh, then fallback paths
  * 4. Fallback: sh
+ *
+ * Custom and auto-resolved configs are cached separately, so clearing
+ * `shellPath` mid-process immediately falls back to the platform default.
  */
 export function getShellConfig(customShellPath?: string, options: ShellConfigOptions = {}): ShellConfig {
 	const configSource = options.configSource ?? path.join(getAgentDir(), MAIN_CONFIG_FILENAMES[0]);
@@ -188,36 +192,30 @@ export function getShellConfig(customShellPath?: string, options: ShellConfigOpt
 		if (!fs.existsSync(customShellPath)) {
 			throw new Error(`Custom shell path not found: ${customShellPath}\nPlease update shellPath in ${configSource}`);
 		}
-		if (cachedShellConfig?.shell !== customShellPath || cachedShellIsCustom !== true) {
-			cachedShellConfig = buildConfig(customShellPath, true);
+		if (cachedCustomShellConfig?.shell !== customShellPath) {
+			cachedCustomShellConfig = buildConfig(customShellPath);
 		}
-		return cachedShellConfig;
+		return cachedCustomShellConfig;
 	}
-	if (cachedShellConfig && !cachedShellIsCustom) {
-		return cachedShellConfig;
-	}
+	cachedDefaultShellConfig ??= buildConfig(resolveDefaultShell());
+	return cachedDefaultShellConfig;
+}
 
+/** Platform shell discovery used when no custom `shellPath` is configured. */
+function resolveDefaultShell(): string {
 	if (process.platform === "win32") {
-		cachedShellConfig = buildConfig(resolveWindowsShell());
-		return cachedShellConfig;
+		return resolveWindowsShell();
 	}
 
 	// Unix: prefer user's shell from $SHELL if it's bash/zsh and executable
 	const userShell = Bun.env.SHELL;
 	const isValidShell = userShell && (userShell.includes("bash") || userShell.includes("zsh"));
 	if (isValidShell && isExecutable(userShell)) {
-		cachedShellConfig = buildConfig(userShell);
-		return cachedShellConfig;
+		return userShell;
 	}
 
 	// 4. Fallback: use basic shell
-	const basicShell = resolveBasicShell();
-	if (basicShell) {
-		cachedShellConfig = buildConfig(basicShell);
-		return cachedShellConfig;
-	}
-	cachedShellConfig = buildConfig("sh");
-	return cachedShellConfig;
+	return resolveBasicShell() ?? "sh";
 }
 
 /**

@@ -27,6 +27,8 @@ import { formatTitleUserMessage } from "../tiny/message-preproc";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
 
+import { cfgRetryModelFallback } from "../session/settings";
+
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 const TITLE_MARKER_INSTRUCTION = prompt.render(titleMarkerInstruction);
 
@@ -127,7 +129,7 @@ function getTitleModels(registry: ModelRegistry, settings: Settings, currentMode
 	);
 	if (
 		currentModel &&
-		(models.length === 0 || settings.get("retry.modelFallback") !== false) &&
+		(models.length === 0 || cfgRetryModelFallback.get(settings) !== false) &&
 		availableModels.some(model => model.provider === currentModel.provider && model.id === currentModel.id) &&
 		!models.some(model => formatModelStringWithRouting(model) === formatModelStringWithRouting(currentModel))
 	) {

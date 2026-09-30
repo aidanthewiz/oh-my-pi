@@ -1,10 +1,10 @@
 # Secret Obfuscation
 
-Prevents sensitive values (API keys, tokens, passwords) from being sent to LLM providers. When enabled, configured secrets and built-in credential-shaped token patterns are replaced before provider-visible text leaves the process. Reversible placeholders are restored in model-authored tool arguments before execution and when local session context is rebuilt for display or resume.
+Prevents sensitive values (API keys, tokens, passwords) from being sent to LLM providers. Credential-marked settings remain protected at all times. When optional scanning is enabled, configured secrets and built-in credential-shaped token patterns are also replaced before provider-visible text leaves the process. Reversible placeholders are restored in model-authored tool arguments before execution and when local session context is rebuilt for display or resume.
 
 ## Enabling
 
-Disabled by default. Toggle via `/settings` UI or directly in `config.yml`:
+Optional environment, `secrets.yml`, and built-in token scanning are disabled by default. Credential-marked settings and the local placeholder key remain protected. Toggle optional scanning via `/settings` UI or directly in `config.yml`; a live toggle takes effect without restarting the session:
 
 ```yaml
 secrets:
@@ -144,7 +144,7 @@ Environment variables are collected first, file-defined entries follow, and the 
 - `packages/coding-agent/src/secrets/index.ts` -- loading, merging, env var collection
 - `packages/coding-agent/src/secrets/obfuscator.ts` -- `SecretObfuscator` class, placeholder generation, message obfuscation
 - `packages/coding-agent/src/secrets/regex.ts` -- regex literal parsing and compilation
-- `packages/coding-agent/src/config/settings-schema.ts` -- `secrets.enabled` setting definition
+- `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` setting definition
 
 ## See also
 

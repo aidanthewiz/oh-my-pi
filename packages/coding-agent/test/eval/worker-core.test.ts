@@ -755,8 +755,8 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");
 send({
 	type: "run", runId: "register-tools", snapshot,
-	code: 'tool(() => { void read("local://package.json:raw"); return "floated"; }, { name: "floatedRead" });' +
-		'tool(async () => { try { await read("local://package.json:raw"); } catch { return "caught"; } }, { name: "caughtRead" });' +
+	code: 'tool(() => { void read("."); return "floated"; }, { name: "floatedRead" });' +
+		'tool(async () => { try { await read("."); } catch { return "caught"; } }, { name: "caughtRead" });' +
 		'tool(async () => { await read("package.json"); return "awaited"; }, { name: "awaitedRead" });',
 	filename: "[register-tools].js",
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	approveRelayBrowser,
 	assertRelayServiceAudience,
@@ -10,7 +10,7 @@ import {
 const AUDIENCE = "https://agent-collab.internal.somahub.io";
 
 function settings(): Settings {
-	const values: Record<string, unknown> = {
+	return Settings.isolated({
 		"identity.relay.audience": AUDIENCE,
 		"identity.aws.profile": "somacommercial",
 		"identity.aws.region": "us-east-1",
@@ -18,8 +18,7 @@ function settings(): Settings {
 		"identity.aws.ssoRegion": "us-east-1",
 		"identity.aws.ssoAccountId": "891455110252",
 		"identity.aws.ssoRoleName": "CoreforgeModelAccess",
-	};
-	return { get: (key: string) => values[key] } as unknown as Settings;
+	});
 }
 
 const identity = {

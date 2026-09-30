@@ -4,11 +4,12 @@ import * as path from "node:path";
 import { getSecretPlaceholderKeyPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import type { Settings } from "../config/settings";
-import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
+import { all as allSettings } from "../config/registry";
 import { type SecretEntry, SecretObfuscator } from "./obfuscator";
 import { CREDENTIAL_PATTERNS } from "./patterns";
 import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName, secretEntriesNeedPlaceholderKey } from "./placeholder";
 import { compileSecretRegex } from "./regex";
+import { cfgSecretsEnabled } from "./settings";
 import { regexHasUnresolvableShortMatchFallback } from "./replacement";
 
 const PLACEHOLDER_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -227,24 +228,25 @@ export function collectEnvSecrets(): SecretEntry[] {
 const CONFIG_CREDENTIAL_REPLACEMENT = "[CONFIG_CREDENTIAL_REDACTED]";
 
 /** Collect effective values for every setting declared as a credential. */
-export function collectSettingsSecrets(settings: Pick<Settings, "get">): SecretEntry[] {
+export function collectSettingsSecrets(settings: Settings): SecretEntry[] {
 	const entries: SecretEntry[] = [];
 	const seen = new Set<string>();
-	for (const [rawPath, definition] of Object.entries(SETTINGS_SCHEMA)) {
-		if (!("credential" in definition) || definition.credential !== true) continue;
-		const settingPath = rawPath as SettingPath;
-		const value = settings.get(settingPath) as unknown;
+	for (const setting of allSettings()) {
+		if (setting.definition.credential !== true) continue;
+		const settingPath = setting.id;
+		const value = setting.get(settings);
 		if (typeof value !== "string" || value.length === 0 || seen.has(value)) continue;
 		seen.add(value);
 		entries.push(
 			value.length >= MIN_OBFUSCATE_SECRET_LEN
-				? { type: "plain", content: value, mode: "obfuscate", friendlyName: settingPath }
+				? { type: "plain", content: value, mode: "obfuscate", friendlyName: settingPath, alwaysOn: true }
 				: {
 						type: "plain",
 						content: value,
 						mode: "replace",
 						replacement: CONFIG_CREDENTIAL_REPLACEMENT,
 						friendlyName: settingPath,
+						alwaysOn: true,
 					},
 		);
 	}
@@ -279,35 +281,38 @@ export function builtinCredentialSecretEntries(): SecretEntry[] {
 /**
  * Build a secret obfuscator from configured settings, secrets.yml entries,
  * secret-shaped environment variables, and built-in credential patterns.
- * Credential-marked settings are always protected because managed configuration
- * can define them independently of `secrets.enabled`; the toggle controls only
- * secrets.yml, environment, and built-in pattern collection.
+ * Credential-marked settings are always protected; the secrets.enabled toggle
+ * controls optional file, environment, and pattern scanning.
  *
- * Only configured entries force startup key creation. Built-in patterns resolve
- * the key lazily on their first match. A persisted key is itself protected even
- * when no configured entry is active.
- *
- * Set `keepAvailable` for long-lived sessions whose credential settings can
- * change after construction. This returns an inert obfuscator that callers can
- * update without replacing every consumer.
+ * Long-lived sessions preload optional entries so a live switch can apply
+ * synchronously without an outbound request escaping before the file reload.
+ * Built-in patterns resolve the placeholder key only when a match needs one.
  */
 export async function buildSecretObfuscator(
 	cwd: string,
 	agentDir: string,
 	options: {
 		keyDir?: string;
-		settings?: Pick<Settings, "get">;
+		settings?: Settings;
 		keepAvailable?: boolean;
 	} = {},
 ): Promise<SecretObfuscator | undefined> {
-	const configurableSecretsEnabled = options.settings?.get("secrets.enabled") ?? true;
+	const configurableSecretsEnabled = options.settings ? cfgSecretsEnabled.get(options.settings) : true;
 	const settingsEntries = options.settings ? collectSettingsSecrets(options.settings) : [];
-	const fileEntries = configurableSecretsEnabled ? await logger.time("loadSecrets", loadSecrets, cwd, agentDir) : [];
-	const envEntries = configurableSecretsEnabled ? collectEnvSecrets() : [];
+	const fileEntries =
+		configurableSecretsEnabled || options.keepAvailable
+			? await logger.time("loadSecrets", loadSecrets, cwd, agentDir)
+			: [];
+	const envEntries = configurableSecretsEnabled || options.keepAvailable ? collectEnvSecrets() : [];
 	const configuredEntries = [...settingsEntries, ...envEntries, ...fileEntries];
 	// Built-in credential patterns come last so configured entries take precedence.
-	const allEntries = [...configuredEntries, ...(configurableSecretsEnabled ? builtinCredentialSecretEntries() : [])];
-	const needsPlaceholderKey = secretEntriesNeedPlaceholderKey(configuredEntries);
+	const allEntries = [
+		...configuredEntries,
+		...(configurableSecretsEnabled || options.keepAvailable ? builtinCredentialSecretEntries() : []),
+	];
+	const needsPlaceholderKey = secretEntriesNeedPlaceholderKey(
+		configurableSecretsEnabled ? configuredEntries : settingsEntries,
+	);
 	const placeholderKey = needsPlaceholderKey
 		? await getSecretPlaceholderKey(options.keyDir)
 		: await getExistingSecretPlaceholderKey(options.keyDir);
@@ -324,6 +329,7 @@ export async function buildSecretObfuscator(
 	if (!obfuscator && options.keepAvailable) {
 		obfuscator = new SecretObfuscator([], () => getSecretPlaceholderKeySync(options.keyDir));
 	}
+	obfuscator?.setObfuscating(configurableSecretsEnabled);
 	return obfuscator;
 }
 

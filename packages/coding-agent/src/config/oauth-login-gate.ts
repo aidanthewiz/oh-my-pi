@@ -1,7 +1,8 @@
 import type { OAuthProviderInfo } from "@oh-my-pi/pi-ai/oauth/types";
 import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
-import { settings } from "./settings";
+import { cfgEnabledModels } from "./model-settings";
+import { Settings } from "./settings";
 
 /**
  * Login-list gate for managed installs: when `enabledModels` is configured,
@@ -22,7 +23,7 @@ import { settings } from "./settings";
 export function filterOAuthLoginProviders(providers: OAuthProviderInfo[]): OAuthProviderInfo[] {
 	let patterns: readonly string[];
 	try {
-		patterns = settings.get("enabledModels") ?? [];
+		patterns = cfgEnabledModels.get(Settings.instance);
 	} catch {
 		return providers; // before Settings.init(): unmanaged context
 	}

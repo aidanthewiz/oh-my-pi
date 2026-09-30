@@ -6,6 +6,7 @@ import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgDisabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -762,12 +763,12 @@ describe("AgentSession prewalk", () => {
 		expect(showStatus).toHaveBeenCalledTimes(1);
 
 		const armPrewalk = vi.spyOn(session, "armPrewalk");
-		settings.set("disabledModels", [`${target.provider}/${target.id}`]);
+		cfgDisabledModels.set(settings, [`${target.provider}/${target.id}`]);
 		settings.setModelRole("smol", `${target.provider}/${target.id}:medium`);
 		expect(await executeBuiltinSlashCommand("/prewalk", runtime)).toBe(true);
 		expect(armPrewalk).not.toHaveBeenCalled();
 		expect(showStatus).toHaveBeenLastCalledWith(expect.stringContaining("enabledModels/disabledModels"));
-		settings.set("disabledModels", []);
+		cfgDisabledModels.set(settings, []);
 		settings.setModelRole("smol", `${primary.provider}/${primary.id}:medium`);
 		armPrewalk.mockRestore();
 		// Restart must not move the active model when an existing arm rejects the requested target.

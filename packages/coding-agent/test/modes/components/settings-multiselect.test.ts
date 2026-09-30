@@ -5,6 +5,8 @@ import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui
 import { createPluginSettingsHost } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/settings-host";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
+import { cfgDevAutoqa } from "@oh-my-pi/pi-coding-agent/tools/settings";
+
 beforeAll(async () => {
 	await initTheme();
 });
@@ -78,13 +80,12 @@ describe("settings section sidebar", () => {
 	it("does not toggle the selected section's first setting", () => {
 		const comp = createSelector();
 		for (let i = 0; i < 7; i++) comp.handleInput("\x1b[C");
-		const initialAutoQa = settings.get("dev.autoqa");
-		expect(initialAutoQa).toBe(false);
+		expect(cfgDevAutoqa.get(settings)).toBe(false);
 
 		clickOption(comp, "Developer");
-		expect(settings.get("dev.autoqa")).toBe(initialAutoQa);
+		expect(cfgDevAutoqa.get(settings)).toBe(false);
 
 		clickOption(comp, "Developer");
-		expect(settings.get("dev.autoqa")).toBe(initialAutoQa);
+		expect(cfgDevAutoqa.get(settings)).toBe(false);
 	});
 });

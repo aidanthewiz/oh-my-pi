@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgShellPath } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import type {
 	ExtensionRunner,
 	ExtensionUIDialogOptions,
@@ -264,7 +265,7 @@ process.exit(1);
 		const approval = await routeTool.prepareRuntimeApproval(toolCallId, args);
 		expect(approval?.prompt).toContain("strict_git:worktree-remove");
 		routeTool.approveRuntimeApproval(toolCallId, args);
-		routeSettings.override("shellPath", psPath);
+		cfgShellPath.override(routeSettings, psPath);
 
 		await expect(routeTool.execute(toolCallId, args)).rejects.toThrow(
 			"Bash execution route or shell changed after safety review",
@@ -348,7 +349,7 @@ process.exit(1);
 			expect(review).toContain("strict_git:worktree-remove");
 			expect(review).toContain("git worktree remove deletes a linked working tree.");
 			expect(review).toContain(JSON.stringify(tempDir));
-			expect(review).toContain(JSON.stringify(`printf runtime-approved > '${resultPath}'`));
+			expect(review).toContain(JSON.stringify(args.command));
 			expect(review).toContain("newlines and control characters are escaped");
 			expect(review).toContain("Only choose Approve once if this exact command is intended.");
 
