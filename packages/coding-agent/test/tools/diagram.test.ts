@@ -92,6 +92,21 @@ describe("DiagramTool", () => {
 		expect((await fs.readFile(path.join(sandbox, "local", "planned.html"), "utf8")).length).toBeGreaterThan(0);
 	});
 
+	it("rejects explicit working-tree output in plan mode before creating it", async () => {
+		testDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-diagram-"));
+		const out = path.join(testDir, "blocked.html");
+		const session = createSession(testDir, {
+			getArtifactsDir: () => path.join(testDir, "artifacts"),
+			getSessionId: () => "diagram-session",
+			getPlanModeState: () => ({ enabled: true, planFilePath: "local://plan.md" }),
+		});
+
+		await expect(new DiagramTool(session).execute("call-1", { spec, out })).rejects.toThrow(
+			"Plan mode: the working tree is read-only",
+		);
+		await expect(fs.stat(out)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("requires exactly one source", async () => {
 		const tool = new DiagramTool(createSession(os.tmpdir()));
 		const emptyParams = {} as DiagramParams;

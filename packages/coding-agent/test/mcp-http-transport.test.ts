@@ -868,6 +868,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		const sseChunk = (payload: string): string =>
 			`HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n${payload.length.toString(16)}\r\n${payload}\r\n`;
 		const pendingRequests = new WeakMap<object, string>();
+		let closePrimingResponse: (() => void) | undefined;
 		const listener = Bun.listen({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -888,8 +889,10 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 					pendingRequests.delete(socket);
 					if (headers.startsWith("POST")) {
 						observed.posts++;
-						// Priming event, then close without the terminal 0-chunk.
-						socket.end(sseChunk("id: stream-1\nretry: 10\ndata:\n\n"));
+						closePrimingResponse = () => socket.end();
+						socket.write(
+							sseChunk('id: stream-1\nretry: 10\ndata: {"jsonrpc":"2.0","method":"notifications/primed"}\n\n'),
+						);
 						return;
 					}
 					if (!headers.startsWith("GET")) return;
@@ -909,6 +912,13 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				url: `http://127.0.0.1:${listener.port}/mcp`,
 				timeout: GUARD_TIMEOUT_MS,
 			});
+			// Disconnect only after the client observes the event ID; a same-packet FIN
+			// can make Bun discard the priming event before its SSE parser sees it.
+			transport.onNotification = method => {
+				if (method !== "notifications/primed") return;
+				if (!closePrimingResponse) throw new Error("Priming response was never opened");
+				closePrimingResponse();
+			};
 			await transport.connect();
 
 			const response = await withPendingGuard(transport.request<ToolList>("tools/list"), "request");
