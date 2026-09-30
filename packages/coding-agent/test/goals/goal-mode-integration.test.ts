@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -32,6 +33,7 @@ function createToolSession(cwd: string, settings: Settings, overrides: Partial<T
 
 type GoalHarness = {
 	tempDir: TempDir;
+	asyncJobManager: AsyncJobManager;
 	settings: Settings;
 	session: AgentSession;
 	mode: InteractiveMode;
@@ -81,6 +83,7 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 	const initialTools = await createTools(bootstrapToolSession, ["read"]);
 	const toolRegistry = new Map<string, Tool>(initialTools.map(tool => [tool.name, tool] as const));
 
+	const asyncJobManager = new AsyncJobManager({});
 	const session = new AgentSession({
 		agent: new Agent({
 			initialState: {
@@ -93,6 +96,8 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 		settings,
 		modelRegistry,
+		agentId: "Main",
+		asyncJobManager,
 		toolRegistry,
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
 	});
@@ -110,6 +115,7 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 
 	return {
 		tempDir,
+		asyncJobManager,
 		settings,
 		session,
 		mode,
@@ -118,6 +124,8 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 		cleanup: async () => {
 			mode.stop();
 			await session.dispose();
+			asyncJobManager.cancelAll();
+			await asyncJobManager.dispose();
 			tempDir.removeSync();
 			resetSettingsForTest();
 		},
@@ -496,6 +504,66 @@ describe("InteractiveMode goal mode integration", () => {
 		streaming = false;
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
 		await waiter.inputPromise;
+	});
+
+	it("waits for owned background work before submitting another goal continuation", async () => {
+		vi.spyOn(vcs, "repo").mockReturnValue(null);
+		vi.spyOn(vcs, "git").mockReturnValue(null);
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		const gate = Promise.withResolvers<string>();
+		const unregister = harness.asyncJobManager.registerDeliverySink("Main", () => {});
+		const terminalStates: Array<boolean | undefined> = [];
+		const unsubscribe = harness.session.subscribe(event => {
+			if (event.type === "agent_end") terminalStates.push(event.isTerminal);
+		});
+		harness.asyncJobManager.register("bash", "pending build", () => gate.promise, { ownerId: "Main" });
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Waiting for the build result." }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		try {
+			harness.session.agent.emitExternalEvent({ type: "agent_start" });
+			harness.session.agent.emitExternalEvent({ type: "message_end", message });
+			harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+			await harness.session.waitForIdle();
+			expect(terminalStates).toEqual([false]);
+
+			vi.advanceTimersByTime(800);
+			await waitForMicrotasks();
+			expect(waiter.getResolvedInput()).toBeUndefined();
+
+			gate.resolve("done");
+			await harness.asyncJobManager.waitForAll();
+			await harness.asyncJobManager.drainDeliveries();
+			expect(harness.session.hasPendingAsyncWork()).toBe(false);
+			harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+			await harness.session.waitForIdle();
+			expect(terminalStates).toEqual([false, true]);
+			vi.advanceTimersByTime(800);
+			await waitForMicrotasks();
+			expect(waiter.getResolvedInput()?.customType).toBe("goal-continuation");
+			await waiter.inputPromise;
+		} finally {
+			gate.resolve("done");
+			unsubscribe();
+			unregister();
+		}
 	});
 
 	it("stops repeated goal continuations when identical tool evidence adds no new signal", async () => {

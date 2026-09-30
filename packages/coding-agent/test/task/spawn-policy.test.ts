@@ -44,16 +44,17 @@ describe("task spawn policy surfaces", () => {
 
 	it("uses the first allowed spawn as the schema default", () => {
 		const schema = getTaskSchema({ isolationEnabled: false, batchEnabled: false, defaultAgent: "fact-finder" });
-		const parsed = schema({ task: "check" });
+		const parsed = schema({ task: "check", complexity: "c" });
 
-		expect(parsed).toEqual({ agent: "fact-finder", task: "check" });
+		expect(parsed).toEqual({ agent: "fact-finder", task: "check", complexity: "c" });
 	});
 
 	it("accepts per-spawn context inheritance policy in flat and batch schemas", () => {
 		const flat = getTaskSchema({ isolationEnabled: false, batchEnabled: false });
-		expect(flat({ task: "start fresh", contextFilePolicy: "none" })).toEqual({
+		expect(flat({ task: "start fresh", complexity: "no inherited context", contextFilePolicy: "none" })).toEqual({
 			agent: "task",
 			task: "start fresh",
+			complexity: "no inherited context",
 			contextFilePolicy: "none",
 		});
 
@@ -62,18 +63,20 @@ describe("task spawn policy surfaces", () => {
 			batch({
 				context: "shared",
 				tasks: [
-					{ task: "inherit", contextFilePolicy: "inherit" },
-					{ task: "fresh", contextFilePolicy: "none" },
+					{ task: "inherit", complexity: "ordinary child", contextFilePolicy: "inherit" },
+					{ task: "fresh", complexity: "no inherited context", contextFilePolicy: "none" },
 				],
 			}),
 		).toEqual({
 			context: "shared",
 			tasks: [
-				{ agent: "task", task: "inherit", contextFilePolicy: "inherit" },
-				{ agent: "task", task: "fresh", contextFilePolicy: "none" },
+				{ agent: "task", task: "inherit", complexity: "ordinary child", contextFilePolicy: "inherit" },
+				{ agent: "task", task: "fresh", complexity: "no inherited context", contextFilePolicy: "none" },
 			],
 		});
-		expect(flat({ task: "invalid", contextFilePolicy: "sometimes" })).toBeInstanceOf(type.errors);
+		expect(flat({ task: "invalid", complexity: "bad policy", contextFilePolicy: "sometimes" })).toBeInstanceOf(
+			type.errors,
+		);
 	});
 
 	it("filters the agent list to the restricted spawn policy in the description", async () => {

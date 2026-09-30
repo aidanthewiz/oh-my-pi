@@ -1,4 +1,5 @@
 import { Args, type CommandMetadata, Flags } from "@oh-my-pi/pi-utils/cli";
+import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { CLI_THINKING_LEVELS } from "@oh-my-pi/pi-tui/thinking";
 import { CF_BRAND, CF_COMMAND } from "../cli/cf-version";
 import { SERVICE_TIER_OPENAI_VALUES } from "../config/service-tier";
@@ -61,7 +62,7 @@ export const launchHelp = {
 		"from-codex": Flags.boolean({ description: `Import a Codex session into ${CF_BRAND}` }),
 		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
 		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
-		models: Flags.string({ description: "Comma-separated model patterns for Ctrl+P cycling" }),
+		models: Flags.string({ description: `Comma-separated model patterns for ${formatKeyHint("ctrl+p")} cycling` }),
 		"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
 		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
 		"no-mcp": Flags.boolean({ description: "Disable MCP discovery and connections entirely for this run" }),

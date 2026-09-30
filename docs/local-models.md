@@ -26,6 +26,12 @@ Inspect the catalog with `omp models --kind tiny`, `omp models --kind tts`, and 
 
 The tiny-model CLI and source registry retain **title** and **memory** groupings because those are the workloads used to benchmark and recommend model sizes. They are not runtime model classes: every entry in both groups has catalog kind `tiny`, and any compatible entry can be assigned to `tiny`, `memory`, or `judge`. Choose based on quality and resource needs rather than the CLI grouping alone.
 
+## Word completion
+
+`spelling.autocomplete` defaults to `auto`, which uses the on-device `ngram` engine. Use `off` to disable ghost text, `apple` for the macOS dictionary, or `smollm` for the optional local SmolLM2 model. `apple` falls back to `ngram` on other platforms. Install SmolLM2 only by running `coreforge tiny-models download smollm`; `coreforge predict --smollm` requires those weights. Plain `coreforge predict` does not download them.
+
+On first use with empty prediction state, the learning engine reads local Coreforge history and `~/.claude/history.jsonl` and `~/.codex/history.jsonl` to learn vocabulary. Those prompts may contain sensitive text. Inference and learned state stay on the device; no prompt is uploaded for word completion. Set `spelling.autocomplete` to `off` to avoid this background history import.
+
 ## Runtime / environment findings
 
 - **Stack**: `@huggingface/transformers` (transformers.js) v4 running under Bun. In Bun the library

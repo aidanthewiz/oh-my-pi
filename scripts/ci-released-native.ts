@@ -20,10 +20,12 @@ const NATIVE_INPUT_FILES = new Set([
 	"MODULE.bazel.lock",
 	"rust-toolchain.toml",
 	"packages/natives/package.json",
+	"packages/natives/native/version-sentinel.js",
 	"packages/natives/scripts/build-bindings.ts",
 	"packages/natives/scripts/gen-enums.ts",
 	"rustfmt.toml",
 	"scripts/bazel-natives.ts",
+	"scripts/stamp-native-version.ts",
 	"scripts/host-detect.ts",
 ]);
 

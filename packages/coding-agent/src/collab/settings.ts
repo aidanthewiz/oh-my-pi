@@ -2,6 +2,7 @@
  * Settings declared by this domain (see `config/registry.ts`). Declaration order is the
  * settings-panel order; `config/all-settings.ts` registers every domain.
  */
+import { CF_COMMAND } from "../cli/cf-version";
 import { register } from "../config/registry";
 import { DEFAULT_RELAY_URL } from "./protocol";
 
@@ -52,14 +53,13 @@ export const cfgCollabAutoStart = register({
 		tab: "interaction",
 		group: "Collab",
 		label: "Auto Start",
-		description:
-			"Host every interactive session via collab.relayUrl as it starts and publish it to the local registry (omp collab list); rooms rotate on session switch",
+		description: `Host every interactive session via collab.relayUrl as it starts and publish it to the local registry (${CF_COMMAND} collab list); rooms rotate on session switch`,
 		options: [
 			{ value: "off", label: "Off", description: "Share only when /collab is run" },
 			{
 				value: "view",
 				label: "View",
-				description: "Auto-host; the registry hands out view-only links (omp collab link --view)",
+				description: `Auto-host; the registry hands out view-only links (${CF_COMMAND} collab link --view)`,
 			},
 			{
 				value: "control",

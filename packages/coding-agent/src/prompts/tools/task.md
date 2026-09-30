@@ -17,14 +17,15 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
 - `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`). Omit only when the default (`{{defaultAgent}}`) fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
 - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
+- `complexity`: Why the task is simple or complex, ≤12 words (`one-line rename, no callers`; `cross-module race, no repro`); sets child thinking depth.
 {{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
 {{/if}}{{#if effortEnabled}}- `effort`: `"lo"`|`"med"`|`"hi"` by complexity.
 {{/if}}- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
-- `contextFilePolicy`: `"inherit"` (default) forwards the ordered global baseline and local overrides; `"none"` starts a deliberately context-agnostic agent.
+- `contextFilePolicy`: `"inherit"` (default) forwards ordered instruction files; `"none"` omits them, but still inherits managed settings and tool policy.
 {{#if isolationEnabled}}{{#if applyIsolatedChanges}}- `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
 {{else}}- `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
-{{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{/if}}{{/if}}Children start without conversation history;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Constraints`, `# Contract` interfaces); NEVER repeat per task.

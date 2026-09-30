@@ -12,6 +12,9 @@
 - `packages/natives/native/loader-state.js` and `loader-state.d.ts`
 - `packages/natives/native/desktop.js` and `desktop.d.ts`
 - `packages/natives/native/clipboard.js` and `clipboard.d.ts`
+- `packages/natives/native/mermaid.js` and `mermaid.d.ts`
+- `packages/natives/native/vcs.js` and `vcs.d.ts`
+- `packages/natives/native/version-sentinel.js` and `version-sentinel.d.ts`
 - `packages/natives/native/embedded-addon.js`
 - `packages/natives/scripts/build-bindings.ts`
 - `packages/natives/scripts/embed-native.ts`
@@ -22,13 +25,15 @@
 
 ## Package entrypoints
 
-The package exports three entrypoints:
+The package exports five entrypoints:
 
 | Import                           | Runtime               | Types                   | Load behavior                                                                           |
 | -------------------------------- | --------------------- | ----------------------- | --------------------------------------------------------------------------------------- |
 | `@oh-my-pi/pi-natives`           | `native/index.js`     | `native/index.d.ts`     | Loads the addon immediately, then binds every generated class/function and enum object. |
 | `@oh-my-pi/pi-natives/desktop`   | `native/desktop.js`   | `native/desktop.d.ts`   | Exposes `createDesktopSession(options)` and defers addon loading until it is called.    |
 | `@oh-my-pi/pi-natives/clipboard` | `native/clipboard.js` | `native/clipboard.d.ts` | Exposes lazy `copyToClipboard` and `readImageFromClipboard` wrappers.                   |
+| `@oh-my-pi/pi-natives/mermaid`  | `native/mermaid.js`  | `native/mermaid.d.ts`  | Renders Mermaid ASCII and loads the addon on first call.                               |
+| `@oh-my-pi/pi-natives/vcs`      | `native/vcs.js`      | `native/vcs.d.ts`      | Exposes VCS wrappers and loads the addon on first call.                                |
 
 There is no `packages/natives/src` wrapper layer. Root consumers call generated N-API exports directly. The lazy subpaths exist so workers can import their JS wrapper without loading the large addon before the relevant operation initializes.
 
@@ -37,7 +42,7 @@ Current root capabilities include:
 - search, globbing, workspace scans, AST matching/editing, code summaries, syntax highlighting, text layout, token counting, and structured diffs;
 - shell, PTY, process, file-lock, isolation, and work-profile primitives;
 - desktop capture/input/accessibility, clipboard, audio capture/playback, live WebRTC, device-check, SIXEL, snapcompact rendering, and vector ranking;
-- PDF inspection/Markdown conversion, SVG rasterization, macOS spelling services, and in-process Git/Jujutsu operations.
+- PDF inspection/Markdown conversion, SVG rasterization, macOS spelling services, local text prediction, and in-process Git/Jujutsu operations.
 
 ## Loader and distribution
 
@@ -50,7 +55,7 @@ Current root capabilities include:
 - `win32-x64`
 - `win32-arm64`
 
-x64 builds have `modern` (x86-64-v3/AVX2) and `baseline` (x86-64-v2) variants. `PI_NATIVE_VARIANT=modern|baseline` overrides automatic detection. Automatic detection reads `/proc/cpuinfo` on Linux, calls `sysctl` on macOS, or queries `System.Runtime.Intrinsics.X86.Avx2` in PowerShell on Windows. Its result is inherited by subsequent workers and child processes through the private `__PI_NATIVE_VARIANT_CACHE` environment entry. Non-x64 builds use an unsuffixed filename.
+x64 builds have `modern` (x86-64-v3/AVX2) and `baseline` (x86-64-v2) variants. `PI_NATIVE_VARIANT=modern|baseline` overrides automatic detection. Detection reads `/proc/cpuinfo` on Linux, calls `sysctl` on macOS, and checks the Windows kernel's AVX2 feature flag through Bun FFI before falling back to PowerShell. Its result is inherited by subsequent workers and child processes through the private `__PI_NATIVE_VARIANT_CACHE` environment entry. Non-x64 builds use an unsuffixed filename.
 
 Filename fallback is:
 
@@ -72,9 +77,9 @@ After an addon loads successfully, the loader best-effort removes cache director
 
 ## Load validation and runtime initialization
 
-Every install or compiled candidate must expose the version sentinel computed from `package.json#version`, such as `__piNativesV18_3_0`. Workspace loads skip this check. The loader does not validate a complete symbol list.
+Every identified install or compiled candidate must report `package.json#version` from `__piNativesBuildVersion()` or a legacy release sentinel. The new version is not compiled in: `scripts/stamp-native-version.ts` writes it into a fixed placeholder slot after linking, on every `scripts/bazel-natives.ts` install and local cargo build, so a release bump does not recompile the addon crate. Pre-sentinel addons with the legacy core API remain compatible when the on-disk file has no current stamp. Workspace loads skip the version check. The loader does not validate a complete symbol list.
 
-After `require(...)` and sentinel validation, the loader calls `__ompInstallTokioRuntime()` when present. Rust deliberately avoids creating worker threads during `#[module_init]`, while the dynamic-loader lock is held. The post-load hook installs bounded Windows Tokio/Rayon pools; older addons without the hook use napi-rs defaults. Hook failure is best-effort and appears only in startup markers when enabled.
+After `require(...)` and version validation, the loader calls `__ompInstallTokioRuntime()` when present. Rust deliberately avoids creating worker threads during `#[module_init]`, while the dynamic-loader lock is held. The post-load hook installs bounded Windows Tokio/Rayon pools; older addons without the hook use napi-rs defaults. Hook failure is best-effort and appears only in startup markers when enabled.
 
 Set `PI_DEBUG_STARTUP` to emit synchronous `[startup]` markers to stderr around addon loading, extraction, and runtime installation.
 
@@ -84,7 +89,7 @@ Set `PI_DEBUG_STARTUP` to emit synchronous `[startup]` markers to stderr around 
 
 - platform/runtime: `appearance`, `clipboard`, `crash_handler`, `desktop`, `devicecheck`, `file_lock`, `iofs`, `power`, `prof`, `ps`, `pty`, `shell`, `spelling`, `tty_writer`, `vcs`;
 - media/live: `audio`, `live`, `sixel`, `snapcompact`, `svg`;
-- code/data: `ast`, `block`, `diff`, `fd`, `glob`, `glob_util`, `grep`, `highlight`, `html`, `keys`, `pdf`, `summary`, `text`, `tokens` (including Jev), `utok`, `vectors`, `workspace`;
+- code/data: `ast`, `block`, `diff`, `fd`, `glob`, `glob_util`, `grep`, `highlight`, `html`, `keys`, `mermaid`, `pdf`, `predict`, `summary`, `text`, `tokens` (including Jev), `utok`, `vectors`, `workspace`;
 - platform model bridge: `applefm` (Apple Foundation Models on supported macOS hosts, a native stub elsewhere);
 - isolation/task support: `iso`, `task`, plus N-API boundary/conversion helpers (`js`, crate-private `utils`, test-only `testing`);
 - language metadata re-exported from `pi_ast::language`.
@@ -104,7 +109,7 @@ For the supporting-crate map, see [`native-crates.md`](./native-crates.md). For 
 1. A consumer imports the eager root or a lazy subpath.
 2. `loadNative()` computes mode, platform, variant, filenames, and ordered candidates.
 3. Embedded extraction or Windows staging may prepend a cache candidate.
-4. Candidates are required in order and install/compiled loads are sentinel-validated.
+4. Candidates are required in order and install/compiled loads are release-stamp-validated.
 5. The optional post-load runtime hook runs, then stale cache versions are cleaned up best-effort.
 6. The root binds generated named exports; lazy subpaths invoke selected bindings through wrappers.
 7. Callers invoke N-API functions/classes; napi-rs performs argument and result conversion.

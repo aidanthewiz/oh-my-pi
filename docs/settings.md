@@ -887,7 +887,7 @@ Every schema path not individually tabulated in this catalog is explicitly defer
 
 - Agent behavior and safety: `ask.*`, `eval.*`, `features.*`, `goal.*`, `loop.*`, `model.loopGuard.*`, `model.toolCallLoopGuard.*`, `prewalk.*`, `recap.*`, `tools.*`, and `vault.*`.
 - Execution and content: `commit.*`, `completion.*`, `edit.*`, `error.*`, `extensionHandlers.*`, `generate_image.*`, `git.*`, `images.*`, `live.*`, `paste.*`, `power.*`, `read.*`, `shellMinimizer.*`, `speech.*`, `terminal.*`, and `title.*`.
-- Interface and startup: `display.*`, `statusLine.*`, `startup.*`, `stt.*`, `tui.*`, and `ttsr.*`.
+- Interface and startup: `display.*`, `spelling.*`, `statusLine.*`, `startup.*`, `stt.*`, `tui.*`, and `ttsr.*`. See [Word completion](./local-models.md#word-completion) for local history import and optional model downloads.
 - Ungrouped keys: `setupVersion`, `proseOnlyThinking`, `omitThinking`, `externalThinking`, `includeWorkspaceTree`, `autocompleteMaxVisible`, `emojiAutocomplete`, `disabledExtensions`, `inlineToolDescriptors`, and `treeFilterMode`.
 
 These settings follow the same schema-defined type and default rules shown above.
@@ -918,6 +918,7 @@ Applied whenever raw settings are loaded (global, project, overlays, and runtime
 | legacy `task.isolation.mode: none`                                       | `task.isolation.enabled: false`                                                                              |
 | legacy `task.isolation.mode: <backend>`                                  | `task.isolation.enabled: true` + `isolation.backend: <backend>`                                              |
 | `task.simple`                                                            | removed                                                                                                      |
+| `spelling.autocomplete: true` / `false`                                 | `spelling.autocomplete: auto` / `off`                                                                      |
 | legacy isolation backends (`worktree`, `fuse-overlay`, `fuse-projfs`)    | `rcopy`, `overlayfs`, `projfs`                                                                               |
 | `lastChangelogVersion`                                                   | moved to a marker file and stripped from `config.yml`                                                        |
 

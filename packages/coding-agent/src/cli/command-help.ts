@@ -102,6 +102,10 @@ export const playHelp = {
 	description: "Replay a /record session recording in the terminal (space pauses, q quits)",
 } satisfies CommandMetadata;
 
+export const predictHelp = {
+	description: "Compare local word-completion engines (SmolLM requires --smollm and installed weights)",
+} satisfies CommandMetadata;
+
 export const psHelp = {
 	description: "List and control daemon-supervised background processes (logs, stop, kill, restart)",
 } satisfies CommandMetadata;
@@ -131,6 +135,10 @@ export const setupHelp = {
 
 export const shellHelp = { description: "Interactive shell console" } satisfies CommandMetadata;
 
+export const skillHelp = {
+	description: "List skills available to a session (no registry or downloads)",
+} satisfies CommandMetadata;
+
 export const sshHelp = { description: "Manage SSH host configurations" } satisfies CommandMetadata;
 
 export const statsHelp = { description: "View usage statistics" } satisfies CommandMetadata;
@@ -140,7 +148,7 @@ export const streamHelp = {
 } satisfies CommandMetadata;
 
 export const tinyModelsHelp = {
-	description: "Download tiny local models (session titles + memory)",
+	description: "Download tiny local models (session titles, memory, word completion)",
 } satisfies CommandMetadata;
 
 export const tokenHelp = { description: "Get the API key or OAuth token for a provider" } satisfies CommandMetadata;

@@ -277,6 +277,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 		return params.tasks;
 	}
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
+	if ("complexity" in params) item.complexity = params.complexity;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("contextFilePolicy" in params) item.contextFilePolicy = params.contextFilePolicy;
@@ -300,6 +301,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
 	if (item.contextFilePolicy !== undefined) spawn.contextFilePolicy = item.contextFilePolicy;
+	if (item.complexity !== undefined) spawn.complexity = item.complexity;
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
@@ -1510,6 +1512,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.contextFilePolicy !== undefined ? { contextFilePolicy: params.contextFilePolicy } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
+				complexity: params.complexity,
 				...(params.tools?.length
 					? {
 							customTools: createEvalCustomTools(
