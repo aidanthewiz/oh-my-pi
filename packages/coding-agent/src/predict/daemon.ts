@@ -75,7 +75,7 @@ class Engine {
 	/** Cursor value covered by the last successful persist. */
 	#persistedCursor: number;
 	#dirty = false;
-	#ingesting: Promise<number> = Promise.resolve(0);
+	#pending: Promise<void> = Promise.resolve();
 
 	constructor(
 		readonly method: TextPredictMethod,
@@ -96,6 +96,15 @@ class Engine {
 		this.#dirty = true;
 	}
 
+	#enqueue<T>(run: () => Promise<T>): Promise<T> {
+		const next = this.#pending.then(run);
+		this.#pending = next.then(
+			() => undefined,
+			() => undefined,
+		);
+		return next;
+	}
+
 	/**
 	 * Feed history rows past the cursor through `observe`, one ingestion at a
 	 * time; empty state first learns the foreign prompt histories.
@@ -103,23 +112,23 @@ class Engine {
 	ingest(historyDbPath: string): Promise<number> {
 		// `apple` only wraps the system dictionary; it learns nothing.
 		if (this.method === "apple") return Promise.resolve(0);
-		const run = (): Promise<number> => this.#ingestNow(historyDbPath);
-		this.#ingesting = this.#ingesting.then(run, run);
-		return this.#ingesting;
+		return this.#enqueue(() => this.#ingestNow(historyDbPath));
 	}
 
-	async persist(): Promise<void> {
-		if (!this.dirty) return;
-		const cursor = this.cursor;
-		this.#dirty = false;
-		try {
-			await this.predictor.persist();
-			await Bun.write(path.join(this.stateDir, CURSOR_FILE), JSON.stringify({ historyId: cursor }));
-			this.#persistedCursor = cursor;
-		} catch (error) {
-			this.#dirty = true;
-			throw error;
-		}
+	persist(): Promise<void> {
+		return this.#enqueue(async () => {
+			if (!this.dirty) return;
+			const cursor = this.cursor;
+			this.#dirty = false;
+			try {
+				await this.predictor.persist();
+				await Bun.write(path.join(this.stateDir, CURSOR_FILE), JSON.stringify({ historyId: cursor }));
+				this.#persistedCursor = cursor;
+			} catch (error) {
+				this.#dirty = true;
+				throw error;
+			}
+		});
 	}
 
 	async #ingestNow(historyDbPath: string): Promise<number> {
