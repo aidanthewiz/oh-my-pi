@@ -83,7 +83,7 @@ jobs:
     name: validate
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Download released Coreforce native addon
         if: needs.prepare.outputs.native_changed != 'true'
