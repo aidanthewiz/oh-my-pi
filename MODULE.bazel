@@ -45,15 +45,9 @@ rust.toolchain(
         "aarch64-apple-darwin",
         "x86_64-pc-windows-msvc",
     ],
-    # Xcode 27 corrupts stripped proc-macro LINKEDIT; ship with pinned lld and keep exec dylibs unstripped.
-    extra_rustc_flags_triples = {
-        "aarch64-apple-darwin": [
-            "-Clink-arg=-fuse-ld=$${pwd}/$(RUST_SYSROOT)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld64.lld",
-        ],
-    },
+    # Xcode 27 corrupts stripped Rust proc-macro dylibs; leave these unstripped.
     extra_exec_rustc_flags_triples = {
         "aarch64-apple-darwin": [
-            "-Clink-arg=-fuse-ld=$${pwd}/$(RUST_SYSROOT)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld64.lld",
             "-Cstrip=none",
         ],
     },

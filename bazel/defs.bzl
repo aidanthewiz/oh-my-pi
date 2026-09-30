@@ -1,19 +1,16 @@
 """Rules for producing release-grade, canonically named pi_natives addons.
 
 `native_addon` transitions //crates/pi-natives:pi_natives onto a shipping
-platform with the release codegen profile (opt, thin LTO, cgu=16, stripped —
-mirrors the cargo `ci` profile) and renames the produced shared library to the
-loader's canonical `pi_natives.<platform>-<arch>[-<variant>].node` filename.
+platform with the release codegen profile (opt, thin LTO, cgu=16, stripped
+except Darwin ARM64 where Xcode 27 corrupts the stripped Mach-O LINKEDIT) and
+renames the produced library to its canonical `.node` filename.
 
 Encoding the profile in the transition means `bazel build //:natives-<t>` is
 always release-grade regardless of -c, and every addon shares one cache entry
 per (platform, source) pair.
 """
 
-_ADDON_RUSTC_FLAGS = [
-    "-Ccodegen-units=16",
-    "-Cstrip=symbols",
-]
+_ADDON_RUSTC_FLAGS = ["-Ccodegen-units=16"]
 
 def _addon_transition_impl(settings, attr):
     # Statically link the MSVC CRT for the shipped win32 addon: rustc gets
@@ -32,7 +29,9 @@ def _addon_transition_impl(settings, attr):
         "//command_line_option:compilation_mode": "opt",
         "//command_line_option:features": features,
         "@rules_rust//rust/settings:lto": "thin",
-        "@rules_rust//rust/settings:extra_rustc_flags": _ADDON_RUSTC_FLAGS,
+        "@rules_rust//rust/settings:extra_rustc_flags": _ADDON_RUSTC_FLAGS + [
+            "-Cstrip=none" if "darwin-arm64" in str(attr.platform) else "-Cstrip=symbols",
+        ],
     }
 
 _addon_transition = transition(
