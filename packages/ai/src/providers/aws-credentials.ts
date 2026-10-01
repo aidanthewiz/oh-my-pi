@@ -18,8 +18,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { allowAmbientAwsModelCredentials } from "../aws-model-auth";
+import { $env, getOperationalAwsLaunchMetadata, isCoreforgeManagedLaunch, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import {
+	allowAmbientAwsModelCredentials,
+	AWS_MODEL_ACCOUNT_ID_ENV,
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
+} from "../aws-model-auth";
 import * as AIError from "../error";
 import type { FetchImpl } from "../types";
 import { raceWithSignal } from "../utils/abort";
@@ -68,6 +74,10 @@ const SHARED_RESOLVE_TIMEOUT_MS = 30_000;
 const RECOVERY_COOLDOWN_MS = 60_000;
 
 const MANAGED_MODEL_CHILD_CLEARED_ENV_VARS = [
+	AWS_MODEL_ACCOUNT_ID_ENV,
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
 	"AWS_PROFILE",
 	"AWS_DEFAULT_PROFILE",
 	"AWS_REGION",
@@ -151,7 +161,12 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 	const profile = resolveAwsProfile(opts.profile);
 	const region = resolveAwsRegion(opts.region, opts.profile);
 	const loadSharedConfig = shouldLoadAwsSharedConfig(opts.profile);
-	const cacheKey = `${credentialCacheKey(profile, region, loadSharedConfig)}\x00${allowAmbientCredentials ? "ambient" : "managed"}`;
+	const expectedAccount = allowAmbientCredentials ? undefined : $env[AWS_MODEL_ACCOUNT_ID_ENV]?.trim();
+	if (!allowAmbientCredentials && !/^\d{12}$/.test(expectedAccount ?? "")) {
+		throw new AIError.AwsCredentialsError("Managed AWS model account ID is missing or invalid.", "resolution");
+	}
+	const cacheKey = `${credentialCacheKey(profile, region, loadSharedConfig)}\x00${allowAmbientCredentials ? "ambient" : `managed:${expectedAccount}`}`;
+	opts.signal?.throwIfAborted();
 
 	const hit = cache.get(cacheKey);
 	if (hit && hit.expiresAt - REFRESH_SKEW_MS > Date.now()) return hit.creds;
@@ -174,6 +189,15 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 				loadSharedConfig,
 				fetchImpl,
 			);
+			if (expectedAccount) {
+				await verifyManagedModelAccount(
+					creds,
+					expectedAccount,
+					region,
+					AbortSignal.timeout(SHARED_RESOLVE_TIMEOUT_MS),
+					fetchImpl,
+				);
+			}
 			cache.set(cacheKey, { creds, expiresAt: creds.expiresAt ?? Number.POSITIVE_INFINITY });
 			return creds;
 		} finally {
@@ -452,7 +476,9 @@ async function readSsoCredentialsViaAwsCli(
 	allowAmbientCredentials: boolean,
 	signal: AbortSignal | undefined,
 ): Promise<ResolvedCredentials | undefined> {
-	const executable = Bun.which("aws", { PATH: $env.PATH });
+	const executable = isCoreforgeManagedLaunch()
+		? getOperationalAwsLaunchMetadata()?.executable
+		: Bun.which("aws", { PATH: $env.PATH });
 	if (!executable) return undefined;
 	try {
 		return await runCredentialCommand(
@@ -564,6 +590,48 @@ async function resolveCredentialSource(
 			return readContainerCredentials(signal, fetchImpl);
 		default:
 			throw new AIError.AwsCredentialsError(`Unsupported AWS credential_source '${source}'.`, "profile");
+	}
+}
+
+/** Prove the account of the exact credentials subsequently used for model signing. */
+async function verifyManagedModelAccount(
+	credentials: ResolvedCredentials,
+	expectedAccount: string,
+	region: string,
+	signal: AbortSignal,
+	fetchImpl: FetchImpl,
+): Promise<void> {
+	const endpoint = new URL(stsEndpoint(region));
+	const body = new TextEncoder().encode("Action=GetCallerIdentity&Version=2011-06-15");
+	const contentType = "application/x-www-form-urlencoded";
+	const headers = await signRequest({
+		method: "POST",
+		host: endpoint.host,
+		path: endpoint.pathname,
+		body,
+		region,
+		service: "sts",
+		credentials,
+		headers: { "content-type": contentType },
+	});
+	const response = await fetchImpl(endpoint, {
+		method: "POST",
+		headers: { ...headers, "content-type": contentType },
+		body,
+		signal,
+	});
+	if (!response.ok) {
+		throw new AIError.AwsCredentialsError(
+			`Managed AWS account verification failed (${response.status}).`,
+			"resolution",
+		);
+	}
+	const account = xmlTag(await response.text(), "Account");
+	if (!account || account !== expectedAccount) {
+		throw new AIError.AwsCredentialsError(
+			"Managed AWS model credentials belong to a different account.",
+			"resolution",
+		);
 	}
 }
 
@@ -1312,6 +1380,6 @@ export function invalidateAwsCredentialCache(opts: { profile?: string; region?: 
 	const region = resolveAwsRegion(opts.region, opts.profile);
 	const loadSharedConfig = shouldLoadAwsSharedConfig(opts.profile);
 	cache.delete(
-		`${credentialCacheKey(profile, region, loadSharedConfig)}\x00${allowAmbientCredentials ? "ambient" : "managed"}`,
+		`${credentialCacheKey(profile, region, loadSharedConfig)}\x00${allowAmbientCredentials ? "ambient" : `managed:${$env[AWS_MODEL_ACCOUNT_ID_ENV]?.trim()}`}`,
 	);
 }

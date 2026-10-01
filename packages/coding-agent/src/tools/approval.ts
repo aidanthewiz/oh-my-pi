@@ -28,6 +28,7 @@ export interface RuntimeApprovalCapableTool {
 		context?: AgentToolContext,
 	): Promise<RuntimeToolApprovalRequest | undefined>;
 	approveRuntimeApproval?(toolCallId: string, args: unknown): void;
+	denyRuntimeApproval?(toolCallId: string, args: unknown): void;
 }
 
 /** Settings-shaped reader the execute-time tool context may carry. */

@@ -865,19 +865,36 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		// chunked response without the terminal chunk, closed mid-body, makes the
 		// client's body read throw.
 		const observed = { posts: 0, lastEventId: null as string | null };
+		const primed = Promise.withResolvers<void>();
 		const sseChunk = (payload: string): string =>
 			`HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n${payload.length.toString(16)}\r\n${payload}\r\n`;
+		const incoming = new WeakMap<object, string>();
 		const listener = Bun.listen({
 			hostname: "127.0.0.1",
 			port: 0,
 			socket: {
 				data(socket, data) {
-					const request = new TextDecoder().decode(data);
+					// Finish the request body before closing; otherwise the peer can reset an unread POST.
+					const request = (incoming.get(socket) ?? "") + new TextDecoder().decode(data);
+					const headerEnd = request.indexOf("\r\n\r\n");
+					if (headerEnd < 0) {
+						incoming.set(socket, request);
+						return;
+					}
+					const contentLength = Number(/^content-length:\s*(\d+)/im.exec(request.slice(0, headerEnd))?.[1] ?? "0");
+					if (request.length - headerEnd - 4 < contentLength) {
+						incoming.set(socket, request);
+						return;
+					}
+					incoming.delete(socket);
 					if (request.startsWith("POST")) {
 						observed.posts++;
-						// Priming event, then close without the terminal 0-chunk.
-						socket.write(sseChunk("id: stream-1\nretry: 10\ndata:\n\n"));
-						socket.end();
+						socket.write(
+							sseChunk(
+								'id: stream-1\nretry: 10\ndata: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n',
+							),
+						);
+						void primed.promise.then(() => socket.end());
 						return;
 					}
 					if (!request.startsWith("GET")) return;
@@ -897,6 +914,9 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				url: `http://127.0.0.1:${listener.port}/mcp`,
 				timeout: GUARD_TIMEOUT_MS,
 			});
+			transport.onNotification = method => {
+				if (method === "notifications/progress") primed.resolve();
+			};
 			await transport.connect();
 
 			await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({

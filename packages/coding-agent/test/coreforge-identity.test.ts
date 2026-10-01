@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_AUTH_MODE_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
@@ -52,6 +53,7 @@ function identitySettings(values: Record<string, unknown> = {}): Settings {
 		"identity.entra.authorityHost": "login.microsoftonline.com",
 		"identity.aws.profile": "somacommercial",
 		"identity.aws.region": "us-east-1",
+		"identity.aws.ssoAccountId": "891455110252",
 		"identity.claude.workspaceId": "wrkspc_test",
 		"identity.claude.baseUrl": "https://aws-external-anthropic.us-east-1.api.aws",
 		...values,
@@ -186,6 +188,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("somacommercial");
 		expect(env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
+		expect(env[AWS_MODEL_ACCOUNT_ID_ENV]).toBe("891455110252");
 		expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe("wrkspc_test");
 		expect(env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 	});
@@ -194,6 +197,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		const script = `
 			import {
 				AWS_MODEL_PROFILE_ENV,
+				AWS_MODEL_ACCOUNT_ID_ENV,
 				AWS_MODEL_REGION_ENV,
 			} from "@oh-my-pi/pi-ai";
 			import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -206,6 +210,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 				"identity.entra.clientId": "${CLIENT_ID}",
 				"identity.aws.profile": "managed-coreforge",
 				"identity.aws.region": "us-east-1",
+				"identity.aws.ssoAccountId": "891455110252",
 				"identity.claude.workspaceId": "wrkspc_sensitive",
 				"identity.claude.baseUrl": "https://aws-external-anthropic.us-east-1.api.aws",
 			});
@@ -217,6 +222,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 			});
 			const modelKeys = [
 				AWS_MODEL_PROFILE_ENV,
+				AWS_MODEL_ACCOUNT_ID_ENV,
 				AWS_MODEL_REGION_ENV,
 				"ANTHROPIC_AWS_WORKSPACE_ID",
 				"ANTHROPIC_BASE_URL",
@@ -296,7 +302,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(result.removedManagedAwsProfile).toBe(true);
 	});
 
-	it("restores the full launcher-captured AWS chain and removes every alias", () => {
+	it("rejects forged operational aliases without adopting them as model credentials", () => {
 		const env: Record<string, string | undefined> = {
 			AWS_PROFILE: "managed-model-profile",
 			AWS_REGION: "managed-model-region",
@@ -309,15 +315,15 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		restoreCoreforgeOperationalAwsEnvironment(env);
 
 		for (const key of OPERATIONAL_AWS_ENV_NAMES) {
-			expect(env[key]).toBe(`launcher-${key}`);
+			expect(env[key]).not.toBe(`launcher-${key}`);
 			expect(env[`OMP_OPERATIONAL_${key}_SET`]).toBeUndefined();
 			expect(env[`OMP_OPERATIONAL_${key}`]).toBeUndefined();
 		}
-		expect(env[AWS_MODEL_PROFILE_ENV]).toBe("managed-model-profile");
-		expect(env[AWS_MODEL_REGION_ENV]).toBe("managed-model-region");
+		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
+		expect(env[AWS_MODEL_REGION_ENV]).toBeUndefined();
 	});
 
-	it("clears ambient model-auth envs while preserving the operational AWS chain", () => {
+	it("clears ambient model authentication and operational credentials", () => {
 		const settings = identitySettings();
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-ant-stale",
@@ -345,16 +351,15 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
 		expect(result.clearedKeys).toContain("OPENAI_API_KEY");
 
-		expect(env.AWS_PROFILE).toBe("user-profile");
-		expect(env.AWS_ACCESS_KEY_ID).toBe("AKIASTALE");
-		expect(env.AWS_SECRET_ACCESS_KEY).toBe("secretstale");
-		expect(env.AWS_CONFIG_FILE).toBe("/home/dev/.aws/other-config");
-		expect(env.AWS_SHARED_CREDENTIALS_FILE).toBe("/home/dev/.aws/other-creds");
-		expect(result.clearedKeys).not.toContain("AWS_ACCESS_KEY_ID");
+		expect(env.AWS_PROFILE).toBeUndefined();
+		expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+		expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+		expect(env.AWS_CONFIG_FILE).not.toBe("/home/dev/.aws/other-config");
+		expect(env.AWS_SHARED_CREDENTIALS_FILE).not.toBe("/home/dev/.aws/other-creds");
 		expect(env.PERPLEXITY_API_KEY).toBe("pplx-keep");
 	});
 
-	it("blocks ambient model auth before sign-in without changing operational AWS credentials", () => {
+	it("blocks ambient model and operational authentication before sign-in", () => {
 		const settings = identitySettings();
 		const env: Record<string, string | undefined> = {
 			ANTHROPIC_API_KEY: "sk-ant-stale",
@@ -371,30 +376,144 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
-		expect(env.AWS_PROFILE).toBe("user-profile");
+		expect(env.AWS_PROFILE).toBeUndefined();
 		expect(env.GITHUB_TOKEN).toBe("ghp-keep");
 	});
 
-	it("is a no-op that leaves ambient envs untouched when Entra is unprovisioned", () => {
+	it("preserves classic AWS credentials and selectors when Entra is unprovisioned", () => {
 		const settings = identitySettings({
 			"identity.entra.tenantId": undefined,
 			"identity.entra.clientId": undefined,
 		});
-		const env: Record<string, string | undefined> = { ANTHROPIC_API_KEY: "sk-keep", AWS_PROFILE: "keep" };
+		const env: Record<string, string | undefined> = {
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "keep",
+			AWS_REGION: "us-west-2",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(false);
-		expect(result.clearedKeys).toEqual([]);
-		expect(result.appliedKeys).toEqual([]);
-		expect(env.ANTHROPIC_API_KEY).toBe("sk-keep");
-		expect(env.AWS_PROFILE).toBe("keep");
+		expect(env).toEqual({
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "keep",
+			AWS_REGION: "us-west-2",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		});
 	});
 
 	it("is a no-op when Entra is disabled entirely", () => {
 		const settings = identitySettings({ "identity.entra.enabled": false });
-		const env: Record<string, string | undefined> = { ANTHROPIC_API_KEY: "sk-keep" };
+		const env: Record<string, string | undefined> = {
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "caller-profile",
+			AWS_REGION: "us-east-1",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		};
 		const result = applyCoreforgeIdentityProviderDefaults(settings, env, () => sampleProfile());
 		expect(result.entraProvisioned).toBe(false);
-		expect(env.ANTHROPIC_API_KEY).toBe("sk-keep");
+		expect(env).toEqual({
+			ANTHROPIC_API_KEY: "sk-keep",
+			AWS_PROFILE: "caller-profile",
+			AWS_REGION: "us-east-1",
+			AWS_ACCESS_KEY_ID: "caller-access",
+			AWS_SECRET_ACCESS_KEY: "caller-secret",
+		});
+	});
+
+	it("preserves classic caller AWS state without exposing credentials to repository children", async () => {
+		const script = `
+			import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+			import { clearAwsCredentialCache, resolveAwsCredentials } from "@oh-my-pi/pi-ai/providers/aws-credentials";
+			import { ensureCoreforgeIdentityAtStartup } from "@oh-my-pi/pi-coding-agent/identity/startup";
+			import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
+			const settings = (enabled, tenantId, clientId) => Settings.isolated({
+				"identity.entra.enabled": enabled,
+				"identity.entra.tenantId": tenantId,
+				"identity.entra.clientId": clientId,
+			});
+			const snapshot = () => {
+				const child = filterChildShellEnv(Bun.env);
+				return {
+					accessIsCaller: Bun.env.AWS_ACCESS_KEY_ID === "caller-access",
+					secretIsCaller: Bun.env.AWS_SECRET_ACCESS_KEY === "caller-secret",
+					sessionIsCaller: Bun.env.AWS_SESSION_TOKEN === "caller-session",
+					profileIsCaller: Bun.env.AWS_PROFILE === "caller-profile",
+					regionIsCaller: Bun.env.AWS_REGION === "us-west-2",
+					defaultProfileIsLaunch: Bun.env.AWS_DEFAULT_PROFILE === "employee",
+					childSafe: child.AWS_ACCESS_KEY_ID === undefined && child.AWS_SECRET_ACCESS_KEY === undefined &&
+						child.AWS_SESSION_TOKEN === undefined && child.OMP_OPERATIONAL_AWS_PROFILE === undefined,
+				};
+			};
+			Bun.env.AWS_ACCESS_KEY_ID = "caller-access";
+			Bun.env.AWS_SECRET_ACCESS_KEY = "caller-secret";
+			Bun.env.AWS_SESSION_TOKEN = "caller-session";
+			Bun.env.AWS_PROFILE = "caller-profile";
+			Bun.env.AWS_REGION = "us-west-2";
+			await ensureCoreforgeIdentityAtStartup(settings(false), { interactive: false });
+			const disabled = snapshot();
+			disabled.modelAccessIsCaller = (await resolveAwsCredentials({ region: "us-west-2" })).accessKeyId === "caller-access";
+			clearAwsCredentialCache();
+			await ensureCoreforgeIdentityAtStartup(settings(true), {
+				interactive: false,
+				createStore: () => { throw Error("store unavailable"); },
+			});
+			const unprovisioned = snapshot();
+			unprovisioned.modelAccessIsCaller = (await resolveAwsCredentials({ region: "us-west-2" })).accessKeyId === "caller-access";
+			await ensureCoreforgeIdentityAtStartup(settings(true, "not-a-uuid", "also-not-a-uuid"), {
+				interactive: false,
+				createStore: () => { throw Error("store unavailable"); },
+			});
+			const managed = snapshot();
+			process.stdout.write(JSON.stringify({ disabled, unprovisioned, managed }));
+		`;
+		const classic = {
+			accessIsCaller: true,
+			secretIsCaller: true,
+			sessionIsCaller: true,
+			profileIsCaller: true,
+			regionIsCaller: true,
+			defaultProfileIsLaunch: true,
+			modelAccessIsCaller: true,
+			childSafe: true,
+		};
+		for (const controlledDotenv of [false, true]) {
+			const proc = Bun.spawn([process.execPath, "-e", script], {
+				cwd: path.resolve(import.meta.dir, "../../.."),
+				env: {
+					PATH: Bun.env.PATH,
+					HOME: Bun.env.HOME,
+					...(controlledDotenv ? { BUN_OPTIONS: "--no-env-file", OMP_NO_ENV_FILE: "1" } : {}),
+					AWS_ACCESS_KEY_ID: "trusted-access",
+					AWS_SECRET_ACCESS_KEY: "trusted-secret",
+					AWS_SESSION_TOKEN: "trusted-session",
+					AWS_DEFAULT_PROFILE: "employee",
+					OMP_OPERATIONAL_AWS_PROFILE: "employee",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			const result = JSON.parse(stdout);
+			expect(result.disabled).toEqual(classic);
+			expect(result.unprovisioned).toEqual(classic);
+			expect(result.managed).toEqual({
+				accessIsCaller: false,
+				secretIsCaller: false,
+				sessionIsCaller: false,
+				profileIsCaller: false,
+				regionIsCaller: false,
+				defaultProfileIsLaunch: false,
+				childSafe: true,
+			});
+		}
 	});
 
 	it("still blocks ambient model auth when a signed-in identity hits a malformed managed value", () => {
@@ -411,7 +530,7 @@ describe("applyCoreforgeIdentityProviderDefaults", () => {
 		expect(env[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
 		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
-		expect(env.AWS_PROFILE).toBe("user-profile");
+		expect(env.AWS_PROFILE).toBeUndefined();
 		expect(result.configError).toContain("Invalid managed Claude Platform on AWS URL");
 	});
 });
@@ -509,5 +628,95 @@ describe("ensureCoreforgeAwsSso", () => {
 				run: neverRun,
 			}),
 		).rejects.toThrow("Invalid managed AWS region");
+	});
+});
+
+describe.skipIf(process.platform === "win32")("AWS CLI launch provenance", () => {
+	it("uses PATH outside managed launches and never falls back to PATH for a managed launch", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "cf-aws-provenance-"));
+		try {
+			const awsDir = path.join(root, ".aws");
+			fs.mkdirSync(awsDir);
+			fs.writeFileSync(
+				path.join(awsDir, "config"),
+				"[profile production]\nregion = us-east-1\nsso_session = employee\nsso_account_id = 123456789012\nsso_role_name = Reader\n[sso-session employee]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n",
+			);
+			fs.writeFileSync(
+				path.join(root, "aws"),
+				`#!${process.execPath}
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(path.join(root, "aws.calls"))}, JSON.stringify(Bun.argv.slice(2)) + "\\n");
+if (Bun.argv.includes("export-credentials")) {
+ console.log(JSON.stringify({Version:1,AccessKeyId:"ASIAFIXTURE",SecretAccessKey:"fixture-secret",SessionToken:"fixture-token",Expiration:"2099-01-01T00:00:00Z"}));
+} else {
+ console.log(JSON.stringify({Account:"123456789012",Arn:"arn:aws:iam::123456789012:user/fixture"}));
+}
+`,
+				{ mode: 0o755 },
+			);
+			const script = `
+import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { ensureCoreforgeAwsSso } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/identity/aws-sso.ts"))};
+import { protectCoreforgeOperationalAwsChildEnvironment } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/identity/runtime.ts"))};
+import { resolveAwsCredentials } from ${JSON.stringify(path.resolve(import.meta.dir, "../../ai/src/providers/aws-credentials.ts"))};
+import { filterChildShellEnv, getOperationalAwsLaunchMetadata, isCoreforgeManagedLaunch } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/index.ts"))};
+const managed = process.env.EXPECT_MANAGED === "1";
+assert.equal(isCoreforgeManagedLaunch(), managed);
+const metadata = getOperationalAwsLaunchMetadata();
+if (process.platform === "linux") assert.ok(metadata);
+assert.equal(metadata?.executable, undefined);
+protectCoreforgeOperationalAwsChildEnvironment();
+const child = filterChildShellEnv({
+ NODE_ENV: "production", OTHER_REGION: "us-east-1",
+ OMP_OPERATIONAL_AWS_PROFILE: "production", OMP_OPERATIONAL_AWS_REGION: "us-east-1",
+ RENAMED_CONFIG: metadata?.configFile,
+}, process.env.HOME);
+assert.equal(child.NODE_ENV, "production");
+assert.equal(child.OTHER_REGION, "us-east-1");
+assert.equal(child.OMP_OPERATIONAL_AWS_PROFILE, undefined);
+assert.equal(child.OMP_OPERATIONAL_AWS_REGION, undefined);
+assert.equal(child.RENAMED_CONFIG, undefined);
+if (managed) {
+ await assert.rejects(ensureCoreforgeAwsSso({profile:"production",region:"us-east-1"}), /AWS CLI v2 is required/);
+ await assert.rejects(resolveAwsCredentials({profile:"production",region:"us-east-1"}));
+ assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8"), "");
+} else {
+ const identity = await ensureCoreforgeAwsSso({profile:"production",region:"us-east-1"});
+ assert.equal(identity.accountId, "123456789012");
+ const credentials = await resolveAwsCredentials({profile:"production",region:"us-east-1"});
+ assert.equal(credentials.accessKeyId, "ASIAFIXTURE");
+ const calls = readFileSync(join(process.env.HOME, "aws.calls"), "utf8");
+ assert.match(calls, /get-caller-identity/);
+ assert.match(calls, /export-credentials/);
+}
+`;
+			for (const managed of [false, true]) {
+				fs.writeFileSync(path.join(root, "aws.calls"), "");
+				const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+					cwd: root,
+					env: {
+						HOME: root,
+						USERPROFILE: root,
+						PATH: root,
+						NODE_ENV: "production",
+						EXPECT_MANAGED: managed ? "1" : "0",
+						...(managed ? { OMP_DOTENV_OVERRIDE: "1", OMP_CF_PRODUCT_VERSION: "fixture" } : {}),
+						...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout, stderr, exit] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect(exit, `${stdout}\n${stderr}`).toBe(0);
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

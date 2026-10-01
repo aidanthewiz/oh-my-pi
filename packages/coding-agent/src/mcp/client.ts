@@ -6,6 +6,7 @@
 import * as path from "node:path";
 import * as url from "node:url";
 import { getProjectDir, logger, withTimeout } from "@oh-my-pi/pi-utils";
+import { listTrustedAwsProfiles } from "../tools/aws";
 import { describeMCPTimeout, isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "./timeout";
 import { createHttpTransport } from "./transports/http";
 import { LegacySseConnectionTimeoutError, createSseTransport } from "./transports/sse";
@@ -40,6 +41,18 @@ import type {
 
 import { MCP_PROTOCOL_VERSION } from "./types";
 
+const AWS_KNOWLEDGE_TOOLS: Readonly<Record<string, true>> = {
+	aws___retrieve_skill: true,
+	aws___search_documentation: true,
+	aws___read_documentation: true,
+	aws___list_regions: true,
+	aws___get_regional_availability: true,
+};
+
+export function isAuthenticatedAwsTool(serverName: string, toolName: string): boolean {
+	return serverName === "coreforge-aws-agent-toolkit" && !Object.hasOwn(AWS_KNOWLEDGE_TOOLS, toolName);
+}
+
 /** Client info sent during initialization */
 const CLIENT_INFO = {
 	name: "omp-coding-agent",
@@ -72,7 +85,11 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
  */
 async function createTransport(
 	config: MCPServerConfig,
-	options?: { preserveExplicitCredentials?: boolean; preserveOperationalAws?: boolean },
+	options?: {
+		preserveExplicitCredentials?: boolean;
+		preserveOperationalAws?: boolean;
+		operationalAwsProfiles?: readonly string[];
+	},
 ): Promise<MCPTransport> {
 	const serverType = config.type ?? "stdio";
 
@@ -159,16 +176,50 @@ export async function connectToServer(
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 		preserveExplicitCredentials?: boolean;
 		preserveOperationalAws?: boolean;
+		awsAnonymousBootstrap?: boolean;
+		awsPreferredProfile?: string;
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
 	const timeoutError = new MCPConnectionTimeoutError(name, timeoutMs);
 	let transport: MCPTransport | undefined;
 
+	let availableAwsProfiles: string[] | undefined;
+	let operationalAwsProfiles: string[] | undefined;
+	if (options?.preserveOperationalAws) {
+		const available = (await listTrustedAwsProfiles())
+			.filter(profile => profile.partition === "aws")
+			.map(profile => profile.name);
+		const explicit =
+			("env" in config ? config.env?.AWS_MCP_PROXY_PROFILES : undefined) ?? Bun.env.AWS_MCP_PROXY_PROFILES;
+		availableAwsProfiles =
+			explicit !== undefined
+				? [
+						...new Set(
+							explicit
+								.split(",")
+								.map(profile => profile.trim())
+								.filter(profile => available.includes(profile)),
+						),
+					]
+				: available;
+		if (options.awsPreferredProfile && !availableAwsProfiles.includes(options.awsPreferredProfile)) {
+			throw new Error("PROFILE_NOT_FOUND: selected profile is not eligible for this managed AWS proxy.");
+		}
+		operationalAwsProfiles = options.awsAnonymousBootstrap
+			? []
+			: options.awsPreferredProfile
+				? [
+						options.awsPreferredProfile,
+						...availableAwsProfiles.filter(profile => profile !== options.awsPreferredProfile),
+					]
+				: availableAwsProfiles;
+	}
 	const connect = async (): Promise<MCPServerConnection> => {
 		transport = await createTransport(config, {
 			preserveExplicitCredentials: options?.preserveExplicitCredentials,
 			preserveOperationalAws: options?.preserveOperationalAws,
+			operationalAwsProfiles,
 		});
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
@@ -195,6 +246,10 @@ export async function connectToServer(
 				name,
 				config,
 				transport,
+				operationalAwsProfiles,
+				awsAvailableProfiles: availableAwsProfiles,
+				awsAnonymousBootstrap: options?.preserveOperationalAws && options.awsAnonymousBootstrap === true,
+				awsPreferredProfile: options?.awsPreferredProfile,
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
 				instructions: initResult.instructions,
@@ -250,7 +305,49 @@ export async function listTools(
 		allTools.push(...result.tools);
 		cursor = result.nextCursor;
 	} while (cursor);
+	if (connection.awsAnonymousBootstrap) {
+		const available = connection.awsAvailableProfiles ?? [];
+		for (let index = allTools.length - 1; index >= 0; index--) {
+			const tool = allTools[index];
+			if (!isAuthenticatedAwsTool(connection.name, tool.name)) continue;
+			if (available.length === 0) {
+				allTools.splice(index, 1);
+				continue;
+			}
+			tool.inputSchema = {
+				...tool.inputSchema,
+				properties: {
+					...tool.inputSchema.properties,
+					aws_profile: {
+						type: "string",
+						enum: available,
+						description: "Explicit commercial AWS profile for the signed first-use connection",
+					},
+				},
+				required: [...new Set([...(tool.inputSchema.required ?? []), "aws_profile"])],
+			};
+		}
+	}
 
+	if (connection.operationalAwsProfiles?.length === 1) {
+		const profile = connection.operationalAwsProfiles[0];
+		for (const tool of allTools) {
+			if (!isAuthenticatedAwsTool(connection.name, tool.name) || tool.inputSchema.properties?.aws_profile) continue;
+			(connection.awsProfileBindings ??= new Map()).set(tool.name, profile);
+			tool.inputSchema = {
+				...tool.inputSchema,
+				properties: {
+					...tool.inputSchema.properties,
+					aws_profile: {
+						type: "string",
+						enum: [profile],
+						description: "Explicit AWS profile bound to this connection",
+					},
+				},
+				required: [...(tool.inputSchema.required ?? []), "aws_profile"],
+			};
+		}
+	}
 	// Cache tools
 	connection.tools = allTools;
 
@@ -266,6 +363,16 @@ export async function callTool(
 	args: Record<string, unknown> = {},
 	options?: MCPRequestOptions,
 ): Promise<MCPToolCallResult> {
+	if (connection.awsAnonymousBootstrap && isAuthenticatedAwsTool(connection.name, toolName)) {
+		throw new Error("AUTH_REQUIRED: authenticated AWS calls require a signed proxy connection.");
+	}
+	const boundProfile = connection.awsProfileBindings?.get(toolName);
+	if (boundProfile !== undefined) {
+		if (args.aws_profile !== boundProfile)
+			throw new Error("PROFILE_NOT_FOUND: this AWS connection is bound to a different profile.");
+		const { aws_profile: _profile, ...forwarded } = args;
+		args = forwarded;
+	}
 	const params: MCPToolCallParams = {
 		name: toolName,
 		arguments: args,

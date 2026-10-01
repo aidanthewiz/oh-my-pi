@@ -1833,10 +1833,9 @@ export async function runRootCommand(
 		// Initialize discovery system with settings for provider persistence
 		logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
-		// [coreforge patch] Default sign-in is Microsoft Entra SSO; explicit env
-		// configuration (.env or exported vars) is honored as a user override and
-		// skips the managed identity defaults entirely. Must run before model
-		// scope/session resolution so anthropic-aws sees the managed env defaults.
+		// [coreforge patch] Apply managed provider defaults before model scope and
+		// session resolution. This path never validates AWS STS: managed-model,
+		// relay, collaboration, and sharing consumers validate only when used.
 		const coreforgeIdentity = await logger.time(
 			"coreforgeIdentity",
 			ensureCoreforgeIdentityAtStartup,

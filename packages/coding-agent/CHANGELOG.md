@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Managed AWS MCP tool discovery no longer fails when the first operational profile has expired SSO credentials; signed calls connect with the selected profile after approved sign-in ([PO-688](https://getsoma.atlassian.net/browse/PO-688)).
+- MCP startup now reports invalid server configurations in its connection status events.
+
 ## [18.2.11] - 2026-09-23
 
 ### Fixed
@@ -260,12 +265,14 @@
 ### Added
 
 - Added `disabledModels`, a path-scoped exact/glob deny-list applied after `enabledModels` across model selection and execution. Exact entries never fuzzy-match nearby models.
+- Added a structured native `aws` tool with explicit local profiles, sovereign-partition routing, isolated credentials, verified mutation identity, and Destructive Command Guard enforcement ([#82](https://github.com/Coreforce-CAD/oh-my-pi/pull/82)).
 - Added an opt-in, payload-reduced RPC control event subscription for agent, tool, compaction, and retry lifecycle frames. The complete event stream remains the protocol-v1 and protocol-v2 default for compatibility.
 
 ### Fixed
 
 - Tool approvals now send configurable terminal notifications before waiting. Destructive Command Guard evaluates commands through its native OMP stdin protocol with explicit agent and shell-dialect selection; ask decisions use the native selector, default to denial, and grant only the reviewed command once. Bash retains the reviewed execution route and shell through startup, and route or shell changes require a fresh safety review.
 - Destructive Command Guard now fails closed on unexpected stderr and on child processes that keep output pipes open past the bounded post-exit drain window.
+- AWS recovery now bounds inherited output pipes and terminates the process tree when sign-in times out ([#82](https://github.com/Coreforce-CAD/oh-my-pi/pull/82)).
 - RPC mode now disables canonical TTY input buffering while it owns stdin, preventing valid JSONL commands from being truncated by the terminal driver. Hub rejects known supervised RPC launches that explicitly request a PTY and defaults those processes to pipes. Broker send acknowledgements report transport byte counts without claiming application delivery.
 - Read loop hints now use the dispatch-resolved selector. Raw reads remain byte-for-byte verbatim, while zero-valued video selectors and literal colon filenames retain their native dispatch.
 - JavaScript Eval now uses explicit Bun-compatible ownership for run-scoped bridge promises. Delayed root failures remain with the originating run, while cross-cell continuations belong to the run that attaches them; ownership no longer falls onto an unrelated live cell or persists on reusable Error objects. Eval file reads reject Read-tool `:raw` suffixes with a direct usage error.
@@ -274,6 +281,7 @@
 ### Changed
 
 - Interactive DCG approval dialogs now use a warning header, semantic field colors, and a highlighted command value so the reviewed action is clear.
+- Interactive prompt readiness no longer waits for MCP connections or managed identity validation. Authentication occurs on first use; shared AWS SSO groups offer one sign-in and retry the original operation once ([#82](https://github.com/Coreforce-CAD/oh-my-pi/pull/82)).
 - Added `tui.titleSpinner` (`braille` | `dots` | `line`, default `braille`) to pick the terminal-title working-state spinner glyphs alongside the existing `tui.titleState` on/off toggle.
 - Expanded built-in secret obfuscation to detect credentials in connection URLs regardless of environment-variable name, including PostgreSQL, MongoDB, MySQL, Redis, AMQP, and other supported schemes.
 - Expanded built-in secret obfuscation to cover AWS access keys, Google API keys, Slack, npm, Stripe secret/restricted keys and webhook secrets, Hugging Face and SendGrid tokens, JWTs, Bearer tokens, and PEM private keys.

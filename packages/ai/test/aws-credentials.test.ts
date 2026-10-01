@@ -3,13 +3,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_AUTH_MODE_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
 	MANAGED_AWS_MODEL_AUTH_MODE,
 } from "@oh-my-pi/pi-ai";
+import { wrapFetchForAnthropicAwsSigV4 } from "@oh-my-pi/pi-ai/providers/anthropic";
 import {
 	clearAwsCredentialCache,
+	invalidateAwsCredentialCache,
 	resolveAwsCredentials,
 	setAwsCredentialRecoveryHandler,
 	tokenizeCredentialProcessCommand,
@@ -35,6 +38,7 @@ const ENV_KEYS = [
 	"AWS_SHARED_CREDENTIALS_FILE",
 	"AWS_EC2_METADATA_DISABLED",
 	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
 	"PATH",
@@ -227,14 +231,95 @@ describe("resolveAwsCredentials", () => {
 		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
 		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
 		Bun.env[AWS_MODEL_REGION_ENV] = "us-east-1";
+		Bun.env[AWS_MODEL_ACCOUNT_ID_ENV] = "111122223333";
 		Bun.env.AWS_PROFILE = "employee-operations";
 		Bun.env.AWS_REGION = "eu-west-1";
 		Bun.env.AWS_ACCESS_KEY_ID = "OPERATIONALKEY";
 		Bun.env.AWS_SECRET_ACCESS_KEY = "operational-secret";
 
-		const creds = await resolveAwsCredentials({ profile: "employee-operations", region: "eu-west-1" });
+		const creds = await resolveAwsCredentials({
+			profile: "employee-operations",
+			region: "eu-west-1",
+			fetch: Object.assign(
+				async (_input: string | URL | Request, init?: RequestInit) => {
+					expect(new Headers(init?.headers).get("authorization")).toContain("Credential=MODELKEY/");
+					return new Response(
+						"<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111122223333</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+					);
+				},
+				{ preconnect: fetch.preconnect },
+			),
+		});
 		expect(creds.accessKeyId).toBe("MODELKEY");
 		expect(creds.secretAccessKey).toBe("model-secret");
+	});
+
+	test("proves a managed account with the resolved credentials before signing a model request", async () => {
+		await writeDefaultConfig("model-inference", "aws_access_key_id = WRONGKEY\naws_secret_access_key = wrong-secret");
+		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
+		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
+		Bun.env[AWS_MODEL_REGION_ENV] = "us-east-1";
+		Bun.env[AWS_MODEL_ACCOUNT_ID_ENV] = "111122223333";
+		const signedRequests: string[] = [];
+		const fetchImpl: FetchImpl = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input);
+				const authorization = new Headers(init?.headers).get("authorization") ?? "";
+				signedRequests.push(url);
+				if (url.startsWith("https://sts.")) {
+					expect(new TextDecoder().decode(init?.body as Uint8Array)).toContain("Action=GetCallerIdentity");
+					expect(authorization).toContain("Credential=WRONGKEY/");
+					return new Response(
+						"<GetCallerIdentityResponse><GetCallerIdentityResult><Account>999988887777</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+					);
+				}
+				return new Response("model call must not occur");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const request = wrapFetchForAnthropicAwsSigV4(fetchImpl, "us-east-1");
+		await expect(
+			request("https://aws-external-anthropic.us-east-1.api.aws/v1/messages", { method: "POST", body: "{}" }),
+		).rejects.toThrow(/different account/);
+		expect(signedRequests).toEqual(["https://sts.us-east-1.amazonaws.com/"]);
+
+		await writeDefaultConfig("model-inference", "aws_access_key_id = RIGHTKEY\naws_secret_access_key = right-secret");
+		invalidateAwsCredentialCache();
+		const validFetch: FetchImpl = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input);
+				signedRequests.push(url);
+				const authorization = new Headers(init?.headers).get("authorization") ?? "";
+				expect(authorization).toContain("Credential=RIGHTKEY/");
+				return url.startsWith("https://sts.")
+					? new Response(
+							"<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111122223333</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+						)
+					: new Response("model accepted");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const validRequest = wrapFetchForAnthropicAwsSigV4(validFetch, "us-east-1");
+		await Promise.all([
+			validRequest("https://aws-external-anthropic.us-east-1.api.aws/v1/messages", { method: "POST", body: "{}" }),
+			validRequest("https://aws-external-anthropic.us-east-1.api.aws/v1/messages", { method: "POST", body: "{}" }),
+		]);
+		expect(signedRequests.filter(url => url.startsWith("https://sts."))).toHaveLength(2);
+		expect(signedRequests.filter(url => url.includes("aws-external-anthropic"))).toHaveLength(2);
+		await writeDefaultConfig("model-inference", "aws_access_key_id = WRONGKEY\naws_secret_access_key = wrong-secret");
+		invalidateAwsCredentialCache();
+		await expect(
+			request("https://aws-external-anthropic.us-east-1.api.aws/v1/messages", { method: "POST", body: "{}" }),
+		).rejects.toThrow(/different account/);
+		expect(signedRequests.filter(url => url.startsWith("https://sts."))).toHaveLength(3);
+		expect(signedRequests.filter(url => url.includes("aws-external-anthropic"))).toHaveLength(2);
+	});
+
+	test("rejects managed model credentials without a configured account before STS or model requests", async () => {
+		await writeDefaultConfig("model-inference", "aws_access_key_id = KEY\naws_secret_access_key = secret");
+		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
+		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
+		await expect(resolveAwsCredentials()).rejects.toThrow(/account ID is missing or invalid/);
 	});
 
 	test("managed role chains reject ambient credential_source credentials", async () => {
@@ -245,6 +330,7 @@ describe("resolveAwsCredentials", () => {
 		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
 		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
 		Bun.env[AWS_MODEL_REGION_ENV] = "us-east-1";
+		Bun.env[AWS_MODEL_ACCOUNT_ID_ENV] = "111122223333";
 		Bun.env.AWS_ACCESS_KEY_ID = "OPERATIONALKEY";
 		Bun.env.AWS_SECRET_ACCESS_KEY = "operational-secret";
 
@@ -256,6 +342,7 @@ describe("resolveAwsCredentials", () => {
 		const script = await writeFixture(
 			"managed-process.js",
 			`await Bun.write(${JSON.stringify(childEnvPath)}, JSON.stringify({
+				modelAccount: Bun.env.OMP_MODEL_AWS_ACCOUNT_ID ?? null,
 				profile: Bun.env.AWS_PROFILE ?? null,
 				region: Bun.env.AWS_REGION ?? null,
 				accessKey: Bun.env.AWS_ACCESS_KEY_ID ?? null,
@@ -272,14 +359,26 @@ describe("resolveAwsCredentials", () => {
 		Bun.env[AWS_MODEL_AUTH_MODE_ENV] = MANAGED_AWS_MODEL_AUTH_MODE;
 		Bun.env[AWS_MODEL_PROFILE_ENV] = "model-inference";
 		Bun.env[AWS_MODEL_REGION_ENV] = "us-east-1";
+		Bun.env[AWS_MODEL_ACCOUNT_ID_ENV] = "111122223333";
 		Bun.env.AWS_PROFILE = "employee-operations";
 		Bun.env.AWS_REGION = "eu-west-1";
 		Bun.env.AWS_ACCESS_KEY_ID = "OPERATIONALKEY";
 		Bun.env.AWS_SECRET_ACCESS_KEY = "operational-secret";
 
-		const creds = await resolveAwsCredentials();
+		const creds = await resolveAwsCredentials({
+			fetch: Object.assign(
+				async (_input: string | URL | Request, init?: RequestInit) => {
+					expect(new Headers(init?.headers).get("authorization")).toContain("Credential=MODELPROCESSKEY/");
+					return new Response(
+						"<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111122223333</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+					);
+				},
+				{ preconnect: fetch.preconnect },
+			),
+		});
 		expect(creds.accessKeyId).toBe("MODELPROCESSKEY");
 		expect(JSON.parse(await Bun.file(childEnvPath).text())).toEqual({
+			modelAccount: null,
 			profile: null,
 			region: null,
 			accessKey: null,
