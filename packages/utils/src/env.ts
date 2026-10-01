@@ -148,7 +148,8 @@ const projectEnvNamesLoadedByOmp = new Set<string>();
 const managedAgentEnvNames = new Set<string>();
 const managedAgentEnvValues = new Set<string>();
 
-function isCoreforgeManagedLaunch(): boolean {
+/** A Linux procfs launch snapshot exists even for ordinary CLI launches; only these captured markers require pinned AWS tools. */
+export function isCoreforgeManagedLaunch(): boolean {
 	const override = launchEnvValues?.get(managedEnvName("OMP_DOTENV_OVERRIDE"));
 	const productVersion = launchEnvValues?.get(managedEnvName("OMP_CF_PRODUCT_VERSION"));
 	return override === "1" && productVersion !== undefined && productVersion.trim() !== "";
@@ -427,7 +428,15 @@ function filterChildShellEnvInternal(
 ): Record<string, string> {
 	const protectedValues = new Set(managedAgentEnvValues);
 	for (const [key, value] of Object.entries(env)) {
-		if (value && hasCredentialValue(key)) protectedValues.add(value);
+		const name = managedEnvName(key);
+		// Routing selectors must not erase unrelated variables with the same ordinary value.
+		if (
+			value &&
+			name !== "OMP_OPERATIONAL_AWS_PROFILE" &&
+			name !== "OMP_OPERATIONAL_AWS_REGION" &&
+			hasCredentialValue(key)
+		)
+			protectedValues.add(value);
 	}
 	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);

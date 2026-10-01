@@ -197,6 +197,8 @@ import { join } from "node:path";
 import { connectToServer, disconnectServer, listTools } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/client.ts"))};
 import { MCPTool } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/tool-bridge.ts"))};
 import { Settings } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/config/settings.ts"))};
+import { MCPManager } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/manager.ts"))};
+import { getAgentDir } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/index.ts"))};
 const config = { command: process.execPath, args: ["--no-env-file", ${JSON.stringify(proxy)}] };
 const options = { preserveOperationalAws: true, awsAnonymousBootstrap: true };
 let connection = await connectToServer("coreforge-aws-agent-toolkit", config, options);
@@ -299,6 +301,41 @@ await disconnectServer(single);
 const empty = await connectToServer("coreforge-aws-agent-toolkit", { ...config, env: { AWS_MCP_PROXY_PROFILES: "" } }, options);
 assert.deepEqual((await listTools(empty)).map(t => t.name), ["aws___list_regions"]);
 await disconnectServer(empty);
+const managerConfig = { ...config, type: "stdio", cwd: process.env.HOME };
+Bun.env.OMP_MANAGED_AWS_MCP_COMMAND = process.execPath;
+Bun.env.OMP_MANAGED_MCP_CWD = process.env.HOME;
+const manager = new MCPManager(process.env.HOME);
+try {
+ const serverName = "coreforge-aws-agent-toolkit";
+ await manager.connectServers({ [serverName]: managerConfig }, {
+  [serverName]: { provider: "mcp-managed", providerName: "Coreforge Managed",
+   path: join(getAgentDir(), "mcp.managed.json"), level: "user" },
+ });
+ await manager.waitForPendingConnections();
+ const managerConnection = manager.getConnection(serverName);
+ const { promise: refreshed, resolve: resolveRefreshed } = Promise.withResolvers();
+ assert.ok(managerConnection?.transport.onNotification);
+ const unsubscribe = manager.addNotificationListener((name, method) => {
+  if (name === serverName && method === "notifications/tools/list_changed") {
+   unsubscribe();
+   resolveRefreshed();
+  }
+ });
+ managerConnection.transport.onNotification("notifications/tools/list_changed", {});
+ await refreshed;
+ const refreshedRun = manager.getTools().find(tool => tool.mcpToolName === "aws___run_script");
+ assert.ok(refreshedRun);
+ const selectedAfterRefresh = await refreshedRun.execute(
+  "selected-after-notification", { aws_profile: "healthy", code: "result = 7" }, undefined, context,
+ );
+ assert.notEqual(selectedAfterRefresh.isError, true, selectedAfterRefresh.content[0]?.text);
+ assert.deepEqual(JSON.parse(selectedAfterRefresh.content[0].text).profiles, ["healthy", "expired", "still-expired"]);
+ assert.equal(JSON.parse(selectedAfterRefresh.content[0].text).args.aws_profile, "healthy");
+} finally {
+ await manager.disconnectAll();
+ delete Bun.env.OMP_MANAGED_AWS_MCP_COMMAND;
+ delete Bun.env.OMP_MANAGED_MCP_CWD;
+}
 console.log("first-use routing passed");
 `;
 		await fs.writeFile(path.join(root, "aws.calls"), "");

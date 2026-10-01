@@ -138,8 +138,6 @@ export function protectCoreforgeOperationalAwsChildEnvironment(): void {
 	registerChildEnvRedactions(OPERATIONAL_AWS_LAUNCH_ENV_NAMES, [
 		metadata?.configFile,
 		metadata?.sharedCredentialsFile,
-		metadata?.profile,
-		metadata?.region,
 		metadata?.executable,
 	]);
 }

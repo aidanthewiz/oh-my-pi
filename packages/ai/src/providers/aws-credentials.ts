@@ -18,7 +18,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, getOperationalAwsLaunchMetadata, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { $env, getOperationalAwsLaunchMetadata, isCoreforgeManagedLaunch, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import {
 	allowAmbientAwsModelCredentials,
 	AWS_MODEL_ACCOUNT_ID_ENV,
@@ -476,8 +476,9 @@ async function readSsoCredentialsViaAwsCli(
 	allowAmbientCredentials: boolean,
 	signal: AbortSignal | undefined,
 ): Promise<ResolvedCredentials | undefined> {
-	const launch = getOperationalAwsLaunchMetadata();
-	const executable = launch ? launch.executable : Bun.which("aws", { PATH: $env.PATH });
+	const executable = isCoreforgeManagedLaunch()
+		? getOperationalAwsLaunchMetadata()?.executable
+		: Bun.which("aws", { PATH: $env.PATH });
 	if (!executable) return undefined;
 	try {
 		return await runCredentialCommand(

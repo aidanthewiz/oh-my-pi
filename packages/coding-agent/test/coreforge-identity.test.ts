@@ -630,3 +630,93 @@ describe("ensureCoreforgeAwsSso", () => {
 		).rejects.toThrow("Invalid managed AWS region");
 	});
 });
+
+describe.skipIf(process.platform === "win32")("AWS CLI launch provenance", () => {
+	it("uses PATH outside managed launches and never falls back to PATH for a managed launch", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "cf-aws-provenance-"));
+		try {
+			const awsDir = path.join(root, ".aws");
+			fs.mkdirSync(awsDir);
+			fs.writeFileSync(
+				path.join(awsDir, "config"),
+				"[profile production]\nregion = us-east-1\nsso_session = employee\nsso_account_id = 123456789012\nsso_role_name = Reader\n[sso-session employee]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n",
+			);
+			fs.writeFileSync(
+				path.join(root, "aws"),
+				`#!${process.execPath}
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(path.join(root, "aws.calls"))}, JSON.stringify(Bun.argv.slice(2)) + "\\n");
+if (Bun.argv.includes("export-credentials")) {
+ console.log(JSON.stringify({Version:1,AccessKeyId:"ASIAFIXTURE",SecretAccessKey:"fixture-secret",SessionToken:"fixture-token",Expiration:"2099-01-01T00:00:00Z"}));
+} else {
+ console.log(JSON.stringify({Account:"123456789012",Arn:"arn:aws:iam::123456789012:user/fixture"}));
+}
+`,
+				{ mode: 0o755 },
+			);
+			const script = `
+import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { ensureCoreforgeAwsSso } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/identity/aws-sso.ts"))};
+import { protectCoreforgeOperationalAwsChildEnvironment } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/identity/runtime.ts"))};
+import { resolveAwsCredentials } from ${JSON.stringify(path.resolve(import.meta.dir, "../../ai/src/providers/aws-credentials.ts"))};
+import { filterChildShellEnv, getOperationalAwsLaunchMetadata, isCoreforgeManagedLaunch } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/index.ts"))};
+const managed = process.env.EXPECT_MANAGED === "1";
+assert.equal(isCoreforgeManagedLaunch(), managed);
+const metadata = getOperationalAwsLaunchMetadata();
+if (process.platform === "linux") assert.ok(metadata);
+assert.equal(metadata?.executable, undefined);
+protectCoreforgeOperationalAwsChildEnvironment();
+const child = filterChildShellEnv({
+ NODE_ENV: "production", OTHER_REGION: "us-east-1",
+ OMP_OPERATIONAL_AWS_PROFILE: "production", OMP_OPERATIONAL_AWS_REGION: "us-east-1",
+ RENAMED_CONFIG: metadata?.configFile,
+}, process.env.HOME);
+assert.equal(child.NODE_ENV, "production");
+assert.equal(child.OTHER_REGION, "us-east-1");
+assert.equal(child.OMP_OPERATIONAL_AWS_PROFILE, undefined);
+assert.equal(child.OMP_OPERATIONAL_AWS_REGION, undefined);
+assert.equal(child.RENAMED_CONFIG, undefined);
+if (managed) {
+ await assert.rejects(ensureCoreforgeAwsSso({profile:"production",region:"us-east-1"}), /AWS CLI v2 is required/);
+ await assert.rejects(resolveAwsCredentials({profile:"production",region:"us-east-1"}));
+ assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8"), "");
+} else {
+ const identity = await ensureCoreforgeAwsSso({profile:"production",region:"us-east-1"});
+ assert.equal(identity.accountId, "123456789012");
+ const credentials = await resolveAwsCredentials({profile:"production",region:"us-east-1"});
+ assert.equal(credentials.accessKeyId, "ASIAFIXTURE");
+ const calls = readFileSync(join(process.env.HOME, "aws.calls"), "utf8");
+ assert.match(calls, /get-caller-identity/);
+ assert.match(calls, /export-credentials/);
+}
+`;
+			for (const managed of [false, true]) {
+				fs.writeFileSync(path.join(root, "aws.calls"), "");
+				const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+					cwd: root,
+					env: {
+						HOME: root,
+						USERPROFILE: root,
+						PATH: root,
+						NODE_ENV: "production",
+						EXPECT_MANAGED: managed ? "1" : "0",
+						...(managed ? { OMP_DOTENV_OVERRIDE: "1", OMP_CF_PRODUCT_VERSION: "fixture" } : {}),
+						...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout, stderr, exit] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect(exit, `${stdout}\n${stderr}`).toBe(0);
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});

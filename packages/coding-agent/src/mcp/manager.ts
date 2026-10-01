@@ -1799,7 +1799,8 @@ export class MCPManager {
 		};
 		try {
 			const serverTools = await listTools(connection);
-			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
+			const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
+				this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
@@ -1849,7 +1850,8 @@ export class MCPManager {
 
 		// Reload tools
 		const serverTools = await listTools(connection);
-		const reconnect = () => this.reconnectServer(name);
+		const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
+			this.#reconnectServerForTool(name, options);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 		void this.toolCache?.set(name, connection.config, serverTools);
 
