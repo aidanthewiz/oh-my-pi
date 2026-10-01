@@ -233,7 +233,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// preflight again. Direct and nested xd:// calls have no loop marker:
 		// their final-input preflight still runs below.
 		const dispatchKey = `${toolCallId}:${this.tool.name}`;
-		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === dispatchKey;
+		const inheritedLoopDispatch =
+			(context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === dispatchKey;
 		const loopDispatchedToolCall =
 			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
 		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {

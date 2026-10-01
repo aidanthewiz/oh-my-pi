@@ -199,7 +199,9 @@ describe("headless MCP readiness", () => {
 		);
 		const capture = printSession(manager);
 		Bun.env.OMP_MCP_REQUIRE_READY = "1";
-		expect(await runPrintMode(capture.session, { mode: "text", initialMessage: "read docs", mcpManager: manager })).toBe(0);
+		expect(
+			await runPrintMode(capture.session, { mode: "text", initialMessage: "read docs", mcpManager: manager }),
+		).toBe(0);
 		expect(capture.prompted()).toEqual([]);
 	}, 5_000);
 
