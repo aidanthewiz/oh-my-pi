@@ -5,6 +5,7 @@
 ### Fixed
 
 - Managed AWS MCP tool discovery no longer fails when the first operational profile has expired SSO credentials; signed calls connect with the selected profile after approved sign-in ([PO-688](https://getsoma.atlassian.net/browse/PO-688)).
+- Native AWS calls use AWS's public operation-to-action reference to identify reads. Cost Explorer and CloudWatch Logs reads no longer request mutation approval; unmapped operations remain approval-gated.
 - MCP startup now reports invalid server configurations in its connection status events.
 
 ## [18.2.11] - 2026-09-23

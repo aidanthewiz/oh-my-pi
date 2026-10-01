@@ -78,6 +78,8 @@ test("native AWS enforces process, account approval, authentication, and output 
 			USERPROFILE: root,
 			PATH: path.join(root, "repository"),
 			...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+			OMP_DOTENV_OVERRIDE: "1",
+			OMP_CF_PRODUCT_VERSION: "fixture",
 			OMP_OPERATIONAL_AWS_CONFIG_FILE: config,
 			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "credentials"),
 			OMP_OPERATIONAL_AWS_EXECUTABLE: executable,
@@ -108,7 +110,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 				],
 				{
 					cwd: root,
-					signal: AbortSignal.timeout(30_000),
+					signal: AbortSignal.timeout(60_000),
 					env: missingCli
 						? { ...env, OMP_OPERATIONAL_AWS_EXECUTABLE: undefined, NATIVE_AWS_EXPECT_NO_CLI: "1" }
 						: env,
@@ -126,4 +128,4 @@ test("native AWS enforces process, account approval, authentication, and output 
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 60_000);
+}, 90_000);

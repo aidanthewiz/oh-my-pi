@@ -420,21 +420,141 @@ export function buildAwsParameterArgv(parameters: Record<string, unknown> | unde
 	return argv;
 }
 
-const READ_ONLY_AWS_OPERATIONS: Readonly<Record<string, true>> = {
-	"batch-get-item": true,
-	"describe-instances": true,
-	"get-caller-identity": true,
-	"get-item": true,
-	"get-object": true,
-	"head-object": true,
-	"list-buckets": true,
-	"list-objects-v2": true,
-	query: true,
-	scan: true,
-};
+const AWS_REFERENCE_ROOT = "https://servicereference.us-east-1.amazonaws.com/v1/";
+const AWS_REFERENCE_TTL_MS = 60 * 60 * 1000;
+const AWS_REFERENCE_FAILURE_TTL_MS = 60 * 1000;
+const AWS_REFERENCE_TIMEOUT_MS = 5_000;
 
-function isMutation(service: string, operation: string): boolean {
-	return !(service === "sso" && operation === "login") && !Object.hasOwn(READ_ONLY_AWS_OPERATIONS, operation);
+interface AwsAuthorizedAction {
+	service: string;
+	name: string;
+}
+
+interface AwsServiceReference {
+	actions: Map<string, boolean>;
+	operations: Map<string, readonly AwsAuthorizedAction[] | null>;
+}
+
+function awsRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function parseAwsServiceReference(value: unknown, service: string): AwsServiceReference | undefined {
+	const document = awsRecord(value);
+	const operationRows = document?.Operations ?? [];
+	if (document?.Name !== service || !Array.isArray(document.Actions) || !Array.isArray(operationRows)) {
+		return undefined;
+	}
+	const actions = new Map<string, boolean>();
+	for (const value of document.Actions) {
+		const action = awsRecord(value);
+		const properties = awsRecord(awsRecord(action?.Annotations)?.Properties);
+		if (typeof action?.Name !== "string") continue;
+		actions.set(
+			action.Name,
+			typeof properties?.IsList === "boolean" &&
+				properties.IsWrite === false &&
+				properties.IsPermissionManagement === false &&
+				properties.IsTaggingOnly === false,
+		);
+	}
+	const operations = new Map<string, readonly AwsAuthorizedAction[] | null>();
+	for (const value of operationRows) {
+		const operation = awsRecord(value);
+		if (!Array.isArray(operation?.SDK)) continue;
+		const authorized = Array.isArray(operation.AuthorizedActions)
+			? operation.AuthorizedActions.map((value: unknown): AwsAuthorizedAction | undefined => {
+					const action = awsRecord(value);
+					if (
+						typeof action?.Name !== "string" ||
+						typeof action.Service !== "string" ||
+						!COMMAND_NAME_RE.test(action.Service)
+					) {
+						return undefined;
+					}
+					return { name: action.Name, service: action.Service };
+				})
+			: [];
+		const permitted =
+			authorized.length > 0 && authorized.every((action): action is AwsAuthorizedAction => action !== undefined)
+				? authorized
+				: null;
+		for (const value of operation.SDK) {
+			const sdk = awsRecord(value);
+			if (sdk?.Package !== "Boto3" || typeof sdk.Name !== "string" || typeof sdk.Method !== "string") {
+				continue;
+			}
+			const key = `${sdk.Name}\0${sdk.Method}`;
+			operations.set(key, operations.has(key) ? null : permitted);
+		}
+	}
+	return { actions, operations };
+}
+
+class AwsOperationAccess {
+	#cache = new Map<string, { value: unknown; expiresAt: number }>();
+	#pending = new Map<string, Promise<unknown>>();
+
+	async #load<T>(path: string, parse: (value: unknown) => T | undefined): Promise<T | undefined> {
+		const cached = this.#cache.get(path);
+		if (cached && cached.expiresAt > Date.now()) return cached.value as T | undefined;
+		let pending = this.#pending.get(path) as Promise<T | undefined> | undefined;
+		if (!pending) {
+			pending = (async () => {
+				try {
+					const response = await fetch(`${AWS_REFERENCE_ROOT}${path}`, {
+						redirect: "error",
+						signal: AbortSignal.timeout(AWS_REFERENCE_TIMEOUT_MS),
+					});
+					return response.ok ? parse(await response.json()) : undefined;
+				} catch {
+					return undefined;
+				}
+			})().then(value => {
+				this.#cache.set(path, {
+					value,
+					expiresAt: Date.now() + (value === undefined ? AWS_REFERENCE_FAILURE_TTL_MS : AWS_REFERENCE_TTL_MS),
+				});
+				this.#pending.delete(path);
+				return value;
+			});
+			this.#pending.set(path, pending);
+		}
+		return pending;
+	}
+
+	async isRead(service: string, operation: string): Promise<boolean> {
+		const sdkService = service === "s3api" ? "s3" : service;
+		const mapping = await this.#load("mapping.json", value =>
+			awsRecord(awsRecord(awsRecord(awsRecord(value)?.SDK)?.Python)?.Boto3),
+		);
+		const referenceService = awsRecord(mapping?.[sdkService])?.service;
+		if (typeof referenceService !== "string" || !COMMAND_NAME_RE.test(referenceService)) return false;
+		const reference = await this.#load(`${referenceService}/${referenceService}.json`, value =>
+			parseAwsServiceReference(value, referenceService),
+		);
+		const authorized = reference?.operations.get(`${sdkService}\0${operation.replaceAll("-", "_")}`);
+		if (!authorized?.length) return false;
+		const results = await Promise.all(
+			authorized.map(async action => {
+				const source =
+					action.service === referenceService
+						? reference
+						: await this.#load(`${action.service}/${action.service}.json`, value =>
+								parseAwsServiceReference(value, action.service),
+							);
+				return source?.actions.get(action.name) === true;
+			}),
+		);
+		return results.every(Boolean);
+	}
+}
+
+// Identity probes must remain available when the public AWS reference is unreachable.
+function isAwsIdentityProbe(service: string, operation: string): boolean {
+	return service === "sts" && operation === "get-caller-identity";
 }
 
 function redactedArgv(argv: readonly string[], redactSecrets = true): string {
@@ -781,6 +901,8 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 	readonly loadMode = "discoverable";
 	#prepared = new Map<string, { fingerprint: string; call: PreparedAwsCall }>();
 	#approved = new Map<string, string>();
+	#access = new AwsOperationAccess();
+	#classifications = new Map<string, { read: boolean; expiresAt: number }>();
 
 	get parameters(): typeof awsSchema {
 		const reserved = getReservedManagedAwsProfiles();
@@ -818,7 +940,15 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const input = args as Partial<AwsToolParams>;
-		return isMutation(String(input.service ?? ""), String(input.operation ?? "")) ? "exec" : "read";
+		if (
+			(input.service === "sso" && input.operation === "login") ||
+			isAwsIdentityProbe(String(input.service ?? ""), String(input.operation ?? ""))
+		) {
+			return "read";
+		}
+		const key = `${input.service}\0${input.operation}`;
+		const classification = this.#classifications.get(key);
+		return classification?.read && classification.expiresAt > Date.now() ? "read" : "exec";
 	};
 
 	readonly formatApprovalDetails = (args: unknown): string[] => {
@@ -907,8 +1037,15 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			params.operation,
 			...buildAwsParameterArgv(params.parameters),
 		];
-		const mutation = isMutation(params.service, params.operation);
 		const dcg = await enforceDestructiveCommandGuard(redactedArgv(argv, false), this.session.cwd, "posix", signal);
+		const mutation =
+			!login &&
+			!isAwsIdentityProbe(params.service, params.operation) &&
+			!(await this.#access.isRead(params.service, params.operation));
+		this.#classifications.set(`${params.service}\0${params.operation}`, {
+			read: !mutation,
+			expiresAt: Date.now() + AWS_REFERENCE_TTL_MS,
+		});
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-aws-"));
 		const configPath = path.join(tempDir, "config");
 		try {

@@ -23,7 +23,7 @@ await fs.writeFile(path.join(cwd, "aws"), "repository interception must never ex
 let artifact = 0;
 const settings = Settings.isolated();
 let activeContext: AgentToolContext | undefined = undefined;
-const tool = new AwsTool({
+const toolSession = {
 	cwd,
 	hasUI: true,
 	getSessionFile: () => null,
@@ -31,7 +31,8 @@ const tool = new AwsTool({
 	settings,
 	getToolContext: () => activeContext,
 	allocateOutputArtifact: async () => ({ id: `aws-${++artifact}`, path: path.join(root, `artifact-${artifact}.txt`) }),
-});
+};
+const tool = new AwsTool(toolSession);
 const calls = async () =>
 	(await fs.readFile(path.join(root, "aws.calls"), "utf8").catch(() => ""))
 		.trim()
@@ -53,6 +54,82 @@ if (process.env.NATIVE_AWS_EXPECT_NO_CLI) {
 	assert.equal((await calls()).length, before);
 	process.exit(0);
 }
+const action = (Name: string, IsWrite = false) => ({
+	Name,
+	Annotations: {
+		Properties: { IsList: false, IsPermissionManagement: false, IsTaggingOnly: false, IsWrite },
+	},
+});
+const operation = (Name: string, sdk: string, Method: string, ...permissions: [string, string][]) => ({
+	Name,
+	SDK: [{ Package: "Boto3", Name: sdk, Method }],
+	AuthorizedActions: permissions.map(([Service, name]) => ({ Service, Name: name })),
+});
+const references: Record<string, unknown> = {
+	"mapping.json": {
+		SDK: {
+			Python: {
+				Boto3: Object.fromEntries(["s3", "ce", "logs", "ec2", "rds"].map(service => [service, { service }])),
+			},
+		},
+	},
+	"s3/s3.json": {
+		Name: "s3",
+		Actions: [action("ListAllMyBuckets"), action("DeleteBucket", true)],
+		Operations: [
+			operation("ListBuckets", "s3", "list_buckets", ["s3", "ListAllMyBuckets"]),
+			operation("DeleteBucket", "s3", "delete_bucket", ["s3", "DeleteBucket"]),
+		],
+	},
+	"ce/ce.json": {
+		Name: "ce",
+		Actions: [action("GetCostAndUsage")],
+		Operations: [
+			operation(
+				"GetCostAndUsage",
+				"ce",
+				"get_cost_and_usage",
+				["ce", "GetCostAndUsage"],
+				["aws-portal", "ViewBilling"],
+			),
+		],
+	},
+	"aws-portal/aws-portal.json": {
+		Name: "aws-portal",
+		Actions: [action("ViewBilling")],
+	},
+	"logs/logs.json": {
+		Name: "logs",
+		Actions: [action("StartQuery"), action("FilterLogEvents")],
+		Operations: [
+			operation("StartQuery", "logs", "start_query", ["logs", "StartQuery"], ["logs", "FilterLogEvents"]),
+			operation("FilterLogEvents", "logs", "filter_log_events", ["logs", "FilterLogEvents"]),
+		],
+	},
+	"rds/rds.json": {
+		Name: "rds",
+		Actions: [action("DescribeDBClusters")],
+		Operations: [operation("DescribeDBClusters", "rds", "describe_db_clusters", ["rds", "DescribeDBClusters"])],
+	},
+	"ec2/ec2.json": {
+		Name: "ec2",
+		Actions: [action("TerminateInstances", true), action("DescribeInstances")],
+		Operations: [
+			operation("TerminateInstances", "ec2", "terminate_instances", ["ec2", "TerminateInstances"]),
+			operation("DescribeInstances", "ec2", "describe_instances", ["ec2", "DescribeInstances"]),
+		],
+	},
+};
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = Object.assign(
+	async (input: string | URL | Request) => {
+		const url = new URL(String(input));
+		assert.equal(url.origin, "https://servicereference.us-east-1.amazonaws.com");
+		const reference = references[url.pathname.slice("/v1/".length)];
+		return reference === undefined ? new Response("not found", { status: 404 }) : Response.json(reference);
+	},
+	{ preconnect: nativeFetch.preconnect },
+);
 const modelEnvironment: Record<string, string | undefined> = {};
 restoreCoreforgeOperationalAwsEnvironment(modelEnvironment);
 assert.equal(modelEnvironment.OMP_MODEL_AWS_PROFILE, undefined);
@@ -107,6 +184,40 @@ assert.match(await fs.readFile(path.join(root, "dcg.calls"), "utf8"), /'s3api' '
 const optionValue = await tool.execute("flag-value", { ...read, parameters: { Prefix: "--profile=coreforge" } });
 assert.match(text(optionValue), /commercial/);
 assert.ok((await calls()).at(-1).argv.includes("--prefix=--profile=coreforge"));
+const identity = { ...read, service: "sts", operation: "get-caller-identity" };
+assert.equal(tool.approval(identity), "read");
+assert.equal(await tool.prepareRuntimeApproval("identity", identity), undefined);
+await tool.execute("identity", identity);
+for (const [id, args] of [
+	["cost", { ...read, service: "ce", operation: "get-cost-and-usage" }],
+	["logs-filter", { ...read, profile: "government", service: "logs", operation: "filter-log-events" }],
+	["logs-query", { ...read, profile: "government", service: "logs", operation: "start-query" }],
+	["rds-acronym", { ...read, profile: "government", service: "rds", operation: "describe-db-clusters" }],
+] as const) {
+	assert.equal(await tool.prepareRuntimeApproval(id, args), undefined, id);
+	assert.equal(tool.approval(args), "read", id);
+	await tool.execute(id, args);
+}
+const unmapped = { ...read, service: "logs", operation: "describe-unmapped" };
+assert.equal(tool.approval(unmapped), "exec");
+assert.match((await tool.prepareRuntimeApproval("unmapped", unmapped))!.prompt, /Account: 123456789012/);
+await assert.rejects(() => tool.execute("unmapped", unmapped), /approval/);
+assert.equal((await calls()).filter(call => call.argv.includes("describe-unmapped")).length, 0);
+tool.denyRuntimeApproval("unmapped", unmapped);
+const referenceFetch = globalThis.fetch;
+globalThis.fetch = Object.assign(async () => new Response("unavailable", { status: 503 }), {
+	preconnect: referenceFetch.preconnect,
+});
+try {
+	const offline = new AwsTool(toolSession);
+	const cost = { ...read, service: "ce", operation: "get-cost-and-usage" };
+	assert.equal(offline.approval(cost), "exec");
+	assert.match((await offline.prepareRuntimeApproval("offline", cost))!.prompt, /Account: 123456789012/);
+	await assert.rejects(() => offline.execute("offline", cost), /approval/);
+	assert.equal((await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length, 1);
+} finally {
+	globalThis.fetch = referenceFetch;
+}
 const mutation = {
 	...read,
 	service: "ec2",
