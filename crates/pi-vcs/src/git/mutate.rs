@@ -212,15 +212,18 @@ impl GitRepo {
 		} else {
 			gix::refs::transaction::PreviousValue::MustNotExist
 		};
-		update_reference(
-			&repo,
-			"git branch",
-			&full,
-			id,
-			constraint,
-			&format!("branch: Created from {start}"),
-			false,
-		)?;
+		// git's reflog tells a `-f` move apart from a creation.
+		let exists = force
+			&& repo
+				.try_find_reference(&full)
+				.map_err(|e| Error::backend("git branch", e))?
+				.is_some();
+		let message = if exists {
+			format!("branch: Reset to {start}")
+		} else {
+			format!("branch: Created from {start}")
+		};
+		update_reference(&repo, "git branch", &full, id, constraint, &message, false)?;
 		Ok(())
 	}
 
@@ -717,6 +720,23 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git worktree add", err))
 	}
 
+	/// Resolve the executable hook `name` as git's `find_hook` does: under
+	/// `core.hooksPath` (a relative value resolves against the checkout root)
+	/// or else the shared `hooks` directory, which linked worktrees read from
+	/// the common dir. `None` when the hook is missing or not executable.
+	pub fn hook_path(&self, name: &str) -> Result<Option<PathBuf>> {
+		let dir = self
+			.gix()?
+			.config_snapshot()
+			.string("core.hooksPath")
+			.map_or_else(
+				|| self.info().common_dir.join("hooks"),
+				|value| self.root().join(value.to_str_lossy().as_ref()),
+			);
+		let hook = dir.join(name);
+		Ok(hook_is_executable(&hook).then_some(hook))
+	}
+
 	/// Remove a linked worktree, returning false when dirty and not forced.
 	pub fn worktree_remove(&self, path: &Path, force: bool) -> Result<bool> {
 		let Some(linked) = Self::discover(path)? else {
@@ -751,6 +771,26 @@ impl GitRepo {
 	}
 }
 
+/// Mirrors git's `find_hook`: any failure to stat the hook (missing, or
+/// `core.hooksPath` pointing at a non-directory such as `/dev/null`) means
+/// "no hook", never a commit failure.
+fn hook_is_executable(path: &Path) -> bool {
+	let Ok(metadata) = fs::metadata(path) else {
+		return false;
+	};
+	if !metadata.is_file() {
+		return false;
+	}
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		metadata.permissions().mode() & 0o111 != 0
+	}
+	#[cfg(not(unix))]
+	{
+		true
+	}
+}
 fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
 	match fs::read(path) {
 		Ok(bytes) => Ok(Some(bytes)),
@@ -1642,6 +1682,7 @@ mod tests {
 		git(temp.path(), &["config", "user.name", "Test"]);
 		git(temp.path(), &["config", "user.email", "test@example.com"]);
 		git(temp.path(), &["config", "commit.gpgSign", "false"]);
+		git(temp.path(), &["config", "core.hooksPath", ".git/hooks"]);
 		fs::write(temp.path().join("a"), "one\n").unwrap();
 		fs::write(temp.path().join("b"), "two\n").unwrap();
 		git(temp.path(), &["add", "."]);

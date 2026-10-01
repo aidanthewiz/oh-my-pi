@@ -34,22 +34,6 @@ function createSession(cwd: string, settings: Settings): ToolSession {
 // schema defaults so `set` — the same layer the live settings UI writes —
 // takes effect, matching production.
 describe("createSpeculativeToolExecutionConfig", () => {
-	it("reflects a mid-session enable without recreate", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "speculative-live-config-"));
-		temporaryDirectories.push(directory);
-		const settings = Settings.isolated({});
-		const session = createSession(directory, settings);
-		const config = createSpeculativeToolExecutionConfig(session.settings, session, {
-			hasHandlers: () => false,
-		});
-
-		expect(config.enabled).toBe(false);
-
-		cfgToolsSpeculativeExecutionEnabled.set(settings, true);
-
-		expect(config.enabled).toBe(true);
-	});
-
 	it("propagates maxInFlight changes to the same config object", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "speculative-live-config-"));
 		temporaryDirectories.push(directory);

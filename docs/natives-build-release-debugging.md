@@ -2,7 +2,7 @@
 
 This runbook describes how `@oh-my-pi/pi-natives` produces `.node` addons, generated declarations, and compiled-binary embedded payloads, and how to debug loader/build failures.
 
-Every release addon is built by Bazel (`rules_rust` + `crate_universe` + hermetic cc toolchains); both Windows addons cross-build from Linux. The cargo workspace stays authoritative for local Rust iteration (rust-analyzer, `cargo nextest`) and host builds. Runtime loading and embedding are unchanged.
+Release addons use Bazel (`rules_rust` + `crate_universe` + hermetic cc toolchains), except Windows ARM64, which builds through Cargo on its native runner. The cargo workspace stays authoritative for local Rust iteration (rust-analyzer, `cargo nextest`) and host builds. Runtime loading and embedding are unchanged.
 
 It follows the architecture terms from `docs/natives-architecture.md`:
 
@@ -51,7 +51,7 @@ Root `BUILD.bazel` instantiates one `native_addon` per Bazel-built `(platform, a
 
 Notes:
 
-- Windows ARM64 cross-builds from Linux like win32-x64 (msvc toolchain with an aarch64 xwin splat); `release_smoke_win32_arm64` runs the resulting binary on `windows-11-arm`. A Windows ARM64 dev host can still build `host` through Cargo/N-API.
+- Windows ARM64 has a Bazel cross-build target from Linux (msvc toolchain with an aarch64 xwin splat), but the Coreforce verify and release matrices build its shipped addon on `windows-11-arm` through Cargo/N-API and smoke-test the binary there.
 - musl addons **intentionally reuse** the plain `linux-<arch>` filenames — the loader never sees gnu and musl side by side; release jobs keep them in separate invocations/dest dirs (`scripts/bazel-natives.ts` hard-errors on a basename collision within one run).
 - Aggregates: `//:natives-linux-all` (all linux targets + the msvc cross build, i.e. everything buildable from a linux-x64 host) and `//:natives-darwin-all` (mac hosts only).
 
@@ -62,9 +62,11 @@ Notes:
 - `--platforms=<the addon's platform>`
 - `--compilation_mode=opt`
 - `@rules_rust//rust/settings:lto=thin`
-- extra rustc flags `-Ccodegen-units=16 -Cstrip=symbols`
+- extra rustc flags `-Ccodegen-units=16`; non-Darwin targets use `-Cstrip=symbols`, while both Darwin targets use `-Cstrip=none -Clink-arg=-Wl,-x,-S`
 
 This mirrors the old cargo `ci` profile. Because the profile lives **in the transition**, a bare `bazel build //:natives-<t>` is always release-grade regardless of `-c`, and every addon shares one cache entry per (platform, source) pair. The rule then symlinks the produced shared library to the loader's canonical `pi_natives.<platform>-<arch>[-<variant>].node` name, scoped under the rule name (`bazel-bin/natives-<t>/…`) so gnu/musl outputs with identical basenames cannot collide at the package level.
+
+The macOS deployment target is pinned to 12.0 in `.bazelrc`. Rust's post-link `rust-objcopy` stripping corrupts those Mach-O dylibs with Xcode 27 (`mis-aligned LINKEDIT string pool`). Darwin release addons instead strip non-global symbols and debug information in Apple's linker. The same `.bazelrc` disables post-link stripping for Darwin exec tools and removes their debug information at link time; do not force `ld64.lld` for Darwin ARM64 builds with the Xcode 27 SDK.
 
 Per-target codegen that is not part of the transition lives in `crates/pi-natives/BUILD.bazel` `rustc_flags` selects: `-Ctarget-cpu=x86-64-v2` (baseline) / `x86-64-v3` (modern) via `//bazel/variants`, the napi link args (`-Wl,-undefined,dynamic_lookup` on macOS, `-Wl,-z,nodelete` on linux — `build.rs`/`napi_build::setup()` is deliberately not wired in), `-Ctarget-feature=-crt-static` for musl, and `-Ctarget-feature=+crt-static` for win32 msvc, x64 and arm64 (paired with the `static_link_msvcrt` cc feature enabled in the `native_addon` transition so the C deps compile `/MT` in lock-step — the shipped `.node` then imports no `VCRUNTIME140.dll` from the VC++ Redistributable). The Cargo host path applies the same `+crt-static` policy to local Windows ARM64 builds in `build-bindings.ts`.
 
@@ -86,14 +88,14 @@ Rust toolchains are nightly (pinned in `MODULE.bazel`), with repo-local musl re-
 
 `@crates//...` is generated from the workspace `Cargo.toml`/`Cargo.lock`, restricted to exactly the eight Bazel triples (including `aarch64-pc-windows-msvc`). Crate-specific build fixes live as `crate.annotation`s in `MODULE.bazel` (see the debugging playbook below).
 
-The root module intentionally omits `crate_universe`'s optional rendering lock. The extension is therefore non-reproducible, and Bazel records its full result in `MODULE.bazel.lock`, keyed by hashes of `Cargo.toml`, `Cargo.lock`, every member manifest, and the `crate.*` tags. While that entry is current, a clean output base (every CI pod) reuses it and never evaluates the extension. After any of those inputs changes (every release version bump, every dependency edit), each fresh server instead re-splices the workspace with `cargo-bazel splice`: about 240 s per CI job, with correct results. That is why the entry must be refreshed and committed together with Cargo changes:
+The root module intentionally omits `crate_universe`'s optional rendering lock. The extension is therefore non-reproducible, and Bazel records its full result in `MODULE.bazel.lock`, keyed by hashes of `Cargo.toml`, `Cargo.lock`, every member manifest, and the `crate.*` tags. While that entry is current, a clean output base reuses it and never evaluates the extension. After any of those inputs changes (every release version bump, every dependency edit), a fresh Bazel server instead re-splices the workspace with `cargo-bazel splice`. Refresh and commit the entry together with Cargo changes:
 
 ```bash
 bun run gen:bazel-lock                  # bazelisk fetch --repo=@crates --lockfile_mode=update; needs bazelisk
-bun scripts/gen-bazel-lock.ts --check   # hash comparison only; what the CI bazel_lock job runs
+bun scripts/gen-bazel-lock.ts --check   # check the recorded input hashes
 ```
 
-`scripts/release.ts` refreshes it after regenerating `Cargo.lock`. The `bazel_lock` CI job (hosted, every event including PRs) fails on a stale entry and uploads a refreshed `MODULE.bazel.lock` artifact. Staleness costs speed, not correctness, so it does not gate publishing.
+`scripts/release.ts` refreshes the lock after regenerating `Cargo.lock`. A stale entry costs build time and should be refreshed before release; the deleted upstream `ci.yml` no longer runs its `bazel_lock` job in this fork.
 
 ## Local development
 
@@ -149,9 +151,11 @@ Remote-cache endpoints and credentials must remain in the user-specific file; th
 
 `.github/workflows/cf-release.yml` builds every shipped binary with a native addon from the same fork tree. `.github/workflows/cf-verify.yml` source-builds addons when native inputs differ from the latest ancestor Coreforce release; otherwise it checks and installs that release's authenticated addon. Linux, Darwin, and Windows x64 use the Bazel targets above. Windows ARM64 runs `bun scripts/bazel-natives.ts host` on `windows-11-arm`, then packages and smoke-tests the addon and binary on that runner.
 
-The Windows ARM64 leg skips Bazel cache steps. Other legs save their native cache before packaging, so packaging failures do not discard completed native work. Pull requests build native addons from the resolved fork source when native inputs change; only an unchanged, ancestor Coreforce release can provide verified native assets. Neither the upstream `ci.yml` nor its public npm native leaves are release inputs.
+The Windows ARM64 leg skips Bazel cache steps. The release's other legs save native caches before packaging, so packaging failures do not discard completed native work. Pull requests restore trusted base-branch caches without saving merge-ref caches; they build native addons from the resolved fork source when native inputs change. Only an unchanged, ancestor Coreforce release can provide verified native assets. Neither the deleted upstream `ci.yml` nor its public npm native leaves are release inputs.
 
 The eight binary targets are `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `win32-x64`, and `win32-arm64`. Each release target has a matching `coreforge-pi-natives-<target>-<tag>.tgz`; Linux musl archives deliberately contain canonical `pi_natives.linux-<arch>*.node` names but never substitute glibc addons. Linux x64 carries both baseline and modern; musl x64 carries baseline only. The executable names are `omp-<target>` except the Windows `omp-windows-<arch>.exe` binaries.
+
+`cf-verify.yml` uses the same eight-target matrix. If native inputs changed since the latest ancestor Coreforce release, each target builds the addon from the fork tree. Otherwise it installs and verifies the matching Coreforce release asset. Darwin ARM64 requires the Swift 6.4/macOS 27 SDK bridge on the `xcode-27` runner; Darwin x64 uses `macos-15-intel`. Windows ARM64 builds the host Cargo addon on `windows-11-arm`. The release job always builds its native addons from the release commit, not upstream npm packages.
 
 ## Debugging playbook
 
@@ -194,8 +198,8 @@ bazelisk build --nobuild //:natives-win32-x64-baseline
 
 ### Cache behavior
 
-- Optional local disk and repository caches are configured in `.bazelrc.user`.
-- **msvc repositories:** the LLVM download is SHA-256 pinned and repository-cache backed. The xwin CRT/SDK payload comes from the Microsoft CDN and is not repository-cache backed. Microsoft can advance that payload, so remote-cache hit rates may decrease after an update. Win32 link actions also do not share cache entries across host operating systems.
+- **GitHub-hosted:** `cf-verify.yml` restores trusted base-branch `coreforge-bazel-v1-<target>-<os>-<arch>-<input-hash>` disk and repository caches for changed native inputs but never saves pull-request merge-ref caches. `cf-release.yml` restores and saves the same per-target caches. Windows ARM64 uses Cargo and skips these Bazel caches. Optional local disk and repository caches belong in `.bazelrc.user`.
+- **MSVC repositories:** the LLVM download is SHA-256 pinned and repository-cache backed. The xwin CRT/SDK payload comes from the Microsoft CDN and is not repository-cache backed. Microsoft can advance that payload, so remote-cache hit rates may decrease after an update. Win32 link actions also do not share cache entries across host operating systems.
 
 ## Target/variant model and naming conventions
 

@@ -156,21 +156,23 @@ describe("Bedrock prompt-cache compat", () => {
 			expect(buildModel(bedrockSpec({ id })).compat).toEqual({ ...expected, streamIdleTimeoutMs: 600_000 });
 		}
 	});
-	test("bundles Nova 2 Lite with the published limits and reasoning surface", () => {
-		const nova = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "global.amazon.nova-2-lite-v1:0");
-		expect(nova).toMatchObject({
-			contextWindow: 1_000_000,
-			maxTokens: 64_000,
-			cost: {
-				input: 0.33,
-				output: 2.75,
-				cacheRead: 0.0825,
-				cacheWrite: 0.33,
-			},
-			thinking: {
-				mode: "effort",
-				efforts: ["low", "medium", "high"],
-			},
+	test("bundles the published Nova 2 Lite limits across inference profiles", () => {
+		for (const region of ["eu", "global", "jp", "us"]) {
+			const nova = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", `${region}.amazon.nova-2-lite-v1:0`);
+			expect(nova).toMatchObject({
+				contextWindow: 1_000_000,
+				maxTokens: 64_000,
+				thinking: {
+					mode: "effort",
+					efforts: ["low", "medium", "high"],
+				},
+			});
+		}
+		expect(getBundledModel("amazon-bedrock", "global.amazon.nova-2-lite-v1:0")?.cost).toMatchObject({
+			input: 0.33,
+			output: 2.75,
+			cacheRead: 0.0825,
+			cacheWrite: 0.33,
 		});
 	});
 

@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import {
 	resolveModelRoleValue,
 	resolveRoleChain,
 	roleCandidatePool,
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { runSearchQuery } from "@oh-my-pi/pi-coding-agent/web/search";
+import * as providerModule from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import { getSearchProvider } from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
@@ -59,16 +61,6 @@ describe("web model role resolution", () => {
 			id: "google/gemini-2.5-flash",
 			webSearch: "openrouter",
 		});
-	});
-
-	it("builds the default web retry chain from catalog role priorities", () => {
-		const { pool, settings } = createRuntime();
-
-		const candidates = resolveRoleChain("web", settings, pool);
-
-		expect(candidates.slice(0, 2).map(candidate => candidate.model.id)).toEqual(["parallel", "perplexity"]);
-		expect(candidates.slice(0, 2).every(candidate => candidate.explicit === false)).toBe(true);
-		expect(candidates.some(candidate => candidate.model.id === "duckduckgo")).toBe(true);
 	});
 
 	it("admits supported direct OpenAI web models but excludes realtime from candidates", () => {
@@ -134,6 +126,88 @@ describe("web model role resolution", () => {
 			["perplexity", true],
 			["duckduckgo", true],
 		]);
+	});
+});
+
+describe("web search transport authorization", () => {
+	it("skips credential-triggered API engines automatically but permits an explicit selection", async () => {
+		const settings = await Settings.init({ inMemory: true });
+		const authStorage = createInMemoryAuthStorage();
+		storages.add(authStorage);
+		for (const name of ["parallel", "exa", "firecrawl"]) {
+			authStorage.keys.setRuntime(name, `test-${name}-key`);
+		}
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { settings });
+		const attempted: string[] = [];
+		vi.spyOn(providerModule, "getSearchProvider").mockResolvedValue({
+			id: "parallel",
+			label: "Recorded search",
+			isAvailable: (_auth, model) =>
+				model?.id === "duckduckgo" || model?.id === "parallel" || model?.id === "exa" || model?.id === "firecrawl",
+			isExplicitlyAvailable: () => true,
+			search: async ({ model }) => {
+				attempted.push(model.id);
+				return {
+					provider: "parallel",
+					sources: [{ title: "Result", url: "https://example.org/result" }],
+				};
+			},
+		});
+		try {
+			const automatic = await runSearchQuery({ query: "example" }, { authStorage, modelRegistry });
+			expect(automatic.details.response.sources[0]?.url).toBe("https://example.org/result");
+			expect(attempted).toEqual(["duckduckgo"]);
+
+			const explicit = await runSearchQuery(
+				{ query: "example", model: "web/parallel" },
+				{ authStorage, modelRegistry },
+			);
+			expect(explicit.details.response.sources[0]?.url).toBe("https://example.org/result");
+			expect(attempted).toEqual(["duckduckgo", "parallel"]);
+		} finally {
+			vi.restoreAllMocks();
+			resetSettingsForTest();
+		}
+	});
+
+	it("keeps an explicitly selected hosted swap on the session provider", async () => {
+		const settings = await Settings.init({ inMemory: true });
+		const authStorage = createInMemoryAuthStorage();
+		storages.add(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-anthropic-key");
+		authStorage.keys.setRuntime("openai", "test-openai-key");
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { settings });
+		const activeModel = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!activeModel) throw new Error("Bundled Anthropic session model missing");
+		const attempted: string[] = [];
+		vi.spyOn(providerModule, "getGroundedSearchProvider").mockResolvedValue({
+			id: "anthropic",
+			label: "Recorded grounding",
+			isAvailable: () => true,
+			isExplicitlyAvailable: () => true,
+			search: async ({ model }) => {
+				attempted.push(`${model.provider}/${model.id}`);
+				return {
+					provider: "anthropic",
+					sources: [{ title: "Result", url: "https://example.org/result" }],
+				};
+			},
+		});
+		try {
+			const result = await runSearchQuery(
+				{ query: "example", model: "web/hosted" },
+				{
+					authStorage,
+					modelRegistry,
+					sessionModel: { ...activeModel, webSearchModel: "openai/gpt-6-luna" },
+				},
+			);
+			expect(result.details.response.sources[0]?.url).toBe("https://example.org/result");
+			expect(attempted).toEqual(["anthropic/claude-sonnet-4-5"]);
+		} finally {
+			vi.restoreAllMocks();
+			resetSettingsForTest();
+		}
 	});
 });
 
