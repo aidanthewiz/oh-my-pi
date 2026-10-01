@@ -34,6 +34,7 @@ import type {
 } from "./types";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
@@ -114,6 +115,15 @@ function supportsCodexMeterBlockScopes(req: Request): boolean {
 		capabilities
 			?.split(",")
 			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
+	);
+}
+
+function supportsBlockRevisions(req: Request): boolean {
+	return (
+		req.headers
+			.get(AUTH_BROKER_CAPABILITIES_HEADER)
+			?.split(",")
+			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS) ?? false
 	);
 }
 
@@ -395,8 +405,10 @@ function buildSnapshot(
 	storage: AuthStorage,
 	refresher: AuthBrokerRefresher | undefined,
 	clientSupportsCodexMeterBlockScopes: boolean,
+	clientSupportsBlockRevisions: boolean,
 ): SnapshotResponse {
 	const serverNowMs = Date.now();
+	const blockRevision = clientSupportsBlockRevisions ? storage.blocks.revision() : undefined;
 	const base = storage.credentials.snapshot();
 	const { wire, nextSweepAt } = resolveRefresherSchedule(refresher, serverNowMs);
 	const credentialIds = base.credentials.map(entry => entry.id);
@@ -412,6 +424,7 @@ function buildSnapshot(
 	});
 	return {
 		generation: base.generation,
+		...(blockRevision ? { blockRevision } : {}),
 		generatedAt: base.generatedAt,
 		serverNowMs,
 		refresher: wire,
@@ -429,12 +442,13 @@ async function serveSnapshot(
 ): Promise<Response> {
 	await storage.credentials.reload();
 	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const clientSupportsBlockRevisions = supportsBlockRevisions(req);
 	let currentGeneration = storage.credentials.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes, clientSupportsBlockRevisions);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -454,7 +468,7 @@ async function serveSnapshot(
 	await storage.credentials.reload();
 	currentGeneration = storage.credentials.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes, clientSupportsBlockRevisions);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -501,6 +515,7 @@ function serveSnapshotStream(
 	const encoder = new TextEncoder();
 	const openedAt = Date.now();
 	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const clientSupportsBlockRevisions = supportsBlockRevisions(req);
 	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let unsubscribe: (() => void) | null = null;
@@ -558,7 +573,12 @@ function serveSnapshotStream(
 				pendingBumps = 0;
 				await storage.credentials.reload();
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+				const snapshot = buildSnapshot(
+					storage,
+					refresher,
+					clientSupportsCodexMeterBlockScopes,
+					clientSupportsBlockRevisions,
+				);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -579,6 +599,7 @@ function serveSnapshotStream(
 						kind: "entry",
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
+						...(snapshot.blockRevision ? { blockRevision: snapshot.blockRevision } : {}),
 						refresher: snapshot.refresher,
 						entry,
 					};
@@ -597,6 +618,7 @@ function serveSnapshotStream(
 						kind: "removed",
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
+						...(snapshot.blockRevision ? { blockRevision: snapshot.blockRevision } : {}),
 						refresher: snapshot.refresher,
 						id,
 					};
@@ -613,7 +635,12 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await storage.credentials.reload();
-			const initial = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+			const initial = buildSnapshot(
+				storage,
+				refresher,
+				clientSupportsCodexMeterBlockScopes,
+				clientSupportsBlockRevisions,
+			);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -823,7 +850,8 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					}
 					try {
 						opts.storage.blocks.upsert(block);
-						const response: CredentialBlockResponse = { ok: true };
+						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
+						const response: CredentialBlockResponse = { ok: true, ...(blockRevision ? { blockRevision } : {}) };
 						logger.info("auth-broker credential block upserted", {
 							id,
 							peer,
@@ -849,7 +877,11 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					}
 					try {
 						opts.storage.blocks.delete(id, parsed.data.providerKey, parsed.data.blockScope);
-						const response: CredentialBlocksDeleteResponse = { ok: true };
+						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
+						const response: CredentialBlocksDeleteResponse = {
+							ok: true,
+							...(blockRevision ? { blockRevision } : {}),
+						};
 						logger.info("auth-broker credential block deleted", { id, peer, ...parsed.data });
 						return json(200, response);
 					} catch (error) {
@@ -867,7 +899,11 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					}
 					try {
 						opts.storage.blocks.deleteAll(id);
-						const response: CredentialBlocksDeleteResponse = { ok: true };
+						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
+						const response: CredentialBlocksDeleteResponse = {
+							ok: true,
+							...(blockRevision ? { blockRevision } : {}),
+						};
 						logger.info("auth-broker credential blocks deleted", { id, peer });
 						return json(200, response);
 					} catch (error) {

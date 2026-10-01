@@ -550,6 +550,10 @@ export class CredentialBlocks implements BlocksApi {
 		}
 	}
 
+	revision(): { instanceId: string; sequence: number } | undefined {
+		return this.#deps.store.getCredentialBlockRevision?.();
+	}
+
 	/**
 	 * Broker-server seam: list non-expired persisted blocks for snapshot entries.
 	 */

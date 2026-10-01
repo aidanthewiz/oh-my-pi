@@ -1269,6 +1269,8 @@ export interface ResetsApi {
 
 /** Persisted credential rate-limit block operations. */
 export interface BlocksApi {
+	/** Revision of persisted block mutations for broker snapshot/ack fencing. */
+	revision(): { instanceId: string; sequence: number } | undefined;
 	/**
 	 * Broker-server seam: list non-expired persisted blocks for snapshot entries.
 	 */

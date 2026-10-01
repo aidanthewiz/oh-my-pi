@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AuthBrokerClient,
 	AuthBrokerError,
@@ -127,6 +128,61 @@ describe("auth-broker wire surface", () => {
 		}
 	});
 
+	test("block acknowledgements and snapshots share a durable revision across broker restart", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+		const credentialId = initial.snapshot.credentials[0]!.id;
+		const firstRevision = initial.snapshot.blockRevision;
+		const legacyResponse = await fetch(`${handle!.url}/v1/snapshot`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(legacyResponse.status).toBe(200);
+		expect(((await legacyResponse.json()) as Record<string, unknown>).blockRevision).toBeUndefined();
+		expect(firstRevision?.instanceId).toMatch(/^[0-9A-F]{32}$/);
+		const block = { providerKey: "anthropic:oauth", blockScope: "tier:fable", blockedUntilMs: Date.now() + 60_000 };
+		const inserted = await client.upsertCredentialBlock(credentialId, block);
+		expect(inserted.blockRevision?.instanceId).toBe(firstRevision!.instanceId);
+		expect(inserted.blockRevision!.sequence).toBeGreaterThan(firstRevision!.sequence);
+		const withBlock = await client.fetchSnapshot();
+		if (withBlock.status !== 200) throw new Error("expected block snapshot");
+		expect(withBlock.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(inserted.blockRevision!.sequence);
+		expect(credentialBlocks(withBlock.snapshot, credentialId)).toHaveLength(1);
+
+		const removed = await client.deleteCredentialBlock(credentialId, {
+			providerKey: block.providerKey,
+			blockScope: block.blockScope,
+		});
+		expect(removed.blockRevision!.sequence).toBeGreaterThan(inserted.blockRevision!.sequence);
+		const withoutBlock = await client.fetchSnapshot();
+		if (withoutBlock.status !== 200) throw new Error("expected deleted block snapshot");
+		expect(withoutBlock.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(removed.blockRevision!.sequence);
+		expect(credentialBlocks(withoutBlock.snapshot, credentialId)).toEqual([]);
+		const secondInsert = await client.upsertCredentialBlock(credentialId, block);
+		const removedAll = await client.deleteCredentialBlocks(credentialId);
+		expect(removedAll.blockRevision!.sequence).toBeGreaterThan(secondInsert.blockRevision!.sequence);
+		const afterDeleteAll = await client.fetchSnapshot();
+		if (afterDeleteAll.status !== 200) throw new Error("expected delete-all snapshot");
+		expect(credentialBlocks(afterDeleteAll.snapshot, credentialId)).toEqual([]);
+		expect(afterDeleteAll.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(
+			removedAll.blockRevision!.sequence,
+		);
+
+		const bindUrl = new URL(handle!.url);
+		const bind = `${bindUrl.hostname}:${bindUrl.port}`;
+		await handle!.close();
+		storage!.close();
+		store!.close();
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		storage = new AuthStorage(store);
+		await storage.credentials.reload();
+		handle = startAuthBroker({ storage, bind, bearerTokens: [token], disableRefresher: true });
+		const afterRestart = await new AuthBrokerClient({ url: handle.url, token }).fetchSnapshot();
+		if (afterRestart.status !== 200) throw new Error("expected restart snapshot");
+		expect(afterRestart.snapshot.credentials[0]!.id).toBe(credentialId);
+		expect(afterRestart.snapshot.blockRevision).toEqual(afterDeleteAll.snapshot.blockRevision);
+	});
+
 	test("preserves an HTTP rejection when the caller aborts while reading its body", async () => {
 		const client = new AuthBrokerClient({
 			url: "http://broker.invalid",
@@ -214,7 +270,9 @@ describe("auth-broker wire surface", () => {
 		const unchanged = await client.fetchSnapshot({ ifGenerationGt: body.generation, waitMs: 10 });
 		expect(unchanged.status).toBe(304);
 		expect(unchanged.generation).toBe(body.generation);
-		expect(observedCapabilities).toEqual([AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES]);
+		expect(observedCapabilities).toEqual([
+			`${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS}`,
+		]);
 
 		const rawUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
 			headers: {

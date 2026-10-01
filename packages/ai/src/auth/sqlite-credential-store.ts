@@ -752,6 +752,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				revision INTEGER NOT NULL
 			);
 			INSERT OR IGNORE INTO auth_change_revision (id, revision) VALUES (1, 0);
+			CREATE TABLE IF NOT EXISTS auth_change_instance (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				instance_id TEXT NOT NULL
+			);
+			INSERT OR IGNORE INTO auth_change_instance (id, instance_id) VALUES (1, hex(randomblob(16)));
 			CREATE TEMP TABLE IF NOT EXISTS auth_local_change_revision (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				revision INTEGER NOT NULL
@@ -1987,6 +1992,15 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#readDataVersion(): number {
 		const row = this.#db.query("PRAGMA data_version").get() as { data_version?: number } | null;
 		return row?.data_version ?? 0;
+	}
+
+	getCredentialBlockRevision(): { instanceId: string; sequence: number } {
+		const row = this.#db
+			.query(
+				"SELECT instance_id, revision FROM auth_change_instance CROSS JOIN auth_change_revision WHERE auth_change_instance.id = 1 AND auth_change_revision.id = 1",
+			)
+			.get() as { instance_id: string; revision: number };
+		return { instanceId: row.instance_id, sequence: row.revision };
 	}
 
 	#readAuthRevision(): number {

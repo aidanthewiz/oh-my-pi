@@ -139,11 +139,14 @@ export const refresherScheduleSchema: FluentType<RefresherSchedule> = type({
 	nextSweepInMs: "number",
 });
 
+const blockRevisionSchema = type({ "+": "reject", instanceId: "string", sequence: "number.integer" });
+
 export const snapshotResponseSchema: FluentType<SnapshotResponse> = type({
 	"+": "reject",
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
 });
@@ -156,6 +159,7 @@ export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapsho
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
 	kind: "'snapshot'",
@@ -167,6 +171,7 @@ export const snapshotStreamEntryEventSchema: FluentType<SnapshotStreamEntryEvent
 	kind: "'entry'",
 	generation: "number.integer",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
 	refresher: refresherScheduleSchema,
 	entry: snapshotEntrySchema,
 });
@@ -177,6 +182,7 @@ export const snapshotStreamRemovedEventSchema: FluentType<SnapshotStreamRemovedE
 	kind: "'removed'",
 	generation: "number.integer",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
 	refresher: refresherScheduleSchema,
 	id: "number.integer",
 });
@@ -403,11 +409,13 @@ export const credentialBlockDeleteRequestSchema: FluentType<CredentialBlockDelet
 export const credentialBlockResponseSchema: FluentType<CredentialBlockResponse> = type({
 	"+": "reject",
 	ok: "boolean",
+	"blockRevision?": blockRevisionSchema,
 });
 
 export const credentialBlocksDeleteResponseSchema: FluentType<CredentialBlocksDeleteResponse> = type({
 	"+": "reject",
 	ok: "boolean",
+	"blockRevision?": blockRevisionSchema,
 });
 
 export const usageStaleResponseSchema: FluentType<UsageStaleResponse> = type({

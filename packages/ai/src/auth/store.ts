@@ -96,6 +96,8 @@ export interface CredentialCacheStore {
 
 /** Durable rate-limit blocks, present together when supported by the store. */
 export interface CredentialBlockStore {
+	/** Durable revision for broker snapshot/ack fencing, when the backing store supports one. */
+	getCredentialBlockRevision?(): { instanceId: string; sequence: number };
 	/** Non-expired block for one (credential, providerKey, scope) key, or undefined. */
 	getCredentialBlock(credentialId: number, providerKey: string, blockScope: string): number | undefined;
 	/** Earliest time a shared-store block should be eligible for live-usage reconciliation. */

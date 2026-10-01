@@ -597,3 +597,289 @@ describe("RemoteAuthCredentialStore.pollExternalChanges content revision", () =>
 		}
 	});
 });
+
+type TestBlock = { providerKey: string; blockScope: string; blockedUntilMs: number; updatedAtMs?: number };
+
+class DeferredBlockBroker extends FakeBrokerClient {
+	readonly blocks = new Map<number, Map<string, TestBlock>>();
+	readonly operations: Array<{
+		id: number;
+		kind: "upsert" | "delete" | "delete-all";
+		release: () => void;
+		completed: Promise<void>;
+	}> = [];
+	readonly #operationWaiters = new Map<number, PromiseWithResolvers<(typeof this.operations)[number]>>();
+	readonly #snapshotWaiters: Array<PromiseWithResolvers<FetchSnapshotResult>> = [];
+	readonly #timestamp: number;
+
+	constructor(initial: SnapshotResponse, timestamp: number) {
+		super(initial);
+		this.current.blockRevision = { instanceId: "test-persisted-db", sequence: 1 };
+		this.#timestamp = timestamp;
+		for (const entry of initial.credentials) {
+			this.blocks.set(entry.id, new Map((entry.blocks ?? []).map(block => [this.#key(block), block])));
+		}
+	}
+
+	#key(block: Pick<TestBlock, "providerKey" | "blockScope">): string {
+		return `${block.providerKey}\0${block.blockScope}`;
+	}
+
+	visible(id: number): TestBlock[] {
+		return [...(this.blocks.get(id)?.values() ?? [])];
+	}
+
+	snapshot(): SnapshotResponse {
+		return {
+			...this.current,
+			credentials: this.current.credentials.map(entry => {
+				const blocks = this.visible(entry.id);
+				return blocks.length ? { ...entry, blocks } : { ...entry, blocks: undefined };
+			}),
+		};
+	}
+
+	deferSnapshot(): PromiseWithResolvers<FetchSnapshotResult> {
+		const waiter = Promise.withResolvers<FetchSnapshotResult>();
+		this.#snapshotWaiters.push(waiter);
+		return waiter;
+	}
+
+	override async fetchSnapshot(opts: { ifGenerationGt?: number } = {}): Promise<FetchSnapshotResult> {
+		if (opts.ifGenerationGt !== undefined) return { status: 304, generation: this.current.generation };
+		const waiter = this.#snapshotWaiters.shift();
+		return waiter?.promise ?? { status: 200, snapshot: this.snapshot(), generation: this.current.generation };
+	}
+
+	waitForOperation(index: number): Promise<(typeof this.operations)[number]> {
+		const operation = this.operations[index];
+		if (operation) return Promise.resolve(operation);
+		const ready = Promise.withResolvers<(typeof this.operations)[number]>();
+		this.#operationWaiters.set(index, ready);
+		return ready.promise;
+	}
+
+	#defer(id: number, kind: "upsert" | "delete" | "delete-all", apply: () => void): Promise<{ ok: true }> {
+		const gate = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<void>();
+		const operation = { id, kind, release: () => gate.resolve(), completed: completed.promise };
+		this.operations.push(operation);
+		const index = this.operations.length - 1;
+		this.#operationWaiters.get(index)?.resolve(operation);
+		this.#operationWaiters.delete(index);
+		return gate.promise.then(() => {
+			apply();
+			this.current.blockRevision = {
+				instanceId: "test-persisted-db",
+				sequence: this.current.blockRevision!.sequence + 1,
+			};
+			completed.resolve();
+			return { ok: true as const, blockRevision: this.current.blockRevision };
+		});
+	}
+
+	upsertCredentialBlock(id: number, block: TestBlock): Promise<{ ok: true }> {
+		return this.#defer(id, "upsert", () => {
+			const rows = this.blocks.get(id) ?? new Map<string, TestBlock>();
+			const key = this.#key(block);
+			const previous = rows.get(key);
+			rows.set(key, {
+				...block,
+				blockedUntilMs: Math.max(previous?.blockedUntilMs ?? 0, block.blockedUntilMs),
+				updatedAtMs: this.#timestamp,
+			});
+			this.blocks.set(id, rows);
+		});
+	}
+
+	deleteCredentialBlock(id: number, block: Pick<TestBlock, "providerKey" | "blockScope">): Promise<{ ok: true }> {
+		return this.#defer(id, "delete", () => {
+			this.blocks.get(id)?.delete(this.#key(block));
+		});
+	}
+
+	deleteCredentialBlocks(id: number): Promise<{ ok: true }> {
+		return this.#defer(id, "delete-all", () => {
+			this.blocks.set(id, new Map());
+		});
+	}
+}
+
+describe("RemoteAuthCredentialStore broker block mutation ordering", () => {
+	const credentialId = 7;
+	const providerKey = "anthropic:oauth";
+	const blockScope = "tier:fable";
+
+	function setup(initialBlocks: TestBlock[] = []) {
+		const now = Date.now();
+		const initial = buildApiKeySnapshot(1, [
+			{ id: credentialId, provider: "anthropic", key: "sk-test" },
+			{ id: 8, provider: "anthropic", key: "sk-other" },
+		]);
+		initial.credentials[0]!.blocks = initialBlocks;
+		const client = new DeferredBlockBroker(initial, now);
+		const remote = new RemoteAuthCredentialStore({
+			client: client as unknown as AuthBrokerClient,
+			initialSnapshot: initial,
+			streamSnapshots: false,
+			backgroundIdleMs: 0,
+		});
+		const block = { credentialId, providerKey, blockScope, blockedUntilMs: now + 60_000, updatedAtMs: now };
+		return { client, remote, block };
+	}
+
+	test("upsert, scoped delete, and upsert commit in invocation order while another ID remains independent", async () => {
+		const { client, remote, block } = setup();
+		try {
+			remote.upsertCredentialBlock(block);
+			remote.deleteCredentialBlock(credentialId, providerKey, blockScope);
+			remote.upsertCredentialBlock(block);
+			remote.upsertCredentialBlock({ ...block, credentialId: 8 });
+			expect(client.operations.map(op => [op.id, op.kind])).toEqual([
+				[credentialId, "upsert"],
+				[8, "upsert"],
+			]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			const deleteOp = await client.waitForOperation(2);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			expect(deleteOp.kind).toBe("delete");
+			deleteOp.release();
+			await deleteOp.completed;
+			await Promise.resolve();
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			const upsertOp = await client.waitForOperation(3);
+			expect(upsertOp.kind).toBe("upsert");
+			upsertOp.release();
+			await upsertOp.completed;
+			await remote.refreshSnapshot();
+			expect(client.visible(credentialId).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			client.operations[1]!.release();
+			await client.operations[1]!.completed;
+			expect(client.visible(8).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("delete-all cannot erase a later upsert, even when an old snapshot arrives between acknowledgements", async () => {
+		const { client, remote, block } = setup([
+			{ providerKey, blockScope, blockedUntilMs: Date.now() + 60_000 },
+			{ providerKey, blockScope: "shared", blockedUntilMs: Date.now() + 60_000 },
+		]);
+		try {
+			remote.deleteCredentialBlocks(credentialId);
+			remote.upsertCredentialBlock(block);
+			expect(client.operations.map(op => op.kind)).toEqual(["delete-all"]);
+			const oldSnapshot = client.snapshot();
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			const upsertOp = await client.waitForOperation(1);
+			expect(upsertOp.kind).toBe("upsert");
+			// The pre-ack read may complete after the DELETE. Its durable revision
+			// still predates the acknowledgement.
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await staleRequest;
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			client.operations[1]!.release();
+			await client.operations[1]!.completed;
+			await remote.refreshSnapshot();
+			expect(client.visible(credentialId).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("an older GET response cannot overwrite a newer committed snapshot", async () => {
+		const { client, remote, block } = setup();
+		try {
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			const oldSnapshot = client.snapshot();
+			remote.upsertCredentialBlock(block);
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			await Promise.resolve();
+			await remote.refreshSnapshot();
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await staleRequest;
+			expect(client.visible(credentialId).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("a later GET cannot roll back an acknowledged block to an older durable revision", async () => {
+		const { client, remote, block } = setup();
+		try {
+			const oldSnapshot = client.snapshot();
+			remote.upsertCredentialBlock(block);
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			await remote.refreshSnapshot();
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(block.blockedUntilMs);
+
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await staleRequest;
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(block.blockedUntilMs);
+			expect(remote.snapshot.blockRevision!.sequence).toBeGreaterThan(oldSnapshot.blockRevision!.sequence);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("a committed same-millisecond recreation survives the deleted row's tombstone", async () => {
+		const timestamp = Date.now();
+		const original = { providerKey, blockScope, blockedUntilMs: timestamp + 60_000, updatedAtMs: timestamp };
+		const { client, remote } = setup([original]);
+		try {
+			remote.deleteCredentialBlock(credentialId, providerKey, blockScope);
+			expect(remote.listCredentialBlocks([credentialId])).toEqual([]);
+			const oldSnapshot = client.snapshot();
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			const staleAckRefresh = client.deferSnapshot();
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			await Promise.resolve();
+			client.blocks.get(credentialId)!.set(`${providerKey}\0${blockScope}`, original);
+			expect(client.visible(credentialId)).toEqual([original]);
+			client.current.blockRevision = {
+				instanceId: "test-persisted-db",
+				sequence: client.current.blockRevision!.sequence + 1,
+			};
+			await remote.refreshSnapshot();
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(original.blockedUntilMs);
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			staleAckRefresh.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await Promise.resolve();
+			await staleRequest;
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(original.blockedUntilMs);
+		} finally {
+			remote.close();
+		}
+	});
+});
