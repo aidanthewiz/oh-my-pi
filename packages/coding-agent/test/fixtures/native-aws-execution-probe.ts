@@ -71,7 +71,16 @@ const references: Record<string, unknown> = {
 	"mapping.json": {
 		SDK: {
 			Python: {
-				Boto3: Object.fromEntries(["s3", "ce", "logs", "ec2", "rds", "sqs"].map(service => [service, { service }])),
+				Boto3: {
+					...Object.fromEntries(
+						["s3", "ce", "logs", "ec2", "rds", "sqs", "sagemaker", "bedrock", "signin"].map(service => [
+							service,
+							{ service },
+						]),
+					),
+					"sagemaker-runtime": { service: "sagemaker" },
+					"bedrock-agent-runtime": { service: "bedrock" },
+				},
 			},
 		},
 	},
@@ -90,6 +99,35 @@ const references: Record<string, unknown> = {
 			operation("ReceiveMessage", "sqs", "receive_message", ["sqs", "ReceiveMessage"]),
 			operation("GetQueueAttributes", "sqs", "get_queue_attributes", ["sqs", "GetQueueAttributes"]),
 		],
+	},
+	"sagemaker/sagemaker.json": {
+		Name: "sagemaker",
+		Actions: [action("ListEndpoints"), action("InvokeEndpoint"), action("InvokeEndpointAsync")],
+		Operations: [
+			operation("ListEndpoints", "sagemaker", "list_endpoints", ["sagemaker", "ListEndpoints"]),
+			operation("InvokeEndpoint", "sagemaker-runtime", "invoke_endpoint", ["sagemaker", "InvokeEndpoint"]),
+			operation("InvokeEndpointAsync", "sagemaker-runtime", "invoke_endpoint_async", [
+				"sagemaker",
+				"InvokeEndpointAsync",
+			]),
+		],
+	},
+	"bedrock/bedrock.json": {
+		Name: "bedrock",
+		Actions: [action("InvokeAgent"), action("InvokeFlow"), action("InvokeInlineAgent")],
+		Operations: [
+			operation("InvokeAgent", "bedrock-agent-runtime", "invoke_agent", ["bedrock", "InvokeAgent"]),
+			operation("InvokeFlow", "bedrock-agent-runtime", "invoke_flow", ["bedrock", "InvokeFlow"]),
+			operation("InvokeInlineAgent", "bedrock-agent-runtime", "invoke_inline_agent", [
+				"bedrock",
+				"InvokeInlineAgent",
+			]),
+		],
+	},
+	"signin/signin.json": {
+		Name: "signin",
+		Actions: [action("CreateOAuth2Token")],
+		Operations: [operation("CreateOAuth2Token", "signin", "create_oauth2_token", ["signin", "CreateOAuth2Token"])],
 	},
 	"ce/ce.json": {
 		Name: "ce",
@@ -337,6 +375,23 @@ await assert.rejects(
 	/requires approval but no interactive UI/,
 );
 assert.equal((await calls()).filter(call => call.argv.includes("receive-message")).length, beforeReceive);
+const listedEndpoints = { ...read, service: "sagemaker", operation: "list-endpoints" };
+assert.equal(await tool.prepareRuntimeApproval("list-endpoints", listedEndpoints), undefined);
+assert.equal(tool.approval(listedEndpoints), "read");
+for (const [service, operationName] of [
+	["sagemaker-runtime", "invoke-endpoint"],
+	["sagemaker-runtime", "invoke-endpoint-async"],
+	["bedrock-agent-runtime", "invoke-agent"],
+	["bedrock-agent-runtime", "invoke-flow"],
+	["bedrock-agent-runtime", "invoke-inline-agent"],
+	["signin", "create-oauth2-token"],
+] as const) {
+	const args = { ...read, service, operation: operationName };
+	assert.match((await tool.prepareRuntimeApproval(operationName, args))!.prompt, /Account: 123456789012/);
+	assert.equal(tool.approval(args), "exec");
+	await assert.rejects(() => tool.execute(operationName, args), /approval/);
+	assert.equal((await calls()).filter(call => call.argv.includes(operationName)).length, 0);
+}
 const mutation = {
 	...read,
 	service: "ec2",

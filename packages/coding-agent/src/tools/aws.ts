@@ -424,8 +424,11 @@ const AWS_REFERENCE_ROOT = "https://servicereference.us-east-1.amazonaws.com/v1/
 const AWS_REFERENCE_TTL_MS = 60 * 60 * 1000;
 const AWS_REFERENCE_FAILURE_TTL_MS = 60 * 1000;
 const AWS_REFERENCE_TIMEOUT_MS = 5_000;
-// SQS ReceiveMessage hides messages and advances receive counts despite its IAM Read label.
+// IAM Read includes SQS consumption, workload invocation, and credential issuance.
 const AWS_STATEFUL_IAM_READ_ACTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+	bedrock: new Set(["InvokeAgent", "InvokeFlow", "InvokeInlineAgent"]),
+	sagemaker: new Set(["InvokeEndpoint", "InvokeEndpointAsync"]),
+	signin: new Set(["CreateOAuth2Token"]),
 	sqs: new Set(["ReceiveMessage"]),
 };
 
