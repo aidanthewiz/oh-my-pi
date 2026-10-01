@@ -4,7 +4,7 @@
  *
  * Collection never spawns a broker: live scopes are queried over the broker
  * socket, dead scopes are read from the persisted per-daemon `meta.json`
- * snapshots.
+ * snapshots and `spec.json` launch specs.
  */
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -17,7 +17,13 @@ import {
 	isEnoent,
 } from "@oh-my-pi/pi-utils";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../launch/client";
-import { canonicalProjectDir, daemonRuntimeDir, readDaemonScopeMeta } from "../launch/paths";
+import {
+	canonicalProjectDir,
+	daemonBrokerRuntimeDir,
+	daemonRuntimeDir,
+	readDaemonScopeMeta,
+	readStoredDaemonRecord,
+} from "../launch/paths";
 import { readLiveDaemonBrokerPid } from "../launch/presence";
 import type { DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/daemon";
 import {
@@ -41,7 +47,8 @@ export const KILL_GRACE_MS = 100;
 /** The single scope named by `target` (defaults to the current project). */
 export async function targetScope(target: PsTarget): Promise<PsScope> {
 	if (target.global) {
-		const runtimeDir = await canonicalRuntimeDir(getGlobalDaemonRuntimeDir(target.global));
+		const runtimeRoot = await canonicalRuntimeDir(getGlobalDaemonRuntimeDir(target.global));
+		const runtimeDir = daemonBrokerRuntimeDir(runtimeRoot);
 		return {
 			kind: "global",
 			runtimeDir,
@@ -50,7 +57,7 @@ export async function targetScope(target: PsTarget): Promise<PsScope> {
 		};
 	}
 	const projectDir = await canonicalProjectDir(target.dir ?? getProjectDir());
-	const runtimeDir = daemonRuntimeDir(projectDir);
+	const runtimeDir = daemonBrokerRuntimeDir(daemonRuntimeDir(projectDir));
 	return { kind: "project", runtimeDir, projectDir, brokerPid: await readLiveDaemonBrokerPid(runtimeDir) };
 }
 
@@ -67,7 +74,7 @@ export async function discoverScopes(): Promise<PsScope[]> {
 	const scopes: PsScope[] = [];
 	for (const entry of await readdirQuiet(getDaemonRuntimeRoot())) {
 		if (!entry.isDirectory() || !PROJECT_SCOPE_KEY.test(entry.name)) continue;
-		const runtimeDir = path.join(getDaemonRuntimeRoot(), entry.name);
+		const runtimeDir = daemonBrokerRuntimeDir(path.join(getDaemonRuntimeRoot(), entry.name));
 		scopes.push({
 			kind: "project",
 			runtimeDir,
@@ -77,7 +84,9 @@ export async function discoverScopes(): Promise<PsScope[]> {
 	}
 	for (const entry of await readdirQuiet(getGlobalDaemonRuntimeRoot())) {
 		if (!entry.isDirectory()) continue;
-		const runtimeDir = await canonicalRuntimeDir(path.join(getGlobalDaemonRuntimeRoot(), entry.name));
+		const runtimeDir = daemonBrokerRuntimeDir(
+			await canonicalRuntimeDir(path.join(getGlobalDaemonRuntimeRoot(), entry.name)),
+		);
 		scopes.push({
 			kind: "global",
 			runtimeDir,
@@ -133,12 +142,18 @@ async function resolveScopeProjectDir(runtimeDir: string): Promise<string | unde
  * discovered scopes). The caller owns the returned client and must close it.
  */
 export async function scopeClient(scope: PsScope): Promise<DaemonBrokerClient | undefined> {
-	const connectDir = scope.projectDir ?? (process.platform === "win32" ? undefined : scope.runtimeDir);
+	const runtimeRoot = path.dirname(scope.runtimeDir);
+	const connectDir =
+		scope.projectDir ?? (process.platform === "win32" && scope.kind !== "global" ? undefined : runtimeRoot);
 	if (connectDir === undefined) return undefined;
-	return createDaemonBrokerClient(connectDir, { runtimeDir: scope.runtimeDir });
+	return createDaemonBrokerClient(connectDir, { runtimeDir: runtimeRoot });
 }
 
-/** Persisted `{snapshot, spec}` pairs from `<runtimeDir>/daemons/<name>/meta.json`. */
+/**
+ * Persisted `{snapshot, spec}` pairs from `<runtimeDir>/daemons/<name>/`: the
+ * spec lives in `spec.json`, or inside `meta.json` for records written by
+ * older brokers.
+ */
 async function readPersistedDaemons(
 	runtimeDir: string,
 ): Promise<Map<string, { snapshot: DaemonSnapshot; spec: DaemonSpec }>> {
@@ -147,11 +162,10 @@ async function readPersistedDaemons(
 	for (const entry of await readdirQuiet(root)) {
 		if (!entry.isDirectory()) continue;
 		try {
-			const decoded: unknown = await Bun.file(path.join(root, entry.name, "meta.json")).json();
-			if (typeof decoded !== "object" || decoded === null || !("daemon" in decoded) || !("spec" in decoded))
-				continue;
-			const snapshot = parseDaemonSnapshot(decoded.daemon);
-			persisted.set(snapshot.name, { snapshot, spec: parseDaemonSpec(decoded.spec) });
+			const stored = await readStoredDaemonRecord(path.join(root, entry.name));
+			if (!stored) continue;
+			const snapshot = parseDaemonSnapshot(stored.meta.daemon);
+			persisted.set(snapshot.name, { snapshot, spec: parseDaemonSpec(stored.spec) });
 		} catch {
 			// Malformed or torn metadata is skipped; the broker rewrites it on next start.
 		}

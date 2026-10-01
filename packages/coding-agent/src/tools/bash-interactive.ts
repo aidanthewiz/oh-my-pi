@@ -7,7 +7,7 @@ import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
+import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
 
 export interface BashInteractiveResult extends OutputSummary {
 	exitCode: number | undefined;
@@ -39,6 +39,7 @@ export async function runInteractiveBashPty(
 		artifactPath: options.artifactPath,
 		artifactId: options.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
 	try {

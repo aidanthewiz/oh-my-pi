@@ -393,6 +393,96 @@ describe("RpcInputDispatcher", () => {
 		expect((outputs[1] as RpcResponse).command).toBe("get_state");
 	});
 
+	test("a steer_subagent waiting for the subagent to accept does not block a later abort", async () => {
+		const accepted = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			started.push(command.type);
+			if (command.type === "steer_subagent") {
+				await accepted.promise;
+				return { id: command.id, type: "response", command: "steer_subagent", success: true };
+			}
+			if (command.type === "abort") return { id: command.id, type: "response", command: "abort", success: true };
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "steer", type: "steer_subagent", subagentId: "SubagentA", message: "go" });
+		dispatcher.dispatch({ id: "abort", type: "abort" });
+		await flushMicrotasks();
+
+		expect(started).toEqual(["steer_subagent", "abort"]);
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort"]);
+
+		accepted.resolve();
+		await flushMicrotasks();
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort", "steer"]);
+	});
+
+	test("a pending predict_word does not hold back later commands", async () => {
+		const releasePrediction = Promise.withResolvers<void>();
+		const { deps, outputs } = makeDeps(async command => {
+			if (command.type === "predict_word") {
+				await releasePrediction.promise;
+				return { id: command.id, type: "response", command: "predict_word", success: true, data: { suffix: "er" } };
+			}
+			if (command.type === "abort_retry") {
+				return { id: command.id, type: "response", command: "abort_retry", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "predict", type: "predict_word", text: "The weath", cursor: 9 });
+		dispatcher.dispatch({ id: "after", type: "abort_retry" });
+		await dispatcher.drain();
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["after"]);
+
+		releasePrediction.resolve();
+		await flushMicrotasks();
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["after", "predict"]);
+	});
+
+	test("get_state and abort_bash overtake a model switch fenced behind an image prompt", async () => {
+		const prepared = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async (command, registerPromptReady) => {
+			started.push(command.type);
+			if (command.type === "prompt") {
+				registerPromptReady?.(prepared.promise);
+			} else if (command.type !== "set_model" && command.type !== "get_state" && command.type !== "abort_bash") {
+				throw new Error(`unexpected command type: ${command.type}`);
+			}
+			return { id: command.id, type: "response", command: command.type, success: true } as RpcResponse;
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({
+				id: "image",
+				type: "prompt",
+				message: "describe image",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: "next" });
+			dispatcher.dispatch({ id: "state", type: "get_state" });
+			dispatcher.dispatch({ id: "bash-abort", type: "abort_bash" });
+			await flushMicrotasks();
+			expect(started).toEqual(["prompt", "get_state", "abort_bash"]);
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["image", "state", "bash-abort"]);
+		} finally {
+			prepared.resolve();
+			await dispatcher.drain();
+		}
+		expect(started).toEqual(["prompt", "get_state", "abort_bash", "set_model"]);
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["image", "state", "bash-abort", "model"]);
+	});
+
 	test("a prompt waits for an earlier session change without blocking a later abort", async () => {
 		const reset = Promise.withResolvers<void>();
 		const admission = Promise.withResolvers<void>();

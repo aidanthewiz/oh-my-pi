@@ -5,6 +5,13 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [18.4.9] - 2026-10-01
+
+### Added
+
+- Added `readTextFromClipboard()` for reading plain text from the system clipboard without starting a subprocess.
+- Added `Shell.pids()` to retrieve the IDs of still-running processes spawned by an in-flight shell command.
+
 ## [18.4.7] - 2026-10-01
 
 ### Fixed

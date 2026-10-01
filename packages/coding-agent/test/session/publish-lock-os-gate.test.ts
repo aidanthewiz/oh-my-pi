@@ -14,7 +14,7 @@
  * lockfile, and the holder's own publish lands cleanly once released.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -23,6 +23,7 @@ import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
 import {
 	FileSessionStorage,
 	SessionLockError,
+	SessionWriteConflictError,
 	sessionContentFingerprint,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
@@ -99,5 +100,60 @@ describe("publish lock OS gate", () => {
 		});
 		if (!fingerprint) throw new Error("file title update must return a confirmed fingerprint");
 		expect(fingerprint.copy().digest("hex")).toBe(sessionContentFingerprint(fs.readFileSync(sessionPath, "utf8")));
+	});
+
+	it("refuses an in-place title update after an equal-size turn replacement", async () => {
+		const storage = new FileSessionStorage();
+		const sessionPath = path.join(tempDir, "title-cas.jsonl");
+		const before = serializeTitleSlot({ title: "Original", source: "user", updatedAt: "t1" }) + "entry\n";
+		storage.writeTextSync(sessionPath, before);
+		const replaced = before.replace("entry\n", "other\n");
+		fs.writeFileSync(sessionPath, replaced);
+		await expect(
+			storage.updateSessionTitle(
+				sessionPath,
+				{ title: "Updated", source: "user", updatedAt: "t2" },
+				{ expectedSize: Buffer.byteLength(before), expectedFingerprint: sessionContentFingerprint(before) },
+			),
+		).rejects.toBeInstanceOf(SessionWriteConflictError);
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe(replaced);
+	});
+
+	it("holds an append while another writer owns the gate", async () => {
+		const storage = new FileSessionStorage();
+		const sessionPath = path.join(tempDir, "session.jsonl");
+		storage.writeTextSync(sessionPath, "original\n");
+		const writer = storage.openWriter(sessionPath);
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("File writer must expose appendSync");
+		// Appends no longer claim the lockfile, so the gate is the only thing
+		// keeping them out of another process's check-then-rename. A holder
+		// mid-publish must make the append fail closed rather than land in the
+		// file its rename is about to replace.
+		const gate = NativeFileLock.tryAcquire(osGatePath(path.join(tempDir, ".session.jsonl.lock")));
+		expect(gate.acquired).toBe(true);
+		try {
+			expect(() => appendSync("lost\n")).toThrow(SessionLockError);
+		} finally {
+			gate.release();
+		}
+		// The failed append poisons the writer; close surfaces it.
+		await expect(writer.close()).rejects.toBeInstanceOf(SessionLockError);
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe("original\n");
+	});
+
+	it("fails closed when the native OS lock cannot be acquired", () => {
+		const storage = new FileSessionStorage();
+		const sessionPath = path.join(tempDir, "unsupported.jsonl");
+		const spy = vi.spyOn(NativeFileLock, "tryAcquire").mockImplementation(() => {
+			throw new Error("OS locks unavailable");
+		});
+		try {
+			expect(() => storage.claimSessionFile(sessionPath)).toThrow(SessionLockError);
+			expect(() => storage.writeTextSync(sessionPath, "not published\n")).toThrow(SessionLockError);
+			expect(fs.existsSync(sessionPath)).toBe(false);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });

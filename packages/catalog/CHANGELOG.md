@@ -9,6 +9,12 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [18.4.9] - 2026-10-01
+
+### Fixed
+
+- Fixed model catalog caching so unchanged catalogs refresh without unnecessary rewrites, and offline snapshots for endpoint-less models (such as Azure models) are now handled correctly across startups.
+
 ## [18.4.6] - 2026-10-01
 
 ### Added
