@@ -450,6 +450,26 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			this.session,
 		);
 	};
+	async prepareRuntimeApproval(_toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
+		const input = args as Partial<WriteParams>;
+		if (typeof input.path !== "string" || typeof input.content !== "string") return undefined;
+		const target = parseXdUrl(unwrapHashlineHeaderPath(input.path));
+		const inst = target?.name && this.session.xdev ? resolveXdevTool(this.session.xdev, target.name) : undefined;
+		const prepare = (
+			inst as { prepareApprovalTier?: (args: unknown, signal?: AbortSignal) => Promise<void> } | undefined
+		)?.prepareApprovalTier;
+		if (!prepare) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(input.content);
+		} catch {
+			return undefined;
+		}
+		// Resolve async device tiers before the outer synchronous xd:// approval gate.
+		if (isRecord(parsed)) await prepare.call(inst, parsed, signal);
+		return undefined;
+	}
+
 	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const params = args as Partial<WriteParams>;
 		const targetPath = typeof params.path === "string" ? params.path : "(missing)";

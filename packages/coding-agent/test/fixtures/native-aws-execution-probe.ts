@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
+import { WriteTool } from "../../src/tools/write";
+import type { XdevState } from "../../src/tools/xdev";
 import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection } from "../../src/mcp/types";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -27,7 +29,7 @@ await fs.writeFile(path.join(cwd, "aws"), "repository interception must never ex
 let artifact = 0;
 const settings = Settings.isolated();
 let activeContext: AgentToolContext | undefined = undefined;
-const tool = new AwsTool({
+const toolSession = {
 	cwd,
 	hasUI: true,
 	getSessionFile: () => null,
@@ -35,7 +37,8 @@ const tool = new AwsTool({
 	settings,
 	getToolContext: () => activeContext,
 	allocateOutputArtifact: async () => ({ id: `aws-${++artifact}`, path: path.join(root, `artifact-${artifact}.txt`) }),
-});
+};
+const tool = new AwsTool(toolSession);
 const calls = async () =>
 	(await fs.readFile(path.join(root, "aws.calls"), "utf8").catch(() => ""))
 		.trim()
@@ -57,6 +60,128 @@ if (process.env.NATIVE_AWS_EXPECT_NO_CLI) {
 	assert.equal((await calls()).length, before);
 	process.exit(0);
 }
+const action = (Name: string, IsWrite = false) => ({
+	Name,
+	Annotations: {
+		Properties: { IsList: false, IsPermissionManagement: false, IsTaggingOnly: false, IsWrite },
+	},
+});
+const operation = (Name: string, sdk: string, Method: string, ...permissions: [string, string][]) => ({
+	Name,
+	SDK: [{ Package: "Boto3", Name: sdk, Method }],
+	AuthorizedActions: permissions.map(([Service, name]) => ({ Service, Name: name })),
+});
+const references: Record<string, unknown> = {
+	"mapping.json": {
+		SDK: {
+			Python: {
+				Boto3: {
+					...Object.fromEntries(
+						["s3", "ce", "logs", "ec2", "rds", "sqs", "sagemaker", "bedrock", "signin"].map(service => [
+							service,
+							{ service },
+						]),
+					),
+					"sagemaker-runtime": { service: "sagemaker" },
+					"bedrock-agent-runtime": { service: "bedrock" },
+				},
+			},
+		},
+	},
+	"s3/s3.json": {
+		Name: "s3",
+		Actions: [action("ListAllMyBuckets"), action("DeleteBucket", true)],
+		Operations: [
+			operation("ListBuckets", "s3", "list_buckets", ["s3", "ListAllMyBuckets"]),
+			operation("DeleteBucket", "s3", "delete_bucket", ["s3", "DeleteBucket"]),
+		],
+	},
+	"sqs/sqs.json": {
+		Name: "sqs",
+		Actions: [action("ReceiveMessage"), action("GetQueueAttributes")],
+		Operations: [
+			operation("ReceiveMessage", "sqs", "receive_message", ["sqs", "ReceiveMessage"]),
+			operation("GetQueueAttributes", "sqs", "get_queue_attributes", ["sqs", "GetQueueAttributes"]),
+		],
+	},
+	"sagemaker/sagemaker.json": {
+		Name: "sagemaker",
+		Actions: [action("ListEndpoints"), action("InvokeEndpoint"), action("InvokeEndpointAsync")],
+		Operations: [
+			operation("ListEndpoints", "sagemaker", "list_endpoints", ["sagemaker", "ListEndpoints"]),
+			operation("InvokeEndpoint", "sagemaker-runtime", "invoke_endpoint", ["sagemaker", "InvokeEndpoint"]),
+			operation("InvokeEndpointAsync", "sagemaker-runtime", "invoke_endpoint_async", [
+				"sagemaker",
+				"InvokeEndpointAsync",
+			]),
+		],
+	},
+	"bedrock/bedrock.json": {
+		Name: "bedrock",
+		Actions: [action("InvokeAgent"), action("InvokeFlow"), action("InvokeInlineAgent")],
+		Operations: [
+			operation("InvokeAgent", "bedrock-agent-runtime", "invoke_agent", ["bedrock", "InvokeAgent"]),
+			operation("InvokeFlow", "bedrock-agent-runtime", "invoke_flow", ["bedrock", "InvokeFlow"]),
+			operation("InvokeInlineAgent", "bedrock-agent-runtime", "invoke_inline_agent", [
+				"bedrock",
+				"InvokeInlineAgent",
+			]),
+		],
+	},
+	"signin/signin.json": {
+		Name: "signin",
+		Actions: [action("CreateOAuth2Token")],
+		Operations: [operation("CreateOAuth2Token", "signin", "create_oauth2_token", ["signin", "CreateOAuth2Token"])],
+	},
+	"ce/ce.json": {
+		Name: "ce",
+		Actions: [action("GetCostAndUsage")],
+		Operations: [
+			operation(
+				"GetCostAndUsage",
+				"ce",
+				"get_cost_and_usage",
+				["ce", "GetCostAndUsage"],
+				["aws-portal", "ViewBilling"],
+			),
+		],
+	},
+	"aws-portal/aws-portal.json": {
+		Name: "aws-portal",
+		Actions: [action("ViewBilling")],
+	},
+	"logs/logs.json": {
+		Name: "logs",
+		Actions: [action("StartQuery"), action("FilterLogEvents")],
+		Operations: [
+			operation("StartQuery", "logs", "start_query", ["logs", "StartQuery"], ["logs", "FilterLogEvents"]),
+			operation("FilterLogEvents", "logs", "filter_log_events", ["logs", "FilterLogEvents"]),
+		],
+	},
+	"rds/rds.json": {
+		Name: "rds",
+		Actions: [action("DescribeDBClusters")],
+		Operations: [operation("DescribeDBClusters", "rds", "describe_db_clusters", ["rds", "DescribeDBClusters"])],
+	},
+	"ec2/ec2.json": {
+		Name: "ec2",
+		Actions: [action("TerminateInstances", true), action("DescribeInstances")],
+		Operations: [
+			operation("TerminateInstances", "ec2", "terminate_instances", ["ec2", "TerminateInstances"]),
+			operation("DescribeInstances", "ec2", "describe_instances", ["ec2", "DescribeInstances"]),
+		],
+	},
+};
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = Object.assign(
+	async (input: string | URL | Request) => {
+		const url = new URL(String(input));
+		assert.equal(url.origin, "https://servicereference.us-east-1.amazonaws.com");
+		const reference = references[url.pathname.slice("/v1/".length)];
+		return reference === undefined ? new Response("not found", { status: 404 }) : Response.json(reference);
+	},
+	{ preconnect: nativeFetch.preconnect },
+);
 const modelEnvironment: Record<string, string | undefined> = {};
 restoreCoreforgeOperationalAwsEnvironment(modelEnvironment);
 assert.equal(modelEnvironment.OMP_MODEL_AWS_PROFILE, undefined);
@@ -111,6 +236,166 @@ assert.match(await fs.readFile(path.join(root, "dcg.calls"), "utf8"), /'s3api' '
 const optionValue = await tool.execute("flag-value", { ...read, parameters: { Prefix: "--profile=coreforge" } });
 assert.match(text(optionValue), /commercial/);
 assert.ok((await calls()).at(-1).argv.includes("--prefix=--profile=coreforge"));
+const identity = { ...read, service: "sts", operation: "get-caller-identity" };
+assert.equal(tool.approval(identity), "read");
+assert.equal(await tool.prepareRuntimeApproval("identity", identity), undefined);
+await tool.execute("identity", identity);
+for (const [id, args] of [
+	["cost", { ...read, service: "ce", operation: "get-cost-and-usage" }],
+	["logs-filter", { ...read, profile: "government", service: "logs", operation: "filter-log-events" }],
+	["logs-query", { ...read, profile: "government", service: "logs", operation: "start-query" }],
+	["rds-acronym", { ...read, profile: "government", service: "rds", operation: "describe-db-clusters" }],
+] as const) {
+	assert.equal(await tool.prepareRuntimeApproval(id, args), undefined, id);
+	assert.equal(tool.approval(args), "read", id);
+	await tool.execute(id, args);
+}
+const unmapped = { ...read, service: "logs", operation: "describe-unmapped" };
+assert.equal(tool.approval(unmapped), "exec");
+assert.match((await tool.prepareRuntimeApproval("unmapped", unmapped))!.prompt, /Account: 123456789012/);
+await assert.rejects(() => tool.execute("unmapped", unmapped), /approval/);
+assert.equal((await calls()).filter(call => call.argv.includes("describe-unmapped")).length, 0);
+tool.denyRuntimeApproval("unmapped", unmapped);
+const referenceFetch = globalThis.fetch;
+globalThis.fetch = Object.assign(async () => new Response("unavailable", { status: 503 }), {
+	preconnect: referenceFetch.preconnect,
+});
+try {
+	const offline = new AwsTool(toolSession);
+	const cost = { ...read, service: "ce", operation: "get-cost-and-usage" };
+	assert.equal(offline.approval(cost), "exec");
+	assert.match((await offline.prepareRuntimeApproval("offline", cost))!.prompt, /Account: 123456789012/);
+	await assert.rejects(() => offline.execute("offline", cost), /approval/);
+	assert.equal((await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length, 1);
+} finally {
+	globalThis.fetch = referenceFetch;
+}
+const referenceStarted = Promise.withResolvers<void>();
+const releaseReference = Promise.withResolvers<void>();
+globalThis.fetch = Object.assign(
+	async () => {
+		referenceStarted.resolve();
+		await releaseReference.promise;
+		return new Response("unavailable", { status: 503 });
+	},
+	{ preconnect: referenceFetch.preconnect },
+);
+let cancelledReference: Promise<string> | undefined;
+try {
+	const controller = new AbortController();
+	cancelledReference = new AwsTool(toolSession)
+		.prepareRuntimeApproval("cancelled-reference", { ...read, service: "logs" }, controller.signal)
+		.then(
+			() => "completed",
+			error => (error instanceof Error ? error.name : String(error)),
+		);
+	await referenceStarted.promise;
+	controller.abort();
+	assert.equal(await Promise.race([cancelledReference, Bun.sleep(500).then(() => "late")]), "AbortError");
+} finally {
+	releaseReference.resolve();
+	await cancelledReference;
+	globalThis.fetch = referenceFetch;
+}
+const firstReadTool = new AwsTool(toolSession);
+const xdev: XdevState = {
+	tools: new Map([["aws", firstReadTool]]),
+	mountedNames: new Set(["aws"]),
+	builtInNames: new Set(["aws"]),
+	isActive: () => false,
+};
+const wrappedWrite = new ExtensionToolWrapper(
+	new WriteTool({ ...toolSession, xdev }) as unknown as AgentTool,
+	{
+		consumeToolCallEmitted: () => false,
+		hasHandlers: () => false,
+		hasUI: () => false,
+		runScoped: <T>(fn: () => T): T => fn(),
+	} as unknown as ExtensionRunner,
+);
+const writeContext = { settings: Settings.isolated({ "tools.approvalMode": "write" }) } as AgentToolContext;
+const firstRead = { ...read, service: "ce", operation: "get-cost-and-usage" };
+const firstReadArgs = { path: "xd://aws", content: JSON.stringify(firstRead) };
+const beforeFirstRead = (await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length;
+assert.equal(firstReadTool.approval(firstRead), "exec");
+const dispatchedRead = await wrappedWrite.execute(
+	"first-mapped-read",
+	firstReadArgs,
+	undefined,
+	undefined,
+	writeContext,
+);
+assert.notEqual(dispatchedRead.isError, true);
+assert.equal((dispatchedRead.details as { xdev?: { tier?: string } } | undefined)?.xdev?.tier, "read");
+assert.equal((await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length, beforeFirstRead + 1);
+await assert.rejects(
+	() =>
+		wrappedWrite.execute(
+			"first-mutation",
+			{
+				path: "xd://aws",
+				content: JSON.stringify({
+					...read,
+					service: "ec2",
+					operation: "terminate-instances",
+					parameters: { InstanceIds: ["i-fixture"] },
+				}),
+			},
+			undefined,
+			undefined,
+			writeContext,
+		),
+	/requires approval but no interactive UI/,
+);
+const queueUrl = "https://sqs.us-east-1.amazonaws.com/123456789012/fixture";
+const queueAttributes = {
+	...read,
+	service: "sqs",
+	operation: "get-queue-attributes",
+	parameters: { QueueUrl: queueUrl, AttributeNames: ["All"] },
+};
+assert.equal(await tool.prepareRuntimeApproval("queue-attributes", queueAttributes), undefined);
+assert.equal(tool.approval(queueAttributes), "read");
+await tool.execute("queue-attributes", queueAttributes);
+const queueReceive = {
+	...read,
+	service: "sqs",
+	operation: "receive-message",
+	parameters: { QueueUrl: queueUrl },
+};
+const beforeReceive = (await calls()).filter(call => call.argv.includes("receive-message")).length;
+assert.match((await tool.prepareRuntimeApproval("queue-receive", queueReceive))!.prompt, /Account: 123456789012/);
+assert.equal(tool.approval(queueReceive), "exec");
+await assert.rejects(() => tool.execute("queue-receive", queueReceive), /approval/);
+await assert.rejects(
+	() =>
+		wrappedWrite.execute(
+			"first-queue-receive",
+			{ path: "xd://aws", content: JSON.stringify(queueReceive) },
+			undefined,
+			undefined,
+			writeContext,
+		),
+	/requires approval but no interactive UI/,
+);
+assert.equal((await calls()).filter(call => call.argv.includes("receive-message")).length, beforeReceive);
+const listedEndpoints = { ...read, service: "sagemaker", operation: "list-endpoints" };
+assert.equal(await tool.prepareRuntimeApproval("list-endpoints", listedEndpoints), undefined);
+assert.equal(tool.approval(listedEndpoints), "read");
+for (const [service, operationName] of [
+	["sagemaker-runtime", "invoke-endpoint"],
+	["sagemaker-runtime", "invoke-endpoint-async"],
+	["bedrock-agent-runtime", "invoke-agent"],
+	["bedrock-agent-runtime", "invoke-flow"],
+	["bedrock-agent-runtime", "invoke-inline-agent"],
+	["signin", "create-oauth2-token"],
+] as const) {
+	const args = { ...read, service, operation: operationName };
+	assert.match((await tool.prepareRuntimeApproval(operationName, args))!.prompt, /Account: 123456789012/);
+	assert.equal(tool.approval(args), "exec");
+	await assert.rejects(() => tool.execute(operationName, args), /approval/);
+	assert.equal((await calls()).filter(call => call.argv.includes(operationName)).length, 0);
+}
 const mutation = {
 	...read,
 	service: "ec2",
