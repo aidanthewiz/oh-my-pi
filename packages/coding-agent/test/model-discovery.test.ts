@@ -42,6 +42,7 @@ describe("ModelRegistry runtime discovery", () => {
 	let originalOllamaHost: string | undefined;
 	let originalOllamaContextLength: string | undefined;
 	let originalAnthropicAuthEnv: Map<(typeof ANTHROPIC_AUTH_ENV_NAMES)[number], string | undefined>;
+	let originalLlamaCppBaseUrl: string | undefined;
 
 	beforeEach(async () => {
 		resetSettingsForTest();
@@ -49,7 +50,13 @@ describe("ModelRegistry runtime discovery", () => {
 		originalOllamaHost = Bun.env.OLLAMA_HOST;
 		originalOllamaContextLength = Bun.env.OLLAMA_CONTEXT_LENGTH;
 		originalAnthropicAuthEnv = new Map(ANTHROPIC_AUTH_ENV_NAMES.map(name => [name, Bun.env[name]]));
+		delete Bun.env.OLLAMA_BASE_URL;
+		delete Bun.env.OLLAMA_HOST;
+		delete Bun.env.OLLAMA_CONTEXT_LENGTH;
 		for (const name of ANTHROPIC_AUTH_ENV_NAMES) delete Bun.env[name];
+		// The developer's shell or ~/.omp/agent/.env must not redirect llama.cpp discovery probes.
+		originalLlamaCppBaseUrl = Bun.env.LLAMA_CPP_BASE_URL;
+		delete Bun.env.LLAMA_CPP_BASE_URL;
 		tempDir = path.join(os.tmpdir(), `pi-test-model-registry-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		modelsJsonPath = path.join(tempDir, "models.json");
@@ -83,6 +90,11 @@ describe("ModelRegistry runtime discovery", () => {
 			} else {
 				Bun.env[name] = value;
 			}
+		}
+		if (originalLlamaCppBaseUrl === undefined) {
+			delete Bun.env.LLAMA_CPP_BASE_URL;
+		} else {
+			Bun.env.LLAMA_CPP_BASE_URL = originalLlamaCppBaseUrl;
 		}
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {

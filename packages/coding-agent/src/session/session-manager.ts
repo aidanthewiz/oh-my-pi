@@ -41,6 +41,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import type { RetryFallbackRole } from "./retry-fallback-chains";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
 	type BranchSummaryEntry,
@@ -143,10 +144,21 @@ export async function copySessionArtifacts(sourceSessionFile: string, destinatio
 	if (path.resolve(sourceArtifactsDir) === path.resolve(destinationArtifactsDir)) return;
 
 	try {
-		const sourceStat = await fs.promises.stat(sourceArtifactsDir);
-		if (sourceStat.isDirectory()) {
-			await fs.promises.cp(sourceArtifactsDir, destinationArtifactsDir, { recursive: true });
+		const sourceStat = await fs.promises.lstat(sourceArtifactsDir);
+		if (!sourceStat.isDirectory())
+			throw new Error(`Session artifacts path is not a real directory: ${sourceArtifactsDir}`);
+		const destinationStat = await fs.promises.lstat(destinationArtifactsDir).catch((error: unknown) => {
+			if (isEnoent(error)) return null;
+			throw error;
+		});
+		if (destinationStat && !destinationStat.isDirectory()) {
+			throw new Error(`Fork artifacts destination is not a real directory: ${destinationArtifactsDir}`);
 		}
+		await fs.promises.cp(sourceArtifactsDir, destinationArtifactsDir, {
+			recursive: true,
+			force: false,
+			errorOnExist: true,
+		});
 	} catch (error) {
 		if (!isEnoent(error)) {
 			logger.warn("Failed to copy artifacts during fork", {
@@ -186,6 +198,26 @@ async function moveEntryWithoutReplacing(from: string, to: string, isDirectory: 
 	} catch (err) {
 		// The entry has landed; a second copy left behind is not a failed move.
 		if (!isEnoent(err)) logger.debug("Artifact placed but its source copy could not be removed", { from, to });
+	}
+}
+
+/** Relocate a session file without replacing a path another writer already owns. */
+async function moveSessionFileWithoutReplacing(source: string, destination: string): Promise<void> {
+	if (!fs.lstatSync(source).isFile()) throw new Error(`Session file is not a regular file: ${source}`);
+	try {
+		// Keep publication and source removal in one synchronous turn so live
+		// appenders never see two paths for the same session.
+		fs.linkSync(source, destination);
+	} catch (error) {
+		if (!isFsError(error) || error.code !== "EXDEV") throw error;
+		await moveFileAcrossDevices(source, destination);
+		return;
+	}
+	try {
+		fs.unlinkSync(source);
+	} catch (error) {
+		fs.unlinkSync(destination);
+		throw error;
 	}
 }
 
@@ -288,6 +320,8 @@ async function mergeDirectoryInto(
  * space cannot both be.
  */
 async function relocateArtifactsDirectory(source: string, destination: string): Promise<"renamed" | "merged"> {
+	const sourceStat = await fs.promises.lstat(source);
+	if (!sourceStat.isDirectory()) throw new Error(`Session artifacts path is not a real directory: ${source}`);
 	try {
 		await fs.promises.rename(source, destination);
 		return "renamed";
@@ -818,12 +852,10 @@ export class SessionManager {
 	/** Set by synchronous appends that land while an atomic replacement is active. */
 	#atomicRewriteDirty = false;
 	/**
-	 * Active {@link moveTo} relocation. Concurrent completed appends write a
-	 * full body to the live path: source while it still exists, destination
-	 * once rename has landed (source gone). Never recreates a vacated source.
-	 * `null` outside an active relocation.
+	 * Active {@link moveTo} relocation. Writes stay at source until a file move
+	 * begins; only then can a vacated source identify destination as ours.
 	 */
-	#sessionFileRelocating: { source: string; dest: string; copying?: boolean } | null = null;
+	#sessionFileRelocating: { source: string; dest: string; moving?: boolean } | null = null;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
 
@@ -1222,20 +1254,13 @@ export class SessionManager {
 		return this.#forceFileCreation || this.#fileIsCurrent || this.#historyContainsAssistantMessage();
 	}
 
-	/**
-	 * Live path for concurrent completed appends during {@link moveTo}.
-	 * Prefers destination once rename has landed (source gone); otherwise
-	 * source. Never invents a path that does not already exist.
-	 */
+	/** Live path for appends while a session file moves without replacing a preexisting destination. */
 	#liveRelocationWritePath(): string | null {
 		const relocating = this.#sessionFileRelocating;
 		if (!relocating) return null;
-		if (relocating.copying && this.#storage.existsSync(relocating.source)) return relocating.source;
-		if (this.#storage.existsSync(relocating.dest)) return relocating.dest;
 		if (this.#storage.existsSync(relocating.source)) return relocating.source;
-		// Rename in flight with neither path visible (rare cross-device edge):
-		// fall back to destination so we do not recreate a vacated source.
-		return relocating.dest;
+		if (relocating.moving && this.#storage.existsSync(relocating.dest)) return relocating.dest;
+		return relocating.source;
 	}
 
 	/**
@@ -2087,11 +2112,9 @@ export class SessionManager {
 		}
 
 		let sessionFileExisted = false;
-		// Track source+dest for concurrent completed appends during relocation
-		// (see `#sessionFileRelocating`). Existence of either path decides the
-		// live write target — not a `#diskEpoch` bump, which would cancel any
-		// disk task already queued at the current epoch (e.g. a header-only
-		// `ensureOnDisk()` materializing rewrite) before the drain below runs it.
+		// Track source+dest for completed appends during relocation. A destination
+		// that already exists is never treated as ours before a move lands. Do not
+		// bump #diskEpoch here: a queued materialization must finish before the move.
 		if (this.#persist && this.#sessionFile) {
 			const source = this.#sessionFile;
 			const dest = path.join(nextSessionDir, path.basename(source));
@@ -2114,28 +2137,33 @@ export class SessionManager {
 					newArtifactsDir !== null &&
 					path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
 				sessionFileExisted = this.#storage.existsSync(oldSessionFile);
+				if (sessionPathChanged && !sessionFileExisted) {
+					const occupant = await fs.promises.lstat(newSessionFile).catch((error: unknown) => {
+						if (isEnoent(error)) return null;
+						throw error;
+					});
+					if (occupant) throw new Error(`Session destination already exists: ${newSessionFile}`);
+				}
 
 				let sessionMoved = false;
 				let artifactsRenamed = false;
 
 				try {
 					if (sessionFileExisted && sessionPathChanged) {
-						try {
-							await fs.promises.rename(oldSessionFile, newSessionFile);
-						} catch (error) {
-							if (!isFsError(error) || error.code !== "EXDEV") throw error;
-							if (this.#sessionFileRelocating) this.#sessionFileRelocating.copying = true;
-							await moveFileAcrossDevices(oldSessionFile, newSessionFile);
-						}
+						if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
+						await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
 						sessionMoved = true;
 					}
 
 					if (artifactPathChanged) {
 						let artifactStat: fs.Stats | null = null;
 						try {
-							artifactStat = await fs.promises.stat(oldArtifactsDir);
+							artifactStat = await fs.promises.lstat(oldArtifactsDir);
 						} catch (err) {
 							if (!isEnoent(err)) throw err;
+						}
+						if (artifactStat && !artifactStat.isDirectory()) {
+							throw new Error(`Session artifacts path is not a real directory: ${oldArtifactsDir}`);
 						}
 						if (artifactStat?.isDirectory()) {
 							// Only a whole-directory rename can be undone by renaming back;
@@ -2144,10 +2172,18 @@ export class SessionManager {
 								(await relocateArtifactsDirectory(oldArtifactsDir, newArtifactsDir)) === "renamed";
 						}
 					}
+					// A synchronous append may materialize a lazy session while
+					// artifact relocation awaits I/O; move those durable bytes too.
+					if (!sessionFileExisted && sessionPathChanged && this.#storage.existsSync(oldSessionFile)) {
+						if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
+						await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
+						sessionMoved = true;
+						sessionFileExisted = true;
+					}
 				} catch (err) {
 					if (artifactsRenamed && oldArtifactsDir && newArtifactsDir) {
 						try {
-							await fs.promises.rename(newArtifactsDir, oldArtifactsDir);
+							await relocateArtifactsDirectory(newArtifactsDir, oldArtifactsDir);
 						} catch (rollbackErr) {
 							throw new Error(
 								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
@@ -2157,12 +2193,7 @@ export class SessionManager {
 
 					if (sessionMoved) {
 						try {
-							try {
-								await fs.promises.rename(newSessionFile, oldSessionFile);
-							} catch (error) {
-								if (!isFsError(error) || error.code !== "EXDEV") throw error;
-								await moveFileAcrossDevices(newSessionFile, oldSessionFile);
-							}
+							await moveSessionFileWithoutReplacing(newSessionFile, oldSessionFile);
 						} catch (rollbackErr) {
 							throw new Error(
 								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
@@ -3032,6 +3063,7 @@ export class SessionManager {
 		agent?: string;
 		modelRole?: string;
 		resolvedModel?: string;
+		retryFallback?: RetryFallbackRole;
 		readOnly?: boolean;
 		outputSchema?: unknown;
 		outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -3883,6 +3915,7 @@ export interface PersistedSessionInit {
 	agent?: string;
 	modelRole?: string;
 	resolvedModel?: string;
+	retryFallback?: RetryFallbackRole;
 	readOnly?: boolean;
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
@@ -3909,6 +3942,7 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			agent: entry.agent,
 			modelRole: entry.modelRole,
 			resolvedModel: entry.resolvedModel,
+			retryFallback: entry.retryFallback,
 			readOnly: entry.readOnly,
 			outputSchema: entry.outputSchema,
 			outputSchemaMode: entry.outputSchemaMode,

@@ -796,15 +796,9 @@ describe("ExtensionRunner", () => {
 			);
 			const controller = new AbortController();
 			const message = createAssistantMessage("original");
-			const started = new Promise<void>(resolve => {
-				const watcher = fs.watch(tempDir.path(), (_eventType, filename) => {
-					if (filename?.toString() !== path.basename(startedPath)) return;
-					watcher.close();
-					resolve();
-				});
-			});
 			const emission = runner.emitAssistantMessage(message, controller.signal);
-			await started;
+			const deadline = Date.now() + 10_000;
+			while (!fs.existsSync(startedPath) && Date.now() < deadline) await Bun.sleep(5);
 			expect(await Bun.file(startedPath).text()).toBe("started");
 			controller.abort(new Error("cancelled"));
 			await expect(emission).resolves.toEqual([{ type: "text", text: "accepted" }]);

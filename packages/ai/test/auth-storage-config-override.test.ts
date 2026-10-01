@@ -11,6 +11,11 @@ import { withEnv } from "./helpers";
 const SUPPRESS_ANTHROPIC_ENV = {
 	ANTHROPIC_API_KEY: undefined,
 	ANTHROPIC_OAUTH_TOKEN: undefined,
+	ANTHROPIC_BASE_URL: undefined,
+	ANTHROPIC_WORKSPACE_ID: undefined,
+	ANTHROPIC_AWS_WORKSPACE_ID: undefined,
+	CLAUDE_CODE_USE_FOUNDRY: undefined,
+	FOUNDRY_BASE_URL: undefined,
 } as const;
 
 describe("AuthStorage config-override apiKey", () => {
@@ -219,8 +224,8 @@ describe("AuthStorage config-override apiKey", () => {
 				await seedOAuth("anthropic-aws", "broker-oauth");
 				const signal = new AbortController().signal;
 				const apiKey = await resolveGatewayApiKey(authStorage, model, "aws-session", signal, "local");
-				expect(apiKey).toBe("aws-workspace-key");
-				if (typeof apiKey !== "string") throw new Error("missing AWS bearer");
+				expect(apiKey).toEqual({ apiKey: "aws-workspace-key" });
+				if (!("apiKey" in apiKey)) throw new Error("missing AWS bearer");
 				const resolver = buildGatewayApiKeyResolver(
 					authStorage,
 					model,

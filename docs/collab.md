@@ -21,7 +21,7 @@ Collab session started!
 
 The browser line is click-to-join (an OSC 8 hyperlink to the full `https://` deep link): the relay serves the web guest client at `/`, and the room id + key ride in the URL fragment. From another Coreforge instance (any directory, any machine), either form works:
 
-Running `/collab` or `/collab view` starts or displays the active hosting session, rendering both the terminal/browser join links and their corresponding QR codes.
+Running `/collab` or `/collab view` starts or displays the active hosting session, rendering terminal/browser join links and a QR code for the browser URL. `/collab` requests control access: if the active room was started view-only, it replaces that room. `/collab view` reuses either access level and prints only the read-only link.
 
 When a browser displays an approval code, the session host runs `coreforge relay authorize <code>` in another signed-in terminal. The public page never needs to expose the internal product name.
 
@@ -35,14 +35,17 @@ The guest's previous session is restored on `/leave` (or when the host stops).
 
 | Command           | Effect                                                                              |
 | ----------------- | ----------------------------------------------------------------------------------- |
-| `/collab`         | Start sharing full-control (or re-print the link/QR when already hosting)           |
+| `/collab`         | Start full-control sharing; reuse a control room or replace a view-only room        |
 | `/collab <relay>` | Start sharing through a specific relay (`relay.example.com`, `ws://localhost:7475`) |
-| `/collab view`    | Start sharing read-only (or re-print the link/QR when already hosting)              |
+| `/collab view [relay]` | Start read-only sharing, or print the existing room's read-only link/QR        |
 | `/collab status`  | Show link + participants                                                            |
 | `/collab stop`    | Stop sharing                                                                        |
 | `/collab list`    | List every active local Collab host (no links)                                      |
 | `/join <link>`    | Join a shared session as a guest                                                    |
 | `/leave`          | Leave (guest) or stop sharing (host)                                                |
+
+`/collab start [relay]` is also accepted. Passing a relay while a reusable room is active does not move that room to another relay; stop it first to change the relay.
+
 
 ### Sharing every session automatically
 
@@ -142,7 +145,10 @@ Guests with a full link can:
 
 Guests with a view-only link can read everything live — back-transcript, streaming text, tool cards, subagent transcripts — but the host rejects prompting, interrupting, and agent control from them.
 
-Everything that mutates the host session or machine is host-only: `/model`, `/compact`, `/resume`, `/branch`, bash (`!`), python (`$`), skills, etc. Guests keep a small local allowlist (`/dump`, `/export`, `/copy`, `/open`, `/help`, `/hotkeys`, `/theme`, `/settings`, `/leave`, `/collab`, `/exit`, `/quit`).
+Advisor records are not guest-visible subagents: they are excluded from roster snapshots and transcript fetches, and advisor chat/kill/revive commands are rejected.
+
+
+Other session/machine commands remain host-only: `/model`, `/compact`, `/resume`, `/branch`, bash (`!`), python (`$`), skills, etc. Guests keep a small local allowlist (`/dump`, `/export`, `/copy`, `/open`, `/help`, `/hotkeys`, `/theme`, `/settings`, `/leave`, `/collab`, `/exit`, `/quit`).
 
 When a guest joins during an assistant turn, that in-flight turn appears on the first subsequent `message_update`: the guest synthesizes the missing `message_start` from the update's full accumulating message before forwarding the delta. If the host emits no further update for that turn after the guest joins, there is no update from which to synthesize the live component. The durable entry still reaches the replica's message state, but entry frames are intentionally not rendered, so that edge case can remain absent from the live TUI.
 
@@ -150,7 +156,7 @@ When a guest joins during an assistant turn, that in-flight turn appears on the 
 
 `packages/collab-web` is a standalone browser client for the same links — no Coreforge install needed on the guest side. The relay serves it at `/`, which is what makes the `/collab` deep link click-to-join: `https://<relay>/#<link>` loads the client and auto-connects from the fragment. It renders the live transcript (streaming text, thinking, tool cards), a subagent panel with on-demand transcripts, and a composer with the same guest powers (prompt, interrupt, hub actions). Run `bun run dev` in the package for a local instance, `bun run mock-host` for an offline scripted host to develop against, and `bun run build` to emit a static `dist/` deployable anywhere (HTTPS required for WebCrypto). The client never talks to anything but the relay, and the key stays in the URL fragment; the relay never receives it.
 
-Set `collab.webUrl` when the browser UI is hosted separately from the websocket relay. When empty, `/collab` derives `http(s)://host[:port]` from `collab.relayUrl`; explicit web UI URLs must use `https://` except for `http://localhost` development origins. The generated browser URL still carries the relay-specific collab link in the fragment.
+Set `collab.webUrl` when the browser UI is hosted separately from the websocket relay. When empty, `/collab` derives `http(s)://host[:port]` from `collab.relayUrl`; explicit web UI URLs must use `https://` except for localhost/loopback `http://` development origins, and cannot contain a query string or fragment. The generated browser URL still carries the relay-specific collab link in the fragment.
 
 ## Settings
 
@@ -161,6 +167,7 @@ Set `collab.webUrl` when the browser UI is hosted separately from the websocket 
 | `collab.displayName` | OS username | Name shown to other participants |
 | `collab.autoStart` | `off` | `view` / `control`: host every interactive session as it starts and publish it to the local registry |
 | `share.serverUrl` | `https://agent-collab.internal.somahub.io/s` | Share viewer/upload base used by `/share` (links are `<base>/<id>#<key>`) |
+| `share.store` | `blob` | `/share` uploads to the blob server; `gist` uses an authenticated secret gist with blob fallback |
 | `share.redactSecrets` | `true` | Run the secret obfuscator over `/share` snapshots before upload |
 
 ## Self-hosting the relay
@@ -180,6 +187,17 @@ The relay routes only the 4-byte peer prefix and opaque AES-GCM frames. `/share`
 Each client address may host at most 25 rooms and upload 20 shares per hour by default (`MAX_HOST_ROOMS_PER_CLIENT`, `MAX_SHARE_UPLOADS_PER_CLIENT`, and `SHARE_UPLOAD_WINDOW_SECONDS`). Idle rooms expire after one hour and every room expires after one day (`ROOM_IDLE_TIMEOUT_SECONDS` and `ROOM_MAX_AGE_SECONDS`). Set `TRUSTED_PROXY_HOPS` only when every request reaches the service through that many trusted proxies; the Coreforce ALB deployment uses `1` so limits use the client address appended by the ALB.
 
 Build the production image with `docker build -f Dockerfile.relay .`. Runtime paths are configured by `COLLAB_WEB_ROOT`, `SHARE_VIEWER_PATH`, and `SHARE_DATA_DIR`; global ceilings are configured by `MAX_ROOMS`, `MAX_GUESTS_PER_ROOM`, and `MAX_WS_PAYLOAD_BYTES`.
+
+## Implementation files
+
+- [`src/slash-commands/builtin-collaboration.ts`](../packages/coding-agent/src/slash-commands/builtin-collaboration.ts) — TUI commands and join-link presentation
+- [`src/collab/controller.ts`](../packages/coding-agent/src/collab/controller.ts) — auto-start and room rotation
+- [`src/collab/host.ts`](../packages/coding-agent/src/collab/host.ts), [`guest.ts`](../packages/coding-agent/src/collab/guest.ts) — authoritative host and local replica
+- [`src/collab/protocol.ts`](../packages/coding-agent/src/collab/protocol.ts), [`crypto.ts`](../packages/coding-agent/src/collab/crypto.ts), [`relay-client.ts`](../packages/coding-agent/src/collab/relay-client.ts) — frames, links, encryption, and transport
+- [`src/collab/registry.ts`](../packages/coding-agent/src/collab/registry.ts) — private local host discovery
+- [`src/collab/settings.ts`](../packages/coding-agent/src/collab/settings.ts) — `collab.*` defaults
+- [`packages/collab-web`](../packages/collab-web/) — browser guest and local development relay
+
 ## Architecture notes
 
 Hub topology — the host is authoritative, guests never peer:
@@ -193,3 +211,5 @@ Hub topology — the host is authoritative, guests never peer:
 7. `ui-request` / `ui-request-end` frames — host select/editor prompts presented to full-control guests and dismissed everywhere once settled. Guests answer with `ui-response`.
 
 Guest→host: `hello`, `prompt`, `abort`, `agent-cmd` (hub chat/kill/revive), `fetch-transcript` (incremental subagent-transcript reads answered by targeted `transcript` frames), and `ui-response`. The replica loads through the regular `/resume` machinery, so theming, ctrl+o, and transcript behavior are native by construction; the guest process never chdirs to host paths.
+
+Transcript fetches are capped at 4 MiB per reply and end on complete JSONL lines. Guests continue from `newSize`; a single entry exceeding the cap produces a terminal transcript error instead of an endless empty-read retry.

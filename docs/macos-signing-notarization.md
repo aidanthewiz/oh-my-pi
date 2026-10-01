@@ -3,7 +3,9 @@
 Coreforge macOS release assets use the compatibility filenames
 `omp-darwin-arm64` and `omp-darwin-x64`. The release workflow can replace their
 initial ad-hoc signatures with **Developer ID Application** signatures and
-submit them for Apple notarization.
+submit them for Apple notarization. An accepted ticket permits online
+Gatekeeper assessment of the bare executable; Coreforce does not publish an
+upstream Homebrew tap.
 
 Signing runs in the Darwin matrix legs of
 `.github/workflows/cf-release.yml` through `scripts/ci-macos-sign.sh`. The
@@ -17,13 +19,17 @@ credentials. Calling the script directly without every credential is an error.
    required entitlements so it runs on the build host.
 2. `scripts/ci-macos-sign.sh`:
    - imports the Developer ID certificate into a temporary keychain;
-   - signs with the hardened runtime, secure timestamp, and
+   - re-signs with the hardened runtime, secure timestamp, and
      `scripts/macos-entitlements.plist`;
    - runs `--version` and `--smoke-test` under the new signature;
-   - submits the binary to Apple with `notarytool submit --wait`.
-3. The `verify_release` job downloads the published arm64 asset, verifies the
-   signature, and repeats both launch checks. When signing credentials exist,
-   it also rejects an ad-hoc published signature.
+   - packages the binary in a ZIP and submits it with
+     `notarytool submit --wait --timeout 30m`;
+   - requires an `Accepted` result, fetching the submission log when
+     available on failure. The temporary keychain and credential files
+     are removed on exit.
+3. The `verify_release` job downloads the published arm64 asset, verifies its
+   strict signature, and repeats both launch checks. When signing credentials
+   exist, it also rejects an ad-hoc published signature.
 
 The signing and notarization calls occur only in the explicit Coreforce release
 workflow. They add no end-user telemetry or background network path.
@@ -88,11 +94,16 @@ Store these files in a local untracked directory, for example
 | `issuer-id.txt` | App Store Connect issuer UUID. |
 | `key-id.txt` | Optional key ID when it cannot be derived from the `.p8` filename. |
 
-### Uploading without printing secret values
+### Uploading credential files
 
-The upload helper validates the files and passes each value to `gh secret set`
-over standard input. It does not print secret values or place them in process
-arguments:
+`scripts/ci-macos-upload-secrets.sh` requires exactly one `.p12` and one `.p8`,
+imports the certificate into a temporary keychain to verify its password and
+Developer ID identity, and checks that the `.p8` contains a PEM private-key
+header. It pipes each uploaded value to `gh secret set` over stdin rather than
+putting it in `gh` arguments or printing the credential payloads. Validation
+does pass the certificate password to `security import -P`, so the password
+can appear in that subprocess's arguments. The script prints the filenames
+and Key ID.
 
 ```sh
 scripts/ci-macos-upload-secrets.sh ~/coreforge-signing --dry-run
@@ -100,7 +111,10 @@ scripts/ci-macos-upload-secrets.sh ~/coreforge-signing
 gh secret list --repo Coreforce-CAD/oh-my-pi
 ```
 
-Re-run the helper when the certificate or API key changes.
+Re-run the helper when the certificate or API key changes. `CF_SIGNING_DIR`
+changes the default input directory; `CF_REPO=owner/repo` changes the target
+repository (default `Coreforce-CAD/oh-my-pi`). Validation requires macOS
+`security`; uploading also requires an authenticated `gh` CLI.
 
 ## Local validation
 

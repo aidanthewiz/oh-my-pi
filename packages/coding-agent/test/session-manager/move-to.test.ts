@@ -83,6 +83,38 @@ describe("SessionManager.moveTo", () => {
 		await fsp.rm(testAgentDir, { recursive: true, force: true });
 	});
 
+	function pauseAfterSessionFileMove(oldFile: string) {
+		const landed = Promise.withResolvers<string>();
+		const release = Promise.withResolvers<void>();
+		const oldArtifactsDir = oldFile.slice(0, -".jsonl".length);
+		const link = fs.linkSync.bind(fs);
+		const lstat = fs.promises.lstat.bind(fs.promises);
+		let destination: string | undefined;
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((source, target) => {
+			link(source, target);
+			if (path.resolve(source.toString()) === path.resolve(oldFile)) destination = path.resolve(target.toString());
+		});
+		const lstatSpy = spyOn(fs.promises, "lstat").mockImplementation((async (target, options) => {
+			if (
+				path.resolve(target.toString()) === path.resolve(oldArtifactsDir) &&
+				destination &&
+				!fs.existsSync(oldFile)
+			) {
+				landed.resolve(destination);
+				await release.promise;
+			}
+			return lstat(target, options);
+		}) as typeof fs.promises.lstat);
+		return {
+			landed: landed.promise,
+			resume: () => release.resolve(),
+			restore: () => {
+				linkSpy.mockRestore();
+				lstatSpy.mockRestore();
+			},
+		};
+	}
+
 	it("moves session file and updates header cwd (baseline)", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
@@ -108,7 +140,7 @@ describe("SessionManager.moveTo", () => {
 		expect(hasAssistantEntry(entries)).toBe(true);
 	});
 
-	it("moves a custom session and artifacts when rename crosses devices", async () => {
+	it("moves a custom session and artifacts when the session and artifact paths cross devices", async () => {
 		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
 		await session.ensureOnDisk();
 		const oldFile = session.getSessionFile()!;
@@ -116,10 +148,15 @@ describe("SessionManager.moveTo", () => {
 		await fsp.mkdir(path.join(oldArtifacts, "child"), { recursive: true });
 		await Bun.write(path.join(oldArtifacts, "1.bash.log"), "saved output");
 		await Bun.write(path.join(oldArtifacts, "child", "2.bash.log"), "nested output");
+		const sessionLink = fs.linkSync.bind(fs);
 		const rename = fs.promises.rename.bind(fs.promises);
 		const link = fs.promises.link.bind(fs.promises);
+		const sessionLinkSpy = spyOn(fs, "linkSync").mockImplementation((from, to) => {
+			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device link"), { code: "EXDEV" });
+			return sessionLink(from, to);
+		});
 		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
-			if (from.toString() === oldFile || from.toString().startsWith(oldArtifacts)) {
+			if (from.toString().startsWith(oldArtifacts)) {
 				throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
 			}
 			return rename(from, to);
@@ -133,6 +170,7 @@ describe("SessionManager.moveTo", () => {
 		try {
 			await session.moveTo(cwdB);
 		} finally {
+			sessionLinkSpy.mockRestore();
 			renameSpy.mockRestore();
 			linkSpy.mockRestore();
 		}
@@ -145,6 +183,64 @@ describe("SessionManager.moveTo", () => {
 		await session.close();
 	});
 
+	it("does not overwrite an occupied destination or lose an append during same-device relocation", async () => {
+		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const oldFile = session.getSessionFile()!;
+		const destinationDir = path.join(testAgentDir, "occupied");
+		await fsp.mkdir(destinationDir);
+		const destination = path.join(destinationDir, path.basename(oldFile));
+		await Bun.write(destination, "another session");
+
+		const link = fs.linkSync.bind(fs);
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((source, target) => {
+			if (source.toString() === oldFile && target.toString() === destination) {
+				session.appendMessage({ role: "user", content: "while destination occupied", timestamp: 2 });
+			}
+			return link(source, target);
+		});
+		try {
+			await expect(session.moveTo(cwdB, destinationDir)).rejects.toThrow();
+			await session.flush();
+		} finally {
+			linkSpy.mockRestore();
+		}
+		expect(session.getCwd()).toBe(cwdA);
+		expect(session.getSessionFile()).toBe(oldFile);
+		expect(await Bun.file(destination).text()).toBe("another session");
+		const entries = await loadEntriesFromFile(oldFile);
+		expect(
+			entries.some(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					entry.message.content === "while destination occupied",
+			),
+		).toBe(true);
+		await session.close();
+	});
+
+	it("leaves a lazy session at its original path when the target already exists", async () => {
+		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
+		const oldFile = session.getSessionFile()!;
+		expect(fs.existsSync(oldFile)).toBe(false);
+		const destinationDir = path.join(testAgentDir, "occupied");
+		await fsp.mkdir(destinationDir);
+		const destination = path.join(destinationDir, path.basename(oldFile));
+		await Bun.write(destination, "another session");
+
+		await expect(session.moveTo(cwdB, destinationDir)).rejects.toThrow("Session destination already exists");
+		expect(session.getCwd()).toBe(cwdA);
+		expect(session.getSessionFile()).toBe(oldFile);
+		expect(await Bun.file(destination).text()).toBe("another session");
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		expect(hasAssistantEntry(await loadEntriesFromFile(oldFile))).toBe(true);
+		expect(await Bun.file(destination).text()).toBe("another session");
+		await session.close();
+	});
+
 	it("retains the source when cross-device publication finds an occupied destination", async () => {
 		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
 		await session.ensureOnDisk();
@@ -153,15 +249,15 @@ describe("SessionManager.moveTo", () => {
 		await fsp.mkdir(destinationDir);
 		const destination = path.join(destinationDir, path.basename(oldFile));
 		await Bun.write(destination, "another session");
-		const rename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
-			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
-			return rename(from, to);
+		const link = fs.linkSync.bind(fs);
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((from, to) => {
+			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device link"), { code: "EXDEV" });
+			return link(from, to);
 		});
 		try {
 			await expect(session.moveTo(cwdB, destinationDir)).rejects.toThrow();
 		} finally {
-			renameSpy.mockRestore();
+			linkSpy.mockRestore();
 		}
 		expect(session.getSessionFile()).toBe(oldFile);
 		expect(getHeader(await loadEntriesFromFile(oldFile))?.cwd).toBe(cwdA);
@@ -174,12 +270,12 @@ describe("SessionManager.moveTo", () => {
 		const session = SessionManager.create(cwdA, path.join(testAgentDir, "custom"));
 		await session.ensureOnDisk();
 		const oldFile = session.getSessionFile()!;
-		const rename = fs.promises.rename.bind(fs.promises);
+		const link = fs.linkSync.bind(fs);
 		const copyFile = fs.promises.copyFile.bind(fs.promises);
 		let appended = false;
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
-			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
-			return rename(from, to);
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((from, to) => {
+			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device link"), { code: "EXDEV" });
+			return link(from, to);
 		});
 		const copySpy = spyOn(fs.promises, "copyFile").mockImplementation(async (from, to, flags) => {
 			await copyFile(from, to, flags);
@@ -191,7 +287,7 @@ describe("SessionManager.moveTo", () => {
 		try {
 			await session.moveTo(cwdB);
 		} finally {
-			renameSpy.mockRestore();
+			linkSpy.mockRestore();
 			copySpy.mockRestore();
 		}
 		const entries = await loadEntriesFromFile(session.getSessionFile()!);
@@ -216,11 +312,15 @@ describe("SessionManager.moveTo", () => {
 		await Bun.write(path.join(oldArtifacts, "1.bash.log"), "saved output");
 		const destinationDir = path.join(testAgentDir, "destination");
 		const destinationFile = path.join(destinationDir, path.basename(oldFile));
+		const link = fs.linkSync.bind(fs);
 		const rename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((from, to) => {
 			if (from.toString() === oldFile || from.toString() === destinationFile) {
-				throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
+				throw Object.assign(new Error("cross-device link"), { code: "EXDEV" });
 			}
+			return link(from, to);
+		});
+		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
 			if (from.toString() === oldArtifacts) {
 				throw Object.assign(new Error("artifact move denied"), { code: "EACCES" });
 			}
@@ -229,6 +329,7 @@ describe("SessionManager.moveTo", () => {
 		try {
 			await expect(session.moveTo(cwdB, destinationDir)).rejects.toThrow("artifact move denied");
 		} finally {
+			linkSpy.mockRestore();
 			renameSpy.mockRestore();
 		}
 		expect(session.getSessionFile()).toBe(oldFile);
@@ -243,11 +344,11 @@ describe("SessionManager.moveTo", () => {
 		await session.ensureOnDisk();
 		const oldFile = session.getSessionFile()!;
 		const destinationDir = path.join(testAgentDir, "destination");
-		const rename = fs.promises.rename.bind(fs.promises);
+		const link = fs.linkSync.bind(fs);
 		const unlink = fs.unlinkSync.bind(fs);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
-			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
-			return rename(from, to);
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((from, to) => {
+			if (from.toString() === oldFile) throw Object.assign(new Error("cross-device link"), { code: "EXDEV" });
+			return link(from, to);
 		});
 		const unlinkSpy = spyOn(fs, "unlinkSync").mockImplementation(file => {
 			if (file.toString() === oldFile) throw Object.assign(new Error("source removal denied"), { code: "EACCES" });
@@ -256,7 +357,7 @@ describe("SessionManager.moveTo", () => {
 		try {
 			await expect(session.moveTo(cwdB, destinationDir)).rejects.toThrow("source removal denied");
 		} finally {
-			renameSpy.mockRestore();
+			linkSpy.mockRestore();
 			unlinkSpy.mockRestore();
 		}
 		expect(session.getSessionFile()).toBe(oldFile);
@@ -445,7 +546,38 @@ describe("SessionManager.moveTo", () => {
 		const newArtifactDir = newFile.slice(0, -6); // strip .jsonl
 		expect(fs.existsSync(newArtifactDir)).toBe(true);
 	});
-	it("does not orphan appends that race the session file rename", async () => {
+
+	it("moves a lazy session materialized while awaiting artifact relocation", async () => {
+		const session = SessionManager.create(cwdA);
+		const oldFile = session.getSessionFile()!;
+		const oldArtifactsDir = oldFile.slice(0, -".jsonl".length);
+		expect(fs.existsSync(oldFile)).toBe(false);
+
+		const lstat = fs.promises.lstat.bind(fs.promises);
+		let materialized = false;
+		const lstatSpy = spyOn(fs.promises, "lstat").mockImplementation((async (target, options) => {
+			if (!materialized && path.resolve(target.toString()) === path.resolve(oldArtifactsDir)) {
+				materialized = true;
+				session.appendMessage(makeAssistantMessage());
+				session.flushSync();
+			}
+			return lstat(target, options);
+		}) as typeof fs.promises.lstat);
+		try {
+			await session.moveTo(cwdB);
+			await session.flush();
+		} finally {
+			lstatSpy.mockRestore();
+		}
+		expect(materialized).toBe(true);
+		expect(fs.existsSync(oldFile)).toBe(false);
+		const newFile = session.getSessionFile()!;
+		expect(hasAssistantEntry(await loadEntriesFromFile(newFile))).toBe(true);
+		expect(getHeader(await loadEntriesFromFile(newFile))?.cwd).toBe(cwdB);
+		await session.close();
+	});
+
+	it("does not orphan appends that race session file relocation", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
@@ -454,26 +586,18 @@ describe("SessionManager.moveTo", () => {
 		const oldFile = session.getSessionFile();
 		if (!oldFile) throw new Error("Expected session file");
 
-		const renameFinished = Promise.withResolvers<void>();
-		const allowMoveToResume = Promise.withResolvers<void>();
-		const rename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			await rename(source, target);
-			if (path.resolve(source.toString()) !== path.resolve(oldFile)) return;
-			renameFinished.resolve();
-			await allowMoveToResume.promise;
-		});
+		const relocation = pauseAfterSessionFileMove(oldFile);
 
 		try {
 			const move = session.moveTo(cwdB);
-			await renameFinished.promise;
+			await relocation.landed;
 			session.appendMessage({ role: "user", content: "during move", timestamp: 2 });
-			allowMoveToResume.resolve();
+			relocation.resume();
 			await move;
 			await session.flush();
 		} finally {
-			allowMoveToResume.resolve();
-			renameSpy.mockRestore();
+			relocation.resume();
+			relocation.restore();
 		}
 
 		expect(fs.existsSync(oldFile)).toBe(false);
@@ -488,7 +612,7 @@ describe("SessionManager.moveTo", () => {
 		).toBe(true);
 	});
 
-	it("does not orphan a flushSync that races the session file rename", async () => {
+	it("does not orphan a flushSync that races session file relocation", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
@@ -497,29 +621,21 @@ describe("SessionManager.moveTo", () => {
 		const oldFile = session.getSessionFile();
 		if (!oldFile) throw new Error("Expected session file");
 
-		const renameFinished = Promise.withResolvers<void>();
-		const allowMoveToResume = Promise.withResolvers<void>();
-		const rename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			await rename(source, target);
-			if (path.resolve(source.toString()) !== path.resolve(oldFile)) return;
-			renameFinished.resolve();
-			await allowMoveToResume.promise;
-		});
+		const relocation = pauseAfterSessionFileMove(oldFile);
 
 		try {
 			const move = session.moveTo(cwdB);
-			await renameFinished.promise;
-			// A fenced append followed by a Ctrl+C flushSync in the post-rename,
-			// pre-repoint window must not recreate the old JSONL path.
+			await relocation.landed;
+			// A fenced append followed by Ctrl+C before the trailing rewrite
+			// must not recreate the old JSONL path.
 			session.appendMessage({ role: "user", content: "during move", timestamp: 2 });
 			session.flushSync();
-			allowMoveToResume.resolve();
+			relocation.resume();
 			await move;
 			await session.flush();
 		} finally {
-			allowMoveToResume.resolve();
-			renameSpy.mockRestore();
+			relocation.resume();
+			relocation.restore();
 		}
 
 		expect(fs.existsSync(oldFile)).toBe(false);
@@ -534,7 +650,7 @@ describe("SessionManager.moveTo", () => {
 		).toBe(true);
 	});
 
-	it("does not orphan title changes that race the session file rename", async () => {
+	it("does not orphan title changes that race session file relocation", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
@@ -543,26 +659,18 @@ describe("SessionManager.moveTo", () => {
 		const oldFile = session.getSessionFile();
 		if (!oldFile) throw new Error("Expected session file");
 
-		const renameFinished = Promise.withResolvers<void>();
-		const allowMoveToResume = Promise.withResolvers<void>();
-		const rename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			await rename(source, target);
-			if (path.resolve(source.toString()) !== path.resolve(oldFile)) return;
-			renameFinished.resolve();
-			await allowMoveToResume.promise;
-		});
+		const relocation = pauseAfterSessionFileMove(oldFile);
 
 		try {
 			const move = session.moveTo(cwdB);
-			await renameFinished.promise;
+			await relocation.landed;
 			await session.setSessionName("during move", "user");
-			allowMoveToResume.resolve();
+			relocation.resume();
 			await move;
 			await session.flush();
 		} finally {
-			allowMoveToResume.resolve();
-			renameSpy.mockRestore();
+			relocation.resume();
+			relocation.restore();
 		}
 
 		expect(fs.existsSync(oldFile)).toBe(false);
@@ -594,11 +702,9 @@ describe("SessionManager.moveTo", () => {
 		expect(resolved?.session.path).toBe(movedFile);
 	});
 
-	it("keeps post-rename fenced appends durable before trailing rewrite", async () => {
-		// Crash window: session file has been renamed to dest, `#sessionFile` is
-		// still the source path, and the trailing atomic rewrite has not run.
-		// Completed entries appended in this window must land on dest (not recreate
-		// source) and survive a crash-equivalent snapshot + reopen.
+	it("keeps post-relocation fenced appends durable before the trailing rewrite", async () => {
+		// Crash window: the session file is at dest, while the manager still
+		// references source. A completed append must survive a reopen before rewrite.
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
@@ -607,20 +713,12 @@ describe("SessionManager.moveTo", () => {
 		const oldFile = session.getSessionFile();
 		if (!oldFile) throw new Error("Expected session file");
 
-		const renameFinished = Promise.withResolvers<{ dest: string }>();
-		const allowMoveToResume = Promise.withResolvers<void>();
-		const rename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			await rename(source, target);
-			if (path.resolve(source.toString()) !== path.resolve(oldFile)) return;
-			renameFinished.resolve({ dest: path.resolve(target.toString()) });
-			await allowMoveToResume.promise;
-		});
+		const relocation = pauseAfterSessionFileMove(oldFile);
 
 		let dest = "";
 		try {
 			const move = session.moveTo(cwdB);
-			({ dest } = await renameFinished.promise);
+			dest = await relocation.landed;
 
 			session.appendMessage({ role: "user", content: "during move crash window", timestamp: 2 });
 			session.appendCustomEntry("tool_execution_start", {
@@ -668,12 +766,12 @@ describe("SessionManager.moveTo", () => {
 				reopenedEntries.some(entry => entry.type === "custom" && entry.customType === "tool_execution_start"),
 			).toBe(true);
 
-			allowMoveToResume.resolve();
+			relocation.resume();
 			await move;
 			await session.flush();
 		} finally {
-			allowMoveToResume.resolve();
-			renameSpy.mockRestore();
+			relocation.resume();
+			relocation.restore();
 		}
 
 		expect(fs.existsSync(oldFile)).toBe(false);
@@ -983,13 +1081,16 @@ describe("SessionManager.moveTo", () => {
 		const oldArtifactsDir = oldFile.slice(0, -6);
 		await session.saveArtifact("keep me", "bash");
 
+		const realLink = fs.linkSync.bind(fs);
 		const realRename = fs.promises.rename.bind(fs.promises);
-		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			const resolvedSource = path.resolve(source.toString());
-			if (resolvedSource === path.resolve(oldFile)) {
+		const linkSpy = spyOn(fs, "linkSync").mockImplementation((source, target) => {
+			if (path.resolve(source.toString()) === path.resolve(oldFile)) {
 				throw Object.assign(new Error("EXDEV: cross-device link not permitted"), { code: "EXDEV" });
 			}
-			if (resolvedSource === path.resolve(oldArtifactsDir)) {
+			return realLink(source, target);
+		});
+		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (path.resolve(source.toString()) === path.resolve(oldArtifactsDir)) {
 				throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
 			}
 			return realRename(source, target);
@@ -997,6 +1098,7 @@ describe("SessionManager.moveTo", () => {
 		try {
 			await expect(session.moveTo(cwdB)).rejects.toThrow("EACCES");
 		} finally {
+			linkSpy.mockRestore();
 			renameSpy.mockRestore();
 		}
 
