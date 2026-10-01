@@ -634,7 +634,8 @@ export function writeModelCache<TApi extends Api>(
 				});
 			}
 			const policy = materializationPolicy();
-			const authoritativeFlag = authoritative ? 1 : 0;
+			const cacheAuthoritative = authoritative && rejectedModelIds.length === 0;
+			const authoritativeFlag = cacheAuthoritative ? 1 : 0;
 			const serializedHeaderOmitted = JSON.stringify(headerOmittedModelIds);
 			const serializedUnrestorable = JSON.stringify(unrestorableHeaderModelIds);
 			const serializedModels = JSON.stringify(cachedModels);
@@ -671,7 +672,7 @@ export function writeModelCache<TApi extends Api>(
 					}
 					if (stored) {
 						const state = rowState(stored);
-						if (state.updatedAt === updatedAt && state.authoritative === authoritative) return "skipped";
+						if (state.updatedAt === updatedAt && state.authoritative === cacheAuthoritative) return "skipped";
 						db.run(
 							`INSERT INTO model_cache_refresh (provider_id, payload_updated_at, updated_at, authoritative)
 							VALUES (?, ?, ?, ?)

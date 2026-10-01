@@ -103,6 +103,75 @@ describe("model cache write churn", () => {
 		expect(payloadRow(dbPath, "rewrite-test")?.authoritative).toBe(1);
 	});
 
+	it("retries a partial discovery instead of pinning a missing model after restart", async () => {
+		let now = 10_000;
+		let fetches = 0;
+		const options = {
+			providerId: "partial-discovery-test",
+			staticModels: [],
+			cacheDbPath: dbPath,
+			now: () => now,
+			fetchDynamicModels: async () => {
+				fetches++;
+				return fetches === 1
+					? [spec("healthy"), { ...spec("late"), cost: { ...spec("late").cost, input: Number.NaN } }]
+					: [spec("healthy"), spec("late")];
+			},
+		};
+
+		const first = await resolveProviderModels(options, "online-if-uncached");
+		expect(first.models.map(item => item.id)).toEqual(["healthy"]);
+		expect(first.stale).toBe(true);
+
+		now += 5 * 60_000;
+		const recovered = await resolveProviderModels(options, "online-if-uncached");
+		expect(fetches).toBe(2);
+		expect(recovered.models.map(item => item.id)).toEqual(["healthy", "late"]);
+		expect(recovered.stale).toBe(false);
+	});
+
+	it("keeps a direct partial cache write non-authoritative", () => {
+		const invalid = model("invalid");
+		writeModelCache(
+			"rewrite-test",
+			1_000,
+			[model("healthy"), { ...invalid, cost: { ...invalid.cost, input: Number.NaN } }],
+			true,
+			"fp",
+			dbPath,
+		);
+		const cached = readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath);
+		expect(cached?.models.map(item => item.id)).toEqual(["healthy"]);
+		expect(cached?.authoritative).toBe(false);
+	});
+
+	it("preserves known models when an authoritative discovery becomes partial", async () => {
+		let now = 10_000;
+		let partial = false;
+		const options = {
+			providerId: "authoritative-partial-test",
+			staticModels: [],
+			cacheDbPath: dbPath,
+			now: () => now,
+			dynamicModelsAuthoritative: true,
+			fetchDynamicModels: async () =>
+				partial
+					? [spec("healthy"), { ...spec("late"), cost: { ...spec("late").cost, input: Number.NaN } }]
+					: [spec("healthy"), spec("late")],
+		};
+
+		const initial = await resolveProviderModels(options, "online");
+		expect(initial.models.map(item => item.id)).toEqual(["healthy", "late"]);
+		partial = true;
+		now += 1_000;
+		const refreshed = await resolveProviderModels(options, "online");
+		expect(refreshed.models.map(item => item.id)).toEqual(["healthy", "late"]);
+		expect(refreshed.stale).toBe(true);
+		const persisted = readModelCache("authoritative-partial-test", TTL_MS, () => now, dbPath);
+		expect(persisted?.models.map(item => item.id)).toEqual(["healthy", "late"]);
+		expect(persisted?.authoritative).toBe(false);
+	});
+
 	it("rewrites a changed payload and drops the stale freshness row", () => {
 		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
 		writeModelCache("rewrite-test", 2_000, [model("a")], true, "fp", dbPath);

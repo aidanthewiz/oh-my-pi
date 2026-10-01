@@ -321,11 +321,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		strategy === "online-if-uncached" && hasUsableFreshCache && hasAuthoritativeCache;
 	const dynamicFetchSucceeded = fetchedDynamicModels !== null;
 	const anyRemoteFetchSucceeded = modelsDevFetchSucceeded || dynamicFetchSucceeded;
+	const modelsDevFetchComplete = modelsDevFetchSucceeded && !fetchedModelsDevModels.incomplete;
+	const dynamicFetchComplete = dynamicFetchSucceeded && !fetchedDynamicModels.incomplete;
 	const allConfiguredRemoteFetchesSucceeded =
 		hasRemoteFetcher &&
-		(!hasModelsDevFetcher || modelsDevFetchSucceeded) &&
-		(!hasDynamicFetcher || dynamicFetchSucceeded);
-	const authoritativeDynamicFetchSucceeded = dynamicModelsAuthoritative && dynamicFetchSucceeded;
+		(!hasModelsDevFetcher || modelsDevFetchComplete) &&
+		(!hasDynamicFetcher || dynamicFetchComplete);
+	const authoritativeDynamicFetchSucceeded = dynamicModelsAuthoritative && dynamicFetchComplete;
 	const remoteResolutionComplete = authoritativeDynamicFetchSucceeded || allConfiguredRemoteFetchesSucceeded;
 	const preparedCacheModels = remoteResolutionComplete
 		? []
@@ -347,10 +349,10 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	// short retry that recovers a transient empty response (#6620). Shared
 	// models.dev snapshots may be empty for one provider and remain authoritative.
 	const cacheAuthoritative = hasDynamicFetcher
-		? dynamicFetchSucceeded &&
+		? dynamicFetchComplete &&
 			dynamicModels.length > 0 &&
-			(dynamicModelsAuthoritative || !hasModelsDevFetcher || modelsDevFetchSucceeded)
-		: modelsDevFetchSucceeded;
+			(dynamicModelsAuthoritative || !hasModelsDevFetcher || modelsDevFetchComplete)
+		: modelsDevFetchComplete;
 	const mergedWithCache = mergeDynamicModels(staticModels, cacheModels);
 	const mergedWithModelsDev = mergeDynamicModels(
 		mergedWithCache,
@@ -456,6 +458,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 interface DiscoveredModelSet<TApi extends Api> {
 	models: Model<TApi>[];
 	explicitKindModels: ReadonlySet<Model<TApi>>;
+	incomplete: boolean;
 }
 
 async function fetchModelsDev<TApi extends Api, TModelsDevPayload>(
@@ -712,16 +715,19 @@ function buildDiscoveredModelSpecs<TApi extends Api>(value: unknown): Discovered
 	const models: Model<TApi>[] = [];
 	const explicitKindModels = new Set<Model<TApi>>();
 	if (!Array.isArray(value)) {
-		return { models, explicitKindModels };
+		return { models, explicitKindModels, incomplete: true };
 	}
+	let incomplete = false;
 	for (const item of value) {
 		if (isModelLike(item)) {
 			const model = buildModel(item as ModelSpec<TApi>);
 			models.push(model);
 			if (item.kind !== undefined) explicitKindModels.add(model);
+		} else {
+			incomplete = true;
 		}
 	}
-	return { models, explicitKindModels };
+	return { models, explicitKindModels, incomplete };
 }
 
 function isModelLike(value: unknown): value is ModelSpec<Api> {
