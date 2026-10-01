@@ -508,7 +508,10 @@ export async function smokeTestIdaHost(): Promise<void> {
 			if (!alive) await Bun.sleep(200);
 		}
 		if (!alive) {
-			throw new Error(`ida host smoke failed: no ping response (${proc.peekStderr().slice(-500) || "no stderr"})`);
+			if (proc.exitCode !== null) await proc.exited.catch(() => {});
+			throw new Error(
+				`ida host smoke failed: no ping response (exit ${proc.exitCode ?? "still running"}; ${proc.peekStderr().trim() || "no stderr"})`,
+			);
 		}
 	} finally {
 		proc.kill();
