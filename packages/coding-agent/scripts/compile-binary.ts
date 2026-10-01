@@ -1,6 +1,7 @@
 // Deep import: the pi-utils barrel loads the host native addon, which is
 // absent on cross-compiling release runners.
 import { USER_AGENT } from "@oh-my-pi/pi-utils/dirs";
+import * as path from "node:path";
 import { buildDocsIndexPayload } from "./generate-docs-index";
 import { createJsonParsePlugin } from "./json-parse-plugin";
 import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
@@ -56,7 +57,19 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 				identifiers: options.minifyIdentifiers ?? false,
 				keepNames: true,
 			},
-			plugins: [createJsonParsePlugin(), await createLegacyPiVirtualModulePlugin()],
+			plugins: [
+				{
+					name: "omp:embedded-native-archive",
+					setup(build) {
+						// Bun 1.4.2 can miss a relative archive import on native Windows build runners.
+						build.onResolve({ filter: /^\.\/embedded-addons\.[a-z0-9-]+\.tar\.gz$/ }, args => ({
+							path: path.resolve(path.dirname(args.importer), args.path),
+						}));
+					},
+				},
+				createJsonParsePlugin(),
+				await createLegacyPiVirtualModulePlugin(),
+			],
 			compile: {
 				// Bun's process-wide fetch User-Agent default. Any explicit
 				// provider fingerprint (Anthropic/Codex OAuth) still wins.
