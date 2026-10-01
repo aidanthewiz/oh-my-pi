@@ -32,6 +32,7 @@ import type {
 	CredentialBlockResponse,
 	CredentialBlockSnapshot,
 	CredentialBlocksDeleteResponse,
+	CredentialBlocksDeleteRequest,
 	CredentialDisableResponse,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
@@ -119,6 +120,7 @@ export const credentialBlockSnapshotSchema: FluentType<CredentialBlockSnapshot> 
 	blockScope: "string",
 	blockedUntilMs: "number",
 	"updatedAtMs?": "number",
+	"mutationToken?": type("string").atLeastLength(1),
 });
 
 export const snapshotEntrySchema: FluentType<SnapshotEntry> = type({
@@ -147,6 +149,7 @@ export const snapshotResponseSchema: FluentType<SnapshotResponse> = type({
 	generatedAt: "number",
 	serverNowMs: "number",
 	"blockRevision?": blockRevisionSchema,
+	"blockMutationTokens?": "true",
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
 });
@@ -160,6 +163,7 @@ export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapsho
 	generatedAt: "number",
 	serverNowMs: "number",
 	"blockRevision?": blockRevisionSchema,
+	"blockMutationTokens?": "true",
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
 	kind: "'snapshot'",
@@ -404,6 +408,13 @@ export const credentialBlockDeleteRequestSchema: FluentType<CredentialBlockDelet
 	"+": "reject",
 	providerKey: type("string").atLeastLength(1),
 	blockScope: "string",
+	"mutationToken?": type("string").atLeastLength(1),
+	"blockedUntilMs?": "number",
+});
+
+export const credentialBlocksDeleteRequestSchema: FluentType<CredentialBlocksDeleteRequest> = type({
+	"+": "reject",
+	blocks: credentialBlockDeleteRequestSchema.array(),
 });
 
 export const credentialBlockResponseSchema: FluentType<CredentialBlockResponse> = type({
@@ -415,6 +426,7 @@ export const credentialBlockResponseSchema: FluentType<CredentialBlockResponse> 
 export const credentialBlocksDeleteResponseSchema: FluentType<CredentialBlocksDeleteResponse> = type({
 	"+": "reject",
 	ok: "boolean",
+	"deleted?": "boolean",
 	"blockRevision?": blockRevisionSchema,
 });
 

@@ -8,6 +8,7 @@ import {
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
 	type CredentialBlockResponse,
+	type CredentialBlocksDeleteResponse,
 	type FetchSnapshotResult,
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
@@ -25,7 +26,7 @@ function requireLimit(report: UsageReport, id: string): UsageLimit {
 	return limit;
 }
 
-const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
+const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_BASE_URL"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
 
 describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
@@ -1250,8 +1251,9 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			blockScope: "",
 			blockedUntilMs: now + 60_000,
 			updatedAtMs: now,
+			mutationToken: "observed-global",
 		};
-		const scopedBlock = { ...globalBlock, blockScope: "tier:fable" };
+		const scopedBlock = { ...globalBlock, blockScope: "tier:fable", mutationToken: "observed-scoped" };
 		let incoming: SnapshotResponse = {
 			...initial.snapshot,
 			credentials: [{ ...entry, blocks: [globalBlock, scopedBlock] }],
@@ -1264,7 +1266,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 				generation: incoming.generation,
 				snapshot: incoming,
 			}));
-		const deletion = Promise.withResolvers<CredentialBlockResponse>();
+		const deletion = Promise.withResolvers<CredentialBlocksDeleteResponse>();
 		const deleteSpy = vi.spyOn(brokerClient, "deleteCredentialBlock").mockReturnValue(deletion.promise);
 		const remoteStore = new RemoteAuthCredentialStore({
 			client: brokerClient,
@@ -1279,14 +1281,19 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 				globalBlock.blockedUntilMs,
 			);
 
-			deletion.resolve({ ok: true });
+			deletion.resolve({ ok: true, deleted: true });
 			await remoteStore.refreshSnapshot();
 			expect(remoteStore.getCredentialBlock(entry.id, globalBlock.providerKey, "")).toBeUndefined();
 
 			incoming = {
 				...incoming,
 				generation: incoming.generation + 1,
-				credentials: [{ ...entry, blocks: [{ ...globalBlock, updatedAtMs: now + 1 }, scopedBlock] }],
+				credentials: [
+					{
+						...entry,
+						blocks: [{ ...globalBlock, updatedAtMs: now + 1, mutationToken: "recreated-global" }, scopedBlock],
+					},
+				],
 			};
 			await remoteStore.refreshSnapshot();
 			expect(remoteStore.getCredentialBlock(entry.id, globalBlock.providerKey, "")).toBe(globalBlock.blockedUntilMs);
@@ -1300,7 +1307,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 				globalBlock.blockedUntilMs,
 			);
 		} finally {
-			deletion.resolve({ ok: true });
+			deletion.resolve({ ok: true, deleted: true });
 			remoteStore.close();
 		}
 	});

@@ -598,7 +598,13 @@ describe("RemoteAuthCredentialStore.pollExternalChanges content revision", () =>
 	});
 });
 
-type TestBlock = { providerKey: string; blockScope: string; blockedUntilMs: number; updatedAtMs?: number };
+type TestBlock = {
+	providerKey: string;
+	blockScope: string;
+	blockedUntilMs: number;
+	updatedAtMs?: number;
+	mutationToken?: string;
+};
 
 class DeferredBlockBroker extends FakeBrokerClient {
 	readonly blocks = new Map<number, Map<string, TestBlock>>();
@@ -659,7 +665,11 @@ class DeferredBlockBroker extends FakeBrokerClient {
 		return ready.promise;
 	}
 
-	#defer(id: number, kind: "upsert" | "delete" | "delete-all", apply: () => void): Promise<{ ok: true }> {
+	#defer(
+		id: number,
+		kind: "upsert" | "delete" | "delete-all",
+		apply: () => boolean | void,
+	): Promise<{ ok: true; deleted?: boolean }> {
 		const gate = Promise.withResolvers<void>();
 		const completed = Promise.withResolvers<void>();
 		const operation = { id, kind, release: () => gate.resolve(), completed: completed.promise };
@@ -668,13 +678,17 @@ class DeferredBlockBroker extends FakeBrokerClient {
 		this.#operationWaiters.get(index)?.resolve(operation);
 		this.#operationWaiters.delete(index);
 		return gate.promise.then(() => {
-			apply();
+			const deleted = apply();
 			this.current.blockRevision = {
 				instanceId: "test-persisted-db",
 				sequence: this.current.blockRevision!.sequence + 1,
 			};
 			completed.resolve();
-			return { ok: true as const, blockRevision: this.current.blockRevision };
+			return {
+				ok: true as const,
+				...(deleted !== undefined ? { deleted } : {}),
+				blockRevision: this.current.blockRevision,
+			};
 		});
 	}
 
@@ -692,15 +706,41 @@ class DeferredBlockBroker extends FakeBrokerClient {
 		});
 	}
 
-	deleteCredentialBlock(id: number, block: Pick<TestBlock, "providerKey" | "blockScope">): Promise<{ ok: true }> {
+	deleteCredentialBlock(
+		id: number,
+		block: Pick<TestBlock, "providerKey" | "blockScope" | "mutationToken" | "blockedUntilMs">,
+	): Promise<{ ok: true; deleted?: boolean }> {
 		return this.#defer(id, "delete", () => {
-			this.blocks.get(id)?.delete(this.#key(block));
+			const rows = this.blocks.get(id);
+			const current = rows?.get(this.#key(block));
+			if (
+				!current ||
+				current.mutationToken !== block.mutationToken ||
+				current.blockedUntilMs !== block.blockedUntilMs
+			)
+				return false;
+			rows!.delete(this.#key(block));
+			return true;
 		});
 	}
 
-	deleteCredentialBlocks(id: number): Promise<{ ok: true }> {
+	deleteCredentialBlocks(id: number, request: { blocks: TestBlock[] }): Promise<{ ok: true; deleted?: boolean }> {
 		return this.#defer(id, "delete-all", () => {
-			this.blocks.set(id, new Map());
+			const rows = this.blocks.get(id);
+			let deleted = true;
+			for (const block of request.blocks) {
+				const current = rows?.get(this.#key(block));
+				if (
+					!current ||
+					current.mutationToken !== block.mutationToken ||
+					current.blockedUntilMs !== block.blockedUntilMs
+				) {
+					deleted = false;
+					continue;
+				}
+				rows!.delete(this.#key(block));
+			}
+			return deleted;
 		});
 	}
 }
@@ -716,7 +756,11 @@ describe("RemoteAuthCredentialStore broker block mutation ordering", () => {
 			{ id: credentialId, provider: "anthropic", key: "sk-test" },
 			{ id: 8, provider: "anthropic", key: "sk-other" },
 		]);
-		initial.credentials[0]!.blocks = initialBlocks;
+		initial.blockMutationTokens = true;
+		initial.credentials[0]!.blocks = initialBlocks.map((block, index) => ({
+			...block,
+			mutationToken: block.mutationToken ?? `initial-${index}`,
+		}));
 		const client = new DeferredBlockBroker(initial, now);
 		const remote = new RemoteAuthCredentialStore({
 			client: client as unknown as AuthBrokerClient,
@@ -853,7 +897,13 @@ describe("RemoteAuthCredentialStore broker block mutation ordering", () => {
 
 	test("a committed same-millisecond recreation survives the deleted row's tombstone", async () => {
 		const timestamp = Date.now();
-		const original = { providerKey, blockScope, blockedUntilMs: timestamp + 60_000, updatedAtMs: timestamp };
+		const original = {
+			providerKey,
+			blockScope,
+			blockedUntilMs: timestamp + 60_000,
+			updatedAtMs: timestamp,
+			mutationToken: "test-original",
+		};
 		const { client, remote } = setup([original]);
 		try {
 			remote.deleteCredentialBlock(credentialId, providerKey, blockScope);
@@ -865,8 +915,9 @@ describe("RemoteAuthCredentialStore broker block mutation ordering", () => {
 			client.operations[0]!.release();
 			await client.operations[0]!.completed;
 			await Promise.resolve();
-			client.blocks.get(credentialId)!.set(`${providerKey}\0${blockScope}`, original);
-			expect(client.visible(credentialId)).toEqual([original]);
+			const recreated = { ...original, mutationToken: "test-recreated" };
+			client.blocks.get(credentialId)!.set(`${providerKey}\0${blockScope}`, recreated);
+			expect(client.visible(credentialId)).toEqual([recreated]);
 			client.current.blockRevision = {
 				instanceId: "test-persisted-db",
 				sequence: client.current.blockRevision!.sequence + 1,

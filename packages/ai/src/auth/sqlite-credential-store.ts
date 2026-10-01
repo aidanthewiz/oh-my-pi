@@ -80,6 +80,7 @@ type CredentialBlockRow = {
 	block_scope: string;
 	blocked_until_ms: number;
 	updated_at: number;
+	mutation_token: string;
 };
 
 type SerializedCredentialRecord = {
@@ -88,7 +89,7 @@ type SerializedCredentialRecord = {
 	identityKey: string | null;
 };
 
-const AUTH_SCHEMA_VERSION = 8;
+const AUTH_SCHEMA_VERSION = 9;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 const LEGACY_CODEX_BLOCK_PROVIDER_KEY = "openai-codex:oauth";
 const LEGACY_CODEX_BLOCK_SCOPE = "shared";
@@ -373,6 +374,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#upsertCredentialBlockStmt: Statement;
 	#deleteCredentialBlocksStmt: Statement;
 	#deleteCredentialBlockStmt: Statement;
+	#deleteCredentialBlockIfMatchesStmt: Statement;
 	#deleteExpiredCredentialBlocksStmt: Statement;
 	#acquireCredentialRefreshLeaseStmt: Statement;
 	#getCredentialRefreshLeaseStmt: Statement;
@@ -457,22 +459,26 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			"SELECT blocked_until_ms, updated_at FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ? AND blocked_until_ms > ?",
 		);
 		this.#listCredentialBlocksByCredentialStmt = this.#db.prepare(
-			`SELECT credential_id, provider_key, block_scope, blocked_until_ms, updated_at
+			`SELECT credential_id, provider_key, block_scope, blocked_until_ms, updated_at, mutation_token
 			FROM auth_credential_blocks
 			WHERE credential_id = ? AND blocked_until_ms > ?
 				AND NOT (provider_key = ? AND block_scope = ?)
 			ORDER BY provider_key ASC, block_scope ASC`,
 		);
 		this.#upsertCredentialBlockStmt = this.#db.prepare(
-			`INSERT INTO auth_credential_blocks (credential_id, provider_key, block_scope, blocked_until_ms, updated_at)
-			VALUES (?, ?, ?, ?, ${SQLITE_NOW_EPOCH})
+			`INSERT INTO auth_credential_blocks (credential_id, provider_key, block_scope, blocked_until_ms, updated_at, mutation_token)
+			VALUES (?, ?, ?, ?, ${SQLITE_NOW_EPOCH}, COALESCE(?, lower(hex(randomblob(16)))))
 			ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
 				blocked_until_ms = MAX(blocked_until_ms, excluded.blocked_until_ms),
-				updated_at = excluded.updated_at`,
+				updated_at = excluded.updated_at,
+				mutation_token = excluded.mutation_token`,
 		);
 		this.#deleteCredentialBlocksStmt = this.#db.prepare("DELETE FROM auth_credential_blocks WHERE credential_id = ?");
 		this.#deleteCredentialBlockStmt = this.#db.prepare(
 			"DELETE FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ?",
+		);
+		this.#deleteCredentialBlockIfMatchesStmt = this.#db.prepare(
+			"DELETE FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ? AND mutation_token = ? AND blocked_until_ms = ? RETURNING credential_id",
 		);
 		this.#deleteExpiredCredentialBlocksStmt = this.#db.prepare(
 			"DELETE FROM auth_credential_blocks WHERE blocked_until_ms <= ?",
@@ -625,6 +631,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#createAuthCredentialBlocksTable();
 			this.#createAuthCredentialRefreshLeasesTable();
 			this.#createAuthCredentialBlockCompatibilityObjects();
+			this.#createAuthCredentialBlockMutationTokenTriggers();
 			this.#createAuthChangeTrackingObjects();
 			this.#writeAuthSchemaVersion(AUTH_SCHEMA_VERSION);
 			return;
@@ -646,6 +653,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#createAuthCredentialRefreshLeasesTable();
 		if (schemaVersion <= AUTH_SCHEMA_VERSION) {
 			this.#createAuthCredentialBlockCompatibilityObjects();
+			this.#createAuthCredentialBlockMutationTokenTriggers();
 		}
 		this.#createAuthChangeTrackingObjects();
 		this.#backfillCredentialIdentityKeys();
@@ -739,6 +747,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				block_scope TEXT NOT NULL DEFAULT '',
 				blocked_until_ms INTEGER NOT NULL,
 				updated_at INTEGER NOT NULL,
+				mutation_token TEXT NOT NULL DEFAULT '',
 				PRIMARY KEY (credential_id, provider_key, block_scope)
 			);
 			CREATE INDEX IF NOT EXISTS idx_auth_credential_blocks_expires ON auth_credential_blocks(blocked_until_ms);
@@ -816,35 +825,41 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 						provider_key,
 						block_scope,
 						blocked_until_ms,
-						updated_at
+						updated_at,
+						mutation_token
 					)
 					VALUES (
 						NEW.credential_id,
 						NEW.provider_key,
 						'chat',
 						NEW.blocked_until_ms,
-						NEW.updated_at
+						NEW.updated_at,
+						lower(hex(randomblob(16)))
 					)
 					ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
 						blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
-						updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at);
+						updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at),
+						mutation_token = excluded.mutation_token;
 					INSERT INTO auth_credential_blocks (
 						credential_id,
 						provider_key,
 						block_scope,
 						blocked_until_ms,
-						updated_at
+						updated_at,
+						mutation_token
 					)
 					VALUES (
 						NEW.credential_id,
 						NEW.provider_key,
 						'spark',
 						NEW.blocked_until_ms,
-						NEW.updated_at
+						NEW.updated_at,
+						lower(hex(randomblob(16)))
 					)
 					ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
 						blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
-						updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at);
+						updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at),
+						mutation_token = excluded.mutation_token;
 					DELETE FROM auth_credential_block_mirror_guard
 					WHERE credential_id = NEW.credential_id;
 				END;
@@ -869,14 +884,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 						provider_key,
 						block_scope,
 						blocked_until_ms,
-						updated_at
+						updated_at,
+						mutation_token
 					)
 					SELECT
 						NEW.credential_id,
 						NEW.provider_key,
 						'shared',
 						MAX(blocked_until_ms),
-						MAX(updated_at)
+						MAX(updated_at),
+						lower(hex(randomblob(16)))
 					FROM auth_credential_blocks
 					WHERE credential_id = NEW.credential_id
 						AND provider_key = NEW.provider_key
@@ -928,14 +945,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					provider_key,
 					block_scope,
 					blocked_until_ms,
-					updated_at
+					updated_at,
+					mutation_token
 				)
 				SELECT
 					OLD.credential_id,
 					OLD.provider_key,
 					'shared',
 					MAX(blocked_until_ms),
-					MAX(updated_at)
+					MAX(updated_at),
+					lower(hex(randomblob(16)))
 				FROM auth_credential_blocks
 				WHERE credential_id = OLD.credential_id
 					AND provider_key = OLD.provider_key
@@ -943,6 +962,41 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				GROUP BY credential_id, provider_key;
 				DELETE FROM auth_credential_block_mirror_guard
 				WHERE credential_id = OLD.credential_id;
+			END;
+		`);
+	}
+
+	#ensureAuthCredentialBlockMutationTokenColumn(): void {
+		const columnsStmt = this.#db.prepare("PRAGMA table_info(auth_credential_blocks)");
+		let columns: Array<{ name: string }>;
+		try {
+			columns = columnsStmt.all() as Array<{ name: string }>;
+		} finally {
+			columnsStmt.finalize();
+		}
+		if (!columns.some(column => column.name === "mutation_token")) {
+			this.#db.run("ALTER TABLE auth_credential_blocks ADD COLUMN mutation_token TEXT NOT NULL DEFAULT ''");
+		}
+	}
+
+	#createAuthCredentialBlockMutationTokenTriggers(): void {
+		// Older binaries omit this column or retain its value on UPDATE.
+		this.#db.run(`
+			CREATE TRIGGER IF NOT EXISTS auth_credential_block_insert_token
+			AFTER INSERT ON auth_credential_blocks
+			WHEN NEW.mutation_token = ''
+			BEGIN
+				UPDATE auth_credential_blocks SET mutation_token = lower(hex(randomblob(16)))
+				WHERE credential_id = NEW.credential_id AND provider_key = NEW.provider_key
+					AND block_scope = NEW.block_scope AND mutation_token = '';
+			END;
+			CREATE TRIGGER IF NOT EXISTS auth_credential_block_update_token
+			AFTER UPDATE ON auth_credential_blocks
+			WHEN NEW.mutation_token = OLD.mutation_token
+			BEGIN
+				UPDATE auth_credential_blocks SET mutation_token = lower(hex(randomblob(16)))
+				WHERE credential_id = NEW.credential_id AND provider_key = NEW.provider_key
+					AND block_scope = NEW.block_scope AND mutation_token = NEW.mutation_token;
 			END;
 		`);
 	}
@@ -977,6 +1031,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 		if (fromVersion < 8) {
 			this.#migrateAuthSchemaV7ToV8();
+		}
+		if (fromVersion < 9) {
+			this.#migrateAuthSchemaV8ToV9();
 		}
 	}
 
@@ -1081,6 +1138,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#migrateAuthSchemaV6ToV7(): void {
 		const migrate = this.#db.transaction(() => {
 			this.#createAuthCredentialBlocksTable();
+			this.#ensureAuthCredentialBlockMutationTokenColumn();
 			this.#createAuthCredentialBlockMirrorGuardTable();
 			this.#db.run(`
 				DELETE FROM auth_credential_block_mirror_guard;
@@ -1185,6 +1243,22 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				);
 			}
 			this.#writeAuthSchemaVersion(8);
+		});
+		migrate.immediate();
+	}
+	#migrateAuthSchemaV8ToV9(): void {
+		const migrate = this.#db.transaction(() => {
+			this.#ensureAuthCredentialBlockMutationTokenColumn();
+			for (const event of ["insert", "update"] as const) {
+				this.#db.run(`DROP TRIGGER IF EXISTS auth_codex_shared_${event}_to_meters`);
+				this.#db.run(`DROP TRIGGER IF EXISTS auth_codex_meter_${event}_to_shared`);
+			}
+			this.#db.run(
+				"UPDATE auth_credential_blocks SET mutation_token = lower(hex(randomblob(16))) WHERE mutation_token = ''",
+			);
+			this.#createAuthCredentialBlockCompatibilityObjects();
+			this.#createAuthCredentialBlockMutationTokenTriggers();
+			this.#writeAuthSchemaVersion(9);
 		});
 		migrate.immediate();
 	}
@@ -1605,6 +1679,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					block.providerKey,
 					blockScope,
 					block.blockedUntilMs,
+					block.mutationToken ?? null,
 				);
 			}
 		});
@@ -1627,6 +1702,24 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void {
 		this.#deleteCredentialBlockStmt.run(credentialId, providerKey, blockScope);
 		this.#credentialBlockReconcileAfter.delete(`${credentialId}\0${providerKey}\0${blockScope}`);
+	}
+	deleteCredentialBlockIfMatches(
+		credentialId: number,
+		providerKey: string,
+		blockScope: string,
+		mutationToken: string,
+		blockedUntilMs: number,
+	): boolean {
+		const deleted = this.#deleteCredentialBlockIfMatchesStmt.get(
+			credentialId,
+			providerKey,
+			blockScope,
+			mutationToken,
+			blockedUntilMs,
+		) as { credential_id: number } | null;
+		if (!deleted) return false;
+		this.#credentialBlockReconcileAfter.delete(`${credentialId}\0${providerKey}\0${blockScope}`);
+		return true;
 	}
 
 	deleteCredentialBlocks(credentialId: number): void {
@@ -1665,6 +1758,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					blockScope: row.block_scope,
 					blockedUntilMs: row.blocked_until_ms,
 					updatedAtMs: row.updated_at * 1000,
+					...(row.mutation_token ? { mutationToken: row.mutation_token } : {}),
 				});
 			}
 		}
@@ -2039,6 +2133,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#upsertCredentialBlockStmt.finalize();
 		this.#deleteCredentialBlocksStmt.finalize();
 		this.#deleteCredentialBlockStmt.finalize();
+		this.#deleteCredentialBlockIfMatchesStmt.finalize();
 		this.#deleteExpiredCredentialBlocksStmt.finalize();
 		this.#insertUsageHistoryStmt.finalize();
 		this.#lastUsageHistoryStmt.finalize();

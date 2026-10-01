@@ -106,6 +106,14 @@ export interface CredentialBlockStore {
 	upsertCredentialBlock(block: StoredCredentialBlock): void;
 	/** Drop one block row for a credential/provider/scope key. */
 	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void;
+	/** Atomically clear only the observed row version; unavailable stores refuse the broker clear. */
+	deleteCredentialBlockIfMatches?(
+		credentialId: number,
+		providerKey: string,
+		blockScope: string,
+		mutationToken: string,
+		blockedUntilMs: number,
+	): boolean;
 	/** Drop every block row for a credential (all providerKeys/scopes). */
 	deleteCredentialBlocks(credentialId: number): void;
 	/** Prune rows with blocked_until_ms <= nowMs. */

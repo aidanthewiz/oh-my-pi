@@ -17,6 +17,7 @@ import type {
 	CredentialBlockRequest,
 	CredentialBlockResponse,
 	CredentialBlocksDeleteResponse,
+	CredentialBlocksDeleteRequest,
 	CredentialDisableRequest,
 	CredentialDisableResponse,
 	CredentialRefreshResponse,
@@ -33,6 +34,7 @@ import type {
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
+	AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 } from "./types";
 import {
@@ -67,7 +69,7 @@ const RESPONSE_SCHEMAS = {
 	usageResponseSchema,
 	usageStaleResponseSchema,
 } as const;
-const BROKER_CAPABILITIES = `${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS}`;
+const BROKER_CAPABILITIES = `${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS},${AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS}`;
 
 type AuthBrokerResponseSchemaName = keyof typeof RESPONSE_SCHEMAS;
 
@@ -412,8 +414,13 @@ export class AuthBrokerClient {
 		});
 	}
 
-	async deleteCredentialBlocks(id: number, signal?: AbortSignal): Promise<CredentialBlocksDeleteResponse> {
+	async deleteCredentialBlocks(
+		id: number,
+		request: CredentialBlocksDeleteRequest,
+		signal?: AbortSignal,
+	): Promise<CredentialBlocksDeleteResponse> {
 		return this.#request<CredentialBlocksDeleteResponse>("DELETE", `/v1/credential/${id}/blocks`, {
+			body: request,
 			schema: "credentialBlocksDeleteResponseSchema",
 			signal,
 		});

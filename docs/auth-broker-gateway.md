@@ -77,7 +77,8 @@ omp auth-broker status    [--json]
 | `POST`   | `/v1/credential/:id/disable` | bearer | Disable one credential with a recorded cause                       |
 | `GET`    | `/v1/credentials/disabled`   | bearer | List disabled credentials; optional `provider` query filter        |
 | `POST`   | `/v1/credential/:id/block`   | bearer | Upsert a provider/scope rate-limit block                           |
-| `DELETE` | `/v1/credential/:id/blocks`  | bearer | Delete all rate-limit blocks for a credential                      |
+| `DELETE` | `/v1/credential/:id/block`   | bearer | Clear one observed provider/scope block if unchanged               |
+| `DELETE` | `/v1/credential/:id/blocks`  | bearer | Clear only observed blocks for a credential if unchanged           |
 | `GET`    | `/v1/usage`                  | bearer | Aggregate current `UsageReport[]` across credentials               |
 | `GET`    | `/v1/usage/history`          | bearer | Persisted usage history; optional `sinceMs` and `provider` filters |
 | `POST`   | `/v1/usage/observed`         | bearer | Record usage observed by a broker client                           |
@@ -111,11 +112,19 @@ as a quoted `ETag`, plus `Cache-Control: no-store` and
 
 Clients that understand per-meter Codex blocks send `OMP-Auth-Broker-Capabilities: codex-meter-block-scopes`. Snapshot responses then carry the canonical `chat` and `spark` scopes. Without that capability, the broker projects those rows to the legacy `shared` scope on the wire.
 
-Local SQLite schema 7 keeps `chat` and `spark` as the canonical scopes exposed by current store APIs. It also maintains a physical `shared` compatibility mirror for pre-meter binaries that read `agent.db` directly. SQLite triggers derive that mirror's deadline and update time independently from the meter rows, and copy a legacy process's `shared` writes back to both meters. Current store APIs omit the physical mirror, so broker snapshots and model selection do not double-count it.
+Local SQLite schema 9 keeps `chat` and `spark` as the canonical scopes exposed by current store APIs. It also maintains a physical `shared` compatibility mirror for pre-meter binaries that read `agent.db` directly. SQLite triggers derive that mirror's deadline and update time independently from the meter rows, and copy a legacy process's `shared` writes back to both meters. Current store APIs omit the physical mirror, so broker snapshots and model selection do not double-count it.
 
 Clients released before this capability, including 17.1.4, receive the conservative `shared` projection until they are upgraded. Those clients are indistinguishable on the existing wire, so mixed-version deployments favor keeping a rate-limited credential blocked over allowing repeated provider requests and 429 responses.
 
 Capability-dependent responses include `Vary: OMP-Auth-Broker-Capabilities` so intermediaries do not reuse one representation for another client. The encrypted client snapshot cache also uses a new format version: older cache files are ignored and fetched again, preventing legacy and meter-scoped representations from being mixed across client versions.
+
+### Conditional credential block clears
+
+Clients advertise `block-mutation-tokens` in `OMP-Auth-Broker-Capabilities`. The broker then includes `blockMutationTokens: true` and each block's `mutationToken` in snapshots. Every upsert changes that token, including writes from older processes that access SQLite directly.
+
+`DELETE /v1/credential/:id/block` requires `{providerKey, blockScope, mutationToken, blockedUntilMs}` from the block observed by the caller. `DELETE /v1/credential/:id/blocks` requires `{blocks: [...]}` with the same fields for each observed block. SQLite compares the token and deadline within each delete statement. A peer's newer block is preserved; the response sets `deleted: false` when an observed row changed. The client refreshes its snapshot after a rejected clear.
+
+Tokenless clears return `409` without modifying broker state, including legacy bulk requests with no body. Older clients may briefly remove their local block while they refresh; updated clients connected to a tokenless broker keep the local block instead of issuing an unsafe clear.
 
 ### Background refresher
 

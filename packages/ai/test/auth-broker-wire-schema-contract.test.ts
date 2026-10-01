@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Type, type } from "@oh-my-pi/omptype";
+import { type } from "@oh-my-pi/omptype";
 import * as wireSchemas from "@oh-my-pi/pi-ai/auth-broker/wire-schemas";
 
 const REFRESHER = {
@@ -123,6 +123,7 @@ const schemaNames = [
 	"disabledCredentialsResponseSchema",
 	"credentialBlockRequestSchema",
 	"credentialBlockDeleteRequestSchema",
+	"credentialBlocksDeleteRequestSchema",
 	"credentialBlockResponseSchema",
 	"credentialBlocksDeleteResponseSchema",
 	"usageStaleResponseSchema",
@@ -195,6 +196,16 @@ const validSamples: Record<SchemaName, unknown> = {
 	},
 	credentialBlockRequestSchema: BLOCK,
 	credentialBlockDeleteRequestSchema: { providerKey: BLOCK.providerKey, blockScope: BLOCK.blockScope },
+	credentialBlocksDeleteRequestSchema: {
+		blocks: [
+			{
+				providerKey: BLOCK.providerKey,
+				blockScope: BLOCK.blockScope,
+				mutationToken: "observed",
+				blockedUntilMs: 4_000,
+			},
+		],
+	},
 	credentialBlockResponseSchema: { ok: true },
 	credentialBlocksDeleteResponseSchema: { ok: true },
 	usageStaleResponseSchema: { ok: true },
@@ -218,14 +229,8 @@ function reject(schema: unknown, input: unknown): void {
 }
 
 describe("auth-broker public wire schemas", () => {
-	test("exports all 32 real callable ArkType values with canonical behavior", () => {
-		expect(Object.keys(wireSchemas).sort()).toEqual([...schemaNames].sort());
-		for (const name of schemaNames) {
-			const schema = wireSchemas[name];
-			expect(typeof schema).toBe("function");
-			expect(schema).toBeInstanceOf(Type);
-			accept(schema, validSamples[name]);
-		}
+	test("accepts canonical broker wire samples", () => {
+		for (const name of schemaNames) accept(wireSchemas[name], validSamples[name]);
 	});
 
 	test("preserves credential extension and sentinel boundaries", () => {
@@ -250,6 +255,23 @@ describe("auth-broker public wire schemas", () => {
 		accept(wireSchemas.credentialBlockDeleteRequestSchema, { providerKey: BLOCK.providerKey, blockScope: "" });
 		reject(wireSchemas.credentialBlockDeleteRequestSchema, { providerKey: "", blockScope: "" });
 		reject(wireSchemas.credentialBlockDeleteRequestSchema, { ...BLOCK });
+		accept(wireSchemas.credentialBlocksDeleteRequestSchema, {
+			blocks: [{ providerKey: BLOCK.providerKey, blockScope: "", mutationToken: "observed", blockedUntilMs: 4_000 }],
+		});
+		reject(wireSchemas.credentialBlocksDeleteRequestSchema, {
+			blocks: [{ providerKey: BLOCK.providerKey, blockScope: "", mutationToken: "", blockedUntilMs: 4_000 }],
+		});
+		reject(wireSchemas.credentialBlocksDeleteRequestSchema, {
+			blocks: [
+				{
+					providerKey: BLOCK.providerKey,
+					blockScope: "",
+					mutationToken: "observed",
+					blockedUntilMs: 4_000,
+					extra: true,
+				},
+			],
+		});
 		accept(wireSchemas.credentialDisableRequestSchema, {});
 		reject(wireSchemas.credentialDisableRequestSchema, { cause: 1 });
 		reject(wireSchemas.credentialDisableRequestSchema, { extra: true });

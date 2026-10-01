@@ -7,6 +7,7 @@ import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from 
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
+	AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AuthBrokerClient,
 	AuthBrokerError,
@@ -147,19 +148,33 @@ describe("auth-broker wire surface", () => {
 		const withBlock = await client.fetchSnapshot();
 		if (withBlock.status !== 200) throw new Error("expected block snapshot");
 		expect(withBlock.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(inserted.blockRevision!.sequence);
-		expect(credentialBlocks(withBlock.snapshot, credentialId)).toHaveLength(1);
+		const observedBlock = credentialBlocks(withBlock.snapshot, credentialId)[0]!;
+		expect(observedBlock.mutationToken).toMatch(/^[0-9a-f]{32}$/);
 
 		const removed = await client.deleteCredentialBlock(credentialId, {
 			providerKey: block.providerKey,
 			blockScope: block.blockScope,
+			mutationToken: observedBlock.mutationToken,
+			blockedUntilMs: observedBlock.blockedUntilMs,
 		});
+		expect(removed.deleted).toBe(true);
 		expect(removed.blockRevision!.sequence).toBeGreaterThan(inserted.blockRevision!.sequence);
 		const withoutBlock = await client.fetchSnapshot();
 		if (withoutBlock.status !== 200) throw new Error("expected deleted block snapshot");
 		expect(withoutBlock.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(removed.blockRevision!.sequence);
 		expect(credentialBlocks(withoutBlock.snapshot, credentialId)).toEqual([]);
 		const secondInsert = await client.upsertCredentialBlock(credentialId, block);
-		const removedAll = await client.deleteCredentialBlocks(credentialId);
+		const secondSnapshot = await client.fetchSnapshot();
+		if (secondSnapshot.status !== 200) throw new Error("expected second block snapshot");
+		const removedAll = await client.deleteCredentialBlocks(credentialId, {
+			blocks: credentialBlocks(secondSnapshot.snapshot, credentialId).map(block => ({
+				providerKey: block.providerKey,
+				blockScope: block.blockScope,
+				mutationToken: block.mutationToken,
+				blockedUntilMs: block.blockedUntilMs,
+			})),
+		});
+		expect(removedAll.deleted).toBe(true);
 		expect(removedAll.blockRevision!.sequence).toBeGreaterThan(secondInsert.blockRevision!.sequence);
 		const afterDeleteAll = await client.fetchSnapshot();
 		if (afterDeleteAll.status !== 200) throw new Error("expected delete-all snapshot");
@@ -181,6 +196,89 @@ describe("auth-broker wire surface", () => {
 		if (afterRestart.status !== 200) throw new Error("expected restart snapshot");
 		expect(afterRestart.snapshot.credentials[0]!.id).toBe(credentialId);
 		expect(afterRestart.snapshot.blockRevision).toEqual(afterDeleteAll.snapshot.blockRevision);
+	});
+
+	test("a stale peer clear cannot delete a newer scoped block or an unobserved bulk block", async () => {
+		const first = new AuthBrokerClient({ url: handle!.url, token });
+		const peer = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await first.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected initial snapshot");
+		const id = initial.snapshot.credentials[0]!.id;
+		const original = {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:fable",
+			blockedUntilMs: Date.now() + 60_000,
+		};
+		await first.upsertCredentialBlock(id, original);
+		const observed = await first.fetchSnapshot();
+		if (observed.status !== 200) throw new Error("expected observed block");
+		const oldBlock = credentialBlocks(observed.snapshot, id)[0]!;
+		const legacyDelete = await fetch(`${handle!.url}/v1/credential/${id}/block`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ providerKey: original.providerKey, blockScope: original.blockScope }),
+		});
+		expect(legacyDelete.status).toBe(409);
+		const newerDeadline = original.blockedUntilMs + 60_000;
+		await peer.upsertCredentialBlock(id, { ...original, blockedUntilMs: newerDeadline });
+		const staleClear = await first.deleteCredentialBlock(id, {
+			providerKey: original.providerKey,
+			blockScope: original.blockScope,
+			mutationToken: oldBlock.mutationToken,
+			blockedUntilMs: oldBlock.blockedUntilMs,
+		});
+		expect(staleClear.deleted).toBe(false);
+		const afterStaleClear = await first.fetchSnapshot();
+		if (afterStaleClear.status !== 200) throw new Error("expected latest peer block");
+		const peerBlock = credentialBlocks(afterStaleClear.snapshot, id)[0]!;
+		expect(peerBlock.blockedUntilMs).toBe(newerDeadline);
+		expect(peerBlock.mutationToken).not.toBe(oldBlock.mutationToken);
+		await peer.upsertCredentialBlock(id, { ...original, blockedUntilMs: newerDeadline });
+		const sameDeadlineClear = await first.deleteCredentialBlock(id, {
+			providerKey: peerBlock.providerKey,
+			blockScope: peerBlock.blockScope,
+			mutationToken: peerBlock.mutationToken,
+			blockedUntilMs: peerBlock.blockedUntilMs,
+		});
+		expect(sameDeadlineClear.deleted).toBe(false);
+		const afterSameDeadlineClear = await first.fetchSnapshot();
+		if (afterSameDeadlineClear.status !== 200) throw new Error("expected same-deadline peer block");
+		expect(credentialBlocks(afterSameDeadlineClear.snapshot, id)[0]!.blockedUntilMs).toBe(newerDeadline);
+		expect(credentialBlocks(afterSameDeadlineClear.snapshot, id)[0]!.mutationToken).not.toBe(peerBlock.mutationToken);
+
+		const other = { ...original, blockScope: "tier:other" };
+		await first.upsertCredentialBlock(id, other);
+		const beforeBulkClear = await first.fetchSnapshot();
+		if (beforeBulkClear.status !== 200) throw new Error("expected bulk snapshot");
+		const observedRows = credentialBlocks(beforeBulkClear.snapshot, id);
+		const legacyBulkDelete = await fetch(`${handle!.url}/v1/credential/${id}/blocks`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				blocks: [{ providerKey: original.providerKey, blockScope: original.blockScope }],
+			}),
+		});
+		expect(legacyBulkDelete.status).toBe(409);
+		const legacyNoBodyDelete = await fetch(`${handle!.url}/v1/credential/${id}/blocks`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(legacyNoBodyDelete.status).toBe(409);
+		await peer.upsertCredentialBlock(id, { ...original, blockedUntilMs: newerDeadline + 60_000 });
+		const staleBulkClear = await first.deleteCredentialBlocks(id, {
+			blocks: observedRows.map(block => ({
+				providerKey: block.providerKey,
+				blockScope: block.blockScope,
+				mutationToken: block.mutationToken,
+				blockedUntilMs: block.blockedUntilMs,
+			})),
+		});
+		expect(staleBulkClear.deleted).toBe(false);
+		const afterBulkClear = await first.fetchSnapshot();
+		if (afterBulkClear.status !== 200) throw new Error("expected current blocks after bulk clear");
+		expect(
+			credentialBlocks(afterBulkClear.snapshot, id).map(block => [block.blockScope, block.blockedUntilMs]),
+		).toEqual([[original.blockScope, newerDeadline + 60_000]]);
 	});
 
 	test("preserves an HTTP rejection when the caller aborts while reading its body", async () => {
@@ -271,7 +369,7 @@ describe("auth-broker wire surface", () => {
 		expect(unchanged.status).toBe(304);
 		expect(unchanged.generation).toBe(body.generation);
 		expect(observedCapabilities).toEqual([
-			`${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS}`,
+			`${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS},${AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS}`,
 		]);
 
 		const rawUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
@@ -404,12 +502,14 @@ describe("auth-broker wire surface", () => {
 				providerKey: "openai-codex:oauth",
 				blockScope: "chat",
 				blockedUntilMs: chatBlockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: chatUpdatedAtSec * 1000,
 			},
 			{
 				providerKey: "openai-codex:oauth",
 				blockScope: "spark",
 				blockedUntilMs: sparkBlockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: sparkUpdatedAtSec * 1000,
 			},
 		]);

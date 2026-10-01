@@ -7,6 +7,7 @@
  * usage reports cache TTL is 5 minutes per credential, so durability across
  * runs isn't required.
  */
+import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import { getAppName, getInstallId, logger } from "@oh-my-pi/pi-utils";
 import type { AuthCredentialStore } from "../auth/store";
@@ -84,6 +85,7 @@ function toCredentialBlockSnapshot(block: StoredCredentialBlock): CredentialBloc
 		blockScope: block.blockScope,
 		blockedUntilMs: block.blockedUntilMs,
 		...(block.updatedAtMs !== undefined ? { updatedAtMs: block.updatedAtMs } : {}),
+		...(block.mutationToken ? { mutationToken: block.mutationToken } : {}),
 	};
 }
 
@@ -101,7 +103,8 @@ function credentialBlockSnapshotsEqual(
 			leftBlock.providerKey !== rightBlock.providerKey ||
 			leftBlock.blockScope !== rightBlock.blockScope ||
 			leftBlock.blockedUntilMs !== rightBlock.blockedUntilMs ||
-			leftBlock.updatedAtMs !== rightBlock.updatedAtMs
+			leftBlock.updatedAtMs !== rightBlock.updatedAtMs ||
+			leftBlock.mutationToken !== rightBlock.mutationToken
 		) {
 			return false;
 		}
@@ -779,6 +782,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					blockScope: block.blockScope,
 					blockedUntilMs: block.blockedUntilMs,
 					updatedAtMs: block.updatedAtMs,
+					...(block.mutationToken ? { mutationToken: block.mutationToken } : {}),
 				});
 			}
 		}
@@ -788,7 +792,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	upsertCredentialBlock(block: StoredCredentialBlock): void {
 		this.#noteActivity();
-		this.#upsertSnapshotBlock(block);
+		const body = toCredentialBlockSnapshot(block);
+		if (this.#snapshot.blockMutationTokens) body.mutationToken = randomUUID();
+		this.#upsertSnapshotBlock({ ...block, mutationToken: body.mutationToken });
 		this.#invalidateUsageCache();
 		const key = blockKey(block.credentialId, block);
 		const revision = ++this.#blockMutationRevision;
@@ -796,7 +802,6 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			key,
 			Math.min(block.blockedUntilMs, Date.now() + CREDENTIAL_BLOCK_RECONCILE_DELAY_MS),
 		);
-		const body = toCredentialBlockSnapshot(block);
 		const existing = this.#snapshot.credentials
 			.find(entry => entry.id === block.credentialId)
 			?.blocks?.find(
@@ -828,10 +833,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void {
 		this.#noteActivity();
 		const key = blockKey(credentialId, { providerKey, blockScope });
-		this.#pendingCredentialBlocks.delete(key);
 		const deleted = this.#snapshot.credentials
 			.find(entry => entry.id === credentialId)
 			?.blocks?.find(block => block.providerKey === providerKey && block.blockScope === blockScope);
+		if (!this.#snapshot.blockMutationTokens || !deleted?.mutationToken) {
+			this.#maybeRefreshSnapshot("credential block delete requires observed token", true);
+			return;
+		}
+		this.#pendingCredentialBlocks.delete(key);
 		const revision = ++this.#blockMutationRevision;
 		this.#deletedCredentialBlocks.set(key, { block: deleted, revision });
 		this.#deleteSnapshotBlocks(credentialId, { providerKey, blockScope });
@@ -839,7 +848,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#invalidateUsageCache();
 		this.#enqueueBlockMutation(credentialId, async () => {
 			try {
-				const response = await this.#client.deleteCredentialBlock(credentialId, { providerKey, blockScope });
+				const response = await this.#client.deleteCredentialBlock(credentialId, {
+					providerKey,
+					blockScope,
+					mutationToken: deleted.mutationToken,
+					blockedUntilMs: deleted.blockedUntilMs,
+				});
+				if (response.deleted !== true) {
+					if (this.#deletedCredentialBlocks.get(key)?.revision === revision) {
+						this.#deletedCredentialBlocks.delete(key);
+						this.#upsertSnapshotBlock({ ...deleted, credentialId });
+					}
+					this.#maybeRefreshSnapshot("credential block delete rejected newer block", true);
+					return;
+				}
 				const tombstone = this.#deletedCredentialBlocks.get(key);
 				if (tombstone?.revision === revision) {
 					tombstone.acknowledgedAt = ++this.#blockAcknowledgementRevision;
@@ -847,8 +869,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				}
 				this.#maybeRefreshSnapshot("credential block delete", true);
 			} catch (error) {
-				if (this.#deletedCredentialBlocks.get(key)?.revision === revision)
+				if (this.#deletedCredentialBlocks.get(key)?.revision === revision) {
 					this.#deletedCredentialBlocks.delete(key);
+					this.#upsertSnapshotBlock({ ...deleted, credentialId });
+				}
 				this.#maybeRefreshSnapshot("credential block delete failed", true);
 				logger.warn("auth-broker credential block delete propagation failed", {
 					id: credentialId,
@@ -862,6 +886,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	deleteCredentialBlocks(credentialId: number): void {
 		this.#noteActivity();
+		const observed = this.#snapshot.credentials.find(entry => entry.id === credentialId)?.blocks ?? [];
+		if (!this.#snapshot.blockMutationTokens || observed.some(block => !block.mutationToken)) {
+			this.#maybeRefreshSnapshot("credential blocks delete requires observed tokens", true);
+			return;
+		}
 		const prefix = `${credentialId}\0`;
 		for (const key of this.#pendingCredentialBlocks.keys()) {
 			if (key.startsWith(prefix)) this.#pendingCredentialBlocks.delete(key);
@@ -878,7 +907,22 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#invalidateUsageCache();
 		this.#enqueueBlockMutation(credentialId, async () => {
 			try {
-				const response = await this.#client.deleteCredentialBlocks(credentialId);
+				const response = await this.#client.deleteCredentialBlocks(credentialId, {
+					blocks: observed.map(block => ({
+						providerKey: block.providerKey,
+						blockScope: block.blockScope,
+						mutationToken: block.mutationToken,
+						blockedUntilMs: block.blockedUntilMs,
+					})),
+				});
+				if (response.deleted !== true) {
+					if (this.#deletedAllCredentialBlocks.get(credentialId)?.revision === revision) {
+						this.#deletedAllCredentialBlocks.delete(credentialId);
+						for (const block of observed) this.#upsertSnapshotBlock({ ...block, credentialId });
+					}
+					this.#maybeRefreshSnapshot("credential blocks delete rejected newer block", true);
+					return;
+				}
 				const tombstone = this.#deletedAllCredentialBlocks.get(credentialId);
 				if (tombstone?.revision === revision) {
 					tombstone.acknowledgedAt = ++this.#blockAcknowledgementRevision;
@@ -886,8 +930,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				}
 				this.#maybeRefreshSnapshot("credential blocks delete", true);
 			} catch (error) {
-				if (this.#deletedAllCredentialBlocks.get(credentialId)?.revision === revision)
+				if (this.#deletedAllCredentialBlocks.get(credentialId)?.revision === revision) {
 					this.#deletedAllCredentialBlocks.delete(credentialId);
+					for (const block of observed) this.#upsertSnapshotBlock({ ...block, credentialId });
+				}
 				this.#maybeRefreshSnapshot("credential blocks delete failed", true);
 				logger.warn("auth-broker credential blocks delete propagation failed", {
 					id: credentialId,
@@ -1134,7 +1180,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				!reported ||
 				!deleted.block ||
 				reported.blockedUntilMs !== deleted.block.blockedUntilMs ||
-				reported.updatedAtMs !== deleted.block.updatedAtMs
+				reported.updatedAtMs !== deleted.block.updatedAtMs ||
+				reported.mutationToken !== deleted.block.mutationToken
 			)
 				this.#deletedCredentialBlocks.delete(key);
 		}
@@ -1151,7 +1198,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					!deleted ||
 					(!!deleted.block &&
 						(deleted.block.blockedUntilMs !== block.blockedUntilMs ||
-							deleted.block.updatedAtMs !== block.updatedAtMs))
+							deleted.block.updatedAtMs !== block.updatedAtMs ||
+							deleted.block.mutationToken !== block.mutationToken))
 				);
 			}),
 			...pending,
@@ -1162,6 +1210,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				blockScope: block.blockScope,
 				blockedUntilMs: block.blockedUntilMs,
 				...(block.updatedAtMs !== undefined ? { updatedAtMs: block.updatedAtMs } : {}),
+				...(block.mutationToken ? { mutationToken: block.mutationToken } : {}),
 			}))
 			.sort(compareCredentialBlockSnapshots);
 		if (blocks.length > 0) return { ...entry, blocks };
@@ -1235,6 +1284,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			const existing = blocks[blockIndex]!;
 			blocks[blockIndex] = {
 				...existing,
+				...incoming,
 				blockedUntilMs: Math.max(existing.blockedUntilMs, incoming.blockedUntilMs),
 			};
 		}

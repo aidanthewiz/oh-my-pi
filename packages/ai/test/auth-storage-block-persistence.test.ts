@@ -212,11 +212,88 @@ describe("AuthStorage credential block persistence", () => {
 					providerKey: PROVIDER_KEY,
 					blockScope: "tier:fable",
 					blockedUntilMs: longerBlock,
+					mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 					updatedAtMs: expect.any(Number),
 				},
 			]);
 		} finally {
 			storage.close();
+		}
+	});
+
+	it("refuses a stale clear when a legacy SQLite peer extends or refreshes the block", async () => {
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		await store.saveOAuth(PROVIDER, oauthCredential("peer"));
+		const id = store.listAuthCredentials(PROVIDER)[0]!.id;
+		const block = {
+			credentialId: id,
+			providerKey: PROVIDER_KEY,
+			blockScope: "tier:fable",
+			blockedUntilMs: FUTURE_BLOCK_MS,
+		};
+		const peerDb = new Database(dbPath);
+		try {
+			store.upsertCredentialBlock(block);
+			const observed = store.listCredentialBlocks([id])[0]!;
+			const update = peerDb.prepare(
+				"UPDATE auth_credential_blocks SET blocked_until_ms = ? WHERE credential_id = ? AND provider_key = ? AND block_scope = ?",
+			);
+			update.run(FUTURE_BLOCK_MS + 60_000, id, PROVIDER_KEY, block.blockScope);
+			expect(
+				store.deleteCredentialBlockIfMatches(
+					id,
+					PROVIDER_KEY,
+					block.blockScope,
+					observed.mutationToken!,
+					observed.blockedUntilMs,
+				),
+			).toBe(false);
+			const extended = store.listCredentialBlocks([id])[0]!;
+			expect(extended.blockedUntilMs).toBe(FUTURE_BLOCK_MS + 60_000);
+			expect(extended.mutationToken).not.toBe(observed.mutationToken);
+
+			update.run(extended.blockedUntilMs, id, PROVIDER_KEY, block.blockScope);
+			expect(
+				store.deleteCredentialBlockIfMatches(
+					id,
+					PROVIDER_KEY,
+					block.blockScope,
+					extended.mutationToken!,
+					extended.blockedUntilMs,
+				),
+			).toBe(false);
+			const refreshed = store.listCredentialBlocks([id])[0]!;
+			expect(refreshed.blockedUntilMs).toBe(extended.blockedUntilMs);
+			expect(refreshed.mutationToken).not.toBe(extended.mutationToken);
+			expect(
+				store.deleteCredentialBlockIfMatches(
+					id,
+					PROVIDER_KEY,
+					block.blockScope,
+					refreshed.mutationToken!,
+					refreshed.blockedUntilMs,
+				),
+			).toBe(true);
+			expect(store.listCredentialBlocks([id])).toEqual([]);
+			peerDb
+				.prepare(
+					"INSERT INTO auth_credential_blocks (credential_id, provider_key, block_scope, blocked_until_ms, updated_at) VALUES (?, ?, ?, ?, ?)",
+				)
+				.run(id, PROVIDER_KEY, block.blockScope, FUTURE_BLOCK_MS, Math.floor(Date.now() / 1000));
+			const inserted = store.listCredentialBlocks([id])[0]!;
+			expect(inserted.mutationToken).toMatch(/^[0-9a-f]{32}$/);
+			expect(
+				store.deleteCredentialBlockIfMatches(
+					id,
+					PROVIDER_KEY,
+					block.blockScope,
+					inserted.mutationToken!,
+					inserted.blockedUntilMs,
+				),
+			).toBe(true);
+		} finally {
+			peerDb.close();
+			store.close();
 		}
 	});
 
@@ -282,6 +359,7 @@ describe("AuthStorage credential block persistence", () => {
 					providerKey: PROVIDER_KEY,
 					blockScope: "tier:fable",
 					blockedUntilMs: FUTURE_BLOCK_MS,
+					mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 					updatedAtMs: expect.any(Number),
 				},
 			]);
@@ -462,6 +540,7 @@ describe("AuthStorage credential block persistence", () => {
 				providerKey: CODEX_PROVIDER_KEY,
 				blockScope: "chat",
 				blockedUntilMs: chatExpiryMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: sharedUpdatedAt * 1000,
 			},
 			{
@@ -469,6 +548,7 @@ describe("AuthStorage credential block persistence", () => {
 				providerKey: CODEX_PROVIDER_KEY,
 				blockScope: "spark",
 				blockedUntilMs: sharedExpiryMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: sparkUpdatedAt * 1000,
 			},
 		]);
@@ -476,12 +556,12 @@ describe("AuthStorage credential block persistence", () => {
 		firstReopen.close();
 		expect(readCredentialBlockRows(dbPath)).toEqual(expectedRows);
 		expect(readLegacyCodexSharedBlock(dbPath, codexRow.id)?.blocked_until_ms).toBe(chatExpiryMs);
-		expect(readAuthSchemaVersion(dbPath)).toBe(8);
+		expect(readAuthSchemaVersion(dbPath)).toBe(9);
 
 		const secondReopen = await SqliteAuthCredentialStore.open(dbPath);
 		secondReopen.close();
 		expect(readCredentialBlockRows(dbPath)).toEqual(expectedRows);
-		expect(readAuthSchemaVersion(dbPath)).toBe(8);
+		expect(readAuthSchemaVersion(dbPath)).toBe(9);
 	});
 
 	it("mirrors a legacy Codex shared insert into meter rows while hiding shared from current APIs", async () => {
@@ -640,6 +720,7 @@ describe("AuthStorage credential block persistence", () => {
 				providerKey: CODEX_PROVIDER_KEY,
 				blockScope: "chat",
 				blockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: expect.any(Number),
 			},
 			{
@@ -647,6 +728,7 @@ describe("AuthStorage credential block persistence", () => {
 				providerKey: CODEX_PROVIDER_KEY,
 				blockScope: "spark",
 				blockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: expect.any(Number),
 			},
 		]);
@@ -684,6 +766,7 @@ describe("AuthStorage credential block persistence", () => {
 				providerKey: CODEX_PROVIDER_KEY,
 				blockScope: "spark",
 				blockedUntilMs: sparkBlockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: expect.any(Number),
 			},
 		]);
@@ -758,7 +841,7 @@ describe("AuthStorage credential block persistence", () => {
 			const expiresAtMs = Date.now() + 3_600_000;
 			expect(migratedStore.tryAcquireCredentialRefreshLease(1, "test-owner", expiresAtMs)).toBe(true);
 			expect(migratedStore.getCredentialRefreshLeaseExpiresAt(1)).toBe(expiresAtMs);
-			expect(readAuthSchemaVersion(dbPath)).toBe(8);
+			expect(readAuthSchemaVersion(dbPath)).toBe(9);
 		} finally {
 			migratedStore.close();
 		}
@@ -809,7 +892,7 @@ describe("AuthStorage credential block persistence", () => {
 			const rows = migratedStore.listAuthCredentials(PROVIDER);
 			expect(rows).toHaveLength(1);
 			expect(rows[0]!.credential).toMatchObject({ type: "oauth", access: "legacy-access" });
-			expect(readAuthSchemaVersion(dbPath)).toBe(8);
+			expect(readAuthSchemaVersion(dbPath)).toBe(9);
 			expect(tableExists(dbPath, "auth_credential_blocks")).toBe(true);
 		} finally {
 			migratedStore.close();

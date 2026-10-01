@@ -44,6 +44,8 @@ export type SnapshotEntry = AuthCredentialSnapshotEntry & {
 export interface SnapshotResponse extends Omit<AuthCredentialSnapshot, "credentials"> {
 	serverNowMs: number;
 	blockRevision?: BlockRevision;
+	/** Broker supports opaque per-block mutation tokens and conditional clears. */
+	blockMutationTokens?: true;
 	refresher: RefresherSchedule;
 	credentials: SnapshotEntry[];
 }
@@ -103,7 +105,15 @@ export interface DisabledCredentialsResponse {
 export type CredentialBlockRequest = CredentialBlockSnapshot;
 
 /** DELETE /v1/credential/:id/block request body; empty scope targets only the global row. */
-export type CredentialBlockDeleteRequest = Pick<CredentialBlockSnapshot, "providerKey" | "blockScope">;
+export type CredentialBlockDeleteRequest = Pick<CredentialBlockSnapshot, "providerKey" | "blockScope"> & {
+	mutationToken?: string;
+	blockedUntilMs?: number;
+};
+
+/** DELETE /v1/credential/:id/blocks conditionally clears only the observed rows. */
+export interface CredentialBlocksDeleteRequest {
+	blocks: CredentialBlockDeleteRequest[];
+}
 
 /** POST /v1/credential/:id/block response body. */
 export interface CredentialBlockResponse {
@@ -114,6 +124,7 @@ export interface CredentialBlockResponse {
 /** DELETE /v1/credential/:id/block or /blocks response body. */
 export interface CredentialBlocksDeleteResponse {
 	ok: boolean;
+	deleted?: boolean;
 	blockRevision?: BlockRevision;
 }
 
@@ -185,6 +196,8 @@ export const AUTH_BROKER_CAPABILITIES_HEADER = "OMP-Auth-Broker-Capabilities";
 export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-block-scopes";
 /** Client accepts durable block revisions on snapshots and mutation acknowledgements. */
 export const AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS = "block-revisions";
+/** Client supports conditional deletes by an opaque per-block mutation token. */
+export const AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS = "block-mutation-tokens";
 
 /** Default port when none is configured. Loopback-only, no external exposure. */
 export const DEFAULT_AUTH_BROKER_BIND = "127.0.0.1:8765";

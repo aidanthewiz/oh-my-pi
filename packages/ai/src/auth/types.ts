@@ -107,6 +107,8 @@ export interface StoredCredentialBlock {
 	blockedUntilMs: number;
 	/** Last row update timestamp in epoch milliseconds, when provided by the backing store. */
 	updatedAtMs?: number;
+	/** Opaque identity of this exact persisted block mutation for conditional broker clears. */
+	mutationToken?: string;
 }
 
 /**
@@ -1283,6 +1285,14 @@ export interface BlocksApi {
 	 * Broker-server seam: clear one exact persisted block and notify snapshot waiters.
 	 */
 	delete(credentialId: number, providerKey: string, blockScope: string): void;
+	/** Broker-only conditional clear, refusing a peer's newer write. */
+	deleteIfMatches(
+		credentialId: number,
+		providerKey: string,
+		blockScope: string,
+		mutationToken: string,
+		blockedUntilMs: number,
+	): boolean;
 	/** Delete all persisted blocks for a credential. */
 	deleteAll(credentialId: number): void;
 }
