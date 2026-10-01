@@ -143,6 +143,22 @@ const createSession = async (
 			toolNames: ["eval"],
 		})
 	).session;
+const createSharedSessions = async (tempDir: TempDir, cwd: string) => {
+	const sessionFile = tempDir.join("sessions", "shared.jsonl");
+	const firstManager = await SessionManager.open(sessionFile, undefined, undefined, {
+		initialCwd: cwd,
+		suppressBreadcrumb: true,
+	});
+	await firstManager.ensureOnDisk();
+	const firstSession = await createSession(tempDir, cwd, { sessionManager: firstManager });
+	const secondManager = await SessionManager.open(sessionFile, undefined, undefined, {
+		initialCwd: cwd,
+		suppressBreadcrumb: true,
+	});
+	const secondSession = await createSession(tempDir, cwd, { sessionManager: secondManager });
+	return [firstSession, secondSession] as const;
+};
+
 const createMockKernel = () => {
 	let alive = true;
 	return {
@@ -354,8 +370,7 @@ describe("AgentSession python cleanup", () => {
 		const startSpy = vi
 			.spyOn(pythonKernel.PythonKernel, "start")
 			.mockResolvedValue(kernel as unknown as PythonKernelInstance);
-		const firstSession = await createSession(tempDir, cwd);
-		const secondSession = await createSession(tempDir, cwd);
+		const [firstSession, secondSession] = await createSharedSessions(tempDir, cwd);
 		expect(startSpy).toHaveBeenCalledTimes(0);
 		let firstDisposed = false;
 
@@ -486,8 +501,7 @@ describe("AgentSession python cleanup", () => {
 			.spyOn(pythonKernel.PythonKernel, "start")
 			.mockResolvedValue(kernel as unknown as PythonKernelInstance);
 
-		const firstSession = await createSession(tempDir, cwd);
-		const secondSession = await createSession(tempDir, cwd);
+		const [firstSession, secondSession] = await createSharedSessions(tempDir, cwd);
 
 		await secondSession.executePython("print('owner-b warmup')");
 		const firstExecution = firstSession.executePython("print('blocked')");

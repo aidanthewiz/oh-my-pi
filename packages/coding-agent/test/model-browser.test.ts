@@ -1,4 +1,5 @@
 import { createModelBrowserSource } from "../src/modes/model-browser-source";
+import { cfgEnabledModels } from "../src/config/model-settings";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -6,14 +7,17 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildBrowserItems,
+	buildSessionModelScope,
 	buildSearchAffinity,
 	rankModelItems,
 	ModelBrowser,
+	SessionModelScopeCache,
 	resolveRoleAssignments,
 	type RoleAssignments,
 	sortModelItems,
 } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { createModelMentionSource } from "@oh-my-pi/pi-tui/prompt/model-mention-autocomplete";
 
 /** Optional presentation metadata a catalog or discovery source may attach. */
 type NativeMetadata = Pick<Model, "description" | "isNew" | "isBeta" | "isRecommended" | "int" | "tps"> &
@@ -109,6 +113,59 @@ describe("resolveRoleAssignments", () => {
 		expect(roles.slow?.model).toBe(slow);
 		expect(roles.advisor?.model).toBe(slow);
 		expect(roles.advisor?.autoSelected).toBe(true);
+	});
+});
+
+test("picker scope cache invalidates on changed model policy", () => {
+	const allowed = makeModel("provider", "allowed");
+	const blocked = makeModel("provider", "blocked");
+	const discovered = makeModel("provider", "discovered");
+	const available = [allowed, blocked, discovered];
+	const settings = Settings.isolated({
+		enabledModels: ["provider/allowed"],
+		modelRoles: { default: "provider/blocked", smol: "provider/allowed" },
+	});
+	const source = createModelBrowserSource(settings);
+	const registry = {
+		getError: () => undefined,
+		getAvailable: () => [...available],
+		getAll: () => [...available],
+	};
+	const cache = new SessionModelScopeCache(source, registry);
+
+	const initial = cache.get([]);
+	expect(initial.items.map(item => item.selector)).toEqual(["provider/allowed"]);
+	expect(initial.roles.default).toBeUndefined();
+	expect(initial.roles.smol?.model).toBe(allowed);
+	expect(buildSessionModelScope(source, registry, []).items.map(item => item.selector)).toEqual(["provider/allowed"]);
+
+	cfgEnabledModels.override(settings, ["provider/discovered"]);
+	const updated = cache.get([]);
+	expect(updated.items.map(item => item.selector)).toEqual(["provider/discovered"]);
+	expect(updated.roles.default).toBeUndefined();
+	expect(updated.roles.smol).toBeUndefined();
+});
+
+describe("createModelMentionSource", () => {
+	test("refreshes candidates when role settings or availability change between queries", () => {
+		const a = makeModel("a", "example-2");
+		const b = makeModel("b", "example-2");
+		const available = [a, b];
+		const settings = Settings.isolated({ modelRoles: { default: "b/example-2" } });
+		const candidates = createModelMentionSource({
+			source: createModelBrowserSource(settings),
+			registry: { getError: () => undefined, getAvailable: () => [...available], getAll: () => [...available] },
+			scopedModels: () => [],
+		});
+		const selectors = (query: string) => candidates(query).map(item => item.selector);
+
+		expect(selectors("example")).toEqual(["b/example-2", "a/example-2"]);
+
+		settings.setModelRole("default", "a/example-2");
+		expect(selectors("example")).toEqual(["a/example-2", "b/example-2"]);
+
+		available.push(makeModel("c", "example-3"));
+		expect(selectors("example")).toContain("c/example-3");
 	});
 });
 
