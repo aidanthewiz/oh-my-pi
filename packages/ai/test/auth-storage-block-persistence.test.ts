@@ -116,13 +116,29 @@ function prepareV6BlockSchema(db: Database): void {
 describe("AuthStorage credential block persistence", () => {
 	let tempDir = "";
 	let dbPath = "";
+	const anthropicEnv = [
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_OAUTH_TOKEN",
+		"ANTHROPIC_BASE_URL",
+		"FOUNDRY_BASE_URL",
+	] as const;
+	const savedEnv: Partial<Record<(typeof anthropicEnv)[number], string | undefined>> = {};
 
 	beforeEach(async () => {
+		for (const key of anthropicEnv) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-blocks-"));
 		dbPath = path.join(tempDir, "agent.db");
 	});
 
 	afterEach(async () => {
+		for (const key of anthropicEnv) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+			delete savedEnv[key];
+		}
 		dbPath = "";
 		if (tempDir) {
 			await removeWithRetries(tempDir);
@@ -199,6 +215,41 @@ describe("AuthStorage credential block persistence", () => {
 					updatedAtMs: expect.any(Number),
 				},
 			]);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("redeeming a Codex quota reset retains unrelated auth and model-policy blocks", async () => {
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		await store.saveOAuth(CODEX_PROVIDER, oauthCredential("blocked"));
+		await store.saveOAuth(CODEX_PROVIDER, oauthCredential("healthy"));
+		const [blocked] = store.listAuthCredentials(CODEX_PROVIDER);
+		if (!blocked) throw new Error("expected blocked credential");
+		const storage = new AuthStorage(store, {
+			usageFetch: Object.assign(async () => Response.json({ code: "reset" }), { preconnect: fetch.preconnect }),
+		});
+		await storage.credentials.reload();
+		try {
+			for (const scope of ["chat", "auth", "model-policy:gpt-5.3-codex"]) {
+				storage.blocks.upsert({
+					credentialId: blocked.id,
+					providerKey: CODEX_PROVIDER_KEY,
+					blockScope: scope,
+					blockedUntilMs: FUTURE_BLOCK_MS,
+				});
+			}
+			const outcome = await storage.resets.redeem({
+				target: { provider: CODEX_PROVIDER, credentialId: blocked.id, creditId: "saved-reset" },
+			});
+			expect(outcome.ok).toBe(true);
+			expect(storage.blocks.list([blocked.id]).map(block => block.blockScope)).toEqual([
+				"auth",
+				"model-policy:gpt-5.3-codex",
+			]);
+			expect(await storage.keys.get(CODEX_PROVIDER, "new-session", { modelId: "gpt-5.3-codex" })).toBe(
+				"access-healthy",
+			);
 		} finally {
 			storage.close();
 		}

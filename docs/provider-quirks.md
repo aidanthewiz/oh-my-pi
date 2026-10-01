@@ -106,7 +106,7 @@ The OpenAI Codex provider integrates ChatGPT Plus/Pro subscription models using 
 - **Token refresh & claims**: `refreshOpenAICodexToken` posts `grant_type: refresh_token` to `https://auth.openai.com/oauth/token`. Extracts `chatgpt_account_id` and user `email` from JWT claims (`https://api.openai.com/auth` and `https://api.openai.com/profile` in `getTokenProfile`).
 - **Account rotation & rate-limit ranking**: Account identity is set via `ChatGPT-Account-Id` header (`getCodexAccountId`). `codexRankingStrategy` in `packages/ai/src/usage/openai-codex.ts` isolates standard chat limits (5h primary, 7d secondary) from Spark meter limits (`-spark` model suffix spends `spark` scope), preventing Spark exhaustion from blocking normal chat requests.
 - **Usage tracking**: `openaiCodexUsageProvider` queries `/wham/usage` on canonical ChatGPT origins. Parses `primary_window` (5h) and `secondary_window` (7d), plus `additional_rate_limits` (Spark/extra meters). Ingests response headers (`x-codex-primary-used-percent`, `x-codex-primary-window-minutes`, `x-codex-primary-reset-at`, `x-codex-secondary-*`) in `parseCodexRateLimitHeaders` (`response-handler.ts` `parseCodexError`).
-- **Saved rate limit reset credits**: Reads `rate_limit_reset_credits` from `/wham/usage`. Lists available credits with `listCodexResetCredits` (`GET /wham/rate-limit-reset-credits`), selects soonest-expiring credit with `pickSoonestExpiringCredit`, and redeems via `consumeCodexResetCredit` (`POST /wham/rate-limit-reset-credits/consume` with client UUID `redeem_request_id`).
+- **Saved rate limit reset credits**: Reads `rate_limit_reset_credits` from `/wham/usage`. Lists available credits with `listCodexResetCredits` (`GET /wham/rate-limit-reset-credits`), selects the soonest-expiring credit with `pickSoonestExpiringCredit`, and redeems via `consumeCodexResetCredit` (`POST /wham/rate-limit-reset-credits/consume` with client UUID `redeem_request_id`). A successful redemption clears only Codex quota blocks (`chat`, `spark`, legacy `shared`/global); authentication and model-policy blocks remain active.
 - **Base URL normalization**: `normalizeCodexBaseUrl` in `packages/ai/src/usage/openai-codex-base-url.ts` forces account API requests (`wham/usage`, reset credits) to canonical `chatgpt.com` or `chat.openai.com` origins (`/backend-api`), ignoring custom proxy overrides (`providers.openai-codex.baseUrl`) that would 404. Stream URLs resolve via `resolveCodexResponsesUrl` in `openai-codex-responses.ts`.
 
 ### Catalog model handling
@@ -462,6 +462,7 @@ Cursor's integration in `packages/ai` operates over an HTTP/2 Connect RPC transp
   - Stream completion verifies `turnEnded` (`sawTurnEnded`) or throws `incomplete-stream`.
 - **Tool Call Synthesis**:
   - `synthesizeCursorExecToolCall` generates display `toolCall` blocks on assistant output messages to mirror local tool execution in the UI and transcript.
+  - An MCP frame with no local handler on a stream flagged `externalToolExecutor` (auth-gateway) synthesizes the block **without** `kCursorExecResolved` and pairs no result: the gateway client is the executor, and `isClientToolUse` only reports a handoff for an unresolved call.
 
 ### Auth & usage
 - **Credentials & Headers**:
@@ -474,6 +475,9 @@ Cursor's integration in `packages/ai` operates over an HTTP/2 Connect RPC transp
 - **Usage & Quota Tracking (`packages/ai/src/usage/cursor.ts`)**:
   - Standard quota fetched from `https://api2.cursor.sh/auth/usage` (`parseCursorUsage`).
   - For OAuth credentials with WorkOS user sessions (`WorkosCursorSessionToken=${userId}::${accessToken}`), fetches personal usage from `https://cursor.com/api/usage-summary` (`parseCursorIndividualUsage`) and user profile email from `https://cursor.com/api/auth/me`.
+- **Turn Usage Accounting (`packages/ai/src/providers/cursor.ts`)**:
+  - `tokenDelta` frames accumulate a running output estimate; `TurnEndedUpdate` then reports the turn's final `input`/`output`/`cache_read`/`cache_write`/`reasoning` counters and every reported bucket replaces that estimate. A frame with no counters leaves the estimate in place.
+  - `conversationCheckpointUpdate.tokenDetails.usedTokens` is whole-conversation occupancy and lands on `usage.contextTokens`, independent of the output estimate — compaction and handoff size the context from it.
 
 ### Catalog model handling
 - **Descriptor Config (`packages/catalog/src/provider-models/descriptors.ts`)**:
@@ -1013,7 +1017,7 @@ LiteLLM is an open-source AI proxy and gateway that unifies access to multiple L
 - **Anthropic & Bedrock tool compatibility (`packages/ai/src/providers/openai-completions.ts`)**:
   - When `context.tools` is `undefined` but conversation history contains tool calls, `params.tools` is set to `[]` for Anthropic-via-LiteLLM compatibility.
   - When `context.tools` is explicitly empty (`[]`, e.g., `/btw` or background turns), `params.tools` and `tool_choice: "none"` are omitted so LiteLLM → Bedrock routes do not generate invalid, empty `toolConfig` blocks.
-- **Telemetry & gateway header detection (`packages/agent/src/telemetry.ts`, `packages/ai/src/auth-gateway/http.ts`)**: `detectGatewayFromHeaders` inspects `x-litellm-call-id` (falling back to `x-litellm-model-id` or `x-litellm-model-group`) to populate `pi.gen_ai.gateway.*` span attributes. Auth gateway HTTP endpoints expose `x-litellm-model-id`, `x-litellm-model-api-base`, `x-litellm-response-cost`, and `x-litellm-response-duration-ms`.
+- **Telemetry & gateway header detection (`packages/agent/src/telemetry.ts`, `packages/ai/src/auth-gateway/http.ts`)**: `detectGatewayFromHeaders` inspects `x-litellm-call-id` (falling back to `x-litellm-model-id` or `x-litellm-model-group`) to populate `omp.gen_ai.gateway.*` span attributes. Auth gateway HTTP endpoints expose `x-litellm-model-id`, `x-litellm-model-api-base`, `x-litellm-response-cost`, and `x-litellm-response-duration-ms`.
 
 ### Auth & usage
 - **Credentials & env (`packages/catalog/src/provider-models/descriptors.ts`, `packages/catalog/src/compat/rules/auth/litellm.kdl`)**: Authenticates via `LITELLM_API_KEY`.

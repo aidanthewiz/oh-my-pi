@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { networkInterfaces } from "node:os";
 import { connect, type Subprocess } from "bun";
 import {
@@ -7,6 +8,7 @@ import {
 	STATS_DASHBOARD_HOSTNAME_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
 } from "../src/port-conflict";
+import { setStatsJudgeProvider } from "../src/frustration";
 import { startServer } from "../src/server";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
@@ -75,6 +77,7 @@ afterEach(async () => {
 		child.kill();
 		await child.exited;
 	}
+	setStatsJudgeProvider(undefined);
 	holderProcesses.length = 0;
 });
 
@@ -90,6 +93,20 @@ describe("startServer access", () => {
 			expect(response.headers.get(STATS_DASHBOARD_HOSTNAME_HEADER)).toBe(STATS_DASHBOARD_HOSTNAME);
 			expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
 			await response.body?.cancel();
+			const dashboard = await fetch(`http://${server.hostname}:${server.port}/`);
+			expect(dashboard.status).toBe(200);
+			expect(dashboard.headers.get("Content-Security-Policy")).toBe("frame-ancestors 'none'");
+			expect(dashboard.headers.get("X-Frame-Options")).toBe("DENY");
+			await dashboard.body?.cancel();
+
+			const rebound = await fetch(`http://${server.hostname}:${server.port}/api/stats/models`, {
+				headers: { Host: `attacker.example:${server.port}` },
+			});
+			expect(rebound.status).toBe(403);
+			const foreignOrigin = await fetch(`http://${server.hostname}:${server.port}/api/stats/models`, {
+				headers: { Origin: "https://attacker.example" },
+			});
+			expect(foreignOrigin.status).toBe(403);
 
 			const nonLoopbackHostname = getNonLoopbackHostname();
 			expect(await tcpConnects(server.hostname, server.port)).toBe(true);
@@ -117,6 +134,54 @@ describe("startServer access", () => {
 			await response.body?.cancel();
 		} finally {
 			server.stop();
+		}
+	});
+
+	it("keeps the judge unavailable on a public bind even when a local dashboard registered one", async () => {
+		const model = getBundledModel("openai", "gpt-5.4");
+		if (!model) throw new Error("fixture model missing from catalog");
+		let loaded = 0;
+		const judge = async () => {
+			loaded++;
+			return {
+				label: "fixture",
+				primaryModel: () => model,
+				judge: async () => {
+					throw new Error("No model request expected");
+				},
+			};
+		};
+		const local = await startServer(0, STATS_DASHBOARD_HOSTNAME, { judge });
+		const publicServer = await startServer(0, "0.0.0.0", { judge });
+
+		try {
+			const localDashboard = await fetch(`http://${local.hostname}:${local.port}/api/stats/frustration`);
+			expect((await localDashboard.json()).judgeAvailable).toBe(true);
+			const reboundAction = await fetch(`http://${local.hostname}:${local.port}/api/frustration/judge`, {
+				method: "POST",
+				headers: {
+					Host: `attacker.example:${local.port}`,
+					"X-Omp-Stats-Action": "1",
+				},
+			});
+			expect(reboundAction.status).toBe(403);
+
+			const url = `http://${STATS_DASHBOARD_HOSTNAME}:${publicServer.port}`;
+			const dashboard = await fetch(`${url}/api/stats/frustration`);
+			expect((await dashboard.json()).judgeAvailable).toBe(false);
+
+			const estimate = await fetch(`${url}/api/frustration/estimate`);
+			expect(await estimate.json()).toMatchObject({ available: false });
+
+			const action = await fetch(`${url}/api/frustration/judge`, {
+				method: "POST",
+				headers: { "X-Omp-Stats-Action": "1" },
+			});
+			expect(action.status).toBe(403);
+			expect(loaded).toBe(0);
+		} finally {
+			publicServer.stop();
+			local.stop();
 		}
 	});
 });

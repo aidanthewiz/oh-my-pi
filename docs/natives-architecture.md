@@ -12,6 +12,7 @@
 - `packages/natives/native/loader-state.js` and `loader-state.d.ts`
 - `packages/natives/native/desktop.js` and `desktop.d.ts`
 - `packages/natives/native/clipboard.js` and `clipboard.d.ts`
+- `packages/natives/native/path.js` and `path.d.ts`
 - `packages/natives/native/mermaid.js` and `mermaid.d.ts`
 - `packages/natives/native/vcs.js` and `vcs.d.ts`
 - `packages/natives/native/version-sentinel.js` and `version-sentinel.d.ts`
@@ -25,7 +26,7 @@
 
 ## Package entrypoints
 
-The package exports five entrypoints:
+The package exports six entrypoints:
 
 | Import                           | Runtime               | Types                   | Load behavior                                                                           |
 | -------------------------------- | --------------------- | ----------------------- | --------------------------------------------------------------------------------------- |
@@ -34,6 +35,7 @@ The package exports five entrypoints:
 | `@oh-my-pi/pi-natives/clipboard` | `native/clipboard.js` | `native/clipboard.d.ts` | Exposes lazy `copyToClipboard` and `readImageFromClipboard` wrappers.                   |
 | `@oh-my-pi/pi-natives/mermaid`  | `native/mermaid.js`  | `native/mermaid.d.ts`  | Renders Mermaid ASCII and loads the addon on first call.                               |
 | `@oh-my-pi/pi-natives/vcs`      | `native/vcs.js`      | `native/vcs.d.ts`      | Exposes VCS wrappers and loads the addon on first call.                                |
+| `@oh-my-pi/pi-natives/path`     | `native/path.js`     | `native/path.d.ts`     | Exposes Windows long/8.3 path helpers; defers addon loading until called on Windows.        |
 
 There is no `packages/natives/src` wrapper layer. Root consumers call generated N-API exports directly. The lazy subpaths exist so workers can import their JS wrapper without loading the large addon before the relevant operation initializes.
 
@@ -77,7 +79,7 @@ After an addon loads successfully, the loader best-effort removes cache director
 
 ## Load validation and runtime initialization
 
-Every identified install or compiled candidate must report `package.json#version` from `__piNativesBuildVersion()` or a legacy release sentinel. The new version is not compiled in: `scripts/stamp-native-version.ts` writes it into a fixed placeholder slot after linking, on every `scripts/bazel-natives.ts` install and local cargo build, so a release bump does not recompile the addon crate. Pre-sentinel addons with the legacy core API remain compatible when the on-disk file has no current stamp. Workspace loads skip the version check. The loader does not validate a complete symbol list.
+Every identified install or compiled candidate must report `package.json#version` from `__piNativesBuildVersion()` or a legacy release sentinel. The version is not compiled in: `scripts/stamp-native-version.ts` writes it into a fixed placeholder slot after linking, on every `scripts/bazel-natives.ts` install, local cargo build, and Nix package build (`nix/package.nix`), so a release bump does not recompile the addon crate. Pre-sentinel addons with the legacy core and desktop ABI remain compatible when the on-disk file has no current stamp. Workspace loads skip the version check. The loader does not validate a complete symbol list.
 
 After `require(...)` and version validation, the loader calls `__ompInstallTokioRuntime()` when present. Rust deliberately avoids creating worker threads during `#[module_init]`, while the dynamic-loader lock is held. The post-load hook installs bounded Windows Tokio/Rayon pools; older addons without the hook use napi-rs defaults. Hook failure is best-effort and appears only in startup markers when enabled.
 
