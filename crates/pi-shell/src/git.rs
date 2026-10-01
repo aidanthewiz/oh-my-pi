@@ -11,15 +11,15 @@
 //! an in-process checkout.
 //!
 //! Arguments are parsed the way git's parse-options does: bundled short flags
-//! (`-qd`, `-qbname`), unique long-option abbreviations, `--no-` negations,
-//! `--opt=value`, options mixed with operands, and `--`/`--end-of-options`.
-//! The builtin serves `-f`, `-b`, `-B`, `-d`, `--checkout`, `--lock`,
-//! `--reason`, `-q`, `--no-track`, `--[no-]guess-remote`, and
-//! `--no-relative-paths`. Everything else — other subcommands and global
-//! options, `--orphan`, `--no-checkout`, `--track`, `--relative-paths`, start
-//! points that set up an upstream, bare/reftable/submodule repositories, env
-//! redirection, and any invocation git would reject — runs the git binary with
-//! the original arguments, so git keeps reporting its own errors.
+//! (`-qd`), unique long-option abbreviations, `--no-` negations, `--opt=value`,
+//! options mixed with operands, and `--`/`--end-of-options`.
+//! The builtin serves `-f`, `-d`, `--checkout`, `--lock`, `--reason`, `-q`,
+//! `--no-track`, `--[no-]guess-remote`, and `--no-relative-paths`. Everything
+//! else — other subcommands and global options, explicit `-b`/`-B`,
+//! `--orphan`, `--no-checkout`, `--track`, `--relative-paths`, start points
+//! that set up an upstream, bare/reftable/submodule repositories, env
+//! redirection (including `GIT_NAMESPACE`), and any invocation git would
+//! reject — runs the git binary with the original arguments.
 
 use std::{
 	io::{self, Write as _},
@@ -123,10 +123,6 @@ struct AddRequest {
 	dirs:           Vec<String>,
 	path:           String,
 	commit_ish:     Option<String>,
-	/// Branch named by `-b`/`-B`.
-	new_branch:     Option<String>,
-	/// `-B`: reset `new_branch` when it exists instead of refusing.
-	reset:          bool,
 	detach:         bool,
 	quiet:          bool,
 	/// `--lock` reason, written to the worktree's `locked` file.
@@ -159,8 +155,6 @@ impl AddRequest {
 			return None;
 		}
 
-		let mut create_branch = None;
-		let mut reset_branch = None;
 		let (mut checkout, mut lock, mut orphan) = (true, false, false);
 		let mut reason = None;
 		let mut operands = Vec::new();
@@ -198,25 +192,12 @@ impl AddRequest {
 					_ => unreachable!("LONG_OPTIONS entry without a handler"),
 				}
 			} else if let Some(shorts) = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty()) {
-				for (at, flag) in shorts.char_indices() {
+				for flag in shorts.chars() {
 					match flag {
 						'f' => {},
 						'd' => request.detach = true,
 						'q' => request.quiet = true,
-						'b' | 'B' => {
-							let rest = &shorts[at + 1..];
-							let name = if rest.is_empty() {
-								args.next()?.clone()
-							} else {
-								rest.to_owned()
-							};
-							*(if flag == 'b' {
-								&mut create_branch
-							} else {
-								&mut reset_branch
-							}) = Some(name);
-							break;
-						},
+						'b' | 'B' => return None,
 						_ => return None,
 					}
 				}
@@ -227,14 +208,9 @@ impl AddRequest {
 
 		// git rejects these combinations; `--orphan` and `--no-checkout` leave
 		// states pi-vcs does not produce.
-		let modes = usize::from(create_branch.is_some())
-			+ usize::from(reset_branch.is_some())
-			+ usize::from(request.detach);
-		if modes > 1 || orphan || !checkout || (reason.is_some() && !lock) {
+		if orphan || !checkout || (reason.is_some() && !lock) {
 			return None;
 		}
-		request.reset = reset_branch.is_some();
-		request.new_branch = create_branch.or(reset_branch);
 		request.lock = lock.then(|| reason.unwrap_or_else(|| DEFAULT_LOCK_REASON.to_owned()));
 
 		let mut operands = operands.into_iter();
@@ -248,12 +224,10 @@ impl AddRequest {
 		let Ok(Some(plan)) = self.plan(cwd, filesystem) else {
 			return Outcome::External;
 		};
-		// A failed branch update changes nothing, so git can report the refusal
-		// (invalid name, concurrent update) in its own words.
 		if let Some(branch) = &plan.branch
 			&& plan
 				.repo
-				.create_branch(&plan.target, &branch.start, branch.reset)
+				.create_branch(&plan.target, &branch.start, false)
 				.is_err()
 		{
 			return Outcome::External;
@@ -320,26 +294,7 @@ impl AddRequest {
 			_ => creates_untracked_branch(&repo, start),
 		};
 
-		let (branch, target, detach, preparing) = if let Some(name) = self.new_branch {
-			let start = self.commit_ish.unwrap_or_else(|| "HEAD".to_owned());
-			let was = if branch_exists(&name)? {
-				if !self.reset || checked_out(&name) {
-					return Ok(None);
-				}
-				Some(repo.short_id(&format!("refs/heads/{name}"))?)
-			} else {
-				None
-			};
-			if !untracked(&start)? {
-				return Ok(None);
-			}
-			let preparing = match was {
-				Some(was) => Preparing::Resetting { branch: name.clone(), was },
-				None => Preparing::NewBranch(name.clone()),
-			};
-			let reset = matches!(preparing, Preparing::Resetting { .. });
-			(Some(BranchStep { start, reset }), name, false, preparing)
-		} else if self.detach {
+		let (branch, target, detach, preparing) = if self.detach {
 			(None, self.commit_ish.unwrap_or_else(|| "HEAD".to_owned()), true, Preparing::Detached)
 		} else if let Some(commit_ish) = self.commit_ish {
 			if branch_exists(&commit_ish)? {
@@ -372,7 +327,7 @@ impl AddRequest {
 				{
 					return Ok(None);
 				}
-				let branch = BranchStep { start: "HEAD".to_owned(), reset: false };
+				let branch = BranchStep { start: "HEAD".to_owned() };
 				(Some(branch), name.clone(), false, Preparing::NewBranch(name))
 			}
 		};
@@ -429,11 +384,9 @@ enum Outcome {
 	Created(Created),
 }
 
-/// Branch update preceding the worktree, as `git branch [-f]` would make it.
+/// Implicit branch creation before worktree checkout.
 struct BranchStep {
 	start: String,
-	/// `-B` on an existing branch: move it rather than create it.
-	reset: bool,
 }
 
 /// A resolved in-process `worktree add`.
@@ -483,7 +436,6 @@ impl Plan {
 /// Parenthesized detail of git's `Preparing worktree (…)` line.
 enum Preparing {
 	NewBranch(String),
-	Resetting { branch: String, was: String },
 	Checkout(String),
 	Detached,
 }
@@ -511,9 +463,6 @@ impl Created {
 		if !self.quiet {
 			let detail = match &self.preparing {
 				Preparing::NewBranch(branch) => format!("new branch '{branch}'"),
-				Preparing::Resetting { branch, was } => {
-					format!("resetting branch '{branch}'; was at {was}")
-				},
 				Preparing::Checkout(branch) => format!("checking out '{branch}'"),
 				Preparing::Detached => {
 					format!("detached HEAD {}", self.oneline.split(' ').next().unwrap_or_default())
@@ -582,10 +531,11 @@ async fn run_git<SE: ShellExtensions>(
 }
 
 /// Whether the command environment points git at another repository or
-/// injects config; the in-process path reads neither.
+/// namespace, or injects config; the in-process path reads none of these.
 fn git_env_redirected<SE: ShellExtensions>(shell: &Shell<SE>) -> bool {
 	shell.env().iter_exported().any(|(name, _)| {
 		is_git_repo_location_var(name)
+			|| name.eq_ignore_ascii_case("GIT_NAMESPACE")
 			|| name
 				.get(..10)
 				.is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG"))
@@ -666,21 +616,16 @@ mod tests {
 	fn parses_worktree_add_like_git() {
 		assert_eq!(parse("worktree add ../wt"), Some(request("../wt")));
 		assert_eq!(
-			parse("-C repo --no-pager worktree add -qfbfeat ../wt main"),
+			parse("-C repo --no-pager worktree add -qf ../wt main"),
 			Some(AddRequest {
 				dirs: vec!["repo".to_owned()],
 				commit_ish: Some("main".to_owned()),
-				new_branch: Some("feat".to_owned()),
 				quiet: true,
 				..request("../wt")
 			})
 		);
-		// Options may follow operands; abbreviations and negations resolve;
-		// the last of a repeated option wins.
-		assert_eq!(
-			parse("worktree add ../wt --det --no-q -B x -B y --no-detach"),
-			Some(AddRequest { new_branch: Some("y".to_owned()), reset: true, ..request("../wt") })
-		);
+		// Options may follow operands; abbreviations and negations resolve.
+		assert_eq!(parse("worktree add ../wt --det --no-q --no-detach"), Some(request("../wt")));
 		assert_eq!(
 			parse("worktree add --lo --reas=busy --no-guess ../wt"),
 			Some(AddRequest {
@@ -723,6 +668,10 @@ mod tests {
 			"worktree add -b x --detach ../wt",
 			"worktree add -b x -B y ../wt",
 			"worktree add -b",
+			"worktree add -b fresh ../wt",
+			"worktree add -B old ../wt",
+			"worktree add ../wt -bfeature",
+			"worktree add -qfBreset ../wt",
 		] {
 			assert_eq!(parse(line), None, "{line}");
 		}
@@ -875,8 +824,8 @@ mod tests {
 		assert_cloned(&wt);
 	}
 
-	/// Detaching at a tag, checking out an existing branch, resetting one with
-	/// `-B`, and locking are distinct git outcomes the builtin must reproduce.
+	/// Tag and existing-branch targets stay in-process; an explicit `-B`
+	/// delegates the atomic branch reset and checkout to git.
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn worktree_add_reproduces_git_target_forms() {
@@ -918,7 +867,60 @@ mod tests {
 		);
 		let listed = git(&repo, &["worktree", "list", "--porcelain"]);
 		assert!(listed.contains("branch refs/heads/old\nlocked busy\n"), "{listed}");
-		assert_cloned(&parent.join("old"));
+		assert!(!parent.join("old/cache/blob").exists(), "-B must use git, not clone the cache");
+	}
+
+	/// Delegated invalid start points leave refs alone; git reports the error.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn invalid_explicit_branch_start_preserves_refs() {
+		let (_temp, repo) = fixture();
+		let parent = repo.parent().expect("parent");
+		git(&repo, &["branch", "existing"]);
+		let existing = git(&repo, &["rev-parse", "existing"]);
+		git(&repo, &["commit", "-q", "--allow-empty", "-m", "second"]);
+
+		for option in ["-b fresh", "-B existing"] {
+			let (code, output) =
+				run(&repo, &format!("git worktree add {option} ../wt missing-start")).await;
+			assert_ne!(code, Some(0), "{option}: {output}");
+			assert!(!parent.join("wt").exists());
+		}
+		assert!(git(&repo, &["branch", "--list", "fresh"]).is_empty());
+		assert_eq!(git(&repo, &["rev-parse", "existing"]), existing);
+
+		let (code, output) = run(&repo, "git worktree add -b fresh ../fresh").await;
+		assert_eq!(code, Some(0), "{output}");
+		assert_eq!(
+			git(&parent.join("fresh"), &["rev-parse", "HEAD"]),
+			git(&repo, &["rev-parse", "HEAD"])
+		);
+		assert!(!parent.join("fresh/cache/blob").exists(), "-b must use git, not clone the cache");
+	}
+
+	/// A namespace must bypass the in-process worktree clone. Native Git
+	/// remains responsible for namespace-specific ref resolution.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn namespaced_worktree_add_uses_external_git_refs() {
+		let (_temp, repo) = fixture();
+		git(&repo, &["branch", "selected"]);
+		let unnamespaced = git(&repo, &["rev-parse", "selected"]);
+		git(&repo, &["commit", "-q", "--allow-empty", "-m", "second"]);
+		let namespaced = git(&repo, &["rev-parse", "HEAD"]);
+		git(&repo, &["update-ref", "refs/namespaces/tenant/refs/heads/selected", "HEAD"]);
+
+		let (code, output) =
+			run(&repo, "GIT_NAMESPACE=tenant git worktree add ../ns-wt selected").await;
+		assert_eq!(code, Some(0), "{output}");
+		let worktree = repo.parent().expect("parent").join("ns-wt");
+		assert!(worktree.join("tracked.txt").exists());
+		assert_eq!(git(&repo, &["rev-parse", "selected"]), unnamespaced);
+		assert_eq!(
+			git(&repo, &["rev-parse", "refs/namespaces/tenant/refs/heads/selected"]),
+			namespaced
+		);
+		assert!(!worktree.join("cache/blob").exists(), "namespace must bypass the clone path");
 	}
 
 	/// Anything the builtin does not serve still reaches git with its

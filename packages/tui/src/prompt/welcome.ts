@@ -1,4 +1,3 @@
-import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { formatDoubleTap, formatKeyHint, formatKeyHints, type KeyName } from "../app-keybindings";
 import { editorKey } from "../chrome/keybinding-hints";
@@ -193,7 +192,7 @@ export class WelcomeComponent implements Component {
 	// Bypassed while the intro animation runs (every frame differs).
 	#cachedWidth = -1;
 	#cachedLines: string[] | undefined;
-	#native: { tip: string | undefined; node: NativeNode } | undefined;
+	#native: { tip: string | undefined; cols: number; node: NativeNode } | undefined;
 
 	constructor(
 		private version: string,
@@ -202,7 +201,7 @@ export class WelcomeComponent implements Component {
 		private recentSessions: RecentSession[] = [],
 		/** Detected project servers; `null` means LSP is disabled and hides the section. */
 		private lspServers: LspServerInfo[] | null = [],
-		private productName: string = APP_NAME,
+		private productName: string = "Coreforge",
 		private greetingName?: string,
 	) {}
 	get tip(): string | undefined {
@@ -219,14 +218,10 @@ export class WelcomeComponent implements Component {
 		this.#native = undefined;
 	}
 
-	/**
-	 * A `card` (`omp.welcome`) holds the brand column (greeting, shimmering
-	 * Coreforge mark, model, provider) beside the info column (keycaps, LSP
-	 * servers, recent sessions). The session tip closes the card.
-	 */
-	describe(_cx: DescribeContext): NativeNode {
+	/** The native card keeps the Coreforge identity in the terminal-owned layout. */
+	describe(cx: DescribeContext): NativeNode {
 		const tip = this.tip;
-		if (this.#native && this.#native.tip === tip) return this.#native.node;
+		if (this.#native && this.#native.tip === tip && this.#native.cols === cx.cols) return this.#native.node;
 		const line = (spans: readonly TspSpan[], role?: string, key?: string): NativeNode =>
 			keyed(text(spans, { wrap: "none", truncate: "end", role }), key ?? role ?? "");
 		// Centered brand lines are short and fixed; the logo is multi-line art that must never truncate.
@@ -236,7 +231,7 @@ export class WelcomeComponent implements Component {
 			col(
 				[
 					art([span(plainLine(this.#welcomeText()), "strong")], "omp.welcome.greeting"),
-					keyed(logoNode(COREFORGE_LOGO, true, "omp.welcome.logo"), "logo"),
+					...(cx.cols >= 70 ? [keyed(logoNode(COREFORGE_LOGO, true, "omp.welcome.logo"), "logo")] : []),
 					art([span(plainLine(this.modelName), "accent")], "omp.welcome.model"),
 					art([span(plainLine(this.providerName), "muted")], "omp.welcome.provider"),
 				],
@@ -255,7 +250,7 @@ export class WelcomeComponent implements Component {
 		const shortcut = (key: string, label: string): NativeNode =>
 			keyed(row([kbd(key), line([span(label, "muted")])], { gap: "sm" }), label);
 		const info: NativeChild[] = [
-			line([span(this.version, "dim mono")], "omp.welcome.version"),
+			line([span(`${this.productName} v${this.version}`, "dim mono")], "omp.welcome.version"),
 			section("tips", "Tips", [
 				shortcut("#", "prompt actions"),
 				shortcut("/", "commands"),
@@ -338,7 +333,7 @@ export class WelcomeComponent implements Component {
 		}
 		// No head row or chevron: the card is the hero; the version sits in the info column.
 		const described = card({ role: "omp.welcome" }, body);
-		this.#native = { tip, node: described };
+		this.#native = { tip, cols: cx.cols, node: described };
 		return described;
 	}
 	/** A click on a recent session resumes it. */
@@ -676,9 +671,9 @@ export const COREFORGE_LOGO = [
 	"           ⣠⠞⢁⣴⣦⡀",
 	"         ⡠⠊⣠⣴⣿⣿⣿⣿⣦⡀",
 	"        ⠚⣠⣾⣿⣿⣿⣿⣿⣿⣿⣦⡀",
-	"        ⠘⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀",
-	"          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⠆",
-	"          ⢠⡀⠙⢿⣿⣿⣿⣿⣿⠟⢁⡴",
+	"        ⠘⢿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀",
+	"          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⠆",
+	"          ⢠⡀⠙⢿⣿⣿⣿⣿⠟⢁⡴",
 	"        ⢠⣤⣤⣤⣤ ⠙⢿⣿⣿⣿⡿⠋⡠⠋",
 	"       ⣤⣤⣤⣤⡄    ⠙⠿⠋⠤⠊",
 	"     ⢠⣤⣤⣤⣤",

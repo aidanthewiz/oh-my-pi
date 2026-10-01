@@ -1862,8 +1862,12 @@ export class ModelRegistry {
 	}
 
 	#isDiscoveryCacheOlderThanModelsConfig(cacheUpdatedAt: number): boolean {
-		const configMtime = this.#modelsConfigFile.getMtimeMs();
-		return configMtime !== null && cacheUpdatedAt < Math.floor(configMtime);
+		const userMtime = this.#modelsConfigFile.getMtimeMs();
+		const managedMtime = this.#managedModelsConfigFile.getMtimeMs();
+		return (
+			(userMtime !== null && cacheUpdatedAt < Math.floor(userMtime)) ||
+			(managedMtime !== null && cacheUpdatedAt < Math.floor(managedMtime))
+		);
 	}
 
 	async #discoverProviderModels(
@@ -3468,6 +3472,7 @@ export interface ProviderConfigInput {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;
+		promptCache?: Model<Api>["promptCache"];
 		/** Whether Codex requests should prefer WebSocket transport. */
 		preferWebsockets?: boolean;
 		headers?: Record<string, string>;

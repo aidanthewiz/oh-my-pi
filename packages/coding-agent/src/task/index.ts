@@ -17,12 +17,7 @@ import { taskSubprocessRenderer } from "@oh-my-pi/pi-tui/tools/subprocess";
  *   - Session artifacts for debugging
  */
 import path from "node:path";
-import type {
-	AgentTool,
-	AgentToolResult,
-	AgentToolUpdateCallback,
-	ToolSpeculationPolicy,
-} from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
@@ -62,7 +57,6 @@ import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/too
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
-import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 
 import { cfgAsyncEnabled } from "../tools/settings";
 import {
@@ -75,7 +69,6 @@ import {
 	cfgTaskMaxConcurrency,
 	cfgTaskMaxRecursionDepth,
 	cfgTaskMaxRuntimeMs,
-	cfgTaskSpeculativeLaunch,
 } from "./settings";
 
 function renderSubagentUserPrompt(assignment: string): string {
@@ -330,11 +323,7 @@ interface SpawnPlan {
 	spawns: TaskParams[];
 }
 
-/**
- * Repair, validate, and normalize a call into its spawns. Returns the
- * validation error the call reports instead when the shape is rejected. Shared
- * by dispatch and the speculative launcher so both derive identical spawns.
- */
+/** Repair, validate, and normalize a call into its spawns. */
 function planSpawns(rawParams: unknown, batchEnabled: boolean, defaultAgent: string): SpawnPlan | string {
 	const params = repairTaskParams(rawParams as TaskParams);
 	const error = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
@@ -343,14 +332,10 @@ function planSpawns(rawParams: unknown, batchEnabled: boolean, defaultAgent: str
 	return { params, items, spawns: items.map(item => spawnParamsFor(params, item, defaultAgent)) };
 }
 
-/**
- * One sync-executed spawn: its item, position in the original call, (for mixed
- * calls) a pre-claimed agent id, and a run already started speculatively.
- */
+/** One sync-executed spawn: its item, original position, and optionally a pre-claimed agent id. */
 interface SyncSpawnRef {
 	item: TaskItem;
 	index: number;
-	run?: SpawnRun;
 	preAllocatedId?: string;
 }
 
@@ -632,39 +617,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		acquire: signal => this.#getSpawnSemaphore().acquire(signal),
 		release: () => this.#releaseSpawnSemaphore(),
 	};
-	/** Streamed calls' speculative launches, keyed by tool-call id until dispatch adopts or discards them. */
-	readonly #launchSessions = new Map<string, TaskLaunchSession>();
-	readonly #launcher: TaskLauncher = {
-		spawns: args => {
-			const plan = planSpawns(args, this.#isBatchEnabled(), this.#defaultAgent());
-			return typeof plan === "string" ? undefined : plan.spawns;
-		},
-		start: (toolCallId, spawn, index, signal) => this.#startSpeculative(toolCallId, spawn, index, signal),
-	};
-
-	/**
-	 * Batch calls start each subagent as soon as its `tasks[]` item streams in;
-	 * see `./speculative-launch` for the abort/adoption contract.
-	 */
-	readonly speculation: ToolSpeculationPolicy = {
-		stream: {
-			open: async context => {
-				if (!cfgTaskSpeculativeLaunch.get(this.session.settings) || !this.#isBatchEnabled()) return undefined;
-				if (!context.coordinator.authorizeLaunch) return undefined;
-				const id = context.parentToolCallId;
-				const session = new TaskLaunchSession({
-					sink: context.coordinator,
-					tool: this,
-					launcher: this.#launcher,
-					onClose: () => {
-						if (this.#launchSessions.get(id) === session) this.#launchSessions.delete(id);
-					},
-				});
-				this.#launchSessions.set(id, session);
-				return session;
-			},
-		},
-	};
 
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
@@ -737,47 +689,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		agentId?: string;
 		detached: boolean;
 	}): SpawnRun {
-		return new SpawnRun(
-			this.#permit,
-			run =>
-				this.#runSpawn(
-					spawn.toolCallId,
-					spawn.params,
-					run.signal,
-					run.onUpdate,
-					spawn.agentId,
-					spawn.index,
-					spawn.detached,
-					run.timing,
-					spawn.detached ? run.onArtifactsRetained : undefined,
-				),
-			{ agentId: spawn.agentId, detached: spawn.detached },
+		return new SpawnRun(this.#permit, run =>
+			this.#runSpawn(
+				spawn.toolCallId,
+				spawn.params,
+				run.signal,
+				run.onUpdate,
+				spawn.agentId,
+				spawn.index,
+				spawn.detached,
+				run.timing,
+				spawn.detached ? run.onArtifactsRetained : undefined,
+			),
 		);
-	}
-
-	/**
-	 * Start a streamed item's run ahead of dispatch. Preflight and execution
-	 * mode mirror dispatch exactly; refuses (undefined) whenever dispatch would
-	 * reject the item, so a refusal halts further speculation for the call.
-	 */
-	async #startSpeculative(
-		toolCallId: string,
-		spawn: TaskParams,
-		index: number,
-		signal: AbortSignal,
-	): Promise<SpawnRun | undefined> {
-		if (spawn.tools?.length && this.session.getPlanModeState?.()?.enabled === true) return undefined;
-		let blocking: boolean;
-		try {
-			blocking = (await this.#resolveSpawnPreflight(spawn)).effectiveAgent.blocking === true;
-		} catch {
-			return undefined;
-		}
-		const detached =
-			cfgAsyncEnabled.get(this.session.settings) && this.session.asyncJobManager !== undefined && !blocking;
-		const agentId = await this.#outputManager().allocate(spawn.name?.trim() || generateTaskName());
-		if (signal.aborted) return undefined;
-		return this.#launch({ toolCallId, params: spawn, index, agentId, detached });
 	}
 
 	#getSpawnSemaphore(): Semaphore {
@@ -829,23 +753,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async execute(
 		toolCallId: string,
 		rawParams: unknown,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
-	): Promise<AgentToolResult<TaskToolDetails>> {
-		const launchSession = this.#launchSessions.get(toolCallId);
-		this.#launchSessions.delete(toolCallId);
-		try {
-			return await this.#dispatch(toolCallId, rawParams, launchSession, signal, onUpdate);
-		} finally {
-			// No-op once dispatch adopted; otherwise nothing launched early may outlive the call.
-			launchSession?.discard("task call settled without adopting speculative launches");
-		}
-	}
-
-	async #dispatch(
-		toolCallId: string,
-		rawParams: unknown,
-		launchSession: TaskLaunchSession | undefined,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
@@ -910,15 +817,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const asyncEnabled = cfgAsyncEnabled.get(this.session.settings);
 		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
 		const asyncItems = manager ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
-		// Runs started while the call streamed. An item runs detached iff it
-		// becomes a background job here; a run launched under the other mode
-		// (settings flipped mid-stream) cannot be re-homed and starts over.
-		const adopted = launchSession ? await launchSession.adopt(normalizedSpawnParams) : new Map<number, SpawnRun>();
-		for (const [index, run] of adopted) {
-			if (run.identity.detached === (manager !== undefined && !itemBlocking[index])) continue;
-			run.discard("task execution mode changed after speculative launch");
-			adopted.delete(index);
-		}
 		const depthCapacity = canSpawnAtDepth(
 			cfgTaskMaxRecursionDepth.get(this.session.settings),
 			this.session.taskDepth ?? 0,
@@ -948,7 +846,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const result = await this.#executeSyncFanout(
 				toolCallId,
 				params,
-				spawnItems.map((item, index) => ({ item, index, run: adopted.get(index) })),
+				spawnItems.map((item, index) => ({ item, index })),
 				defaultAgent,
 				signal,
 				onUpdate,
@@ -1005,23 +903,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			item: TaskItem;
 			index: number;
 			blocking: boolean;
-			run: SpawnRun | undefined;
 			progress: AgentProgress;
 		}> = [];
 		for (const [index, item] of spawnItems.entries()) {
 			const agentType = resolvedAgents[index]!;
 			const policy = policies[index]!;
 			const agentSource = policy.agent.source;
-			const run = adopted.get(index);
-			const agentId =
-				run?.identity.agentId ?? (await outputManager.allocate(item.name?.trim() || generateTaskName()));
+			const agentId = await outputManager.allocate(item.name?.trim() || generateTaskName());
 			const assignment = (item.task ?? "").trim();
 			spawns.push({
 				agentId,
 				item,
 				index,
 				blocking: itemBlocking[index],
-				run,
 				progress: {
 					index,
 					id: agentId,
@@ -1082,7 +976,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					toolCallId,
 					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
 					agentId: spawn.agentId,
-					run: spawn.run,
 					progress: spawn.progress,
 					ircEnabled,
 					buildDetails: buildAsyncDetails,
@@ -1096,8 +989,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				started.push({ agentId: spawn.agentId, jobId });
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				// An adopted run already executes; without its job nothing would own it.
-				spawn.run?.discard(`background job registration failed: ${message}`);
 				failedSchedules.push(`${spawn.agentId}: ${message}`);
 				spawn.progress.status = "failed";
 				settledCount += 1;
@@ -1195,7 +1086,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				item: spawn.item,
 				index: spawn.index,
 				preAllocatedId: spawn.agentId,
-				run: spawn.run,
 			})),
 			onItemProgress: onUpdate
 				? (index, progress) => {
@@ -1254,26 +1144,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		toolCallId: string;
 		spawnParams: TaskParams;
 		agentId: string;
-		/** Run already started while the call streamed; the job adopts it instead of launching. */
-		run?: SpawnRun;
 		progress: AgentProgress;
 		ircEnabled: boolean;
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 		onSettled?: (failed: boolean) => void;
 	}): string {
-		const {
-			manager,
-			toolCallId,
-			spawnParams,
-			agentId,
-			run,
-			progress,
-			ircEnabled,
-			buildDetails,
-			onUpdate,
-			onSettled,
-		} = options;
+		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
+			options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			// Isolated runs are parked without a reviver once the run ends
 			// (`finalizeSubagentLifecycle`), so "message it" would point the
@@ -1334,8 +1212,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						update.content.find(part => part.type === "text")?.text ?? `Running background task ${agentId}...`;
 					await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
 				};
-				const spawnRun =
-					run ?? this.#launch({ toolCallId, params: spawnParams, index: progress.index, agentId, detached: true });
+				const spawnRun = this.#launch({
+					toolCallId,
+					params: spawnParams,
+					index: progress.index,
+					agentId,
+					detached: true,
+				});
 				spawnRun.attach({
 					signal: runSignal,
 					onUpdate: forwardSyncProgress,
@@ -1466,15 +1349,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
-			const run =
-				spawn.run ??
-				this.#launch({
-					toolCallId,
-					params: spawnParamsFor(params, spawn.item, defaultAgent),
-					index: spawn.index,
-					agentId: spawn.preAllocatedId,
-					detached: false,
-				});
+			const run = this.#launch({
+				toolCallId,
+				params: spawnParamsFor(params, spawn.item, defaultAgent),
+				index: spawn.index,
+				agentId: spawn.preAllocatedId,
+				detached: false,
+			});
 			run.attach({ signal, onUpdate });
 			return await run.result;
 		}
@@ -1543,15 +1424,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			spawns,
 			spawns.length,
 			async (spawn, _position, workerSignal) => {
-				const run =
-					spawn.run ??
-					this.#launch({
-						toolCallId,
-						params: spawnParamsFor(params, spawn.item, defaultAgent),
-						index: spawn.index,
-						agentId: spawn.preAllocatedId,
-						detached: false,
-					});
+				const run = this.#launch({
+					toolCallId,
+					params: spawnParamsFor(params, spawn.item, defaultAgent),
+					index: spawn.index,
+					agentId: spawn.preAllocatedId,
+					detached: false,
+				});
 				run.attach({
 					signal: workerSignal,
 					onUpdate: onItemProgress
@@ -1571,10 +1450,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			},
 			signal,
 		);
-		// A worker never invoked (call aborted first) never attached its adopted run.
-		spawns.forEach((spawn, position) => {
-			if (!results[position]) spawn.run?.discard("task call aborted before the spawn started");
-		});
 		return results.map((settled, position) => {
 			if (!settled) return undefined;
 			if (settled.status === "fulfilled") return settled.value;

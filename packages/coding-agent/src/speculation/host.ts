@@ -23,7 +23,6 @@ import { type LocalReadSpeculationEvidence, resolveSpeculativeReadTarget, SNAPSH
 import { isCpuProfilePath } from "../utils/cpuprofile";
 import { isSampleProfilePath } from "../utils/sample-profile";
 import { isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
-import { cfgTaskSpeculativeLaunch } from "../task/settings";
 
 import {
 	cfgToolsApproval,
@@ -313,9 +312,6 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
  * while the single shared host preserves accumulated evidence across toggles.
  * The host's own `authorize` re-checks the enabled flag per operation, so a
  * lingering coordinator from before a disable still vetoes new candidates.
- * `task.speculativeLaunch` also keeps the coordinator alive: reads and eval
- * stay gated by `tools.speculativeExecution.enabled`, while the task tool's
- * stream session gates itself on its own flag.
  */
 export function createSpeculativeToolExecutionConfig(
 	settings: Settings,
@@ -325,7 +321,7 @@ export function createSpeculativeToolExecutionConfig(
 	const host = new CodingAgentSpeculativeExecutionHost(settings, toolSession, extensionRunner);
 	return {
 		get enabled() {
-			return cfgToolsSpeculativeExecutionEnabled.get(settings) || cfgTaskSpeculativeLaunch.get(settings);
+			return cfgToolsSpeculativeExecutionEnabled.get(settings);
 		},
 		get maxInFlight() {
 			return cfgToolsSpeculativeExecutionMaxInFlight.get(settings);

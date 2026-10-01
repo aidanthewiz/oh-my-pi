@@ -13,7 +13,7 @@ rust_library(
     crate_name = "pi_ast",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    version = "18.4.5",
+    version = "18.4.6",
     deps = all_crate_deps(normal = True) + [
         "//crates/vendor/tree-sitter-go",
     ],

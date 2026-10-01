@@ -87,4 +87,17 @@ describe("WelcomeComponent", () => {
 		expect(disabled).not.toContain("No LSP servers");
 		expect(disabled).toContain("Recent sessions");
 	});
+
+	it("keeps the Coreforge mark on wide native cards and the brand on narrow cards", () => {
+		const welcome = new WelcomeComponent("18.4.6", "model", "provider", [], [], "Coreforge", "Aidan");
+		const cx = { cols: 80, dark: true, reduceMotion: false, supports: () => true, feature: () => true };
+		const wide = JSON.stringify(welcome.describe(cx));
+		const narrow = JSON.stringify(welcome.describe({ ...cx, cols: 55 }));
+
+		expect(wide).toContain("⣠⠞⢁⣴⣦⡀");
+		expect(wide).toContain("Welcome back, Aidan!");
+		expect(wide).toContain("Coreforge v18.4.6");
+		expect(narrow).not.toContain("⣠⠞⢁⣴⣦⡀");
+		expect(narrow).toContain("Coreforge v18.4.6");
+	});
 });

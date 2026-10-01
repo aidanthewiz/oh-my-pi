@@ -13,6 +13,12 @@
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
 - Kept Anthropic fallback-credit tokens and frozen request bodies on official API-key routes when retry models change endpoint.
+## [18.4.6] - 2026-10-01
+
+### Fixed
+
+- Fixed forced tool calls failing for Claude Opus 5.5 and Sonnet 5.5 through Amazon Bedrock, including required-tool retries in plan mode.
+
 ## [18.4.5] - 2026-09-30
 
 ### Added

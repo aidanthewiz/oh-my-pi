@@ -217,7 +217,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#version = "";
 	#modelName = "";
 	#providerName = "";
-	#productName = "";
+	#productName = "Coreforge";
 	#greetingName: string | undefined;
 	#recentSessions: RecentSession[] = [];
 	#lspServers: LspServerInfo[] | null = [];
