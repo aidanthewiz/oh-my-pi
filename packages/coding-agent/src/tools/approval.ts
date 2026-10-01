@@ -30,6 +30,7 @@ export interface RuntimeApprovalCapableTool {
 		context?: AgentToolContext,
 	): Promise<RuntimeToolApprovalRequest | undefined>;
 	approveRuntimeApproval?(toolCallId: string, args: unknown): void;
+	denyRuntimeApproval?(toolCallId: string, args: unknown): void;
 }
 
 /** The slice of `AgentToolContext` that approval resolution actually reads. */

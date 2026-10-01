@@ -50,6 +50,8 @@ async function resolveEnvInChild(opts: {
 	// source launcher and gives the env module authoritative launch provenance.
 	launchWithNoEnvFile?: boolean;
 	launcherPolicy?: Record<string, string | undefined>;
+	// Pair the launcher's explicit empty env file with the same captured Bun option.
+	trustedBunOptions?: boolean;
 	// When set, model the real shipped launch: a named profile whose agent `.env`
 	// lives at `$HOME/.omp/profiles/<profile>/agent/.env`. Named profiles ignore
 	// PI_CODING_AGENT_DIR (dirs.ts DirResolver), so this drives OMP_PROFILE + HOME.
@@ -79,11 +81,11 @@ async function resolveEnvInChild(opts: {
 		await fs.writeFile(emptyEnvFile, "");
 
 		const probePath = path.join(root, "probe.ts");
-		const spawnedProbe = `const out = {}; for (const k of ${JSON.stringify(opts.spawnedChildKeys ?? [])}) out[k] = process.env[k]; process.stdout.write(JSON.stringify(out));`;
+		const spawnedProbe = `const out = {}; for (const k of ${JSON.stringify(opts.spawnedChildKeys ?? [])}) out[k] = process.env[k]; out.noEnvFile = process.execArgv.includes('--no-env-file'); process.stdout.write(JSON.stringify(out));`;
 		await Bun.write(
 			probePath,
 			[
-				`import { $env, filterChildShellEnv, filterTrustedChildShellEnv, filterUserMcpChildEnv } from ${JSON.stringify(envUrl)};`,
+				`import { $env, filterChildShellEnv, filterUserMcpChildEnv } from ${JSON.stringify(envUrl)};`,
 				`const keys = ${JSON.stringify(opts.keys)};`,
 				`const childKeys = ${JSON.stringify(opts.childKeys ?? [])};`,
 				`const spawnedChildKeys = ${JSON.stringify(opts.spawnedChildKeys ?? [])};`,
@@ -91,9 +93,7 @@ async function resolveEnvInChild(opts: {
 				"for (const k of keys) out[k] = $env[k];",
 				`const childEnv = filterChildShellEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
 				"for (const k of childKeys) out['child:' + k] = childEnv[k];",
-				`const trustedChildEnv = filterTrustedChildShellEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
 				`const userMcpChildEnv = filterUserMcpChildEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
-				"for (const k of childKeys) out['trusted:' + k] = trustedChildEnv[k];",
 				"for (const k of childKeys) out['userMcp:' + k] = userMcpChildEnv[k];",
 				"if (spawnedChildKeys.length) {",
 				`  const spawned = Bun.spawn([process.execPath, '-e', ${JSON.stringify(spawnedProbe)}], { env: childEnv, stdout: 'pipe', stderr: 'pipe' });`,
@@ -125,6 +125,7 @@ async function resolveEnvInChild(opts: {
 						AZURE_CORE_COLLECT_TELEMETRY: "no",
 						GREPTILE_TELEMETRY_DISABLED: "1",
 						...opts.launcherPolicy,
+						...(opts.trustedBunOptions ? { BUN_OPTIONS: `--env-file=${emptyEnvFile}` } : {}),
 					}
 				: {}),
 		};
@@ -291,7 +292,7 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 		expect(out["child:AZURE_MCP_COLLECT_TELEMETRY"]).toBeUndefined();
 		expect(out["child:AZURE_MCP_COLLECT_TELEMETRY_MICROSOFT"]).toBeUndefined();
 		expect(out["child:ARBITRARY_DOTENV_ONLY"]).toBeUndefined();
-		for (const prefix of ["trusted:", "userMcp:"]) {
+		for (const prefix of ["userMcp:"]) {
 			expect(out[`${prefix}AZURE_CORE_COLLECT_TELEMETRY`]).toBe("no");
 			expect(out[`${prefix}GREPTILE_TELEMETRY_DISABLED`]).toBe("1");
 			expect(out[`${prefix}OMP_DOTENV_OVERRIDE`]).toBe("1");
@@ -305,7 +306,44 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 			GREPTILE_TELEMETRY_DISABLED: "1",
 			OMP_DOTENV_OVERRIDE: "1",
 			OMP_CF_PRODUCT_VERSION: "test-product-version",
+			noEnvFile: true,
 		});
+	});
+
+	it("does not propagate forged Bun options from a profile, project, or child overlay", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "BUN_OPTIONS=--smol\n",
+			ambient: {},
+			projectLocalEnvContent: "BUN_OPTIONS=--smol\nPROJECT_ONLY_MARKER=project-dotenv\n",
+			keys: [],
+			childKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE"],
+			spawnedChildKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE", "PROJECT_ONLY_MARKER"],
+			childOverlay: { BUN_OPTIONS: "--smol", OMP_NO_ENV_FILE: "0" },
+			managed: true,
+		});
+		expect(out["child:BUN_OPTIONS"]).toBe("--no-env-file");
+		expect(out["child:OMP_NO_ENV_FILE"]).toBe("1");
+		expect(out.spawned).toEqual(expect.objectContaining({ OMP_NO_ENV_FILE: "1", noEnvFile: true }));
+		expect(out.spawned).not.toHaveProperty("PROJECT_ONLY_MARKER");
+	});
+
+	it("honors captured launcher options without allowing a project or overlay to replace them", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "",
+			ambient: {},
+			projectLocalEnvContent: "BUN_OPTIONS=--smol\nPROJECT_ONLY_MARKER=project-dotenv\n",
+			keys: [],
+			childKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE"],
+			spawnedChildKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE", "PROJECT_ONLY_MARKER"],
+			childOverlay: { BUN_OPTIONS: "--smol", OMP_NO_ENV_FILE: "0" },
+			managed: true,
+			launchWithNoEnvFile: false,
+			trustedBunOptions: true,
+		});
+		expect(out["child:BUN_OPTIONS"]).toMatch(/^--env-file=.*empty\.env --no-env-file$/);
+		expect(out["child:OMP_NO_ENV_FILE"]).toBe("1");
+		expect(out.spawned).toEqual(expect.objectContaining({ OMP_NO_ENV_FILE: "1", noEnvFile: true }));
+		expect(out.spawned).not.toHaveProperty("PROJECT_ONLY_MARKER");
 	});
 
 	it("accepts managed provenance with an explicit empty launch env file", async () => {
@@ -543,15 +581,6 @@ describe("child process dotenv boundary", () => {
 			expect(exitCode, stderr).toBe(0);
 			expect(stdout).toBe("");
 			expect(childEnv.BUN_OPTIONS).toBe("--no-env-file");
-			expect(filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: "--smol" }, root).BUN_OPTIONS).toBe(
-				"--smol --no-env-file",
-			);
-			expect(
-				filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: "--smol" }, root, {
-					BUN_OPTIONS: "",
-					OMP_NO_ENV_FILE: "0",
-				}),
-			).toEqual(expect.objectContaining({ BUN_OPTIONS: "--no-env-file", OMP_NO_ENV_FILE: "1" }));
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -665,10 +694,9 @@ describe("child process dotenv boundary", () => {
 		expect(out["child:greptile_telemetry_disabled"]).toBeUndefined();
 	});
 
-	it("strips operational credentials and renamed protected values from repository children", async () => {
+	it("strips operational credentials, metadata, and renamed protected values from repository children", async () => {
 		// Dynamic import preserves env.ts's controlled one-time initialization for this suite.
-		const { filterChildShellEnv, filterTrustedChildShellEnv, filterUserMcpChildEnv, registerChildEnvRedactions } =
-			await import(envUrl);
+		const { filterChildShellEnv, filterUserMcpChildEnv, registerChildEnvRedactions } = await import(envUrl);
 		const managedName = `OMP_MANAGED_SECRET_${crypto.randomUUID().replaceAll("-", "")}`;
 		const managedSecret = `managed-${crypto.randomUUID()}`;
 		const awsSecret = `aws-${crypto.randomUUID()}`;
@@ -686,6 +714,12 @@ describe("child process dotenv boundary", () => {
 			ANTHROPIC_CUSTOM_HEADERS: "Authorization: Bearer anthropic-secret",
 			CLAUDE_CODE_CLIENT_KEY: "-----BEGIN PRIVATE KEY-----client-secret",
 			PERPLEXITY_COOKIES: "session=perplexity-secret",
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: "/trusted/config",
+			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: "/trusted/credentials",
+			OMP_OPERATIONAL_AWS_PROFILE: "trusted-profile",
+			OMP_OPERATIONAL_AWS_REGION: "us-east-1",
+			OMP_OPERATIONAL_AWS_EXECUTABLE: "/trusted/aws",
+			OMP_OPERATIONAL_AWS_HOME_DIRECTORY: "/trusted/home",
 			[managedName]: managedSecret,
 		};
 		const overlay = {
@@ -693,6 +727,12 @@ describe("child process dotenv boundary", () => {
 			GH_TOKEN: "github-secret",
 			RENAMED_MANAGED_SECRET: managedSecret,
 			RENAMED_AWS_SECRET: awsSecret,
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: "/project/config",
+			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: "/project/credentials",
+			OMP_OPERATIONAL_AWS_PROFILE: "project-profile",
+			OMP_OPERATIONAL_AWS_REGION: "eu-west-1",
+			OMP_OPERATIONAL_AWS_EXECUTABLE: "/project/aws",
+			OMP_OPERATIONAL_AWS_HOME_DIRECTORY: "/project/home",
 		};
 
 		const child = filterChildShellEnv(parent, process.cwd(), overlay);
@@ -711,18 +751,16 @@ describe("child process dotenv boundary", () => {
 		expect(child.AWS_CONFIG_FILE).toBe(os.devNull);
 		expect(child.AWS_SHARED_CREDENTIALS_FILE).toBe(os.devNull);
 		expect(child.AWS_EC2_METADATA_DISABLED).toBe("true");
-
-		const trusted = filterTrustedChildShellEnv(parent, process.cwd(), overlay);
-		expect(trusted.AWS_PROFILE).toBe("overlay-profile");
-		expect(trusted.AWS_REGION).toBe("us-west-2");
-		expect(trusted.GH_TOKEN).toBeUndefined();
-		expect(trusted.OPENAI_API_KEY).toBeUndefined();
-		expect(trusted[managedName]).toBeUndefined();
-		expect(trusted.RENAMED_MANAGED_SECRET).toBeUndefined();
-		expect(trusted.RENAMED_AWS_SECRET).toBeUndefined();
-		expect(trusted.ANTHROPIC_CUSTOM_HEADERS).toBeUndefined();
-		expect(trusted.CLAUDE_CODE_CLIENT_KEY).toBeUndefined();
-		expect(trusted.PERPLEXITY_COOKIES).toBeUndefined();
+		for (const key of [
+			"OMP_OPERATIONAL_AWS_CONFIG_FILE",
+			"OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE",
+			"OMP_OPERATIONAL_AWS_PROFILE",
+			"OMP_OPERATIONAL_AWS_REGION",
+			"OMP_OPERATIONAL_AWS_EXECUTABLE",
+			"OMP_OPERATIONAL_AWS_HOME_DIRECTORY",
+		]) {
+			expect(child[key]).toBeUndefined();
+		}
 
 		const userMcp = filterUserMcpChildEnv(parent, process.cwd(), overlay);
 		expect(userMcp.AWS_PROFILE).toBe("overlay-profile");
@@ -738,58 +776,5 @@ describe("child process dotenv boundary", () => {
 		expect(userMcp.ANTHROPIC_CUSTOM_HEADERS).toBeUndefined();
 		expect(userMcp.CLAUDE_CODE_CLIENT_KEY).toBeUndefined();
 		expect(userMcp.PERPLEXITY_COOKIES).toBeUndefined();
-	});
-
-	it("preserves only launcher-proven AWS values across self-referential project dotenv entries", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-operational-aws-"));
-		try {
-			const operational = {
-				AWS_PROFILE: "employee-operations",
-				AWS_REGION: "us-west-2",
-				AWS_ACCESS_KEY_ID: "AKIA-LAUNCHER",
-				AWS_SECRET_ACCESS_KEY: `secret-${crypto.randomUUID()}`,
-				AWS_SESSION_TOKEN: `session-${crypto.randomUUID()}`,
-				AWS_CONFIG_FILE: path.join(root, "aws-config"),
-				AWS_WEB_IDENTITY_TOKEN_FILE: path.join(root, "web-identity"),
-				AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://127.0.0.1:9911/credentials",
-				AWS_CONTAINER_AUTHORIZATION_TOKEN: `container-${crypto.randomUUID()}`,
-			};
-			await fs.writeFile(
-				path.join(root, ".env"),
-				`${Object.keys(operational)
-					.map(key => `${key}=$${key}`)
-					.join("\n")}\nAWS_DEFAULT_PROFILE=$AWS_DEFAULT_PROFILE\n`,
-			);
-			const {
-				filterChildShellEnv,
-				filterTrustedChildShellEnv,
-				filterUserMcpChildEnv,
-				registerOperationalAwsEnvProvenance,
-			} = await import(envUrl);
-			registerOperationalAwsEnvProvenance([
-				...Object.entries(operational),
-				["AWS_DEFAULT_PROFILE", "launcher-default"],
-			]);
-			const parent = { ...operational, AWS_DEFAULT_PROFILE: "repo-controlled" };
-
-			const trusted = filterTrustedChildShellEnv(parent, root);
-			for (const [key, value] of Object.entries(operational)) expect(trusted[key]).toBe(value);
-			expect(trusted.AWS_DEFAULT_PROFILE).toBeUndefined();
-
-			const userMcp = filterUserMcpChildEnv(parent, root);
-			for (const key of Object.keys(operational)) {
-				if (key === "AWS_CONFIG_FILE") expect(userMcp[key]).toBe(os.devNull);
-				else expect(userMcp[key]).toBeUndefined();
-			}
-			expect(userMcp.AWS_DEFAULT_PROFILE).toBeUndefined();
-
-			const child = filterChildShellEnv(parent, root);
-			for (const key of Object.keys(operational)) {
-				if (key === "AWS_CONFIG_FILE") expect(child[key]).toBe(os.devNull);
-				else expect(child[key]).toBeUndefined();
-			}
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
 	});
 });

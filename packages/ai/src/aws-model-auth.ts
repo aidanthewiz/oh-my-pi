@@ -1,6 +1,7 @@
 import { $env } from "@oh-my-pi/pi-utils";
 
 export const AWS_MODEL_AUTH_MODE_ENV = "OMP_MODEL_AWS_AUTH_MODE";
+export const AWS_MODEL_ACCOUNT_ID_ENV = "OMP_MODEL_AWS_ACCOUNT_ID";
 export const AWS_MODEL_PROFILE_ENV = "OMP_MODEL_AWS_PROFILE";
 export const AWS_MODEL_REGION_ENV = "OMP_MODEL_AWS_REGION";
 export const MANAGED_AWS_MODEL_AUTH_MODE = "managed";

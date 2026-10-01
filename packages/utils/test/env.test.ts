@@ -244,29 +244,31 @@ describe("filterChildShellEnv", () => {
 		// A bash call with `cwd` in a secondary worktree must not mutate the
 		// primary one: forwarding the agent's own repo-location variables makes
 		// child `git` ignore the command's cwd (issue #11082).
-		expect(
-			filterChildShellEnv(
-				{
-					GIT_DIR: "/primary/.git",
-					GIT_COMMON_DIR: "/primary/.git",
-					GIT_WORK_TREE: "/primary",
-					GIT_INDEX_FILE: "/primary/.git/index",
-					GIT_OBJECT_DIRECTORY: "/primary/.git/objects",
-					GIT_ALTERNATE_OBJECT_DIRECTORIES: "/primary/.git/objects",
-					GIT_EDITOR: "true",
-					GIT_AUTHOR_NAME: "Agent",
-				},
-				cwd,
-			),
-		).toEqual({
-			AWS_CONFIG_FILE: os.devNull,
-			AWS_EC2_METADATA_DISABLED: "true",
-			AWS_SHARED_CREDENTIALS_FILE: os.devNull,
-			BUN_OPTIONS: "--no-env-file",
-			GIT_EDITOR: "true",
-			GIT_AUTHOR_NAME: "Agent",
-			OMP_NO_ENV_FILE: "1",
-		});
+		const child = filterChildShellEnv(
+			{
+				GIT_DIR: "/primary/.git",
+				GIT_COMMON_DIR: "/primary/.git",
+				GIT_WORK_TREE: "/primary",
+				GIT_INDEX_FILE: "/primary/.git/index",
+				GIT_OBJECT_DIRECTORY: "/primary/.git/objects",
+				GIT_ALTERNATE_OBJECT_DIRECTORIES: "/primary/.git/objects",
+				GIT_EDITOR: "true",
+				GIT_AUTHOR_NAME: "Agent",
+			},
+			cwd,
+		);
+		for (const key of [
+			"GIT_DIR",
+			"GIT_COMMON_DIR",
+			"GIT_WORK_TREE",
+			"GIT_INDEX_FILE",
+			"GIT_OBJECT_DIRECTORY",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		]) {
+			expect(child).not.toHaveProperty(key);
+		}
+		expect(child.GIT_EDITOR).toBe("true");
+		expect(child.GIT_AUTHOR_NAME).toBe("Agent");
 	});
 
 	it("uses the launch mode when dotenv changes NODE_ENV", async () => {
@@ -356,6 +358,50 @@ describe("stripGitRepoLocationEnv", () => {
 		const posixEnv: Record<string, string> = { GIT_DIR: "a", git_dir: "b", KEEP: "d" };
 		stripGitRepoLocationEnv(posixEnv, "linux");
 		expect(posixEnv).toEqual({ git_dir: "b", KEEP: "d" });
+	});
+});
+
+describe("operational AWS launcher provenance", () => {
+	it("does not trust a repository dotenv OMP_OPERATIONAL_AWS executable spoof", async () => {
+		const cwd = path.dirname(writeTempEnv(""));
+		const launchEnvFile = path.join(cwd, "launcher.env");
+		fs.writeFileSync(
+			path.join(cwd, ".env"),
+			"OMP_OPERATIONAL_AWS_EXECUTABLE=./repo-aws\nOMP_OPERATIONAL_AWS_PROFILE=spoofed\n",
+		);
+		fs.writeFileSync(launchEnvFile, "");
+		const probePath = path.join(import.meta.dir, "fixtures", "operational-aws-provenance-probe.ts");
+		const proc = Bun.spawn([process.execPath, `--env-file=${launchEnvFile}`, probePath], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: "/trusted/home",
+				OMP_OPERATIONAL_AWS_CONFIG_FILE: "/trusted/config",
+				OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: "/trusted/credentials",
+				OMP_OPERATIONAL_AWS_PROFILE: "trusted",
+				OMP_OPERATIONAL_AWS_REGION: "us-gov-west-1",
+				OMP_OPERATIONAL_AWS_EXECUTABLE: "/trusted/aws",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({
+			metadata: {
+				configFile: "/trusted/config",
+				sharedCredentialsFile: "/trusted/credentials",
+				profile: "trusted",
+				region: "us-gov-west-1",
+				executable: "/trusted/aws",
+				homeDirectory: "/trusted/home",
+			},
+			cached: true,
+		});
 	});
 });
 

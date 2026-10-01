@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AWS_MODEL_ACCOUNT_ID_ENV,
 	AWS_MODEL_AUTH_MODE_ENV,
 	AWS_MODEL_PROFILE_ENV,
 	AWS_MODEL_REGION_ENV,
@@ -11,7 +12,6 @@ import {
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CoreforgeIdentityStore } from "@oh-my-pi/pi-coding-agent/identity/coreforge-store";
 import { ensureCoreforgeIdentityAtStartup } from "@oh-my-pi/pi-coding-agent/identity/startup";
-import { filterChildShellEnv, filterTrustedChildShellEnv } from "@oh-my-pi/pi-utils";
 
 // The startup gate's "never throws" contract at its outermost boundary: the
 // identity store constructor performs filesystem work (mkdir + SQLite open)
@@ -19,9 +19,15 @@ import { filterChildShellEnv, filterTrustedChildShellEnv } from "@oh-my-pi/pi-ut
 // here bricks every managed install with a read-only home dir or full disk.
 
 const TENANT_ID = "11111111-2222-4333-8444-555555555555";
-const MANAGED_MODEL_ENV_KEYS = [AWS_MODEL_AUTH_MODE_ENV, AWS_MODEL_PROFILE_ENV, AWS_MODEL_REGION_ENV] as const;
+const MANAGED_MODEL_ENV_KEYS = [
+	AWS_MODEL_AUTH_MODE_ENV,
+	AWS_MODEL_ACCOUNT_ID_ENV,
+	AWS_MODEL_PROFILE_ENV,
+	AWS_MODEL_REGION_ENV,
+] as const;
 const initialManagedModelEnv: Record<string, string | undefined> = {
 	[AWS_MODEL_AUTH_MODE_ENV]: Bun.env[AWS_MODEL_AUTH_MODE_ENV],
+	[AWS_MODEL_ACCOUNT_ID_ENV]: Bun.env[AWS_MODEL_ACCOUNT_ID_ENV],
 	[AWS_MODEL_PROFILE_ENV]: Bun.env[AWS_MODEL_PROFILE_ENV],
 	[AWS_MODEL_REGION_ENV]: Bun.env[AWS_MODEL_REGION_ENV],
 };
@@ -68,7 +74,7 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 		}
 	});
 
-	it("prompts for sign-in (does not fall back to envs) when provisioned, non-interactive, not signed in", async () => {
+	it("returns a sign-in notice without falling back to envs when provisioned and signed out", async () => {
 		// Ambient env auth used to suppress the managed flow entirely; now, with
 		// Entra provisioned, it must NOT — the user is told to sign in instead.
 		const previous = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
@@ -92,93 +98,17 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 		}
 	});
 
-	it("restores launcher-owned AWS credentials before disabled or unprovisioned identity exits", async () => {
-		const previous = {
-			AWS_PROFILE: Bun.env.AWS_PROFILE,
-			AWS_REGION: Bun.env.AWS_REGION,
-			OMP_OPERATIONAL_AWS_PROFILE_SET: Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET,
-			OMP_OPERATIONAL_AWS_PROFILE: Bun.env.OMP_OPERATIONAL_AWS_PROFILE,
-			OMP_OPERATIONAL_AWS_REGION_SET: Bun.env.OMP_OPERATIONAL_AWS_REGION_SET,
-			OMP_OPERATIONAL_AWS_REGION: Bun.env.OMP_OPERATIONAL_AWS_REGION,
-			AWS_ACCESS_KEY_ID: Bun.env.AWS_ACCESS_KEY_ID,
-			AWS_SECRET_ACCESS_KEY: Bun.env.AWS_SECRET_ACCESS_KEY,
-			AWS_SESSION_TOKEN: Bun.env.AWS_SESSION_TOKEN,
-			AWS_CONFIG_FILE: Bun.env.AWS_CONFIG_FILE,
-			OMP_OPERATIONAL_AWS_ACCESS_KEY_ID_SET: Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID_SET,
-			OMP_OPERATIONAL_AWS_ACCESS_KEY_ID: Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID,
-			OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY_SET: Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY_SET,
-			OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY: Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY,
-			OMP_OPERATIONAL_AWS_SESSION_TOKEN_SET: Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN_SET,
-			OMP_OPERATIONAL_AWS_SESSION_TOKEN: Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN,
-			OMP_OPERATIONAL_AWS_CONFIG_FILE_SET: Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE_SET,
-			OMP_OPERATIONAL_AWS_CONFIG_FILE: Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE,
-		};
+	it("returns a sign-in notice without opening a browser for an interactive fresh identity", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
-		fs.writeFileSync(
-			path.join(dir, ".env"),
-			[
-				"AWS_PROFILE=$AWS_PROFILE",
-				"AWS_REGION=$AWS_REGION",
-				"AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID",
-				"AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY",
-				"AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN",
-				"AWS_CONFIG_FILE=$AWS_CONFIG_FILE",
-			].join("\n"),
-		);
 		try {
-			for (const enabled of [false, true]) {
-				delete Bun.env[AWS_MODEL_PROFILE_ENV];
-				delete Bun.env[AWS_MODEL_REGION_ENV];
-				Bun.env.AWS_PROFILE = "managed-dotenv-profile";
-				Bun.env.AWS_REGION = "us-east-1";
-				Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET = "1";
-				Bun.env.OMP_OPERATIONAL_AWS_PROFILE = "employee-operations";
-				Bun.env.OMP_OPERATIONAL_AWS_REGION_SET = "1";
-				Bun.env.OMP_OPERATIONAL_AWS_REGION = "eu-west-1";
-				Bun.env.AWS_ACCESS_KEY_ID = "managed-dotenv-access-key";
-				Bun.env.AWS_SECRET_ACCESS_KEY = "managed-dotenv-secret";
-				Bun.env.AWS_SESSION_TOKEN = "managed-dotenv-session";
-				Bun.env.AWS_CONFIG_FILE = "/tmp/managed-dotenv-aws-config";
-				Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID_SET = "1";
-				Bun.env.OMP_OPERATIONAL_AWS_ACCESS_KEY_ID = "AKIA-LAUNCHER";
-				Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY_SET = "1";
-				Bun.env.OMP_OPERATIONAL_AWS_SECRET_ACCESS_KEY = "launcher-secret";
-				Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN_SET = "1";
-				Bun.env.OMP_OPERATIONAL_AWS_SESSION_TOKEN = "launcher-session";
-				Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE_SET = "1";
-				Bun.env.OMP_OPERATIONAL_AWS_CONFIG_FILE = "/tmp/launcher-aws-config";
-				const settings = Settings.isolated({ "identity.entra.enabled": enabled });
-				const result = await ensureCoreforgeIdentityAtStartup(settings, {
-					interactive: false,
-					createStore: () => new CoreforgeIdentityStore(path.join(dir, `agent-${enabled}.db`)),
-				});
-				expect(result.notices).toEqual([]);
-				expect(Bun.env.AWS_PROFILE).toBe("employee-operations");
-				expect(Bun.env.AWS_REGION).toBe("eu-west-1");
-				expect(Bun.env.AWS_ACCESS_KEY_ID).toBe("AKIA-LAUNCHER");
-				expect(Bun.env.AWS_SECRET_ACCESS_KEY).toBe("launcher-secret");
-				expect(Bun.env.AWS_SESSION_TOKEN).toBe("launcher-session");
-				expect(Bun.env.AWS_CONFIG_FILE).toBe("/tmp/launcher-aws-config");
-				const trustedChild = filterTrustedChildShellEnv(Bun.env, dir);
-				expect(trustedChild.AWS_PROFILE).toBe("employee-operations");
-				expect(trustedChild.AWS_REGION).toBe("eu-west-1");
-				expect(trustedChild.AWS_ACCESS_KEY_ID).toBe("AKIA-LAUNCHER");
-				expect(trustedChild.AWS_SECRET_ACCESS_KEY).toBe("launcher-secret");
-				expect(trustedChild.AWS_SESSION_TOKEN).toBe("launcher-session");
-				expect(trustedChild.AWS_CONFIG_FILE).toBe("/tmp/launcher-aws-config");
-				expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("managed-dotenv-profile");
-				expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
-				const child = filterChildShellEnv(Bun.env);
-				expect(child[AWS_MODEL_PROFILE_ENV]).toBeUndefined();
-				expect(child[AWS_MODEL_REGION_ENV]).toBeUndefined();
-				expect(Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET).toBeUndefined();
-				expect(Bun.env.OMP_OPERATIONAL_AWS_REGION_SET).toBeUndefined();
-			}
+			const result = await ensureCoreforgeIdentityAtStartup(identitySettings(), {
+				interactive: true,
+				isTty: () => true,
+				createStore: () => new CoreforgeIdentityStore(path.join(dir, "agent.db")),
+			});
+
+			expect(result.notices).toEqual(["Coreforge sign-in required: run `coreforge identity login`."]);
 		} finally {
-			for (const [key, value] of Object.entries(previous)) {
-				if (value === undefined) delete Bun.env[key];
-				else Bun.env[key] = value;
-			}
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -305,23 +235,13 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 	});
 
 	it("injects the signed-in profile's adopted AWS identity through the store-bound loader", async () => {
-		// Regression: managed .env loading must not replace the shell context
-		// captured by the Coreforge launcher before engine startup.
 		const previousOperationalEnv = {
 			AWS_PROFILE: Bun.env.AWS_PROFILE,
 			AWS_REGION: Bun.env.AWS_REGION,
-			OMP_OPERATIONAL_AWS_PROFILE_SET: Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET,
-			OMP_OPERATIONAL_AWS_PROFILE: Bun.env.OMP_OPERATIONAL_AWS_PROFILE,
-			OMP_OPERATIONAL_AWS_REGION_SET: Bun.env.OMP_OPERATIONAL_AWS_REGION_SET,
-			OMP_OPERATIONAL_AWS_REGION: Bun.env.OMP_OPERATIONAL_AWS_REGION,
 		};
 		const previousKey = Bun.env.AWS_BEARER_TOKEN_BEDROCK;
 		Bun.env.AWS_PROFILE = "adopted-model-inference";
 		Bun.env.AWS_REGION = "us-east-1";
-		Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET = "1";
-		Bun.env.OMP_OPERATIONAL_AWS_PROFILE = "employee-operations";
-		Bun.env.OMP_OPERATIONAL_AWS_REGION_SET = "1";
-		Bun.env.OMP_OPERATIONAL_AWS_REGION = "eu-west-1";
 		Bun.env.AWS_BEARER_TOKEN_BEDROCK = "bedrock-stale";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
@@ -355,6 +275,7 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 				"identity.entra.authorityHost": "login.microsoftonline.com",
 				"identity.aws.profile": "model-inference",
 				"identity.aws.region": "us-east-1",
+				"identity.aws.ssoAccountId": "891455110252",
 				"identity.claude.workspaceId": "wrkspc_test",
 				"identity.claude.baseUrl": "https://aws-external-anthropic.us-east-1.api.aws",
 			});
@@ -362,15 +283,10 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 				interactive: false,
 				createStore: () => store,
 			});
-			// The adopted inference profile is isolated while the employee's
-			// operational AWS profile remains available to CLI and MCP tools.
-			expect(Bun.env.AWS_PROFILE).toBe("employee-operations");
-			expect(Bun.env.AWS_REGION).toBe("eu-west-1");
-			expect(Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET).toBeUndefined();
-			expect(Bun.env.OMP_OPERATIONAL_AWS_PROFILE).toBeUndefined();
 			expect(Bun.env[AWS_MODEL_AUTH_MODE_ENV]).toBe(MANAGED_AWS_MODEL_AUTH_MODE);
 			expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("adopted-model-inference");
 			expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
+			expect(Bun.env[AWS_MODEL_ACCOUNT_ID_ENV]).toBe("891455110252");
 			expect(Bun.env.ANTHROPIC_BASE_URL).toBe("https://aws-external-anthropic.us-east-1.api.aws");
 			// Stale ambient Bedrock bearer credentials cannot bypass the managed
 			// profile, but their removal is not surfaced as a startup warning.
@@ -388,15 +304,11 @@ describe("ensureCoreforgeIdentityAtStartup store failure", () => {
 	});
 });
 
-describe("ensureCoreforgeIdentityAtStartup AWS refresh", () => {
-	it("revalidates AWS SSO on interactive startup and stores the resolved profile", async () => {
+describe("ensureCoreforgeIdentityAtStartup managed AWS lifecycle", () => {
+	it("does not validate AWS SSO on interactive startup", async () => {
 		const previousProfile = Bun.env.AWS_PROFILE;
 		const previousBaseUrl = Bun.env.ANTHROPIC_BASE_URL;
-		const previousCapturedProfile = Bun.env.OMP_OPERATIONAL_AWS_PROFILE;
-		const previousCapturedProfileState = Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET;
 		Bun.env.AWS_PROFILE = "adopted-coreforge";
-		Bun.env.OMP_OPERATIONAL_AWS_PROFILE = "adopted-coreforge";
-		Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET = "1";
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cf-startup-"));
 		try {
 			const store = new CoreforgeIdentityStore(path.join(dir, "agent.db"));
@@ -435,47 +347,23 @@ describe("ensureCoreforgeIdentityAtStartup AWS refresh", () => {
 				"identity.claude.workspaceId": "wrkspc_test",
 				"identity.claude.baseUrl": "https://aws-external-anthropic.us-east-1.api.aws",
 			});
-			let refreshes = 0;
 			let recoveryProfile: string | undefined;
-			const result = await ensureCoreforgeIdentityAtStartup(settings, {
+			await ensureCoreforgeIdentityAtStartup(settings, {
 				interactive: true,
 				isTty: () => true,
 				createStore: () => store,
-				ensureAwsSso: async (config, constants) => {
-					refreshes += 1;
-					expect(config.profile).toBe("coreforge");
-					expect(constants?.ssoRoleName).toBe("CoreforgeModelAccess");
-					return {
-						profile: "adopted-coreforge",
-						region: "us-east-1",
-						accountId: "891455110252",
-						roleArn: "arn:aws:sts::891455110252:assumed-role/CoreforgeModelAccess/aidan",
-						validatedAt: 1_700_000_200_000,
-					};
-				},
 				installAwsRecovery: options => {
 					recoveryProfile = options.awsConfig.profile;
 				},
 			});
-			expect(refreshes).toBe(1);
-			expect(result.notices).toContain(
-				"Coreforge isolated its managed inference profile from operational AWS tools; local AWS settings remain authoritative.",
-			);
-			expect(recoveryProfile).toBe("adopted-coreforge");
-			expect(Bun.env.AWS_PROFILE).toBeUndefined();
-			expect(Bun.env.OMP_OPERATIONAL_AWS_PROFILE).toBeUndefined();
-			expect(Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET).toBeUndefined();
-			expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("adopted-coreforge");
+			expect(Bun.env[AWS_MODEL_PROFILE_ENV]).toBe("legacy-name");
 			expect(Bun.env[AWS_MODEL_REGION_ENV]).toBe("us-east-1");
+			expect(recoveryProfile).toBe("legacy-name");
 		} finally {
 			if (previousProfile === undefined) delete Bun.env.AWS_PROFILE;
 			else Bun.env.AWS_PROFILE = previousProfile;
 			if (previousBaseUrl === undefined) delete Bun.env.ANTHROPIC_BASE_URL;
 			else Bun.env.ANTHROPIC_BASE_URL = previousBaseUrl;
-			if (previousCapturedProfile === undefined) delete Bun.env.OMP_OPERATIONAL_AWS_PROFILE;
-			else Bun.env.OMP_OPERATIONAL_AWS_PROFILE = previousCapturedProfile;
-			if (previousCapturedProfileState === undefined) delete Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET;
-			else Bun.env.OMP_OPERATIONAL_AWS_PROFILE_SET = previousCapturedProfileState;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});

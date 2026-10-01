@@ -26,6 +26,8 @@ describe("createAgentSession MCP deferral (B1)", () => {
 	let modelRegistry: ModelRegistry;
 
 	const PENDING_MCP_TOOL = "mcp__pending_connectingtool";
+	const HANGING_MCP_FIXTURE = path.join(import.meta.dir, "fixtures", "hang-during-init-mcp.ts");
+	const BUN_EXEC = process.execPath;
 
 	const baseOptions = () => ({
 		cwd: tempDir,
@@ -91,6 +93,32 @@ describe("createAgentSession MCP deferral (B1)", () => {
 				} satisfies CustomTool,
 			]);
 			expect(session.getToolByName(PENDING_MCP_TOOL)?.label).toBe("Connected MCP tool");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps the prompt session usable while an MCP initialization remains unresolved", async () => {
+		await Bun.write(
+			path.join(tempDir, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					hang: {
+						command: BUN_EXEC,
+						args: [HANGING_MCP_FIXTURE],
+					},
+				},
+			}),
+		);
+		const started = performance.now();
+		const { session } = await createAgentSession({
+			...baseOptions(),
+			hasUI: true,
+			toolNames: ["read"],
+		});
+		try {
+			expect(performance.now() - started).toBeLessThan(5_000);
+			expect(session.getActiveToolNames()).toContain("read");
 		} finally {
 			await session.dispose();
 		}

@@ -77,6 +77,37 @@ describe("MCPManager initial connection ownership", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 	});
 
+	it("aborts an unresolved background initialization during manager disposal", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connectStarted = Promise.withResolvers<void>();
+		const abortObserved = Promise.withResolvers<void>();
+		const pending = Promise.withResolvers<MCPServerConnection>();
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation((_name, _config, options) => {
+			connectStarted.resolve();
+			options?.signal?.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+			return pending.promise;
+		});
+
+		const loading = manager.connectServers({ server: CONFIG }, {});
+		await connectStarted.promise;
+		await manager.disconnectAll();
+		await abortObserved.promise;
+		pending.reject(new Error("aborted"));
+		await loading;
+	});
+
+	it("closes and forgets a connection whose initial tools/list fails", async () => {
+		const manager = new MCPManager(process.cwd());
+		const failed = fakeConnection("server");
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(failed.connection);
+		vi.spyOn(mcpClient, "listTools").mockRejectedValue(new Error("initial tools/list failed"));
+
+		const result = await manager.connectServers({ server: CONFIG }, {});
+
+		expect(result.errors.get("server")).toBe("initial tools/list failed");
+		expect(failed.transport.closeCalls).toBe(1);
+		expect(manager.getConnectedServers()).toEqual([]);
+	});
 	it("recovers tools after an initial handshake timeout", async () => {
 		const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-initial-recovery-"));
 		const manager = new MCPManager(workDir);

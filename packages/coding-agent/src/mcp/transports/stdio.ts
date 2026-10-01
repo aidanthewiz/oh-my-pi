@@ -9,9 +9,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	filterChildShellEnv,
-	filterTrustedChildShellEnv,
 	filterUserMcpChildEnv,
+	getOperationalAwsLaunchMetadata,
 	getProjectDir,
+	getReservedManagedAwsProfiles,
 	readJsonl,
 } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
@@ -575,6 +576,7 @@ export class StdioTransport implements MCPTransport {
 		private credentialPolicy: {
 			preserveExplicitCredentials?: boolean;
 			preserveOperationalAws?: boolean;
+			operationalAwsProfiles?: readonly string[];
 		} = {},
 	) {}
 
@@ -590,10 +592,26 @@ export class StdioTransport implements MCPTransport {
 
 		const cwd = this.config.cwd ?? getProjectDir();
 		const env = this.credentialPolicy.preserveOperationalAws
-			? filterTrustedChildShellEnv(Bun.env, cwd, this.config.env)
+			? filterChildShellEnv(Bun.env, cwd, this.config.env)
 			: this.credentialPolicy.preserveExplicitCredentials
 				? filterUserMcpChildEnv(Bun.env, cwd, this.config.env)
 				: filterChildShellEnv(Bun.env, cwd, this.config.env);
+		if (this.credentialPolicy.preserveOperationalAws) {
+			env.OMP_OPERATIONAL_AWS_RESERVED_PROFILES = getReservedManagedAwsProfiles().join("\n");
+			if (this.credentialPolicy.operationalAwsProfiles) {
+				env.OMP_OPERATIONAL_AWS_PROFILES = this.credentialPolicy.operationalAwsProfiles.join("\n");
+			}
+			const metadata = getOperationalAwsLaunchMetadata();
+			if (metadata) {
+				if (metadata.configFile) env.OMP_OPERATIONAL_AWS_CONFIG_FILE = metadata.configFile;
+				if (metadata.sharedCredentialsFile)
+					env.OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE = metadata.sharedCredentialsFile;
+				if (metadata.profile) env.OMP_OPERATIONAL_AWS_PROFILE = metadata.profile;
+				if (metadata.region) env.OMP_OPERATIONAL_AWS_REGION = metadata.region;
+				if (metadata.executable) env.OMP_OPERATIONAL_AWS_EXECUTABLE = metadata.executable;
+				env.OMP_OPERATIONAL_AWS_HOME_DIRECTORY = metadata.homeDirectory;
+			}
+		}
 		const spawnCommand = await resolveStdioSpawnCommand(this.config, {
 			cwd,
 			env,
@@ -972,7 +990,11 @@ export class StdioTransport implements MCPTransport {
  */
 export async function createStdioTransport(
 	config: MCPStdioServerConfig,
-	options?: { preserveExplicitCredentials?: boolean; preserveOperationalAws?: boolean },
+	options?: {
+		preserveExplicitCredentials?: boolean;
+		preserveOperationalAws?: boolean;
+		operationalAwsProfiles?: readonly string[];
+	},
 ): Promise<StdioTransport> {
 	const transport = new StdioTransport(config, options);
 	try {

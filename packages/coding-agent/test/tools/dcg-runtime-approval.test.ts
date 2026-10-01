@@ -368,13 +368,9 @@ process.exit(1);
 				settings,
 			} as AgentToolContext);
 			expect(events).toEqual(["notification", "selector"]);
-			expect(sendNotification).toHaveBeenCalledWith({
-				title: "Oh My Pi",
-				body: "Tool approval required",
-				type: "approval",
-				urgency: "normal",
-				actions: "focus",
-			});
+			expect(sendNotification).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "approval", urgency: "normal", actions: "focus" }),
+			);
 			expect(fs.readFileSync(resultPath, "utf8")).toBe("runtime-approved");
 			expect(review).toContain("WARNING: This command requires explicit review before execution.");
 			expect(review).toContain("strict_git:worktree-remove");

@@ -148,7 +148,8 @@ const projectEnvNamesLoadedByOmp = new Set<string>();
 const managedAgentEnvNames = new Set<string>();
 const managedAgentEnvValues = new Set<string>();
 
-function isCoreforgeManagedLaunch(): boolean {
+/** A Linux procfs launch snapshot exists even for ordinary CLI launches; only these captured markers require pinned AWS tools. */
+export function isCoreforgeManagedLaunch(): boolean {
 	const override = launchEnvValues?.get(managedEnvName("OMP_DOTENV_OVERRIDE"));
 	const productVersion = launchEnvValues?.get(managedEnvName("OMP_CF_PRODUCT_VERSION"));
 	return override === "1" && productVersion !== undefined && productVersion.trim() !== "";
@@ -204,6 +205,79 @@ export const OPERATIONAL_AWS_ENV_NAMES = [
 	"AMAZON_SECRET_ACCESS_KEY",
 	"AMAZON_SESSION_TOKEN",
 ] as const;
+
+/**
+ * Operational AWS metadata names captured before managed setup and repository
+ * dotenv processing. Values are never credentials.
+ */
+export const OPERATIONAL_AWS_LAUNCH_ENV_NAMES = [
+	"OMP_OPERATIONAL_AWS_CONFIG_FILE",
+	"OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE",
+	"OMP_OPERATIONAL_AWS_PROFILE",
+	"OMP_OPERATIONAL_AWS_REGION",
+	"OMP_OPERATIONAL_AWS_EXECUTABLE",
+	"OMP_OPERATIONAL_AWS_HOME_DIRECTORY",
+	"OMP_OPERATIONAL_AWS_RESERVED_PROFILES",
+] as const;
+
+export interface OperationalAwsLaunchMetadata {
+	configFile?: string;
+	sharedCredentialsFile?: string;
+	profile?: string;
+	region?: string;
+	executable?: string;
+	homeDirectory: string;
+}
+
+let reservedManagedAwsProfiles: readonly string[] = Object.freeze(["coreforge"]);
+
+export function reserveManagedAwsProfile(profile: string): void {
+	if (profile && !reservedManagedAwsProfiles.includes(profile)) {
+		reservedManagedAwsProfiles = Object.freeze([...reservedManagedAwsProfiles, profile]);
+	}
+}
+
+export function getReservedManagedAwsProfiles(): readonly string[] {
+	return reservedManagedAwsProfiles;
+}
+
+function launchValue(name: (typeof OPERATIONAL_AWS_LAUNCH_ENV_NAMES)[number]): string | undefined {
+	const value = launchEnvValues?.get(managedEnvName(name))?.trim();
+	return value || undefined;
+}
+
+/**
+ * Return immutable launch provenance for operational AWS routes.
+ *
+ * Deliberately consults the process-launch snapshot rather than `Bun.env`:
+ * repository dotenv files can otherwise manufacture an `OMP_OPERATIONAL_*`
+ * value after launch and redirect a privileged native invocation.
+ */
+const operationalAwsLaunchMetadata: Readonly<OperationalAwsLaunchMetadata> | undefined = (() => {
+	if (!launchEnvValues) return undefined;
+	const homeDirectory =
+		launchValue("OMP_OPERATIONAL_AWS_HOME_DIRECTORY") ||
+		(process.platform === "win32"
+			? launchEnvValues.get(managedEnvName("USERPROFILE"))?.trim() ||
+				launchEnvValues.get(managedEnvName("HOME"))?.trim()
+			: launchEnvValues.get(managedEnvName("HOME"))?.trim() ||
+				launchEnvValues.get(managedEnvName("USERPROFILE"))?.trim()) ||
+		os.userInfo().homedir;
+	const awsDir = path.join(homeDirectory, ".aws");
+	return Object.freeze({
+		configFile: launchValue("OMP_OPERATIONAL_AWS_CONFIG_FILE") ?? path.join(awsDir, "config"),
+		sharedCredentialsFile:
+			launchValue("OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE") ?? path.join(awsDir, "credentials"),
+		profile: launchValue("OMP_OPERATIONAL_AWS_PROFILE"),
+		region: launchValue("OMP_OPERATIONAL_AWS_REGION"),
+		executable: launchValue("OMP_OPERATIONAL_AWS_EXECUTABLE"),
+		homeDirectory,
+	});
+})();
+
+export function getOperationalAwsLaunchMetadata(): Readonly<OperationalAwsLaunchMetadata> | undefined {
+	return operationalAwsLaunchMetadata;
+}
 const operationalAwsEnvNames = new Set<string>(OPERATIONAL_AWS_ENV_NAMES.map(managedEnvName));
 const trustedOperationalAwsValues = new Map<string, string>();
 const CREDENTIAL_ENV_NAMES = new Set(
@@ -268,11 +342,7 @@ export function registerChildEnvRedactions(names: Iterable<string>, values: Iter
 	}
 }
 
-/**
- * Record exact launcher-captured AWS values. Trusted child modes may preserve
- * only these values when a repository dotenv assignment is indistinguishable
- * from Bun's preloaded environment on platforms without launch provenance.
- */
+/** Record exact launcher-captured AWS values for trusted child environment provenance. */
 export function registerOperationalAwsEnvProvenance(entries: Iterable<readonly [string, string | undefined]>): void {
 	for (const [name, value] of entries) {
 		const normalized = managedEnvName(name);
@@ -358,7 +428,15 @@ function filterChildShellEnvInternal(
 ): Record<string, string> {
 	const protectedValues = new Set(managedAgentEnvValues);
 	for (const [key, value] of Object.entries(env)) {
-		if (value && hasCredentialValue(key)) protectedValues.add(value);
+		const name = managedEnvName(key);
+		// Routing selectors must not erase unrelated variables with the same ordinary value.
+		if (
+			value &&
+			name !== "OMP_OPERATIONAL_AWS_PROFILE" &&
+			name !== "OMP_OPERATIONAL_AWS_REGION" &&
+			hasCredentialValue(key)
+		)
+			protectedValues.add(value);
 	}
 	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);

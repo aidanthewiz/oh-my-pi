@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { spawn } from "@oh-my-pi/pi-utils/ptree";
+import { exec, spawn } from "@oh-my-pi/pi-utils/ptree";
 
 describe("ptree.ChildProcess.bytes()", () => {
 	// Regression for https://github.com/can1357/oh-my-pi/issues/3712:
@@ -24,4 +24,18 @@ describe("ptree.ChildProcess.bytes()", () => {
 		expect(bytes.indexOf(0)).toBe(-1);
 		expect(bytes.subarray(0, 4)).toEqual(new Uint8Array([0x61, 0x61, 0x61, 0x61]));
 	});
+});
+
+it("caps retained stdout while draining the producer through normal exit", async () => {
+	const result = await exec(
+		[process.execPath, "-e", 'process.stdout.write("x".repeat(2_000_000), () => process.stderr.write("drained"))'],
+		{
+			maxOutputBytes: 1024,
+			timeout: 5000,
+		},
+	);
+	expect(result.stdout).toBe("x".repeat(1024));
+	expect(result.stdoutTruncated).toBe(true);
+	expect(result.stderr).toBe("drained");
+	expect(result.exitCode).toBe(0);
 });
