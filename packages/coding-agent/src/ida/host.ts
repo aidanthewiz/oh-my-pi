@@ -5,8 +5,8 @@
  * lists it as `omp.ida.<id>`. The host listens on its endpoint first, then takes the IDB lock and
  * opens the database in an {@link IdaWorker}; every omp process in the project shares that worker
  * over NDJSON ({@link IdaHostRequest}). The host exits once the worker does (`close`, idle close,
- * crash). SIGTERM (broker shutdown after the last omp process leaves, `omp ps stop`) closes the
- * worker first, saving when it has unsaved changes.
+ * crash). SIGTERM (broker shutdown after the last omp process leaves, `omp ps stop`) drains
+ * accepted requests before closing the worker and saving any unsaved changes.
  */
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -32,7 +32,7 @@ const OPEN_FAILED_LINGER_MS = 10_000;
 /** Budget for a `flush` save. */
 const FLUSH_TIMEOUT_MS = 120_000;
 
-class IdaHost {
+export class IdaHost {
 	readonly #config: IdaHostConfig;
 	readonly #startedAt = Date.now();
 	readonly #opening: Promise<IdaWorker>;
@@ -43,6 +43,7 @@ class IdaHost {
 	/** The open worker; cleared once it exits. */
 	#worker: IdaWorker | undefined;
 	#stopping: Promise<void> | undefined;
+	#closing = false;
 
 	constructor(config: IdaHostConfig) {
 		this.#config = config;
@@ -83,14 +84,19 @@ class IdaHost {
 		return code === 0 ? 0 : 1;
 	}
 
-	/** Close the worker (saving unsaved changes), let pending requests answer, then stop listening. */
+	/** Drain accepted requests, save and close the worker, then stop listening. */
 	shutdown(): Promise<void> {
-		this.#stopping ??= this.#stop();
+		if (!this.#stopping) {
+			this.#closing = true;
+			this.#stopping = this.#stop();
+		}
 		return this.#stopping;
 	}
 
 	async #stop(): Promise<void> {
-		const worker = this.#worker;
+		await Promise.all(this.#inflight);
+		// Opening may still be in progress when shutdown starts without any active requests.
+		const worker = await this.#opening.catch(() => undefined);
 		this.#worker = undefined;
 		if (worker) {
 			try {
@@ -99,7 +105,6 @@ class IdaHost {
 				logger.warn("IDA host close failed", { id: this.#config.loc.id, error: errorMessage(error) });
 			}
 		}
-		await Promise.all(this.#inflight);
 		const server = this.#server;
 		this.#server = undefined;
 		if (server) {
@@ -160,6 +165,10 @@ class IdaHost {
 	}
 
 	#accept(socket: net.Socket): void {
+		if (this.#closing) {
+			socket.end();
+			return;
+		}
 		this.#sockets.add(socket);
 		// This connection's pending `call`s, aborted by `cancel` or when the connection drops.
 		const calls = new Map<number, AbortController>();
@@ -180,19 +189,27 @@ class IdaHost {
 				calls.get(request.target)?.abort();
 				return;
 			}
-			const handled = this.#handle(request, calls).then(
-				result => writeFrame(socket, { id: request.id, ok: true, result }),
-				error => writeFrame(socket, { id: request.id, ok: false, error: errorMessage(error) }),
-			);
+			if (this.#closing) return;
+			if (request.op === "call" && calls.has(request.id)) {
+				writeFrame(socket, { id: request.id, ok: false, error: "IDA call ID is already pending" });
+				return;
+			}
+			const controller = request.op === "call" ? new AbortController() : undefined;
+			if (controller) calls.set(request.id, controller);
+			const handled = this.#handle(request, controller)
+				.then(
+					result => writeFrame(socket, { id: request.id, ok: true, result }),
+					error => writeFrame(socket, { id: request.id, ok: false, error: errorMessage(error) }),
+				)
+				.finally(() => {
+					if (controller) calls.delete(request.id);
+				});
 			this.#inflight.add(handled);
 			void handled.finally(() => this.#inflight.delete(handled));
 		});
 	}
 
-	async #handle(
-		request: Exclude<IdaHostRequest, { op: "cancel" }>,
-		calls: Map<number, AbortController>,
-	): Promise<unknown> {
+	async #handle(request: Exclude<IdaHostRequest, { op: "cancel" }>, controller?: AbortController): Promise<unknown> {
 		switch (request.op) {
 			case "ping":
 				return "pong";
@@ -203,16 +220,10 @@ class IdaHost {
 				return this.#status();
 			case "call": {
 				const worker = await this.#liveWorker();
-				const controller = new AbortController();
-				calls.set(request.id, controller);
-				try {
-					return await worker.request(request.method, request.params, {
-						signal: controller.signal,
-						timeoutMs: request.timeoutMs,
-					});
-				} finally {
-					calls.delete(request.id);
-				}
+				return worker.request(request.method, request.params, {
+					signal: controller?.signal,
+					timeoutMs: request.timeoutMs,
+				});
 			}
 			case "flush": {
 				const worker = await this.#liveWorker();
@@ -231,7 +242,7 @@ class IdaHost {
 	async #liveWorker(): Promise<IdaWorker> {
 		await this.#opening;
 		const worker = this.#worker;
-		if (!worker || this.#stopping) throw new ToolError(`IDA database ${this.#config.loc.id} is closing`);
+		if (!worker) throw new ToolError(`IDA database ${this.#config.loc.id} is closing`);
 		return worker;
 	}
 }
