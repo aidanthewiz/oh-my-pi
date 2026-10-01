@@ -71,7 +71,7 @@ const references: Record<string, unknown> = {
 	"mapping.json": {
 		SDK: {
 			Python: {
-				Boto3: Object.fromEntries(["s3", "ce", "logs", "ec2", "rds"].map(service => [service, { service }])),
+				Boto3: Object.fromEntries(["s3", "ce", "logs", "ec2", "rds", "sqs"].map(service => [service, { service }])),
 			},
 		},
 	},
@@ -81,6 +81,14 @@ const references: Record<string, unknown> = {
 		Operations: [
 			operation("ListBuckets", "s3", "list_buckets", ["s3", "ListAllMyBuckets"]),
 			operation("DeleteBucket", "s3", "delete_bucket", ["s3", "DeleteBucket"]),
+		],
+	},
+	"sqs/sqs.json": {
+		Name: "sqs",
+		Actions: [action("ReceiveMessage"), action("GetQueueAttributes")],
+		Operations: [
+			operation("ReceiveMessage", "sqs", "receive_message", ["sqs", "ReceiveMessage"]),
+			operation("GetQueueAttributes", "sqs", "get_queue_attributes", ["sqs", "GetQueueAttributes"]),
 		],
 	},
 	"ce/ce.json": {
@@ -297,6 +305,38 @@ await assert.rejects(
 		),
 	/requires approval but no interactive UI/,
 );
+const queueUrl = "https://sqs.us-east-1.amazonaws.com/123456789012/fixture";
+const queueAttributes = {
+	...read,
+	service: "sqs",
+	operation: "get-queue-attributes",
+	parameters: { QueueUrl: queueUrl, AttributeNames: ["All"] },
+};
+assert.equal(await tool.prepareRuntimeApproval("queue-attributes", queueAttributes), undefined);
+assert.equal(tool.approval(queueAttributes), "read");
+await tool.execute("queue-attributes", queueAttributes);
+const queueReceive = {
+	...read,
+	service: "sqs",
+	operation: "receive-message",
+	parameters: { QueueUrl: queueUrl },
+};
+const beforeReceive = (await calls()).filter(call => call.argv.includes("receive-message")).length;
+assert.match((await tool.prepareRuntimeApproval("queue-receive", queueReceive))!.prompt, /Account: 123456789012/);
+assert.equal(tool.approval(queueReceive), "exec");
+await assert.rejects(() => tool.execute("queue-receive", queueReceive), /approval/);
+await assert.rejects(
+	() =>
+		wrappedWrite.execute(
+			"first-queue-receive",
+			{ path: "xd://aws", content: JSON.stringify(queueReceive) },
+			undefined,
+			undefined,
+			writeContext,
+		),
+	/requires approval but no interactive UI/,
+);
+assert.equal((await calls()).filter(call => call.argv.includes("receive-message")).length, beforeReceive);
 const mutation = {
 	...read,
 	service: "ec2",
