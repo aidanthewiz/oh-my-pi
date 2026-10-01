@@ -218,6 +218,33 @@ try {
 } finally {
 	globalThis.fetch = referenceFetch;
 }
+const referenceStarted = Promise.withResolvers<void>();
+const releaseReference = Promise.withResolvers<void>();
+globalThis.fetch = Object.assign(
+	async () => {
+		referenceStarted.resolve();
+		await releaseReference.promise;
+		return new Response("unavailable", { status: 503 });
+	},
+	{ preconnect: referenceFetch.preconnect },
+);
+let cancelledReference: Promise<string> | undefined;
+try {
+	const controller = new AbortController();
+	cancelledReference = new AwsTool(toolSession)
+		.prepareRuntimeApproval("cancelled-reference", { ...read, service: "logs" }, controller.signal)
+		.then(
+			() => "completed",
+			error => (error instanceof Error ? error.name : String(error)),
+		);
+	await referenceStarted.promise;
+	controller.abort();
+	assert.equal(await Promise.race([cancelledReference, Bun.sleep(500).then(() => "late")]), "AbortError");
+} finally {
+	releaseReference.resolve();
+	await cancelledReference;
+	globalThis.fetch = referenceFetch;
+}
 const mutation = {
 	...read,
 	service: "ec2",

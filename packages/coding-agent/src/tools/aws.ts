@@ -497,7 +497,12 @@ class AwsOperationAccess {
 	#cache = new Map<string, { value: unknown; expiresAt: number }>();
 	#pending = new Map<string, Promise<unknown>>();
 
-	async #load<T>(path: string, parse: (value: unknown) => T | undefined): Promise<T | undefined> {
+	async #load<T>(
+		path: string,
+		parse: (value: unknown) => T | undefined,
+		signal?: AbortSignal,
+	): Promise<T | undefined> {
+		signal?.throwIfAborted();
 		const cached = this.#cache.get(path);
 		if (cached && cached.expiresAt > Date.now()) return cached.value as T | undefined;
 		let pending = this.#pending.get(path) as Promise<T | undefined> | undefined;
@@ -522,18 +527,22 @@ class AwsOperationAccess {
 			});
 			this.#pending.set(path, pending);
 		}
-		return pending;
+		return untilAborted(signal, pending);
 	}
 
-	async isRead(service: string, operation: string): Promise<boolean> {
+	async isRead(service: string, operation: string, signal?: AbortSignal): Promise<boolean> {
 		const sdkService = service === "s3api" ? "s3" : service;
-		const mapping = await this.#load("mapping.json", value =>
-			awsRecord(awsRecord(awsRecord(awsRecord(value)?.SDK)?.Python)?.Boto3),
+		const mapping = await this.#load(
+			"mapping.json",
+			value => awsRecord(awsRecord(awsRecord(awsRecord(value)?.SDK)?.Python)?.Boto3),
+			signal,
 		);
 		const referenceService = awsRecord(mapping?.[sdkService])?.service;
 		if (typeof referenceService !== "string" || !COMMAND_NAME_RE.test(referenceService)) return false;
-		const reference = await this.#load(`${referenceService}/${referenceService}.json`, value =>
-			parseAwsServiceReference(value, referenceService),
+		const reference = await this.#load(
+			`${referenceService}/${referenceService}.json`,
+			value => parseAwsServiceReference(value, referenceService),
+			signal,
 		);
 		const authorized = reference?.operations.get(`${sdkService}\0${operation.replaceAll("-", "_")}`);
 		if (!authorized?.length) return false;
@@ -542,8 +551,10 @@ class AwsOperationAccess {
 				const source =
 					action.service === referenceService
 						? reference
-						: await this.#load(`${action.service}/${action.service}.json`, value =>
-								parseAwsServiceReference(value, action.service),
+						: await this.#load(
+								`${action.service}/${action.service}.json`,
+								value => parseAwsServiceReference(value, action.service),
+								signal,
 							);
 				return source?.actions.get(action.name) === true;
 			}),
@@ -1041,7 +1052,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const mutation =
 			!login &&
 			!isAwsIdentityProbe(params.service, params.operation) &&
-			!(await this.#access.isRead(params.service, params.operation));
+			!(await this.#access.isRead(params.service, params.operation, signal));
 		this.#classifications.set(`${params.service}\0${params.operation}`, {
 			read: !mutation,
 			expiresAt: Date.now() + AWS_REFERENCE_TTL_MS,
