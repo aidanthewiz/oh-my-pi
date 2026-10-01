@@ -5012,6 +5012,18 @@ export class AgentSession implements SettingsScope {
 		}
 		return this.#sessionTransitionScope;
 	}
+	/** Keep the owner stable until paid warm usage settles; reject if cancellation does not finish. */
+	async #drainCacheWarmerForTransition(): Promise<void> {
+		if (!this.#cacheWarmer) return;
+		const timeout = new Error("Timed out draining cache warmer before session transition");
+		try {
+			await withTimeout(this.#cacheWarmer.drain(), POST_PROMPT_DRAIN_TIMEOUT_MS, timeout);
+		} catch (error) {
+			if (error !== timeout) throw error;
+			logger.warn("Cache warmer still draining at session transition deadline", { error: String(error) });
+			throw error;
+		}
+	}
 
 	/** Register cleanup that runs when this AgentSession adopts a different session ID. */
 	registerSessionChangeCallback(callback: () => void): () => void {
@@ -5583,7 +5595,7 @@ export class AgentSession implements SettingsScope {
 		// after the boundary and re-enter the supposedly empty context. The
 		// sibling boundary op (branchFromBtw) guards on the same predicates.
 		if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
@@ -9019,7 +9031,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 
@@ -9156,7 +9168,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async fork(): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
@@ -10413,7 +10425,7 @@ export class AgentSession implements SettingsScope {
 		},
 	): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -10784,7 +10796,7 @@ export class AgentSession implements SettingsScope {
 		cancelled: boolean;
 	}> {
 		using _transition = this.#beginSessionTransition();
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		const previousSessionFile = this.sessionFile;
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
@@ -10893,7 +10905,7 @@ export class AgentSession implements SettingsScope {
 		sessionId: string,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
 		using _transition = this.#beginSessionTransition();
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		const previousSessionFile = this.sessionFile;
 		if (!this.sessionManager.getSessionFile()) {
 			throw new Error("Cannot branch /btw: session is not persisted");
@@ -11086,7 +11098,7 @@ export class AgentSession implements SettingsScope {
 		askReanswerCommitted?: boolean;
 	}> {
 		using _transition = this.#beginSessionTransition();
-		await this.#cacheWarmer?.drain();
+		await this.#drainCacheWarmerForTransition();
 		await this.#bash.flushPending();
 		const oldLeafId = this.sessionManager.getLeafId();
 

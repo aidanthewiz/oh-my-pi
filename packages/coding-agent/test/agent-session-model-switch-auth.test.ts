@@ -188,9 +188,11 @@ describe("AgentSession model switch auth pre-flight", () => {
 		s.startCacheWarming(model, { messages: [] }, {});
 		expect(s.cacheWarmingStatus?.state).toBe("scheduled");
 		const switched = s.newSession();
-		vi.advanceTimersByTime(270_000);
 		vi.useRealTimers();
 		expect(await switched).toBe(true);
+		vi.useFakeTimers();
+		vi.advanceTimersByTime(270_000);
+		vi.useRealTimers();
 		expect(replays).toBe(0);
 		expect(s.cacheWarmingStatus?.state).toBe("inactive");
 	});
@@ -254,6 +256,91 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
 		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
 			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
+		]);
+		await old.close();
+	});
+
+	it("keeps the original session and branch until a cancelled paid replay finally reports usage", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		const usage: AssistantMessage["usage"] = {
+			input: 1,
+			output: 0,
+			cacheRead: 100_000,
+			cacheWrite: 0,
+			totalTokens: 100_001,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage,
+			stopReason: "aborted",
+		};
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const warmer = new CacheWarmer({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(partial),
+			}),
+			getPromptTokens: () => usage.totalTokens,
+			getMode: () => "idle",
+		});
+		const manager = SessionManager.create(sharedDir.path(), path.join(sharedDir.path(), "sessions"));
+		const ownerLeaf = manager.appendMessage({
+			...partial,
+			content: [{ type: "text", text: "prior response" }],
+			stopReason: "stop",
+		});
+		const originalId = manager.getSessionId();
+		const originalFile = manager.getSessionFile();
+		const s = makeSession(model, undefined, warmer, manager);
+		vi.useFakeTimers();
+		try {
+			s.startCacheWarming(model, { messages: [] }, {});
+			vi.advanceTimersByTime(270_000);
+			await accepted.promise;
+
+			let settled = false;
+			const outcome = s.newSession().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			void outcome.then(() => {
+				settled = true;
+			});
+			vi.advanceTimersByTime(4_999);
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			expect(manager.getSessionId()).toBe(originalId);
+			vi.advanceTimersByTime(1);
+			expect(await outcome).toHaveProperty("message", "Timed out draining cache warmer before session transition");
+			expect(manager.getSessionId()).toBe(originalId);
+			expect(s.isSessionTransitioning).toBe(false);
+		} finally {
+			vi.useRealTimers();
+			release.resolve();
+		}
+		await warmer.drain();
+		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ parentId: ownerLeaf, purpose: "cache-warm", usage: { totalTokens: usage.totalTokens } },
+		]);
+		expect(manager.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(await s.newSession()).toBe(true);
+		expect(manager.getSessionId()).not.toBe(originalId);
+		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);
+		expect(originalFile).toBeDefined();
+		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
+		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ parentId: ownerLeaf, purpose: "cache-warm", usage: { totalTokens: usage.totalTokens } },
 		]);
 		await old.close();
 	});
