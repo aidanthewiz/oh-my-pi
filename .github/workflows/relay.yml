@@ -149,6 +149,16 @@ jobs:
           export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
           bun scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern
 
+      - name: Reclaim completed native build outputs
+        if: needs.prepare.outputs.native_changed == 'true'
+        run: |
+          set -euo pipefail
+          df -h /
+          rm -rf "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
+          BAZEL="$(command -v bazelisk || command -v bazel)"
+          "$BAZEL" --bazelrc="$RUNNER_TEMP/coreforge-bazel.rc" clean --expunge
+          df -h /
+
       - name: Check relay clients
         run: |
           bun --cwd=packages/wire run check
