@@ -142,7 +142,7 @@ export async function embedNativeAddon({
 
 ${embeddedAddonTypedefs}
 
-import archivePath from ${JSON.stringify(`../native/${archiveFilename}`)} with { type: "file" };
+import archivePath from ${JSON.stringify(`./${archiveFilename}`)} with { type: "file" };
 
 export const embeddedAddon = {
 \tplatformTag: ${JSON.stringify(platformTag)},

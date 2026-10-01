@@ -166,7 +166,7 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 			.catch(statError => String(statError));
 		const importState = await fs
 			.readFile(path.join(nativeDir, "embedded-addon.js"), "utf8")
-			.then(source => source.includes(`../native/${archiveFilename}`))
+			.then(source => source.includes(`./${archiveFilename}`))
 			.catch(() => false);
 		console.error(`Native embedding for ${target.id}: ${archive} (${archiveState}); import matches: ${importState}`);
 		throw error;
