@@ -1571,7 +1571,6 @@ export class AgentSession implements SettingsScope {
 		this.#cacheWarmer = config.cacheWarmer;
 		if (config.cacheWarmer) {
 			const warmer = config.cacheWarmer;
-			warmer.onWarmed = (message, extensionOverride) => this.#recordCacheWarmUsage(message, extensionOverride);
 			this.subscribeRunState(state => {
 				if (state === "idle") warmer.onAgentSettled();
 			});
@@ -4906,32 +4905,37 @@ export class AgentSession implements SettingsScope {
 		}
 		const armMessages = this.messages;
 		const armSessionId = this.sessionId;
+		const usageOwner = { sessionId: armSessionId, parentId: this.sessionManager.getLeafId() };
 		const armGeneration = this.#promptGeneration;
 		const armTools = this.agent.state.tools;
 		const armShape = this.#cacheWarmingShape(model);
-		warmer.start({ model, context, options }, () => {
-			// The armed request must still be a prefix of the live messages by
-			// entry identity: appends are fine (tool results mid-run), but a
-			// rewrite, shallow array copy with new objects, compaction, branch,
-			// or session switch invalidates the cache key being warmed.
-			if (
-				this.#isDisposed ||
-				this.#abortInProgress ||
-				this.isSessionTransitioning ||
-				this.sessionId !== armSessionId ||
-				this.#promptGeneration !== armGeneration ||
-				this.agent.state.tools !== armTools
-			)
-				return false;
-			const current = this.messages;
-			if (current.length < armMessages.length) return false;
-			for (let index = 0; index < armMessages.length; index++) {
-				if (current[index] !== armMessages[index]) return false;
-			}
-			// So does anything else the next real request would send differently:
-			// replaying the old shape would keep an entry nobody reads.
-			return this.#cacheWarmingShape(this.model) === armShape;
-		});
+		warmer.start(
+			{ model, context, options },
+			() => {
+				// The armed request must still be a prefix of the live messages by
+				// entry identity: appends are fine (tool results mid-run), but a
+				// rewrite, shallow array copy with new objects, compaction, branch,
+				// or session switch invalidates the cache key being warmed.
+				if (
+					this.#isDisposed ||
+					this.#abortInProgress ||
+					this.isSessionTransitioning ||
+					this.sessionId !== armSessionId ||
+					this.#promptGeneration !== armGeneration ||
+					this.agent.state.tools !== armTools
+				)
+					return false;
+				const current = this.messages;
+				if (current.length < armMessages.length) return false;
+				for (let index = 0; index < armMessages.length; index++) {
+					if (current[index] !== armMessages[index]) return false;
+				}
+				// So does anything else the next real request would send differently:
+				// replaying the old shape would keep an entry nobody reads.
+				return this.#cacheWarmingShape(this.model) === armShape;
+			},
+			(message, extensionOverride) => this.#recordCacheWarmUsage(message, extensionOverride, usageOwner),
+		);
 	}
 
 	/**
@@ -4966,8 +4970,12 @@ export class AgentSession implements SettingsScope {
 		return 0;
 	}
 
-	/** Persist a completed warm request as off-transcript usage so session totals include its cost. */
-	#recordCacheWarmUsage(message: AssistantMessage, extensionOverride: boolean): void {
+	/** Attribute paid warm responses, including canceled replays, to the initiating session and branch. */
+	#recordCacheWarmUsage(
+		message: AssistantMessage,
+		extensionOverride: boolean,
+		owner: { sessionId: string; parentId: string | null },
+	): void {
 		try {
 			this.sessionManager.appendModelUsage(
 				{
@@ -4978,7 +4986,7 @@ export class AgentSession implements SettingsScope {
 					usage: message.usage,
 					stopReason: message.stopReason,
 				},
-				{ sessionId: this.sessionId, parentId: this.sessionManager.getLeafId() },
+				owner,
 			);
 		} catch (error) {
 			logger.debug("Failed to persist cache-warm usage", { error: String(error) });
@@ -5186,7 +5194,6 @@ export class AgentSession implements SettingsScope {
 	beginDispose(): void {
 		this.#isDisposed = true;
 		if (this.#cacheWarmer) {
-			this.#cacheWarmer.onWarmed = undefined;
 			this.#cacheWarmer.cancel();
 		}
 		for (const dispose of this.#disposers.splice(0)) dispose();
@@ -5445,6 +5452,7 @@ export class AgentSession implements SettingsScope {
 			await withTimeout(
 				(async () => {
 					await this.agent.waitForIdle();
+					await this.#cacheWarmer?.drain();
 					await this.#drainInFlightEventHandlers();
 				})(),
 				options.drainTimeoutMs ?? POST_PROMPT_DRAIN_TIMEOUT_MS,
@@ -5575,6 +5583,7 @@ export class AgentSession implements SettingsScope {
 		// after the boundary and re-enter the supposedly empty context. The
 		// sibling boundary op (branchFromBtw) guards on the same predicates.
 		if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
+		await this.#cacheWarmer?.drain();
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
@@ -9010,6 +9019,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
+		await this.#cacheWarmer?.drain();
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 
@@ -9146,6 +9156,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async fork(): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
+		await this.#cacheWarmer?.drain();
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
@@ -10402,6 +10413,7 @@ export class AgentSession implements SettingsScope {
 		},
 	): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
+		await this.#cacheWarmer?.drain();
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -10772,6 +10784,7 @@ export class AgentSession implements SettingsScope {
 		cancelled: boolean;
 	}> {
 		using _transition = this.#beginSessionTransition();
+		await this.#cacheWarmer?.drain();
 		const previousSessionFile = this.sessionFile;
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
@@ -10880,6 +10893,7 @@ export class AgentSession implements SettingsScope {
 		sessionId: string,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
 		using _transition = this.#beginSessionTransition();
+		await this.#cacheWarmer?.drain();
 		const previousSessionFile = this.sessionFile;
 		if (!this.sessionManager.getSessionFile()) {
 			throw new Error("Cannot branch /btw: session is not persisted");
@@ -11072,6 +11086,7 @@ export class AgentSession implements SettingsScope {
 		askReanswerCommitted?: boolean;
 	}> {
 		using _transition = this.#beginSessionTransition();
+		await this.#cacheWarmer?.drain();
 		await this.#bash.flushPending();
 		const oldLeafId = this.sessionManager.getLeafId();
 

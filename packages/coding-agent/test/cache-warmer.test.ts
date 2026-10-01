@@ -62,7 +62,7 @@ function makeMessage(usage: Usage, stopReason: AssistantMessage["stopReason"] = 
 
 type ReplayScript =
 	/** Envelope carries `usage`, then the model starts generating (the warmer cuts it off). */
-	| { kind: "generate"; usage: Usage }
+	| { kind: "generate"; usage: Usage; finalUsage?: Usage }
 	/** The replay completes without generating (e.g. a one-token cap on a non-thinking model). */
 	| { kind: "done"; usage: Usage }
 	/** The provider rejects the replay. */
@@ -90,7 +90,7 @@ function scriptedStream(script: ReplayScript, record: ReplayRecord): CacheWarmSt
 			events.push({ type: "thinking_start", contentIndex: 0, partial });
 			events.push({ type: "thinking_delta", contentIndex: 0, delta: "more thinking", partial });
 		}
-		final = script.kind === "done" ? partial : makeMessage(script.usage, "aborted");
+		final = script.kind === "done" ? partial : makeMessage(script.finalUsage ?? script.usage, "aborted");
 		if (script.kind === "done") events.push({ type: "done", reason: "stop", message: final });
 	}
 	return {
@@ -248,6 +248,19 @@ describe("cache warmer lifecycle", () => {
 		expect(h.replays).toHaveLength(2);
 	});
 
+	test("records settled provider usage after a generated-block cutoff", async () => {
+		const h = harness();
+		h.script = {
+			kind: "generate",
+			usage: makeUsage({}),
+			finalUsage: makeUsage({ cacheRead: PROMPT_TOKENS }),
+		};
+		start(h);
+		await advance(SHORT_DELAY_MS);
+		expect(h.warmed.map(({ message }) => message.usage.cacheRead)).toEqual([PROMPT_TOKENS]);
+		expect(h.warmer.status.state).toBe("scheduled");
+	});
+
 	test("stops after a refresh that re-wrote the prefix instead of reading it", async () => {
 		const h = harness();
 		h.script = { kind: "done", usage: makeUsage({ cacheWrite: PROMPT_TOKENS, output: 1 }) };
@@ -388,6 +401,39 @@ describe("cache warmer lifecycle", () => {
 		expect(slow.replays).toHaveLength(0);
 		await advance(2_000);
 		expect(slow.replays).toHaveLength(1);
+	});
+
+	test("records a paid replay accepted before cancellation without restarting warming", async () => {
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const usage = makeUsage({ cacheRead: PROMPT_TOKENS });
+		const h = harness({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial: makeMessage(usage) } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(makeMessage(usage, "aborted")),
+			}),
+		});
+		start(h);
+		vi.advanceTimersByTime(SHORT_DELAY_MS);
+		await accepted.promise;
+		h.warmer.cancel();
+		const settled = h.warmer.drain();
+		let drained = false;
+		void settled.then(() => {
+			drained = true;
+		});
+		await Promise.resolve();
+		expect(drained).toBe(false);
+		release.resolve();
+		await settled;
+		expect(h.warmed.map(({ message }) => message.usage.totalTokens)).toEqual([usage.totalTokens]);
+		expect(h.warmer.status.state).toBe("inactive");
+		await advance(SHORT_DELAY_MS);
+		expect(h.warmed).toHaveLength(1);
 	});
 
 	test("cancellation while an extension decides cannot start a stale paid replay", async () => {

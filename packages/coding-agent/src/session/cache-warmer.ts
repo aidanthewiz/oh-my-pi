@@ -163,6 +163,10 @@ function price(
 	return calculateCost(model, usage).total;
 }
 
+function reportedTokens(usage: Usage): number {
+	return Math.max(usage.totalTokens, usage.input + usage.output + usage.cacheRead + usage.cacheWrite);
+}
+
 export type CacheWarmingAction = "warm" | "stop";
 
 /** Inputs and outcome of one warm-or-stop decision, as surfaced by the session status. */
@@ -217,6 +221,7 @@ interface ActiveRun extends CacheWarmRequest {
 	nextWarmAt: number;
 	/** Set while a refresh that an extension forced is in flight. */
 	extensionOverride: boolean;
+	onWarmed?: (message: AssistantMessage, extensionOverride: boolean) => void;
 	timer?: NodeJS.Timeout;
 }
 
@@ -246,6 +251,7 @@ export interface CacheWarmerDeps {
  */
 export class CacheWarmer {
 	#run?: ActiveRun;
+	readonly #inFlight = new Set<Promise<void>>();
 	#inactive: CacheWarmingStatus;
 	readonly #deps: CacheWarmerDeps;
 	/** Called with every paid warm response, including one that missed the cache. */
@@ -275,7 +281,7 @@ export class CacheWarmer {
 	}
 
 	/** Keep the prompt cache entry written by `request` warm while `isCurrent` holds. */
-	start(request: CacheWarmRequest, isCurrent: () => boolean): void {
+	start(request: CacheWarmRequest, isCurrent: () => boolean, onWarmed?: CacheWarmer["onWarmed"]): void {
 		this.#clearRun();
 		const mode = this.#deps.getMode();
 		if (mode === "off") {
@@ -306,6 +312,7 @@ export class CacheWarmer {
 		this.#run = {
 			...request,
 			isCurrent,
+			onWarmed,
 			tier,
 			delayMs,
 			startedAt: Date.now(),
@@ -361,6 +368,10 @@ export class CacheWarmer {
 		this.#stop("inactive");
 	}
 
+	/** Wait for accepted replays to report their final usage before their owner changes. */
+	async drain(): Promise<void> {
+		while (this.#inFlight.size > 0) await Promise.allSettled(this.#inFlight);
+	}
 	#delayFor(model: Model<Api>, tier: PromptCacheTier): number | undefined {
 		const seconds = model.promptCache?.[tier];
 		return seconds === undefined ? undefined : getCacheWarmingDelayMs(seconds * 1000);
@@ -401,7 +412,17 @@ export class CacheWarmer {
 			this.#stop(reason);
 			return;
 		}
-		run.timer = setTimeout(() => void this.#refresh(run), Math.max(0, run.nextWarmAt - Date.now()));
+		run.timer = setTimeout(
+			() => {
+				const refresh = this.#refresh(run);
+				this.#inFlight.add(refresh);
+				void refresh.then(
+					() => this.#inFlight.delete(refresh),
+					() => this.#inFlight.delete(refresh),
+				);
+			},
+			Math.max(0, run.nextWarmAt - Date.now()),
+		);
 		run.timer.unref?.();
 	}
 
@@ -451,8 +472,9 @@ export class CacheWarmer {
 
 		run.extensionOverride = extensionOverride;
 		const message = await this.#replay(run);
+		if (message && (reportedTokens(message.usage) > 0 || message.usage.cost.total > 0))
+			(run.onWarmed ?? this.onWarmed)?.(message, extensionOverride);
 		if (this.#run !== run) return;
-		if (message && message.usage.totalTokens > 0) this.onWarmed?.(message, extensionOverride);
 		if (!message || message.stopReason === "error") {
 			this.#stop("refresh failed");
 			return;
@@ -503,7 +525,8 @@ export class CacheWarmer {
 			// Stream failures past acceptance still carry the envelope's usage.
 		}
 		try {
-			await stream.result();
+			const completed = await stream.result();
+			if (!partial || reportedTokens(completed.usage) >= reportedTokens(partial.usage)) partial = completed;
 		} catch {
 			// The deliberate cutoff surfaces as an aborted result.
 		}

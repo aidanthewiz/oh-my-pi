@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from 
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { type Api, type AssistantMessage, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
@@ -57,6 +57,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		initialModel: Model<Api>,
 		roles?: Record<string, string>,
 		cacheWarmer?: CacheWarmer,
+		sessionManager: SessionManager = SessionManager.inMemory(),
 	): AgentSession {
 		const settings = Settings.isolated();
 		if (roles) {
@@ -73,7 +74,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		});
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
 			cacheWarmer,
 			modelRegistry: registry,
@@ -192,6 +193,126 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(await switched).toBe(true);
 		expect(replays).toBe(0);
 		expect(s.cacheWarmingStatus?.state).toBe("inactive");
+	});
+
+	it("charges an accepted warm replay to its original session before switching", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		const usage: AssistantMessage["usage"] = {
+			input: 1,
+			output: 0,
+			cacheRead: 100_000,
+			cacheWrite: 0,
+			totalTokens: 100_001,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage,
+			stopReason: "aborted",
+		};
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const warmer = new CacheWarmer({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(partial),
+			}),
+			getPromptTokens: () => usage.totalTokens,
+			getMode: () => "idle",
+		});
+		const manager = SessionManager.create(sharedDir.path(), path.join(sharedDir.path(), "sessions"));
+		const originalFile = manager.getSessionFile();
+		manager.appendMessage({ role: "user", content: "prefix to keep warm", timestamp: Date.now() });
+		manager.appendMessage({ ...partial, content: [{ type: "text", text: "prior response" }], stopReason: "stop" });
+		const s = makeSession(model, undefined, warmer, manager);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		vi.advanceTimersByTime(270_000);
+		await accepted.promise;
+		const originalId = manager.getSessionId();
+
+		const switching = s.newSession();
+		vi.useRealTimers();
+		const settledBeforeUsage = await Promise.race([switching.then(() => true), Bun.sleep(100).then(() => false)]);
+		const sessionIdBeforeUsage = manager.getSessionId();
+		release.resolve();
+		expect(settledBeforeUsage).toBe(false);
+		expect(sessionIdBeforeUsage).toBe(originalId);
+		expect(await switching).toBe(true);
+		expect(s.sessionManager.getUsageStatistics().cost).toBe(0);
+		expect(originalFile).toBeDefined();
+		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
+		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
+		]);
+		await old.close();
+	});
+
+	it("persists an accepted warm replay before sealing the session on disposal", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		const usage: AssistantMessage["usage"] = {
+			input: 1,
+			output: 0,
+			cacheRead: 100_000,
+			cacheWrite: 0,
+			totalTokens: 100_001,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const response: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage,
+			stopReason: "aborted",
+		};
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const warmer = new CacheWarmer({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial: response } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(response),
+			}),
+			getPromptTokens: () => usage.totalTokens,
+			getMode: () => "idle",
+		});
+		const manager = SessionManager.create(sharedDir.path(), path.join(sharedDir.path(), "sessions"));
+		const originalFile = manager.getSessionFile();
+		manager.appendMessage({ ...response, content: [{ type: "text", text: "prior response" }], stopReason: "stop" });
+		const s = makeSession(model, undefined, warmer, manager);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		vi.advanceTimersByTime(270_000);
+		await accepted.promise;
+
+		s.beginDispose();
+		const closing = s.dispose();
+		release.resolve();
+		vi.useRealTimers();
+		await closing;
+		expect(originalFile).toBeDefined();
+		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
+		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
+		]);
+		await old.close();
 	});
 
 	it("cancels a scheduled paid replay as soon as disposal begins", () => {
