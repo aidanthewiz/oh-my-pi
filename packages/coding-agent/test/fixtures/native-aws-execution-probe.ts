@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
+import { WriteTool } from "../../src/tools/write";
+import type { XdevState } from "../../src/tools/xdev";
 import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection } from "../../src/mcp/types";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -245,6 +247,56 @@ try {
 	await cancelledReference;
 	globalThis.fetch = referenceFetch;
 }
+const firstReadTool = new AwsTool(toolSession);
+const xdev: XdevState = {
+	tools: new Map([["aws", firstReadTool]]),
+	mountedNames: new Set(["aws"]),
+	builtInNames: new Set(["aws"]),
+	isActive: () => false,
+};
+const wrappedWrite = new ExtensionToolWrapper(
+	new WriteTool({ ...toolSession, xdev }) as unknown as AgentTool,
+	{
+		consumeToolCallEmitted: () => false,
+		hasHandlers: () => false,
+		hasUI: () => false,
+		runScoped: <T>(fn: () => T): T => fn(),
+	} as unknown as ExtensionRunner,
+);
+const writeContext = { settings: Settings.isolated({ "tools.approvalMode": "write" }) } as AgentToolContext;
+const firstRead = { ...read, service: "ce", operation: "get-cost-and-usage" };
+const firstReadArgs = { path: "xd://aws", content: JSON.stringify(firstRead) };
+const beforeFirstRead = (await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length;
+assert.equal(firstReadTool.approval(firstRead), "exec");
+const dispatchedRead = await wrappedWrite.execute(
+	"first-mapped-read",
+	firstReadArgs,
+	undefined,
+	undefined,
+	writeContext,
+);
+assert.notEqual(dispatchedRead.isError, true);
+assert.equal((dispatchedRead.details as { xdev?: { tier?: string } } | undefined)?.xdev?.tier, "read");
+assert.equal((await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length, beforeFirstRead + 1);
+await assert.rejects(
+	() =>
+		wrappedWrite.execute(
+			"first-mutation",
+			{
+				path: "xd://aws",
+				content: JSON.stringify({
+					...read,
+					service: "ec2",
+					operation: "terminate-instances",
+					parameters: { InstanceIds: ["i-fixture"] },
+				}),
+			},
+			undefined,
+			undefined,
+			writeContext,
+		),
+	/requires approval but no interactive UI/,
+);
 const mutation = {
 	...read,
 	service: "ec2",

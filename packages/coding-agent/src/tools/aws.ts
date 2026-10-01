@@ -961,6 +961,25 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const classification = this.#classifications.get(key);
 		return classification?.read && classification.expiresAt > Date.now() ? "read" : "exec";
 	};
+	async prepareApprovalTier(args: unknown, signal?: AbortSignal): Promise<void> {
+		const input = args as Partial<AwsToolParams>;
+		if (
+			typeof input.service !== "string" ||
+			typeof input.operation !== "string" ||
+			!COMMAND_NAME_RE.test(input.service) ||
+			!COMMAND_NAME_RE.test(input.operation) ||
+			Object.hasOwn(BLOCKED_AWS_SERVICES, input.service) ||
+			input.service === "sso" ||
+			this.approval(input) === "read"
+		) {
+			return;
+		}
+		const read = await this.#access.isRead(input.service, input.operation, signal);
+		this.#classifications.set(`${input.service}\0${input.operation}`, {
+			read,
+			expiresAt: Date.now() + AWS_REFERENCE_TTL_MS,
+		});
+	}
 
 	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const input = args as Partial<AwsToolParams>;
@@ -1049,14 +1068,8 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			...buildAwsParameterArgv(params.parameters),
 		];
 		const dcg = await enforceDestructiveCommandGuard(redactedArgv(argv, false), this.session.cwd, "posix", signal);
-		const mutation =
-			!login &&
-			!isAwsIdentityProbe(params.service, params.operation) &&
-			!(await this.#access.isRead(params.service, params.operation, signal));
-		this.#classifications.set(`${params.service}\0${params.operation}`, {
-			read: !mutation,
-			expiresAt: Date.now() + AWS_REFERENCE_TTL_MS,
-		});
+		await this.prepareApprovalTier(params, signal);
+		const mutation = !login && this.approval(params) !== "read";
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-aws-"));
 		const configPath = path.join(tempDir, "config");
 		try {
