@@ -174,6 +174,35 @@ describe("headless MCP readiness", () => {
 		expect(output.join("")).toContain("Error: MCP servers not ready: broken");
 	}, 2_000);
 
+	it("treats a resources-only server as ready for strict print and reads its resources", async () => {
+		const manager = new MCPManager(import.meta.dir);
+		managers.push(manager);
+		const result = await manager.connectServers(
+			{
+				docs: {
+					type: "stdio",
+					command: process.execPath,
+					args: [path.join(import.meta.dir, "fixtures", "resources-no-templates-mcp.ts")],
+				},
+			},
+			{},
+			undefined,
+			0,
+		);
+		expect(result.connectedServers).toEqual(["docs"]);
+		expect(manager.getTools()).toEqual([]);
+		expect(await manager.waitForStartup(1_000)).toEqual({ connected: ["docs"], pending: [], failed: [] });
+		await manager.ensureServerResources("docs");
+		expect(manager.getServerResources("docs")?.resources.map(resource => resource.uri)).toContain("test://alpha");
+		expect((await manager.readServerResource("docs", "test://alpha"))?.contents[0]?.text).toBe(
+			"fixture content for test://alpha",
+		);
+		const capture = printSession(manager);
+		Bun.env.OMP_MCP_REQUIRE_READY = "1";
+		expect(await runPrintMode(capture.session, { mode: "text", initialMessage: "read docs", mcpManager: manager })).toBe(0);
+		expect(capture.prompted()).toEqual([]);
+	}, 5_000);
+
 	it("returns from interactive discovery around the startup window with slowstart pending", async () => {
 		const { manager, elapsedMs } = await startServers();
 		expect(elapsedMs).toBeLessThan(900);

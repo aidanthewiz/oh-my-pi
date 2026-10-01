@@ -1283,7 +1283,7 @@ export class MCPManager {
 	}
 
 	/**
-	 * Wait for configured servers' initial tools (including timeout-triggered reconnects).
+	 * Wait for configured servers' initial tool registration, including empty tool lists.
 	 * Zero disables the barrier deadline; an unresponsive server can then wait indefinitely.
 	 * Tool-change callbacks are drained before returning; callers should still refresh their
 	 * session with the final tool snapshot before sending a prompt.
@@ -1313,12 +1313,12 @@ export class MCPManager {
 				this.#pendingReconnections.has(name)
 			) {
 				status.pending.push(name);
-			} else if (this.#connections.get(name)?.tools !== undefined) {
+			} else if (this.#connections.has(name)) {
 				status.connected.push(name);
 			} else {
 				status.failed.push({
 					name,
-					error: this.#startupFailures.get(name) ?? "Connection closed before tools became available",
+					error: this.#startupFailures.get(name) ?? "Connection closed before startup completed",
 				});
 			}
 		}
