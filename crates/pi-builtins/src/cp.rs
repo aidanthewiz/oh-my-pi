@@ -2631,34 +2631,51 @@ fn copy_data(
 		return Err(CpError::Error("--sparse is only supported on linux".to_string()));
 	}
 
-	// Clone before opening anything; `auto` copies the data wherever the
-	// files cannot share extents (another filesystem, ext4, NTFS, ...).
+	// Cloning over an existing file swaps its inode and loses destination
+	// xattrs/ACLs. An ordinary copy must write through that inode instead.
 	let mut reflink_debug = OffloadReflinkDebug::No;
 	if native && !source_is_stream && options.reflink_mode != ReflinkMode::Never {
-		match pi_iso::cow::clone_file(&source_fs, &dest_fs) {
-			Ok(()) => {
-				// An APFS clone carries the source's timestamps; a copy is new.
-				if !matches!(options.attributes.timestamps, Preserve::Yes { .. }) {
-					filesystem
-						.set_times(&dest_fs, FileTime::Now, FileTime::Now, true)
-						.map_err(|e| CpError::IoErrContext(e, context_for(source, dest)))?;
-				}
-				let copy_debug = CopyDebug {
-					offload:          OffloadReflinkDebug::Unknown,
-					reflink:          OffloadReflinkDebug::Yes,
-					sparse_detection: SparseDebug::Unsupported,
-				};
-				return Ok((copy_debug, DestFate::Kept));
-			},
-			Err(_) if options.reflink_mode == ReflinkMode::Auto => {
-				reflink_debug = OffloadReflinkDebug::Unsupported;
-			},
+		let dest_exists = match filesystem.symlink_metadata(&dest_fs) {
+			Ok(_) => true,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => false,
 			Err(error) => {
+				return Err(CpError::IoErrContext(error, format!("cannot stat {}", dest.quote())));
+			},
+		};
+		if dest_exists {
+			if options.reflink_mode == ReflinkMode::Always {
 				return Err(CpError::IoErrContext(
-					error,
+					operation_not_supported(),
 					format!("failed to clone {} from {}", dest.quote(), source.quote()),
 				));
-			},
+			}
+			reflink_debug = OffloadReflinkDebug::Avoided;
+		} else {
+			match pi_iso::cow::clone_file_new(&source_fs, &dest_fs) {
+				Ok(()) => {
+					// An APFS clone carries the source's timestamps; a copy is new.
+					if !matches!(options.attributes.timestamps, Preserve::Yes { .. }) {
+						filesystem
+							.set_times(&dest_fs, FileTime::Now, FileTime::Now, true)
+							.map_err(|e| CpError::IoErrContext(e, context_for(source, dest)))?;
+					}
+					let copy_debug = CopyDebug {
+						offload:          OffloadReflinkDebug::Unknown,
+						reflink:          OffloadReflinkDebug::Yes,
+						sparse_detection: SparseDebug::Unsupported,
+					};
+					return Ok((copy_debug, DestFate::Kept));
+				},
+				Err(_) if options.reflink_mode == ReflinkMode::Auto => {
+					reflink_debug = OffloadReflinkDebug::Unsupported;
+				},
+				Err(error) => {
+					return Err(CpError::IoErrContext(
+						error,
+						format!("failed to clone {} from {}", dest.quote(), source.quote()),
+					));
+				},
+			}
 		}
 	}
 
@@ -3398,13 +3415,29 @@ mod tests {
 	#[test]
 	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 	fn clone_overwrite_keeps_destination_mode_and_hard_links() {
-		use std::os::unix::fs::PermissionsExt as _;
+		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 		let fixture = tempdir().unwrap();
 		let path = |name: &str| fixture.path().join(name);
 		fs::write(path("source"), b"new").unwrap();
 		fs::write(path("private"), b"old").unwrap();
 		fs::set_permissions(path("private"), fs::Permissions::from_mode(0o600)).unwrap();
+		let private_inode = fs::metadata(path("private")).unwrap().ino();
+		let native = pi_vfs::BlockingFs::native();
+		#[cfg(target_os = "macos")]
+		let xattr = "com.coreforge.cp.destination";
+		#[cfg(not(target_os = "macos"))]
+		let xattr = "user.coreforge.cp.destination";
+		let has_xattr = match native.set_xattr(path("private"), xattr, b"retained", true) {
+			Ok(()) => true,
+			Err(error)
+				if error.kind() == std::io::ErrorKind::Unsupported
+					|| error.raw_os_error() == Some(libc::ENOTSUP) =>
+			{
+				false
+			},
+			Err(error) => panic!("cannot set test xattr: {error}"),
+		};
 		fs::write(path("linked"), b"old").unwrap();
 		fs::hard_link(path("linked"), path("alias")).unwrap();
 
@@ -3413,10 +3446,12 @@ mod tests {
 			assert_eq!(code, 0, "{}", capture.err());
 		}
 
-		// A clone swapped in for `private` must still pass for an in-place copy.
 		assert_eq!(fs::read(path("private")).unwrap(), b"new");
+		assert_eq!(fs::metadata(path("private")).unwrap().ino(), private_inode);
 		assert_eq!(fs::metadata(path("private")).unwrap().permissions().mode() & 0o777, 0o600);
-		// A hard-linked destination cannot be swapped; every link sees the data.
+		if has_xattr {
+			assert_eq!(native.get_xattr(path("private"), xattr, true).unwrap(), Some(b"retained".to_vec()));
+		}
 		assert_eq!(fs::read(path("alias")).unwrap(), b"new");
 		let mut names: Vec<_> = fs::read_dir(fixture.path())
 			.unwrap()
@@ -3424,6 +3459,48 @@ mod tests {
 			.collect();
 		names.sort();
 		assert_eq!(names, ["alias", "linked", "private", "source"], "no temporary clone is left");
+
+		fs::write(path("private"), b"untouched").unwrap();
+		let (code, _) =
+			run_util::<Cp>(&["--reflink=always", "source", "private"], "", fixture.path());
+		assert_ne!(code, 0, "an existing destination must not be replaced by a clone");
+		assert_eq!(fs::read(path("private")).unwrap(), b"untouched");
+		assert_eq!(fs::metadata(path("private")).unwrap().ino(), private_inode);
+		if has_xattr {
+			assert_eq!(native.get_xattr(path("private"), xattr, true).unwrap(), Some(b"retained".to_vec()));
+		}
+
+		let raced = pi_iso::cow::clone_file_new(&path("source"), &path("private"));
+		assert_eq!(raced.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+		assert_eq!(fs::read(path("private")).unwrap(), b"untouched");
+		assert_eq!(fs::metadata(path("private")).unwrap().ino(), private_inode);
+
+		// A clone-capable volume must still clone a fresh name and an explicitly
+		// removed destination, rather than silently copying their bytes.
+		if pi_iso::cow::clone_file(&path("source"), &path("probe")).is_ok() {
+			fs::remove_file(path("probe")).unwrap();
+			let (code, capture) =
+				run_util::<Cp>(&["--reflink=always", "source", "fresh"], "", fixture.path());
+			assert_eq!(code, 0, "{}", capture.err());
+			assert_eq!(fs::read(path("fresh")).unwrap(), b"new");
+			let (code, capture) =
+				run_util::<Cp>(&["--debug", "-c", "source", "fresh-auto"], "", fixture.path());
+			assert_eq!(code, 0, "{}", capture.err());
+			assert!(capture.out().contains("reflink: yes"), "{}", capture.out());
+			assert_eq!(fs::read(path("fresh-auto")).unwrap(), b"new");
+
+			fs::write(path("source"), b"replacement").unwrap();
+			let linked_inode = fs::metadata(path("linked")).unwrap().ino();
+			let (code, capture) = run_util::<Cp>(
+				&["--remove-destination", "--reflink=always", "source", "linked"],
+				"",
+				fixture.path(),
+			);
+			assert_eq!(code, 0, "{}", capture.err());
+			assert_eq!(fs::read(path("linked")).unwrap(), b"replacement");
+			assert_ne!(fs::metadata(path("linked")).unwrap().ino(), linked_inode);
+			assert_eq!(fs::read(path("alias")).unwrap(), b"new");
+		}
 	}
 
 	#[test]

@@ -67,6 +67,14 @@ pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
 	}
 }
 
+/// Clone only into a missing destination. The platform create-new operation
+/// rejects a concurrent creator rather than replacing its inode or metadata.
+pub fn clone_file_new(src: &Path, dst: &Path) -> io::Result<()> {
+	#[cfg(unix)]
+	check_same_device(src, dst, None)?;
+	clone_new(src, dst)
+}
+
 /// Whether `err` from [`clone_file`] means the files cannot be cloned, as
 /// opposed to an I/O failure a data copy would hit too.
 pub fn is_unsupported(err: &io::Error) -> bool {
