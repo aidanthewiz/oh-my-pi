@@ -100,7 +100,7 @@ function readResponse(payload: unknown, modelId: string, resultLimit: number): S
 	const citations: SearchCitation[] = [];
 	const sourceIndexes = new Map<string, number>();
 	const citationIndexes = new Map<string, number>();
-	const addSource = (urlValue: unknown, titleValue?: unknown, citedTextValue?: string): void => {
+	const addSource = (urlValue: unknown, titleValue?: unknown, citedTextValue?: string, isCitation = false): void => {
 		if (typeof urlValue !== "string") return;
 		const url = urlValue.trim();
 		if (!url) return;
@@ -116,6 +116,7 @@ function readResponse(payload: unknown, modelId: string, resultLimit: number): S
 			if (citedText && !source.snippet) source.snippet = citedText;
 		}
 
+		if (!isCitation) return;
 		const citationIndex = citationIndexes.get(url);
 		if (citationIndex === undefined) {
 			citationIndexes.set(url, citations.length);
@@ -158,14 +159,14 @@ function readResponse(payload: unknown, modelId: string, resultLimit: number): S
 					typeof start === "number" && typeof end === "number" && start >= 0 && end > start
 						? text.slice(start, end)
 						: undefined;
-				addSource(annotation.url, annotation.title, citedText);
+				addSource(annotation.url, annotation.title, citedText, true);
 			}
 		}
 		if (Array.isArray(item.annotations)) {
 			for (const rawAnnotation of item.annotations) {
 				const annotation = asRecord(rawAnnotation);
 				if (annotation?.type !== "url_citation") continue;
-				addSource(annotation.url, annotation.title);
+				addSource(annotation.url, annotation.title, undefined, true);
 			}
 		}
 	}

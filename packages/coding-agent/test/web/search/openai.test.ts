@@ -191,6 +191,7 @@ describe("OpenAI API-billed Responses web search", () => {
 				sources: [{ url: "https://search.example.test/result", title: "Search result" }],
 				usage: { searchRequests: 1 },
 			});
+			expect(result.citations).toBeUndefined();
 		} finally {
 			fixture.authStorage.close();
 		}
@@ -264,8 +265,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			expect(result.sources).toHaveLength(10);
 			expect(result.sources[0]).toMatchObject({ url: citedUrl, title: "Answer citation" });
 			expect(result.sources.some(source => source.url === "https://results.example.test/10")).toBe(false);
-			expect(result.citations).toHaveLength(10);
-			expect(result.citations).toContainEqual({ url: citedUrl, title: "Answer citation" });
+			expect(result.citations).toEqual([{ url: citedUrl, title: "Answer citation" }]);
 		} finally {
 			fixture.authStorage.close();
 		}
