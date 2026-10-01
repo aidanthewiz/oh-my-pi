@@ -958,17 +958,10 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						if (parsed.data.blocks.some(block => !block.mutationToken || block.blockedUntilMs === undefined)) {
 							return json(409, { error: "Block delete requires every observed mutation token and deadline" });
 						}
-						let deleted = true;
-						for (const block of parsed.data.blocks) {
-							deleted =
-								opts.storage.blocks.deleteIfMatches(
-									id,
-									block.providerKey,
-									block.blockScope,
-									block.mutationToken!,
-									block.blockedUntilMs!,
-								) && deleted;
-						}
+						const deleted = opts.storage.blocks.deleteIfAllMatch(
+							id,
+							parsed.data.blocks as Parameters<typeof opts.storage.blocks.deleteIfAllMatch>[1],
+						);
 						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
 						const response: CredentialBlocksDeleteResponse = {
 							ok: true,

@@ -1293,6 +1293,11 @@ export interface BlocksApi {
 		mutationToken: string,
 		blockedUntilMs: number,
 	): boolean;
+	/** Broker-only atomic clear of every observed row, refusing any stale or repeated row. */
+	deleteIfAllMatch(
+		credentialId: number,
+		blocks: readonly Pick<StoredCredentialBlock, "providerKey" | "blockScope" | "mutationToken" | "blockedUntilMs">[],
+	): boolean;
 	/** Delete all persisted blocks for a credential. */
 	deleteAll(credentialId: number): void;
 }

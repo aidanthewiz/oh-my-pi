@@ -276,9 +276,83 @@ describe("auth-broker wire surface", () => {
 		expect(staleBulkClear.deleted).toBe(false);
 		const afterBulkClear = await first.fetchSnapshot();
 		if (afterBulkClear.status !== 200) throw new Error("expected current blocks after bulk clear");
-		expect(
-			credentialBlocks(afterBulkClear.snapshot, id).map(block => [block.blockScope, block.blockedUntilMs]),
-		).toEqual([[original.blockScope, newerDeadline + 60_000]]);
+		const currentRows = credentialBlocks(afterBulkClear.snapshot, id);
+		expect(currentRows).toHaveLength(2);
+		expect(currentRows.find(block => block.blockScope === other.blockScope)).toEqual(
+			observedRows.find(block => block.blockScope === other.blockScope),
+		);
+		expect(currentRows.find(block => block.blockScope === original.blockScope)?.blockedUntilMs).toBe(
+			newerDeadline + 60_000,
+		);
+	});
+
+	test("bulk block clear rolls back earlier deletes when a peer replaces a later row", async () => {
+		const first = new AuthBrokerClient({ url: handle!.url, token });
+		const peer = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await first.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected initial snapshot");
+		const id = initial.snapshot.credentials[0]!.id;
+		const deadline = Date.now() + 120_000;
+		await first.upsertCredentialBlock(id, {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:a",
+			blockedUntilMs: deadline,
+		});
+		await first.upsertCredentialBlock(id, {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:b",
+			blockedUntilMs: deadline,
+		});
+		const observed = await first.fetchSnapshot();
+		if (observed.status !== 200) throw new Error("expected observed blocks");
+		const oldRows = credentialBlocks(observed.snapshot, id);
+		expect(oldRows.map(block => block.blockScope)).toEqual(["tier:a", "tier:b"]);
+
+		await peer.upsertCredentialBlock(id, {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:b",
+			blockedUntilMs: deadline + 60_000,
+		});
+		const replaced = await first.fetchSnapshot();
+		if (replaced.status !== 200) throw new Error("expected replaced block");
+		const currentRows = credentialBlocks(replaced.snapshot, id);
+		expect(currentRows[1]!.mutationToken).not.toBe(oldRows[1]!.mutationToken);
+		const stale = await first.deleteCredentialBlocks(id, {
+			blocks: oldRows.map(({ providerKey, blockScope, mutationToken, blockedUntilMs }) => ({
+				providerKey,
+				blockScope,
+				mutationToken,
+				blockedUntilMs,
+			})),
+		});
+		expect(stale.deleted).toBe(false);
+		expect(stale.blockRevision).toEqual(replaced.snapshot.blockRevision);
+		const afterStale = await first.fetchSnapshot();
+		if (afterStale.status !== 200) throw new Error("expected intact blocks");
+		expect(credentialBlocks(afterStale.snapshot, id)).toEqual(currentRows);
+
+		const { providerKey, blockScope, mutationToken, blockedUntilMs } = currentRows[0]!;
+		const duplicateBlock = { providerKey, blockScope, mutationToken, blockedUntilMs };
+		const duplicate = await first.deleteCredentialBlocks(id, { blocks: [duplicateBlock, duplicateBlock] });
+		expect(duplicate.deleted).toBe(false);
+		expect(duplicate.blockRevision).toEqual(replaced.snapshot.blockRevision);
+		const afterDuplicate = await first.fetchSnapshot();
+		if (afterDuplicate.status !== 200) throw new Error("expected intact blocks after duplicate");
+		expect(credentialBlocks(afterDuplicate.snapshot, id)).toEqual(currentRows);
+
+		const retry = await first.deleteCredentialBlocks(id, {
+			blocks: currentRows.map(({ providerKey, blockScope, mutationToken, blockedUntilMs }) => ({
+				providerKey,
+				blockScope,
+				mutationToken,
+				blockedUntilMs,
+			})),
+		});
+		expect(retry.deleted).toBe(true);
+		expect(retry.blockRevision!.sequence).toBeGreaterThan(replaced.snapshot.blockRevision!.sequence);
+		const cleared = await first.fetchSnapshot();
+		if (cleared.status !== 200) throw new Error("expected cleared snapshot");
+		expect(credentialBlocks(cleared.snapshot, id)).toEqual([]);
 	});
 
 	test("preserves an HTTP rejection when the caller aborts while reading its body", async () => {

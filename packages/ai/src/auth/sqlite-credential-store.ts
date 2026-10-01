@@ -1722,6 +1722,40 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		return true;
 	}
 
+	deleteCredentialBlocksIfAllMatch(
+		credentialId: number,
+		blocks: readonly Pick<StoredCredentialBlock, "providerKey" | "blockScope" | "mutationToken" | "blockedUntilMs">[],
+	): boolean {
+		if (blocks.length === 0) return true;
+		const mismatch = Symbol("credential block mismatch");
+		const remove = this.#db.transaction(() => {
+			const seen = new Set<string>();
+			for (const block of blocks) {
+				const key = JSON.stringify([block.providerKey, block.blockScope]);
+				if (seen.has(key)) throw mismatch;
+				seen.add(key);
+				const deleted = this.#deleteCredentialBlockIfMatchesStmt.get(
+					credentialId,
+					block.providerKey,
+					block.blockScope,
+					block.mutationToken,
+					block.blockedUntilMs,
+				);
+				if (!deleted) throw mismatch;
+			}
+		});
+		try {
+			remove.immediate();
+		} catch (err) {
+			if (err === mismatch) return false;
+			throw err;
+		}
+		for (const block of blocks) {
+			this.#credentialBlockReconcileAfter.delete(`${credentialId}\0${block.providerKey}\0${block.blockScope}`);
+		}
+		return true;
+	}
+
 	deleteCredentialBlocks(credentialId: number): void {
 		this.#deleteCredentialBlocksStmt.run(credentialId);
 		for (const key of this.#credentialBlockReconcileAfter.keys()) {

@@ -626,6 +626,30 @@ export class CredentialBlocks implements BlocksApi {
 		return deleted;
 	}
 
+	deleteIfAllMatch(
+		credentialId: number,
+		blocks: readonly Pick<StoredCredentialBlock, "providerKey" | "blockScope" | "mutationToken" | "blockedUntilMs">[],
+	): boolean {
+		this.#deps.health.assertWritable();
+		const deleteIfAllMatch = this.#deps.store.deleteCredentialBlocksIfAllMatch?.bind(this.#deps.store);
+		if (!deleteIfAllMatch) return false;
+		let deleted: boolean;
+		try {
+			deleted = deleteIfAllMatch(credentialId, blocks);
+		} catch (err) {
+			if (this.#deps.health.handle(err)) this.#deps.health.assertWritable();
+			throw err;
+		}
+		if (deleted && blocks.length > 0) {
+			for (const block of blocks) {
+				this.#deleteCredentialBackoff(scopedBackoffKey(block.providerKey, block.blockScope), credentialId);
+				this.#deps.usageCache.invalidateProviderKey(block.providerKey);
+				this.#deps.pool.bump("credential-block");
+			}
+		}
+		return deleted;
+	}
+
 	deleteAll(credentialId: number): void {
 		this.#deps.health.assertWritable();
 		const deleteCredentialBlocks = this.#deps.store.deleteCredentialBlocks?.bind(this.#deps.store);

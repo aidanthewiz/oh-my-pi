@@ -114,6 +114,11 @@ export interface CredentialBlockStore {
 		mutationToken: string,
 		blockedUntilMs: number,
 	): boolean;
+	/** Atomically clear all observed rows or leave every row and revision unchanged. */
+	deleteCredentialBlocksIfAllMatch?(
+		credentialId: number,
+		blocks: readonly Pick<StoredCredentialBlock, "providerKey" | "blockScope" | "mutationToken" | "blockedUntilMs">[],
+	): boolean;
 	/** Drop every block row for a credential (all providerKeys/scopes). */
 	deleteCredentialBlocks(credentialId: number): void;
 	/** Prune rows with blocked_until_ms <= nowMs. */
