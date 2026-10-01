@@ -851,8 +851,10 @@ export class SessionManager {
 	#expectedDiskFingerprint: Hash | undefined;
 	/** Backend title metadata from the same confirmed snapshot as the content fingerprint. */
 	#expectedDiskTitleMeta: string | null | undefined;
-	/** Invalidates a title-slot fingerprint if another append or rewrite lands before its acknowledgment. */
+	/** Detects writes during a title-slot update. */
 	#fingerprintRevision = 0;
+	/** Durable append lines recorded while the title-slot update is awaiting acknowledgment. */
+	#titleAppendTail: string[] | undefined;
 	/**
 	 * Generation of the latest deferred publish queued on a `defersSyncPublish`
 	 * backend. A deferred-rewrite confirmation older than the latest queued
@@ -1102,7 +1104,21 @@ export class SessionManager {
 			this.#index.insert(entry);
 			adopted++;
 		}
-		this.#index.setLeaf(leaf);
+		if (adopted > 0) {
+			const marker: BranchSummaryEntry = {
+				type: "branch_summary",
+				id: generateId(this.#index),
+				parentId: leaf,
+				timestamp: nowIso(),
+				fromId: leaf ?? "root",
+				summary: "",
+				details: { kind: "foreign-entry-recovery" },
+			};
+			this.#entries.push(marker);
+			this.#index.insert(marker);
+		} else {
+			this.#index.setLeaf(leaf);
+		}
 		this.#fingerprintRevision++;
 		this.#expectedDiskSize = Buffer.byteLength(content, "utf8");
 		this.#expectedDiskFingerprint = createHash("sha1").update(content);
@@ -1478,6 +1494,7 @@ export class SessionManager {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
 		if (wasAbsent) this.#expectedDiskFingerprint = createHash("sha1");
 		this.#expectedDiskFingerprint?.update(line);
+		this.#titleAppendTail?.push(line);
 	}
 
 	#recordFullRewrite(body: string): void {
@@ -1906,15 +1923,27 @@ export class SessionManager {
 						throw new Error("Cannot update session title without a confirmed content fingerprint.");
 					}
 					const fingerprintRevision = this.#fingerprintRevision;
-					const updatedFingerprint = await this.#storage.updateSessionTitle(sessionFile, update, {
-						expectedSize: this.#expectedDiskSize,
-						expectedFingerprint: this.#expectedDiskFingerprint.copy().digest("hex"),
-						expectedTitleMeta: this.#expectedDiskTitleMeta,
-					});
+					const titleAppendTail: string[] = [];
+					this.#titleAppendTail = titleAppendTail;
+					let updatedFingerprint: Hash | void;
+					try {
+						updatedFingerprint = await this.#storage.updateSessionTitle(sessionFile, update, {
+							expectedSize: this.#expectedDiskSize,
+							expectedFingerprint: this.#expectedDiskFingerprint.copy().digest("hex"),
+							expectedTitleMeta: this.#expectedDiskTitleMeta,
+						});
+					} finally {
+						if (this.#titleAppendTail === titleAppendTail) this.#titleAppendTail = undefined;
+					}
 					if (this.#diskEpoch !== epoch || this.#sessionFile !== sessionFile) return;
 					if (updatedFingerprint) {
-						this.#expectedDiskFingerprint =
-							fingerprintRevision === this.#fingerprintRevision ? updatedFingerprint : undefined;
+						if (fingerprintRevision !== this.#fingerprintRevision) {
+							if (titleAppendTail.length === 0) {
+								throw new Error("Cannot reconcile title fingerprint after an unrelated publish.");
+							}
+							for (const appendedLine of titleAppendTail) updatedFingerprint.update(appendedLine);
+						}
+						this.#expectedDiskFingerprint = updatedFingerprint;
 					}
 					if (this.#storage.readTextSnapshot) this.#expectedDiskTitleMeta = JSON.stringify(update);
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import * as path from "node:path";
 import type { PsScope } from "@oh-my-pi/pi-tui/apps/ps-data";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -7,7 +9,7 @@ import { collectScope } from "../../src/cli/ps-data";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
-import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
+import { daemonBrokerEndpoint, daemonBrokerRuntimeDir } from "../../src/launch/paths";
 
 function startBroker(projectDir: string, runtimeDir: string): { listening: Promise<boolean>; finished: Promise<void> } {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
@@ -262,4 +264,261 @@ describe("daemon metadata writes", () => {
 		expect(await Bun.file(path.join(legacyDir, "spec.json")).json()).toMatchObject({ cwd: projectDir });
 		expect(await rows(undefined)).toEqual(expected(false));
 	}, 20_000);
+	it("adopts an old-scope detached daemon before allowing another process with the same name", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-upgrade-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		const spec = {
+			name: "survivor",
+			application: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000)"],
+			env: {},
+			cwd: projectDir,
+			pty: false,
+			restart: "no" as const,
+			persist: true,
+			detached: true,
+		};
+		const legacyDir = path.join(runtimeDir, "daemons", spec.name);
+		const versionedDir = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons", spec.name);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		await Bun.write(
+			path.join(legacyDir, "meta.json"),
+			JSON.stringify({
+				daemon: {
+					name: spec.name,
+					id: crypto.randomUUID(),
+					state: "running",
+					pid: child.pid,
+					createdAt: Date.now(),
+					startedAt: Date.now(),
+					restartCount: 0,
+					outputBytes: 0,
+					persist: true,
+					detached: true,
+				},
+				spec,
+			}),
+		);
+		await Bun.write(path.join(legacyDir, "output.log"), "legacy output\n");
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			await broker.listening;
+			const described = await client.request({ op: "describe", name: spec.name });
+			if (described.op !== "describe") throw new Error(`Unexpected response ${described.op}`);
+			expect(described.daemon.pid).toBe(child.pid);
+			expect(described.daemon.state).toBe("running");
+			expect(await fs.exists(legacyDir)).toBe(false);
+			expect(await fs.exists(versionedDir)).toBe(true);
+			const logs = await client.request({
+				op: "logs",
+				name: spec.name,
+				lines: 10,
+				head: false,
+				follow: false,
+				timeoutMs: 1_000,
+			});
+			if (logs.op !== "logs") throw new Error(`Unexpected response ${logs.op}`);
+			expect(logs.text).toContain("legacy output");
+			await expect(client.request({ op: "start", spec })).rejects.toThrow(/already running/);
+			const stopped = await client.request({ op: "stop", name: spec.name, timeoutMs: 2_000 });
+			if (stopped.op !== "stop") throw new Error(`Unexpected response ${stopped.op}`);
+			expect(stopped.daemon.state).toBe("exited");
+		} finally {
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			child.kill();
+			await child.exited;
+		}
+	}, 20_000);
+	it("refuses a v3 broker while an older broker still owns its scope", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-upgrade-lease-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		await fs.mkdir(runtimeDir);
+		const lock = FileLock.tryAcquire(path.join(runtimeDir, "broker.pid"));
+		if (!lock.acquired) throw new Error("Expected isolated legacy broker lease");
+		try {
+			const broker = startBroker(projectDir, runtimeDir);
+			await expect(broker.finished).rejects.toThrow(/older daemon broker still owns/);
+			expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
+		} finally {
+			lock.release();
+		}
+	});
+
+	it("waits for an older client even after its broker exits before transferring ownership", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-upgrade-client-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		await Bun.write(
+			path.join(runtimeDir, "clients", `${process.pid}-old.json`),
+			JSON.stringify({ pid: process.pid, id: `${process.pid}-old`, projectDir }),
+		);
+		const broker = startBroker(projectDir, runtimeDir);
+		await expect(broker.finished).rejects.toThrow(/older daemon client still owns/);
+		expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
+	});
+
+	it("refuses a live older broker that predates the native lease", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-upgrade-socket-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		await fs.mkdir(runtimeDir);
+		const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		await Bun.write(path.join(runtimeDir, "broker.pid"), JSON.stringify({ pid: child.pid }));
+		const server = net.createServer(socket => socket.destroy());
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(daemonBrokerEndpoint(projectDir, runtimeDir), resolve);
+		});
+		try {
+			const broker = startBroker(projectDir, runtimeDir);
+			await expect(broker.finished).rejects.toThrow(/older daemon broker still owns/);
+			expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+			child.kill();
+			await child.exited;
+		}
+	});
+
+	it("lists an unversioned broker's records without contacting the incompatible v3 socket", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-legacy-ps-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		const name = "old-service";
+		const spec = {
+			name,
+			application: process.execPath,
+			args: [],
+			env: {},
+			cwd: projectDir,
+			pty: false,
+			restart: "no",
+			persist: false,
+			detached: false,
+		};
+		await fs.mkdir(projectDir);
+		await Bun.write(
+			path.join(runtimeDir, "daemons", name, "meta.json"),
+			JSON.stringify({
+				daemon: {
+					name,
+					id: name,
+					state: "exited",
+					createdAt: 1,
+					startedAt: 1,
+					exitedAt: 2,
+					restartCount: 0,
+					outputBytes: 0,
+					persist: false,
+					detached: false,
+				},
+				spec,
+			}),
+		);
+		const scope: PsScope = { kind: "project", runtimeDir, projectDir, brokerPid: process.pid };
+		const report = await collectScope(scope);
+		expect(report.daemons.map(row => ({ name: row.snapshot.name, supervised: row.supervised }))).toEqual([
+			{ name, supervised: false },
+		]);
+		expect(await fs.exists(daemonBrokerRuntimeDir(runtimeDir))).toBe(false);
+	}, 10_000);
+	it("discovers old project and global scopes in explicit, default and all-process listings", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-upgrade-ps-");
+		const home = tempDir.path();
+		const projectDir = path.join(home, "project");
+		await fs.mkdir(projectDir);
+		const daemonRoot = path.join(home, ".omp", "run", "daemons");
+		const key = Bun.hash
+			.wyhash(await fs.realpath(projectDir))
+			.toString(16)
+			.padStart(16, "0");
+		const projectRuntime = path.join(daemonRoot, key);
+		const globalRuntime = path.join(daemonRoot, "global", "legacy-service");
+		const writeRecord = async (runtimeDir: string, name: string) => {
+			await Bun.write(
+				path.join(runtimeDir, "daemons", name, "meta.json"),
+				JSON.stringify({
+					daemon: {
+						name,
+						id: name,
+						state: "running",
+						pid: process.pid,
+						createdAt: 1,
+						startedAt: 1,
+						restartCount: 0,
+						outputBytes: 0,
+						persist: true,
+						detached: true,
+					},
+					spec: {
+						name,
+						application: process.execPath,
+						args: [],
+						env: {},
+						cwd: projectDir,
+						pty: false,
+						restart: "no",
+						persist: true,
+						detached: true,
+					},
+				}),
+			);
+		};
+		await writeRecord(projectRuntime, "project-worker");
+		await writeRecord(globalRuntime, "global-worker");
+		await Bun.write(path.join(projectRuntime, "scope.json"), JSON.stringify({ projectDir }));
+		const inspect = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"-e",
+				`const { collectReports } = await import(process.env.PS_DATA_URL);
+				const project = await collectReports(false, { dir: process.env.PS_PROJECT });
+				const globals = await collectReports(false, {});
+				const all = await collectReports(true, {});
+				console.log(JSON.stringify({
+					project: project.flatMap(report => report.daemons.map(row => row.snapshot.name)),
+					globals: globals.flatMap(report => report.daemons.map(row => row.snapshot.name)),
+					all: all.flatMap(report => report.daemons.map(row => row.snapshot.name)),
+				}));`,
+			],
+			env: {
+				...process.env,
+				HOME: home,
+				USERPROFILE: home,
+				PI_CONFIG_DIR: ".omp",
+				OMP_PROFILE: "",
+				PI_PROFILE: "",
+				PI_CODING_AGENT_DIR: "",
+				XDG_STATE_HOME: "",
+				PS_DATA_URL: new URL("../../src/cli/ps-data.ts", import.meta.url).href,
+				PS_PROJECT: projectDir,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (inspect.exitCode !== 0) throw new Error(new TextDecoder().decode(inspect.stderr));
+		const rows = JSON.parse(new TextDecoder().decode(inspect.stdout));
+		expect(rows).toEqual({
+			project: ["project-worker"],
+			globals: ["global-worker"],
+			all: ["project-worker", "global-worker"],
+		});
+	}, 10_000);
 });

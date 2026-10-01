@@ -376,6 +376,18 @@ class PausedTitleMoveStorage extends MemorySessionStorage {
 	}
 }
 
+class PausedTitleAcknowledgementStorage extends MemorySessionStorage {
+	readonly titlePersisted = Promise.withResolvers<void>();
+	readonly allowAcknowledgement = Promise.withResolvers<void>();
+
+	override async updateSessionTitle(sessionPath: string, update: SessionTitleUpdate): Promise<Hash> {
+		const fingerprint = await super.updateSessionTitle(sessionPath, update);
+		this.titlePersisted.resolve();
+		await this.allowAcknowledgement.promise;
+		return fingerprint;
+	}
+}
+
 describe("SessionManager cross-process rewrite freshness", () => {
 	const userTurn = (content: string) => ({ role: "user" as const, content, timestamp: Date.now() });
 	const userTurnsOf = (entries: readonly SessionEntry[]) =>
@@ -464,6 +476,35 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		await reopened.close();
 	});
 
+	it("restores its selected branch after adopting a foreign turn without another local append", async () => {
+		using tempDir = TempDir.createSync("@omp-session-recovery-leaf-");
+		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
+		await creator.ensureOnDisk();
+		creator.appendMessage(userTurn("our active turn"));
+		const sessionFile = creator.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		await creator.close();
+
+		const theirs = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		const ours = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		theirs.appendMessage(userTurn("foreign turn"));
+		await theirs.close();
+		await ours.rewriteEntries();
+		expect(userTurnsOf(ours.getBranch())).toEqual(["our active turn"]);
+		await ours.close();
+
+		const reopened = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		expect(userTurnsOf(reopened.getEntries())).toContain("foreign turn");
+		expect(userTurnsOf(reopened.getBranch())).toEqual(["our active turn"]);
+		await reopened.close();
+	});
+
 	it("keeps a same-size replacement of a prior turn instead of adopting stale bytes", async () => {
 		using tempDir = TempDir.createSync("@omp-session-rewrite-same-size-");
 		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
@@ -521,6 +562,26 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		expect(await storage.readText(sibling)).toContain('"content":"trigger sibling"');
 		await manager.rewriteEntries();
 		expect(await storage.readText(sibling)).toContain('"title":"Updated"');
+		await manager.close();
+	});
+
+	it("keeps rewriting after an append races a successful title acknowledgement", async () => {
+		const storage = new PausedTitleAcknowledgementStorage();
+		const manager = SessionManager.create("/cwd", "/sessions", storage);
+		await manager.ensureOnDisk();
+		manager.appendMessage(userTurn("before title"));
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		const rename = manager.setSessionName("Updated", "user", "test");
+		await storage.titlePersisted.promise;
+		manager.appendMessage(userTurn("during title acknowledgement"));
+		storage.allowAcknowledgement.resolve();
+		await rename;
+		expect(manager.getSessionFile()).toBe(sessionFile);
+		manager.appendMessage(userTurn("after title acknowledgement"));
+		await manager.rewriteEntries();
+		expect(await storage.readText(sessionFile)).toContain('"content":"after title acknowledgement"');
 		await manager.close();
 	});
 

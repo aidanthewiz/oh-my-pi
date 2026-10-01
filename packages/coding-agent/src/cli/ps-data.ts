@@ -74,27 +74,47 @@ export async function discoverScopes(): Promise<PsScope[]> {
 	const scopes: PsScope[] = [];
 	for (const entry of await readdirQuiet(getDaemonRuntimeRoot())) {
 		if (!entry.isDirectory() || !PROJECT_SCOPE_KEY.test(entry.name)) continue;
-		const runtimeDir = daemonBrokerRuntimeDir(path.join(getDaemonRuntimeRoot(), entry.name));
-		scopes.push({
+		const root = path.join(getDaemonRuntimeRoot(), entry.name);
+		const runtimeDir = daemonBrokerRuntimeDir(root);
+		const scope: PsScope = {
 			kind: "project",
 			runtimeDir,
-			projectDir: await resolveScopeProjectDir(runtimeDir),
+			projectDir: (await resolveScopeProjectDir(runtimeDir)) ?? (await resolveScopeProjectDir(root)),
 			brokerPid: await readLiveDaemonBrokerPid(runtimeDir),
-		});
+		};
+		scopes.push(scope);
+		const legacy = await legacyScopeOf(scope);
+		if (legacy) scopes.push(legacy);
 	}
 	for (const entry of await readdirQuiet(getGlobalDaemonRuntimeRoot())) {
 		if (!entry.isDirectory()) continue;
-		const runtimeDir = daemonBrokerRuntimeDir(
-			await canonicalRuntimeDir(path.join(getGlobalDaemonRuntimeRoot(), entry.name)),
-		);
-		scopes.push({
+		const root = await canonicalRuntimeDir(path.join(getGlobalDaemonRuntimeRoot(), entry.name));
+		const runtimeDir = daemonBrokerRuntimeDir(root);
+		const scope: PsScope = {
 			kind: "global",
 			runtimeDir,
 			service: entry.name,
 			brokerPid: await readLiveDaemonBrokerPid(runtimeDir),
-		});
+		};
+		scopes.push(scope);
+		const legacy = await legacyScopeOf(scope);
+		if (legacy) scopes.push(legacy);
 	}
 	return scopes;
+}
+
+async function legacyScopeOf(scope: PsScope): Promise<PsScope | undefined> {
+	const runtimeDir = path.dirname(scope.runtimeDir);
+	if (daemonBrokerRuntimeDir(runtimeDir) !== scope.runtimeDir) return undefined;
+	const brokerPid = await readLiveDaemonBrokerPid(runtimeDir);
+	const records = await readdirQuiet(path.join(runtimeDir, "daemons"));
+	if (brokerPid === undefined && !records.some(entry => entry.isDirectory())) return undefined;
+	return {
+		...scope,
+		runtimeDir,
+		brokerPid,
+		projectDir: scope.projectDir ?? (await resolveScopeProjectDir(runtimeDir)),
+	};
 }
 
 async function readdirQuiet(dir: string): Promise<Dirent[]> {
@@ -143,6 +163,7 @@ async function resolveScopeProjectDir(runtimeDir: string): Promise<string | unde
  */
 export async function scopeClient(scope: PsScope): Promise<DaemonBrokerClient | undefined> {
 	const runtimeRoot = path.dirname(scope.runtimeDir);
+	if (daemonBrokerRuntimeDir(runtimeRoot) !== scope.runtimeDir) return undefined;
 	const connectDir =
 		scope.projectDir ?? (process.platform === "win32" && scope.kind !== "global" ? undefined : runtimeRoot);
 	if (connectDir === undefined) return undefined;
@@ -251,20 +272,18 @@ function compareRows(a: PsDaemonRow, b: PsDaemonRow): number {
  * brokerless are hidden; the current project always shows.
  */
 export async function collectReports(all: boolean, target: PsTarget): Promise<PsScopeReport[]> {
-	if (!all && (target.dir !== undefined || target.global !== undefined)) {
-		return [await collectScope(await targetScope(target))];
-	}
 	if (all) {
 		const reports = await Promise.all((await discoverScopes()).map(collectScope));
 		return reports.filter(report => report.daemons.length > 0 || report.scope.brokerPid !== undefined);
 	}
+	const current = await targetScope(target);
+	const legacy = await legacyScopeOf(current);
+	const currentReports = await Promise.all([current, ...(legacy ? [legacy] : [])].map(collectScope));
+	if (target.dir !== undefined || target.global !== undefined) return currentReports;
 	const globals = (await discoverScopes()).filter(scope => scope.kind === "global");
-	const [current, globalReports] = await Promise.all([
-		targetScope(target).then(collectScope),
-		Promise.all(globals.map(collectScope)),
-	]);
+	const globalReports = await Promise.all(globals.map(collectScope));
 	const liveGlobals = globalReports
 		.map(report => ({ ...report, daemons: report.daemons.filter(row => !TERMINAL_STATES[row.snapshot.state]) }))
 		.filter(report => report.daemons.length > 0);
-	return [current, ...liveGlobals];
+	return [...currentReports, ...liveGlobals];
 }

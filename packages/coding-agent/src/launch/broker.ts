@@ -24,6 +24,7 @@ import {
 import {
 	DAEMON_META_FILE,
 	DAEMON_SPEC_FILE,
+	daemonBrokerRuntimeDir,
 	daemonBrokerEndpoint,
 	readStoredDaemonRecord,
 	writeDaemonScopeMeta,
@@ -1587,6 +1588,61 @@ export interface DaemonBrokerStartOptions {
 	onListening?: () => void;
 }
 
+async function migrateLegacyDaemonRecords(projectDir: string, runtimeDir: string): Promise<FileLock | undefined> {
+	const legacyRuntimeDir = path.dirname(runtimeDir);
+	if (daemonBrokerRuntimeDir(legacyRuntimeDir) !== runtimeDir) return undefined;
+	const oldRecords = path.join(legacyRuntimeDir, "daemons");
+	const pidPath = path.join(legacyRuntimeDir, PID_FILE);
+	const clientsDir = path.join(legacyRuntimeDir, "clients");
+	if (!(await fs.exists(oldRecords)) && !(await fs.exists(pidPath)) && !(await fs.exists(clientsDir)))
+		return undefined;
+	const lock = FileLock.tryAcquire(pidPath);
+	if (!lock.acquired) {
+		lock.release();
+		throw new Error(`An older daemon broker still owns ${legacyRuntimeDir}; stop it before upgrading.`);
+	}
+	try {
+		if (await holdsLiveForeignLease(pidPath, daemonBrokerEndpoint(projectDir, legacyRuntimeDir))) {
+			throw new Error(`An older daemon broker still owns ${legacyRuntimeDir}; stop it before upgrading.`);
+		}
+		if (await hasLiveDaemonProjectPresence(legacyRuntimeDir)) {
+			throw new Error(`An older daemon client still owns ${legacyRuntimeDir}; close it before upgrading.`);
+		}
+		const entries = await fs.readdir(oldRecords, { withFileTypes: true }).catch(error => {
+			if (isEnoent(error)) return [];
+			throw error;
+		});
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const source = path.join(oldRecords, entry.name);
+			const stored = await readStoredDaemonRecord(source);
+			if (!stored) throw new Error(`Cannot migrate incomplete legacy daemon ${entry.name}`);
+			const snapshot = parseDaemonSnapshot(stored.meta.daemon);
+			const spec = parseDaemonSpec(stored.spec);
+			if (snapshot.name !== entry.name || spec.name !== entry.name) {
+				throw new Error(`Cannot migrate mismatched legacy daemon ${entry.name}`);
+			}
+			const destination = path.join(runtimeDir, "daemons", entry.name);
+			if (await fs.exists(destination)) {
+				if (
+					!terminalState(snapshot.state) &&
+					snapshot.pid !== undefined &&
+					Process.fromPid(snapshot.pid)?.status() === "running"
+				) {
+					throw new Error(`Cannot migrate live legacy daemon ${entry.name} over an existing broker record`);
+				}
+				continue;
+			}
+			await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+			await fs.rename(source, destination);
+		}
+		return lock;
+	} catch (error) {
+		lock.release();
+		throw error;
+	}
+}
+
 /** Start the detached project or global daemon broker selected by the CLI worker host. */
 export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStartOptions = {}): Promise<void> {
 	const projectDir = process.env[DAEMON_PROJECT_DIR_ENV];
@@ -1609,29 +1665,35 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 	// releases on exit, so keeping `lease` referenced keeps the scope owned.
 	const lease = await acquireBrokerLease(runtimeDir, endpoint);
 	if (!lease) return;
-	setProcessName("omp daemon broker");
-	// Record the scope's project dir so `omp ps` can map this hash-keyed runtime
-	// dir back to its project (and derive the Windows pipe name) offline.
-	void writeDaemonScopeMeta(runtimeDir, projectDir).catch(error => {
-		logger.warn("Failed to record daemon scope metadata", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	});
-	// Reclaim sibling daemon scopes left behind by dead brokers (issue #8674).
-	// Detached and non-throwing so it never delays clients connecting to us.
-	void pruneDeadDaemonRuntimeDirs(runtimeDir).catch(error => {
-		logger.warn("Daemon runtime prune failed", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	});
-	const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
-	if (!token) throw new Error("Daemon broker token is empty");
-	const broker = new DaemonBroker(projectDir, runtimeDir, token, idleGraceMs, restartBackoffBaseMs);
-	const cancelCleanup = postmortem.register("daemon-broker", () => broker.shutdown());
+	let legacyLock: FileLock | undefined;
 	try {
-		await broker.run(options.onListening);
+		legacyLock = await migrateLegacyDaemonRecords(projectDir, runtimeDir);
+		setProcessName("omp daemon broker");
+		// Record the scope's project dir so `omp ps` can map this hash-keyed runtime
+		// dir back to its project (and derive the Windows pipe name) offline.
+		void writeDaemonScopeMeta(runtimeDir, projectDir).catch(error => {
+			logger.warn("Failed to record daemon scope metadata", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		// Reclaim sibling daemon scopes left behind by dead brokers (issue #8674).
+		// Detached and non-throwing so it never delays clients connecting to us.
+		void pruneDeadDaemonRuntimeDirs(runtimeDir).catch(error => {
+			logger.warn("Daemon runtime prune failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
+		if (!token) throw new Error("Daemon broker token is empty");
+		const broker = new DaemonBroker(projectDir, runtimeDir, token, idleGraceMs, restartBackoffBaseMs);
+		const cancelCleanup = postmortem.register("daemon-broker", () => broker.shutdown());
+		try {
+			await broker.run(options.onListening);
+		} finally {
+			cancelCleanup();
+		}
 	} finally {
-		cancelCleanup();
+		legacyLock?.release();
 		await releaseBrokerLease(lease);
 	}
 }

@@ -1,8 +1,9 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
-import { canonicalProjectDir, daemonBrokerRuntimeDir, daemonRuntimeDir } from "./paths";
+import { hasFsCode, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
+import { canonicalProjectDir, daemonBrokerRuntimeDir, daemonRuntimeDir, readStoredDaemonRecord } from "./paths";
+import { parseDaemonSnapshot, parseDaemonSpec } from "./protocol";
 
 const CLIENTS_DIR = "clients";
 const BROKER_PID_FILE = "broker.pid";
@@ -85,8 +86,9 @@ export async function hasLiveDaemonProjectPresence(runtimeDir: string): Promise<
 			try {
 				process.kill(decoded.pid, 0);
 				live = true;
-			} catch {
-				await fs.rm(presencePath, { force: true });
+			} catch (error) {
+				if (hasFsCode(error, "ESRCH")) await fs.rm(presencePath, { force: true });
+				else live = true;
 			}
 		} catch (error) {
 			if (!isEnoent(error)) await fs.rm(presencePath, { force: true });
@@ -109,28 +111,51 @@ export async function readLiveDaemonBrokerPid(runtimeDir: string): Promise<numbe
 	try {
 		process.kill(raw.pid, 0);
 		return raw.pid;
-	} catch {
-		return undefined;
+	} catch (error) {
+		return hasFsCode(error, "ESRCH") ? undefined : raw.pid;
 	}
 }
 
+async function hasLiveDaemonInRuntime(runtimeDir: string): Promise<boolean> {
+	let entries: Dirent[];
+	try {
+		entries = await fs.readdir(path.join(runtimeDir, DAEMONS_DIR), { withFileTypes: true });
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		try {
+			const stored = await readStoredDaemonRecord(path.join(runtimeDir, DAEMONS_DIR, entry.name));
+			if (!stored) return true;
+			const snapshot = parseDaemonSnapshot(stored.meta.daemon);
+			const spec = parseDaemonSpec(stored.spec);
+			if (!spec.detached || snapshot.pid === undefined || ["exited", "failed"].includes(snapshot.state)) continue;
+			try {
+				process.kill(snapshot.pid, 0);
+				return true;
+			} catch (error) {
+				if (!hasFsCode(error, "ESRCH")) return true;
+			}
+		} catch {
+			return true;
+		}
+	}
+	return false;
+}
+
 /**
- * Remove sibling project daemon runtime directories whose broker is dead and
- * whose client-presence set is empty, reclaiming the disk that short-lived
- * project directories leave behind (issue #8674).
- *
- * Best-effort and non-throwing: a scope is deleted only when its `broker.pid`
- * is absent/dead, no live client presence remains, and it has been untouched
- * for {@link DAEMON_RUNTIME_STALE_GRACE_MS}. The caller's own `currentRuntimeDir`
- * is always skipped, and the sweep runs only inside the {@link DAEMONS_DIR}
- * container over entries named like a {@link DAEMON_SCOPE_KEY} — so a runtime
- * dir relocated elsewhere (e.g. the smoke test under `os.tmpdir()`) never
- * reclaims unrelated neighbours (issue #8721).
+ * Sweep only hash-keyed project scopes inside `run/daemons`, never relocated or global runtimes.
+ * A scope with any live legacy or versioned broker, client, or detached daemon retains its metadata.
  */
 export async function pruneDeadDaemonRuntimeDirs(currentRuntimeDir: string): Promise<void> {
-	const root = path.dirname(currentRuntimeDir);
-	if (path.basename(root) !== DAEMONS_DIR) return;
-	const current = path.resolve(currentRuntimeDir);
+	const scope = path.basename(currentRuntimeDir).match(/^broker-v\d+$/)
+		? path.dirname(currentRuntimeDir)
+		: currentRuntimeDir;
+	const root = path.dirname(scope);
+	if (path.basename(root) !== DAEMONS_DIR || !DAEMON_SCOPE_KEY.test(path.basename(scope))) return;
+	const current = path.resolve(scope);
 	let entries: Dirent[];
 	try {
 		entries = await fs.readdir(root, { withFileTypes: true });
@@ -151,8 +176,23 @@ export async function pruneDeadDaemonRuntimeDirs(currentRuntimeDir: string): Pro
 		try {
 			const stat = await fs.stat(dir);
 			if (now - stat.mtimeMs < DAEMON_RUNTIME_STALE_GRACE_MS) continue;
-			if ((await readLiveDaemonBrokerPid(dir)) !== undefined) continue;
-			if (await hasLiveDaemonProjectPresence(dir)) continue;
+			const runtimes = [dir];
+			for (const version of await fs.readdir(dir, { withFileTypes: true })) {
+				if (version.isDirectory() && /^broker-v\d+$/.test(version.name))
+					runtimes.push(path.join(dir, version.name));
+			}
+			let occupied = false;
+			for (const runtime of runtimes) {
+				if (
+					(await readLiveDaemonBrokerPid(runtime)) !== undefined ||
+					(await hasLiveDaemonProjectPresence(runtime)) ||
+					(await hasLiveDaemonInRuntime(runtime))
+				) {
+					occupied = true;
+					break;
+				}
+			}
+			if (occupied) continue;
 			await fs.rm(dir, { recursive: true, force: true });
 		} catch (error) {
 			if (isEnoent(error)) continue;

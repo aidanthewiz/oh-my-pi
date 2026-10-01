@@ -61,6 +61,70 @@ describe("pruneDeadDaemonRuntimeDirs", () => {
 		expect(remaining.has("global")).toBe(true); // non-scope name skipped
 	});
 
+	it("prunes stale v3 scopes but preserves siblings with a live versioned broker", async () => {
+		using tempDir = TempDir.createSync("@omp-daemon-prune-v3-");
+		const daemons = path.join(tempDir.path(), "run", "daemons");
+		const currentRoot = await scope(daemons, "aaaaaaaaaaaaaaaa", { stale: true });
+		const current = await scope(currentRoot, "broker-v3", { pid: process.pid });
+		const dead = await scope(daemons, "bbbbbbbbbbbbbbbb", {});
+		await scope(dead, "broker-v3", { pid: "dead" });
+		await fs.utimes(dead, STALE, STALE);
+		const live = await scope(daemons, "cccccccccccccccc", {});
+		await scope(live, "broker-v3", { pid: process.pid });
+		await fs.utimes(live, STALE, STALE);
+
+		await pruneDeadDaemonRuntimeDirs(current);
+
+		expect(await fs.exists(dead)).toBe(false);
+		expect(await fs.exists(live)).toBe(true);
+		expect(await fs.exists(currentRoot)).toBe(true);
+	});
+
+	it("retains aged scopes with a live versioned client or an unversioned detached child", async () => {
+		using tempDir = TempDir.createSync("@omp-daemon-prune-survivor-");
+		const daemons = path.join(tempDir.path(), "run", "daemons");
+		const current = path.join(await scope(daemons, "aaaaaaaaaaaaaaaa", {}), "broker-v3");
+		const client = await scope(daemons, "bbbbbbbbbbbbbbbb", {});
+		await scope(client, "broker-v3", { clients: [process.pid] });
+		await fs.utimes(client, STALE, STALE);
+		const detached = await scope(daemons, "cccccccccccccccc", {});
+		const name = "legacy-survivor";
+		await Bun.write(
+			path.join(detached, "daemons", name, "meta.json"),
+			JSON.stringify({
+				daemon: {
+					name,
+					id: name,
+					state: "running",
+					pid: process.pid,
+					createdAt: 1,
+					startedAt: 1,
+					restartCount: 0,
+					outputBytes: 0,
+					persist: true,
+					detached: true,
+				},
+				spec: {
+					name,
+					application: process.execPath,
+					args: [],
+					env: {},
+					cwd: tempDir.path(),
+					pty: false,
+					restart: "no",
+					persist: true,
+					detached: true,
+				},
+			}),
+		);
+		await fs.utimes(detached, STALE, STALE);
+
+		await pruneDeadDaemonRuntimeDirs(current);
+
+		expect(await fs.exists(client)).toBe(true);
+		expect(await fs.exists(detached)).toBe(true);
+	});
+
 	it("does not sweep sibling machine-global service runtimes", async () => {
 		using tempDir = TempDir.createSync("@omp-daemon-prune-global-");
 		const globalRoot = path.join(tempDir.path(), "run", "daemons", "global");
