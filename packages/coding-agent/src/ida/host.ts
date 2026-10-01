@@ -5,8 +5,8 @@
  * lists it as `omp.ida.<id>`. The host listens on its endpoint first, then takes the IDB lock and
  * opens the database in an {@link IdaWorker}; every omp process in the project shares that worker
  * over NDJSON ({@link IdaHostRequest}). The host exits once the worker does (`close`, idle close,
- * crash). SIGTERM (broker shutdown after the last omp process leaves, `omp ps stop`) drains
- * accepted requests before closing the worker and saving any unsaved changes.
+ * crash). SIGTERM (broker shutdown after the last omp process leaves, `omp ps stop`) gives
+ * accepted requests a grace period, then interrupts stragglers before closing and saving.
  */
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -31,6 +31,8 @@ import { IdaWorker } from "./supervisor";
 const OPEN_FAILED_LINGER_MS = 10_000;
 /** Budget for a `flush` save. */
 const FLUSH_TIMEOUT_MS = 120_000;
+/** Let admitted calls finish before interrupting those still running during shutdown. */
+const SHUTDOWN_DRAIN_GRACE_MS = 30_000;
 
 export class IdaHost {
 	readonly #config: IdaHostConfig;
@@ -39,6 +41,7 @@ export class IdaHost {
 	readonly #sockets = new Set<net.Socket>();
 	/** Request handlers still running; shutdown lets them answer before closing sockets. */
 	readonly #inflight = new Set<Promise<void>>();
+	readonly #calls = new Set<AbortController>();
 	#server: net.Server | undefined;
 	/** The open worker; cleared once it exits. */
 	#worker: IdaWorker | undefined;
@@ -84,7 +87,7 @@ export class IdaHost {
 		return code === 0 ? 0 : 1;
 	}
 
-	/** Drain accepted requests, save and close the worker, then stop listening. */
+	/** Drain accepted requests with a grace period, then save, close, and stop listening. */
 	shutdown(): Promise<void> {
 		if (!this.#stopping) {
 			this.#closing = true;
@@ -94,7 +97,22 @@ export class IdaHost {
 	}
 
 	async #stop(): Promise<void> {
-		await Promise.all(this.#inflight);
+		const drained = Promise.allSettled(this.#inflight);
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			const completed = await Promise.race([
+				drained.then(() => true),
+				new Promise<false>(resolve => {
+					timer = setTimeout(() => resolve(false), SHUTDOWN_DRAIN_GRACE_MS);
+				}),
+			]);
+			if (!completed) {
+				for (const controller of this.#calls) controller.abort();
+				await drained;
+			}
+		} finally {
+			clearTimeout(timer);
+		}
 		// Opening may still be in progress when shutdown starts without any active requests.
 		const worker = await this.#opening.catch(() => undefined);
 		this.#worker = undefined;
@@ -195,14 +213,20 @@ export class IdaHost {
 				return;
 			}
 			const controller = request.op === "call" ? new AbortController() : undefined;
-			if (controller) calls.set(request.id, controller);
+			if (controller) {
+				calls.set(request.id, controller);
+				this.#calls.add(controller);
+			}
 			const handled = this.#handle(request, controller)
 				.then(
 					result => writeFrame(socket, { id: request.id, ok: true, result }),
 					error => writeFrame(socket, { id: request.id, ok: false, error: errorMessage(error) }),
 				)
 				.finally(() => {
-					if (controller) calls.delete(request.id);
+					if (controller) {
+						calls.delete(request.id);
+						this.#calls.delete(controller);
+					}
 				});
 			this.#inflight.add(handled);
 			void handled.finally(() => this.#inflight.delete(handled));
