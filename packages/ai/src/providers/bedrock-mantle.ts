@@ -23,13 +23,23 @@ function resolveBedrockMantleUrl(
 		throw new Error(`Invalid AWS region for Bedrock Mantle: ${region}`);
 	}
 	const expectedHost = `bedrock-mantle.${region}.api.aws`;
+	const privateLinkSuffix = `.bedrock-mantle.${region}.vpce.amazonaws.com`;
 	const raw = input instanceof Request ? input.url : input.toString();
 	const url = new URL(raw.replaceAll("{region}", region));
+	const validHost =
+		url.hostname === expectedHost ||
+		(url.hostname.endsWith(privateLinkSuffix) &&
+			/^vpce-[a-z0-9-]+$/.test(url.hostname.slice(0, -privateLinkSuffix.length)));
+	const basePath = url.pathname === "/v1" || url.pathname === "/openai/v1" || url.pathname === "/anthropic";
 	const validPath =
-		pathKind === "base" ? url.pathname === "/v1" : url.pathname === "/v1" || url.pathname.startsWith("/v1/");
+		basePath ||
+		(pathKind === "request" &&
+			(url.pathname.startsWith("/v1/") ||
+				url.pathname.startsWith("/openai/v1/") ||
+				url.pathname.startsWith("/anthropic/")));
 	if (
 		url.protocol !== "https:" ||
-		url.hostname !== expectedHost ||
+		!validHost ||
 		url.port !== "" ||
 		url.username !== "" ||
 		url.password !== "" ||
@@ -37,7 +47,7 @@ function resolveBedrockMantleUrl(
 		url.hash !== "" ||
 		!validPath
 	) {
-		throw new Error(`Bedrock Mantle endpoint must use https://${expectedHost}/v1`);
+		throw new Error(`Bedrock Mantle endpoint must use a regional HTTPS /v1, /openai/v1, or /anthropic route`);
 	}
 	return url;
 }

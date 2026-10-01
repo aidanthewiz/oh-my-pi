@@ -30,6 +30,7 @@ import { toJsonRpcError } from "../../mcp/types";
 import { createMCPJsonRpcError, MCPTransportError, normalizeMCPTransportError } from "../errors";
 import { RequestIdAllocator } from "../request-id";
 import { isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "../timeout";
+import { isThenable } from "../../utils/ipc";
 
 /** Subprocess argv and platform-derived spawn flags for an MCP stdio server. */
 export interface StdioSpawnCommand {
@@ -369,15 +370,6 @@ export async function resolveStdioSpawnCommand(
 interface FrameSink {
 	write(chunk: string): unknown;
 	flush(): unknown;
-}
-
-/** Narrow a value to a thenable so a rejection handler can be attached. */
-function isThenable(value: unknown): value is PromiseLike<unknown> {
-	return (
-		value != null &&
-		(typeof value === "object" || typeof value === "function") &&
-		typeof (value as { then?: unknown }).then === "function"
-	);
 }
 
 /**

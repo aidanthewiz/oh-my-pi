@@ -519,14 +519,43 @@ process.exit(1);
 		}
 	});
 
-	it("invalidates a service approval when its name, environment, or readiness changes", async () => {
+	it("starts services with one reviewed shell prefix and the prepared shell environment", async () => {
+		const prefixMarker = path.join(tempDir, "service-prefix-count");
+		const envMarker = path.join(tempDir, "service-shell-environment");
+		const serviceSettings = Settings.isolated({ "launch.enabled": true, "bashInterceptor.enabled": false });
+		const shell = serviceSettings.getShellConfig();
+		const shellConfig = spyOn(serviceSettings, "getShellConfig").mockReturnValue({
+			...shell,
+			shell: "/bin/sh",
+			args: ["-c"],
+			prefix: `printf p >> '${prefixMarker}';`,
+			env: { ...shell.env, PI_BASH_PREFIX_TEST: "prepared" },
+		});
+		const serviceSession = { ...session, settings: serviceSettings } as ToolSession;
+		const serviceTool = new BashTool(serviceSession);
+		try {
+			const result = await serviceTool.execute("service-prefix", {
+				command: `printf '%s' "$PI_BASH_PREFIX_TEST" > '${envMarker}'; printf svc-allow; sleep 20`,
+				cwd: tempDir,
+				name: "prefix-once-service",
+				pty: false,
+				ready: { log: "svc-allow", timeout: 5 },
+			});
+			expect(result.details?.service).toMatchObject({ ready: true, timedOut: false });
+			expect(fs.readFileSync(prefixMarker, "utf8")).toBe("p");
+			expect(fs.readFileSync(envMarker, "utf8")).toBe("prepared");
+		} finally {
+			await stopService(serviceSession, "prefix-once-service").catch(() => undefined);
+			await closeDaemonClients();
+			shellConfig.mockRestore();
+		}
+	});
+
+	it("invalidates a service approval when its name or readiness changes", async () => {
 		const marker = path.join(tempDir, "changed-service-started");
 		const mutations: Array<(args: BashToolInput) => void> = [
 			args => {
 				args.name = "changed-service-name";
-			},
-			args => {
-				args.env!.FEATURE = "changed";
 			},
 			args => {
 				args.ready!.log = "changed";
@@ -538,7 +567,6 @@ process.exit(1);
 				cwd: tempDir,
 				name: "reviewed-service",
 				pty: false,
-				env: { FEATURE: "original" },
 				ready: { log: "svc-ask" },
 			};
 			const id = `service-fingerprint-${index}`;
@@ -550,23 +578,21 @@ process.exit(1);
 		}
 	});
 
-	it("rejects shell and language preloads in a named service environment", async () => {
+	it("rejects caller-provided environment fields before Bash can launch a command or service", async () => {
 		const marker = path.join(tempDir, "preloaded-service-started");
-		const environments: Record<string, string>[] = [
-			{ BASH_ENV: marker },
-			{ NODE_OPTIONS: `--require=${marker}` },
-			{ "BASH_FUNC_printf%%": "() { command printf injected; }" },
-		];
-		for (const env of environments) {
-			const args: BashToolInput = {
+		for (const name of [undefined, "preloaded-service"]) {
+			const args = {
 				command: `printf svc-allow > '${marker}'`,
 				cwd: tempDir,
-				name: "preloaded-service",
+				name,
 				pty: false,
-				env,
+				env: { BASH_ENV: marker },
 			};
+			await expect(tool.prepareRuntimeApproval("service-preload", args)).rejects.toThrow(
+				"Bash no longer accepts an env parameter.",
+			);
 			await expect(tool.execute("service-preload", args)).rejects.toThrow(
-				/Service env cannot set shell startup or preload variable/u,
+				"Bash no longer accepts an env parameter.",
 			);
 			expect(fs.existsSync(marker)).toBeFalse();
 		}

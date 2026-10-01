@@ -163,6 +163,16 @@ export interface SourceMeta {
 	 * foreign Claude tree. See `isSourceEnabled` in `extensibility/skills.ts`.
 	 */
 	origin?: string;
+	/**
+	 * Plugin or package name supplying this item (`claude-plugins` and
+	 * `agent-plugins` use the plugin name, `omp-plugins` the extension package
+	 * directory name).
+	 * Preferred by `skillNamespace` in `extensibility/skills.ts` over parsing
+	 * the item's path, since installed plugin caches
+	 * (`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/...`)
+	 * put the version, not the plugin name, in the path segment owning `skills/`.
+	 */
+	pluginName?: string;
 }
 
 /**

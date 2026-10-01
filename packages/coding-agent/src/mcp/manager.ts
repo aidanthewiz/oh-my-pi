@@ -201,10 +201,6 @@ function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	return tracked;
 }
 
-function delay(ms: number): Promise<void> {
-	return Bun.sleep(ms);
-}
-
 /**
  * Stable, total ordering on MCP tools by name.
  *
@@ -1113,7 +1109,7 @@ export class MCPManager {
 			const initialLoads = Promise.allSettled(startupTasks.map(task => task.tracked.promise));
 			const windowMs = resolveMCPStartupTimeoutMs(startupTimeoutMs);
 			if (windowMs === 0) await initialLoads;
-			else await Promise.race([initialLoads, delay(windowMs)]);
+			else await Promise.race([initialLoads, Bun.sleep(windowMs)]);
 		}
 
 		if (connectionTasks.length > 0) {

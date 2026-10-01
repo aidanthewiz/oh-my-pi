@@ -405,7 +405,7 @@ Reason: review ${hyperlink}`,
 		component.handleInput("1");
 
 		expect(selected).toBeUndefined();
-		expect(component.render(80).join("\n")).toContain("Search: 1");
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("Search: 1");
 	});
 
 	it("renders disabled options dimmed", () => {

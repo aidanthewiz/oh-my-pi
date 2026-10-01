@@ -1,22 +1,18 @@
 import { centerLine, visibleWidth } from "../../utils";
 import { padToWidth } from "../../render/utils";
-import { gradientEscape, gradientLogo, PI_LOGO, type ShineConfig } from "../../prompt/welcome";
+import { COREFORGE_LOGO, gradientEscape, gradientLogo, logoNode, type ShineConfig } from "../../prompt/welcome";
 import { theme } from "../../theme/theme";
 import { formatKeyHint } from "../../app-keybindings";
+import { col, node, span, text } from "../../native/describe";
+import type { NativeNode } from "../../native/node";
+import { Memo } from "../../native/memo";
 
 export const SETUP_SPLASH_MS = 2600;
 export const SETUP_TICK_MS = 33;
 
-/** Brand mark at 2x: every glyph doubled horizontally, every row doubled vertically. */
-const LARGE_LOGO = PI_LOGO.flatMap(line => {
-	let wide = "";
-	for (const char of line) {
-		wide += char === " " ? "  " : `${char}${char}`;
-	}
-	return [wide, wide];
-});
-const LOGO_WIDTH = Math.max(...LARGE_LOGO.map(line => visibleWidth(line)));
-const LOGO_HEIGHT = LARGE_LOGO.length;
+/** The 24-cell mark leaves room for the animated water below it. */
+const LOGO_WIDTH = Math.max(...COREFORGE_LOGO.map(line => visibleWidth(line)));
+const LOGO_HEIGHT = COREFORGE_LOGO.length;
 const RESET = "\x1b[0m";
 
 /** Full scene needs comfortable room; below this we drop to a centered mark. */
@@ -110,11 +106,8 @@ function waterAmplitude(
 }
 
 /**
- * Animated setup splash, in the spirit of the omp landing page: the brand π
- * mark rendered with the live diagonal gradient + shine sweep, rising out of a
- * rippling, gradient-lit water surface, under a faint twinkling starfield. The
- * mark and water share one continuous gradient so the sweep reads across the
- * whole scene; the water surface drifts each frame.
+ * Animated setup splash: the Coreforge mark shares a moving gradient with
+ * the rippling water beneath it and the sky above it.
  */
 export function renderSetupSplash(width: number, height: number, elapsedMs: number): string[] {
 	const w = Math.max(1, width);
@@ -156,7 +149,7 @@ export function renderSetupSplash(width: number, height: number, elapsedMs: numb
 		}
 	}
 	// 3. hero — the brand mark with the live gradient + shine sweep
-	LARGE_LOGO.forEach((line, row) => {
+	COREFORGE_LOGO.forEach((line, row) => {
 		let col = 0;
 		for (const ch of line) {
 			if (ch !== " ") {
@@ -181,10 +174,33 @@ export function renderSetupSplash(width: number, height: number, elapsedMs: numb
 	return cells.map(row => row.join(""));
 }
 
+const splashMemo = new Memo();
+
+/**
+ * Native splash: the 2x brand mark with a terminal-clocked shimmer, the
+ * wordmark, and the skip hint pinned to the bottom. The water and starfield
+ * are cell paintings with no semantic counterpart. A click on the splash
+ * sends the `skip` action.
+ */
+export function describeSetupSplash(): NativeNode {
+	const hint = skipHint();
+	return splashMemo.get([hint], () =>
+		col(
+			[
+				node("spacer", { grow: 1 }),
+				logoNode(COREFORGE_LOGO, true),
+				text([span("C o r e f o r g e", "strong")], { wrap: "none" }),
+				node("spacer", { grow: 1 }),
+				text([span(hint, "dim")], { wrap: "none" }),
+			],
+			{ align: "center", gap: "md", grow: 1, role: "omp.setup.splash", actions: { click: "skip" } },
+		),
+	);
+}
+
 /** Centered fallback for windows too small to hold the full scene. */
 function renderCompactSplash(width: number, height: number, phase: number, shine: ShineConfig): string[] {
-	const art = height >= 14 ? LARGE_LOGO : PI_LOGO;
-	const content = [...gradientLogo(art, phase, shine), "", theme.bold("O h   M y   P i")];
+	const content = [...gradientLogo(COREFORGE_LOGO, phase, shine), "", theme.bold("C o r e f o r g e")];
 	const start = Math.max(0, Math.floor((height - content.length) / 2));
 	const lines: string[] = [];
 	for (let y = 0; y < height; y++) {

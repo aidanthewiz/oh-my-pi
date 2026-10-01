@@ -26,7 +26,7 @@ export interface ServiceStart {
 	cwd?: string;
 	pty?: boolean;
 	env?: Record<string, string>;
-	shell: { shell: string; args: string[]; env: Record<string, string> };
+	shell: { shell: string; args: string[]; prefix?: string; env: Record<string, string> };
 	ready?: ServiceReady;
 }
 
@@ -207,7 +207,7 @@ export async function startService(
 	const spec: DaemonSpec = {
 		name: params.name,
 		application: params.shell.shell,
-		args: [...params.shell.args, params.command],
+		args: [...params.shell.args, `${params.shell.prefix ? `${params.shell.prefix} ` : ""}${params.command}`],
 		env: { ...params.shell.env, ...params.env },
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
 		pty: params.pty ?? true,

@@ -118,7 +118,6 @@ describe("BashTool execution results", () => {
 			command: "printf plain",
 			name: "  ",
 			ready: { log: "NEVER_READY" },
-			env: { PI_BASH_UNUSED_SERVICE_ENV: "not-inherited" },
 		};
 		expect(await tool.prepareRuntimeApproval("call-plain", input)).toBeUndefined();
 		const result = await tool.execute("call-plain", input);
@@ -126,7 +125,7 @@ describe("BashTool execution results", () => {
 		expect(result.details?.service).toBeUndefined();
 		const text = result.content.find(content => content.type === "text")?.text ?? "";
 		expect(text).toContain("plain");
-		expect(text).toContain("Ignored ready and env: service-only, and no service name was given.");
+		expect(text).toContain("Ignored ready: service-only, and no service name was given.");
 	});
 
 	it("links the raw artifact when the per-line column cap drops bytes", async () => {

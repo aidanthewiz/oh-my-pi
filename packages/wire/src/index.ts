@@ -456,3 +456,4 @@ export type RelayControlToClient = RelayAuthAccepted;
 export type RelayControlMessage = RelayControlToHost | RelayControlToGuest | RelayControlToClient;
 
 export * from "./stream";
+export * from "./tsp";

@@ -368,7 +368,6 @@ const bashSchemaWithService = type({
 		"host?": "string",
 		"timeout?": "number",
 	}),
-	"env?": type.record("string", "string"),
 });
 
 const bashSchemaWithAsyncAndService = type({
@@ -384,7 +383,6 @@ const bashSchemaWithAsyncAndService = type({
 		"host?": "string",
 		"timeout?": "number",
 	}),
-	"env?": type.record("string", "string"),
 });
 
 type BashToolSchema =
@@ -399,7 +397,6 @@ export interface BashToolInput {
 	cwd?: string;
 	name?: string;
 	ready?: ServiceReady;
-	env?: Record<string, string>;
 	async?: boolean;
 	pty?: boolean;
 }
@@ -431,23 +428,15 @@ function normalizeReady(ready: ServiceReady | undefined): ServiceReady | undefin
 	return { log, host, port, timeout };
 }
 
-/** Drops a record with no keys: `env: {}` sets nothing, so it requests nothing. */
-function nonEmptyRecord(record: Record<string, string> | undefined): Record<string, string> | undefined {
-	if (!record) return undefined;
-	for (const _key in record) return record;
-	return undefined;
-}
-
 function normalizeBashInput(input: BashToolInput): BashToolInput {
+	if ("env" in input) throw new ToolError("Bash no longer accepts an env parameter.");
 	const name = blankToUndefined(input.name);
 	return {
 		...input,
 		name,
 		ready: name === undefined ? undefined : normalizeReady(input.ready),
-		env: name === undefined ? undefined : nonEmptyRecord(input.env),
 	};
 }
-
 export interface BashToolOptions {}
 
 interface PreparedShellConfig {
@@ -544,7 +533,7 @@ function formatDcgRuntimeApproval(
 			rule,
 			reason: decision.reason,
 			workingDirectory: JSON.stringify(prepared.commandCwd),
-			environment: input.name === undefined ? "{}" : JSON.stringify(Object.keys(input.env ?? {})),
+			environment: "{}",
 			executionMode:
 				input.name !== undefined
 					? `named service ${JSON.stringify(input.name)}`
@@ -566,7 +555,6 @@ function bashInputFingerprint(input: BashToolInput): string {
 		cwd: input.cwd,
 		name: input.name,
 		ready: input.ready,
-		env: input.env,
 		async: input.async,
 		pty: input.pty,
 	});
@@ -857,8 +845,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (!this.#launchEnabled) throw new ToolError("Service launch is disabled in this session.");
 			if (input.async === true || input.timeout !== undefined)
 				throw new ToolError("Service mode does not accept async or timeout; use ready.timeout for readiness.");
-		} else if (input.ready !== undefined || input.env !== undefined) {
-			throw new ToolError("ready and env require a service name.");
 		}
 		if (input.async === true && !cfgAsyncEnabled.get(this.session.settings)) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
@@ -926,22 +912,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			);
 		}
 		const guardCwd = hostCwd ?? (virtualCwd ? this.session.cwd : commandCwd);
-		if (backend.kind === "service") assertSafeServiceEnv(input.env);
 		if (backend.kind !== "local" && INTERNAL_BASH_URL_RE.test(command)) {
 			throw new ToolError(
 				"Internal URL command paths require the embedded shell; external processes need host paths.",
 			);
 		}
 		const preflight = await applyDirenvPreflight(command, commandCwd, {
-			callerEnv: input.env,
 			signal,
 			timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
 			callerTimeoutMs: input.timeout && input.timeout > 0 ? input.timeout * 1000 : undefined,
 			direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(this.session.settings),
 			commandPrefix:
-				backend.kind === "local" || backend.kind === "service"
-					? this.session.settings.getShellConfig().prefix
-					: undefined,
+				backend.kind === "service"
+					? backend.shellConfig.prefix
+					: backend.kind === "local"
+						? this.session.settings.getShellConfig().prefix
+						: undefined,
 		});
 		if (backend.kind === "service") assertSafeServiceEnv(preflight.env);
 		const dialect = dcgDialectForBackend(backend);
@@ -1341,11 +1327,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const { command, commandCwd, backend } = prepared;
 		const pendingNotices: string[] = [];
-		if (normalizedInput.name === undefined) {
-			const ignored = [normalizeReady(input.ready) && "ready", nonEmptyRecord(input.env) && "env"]
-				.filter(Boolean)
-				.join(" and ");
-			if (ignored) pendingNotices.push(`Ignored ${ignored}: service-only, and no service name was given.`);
+		if (normalizedInput.name === undefined && normalizeReady(input.ready)) {
+			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
 		}
 		const approval = this.approval(input);
 		const approvalTier = typeof approval === "string" ? approval : approval.tier;
@@ -1370,7 +1353,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					pty: normalizedInput.pty,
 					env: prepared.preflight.env,
 					ready: normalizedInput.ready,
-					shell: backend.shellConfig,
+					shell: { ...backend.shellConfig, prefix: undefined },
 				},
 				signal,
 			);
