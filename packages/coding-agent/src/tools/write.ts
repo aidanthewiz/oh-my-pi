@@ -54,6 +54,7 @@ import {
 import { decodeUtf8Text } from "./read-format";
 import { routeReadThroughBridge } from "./read-summary";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { parseXdUrl } from "@oh-my-pi/pi-tui/tools/xd-url";
 
 import {
 	deleteRowByKey,
@@ -68,6 +69,7 @@ import {
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
+import { resolveXdevTool } from "./xdev";
 
 import { cfgLspDiagnosticsDeduplicate, cfgLspDiagnosticsOnWrite, cfgLspFormatOnWrite } from "../lsp/settings";
 
@@ -453,8 +455,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async prepareRuntimeApproval(_toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
 		const input = args as Partial<WriteParams>;
 		if (typeof input.path !== "string" || typeof input.content !== "string") return undefined;
-		const target = parseXdUrl(unwrapHashlineHeaderPath(input.path));
-		const inst = target?.name && this.session.xdev ? resolveXdevTool(this.session.xdev, target.name) : undefined;
+		const url = InternalUrlRouter.instance().writeTarget(unwrapHashlineHeaderPath(input.path))?.url;
+		if (url?.protocol !== "xd:") return undefined;
+		const name = parseXdUrl(url.rawHref ?? url.href)?.name;
+		const inst = name && this.session.xdev ? resolveXdevTool(this.session.xdev, name) : undefined;
 		const prepare = (
 			inst as { prepareApprovalTier?: (args: unknown, signal?: AbortSignal) => Promise<void> } | undefined
 		)?.prepareApprovalTier;
