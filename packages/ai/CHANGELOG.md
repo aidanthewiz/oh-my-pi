@@ -13,6 +13,11 @@
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
 - Kept Anthropic fallback-credit tokens and frozen request bodies on official API-key routes when retry models change endpoint.
+## [18.3.5] - 2026-09-27
+
+### Breaking Changes
+
+- Removed the stream-level Anthropic prompt-cache keep-alive: `StreamOptions.anthropicCacheRefresh`, `StreamOptions.anthropicCacheRefreshRequest`, and the zero-output refresh request path. Prompt-cache warming now lives in the coding agent's session-level cache warmer ([#12699](https://github.com/can1357/oh-my-pi/pull/12699) by [@KamijoToma](https://github.com/KamijoToma)).
 
 ## [18.3.4] - 2026-09-27
 

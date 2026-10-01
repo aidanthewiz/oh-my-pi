@@ -2061,6 +2061,37 @@ describe("ModelRegistry", () => {
 			});
 		});
 
+		test("prompt-cache overrides survive catalog policy and discovery recomposition", () => {
+			const base = buildModel({
+				id: "claude-sonnet-5",
+				name: "Claude Sonnet 5",
+				api: "anthropic-messages",
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+				contextWindow: 200_000,
+				maxTokens: 8192,
+			});
+			expect(base.promptCache).toEqual({ short: 300, long: 3600 });
+			const customLifetime = { short: 240 };
+			const overridden = applyModelPatch(base, { promptCache: customLifetime }, "merge");
+			expect(overridden.promptCache).toEqual(customLifetime);
+			expect(mergeDiscoveredModel(base, overridden).promptCache).toEqual(customLifetime);
+			const custom = finalizeCustomModel(
+				{
+					id: base.id,
+					provider: base.provider,
+					api: base.api,
+					baseUrl: base.baseUrl,
+					promptCache: customLifetime,
+				},
+				{ useDefaults: true },
+			);
+			expect(custom.promptCache).toEqual(customLifetime);
+		});
+
 		test("non-price overrides keep scheduled rates while user prices stay fixed across tariff changes", () => {
 			expect(scheduledPrices.getError()).toBeUndefined();
 			const renamed = scheduledPrices.find("deepseek", "deepseek-v4-flash");

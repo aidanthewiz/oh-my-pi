@@ -5,6 +5,15 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+## [18.3.5] - 2026-09-27
+
+### Changed
+
+- Improved syntax highlighting to use about 5x less memory and run 3-5x faster by compiling grammars with Oniguruma instead of fancy-regex; highlighted output is unchanged.
+
+### Fixed
+
+- Fixed SmolLM word completion (`spelling.autocomplete: smollm`) being about 25x slower on Windows x64 and Intel Macs; suggestions are unchanged ([#13488](https://github.com/can1357/oh-my-pi/pull/13488) by [@H4vC](https://github.com/H4vC))
 
 ## [18.3.4] - 2026-09-27
 

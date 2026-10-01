@@ -88,8 +88,9 @@ export function mergeDiscoveredModel<TApi extends Api>(
 ): Model<TApi> {
 	if (existing) {
 		const supportsTools = model.supportsTools ?? existing.supportsTools;
-		return buildModel({
+		const built = buildModel({
 			...toModelSpec(model),
+			promptCache: existing.promptCache ?? model.promptCache,
 			baseUrl: resolveProviderBaseUrl(model.api, model.baseUrl ?? existing.baseUrl, providerOverride),
 			headers: undefined,
 			resolveHeaders: createConfigHeaderResolver(
@@ -111,6 +112,8 @@ export function mergeDiscoveredModel<TApi extends Api>(
 			...(supportsTools !== undefined ? { supportsTools } : {}),
 			compat: mergeCompat(model.compatConfig, providerOverride?.compat),
 		} as ModelSpec<TApi>);
+		if (existing.promptCache !== undefined) built.promptCache = existing.promptCache;
+		return built;
 	}
 	if (providerOverride) {
 		return buildModel({
@@ -240,6 +243,7 @@ export interface ModelPatch {
 	tokenizer?: Model<Api>["tokenizer"];
 	supportsTools?: boolean;
 	cost?: Partial<Model<Api>["cost"]>;
+	promptCache?: Model<Api>["promptCache"];
 	contextWindow?: number;
 	/** Registry-only window preference; never patches the provider-advertised maximum. */
 	maxContextWindow?: number;
@@ -273,6 +277,7 @@ export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: 
 	if (patch.tokenizer !== undefined) result.tokenizer = patch.tokenizer;
 	if (patch.imageInputDecoder !== undefined) result.imageInputDecoder = patch.imageInputDecoder;
 	if (patch.supportsTools !== undefined) result.supportsTools = patch.supportsTools;
+	if (patch.promptCache !== undefined) result.promptCache = patch.promptCache;
 	if (patch.contextWindow !== undefined) result.contextWindow = patch.contextWindow;
 	if (patch.maxTokens !== undefined) result.maxTokens = patch.maxTokens;
 	if (patch.omitMaxOutputTokens !== undefined) result.omitMaxOutputTokens = patch.omitMaxOutputTokens;
@@ -322,6 +327,7 @@ export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: 
 	if (patch.input !== undefined) built.input = patch.input;
 	// Patches never change model identity. Preserve already-resolved pricing,
 	// including earlier custom prices and the deliberate absence of a schedule.
+	if (patch.promptCache !== undefined) built.promptCache = patch.promptCache;
 	built.cost = result.cost;
 	return built;
 }

@@ -71,6 +71,57 @@ describe("web model role resolution", () => {
 		expect(candidates.some(candidate => candidate.model.id === "duckduckgo")).toBe(true);
 	});
 
+	it("admits supported direct OpenAI web models but excludes realtime from candidates", () => {
+		const authStorage = createInMemoryAuthStorage();
+		storages.add(authStorage);
+		authStorage.keys.setRuntime("openai", "test-openai-key");
+		const settings = Settings.isolated();
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { settings });
+		const openAiCandidates = roleCandidatePool("web", settings, modelRegistry).filter(
+			model => model.provider === "openai",
+		);
+		expect(openAiCandidates.some(model => model.id === "gpt-6-luna")).toBe(true);
+		expect(openAiCandidates.some(model => model.id === "gpt-realtime-2.1")).toBe(false);
+		const candidates = resolveRoleChain("web", settings, openAiCandidates);
+
+		// Credentials alone do not authorize API-billed search in the automatic chain.
+		expect(candidates).toEqual([]);
+	});
+
+	it("selects API-billed OpenAI only when the web role explicitly requests it", () => {
+		const authStorage = createInMemoryAuthStorage();
+		storages.add(authStorage);
+		authStorage.keys.setRuntime("openai", "test-openai-key");
+		const settings = Settings.isolated({
+			modelRoles: { web: "openai/gpt-6-luna" },
+			"retry.fallbackChains": { web: [] },
+		});
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { settings });
+		const pool = roleCandidatePool("web", settings, modelRegistry);
+		const candidates = resolveRoleChain("web", settings, pool);
+
+		expect(
+			candidates.map(candidate => [`${candidate.model.provider}/${candidate.model.id}`, candidate.explicit]),
+		).toEqual([["openai/gpt-6-luna", true]]);
+	});
+
+	it("does not select API-billed OpenAI outside the configured model scope", () => {
+		const authStorage = createInMemoryAuthStorage();
+		storages.add(authStorage);
+		authStorage.keys.setRuntime("openai", "test-openai-key");
+		const settings = Settings.isolated({
+			enabledModels: ["web/duckduckgo"],
+			modelRoles: { web: "openai/gpt-6-luna" },
+			"retry.fallbackChains": { web: [] },
+		});
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { settings });
+		const pool = roleCandidatePool("web", settings, modelRegistry);
+
+		expect(resolveRoleChain("web", settings, pool).some(candidate => candidate.model.provider === "openai")).toBe(
+			false,
+		);
+	});
+
 	it("marks configured primaries and configured fallbacks explicit", () => {
 		const { pool, settings } = createRuntime({
 			modelRoles: { web: "web/perplexity" },

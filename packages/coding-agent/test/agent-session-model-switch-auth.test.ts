@@ -1,5 +1,6 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import * as path from "node:path";
+import { Type } from "@oh-my-pi/omptype/typebox";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -7,6 +8,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { CacheWarmer } from "@oh-my-pi/pi-coding-agent/session/cache-warmer";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -37,6 +39,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
 		for (const spy of spies.splice(0)) spy.mockRestore();
 		if (session) {
 			await session.dispose();
@@ -50,7 +53,11 @@ describe("AgentSession model switch auth pre-flight", () => {
 		return model;
 	}
 
-	function makeSession(initialModel: Model<Api>, roles?: Record<string, string>): AgentSession {
+	function makeSession(
+		initialModel: Model<Api>,
+		roles?: Record<string, string>,
+		cacheWarmer?: CacheWarmer,
+	): AgentSession {
 		const settings = Settings.isolated();
 		if (roles) {
 			for (const role in roles) settings.setModelRole(role, roles[role]);
@@ -68,6 +75,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			cacheWarmer,
 			modelRegistry: registry,
 		});
 		return session;
@@ -145,5 +153,64 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(s.resolveRoleModel("slow")).toBeUndefined();
 		await expect(s.setModel(to)).rejects.toThrow(`Model "${to.provider}/${to.id}" is excluded by model policy`);
 		expect(s.model?.id).toBe(from.id);
+	});
+
+	it("does not replay an old request after tools change or the session is replaced", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		let replays = 0;
+		const warmer = new CacheWarmer({
+			stream: () => {
+				replays++;
+				throw new Error("Stale request replayed");
+			},
+			getPromptTokens: () => 100_000,
+			getMode: () => "idle",
+		});
+		const s = makeSession(model, undefined, warmer);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		expect(s.cacheWarmingStatus?.state).toBe("scheduled");
+		s.agent.setTools([
+			{
+				name: "changed_tool",
+				label: "Changed tool",
+				description: "A newly selected tool",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+			},
+		]);
+		vi.advanceTimersByTime(270_000);
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(replays).toBe(0);
+		expect(s.cacheWarmingStatus?.reason).toBe("conversation context changed");
+
+		s.startCacheWarming(model, { messages: [] }, {});
+		expect(s.cacheWarmingStatus?.state).toBe("scheduled");
+		const switched = s.newSession();
+		vi.advanceTimersByTime(270_000);
+		vi.useRealTimers();
+		expect(await switched).toBe(true);
+		expect(replays).toBe(0);
+		expect(s.cacheWarmingStatus?.state).toBe("inactive");
+	});
+
+	it("cancels a scheduled paid replay as soon as disposal begins", () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		let replays = 0;
+		const warmer = new CacheWarmer({
+			stream: () => {
+				replays++;
+				throw new Error("Disposed session replayed");
+			},
+			getPromptTokens: () => 100_000,
+			getMode: () => "idle",
+		});
+		const s = makeSession(model, undefined, warmer);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		s.beginDispose();
+		vi.advanceTimersByTime(270_000);
+		expect(replays).toBe(0);
+		expect(s.cacheWarmingStatus?.state).toBe("inactive");
 	});
 });
