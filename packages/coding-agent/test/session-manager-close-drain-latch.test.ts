@@ -26,6 +26,9 @@ class FailingPublishBackend implements SessionStorageBackend {
 	readFull(): Promise<string | null> {
 		return Promise.resolve(null);
 	}
+	readFullWithTitleMeta(): Promise<null> {
+		return Promise.resolve(null);
+	}
 
 	readSlices(): Promise<[string, string]> {
 		return Promise.resolve(["", ""]);

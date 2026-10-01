@@ -15,6 +15,7 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 	readonly #sessionPath: string;
 	readonly #initialEntry: SessionStorageIndexEntry;
 	#content: string;
+	#titleMeta: string | null = JSON.stringify({ title: "Old", source: "auto", updatedAt: "t0" });
 	#firstUpdate: PromiseWithResolvers<void> | undefined;
 	#updateCount = 0;
 
@@ -42,6 +43,10 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 	readFull(path: string): Promise<string | null> {
 		return Promise.resolve(path === this.#sessionPath ? this.#content : null);
 	}
+	readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		if (path !== this.#sessionPath) return Promise.resolve(null);
+		return Promise.resolve({ rawContent: this.#content, titleMeta: this.#titleMeta });
+	}
 
 	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		if (path !== this.#sessionPath) return Promise.resolve(["", ""]);
@@ -49,8 +54,9 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 		return Promise.resolve([this.#content.slice(0, prefixBytes), suffix]);
 	}
 
-	writeFull(_path: string, content: string, _mtimeMs: number, _title?: SessionTitleUpdate): Promise<void> {
+	writeFull(_path: string, content: string, _mtimeMs: number, title?: SessionTitleUpdate): Promise<void> {
 		this.#content = content;
+		this.#titleMeta = title ? JSON.stringify(title) : null;
 		return Promise.resolve();
 	}
 
@@ -59,12 +65,13 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 		return Promise.resolve();
 	}
 
-	updateSessionTitle(_path: string, _title: SessionTitleUpdate, _mtimeMs: number): Promise<void> {
+	updateSessionTitle(_path: string, title: SessionTitleUpdate, _mtimeMs: number): Promise<void> {
 		this.#updateCount++;
 		if (this.#updateCount === 1) {
 			this.#firstUpdate = Promise.withResolvers<void>();
 			return this.#firstUpdate.promise;
 		}
+		this.#titleMeta = JSON.stringify(title);
 		return Promise.resolve();
 	}
 
@@ -533,6 +540,37 @@ describe("IndexedSessionStorage.updateSessionTitle", () => {
 	});
 });
 
+it("reads transcript and title metadata from one committed indexed snapshot after a peer publish", async () => {
+	const sessionPath = "/sessions/shared.jsonl";
+	const oldTitle = { title: "Old", source: "auto" as const, updatedAt: "t0" };
+	const newTitle = { title: "New", source: "user" as const, updatedAt: "t1" };
+	const oldRaw = `${serializeTitleSlot(oldTitle)}old-entry\n`;
+	const newRaw = `${serializeTitleSlot(newTitle)}new-entry\n`;
+	class InterleavedBackend extends ControlledTitleUpdateBackend {
+		override readFull(): Promise<string> {
+			// A split read captures old bytes before a peer publishes the new title.
+			return Promise.resolve(oldRaw);
+		}
+		readTitleMeta(): Promise<string> {
+			return Promise.resolve(JSON.stringify(newTitle));
+		}
+		override readFullWithTitleMeta(): Promise<{ rawContent: string; titleMeta: string }> {
+			return Promise.resolve({ rawContent: newRaw, titleMeta: JSON.stringify(newTitle) });
+		}
+	}
+	const storage = new IndexedSessionStorage(new InterleavedBackend(sessionPath, oldRaw));
+	await storage.initialize();
+	expect(await storage.readTextSnapshot(sessionPath)).toEqual({
+		content: newRaw,
+		rawContent: newRaw,
+		titleMeta: JSON.stringify(newTitle),
+	});
+	expect(await storage.readCommittedState(sessionPath)).toEqual({
+		content: newRaw,
+		titleMeta: JSON.stringify(newTitle),
+	});
+});
+
 class PausableWriteFullBackend implements SessionStorageBackend {
 	readonly writeFullCalls: Array<{ content: string; mtimeMs: number }> = [];
 	readonly firstWriteStarted = Promise.withResolvers<void>();
@@ -546,6 +584,9 @@ class PausableWriteFullBackend implements SessionStorageBackend {
 		return Promise.resolve([]);
 	}
 	readFull(): Promise<string | null> {
+		return Promise.resolve(null);
+	}
+	readFullWithTitleMeta(): Promise<null> {
 		return Promise.resolve(null);
 	}
 	readSlices(): Promise<[string, string]> {

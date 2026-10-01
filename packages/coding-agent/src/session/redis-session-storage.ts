@@ -49,13 +49,23 @@ const DEFAULT_SCAN_COUNT = 500;
 
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
-if expected ~= "" then
+local fingerprint = ARGV[7]
+local titleFence = ARGV[8]
+if expected ~= "" or fingerprint ~= "" or titleFence ~= "" then
 	local actual = -1
 	if redis.call("EXISTS", KEYS[1]) == 1 then
 		actual = redis.call("STRLEN", KEYS[1])
 	end
-	if actual ~= tonumber(expected) then
+	if (expected ~= "" and actual ~= tonumber(expected)) or
+		(fingerprint ~= "" and (actual == -1 or redis.sha1hex(redis.call("GET", KEYS[1])) ~= fingerprint)) then
 		return {0, actual}
+	end
+	if titleFence ~= "" then
+		local currentTitle = redis.call("HGET", KEYS[3], ARGV[2])
+		if (titleFence == "0" and currentTitle) or
+			(titleFence ~= "0" and currentTitle ~= string.sub(titleFence, 2)) then
+			return {0, actual}
+		end
 	end
 end
 redis.call("SET", KEYS[1], ARGV[1])
@@ -66,6 +76,12 @@ else
 	redis.call("HDEL", KEYS[3], ARGV[2])
 end
 return {1, string.len(ARGV[1])}`;
+
+const READ_FULL_WITH_TITLE_SCRIPT = `-- OMP_READ_FULL_WITH_TITLE
+local content = redis.call("GET", KEYS[1])
+if not content then return {0} end
+local title = redis.call("HGET", KEYS[2], ARGV[1])
+return {1, content, title or ""}`;
 
 const APPEND_SCRIPT = `-- OMP_APPEND
 local size = redis.call("APPEND", KEYS[1], ARGV[1])
@@ -174,6 +190,21 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			}),
 		);
 	}
+	async readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		const result = await this.#client.send("EVAL", [
+			READ_FULL_WITH_TITLE_SCRIPT,
+			"2",
+			this.#fileKey(path),
+			this.#titleMetaKey(),
+			path,
+		]);
+		if (!Array.isArray(result)) throw new Error("Invalid Redis session snapshot response.");
+		if (Number(result[0]) === 0) return null;
+		if (Number(result[0]) !== 1 || typeof result[1] !== "string" || typeof result[2] !== "string") {
+			throw new Error("Invalid Redis session snapshot response.");
+		}
+		return { rawContent: result[1], titleMeta: result[2] || null };
+	}
 
 	readFull(path: string): Promise<string | null> {
 		return this.#client.get(this.#fileKey(path));
@@ -192,6 +223,8 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		mtimeMs: number,
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
+		expectedFingerprint?: string,
+		expectedTitleMeta?: string | null,
 	): Promise<void> {
 		const result = await this.#client.send("EVAL", [
 			WRITE_FULL_SCRIPT,
@@ -205,13 +238,15 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			title ? "1" : "0",
 			title ? encodeTitleMeta(title) : "",
 			expectedSize === undefined ? "" : String(expectedSize ?? -1),
+			expectedFingerprint ?? "",
+			expectedTitleMeta === undefined ? "" : expectedTitleMeta === null ? "0" : "1" + expectedTitleMeta,
 		]);
-		if (expectedSize === undefined) return;
+		if (expectedSize === undefined && expectedFingerprint === undefined && expectedTitleMeta === undefined) return;
 		const written = Array.isArray(result) && Number(result[0]) === 1;
 		if (written) return;
 		const encodedActual = Array.isArray(result) ? Number(result[1]) : Number.NaN;
 		const actualSize = encodedActual === -1 ? null : Number.isFinite(encodedActual) ? encodedActual : null;
-		throw new SessionWriteConflictError(path, expectedSize, actualSize);
+		throw new SessionWriteConflictError(path, expectedSize ?? null, actualSize, actualSize === expectedSize);
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {

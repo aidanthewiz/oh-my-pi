@@ -1,3 +1,4 @@
+import { createHash, type Hash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
@@ -15,6 +16,9 @@ import { overlayTitleSlotContent, type SessionTitleUpdate, serializeTitleSlot } 
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
 const utf8Decoder = new TextDecoder("utf-8");
+export function sessionContentFingerprint(content: string): string {
+	return createHash("sha1").update(content).digest("hex");
+}
 
 export interface SessionStorageStat {
 	size: number;
@@ -53,10 +57,14 @@ export interface SessionStorageWriter {
 	getError(): Error | undefined;
 }
 
-/** Optimistic precondition for replacing a session file. */
+/** Optimistic preconditions for replacing a session file. */
 export interface SessionStorageWriteOptions {
 	/** Current UTF-8 byte length, or `null` when the target must not exist. */
 	expectedSize?: number | null;
+	/** SHA-1 detects accidental stale writers; it is not an authentication primitive. */
+	expectedFingerprint?: string;
+	/** Exact backend title metadata; null means absent. Only indexed backends use it. */
+	expectedTitleMeta?: string | null;
 }
 
 /**
@@ -68,10 +76,13 @@ export class SessionWriteConflictError extends Error {
 	readonly expectedSize: number | null;
 	readonly actualSize: number | null;
 
-	constructor(path: string, expectedSize: number | null, actualSize: number | null) {
+	constructor(path: string, expectedSize: number | null, actualSize: number | null, stateMismatch = false) {
 		const expected = expectedSize === null ? "missing" : `${expectedSize} bytes`;
 		const actual = actualSize === null ? "missing" : `${actualSize} bytes`;
-		super(`Session file changed before rewrite: ${path} (expected ${expected}, found ${actual}).`);
+		super(
+			`Session file changed before rewrite: ${path} (expected ${expected}, found ${actual}` +
+				`${stateMismatch ? ", content or title differs" : ""}).`,
+		);
 		this.name = "SessionWriteConflictError";
 		this.path = path;
 		this.expectedSize = expectedSize;
@@ -99,10 +110,9 @@ export class SessionLockError extends Error {
 
 /**
  * Optional guards applied by {@link SessionStorage.writeTextAtomic}. The
- * backend MUST check `expectedSize` and call `commitGuard()` synchronously
- * immediately before it makes the staged content visible at `path`. Failed
- * preconditions leave the target untouched. Backends MUST NOT yield between
- * the checks and publishing the write.
+ * backend MUST check size, content fingerprint, and indexed title metadata
+ * at the publish boundary. Failed preconditions leave the target untouched.
+ * The commit guard cannot yield between its check and publication.
  */
 export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
 	commitGuard?: () => boolean;
@@ -136,12 +146,16 @@ export interface SessionStorage {
 	 * backends can store the semantic title fields and synthesize the slot when
 	 * reading.
 	 */
-	updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void>;
+	updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<Hash | void>;
 	statSync(path: string): SessionStorageStat;
 	listFilesSync(dir: string, pattern: string): string[];
 
 	exists(path: string): Promise<boolean>;
 	readText(path: string): Promise<string>;
+	/** Read visible content, raw backing bytes, and title metadata in one indexed snapshot. */
+	readTextSnapshot?(path: string): Promise<{ content: string; rawContent: string; titleMeta: string | null }>;
+	/** Read authoritative bytes and title metadata after an uncertain indexed publish. */
+	readCommittedState?(path: string): Promise<{ content: string; titleMeta: string | null }>;
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
@@ -415,8 +429,23 @@ function isPidAlive(pid: number): boolean {
 }
 
 export class FileSessionStorage implements SessionStorage {
-	#assertExpectedSize(fpath: string, expectedSize: number | null | undefined): void {
-		if (expectedSize === undefined) return;
+	#fingerprintFile(fpath: string): Hash {
+		const hash = createHash("sha1");
+		const chunk = Buffer.allocUnsafe(64 * 1024);
+		const fd = fs.openSync(fpath, "r");
+		try {
+			let bytesRead: number;
+			while ((bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+				hash.update(chunk.subarray(0, bytesRead));
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+		return hash;
+	}
+
+	#assertExpectedState(fpath: string, options?: SessionStorageWriteOptions): void {
+		if (options?.expectedSize === undefined && options?.expectedFingerprint === undefined) return;
 		let actualSize: number | null;
 		try {
 			actualSize = fs.statSync(fpath).size;
@@ -424,8 +453,14 @@ export class FileSessionStorage implements SessionStorage {
 			if (!isEnoent(error)) throw error;
 			actualSize = null;
 		}
-		if (actualSize !== expectedSize) {
-			throw new SessionWriteConflictError(fpath, expectedSize, actualSize);
+		if (options?.expectedSize !== undefined && actualSize !== options.expectedSize) {
+			throw new SessionWriteConflictError(fpath, options.expectedSize, actualSize);
+		}
+		if (
+			options?.expectedFingerprint !== undefined &&
+			this.#fingerprintFile(fpath).digest("hex") !== options.expectedFingerprint
+		) {
+			throw new SessionWriteConflictError(fpath, options.expectedSize ?? null, actualSize, true);
 		}
 	}
 
@@ -648,7 +683,7 @@ export class FileSessionStorage implements SessionStorage {
 		// append between the size check and the rename.
 		try {
 			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedSize(fpath, options?.expectedSize);
+				this.#assertExpectedState(fpath, options);
 				try {
 					this.renameSync(tempPath, fpath);
 				} catch (err) {
@@ -662,23 +697,26 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
-	async updateSessionTitle(fpath: string, update: SessionTitleUpdate): Promise<void> {
-		const fd = fs.openSync(fpath, "r+");
-		try {
-			const buf = Buffer.from(serializeTitleSlot(update), "utf-8");
-			let offset = 0;
-			while (offset < buf.length) {
-				const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset);
-				if (written === 0) {
-					throw new Error("Short write");
+	async updateSessionTitle(fpath: string, update: SessionTitleUpdate): Promise<Hash> {
+		let fingerprint!: Hash;
+		this.#withPublishLock(fpath, () => {
+			const fd = fs.openSync(fpath, "r+");
+			try {
+				const buf = Buffer.from(serializeTitleSlot(update), "utf-8");
+				let offset = 0;
+				while (offset < buf.length) {
+					const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset);
+					if (written === 0) throw new Error("Short write");
+					offset += written;
 				}
-				offset += written;
+			} catch (err) {
+				throw toError(err);
+			} finally {
+				fs.closeSync(fd);
 			}
-		} catch (err) {
-			throw toError(err);
-		} finally {
-			fs.closeSync(fd);
-		}
+			fingerprint = this.#fingerprintFile(fpath);
+		});
+		return fingerprint;
 	}
 
 	statSync(path: string): SessionStorageStat {
@@ -754,7 +792,7 @@ export class FileSessionStorage implements SessionStorage {
 			// its EPERM fallback): a cooperating appender or rewrite cannot
 			// interleave, and appenders re-open a replaced path before writing.
 			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedSize(fpath, options?.expectedSize);
+				this.#assertExpectedState(fpath, options);
 				try {
 					this.renameSync(tempPath, fpath);
 					return;
@@ -1174,19 +1212,25 @@ export class MemorySessionStorage implements SessionStorage {
 	}
 
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
-		const actualSize = this.#files.get(path)?.size ?? null;
+		const previous = this.#files.get(path);
+		const actualSize = previous?.size ?? null;
 		if (options?.expectedSize !== undefined && actualSize !== options.expectedSize) {
 			throw new SessionWriteConflictError(path, options.expectedSize, actualSize);
+		}
+		if (
+			options?.expectedFingerprint !== undefined &&
+			(previous ? sessionContentFingerprint(materializeMemoryEntry(previous)) : null) !== options.expectedFingerprint
+		) {
+			throw new SessionWriteConflictError(path, options.expectedSize ?? null, actualSize, true);
 		}
 		this.#files.set(path, createMemoryFileEntry(content, Date.now()));
 	}
 
-	async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void> {
+	async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<Hash> {
 		const entry = this.#requireEntry(path);
-		this.#files.set(
-			path,
-			createMemoryFileEntry(overlayTitleSlotContent(materializeMemoryEntry(entry), update), Date.now()),
-		);
+		const body = overlayTitleSlotContent(materializeMemoryEntry(entry), update);
+		this.#files.set(path, createMemoryFileEntry(body, Date.now()));
+		return createHash("sha1").update(body);
 	}
 
 	/**
@@ -1259,7 +1303,7 @@ export class MemorySessionStorage implements SessionStorage {
 
 	writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
 		if (options?.commitGuard && !options.commitGuard()) return Promise.resolve();
-		this.writeTextSync(path, content, { expectedSize: options?.expectedSize });
+		this.writeTextSync(path, content, options);
 		return Promise.resolve();
 	}
 

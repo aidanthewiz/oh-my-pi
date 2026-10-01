@@ -25,14 +25,25 @@
  * transcript -- not merely the exit-record bookkeeping -- is reported lost.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it } from "bun:test";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { MemorySessionStorage, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	SessionManager,
+	SessionPersistenceIndeterminateError,
+} from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	FileSessionStorage,
+	MemorySessionStorage,
+	SessionWriteConflictError,
+	sessionContentFingerprint,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 
 /** Real-shape indexed backend: local index is set synchronously by the
  * caller (`IndexedSessionStorage`) before this backend is ever invoked, so no
@@ -56,6 +67,10 @@ class FakeIndexedBackend implements SessionStorageBackend {
 	async readFull(path: string): Promise<string | null> {
 		return this.files.get(path) ?? null;
 	}
+	async readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		const rawContent = this.files.get(path);
+		return rawContent === undefined ? null : { rawContent, titleMeta: null };
+	}
 
 	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const bytes = Buffer.from(this.files.get(path) ?? "", "utf8");
@@ -75,11 +90,18 @@ class FakeIndexedBackend implements SessionStorageBackend {
 		mtimeMs: number,
 		_title?: unknown,
 		expectedSize?: number | null,
+		expectedFingerprint?: string,
 	): Promise<void> {
 		const current = this.files.get(path) ?? null;
 		const actualSize = current === null ? null : Buffer.byteLength(current, "utf8");
 		if (expectedSize !== undefined && actualSize !== expectedSize) {
 			throw new SessionWriteConflictError(path, expectedSize, actualSize);
+		}
+		if (
+			expectedFingerprint !== undefined &&
+			(current === null || sessionContentFingerprint(current) !== expectedFingerprint)
+		) {
+			throw new SessionWriteConflictError(path, expectedSize ?? null, actualSize, true);
 		}
 		this.files.set(path, content);
 		this.mtimes.set(path, mtimeMs);
@@ -131,15 +153,14 @@ function assistantMessage(text: string) {
 }
 
 /**
- * `MemorySessionStorage` with `defersSyncPublish` flipped on and no other
- * change: `close()`'s terminal-rewrite retry only runs for a deferred-publish
- * backend (the self-race this PR fixes), and `MemorySessionStorage.writeTextAtomic`
- * has no readback of its own -- unlike `IndexedSessionStorage`'s, which would
- * mask the gap under test -- so the tolerance exercised below is entirely
- * `SessionManager`'s own.
+ * Synchronous memory writes with deferred-publish confirmation. This isolates
+ * SessionManager's ack-lost readback from IndexedSessionStorage's own readback.
  */
 class DeferredPublishMemoryStorage extends MemorySessionStorage {
 	readonly defersSyncPublish = true;
+	confirmWrites(_path: string): Promise<void> {
+		return Promise.resolve();
+	}
 }
 
 describe("SessionManager seal()+close() recovers a sync-rewrite conflict against a deferred-publish backend", () => {
@@ -183,6 +204,48 @@ describe("SessionManager seal()+close() recovers a sync-rewrite conflict against
 		expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(body, "utf8"));
 	});
 
+	it("rejects a stale terminal repair after a newer owner replaces equal-length bytes", async () => {
+		const backend = new FakeIndexedBackend();
+		const staleStorage = new IndexedSessionStorage(backend);
+		await staleStorage.initialize();
+		const stale = SessionManager.create("/cwd", "/sessions/proj", staleStorage);
+		const sessionFile = stale.getSessionFile();
+		if (!sessionFile) throw new Error("expected a session file");
+
+		stale.appendMessage(assistantMessage("OLD OWNER"));
+		let conflict: unknown;
+		try {
+			stale.appendCustomEntry("session_exit", { reason: "dispose" });
+			stale.flushSync();
+		} catch (error) {
+			conflict = error;
+		}
+		expect(conflict).toBeInstanceOf(SessionWriteConflictError);
+		stale.seal();
+		await staleStorage.drain();
+		const original = backend.files.get(sessionFile);
+		if (!original) throw new Error("first owner did not publish");
+
+		const replacement = original.replace("OLD OWNER", "NEW OWNER");
+		expect(replacement).not.toBe(original);
+		expect(Buffer.byteLength(replacement, "utf8")).toBe(Buffer.byteLength(original, "utf8"));
+		const newerStorage = new IndexedSessionStorage(backend);
+		await newerStorage.initialize();
+		await newerStorage.writeTextAtomic(sessionFile, replacement, {
+			expectedSize: Buffer.byteLength(original, "utf8"),
+		});
+
+		const closeError = await stale.close().then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(closeError).toBeInstanceOf(SessionPersistenceIndeterminateError);
+		expect((closeError as SessionPersistenceIndeterminateError).recoveryErrors).toEqual(
+			expect.arrayContaining([expect.objectContaining({ name: "SessionWriteConflictError" })]),
+		);
+		expect(backend.files.get(sessionFile)).toBe(replacement);
+	});
+
 	it("still throws when the retried rewrite itself cannot reach the backend", async () => {
 		const backend = new FakeIndexedBackend();
 		const storage = new IndexedSessionStorage(backend);
@@ -215,13 +278,16 @@ describe("SessionManager seal()+close() recovers a sync-rewrite conflict against
 		if (!sessionFile) throw new Error("expected a session file");
 
 		manager.appendMessage(assistantMessage("FINAL MESSAGE"));
+		await manager.flush();
 		manager.appendCustomEntry("session_exit", { reason: "dispose" });
+		await manager.flush();
 
 		// Latch a disk failure via a transient, fully-unresolvable backend
 		// outage (the write fails and the readback returns stale content), so
 		// close() below finds `#diskFailure` already set, the same way a real
 		// conflict or outage would leave it before dispose.
 		const originalReadText = storage.readText.bind(storage);
+		const originalAtomicWrite = MemorySessionStorage.prototype.writeTextAtomic.bind(storage);
 		storage.writeTextAtomic = async (): Promise<void> => {
 			throw new Error("transient backend outage");
 		};
@@ -236,8 +302,8 @@ describe("SessionManager seal()+close() recovers a sync-rewrite conflict against
 		// tolerates via a readback; close()'s terminal rewrite must tolerate
 		// it the same way now that both share `#publishAuthoritativeBody`.
 		let ackLost = true;
-		storage.writeTextAtomic = async (path: string, content: string): Promise<void> => {
-			storage.writeTextSync(path, content);
+		storage.writeTextAtomic = async (path, content, options): Promise<void> => {
+			await originalAtomicWrite(path, content, options);
 			if (ackLost) {
 				ackLost = false;
 				throw new Error("connection reset after commit");
@@ -250,5 +316,36 @@ describe("SessionManager seal()+close() recovers a sync-rewrite conflict against
 		const body = await storage.readText(sessionFile);
 		expect(body).toContain("FINAL MESSAGE");
 		expect(body).toContain("session_exit");
+	});
+});
+
+describe("session repair fingerprint preconditions", () => {
+	it("memory rejects a newer equal-size transcript before replacement", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/fenced.jsonl";
+		storage.writeTextSync(sessionFile, "old owner\n");
+		const expectedFingerprint = sessionContentFingerprint("old owner\n");
+		storage.writeTextSync(sessionFile, "new owner\n");
+		expect(() =>
+			storage.writeTextAtomic(sessionFile, "stale end\n", { expectedSize: 10, expectedFingerprint }),
+		).toThrow(SessionWriteConflictError);
+		expect(await storage.readText(sessionFile)).toBe("new owner\n");
+	});
+
+	it("file rejects a newer equal-size transcript under the publish lock", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-fence-"));
+		try {
+			const storage = new FileSessionStorage();
+			const sessionFile = path.join(dir, "fenced.jsonl");
+			storage.writeTextSync(sessionFile, "old owner\n");
+			const expectedFingerprint = sessionContentFingerprint("old owner\n");
+			storage.writeTextSync(sessionFile, "new owner\n");
+			await expect(
+				storage.writeTextAtomic(sessionFile, "stale end\n", { expectedSize: 10, expectedFingerprint }),
+			).rejects.toBeInstanceOf(SessionWriteConflictError);
+			expect(fs.readFileSync(sessionFile, "utf8")).toBe("new owner\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

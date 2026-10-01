@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { createHash, type Hash } from "node:crypto";
 import { ConcatSink, getBlobsDir, isEnoent, isEnotdir, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { Semaphore } from "../task/parallel";
@@ -42,6 +43,8 @@ export interface VisitEntriesFromFileStreamOptions {
 	 * callers derive the exact snapshot size without re-stating the file.
 	 */
 	onBytesConsumed?: (bytes: number) => void;
+	/** Raw chunks from the same snapshot the parser consumes. */
+	onChunk?: (chunk: Uint8Array) => void;
 }
 
 /** Controls how a missing session file is handled. */
@@ -57,6 +60,10 @@ export interface SessionLoadResult {
 	malformedRecords: number;
 	/** Byte length of the snapshot actually parsed, or `null` when the path did not exist. */
 	sourceSize?: number | null;
+	/** Hash state of the exact parsed bytes, before any entry migrations. */
+	sourceFingerprint?: Hash;
+	/** Indexed backend metadata observed with the raw bytes, or undefined for file-like storage. */
+	sourceTitleMeta?: string | null;
 	/** Whether non-empty session data was found without a valid leading session header. */
 	invalidHeader: boolean;
 }
@@ -232,6 +239,7 @@ export async function visitEntriesFromFileStream(
 			if (stopped) break;
 			bytesSinceYield += chunk.byteLength;
 			options.onBytesConsumed?.(chunk.byteLength);
+			options.onChunk?.(chunk);
 			// Parsing before the chunk closes a line re-scans the unfinished record
 			// on every chunk, which is quadratic for large records.
 			if (chunk.lastIndexOf(0x0a) === -1) {
@@ -299,6 +307,7 @@ export async function loadEntriesFromFileStream(
 	const entries: FileEntry[] = [];
 	let malformedRecords = 0;
 	let bytesConsumed = 0;
+	const fingerprint = createHash("sha1");
 	const titleSlot = await visitEntriesFromFileStream(
 		filePath,
 		entry => {
@@ -312,6 +321,9 @@ export async function loadEntriesFromFileStream(
 			onBytesConsumed: bytes => {
 				bytesConsumed += bytes;
 			},
+			onChunk: chunk => {
+				fingerprint.update(chunk);
+			},
 		},
 	);
 	return {
@@ -319,6 +331,7 @@ export async function loadEntriesFromFileStream(
 		titleSlot,
 		malformedRecords,
 		sourceSize: bytesConsumed,
+		sourceFingerprint: fingerprint,
 		invalidHeader: entries.length > 0 ? !isValidSessionHeader(entries[0]) : malformedRecords > 0,
 	};
 }
@@ -341,8 +354,15 @@ async function loadWithKnownSize(
 		const sourceSize = loaded.sourceSize ?? 0;
 		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 	}
-	const content = await storage.readText(filePath);
-	const loaded = parseSessionContent(content);
+	const snapshot = storage.readTextSnapshot
+		? await storage.readTextSnapshot(filePath)
+		: { content: await storage.readText(filePath), rawContent: undefined };
+	const { content } = snapshot;
+	const loaded = {
+		...parseSessionContent(content),
+		sourceFingerprint: createHash("sha1").update(snapshot.rawContent ?? content),
+		sourceTitleMeta: "titleMeta" in snapshot ? snapshot.titleMeta : undefined,
+	};
 	return {
 		loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded,
 		sourceSize: Buffer.byteLength(content, "utf8"),

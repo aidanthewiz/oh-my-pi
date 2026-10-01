@@ -20,7 +20,12 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
-import { FileSessionStorage, SessionLockError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	SessionLockError,
+	sessionContentFingerprint,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 /** Mirrors the OS-gate sidecar derived in `#withPublishLock`. */
 function osGatePath(lockPath: string): string {
@@ -70,5 +75,29 @@ describe("publish lock OS gate", () => {
 		// The holder resumes after its deschedule and publishes cleanly.
 		storage.writeTextSync(sessionPath, "A-content\n");
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("A-content\n");
+	});
+	it("serializes in-place title updates with the same publish gate", async () => {
+		const storage = new FileSessionStorage();
+		const sessionPath = path.join(tempDir, "title.jsonl");
+		const before = serializeTitleSlot({ title: "Original", source: "user", updatedAt: "t1" }) + "entry\n";
+		storage.writeTextSync(sessionPath, before);
+		const lockPath = path.join(tempDir, ".title.jsonl.lock");
+		const gate = NativeFileLock.tryAcquire(osGatePath(lockPath));
+		expect(gate.acquired).toBe(true);
+		try {
+			await expect(
+				storage.updateSessionTitle(sessionPath, { title: "Updated", source: "user", updatedAt: "t2" }),
+			).rejects.toBeInstanceOf(SessionLockError);
+			expect(fs.readFileSync(sessionPath, "utf8")).toBe(before);
+		} finally {
+			gate.release();
+		}
+		const fingerprint = await storage.updateSessionTitle(sessionPath, {
+			title: "Updated",
+			source: "user",
+			updatedAt: "t2",
+		});
+		if (!fingerprint) throw new Error("file title update must return a confirmed fingerprint");
+		expect(fingerprint.copy().digest("hex")).toBe(sessionContentFingerprint(fs.readFileSync(sessionPath, "utf8")));
 	});
 });

@@ -1,3 +1,4 @@
+import type { Hash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
@@ -440,7 +441,7 @@ class TitleFallbackPausingStorage extends MemorySessionStorage {
 	writeTextAtomicCalls = 0;
 	failNextUpdateTitle = false;
 
-	override async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void> {
+	override async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<Hash> {
 		if (this.failNextUpdateTitle) {
 			this.failNextUpdateTitle = false;
 			throw new Error("updateSessionTitle forced failure");
@@ -959,6 +960,10 @@ class CommitThenThrowIndexedBackend implements SessionStorageBackend {
 	async readFull(): Promise<string | null> {
 		if (this.#atomicWriteFailed) await this.newerWriteFinished.promise;
 		return this.content;
+	}
+	async readFullWithTitleMeta(): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		const rawContent = await this.readFull();
+		return rawContent === null ? null : { rawContent, titleMeta: null };
 	}
 
 	async readSlices(): Promise<[string, string]> {

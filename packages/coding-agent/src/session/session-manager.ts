@@ -1,3 +1,4 @@
+import { createHash, type Hash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -100,7 +101,12 @@ import {
 	type SessionStorage,
 	type SessionStorageWriter,
 } from "./session-storage";
-import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
+import {
+	parseTitleSlotFromContent,
+	serializeTitleSlot,
+	titleUpdateFromSlot,
+	type SessionTitleUpdate,
+} from "./session-title-slot";
 import {
 	additionalWorkspaceDirectories,
 	normalizeSessionWorkspace,
@@ -643,6 +649,8 @@ interface SessionManagerStateSnapshot {
 	titleSource: SessionTitleSource | undefined;
 	sessionFile: string | undefined;
 	expectedDiskSize: number | null;
+	expectedDiskFingerprint: Hash | undefined;
+	expectedDiskTitleMeta: string | null | undefined;
 	titleUpdatedAt: string;
 	hasTitleSlot: boolean;
 	onDisk: boolean;
@@ -749,6 +757,12 @@ export class SessionManager {
 	#rewriteRequired = false;
 	/** Byte length this manager last loaded or durably wrote; `null` means the path was absent. */
 	#expectedDiskSize: number | null = null;
+	/** Incremental fingerprint of the last confirmed bytes; undefined when the body cannot be proven. */
+	#expectedDiskFingerprint: Hash | undefined;
+	/** Backend title metadata from the same confirmed snapshot as the content fingerprint. */
+	#expectedDiskTitleMeta: string | null | undefined;
+	/** Invalidates a title-slot fingerprint if another append or rewrite lands before its acknowledgment. */
+	#fingerprintRevision = 0;
 	/**
 	 * Generation of the latest deferred publish queued on a `defersSyncPublish`
 	 * backend. A deferred-rewrite confirmation older than the latest queued
@@ -1067,8 +1081,22 @@ export class SessionManager {
 		commitGuard?: () => boolean,
 	): Promise<void> {
 		const body = this.#fileBody();
+		if (
+			this.#expectedDiskSize !== null &&
+			(!this.#expectedDiskFingerprint ||
+				(this.#storage.readTextSnapshot && this.#expectedDiskTitleMeta === undefined))
+		) {
+			throw this.#latchIndeterminate(operationError, [
+				new Error("Cannot fence session repair without confirmed content."),
+			]);
+		}
 		try {
-			await this.#storage.writeTextAtomic(sessionFile, body, { expectedSize: this.#expectedDiskSize, commitGuard });
+			await this.#storage.writeTextAtomic(sessionFile, body, {
+				expectedSize: this.#expectedDiskSize,
+				expectedFingerprint: this.#expectedDiskFingerprint?.copy().digest("hex"),
+				expectedTitleMeta: this.#expectedDiskTitleMeta,
+				commitGuard,
+			});
 		} catch (error) {
 			const recoveryErrors = [toError(error)];
 			try {
@@ -1078,7 +1106,16 @@ export class SessionManager {
 			}
 			let actual: string;
 			try {
-				actual = await this.#storage.readText(sessionFile);
+				const observed = this.#storage.readCommittedState
+					? await this.#storage.readCommittedState(sessionFile)
+					: { content: await this.#storage.readText(sessionFile), titleMeta: undefined };
+				actual = observed.content;
+				if (this.#storage.readCommittedState) {
+					const title = titleUpdateFromSlot(parseTitleSlotFromContent(body));
+					if (observed.titleMeta !== (title ? JSON.stringify(title) : null)) {
+						throw new Error("Authoritative session title metadata did not match durable storage.");
+					}
+				}
 			} catch (readFailure) {
 				recoveryErrors.push(toError(readFailure));
 				throw this.#latchIndeterminate(operationError, recoveryErrors);
@@ -1107,11 +1144,21 @@ export class SessionManager {
 		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
 	}
 	#recordDurableAppend(line: string): void {
+		const wasAbsent = this.#expectedDiskSize === null;
+		this.#fingerprintRevision++;
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
+		if (wasAbsent) this.#expectedDiskFingerprint = createHash("sha1");
+		this.#expectedDiskFingerprint?.update(line);
 	}
 
 	#recordFullRewrite(body: string): void {
+		this.#fingerprintRevision++;
 		this.#expectedDiskSize = Buffer.byteLength(body, "utf8");
+		this.#expectedDiskFingerprint = createHash("sha1").update(body);
+		if (this.#storage.readTextSnapshot) {
+			const title = titleUpdateFromSlot(parseTitleSlotFromContent(body));
+			this.#expectedDiskTitleMeta = title ? JSON.stringify(title) : null;
+		}
 	}
 
 	/**
@@ -1499,7 +1546,13 @@ export class SessionManager {
 				try {
 					await this.#appendWriter().append(line);
 					this.#recordDurableAppend(line);
-					await this.#storage.updateSessionTitle(sessionFile, update);
+					const fingerprintRevision = this.#fingerprintRevision;
+					const updatedFingerprint = await this.#storage.updateSessionTitle(sessionFile, update);
+					if (updatedFingerprint) {
+						this.#expectedDiskFingerprint =
+							fingerprintRevision === this.#fingerprintRevision ? updatedFingerprint : undefined;
+					}
+					if (this.#storage.readTextSnapshot) this.#expectedDiskTitleMeta = JSON.stringify(update);
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
 				} catch {
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
@@ -1528,6 +1581,8 @@ export class SessionManager {
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
+		this.#expectedDiskTitleMeta = undefined;
+		this.#expectedDiskFingerprint = undefined;
 		this.#reconcileSessionDirForFallback();
 		if (options?.sessionDir && this.#persist) {
 			this.#sessionDir = path.resolve(options.sessionDir);
@@ -1736,6 +1791,8 @@ export class SessionManager {
 			hasTitleSlot: this.#hasTitleSlot,
 			sessionFile: this.#sessionFile,
 			expectedDiskSize: this.#expectedDiskSize,
+			expectedDiskFingerprint: this.#expectedDiskFingerprint?.copy(),
+			expectedDiskTitleMeta: this.#expectedDiskTitleMeta,
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
@@ -1763,6 +1820,8 @@ export class SessionManager {
 		if (!persist) {
 			clone.#sessionFile = undefined;
 			clone.#expectedDiskSize = null;
+			clone.#expectedDiskTitleMeta = undefined;
+			clone.#expectedDiskFingerprint = undefined;
 			clone.#fileIsCurrent = false;
 			clone.#rewriteRequired = false;
 			clone.#forceFileCreation = false;
@@ -1779,6 +1838,8 @@ export class SessionManager {
 		this.#sessionDir = snapshot.sessionDir;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#expectedDiskSize = snapshot.expectedDiskSize;
+		this.#expectedDiskFingerprint = snapshot.expectedDiskFingerprint?.copy();
+		this.#expectedDiskTitleMeta = snapshot.expectedDiskTitleMeta;
 		this.#fileIsCurrent = snapshot.onDisk;
 		this.#rewriteRequired = snapshot.needsRewrite;
 		this.#forceFileCreation = snapshot.onDisk;
@@ -1826,10 +1887,14 @@ export class SessionManager {
 		// reapply it — otherwise the final rewrite would compare a stale size and
 		// reject an otherwise successful rollback.
 		const relocatedDiskSize = this.#expectedDiskSize;
+		const relocatedTitleMeta = this.#expectedDiskTitleMeta;
+		const relocatedFingerprint = this.#expectedDiskFingerprint?.copy();
 		this.restoreState(snapshot);
 		// Persist the captured header so disk and memory agree after a fresh open.
 		if (this.#persist && this.#sessionFile) {
 			this.#expectedDiskSize = relocatedDiskSize;
+			this.#expectedDiskTitleMeta = relocatedTitleMeta;
+			this.#expectedDiskFingerprint = relocatedFingerprint;
 			this.#forceFileCreation = true;
 			this.#rewriteRequired = true;
 			await this.#rewriteAtomically();
@@ -1877,6 +1942,8 @@ export class SessionManager {
 			// keep the requested path and materialize the header immediately.
 			this.#resetToNewSession(options?.newSession, resolvedSessionFile);
 			this.#expectedDiskSize = sourceSize;
+			this.#expectedDiskFingerprint = loaded.sourceFingerprint?.copy();
+			this.#expectedDiskTitleMeta = loaded.sourceTitleMeta;
 			this.#forceFileCreation = true;
 			await this.#rewriteAtomically();
 			this.#fileIsCurrent = true;
@@ -1913,6 +1980,8 @@ export class SessionManager {
 
 		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
 		this.#expectedDiskSize = sourceSize;
+		this.#expectedDiskFingerprint = loaded.sourceFingerprint?.copy();
+		this.#expectedDiskTitleMeta = loaded.sourceTitleMeta;
 		this.#additionalDirectories = header.additionalDirectories ?? [];
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
@@ -1965,6 +2034,8 @@ export class SessionManager {
 		this.#sessionId = mintSessionId();
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
+		this.#expectedDiskFingerprint = undefined;
+		this.#expectedDiskTitleMeta = undefined;
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -2115,6 +2186,8 @@ export class SessionManager {
 				// holds no bytes this manager wrote, so a recreate-from-memory must
 				// publish against an absent file rather than a stale size.
 				if (sessionPathChanged && !sessionMoved) this.#expectedDiskSize = null;
+				if (sessionPathChanged && !sessionMoved) this.#expectedDiskFingerprint = undefined;
+				if (sessionPathChanged && !sessionMoved) this.#expectedDiskTitleMeta = undefined;
 				this.#artifactManager = null;
 				this.#artifactManagerSessionFile = null;
 				// Path is repointed; hot-path appends may use `#sessionFile` again.
@@ -3363,6 +3436,8 @@ export class SessionManager {
 
 		this.#sessionFile = newSessionFile;
 		this.#expectedDiskSize = null;
+		this.#expectedDiskFingerprint = undefined;
+		this.#expectedDiskTitleMeta = undefined;
 		this.#rewriteSynchronously();
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 		return newSessionFile;

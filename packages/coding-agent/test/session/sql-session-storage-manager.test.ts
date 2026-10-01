@@ -10,7 +10,11 @@ import { describe, expect, it } from "bun:test";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	SessionWriteConflictError,
+	sessionContentFingerprint,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SQL } from "bun";
 
 function fakeUsage(input: number, output: number): Usage {
@@ -141,5 +145,29 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
 		expect(await secondStorage.readText(sessionFile)).toContain("durable SQL peer turn");
 		await client.end();
+	});
+	it("rejects a stale title-only replacement even when SQL content bytes do not change", async () => {
+		const client = new SQL("sqlite::memory:");
+		try {
+			const first = await SqlSessionStorage.create({ client });
+			const sessionPath = "/sessions/title-fence.jsonl";
+			const oldTitle = { title: "Old", source: "auto" as const, updatedAt: "t1" };
+			const raw = `${serializeTitleSlot(oldTitle)}{"type":"session","id":"s","timestamp":"t1","cwd":"/cwd"}\n`;
+			await first.writeText(sessionPath, raw);
+			const newer = await SqlSessionStorage.create({ client });
+			const newTitle = { title: "New", source: "user" as const, updatedAt: "t2" };
+			await newer.updateSessionTitle(sessionPath, newTitle);
+
+			await expect(
+				first.writeTextAtomic(sessionPath, raw, {
+					expectedSize: Buffer.byteLength(raw, "utf8"),
+					expectedFingerprint: sessionContentFingerprint(raw),
+					expectedTitleMeta: JSON.stringify(oldTitle),
+				}),
+			).rejects.toBeInstanceOf(SessionWriteConflictError);
+			expect((await newer.readCommittedState(sessionPath)).titleMeta).toBe(JSON.stringify(newTitle));
+		} finally {
+			await client.end();
+		}
 	});
 });
