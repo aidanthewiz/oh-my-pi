@@ -27,11 +27,67 @@
 // The library targets the addon's minimum macOS; everything touching
 // FoundationModels is gated on macOS 27 and the framework is weak-linked.
 
+import Foundation
+#if !APPLEFM_GATE_TEST
 import CoreGraphics
 import Darwin
-import Foundation
 import FoundationModels
 import ImageIO
+#endif
+
+// MARK: - Scheduling
+
+/// FIFO gate: the on-device model serves one generation at a time.
+actor Gate {
+	private var busy = false
+	private var waiters: [(UUID, CheckedContinuation<Bool, Never>)] = []
+
+	#if APPLEFM_GATE_TEST
+	private var queueObservers: [(Int, CheckedContinuation<Void, Never>)] = []
+
+	func waitForQueued(_ count: Int) async {
+		if waiters.count >= count { return }
+		await withCheckedContinuation { queueObservers.append((count, $0)) }
+	}
+	#endif
+
+	func acquire() async -> Bool {
+		let id = UUID()
+		return await withTaskCancellationHandler {
+			if Task.isCancelled { return false }
+			if !busy {
+				busy = true
+				return true
+			}
+			return await withCheckedContinuation { continuation in
+				waiters.append((id, continuation))
+				#if APPLEFM_GATE_TEST
+				let ready = queueObservers.filter { $0.0 <= waiters.count }
+				queueObservers.removeAll { $0.0 <= waiters.count }
+				for (_, observer) in ready { observer.resume() }
+				#endif
+			}
+		} onCancel: {
+			Task { await self.cancel(id) }
+		}
+	}
+
+	private func cancel(_ id: UUID) {
+		if let index = waiters.firstIndex(where: { $0.0 == id }) {
+			waiters.remove(at: index).1.resume(returning: false)
+		}
+	}
+
+	func release() {
+		if waiters.isEmpty {
+			busy = false
+		} else {
+			waiters.removeFirst().1.resume(returning: true)
+		}
+	}
+}
+
+#if !APPLEFM_GATE_TEST
 
 // MARK: - Wire types
 
@@ -137,29 +193,7 @@ struct Emitter: @unchecked Sendable {
 	}
 }
 
-// MARK: - Scheduling
-
-/// FIFO gate: the on-device model serves one generation at a time.
-actor Gate {
-	private var busy = false
-	private var waiters: [CheckedContinuation<Void, Never>] = []
-
-	func acquire() async {
-		if !busy {
-			busy = true
-			return
-		}
-		await withCheckedContinuation { waiters.append($0) }
-	}
-
-	func release() {
-		if waiters.isEmpty {
-			busy = false
-		} else {
-			waiters.removeFirst().resume()
-		}
-	}
-}
+// MARK: - Request lifecycle
 
 /// In-flight requests by caller-assigned handle, for cancellation.
 actor Registry {
@@ -589,7 +623,10 @@ public func ompAppleFmGenerate(
 	}
 	Task {
 		await registry.start(handle) {
-			await gate.acquire()
+			guard await gate.acquire() else {
+				emit(.failure(classify(CancellationError())))
+				return
+			}
 			do {
 				try Task.checkCancellation()
 				try await generate(request, emit: emit)
@@ -612,3 +649,4 @@ public func ompAppleFmCancel(_ handle: UInt64) {
 public func ompAppleFmFree(_ pointer: UnsafeMutablePointer<CChar>?) {
 	free(pointer)
 }
+#endif

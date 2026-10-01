@@ -142,6 +142,14 @@ jobs:
             exit 1
           fi
           printf 'Apple Foundation Models bridge: %s\n' "$toolchain"
+      - name: Test Apple Foundation Models gate
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          swiftc -swift-version 6 -parse-as-library -D APPLEFM_GATE_TEST \
+            crates/pi-natives/src/applefm/bridge.swift \
+            crates/pi-natives/src/applefm/gate-test.swift \
+            -o "$RUNNER_TEMP/applefm-gate-test"
+          "$RUNNER_TEMP/applefm-gate-test"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.2"
