@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/collab-web",
-  "version": "18.4.0",
+  "version": "18.4.1",
   "private": true,
   "description": "Browser guest client and local relay tools for Coreforce agent collaboration",
   "homepage": "https://agent-collab.internal.somahub.io",

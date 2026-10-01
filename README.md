@@ -201,7 +201,7 @@ Core tools live in the same namespace as `read` and `bash`. Pin the active set w
 **Coordination**
 
 - `task` — fan out subagents in parallel, optionally workspace-isolated.
-- `wait` — block only when no independent work remains; background results otherwise deliver automatically.
+- `wait` — block only when no independent work remains; it returns on the next background result, peer message, or steering interrupt. Background results also deliver automatically.
 - `write agent://<id>` — message subagents; `read proc://` inspects jobs and named `bash` services.
 - `todo` — ordered mutations over the session todo list with phase tracking.
 - `ask` — structured follow-up questions for interactive runs.

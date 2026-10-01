@@ -2,33 +2,6 @@
 {{systemPromptCustomization}}
 {{/if}}
 {{customPrompt}}
-{{#if appendPrompt}}
-{{appendPrompt}}
-{{/if}}
-{{#ifAny contextFiles.length git.isRepo}}
-<project>
-{{#if contextFiles.length}}
-## Context
-<instructions>
-Files are ordered from the global baseline to the most local scope. A clear conflict in a later, more local file overrides an earlier instruction; no marker or configuration flag is required.
-{{#list contextFiles join="\n"}}
-<file path="{{path}}">
-{{content}}
-</file>
-{{/list}}
-</instructions>
-{{/if}}
-{{#if git.isRepo}}
-## Version Control
-Snapshot; does not update during conversation.
-Current branch: {{git.currentBranch}}
-Main branch: {{git.mainBranch}}
-{{git.status}}
-### History
-{{git.commits}}
-{{/if}}
-</project>
-{{/ifAny}}
 {{#if skills.length}}
 Skills are specialized knowledge. Scan descriptions for your task domain.
 If a skill applies, you MUST read `skill://<name>` before proceeding.

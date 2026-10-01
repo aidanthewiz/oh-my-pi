@@ -2357,6 +2357,62 @@ describe("ExtensionRunner", () => {
 			]);
 			delete globalState.__approvalEvents;
 		});
+		it("runs bridged preflight before approval and cancels denied state", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const order: string[] = [];
+			initializeRunner(runner, async () => {
+				order.push("ui_select");
+				return "Approve";
+			});
+			runner.setToolCallPreflight({
+				before: async () => {
+					order.push("preflight");
+					return { block: true, reason: "rule blocked" };
+				},
+			});
+			const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+			await expect(
+				(wrapper as ExtensionToolWrapper<any>).execute("call-preflight-order", {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				}),
+			).rejects.toThrow("rule blocked");
+			expect(order).toEqual(["preflight"]);
+
+			const deniedRunner = new ExtensionRunner(
+				[],
+				new ExtensionRuntime(),
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(deniedRunner, async () => "Deny");
+			let cancelled = 0;
+			deniedRunner.setToolCallPreflight({
+				before: async () => undefined,
+				cancel: () => {
+					cancelled++;
+				},
+			});
+			const deniedWrapper = new ExtensionToolWrapper(approvalTool, deniedRunner);
+			await expect(
+				(deniedWrapper as ExtensionToolWrapper<any>).execute("call-preflight-denied", {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				}),
+			).rejects.toThrow("denied by user");
+			expect(cancelled).toBe(1);
+		});
 
 		it("does not present approval before canonical or wire-aliased tool previews are ready", async () => {
 			const cases = [
@@ -2377,9 +2433,11 @@ describe("ExtensionRunner", () => {
 					modelRegistry,
 				);
 				const preview = Promise.withResolvers<void>();
+				const previewWaitStarted = Promise.withResolvers<void>();
 				const order: string[] = [];
 				runner.setToolApprovalPreviewWaiter(async waitedToolCallId => {
 					order.push(`preview_wait:${waitedToolCallId}`);
+					previewWaitStarted.resolve();
 					await preview.promise;
 					order.push("preview_ready");
 				});
@@ -2407,7 +2465,12 @@ describe("ExtensionRunner", () => {
 						toolCalls: [{ id: toolCallId, name: wireName }],
 					},
 				});
-				await Promise.resolve();
+				await Promise.race([
+					previewWaitStarted.promise,
+					execution.then(() => {
+						throw new Error("Approval completed before its preview was ready");
+					}),
+				]);
 				expect(order).toEqual([`preview_wait:${toolCallId}`]);
 
 				preview.resolve();

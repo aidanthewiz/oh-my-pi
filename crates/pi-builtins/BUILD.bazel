@@ -143,11 +143,12 @@ rust_library(
     crate_name = "pi_builtins",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    version = "18.4.0",
+    version = "18.4.1",
     deps = all_crate_deps(normal = True) + [
         "//crates/pi-vfs",
         "//crates/pi-walker",
         "//crates/vendor/brush-core",
+        "//crates/vendor/brush-parser",
     ],
 )
 

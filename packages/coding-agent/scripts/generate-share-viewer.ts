@@ -24,7 +24,6 @@ const themeStyles = webExportThemeStyles();
 
 const html = getTemplate()
 	.replace("<theme-vars/>", () => `<style>${themeStyles}</style>`)
-	.replace("<title>Session Export</title>", () => "<title>omp session</title>")
 	.replace("{{SESSION_DATA}}</script>", () => `</script>\n  <script>${loaderJs}</script>`);
 
 if (html.includes("{{SESSION_DATA}}")) throw new Error("session-data placeholder survived substitution");

@@ -404,6 +404,50 @@ export interface BashToolInput {
 	pty?: boolean;
 }
 
+/**
+ * Treats a blank string as an unset field.
+ *
+ * Some tool-call layers materialize every optional argument, spelling "not set"
+ * as `""`; a whitespace-only service name is no more a name than a missing one.
+ */
+function blankToUndefined(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+/**
+ * Drops readiness fields that carry no condition, and the whole spec when none
+ * survive. An empty `log` pattern would otherwise match the first byte of
+ * output and an empty `host` would break the TCP probe, so placeholder values
+ * must not reach {@link startService}.
+ */
+function normalizeReady(ready: ServiceReady | undefined): ServiceReady | undefined {
+	if (!ready) return undefined;
+	const log = blankToUndefined(ready.log);
+	const host = blankToUndefined(ready.host);
+	const port = Number.isFinite(ready.port) ? ready.port : undefined;
+	const timeout = Number.isFinite(ready.timeout) ? ready.timeout : undefined;
+	if (log === undefined && host === undefined && port === undefined && timeout === undefined) return undefined;
+	return { log, host, port, timeout };
+}
+
+/** Drops a record with no keys: `env: {}` sets nothing, so it requests nothing. */
+function nonEmptyRecord(record: Record<string, string> | undefined): Record<string, string> | undefined {
+	if (!record) return undefined;
+	for (const _key in record) return record;
+	return undefined;
+}
+
+function normalizeBashInput(input: BashToolInput): BashToolInput {
+	const name = blankToUndefined(input.name);
+	return {
+		...input,
+		name,
+		ready: name === undefined ? undefined : normalizeReady(input.ready),
+		env: name === undefined ? undefined : nonEmptyRecord(input.env),
+	};
+}
+
 export interface BashToolOptions {}
 
 interface PreparedShellConfig {
@@ -811,7 +855,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (input.name !== undefined) {
 			if (!this.#launchEnabled) throw new ToolError("Service launch is disabled in this session.");
-			if (input.async !== undefined || input.timeout !== undefined)
+			if (input.async === true || input.timeout !== undefined)
 				throw new ToolError("Service mode does not accept async or timeout; use ready.timeout for readiness.");
 		} else if (input.ready !== undefined || input.env !== undefined) {
 			throw new ToolError("ready and env require a service name.");
@@ -927,7 +971,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	): Promise<RuntimeToolApprovalRequest | undefined> {
 		if (typeof args !== "object" || args === null) return undefined;
 		const input = args as BashToolInput;
-		const execution = await this.#prepareExecution(input, signal, context);
+		const normalizedInput = normalizeBashInput(input);
+		const execution = await this.#prepareExecution(normalizedInput, signal, context);
 		this.#preparedExecutions.set(args, {
 			toolCallId,
 			approved: false,
@@ -935,7 +980,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			execution,
 		});
 		if (execution.dcgDecision.decision === "allow") return undefined;
-		return formatDcgRuntimeApproval(input, execution, execution.dcgDecision);
+		return formatDcgRuntimeApproval(normalizedInput, execution, execution.dcgDecision);
 	}
 
 	approveRuntimeApproval(toolCallId: string, args: unknown): void {
@@ -1250,16 +1295,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
+		const normalizedInput = normalizeBashInput(input);
 		const cached = this.#preparedExecutions.get(input);
 		if (cached) this.#preparedExecutions.delete(input);
 		const cacheMatches = cached?.toolCallId === toolCallId && cached.inputFingerprint === bashInputFingerprint(input);
 		const runtimeApproved = cacheMatches === true && cached.approved;
-		let prepared = cacheMatches ? cached.execution : await this.#prepareExecution(input, signal, ctx);
+		let prepared = cacheMatches ? cached.execution : await this.#prepareExecution(normalizedInput, signal, ctx);
 		if (cacheMatches) {
-			if (!sameBashBackend(prepared.backend, this.#resolveExecutionBackend(input, ctx))) {
+			if (!sameBashBackend(prepared.backend, this.#resolveExecutionBackend(normalizedInput, ctx))) {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
-			const materialized = await this.#prepareExecution(input, signal, ctx);
+			const materialized = await this.#prepareExecution(normalizedInput, signal, ctx);
 			if (!sameBashBackend(prepared.backend, materialized.backend)) {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
@@ -1294,11 +1340,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		const { command, commandCwd, backend } = prepared;
+		const pendingNotices: string[] = [];
+		if (normalizedInput.name === undefined) {
+			const ignored = [normalizeReady(input.ready) && "ready", nonEmptyRecord(input.env) && "env"]
+				.filter(Boolean)
+				.join(" and ");
+			if (ignored) pendingNotices.push(`Ignored ${ignored}: service-only, and no service name was given.`);
+		}
 		const approval = this.approval(input);
 		const approvalTier = typeof approval === "string" ? approval : approval.tier;
-		const asyncRequested = input.async ?? false;
-		const pty = input.pty ?? false;
-		const requestedTimeoutSec = input.timeout ?? 300;
+		const asyncRequested = normalizedInput.async === true;
+		const pty = normalizedInput.pty ?? false;
+		const requestedTimeoutSec = normalizedInput.timeout ?? 300;
 
 		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
 		// number touched by a mutating `gh` subcommand inside this bash call so
@@ -1306,17 +1359,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// instead of the cached pre-mutation snapshot.
 		invalidateGithubCacheForBashCommand(command);
 
-		if (input.name !== undefined) {
+		if (normalizedInput.name !== undefined) {
 			if (backend.kind !== "service") throw new ToolError("Bash execution route changed after safety review.");
 			const service = await startService(
 				this.session,
 				{
-					name: input.name,
+					name: normalizedInput.name,
 					command,
 					cwd: commandCwd,
-					pty: input.pty,
+					pty: normalizedInput.pty,
 					env: prepared.preflight.env,
-					ready: input.ready,
+					ready: normalizedInput.ready,
 					shell: backend.shellConfig,
 				},
 				signal,
@@ -1327,7 +1380,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			];
 			if (service.readyTimedOut)
 				lines.push(
-					`NOT ready — readiness timed out after ${input.ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
+					`NOT ready — readiness timed out after ${normalizedInput.ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
 				);
 			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
 			if (service.log) lines.push(service.log);
@@ -1335,7 +1388,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: {
 					service: {
-						name: input.name,
+						name: normalizedInput.name,
 						state: daemon.state,
 						ready: daemon.readyAt !== undefined || daemon.state === "running",
 						timedOut: service.readyTimedOut,
@@ -1351,7 +1404,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const maxTimeout = cfgToolsMaxTimeout.get(this.session.settings);
 		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
 		const timeoutMs = timeoutSec === undefined ? undefined : timeoutSec * 1000;
-		const pendingNotices: string[] = [];
 		if (timeoutSec !== undefined) {
 			const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec, maxTimeout);
 			if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);

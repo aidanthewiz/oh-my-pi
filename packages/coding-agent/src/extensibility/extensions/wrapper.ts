@@ -145,6 +145,9 @@ export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: E
 	return registeredTools.map(rt => wrapRegisteredTool(rt, runner));
 }
 
+const LOOP_DISPATCH_CONTEXT = Symbol("omp.loop-dispatch");
+type LoopAwareToolContext = AgentToolContext & { [LOOP_DISPATCH_CONTEXT]?: true };
+
 function computerSafetyChecks(context: AgentToolContext | undefined): ComputerSafetyCheck[] {
 	const metadata = context?.toolCall?.providerMetadata;
 	return metadata?.type === "computer" ? metadata.pendingSafetyChecks : [];
@@ -226,6 +229,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// unconditionally so it cannot go stale; emit here only for dispatches
 		// the loop never saw — nested xd:// device dispatches and direct
 		// (non-loop) execution such as Cursor exec handlers.
+		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === true;
+		const loopDispatchedToolCall =
+			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
+		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {
+			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
+		}
 		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
 		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
@@ -249,6 +258,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// matches the loop's rule for context prepared at arg-prep time.
 		let pendingAdditionalContext: string | undefined;
 		let effectiveParams = params;
+		const cancelPreflight = (): void => {
+			if (!loopDispatchedToolCall) this.runner.cancelToolCallPreflight?.(toolCallId);
+		};
 		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
 			try {
 				const callResult = (await this.runner.emitToolCall(
@@ -286,6 +298,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
+		if (!loopDispatchedToolCall) {
+			const preflight = await this.runner.runToolCallPreflightBefore?.(
+				toolCallId,
+				this.tool,
+				effectiveParams,
+				context,
+			);
+			if (preflight?.block) {
+				throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
+			}
+		}
 
 		const runtimeApprovalTool = this.tool as AgentTool<TParameters, TDetails> & RuntimeApprovalCapableTool;
 		const runtimeApproval = await runtimeApprovalTool.prepareRuntimeApproval?.(
@@ -306,6 +329,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
+			cancelPreflight();
 			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
@@ -369,6 +393,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			if (!this.runner.hasUI()) {
 				const reason = "no interactive UI available";
 				await emitApprovalResolved(false, reason);
+				cancelPreflight();
 				if (runtimeApproval) {
 					throw new Error(
 						`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
@@ -424,17 +449,22 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+				cancelPreflight();
 				throw err;
 			}
 			await emitApprovalResolved(approved, approved ? undefined : denialReason);
 			if (!approved) {
+				cancelPreflight();
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
 			}
 			if (runtimeApproval) {
 				runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
 			}
 			if (pendingSafetyChecks.length > 0) {
-				if (!context) throw new Error("Provider safety approval context is unavailable");
+				if (!context) {
+					cancelPreflight();
+					throw new Error("Provider safety approval context is unavailable");
+				}
 				context.providerSafetyApproved = true;
 			}
 		}
@@ -464,6 +494,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,
 			};
+		}
+		if (!loopDispatchedToolCall) {
+			const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
+			if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status

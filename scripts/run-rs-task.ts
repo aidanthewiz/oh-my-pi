@@ -26,6 +26,8 @@ const VENDORED_FORK_EXCLUDES = [
 	"--exclude",
 	"brush-core",
 	"--exclude",
+	"brush-parser",
+	"--exclude",
 	"cfg_aliases",
 	"--exclude",
 	"napi",

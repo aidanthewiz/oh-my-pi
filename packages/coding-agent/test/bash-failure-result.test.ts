@@ -112,6 +112,23 @@ describe("BashTool execution results", () => {
 		expect(text).not.toContain("Command exited with code");
 	});
 
+	it("executes plain commands with a blank service name and reports ignored service options", async () => {
+		const tool = new BashTool(makeSession());
+		const input = {
+			command: "printf plain",
+			name: "  ",
+			ready: { log: "NEVER_READY" },
+			env: { PI_BASH_UNUSED_SERVICE_ENV: "not-inherited" },
+		};
+		expect(await tool.prepareRuntimeApproval("call-plain", input)).toBeUndefined();
+		const result = await tool.execute("call-plain", input);
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.service).toBeUndefined();
+		const text = result.content.find(content => content.type === "text")?.text ?? "";
+		expect(text).toContain("plain");
+		expect(text).toContain("Ignored ready and env: service-only, and no service name was given.");
+	});
+
 	it("links the raw artifact when the per-line column cap drops bytes", async () => {
 		const artifactPath = path.join(tempDir.path(), "bash-column-cap.txt");
 		const session = makeSession({
