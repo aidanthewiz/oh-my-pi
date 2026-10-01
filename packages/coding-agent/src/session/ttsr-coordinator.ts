@@ -176,6 +176,16 @@ export class TtsrCoordinator {
 		return undefined;
 	}
 
+	/** Rechecks the arguments that the extension event left for loop dispatch.
+	 * Clear the prior snapshot: a rewrite can change path or scope without
+	 * changing source text, and AST matching must use the final context. */
+	async beforeFinalizedToolCall(ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> {
+		if (!this.#manager?.hasAstRules()) return undefined;
+		const matchContext = this.#inspector.matchContext({ ...ctx.toolCall, arguments: ctx.args }, 0);
+		if (matchContext.streamKey) this.#manager.clearStream(matchContext.streamKey);
+		return this.beforeToolCall(ctx);
+	}
+
 	/** Checks finalized arguments for a tool call issued through eval or another non-loop bridge. */
 	async beforeBridgedToolCall(
 		toolCallId: string,

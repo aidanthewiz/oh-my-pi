@@ -9,6 +9,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type Api,
+	type AssistantMessage,
 	type Context,
 	clearCustomApis,
 	type ImageContent,
@@ -19,12 +20,14 @@ import {
 	type SimpleStreamOptions,
 	type TextContent,
 	type ToolCall,
+	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -2144,6 +2147,128 @@ describe("AgentSession message pipeline", () => {
 			const text = toolResult?.content.find(block => block.type === "text")?.text ?? "";
 			expect(text).toContain("revised");
 			expect(text).not.toContain("original");
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+	it.each([
+		["original-denied", 'console.log("blocked");\n', "export const value = 2;\n", false, 0],
+		["revised-denied", "export const value = 1;\n", 'console.log("blocked");\n', false, 1],
+		["revised-allowed", "export const value = 1;\n", "export const value = 2;\n", true, 1],
+	] as const)("checks %s write arguments with TTSR before dispatch", async (kind, original, content, allowed, events) => {
+		using tempDir = TempDir.createSync("@pi-tool-call-ast-revision-");
+		const target = tempDir.join("revision.ts");
+		const api = `test-tool-call-ast-${kind}`;
+		let requests = 0;
+		registerCustomApi(api, () => {
+			requests++;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (requests === 1) {
+					const message = createAssistantMessage("");
+					const toolCall = {
+						type: "toolCall",
+						id: "call-ast-revise-1",
+						name: "write",
+						arguments: { path: target, content: original },
+					} as const;
+					message.content = [toolCall];
+					message.stopReason = "toolUse";
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: toolCall as never, partial: message });
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					const message = createAssistantMessage("done");
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: `local-ast-revision-${kind}`,
+			name: "Local AST Revision Model",
+			api,
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const rule: Rule = {
+			name: "no-console-log-on-write",
+			path: "no-console-log-on-write.md",
+			content: "Do not add console.log calls.",
+			astCondition: ["console.log($$$)"],
+			scope: ["tool:write(*.ts)"],
+			_source: {
+				provider: "test",
+				providerName: "test",
+				path: "no-console-log-on-write.md",
+				level: "project",
+			},
+		};
+		let handlerCalls = 0;
+		const reviseWrite: ExtensionFactory = pi => {
+			pi.on("tool_call", async event => {
+				if (event.toolName !== "write") return undefined;
+				handlerCalls++;
+				return { input: { path: target, content } };
+			});
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"ttsr.builtinRules": false,
+				"ttsr.contextMode": "keep",
+				"tools.approvalMode": "yolo",
+			}),
+			model,
+			rules: [rule],
+			disableExtensionDiscovery: true,
+			extensions: [reviseWrite],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: ["write"],
+		});
+		try {
+			await session.sendUserMessage("write the source");
+			await session.waitForIdle();
+			expect(handlerCalls).toBe(events);
+			expect(await Bun.file(target).exists()).toBe(allowed);
+			const messages = session.agent.state.messages;
+			const toolResult = messages.find(
+				(m): m is ToolResultMessage => m.role === "toolResult" && m.toolCallId === "call-ast-revise-1",
+			);
+			expect(toolResult?.isError).toBe(!allowed);
+			const assistant = messages.find(
+				(m): m is AssistantMessage =>
+					m.role === "assistant" && m.content.some(block => block.type === "toolCall"),
+			);
+			expect(assistant?.stopReason).toBe(allowed ? "toolUse" : "aborted");
+			if (allowed) {
+				expect(await Bun.file(target).text()).toBe(content);
+				expect(
+					messages.filter(m => m.role === "toolResult" && m.toolCallId === "call-ast-revise-1"),
+				).toHaveLength(1);
+			} else {
+				expect(assistant?.errorMessage).toContain(rule.name);
+				expect(JSON.stringify(toolResult)).toContain(rule.name);
+			}
 		} finally {
 			await session.dispose();
 			authStorage.close();

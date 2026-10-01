@@ -150,7 +150,7 @@ export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: E
 }
 
 const LOOP_DISPATCH_CONTEXT = Symbol("omp.loop-dispatch");
-type LoopAwareToolContext = AgentToolContext & { [LOOP_DISPATCH_CONTEXT]?: true };
+type LoopAwareToolContext = AgentToolContext & { [LOOP_DISPATCH_CONTEXT]?: string };
 
 function computerSafetyChecks(context: AgentToolContext | undefined): ComputerSafetyCheck[] {
 	const metadata = context?.toolCall?.providerMetadata;
@@ -227,17 +227,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
-		// The agent loop emits `tool_call` at arg-prep time (session
-		// `beforeToolCall` wiring) so a handler revision lands before concurrency
-		// scheduling and `tool_execution_start`. Consume the marker
-		// unconditionally so it cannot go stale; emit here only for dispatches
-		// the loop never saw — nested xd:// device dispatches and direct
-		// (non-loop) execution such as Cursor exec handlers.
-		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === true;
+		// Loop dispatch checks TTSR both before and after the extension
+		// `tool_call` event in session `beforeToolCall`, before scheduling.
+		// Consume the loop marker so this wrapper does not emit the event or
+		// preflight again. Direct and nested xd:// calls have no loop marker:
+		// their final-input preflight still runs below.
+		const dispatchKey = `${toolCallId}:${this.tool.name}`;
+		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === dispatchKey;
 		const loopDispatchedToolCall =
 			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
 		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {
-			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
+			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = dispatchKey;
 		}
 		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the

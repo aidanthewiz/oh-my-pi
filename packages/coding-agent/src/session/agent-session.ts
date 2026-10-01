@@ -4521,10 +4521,11 @@ export class AgentSession implements SettingsScope {
 	 * arg-prep time — before concurrency scheduling, `tool_execution_start`,
 	 * and the wrapper's approval gate. A handler block becomes a blocked tool
 	 * result; a handler `input` revision becomes the arguments the loop
-	 * schedules, displays, persists, and executes, so approval resolves against
-	 * what actually runs. Marks the dispatch so `ExtensionToolWrapper` does not
-	 * emit a second event (nested xd:// device dispatches and direct non-loop
-	 * execution still emit there).
+	 * schedules, displays, persists, and executes. TTSR checks the original
+	 * arguments before the event and the final arguments after it, before the
+	 * loop dispatches the tool. Marks the dispatch so `ExtensionToolWrapper`
+	 * does not emit a second event (nested xd:// device dispatches and direct
+	 * non-loop execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
 		const runner = this.#extensionRunner;
@@ -4550,7 +4551,6 @@ export class AgentSession implements SettingsScope {
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
 		const mcpIdentity = mcpToolEventIdentity(ctx.tool, eventArgs, name => this.#tools.getToolByName(name));
-		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
 		let callResult: ToolCallEventResult | undefined;
 		try {
 			callResult = await runner.emitToolCall(
@@ -4573,9 +4573,19 @@ export class AgentSession implements SettingsScope {
 		}
 		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
 		// view, not the execution params — a revision cannot map back onto them.
-		const args = callResult?.input !== undefined && !computer ? callResult.input : undefined;
+		const args = callResult?.input !== undefined && !computer ? callResult.input : ctx.args;
+		// Handlers may also mutate their input in place without returning a
+		// replacement. Check the actual scheduled arguments after every event.
+		const finalTtsrResult = await this.#ttsr.beforeFinalizedToolCall({ ...ctx, args });
+		if (finalTtsrResult) {
+			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+			return finalTtsrResult;
+		}
+		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
 		const additionalContext = callResult?.additionalContext;
-		if (args === undefined && additionalContext === undefined) return undefined;
+		if (callResult?.input === undefined || computer) {
+			return additionalContext === undefined ? undefined : { additionalContext };
+		}
 		return { args, additionalContext };
 	}
 
