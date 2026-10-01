@@ -14,6 +14,7 @@ import {
 	rpcControlEventFrame,
 	RpcPendingExtensionRequests,
 	RpcShutdownCoordinator,
+	startRpcPromptWithModelFence,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type {
 	RpcCommand,
@@ -622,6 +623,8 @@ describe("RpcInputDispatcher", () => {
 		const sessionManager = SessionManager.inMemory();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const nextModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!nextModel) throw new Error("Expected claude-haiku-4-5 model to exist");
 		const mock = createMockModel({ responses: [{ content: ["should not run before release"] }] });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -649,18 +652,25 @@ describe("RpcInputDispatcher", () => {
 			});
 
 			let trackedPromptTask: Promise<void> | undefined;
-			const handleCommand: RpcInputFrameDeps["handleCommand"] = async command => {
+			const handleCommand: RpcInputFrameDeps["handleCommand"] = async (command, registerPromptReady) => {
 				if (command.type === "prompt") {
-					// Mirrors the real RPC "prompt" handler: the response is held until
-					// the message is admitted (or settles without ever being admitted).
 					const admitted = Promise.withResolvers<void>();
-					const settled = session.prompt(command.message, { onPromptAdmitted: admitted.resolve }).catch(() => {});
+					const settled = startRpcPromptWithModelFence(
+						session,
+						command.message,
+						{ images: command.images, onPromptAdmitted: admitted.resolve },
+						registerPromptReady,
+					).catch(() => {});
 					await Promise.race([admitted.promise, settled]);
 					return { id: command.id, type: "response", command: "prompt", success: true };
 				}
 				if (command.type === "abort") {
 					await session.abort({ reason: "user-interrupt" });
 					return { id: command.id, type: "response", command: "abort", success: true };
+				}
+				if (command.type === "set_model") {
+					await session.setModel(nextModel);
+					return { id: command.id, type: "response", command: "set_model", success: true, data: nextModel };
 				}
 				throw new Error(`unexpected command type: ${command.type}`);
 			};
@@ -670,12 +680,24 @@ describe("RpcInputDispatcher", () => {
 			};
 			const dispatcher = new RpcInputDispatcher({ deps });
 
-			dispatcher.dispatch({ id: "p1", type: "prompt", message: "go while normalizing" });
+			dispatcher.dispatch({
+				id: "p1",
+				type: "prompt",
+				message: "go while normalizing",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
 			await normalizeStarted.promise;
 			expect(trackedPromptTask).toBeInstanceOf(Promise);
 			expect(outputs).toHaveLength(0);
 
 			dispatcher.dispatch({ id: "a1", type: "abort" });
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: nextModel.id });
 			// Bounded poll (not a fixed-duration guess): before the fix, `prompt`
 			// serializes through the same tail chain as `abort`, so `abort` never
 			// starts while normalization is gated — this loop would exhaust without
@@ -687,6 +709,9 @@ describe("RpcInputDispatcher", () => {
 
 			releaseNormalize.resolve();
 			await trackedPromptTask;
+			await dispatcher.drain();
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["a1", "p1", "model"]);
+			expect(session.model?.id).toBe(nextModel.id);
 			expect(outputs).toContainEqual({ id: "p1", type: "response", command: "prompt", success: true });
 
 			normalizeSpy.mockRestore();
@@ -694,6 +719,150 @@ describe("RpcInputDispatcher", () => {
 			await session.dispose();
 			authStorage.close();
 		}
+	});
+	test("an image prompt uses its selected model when a later RPC model switch arrives during preparation", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const initialModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const nextModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!initialModel || !nextModel) throw new Error("Expected bundled Anthropic models");
+		const requestedModels: string[] = [];
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: initialModel, systemPrompt: ["Test"], tools: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(model.id);
+					return mock.stream(model, context, options);
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
+			modelRegistry,
+		});
+		const normalizeStarted = Promise.withResolvers<void>();
+		const releaseNormalize = Promise.withResolvers<void>();
+		const normalizeSpy = spyOn(imageLoading, "normalizeModelContextImages").mockImplementation(async images => {
+			normalizeStarted.resolve();
+			await releaseNormalize.promise;
+			return images;
+		});
+		const admittedModels: string[] = [];
+		let promptFailure: unknown;
+		let promptSettled: Promise<boolean | void> | undefined;
+		let trackedPromptTask: Promise<void> | undefined;
+		const handleCommand: RpcInputFrameDeps["handleCommand"] = async (command, registerPromptReady) => {
+			if (command.type === "prompt") {
+				const admitted = Promise.withResolvers<void>();
+				const settled = startRpcPromptWithModelFence(
+					session,
+					command.message,
+					{
+						images: command.images,
+						onPromptAdmitted: () => {
+							admittedModels.push(session.model?.id ?? "");
+							admitted.resolve();
+						},
+					},
+					registerPromptReady,
+				).catch(error => {
+					promptFailure = error;
+				});
+				promptSettled = settled;
+				await Promise.race([admitted.promise, settled]);
+				return { id: command.id, type: "response", command: "prompt", success: true };
+			}
+			if (command.type === "set_model") {
+				await session.setModel(nextModel);
+				return { id: command.id, type: "response", command: "set_model", success: true, data: nextModel };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		};
+		const { deps, outputs } = makeDeps(handleCommand);
+		deps.trackBackgroundTask = task => {
+			trackedPromptTask = task;
+		};
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({
+				id: "image",
+				type: "prompt",
+				message: "describe this image",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
+			await normalizeStarted.promise;
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: nextModel.id });
+			for (let i = 0; i < 50 && outputs.length === 0; i++) await flushMicrotasks();
+			expect(session.model?.id).toBe(initialModel.id);
+			expect(outputs).toHaveLength(0);
+
+			releaseNormalize.resolve();
+			await trackedPromptTask;
+			await dispatcher.drain();
+			expect(admittedModels).toEqual([initialModel.id]);
+			await promptSettled;
+			expect(promptFailure).toBeUndefined();
+			expect(requestedModels).toEqual([initialModel.id]);
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["image", "model"]);
+			expect(session.model?.id).toBe(nextModel.id);
+		} finally {
+			releaseNormalize.resolve();
+			await dispatcher.drain();
+			await trackedPromptTask;
+			normalizeSpy.mockRestore();
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+	test("abort still overtakes a model change waiting on an earlier prompt", async () => {
+		const admission = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const replacement = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!replacement) throw new Error("Expected bundled claude-haiku-4-5 model");
+		let activeModel = "original";
+		let background: Promise<void> | undefined;
+		const { deps, outputs } = makeDeps(async command => {
+			if (command.type === "prompt") {
+				started.resolve();
+				await admission.promise;
+				return { id: command.id, type: "response", command: "prompt", success: true };
+			}
+			if (command.type === "set_model") {
+				activeModel = replacement.id;
+				return { id: command.id, type: "response", command: "set_model", success: true, data: replacement };
+			}
+			if (command.type === "abort") {
+				return { id: command.id, type: "response", command: "abort", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		deps.trackBackgroundTask = task => {
+			background = task;
+		};
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({ id: "prompt", type: "prompt", message: "prepare image" });
+			await started.promise;
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: replacement.id });
+			dispatcher.dispatch({ id: "abort", type: "abort" });
+			for (let i = 0; i < 50 && outputs.length === 0; i++) await flushMicrotasks();
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort"]);
+			expect(activeModel).toBe("original");
+		} finally {
+			admission.resolve();
+			await dispatcher.drain();
+			await background;
+		}
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort", "prompt", "model"]);
+		expect(activeModel).toBe(replacement.id);
 	});
 });
 

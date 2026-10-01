@@ -32,7 +32,7 @@ import {
 	type SkillPromptInput,
 } from "../../extensibility/skills";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../session/agent-session";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
@@ -298,7 +298,7 @@ export async function tryRunRpcSkillCommand(
  * entrypoint; broken out so tests can drive the input loop with stubs.
  */
 export interface RpcInputFrameDeps {
-	handleCommand: (command: RpcCommand) => Promise<RpcResponse>;
+	handleCommand: (command: RpcCommand, registerPromptReady?: (ready: Promise<void>) => void) => Promise<RpcResponse>;
 	output: RpcOutput;
 	errorResponse: (id: string | undefined, command: string, message: string) => RpcResponse;
 	trackBackgroundTask?: (task: Promise<void>) => void;
@@ -398,11 +398,33 @@ export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps):
 	})();
 }
 
-/** Starts prompts after earlier ordinary commands, without awaiting admission.
- * Control frames and `bash` dispatch immediately (see dispatchRpcInputFrame). */
+/** Hold a later model change until this image prompt has prepared its first provider call. */
+export function startRpcPromptWithModelFence(
+	session: AgentSession,
+	text: string,
+	options: PromptOptions,
+	registerPromptReady?: (ready: Promise<void>) => void,
+): Promise<boolean> {
+	if (!registerPromptReady || !options.images?.length) return session.prompt(text, options);
+
+	const ready = Promise.withResolvers<void>();
+	registerPromptReady(ready.promise);
+	const prompt = session.prompt(text, { ...options, onModelPrepared: ready.resolve });
+	void prompt.then(
+		() => ready.resolve(),
+		() => ready.resolve(),
+	);
+	return prompt;
+}
+
+/** Starts prompts after earlier ordinary commands without blocking their admission.
+ * Model changes wait for earlier prompts; abort, abort_bash and get_state can overtake that wait. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
 	#tasks = new Set<Promise<void>>();
+	#pendingPromptAdmissions = new Set<Promise<void>>();
+	#modelChangePreemptionTail: Promise<void> | undefined;
+	#waitingModelChanges = 0;
 	readonly #deps: RpcInputFrameDeps;
 	readonly #afterSerialCommand: (() => Promise<void>) | undefined;
 
@@ -417,22 +439,45 @@ export class RpcInputDispatcher {
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 
 			const command = parsed as RpcCommand;
-			// Bash retains its immediate side channel. Prompts start through the
-			// serial tail, but dispatchRpcInputFrame backgrounds their admission.
 			if (command.type === "bash") {
 				dispatchRpcInputFrame(command, this.#deps);
 				return;
 			}
 
-			const task = this.#tail.then(
-				() => this.#dispatchSerialCommand(command),
-				() => this.#dispatchSerialCommand(command),
-			);
-			this.#tail = task.catch(() => {});
+			const admissions =
+				(command.type === "set_model" || command.type === "cycle_model") && this.#pendingPromptAdmissions.size > 0
+					? [...this.#pendingPromptAdmissions]
+					: undefined;
+			let finishPrompt: (() => void) | undefined;
+			if (command.type === "prompt") {
+				const admission = Promise.withResolvers<void>();
+				this.#pendingPromptAdmissions.add(admission.promise);
+				finishPrompt = () => {
+					if (this.#pendingPromptAdmissions.delete(admission.promise)) admission.resolve();
+				};
+			}
+
+			const preemptionTail = this.#modelChangePreemptionTail;
+			const bypassModelChange =
+				preemptionTail !== undefined &&
+				(command.type === "abort" || command.type === "abort_bash" || command.type === "get_state");
+			const prior = bypassModelChange ? preemptionTail : this.#tail;
+			if (admissions) {
+				this.#modelChangePreemptionTail ??= this.#tail;
+				this.#waitingModelChanges++;
+			}
+			const run = async () => {
+				if (admissions) await Promise.all(admissions);
+				await this.#dispatchSerialCommand(command, finishPrompt);
+			};
+			const task = prior.then(run, run);
+			if (!bypassModelChange) this.#tail = task.catch(() => {});
 			this.#tasks.add(task);
-			void task.finally(() => {
+			const finish = () => {
 				this.#tasks.delete(task);
-			});
+				if (admissions && --this.#waitingModelChanges === 0) this.#modelChangePreemptionTail = undefined;
+			};
+			void task.then(finish, finish);
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
@@ -446,14 +491,39 @@ export class RpcInputDispatcher {
 		}
 	}
 
-	async #dispatchSerialCommand(command: RpcCommand): Promise<void> {
+	async #dispatchSerialCommand(command: RpcCommand, onPromptSettled?: () => void): Promise<void> {
+		let backgroundStarted = false;
+		let promptReadyRegistered = false;
 		try {
-			const awaited = dispatchRpcInputFrame(command, this.#deps);
+			const deps: RpcInputFrameDeps = onPromptSettled
+				? {
+						...this.#deps,
+						handleCommand: frame =>
+							this.#deps.handleCommand(frame, ready => {
+								promptReadyRegistered = true;
+								void ready.then(onPromptSettled, onPromptSettled);
+							}),
+						trackBackgroundTask: task => {
+							backgroundStarted = true;
+							void task.then(
+								() => {
+									if (!promptReadyRegistered) onPromptSettled();
+								},
+								() => {
+									if (!promptReadyRegistered) onPromptSettled();
+								},
+							);
+							this.#deps.trackBackgroundTask?.(task);
+						},
+					}
+				: this.#deps;
+			const awaited = dispatchRpcInputFrame(command, deps);
 			if (awaited) await awaited;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
 		} finally {
+			if (!backgroundStarted) onPromptSettled?.();
 			await this.#afterSerialCommand?.();
 		}
 	}
@@ -1195,7 +1265,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	await emitAvailableCommandsUpdate();
 
 	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+	const handleCommand: RpcInputFrameDeps["handleCommand"] = async (command, registerPromptReady) => {
 		const id = command.id;
 
 		switch (command.type) {
@@ -1254,7 +1324,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 							await watchAndReportPromptResult({
 								ticket,
 								startPrompt: onPromptAdmitted =>
-									session.prompt(builtinResult.prompt, { images: command.images, onPromptAdmitted }),
+									startRpcPromptWithModelFence(
+										session,
+										builtinResult.prompt,
+										{ images: command.images, onPromptAdmitted },
+										registerPromptReady,
+									),
 								results: promptResults,
 								onError: onPromptError(id, "prompt"),
 								extensionUserMessageTracker,
@@ -1294,11 +1369,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					await watchAndReportPromptResult({
 						ticket,
 						startPrompt: onPromptAdmitted =>
-							session.prompt(command.message, {
-								images: command.images,
-								streamingBehavior: command.streamingBehavior,
-								onPromptAdmitted,
-							}),
+							startRpcPromptWithModelFence(
+								session,
+								command.message,
+								{
+									images: command.images,
+									streamingBehavior: command.streamingBehavior,
+									onPromptAdmitted,
+								},
+								registerPromptReady,
+							),
 						results: promptResults,
 						onError: onPromptError(id, "prompt"),
 						extensionUserMessageTracker,

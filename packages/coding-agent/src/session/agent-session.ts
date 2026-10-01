@@ -7519,7 +7519,7 @@ export class AgentSession implements SettingsScope {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted"
+			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted" | "onModelPrepared"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -7736,7 +7736,7 @@ export class AgentSession implements SettingsScope {
 				this.#planReferenceSent = true;
 			}
 			try {
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, options?.onModelPrepared);
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}

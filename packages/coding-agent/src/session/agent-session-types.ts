@@ -397,6 +397,8 @@ export interface PromptOptions {
 	 * failed before admission still only settles through the returned promise.
 	 */
 	onPromptAdmitted?: () => void;
+	/** Called once the provider model for this prompt's first call is prepared, before dispatch. */
+	onModelPrepared?: () => void;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
