@@ -233,7 +233,7 @@ jobs:
         run: |
           toolchain="$(/bin/sh crates/pi-natives/src/applefm/build-bridge.sh detect)"
           if [ -z "$toolchain" ]; then
-            echo "::error::Darwin ARM64 release requires Swift 6.4+ and macOS 27 SDK; refusing to publish a stub-only addon"
+            echo "::error::Darwin ARM64 release requires Swift 6.4+ and macOS 27 SDK; refusing an addon without the Apple Foundation Models bridge"
             exit 1
           fi
           printf 'Apple Foundation Models bridge: %s\n' "$toolchain"
@@ -307,6 +307,16 @@ jobs:
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
           key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+      - name: Verify embedded Apple Foundation Models bridge
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          addon=packages/natives/native/pi_natives.darwin-arm64.node
+          test -s "$addon"
+          grep -aqF OmpAppleFm "$addon" ||
+            { echo "::error::Darwin ARM64 addon lacks the embedded Apple Foundation Models bridge"; exit 1; }
+          if otool -L "$addon" | grep -E 'libswift|FoundationModels'; then
+            echo "::error::Darwin ARM64 addon directly links the Swift runtime or FoundationModels"; exit 1
+          fi
       - name: Package source-built native addon
         if: matrix.windows != '1'
         run: |

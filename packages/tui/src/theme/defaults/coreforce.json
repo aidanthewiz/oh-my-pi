@@ -82,5 +82,15 @@
 		"statusLineOutput": "soft",
 		"statusLineCost": "soft",
 		"statusLineSubagents": "accent"
+	},
+	"terminal": {
+		"background": "page",
+		"foreground": "ink",
+		"chrome": "#001e31",
+		"widget": "paper2",
+		"ansi": [
+			"page", "danger", "#36b88a", "#f4bf75", "link", "#bb9ad8", "#27b7d9", "ink2",
+			"rule", "accent", "#67d5a9", "#ffdc99", "#6bc6f0", "#dbb8f2", "#84dbef", "ink"
+		]
 	}
 }

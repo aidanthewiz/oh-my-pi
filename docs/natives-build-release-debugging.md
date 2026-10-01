@@ -70,7 +70,11 @@ The macOS deployment target is pinned to 12.0 in `.bazelrc`. Rust's post-link `r
 
 Per-target codegen that is not part of the transition lives in `crates/pi-natives/BUILD.bazel` `rustc_flags` selects: `-Ctarget-cpu=x86-64-v2` (baseline) / `x86-64-v3` (modern) via `//bazel/variants`, the napi link args (`-Wl,-undefined,dynamic_lookup` on macOS, `-Wl,-z,nodelete` on linux — `build.rs`/`napi_build::setup()` is deliberately not wired in), `-Ctarget-feature=-crt-static` for musl, and `-Ctarget-feature=+crt-static` for win32 msvc, x64 and arm64 (paired with the `static_link_msvcrt` cc feature enabled in the `native_addon` transition so the C deps compile `/MT` in lock-step — the shipped `.node` then imports no `VCRUNTIME140.dll` from the VC++ Redistributable). The Cargo host path applies the same `+crt-static` policy to local Windows ARM64 builds in `build-bindings.ts`.
 
-`pi-natives` embeds the Jev rank tables from `data/jev_*.bin.zst`; Bazel includes them through `compile_data` and Cargo through `include_bytes!`. On Darwin, the Bazel `applefm_bridge` rule and Cargo `build.rs` use the same `src/applefm/build-bridge.sh`: Swift requires Swift 6.4+/macOS 27 SDK on Apple silicon, and other targets build an explicit C stub. The `@applefm_swift` toolchain fingerprint prevents cache reuse across Swift SDKs. The Darwin ARM64 verify and release legs request GitHub's `xcode-27` preview runner and fail before building if bridge toolchain detection fails; Darwin x64 intentionally uses the stub. Verify runner availability and the complete source build before allowing release publication.
+`pi-natives` embeds the Jev rank tables from `data/jev_*.bin.zst`. Bazel includes them through `compile_data`; Cargo uses `include_bytes!`.
+
+On Darwin, the Bazel `applefm_bridge` rule and Cargo `build.rs` use the same `src/applefm/build-bridge.sh`. Apple silicon requires Swift 6.4+ and the macOS 27 SDK to build the standalone bridge dylib. Without that toolchain, or on Darwin x64, they embed an empty file rather than linking a C stub. The addon targets macOS 12.0 and only stages and loads the bridge on macOS 27+. Older macOS never loads FoundationModels or its Swift runtime.
+
+The `@applefm_swift` toolchain fingerprint prevents cache reuse across Swift SDKs. Darwin ARM64 verify and release legs request GitHub's `xcode-27` preview runner and fail before building if bridge toolchain detection fails. Verify runner availability and the complete source build before allowing release publication.
 
 ### 3) Platforms and toolchains
 
@@ -157,7 +161,7 @@ The Windows ARM64 leg skips Bazel cache steps. The release's other legs save nat
 
 The eight binary targets are `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `win32-x64`, and `win32-arm64`. Each release target has a matching `coreforge-pi-natives-<target>-<tag>.tgz`; Linux musl archives deliberately contain canonical `pi_natives.linux-<arch>*.node` names but never substitute glibc addons. Linux x64 carries both baseline and modern; musl x64 carries baseline only. The executable names are `omp-<target>` except the Windows `omp-windows-<arch>.exe` binaries.
 
-`cf-verify.yml` uses the same eight-target matrix. If native inputs changed since the latest ancestor Coreforce release, each target builds the addon from the fork tree. Otherwise it installs and verifies the matching Coreforce release asset. Darwin ARM64 requires the Swift 6.4/macOS 27 SDK bridge on the `xcode-27` runner; Darwin x64 uses `macos-15-intel`. Windows ARM64 builds the host Cargo addon on `windows-11-arm`. The release job always builds its native addons from the release commit, not upstream npm packages.
+`cf-verify.yml` uses the same eight-target matrix. If native inputs changed since the latest ancestor Coreforce release, each target builds the addon from the fork tree. Otherwise it installs and verifies the matching Coreforce release asset. Darwin ARM64 requires Swift 6.4/macOS 27 SDK on the `xcode-27` runner. Its addon must embed the bridge without linking FoundationModels or Swift; Darwin x64 embeds an empty bridge on `macos-15-intel`. Windows ARM64 builds the host Cargo addon on `windows-11-arm`. The release job always builds its native addons from the release commit, not upstream npm packages.
 
 ## Debugging playbook
 

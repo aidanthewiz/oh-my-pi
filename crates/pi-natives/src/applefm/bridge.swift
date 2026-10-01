@@ -1,4 +1,4 @@
-// Apple Foundation Models bridge for omp, linked into the pi-natives addon.
+// Apple Foundation Models bridge for omp, embedded as a dylib in the pi-natives addon.
 //
 // Drives the on-device system language model through the stateless
 // `LanguageModelExecutor` API (macOS 27+): every generation request carries the
@@ -24,8 +24,8 @@
 // values whose discriminators are internal enums; they are decoded through
 // `Mirror` while every payload is cast back to its public type.
 //
-// The library targets the addon's minimum macOS; everything touching
-// FoundationModels is gated on macOS 27 and the framework is weak-linked.
+// The standalone bridge targets macOS 27; the addon only dlopens it on supported
+// hosts, leaving older macOS versions independent of FoundationModels and Swift.
 
 import Foundation
 #if !APPLEFM_GATE_TEST
