@@ -23,6 +23,7 @@
  * yields on its inner writer `close()` — which is our parked promise.
  */
 
+import type { Hash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -84,7 +85,7 @@ class CloseHoldingStorage implements SessionStorage {
 	writeTextSync(p: string, content: string): void {
 		this.#inner.writeTextSync(p, content);
 	}
-	updateSessionTitle(p: string, title: SessionTitleUpdate): Promise<void> {
+	updateSessionTitle(p: string, title: SessionTitleUpdate): Promise<Hash> {
 		return this.#inner.updateSessionTitle(p, title);
 	}
 	statSync(p: string) {

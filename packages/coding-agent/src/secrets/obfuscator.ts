@@ -50,6 +50,8 @@ export interface SecretEntry {
 	replacement?: string;
 	flags?: string;
 	friendlyName?: string;
+	/** Mandatory policy credentials remain protected when optional secret scanning is disabled. */
+	alwaysOn?: boolean;
 	/**
 	 * Regex entries only: literal substrings at least one of which every match
 	 * contains. Text containing none is skipped without running the regex.
@@ -88,6 +90,7 @@ export class SecretObfuscator {
 
 	/** Replace-mode plain mappings: secret → replacement */
 	#replaceMappings = new Map<string, string>();
+	#alwaysOnPlain = new Set<string>();
 
 	/** Reverse lookup for LIVE deobfuscation (provider output, tool-call args):
 	 *  keyed placeholder → secret plus recursion policy. Only placeholders this
@@ -129,6 +132,9 @@ export class SecretObfuscator {
 
 	/** Whether any secrets were configured */
 	#hasAny: boolean;
+
+	/** Outbound optional-secret switch (`secrets.enabled`); mandatory credentials remain protected. */
+	#obfuscating = true;
 
 	/**
 	 * Private per-install (or per-process) key for the keyed placeholder digest.
@@ -201,6 +207,7 @@ export class SecretObfuscator {
 		// Collect the full batch before minting placeholders so one new secret
 		// cannot appear in another new secret's friendly placeholder.
 		for (const entry of entries) {
+			if (entry.type === "plain" && entry.alwaysOn) this.#alwaysOnPlain.add(entry.content);
 			if (entry.type === "plain") this.#configuredSecretValues.add(entry.content);
 		}
 		for (const entry of entries) {
@@ -232,6 +239,7 @@ export class SecretObfuscator {
 		this.#key = key;
 		this.#replaceMappings.set(key, this.#generateSecretReplacement(key));
 		this.#configuredSecretValues.add(key);
+		this.#alwaysOnPlain.add(key);
 	}
 
 	/** Resolve the placeholder key once, minting its self-redaction on first use. */
@@ -263,6 +271,16 @@ export class SecretObfuscator {
 		return this.#hasAny;
 	}
 
+	/** Whether outbound text has any enabled secret protection. */
+	obfuscates(): boolean {
+		return this.#hasAny && (this.#obfuscating || this.#alwaysOnPlain.size > 0);
+	}
+
+	/** Toggle optional outbound scanning without disabling mandatory configured credentials or deobfuscation. */
+	setObfuscating(enabled: boolean): void {
+		this.#obfuscating = enabled;
+	}
+
 	/** Obfuscate all secrets in text. Bidirectional placeholders for obfuscate mode, one-way for replace. */
 	#assertNoLivePlaceholderCollision(): void {
 		if (this.#livePlaceholderCollision) {
@@ -274,7 +292,7 @@ export class SecretObfuscator {
 
 	obfuscate(text: string, sharedRegexSecretValues?: ReadonlySet<string>): string {
 		this.#assertNoLivePlaceholderCollision();
-		if (!this.#hasAny) return text;
+		if (!this.obfuscates()) return text;
 		this.#currentRegexSecretValues = this.collectRegexSecretValuesForObfuscation(text);
 		for (const secretValue of sharedRegexSecretValues ?? []) {
 			this.#currentRegexSecretValues.add(secretValue);
@@ -299,6 +317,7 @@ export class SecretObfuscator {
 		let origin = "I".repeat(text.length);
 		// 1. Process replace-mode plain secrets
 		for (const [secret, replacement] of [...this.#replaceMappings].sort((a, b) => b[0].length - a[0].length)) {
+			if (!this.#obfuscating && !this.#alwaysOnPlain.has(secret)) continue;
 			({ text: result, origin } = this.#replaceOutsidePlaceholdersTracked(result, origin, secret, replacement, "I"));
 		}
 		for (const secretValue of this.#collectRegexSecretValues(result)) {
@@ -314,6 +333,7 @@ export class SecretObfuscator {
 
 		// 2. Process obfuscate-mode plain secrets
 		for (const [secret, index] of [...this.#plainMappings].sort((a, b) => b[0].length - a[0].length)) {
+			if (!this.#obfuscating && !this.#alwaysOnPlain.has(secret)) continue;
 			const mapping = this.#obfuscateMappings.get(index)!;
 			({ text: result, origin } = this.#replaceOutsidePlaceholdersTracked(
 				result,
@@ -327,6 +347,7 @@ export class SecretObfuscator {
 		// 3. Process regex entries — discover new matches
 		const foldedResult = this.#foldedOnce(result);
 		for (const entry of this.#regexEntries) {
+			if (!this.#obfuscating) break;
 			if (!this.#entryMayMatch(entry, result, foldedResult)) continue;
 			entry.regex.lastIndex = 0;
 			const matches = this.#collectRegexMatches(result, entry.regex, entry.mode, origin, entry.replacement);
@@ -468,7 +489,8 @@ export class SecretObfuscator {
 				}
 			}
 		}
-		({ text: result, origin } = this.#stabilizeReplaceRegexPlaceholderSpillover(result, origin));
+		if (this.#obfuscating)
+			({ text: result, origin } = this.#stabilizeReplaceRegexPlaceholderSpillover(result, origin));
 
 		this.#currentRegexSecretValues = new Set();
 		return result;
@@ -881,6 +903,7 @@ export class SecretObfuscator {
 	// stamped unredacted onto every use of this secret.
 	#collectRegexSecretValues(text: string): Set<string> {
 		const values = new Set<string>();
+		if (!this.#obfuscating) return values;
 		const folded = this.#foldedOnce(text);
 		for (const entry of this.#regexEntries) {
 			if (!this.#entryMayMatch(entry, text, folded)) continue;
@@ -901,6 +924,7 @@ export class SecretObfuscator {
 
 	collectRegexSecretValuesForObfuscation(text: string): Set<string> {
 		this.#assertNoLivePlaceholderCollision();
+		if (!this.#obfuscating) return new Set();
 		const values = this.#collectRegexSecretValues(text);
 		let result = text;
 		let origin = "I".repeat(text.length);

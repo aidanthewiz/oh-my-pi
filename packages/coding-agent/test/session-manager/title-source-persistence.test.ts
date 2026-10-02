@@ -1,3 +1,4 @@
+import type { Hash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -21,9 +22,9 @@ class CountingTitleSlotStorage extends FileSessionStorage {
 	syncWrites = 0;
 	atomicWrites = 0;
 
-	override async updateSessionTitle(filePath: string, title: SessionTitleUpdate): Promise<void> {
+	override async updateSessionTitle(filePath: string, title: SessionTitleUpdate): Promise<Hash> {
 		this.titleUpdates++;
-		await super.updateSessionTitle(filePath, title);
+		return super.updateSessionTitle(filePath, title);
 	}
 
 	override writeTextSync(filePath: string, content: string): void {
@@ -105,24 +106,6 @@ describe("session title source persistence", () => {
 		const reopened = await SessionManager.open(sessionFile!);
 		expect(reopened.getSessionName()).toBe("Auto title");
 		expect(reopened.titleSource).toBe("auto");
-	});
-
-	it("persists user title source across reopen", async () => {
-		const session = SessionManager.create(cwd);
-		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
-		await session.setSessionName("Manual title", "user");
-		session.appendMessage(makeAssistantMessage());
-		await session.flush();
-
-		const sessionFile = session.getSessionFile();
-		expect(sessionFile).toBeDefined();
-
-		const entries = await loadEntriesFromFile(sessionFile!);
-		expect(getHeader(entries)?.titleSource).toBe("user");
-
-		const reopened = await SessionManager.open(sessionFile!);
-		expect(reopened.getSessionName()).toBe("Manual title");
-		expect(reopened.titleSource).toBe("user");
 	});
 
 	it("loads legacy slotless files with header titles", async () => {

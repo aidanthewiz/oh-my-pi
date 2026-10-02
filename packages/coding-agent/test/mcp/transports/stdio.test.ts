@@ -142,12 +142,14 @@ it("does not let explicit server env reopen managed dotenv loading", async () =>
 	const agentDir = path.join(cwd, "agent");
 	const outputPath = path.join(cwd, "child-env.json");
 	const secretKey = `OMP_MCP_MANAGED_SECRET_${Date.now()}`;
+	const projectKey = `OMP_MCP_PROJECT_ONLY_${Date.now()}`;
 	await fs.mkdir(agentDir, { recursive: true });
 	await Bun.write(path.join(agentDir, ".env"), `${secretKey}=managed-profile-secret\n`);
+	await Bun.write(path.join(cwd, ".env"), `${projectKey}=project-dotenv\n`);
 	const envModuleUrl = new URL("../../../../utils/src/env.ts", import.meta.url).href;
 	const script = [
 		`const { $env } = await import(${JSON.stringify(envModuleUrl)});`,
-		`await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify({ secret: $env[${JSON.stringify(secretKey)}], sentinel: process.env.OMP_NO_ENV_FILE, bunOptions: process.env.BUN_OPTIONS }));`,
+		`await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify({ secret: $env[${JSON.stringify(secretKey)}], projectValue: process.env[${JSON.stringify(projectKey)}], sentinel: process.env.OMP_NO_ENV_FILE, noEnvFile: process.execArgv.includes("--no-env-file") }));`,
 		"await Bun.sleep(60_000);",
 	].join("\n");
 	const transport = new StdioTransport({
@@ -171,12 +173,14 @@ it("does not let explicit server env reopen managed dotenv loading", async () =>
 		expect(await Bun.file(outputPath).exists()).toBeTrue();
 		const childEnv = JSON.parse(await Bun.file(outputPath).text()) as {
 			secret?: string;
+			projectValue?: string;
 			sentinel?: string;
-			bunOptions?: string;
+			noEnvFile?: boolean;
 		};
 		expect(childEnv.secret).toBeUndefined();
 		expect(childEnv.sentinel).toBe("1");
-		expect(childEnv.bunOptions).toBe("--no-env-file");
+		expect(childEnv.projectValue).toBeUndefined();
+		expect(childEnv.noEnvFile).toBe(true);
 	} finally {
 		await transport.close();
 		await fs.rm(cwd, { recursive: true, force: true });

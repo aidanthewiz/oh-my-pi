@@ -6,6 +6,8 @@ import * as path from "node:path";
 import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
+	AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AuthBrokerClient,
 	AuthBrokerError,
@@ -77,9 +79,9 @@ describe("auth-broker wire surface", () => {
 		}
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-wire-"));
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-		store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
+		await store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
 		storage = new AuthStorage(store);
-		await storage.reload();
+		await storage.credentials.reload();
 		token = "test-bearer";
 		handle = startAuthBroker({
 			storage,
@@ -125,6 +127,249 @@ describe("auth-broker wire surface", () => {
 			// Refresh token is replaced with the wire sentinel — clients never see it.
 			expect(entry.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
 		}
+	});
+
+	test("block acknowledgements and snapshots share a durable revision across broker restart", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+		const credentialId = initial.snapshot.credentials[0]!.id;
+		const firstRevision = initial.snapshot.blockRevision;
+		const legacyResponse = await fetch(`${handle!.url}/v1/snapshot`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(legacyResponse.status).toBe(200);
+		expect(((await legacyResponse.json()) as Record<string, unknown>).blockRevision).toBeUndefined();
+		expect(firstRevision?.instanceId).toMatch(/^[0-9A-F]{32}$/);
+		const block = { providerKey: "anthropic:oauth", blockScope: "tier:fable", blockedUntilMs: Date.now() + 60_000 };
+		const inserted = await client.upsertCredentialBlock(credentialId, block);
+		expect(inserted.blockRevision?.instanceId).toBe(firstRevision!.instanceId);
+		expect(inserted.blockRevision!.sequence).toBeGreaterThan(firstRevision!.sequence);
+		const withBlock = await client.fetchSnapshot();
+		if (withBlock.status !== 200) throw new Error("expected block snapshot");
+		expect(withBlock.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(inserted.blockRevision!.sequence);
+		const observedBlock = credentialBlocks(withBlock.snapshot, credentialId)[0]!;
+		expect(observedBlock.mutationToken).toMatch(/^[0-9a-f]{32}$/);
+
+		const removed = await client.deleteCredentialBlock(credentialId, {
+			providerKey: block.providerKey,
+			blockScope: block.blockScope,
+			mutationToken: observedBlock.mutationToken,
+			blockedUntilMs: observedBlock.blockedUntilMs,
+		});
+		expect(removed.deleted).toBe(true);
+		expect(removed.blockRevision!.sequence).toBeGreaterThan(inserted.blockRevision!.sequence);
+		const withoutBlock = await client.fetchSnapshot();
+		if (withoutBlock.status !== 200) throw new Error("expected deleted block snapshot");
+		expect(withoutBlock.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(removed.blockRevision!.sequence);
+		expect(credentialBlocks(withoutBlock.snapshot, credentialId)).toEqual([]);
+		const secondInsert = await client.upsertCredentialBlock(credentialId, block);
+		const secondSnapshot = await client.fetchSnapshot();
+		if (secondSnapshot.status !== 200) throw new Error("expected second block snapshot");
+		const removedAll = await client.deleteCredentialBlocks(credentialId, {
+			blocks: credentialBlocks(secondSnapshot.snapshot, credentialId).map(block => ({
+				providerKey: block.providerKey,
+				blockScope: block.blockScope,
+				mutationToken: block.mutationToken,
+				blockedUntilMs: block.blockedUntilMs,
+			})),
+		});
+		expect(removedAll.deleted).toBe(true);
+		expect(removedAll.blockRevision!.sequence).toBeGreaterThan(secondInsert.blockRevision!.sequence);
+		const afterDeleteAll = await client.fetchSnapshot();
+		if (afterDeleteAll.status !== 200) throw new Error("expected delete-all snapshot");
+		expect(credentialBlocks(afterDeleteAll.snapshot, credentialId)).toEqual([]);
+		expect(afterDeleteAll.snapshot.blockRevision!.sequence).toBeGreaterThanOrEqual(
+			removedAll.blockRevision!.sequence,
+		);
+
+		const bindUrl = new URL(handle!.url);
+		const bind = `${bindUrl.hostname}:${bindUrl.port}`;
+		await handle!.close();
+		storage!.close();
+		store!.close();
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		storage = new AuthStorage(store);
+		await storage.credentials.reload();
+		handle = startAuthBroker({ storage, bind, bearerTokens: [token], disableRefresher: true });
+		const afterRestart = await new AuthBrokerClient({ url: handle.url, token }).fetchSnapshot();
+		if (afterRestart.status !== 200) throw new Error("expected restart snapshot");
+		expect(afterRestart.snapshot.credentials[0]!.id).toBe(credentialId);
+		expect(afterRestart.snapshot.blockRevision).toEqual(afterDeleteAll.snapshot.blockRevision);
+	});
+
+	test("a stale peer clear cannot delete a newer scoped block or an unobserved bulk block", async () => {
+		const first = new AuthBrokerClient({ url: handle!.url, token });
+		const peer = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await first.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected initial snapshot");
+		const id = initial.snapshot.credentials[0]!.id;
+		const original = {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:fable",
+			blockedUntilMs: Date.now() + 60_000,
+		};
+		await first.upsertCredentialBlock(id, original);
+		const observed = await first.fetchSnapshot();
+		if (observed.status !== 200) throw new Error("expected observed block");
+		const oldBlock = credentialBlocks(observed.snapshot, id)[0]!;
+		const legacyDelete = await fetch(`${handle!.url}/v1/credential/${id}/block`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ providerKey: original.providerKey, blockScope: original.blockScope }),
+		});
+		expect(legacyDelete.status).toBe(409);
+		const newerDeadline = original.blockedUntilMs + 60_000;
+		await peer.upsertCredentialBlock(id, { ...original, blockedUntilMs: newerDeadline });
+		const staleClear = await first.deleteCredentialBlock(id, {
+			providerKey: original.providerKey,
+			blockScope: original.blockScope,
+			mutationToken: oldBlock.mutationToken,
+			blockedUntilMs: oldBlock.blockedUntilMs,
+		});
+		expect(staleClear.deleted).toBe(false);
+		const afterStaleClear = await first.fetchSnapshot();
+		if (afterStaleClear.status !== 200) throw new Error("expected latest peer block");
+		const peerBlock = credentialBlocks(afterStaleClear.snapshot, id)[0]!;
+		expect(peerBlock.blockedUntilMs).toBe(newerDeadline);
+		expect(peerBlock.mutationToken).not.toBe(oldBlock.mutationToken);
+		await peer.upsertCredentialBlock(id, { ...original, blockedUntilMs: newerDeadline });
+		const sameDeadlineClear = await first.deleteCredentialBlock(id, {
+			providerKey: peerBlock.providerKey,
+			blockScope: peerBlock.blockScope,
+			mutationToken: peerBlock.mutationToken,
+			blockedUntilMs: peerBlock.blockedUntilMs,
+		});
+		expect(sameDeadlineClear.deleted).toBe(false);
+		const afterSameDeadlineClear = await first.fetchSnapshot();
+		if (afterSameDeadlineClear.status !== 200) throw new Error("expected same-deadline peer block");
+		expect(credentialBlocks(afterSameDeadlineClear.snapshot, id)[0]!.blockedUntilMs).toBe(newerDeadline);
+		expect(credentialBlocks(afterSameDeadlineClear.snapshot, id)[0]!.mutationToken).not.toBe(peerBlock.mutationToken);
+
+		const other = { ...original, blockScope: "tier:other" };
+		await first.upsertCredentialBlock(id, other);
+		const beforeBulkClear = await first.fetchSnapshot();
+		if (beforeBulkClear.status !== 200) throw new Error("expected bulk snapshot");
+		const observedRows = credentialBlocks(beforeBulkClear.snapshot, id);
+		const legacyBulkDelete = await fetch(`${handle!.url}/v1/credential/${id}/blocks`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				blocks: [{ providerKey: original.providerKey, blockScope: original.blockScope }],
+			}),
+		});
+		expect(legacyBulkDelete.status).toBe(409);
+		const legacyNoBodyDelete = await fetch(`${handle!.url}/v1/credential/${id}/blocks`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(legacyNoBodyDelete.status).toBe(409);
+		await peer.upsertCredentialBlock(id, { ...original, blockedUntilMs: newerDeadline + 60_000 });
+		const staleBulkClear = await first.deleteCredentialBlocks(id, {
+			blocks: observedRows.map(block => ({
+				providerKey: block.providerKey,
+				blockScope: block.blockScope,
+				mutationToken: block.mutationToken,
+				blockedUntilMs: block.blockedUntilMs,
+			})),
+		});
+		expect(staleBulkClear.deleted).toBe(false);
+		const afterBulkClear = await first.fetchSnapshot();
+		if (afterBulkClear.status !== 200) throw new Error("expected current blocks after bulk clear");
+		const currentRows = credentialBlocks(afterBulkClear.snapshot, id);
+		expect(currentRows).toHaveLength(2);
+		expect(currentRows.find(block => block.blockScope === other.blockScope)).toEqual(
+			observedRows.find(block => block.blockScope === other.blockScope),
+		);
+		expect(currentRows.find(block => block.blockScope === original.blockScope)?.blockedUntilMs).toBe(
+			newerDeadline + 60_000,
+		);
+	});
+
+	test("bulk block clear rolls back earlier deletes when a peer replaces a later row", async () => {
+		const first = new AuthBrokerClient({ url: handle!.url, token });
+		const peer = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await first.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected initial snapshot");
+		const id = initial.snapshot.credentials[0]!.id;
+		const deadline = Date.now() + 120_000;
+		await first.upsertCredentialBlock(id, {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:a",
+			blockedUntilMs: deadline,
+		});
+		await first.upsertCredentialBlock(id, {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:b",
+			blockedUntilMs: deadline,
+		});
+		const observed = await first.fetchSnapshot();
+		if (observed.status !== 200) throw new Error("expected observed blocks");
+		const oldRows = credentialBlocks(observed.snapshot, id);
+		expect(oldRows.map(block => block.blockScope)).toEqual(["tier:a", "tier:b"]);
+
+		await peer.upsertCredentialBlock(id, {
+			providerKey: "anthropic:oauth",
+			blockScope: "tier:b",
+			blockedUntilMs: deadline + 60_000,
+		});
+		const replaced = await first.fetchSnapshot();
+		if (replaced.status !== 200) throw new Error("expected replaced block");
+		const currentRows = credentialBlocks(replaced.snapshot, id);
+		expect(currentRows[1]!.mutationToken).not.toBe(oldRows[1]!.mutationToken);
+		const stale = await first.deleteCredentialBlocks(id, {
+			blocks: oldRows.map(({ providerKey, blockScope, mutationToken, blockedUntilMs }) => ({
+				providerKey,
+				blockScope,
+				mutationToken,
+				blockedUntilMs,
+			})),
+		});
+		expect(stale.deleted).toBe(false);
+		expect(stale.blockRevision).toEqual(replaced.snapshot.blockRevision);
+		const afterStale = await first.fetchSnapshot();
+		if (afterStale.status !== 200) throw new Error("expected intact blocks");
+		expect(credentialBlocks(afterStale.snapshot, id)).toEqual(currentRows);
+
+		const { providerKey, blockScope, mutationToken, blockedUntilMs } = currentRows[0]!;
+		const duplicateBlock = { providerKey, blockScope, mutationToken, blockedUntilMs };
+		const duplicate = await first.deleteCredentialBlocks(id, { blocks: [duplicateBlock, duplicateBlock] });
+		expect(duplicate.deleted).toBe(false);
+		expect(duplicate.blockRevision).toEqual(replaced.snapshot.blockRevision);
+		const afterDuplicate = await first.fetchSnapshot();
+		if (afterDuplicate.status !== 200) throw new Error("expected intact blocks after duplicate");
+		expect(credentialBlocks(afterDuplicate.snapshot, id)).toEqual(currentRows);
+
+		const retry = await first.deleteCredentialBlocks(id, {
+			blocks: currentRows.map(({ providerKey, blockScope, mutationToken, blockedUntilMs }) => ({
+				providerKey,
+				blockScope,
+				mutationToken,
+				blockedUntilMs,
+			})),
+		});
+		expect(retry.deleted).toBe(true);
+		expect(retry.blockRevision!.sequence).toBeGreaterThan(replaced.snapshot.blockRevision!.sequence);
+		const cleared = await first.fetchSnapshot();
+		if (cleared.status !== 200) throw new Error("expected cleared snapshot");
+		expect(credentialBlocks(cleared.snapshot, id)).toEqual([]);
+	});
+
+	test("GET /v1/snapshot orders tied credential blocks by updatedAtMs", async () => {
+		const credentialId = storage!.credentials.snapshot().credentials[0]!.id;
+		const blockedUntilMs = Date.now() + 60_000;
+		const block = { credentialId, providerKey: "anthropic:oauth", blockScope: "", blockedUntilMs };
+		// SQLite's primary key cannot hold this tie, so feed it straight to the
+		// snapshot builder: only the server's sort decides the wire order, and it
+		// must match the client store's canonical order (oldest update first).
+		vi.spyOn(storage!.blocks, "list").mockReturnValue([
+			{ ...block, updatedAtMs: 2_000 },
+			{ ...block, updatedAtMs: 1_000 },
+		]);
+
+		const result = await new AuthBrokerClient({ url: handle!.url, token }).fetchSnapshot();
+		if (result.status !== 200) throw new Error("expected snapshot");
+		expect(credentialBlocks(result.snapshot, credentialId).map(entry => entry.updatedAtMs)).toEqual([1_000, 2_000]);
 	});
 
 	test("preserves an HTTP rejection when the caller aborts while reading its body", async () => {
@@ -214,7 +459,9 @@ describe("auth-broker wire surface", () => {
 		const unchanged = await client.fetchSnapshot({ ifGenerationGt: body.generation, waitMs: 10 });
 		expect(unchanged.status).toBe(304);
 		expect(unchanged.generation).toBe(body.generation);
-		expect(observedCapabilities).toEqual([AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES]);
+		expect(observedCapabilities).toEqual([
+			`${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS},${AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS}`,
+		]);
 
 		const rawUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
 			headers: {
@@ -227,7 +474,7 @@ describe("auth-broker wire surface", () => {
 	});
 
 	test("ignores external SQLite commits outside auth tables", async () => {
-		const generation = storage!.getGeneration();
+		const generation = storage!.credentials.generation;
 		const db = new Database(path.join(tempDir, "agent.db"));
 		try {
 			db.run("CREATE TABLE unrelated_state (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
@@ -236,8 +483,8 @@ describe("auth-broker wire surface", () => {
 			db.close();
 		}
 
-		expect(await storage!.pollExternalChanges()).toBe(false);
-		expect(storage!.getGeneration()).toBe(generation);
+		expect(await storage!.credentials.poll()).toBe(false);
+		expect(storage!.credentials.generation).toBe(generation);
 	});
 
 	test("does not double-bump after a local auth write with an unrelated external commit pending", async () => {
@@ -248,15 +495,15 @@ describe("auth-broker wire surface", () => {
 		} finally {
 			db.close();
 		}
-		storage!.upsertCredential("unit-local", { type: "api_key", key: "local-key" });
-		const generation = storage!.getGeneration();
+		await storage!.credentials.upsert("unit-local", { type: "api_key", key: "local-key" });
+		const generation = storage!.credentials.generation;
 
-		expect(await storage!.pollExternalChanges()).toBe(false);
-		expect(storage!.getGeneration()).toBe(generation);
+		expect(await storage!.credentials.poll()).toBe(false);
+		expect(storage!.credentials.generation).toBe(generation);
 	});
 
 	test("preserves a pending external auth commit while acknowledging local changes", async () => {
-		const generation = storage!.getGeneration();
+		const generation = storage!.credentials.generation;
 		const db = new Database(path.join(tempDir, "agent.db"));
 		try {
 			db.run("UPDATE auth_credentials SET updated_at = updated_at + 1 WHERE provider = 'anthropic'");
@@ -265,26 +512,28 @@ describe("auth-broker wire surface", () => {
 		}
 
 		store!.acknowledgeLocalChanges();
-		expect(await storage!.pollExternalChanges()).toBe(true);
-		expect(storage!.getGeneration()).toBeGreaterThan(generation);
+		expect(await storage!.credentials.poll()).toBe(true);
+		expect(storage!.credentials.generation).toBeGreaterThan(generation);
 	});
 
 	test("projects Codex meter blocks for legacy clients and observes writes from another connection", async () => {
 		await handle!.close();
 		handle = undefined;
-		const credential = storage!.upsertCredential("openai-codex", {
-			...mintOAuthCredential("codex-scopes", Date.now() + 60_000),
-		})[0];
+		const credential = (
+			await storage!.credentials.upsert("openai-codex", {
+				...mintOAuthCredential("codex-scopes", Date.now() + 60_000),
+			})
+		)[0];
 		if (!credential) throw new Error("expected Codex credential");
 		const chatBlockedUntilMs = Date.now() + 60_000;
 		const sparkBlockedUntilMs = Date.now() + 120_000;
-		storage!.upsertCredentialBlock({
+		storage!.blocks.upsert({
 			credentialId: credential.id,
 			providerKey: "openai-codex:oauth",
 			blockScope: "chat",
 			blockedUntilMs: chatBlockedUntilMs,
 		});
-		storage!.upsertCredentialBlock({
+		storage!.blocks.upsert({
 			credentialId: credential.id,
 			providerKey: "openai-codex:oauth",
 			blockScope: "spark",
@@ -306,7 +555,7 @@ describe("auth-broker wire surface", () => {
 		} finally {
 			db.close();
 		}
-		await storage!.pollExternalChanges();
+		await storage!.credentials.poll();
 		expect(readRawCodexCredentialBlocks(path.join(tempDir, "agent.db"), credential.id)).toEqual([
 			{
 				block_scope: "chat",
@@ -344,12 +593,14 @@ describe("auth-broker wire surface", () => {
 				providerKey: "openai-codex:oauth",
 				blockScope: "chat",
 				blockedUntilMs: chatBlockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: chatUpdatedAtSec * 1000,
 			},
 			{
 				providerKey: "openai-codex:oauth",
 				blockScope: "spark",
 				blockedUntilMs: sparkBlockedUntilMs,
+				mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/),
 				updatedAtMs: sparkUpdatedAtSec * 1000,
 			},
 		]);
@@ -373,8 +624,8 @@ describe("auth-broker wire surface", () => {
 		]);
 
 		expect(
-			storage!
-				.listCredentialBlocks([credential.id])
+			storage!.blocks
+				.list([credential.id])
 				.map(block => block.blockScope)
 				.sort(),
 		).toEqual(["chat", "spark"]);
@@ -415,8 +666,8 @@ describe("auth-broker wire surface", () => {
 		if (initial.status !== 200) throw new Error("expected snapshot");
 
 		const pending = client.fetchSnapshot({ ifGenerationGt: initial.generation, waitMs: 1000 });
-		setTimeout(() => {
-			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		setTimeout(async () => {
+			await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 		}, 10);
 
 		const changed = await pending;
@@ -636,7 +887,7 @@ describe("auth-broker wire surface", () => {
 				expect(first.value.credentials[0].provider).toBe("anthropic");
 			}
 
-			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+			await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 
 			const next = await nextMatching(iter, event => event.kind === "entry");
 			if (next.kind !== "entry") throw new Error("expected entry frame");
@@ -653,19 +904,21 @@ describe("auth-broker wire surface", () => {
 	});
 
 	test("SSE stream projects Codex meter blocks only for clients without the capability", async () => {
-		const credential = storage!.upsertCredential("openai-codex", {
-			...mintOAuthCredential("codex-stream-scopes", Date.now() + 60_000),
-		})[0];
+		const credential = (
+			await storage!.credentials.upsert("openai-codex", {
+				...mintOAuthCredential("codex-stream-scopes", Date.now() + 60_000),
+			})
+		)[0];
 		if (!credential) throw new Error("expected Codex credential");
 		const chatBlockedUntilMs = Date.now() + 60_000;
 		const sparkBlockedUntilMs = Date.now() + 120_000;
-		storage!.upsertCredentialBlock({
+		storage!.blocks.upsert({
 			credentialId: credential.id,
 			providerKey: "openai-codex:oauth",
 			blockScope: "chat",
 			blockedUntilMs: chatBlockedUntilMs,
 		});
-		storage!.upsertCredentialBlock({
+		storage!.blocks.upsert({
 			credentialId: credential.id,
 			providerKey: "openai-codex:oauth",
 			blockScope: "spark",
@@ -710,7 +963,7 @@ describe("auth-broker wire surface", () => {
 			]);
 
 			const updatedChatBlockedUntilMs = sparkBlockedUntilMs + 60_000;
-			storage!.upsertCredentialBlock({
+			storage!.blocks.upsert({
 				credentialId: credential.id,
 				providerKey: "openai-codex:oauth",
 				blockScope: "chat",
@@ -768,7 +1021,7 @@ describe("auth-broker wire surface", () => {
 			const first = await iter.next();
 			if (first.done) throw new Error("expected snapshot frame");
 
-			await storage!.refreshCredentialById(id);
+			await storage!.oauth.refresh(id);
 
 			const next = await nextMatching(
 				iter,
@@ -796,7 +1049,7 @@ describe("auth-broker wire surface", () => {
 			const first = await iter.next();
 			if (first.done) throw new Error("expected snapshot frame");
 
-			const disabled = storage!.disableCredentialById(id, "revoked by test");
+			const disabled = await storage!.credentials.disable(id, "revoked by test");
 			expect(disabled).toBe(true);
 
 			const next = await nextMatching(iter, event => event.kind === "removed");
@@ -810,9 +1063,9 @@ describe("auth-broker wire surface", () => {
 
 	test("SSE stream keepalive comment arrives on cadence", async () => {
 		const localStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "keepalive.db"));
-		localStore.saveOAuth("anthropic", mintOAuthCredential("k", Date.now() + 60_000));
+		await localStore.saveOAuth("anthropic", mintOAuthCredential("k", Date.now() + 60_000));
 		const localStorage = new AuthStorage(localStore);
-		await localStorage.reload();
+		await localStorage.credentials.reload();
 		const localToken = "keepalive-bearer";
 		const localHandle = startAuthBroker({
 			storage: localStorage,

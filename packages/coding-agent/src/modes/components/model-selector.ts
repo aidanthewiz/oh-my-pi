@@ -27,6 +27,7 @@ import {
 } from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS, MODEL_ROLES } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
+import { cfgDefaultThinkingLevel } from "../../session/settings";
 import { type ThemeColor, theme } from "@oh-my-pi/pi-tui/theme";
 import { matchesSelectDown, matchesSelectUp } from "@oh-my-pi/pi-tui/keybinding-matchers";
 import {
@@ -934,7 +935,7 @@ export class ModelSelectorComponent extends Container {
 			return resolved.thinkingLevel;
 		}
 		if (role === "default") {
-			return parseConfiguredThinkingLevel(this.#settings.get("defaultThinkingLevel")) ?? ThinkingLevel.Inherit;
+			return parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(this.#settings)) ?? ThinkingLevel.Inherit;
 		}
 		return ThinkingLevel.Inherit;
 	}

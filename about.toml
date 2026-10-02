@@ -20,6 +20,9 @@ accepted = [
 [inferno]
 accepted = ["CDDL-1.0"]
 
+[uluru]
+accepted = ["MPL-2.0"]
+
 [terminfo]
 accepted = ["WTFPL"]
 

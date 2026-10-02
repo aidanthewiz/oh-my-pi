@@ -6,6 +6,8 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { cfgShellPath } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import type {
 	ExtensionRunner,
 	ExtensionUIDialogOptions,
@@ -14,6 +16,8 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { stopService } from "@oh-my-pi/pi-coding-agent/launch/services";
 import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -29,6 +33,7 @@ describe.skipIf(process.platform === "win32")("DCG runtime approval", () => {
 	let tempDir: string;
 	let settings: Settings;
 	let tool: BashTool;
+	let session: ToolSession;
 	let previousEnv: Record<string, string | undefined>;
 
 	beforeAll(() => {
@@ -48,6 +53,22 @@ const actualArgs = process.argv.slice(2);
 if (JSON.stringify(actualArgs) !== JSON.stringify(expectedArgs)) {
 	console.error(\`unexpected arguments: \${JSON.stringify(actualArgs)}\`);
 	process.exit(3);
+}
+if (command.includes("guard-virtual-cwd")) {
+	if (!process.cwd().endsWith("/work")) {
+		console.log(JSON.stringify({ decision: "deny", reason: "guard did not inspect the virtual directory's host path" }));
+		process.exit(1);
+	}
+	console.log(JSON.stringify({ decision: "allow" }));
+	process.exit(0);
+}
+if (command.includes("svc-deny")) {
+	console.log(JSON.stringify({ decision: "deny", rule_id: "strict_service:deny", reason: "blocked service" }));
+	process.exit(1);
+}
+if (command.includes("svc-allow")) {
+	console.log(JSON.stringify({ decision: "allow" }));
+	process.exit(0);
 }
 console.log(JSON.stringify({
 	decision: "ask",
@@ -74,7 +95,7 @@ process.exit(1);
 			"bashInterceptor.enabled": false,
 			"tools.approvalMode": "yolo",
 		});
-		const session = {
+		session = {
 			cwd: tempDir,
 			hasUI: true,
 			settings,
@@ -169,6 +190,28 @@ process.exit(1);
 		}
 	});
 
+	it("guards a URL working directory from its backed host path before executing", async () => {
+		const localRoot = resolveLocalRoot({
+			getArtifactsDir: () => path.join(tempDir, "artifacts"),
+			getSessionId: () => "dcg-runtime-test",
+		});
+		fs.mkdirSync(path.join(localRoot, "work"), { recursive: true });
+
+		const result = await tool.execute("virtual-cwd", {
+			command: "printf guard-virtual-cwd",
+			cwd: "local://work",
+			pty: false,
+		});
+		expect(result.isError).toBeUndefined();
+		expect(result.content.find(item => item.type === "text")?.text).toContain("guard-virtual-cwd");
+	});
+
+	it("refuses an unbacked virtual cwd when DCG cannot evaluate relative paths", async () => {
+		await expect(
+			tool.execute("virtual-cwd-unbacked", { command: "printf guard-virtual-cwd", cwd: "omp://", pty: false }),
+		).rejects.toThrow("Destructive Command Guard cannot verify a working directory without host backing");
+	});
+
 	it("invalidates approval when the client terminal route changes before execution", async () => {
 		const shellDir = path.join(tempDir, "route-change-shell");
 		fs.mkdirSync(shellDir);
@@ -253,7 +296,7 @@ process.exit(1);
 		const approval = await routeTool.prepareRuntimeApproval(toolCallId, args);
 		expect(approval?.prompt).toContain("strict_git:worktree-remove");
 		routeTool.approveRuntimeApproval(toolCallId, args);
-		routeSettings.override("shellPath", psPath);
+		cfgShellPath.override(routeSettings, psPath);
 
 		await expect(routeTool.execute(toolCallId, args)).rejects.toThrow(
 			"Bash execution route or shell changed after safety review",
@@ -325,19 +368,15 @@ process.exit(1);
 				settings,
 			} as AgentToolContext);
 			expect(events).toEqual(["notification", "selector"]);
-			expect(sendNotification).toHaveBeenCalledWith({
-				title: "Oh My Pi",
-				body: "Tool approval required",
-				type: "approval",
-				urgency: "normal",
-				actions: "focus",
-			});
+			expect(sendNotification).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "approval", urgency: "normal", actions: "focus" }),
+			);
 			expect(fs.readFileSync(resultPath, "utf8")).toBe("runtime-approved");
 			expect(review).toContain("WARNING: This command requires explicit review before execution.");
 			expect(review).toContain("strict_git:worktree-remove");
 			expect(review).toContain("git worktree remove deletes a linked working tree.");
 			expect(review).toContain(JSON.stringify(tempDir));
-			expect(review).toContain(JSON.stringify(`printf runtime-approved > '${resultPath}'`));
+			expect(review).toContain(JSON.stringify(args.command));
 			expect(review).toContain("newlines and control characters are escaped");
 			expect(review).toContain("Only choose Approve once if this exact command is intended.");
 
@@ -435,5 +474,166 @@ process.exit(1);
 		await expect(
 			wrapped.execute("headless-call", args, undefined, undefined, { settings } as AgentToolContext),
 		).rejects.toThrow(/runtime approval but no interactive UI/u);
+	});
+	it("blocks a denied named service before the broker can launch it", async () => {
+		const marker = path.join(tempDir, "denied-service-started");
+		const args: BashToolInput = {
+			command: `printf svc-deny > '${marker}'`,
+			cwd: tempDir,
+			name: "denied-service",
+			pty: false,
+		};
+
+		await expect(tool.prepareRuntimeApproval("service-deny", args)).rejects.toThrow(
+			"Command blocked by Destructive Command Guard (strict_service:deny)",
+		);
+		await expect(tool.execute("service-deny", args)).rejects.toThrow(
+			"Command blocked by Destructive Command Guard (strict_service:deny)",
+		);
+		expect(fs.existsSync(marker)).toBeFalse();
+	});
+
+	it("requires exact approval for named services and supervises an approved process", async () => {
+		const args: BashToolInput = {
+			command: "printf svc-ask; sleep 20",
+			cwd: tempDir,
+			name: "approved-service",
+			pty: false,
+			ready: { log: "svc-ask", timeout: 5 },
+		};
+		const approval = await tool.prepareRuntimeApproval("service-ask", args);
+		expect(approval?.prompt).toContain("named service");
+		expect(approval?.prompt).toContain("svc-ask");
+		await expect(tool.execute("service-ask", args)).rejects.toThrow(/requires interactive approval/u);
+
+		const reviewed = await tool.prepareRuntimeApproval("service-ask-approved", args);
+		expect(reviewed?.prompt).toContain("strict_git:worktree-remove");
+		tool.approveRuntimeApproval("service-ask-approved", args);
+		try {
+			const result = await tool.execute("service-ask-approved", args);
+			expect(result.details?.service).toMatchObject({ name: "approved-service", ready: true, timedOut: false });
+			expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("svc-ask") });
+		} finally {
+			await stopService(session, "approved-service").catch(() => undefined);
+			await closeDaemonClients();
+		}
+	});
+
+	it("starts services with one reviewed shell prefix and the prepared shell environment", async () => {
+		const prefixMarker = path.join(tempDir, "service-prefix-count");
+		const envMarker = path.join(tempDir, "service-shell-environment");
+		const serviceSettings = Settings.isolated({ "launch.enabled": true, "bashInterceptor.enabled": false });
+		const shell = serviceSettings.getShellConfig();
+		const shellConfig = spyOn(serviceSettings, "getShellConfig").mockReturnValue({
+			...shell,
+			shell: "/bin/sh",
+			args: ["-c"],
+			prefix: `printf p >> '${prefixMarker}';`,
+			env: { ...shell.env, PI_BASH_PREFIX_TEST: "prepared" },
+		});
+		const serviceSession = { ...session, settings: serviceSettings } as ToolSession;
+		const serviceTool = new BashTool(serviceSession);
+		try {
+			const result = await serviceTool.execute("service-prefix", {
+				command: `printf '%s' "$PI_BASH_PREFIX_TEST" > '${envMarker}'; printf svc-allow; sleep 20`,
+				cwd: tempDir,
+				name: "prefix-once-service",
+				pty: false,
+				ready: { log: "svc-allow", timeout: 5 },
+			});
+			expect(result.details?.service).toMatchObject({ ready: true, timedOut: false });
+			expect(fs.readFileSync(prefixMarker, "utf8")).toBe("p");
+			expect(fs.readFileSync(envMarker, "utf8")).toBe("prepared");
+		} finally {
+			await stopService(serviceSession, "prefix-once-service").catch(() => undefined);
+			await closeDaemonClients();
+			shellConfig.mockRestore();
+		}
+	});
+
+	it("invalidates a service approval when its name or readiness changes", async () => {
+		const marker = path.join(tempDir, "changed-service-started");
+		const mutations: Array<(args: BashToolInput) => void> = [
+			args => {
+				args.name = "changed-service-name";
+			},
+			args => {
+				args.ready!.log = "changed";
+			},
+		];
+		for (const [index, mutate] of mutations.entries()) {
+			const args: BashToolInput = {
+				command: `printf svc-ask > '${marker}'`,
+				cwd: tempDir,
+				name: "reviewed-service",
+				pty: false,
+				ready: { log: "svc-ask" },
+			};
+			const id = `service-fingerprint-${index}`;
+			expect(await tool.prepareRuntimeApproval(id, args)).toBeDefined();
+			tool.approveRuntimeApproval(id, args);
+			mutate(args);
+			await expect(tool.execute(id, args)).rejects.toThrow(/requires interactive approval/u);
+			expect(fs.existsSync(marker)).toBeFalse();
+		}
+	});
+
+	it("rejects caller-provided environment fields before Bash can launch a command or service", async () => {
+		const marker = path.join(tempDir, "preloaded-service-started");
+		for (const name of [undefined, "preloaded-service"]) {
+			const args = {
+				command: `printf svc-allow > '${marker}'`,
+				cwd: tempDir,
+				name,
+				pty: false,
+				env: { BASH_ENV: marker },
+			};
+			await expect(tool.prepareRuntimeApproval("service-preload", args)).rejects.toThrow(
+				"Bash no longer accepts an env parameter.",
+			);
+			await expect(tool.execute("service-preload", args)).rejects.toThrow(
+				"Bash no longer accepts an env parameter.",
+			);
+			expect(fs.existsSync(marker)).toBeFalse();
+		}
+	});
+
+	it("applies custom bash interceptor rules to named services", async () => {
+		const interceptorSettings = Settings.isolated({
+			"launch.enabled": true,
+			"bashInterceptor.enabled": true,
+			"bashInterceptor.patterns": [{ pattern: "^printf svc-allow", tool: "bash", message: "Custom service block" }],
+		});
+		const interceptorSession = { ...session, settings: interceptorSettings } as ToolSession;
+		const interceptorTool = new BashTool(interceptorSession);
+		const args: BashToolInput = { command: "printf svc-allow", cwd: tempDir, name: "blocked-service", pty: false };
+		try {
+			await expect(
+				interceptorTool.execute("service-interceptor", args, undefined, undefined, {
+					toolNames: ["bash"],
+				} as AgentToolContext),
+			).rejects.toThrow("Custom service block");
+		} finally {
+			await stopService(interceptorSession, "blocked-service").catch(() => undefined);
+			await closeDaemonClients();
+		}
+	});
+
+	it("starts a DCG-allowed service and reports its readiness and output", async () => {
+		const args: BashToolInput = {
+			command: "printf svc-allow; sleep 20",
+			cwd: tempDir,
+			name: "allowed-service",
+			pty: false,
+			ready: { log: "svc-allow", timeout: 5 },
+		};
+		try {
+			const result = await tool.execute("service-allow", args);
+			expect(result.details?.service).toMatchObject({ name: "allowed-service", ready: true, timedOut: false });
+			expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("svc-allow") });
+		} finally {
+			await stopService(session, "allowed-service").catch(() => undefined);
+			await closeDaemonClients();
+		}
 	});
 });

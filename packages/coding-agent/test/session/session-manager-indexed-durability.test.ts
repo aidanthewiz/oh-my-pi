@@ -41,6 +41,10 @@ class FakeBackend implements SessionStorageBackend {
 	async readFull(path: string): Promise<string | null> {
 		return this.files.get(path) ?? null;
 	}
+	async readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		const rawContent = this.files.get(path);
+		return rawContent === undefined ? null : { rawContent, titleMeta: null };
+	}
 
 	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const bytes = Buffer.from(this.files.get(path) ?? "", "utf8");

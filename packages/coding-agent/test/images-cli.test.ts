@@ -431,7 +431,7 @@ describe("images purge", () => {
 			dependencies({
 				openAuthStorage: async () => {
 					const storage = await AuthStorage.create(":memory:");
-					storage.setRuntimeApiKey("openai", credential);
+					storage.keys.setRuntime("openai", credential);
 					return storage;
 				},
 				fetch: providerFetch,

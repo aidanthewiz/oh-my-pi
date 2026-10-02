@@ -8,6 +8,7 @@ import {
 	type WriteTextAtomicOptions,
 } from "./session-storage";
 import { isAssistantMessageLine } from "./session-entries";
+import { enoent } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
@@ -29,10 +30,12 @@ export interface SessionStorageBackend {
 	init(): Promise<void>;
 	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>>;
 	readFull(path: string): Promise<string | null>;
+	/** One committed version of both transcript bytes and title metadata. */
+	readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null>;
 	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
-	 * Replace content, atomically rejecting when the shared backend's current
-	 * UTF-8 byte length differs from `expectedSize`.
+	 * Replace content atomically against the shared backend's current size,
+	 * fingerprint, and title metadata. The local index cannot establish ownership.
 	 */
 	writeFull(
 		path: string,
@@ -40,6 +43,8 @@ export interface SessionStorageBackend {
 		mtimeMs: number,
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
+		expectedFingerprint?: string,
+		expectedTitleMeta?: string | null,
 	): Promise<void>;
 	append(path: string, line: string, mtimeMs: number): Promise<void>;
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
@@ -75,15 +80,6 @@ interface IndexAppend {
 }
 
 const RESOLVED = Promise.resolve();
-
-function enoent(p: string): NodeJS.ErrnoException {
-	const err = new Error(`ENOENT: no such file, '${p}'`) as NodeJS.ErrnoException;
-	err.code = "ENOENT";
-	err.errno = -2;
-	err.path = p;
-	err.syscall = "open";
-	return err;
-}
 
 function matchesGlob(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
@@ -268,13 +264,30 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async readText(path: string): Promise<string> {
-		const entry = this.#index.get(path);
-		if (!entry) throw enoent(path);
+		return (await this.readTextSnapshot(path)).content;
+	}
+
+	async readTextSnapshot(path: string): Promise<{ content: string; rawContent: string; titleMeta: string | null }> {
+		if (!this.#index.has(path)) throw enoent(path);
 		await this.#awaitPath(path);
-		const content = await this.#backend.readFull(path);
-		if (content === null) throw enoent(path);
-		const title = titleUpdateForIndex(entry);
-		return title ? overlayTitleSlotContent(content, title) : content;
+		const snapshot = await this.#backend.readFullWithTitleMeta(path);
+		if (!snapshot) throw enoent(path);
+		const title = snapshot.titleMeta ? (JSON.parse(snapshot.titleMeta) as SessionTitleUpdate) : undefined;
+		return {
+			content: title ? overlayTitleSlotContent(snapshot.rawContent, title) : snapshot.rawContent,
+			rawContent: snapshot.rawContent,
+			titleMeta: snapshot.titleMeta,
+		};
+	}
+
+	async readCommittedState(path: string): Promise<{ content: string; titleMeta: string | null }> {
+		const snapshot = await this.#backend.readFullWithTitleMeta(path);
+		if (!snapshot) throw enoent(path);
+		const title = snapshot.titleMeta ? (JSON.parse(snapshot.titleMeta) as SessionTitleUpdate) : undefined;
+		return {
+			content: title ? overlayTitleSlotContent(snapshot.rawContent, title) : snapshot.rawContent,
+			titleMeta: snapshot.titleMeta,
+		};
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
@@ -339,7 +352,15 @@ export class IndexedSessionStorage implements SessionStorage {
 						this.#dropFrame(path, mtimeMs);
 						return;
 					}
-					await this.#backend.writeFull(path, content, mtimeMs, title, options?.expectedSize);
+					await this.#backend.writeFull(
+						path,
+						content,
+						mtimeMs,
+						title,
+						options?.expectedSize,
+						options?.expectedFingerprint,
+						options?.expectedTitleMeta,
+					);
 				},
 				{ trackDrain: false },
 			);
@@ -347,7 +368,13 @@ export class IndexedSessionStorage implements SessionStorage {
 		} catch (err) {
 			const error = toError(err);
 			try {
-				if ((await this.#backend.readFull(path)) === content) {
+				if (options?.expectedTitleMeta !== undefined) {
+					const observed = await this.readCommittedState(path);
+					if (observed.content === content && observed.titleMeta === (title ? JSON.stringify(title) : null)) {
+						this.#dropFrame(path, mtimeMs);
+						return;
+					}
+				} else if ((await this.#backend.readFull(path)) === content) {
 					this.#dropFrame(path, mtimeMs);
 					return;
 				}

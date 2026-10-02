@@ -1,9 +1,11 @@
+import { createHash, type Hash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
-import { withFileLockSync } from "@oh-my-pi/pi-utils/file-lock";
-import { hasFsCode, isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+import { type FileLockHandle, tryAcquireFileLock, withFileLockSync } from "@oh-my-pi/pi-utils/file-lock";
+import { type FsError, hasFsCode, isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+import { openCloexecSync } from "@oh-my-pi/pi-utils/fs-open";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { peekFileEnds } from "@oh-my-pi/pi-utils/peek-file";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
@@ -11,7 +13,12 @@ import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { isAssistantMessageLine } from "./session-entries";
 import { overlayTitleSlotContent, type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 
+/** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
+const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
 const utf8Decoder = new TextDecoder("utf-8");
+export function sessionContentFingerprint(content: string): string {
+	return createHash("sha1").update(content).digest("hex");
+}
 
 export interface SessionStorageStat {
 	size: number;
@@ -50,10 +57,14 @@ export interface SessionStorageWriter {
 	getError(): Error | undefined;
 }
 
-/** Optimistic precondition for replacing a session file. */
+/** Optimistic preconditions for replacing a session file. */
 export interface SessionStorageWriteOptions {
 	/** Current UTF-8 byte length, or `null` when the target must not exist. */
 	expectedSize?: number | null;
+	/** SHA-1 detects accidental stale writers; it is not an authentication primitive. */
+	expectedFingerprint?: string;
+	/** Exact backend title metadata; null means absent. Only indexed backends use it. */
+	expectedTitleMeta?: string | null;
 }
 
 /**
@@ -65,10 +76,13 @@ export class SessionWriteConflictError extends Error {
 	readonly expectedSize: number | null;
 	readonly actualSize: number | null;
 
-	constructor(path: string, expectedSize: number | null, actualSize: number | null) {
+	constructor(path: string, expectedSize: number | null, actualSize: number | null, stateMismatch = false) {
 		const expected = expectedSize === null ? "missing" : `${expectedSize} bytes`;
 		const actual = actualSize === null ? "missing" : `${actualSize} bytes`;
-		super(`Session file changed before rewrite: ${path} (expected ${expected}, found ${actual}).`);
+		super(
+			`Session file changed before rewrite: ${path} (expected ${expected}, found ${actual}` +
+				`${stateMismatch ? ", content or title differs" : ""}).`,
+		);
 		this.name = "SessionWriteConflictError";
 		this.path = path;
 		this.expectedSize = expectedSize;
@@ -96,10 +110,9 @@ export class SessionLockError extends Error {
 
 /**
  * Optional guards applied by {@link SessionStorage.writeTextAtomic}. The
- * backend MUST check `expectedSize` and call `commitGuard()` synchronously
- * immediately before it makes the staged content visible at `path`. Failed
- * preconditions leave the target untouched. Backends MUST NOT yield between
- * the checks and publishing the write.
+ * backend MUST check size, content fingerprint, and indexed title metadata
+ * at the publish boundary. Failed preconditions leave the target untouched.
+ * The commit guard cannot yield between its check and publication.
  */
 export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
 	commitGuard?: () => boolean;
@@ -133,12 +146,26 @@ export interface SessionStorage {
 	 * backends can store the semantic title fields and synthesize the slot when
 	 * reading.
 	 */
-	updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void>;
+	updateSessionTitle(
+		path: string,
+		update: SessionTitleUpdate,
+		options?: SessionStorageWriteOptions,
+	): Promise<Hash | void>;
 	statSync(path: string): SessionStorageStat;
 	listFilesSync(dir: string, pattern: string): string[];
 
 	exists(path: string): Promise<boolean>;
 	readText(path: string): Promise<string>;
+	/** Read visible content, raw backing bytes, and title metadata in one indexed snapshot. */
+	readTextSnapshot?(path: string): Promise<{ content: string; rawContent: string; titleMeta: string | null }>;
+	/** Read authoritative bytes and title metadata after an uncertain indexed publish. */
+	readCommittedState?(path: string): Promise<{ content: string; titleMeta: string | null }>;
+	/**
+	 * Synchronous {@link readText}. Optional: `SessionManager` reads the file
+	 * back to keep another writer's entries when a synchronous rewrite meets
+	 * them, and reports the conflict instead on backends without it.
+	 */
+	readTextSync?(path: string): string;
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
@@ -160,6 +187,14 @@ export interface SessionStorage {
 	 * participate in close-time draft GC.
 	 */
 	withSessionFileLockSync?<T>(sessionPath: string, operation: () => T): T;
+	/**
+	 * Claim this process's ownership of a session file it writes, until the
+	 * returned release callback runs. Returns `null` while another live process
+	 * holds the claim; `SessionManager` then moves its session to a sibling
+	 * instead of writing that file. Optional because only backends with a
+	 * process-owned lock can tell that another process writes a session.
+	 */
+	claimSessionFile?(sessionPath: string): (() => void) | null;
 	/**
 	 * Atomically delete a session and its artifacts only when `shouldDelete`
 	 * accepts the current session content. Optional because backends without a
@@ -190,7 +225,7 @@ const writerRegistry = new FinalizationRegistry<number>(fd => {
 class FileSessionStorageWriter implements SessionStorageWriter {
 	#fd: number;
 	#fpath: string;
-	#publishLock: ((task: () => void) => void) | undefined;
+	#publishLock: ((append: () => void, landed: () => boolean) => void) | undefined;
 	#closed = false;
 	#error: Error | undefined;
 	#onError: ((err: Error) => void) | undefined;
@@ -200,7 +235,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		options?: {
 			flags?: "a" | "w";
 			onError?: (err: Error) => void;
-			publishLock?: (task: () => void) => void;
+			publishLock?: (append: () => void, landed: () => boolean) => void;
 		},
 	) {
 		this.#fpath = fpath;
@@ -213,7 +248,10 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 			fs.mkdirSync(dir, { recursive: true });
 		}
 		// Open file once, keep fd for lifetime
-		this.#fd = fs.openSync(fpath, flags === "w" ? "w" : "a");
+		this.#fd = openCloexecSync(
+			fpath,
+			SESSION_WRITE_FLAGS | (flags === "w" ? fs.constants.O_TRUNC : fs.constants.O_APPEND),
+		);
 		// Register for cleanup if abandoned without close()
 		writerRegistry.register(this, this.#fd, this);
 	}
@@ -223,17 +261,21 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	 * writer's descriptor on the orphaned previous inode, where the append would
 	 * be silently lost. Under the publish lock no cooperating replacement can
 	 * interleave, so re-open the live path when its identity changed.
+	 *
+	 * Returns the size of the descriptor the next write appends to: the one
+	 * `fstat` serves both the identity check and the append rollback point.
 	 */
-	#reopenIfReplaced(): void {
+	#reopenIfReplaced(): number {
+		const current = fs.fstatSync(this.#fd);
 		let live: fs.Stats;
 		try {
 			live = fs.statSync(this.#fpath);
 		} catch (err) {
-			if (isEnoent(err)) return;
+			if (isEnoent(err)) return current.size;
 			throw err;
 		}
-		if (live.ino === fs.fstatSync(this.#fd).ino) return;
-		const nextFd = fs.openSync(this.#fpath, "a");
+		if (live.ino === current.ino) return current.size;
+		const nextFd = openCloexecSync(this.#fpath, SESSION_WRITE_FLAGS | fs.constants.O_APPEND);
 		writerRegistry.unregister(this);
 		try {
 			fs.closeSync(this.#fd);
@@ -242,6 +284,24 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		}
 		this.#fd = nextFd;
 		writerRegistry.register(this, nextFd, this);
+		return fs.fstatSync(nextFd).size;
+	}
+
+	/**
+	 * Whether the descriptor the last append wrote through is still the file the
+	 * session path names. A vanished path counts as landed: nothing replaced it,
+	 * and `#reopenIfReplaced` would append to the same descriptor again.
+	 */
+	#holdsLivePath(): boolean {
+		const held = fs.fstatSync(this.#fd, { bigint: true });
+		let live: fs.BigIntStats;
+		try {
+			live = fs.statSync(this.#fpath, { bigint: true });
+		} catch (err) {
+			if (isEnoent(err)) return true;
+			throw err;
+		}
+		return live.ino === held.ino && live.dev === held.dev;
 	}
 
 	#recordError(err: unknown): Error {
@@ -251,8 +311,8 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		return error;
 	}
 
-	#writeNow(line: string): void {
-		const originalSize = fs.fstatSync(this.#fd).size;
+	/** Append `line` at the end of the held descriptor, rolling back to `originalSize` on failure. */
+	#writeNow(line: string, originalSize: number): void {
 		const buf = Buffer.from(line, "utf-8");
 		let offset = 0;
 		try {
@@ -267,10 +327,28 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 			try {
 				fs.ftruncateSync(this.#fd, originalSize);
 			} catch (rollbackError) {
-				throw new AggregateError(
-					[toError(writeError), toError(rollbackError)],
-					"Session append failed and its partial bytes could not be rolled back",
-				);
+				// Windows refuses ftruncate on an O_APPEND handle. Reopen without
+				// O_APPEND and verify its identity before rolling back: the path may
+				// now name a different session file after an external replacement.
+				try {
+					const rollbackFd = fs.openSync(this.#fpath, "r+");
+					try {
+						const original = fs.fstatSync(this.#fd);
+						const current = fs.fstatSync(rollbackFd);
+						if (original.dev !== current.dev || original.ino !== current.ino) {
+							throw new Error("Session file was replaced before append rollback");
+						}
+						fs.ftruncateSync(rollbackFd, originalSize);
+					} finally {
+						fs.closeSync(rollbackFd);
+					}
+				} catch (pathRollbackError) {
+					// Keep the write failure visible in the message.
+					throw new AggregateError(
+						[toError(writeError), toError(rollbackError), toError(pathRollbackError)],
+						`Session append failed and its partial bytes could not be rolled back: ${toError(writeError).message}`,
+					);
+				}
 			}
 			throw writeError;
 		}
@@ -287,12 +365,12 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// check-then-rename, which would otherwise erase the appended turn.
 		try {
 			if (this.#publishLock) {
-				this.#publishLock(() => {
-					this.#reopenIfReplaced();
-					this.#writeNow(line);
-				});
+				this.#publishLock(
+					() => this.#writeNow(line, this.#reopenIfReplaced()),
+					() => this.#holdsLivePath(),
+				);
 			} else {
-				this.#writeNow(line);
+				this.#writeNow(line, fs.fstatSync(this.#fd).size);
 			}
 		} catch (err) {
 			throw this.#recordError(err);
@@ -349,9 +427,11 @@ class FileSessionStorageWriter implements SessionStorageWriter {
  * current writers the gate serializes the whole claim, which also closes
  * the two-reclaimer unlink race (rJDh). Against a previous-binary peer the
  * protocol degrades to its released semantics, documented on the steal
- * path. The window that remains is non-cooperating writers (plain
- * editors), against which the size check still fails closed whenever the
- * skew is detectable.
+ * path. Appends claim the lockfile only when a previous-binary publisher
+ * can be in flight (see `#withAppendLock`), so a transcript line does not
+ * create and unlink a file beside the session. The window that remains is
+ * non-cooperating writers (plain editors), against which the size check
+ * still fails closed whenever the skew is detectable.
  *
  * The region is held for microseconds and never yields, so in-process
  * contention is impossible; cross-process contention fails closed after a
@@ -388,9 +468,41 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
+/**
+ * This process's ownership leases, shared by every `FileSessionStorage`
+ * instance: managers in one process share one lease per session file and only
+ * ever contend with other processes. The OS reclaims a lease when its process
+ * exits, so a crashed owner never blocks a later claim.
+ */
+const sessionFileLeases = new Map<string, { lease: FileLockHandle; holders: number }>();
+
+/**
+ * Lock name of a session file's ownership lease: a process writing the session
+ * holds it (see `FileSessionStorage.claimSessionFile`) until it exits.
+ */
+export function sessionOwnerLeasePath(sessionPath: string): string {
+	const resolved = path.resolve(sessionPath);
+	return path.join(path.dirname(resolved), `.${path.basename(resolved)}.owner`);
+}
+
 export class FileSessionStorage implements SessionStorage {
-	#assertExpectedSize(fpath: string, expectedSize: number | null | undefined): void {
-		if (expectedSize === undefined) return;
+	#fingerprintFile(fpath: string): Hash {
+		const hash = createHash("sha1");
+		const chunk = Buffer.allocUnsafe(64 * 1024);
+		const fd = fs.openSync(fpath, "r");
+		try {
+			let bytesRead: number;
+			while ((bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+				hash.update(chunk.subarray(0, bytesRead));
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+		return hash;
+	}
+
+	#assertExpectedState(fpath: string, options?: SessionStorageWriteOptions): void {
+		if (options?.expectedSize === undefined && options?.expectedFingerprint === undefined) return;
 		let actualSize: number | null;
 		try {
 			actualSize = fs.statSync(fpath).size;
@@ -398,8 +510,14 @@ export class FileSessionStorage implements SessionStorage {
 			if (!isEnoent(error)) throw error;
 			actualSize = null;
 		}
-		if (actualSize !== expectedSize) {
-			throw new SessionWriteConflictError(fpath, expectedSize, actualSize);
+		if (options?.expectedSize !== undefined && actualSize !== options.expectedSize) {
+			throw new SessionWriteConflictError(fpath, options.expectedSize, actualSize);
+		}
+		if (
+			options?.expectedFingerprint !== undefined &&
+			this.#fingerprintFile(fpath).digest("hex") !== options.expectedFingerprint
+		) {
+			throw new SessionWriteConflictError(fpath, options.expectedSize ?? null, actualSize, true);
 		}
 	}
 
@@ -426,13 +544,57 @@ export class FileSessionStorage implements SessionStorage {
 			try {
 				task();
 			} finally {
-				try {
-					fs.unlinkSync(lockPath);
-				} catch (err) {
-					if (!isEnoent(err)) {
-						logger.warn("Failed to remove session publish lock", { sessionFile: fpath, lockPath });
-					}
-				}
+				this.#releasePublishLock(fpath, lockPath);
+			}
+		} finally {
+			osGate.release();
+		}
+	}
+
+	#releasePublishLock(fpath: string, lockPath: string): void {
+		try {
+			fs.unlinkSync(lockPath);
+		} catch (err) {
+			if (!isEnoent(err)) {
+				logger.warn("Failed to remove session publish lock", { sessionFile: fpath, lockPath });
+			}
+		}
+	}
+
+	/**
+	 * Run `append` under the OS gate, claiming the lockfile only when a
+	 * previous-binary publisher may overlap it. Current publishers hold the
+	 * gate across their freshness check and rename, so among current writers
+	 * the gate alone excludes them and an append touches nothing beside the
+	 * session. A previous binary takes only the lockfile, so its claim stays
+	 * observable: an append that finds the lockfile waits for it exactly as
+	 * before, and one that saw it appear (or saw the path renamed away from
+	 * the descriptor it wrote through) waits for that publisher to finish and
+	 * re-appends to whatever file it published when the line did not survive.
+	 * That reproduces the serial order "their publish, then our append" the
+	 * lockfile used to enforce, and fails closed when the holder outlives the
+	 * bounded wait.
+	 */
+	#withAppendLock(fpath: string, append: () => void, landed: () => boolean): void {
+		const lockPath = this.#publishLockPath(fpath);
+		this.ensureDirSync(path.dirname(lockPath));
+		const osGate = this.#acquireOsPublishLock(fpath, lockPath);
+		try {
+			let appended = false;
+			if (!fs.existsSync(lockPath)) {
+				append();
+				appended = true;
+				// Lockfile before identity: a previous-binary publisher whose
+				// freshness check preceded our write holds the lockfile through its
+				// rename, so it is either still visible here or has already moved
+				// the path off our descriptor.
+				if (!fs.existsSync(lockPath) && landed()) return;
+			}
+			this.#acquirePublishLock(fpath, lockPath);
+			try {
+				if (!appended || !landed()) append();
+			} finally {
+				this.#releasePublishLock(fpath, lockPath);
 			}
 		} finally {
 			osGate.release();
@@ -449,7 +611,12 @@ export class FileSessionStorage implements SessionStorage {
 	#acquireOsPublishLock(fpath: string, lockPath: string): NativeFileLock {
 		const deadline = Date.now() + SESSION_PUBLISH_LOCK_WAIT_MS;
 		for (;;) {
-			const gate = NativeFileLock.tryAcquire(this.#osGatePath(lockPath));
+			let gate: NativeFileLock;
+			try {
+				gate = NativeFileLock.tryAcquire(this.#osGatePath(lockPath));
+			} catch (error) {
+				throw new SessionLockError(fpath, `OS publish gate failed: ${toError(error).message}`);
+			}
 			if (gate.acquired) return gate;
 			gate.release();
 			if (Date.now() >= deadline) {
@@ -518,22 +685,29 @@ export class FileSessionStorage implements SessionStorage {
 			}
 			throw toError(err);
 		}
-		try {
-			fs.closeSync(fd);
-		} catch {
-			// Ignore close errors; the lock content is already written.
-		}
 		// Verify the record survived: a concurrent stale-lock steal may have
 		// removed our file between create and write (a POSIX fd write succeeds
 		// on the unlinked inode), in which case we hold nothing. Retry instead
-		// of entering the region unexclusively (hV-oE).
+		// of entering the region unexclusively (hV-oE). The path still naming
+		// our inode proves the record is there (holders only ever create and
+		// unlink lock files), and comparing identities costs two stats instead
+		// of a full open/read/close. The descriptor stays open until after the
+		// comparison so the inode cannot be freed and its number reused by a
+		// successor's file; bigint keeps 64-bit Windows file IDs exact.
 		try {
-			if (fs.readFileSync(lockPath, "utf8") !== record) return false;
+			const held = fs.fstatSync(fd, { bigint: true });
+			const named = fs.statSync(lockPath, { bigint: true });
+			return held.ino === named.ino && held.dev === named.dev;
 		} catch {
 			// Removed under us: hold nothing, retry.
 			return false;
+		} finally {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Ignore close errors; the lock content is already written.
+			}
 		}
-		return true;
 	}
 
 	/**
@@ -615,7 +789,7 @@ export class FileSessionStorage implements SessionStorage {
 		// append between the size check and the rename.
 		try {
 			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedSize(fpath, options?.expectedSize);
+				this.#assertExpectedState(fpath, options);
 				try {
 					this.renameSync(tempPath, fpath);
 				} catch (err) {
@@ -629,23 +803,31 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
-	async updateSessionTitle(fpath: string, update: SessionTitleUpdate): Promise<void> {
-		const fd = fs.openSync(fpath, "r+");
-		try {
-			const buf = Buffer.from(serializeTitleSlot(update), "utf-8");
-			let offset = 0;
-			while (offset < buf.length) {
-				const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset);
-				if (written === 0) {
-					throw new Error("Short write");
+	async updateSessionTitle(
+		fpath: string,
+		update: SessionTitleUpdate,
+		options?: SessionStorageWriteOptions,
+	): Promise<Hash> {
+		let fingerprint!: Hash;
+		this.#withPublishLock(fpath, () => {
+			this.#assertExpectedState(fpath, options);
+			const fd = fs.openSync(fpath, "r+");
+			try {
+				const buf = Buffer.from(serializeTitleSlot(update), "utf-8");
+				let offset = 0;
+				while (offset < buf.length) {
+					const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset);
+					if (written === 0) throw new Error("Short write");
+					offset += written;
 				}
-				offset += written;
+			} catch (err) {
+				throw toError(err);
+			} finally {
+				fs.closeSync(fd);
 			}
-		} catch (err) {
-			throw toError(err);
-		} finally {
-			fs.closeSync(fd);
-		}
+			fingerprint = this.#fingerprintFile(fpath);
+		});
+		return fingerprint;
 	}
 
 	statSync(path: string): SessionStorageStat {
@@ -673,6 +855,10 @@ export class FileSessionStorage implements SessionStorage {
 
 	readText(path: string): Promise<string> {
 		return Bun.file(path).text();
+	}
+
+	readTextSync(path: string): string {
+		return fs.readFileSync(path, "utf8");
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
@@ -721,7 +907,7 @@ export class FileSessionStorage implements SessionStorage {
 			// its EPERM fallback): a cooperating appender or rewrite cannot
 			// interleave, and appenders re-open a replaced path before writing.
 			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedSize(fpath, options?.expectedSize);
+				this.#assertExpectedState(fpath, options);
 				try {
 					this.renameSync(tempPath, fpath);
 					return;
@@ -847,13 +1033,46 @@ export class FileSessionStorage implements SessionStorage {
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
 		return new FileSessionStorageWriter(path, {
 			...options,
-			publishLock: task => this.#withPublishLock(path, task),
+			publishLock: (append, landed) => this.#withAppendLock(path, append, landed),
 		});
 	}
 
 	/** Run a synchronous session mutation under its cross-process lock. */
 	withSessionFileLockSync<T>(sessionPath: string, operation: () => T): T {
 		return withFileLockSync(sessionPath, operation);
+	}
+
+	/**
+	 * The lease is an OS lock (`flock` sidecar, abstract socket, or named mutex)
+	 * beside the session file, so the kernel drops a dead owner's claim.
+	 * A failed OS acquisition must not be treated as ownership.
+	 */
+	claimSessionFile(sessionPath: string): (() => void) | null {
+		const key = path.resolve(sessionPath);
+		let held = sessionFileLeases.get(key);
+		if (!held) {
+			let lease: FileLockHandle | null;
+			try {
+				// Like the publish lock: the directory may not exist before the first write.
+				this.ensureDirSync(path.dirname(key));
+				lease = tryAcquireFileLock(sessionOwnerLeasePath(key));
+			} catch (err) {
+				throw new SessionLockError(key, `OS ownership lease failed: ${toError(err).message}`);
+			}
+			if (!lease) return null;
+			held = { lease, holders: 0 };
+			sessionFileLeases.set(key, held);
+		}
+		const claim = held;
+		claim.holders++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (--claim.holders > 0) return;
+			sessionFileLeases.delete(key);
+			claim.lease.release();
+		};
 	}
 
 	/**
@@ -1118,6 +1337,11 @@ function sliceChunksTail(entry: MemoryFileEntry, maxBytes: number): string {
 	return chunkSuffix + joinChunkRange(entry.chunks, boundaryIndex + 1, entry.chunks.length);
 }
 
+/** A missing in-memory file, coded `ENOENT` like the file backend so callers' `isEnoent` checks agree. */
+function memoryFileNotFound(path: string): FsError {
+	return Object.assign(new Error(`File not found: ${path}`), { code: "ENOENT" });
+}
+
 export class MemorySessionStorage implements SessionStorage {
 	// Each path keeps appended string chunks plus cumulative UTF-8 byte offsets.
 	// Full reads materialize the chunks into one string chunk, so repeated reads
@@ -1128,7 +1352,7 @@ export class MemorySessionStorage implements SessionStorage {
 
 	#requireEntry(path: string): MemoryFileEntry {
 		const entry = this.#files.get(path);
-		if (!entry) throw new Error(`File not found: ${path}`);
+		if (!entry) throw memoryFileNotFound(path);
 		return entry;
 	}
 
@@ -1141,19 +1365,25 @@ export class MemorySessionStorage implements SessionStorage {
 	}
 
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
-		const actualSize = this.#files.get(path)?.size ?? null;
+		const previous = this.#files.get(path);
+		const actualSize = previous?.size ?? null;
 		if (options?.expectedSize !== undefined && actualSize !== options.expectedSize) {
 			throw new SessionWriteConflictError(path, options.expectedSize, actualSize);
+		}
+		if (
+			options?.expectedFingerprint !== undefined &&
+			(previous ? sessionContentFingerprint(materializeMemoryEntry(previous)) : null) !== options.expectedFingerprint
+		) {
+			throw new SessionWriteConflictError(path, options.expectedSize ?? null, actualSize, true);
 		}
 		this.#files.set(path, createMemoryFileEntry(content, Date.now()));
 	}
 
-	async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void> {
+	async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<Hash> {
 		const entry = this.#requireEntry(path);
-		this.#files.set(
-			path,
-			createMemoryFileEntry(overlayTitleSlotContent(materializeMemoryEntry(entry), update), Date.now()),
-		);
+		const body = overlayTitleSlotContent(materializeMemoryEntry(entry), update);
+		this.#files.set(path, createMemoryFileEntry(body, Date.now()));
+		return createHash("sha1").update(body);
 	}
 
 	/**
@@ -1200,19 +1430,25 @@ export class MemorySessionStorage implements SessionStorage {
 
 	readText(path: string): Promise<string> {
 		const entry = this.#files.get(path);
-		if (!entry) return Promise.reject(new Error(`File not found: ${path}`));
+		if (!entry) return Promise.reject(memoryFileNotFound(path));
 		return Promise.resolve(materializeMemoryEntry(entry));
+	}
+
+	readTextSync(path: string): string {
+		const entry = this.#files.get(path);
+		if (!entry) throw memoryFileNotFound(path);
+		return materializeMemoryEntry(entry);
 	}
 
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const entry = this.#files.get(path);
-		if (!entry) return Promise.reject(new Error(`File not found: ${path}`));
+		if (!entry) return Promise.reject(memoryFileNotFound(path));
 		return Promise.resolve([sliceChunksHead(entry, prefixBytes), sliceChunksTail(entry, suffixBytes)]);
 	}
 
 	async hasAssistantTurn(path: string): Promise<boolean> {
 		const entry = this.#files.get(path);
-		if (!entry) throw new Error(`File not found: ${path}`);
+		if (!entry) throw memoryFileNotFound(path);
 		for (const line of materializeMemoryEntry(entry).split("\n")) {
 			if (isAssistantMessageLine(line)) return true;
 		}
@@ -1226,13 +1462,13 @@ export class MemorySessionStorage implements SessionStorage {
 
 	writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
 		if (options?.commitGuard && !options.commitGuard()) return Promise.resolve();
-		this.writeTextSync(path, content, { expectedSize: options?.expectedSize });
+		this.writeTextSync(path, content, options);
 		return Promise.resolve();
 	}
 
 	rename(path: string, nextPath: string): Promise<void> {
 		const entry = this.#files.get(path);
-		if (!entry) return Promise.reject(new Error(`File not found: ${path}`));
+		if (!entry) return Promise.reject(memoryFileNotFound(path));
 		this.#files.set(nextPath, entry);
 		this.#files.delete(path);
 		return Promise.resolve();

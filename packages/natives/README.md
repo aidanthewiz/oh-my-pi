@@ -45,6 +45,14 @@ const pdf = await pdfToMarkdown(pdfBytes);
 console.log(pdf.markdown, pdf.pagesNeedingOcr);
 ```
 
+### Lazy Windows path helpers
+
+Import `expandWindowsLongPath` and `getWindowsShortPath` from
+`@oh-my-pi/pi-natives/path` when importing a module must not load the native addon.
+The addon loads only when a helper is called on Windows; other platforms preserve
+the input path without loading it. These helpers change long/8.3 spellings without
+resolving symlinks or junctions.
+
 ## Building
 
 ```bash
@@ -57,8 +65,9 @@ bun run check
 
 ## Architecture
 
-`@oh-my-pi/pi-natives` publishes a small core package plus generated
-platform-specific optional dependency packages:
+The loader supports generated platform-specific optional dependency packages
+for upstream npm installations. Coreforge instead distributes each fork-built
+addon alongside its matching binary on the authenticated Coreforce release:
 
 ```
 crates/pi-natives/       # Rust source (workspace member)
@@ -77,9 +86,8 @@ npm/<platform>-<arch>/   # Generated at publish time, not committed
   *.node                 # Only that platform's addon binary or x64 ISA variants
 ```
 
-The published core package contains only the JS loader, declarations, README,
-and `package.json`. Release publishing generates one leaf package per supported
-`os`/`cpu` pair and injects those leaves into the core manifest as pinned
-`optionalDependencies`, so package managers install only the host platform's
-native addon. x64 leaves include every built ISA variant, and the loader keeps
-choosing between `baseline` and `modern` at runtime.
+The upstream npm publishing script can produce leaf packages, but Coreforge
+does not publish that channel. Source installs build the addon from this fork;
+released installs use the exact-version Coreforce addon archive. x64 archives
+include both built ISA variants, and the loader selects `baseline` or `modern`
+at runtime.

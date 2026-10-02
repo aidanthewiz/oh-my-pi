@@ -9,7 +9,11 @@ import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection } from "../../src/mcp/types";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { reserveManagedAwsProfile } from "@oh-my-pi/pi-utils";
+import {
+	getOperationalAwsLaunchMetadata,
+	isCoreforgeManagedLaunch,
+	reserveManagedAwsProfile,
+} from "@oh-my-pi/pi-utils";
 import { ensureCoreforgeAwsSso } from "../../src/identity/aws-sso";
 import { restoreCoreforgeOperationalAwsEnvironment } from "../../src/identity/runtime";
 import { resolveAwsCredentials } from "@oh-my-pi/pi-ai/providers/aws-credentials";
@@ -682,7 +686,13 @@ const saved = await Promise.all(
 assert.ok(saved.some(value => value.includes('"rows"')));
 assert.ok(saved.every(value => !value.includes("fixture-secret") && !value.includes("fixture-token")));
 const originalPath = Bun.env.PATH;
+assert.equal(isCoreforgeManagedLaunch(), true);
+assert.equal(
+	getOperationalAwsLaunchMetadata()?.executable,
+	path.join(root, process.platform === "win32" ? "aws.exe" : "aws"),
+);
 Bun.env.PATH = cwd;
+Bun.env.OMP_OPERATIONAL_AWS_EXECUTABLE = path.join(cwd, "aws");
 try {
 	const managedIdentity = await ensureCoreforgeAwsSso({ profile: "coreforge", region: "us-east-1" });
 	assert.match(managedIdentity.roleArn, /user\/fixture$/);
@@ -711,6 +721,7 @@ try {
 	assert.equal(modelCredentials.accessKeyId, "fixture-model-access");
 } finally {
 	Bun.env.PATH = originalPath;
+	delete Bun.env.OMP_OPERATIONAL_AWS_EXECUTABLE;
 }
 const cancel = new AbortController();
 const hanging = tool.execute("cancel", { ...read, parameters: { Prefix: "hang" } }, cancel.signal);

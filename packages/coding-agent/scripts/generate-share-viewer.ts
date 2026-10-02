@@ -9,7 +9,8 @@
  *
  */
 import * as path from "node:path";
-import { generateThemeStyles, getTemplate } from "../src/export/html";
+import { getTemplate } from "../src/export/html/template-assets";
+import { webExportThemeStyles } from "../src/export/html/web-palette";
 
 const outPath = process.argv[2];
 if (!outPath) {
@@ -19,11 +20,10 @@ if (!outPath) {
 
 const loaderJs = await Bun.file(new URL("../src/export/html/share-loader.js", import.meta.url).pathname).text();
 // Public artifacts use the bundled omp web themes rather than TUI themes.
-const themeStyles = await generateThemeStyles("web");
+const themeStyles = webExportThemeStyles();
 
 const html = getTemplate()
 	.replace("<theme-vars/>", () => `<style>${themeStyles}</style>`)
-	.replace("<title>Session Export</title>", () => "<title>omp session</title>")
 	.replace("{{SESSION_DATA}}</script>", () => `</script>\n  <script>${loaderJs}</script>`);
 
 if (html.includes("{{SESSION_DATA}}")) throw new Error("session-data placeholder survived substitution");

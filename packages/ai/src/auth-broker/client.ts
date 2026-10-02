@@ -8,14 +8,16 @@
 
 import { type } from "@oh-my-pi/omptype";
 import { readSseEvents } from "@oh-my-pi/pi-utils";
-import type { AuthCredential, DisabledCredentialSummary } from "../auth-storage";
+import type { AuthCredential, DisabledCredentialSummary, OAuthRefreshReason } from "../auth-storage";
 import type {
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
 	ClientUsageSummaryResponse,
+	CredentialBlockDeleteRequest,
 	CredentialBlockRequest,
 	CredentialBlockResponse,
 	CredentialBlocksDeleteResponse,
+	CredentialBlocksDeleteRequest,
 	CredentialDisableRequest,
 	CredentialDisableResponse,
 	CredentialRefreshResponse,
@@ -29,7 +31,13 @@ import type {
 	UsageResponse,
 	UsageStaleResponse,
 } from "./types";
-import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES } from "./types";
+import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
+	AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+} from "./types";
+import { parseGenerationTag } from "./protocol";
 import {
 	clientUsageReportResponseSchema,
 	clientUsageSummaryResponseSchema,
@@ -62,6 +70,7 @@ const RESPONSE_SCHEMAS = {
 	usageResponseSchema,
 	usageStaleResponseSchema,
 } as const;
+const BROKER_CAPABILITIES = `${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS},${AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS}`;
 
 type AuthBrokerResponseSchemaName = keyof typeof RESPONSE_SCHEMAS;
 
@@ -111,18 +120,6 @@ export type FetchSnapshotResult =
 	| { status: 200; snapshot: SnapshotResponse; generation: number }
 	| { status: 304; generation: number };
 
-function parseGenerationTag(header: string | null): number | undefined {
-	if (!header) return undefined;
-	let value = header.trim();
-	if (value.startsWith("W/")) value = value.slice(2).trim();
-	if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
-		value = value.slice(1, -1);
-	}
-	const generation = Number(value);
-	if (!Number.isInteger(generation) || generation < 0) return undefined;
-	return generation;
-}
-
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RETRIES = 1;
 
@@ -157,7 +154,7 @@ export class AuthBrokerClient {
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
 		const headers: Record<string, string> = {
-			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: BROKER_CAPABILITIES,
 		};
 		if (opts.ifGenerationGt !== undefined) headers["If-None-Match"] = `"${opts.ifGenerationGt}"`;
 		const timeoutMs =
@@ -199,7 +196,7 @@ export class AuthBrokerClient {
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			Authorization: `Bearer ${this.#token}`,
-			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: BROKER_CAPABILITIES,
 		};
 		if (opts.signal?.aborted) {
 			throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });
@@ -326,8 +323,13 @@ export class AuthBrokerClient {
 		});
 	}
 
-	async refreshCredential(id: number, signal?: AbortSignal): Promise<CredentialRefreshResponse> {
-		return this.#request<CredentialRefreshResponse>("POST", `/v1/credential/${id}/refresh`, {
+	async refreshCredential(
+		id: number,
+		signal?: AbortSignal,
+		reason?: OAuthRefreshReason,
+	): Promise<CredentialRefreshResponse> {
+		const suffix = reason === "auth-recovery" ? "?reason=auth-recovery" : "";
+		return this.#request<CredentialRefreshResponse>("POST", `/v1/credential/${id}/refresh${suffix}`, {
 			schema: "credentialRefreshResponseSchema",
 			signal,
 		});
@@ -389,8 +391,25 @@ export class AuthBrokerClient {
 		});
 	}
 
-	async deleteCredentialBlocks(id: number, signal?: AbortSignal): Promise<CredentialBlocksDeleteResponse> {
+	async deleteCredentialBlock(
+		id: number,
+		block: CredentialBlockDeleteRequest,
+		signal?: AbortSignal,
+	): Promise<CredentialBlocksDeleteResponse> {
+		return this.#request<CredentialBlocksDeleteResponse>("DELETE", `/v1/credential/${id}/block`, {
+			body: block,
+			schema: "credentialBlocksDeleteResponseSchema",
+			signal,
+		});
+	}
+
+	async deleteCredentialBlocks(
+		id: number,
+		request: CredentialBlocksDeleteRequest,
+		signal?: AbortSignal,
+	): Promise<CredentialBlocksDeleteResponse> {
 		return this.#request<CredentialBlocksDeleteResponse>("DELETE", `/v1/credential/${id}/blocks`, {
+			body: request,
 			schema: "credentialBlocksDeleteResponseSchema",
 			signal,
 		});
@@ -445,7 +464,11 @@ export class AuthBrokerClient {
 	): Promise<Response> {
 		const auth = opts.auth ?? true;
 		const url = `${this.#baseUrl}${path}`;
-		const headers: Record<string, string> = { Accept: "application/json", ...opts.headers };
+		const headers: Record<string, string> = {
+			Accept: "application/json",
+			[AUTH_BROKER_CAPABILITIES_HEADER]: BROKER_CAPABILITIES,
+			...opts.headers,
+		};
 		if (auth) headers.Authorization = `Bearer ${this.#token}`;
 		let payload: string | undefined;
 		if (opts.body !== undefined) {

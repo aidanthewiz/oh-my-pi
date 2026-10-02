@@ -59,3 +59,11 @@ packages/*/CHANGELOG.md merge=union
 packages/catalog/src/models.json binary
 packages/catalog/src/compat/rules.json binary
 
+# Preserve verbatim third-party license payload whitespace in generated notices.
+THIRD-PARTY-NOTICES.txt whitespace=-trailing-space
+packages/coding-agent/src/tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt whitespace=-trailing-space
+packages/natives/THIRD-PARTY-NOTICES.txt whitespace=-trailing-space
+
+# Generated tree-sitter parser: regenerate from grammar.js (see its README.md).
+crates/vendor/tree-sitter-go/src/parser.c linguist-generated
+

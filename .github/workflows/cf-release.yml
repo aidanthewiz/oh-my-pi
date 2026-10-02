@@ -19,8 +19,8 @@
 # bun target names, initial Darwin ad-hoc signing, and asset names matching
 # `getBinaryName()` in `update-cli.ts`. When every `APPLE_*` secret exists, the
 # workflow replaces Darwin signatures with notarized Developer ID signatures.
-# Darwin builds run natively on macOS; win32 is cross-built on Linux exactly
-# like upstream.
+# Darwin builds run natively on macOS; Linux, Linux musl, and Windows x64
+# run on Linux/ARM runners as appropriate; Windows ARM64 runs on Windows ARM.
 # Native addons are built from this fork's source for every target. This keeps
 # release binaries aligned with Coreforge native adaptations instead of
 # silently substituting upstream npm prebuilts.
@@ -56,7 +56,7 @@ jobs:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
       - name: Resolve release tag
         id: release
         env:
@@ -155,7 +155,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            os: macos-14
+            os: xcode-27
             binary: omp-darwin-arm64
             native_targets: darwin-arm64
           - target: darwin-x64
@@ -170,6 +170,16 @@ jobs:
             os: ubuntu-24.04-arm
             binary: omp-linux-arm64
             native_targets: linux-arm64
+          - target: linux-musl-x64
+            os: ubuntu-22.04
+            cross: "1"
+            binary: omp-linux-musl-x64
+            native_targets: linux-musl-x64-baseline
+          - target: linux-musl-arm64
+            os: ubuntu-24.04-arm
+            cross: "1"
+            binary: omp-linux-musl-arm64
+            native_targets: linux-musl-arm64
           - target: win32-x64
             os: ubuntu-24.04
             cross: "1"
@@ -218,9 +228,18 @@ jobs:
             throw "prepared commit $env:RELEASE_SHA is not the coreforge tip ($tip) - refusing to release"
           }
           Write-Host "release commit $env:RELEASE_SHA is the coreforge tip - ok"
+      - name: Require Apple Foundation Models toolchain
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          toolchain="$(/bin/sh crates/pi-natives/src/applefm/build-bridge.sh detect)"
+          if [ -z "$toolchain" ]; then
+            echo "::error::Darwin ARM64 release requires Swift 6.4+ and macOS 27 SDK; refusing an addon without the Apple Foundation Models bridge"
+            exit 1
+          fi
+          printf 'Apple Foundation Models bridge: %s\n' "$toolchain"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
       - name: Guard tag against package version
         if: matrix.windows != '1'
         run: |
@@ -241,7 +260,7 @@ jobs:
           }
           Write-Host "tag $tag rolls upstream $pkg - ok"
       - name: Reclaim disk for large native builds
-        if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64'
+        if: matrix.target == 'win32-x64' || matrix.target == 'linux-x64' || matrix.target == 'linux-musl-x64'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
@@ -288,12 +307,24 @@ jobs:
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
           key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+      - name: Verify embedded Apple Foundation Models bridge
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          addon=packages/natives/native/pi_natives.darwin-arm64.node
+          test -s "$addon"
+          grep -aqF OmpAppleFm "$addon" ||
+            { echo "::error::Darwin ARM64 addon lacks the embedded Apple Foundation Models bridge"; exit 1; }
+          if otool -L "$addon" | grep -E 'libswift|FoundationModels'; then
+            echo "::error::Darwin ARM64 addon directly links the Swift runtime or FoundationModels"; exit 1
+          fi
       - name: Package source-built native addon
         if: matrix.windows != '1'
         run: |
           set -euo pipefail
           shopt -s nullglob
-          addons=(packages/natives/native/pi_natives."${{ matrix.target }}"*.node)
+          native_target="${{ matrix.target }}"
+          if [[ "$native_target" == linux-musl-* ]]; then native_target="${native_target/linux-musl-/linux-}"; fi
+          addons=(packages/natives/native/pi_natives."${native_target}"*.node)
           expected=1
           if [ "${{ matrix.target }}" = "linux-x64" ]; then expected=2; fi
           if [ "${#addons[@]}" -ne "$expected" ]; then
@@ -402,7 +433,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.release_sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
       - name: Fetch upstream release base
         env:
           OMP_UPSTREAM_REPO: can1357/oh-my-pi

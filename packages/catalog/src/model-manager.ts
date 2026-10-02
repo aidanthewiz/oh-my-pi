@@ -57,6 +57,16 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 	cacheTtlMs?: number;
 	/** When true, a successful dynamic fetch is the complete provider catalog and prunes static-only models. */
 	dynamicModelsAuthoritative?: boolean;
+	/**
+	 * When true, a fresh cache never satisfies an online-eligible refresh: the
+	 * dynamic fetch always runs (an explicit `"offline"` strategy is still
+	 * honored), and the cache serves only as the fetch-failure fallback. For
+	 * providers whose dynamic result encodes fast-changing live state that a
+	 * TTL cache would replay wrongly — e.g. Factory discovery includes live
+	 * organization model policy and upstream blocks. Cached eligibility is
+	 * an offline snapshot, not current entitlement.
+	 */
+	alwaysRefetchDynamicModels?: boolean;
 	/** Cached model ids whose presence forces refresh when the static or migration-policy fingerprint changes. */
 	dropCachedModelIdsOnStaticMismatch?: readonly string[];
 	/**
@@ -217,6 +227,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	options: ModelManagerOptions<TApi, TModelsDevPayload>,
 	strategy: ModelRefreshStrategy = "online-if-uncached",
 ): Promise<ModelResolutionResult<TApi>> {
+	if (options.alwaysRefetchDynamicModels && strategy === "online-if-uncached") {
+		strategy = "online";
+	}
 	const cacheProviderId = options.cacheProviderId ?? options.providerId;
 	const now = options.now ?? Date.now;
 	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
@@ -308,11 +321,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		strategy === "online-if-uncached" && hasUsableFreshCache && hasAuthoritativeCache;
 	const dynamicFetchSucceeded = fetchedDynamicModels !== null;
 	const anyRemoteFetchSucceeded = modelsDevFetchSucceeded || dynamicFetchSucceeded;
+	const modelsDevFetchComplete = modelsDevFetchSucceeded && !fetchedModelsDevModels.incomplete;
+	const dynamicFetchComplete = dynamicFetchSucceeded && !fetchedDynamicModels.incomplete;
 	const allConfiguredRemoteFetchesSucceeded =
 		hasRemoteFetcher &&
-		(!hasModelsDevFetcher || modelsDevFetchSucceeded) &&
-		(!hasDynamicFetcher || dynamicFetchSucceeded);
-	const authoritativeDynamicFetchSucceeded = dynamicModelsAuthoritative && dynamicFetchSucceeded;
+		(!hasModelsDevFetcher || modelsDevFetchComplete) &&
+		(!hasDynamicFetcher || dynamicFetchComplete);
+	const authoritativeDynamicFetchSucceeded = dynamicModelsAuthoritative && dynamicFetchComplete;
 	const remoteResolutionComplete = authoritativeDynamicFetchSucceeded || allConfiguredRemoteFetchesSucceeded;
 	const preparedCacheModels = remoteResolutionComplete
 		? []
@@ -334,10 +349,10 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	// short retry that recovers a transient empty response (#6620). Shared
 	// models.dev snapshots may be empty for one provider and remain authoritative.
 	const cacheAuthoritative = hasDynamicFetcher
-		? dynamicFetchSucceeded &&
+		? dynamicFetchComplete &&
 			dynamicModels.length > 0 &&
-			(dynamicModelsAuthoritative || !hasModelsDevFetcher || modelsDevFetchSucceeded)
-		: modelsDevFetchSucceeded;
+			(dynamicModelsAuthoritative || !hasModelsDevFetcher || modelsDevFetchComplete)
+		: modelsDevFetchComplete;
 	const mergedWithCache = mergeDynamicModels(staticModels, cacheModels);
 	const mergedWithModelsDev = mergeDynamicModels(
 		mergedWithCache,
@@ -443,6 +458,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 interface DiscoveredModelSet<TApi extends Api> {
 	models: Model<TApi>[];
 	explicitKindModels: ReadonlySet<Model<TApi>>;
+	incomplete: boolean;
 }
 
 async function fetchModelsDev<TApi extends Api, TModelsDevPayload>(
@@ -699,16 +715,19 @@ function buildDiscoveredModelSpecs<TApi extends Api>(value: unknown): Discovered
 	const models: Model<TApi>[] = [];
 	const explicitKindModels = new Set<Model<TApi>>();
 	if (!Array.isArray(value)) {
-		return { models, explicitKindModels };
+		return { models, explicitKindModels, incomplete: true };
 	}
+	let incomplete = false;
 	for (const item of value) {
 		if (isModelLike(item)) {
 			const model = buildModel(item as ModelSpec<TApi>);
 			models.push(model);
 			if (item.kind !== undefined) explicitKindModels.add(model);
+		} else {
+			incomplete = true;
 		}
 	}
-	return { models, explicitKindModels };
+	return { models, explicitKindModels, incomplete };
 }
 
 function isModelLike(value: unknown): value is ModelSpec<Api> {

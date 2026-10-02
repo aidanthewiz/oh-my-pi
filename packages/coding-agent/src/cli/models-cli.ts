@@ -13,8 +13,9 @@
  */
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
+import { getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
-import { modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
+import { type ModelKind, type ModelPricingStatus, modelKind } from "@oh-my-pi/pi-catalog/types";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { ConfigError } from "../config/config-file";
@@ -31,6 +32,13 @@ import { ensureCoreforgeIdentityAtStartup } from "../identity/startup";
 import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
 import { EventBus } from "../utils/event-bus";
+
+import {
+	cfgDisabledExtensions,
+	cfgExtensions,
+	cfgPluginsPersistentAllowlist,
+	cfgPluginsPersistentPolicy,
+} from "../extensibility/settings";
 
 export type ModelsAction = "ls" | "find" | "refresh";
 
@@ -88,6 +96,7 @@ interface ModelJson {
 	thinking: readonly Effort[] | null;
 	input: ("text" | "image")[];
 	cost: Model<Api>["cost"];
+	pricingStatus: ModelPricingStatus;
 }
 
 interface ProviderDiscoveryJson {
@@ -136,6 +145,7 @@ function toModelJson(model: Model<Api>): ModelJson {
 		thinking: model.thinking ? getSupportedEfforts(model) : null,
 		input: model.input,
 		cost: model.cost,
+		pricingStatus: getModelPricingStatus(model),
 	};
 }
 
@@ -350,8 +360,8 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		disableExtensionDiscovery = false,
 	} = options;
 	const policy = createPersistentPluginPolicy(
-		settings?.get("plugins.persistentPolicy") ?? "open",
-		settings?.get("plugins.persistentAllowlist") ?? [],
+		settings ? cfgPluginsPersistentPolicy.get(settings) : "open",
+		settings ? cfgPluginsPersistentAllowlist.get(settings) : [],
 	);
 
 	const eventBus = new EventBus();
@@ -431,13 +441,13 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 	}
 
 	const cwd = getProjectDir();
-	const authStorage = await discoverAuthStorage();
+	const settings = await Settings.init({ cwd, configFiles: command.flags.config });
+	const identity = await ensureCoreforgeIdentityAtStartup(settings, { interactive: false });
+	for (const notice of identity.notices) {
+		process.stderr.write(`${notice}\n`);
+	}
+	const authStorage = await discoverAuthStorage(undefined, { settings });
 	try {
-		const settings = await Settings.init({ cwd, configFiles: command.flags.config });
-		const identity = await ensureCoreforgeIdentityAtStartup(settings, { interactive: false });
-		for (const notice of identity.notices) {
-			process.stderr.write(`${notice}\n`);
-		}
 		const modelRegistry = new ModelRegistry(authStorage);
 
 		if (action === "refresh" && !json && process.stderr.isTTY) {
@@ -458,8 +468,8 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			json,
 			kind,
 			additionalExtensionPaths: cliExtensionPaths,
-			settingsExtensions: settings.get("extensions") ?? [],
-			disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+			settingsExtensions: cfgExtensions.get(settings),
+			disabledExtensionIds: cfgDisabledExtensions.get(settings),
 			disableExtensionDiscovery: Boolean(command.flags.noExtensions),
 		});
 	} finally {

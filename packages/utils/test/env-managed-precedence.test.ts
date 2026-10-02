@@ -50,6 +50,8 @@ async function resolveEnvInChild(opts: {
 	// source launcher and gives the env module authoritative launch provenance.
 	launchWithNoEnvFile?: boolean;
 	launcherPolicy?: Record<string, string | undefined>;
+	// Pair the launcher's explicit empty env file with the same captured Bun option.
+	trustedBunOptions?: boolean;
 	// When set, model the real shipped launch: a named profile whose agent `.env`
 	// lives at `$HOME/.omp/profiles/<profile>/agent/.env`. Named profiles ignore
 	// PI_CODING_AGENT_DIR (dirs.ts DirResolver), so this drives OMP_PROFILE + HOME.
@@ -79,7 +81,7 @@ async function resolveEnvInChild(opts: {
 		await fs.writeFile(emptyEnvFile, "");
 
 		const probePath = path.join(root, "probe.ts");
-		const spawnedProbe = `const out = {}; for (const k of ${JSON.stringify(opts.spawnedChildKeys ?? [])}) out[k] = process.env[k]; process.stdout.write(JSON.stringify(out));`;
+		const spawnedProbe = `const out = {}; for (const k of ${JSON.stringify(opts.spawnedChildKeys ?? [])}) out[k] = process.env[k]; out.noEnvFile = process.execArgv.includes('--no-env-file'); process.stdout.write(JSON.stringify(out));`;
 		await Bun.write(
 			probePath,
 			[
@@ -123,6 +125,7 @@ async function resolveEnvInChild(opts: {
 						AZURE_CORE_COLLECT_TELEMETRY: "no",
 						GREPTILE_TELEMETRY_DISABLED: "1",
 						...opts.launcherPolicy,
+						...(opts.trustedBunOptions ? { BUN_OPTIONS: `--env-file=${emptyEnvFile}` } : {}),
 					}
 				: {}),
 		};
@@ -303,7 +306,44 @@ describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
 			GREPTILE_TELEMETRY_DISABLED: "1",
 			OMP_DOTENV_OVERRIDE: "1",
 			OMP_CF_PRODUCT_VERSION: "test-product-version",
+			noEnvFile: true,
 		});
+	});
+
+	it("does not propagate forged Bun options from a profile, project, or child overlay", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "BUN_OPTIONS=--smol\n",
+			ambient: {},
+			projectLocalEnvContent: "BUN_OPTIONS=--smol\nPROJECT_ONLY_MARKER=project-dotenv\n",
+			keys: [],
+			childKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE"],
+			spawnedChildKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE", "PROJECT_ONLY_MARKER"],
+			childOverlay: { BUN_OPTIONS: "--smol", OMP_NO_ENV_FILE: "0" },
+			managed: true,
+		});
+		expect(out["child:BUN_OPTIONS"]).toBe("--no-env-file");
+		expect(out["child:OMP_NO_ENV_FILE"]).toBe("1");
+		expect(out.spawned).toEqual(expect.objectContaining({ OMP_NO_ENV_FILE: "1", noEnvFile: true }));
+		expect(out.spawned).not.toHaveProperty("PROJECT_ONLY_MARKER");
+	});
+
+	it("honors captured launcher options without allowing a project or overlay to replace them", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "",
+			ambient: {},
+			projectLocalEnvContent: "BUN_OPTIONS=--smol\nPROJECT_ONLY_MARKER=project-dotenv\n",
+			keys: [],
+			childKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE"],
+			spawnedChildKeys: ["BUN_OPTIONS", "OMP_NO_ENV_FILE", "PROJECT_ONLY_MARKER"],
+			childOverlay: { BUN_OPTIONS: "--smol", OMP_NO_ENV_FILE: "0" },
+			managed: true,
+			launchWithNoEnvFile: false,
+			trustedBunOptions: true,
+		});
+		expect(out["child:BUN_OPTIONS"]).toMatch(/^--env-file=.*empty\.env --no-env-file$/);
+		expect(out["child:OMP_NO_ENV_FILE"]).toBe("1");
+		expect(out.spawned).toEqual(expect.objectContaining({ OMP_NO_ENV_FILE: "1", noEnvFile: true }));
+		expect(out.spawned).not.toHaveProperty("PROJECT_ONLY_MARKER");
 	});
 
 	it("accepts managed provenance with an explicit empty launch env file", async () => {
@@ -541,15 +581,6 @@ describe("child process dotenv boundary", () => {
 			expect(exitCode, stderr).toBe(0);
 			expect(stdout).toBe("");
 			expect(childEnv.BUN_OPTIONS).toBe("--no-env-file");
-			expect(filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: "--smol" }, root).BUN_OPTIONS).toBe(
-				"--smol --no-env-file",
-			);
-			expect(
-				filterChildShellEnv({ ...Bun.env, BUN_OPTIONS: "--smol" }, root, {
-					BUN_OPTIONS: "",
-					OMP_NO_ENV_FILE: "0",
-				}),
-			).toEqual(expect.objectContaining({ BUN_OPTIONS: "--no-env-file", OMP_NO_ENV_FILE: "1" }));
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

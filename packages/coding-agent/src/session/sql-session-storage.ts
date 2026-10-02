@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
+import { enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -87,6 +89,10 @@ interface DialectQueries {
 	loadIndex: string;
 	/** Read the full content for the async `readText` surface. */
 	readFull: string;
+	/** Read transcript bytes and title fields from one row snapshot. */
+	readFullWithTitleMeta: string;
+	/** Lock the row while verifying the content fingerprint and replacing it. */
+	readFullLocked: string;
 	/** Read bounded byte windows from the head and tail of the content. */
 	readSlices: string;
 }
@@ -102,6 +108,19 @@ interface IndexRow {
 
 interface ContentRow {
 	content: string;
+	title?: string | null;
+	title_source?: string | null;
+	title_updated_at?: string | null;
+}
+
+function titleMetaFromRow(row: ContentRow | undefined): string | null {
+	return row?.title_updated_at
+		? JSON.stringify({
+				title: row.title ?? undefined,
+				source: rowTitleSource(row.title_source),
+				updatedAt: row.title_updated_at,
+			})
+		: null;
 }
 
 interface SliceRow {
@@ -112,15 +131,6 @@ interface SliceRow {
 const DEFAULT_TABLE = "omp_session_files";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const utf8Decoder = new TextDecoder("utf-8");
-
-function enoent(p: string): NodeJS.ErrnoException {
-	const err = new Error(`ENOENT: no such file, '${p}'`) as NodeJS.ErrnoException;
-	err.code = "ENOENT";
-	err.errno = -2;
-	err.path = p;
-	err.syscall = "open";
-	return err;
-}
 
 function detectAdapter(client: SqlSessionStorageClient): SqlSessionStorageAdapter {
 	const reported = String(client.options?.adapter ?? "").toLowerCase();
@@ -167,6 +177,8 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
 			loadIndex: `SELECT path, mtime_ms, length(content) AS byte_len, title, title_source, title_updated_at FROM ${table}`,
 			readFull: `SELECT content AS content FROM ${table} WHERE path = ?`,
+			readFullWithTitleMeta: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ?`,
+			readFullLocked: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ? FOR UPDATE`,
 			readSlices:
 				`SELECT substring(cast(content AS binary), 1, ?) AS head, ` +
 				`CASE WHEN ? <= 0 THEN cast('' AS binary) ` +
@@ -224,6 +236,11 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)} RETURNING path`,
 		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len, title, title_source, title_updated_at FROM ${table}`,
 		readFull: `SELECT content AS content FROM ${table} WHERE path = ${placeholder(1)}`,
+		readFullWithTitleMeta: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ${placeholder(1)}`,
+		readFullLocked:
+			adapter === "sqlite"
+				? `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ?`
+				: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ${placeholder(1)} FOR UPDATE`,
 		readSlices,
 	};
 }
@@ -347,6 +364,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const row = rows[0];
 		return row ? row.content : null;
 	}
+	async readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		const rows = (await this.#client.unsafe(this.#q.readFullWithTitleMeta, [path])) as ContentRow[];
+		const row = rows[0];
+		return row ? { rawContent: row.content, titleMeta: titleMetaFromRow(row) } : null;
+	}
 
 	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const values =
@@ -365,8 +387,44 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		mtimeMs: number,
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
+		expectedFingerprint?: string,
+		expectedTitleMeta?: string | null,
 	): Promise<void> {
 		const titleValues = [title?.title ?? null, title?.source ?? null, title?.updatedAt ?? null];
+		if (expectedFingerprint !== undefined || expectedTitleMeta !== undefined) {
+			if (expectedSize === undefined || expectedSize === null) {
+				throw new Error("A session content fingerprint requires an existing size precondition.");
+			}
+			await this.#client.transaction(async tx => {
+				const rows = (await tx.unsafe(this.#q.readFullLocked, [path])) as ContentRow[];
+				const row = rows[0];
+				const current = row?.content ?? null;
+				const actualSize = current === null ? null : Buffer.byteLength(current, "utf8");
+				const actualTitleMeta = titleMetaFromRow(row);
+				if (
+					actualSize !== expectedSize ||
+					(expectedFingerprint !== undefined &&
+						current !== null &&
+						createHash("sha1").update(current).digest("hex") !== expectedFingerprint) ||
+					(expectedTitleMeta !== undefined && actualTitleMeta !== expectedTitleMeta)
+				) {
+					throw new SessionWriteConflictError(path, expectedSize, actualSize, actualSize === expectedSize);
+				}
+				const result = await tx.unsafe(this.#q.replaceIfSize, [
+					content,
+					mtimeMs,
+					...titleValues,
+					path,
+					expectedSize,
+				]);
+				if (this.#adapter === "mysql" ? result.affectedRows !== 1 : result.length !== 1) {
+					if (current !== content || actualTitleMeta !== (title ? JSON.stringify(title) : null)) {
+						throw new SessionWriteConflictError(path, expectedSize, actualSize);
+					}
+				}
+			});
+			return;
+		}
 		if (expectedSize === undefined) {
 			const values = [path, content, mtimeMs, ...titleValues];
 			if (this.#adapter === "mysql") values.push(content, mtimeMs, ...titleValues);
@@ -383,13 +441,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 		const current = await this.readFull(path);
 		const actualSize = current === null ? null : Buffer.byteLength(current, "utf8");
-		// MySQL reports `affectedRows: 0` for a matched-but-unchanged row, so a
-		// byte-identical replace looks unwritten. A size match means the size
-		// precondition holds and there is nothing to conflict about; only a real
-		// size divergence throws. (Same granularity as the size-token contract
-		// everywhere else: same-length different content is not detectable here
-		// on any dialect. Actual MySQL driver/flag behavior is unverified in
-		// this environment; this re-check is exact regardless of it.)
+		// MySQL can report zero changed rows for a byte-identical update.
+		// The size-only hot rewrite retains its original precondition; the
+		// content-fenced repair above never accepts equal-size peer content.
 		if (actualSize === expectedSize) return;
 		throw new SessionWriteConflictError(path, expectedSize, actualSize);
 	}

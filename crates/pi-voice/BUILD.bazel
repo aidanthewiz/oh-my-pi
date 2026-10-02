@@ -7,8 +7,8 @@ exports_files(["Cargo.toml"])
 
 # napi-free voice engine (in-house capture/playback backends + WebRTC/Opus live
 # peer). Keeping the webrtc/opus graph behind this rlib means the pi_natives
-# leaf — which recompiles on every release (version-sentinel edit in lib.rs) —
-# no longer pays for the voice stack's monomorphization.
+# leaf — which recompiles whenever its own sources change — does not pay for
+# the voice stack's monomorphization.
 rust_library(
     name = "pi-voice",
     srcs = glob(["src/**/*.rs"]),
@@ -16,7 +16,7 @@ rust_library(
     crate_name = "pi_voice",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    version = "17.2.15",
+    version = "18.4.9",
     deps = all_crate_deps(normal = True),
 )
 

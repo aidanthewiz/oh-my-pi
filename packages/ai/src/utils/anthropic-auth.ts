@@ -4,9 +4,8 @@
  * Thin helper for turning an already-resolved API key into the request-shaping
  * config consumed by {@link buildAnthropicSearchHeaders} / {@link buildAnthropicUrl}.
  *
- * Credential storage and refresh live in `AuthStorage` — call
- * `authStorage.getApiKey("anthropic", sessionId)` first, then pass the result
- * through {@link buildAnthropicAuthConfig} for header/URL shaping.
+ * Resolve credentials with `authStorage.keys.get("anthropic", sessionId, { baseUrl, modelId })`
+ * before shaping headers and URL with {@link buildAnthropicAuthConfig}.
  */
 import { $env } from "@oh-my-pi/pi-utils";
 import { buildAnthropicHeaders, resolveAnthropicCustomHeadersForBaseUrl } from "../providers/anthropic";
@@ -46,9 +45,8 @@ export function isOAuthToken(apiKey: string): boolean {
 /**
  * Build an {@link AnthropicAuthConfig} from an already-resolved API key.
  *
- * `apiKey` is whatever the caller chose for `Authorization`/`x-api-key` —
- * usually `authStorage.getApiKey("anthropic")`. `baseUrl` overrides the
- * env-derived base; pass `undefined` to fall back to FOUNDRY/ANTHROPIC env
+ * `apiKey` is the resolved bearer (usually from `authStorage.keys.get`).
+ * `baseUrl` overrides the env-derived base; `undefined` uses FOUNDRY/ANTHROPIC
  * resolution and finally `DEFAULT_BASE_URL`.
  *
  * `isOAuth` is derived from the token prefix so the helper stays pure: callers

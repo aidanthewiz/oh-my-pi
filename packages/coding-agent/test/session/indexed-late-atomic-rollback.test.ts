@@ -57,6 +57,10 @@ class GatedBackend implements SessionStorageBackend {
 		}
 		return this.files.get(path) ?? null;
 	}
+	async readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		const rawContent = await this.readFull(path);
+		return rawContent === null ? null : { rawContent, titleMeta: null };
+	}
 
 	releaseReadFull(): void {
 		if (!this.#readGateOpen) {

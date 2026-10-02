@@ -352,6 +352,7 @@ describe("anthropic-aws transport with native names + gateway URL", () => {
 		// The transport must still emit the mandatory workspace header; the apiKey
 		// arg is what the gate (getEnvApiKey) resolved — here the native key.
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
+		process.env.ANTHROPIC_API_KEY = "key-native";
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		const options = buildAnthropicClientOptions({
 			model: makeAwsClaudeModel(),
@@ -459,6 +460,7 @@ describe("anthropic-aws transport with native names + gateway URL", () => {
 
 	it("derives the endpoint region from ANTHROPIC_BASE_URL when AWS_REGION is unset", () => {
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
+		process.env.ANTHROPIC_API_KEY = "key-native";
 		process.env.ANTHROPIC_BASE_URL = "https://aws-external-anthropic.us-gov-west-1.api.aws";
 		const options = buildAnthropicClientOptions({
 			model: makeAwsClaudeModel(),
@@ -471,6 +473,7 @@ describe("anthropic-aws transport with native names + gateway URL", () => {
 
 	it("lets AWS_REGION override the base-URL region", () => {
 		process.env.ANTHROPIC_WORKSPACE_ID = "wrkspc_native";
+		process.env.ANTHROPIC_API_KEY = "key-native";
 		process.env.ANTHROPIC_BASE_URL = GATEWAY_URL;
 		process.env.AWS_REGION = "eu-west-1";
 		const options = buildAnthropicClientOptions({

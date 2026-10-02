@@ -1,4 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { configureRpcInputTerminal } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-input";
 import { RpcHostToolBridge } from "@oh-my-pi/pi-coding-agent/modes/rpc/host-tools";
 import {
@@ -9,6 +14,7 @@ import {
 	rpcControlEventFrame,
 	RpcPendingExtensionRequests,
 	RpcShutdownCoordinator,
+	startRpcPromptWithModelFence,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type {
 	RpcCommand,
@@ -17,6 +23,10 @@ import type {
 	RpcHostToolCancelRequest,
 	RpcResponse,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 
 type OutputFrame = RpcResponse | object;
 
@@ -193,38 +203,6 @@ describe("dispatchRpcInputFrame", () => {
 		}
 	});
 
-	test("non-bash commands are dispatched serially (ordering preserved)", async () => {
-		const started: string[] = [];
-		const finished: string[] = [];
-		const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
-			started.push(command.type);
-			finished.push(command.type);
-			if (command.type === "abort_retry") {
-				return { id: command.id, type: "response", command: "abort_retry", success: true };
-			}
-			if (command.type === "set_auto_retry") {
-				return { id: command.id, type: "response", command: "set_auto_retry", success: true };
-			}
-			throw new Error(`unexpected: ${command.type}`);
-		};
-
-		const { deps, outputs } = makeDeps(handleCommand);
-
-		const first = dispatchRpcInputFrame({ id: "c1", type: "abort_retry" }, deps);
-		expect(first).toBeInstanceOf(Promise);
-		// The input loop awaits each command's promise before pulling the next
-		// frame; simulate that contract by awaiting before the next dispatch.
-		await first;
-		expect(outputs).toHaveLength(1);
-		expect(started).toEqual(["abort_retry"]);
-		expect(finished).toEqual(["abort_retry"]);
-
-		const second = dispatchRpcInputFrame({ id: "c2", type: "set_auto_retry", enabled: true }, deps);
-		await second;
-		expect(outputs).toHaveLength(2);
-		expect(started).toEqual(["abort_retry", "set_auto_retry"]);
-	});
-
 	test("bash handler errors surface as an error response on the background frame", async () => {
 		const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 			if (command.type === "bash") throw new Error("kaboom");
@@ -292,12 +270,12 @@ describe("dispatchRpcInputFrame", () => {
 describe("RpcInputDispatcher", () => {
 	test("control frames resolve extension UI requests while an ordinary command is active", async () => {
 		const { deps, outputs } = makeDeps(async command => {
-			if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
+			if (command.type !== "steer") throw new Error(`unexpected command type: ${command.type}`);
 			const response = await requestExtensionInput(depsRef, "ui-active", "Continue?");
 			return {
 				id: command.id,
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: true,
 				data: { agentInvoked: "value" in response && response.value === "continue" },
 			};
@@ -305,7 +283,7 @@ describe("RpcInputDispatcher", () => {
 		const depsRef = deps;
 		const dispatcher = new RpcInputDispatcher({ deps });
 
-		dispatcher.dispatch({ id: "prompt-1", type: "prompt", message: "ask extension" });
+		dispatcher.dispatch({ id: "steer-1", type: "steer", message: "ask extension" });
 		await flushMicrotasks();
 
 		expect(outputs).toEqual([
@@ -328,9 +306,9 @@ describe("RpcInputDispatcher", () => {
 				message: "Continue?",
 			},
 			{
-				id: "prompt-1",
+				id: "steer-1",
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: true,
 				data: { agentInvoked: true },
 			},
@@ -388,6 +366,9 @@ describe("RpcInputDispatcher", () => {
 						tokensPerSecond: null,
 						messageCount: 0,
 						queuedMessageCount: 0,
+						hasPendingAsyncWork: false,
+						isSettled: true,
+						queuedMessages: { steering: [], followUp: [] },
 						todoPhases: [],
 					},
 				};
@@ -410,6 +391,147 @@ describe("RpcInputDispatcher", () => {
 		expect((outputs[0] as RpcResponse).id).toBe("first");
 		expect((outputs[1] as RpcResponse).id).toBe("second");
 		expect((outputs[1] as RpcResponse).command).toBe("get_state");
+	});
+
+	test("a steer_subagent waiting for the subagent to accept does not block a later abort", async () => {
+		const accepted = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			started.push(command.type);
+			if (command.type === "steer_subagent") {
+				await accepted.promise;
+				return { id: command.id, type: "response", command: "steer_subagent", success: true };
+			}
+			if (command.type === "abort") return { id: command.id, type: "response", command: "abort", success: true };
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "steer", type: "steer_subagent", subagentId: "SubagentA", message: "go" });
+		dispatcher.dispatch({ id: "abort", type: "abort" });
+		await flushMicrotasks();
+
+		expect(started).toEqual(["steer_subagent", "abort"]);
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort"]);
+
+		accepted.resolve();
+		await flushMicrotasks();
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort", "steer"]);
+	});
+
+	test("a pending predict_word does not hold back later commands", async () => {
+		const releasePrediction = Promise.withResolvers<void>();
+		const { deps, outputs } = makeDeps(async command => {
+			if (command.type === "predict_word") {
+				await releasePrediction.promise;
+				return { id: command.id, type: "response", command: "predict_word", success: true, data: { suffix: "er" } };
+			}
+			if (command.type === "abort_retry") {
+				return { id: command.id, type: "response", command: "abort_retry", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "predict", type: "predict_word", text: "The weath", cursor: 9 });
+		dispatcher.dispatch({ id: "after", type: "abort_retry" });
+		await dispatcher.drain();
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["after"]);
+
+		releasePrediction.resolve();
+		await flushMicrotasks();
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["after", "predict"]);
+	});
+
+	test("get_state and abort_bash overtake a model switch fenced behind an image prompt", async () => {
+		const prepared = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async (command, registerPromptReady) => {
+			started.push(command.type);
+			if (command.type === "prompt") {
+				registerPromptReady?.(prepared.promise);
+			} else if (command.type !== "set_model" && command.type !== "get_state" && command.type !== "abort_bash") {
+				throw new Error(`unexpected command type: ${command.type}`);
+			}
+			return { id: command.id, type: "response", command: command.type, success: true } as RpcResponse;
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({
+				id: "image",
+				type: "prompt",
+				message: "describe image",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: "next" });
+			dispatcher.dispatch({ id: "state", type: "get_state" });
+			dispatcher.dispatch({ id: "bash-abort", type: "abort_bash" });
+			await flushMicrotasks();
+			expect(started).toEqual(["prompt", "get_state", "abort_bash"]);
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["image", "state", "bash-abort"]);
+		} finally {
+			prepared.resolve();
+			await dispatcher.drain();
+		}
+		expect(started).toEqual(["prompt", "get_state", "abort_bash", "set_model"]);
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["image", "state", "bash-abort", "model"]);
+	});
+
+	test("a prompt waits for an earlier session change without blocking a later abort", async () => {
+		const reset = Promise.withResolvers<void>();
+		const admission = Promise.withResolvers<void>();
+		let currentSession = "old";
+		let promptedSession: string | undefined;
+		let background: Promise<void> | undefined;
+		const { deps, outputs } = makeDeps(async command => {
+			if (command.type === "new_session") {
+				await reset.promise;
+				currentSession = "new";
+				return {
+					id: command.id,
+					type: "response",
+					command: "new_session",
+					success: true,
+					data: { cancelled: false },
+				};
+			}
+			if (command.type === "prompt") {
+				promptedSession = currentSession;
+				await admission.promise;
+				return { id: command.id, type: "response", command: "prompt", success: true };
+			}
+			if (command.type === "abort") {
+				return { id: command.id, type: "response", command: "abort", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		deps.trackBackgroundTask = task => {
+			background = task;
+		};
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({ id: "reset", type: "new_session" });
+			dispatcher.dispatch({ id: "prompt", type: "prompt", message: "use the new session" });
+			dispatcher.dispatch({ id: "abort", type: "abort" });
+			await flushMicrotasks();
+			expect(promptedSession).toBeUndefined();
+			reset.resolve();
+			await dispatcher.drain();
+			expect(promptedSession).toBe("new");
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["reset", "abort"]);
+		} finally {
+			reset.resolve();
+			admission.resolve();
+			await dispatcher.drain();
+			await background;
+		}
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["reset", "abort", "prompt"]);
 	});
 
 	test("serial command rejection emits an error response and does not poison the queue", async () => {
@@ -465,21 +587,21 @@ describe("RpcInputDispatcher", () => {
 		]);
 		const started: string[] = [];
 		const { deps, outputs } = makeDeps(async command => {
-			if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
+			if (command.type !== "steer") throw new Error(`unexpected command type: ${command.type}`);
 			started.push(command.id ?? "");
 			await tool.execute(`toolu_${command.id}`, {});
 			return {
 				id: command.id,
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: true,
 				data: { agentInvoked: true },
 			};
 		});
 		const dispatcher = new RpcInputDispatcher({ deps });
 
-		dispatcher.dispatch({ id: "active", type: "prompt", message: "active host tool" });
-		dispatcher.dispatch({ id: "queued", type: "prompt", message: "queued host tool" });
+		dispatcher.dispatch({ id: "active", type: "steer", message: "active host tool" });
+		dispatcher.dispatch({ id: "queued", type: "steer", message: "queued host tool" });
 		await flushMicrotasks();
 
 		expect(started).toEqual(["active"]);
@@ -500,14 +622,14 @@ describe("RpcInputDispatcher", () => {
 			{
 				id: "active",
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: false,
 				error: disconnectMessage,
 			},
 			{
 				id: "queued",
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: false,
 				error: disconnectMessage,
 			},
@@ -520,13 +642,13 @@ describe("RpcInputDispatcher", () => {
 		const started: string[] = [];
 		const { deps, outputs } = makeDeps(
 			async command => {
-				if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
+				if (command.type !== "steer") throw new Error(`unexpected command type: ${command.type}`);
 				started.push(command.id ?? "");
 				await requestExtensionInput(depsRef, `${command.id}-dialog`, command.message);
 				return {
 					id: command.id,
 					type: "response",
-					command: "prompt",
+					command: "steer",
 					success: true,
 					data: { agentInvoked: true },
 				};
@@ -536,8 +658,8 @@ describe("RpcInputDispatcher", () => {
 		const depsRef = deps;
 		const dispatcher = new RpcInputDispatcher({ deps });
 
-		dispatcher.dispatch({ id: "active", type: "prompt", message: "active dialog" });
-		dispatcher.dispatch({ id: "queued", type: "prompt", message: "queued dialog" });
+		dispatcher.dispatch({ id: "active", type: "steer", message: "active dialog" });
+		dispatcher.dispatch({ id: "queued", type: "steer", message: "queued dialog" });
 		await flushMicrotasks();
 
 		expect(started).toEqual(["active"]);
@@ -564,7 +686,7 @@ describe("RpcInputDispatcher", () => {
 			{
 				id: "active",
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: false,
 				error: disconnectMessage,
 			},
@@ -577,11 +699,260 @@ describe("RpcInputDispatcher", () => {
 			{
 				id: "queued",
 				type: "response",
-				command: "prompt",
+				command: "steer",
 				success: false,
 				error: disconnectMessage,
 			},
 		]);
+	});
+
+	test("a prompt blocked on admission does not hold up abort (RPC queue must keep flowing during vision preprocessing)", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const sessionManager = SessionManager.inMemory();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const nextModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!nextModel) throw new Error("Expected claude-haiku-4-5 model to exist");
+		const mock = createMockModel({ responses: [{ content: ["should not run before release"] }] });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
+			modelRegistry,
+		});
+
+		try {
+			// Real vision/preprocessing seam already used elsewhere (see
+			// agent-session-aside-delivery.test.ts): gate normalizeModelContextImages
+			// so admission spans real (simulated) wall-clock time, exactly like a slow
+			// vision-model description call for a text-only model.
+			const normalizeStarted = Promise.withResolvers<void>();
+			const releaseNormalize = Promise.withResolvers<void>();
+			const normalizeSpy = spyOn(imageLoading, "normalizeModelContextImages").mockImplementation(async images => {
+				normalizeStarted.resolve();
+				await releaseNormalize.promise;
+				return images;
+			});
+
+			let trackedPromptTask: Promise<void> | undefined;
+			const handleCommand: RpcInputFrameDeps["handleCommand"] = async (command, registerPromptReady) => {
+				if (command.type === "prompt") {
+					const admitted = Promise.withResolvers<void>();
+					const settled = startRpcPromptWithModelFence(
+						session,
+						command.message,
+						{ images: command.images, onPromptAdmitted: admitted.resolve },
+						registerPromptReady,
+					).catch(() => {});
+					await Promise.race([admitted.promise, settled]);
+					return { id: command.id, type: "response", command: "prompt", success: true };
+				}
+				if (command.type === "abort") {
+					await session.abort({ reason: "user-interrupt" });
+					return { id: command.id, type: "response", command: "abort", success: true };
+				}
+				if (command.type === "set_model") {
+					await session.setModel(nextModel);
+					return { id: command.id, type: "response", command: "set_model", success: true, data: nextModel };
+				}
+				throw new Error(`unexpected command type: ${command.type}`);
+			};
+			const { deps, outputs } = makeDeps(handleCommand);
+			deps.trackBackgroundTask = task => {
+				trackedPromptTask = task;
+			};
+			const dispatcher = new RpcInputDispatcher({ deps });
+
+			dispatcher.dispatch({
+				id: "p1",
+				type: "prompt",
+				message: "go while normalizing",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
+			await normalizeStarted.promise;
+			expect(trackedPromptTask).toBeInstanceOf(Promise);
+			expect(outputs).toHaveLength(0);
+
+			dispatcher.dispatch({ id: "a1", type: "abort" });
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: nextModel.id });
+			// Bounded poll (not a fixed-duration guess): before the fix, `prompt`
+			// serializes through the same tail chain as `abort`, so `abort` never
+			// starts while normalization is gated — this loop would exhaust without
+			// `outputs` ever gaining the abort response.
+			for (let i = 0; i < 50 && outputs.length === 0; i++) {
+				await flushMicrotasks();
+			}
+			expect(outputs).toEqual([{ id: "a1", type: "response", command: "abort", success: true }]);
+
+			releaseNormalize.resolve();
+			await trackedPromptTask;
+			await dispatcher.drain();
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["a1", "p1", "model"]);
+			expect(session.model?.id).toBe(nextModel.id);
+			expect(outputs).toContainEqual({ id: "p1", type: "response", command: "prompt", success: true });
+
+			normalizeSpy.mockRestore();
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+	test("an image prompt uses its selected model when a later RPC model switch arrives during preparation", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const initialModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const nextModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!initialModel || !nextModel) throw new Error("Expected bundled Anthropic models");
+		const requestedModels: string[] = [];
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: initialModel, systemPrompt: ["Test"], tools: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(model.id);
+					return mock.stream(model, context, options);
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
+			modelRegistry,
+		});
+		const normalizeStarted = Promise.withResolvers<void>();
+		const releaseNormalize = Promise.withResolvers<void>();
+		const normalizeSpy = spyOn(imageLoading, "normalizeModelContextImages").mockImplementation(async images => {
+			normalizeStarted.resolve();
+			await releaseNormalize.promise;
+			return images;
+		});
+		const admittedModels: string[] = [];
+		let promptFailure: unknown;
+		let promptSettled: Promise<boolean | void> | undefined;
+		let trackedPromptTask: Promise<void> | undefined;
+		const handleCommand: RpcInputFrameDeps["handleCommand"] = async (command, registerPromptReady) => {
+			if (command.type === "prompt") {
+				const admitted = Promise.withResolvers<void>();
+				const settled = startRpcPromptWithModelFence(
+					session,
+					command.message,
+					{
+						images: command.images,
+						onPromptAdmitted: () => {
+							admittedModels.push(session.model?.id ?? "");
+							admitted.resolve();
+						},
+					},
+					registerPromptReady,
+				).catch(error => {
+					promptFailure = error;
+				});
+				promptSettled = settled;
+				await Promise.race([admitted.promise, settled]);
+				return { id: command.id, type: "response", command: "prompt", success: true };
+			}
+			if (command.type === "set_model") {
+				await session.setModel(nextModel);
+				return { id: command.id, type: "response", command: "set_model", success: true, data: nextModel };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		};
+		const { deps, outputs } = makeDeps(handleCommand);
+		deps.trackBackgroundTask = task => {
+			trackedPromptTask = task;
+		};
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({
+				id: "image",
+				type: "prompt",
+				message: "describe this image",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
+			await normalizeStarted.promise;
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: nextModel.id });
+			for (let i = 0; i < 50 && outputs.length === 0; i++) await flushMicrotasks();
+			expect(session.model?.id).toBe(initialModel.id);
+			expect(outputs).toHaveLength(0);
+
+			releaseNormalize.resolve();
+			await trackedPromptTask;
+			await dispatcher.drain();
+			expect(admittedModels).toEqual([initialModel.id]);
+			await promptSettled;
+			expect(promptFailure).toBeUndefined();
+			expect(requestedModels).toEqual([initialModel.id]);
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["image", "model"]);
+			expect(session.model?.id).toBe(nextModel.id);
+		} finally {
+			releaseNormalize.resolve();
+			await dispatcher.drain();
+			await trackedPromptTask;
+			normalizeSpy.mockRestore();
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+	test("abort still overtakes a model change waiting on an earlier prompt", async () => {
+		const admission = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const replacement = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!replacement) throw new Error("Expected bundled claude-haiku-4-5 model");
+		let activeModel = "original";
+		let background: Promise<void> | undefined;
+		const { deps, outputs } = makeDeps(async command => {
+			if (command.type === "prompt") {
+				started.resolve();
+				await admission.promise;
+				return { id: command.id, type: "response", command: "prompt", success: true };
+			}
+			if (command.type === "set_model") {
+				activeModel = replacement.id;
+				return { id: command.id, type: "response", command: "set_model", success: true, data: replacement };
+			}
+			if (command.type === "abort") {
+				return { id: command.id, type: "response", command: "abort", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		deps.trackBackgroundTask = task => {
+			background = task;
+		};
+		const dispatcher = new RpcInputDispatcher({ deps });
+		try {
+			dispatcher.dispatch({ id: "prompt", type: "prompt", message: "prepare image" });
+			await started.promise;
+			dispatcher.dispatch({ id: "model", type: "set_model", provider: "anthropic", modelId: replacement.id });
+			dispatcher.dispatch({ id: "abort", type: "abort" });
+			for (let i = 0; i < 50 && outputs.length === 0; i++) await flushMicrotasks();
+			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort"]);
+			expect(activeModel).toBe("original");
+		} finally {
+			admission.resolve();
+			await dispatcher.drain();
+			await background;
+		}
+		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort", "prompt", "model"]);
+		expect(activeModel).toBe(replacement.id);
 	});
 });
 

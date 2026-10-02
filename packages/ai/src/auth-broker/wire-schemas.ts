@@ -27,10 +27,12 @@ import type {
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
 	ClientUsageSummaryResponse,
+	CredentialBlockDeleteRequest,
 	CredentialBlockRequest,
 	CredentialBlockResponse,
 	CredentialBlockSnapshot,
 	CredentialBlocksDeleteResponse,
+	CredentialBlocksDeleteRequest,
 	CredentialDisableResponse,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
@@ -118,6 +120,7 @@ export const credentialBlockSnapshotSchema: FluentType<CredentialBlockSnapshot> 
 	blockScope: "string",
 	blockedUntilMs: "number",
 	"updatedAtMs?": "number",
+	"mutationToken?": type("string").atLeastLength(1),
 });
 
 export const snapshotEntrySchema: FluentType<SnapshotEntry> = type({
@@ -138,11 +141,15 @@ export const refresherScheduleSchema: FluentType<RefresherSchedule> = type({
 	nextSweepInMs: "number",
 });
 
+const blockRevisionSchema = type({ "+": "reject", instanceId: "string", sequence: "number.integer" });
+
 export const snapshotResponseSchema: FluentType<SnapshotResponse> = type({
 	"+": "reject",
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
+	"blockMutationTokens?": "true",
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
 });
@@ -155,6 +162,8 @@ export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapsho
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
+	"blockMutationTokens?": "true",
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
 	kind: "'snapshot'",
@@ -166,6 +175,7 @@ export const snapshotStreamEntryEventSchema: FluentType<SnapshotStreamEntryEvent
 	kind: "'entry'",
 	generation: "number.integer",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
 	refresher: refresherScheduleSchema,
 	entry: snapshotEntrySchema,
 });
@@ -176,6 +186,7 @@ export const snapshotStreamRemovedEventSchema: FluentType<SnapshotStreamRemovedE
 	kind: "'removed'",
 	generation: "number.integer",
 	serverNowMs: "number",
+	"blockRevision?": blockRevisionSchema,
 	refresher: refresherScheduleSchema,
 	id: "number.integer",
 });
@@ -393,14 +404,30 @@ export const disabledCredentialsResponseSchema: FluentType<DisabledCredentialsRe
 
 export const credentialBlockRequestSchema: FluentType<CredentialBlockRequest> = credentialBlockSnapshotSchema;
 
+export const credentialBlockDeleteRequestSchema: FluentType<CredentialBlockDeleteRequest> = type({
+	"+": "reject",
+	providerKey: type("string").atLeastLength(1),
+	blockScope: "string",
+	"mutationToken?": type("string").atLeastLength(1),
+	"blockedUntilMs?": "number",
+});
+
+export const credentialBlocksDeleteRequestSchema: FluentType<CredentialBlocksDeleteRequest> = type({
+	"+": "reject",
+	blocks: credentialBlockDeleteRequestSchema.array(),
+});
+
 export const credentialBlockResponseSchema: FluentType<CredentialBlockResponse> = type({
 	"+": "reject",
 	ok: "boolean",
+	"blockRevision?": blockRevisionSchema,
 });
 
 export const credentialBlocksDeleteResponseSchema: FluentType<CredentialBlocksDeleteResponse> = type({
 	"+": "reject",
 	ok: "boolean",
+	"deleted?": "boolean",
+	"blockRevision?": blockRevisionSchema,
 });
 
 export const usageStaleResponseSchema: FluentType<UsageStaleResponse> = type({

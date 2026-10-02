@@ -15,6 +15,13 @@ import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
+import { cfgAutolearnEnabled } from "@oh-my-pi/pi-coding-agent/autolearn/settings";
+import {
+	cfgPluginsPersistentAllowlist,
+	cfgPluginsPersistentPolicy,
+	cfgSkillsCustomDirectories,
+} from "@oh-my-pi/pi-coding-agent/extensibility/settings";
+
 function createIsolatedSkillsSettings(extensions: string[] = []): Settings {
 	return Settings.isolated({
 		"skills.enabled": true,
@@ -263,8 +270,8 @@ This skill is added after session creation.
 		);
 		configurePersistentPluginPolicy("open", []);
 		const settings = createIsolatedSkillsSettings();
-		settings.set("plugins.persistentPolicy", "allowlist");
-		settings.set("plugins.persistentAllowlist", []);
+		cfgPluginsPersistentPolicy.set(settings, "allowlist");
+		cfgPluginsPersistentAllowlist.set(settings, []);
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -282,12 +289,45 @@ This skill is added after session creation.
 		}
 	});
 
+	it("a live skills.customDirectories edit exposes the directory's skills without restart", async () => {
+		const settings = createIsolatedSkillsSettings();
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(tempDir),
+			modelRegistry: sharedModelRegistry,
+			settings,
+		});
+		try {
+			const customDir = path.join(tempDir, "live-custom-skills");
+			fs.mkdirSync(path.join(customDir, "live-custom-skill"), { recursive: true });
+			fs.writeFileSync(
+				path.join(customDir, "live-custom-skill", "SKILL.md"),
+				"---\nname: live-custom-skill\ndescription: Added through a live settings edit.\n---\nbody\n",
+			);
+			expect(session.skills.some((skill: Skill) => skill.name === "live-custom-skill")).toBe(false);
+			const skillAnnounced = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribeCommandMetadataChanged(() => {
+				if (session.skills.some((skill: Skill) => skill.name === "live-custom-skill")) skillAnnounced.resolve();
+			});
+			try {
+				cfgSkillsCustomDirectories.set(settings, [customDir]);
+				await skillAnnounced.promise;
+				expect(session.systemPrompt.join("\n")).toContain("live-custom-skill");
+			} finally {
+				unsubscribe();
+			}
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("manage_skill hot-registers managed skills in the active session", async () => {
 		const originalAgentDir = getAgentDir();
 		const managedAgentDir = path.join(tempHomeDir, ".omp", "agent");
 		setAgentDir(managedAgentDir);
 		const settings = createIsolatedSkillsSettings();
-		settings.set("autolearn.enabled", true);
+		cfgAutolearnEnabled.set(settings, true);
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: managedAgentDir,

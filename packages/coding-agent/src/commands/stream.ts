@@ -7,6 +7,8 @@ import { StencilCredential } from "../stencil/credential";
 import { StreamRedactor } from "../stream/redactor";
 import { resolveStreamUrls, runStreamConsole, type StreamUrls } from "../stream/streamer";
 
+import { cfgStreamRedactPatterns, cfgStreamServerUrl } from "../stream/settings";
+
 export default class Stream extends Command {
 	static description = commandHelp.description;
 
@@ -29,7 +31,7 @@ export default class Stream extends Command {
 			throw new CliUsageError(`title must be at most ${STREAM_TITLE_MAX} characters`);
 		}
 		const settings = await Settings.loadReadOnly({ cwd });
-		const serverUrl = flags.server?.trim() || (settings.get("stream.serverUrl") ?? "").trim();
+		const serverUrl = flags.server?.trim() || cfgStreamServerUrl.get(settings).trim();
 		if (!serverUrl) {
 			throw new CliUsageError("stream server required: use --server <url> or configure stream.serverUrl");
 		}
@@ -50,7 +52,7 @@ export default class Stream extends Command {
 				projectDir: cwd,
 				title,
 				hostUrl: urls.hostUrl,
-				redactor: await StreamRedactor.load(cwd, settings.get("stream.redactPatterns")),
+				redactor: await StreamRedactor.load(cwd, cfgStreamRedactPatterns.get(settings)),
 				token: () => credential.resolve(),
 				noTui: flags["no-tui"],
 			});

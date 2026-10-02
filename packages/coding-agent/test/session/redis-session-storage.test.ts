@@ -14,12 +14,15 @@
  *   visible after an explicit re-scan.
  */
 
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it } from "bun:test";
 import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 
 interface FakeRedisCall {
 	method: string;
@@ -76,16 +79,37 @@ function createFakeRedis(): FakeRedis {
 			const keyCount = Number(args[1] ?? "0");
 			const keys = args.slice(2, 2 + keyCount);
 			const argv = args.slice(2 + keyCount);
+			if (script.includes("OMP_READ_FULL_WITH_TITLE")) {
+				checkFailure("get");
+				const [fileKey, titleKey] = keys;
+				const content = strings.get(fileKey);
+				return content === undefined ? [0] : [1, content, getHash(titleKey).get(argv[0]) ?? ""];
+			}
 			if (script.includes("OMP_WRITE_FULL")) {
 				checkFailure("set");
 				checkFailure("hset");
 				const [fileKey, metaKey, titleKey] = keys;
-				const [content, filePath, mtimeMs, hasTitle, title] = argv;
+				const [content, filePath, mtimeMs, hasTitle, title, expectedSize, expectedFingerprint, expectedTitleMeta] =
+					argv;
+				const current = strings.get(fileKey);
+				const size = current === undefined ? -1 : Buffer.byteLength(current, "utf8");
+				if (
+					(expectedSize !== "" && size !== Number(expectedSize)) ||
+					(expectedFingerprint !== "" &&
+						(current === undefined ||
+							createHash("sha1").update(current).digest("hex") !== expectedFingerprint)) ||
+					(expectedTitleMeta !== "" &&
+						(expectedTitleMeta === "0"
+							? getHash(titleKey).has(filePath)
+							: getHash(titleKey).get(filePath) !== expectedTitleMeta.slice(1)))
+				) {
+					return [0, size];
+				}
 				strings.set(fileKey, content);
 				getHash(metaKey).set(filePath, mtimeMs);
 				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
 				else getHash(titleKey).delete(filePath);
-				return 1;
+				return [1, Buffer.byteLength(content, "utf8")];
 			}
 			if (script.includes("OMP_APPEND")) {
 				checkFailure("append");
@@ -239,6 +263,21 @@ describe("RedisSessionStorage", () => {
 		expect(redis.calls.some(call => call.method === "send" && call.args[0] === "EVAL")).toBe(true);
 	});
 
+	it("rejects equal-byte-length stale content without changing the file or metadata", async () => {
+		const first = await RedisSessionStorage.create({ client: redis });
+		const sessionPath = "/sessions/p/fenced.jsonl";
+		await first.writeText(sessionPath, "owner-one\n");
+		const expectedFingerprint = createHash("sha1").update("owner-one\n").digest("hex");
+		const second = await RedisSessionStorage.create({ client: redis });
+		await second.writeTextAtomic(sessionPath, "owner-two\n", { expectedSize: 10 });
+		const newerMtime = redis.hashes.get("omp:sessions:meta")?.get(sessionPath);
+		await expect(
+			first.writeTextAtomic(sessionPath, "stale-end\n", { expectedSize: 10, expectedFingerprint }),
+		).rejects.toBeInstanceOf(SessionWriteConflictError);
+		expect(redis.strings.get(`omp:sessions:file:${sessionPath}`)).toBe("owner-two\n");
+		expect(redis.hashes.get("omp:sessions:meta")?.get(sessionPath)).toBe(newerMtime);
+	});
+
 	it("create() warms the metadata index with STRLEN and never GETs full content", async () => {
 		redis.strings.set("omp:sessions:file:/sessions/p/huge.jsonl", "0123456789");
 		redis.hashes.set("omp:sessions:meta", new Map([["/sessions/p/huge.jsonl", String(Date.now())]]));
@@ -286,6 +325,20 @@ describe("RedisSessionStorage", () => {
 			source: "user",
 			updatedAt: "t2",
 		});
+		const loaded = await loadSessionFile(sessionPath, reloaded);
+		expect(loaded.titleSlot?.title).toBe("New");
+		const rawBody = redis.strings.get(`omp:sessions:file:${sessionPath}`);
+		if (!rawBody) throw new Error("missing raw title-backed transcript");
+		const fingerprint = createHash("sha1").update(rawBody).digest("hex");
+		expect(loaded.sourceFingerprint?.copy().digest("hex")).toBe(fingerprint);
+		await expect(
+			reloaded.writeTextAtomic(sessionPath, rawBody, {
+				expectedSize: Buffer.byteLength(rawBody, "utf8"),
+				expectedFingerprint: fingerprint,
+				expectedTitleMeta: JSON.stringify({ title: "Old", source: "auto", updatedAt: "t1" }),
+			}),
+		).rejects.toBeInstanceOf(SessionWriteConflictError);
+		expect(JSON.parse((await reloaded.readCommittedState(sessionPath)).content.split("\n")[0]).title).toBe("New");
 	});
 
 	it("listFilesSync returns only direct children matching the glob", async () => {

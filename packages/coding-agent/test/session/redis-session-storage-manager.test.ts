@@ -8,6 +8,7 @@
  * `redis-session-storage.test.ts`; we don't require a live server.
  */
 
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import {
@@ -44,12 +45,29 @@ function createFakeRedis(): FakeRedis {
 			const keyCount = Number(args[1] ?? "0");
 			const keys = args.slice(2, 2 + keyCount);
 			const argv = args.slice(2 + keyCount);
+			if (script.includes("OMP_READ_FULL_WITH_TITLE")) {
+				const [fileKey, titleKey] = keys;
+				const content = strings.get(fileKey);
+				return content === undefined ? [0] : [1, content, getHash(titleKey).get(argv[0]) ?? ""];
+			}
 			if (script.includes("OMP_WRITE_FULL")) {
 				const [fileKey, metaKey, titleKey] = keys;
-				const [content, filePath, mtimeMs, hasTitle, title, expectedSize] = argv;
+				const [content, filePath, mtimeMs, hasTitle, title, expectedSize, expectedFingerprint, expectedTitleMeta] =
+					argv;
 				const current = strings.get(fileKey);
 				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf8");
-				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
+				if (
+					(expectedSize !== "" && actualSize !== Number(expectedSize)) ||
+					(expectedFingerprint !== "" &&
+						(current === undefined ||
+							createHash("sha1").update(current).digest("hex") !== expectedFingerprint)) ||
+					(expectedTitleMeta !== "" &&
+						(expectedTitleMeta === "0"
+							? getHash(titleKey).has(filePath)
+							: getHash(titleKey).get(filePath) !== expectedTitleMeta.slice(1)))
+				) {
+					return [0, actualSize];
+				}
 				strings.set(fileKey, content);
 				getHash(metaKey).set(filePath, mtimeMs);
 				if (hasTitle === "1") getHash(titleKey).set(filePath, title);

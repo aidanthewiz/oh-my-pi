@@ -6,6 +6,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgAuthBrokerToken } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -466,7 +467,7 @@ describe("createAgentSession session storage isolation", () => {
 			const oldToken = "broker-token-before-rotation";
 			const newToken = "broker-token-after-rotation";
 			const settings = Settings.isolated();
-			settings.set("auth.broker.token", oldToken);
+			cfgAuthBrokerToken.set(settings, oldToken);
 			const { session } = await createAgentSession({
 				cwd,
 				agentDir,
@@ -483,14 +484,14 @@ describe("createAgentSession session storage isolation", () => {
 			const obfuscator = session.obfuscator;
 			try {
 				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
-				settings.set("auth.broker.token", newToken);
+				cfgAuthBrokerToken.set(settings, newToken);
 				expect(obfuscator?.obfuscate(newToken)).not.toContain(newToken);
 				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
 			} finally {
 				await session.dispose();
 			}
 			const postDisposeToken = "broker-token-after-dispose";
-			settings.set("auth.broker.token", postDisposeToken);
+			cfgAuthBrokerToken.set(settings, postDisposeToken);
 			expect(obfuscator?.obfuscate(postDisposeToken)).toBe(postDisposeToken);
 		});
 	});
@@ -508,7 +509,7 @@ describe("createAgentSession session storage isolation", () => {
 			const newToken = "broker-token-after-project-move";
 			fs.writeFileSync(path.join(projectB, ".omp", "config.yml"), `auth:\n  broker:\n    token: ${newToken}\n`);
 			const settings = await Settings.loadIsolated({ cwd: projectA, agentDir });
-			settings.set("auth.broker.token", oldToken);
+			cfgAuthBrokerToken.set(settings, oldToken);
 			const { session } = await createAgentSession({
 				cwd: projectA,
 				agentDir,
@@ -526,7 +527,7 @@ describe("createAgentSession session storage isolation", () => {
 			try {
 				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
 				await settings.reloadForCwd(projectB);
-				expect(settings.get("auth.broker.token")).toBe(newToken);
+				expect(cfgAuthBrokerToken.get(settings)).toBe(newToken);
 				expect(obfuscator?.obfuscate(newToken)).not.toContain(newToken);
 				expect(obfuscator?.obfuscate(oldToken)).not.toContain(oldToken);
 			} finally {

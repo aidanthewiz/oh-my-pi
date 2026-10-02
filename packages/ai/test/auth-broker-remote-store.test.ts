@@ -53,9 +53,9 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		}
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-remote-store-"));
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-		store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
+		await store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
 		storage = new AuthStorage(store);
-		await storage.reload();
+		await storage.credentials.reload();
 		handle = startAuthBroker({
 			storage,
 			bind: "127.0.0.1:0",
@@ -93,7 +93,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		const initialGeneration = remote!.snapshot.generation;
 
 		// 2. Server-side upsert is delivered as an `entry` frame.
-		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 		await waitUntil(() => remote!.snapshot.credentials.length === 2);
 		expect(remote!.snapshot.generation).toBeGreaterThan(initialGeneration);
 		const accessTokens = remote!.snapshot.credentials
@@ -107,7 +107,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			entry => entry.credential.type === "oauth" && entry.credential.access === "access-b",
 		)?.id;
 		expect(bId).toBeDefined();
-		const disabled = storage!.disableCredentialById(bId!, "revoked by test");
+		const disabled = await storage!.credentials.disable(bId!, "revoked by test");
 		expect(disabled).toBe(true);
 		await waitUntil(() => remote!.snapshot.credentials.length === 1);
 		expect(remote!.snapshot.credentials[0].id).not.toBe(bId);
@@ -124,36 +124,36 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		remote = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot });
 		const gatewayStorage = new AuthStorage(remote, { sourceLabel: `broker ${handle!.url}` });
 		try {
-			await gatewayStorage.reload();
+			await gatewayStorage.credentials.reload();
 			await waitUntil(() => remote!.snapshot.credentials.length === 1);
 			// Boot generation is acknowledged: no spurious reload before any change.
-			expect(await gatewayStorage.pollExternalChanges()).toBe(false);
-			expect(gatewayStorage.exportSnapshot().credentials.map(c => c.provider)).toEqual(["anthropic"]);
+			expect(await gatewayStorage.credentials.poll()).toBe(false);
+			expect(gatewayStorage.credentials.snapshot().credentials.map(c => c.provider)).toEqual(["anthropic"]);
 
 			// Another process logs in a new provider; the change reaches the remote
 			// store over SSE.
-			storage!.upsertCredential("deepseek", { type: "api_key", key: "sk-repro" });
+			await storage!.credentials.upsert("deepseek", { type: "api_key", key: "sk-repro" });
 			await waitUntil(() => remote!.snapshot.credentials.some(c => c.provider === "deepseek"));
 
 			// The poll now reports the change and the reload widens the gateway view.
-			expect(await gatewayStorage.pollExternalChanges()).toBe(true);
+			expect(await gatewayStorage.credentials.poll()).toBe(true);
 			expect(
-				gatewayStorage
-					.exportSnapshot()
+				gatewayStorage.credentials
+					.snapshot()
 					.credentials.map(c => c.provider)
 					.sort(),
 			).toEqual(["anthropic", "deepseek"]);
 			// One true per observed change: an unchanged generation reports false.
-			expect(await gatewayStorage.pollExternalChanges()).toBe(false);
+			expect(await gatewayStorage.credentials.poll()).toBe(false);
 
 			// A logout in another process removes the credential over SSE, and the
 			// next poll drops it from the gateway view.
 			const deepseekId = remote!.snapshot.credentials.find(c => c.provider === "deepseek")?.id;
 			expect(deepseekId).toBeDefined();
-			expect(storage!.disableCredentialById(deepseekId!, "logged out by test")).toBe(true);
+			expect(await storage!.credentials.disable(deepseekId!, "logged out by test")).toBe(true);
 			await waitUntil(() => !remote!.snapshot.credentials.some(c => c.provider === "deepseek"));
-			expect(await gatewayStorage.pollExternalChanges()).toBe(true);
-			expect(gatewayStorage.exportSnapshot().credentials.map(c => c.provider)).toEqual(["anthropic"]);
+			expect(await gatewayStorage.credentials.poll()).toBe(true);
+			expect(gatewayStorage.credentials.snapshot().credentials.map(c => c.provider)).toEqual(["anthropic"]);
 		} finally {
 			gatewayStorage.close();
 		}
@@ -166,17 +166,17 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		remote = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot });
 		const gatewayStorage = new AuthStorage(remote, { sourceLabel: `broker ${handle!.url}` });
 		try {
-			await gatewayStorage.reload();
+			await gatewayStorage.credentials.reload();
 
 			// Drive the original broker above the generation its replacement will
 			// start at, then acknowledge that complete credential view.
-			storage!.upsertCredential("deepseek", { type: "api_key", key: "sk-deepseek" });
-			storage!.upsertCredential("openai", { type: "api_key", key: "sk-openai" });
-			storage!.upsertCredential("xai", { type: "api_key", key: "sk-xai" });
+			await storage!.credentials.upsert("deepseek", { type: "api_key", key: "sk-deepseek" });
+			await storage!.credentials.upsert("openai", { type: "api_key", key: "sk-openai" });
+			await storage!.credentials.upsert("xai", { type: "api_key", key: "sk-xai" });
 			await waitUntil(() => remote!.snapshot.credentials.length === 4);
 			const previousGeneration = remote.snapshot.generation;
-			expect(await gatewayStorage.pollExternalChanges()).toBe(true);
-			expect(await gatewayStorage.pollExternalChanges()).toBe(false);
+			expect(await gatewayStorage.credentials.poll()).toBe(true);
+			expect(await gatewayStorage.credentials.poll()).toBe(false);
 
 			// Stop the broker, replace its persisted credential set, and boot a
 			// fresh AuthStorage whose in-memory generation starts below the
@@ -188,12 +188,12 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 
 			store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 			for (const provider of ["anthropic", "deepseek", "openai", "xai"]) {
-				store.deleteProvider(provider);
+				await store.deleteProvider(provider);
 			}
-			store.saveApiKey("google", "sk-restarted");
+			await store.saveApiKey("google", "sk-restarted");
 			storage = new AuthStorage(store);
-			await storage.reload();
-			expect(storage.getGeneration()).toBeLessThan(previousGeneration);
+			await storage.credentials.reload();
+			expect(storage.credentials.generation).toBeLessThan(previousGeneration);
 			handle = startAuthBroker({
 				storage,
 				bind,
@@ -210,18 +210,18 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 					remote!.snapshot.credentials[0]?.provider === "google",
 				4_000,
 			);
-			expect(await gatewayStorage.pollExternalChanges()).toBe(true);
-			expect(gatewayStorage.exportSnapshot().credentials.map(c => c.provider)).toEqual(["google"]);
+			expect(await gatewayStorage.credentials.poll()).toBe(true);
+			expect(gatewayStorage.credentials.snapshot().credentials.map(c => c.provider)).toEqual(["google"]);
 
 			// Incremental events are now ordered against the replacement
 			// baseline, not the previous broker process's higher generation.
-			storage!.upsertCredential("deepseek", { type: "api_key", key: "sk-after-restart" });
+			await storage!.credentials.upsert("deepseek", { type: "api_key", key: "sk-after-restart" });
 			await waitUntil(() => remote!.snapshot.credentials.some(c => c.provider === "deepseek"));
 			expect(remote.snapshot.generation).toBeLessThan(previousGeneration);
-			expect(await gatewayStorage.pollExternalChanges()).toBe(true);
+			expect(await gatewayStorage.credentials.poll()).toBe(true);
 			expect(
-				gatewayStorage
-					.exportSnapshot()
+				gatewayStorage.credentials
+					.snapshot()
 					.credentials.map(c => c.provider)
 					.sort(),
 			).toEqual(["deepseek", "google"]);
@@ -275,8 +275,8 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			},
 		]);
 
-		await waitUntil(() => storage!.getClientUsageSummary(0).clients.length === 1);
-		const summary = storage!.getClientUsageSummary(0);
+		await waitUntil(() => storage!.usage.clientSummary(0).clients.length === 1);
+		const summary = storage!.usage.clientSummary(0);
 		const reported = summary.clients[0];
 		expect(reported.installId.length).toBeGreaterThan(0);
 		expect(reported.hostname).toBe(os.hostname());
@@ -302,14 +302,14 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		// like the coding-agent does per assistant message — merges into the same
 		// 5-minute bucket row instead of accreting a new row per flush.
 		const clientStorage = new AuthStorage(remote);
-		clientStorage.recordObservedUsage({
+		clientStorage.usage.observe({
 			provider: "anthropic",
 			model: "claude-x",
 			at: at + 3,
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
 		});
 		await waitUntil(() => {
-			const current = storage!.getClientUsageSummary(0).clients[0];
+			const current = storage!.usage.clientSummary(0).clients[0];
 			return current?.providers.find(p => p.provider === "anthropic")?.requests === 3;
 		});
 		// An explicit identity (the auth-gateway attributing a caller) must
@@ -330,8 +330,8 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			],
 			{ installId: "robomp-install", hostname: "robomp-box", app: "robomp" },
 		);
-		await waitUntil(() => storage!.getClientUsageSummary(0).clients.length === 2);
-		const attributed = storage!.getClientUsageSummary(0).clients.find(c => c.installId === "robomp-install");
+		await waitUntil(() => storage!.usage.clientSummary(0).clients.length === 2);
+		const attributed = storage!.usage.clientSummary(0).clients.find(c => c.installId === "robomp-install");
 		expect(attributed?.hostname).toBe("robomp-box");
 		expect(attributed?.providers).toEqual([
 			{
@@ -396,8 +396,8 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 	});
 
 	test("filters configured OAuth identities while preserving API keys and raw snapshot callbacks", async () => {
-		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
-		storage!.upsertCredential("anthropic", { type: "api_key", key: "visible-api-key" });
+		await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await storage!.credentials.upsert("anthropic", { type: "api_key", key: "visible-api-key" });
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const initialResult = await client.fetchSnapshot();
 		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
@@ -441,7 +441,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		});
 		const initialGeneration = remote.snapshot.generation;
 
-		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 		await waitUntil(() => remote!.snapshot.generation > initialGeneration);
 
 		expect(remote.snapshot.credentials).toHaveLength(1);
@@ -449,7 +449,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 	});
 
 	test("treats a missing provider as unrestricted and an empty provider pool as OAuth-disabled", async () => {
-		storage!.upsertCredential("openai-codex", mintOAuthCredential("codex", Date.now() + 120_000));
+		await storage!.credentials.upsert("openai-codex", mintOAuthCredential("codex", Date.now() + 120_000));
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const initialResult = await client.fetchSnapshot();
 		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
@@ -465,7 +465,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 	});
 
 	test("loads the account pool once for broker-backed discovery", async () => {
-		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const initialResult = await client.fetchSnapshot();
 		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
@@ -487,15 +487,11 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 					cachePath: path.join(tempDir, "snapshot-cache.enc"),
 				});
 				try {
-					expect(discovered.listOAuthAccounts("anthropic").map(account => account.email)).toEqual([
-						"a@example.com",
-					]);
+					expect(discovered.oauth.accounts("anthropic").map(account => account.email)).toEqual(["a@example.com"]);
 
 					await Bun.write(poolPath, JSON.stringify({ anthropic: [allowed.identityKey, excluded.identityKey] }));
-					await discovered.reload();
-					expect(discovered.listOAuthAccounts("anthropic").map(account => account.email)).toEqual([
-						"a@example.com",
-					]);
+					await discovered.credentials.reload();
+					expect(discovered.oauth.accounts("anthropic").map(account => account.email)).toEqual(["a@example.com"]);
 				} finally {
 					discovered.close();
 				}
@@ -517,7 +513,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 					accountPool: new Map([["anthropic", new Set()]]),
 				});
 				try {
-					expect(discovered.listOAuthAccounts("anthropic")).toEqual([]);
+					expect(discovered.oauth.accounts("anthropic")).toEqual([]);
 				} finally {
 					discovered.close();
 				}
@@ -598,6 +594,343 @@ describe("RemoteAuthCredentialStore.pollExternalChanges content revision", () =>
 			expect(store.pollExternalChanges()).toBe(false);
 		} finally {
 			store.close();
+		}
+	});
+});
+
+type TestBlock = {
+	providerKey: string;
+	blockScope: string;
+	blockedUntilMs: number;
+	updatedAtMs?: number;
+	mutationToken?: string;
+};
+
+class DeferredBlockBroker extends FakeBrokerClient {
+	readonly blocks = new Map<number, Map<string, TestBlock>>();
+	readonly operations: Array<{
+		id: number;
+		kind: "upsert" | "delete" | "delete-all";
+		release: () => void;
+		completed: Promise<void>;
+	}> = [];
+	readonly #operationWaiters = new Map<number, PromiseWithResolvers<(typeof this.operations)[number]>>();
+	readonly #snapshotWaiters: Array<PromiseWithResolvers<FetchSnapshotResult>> = [];
+	readonly #timestamp: number;
+
+	constructor(initial: SnapshotResponse, timestamp: number) {
+		super(initial);
+		this.current.blockRevision = { instanceId: "test-persisted-db", sequence: 1 };
+		this.#timestamp = timestamp;
+		for (const entry of initial.credentials) {
+			this.blocks.set(entry.id, new Map((entry.blocks ?? []).map(block => [this.#key(block), block])));
+		}
+	}
+
+	#key(block: Pick<TestBlock, "providerKey" | "blockScope">): string {
+		return `${block.providerKey}\0${block.blockScope}`;
+	}
+
+	visible(id: number): TestBlock[] {
+		return [...(this.blocks.get(id)?.values() ?? [])];
+	}
+
+	snapshot(): SnapshotResponse {
+		return {
+			...this.current,
+			credentials: this.current.credentials.map(entry => {
+				const blocks = this.visible(entry.id);
+				return blocks.length ? { ...entry, blocks } : { ...entry, blocks: undefined };
+			}),
+		};
+	}
+
+	deferSnapshot(): PromiseWithResolvers<FetchSnapshotResult> {
+		const waiter = Promise.withResolvers<FetchSnapshotResult>();
+		this.#snapshotWaiters.push(waiter);
+		return waiter;
+	}
+
+	override async fetchSnapshot(opts: { ifGenerationGt?: number } = {}): Promise<FetchSnapshotResult> {
+		if (opts.ifGenerationGt !== undefined) return { status: 304, generation: this.current.generation };
+		const waiter = this.#snapshotWaiters.shift();
+		return waiter?.promise ?? { status: 200, snapshot: this.snapshot(), generation: this.current.generation };
+	}
+
+	waitForOperation(index: number): Promise<(typeof this.operations)[number]> {
+		const operation = this.operations[index];
+		if (operation) return Promise.resolve(operation);
+		const ready = Promise.withResolvers<(typeof this.operations)[number]>();
+		this.#operationWaiters.set(index, ready);
+		return ready.promise;
+	}
+
+	#defer(
+		id: number,
+		kind: "upsert" | "delete" | "delete-all",
+		apply: () => boolean | void,
+	): Promise<{ ok: true; deleted?: boolean }> {
+		const gate = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<void>();
+		const operation = { id, kind, release: () => gate.resolve(), completed: completed.promise };
+		this.operations.push(operation);
+		const index = this.operations.length - 1;
+		this.#operationWaiters.get(index)?.resolve(operation);
+		this.#operationWaiters.delete(index);
+		return gate.promise.then(() => {
+			const deleted = apply();
+			this.current.blockRevision = {
+				instanceId: "test-persisted-db",
+				sequence: this.current.blockRevision!.sequence + 1,
+			};
+			completed.resolve();
+			return {
+				ok: true as const,
+				...(deleted !== undefined ? { deleted } : {}),
+				blockRevision: this.current.blockRevision,
+			};
+		});
+	}
+
+	upsertCredentialBlock(id: number, block: TestBlock): Promise<{ ok: true }> {
+		return this.#defer(id, "upsert", () => {
+			const rows = this.blocks.get(id) ?? new Map<string, TestBlock>();
+			const key = this.#key(block);
+			const previous = rows.get(key);
+			rows.set(key, {
+				...block,
+				blockedUntilMs: Math.max(previous?.blockedUntilMs ?? 0, block.blockedUntilMs),
+				updatedAtMs: this.#timestamp,
+			});
+			this.blocks.set(id, rows);
+		});
+	}
+
+	deleteCredentialBlock(
+		id: number,
+		block: Pick<TestBlock, "providerKey" | "blockScope" | "mutationToken" | "blockedUntilMs">,
+	): Promise<{ ok: true; deleted?: boolean }> {
+		return this.#defer(id, "delete", () => {
+			const rows = this.blocks.get(id);
+			const current = rows?.get(this.#key(block));
+			if (
+				!current ||
+				current.mutationToken !== block.mutationToken ||
+				current.blockedUntilMs !== block.blockedUntilMs
+			)
+				return false;
+			rows!.delete(this.#key(block));
+			return true;
+		});
+	}
+
+	deleteCredentialBlocks(id: number, request: { blocks: TestBlock[] }): Promise<{ ok: true; deleted?: boolean }> {
+		return this.#defer(id, "delete-all", () => {
+			const rows = this.blocks.get(id);
+			let deleted = true;
+			for (const block of request.blocks) {
+				const current = rows?.get(this.#key(block));
+				if (
+					!current ||
+					current.mutationToken !== block.mutationToken ||
+					current.blockedUntilMs !== block.blockedUntilMs
+				) {
+					deleted = false;
+					continue;
+				}
+				rows!.delete(this.#key(block));
+			}
+			return deleted;
+		});
+	}
+}
+
+describe("RemoteAuthCredentialStore broker block mutation ordering", () => {
+	const credentialId = 7;
+	const providerKey = "anthropic:oauth";
+	const blockScope = "tier:fable";
+
+	function setup(initialBlocks: TestBlock[] = []) {
+		const now = Date.now();
+		const initial = buildApiKeySnapshot(1, [
+			{ id: credentialId, provider: "anthropic", key: "sk-test" },
+			{ id: 8, provider: "anthropic", key: "sk-other" },
+		]);
+		initial.blockMutationTokens = true;
+		initial.credentials[0]!.blocks = initialBlocks.map((block, index) => ({
+			...block,
+			mutationToken: block.mutationToken ?? `initial-${index}`,
+		}));
+		const client = new DeferredBlockBroker(initial, now);
+		const remote = new RemoteAuthCredentialStore({
+			client: client as unknown as AuthBrokerClient,
+			initialSnapshot: initial,
+			streamSnapshots: false,
+			backgroundIdleMs: 0,
+		});
+		const block = { credentialId, providerKey, blockScope, blockedUntilMs: now + 60_000, updatedAtMs: now };
+		return { client, remote, block };
+	}
+
+	test("upsert, scoped delete, and upsert commit in invocation order while another ID remains independent", async () => {
+		const { client, remote, block } = setup();
+		try {
+			remote.upsertCredentialBlock(block);
+			remote.deleteCredentialBlock(credentialId, providerKey, blockScope);
+			remote.upsertCredentialBlock(block);
+			remote.upsertCredentialBlock({ ...block, credentialId: 8 });
+			expect(client.operations.map(op => [op.id, op.kind])).toEqual([
+				[credentialId, "upsert"],
+				[8, "upsert"],
+			]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			const deleteOp = await client.waitForOperation(2);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			expect(deleteOp.kind).toBe("delete");
+			deleteOp.release();
+			await deleteOp.completed;
+			await Promise.resolve();
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			const upsertOp = await client.waitForOperation(3);
+			expect(upsertOp.kind).toBe("upsert");
+			upsertOp.release();
+			await upsertOp.completed;
+			await remote.refreshSnapshot();
+			expect(client.visible(credentialId).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			client.operations[1]!.release();
+			await client.operations[1]!.completed;
+			expect(client.visible(8).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("delete-all cannot erase a later upsert, even when an old snapshot arrives between acknowledgements", async () => {
+		const { client, remote, block } = setup([
+			{ providerKey, blockScope, blockedUntilMs: Date.now() + 60_000 },
+			{ providerKey, blockScope: "shared", blockedUntilMs: Date.now() + 60_000 },
+		]);
+		try {
+			remote.deleteCredentialBlocks(credentialId);
+			remote.upsertCredentialBlock(block);
+			expect(client.operations.map(op => op.kind)).toEqual(["delete-all"]);
+			const oldSnapshot = client.snapshot();
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			const upsertOp = await client.waitForOperation(1);
+			expect(upsertOp.kind).toBe("upsert");
+			// The pre-ack read may complete after the DELETE. Its durable revision
+			// still predates the acknowledgement.
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await staleRequest;
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+			client.operations[1]!.release();
+			await client.operations[1]!.completed;
+			await remote.refreshSnapshot();
+			expect(client.visible(credentialId).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("an older GET response cannot overwrite a newer committed snapshot", async () => {
+		const { client, remote, block } = setup();
+		try {
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			const oldSnapshot = client.snapshot();
+			remote.upsertCredentialBlock(block);
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			await Promise.resolve();
+			await remote.refreshSnapshot();
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await staleRequest;
+			expect(client.visible(credentialId).map(row => row.blockedUntilMs)).toEqual([block.blockedUntilMs]);
+			expect(remote.listCredentialBlocks([credentialId]).map(row => row.blockedUntilMs)).toEqual([
+				block.blockedUntilMs,
+			]);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("a later GET cannot roll back an acknowledged block to an older durable revision", async () => {
+		const { client, remote, block } = setup();
+		try {
+			const oldSnapshot = client.snapshot();
+			remote.upsertCredentialBlock(block);
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			await remote.refreshSnapshot();
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(block.blockedUntilMs);
+
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await staleRequest;
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(block.blockedUntilMs);
+			expect(remote.snapshot.blockRevision!.sequence).toBeGreaterThan(oldSnapshot.blockRevision!.sequence);
+		} finally {
+			remote.close();
+		}
+	});
+
+	test("a committed same-millisecond recreation survives the deleted row's tombstone", async () => {
+		const timestamp = Date.now();
+		const original = {
+			providerKey,
+			blockScope,
+			blockedUntilMs: timestamp + 60_000,
+			updatedAtMs: timestamp,
+			mutationToken: "test-original",
+		};
+		const { client, remote } = setup([original]);
+		try {
+			remote.deleteCredentialBlock(credentialId, providerKey, blockScope);
+			expect(remote.listCredentialBlocks([credentialId])).toEqual([]);
+			const oldSnapshot = client.snapshot();
+			const stale = client.deferSnapshot();
+			const staleRequest = remote.refreshSnapshot();
+			const staleAckRefresh = client.deferSnapshot();
+			client.operations[0]!.release();
+			await client.operations[0]!.completed;
+			await Promise.resolve();
+			const recreated = { ...original, mutationToken: "test-recreated" };
+			client.blocks.get(credentialId)!.set(`${providerKey}\0${blockScope}`, recreated);
+			expect(client.visible(credentialId)).toEqual([recreated]);
+			client.current.blockRevision = {
+				instanceId: "test-persisted-db",
+				sequence: client.current.blockRevision!.sequence + 1,
+			};
+			await remote.refreshSnapshot();
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(original.blockedUntilMs);
+			stale.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			staleAckRefresh.resolve({ status: 200, generation: oldSnapshot.generation, snapshot: oldSnapshot });
+			await Promise.resolve();
+			await staleRequest;
+			expect(remote.getCredentialBlock(credentialId, providerKey, blockScope)).toBe(original.blockedUntilMs);
+		} finally {
+			remote.close();
 		}
 	});
 });

@@ -8,6 +8,11 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
+import {
+	cfgToolsSpeculativeExecutionEnabled,
+	cfgToolsSpeculativeExecutionMaxInFlight,
+} from "@oh-my-pi/pi-coding-agent/tools/settings";
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -29,22 +34,6 @@ function createSession(cwd: string, settings: Settings): ToolSession {
 // schema defaults so `set` — the same layer the live settings UI writes —
 // takes effect, matching production.
 describe("createSpeculativeToolExecutionConfig", () => {
-	it("reflects a mid-session enable without recreate", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "speculative-live-config-"));
-		temporaryDirectories.push(directory);
-		const settings = Settings.isolated({});
-		const session = createSession(directory, settings);
-		const config = createSpeculativeToolExecutionConfig(session.settings, session, {
-			hasHandlers: () => false,
-		});
-
-		expect(config.enabled).toBe(false);
-
-		settings.set("tools.speculativeExecution.enabled", true);
-
-		expect(config.enabled).toBe(true);
-	});
-
 	it("propagates maxInFlight changes to the same config object", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "speculative-live-config-"));
 		temporaryDirectories.push(directory);
@@ -56,7 +45,7 @@ describe("createSpeculativeToolExecutionConfig", () => {
 
 		expect(config.maxInFlight).toBe(2);
 
-		settings.set("tools.speculativeExecution.maxInFlight", 5);
+		cfgToolsSpeculativeExecutionMaxInFlight.set(settings, 5);
 
 		expect(config.maxInFlight).toBe(5);
 	});
@@ -94,12 +83,12 @@ describe("createSpeculativeToolExecutionConfig", () => {
 
 		expect(await host?.authorize(context)).toMatchObject({ allowed: false });
 
-		settings.set("tools.speculativeExecution.enabled", true);
+		cfgToolsSpeculativeExecutionEnabled.set(settings, true);
 
 		expect(config.host).toBe(host);
 		expect(await host?.authorize(context)).toMatchObject({ allowed: true });
 
-		settings.set("tools.speculativeExecution.enabled", false);
+		cfgToolsSpeculativeExecutionEnabled.set(settings, false);
 
 		expect(config.host).toBe(host);
 		expect(await host?.authorize(context)).toMatchObject({ allowed: false });

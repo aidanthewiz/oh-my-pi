@@ -9,6 +9,7 @@ interface ProbeRunResult {
 	childElapsedMs: number;
 	cached: unknown;
 	count: number;
+	systemPrompt: string;
 }
 
 async function runProbeScenario(options: {
@@ -58,14 +59,15 @@ const buildOptions = {
 	activeRepoContext: null,
 };
 const startedAt = performance.now();
+let systemPrompt = "";
 for (let index = 0; index < Number(process.env.OMP_GPU_PROBE_RUNS ?? "1"); index += 1) {
-	await buildSystemPrompt(buildOptions);
+	systemPrompt = (await buildSystemPrompt(buildOptions)).systemPrompt.join("\\n");
 }
 const cacheFile = Bun.file(getGpuCachePath());
 const cached = await cacheFile.exists() ? await cacheFile.json() : null;
 const countFile = Bun.file(process.env.OMP_GPU_PROBE_COUNT ?? "");
 const count = await countFile.exists() ? (await countFile.text()).length : 0;
-console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt), cached, count }));
+console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt), cached, count, systemPrompt }));
 `,
 		);
 
@@ -171,6 +173,7 @@ describe.skipIf(process.platform !== "linux")("system prompt GPU probe", () => {
 		// Probe exited 0 with valid output before bg sleep held stdout open.
 		// Captured stdout MUST be cached, not discarded as if the probe failed.
 		expect(result.cached).toEqual({ version: 1, gpu: "02.0 VGA compatible controller: NVIDIA TestGPU" });
+		expect(result.systemPrompt).toContain("- GPU: 02.0 VGA compatible controller: NVIDIA TestGPU");
 		expect(result.elapsedMs).toBeLessThan(2000);
 		// Budgets bun spawn/startup overhead; blocking on the descendant would
 		// take at least the 8s sleep.
@@ -185,6 +188,7 @@ describe.skipIf(process.platform !== "linux")("system prompt GPU probe", () => {
 		});
 
 		expect(result.cached).toEqual({ version: 1, gpu: "NVIDIA GeForce RTX 2080 Ti" });
+		expect(result.systemPrompt).toContain("- GPU: NVIDIA GeForce RTX 2080 Ti");
 		expect(result.count).toBe(1);
 	});
 
@@ -196,6 +200,7 @@ describe.skipIf(process.platform !== "linux")("system prompt GPU probe", () => {
 		});
 
 		expect(result.cached).toEqual({ version: 1, gpu: "Remote Display Adapter" });
+		expect(result.systemPrompt).toContain("- GPU: Remote Display Adapter");
 		expect(result.count).toBe(1);
 	});
 
@@ -210,39 +215,32 @@ describe.skipIf(process.platform !== "linux")("system prompt GPU probe", () => {
 		// The old unversioned cache holds the virtual adapter the previous parser
 		// picked; it MUST be discarded and re-probed, not served indefinitely.
 		expect(result.cached).toEqual({ version: 1, gpu: "NVIDIA GeForce RTX 2080 Ti" });
+		expect(result.systemPrompt).toContain("- GPU: NVIDIA GeForce RTX 2080 Ti");
 		expect(result.count).toBe(1);
 	});
 });
 
 describe.skipIf(process.platform !== "linux")("system prompt CPU model", () => {
-	it("does not call os.cpus while building the workstation block", async () => {
-		const cpus = spyOn(os, "cpus").mockImplementation(() => [
-			{
-				model: "Synthetic Slow CPU",
-				speed: 0,
-				times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
-			},
-		]);
-		try {
-			await buildSystemPrompt({
-				resolvedCustomPrompt: "Base prompt",
-				contextFiles: [],
-				skills: [],
-				rules: [],
-				workspaceTree: {
-					rootPath: import.meta.dir,
-					rendered: "",
-					truncated: false,
-					totalLines: 0,
-					agentsMdFiles: [],
-				},
-				activeRepoContext: null,
-			});
+	it("includes the kernel-reported Linux CPU model", async () => {
+		const cpuModel = /^model name\s*:\s*(.+)$/m.exec(await Bun.file("/proc/cpuinfo").text())?.[1]?.trim();
+		if (!cpuModel) throw new Error("Linux did not expose a CPU model in /proc/cpuinfo");
 
-			expect(cpus).not.toHaveBeenCalled();
-		} finally {
-			cpus.mockRestore();
-		}
+		const systemPrompt = await buildSystemPrompt({
+			resolvedCustomPrompt: "Base prompt",
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			workspaceTree: {
+				rootPath: import.meta.dir,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+			activeRepoContext: null,
+		});
+
+		expect(systemPrompt.systemPrompt.join("\n")).toContain(`- CPU: ${cpuModel}`);
 	});
 });
 
@@ -273,7 +271,6 @@ describe("non-Linux system prompt CPU model", () => {
 				activeRepoContext: null,
 			});
 
-			expect(cpus).toHaveBeenCalledTimes(1);
 			expect(systemPrompt.systemPrompt.join("\n")).toContain("- CPU: Synthetic Non-Linux CPU");
 		} finally {
 			cpus.mockRestore();

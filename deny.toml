@@ -39,9 +39,8 @@ allow = [
 exceptions = [
     { allow = ["CDDL-1.0"], crate = "inferno@0.12.8" },
     { allow = ["WTFPL"], crate = "terminfo@0.9.0" },
-    # uluru (via pi-vcs → jj-lib → gix → gix-pack) is MPL-2.0: file-level
-    # copyleft, satisfied by upstream source availability; no obligations
-    # attach to our unmodified use. Keep it package-scoped like inferno.
+    # uluru (via pi-vcs → jj-lib → gix → gix-pack) is MPL-2.0: retain
+    # package-scoped review and identify its exact source in distributed notices.
     { allow = ["MPL-2.0"], crate = "uluru@3.1.0" },
 ]
 

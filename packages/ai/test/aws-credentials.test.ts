@@ -146,7 +146,7 @@ describe("resolveAwsCredentials", () => {
 		return p;
 	}
 
-	async function installFakeAws(body: string): Promise<void> {
+	async function installFakeAws(body: string): Promise<string> {
 		const script = await writeFixture("fake-aws.js", body);
 		const isWindows = process.platform === "win32";
 		const executable = await writeFixture(
@@ -156,7 +156,46 @@ describe("resolveAwsCredentials", () => {
 				: `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`,
 		);
 		if (!isWindows) await fs.chmod(executable, 0o755);
-		Bun.env.PATH = `${tmp}${path.delimiter}${saved.get("PATH") ?? ""}`;
+		return executable;
+	}
+
+	async function runTrustedSsoProbe<T>(fakeAws: string, body: string): Promise<T> {
+		await writeConfig("managed", MODERN_SSO_CONFIG);
+		const executable = await installFakeAws(fakeAws);
+		const source = path.resolve(import.meta.dir, "../src/providers/aws-credentials.ts");
+		const probe = Bun.spawn(
+			[
+				process.execPath,
+				"--no-env-file",
+				"-e",
+				`import { resolveAwsCredentials, setAwsCredentialRecoveryHandler } from ${JSON.stringify(source)};
+				${body}`,
+			],
+			{
+				cwd: tmp,
+				env: {
+					HOME: tmp,
+					USERPROFILE: tmp,
+					PATH: path.join(tmp, "no-aws-on-path"),
+					AWS_CONFIG_FILE: path.join(tmp, "config"),
+					AWS_SHARED_CREDENTIALS_FILE: path.join(tmp, "credentials"),
+					AWS_EC2_METADATA_DISABLED: "true",
+					OMP_DOTENV_OVERRIDE: "1",
+					OMP_CF_PRODUCT_VERSION: "fixture",
+					OMP_OPERATIONAL_AWS_EXECUTABLE: executable,
+					...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const [stdout, stderr, exit] = await Promise.all([
+			new Response(probe.stdout).text(),
+			new Response(probe.stderr).text(),
+			probe.exited,
+		]);
+		expect(exit, `${stdout}\n${stderr}`).toBe(0);
+		return JSON.parse(stdout) as T;
 	}
 
 	async function writeConfig(profile: string, line: string): Promise<void> {
@@ -436,13 +475,17 @@ describe("resolveAwsCredentials", () => {
 
 	test("uses AWS CLI token refresh for a modern SSO session", async () => {
 		const argvPath = path.join(tmp, "aws-argv.json");
-		await installFakeAws(
+		const creds = await runTrustedSsoProbe<{
+			accessKeyId: string;
+			secretAccessKey: string;
+			sessionToken: string;
+			expiresAt: number;
+		}>(
 			`await Bun.write(${JSON.stringify(argvPath)}, JSON.stringify(Bun.argv.slice(2)));
 console.log(JSON.stringify({Version:1,AccessKeyId:"ASIAREFRESHED",SecretAccessKey:"secret",SessionToken:"session",Expiration:"2099-01-01T00:00:00Z"}));`,
+			`const creds = await resolveAwsCredentials({ profile: "managed", region: "us-east-1" });
+			process.stdout.write(JSON.stringify(creds));`,
 		);
-		await writeConfig("managed", MODERN_SSO_CONFIG);
-
-		const creds = await resolveAwsCredentials({ profile: "managed", region: "us-east-1" });
 
 		expect(creds).toEqual({
 			accessKeyId: "ASIAREFRESHED",
@@ -496,44 +539,67 @@ console.log(JSON.stringify({Version:1,AccessKeyId:"ASIAREFRESHED",SecretAccessKe
 	});
 
 	test("does not fall back when AWS CLI credential export fails", async () => {
-		await installFakeAws(`process.stderr.write("AccessDenied: role is not assigned"); process.exit(17);`);
-		await writeConfig("managed", MODERN_SSO_CONFIG);
-
-		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({ kind: "sso-role" });
+		const failure = await runTrustedSsoProbe<{ kind: string; message: string }>(
+			`process.stderr.write("AccessDenied: role is not assigned"); process.exit(17);`,
+			`const failure = await resolveAwsCredentials({ profile: "managed" }).then(
+				() => null,
+				error => ({ kind: error.kind, message: error.message }),
+			);
+			process.stdout.write(JSON.stringify(failure));`,
+		);
+		expect(failure.kind).toBe("sso-role");
+		expect(failure.message).toContain("AccessDenied: role is not assigned");
 	});
 
 	test("classifies an exhausted AWS CLI SSO session as an expired token", async () => {
-		await installFakeAws(`process.stderr.write("The SSO session has expired and refresh failed"); process.exit(1);`);
-		await writeConfig("managed", MODERN_SSO_CONFIG);
-
-		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({
-			kind: "sso-token-expired",
-		});
+		const failure = await runTrustedSsoProbe<{ kind: string; message: string }>(
+			`process.stderr.write("The SSO session has expired and refresh failed"); process.exit(1);`,
+			`const failure = await resolveAwsCredentials({ profile: "managed" }).then(
+				() => null,
+				error => ({ kind: error.kind, message: error.message }),
+			);
+			process.stdout.write(JSON.stringify(failure));`,
+		);
+		expect(failure.kind).toBe("sso-token-expired");
+		expect(failure.message).toContain("The SSO session has expired and refresh failed");
 	});
+
 	test("clears recovery cooldown after a non-auth post-login failure", async () => {
 		const counterPath = path.join(tmp, "recovery-calls.txt");
-		await installFakeAws(
-			`const fs=require("node:fs");
-			 const prev=fs.existsSync(${JSON.stringify(counterPath)})?Number(fs.readFileSync(${JSON.stringify(counterPath)},"utf8")):0;
-			 fs.writeFileSync(${JSON.stringify(counterPath)},String(prev+1));
-			 process.stderr.write(prev===0?"The SSO session has expired and refresh failed":"AccessDenied: role is not assigned");
-			 process.exit(1);`,
+		const fakeAws = `const fs=require("node:fs");
+			const prev=fs.existsSync(${JSON.stringify(counterPath)})?Number(fs.readFileSync(${JSON.stringify(counterPath)},"utf8")):0;
+			fs.writeFileSync(${JSON.stringify(counterPath)},String(prev+1));
+			process.stderr.write(prev===0?"The SSO session has expired and refresh failed":"AccessDenied: role is not assigned");
+			process.exit(1);`;
+		const outcome = await runTrustedSsoProbe<{
+			first: { kind: string; message: string };
+			second: { kind: string; message: string };
+			recoveries: number;
+			calls: number;
+		}>(
+			fakeAws,
+			`let recoveries = 0;
+			setAwsCredentialRecoveryHandler(() => { recoveries += 1; return true; });
+			const fail = () => resolveAwsCredentials({ profile: "managed" }).then(
+				() => null, error => ({ kind: error.kind, message: error.message }),
+			);
+			const first = await fail();
+			await Bun.write(${JSON.stringify(path.join(tmp, "fake-aws.js"))}, ${JSON.stringify(
+				`const fs=require("node:fs");
+				const p=${JSON.stringify(counterPath)};
+				fs.writeFileSync(p,String(Number(fs.readFileSync(p,"utf8"))+1));
+				process.stderr.write("The SSO session has expired and refresh failed");
+				process.exit(1);`,
+			)});
+			const second = await fail();
+			const calls = Number(await Bun.file(${JSON.stringify(counterPath)}).text());
+			process.stdout.write(JSON.stringify({ first, second, recoveries, calls }));`,
 		);
-		await writeConfig("managed", MODERN_SSO_CONFIG);
-		let recoveries = 0;
-		setAwsCredentialRecoveryHandler(() => {
-			recoveries += 1;
-			return true;
-		});
-
-		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({ kind: "sso-role" });
-		expect(recoveries).toBe(1);
-
-		await installFakeAws(`process.stderr.write("The SSO session has expired and refresh failed"); process.exit(1);`);
-		await expect(resolveAwsCredentials({ profile: "managed" })).rejects.toMatchObject({
-			kind: "sso-token-expired",
-		});
-		expect(recoveries).toBe(2);
+		expect(outcome.first.kind).toBe("sso-role");
+		expect(outcome.first.message).toContain("AccessDenied: role is not assigned");
+		expect(outcome.second.kind).toBe("sso-token-expired");
+		expect(outcome.recoveries).toBe(2);
+		expect(outcome.calls).toBe(4);
 	});
 
 	test("resolves ECS container credentials with the authorization token", async () => {

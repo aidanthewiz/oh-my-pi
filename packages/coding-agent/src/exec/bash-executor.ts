@@ -5,19 +5,39 @@
  */
 import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { type MinimizerOptions, PtySession, Shell, type ShellRunResult } from "@oh-my-pi/pi-natives";
+import {
+	type MinimizerOptions,
+	PtySession,
+	Shell,
+	type ShellFilesystem,
+	type ShellRunResult,
+} from "@oh-my-pi/pi-natives";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
-import { Settings, type ShellMinimizerSettings } from "../config/settings";
+import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
+import {
+	resolveOutputMaxColumns,
+	resolveOutputSinkArtifactMaxBytes,
+	resolveOutputSinkHeadBytes,
+} from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
 
+import {
+	cfgBashDirenv,
+	cfgBashDirenvLoadTimeoutMs,
+	cfgShellMinimizer,
+	cfgShellPath,
+	type ShellMinimizerSettings,
+} from "./settings";
+
 export interface BashExecutorOptions {
 	cwd?: string;
+	/** Effective settings of the owning session; standalone callers use the process settings. */
+	settings?: Settings;
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
 	timeout?: number;
 	onChunk?: (chunk: string) => void;
@@ -27,10 +47,23 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/** Command and environment already transformed and reviewed by the calling tool. */
+	preflight?: { command: string; env: Record<string, string> | undefined };
 	/** Run through the configured user shell instead of brush parsing directly. */
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
 	pty?: BashPtyOptions;
+	/**
+	 * Filesystem for `scheme://` paths in this run of the embedded shell (a URL
+	 * `cwd` included). External shells and processes never see it.
+	 */
+	filesystem?: ShellFilesystem;
+	/**
+	 * Invoked once the embedded shell starts the command, with a probe of the
+	 * live pids it spawned (empty once the run ends). Not called on the
+	 * user-shell paths.
+	 */
+	onStart?: (pids: () => readonly number[]) => void;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -66,6 +99,8 @@ export interface BashResult extends OutputSummary {
 	outputLines: number;
 	outputBytes: number;
 	artifactId?: string;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	workingDir?: string;
 	/** Terminal graphics extracted from raw stdout before sanitization or truncation. */
@@ -76,6 +111,9 @@ export interface BashResult extends OutputSummary {
  *  command line, so a hostile `.envrc` can't smuggle shell syntax through
  *  `unset`. `.envrc` never produces non-identifier names in practice. */
 const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A `scheme://` working directory: it exists only in the embedded shell's injected filesystem. */
+const URL_CWD_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 export interface DirenvPreflightOptions {
 	/** Caller-supplied env overlay; these values win over direnv-provided ones. */
@@ -358,7 +396,7 @@ function buildUserShellCommand(shell: string, args: string[], command: string): 
 }
 
 function resolveUserShellConfig(settings: Settings, baseConfig: ShellConfig): ShellConfig {
-	const customShellPath = settings.get("shellPath");
+	const customShellPath = cfgShellPath.get(settings);
 	const envShell = Bun.env.SHELL;
 	if (customShellPath || process.platform === "win32" || !envShell || envShell === baseConfig.shell) {
 		return baseConfig;
@@ -460,7 +498,7 @@ async function executeUserShellPty(run: {
 }
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
-	const settings = await Settings.init();
+	const settings = options?.settings ?? (await Settings.init());
 	const baseShellConfig = settings.getShellConfig();
 	const shellConfig =
 		options?.useUserShell === true ? resolveUserShellConfig(settings, baseShellConfig) : baseShellConfig;
@@ -480,22 +518,25 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		!isPersistentShellCdCommand(command);
 	const snapshotPath = bashShell ? await getOrCreateSnapshot(shell, shellEnv) : null;
 
-	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
+	const minimizer = buildMinimizerOptions(cfgShellMinimizer.get(settings));
 
 	const commandCwd = resolveShellCwd(options?.cwd);
-	// Fold the repo's direnv/devenv env into the command + env so devenv tools
-	// land on PATH; the caller's explicit `env` still wins. Thread the caller's
-	// signal + timeout so an aborted / short-timeout call can't hang on a cold
-	// `.envrc` load before the abort listener is installed. The helper applies
-	// the configured shell `prefix` after any `unset -v` it prepends.
-	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
-		callerEnv: options?.env,
-		signal: options?.signal,
-		timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
-		callerTimeoutMs: options?.timeout,
-		direnvSetting: settings.get("bash.direnv"),
-		commandPrefix: prefix,
-	});
+	const virtualCwd = commandCwd !== undefined && URL_CWD_RE.test(commandCwd);
+	if (virtualCwd && (usePty || !options?.filesystem)) {
+		throw new Error(`Working directory ${commandCwd} needs the embedded shell with an injected filesystem`);
+	}
+	// The bash tool supplies an already reviewed command after direnv and prefix transformation.
+	// Other callers prepare those values here; do not transform an approved command twice.
+	const preflight =
+		options?.preflight ??
+		(await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
+			callerEnv: options?.env,
+			signal: options?.signal,
+			timeoutMs: cfgBashDirenvLoadTimeoutMs.get(settings),
+			callerTimeoutMs: options?.timeout,
+			direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
+			commandPrefix: prefix,
+		}));
 	const commandEnv = buildNonInteractiveEnv(preflight.env);
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
@@ -512,6 +553,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
+		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 		chunkThrottleMs: !usePty && options?.onChunk ? (options.chunkThrottleMs ?? 50) : 0,
 	});
@@ -649,6 +691,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				env: commandEnv,
 				timeoutMs: nativeTimeoutMs,
 				signal: runAbortController.signal,
+				filesystem: options?.filesystem,
 			},
 			(err, chunk) => {
 				if (!err) {
@@ -656,6 +699,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				}
 			},
 		);
+		options?.onStart?.(() => executionShell.pids());
 
 		const ey = new ExponentialYield();
 		const winner = await ey.race<

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -38,6 +39,12 @@ async function writeTemp(content: string): Promise<string> {
 	const file = path.join(dir, "session.jsonl");
 	fs.writeFileSync(file, content);
 	return file;
+}
+
+function expectStreamParity(stream: sessionLoader.SessionLoadResult, content: string): void {
+	const { sourceFingerprint, ...parsed } = stream;
+	expect(parsed).toEqual(sessionLoader.parseSessionContent(content));
+	expect(sourceFingerprint?.copy().digest("hex")).toBe(createHash("sha1").update(content).digest("hex"));
 }
 
 function entryTypes(entries: FileEntry[]): string[] {
@@ -191,10 +198,9 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 		const file = await writeTemp(content);
 
 		const stream = await sessionLoader.loadEntriesFromFileStream(file);
-		const reference = sessionLoader.parseSessionContent(content);
 
-		// Parity: the stream path must agree with the common path exactly.
-		expect(stream).toEqual(reference);
+		// The parsed content agrees with the common path; the stream also fingerprints its raw bytes.
+		expectStreamParity(stream, content);
 		// And the concrete contracts that parity implies:
 		expect(stream.titleSlot?.title).toBe("Hello world"); // title slot peeled + folded
 		expect(entryTypes(stream.entries)).toEqual(["session", "message", "message"]);
@@ -214,9 +220,8 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 		const file = await writeTemp(content);
 
 		const stream = await sessionLoader.loadEntriesFromFileStream(file);
-		const reference = sessionLoader.parseSessionContent(content);
 
-		expect(stream).toEqual(reference);
+		expectStreamParity(stream, content);
 		expect(stream.titleSlot).toBeUndefined();
 		expect(entryIds(stream.entries)).toEqual(["s1", "m1", "m2"]);
 	});
@@ -235,10 +240,9 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 		const file = await writeTemp(content);
 
 		const stream = await sessionLoader.loadEntriesFromFileStream(file);
-		const reference = sessionLoader.parseSessionContent(content);
 
-		// Parity (a corrupted multibyte sequence would diverge here) ...
-		expect(stream).toEqual(reference);
+		// A corrupted multibyte sequence would diverge in the entries or raw-byte fingerprint.
+		expectStreamParity(stream, content);
 		// ... and explicitly: every entry's text round-trips intact, no U+FFFD.
 		for (const text of messageTexts(stream.entries)) {
 			expect(text).toBe(multibyte);

@@ -15,6 +15,7 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 	readonly #sessionPath: string;
 	readonly #initialEntry: SessionStorageIndexEntry;
 	#content: string;
+	#titleMeta: string | null = JSON.stringify({ title: "Old", source: "auto", updatedAt: "t0" });
 	#firstUpdate: PromiseWithResolvers<void> | undefined;
 	#updateCount = 0;
 
@@ -42,6 +43,10 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 	readFull(path: string): Promise<string | null> {
 		return Promise.resolve(path === this.#sessionPath ? this.#content : null);
 	}
+	readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
+		if (path !== this.#sessionPath) return Promise.resolve(null);
+		return Promise.resolve({ rawContent: this.#content, titleMeta: this.#titleMeta });
+	}
 
 	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		if (path !== this.#sessionPath) return Promise.resolve(["", ""]);
@@ -49,8 +54,9 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 		return Promise.resolve([this.#content.slice(0, prefixBytes), suffix]);
 	}
 
-	writeFull(_path: string, content: string, _mtimeMs: number, _title?: SessionTitleUpdate): Promise<void> {
+	writeFull(_path: string, content: string, _mtimeMs: number, title?: SessionTitleUpdate): Promise<void> {
 		this.#content = content;
+		this.#titleMeta = title ? JSON.stringify(title) : null;
 		return Promise.resolve();
 	}
 
@@ -59,12 +65,13 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 		return Promise.resolve();
 	}
 
-	updateSessionTitle(_path: string, _title: SessionTitleUpdate, _mtimeMs: number): Promise<void> {
+	updateSessionTitle(_path: string, title: SessionTitleUpdate, _mtimeMs: number): Promise<void> {
 		this.#updateCount++;
 		if (this.#updateCount === 1) {
 			this.#firstUpdate = Promise.withResolvers<void>();
 			return this.#firstUpdate.promise;
 		}
+		this.#titleMeta = JSON.stringify(title);
 		return Promise.resolve();
 	}
 
@@ -113,6 +120,72 @@ describe("FileSessionStorage writer", () => {
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("one\n");
 		appendSync("two\n");
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("one\ntwo\n");
+		void writer.close();
+	});
+
+	it("appends without creating or removing a lockfile beside the session", () => {
+		const sessionPath = path.join(tempDir, "no-lockfile.jsonl");
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("File writer must expose appendSync");
+		// Each transcript line used to claim `.<session>.lock` (create, record,
+		// stat, close) and unlink it again: two directory mutations per append.
+		// The OS gate alone serializes current writers, so appends must leave
+		// the session directory untouched apart from the transcript itself.
+		const openSpy = vi.spyOn(fs, "openSync");
+		const unlinkSpy = vi.spyOn(fs, "unlinkSync");
+		for (const line of ["one\n", "two\n", "three\n"]) appendSync(line);
+		const touched = [...openSpy.mock.calls, ...unlinkSpy.mock.calls].map(call => String(call[0]));
+		vi.restoreAllMocks();
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe("one\ntwo\nthree\n");
+		expect(touched.filter(file => file.endsWith(".lock"))).toEqual([]);
+		void writer.close();
+	});
+
+	it("fails an append closed while a previous-binary publisher holds the lockfile", async () => {
+		const sessionPath = path.join(tempDir, "legacy-held.jsonl");
+		fs.writeFileSync(sessionPath, "old\n");
+		const writer = storage.openWriter(sessionPath);
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("File writer must expose appendSync");
+		// A binary that predates the OS gate publishes under the lockfile alone:
+		// it claimed the name and passed its size check, and its rename will
+		// replace this file. Appending now would land a line that rename erases.
+		fs.writeFileSync(path.join(tempDir, ".legacy-held.jsonl.lock"), `${process.pid}:${Date.now()}\n`);
+		expect(() => appendSync("new-entry\n")).toThrow(SessionLockError);
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe("old\n");
+		await expect(writer.close()).rejects.toBeInstanceOf(SessionLockError);
+	});
+
+	it("re-appends a line a previous-binary publisher renamed away mid-append", () => {
+		const sessionPath = path.join(tempDir, "legacy-race.jsonl");
+		const lockPath = path.join(tempDir, ".legacy-race.jsonl.lock");
+		const stagedPath = path.join(tempDir, ".legacy-race.jsonl.staged.tmp");
+		fs.writeFileSync(sessionPath, "old\n");
+		fs.writeFileSync(stagedPath, "old\nrewrite\n");
+		const writer = storage.openWriter(sessionPath);
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("File writer must expose appendSync");
+		// The previous binary claims the lockfile after our check, sizes the
+		// session before our line lands, then publishes its rewrite over the path
+		// and releases: the line is now only in the replaced inode. Publishing
+		// moves the old file aside first, as Windows publishers do when a writer
+		// still holds it open.
+		const existsSync = fs.existsSync;
+		let published = false;
+		vi.spyOn(fs, "existsSync").mockImplementation((file: fs.PathLike) => {
+			if (!published && String(file) === lockPath && fs.readFileSync(sessionPath, "utf8") === "old\nnew-entry\n") {
+				published = true;
+				fs.renameSync(sessionPath, path.join(tempDir, "legacy-race.jsonl.bak"));
+				fs.renameSync(stagedPath, sessionPath);
+			}
+			return existsSync(file);
+		});
+		appendSync("new-entry\n");
+		vi.restoreAllMocks();
+		expect(published).toBe(true);
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe("old\nrewrite\nnew-entry\n");
+		expect(fs.existsSync(lockPath)).toBe(false);
 		void writer.close();
 	});
 
@@ -167,6 +240,56 @@ describe("FileSessionStorage writer", () => {
 		if (!appendSync) throw new Error("File writer must expose appendSync");
 		expect(() => appendSync("partial entry\n")).toThrow("ENOSPC");
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("complete\n");
+	});
+
+	it("rolls back a partial append through a reopened handle when the append handle refuses truncation", () => {
+		const sessionPath = path.join(tempDir, "append-handle-no-truncate.jsonl");
+		fs.writeFileSync(sessionPath, "complete\n");
+		const writer = storage.openWriter(sessionPath);
+		const ftruncateSync = fs.ftruncateSync;
+		// Windows refuses ftruncate on an O_APPEND handle; the reopened handle must succeed.
+		vi.spyOn(fs, "ftruncateSync")
+			.mockImplementationOnce(() => {
+				throw Object.assign(new Error("EPERM: operation not permitted, ftruncate"), { code: "EPERM" });
+			})
+			.mockImplementation((fd, len) => ftruncateSync(fd, len));
+		vi.spyOn(fs, "writeSync")
+			.mockImplementationOnce(() => {
+				fs.appendFileSync(sessionPath, "par");
+				return 3;
+			})
+			.mockImplementation(() => {
+				throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+			});
+
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("File writer must expose appendSync");
+		expect(() => appendSync("partial entry\n")).toThrow("ENOSPC");
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe("complete\n");
+	});
+
+	it("does not truncate a replacement session when append rollback reopens the path", async () => {
+		const sessionPath = path.join(tempDir, "original.jsonl");
+		const replacementPath = path.join(tempDir, "replacement.jsonl");
+		fs.writeFileSync(sessionPath, "old\n");
+		fs.writeFileSync(replacementPath, "replacement session\n");
+		const writer = storage.openWriter(sessionPath);
+		const openSync = fs.openSync;
+		vi.spyOn(fs, "writeSync").mockImplementation(() => {
+			throw new Error("disk full");
+		});
+		vi.spyOn(fs, "ftruncateSync").mockImplementationOnce(() => {
+			throw new Error("append handle cannot truncate");
+		});
+		vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) =>
+			openSync(file === sessionPath && flags === "r+" ? replacementPath : file, flags, mode),
+		);
+
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("File writer must expose appendSync");
+		expect(() => appendSync("new\n")).toThrow("partial bytes could not be rolled back");
+		expect(fs.readFileSync(replacementPath, "utf8")).toBe("replacement session\n");
+		await expect(writer.close()).rejects.toThrow("partial bytes could not be rolled back");
 	});
 });
 
@@ -483,6 +606,37 @@ describe("IndexedSessionStorage.updateSessionTitle", () => {
 	});
 });
 
+it("reads transcript and title metadata from one committed indexed snapshot after a peer publish", async () => {
+	const sessionPath = "/sessions/shared.jsonl";
+	const oldTitle = { title: "Old", source: "auto" as const, updatedAt: "t0" };
+	const newTitle = { title: "New", source: "user" as const, updatedAt: "t1" };
+	const oldRaw = `${serializeTitleSlot(oldTitle)}old-entry\n`;
+	const newRaw = `${serializeTitleSlot(newTitle)}new-entry\n`;
+	class InterleavedBackend extends ControlledTitleUpdateBackend {
+		override readFull(): Promise<string> {
+			// A split read captures old bytes before a peer publishes the new title.
+			return Promise.resolve(oldRaw);
+		}
+		readTitleMeta(): Promise<string> {
+			return Promise.resolve(JSON.stringify(newTitle));
+		}
+		override readFullWithTitleMeta(): Promise<{ rawContent: string; titleMeta: string }> {
+			return Promise.resolve({ rawContent: newRaw, titleMeta: JSON.stringify(newTitle) });
+		}
+	}
+	const storage = new IndexedSessionStorage(new InterleavedBackend(sessionPath, oldRaw));
+	await storage.initialize();
+	expect(await storage.readTextSnapshot(sessionPath)).toEqual({
+		content: newRaw,
+		rawContent: newRaw,
+		titleMeta: JSON.stringify(newTitle),
+	});
+	expect(await storage.readCommittedState(sessionPath)).toEqual({
+		content: newRaw,
+		titleMeta: JSON.stringify(newTitle),
+	});
+});
+
 class PausableWriteFullBackend implements SessionStorageBackend {
 	readonly writeFullCalls: Array<{ content: string; mtimeMs: number }> = [];
 	readonly firstWriteStarted = Promise.withResolvers<void>();
@@ -496,6 +650,9 @@ class PausableWriteFullBackend implements SessionStorageBackend {
 		return Promise.resolve([]);
 	}
 	readFull(): Promise<string | null> {
+		return Promise.resolve(null);
+	}
+	readFullWithTitleMeta(): Promise<null> {
 		return Promise.resolve(null);
 	}
 	readSlices(): Promise<[string, string]> {

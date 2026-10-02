@@ -1,6 +1,7 @@
 import type { KnownProvider } from "@oh-my-pi/pi-catalog";
 import { authProviders } from "@oh-my-pi/pi-catalog/compat/auth";
 import type { AuthProviderId, LoginProviderId } from "@oh-my-pi/pi-catalog/compat/auth-ids";
+import { resolveAnthropicAwsProviderCredential } from "./anthropic-aws-env";
 import { anthropicTransport } from "./anthropic";
 import { amazonBedrockTransport } from "./amazon-bedrock";
 import { bedrockMantleTransport } from "./bedrock-mantle";
@@ -17,6 +18,10 @@ import type { ProviderDefinition } from "./types";
 const TRANSPORTS: Record<string, ProviderTransport> = {
 	"amazon-bedrock": amazonBedrockTransport,
 	anthropic: anthropicTransport,
+	"anthropic-aws": {
+		requestEnvironmentOwnsCredential: () => true,
+		envKeysForRequest: resolveAnthropicAwsProviderCredential,
+	},
 	"bedrock-mantle": bedrockMantleTransport,
 	"cloudflare-ai-gateway": cloudflareAiGatewayTransport,
 	"muse-code": museCodeTransport,

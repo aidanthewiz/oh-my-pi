@@ -37,7 +37,7 @@ describe("AgentSession aside delivery", () => {
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-aside-delivery-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		authStorage.setRuntimeApiKey("openai", "openai-test-key");
+		authStorage.keys.setRuntime("openai", "openai-test-key");
 	});
 
 	afterEach(async () => {
@@ -776,7 +776,6 @@ describe("AgentSession aside delivery", () => {
 		const host: IrcBridgeHost = {
 			agent: {} as Agent,
 			sessionManager: {} as SessionManager,
-			settings: {} as Settings,
 			isDisposed: () => false,
 			isStreaming: () => false,
 			planModeEnabled: () => false,
@@ -828,7 +827,6 @@ describe("AgentSession aside delivery", () => {
 		const host: IrcBridgeHost = {
 			agent: {} as Agent,
 			sessionManager: {} as SessionManager,
-			settings: {} as Settings,
 			isDisposed: () => false,
 			isStreaming: () => false,
 			planModeEnabled: () => false,
@@ -865,7 +863,6 @@ describe("AgentSession aside delivery", () => {
 				emitExternalEvent: (event: { message: AgentMessage }) => emitted.push(event.message),
 			} as unknown as Agent,
 			sessionManager: {} as SessionManager,
-			settings: {} as Settings,
 			isDisposed: () => false,
 			isStreaming: () => false,
 			planModeEnabled: () => false,

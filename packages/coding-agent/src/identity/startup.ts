@@ -1,5 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { cfgIdentityEntraEnabled } from "../config/model-settings";
 import { installCoreforgeAwsRecovery } from "./aws-recovery";
 import { CoreforgeIdentityStore, coreforgeIdentityFirstName } from "./coreforge-store";
 import type { CoreforgeEntraConfig } from "./entra";
@@ -29,7 +30,7 @@ export async function ensureCoreforgeIdentityAtStartup(
 		installAwsRecovery?: typeof installCoreforgeAwsRecovery;
 	},
 ): Promise<CoreforgeStartupIdentity> {
-	if (!settings.get("identity.entra.enabled")) {
+	if (!cfgIdentityEntraEnabled.get(settings)) {
 		protectCoreforgeOperationalAwsChildEnvironment();
 		return { notices: [] };
 	}

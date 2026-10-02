@@ -1,4 +1,5 @@
 import type { Settings } from "../config/settings";
+import { cfgIdentityRelayAudience } from "../config/model-settings";
 import { ensureManagedCoreforgeAwsSso } from "./aws-sso";
 import { resolveCoreforgeAwsConfig, resolveCoreforgeAwsSsoConstants } from "./runtime";
 
@@ -36,7 +37,7 @@ async function runCommand(command: string[], interactive: boolean): Promise<AwsC
 
 /** Managed relay audience, absent when upstream/self-hosted omp authentication is disabled. */
 export function resolveRelayIdentityAudience(settings: Settings): string | undefined {
-	const configured = settings.get("identity.relay.audience")?.trim();
+	const configured = cfgIdentityRelayAudience.get(settings)?.trim();
 	if (!configured) return undefined;
 	let parsed: URL;
 	try {

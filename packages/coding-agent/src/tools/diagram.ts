@@ -164,8 +164,8 @@ export class DiagramTool implements AgentTool<typeof diagramSchema, DiagramToolD
 					? `local://${params.out}`
 					: path.join(getArtifactsDir(), params.out)
 				: params.out;
-			enforcePlanModeWrite(this.session, target, { op: "create" });
-			resolvedPath = resolvePlanPath(this.session, target);
+			await enforcePlanModeWrite(this.session, target, { op: "create" });
+			resolvedPath = await resolvePlanPath(this.session, target);
 			const format = params.format ?? "html";
 			await Bun.write(resolvedPath, format === "svg" ? rendered.svg : rendered.html);
 			content.push(

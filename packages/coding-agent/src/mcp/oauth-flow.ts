@@ -10,6 +10,7 @@ import { OAuthCallbackFlow } from "@oh-my-pi/pi-ai/oauth/callback-server";
 import type { OAuthController, OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
+import { CF_BRAND } from "../cli/cf-version";
 import type { OAuthCredential } from "../session/auth-storage";
 import coreforgeHammerSvg from "./coreforge-hammer.svg" with { type: "text" };
 import { buildWellKnownUrls } from "./oauth-discovery";
@@ -245,13 +246,13 @@ function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOption
 		callbackPath: resolveCallbackPath(config.callbackPath, redirectUri),
 		callbackHostname: resolveCallbackHostname(redirectUri),
 		redirectUri,
-		branding: config.clientName?.trim()
-			? {
-					displayName: config.clientName.trim(),
-					iconDataUrl:
-						config.clientName.trim().toLowerCase() === "coreforge" ? COREFORGE_HAMMER_DATA_URL : undefined,
-				}
-			: undefined,
+		branding: {
+			displayName: config.clientName?.trim() || CF_BRAND,
+			iconDataUrl:
+				(config.clientName?.trim() || CF_BRAND).toLowerCase() === "coreforge"
+					? COREFORGE_HAMMER_DATA_URL
+					: undefined,
+		},
 		allowPortFallback,
 	};
 }
@@ -638,7 +639,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 
 		try {
 			const registrationBody: Record<string, unknown> = {
-				client_name: this.config.clientName?.trim() || "oh-my-pi",
+				client_name: this.config.clientName?.trim() || CF_BRAND,
 				redirect_uris: [redirectUri],
 				grant_types: ["authorization_code", "refresh_token"],
 				response_types: ["code"],

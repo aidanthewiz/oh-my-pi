@@ -39,6 +39,7 @@ beforeEach(() => {
 		delete process.env[key];
 	}
 	process.env.ANTHROPIC_AWS_WORKSPACE_ID = "wrkspc_testworkspace01";
+	process.env.ANTHROPIC_AWS_API_KEY = "sk-aws-external-test";
 	clearAwsCredentialCache();
 });
 
@@ -139,6 +140,22 @@ describe("Claude Platform on AWS auth config", () => {
 		expect(options.isOAuthToken).toBe(false);
 	});
 
+	it("ignores a broker-supplied key when the AWS workspace owns the bearer", () => {
+		const options = buildAnthropicClientOptions({
+			model: makeAwsClaudeModel(),
+			apiKey: "broker-oauth-should-not-leave",
+		});
+		expect(headerCaseInsensitive(options.defaultHeaders, "authorization")).toBe(
+			`Bearer ${process.env.ANTHROPIC_AWS_API_KEY}`,
+		);
+
+		delete process.env.ANTHROPIC_AWS_API_KEY;
+		process.env.OMP_MODEL_AWS_AUTH_MODE = "managed";
+		expect(() =>
+			buildAnthropicClientOptions({ model: makeAwsClaudeModel(), apiKey: "broker-oauth-should-not-leave" }),
+		).toThrow("requires a matching API key or AWS credential chain");
+	});
+
 	it("rewrites the endpoint region from AWS_REGION / AWS_DEFAULT_REGION", () => {
 		process.env.AWS_REGION = "eu-west-1";
 		expect(
@@ -155,6 +172,8 @@ describe("Claude Platform on AWS auth config", () => {
 	});
 
 	it("carries no API key or Bearer credential on the SigV4 path (signature is the sole auth)", () => {
+		delete process.env.ANTHROPIC_AWS_API_KEY;
+		process.env.AWS_PROFILE = "unit-test-sigv4";
 		const options = buildAnthropicClientOptions({
 			model: makeAwsClaudeModel(),
 			apiKey: "<authenticated>",
@@ -170,6 +189,7 @@ describe("Claude Platform on AWS auth config", () => {
 	});
 
 	it("SigV4-signs the request with service aws-external-anthropic and signs the workspace header", async () => {
+		delete process.env.ANTHROPIC_AWS_API_KEY;
 		process.env.AWS_REGION = "us-west-2";
 		process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
 		process.env.AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -204,6 +224,7 @@ describe("Claude Platform on AWS auth config", () => {
 	});
 
 	it("invalidates the active named-profile credentials after an authorization failure", async () => {
+		delete process.env.ANTHROPIC_AWS_API_KEY;
 		process.env.AWS_PROFILE = "coreforge-managed";
 		process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
 		process.env.AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";

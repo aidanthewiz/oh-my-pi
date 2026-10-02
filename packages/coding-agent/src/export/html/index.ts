@@ -7,43 +7,11 @@ import type { SessionEntry, SessionHeader } from "../../session/session-entries"
 import { loadEntriesFromFile } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
 import type { ExportThemeNames } from "./args";
-import templateCssPath from "./template.css" with { type: "file" };
-import templateHtmlPath from "./template.html" with { type: "file" };
-import templateJsPath from "./template.js" with { type: "file" };
-// Pre-built React tool renderers: built by `gen:tool-views` (`bun run gen:tool-views`),
-// run automatically by root `prepare` on install and by `prepack` at publish.
-import toolViewsJsPath from "./tool-views.generated.js" with { type: "file" };
-import { webExportThemeVars } from "./web-palette";
+import { getTemplate } from "./template-assets";
+import { webExportThemeStyles, webExportThemeVars } from "./web-palette";
 
 export { type ExportThemeNames, parseExportArgs } from "./args";
-
-let cachedTemplate: string | undefined;
-/** Resolve a Bun file-loader value without parsing Windows drive letters as URL schemes. */
-export function resolveBundledHtmlAssetPath(assetPath: string, moduleDir: string = import.meta.dir): string {
-	if (path.isAbsolute(assetPath) || path.win32.isAbsolute(assetPath)) return assetPath;
-	return path.resolve(moduleDir, assetPath);
-}
-
-/** Compose the standalone export template: minified CSS, tool renderers, and viewer JS inlined. */
-export function getTemplate(): string {
-	if (cachedTemplate) return cachedTemplate;
-	const templateCss = fs.readFileSync(resolveBundledHtmlAssetPath(templateCssPath), "utf8");
-	const templateHtml = fs.readFileSync(resolveBundledHtmlAssetPath(templateHtmlPath as unknown as string), "utf8");
-	const templateJs = fs.readFileSync(resolveBundledHtmlAssetPath(templateJsPath), "utf8");
-	const toolViewsJs = fs.readFileSync(resolveBundledHtmlAssetPath(toolViewsJsPath), "utf8");
-	const minifiedCss = templateCss
-		.replace(/\/\*[\s\S]*?\*\//g, "")
-		.replace(/\s+/g, " ")
-		.replace(/\s*([{}:;,])\s*/g, "$1")
-		.trim();
-	// Function replacements so `$'`, `$&`, `$$`, etc. inside the embedded
-	// CSS/JS are not interpreted as substitution patterns.
-	cachedTemplate = templateHtml
-		.replace("<template-css/>", () => `<style>${minifiedCss}</style>`)
-		.replace("<template-tool-views/>", () => `<script>${toolViewsJs}</script>`)
-		.replace("<template-js/>", () => `<script>${templateJs}</script>`);
-	return cachedTemplate;
-}
+export { getTemplate, resolveBundledHtmlAssetPath } from "./template-assets";
 
 export interface ExportOptions {
 	outputPath?: string;
@@ -158,13 +126,11 @@ export async function generateThemeStyles(
 	themeNames?: ExportThemeNames,
 	legacyThemeName?: string,
 ): Promise<string> {
-	const [dark, light] =
-		palette === "web"
-			? [webExportThemeVars("dark"), webExportThemeVars("light")]
-			: await Promise.all([
-					generateThemeVars("theme", themeNames?.dark ?? legacyThemeName ?? "dark"),
-					generateThemeVars("theme", themeNames?.light ?? legacyThemeName ?? "light"),
-				]);
+	if (palette === "web") return webExportThemeStyles();
+	const [dark, light] = await Promise.all([
+		generateThemeVars("theme", themeNames?.dark ?? legacyThemeName ?? "dark"),
+		generateThemeVars("theme", themeNames?.light ?? legacyThemeName ?? "light"),
+	]);
 	return [
 		`:root, :root[data-theme="dark"] { color-scheme: dark; ${dark} }`,
 		`:root[data-theme="light"] { color-scheme: light; ${light} }`,

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { MANAGED_CONFIG_FILE_ENV, MANAGED_CONFIG_FILENAME, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgSetupVersion } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -97,6 +98,40 @@ describe("Settings managed overlay", () => {
 		expect(settings.getModelRole("default")).toBe("anthropic-aws/org-pinned");
 	});
 
+	it("reports effective project and managed ownership for settings, model roles, and extension roots", async () => {
+		await writeGlobal({
+			setupVersion: 1,
+			extensions: ["../global-ext"],
+			modelRoles: { default: "anthropic/global" },
+		});
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify(
+				{ setupVersion: 2, extensions: ["../project-ext"], modelRoles: { default: "openai/project" } },
+				null,
+				2,
+			),
+		);
+
+		const project = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+		expect(cfgSetupVersion.get(project)).toBe(2);
+		expect(cfgSetupVersion.provenance(project)).toBe("project");
+		expect(project.getModelRoleProvenance("default")).toBe("project");
+		expect(project.extensionsSourceLevel()).toBe("project");
+
+		await writeManaged({
+			setupVersion: 3,
+			extensions: ["../managed-ext"],
+			modelRoles: { default: "anthropic-aws/org-pinned" },
+		});
+		const managed = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+		expect(cfgSetupVersion.get(managed)).toBe(3);
+		expect(cfgSetupVersion.provenance(managed)).toBe("managed");
+		expect(managed.getModelRole("default")).toBe("anthropic-aws/org-pinned");
+		expect(managed.getModelRoleProvenance("default")).toBe("managed");
+		expect(managed.extensionsSourceLevel()).toBe("user");
+	});
+
 	it("overrides --config CLI overlays", async () => {
 		const overlayPath = tempDir.join("overlay.yml");
 		await Bun.write(overlayPath, YAML.stringify({ modelRoles: { default: "openai/cli-model" } }, null, 2));
@@ -133,7 +168,7 @@ describe("Settings managed overlay", () => {
 		await writeManaged({ modelRoles: { default: "anthropic-aws/org-pinned" } });
 
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
-		settings.set("setupVersion", 3);
+		cfgSetupVersion.set(settings, 3);
 		await settings.flush();
 
 		const managedRaw = YAML.parse(await Bun.file(managedPath()).text()) as Record<string, unknown>;

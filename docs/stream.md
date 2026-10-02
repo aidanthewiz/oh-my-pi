@@ -6,7 +6,7 @@ Stream is independent from [Collab](collab.md). Collab replicates the session it
 
 ## Quick start
 
-Streaming needs a Stencil-compatible account on the selected server. Sign in once from any Coreforge session with `/login` → **Stencil (stencil.so account)**; the credential is stored with your other logins and refreshed automatically. For scripts and local development, `STENCIL_API_KEY=<token>` overrides the stored credential; `STENCIL_AUTH_URL` re-bases the sign-in and `STENCIL_BASE_URL` the Stencil API.
+Streaming needs a Stencil-compatible account on the selected server. Sign in once from any Coreforge session with `/login` → **Stencil (stencil.so account)**; the credential is stored with your other logins and refreshed automatically. For scripts and local development, `STENCIL_API_KEY=<token>` overrides the stored credential; `STENCIL_AUTH_URL` re-bases sign-in and `STENCIL_BASE_URL` the Stencil API for a local server.
 
 Your Stencil username is the channel. The server derives it from the bearer token, so `coreforge stream` takes no channel argument.
 
@@ -23,9 +23,11 @@ prints
   waiting for sessions in /work/proj …
 ```
 
-Then start Coreforge in the same directory from another terminal. Each session started while `coreforge stream` runs attaches automatically and shows `● LIVE 3` in its footer (`3` = current viewers). The viewer page shows each session as its own pane; a pane disappears when its session exits. Ctrl-C in the streamer ends the broadcast and every attached session drops its badge.
+Then start interactive Coreforge in the same directory from another terminal (as many times as you like). Each interactive session started while `coreforge stream` runs attaches automatically and shows `● LIVE 3` in its footer (`3` = current viewers). The viewer page shows each session as its own pane; a pane disappears when its session exits. Ctrl-C in the streamer ends the broadcast and every attached session drops its badge.
 
 Sessions that were already running before `coreforge stream` started are not attached. Restart them.
+
+Only one `omp stream` process can listen for a given directory, and the server rejects a second live host for the same channel. If the remote connection drops, the streamer reconnects and replays each pane's current viewport and bounded history; it does not replay missed chat.
 
 ### Streamer console
 
@@ -38,14 +40,14 @@ On a terminal, `coreforge stream` is a full-screen chat console: header with the
 | `/quit`, Ctrl-C  | Stop streaming (sessions detach, channel goes offline)  |
 | Up / Down        | Recall previous messages                                |
 
-`--no-tui` (or a non-TTY stdout/stdin) falls back to a line log where stdin lines are chat.
+`--no-tui` (or a non-TTY stdout/stdin) falls back to a line log where stdin lines are chat (`/title` is still recognized; `/quit` is TUI-only). Ctrl-C stops either console.
 
 ### Options and settings
 
 | Flag / setting            | Meaning                                                                          |
 | ------------------------- | -------------------------------------------------------------------------------- |
 | Channel                   | Your Stencil username, derived by the server from the bearer token               |
-| `--title <text>`          | Stream title (default: directory name)                                           |
+| `--title <text>`          | Stream title (default: directory name; maximum 120 characters)                   |
 | `--server <url>`          | Stream server base; required unless `stream.serverUrl` is configured              |
 | `--no-tui`                | Line-log console instead of the full-screen chat                                 |
 | `STENCIL_API_KEY`         | Bearer token override; otherwise the `/login` Stencil credential is used         |
@@ -54,14 +56,14 @@ On a terminal, `coreforge stream` is a full-screen chat console: header with the
 
 ## What leaves the machine
 
-Only terminal rows. The session process:
+The screen feed contains terminal rows and pane metadata (title and dimensions), not session entries. Chat is a separate message channel. The session process:
 
 1. Takes the rows the TUI just painted (scrollback commits and the live viewport).
 2. Strips every escape except text styling (SGR) and hyperlinks (OSC 8); inline images become `[image]`.
 3. **Redacts** the row (below).
 4. Diffs against the last sent viewport and sends row patches — never session entries, prompts, tool arguments, or file contents as data.
 
-Rows cross a private local socket (`0600`, under the per-directory Coreforge runtime dir) to the `coreforge stream` process, which multiplexes sessions into panes and forwards them to the configured server in plaintext over WSS. The server keeps each pane's viewport and the last 2000 history rows in memory so late viewers get a snapshot; nothing is persisted.
+Rows cross a private local Unix socket (`0600`, under the per-directory Coreforge runtime dir; a named pipe on Windows) to the `coreforge stream` process, which multiplexes sessions into panes and forwards JSON screen frames to the configured server over WSS when using HTTPS. Custom `http`/`ws` servers use unencrypted WS. The server keeps each pane's viewport and the last 2000 history rows in memory so late viewers get a snapshot; nothing is persisted.
 
 ### Redaction
 
@@ -76,7 +78,7 @@ Redaction is irreversible and intentionally over-matches. Any match replaces the
 
 Known plain values are also matched by prefix (6+ characters) so a partially typed secret is masked before it is complete.
 
-Redaction cannot know about secrets it has never seen: a token pasted from elsewhere that matches no shape and no configured value is shown. Use `stream.redactPatterns` or `secrets.yml` for anything unusual, and prefer pausing: viewers of a paused pane see a `BRB` card.
+Redaction cannot know about secrets it has never seen: a token pasted from elsewhere that matches no shape and no configured value is shown. Use `stream.redactPatterns` or `secrets.yml` for anything unusual. Editing `stream.redactPatterns` during a live session reloads the redactor and repaints its viewport; it cannot retract previously sent rows. Chat messages are sent separately and are not passed through terminal-row redaction.
 
 ## Recording
 
@@ -89,7 +91,7 @@ coreforge play                      # newest recording
 coreforge play <file> -s 2 -i 1     # 2× speed, pauses capped at 1s
 ```
 
-Playback runs on the normal screen: the recorded viewport occupies the bottom of the terminal and recorded scrollback scrolls into your terminal's scrollback, so the output stays after playback ends. Space pauses/resumes; `q`, Esc, or Ctrl-C quits.
+Playback requires an interactive terminal and runs on the normal screen: the recorded viewport occupies the bottom of the terminal and recorded scrollback scrolls into your terminal's scrollback, so the output stays after playback ends. Space pauses/resumes; `q`, Esc, or Ctrl-C quits.
 
 ### Clips
 
@@ -98,7 +100,7 @@ coreforge clip                                          # newest recording
 coreforge clip <file> -t "Streaming the lexer" -d "…"   # title and description
 ```
 
-`coreforge clip` uploads a recording to the configured stream server with the same Stencil credential as `coreforge stream` and prints its public page URL. The page plays the clip in the live viewer's terminal pane, with the title, description, and a comment thread underneath; signing in with Stencil lets viewers comment and the owner edit the title and description. Rows were already redacted when recorded; nothing is re-read from your machine at upload time.
+`coreforge clip` uploads a recording to the configured stream server with the same Stencil credential as `coreforge stream` and prints its public page URL. `--server <url>` overrides `stream.serverUrl`; titles are limited to 120 characters and descriptions to 5000. The page plays the clip in the live viewer's terminal pane, with the title, description, and a comment thread underneath; signing in with Stencil lets viewers comment and the owner edit the title and description. Rows were already redacted when recorded; nothing is re-read from your machine at upload time.
 
 ## Server
 

@@ -1,5 +1,12 @@
 import * as path from "node:path";
-import { type ApiKeyResolver, type FetchImpl, getEnvApiKey, type UsageProvider } from "@oh-my-pi/pi-ai";
+import {
+	type ApiKeyResolver,
+	type FetchImpl,
+	getEnvApiKey,
+	type ResolvedApiKey,
+	type UsageProvider,
+} from "@oh-my-pi/pi-ai";
+import type { AuthApiKeyOptions } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
@@ -23,7 +30,7 @@ import {
 	resolveMaxContextWindow,
 } from "@oh-my-pi/pi-catalog/compat/context-window";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "@oh-my-pi/pi-catalog/identity/metrics";
-import { readModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { getModelCacheWriteStats, readModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	createModelManager,
 	fingerprintStaticModels,
@@ -135,10 +142,15 @@ import {
 import type { ModelOverride, ModelsConfig, ProviderAuthMode } from "./models-config-schema";
 import { type Settings, settings } from "./settings";
 
+import { cfgDisabledProviders } from "./model-settings";
+import { cfgExtendedContext } from "../session/context-settings";
+
 // DeviceCheck attestation (`x-oai-attestation`) for ChatGPT-OAuth Codex
 // requests; the pi-ai provider resolves it just-in-time per request.
 setCodexAttestationProvider(generateCodexAttestation);
 
+/** One built-in discovery pass rewriting more payload rows than this is debug-logged. */
+const MODEL_CACHE_REWRITE_LOG_THRESHOLD = 5;
 const BUILT_IN_MODEL_MANAGER_PROVIDER_IDS: Readonly<Record<string, true>> = Object.freeze(
 	Object.fromEntries(
 		[...PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId), ...SPECIAL_MODEL_MANAGER_PROVIDER_IDS].map(
@@ -199,7 +211,7 @@ type ModifyModelsHook = (models: Model<Api>[], credentials: OAuthCredentials) =>
 
 function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<string> {
 	try {
-		return new Set((settingsInstance ?? settings).get("disabledProviders"));
+		return new Set(cfgDisabledProviders.get(settingsInstance ?? settings));
 	} catch {
 		return new Set();
 	}
@@ -214,7 +226,7 @@ function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<st
  */
 function isExtendedContextEnabledFromSettings(settingsInstance?: Settings): boolean {
 	try {
-		return (settingsInstance ?? settings).get("extendedContext");
+		return cfgExtendedContext.get(settingsInstance ?? settings);
 	} catch {
 		return false;
 	}
@@ -293,7 +305,8 @@ export class ModelRegistry {
 	// Runtime extension model overlays — persist across refresh() cycles so that
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
-	#runtimeProviderApiKeys: Map<string, string> = new Map();
+	// `fallback` ranks the key below stored login credentials (see registerProvider).
+	#runtimeProviderApiKeys: Map<string, { keyConfig: string; fallback: boolean }> = new Map();
 	#runtimeProviderCustomApiIds: Map<string, string> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
 	// Command-backed values from registerProvider (apiKey + provider/model
@@ -398,9 +411,9 @@ export class ModelRegistry {
 		this.#reloadStaticModels();
 	}
 
-	#installProviderApiKey(provider: string, keyConfig: string): void {
+	#installProviderApiKey(provider: string, keyConfig: string, options?: { fallback?: boolean }): void {
 		this.#customProviderApiKeys.set(provider, keyConfig);
-		this.authStorage.setConfigApiKey(provider, keyConfig);
+		this.authStorage.keys.setConfig(provider, keyConfig, options);
 	}
 
 	/**
@@ -447,7 +460,7 @@ export class ModelRegistry {
 		);
 		this.#cacheDbPath =
 			options?.cacheDbPath ?? (modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined);
-		this.authStorage.setConfigValueResolver(resolveConfigValue);
+		this.authStorage.keys.setResolver(resolveConfigValue);
 		// Load config and cache-backed layers synchronously in the constructor.
 		this.#loadModels();
 	}
@@ -558,10 +571,32 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Catch the catalog up for a view that just read it, rebuilding only when it
+	 * is actually stale: waits out an in-flight background refresh, then runs an
+	 * offline {@link refresh} if models.yml changed on disk since the last load.
+	 * Resolves `true` when either may have changed the catalog (the view should
+	 * re-read it), `false` without any rebuild when the in-memory catalog is
+	 * already current. Rejects when the offline rebuild fails.
+	 */
+	async refreshIfStale(): Promise<boolean> {
+		let changed = false;
+		if (this.#backgroundRefresh) {
+			await this.#backgroundRefresh;
+			changed = true;
+		}
+		if (this.#staticModelsMtimeSignature() !== this.#lastStaticLoadMtime) {
+			await this.refresh("offline");
+			changed = true;
+		}
+		return changed;
+	}
+
+	/**
 	 * Resolve once the initial background discovery has settled, arming a waiter
 	 * even when the refresh has not started yet. In the CLI path
-	 * {@link refreshInBackground} runs right after the session is constructed
-	 * (`main.ts`), so a consumer created in the constructor cannot rely on an
+	 * {@link refreshInBackground} runs after the session is constructed
+	 * (`main.ts`; interactive mode waits for the first frame), so a consumer
+	 * created in the constructor cannot rely on an
 	 * in-flight snapshot — it must observe the settle whenever it happens.
 	 * Resolves immediately once any background refresh has completed; never
 	 * rejects (discovery errors are swallowed by `refreshInBackground`). Stays
@@ -623,14 +658,10 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Refresh only the named discovery-backed providers, leaving every other
-	 * provider's discovered models and any in-flight runtime discovery untouched.
-	 *
-	 * Unlike {@link refreshProvider}, this does no static reload and never
-	 * re-fetches the other runtime managers, so restoring a saved
-	 * discovery-backed model (e.g. on `omp --resume`) cannot wait on — or
-	 * duplicate — an unrelated provider's network/OAuth work. Ids that are not
-	 * configured discovery providers are ignored by the underlying filter.
+	 * Refresh only named discovery providers (configured `models.yml` providers or
+	 * extension `fetchDynamicModels` managers). Unlike {@link refreshProvider},
+	 * this avoids a static reload and leaves unrelated runtime discovery alone.
+	 * Unknown ids have no effect.
 	 */
 	async refreshDiscoverableProviders(
 		providerIds: Iterable<string>,
@@ -810,11 +841,11 @@ export class ModelRegistry {
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
-		this.authStorage.clearConfigApiKeys();
+		this.authStorage.keys.clearConfig();
 		// Restore runtime API keys before #loadModels — survives because
 		// #loadModels only calls .set() on #customProviderApiKeys, never reassigns it.
-		for (const [k, v] of this.#runtimeProviderApiKeys) {
-			this.#installProviderApiKey(k, v);
+		for (const [provider, { keyConfig, fallback }] of this.#runtimeProviderApiKeys) {
+			this.#installProviderApiKey(provider, keyConfig, { fallback });
 		}
 		this.#providerOverrides.clear();
 		this.#modelOverrides.clear();
@@ -971,7 +1002,7 @@ export class ModelRegistry {
 		if (this.#runtimeModelModifiers.size === 0) return models;
 		let projected = models;
 		for (const [providerName, modifyModels] of this.#runtimeModelModifiers) {
-			const credential = this.authStorage.getOAuthCredential(providerName);
+			const credential = this.authStorage.credentials.getOAuth(providerName);
 			if (!credential) continue;
 			try {
 				// Clone mutable catalog data, retaining resolver functions as opaque
@@ -1173,7 +1204,7 @@ export class ModelRegistry {
 				const discoveryExpected =
 					sharedCatalogProvider ||
 					(descriptor !== undefined &&
-						(this.authStorage.hasAuth(providerId) ||
+						(this.authStorage.keys.source(providerId) !== undefined ||
 							descriptor.allowUnauthenticated === true ||
 							this.#keylessProviders.has(providerId)));
 				if (discoveryExpected) {
@@ -1465,9 +1496,24 @@ export class ModelRegistry {
 				optional: !Bun.env.LLAMA_CPP_BASE_URL,
 			});
 			// Only mark as keyless if no API key is configured
-			if (!this.authStorage.hasAuth("llama.cpp")) {
+			if (this.authStorage.keys.source("llama.cpp") === undefined) {
 				this.#keylessProviders.add("llama.cpp");
 			}
+		}
+		if (
+			process.platform === "darwin" &&
+			process.arch === "arm64" &&
+			!configuredProviders.has("apple") &&
+			!disabledProviders.has("apple")
+		) {
+			this.#discoverableProviders.push({
+				provider: "apple",
+				api: "apple-foundation-models",
+				baseUrl: "local://apple-foundation-models",
+				discovery: { type: "apple-foundation-models" },
+				optional: true,
+			});
+			this.#keylessProviders.add("apple");
 		}
 		if (!configuredProviders.has("lm-studio") && !disabledProviders.has("lm-studio")) {
 			this.#discoverableProviders.push({
@@ -1818,8 +1864,12 @@ export class ModelRegistry {
 	}
 
 	#isDiscoveryCacheOlderThanModelsConfig(cacheUpdatedAt: number): boolean {
-		const configMtime = this.#modelsConfigFile.getMtimeMs();
-		return configMtime !== null && cacheUpdatedAt < Math.floor(configMtime);
+		const userMtime = this.#modelsConfigFile.getMtimeMs();
+		const managedMtime = this.#managedModelsConfigFile.getMtimeMs();
+		return (
+			(userMtime !== null && cacheUpdatedAt < Math.floor(userMtime)) ||
+			(managedMtime !== null && cacheUpdatedAt < Math.floor(managedMtime))
+		);
 	}
 
 	async #discoverProviderModels(
@@ -1836,7 +1886,7 @@ export class ModelRegistry {
 			effectiveStrategy === "online" || (effectiveStrategy === "online-if-uncached" && cached === null);
 		const requiresAuth = !this.#keylessProviders.has(providerConfig.provider);
 		if (requiresAuth && willFetch) {
-			const apiKey = await this.#peekApiKeyForProvider(providerConfig.provider);
+			const apiKey = await this.#peekApiKeyForProvider(providerConfig.provider, providerConfig.baseUrl);
 			if (!isAuthenticated(apiKey)) {
 				this.#providerDiscoveryStates.set(providerConfig.provider, {
 					provider: providerConfig.provider,
@@ -1863,7 +1913,7 @@ export class ModelRegistry {
 				const requestConfig = { ...providerConfig, headers: resolvedHeaders };
 				const models = this.#applyProviderModelOverrides(
 					providerId,
-					await discoverModelsByProviderType(requestConfig, this.#discoveryContext()),
+					await discoverModelsByProviderType(requestConfig, this.#discoveryContext(providerConfig.baseUrl)),
 				);
 				this.#lastDiscoveryWarnings.delete(providerId);
 				return models.map(toModelSpec);
@@ -1937,15 +1987,15 @@ export class ModelRegistry {
 		};
 	}
 
-	#discoveryContext(): DiscoveryContext {
+	#discoveryContext(baseUrl?: string): DiscoveryContext {
 		return {
 			fetch: this.#fetch,
 			getBearerApiKeyResolver: async provider => {
-				const apiKey = await this.getApiKeyForProvider(provider);
+				const apiKey = await this.getApiKeyForProvider(provider, undefined, { baseUrl });
 				if (!isDiscoveryBearerApiKey(apiKey)) {
 					return undefined;
 				}
-				return this.resolver(provider);
+				return this.resolver(provider, { baseUrl });
 			},
 		};
 	}
@@ -1984,9 +2034,23 @@ export class ModelRegistry {
 		if (managerOptions.length === 0) {
 			return { models: [], authoritativeProviders: new Set(), replaceRuntimeProviders: new Set() };
 		}
+		const writesBefore = getModelCacheWriteStats();
 		const discoveries = await Promise.all(
 			managerOptions.map(options => this.#discoverWithModelManager(options, strategy)),
 		);
+		const writesAfter = getModelCacheWriteStats();
+		const rewrittenRows = writesAfter.payloadWrites - writesBefore.payloadWrites;
+		if (rewrittenRows > MODEL_CACHE_REWRITE_LOG_THRESHOLD) {
+			// Unchanged snapshots only advance a small freshness row; a burst of
+			// full payload rewrites means catalogs really changed (or a cache
+			// policy switch replaced them) and is worth seeing in debug logs.
+			logger.debug("model refresh rewrote many model cache rows", {
+				rows: rewrittenRows,
+				bytes: writesAfter.payloadBytes - writesBefore.payloadBytes,
+				providers: writesAfter.recentPayloadProviders.slice(-rewrittenRows),
+				strategy,
+			});
+		}
 		const authoritativeProviders = new Set<string>();
 		const replaceRuntimeProviders = new Set<string>();
 		const models: Model<Api>[] = [];
@@ -2008,7 +2072,9 @@ export class ModelRegistry {
 		cacheProviderId: string,
 		authoritative: boolean,
 	): Promise<string | undefined> {
-		const peekedKey = await this.#peekApiKeyForProvider(providerId);
+		const baseUrl = this.#descriptorBaseUrl(providerId);
+		const peekedKey = await this.#peekApiKeyForProvider(providerId, baseUrl);
+		if (getProviderDefinition(providerId)?.requestEnvironmentOwnsCredential?.({ baseUrl })) return peekedKey;
 		if (isAuthenticated(peekedKey) || strategy === "offline") {
 			return peekedKey;
 		}
@@ -2037,7 +2103,7 @@ export class ModelRegistry {
 			}
 		}
 		try {
-			return await this.getApiKeyForProvider(providerId);
+			return await this.getApiKeyForProvider(providerId, undefined, { baseUrl });
 		} catch (error) {
 			logger.debug("OAuth refresh failed during model discovery preflight", {
 				provider: providerId,
@@ -2147,7 +2213,8 @@ export class ModelRegistry {
 				descriptor.providerId === "vllm" &&
 				(this.#runtimeProviderOverrides.has(descriptor.providerId) ||
 					this.#providerOverrides.has(descriptor.providerId) ||
-					this.#keylessProviders.has(descriptor.providerId));
+					this.#keylessProviders.has(descriptor.providerId) ||
+					this.authStorage.keys.keyless(descriptor.providerId));
 			const supportsSharedCatalog = MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[descriptor.providerId] === true;
 			const canUseSharedCatalogWithoutAuth = supportsSharedCatalog && !descriptor.dynamicModelsAuthoritative;
 			if (
@@ -2156,10 +2223,18 @@ export class ModelRegistry {
 				hasExplicitVllmConfig ||
 				canUseSharedCatalogWithoutAuth
 			) {
+				// Residency belongs to the token selected for discovery, not another
+				// stored account that happens to appear first in the pool.
+				const identity = getOAuthCredentialsForProvider(this.authStorage, descriptor.providerId).find(
+					credential => credential.access === apiKey,
+				);
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
+					region: identity?.region,
+					inferenceRegion: identity?.inferenceRegion,
+					orgId: identity?.orgId,
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??
@@ -2486,50 +2561,58 @@ export class ModelRegistry {
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
 		const extendedContext = isExtendedContextEnabledFromSettings(this.#settings);
 		return models.map(model => {
-			const maximum = resolveMaxContextWindow(model);
-			if (maximum !== undefined && model.contextWindow !== null) {
-				// Only extended-window models need a fresh policy baseline: a
-				// materialized cache row may carry an earlier applied window.
-				// Preserve valid standard capacity when an advertised maximum is
-				// smaller, without retaining an obsolete extended window.
-				const standardWindow = buildModel(toModelSpec(model)).contextWindow ?? model.contextWindow;
-				if (extendedContext) {
-					const window = Math.max(standardWindow, maximum);
-					if (window !== model.contextWindow) {
-						model = applyModelOverride(model, { contextWindow: window });
-					}
-				} else if (standardWindow < model.contextWindow) {
-					model = { ...model, contextWindow: standardWindow };
-				}
-			}
-			// Extended context off: cap models with a premium long-context price
-			// tier (e.g. GPT-5.6 bills 2x input above 272K) at the standard-pricing
-			// threshold so compaction fires before a request crosses into the tier.
-			// xai-oauth carries public xAI prices only for API-equivalent stats;
-			// SuperGrok requests remain subscription-backed, so its estimated tier
-			// must not constrain the runtime context window. Explicit per-model
-			// `contextWindow` overrides reapply later in composition and win over
-			// this cap.
-			if (!extendedContext && model.provider !== "xai-oauth") {
-				const threshold = model.cost.longContext?.inputThreshold;
-				if (threshold !== undefined && model.contextWindow !== null && model.contextWindow > threshold) {
-					model = applyModelOverride(model, { contextWindow: threshold });
-				}
-			}
+			// Hosts whose context window is authoritative (subscription limits that
+			// carry public price tiers only as estimates) skip every inferred
+			// window policy.
+			if (!model.contextWindowAuthoritative) model = this.#applyContextWindowPolicies(model, extendedContext);
 			if (model.provider === "ollama-cloud" && model.omitMaxOutputTokens !== true) {
 				model = applyModelOverride(model, { omitMaxOutputTokens: true });
 			}
-			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
-				return model;
+			return model;
+		});
+	}
+
+	#applyContextWindowPolicies(model: Model<Api>, extendedContext: boolean): Model<Api> {
+		const maximum = resolveMaxContextWindow(model);
+		if (maximum !== undefined && model.contextWindow !== null) {
+			// Only extended-window models need a fresh policy baseline: a
+			// materialized cache row may carry an earlier applied window.
+			// Preserve valid standard capacity when an advertised maximum is
+			// smaller, without retaining an obsolete extended window.
+			const standardWindow = buildModel(toModelSpec(model)).contextWindow ?? model.contextWindow;
+			if (extendedContext) {
+				const window = Math.max(standardWindow, maximum);
+				if (window !== model.contextWindow) {
+					model = applyModelOverride(model, { contextWindow: window });
+				}
+			} else if (standardWindow < model.contextWindow) {
+				model = { ...model, contextWindow: standardWindow };
 			}
-			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
-			if (!overrides) {
-				return applyModelOverride(model, { contextWindow: 1_000_000 });
+		}
+		// Extended context off: cap models with a premium long-context price
+		// tier (e.g. GPT-5.6 bills 2x input above 272K) at the standard-pricing
+		// threshold so compaction fires before a request crosses into the tier.
+		// xai-oauth carries public xAI prices only for API-equivalent stats;
+		// SuperGrok requests remain subscription-backed, so its estimated tier
+		// must not constrain the runtime context window. Explicit per-model
+		// `contextWindow` overrides reapply later in composition and win over
+		// this cap.
+		if (!extendedContext && model.provider !== "xai-oauth") {
+			const threshold = model.cost.longContext?.inputThreshold;
+			if (threshold !== undefined && model.contextWindow !== null && model.contextWindow > threshold) {
+				model = applyModelOverride(model, { contextWindow: threshold });
 			}
-			return applyModelOverride(model, {
-				contextWindow: overrides.contextWindow ?? 1_000_000,
-				...overrides,
-			});
+		}
+		if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
+			return model;
+		}
+		const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
+		if (!overrides) {
+			return applyModelOverride(model, { contextWindow: 1_000_000 });
+		}
+		return applyModelOverride(model, {
+			contextWindow: overrides.contextWindow ?? 1_000_000,
+			...overrides,
 		});
 	}
 
@@ -2618,10 +2701,11 @@ export class ModelRegistry {
 					disabled: disabledProviders.has(model.provider),
 					authenticated:
 						this.#keylessProviders.has(model.provider) ||
-						this.authStorage.hasKeylessPlaceholder(model.provider) ||
-						(hasRequestEnvironmentResolver
-							? this.authStorage.hasNonEnvCredential(model.provider)
-							: this.authStorage.hasAuth(model.provider)),
+						this.authStorage.keys.keyless(model.provider) ||
+						this.authStorage.keys.source(
+							model.provider,
+							hasRequestEnvironmentResolver ? { env: "none" } : undefined,
+						) !== undefined,
 					hasRequestEnvironmentResolver,
 				};
 				byProvider.set(model.provider, state);
@@ -2685,10 +2769,11 @@ export class ModelRegistry {
 	 *
 	 * Cross-provider env aliases count here (`xai-oauth` can borrow `XAI_API_KEY`)
 	 * so an explicit `xai-oauth/…` selector does not fail with "No API key".
-	 * Default-model availability still uses {@link AuthStorage.hasAuth}, which
+	 * Default-model availability still uses {@link AuthStorage.keys.source}, which
 	 * ignores that alias so SuperGrok is not auto-selected from a paid key.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		if (this.#isProviderDisabled(model.provider)) return false;
 		const context = { baseUrl: model.baseUrl, modelId: model.id };
 		const definition = getProviderDefinition(model.provider);
 		if (definition?.requestEnvironmentOwnsCredential?.(context)) {
@@ -2698,8 +2783,9 @@ export class ModelRegistry {
 		return (
 			keyConfig !== undefined ||
 			this.#keylessProviders.has(model.provider) ||
-			this.authStorage.hasNonEnvCredential(model.provider) ||
-			getEnvApiKey(model.provider, context) !== undefined
+			this.authStorage.keys.source(model.provider, { env: "aliases" }) !== undefined ||
+			getEnvApiKey(model.provider, context) !== undefined ||
+			this.authStorage.keys.keyless(model.provider)
 		);
 	}
 
@@ -2709,13 +2795,17 @@ export class ModelRegistry {
 	 * self-resolving AWS/Vertex sentinel that only signals an ambient credential
 	 * *source* exists. Default-model auto-selection prefers concretely-authed
 	 * providers so an ambiently-available Bedrock/Vertex provider never displaces
-	 * the provider the user actually signed into. See {@link AuthStorage.hasConcreteAuth}
+	 * the provider the user actually signed into. See {@link AuthStorage.keys.source}
 	 * and issue #9967.
 	 */
 	hasConcreteAuth(provider: string): boolean {
+		if (this.#isProviderDisabled(provider)) return false;
 		const keyConfig = this.#customProviderApiKeys.get(provider);
 		return (
-			keyConfig !== undefined || this.#keylessProviders.has(provider) || this.authStorage.hasConcreteAuth(provider)
+			keyConfig !== undefined ||
+			this.#keylessProviders.has(provider) ||
+			this.authStorage.keys.source(provider)?.concrete === true ||
+			this.authStorage.keys.keyless(provider)
 		);
 	}
 
@@ -2735,6 +2825,18 @@ export class ModelRegistry {
 		return this.#discoverableProviders
 			.filter(provider => !disabledProviders.has(provider.provider))
 			.map(provider => provider.provider);
+	}
+
+	/** Canonical id of a configured or extension-backed discovery provider. */
+	getDiscoveryProviderId(requestedId: string): string | undefined {
+		const normalized = requestedId.toLowerCase();
+		for (const { provider } of this.#discoverableProviders) {
+			if (provider.toLowerCase() === normalized) return provider;
+		}
+		for (const provider of this.#runtimeModelManagers.keys()) {
+			if (provider.toLowerCase() === normalized) return provider;
+		}
+		return undefined;
 	}
 
 	/**
@@ -2778,10 +2880,19 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Find a model by provider and ID.
+	 * Find a model by provider and ID. A provider disabled in settings has no
+	 * models to find: every caller that falls back to a literal lookup when
+	 * availability-filtered resolution misses (retry fallback candidates,
+	 * advisors, restored and CLI models) would otherwise reach it anyway.
 	 */
 	find(provider: string, modelId: string): Model<Api> | undefined {
+		if (this.#isProviderDisabled(provider)) return undefined;
 		return resolveProviderModelReference(provider, modelId, this.#modelsForProviderLookup(provider));
+	}
+
+	/** Whether settings disable `provider` (`disabledProviders`). */
+	#isProviderDisabled(provider: string): boolean {
+		return getDisabledProviderIdsFromSettings(this.#settings).has(provider);
 	}
 
 	/**
@@ -2833,19 +2944,30 @@ export class ModelRegistry {
 		return model.headers ? { ...model.headers } : undefined;
 	}
 
-	/**
-	 * Get API key for a model.
-	 */
+	#isKeylessProvider(provider: string, context: { baseUrl?: string; modelId?: string } = {}): boolean {
+		return (
+			!getProviderDefinition(provider)?.requestEnvironmentOwnsCredential?.(context) &&
+			(this.#keylessProviders.has(provider) || this.authStorage.keys.keyless(provider)) &&
+			this.authStorage.keys.source(provider) === undefined
+		);
+	}
+
+	/** Resolve a model's request credential or the no-auth sentinel. */
 	async getApiKey(
 		model: Model<Api>,
 		sessionId?: string,
 		options?: { signal?: AbortSignal },
 	): Promise<string | undefined> {
+		// Disabled providers never resolve a credential, even for restored models.
+		if (this.#isProviderDisabled(model.provider)) return undefined;
 		const context = { baseUrl: model.baseUrl, modelId: model.id, signal: options?.signal };
-		if (this.#keylessProviders.has(model.provider) && !this.authStorage.hasAuth(model.provider)) {
+		if (this.#isKeylessProvider(model.provider, context)) {
 			return kNoAuth;
 		}
-		return this.authStorage.getApiKey(model.provider, sessionId, context);
+		return this.authStorage.keys.get(model.provider, sessionId, {
+			...context,
+			accountIds: model.accountAccess && Object.keys(model.accountAccess),
+		});
 	}
 
 	/** Resolve request authentication through the historical Pi extension facade. */
@@ -2863,7 +2985,7 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Get API key for a provider (e.g., "openai").
+	 * Resolve a provider's request credential or the no-auth sentinel.
 	 *
 	 * `options.forceRefresh` powers step (b) of the auth-retry policy — it
 	 * re-mints the session-sticky OAuth token even when the cached copy still
@@ -2872,19 +2994,30 @@ export class ModelRegistry {
 	async getApiKeyForProvider(
 		provider: string,
 		sessionId?: string,
-		options?: { baseUrl?: string; modelId?: string; forceRefresh?: boolean; signal?: AbortSignal },
+		options?: AuthApiKeyOptions,
 	): Promise<string | undefined> {
+		return (await this.getApiKeyWithCredentialForProvider(provider, sessionId, options))?.apiKey;
+	}
+
+	async getApiKeyWithCredentialForProvider(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+	): Promise<ResolvedApiKey | undefined> {
+		if (this.#isProviderDisabled(provider)) return undefined;
 		if (options?.forceRefresh) this.#invalidateProviderCommandConfigs(provider);
-		const context = {
+		if (this.#isKeylessProvider(provider, { baseUrl: options?.baseUrl, modelId: options?.modelId })) {
+			return { apiKey: kNoAuth };
+		}
+		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;
+		return this.authStorage.keys.getWithCredential(provider, sessionId, {
 			baseUrl: options?.baseUrl,
 			modelId: options?.modelId,
+			accountIds: accountAccess && Object.keys(accountAccess),
 			forceRefresh: options?.forceRefresh,
+			refreshReason: options?.refreshReason,
 			signal: options?.signal,
-		};
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.getApiKey(provider, sessionId, context);
+		});
 	}
 
 	/**
@@ -2908,18 +3041,18 @@ export class ModelRegistry {
 		});
 	}
 
-	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.peekApiKey(provider);
+	async #peekApiKeyForProvider(provider: string, baseUrl?: string): Promise<string | undefined> {
+		if (this.#isProviderDisabled(provider)) return undefined;
+		const context = { baseUrl };
+		if (this.#isKeylessProvider(provider, context)) return kNoAuth;
+		return this.authStorage.keys.peek(provider, context);
 	}
 
 	/**
 	 * Check if a model is using OAuth credentials (subscription).
 	 */
 	isUsingOAuth(model: Model<Api>): boolean {
-		return this.authStorage.hasOAuth(model.provider);
+		return this.authStorage.credentials.hasOAuth(model.provider);
 	}
 
 	#clearRuntimeProviderState(providerName: string): void {
@@ -2946,8 +3079,8 @@ export class ModelRegistry {
 			this.#providerDiscoveryStates.delete(providerName);
 		}
 		this.#invalidateProviderModelCache(providerName);
-		this.authStorage.removeConfigApiKey(providerName);
-		this.authStorage.removeRuntimeUsageProvider(providerName);
+		this.authStorage.keys.removeConfig(providerName);
+		this.authStorage.usage.removeProvider(providerName);
 	}
 
 	#unregisterProviderCustomApi(providerName: string, sourceId: string): void {
@@ -3099,12 +3232,18 @@ export class ModelRegistry {
 		// provider lifetime. #clearRuntimeProviderState removes this override when
 		// the owning extension is unregistered or replaced.
 		if (config.usage) {
-			this.authStorage.setRuntimeUsageProvider(providerName, config.usage, config.apiKey);
+			this.authStorage.usage.setProvider(providerName, config.usage, config.apiKey);
 		}
 		if (config.apiKey) {
-			this.#installProviderApiKey(providerName, config.apiKey);
+			// A provider that owns a /login flow must not let its default key
+			// reference shadow the credential that login stores. Its apiKey is
+			// typically an env-var name; unset, it resolves to its literal text
+			// and would otherwise be sent (and passed to fetchDynamicModels)
+			// instead of the saved key.
+			const fallback = config.oauth !== undefined;
+			this.#installProviderApiKey(providerName, config.apiKey, { fallback });
 			// Persist runtime API keys so they survive #reloadStaticModels() cycles
-			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
+			this.#runtimeProviderApiKeys.set(providerName, { keyConfig: config.apiKey, fallback });
 		}
 		this.#recordRuntimeCommandConfigs(providerName, config);
 
@@ -3193,7 +3332,7 @@ export class ModelRegistry {
 				cacheTtlMs: 24 * 60 * 60 * 1000,
 				dynamicModelsAuthoritative: true,
 				fetchDynamicModels: async () => {
-					const apiKey = await this.#peekApiKeyForProvider(providerName);
+					const apiKey = await this.#peekApiKeyForProvider(providerName, config.baseUrl);
 					const resolvedKey = isAuthenticated(apiKey) ? apiKey : undefined;
 					const modelDefs = await withModelDiscoveryTimeout(RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS, () =>
 						fetcher(resolvedKey),
@@ -3349,6 +3488,7 @@ export interface ProviderConfigInput {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;
+		promptCache?: Model<Api>["promptCache"];
 		/** Whether Codex requests should prefer WebSocket transport. */
 		preferWebsockets?: boolean;
 		headers?: Record<string, string>;

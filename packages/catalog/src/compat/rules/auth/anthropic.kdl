@@ -1,5 +1,6 @@
 auth "anthropic" {
 	name "Anthropic (Claude Pro/Max)"
+	org-scoped-identity #true
 	// Foundry and AWS gateway routing can switch Anthropic to environment-owned credentials.
 	env hook="anthropic-environment"
 	login "oauth-code" {

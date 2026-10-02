@@ -42,7 +42,7 @@ import {
 import { getPackageDir as getOmpPackageDir } from "../config";
 import { formatKeyHints } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { PromptTemplate } from "../config/prompt-templates";
-import { findScopedSettings, type SettingPath, Settings } from "../config/settings";
+import { findScopedSettings, Settings } from "../config/settings";
 import { EditTool } from "../edit";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult, LoadExtensionsResult } from "../sdk";
 import {
@@ -67,6 +67,7 @@ import { GrepTool } from "../tools/grep";
 import { ReadTool } from "../tools/read";
 import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { WriteTool } from "../tools/write";
+import { resolveToCwd } from "../tools/path-utils";
 import { EventBus } from "../utils/event-bus";
 import { convertImageToPng } from "@oh-my-pi/pi-tui/chat/image-loading";
 import { discoverExtensionPaths, loadExtensionFromFactory, loadExtensions } from "./extensions";
@@ -92,6 +93,14 @@ import {
 import type { Skill } from "./skills";
 import { loadSkillsFromDir } from "./skills";
 
+import {
+	cfgDisabledExtensions,
+	cfgExtensions,
+	cfgPluginsPersistentAllowlist,
+	cfgPluginsPersistentPolicy,
+	cfgSkills,
+} from "./settings";
+
 const TOOL_DEFINITION_MARKER = "__isToolDefinition";
 const LEGACY_BUILTIN_TOOL_MARKER = "__ompLegacyBuiltinTool";
 const LEGACY_CODING_TOOL_NAMES = ["read", "bash", "edit", "write"] as const;
@@ -101,7 +110,7 @@ type LegacyCodingToolName = (typeof LEGACY_CODING_TOOL_NAMES)[number];
 type LegacyRegistryToolName = LegacyCodingToolName | "grep" | "glob";
 type LegacyBuiltinToolDefinition = ToolDefinition & { [LEGACY_BUILTIN_TOOL_MARKER]: true };
 
-type LegacySettingOverrides = Partial<Record<SettingPath, unknown>>;
+type LegacySettingOverrides = Record<string, unknown>;
 
 interface LegacyThemeLike {
 	fg(color: string, text: string): string;
@@ -542,12 +551,15 @@ export function createBashToolDefinition(cwd: string, options?: BashToolOptions)
 					onUpdate,
 				);
 			}
+			// The registry tool takes no per-call environment: `env` is service-launch
+			// configuration and is rejected outside it. A hook's env reaches `!` user
+			// shells through `shellEnv` above and the `operations` branch through its
+			// exec options.
 			return tool.execute(
 				toolCallId,
 				{
 					command: spawn?.command ?? command,
 					cwd: spawn?.cwd ?? cwd,
-					env: spawn?.env,
 					timeout,
 				},
 				signal,
@@ -586,11 +598,19 @@ export function createGrepToolDefinition(cwd: string, options?: GrepToolOptions)
 			return new Text(`${themedTitle(theme, "grep")} ${themedMuted(theme, `/${pattern}/ in ${searchPath}`)}`, 0, 0);
 		},
 		renderResult: legacyRenderResult,
-		execute: (toolCallId, params, signal, onUpdate) => {
+		execute: async (toolCallId, params, signal, onUpdate) => {
 			const rawPattern = stringField(params, "pattern") ?? "";
 			const pattern = booleanField(params, "literal") ? piEscapeRegexLiteral(rawPattern) : rawPattern;
 			const searchPath = stringField(params, "path") ?? ".";
 			const glob = stringField(params, "glob");
+			let isFile = false;
+			if (glob) {
+				try {
+					isFile = (await fs.promises.stat(resolveToCwd(searchPath, cwd))).isFile();
+				} catch {
+					// Leave unresolved paths and URLs to the built-in grep resolver.
+				}
+			}
 			const context = numberField(params, "context");
 			// The new grep reads context from settings fixed at construction; build a
 			// per-call tool when the model passes an explicit legacy `context`.
@@ -605,7 +625,7 @@ export function createGrepToolDefinition(cwd: string, options?: GrepToolOptions)
 				toolCallId,
 				{
 					pattern,
-					path: glob ? piJoinPath(searchPath, glob) : searchPath,
+					path: glob && !isFile ? piJoinPath(searchPath, glob) : searchPath,
 					case: booleanField(params, "ignoreCase") ? false : undefined,
 				},
 				signal,
@@ -848,12 +868,12 @@ export class DefaultPackageManager {
 	async resolve(_onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
 		const settings = await this.#settingsManager;
 		const policy = createPersistentPluginPolicy(
-			settings.get("plugins.persistentPolicy"),
-			settings.get("plugins.persistentAllowlist"),
+			cfgPluginsPersistentPolicy.get(settings),
+			cfgPluginsPersistentAllowlist.get(settings),
 		);
 		return withPersistentPluginPolicy(policy, async () => {
-			const configuredPaths = filterPersistentExtensionPaths(settings.get("extensions") ?? [], this.#cwd);
-			const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
+			const configuredPaths = filterPersistentExtensionPaths(cfgExtensions.get(settings), this.#cwd);
+			const disabledExtensionIds = cfgDisabledExtensions.get(settings);
 			const [extensionPaths, plugins] = await Promise.all([
 				discoverExtensionPaths(configuredPaths, this.#cwd, disabledExtensionIds),
 				getEnabledPlugins(this.#cwd),
@@ -1111,8 +1131,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 				options.noSkills
 					? Promise.resolve({ skills: [], warnings: [] })
 					: discoverSkills(cwd, agentDir, {
-							...settings.getGroup("skills"),
-							disabledExtensions: settings.get("disabledExtensions") ?? [],
+							...cfgSkills.get(settings),
+							disabledExtensions: cfgDisabledExtensions.get(settings),
 						}),
 				this.#loadAdditionalSkills(),
 				options.noPromptTemplates ? Promise.resolve([]) : discoverPromptTemplates(cwd, agentDir),
@@ -1441,10 +1461,10 @@ export async function createAgentSession(
 }
 
 /**
- * Synchronous auth storage surface retained for legacy extensions.
+ * Legacy auth storage surface with synchronous reads and asynchronous writes.
  *
- * Modern OMP auth storage is asynchronous, while older provider extensions
- * call `AuthStorage.create().get()` during module initialization.
+ * Older provider extensions call `AuthStorage.create().get()` during module
+ * initialization; writes now await the underlying credential store.
  */
 export class AuthStorage {
 	constructor() {
@@ -1464,10 +1484,10 @@ export class AuthStorage {
 		}
 	}
 
-	set(provider: string, credential: AuthCredential): void {
+	async set(provider: string, credential: AuthCredential): Promise<void> {
 		const store = new SqliteAuthCredentialStore(new Database(getAgentDbPath()));
 		try {
-			store.upsertAuthCredentialForProvider(provider, credential);
+			await store.upsertAuthCredential(provider, credential);
 		} finally {
 			store.close();
 		}

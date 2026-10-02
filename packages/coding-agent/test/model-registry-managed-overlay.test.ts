@@ -181,7 +181,7 @@ describe("ModelRegistry managed models overlay", () => {
 		expect(registry().getError()).toBeDefined();
 	});
 
-	test("managed-only edit invalidates the reload fast-path", async () => {
+	test("managed-only edit invalidates the stale-refresh fast-path", async () => {
 		fs.writeFileSync(
 			managedPath,
 			[
@@ -194,6 +194,7 @@ describe("ModelRegistry managed models overlay", () => {
 		);
 		const reg = registry();
 		expect(reg.find("openai-codex", "gpt-5.6-sol")?.contextPromotionTarget).toBe("anthropic-aws/claude-fable-5");
+		expect(await reg.refreshIfStale()).toBe(false);
 
 		// Rewrite ONLY the managed overlay, then refresh: the composite mtime
 		// signature must detect the change and re-merge (different target).
@@ -212,7 +213,8 @@ describe("ModelRegistry managed models overlay", () => {
 		);
 		const future = new Date(Date.now() + 10_000);
 		fs.utimesSync(managedPath, future, future);
-		await reg.refresh("offline");
+		expect(await reg.refreshIfStale()).toBe(true);
 		expect(reg.find("openai-codex", "gpt-5.6-sol")?.contextPromotionTarget).toBe("anthropic-aws/claude-sonnet-5");
+		expect(await reg.refreshIfStale()).toBe(false);
 	});
 });

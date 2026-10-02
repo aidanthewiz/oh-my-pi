@@ -20,9 +20,33 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
+import { executeSend, isIrcEnabled } from "../irc/messaging";
 import { applyQuery } from "./json-query";
+import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "text" };
 import { artifactsDirsFromRegistry } from "./registry-helpers";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
+import type {
+	InternalResource,
+	InternalWriteResult,
+	InternalUrl,
+	ProtocolHandler,
+	ResolveContext,
+	SchemeSpec,
+	UrlCompletion,
+	WriteContext,
+} from "./types";
+
+/** Result of scanning the caller's artifact dirs for `<id>.md`. */
+interface OutputScan {
+	foundPath?: string;
+	jsonPath?: string;
+	anyDirExists: boolean;
+	availableIds: Set<string>;
+}
+
+/** True when the URL extracts a `/<json-path>` value instead of naming the whole output. */
+function hasPathExtraction(url: InternalUrl): boolean {
+	return url.pathname !== "" && url.pathname !== "/";
+}
 
 /**
  * Walk `segments` into a JSON value: object segments index by key, array
@@ -49,42 +73,89 @@ function extractJsonPath(data: unknown, segments: string[]): unknown {
  */
 export class AgentProtocolHandler implements ProtocolHandler {
 	readonly scheme = "agent";
-	readonly immutable = true;
+	readonly spec: SchemeSpec = {
+		backing: "file",
+		selectors: "lines",
+		immutable: true,
+		linkable: true,
+		write: { via: "handler", payload: "verbatim", scope: "coordination", tier: () => "read" },
+	};
+
+	promptDoc(): string {
+		return agentPromptDoc.trim();
+	}
+
+	/**
+	 * The `<id>.md` output file. JSON-path URLs (`/<json-path>`) render a value
+	 * rather than the file, so they locate to null, as do missing ids.
+	 */
+	async locate(url: InternalUrl, context?: ResolveContext): Promise<string | null> {
+		const outputId = url.rawHost || url.hostname;
+		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
+		if (outputId === "all" || hasPathExtraction(url) || url.searchParams.has("q")) return null;
+		const dirs = await this.#outputDirs(context);
+		if (dirs.length === 0) return null;
+		return (await this.#findOutput(dirs, outputId)).foundPath ?? null;
+	}
+
+	async write(url: InternalUrl, content: string, context?: WriteContext): Promise<InternalWriteResult> {
+		const session = context?.session;
+		if (!session) throw new Error("agent:// messaging requires a tool session");
+		const registry = session.agentRegistry;
+		const senderId = session.getAgentId?.();
+		if (
+			!registry ||
+			!senderId ||
+			session.enableIrc === false ||
+			!isIrcEnabled(session.settings, session.taskDepth ?? 0)
+		) {
+			throw new Error("Peer messaging is unavailable in this session.");
+		}
+		const to = url.rawHost || url.hostname;
+		if (!to) throw new Error("agent:// URL requires a recipient: agent://<id>");
+		if (hasPathExtraction(url)) {
+			throw new Error("agent:// message target cannot have a JSON-path suffix.");
+		}
+		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
+		const deliverySignal = context?.signal
+			? AbortSignal.any([context.signal, AbortSignal.timeout(120_000)])
+			: AbortSignal.timeout(120_000);
+		const result = await executeSend(
+			{ registry, senderId, sessionFileHint: session.getSessionFile?.(), signal: deliverySignal },
+			{ to, message: content },
+		);
+		return {
+			content: [
+				{
+					type: "text",
+					text: result.content.find(item => item.type === "text")?.text ?? "Message delivery failed.",
+				},
+			],
+			details: { message: result.details },
+			isError: result.isError,
+		};
+	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const outputId = url.rawHost || url.hostname;
+		if (outputId === "all") throw new Error("agent://all is write-only; use it to broadcast a message.");
 		if (!outputId) {
 			throw new Error("agent:// URL requires an output ID: agent://<id>");
 		}
 
-		const urlPath = url.pathname;
 		const queryParam = url.searchParams.get("q");
-		const hasPathExtraction = urlPath && urlPath !== "/" && urlPath !== "";
+		const extraction = hasPathExtraction(url);
 		const hasQueryExtraction = queryParam !== null && queryParam !== "";
-		if (hasPathExtraction && hasQueryExtraction) {
+		if (extraction && hasQueryExtraction) {
 			throw new Error("agent:// URL cannot combine path extraction with ?q=");
 		}
 
-		const registry = AgentRegistry.global();
-		const rootSessionFile = context?.sessionFile
-			? await ensurePersistedRoster(registry, context.sessionFile)
-			: undefined;
-		// The caller root's canonical artifact directory (its session file minus
-		// the `.jsonl` suffix) is scanned FIRST, ahead of every process-global
-		// registry dir. The roster ref this refresh installs for the caller's
-		// parked id contributes only its nested child dir, not the root dir that
-		// actually holds `<id>.md` — and with two coexisting roots the global
-		// `Main` ref can belong to the other root, whose dir would otherwise win
-		// the first-hit id map for a shared id. No caller session file: keep the
-		// pre-existing global scan untouched.
-		const dirs = artifactsDirsFromRegistry(
-			rootSessionFile ? { preferredDir: rootSessionFile.slice(0, -6) } : undefined,
-		);
+		const dirs = await this.#outputDirs(context);
 		if (dirs.length === 0) {
 			throw new Error("No session - agent outputs unavailable");
 		}
 
-		const pathSegments = hasPathExtraction ? urlPath.split("/").filter(Boolean) : [];
+		const pathSegments = extraction ? url.pathname.split("/").filter(Boolean) : [];
 		const decodedSegments = pathSegments.map(segment => {
 			try {
 				return decodeURIComponent(segment);
@@ -108,7 +179,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		let contentType: InternalResource["contentType"] = "text/markdown";
 
 		let extractedFrom = scan.foundPath;
-		if (hasPathExtraction || hasQueryExtraction) {
+		if (extraction || hasQueryExtraction) {
 			let jsonValue: unknown;
 			let parsed = false;
 			if (scan.jsonPath) {
@@ -155,7 +226,27 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: extractedFrom,
 			notes,
+			shape: extraction || hasQueryExtraction ? "value" : "document",
 		};
+	}
+
+	/**
+	 * Artifact dirs to scan for the caller's outputs, in priority order.
+	 *
+	 * The caller root's canonical artifact directory (its session file minus
+	 * the `.jsonl` suffix) is scanned FIRST, ahead of every process-global
+	 * registry dir. The roster ref the refresh installs for the caller's
+	 * parked id contributes only its nested child dir, not the root dir that
+	 * actually holds `<id>.md` — and with two coexisting roots the global
+	 * `Main` ref can belong to the other root, whose dir would otherwise win
+	 * the first-hit id map for a shared id. No caller session file: keep the
+	 * pre-existing global scan untouched.
+	 */
+	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
+		const rootSessionFile = context?.sessionFile
+			? await ensurePersistedRoster(AgentRegistry.global(), context.sessionFile)
+			: undefined;
+		return artifactsDirsFromRegistry(rootSessionFile ? { preferredDir: rootSessionFile.slice(0, -6) } : undefined);
 	}
 
 	/**
@@ -163,15 +254,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 * Returns the resolved path and its same-dir `.json` sidecar, plus the set
 	 * of available ids gathered from the scanned dirs for the not-found message.
 	 */
-	async #findOutput(
-		dirs: string[],
-		id: string,
-	): Promise<{
-		foundPath?: string;
-		jsonPath?: string;
-		anyDirExists: boolean;
-		availableIds: Set<string>;
-	}> {
+	async #findOutput(dirs: string[], id: string): Promise<OutputScan> {
 		const byId = new Map<string, string>();
 		const jsonById = new Map<string, string>();
 		let anyDirExists = false;

@@ -150,6 +150,32 @@ describe("launch send acknowledgement", () => {
 	});
 });
 
+describe("daemon mode protocol", () => {
+	it("accepts persistence transitions and rejects unsupported modes", () => {
+		const request = parseDaemonWireRequest({
+			id: "mode-request",
+			protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+			token: "token",
+			operation: { op: "mode", name: "web", mode: "persist" },
+		});
+		expect(request.operation).toEqual({ op: "mode", name: "web", mode: "persist" });
+		expect(
+			parseDaemonRpcResult(
+				{ op: "mode", name: "web", mode: "persist" },
+				{ daemon: { ...baseSnapshot, persist: true } },
+			),
+		).toEqual({ op: "mode", daemon: { ...baseSnapshot, persist: true } });
+		expect(() =>
+			parseDaemonWireRequest({
+				id: "bad-mode",
+				protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+				token: "token",
+				operation: { op: "mode", name: "web", mode: "restart" },
+			}),
+		).toThrow("operation.mode must be persist, session, or detached");
+	});
+});
+
 describe("regex-derived protocol fields", () => {
 	it("preserves an empty wait pattern match", () => {
 		const waitOperation: Extract<DaemonOperation, { op: "wait" }> = {

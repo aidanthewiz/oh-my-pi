@@ -1,19 +1,24 @@
 """Rules for producing release-grade, canonically named pi_natives addons.
 
 `native_addon` transitions //crates/pi-natives:pi_natives onto a shipping
-platform with the release codegen profile (opt, thin LTO, cgu=16, stripped —
-mirrors the cargo `ci` profile) and renames the produced shared library to the
-loader's canonical `pi_natives.<platform>-<arch>[-<variant>].node` filename.
+platform with the release codegen profile (opt, thin LTO, cgu=16). Darwin
+strips non-global symbols and debug information at link time because rustc's
+post-link strip corrupts Mach-O dylibs with macOS deployment targets >= 12;
+other targets strip symbols through rustc. The rule then
+renames the produced library to its canonical `.node` filename.
 
 Encoding the profile in the transition means `bazel build //:natives-<t>` is
 always release-grade regardless of -c, and every addon shares one cache entry
 per (platform, source) pair.
 """
 
-_ADDON_RUSTC_FLAGS = [
-    "-Ccodegen-units=16",
-    "-Cstrip=symbols",
-]
+_ADDON_RUSTC_FLAGS = ["-Ccodegen-units=16"]
+
+# Darwin strips at link time (-x: non-global symbols, -S: debug info) because
+# rustc's rust-objcopy strip corrupts minos >= 12.0 dylibs; see .bazelrc.
+# -Cstrip=none also overrides the opt-mode toolchain `strip=debuginfo`.
+_DARWIN_STRIP_FLAGS = ["-Cstrip=none", "-Clink-arg=-Wl,-x,-S"]
+_STRIP_FLAGS = ["-Cstrip=symbols"]
 
 def _addon_transition_impl(settings, attr):
     # Statically link the MSVC CRT for the shipped win32 addon: rustc gets
@@ -32,7 +37,9 @@ def _addon_transition_impl(settings, attr):
         "//command_line_option:compilation_mode": "opt",
         "//command_line_option:features": features,
         "@rules_rust//rust/settings:lto": "thin",
-        "@rules_rust//rust/settings:extra_rustc_flags": _ADDON_RUSTC_FLAGS,
+        "@rules_rust//rust/settings:extra_rustc_flags": _ADDON_RUSTC_FLAGS + (
+            _DARWIN_STRIP_FLAGS if "darwin" in str(attr.platform) else _STRIP_FLAGS
+        ),
     }
 
 _addon_transition = transition(

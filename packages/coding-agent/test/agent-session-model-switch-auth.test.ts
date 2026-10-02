@@ -1,11 +1,14 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import * as path from "node:path";
+import { Type } from "@oh-my-pi/omptype/typebox";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { type Api, type AssistantMessage, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { CacheWarmer } from "@oh-my-pi/pi-coding-agent/session/cache-warmer";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -26,7 +29,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 	beforeAll(async () => {
 		sharedDir = TempDir.createSync("@pi-model-switch-auth-");
 		authStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		registry = new ModelRegistry(authStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
@@ -36,6 +39,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
 		for (const spy of spies.splice(0)) spy.mockRestore();
 		if (session) {
 			await session.dispose();
@@ -49,7 +53,12 @@ describe("AgentSession model switch auth pre-flight", () => {
 		return model;
 	}
 
-	function makeSession(initialModel: Model<Api>, roles?: Record<string, string>): AgentSession {
+	function makeSession(
+		initialModel: Model<Api>,
+		roles?: Record<string, string>,
+		cacheWarmer?: CacheWarmer,
+		sessionManager: SessionManager = SessionManager.inMemory(),
+	): AgentSession {
 		const settings = Settings.isolated();
 		if (roles) {
 			for (const role in roles) settings.setModelRole(role, roles[role]);
@@ -65,8 +74,9 @@ describe("AgentSession model switch auth pre-flight", () => {
 		});
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
+			cacheWarmer,
 			modelRegistry: registry,
 		});
 		return session;
@@ -139,10 +149,276 @@ describe("AgentSession model switch auth pre-flight", () => {
 		const from = modelOrThrow("claude-sonnet-4-5");
 		const to = modelOrThrow("claude-sonnet-4-6");
 		const s = makeSession(from, { slow: `${to.provider}/${to.id}` });
-		s.settings.override("enabledModels", [`${from.provider}/${from.id}`]);
+		cfgEnabledModels.override(s.settings, [`${from.provider}/${from.id}`]);
 
 		expect(s.resolveRoleModel("slow")).toBeUndefined();
 		await expect(s.setModel(to)).rejects.toThrow(`Model "${to.provider}/${to.id}" is excluded by model policy`);
 		expect(s.model?.id).toBe(from.id);
+	});
+
+	it("does not replay an old request after tools change or the session is replaced", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		let replays = 0;
+		const warmer = new CacheWarmer({
+			stream: () => {
+				replays++;
+				throw new Error("Stale request replayed");
+			},
+			getPromptTokens: () => 100_000,
+			getMode: () => "idle",
+		});
+		const s = makeSession(model, undefined, warmer);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		expect(s.cacheWarmingStatus?.state).toBe("scheduled");
+		s.agent.setTools([
+			{
+				name: "changed_tool",
+				label: "Changed tool",
+				description: "A newly selected tool",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+			},
+		]);
+		vi.advanceTimersByTime(270_000);
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(replays).toBe(0);
+		expect(s.cacheWarmingStatus?.reason).toBe("conversation context changed");
+
+		s.startCacheWarming(model, { messages: [] }, {});
+		expect(s.cacheWarmingStatus?.state).toBe("scheduled");
+		const switched = s.newSession();
+		vi.useRealTimers();
+		expect(await switched).toBe(true);
+		vi.useFakeTimers();
+		vi.advanceTimersByTime(270_000);
+		vi.useRealTimers();
+		expect(replays).toBe(0);
+		expect(s.cacheWarmingStatus?.state).toBe("inactive");
+	});
+
+	it("charges an accepted warm replay to its original session before switching", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		const usage: AssistantMessage["usage"] = {
+			input: 1,
+			output: 0,
+			cacheRead: 100_000,
+			cacheWrite: 0,
+			totalTokens: 100_001,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage,
+			stopReason: "aborted",
+		};
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const warmer = new CacheWarmer({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(partial),
+			}),
+			getPromptTokens: () => usage.totalTokens,
+			getMode: () => "idle",
+		});
+		const manager = SessionManager.create(sharedDir.path(), path.join(sharedDir.path(), "sessions"));
+		const originalFile = manager.getSessionFile();
+		manager.appendMessage({ role: "user", content: "prefix to keep warm", timestamp: Date.now() });
+		manager.appendMessage({ ...partial, content: [{ type: "text", text: "prior response" }], stopReason: "stop" });
+		const s = makeSession(model, undefined, warmer, manager);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		vi.advanceTimersByTime(270_000);
+		await accepted.promise;
+		const originalId = manager.getSessionId();
+
+		const switching = s.newSession();
+		vi.useRealTimers();
+		const settledBeforeUsage = await Promise.race([switching.then(() => true), Bun.sleep(100).then(() => false)]);
+		const sessionIdBeforeUsage = manager.getSessionId();
+		release.resolve();
+		expect(settledBeforeUsage).toBe(false);
+		expect(sessionIdBeforeUsage).toBe(originalId);
+		expect(await switching).toBe(true);
+		expect(s.sessionManager.getUsageStatistics().cost).toBe(0);
+		expect(originalFile).toBeDefined();
+		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
+		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
+		]);
+		await old.close();
+	});
+
+	it("keeps the original session and branch until a cancelled paid replay finally reports usage", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		const usage: AssistantMessage["usage"] = {
+			input: 1,
+			output: 0,
+			cacheRead: 100_000,
+			cacheWrite: 0,
+			totalTokens: 100_001,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage,
+			stopReason: "aborted",
+		};
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const warmer = new CacheWarmer({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(partial),
+			}),
+			getPromptTokens: () => usage.totalTokens,
+			getMode: () => "idle",
+		});
+		const manager = SessionManager.create(sharedDir.path(), path.join(sharedDir.path(), "sessions"));
+		const ownerLeaf = manager.appendMessage({
+			...partial,
+			content: [{ type: "text", text: "prior response" }],
+			stopReason: "stop",
+		});
+		const originalId = manager.getSessionId();
+		const originalFile = manager.getSessionFile();
+		const s = makeSession(model, undefined, warmer, manager);
+		vi.useFakeTimers();
+		try {
+			s.startCacheWarming(model, { messages: [] }, {});
+			vi.advanceTimersByTime(270_000);
+			await accepted.promise;
+
+			let settled = false;
+			const outcome = s.newSession().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			void outcome.then(() => {
+				settled = true;
+			});
+			vi.advanceTimersByTime(4_999);
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			expect(manager.getSessionId()).toBe(originalId);
+			vi.advanceTimersByTime(1);
+			expect(await outcome).toHaveProperty("message", "Timed out draining cache warmer before session transition");
+			expect(manager.getSessionId()).toBe(originalId);
+			expect(s.isSessionTransitioning).toBe(false);
+		} finally {
+			vi.useRealTimers();
+			release.resolve();
+		}
+		await warmer.drain();
+		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ parentId: ownerLeaf, purpose: "cache-warm", usage: { totalTokens: usage.totalTokens } },
+		]);
+		expect(manager.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(await s.newSession()).toBe(true);
+		expect(manager.getSessionId()).not.toBe(originalId);
+		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);
+		expect(originalFile).toBeDefined();
+		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
+		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ parentId: ownerLeaf, purpose: "cache-warm", usage: { totalTokens: usage.totalTokens } },
+		]);
+		await old.close();
+	});
+
+	it("persists an accepted warm replay before sealing the session on disposal", async () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		const usage: AssistantMessage["usage"] = {
+			input: 1,
+			output: 0,
+			cacheRead: 100_000,
+			cacheWrite: 0,
+			totalTokens: 100_001,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const response: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage,
+			stopReason: "aborted",
+		};
+		const accepted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const warmer = new CacheWarmer({
+			stream: () => ({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial: response } as const;
+					accepted.resolve();
+					await release.promise;
+				},
+				result: () => Promise.resolve(response),
+			}),
+			getPromptTokens: () => usage.totalTokens,
+			getMode: () => "idle",
+		});
+		const manager = SessionManager.create(sharedDir.path(), path.join(sharedDir.path(), "sessions"));
+		const originalFile = manager.getSessionFile();
+		manager.appendMessage({ ...response, content: [{ type: "text", text: "prior response" }], stopReason: "stop" });
+		const s = makeSession(model, undefined, warmer, manager);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		vi.advanceTimersByTime(270_000);
+		await accepted.promise;
+
+		s.beginDispose();
+		const closing = s.dispose();
+		release.resolve();
+		vi.useRealTimers();
+		await closing;
+		expect(originalFile).toBeDefined();
+		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
+		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
+		]);
+		await old.close();
+	});
+
+	it("cancels a scheduled paid replay as soon as disposal begins", () => {
+		const model = { ...modelOrThrow("claude-sonnet-4-5"), promptCache: { short: 300 } };
+		let replays = 0;
+		const warmer = new CacheWarmer({
+			stream: () => {
+				replays++;
+				throw new Error("Disposed session replayed");
+			},
+			getPromptTokens: () => 100_000,
+			getMode: () => "idle",
+		});
+		const s = makeSession(model, undefined, warmer);
+		vi.useFakeTimers();
+		s.startCacheWarming(model, { messages: [] }, {});
+		s.beginDispose();
+		vi.advanceTimersByTime(270_000);
+		expect(replays).toBe(0);
+		expect(s.cacheWarmingStatus?.state).toBe("inactive");
 	});
 });

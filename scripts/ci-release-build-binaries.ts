@@ -146,15 +146,31 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 		return;
 	}
 
-	await compileCodingAgent({
-		repoRoot,
-		entrypoint,
-		outfile: path.join(repoRoot, target.outfile),
-		transformersVersion,
-		target: target.target,
-		minifyIdentifiers: true,
-		skipBuiltinCodesign: shouldAdhocSignDarwinBinary(target),
-	});
+	try {
+		await compileCodingAgent({
+			repoRoot,
+			entrypoint,
+			outfile: path.join(repoRoot, target.outfile),
+			transformersVersion,
+			target: target.target,
+			minifyIdentifiers: true,
+			skipBuiltinCodesign: shouldAdhocSignDarwinBinary(target),
+		});
+	} catch (error) {
+		const archiveFilename = `embedded-addons.${target.platform}-${target.arch}.tar.gz`;
+		const nativeDir = path.join(repoRoot, "packages", "natives", "native");
+		const archive = path.join(nativeDir, archiveFilename);
+		const archiveState = await fs
+			.stat(archive)
+			.then(stat => `${stat.size} bytes`)
+			.catch(statError => String(statError));
+		const importState = await fs
+			.readFile(path.join(nativeDir, "embedded-addon.js"), "utf8")
+			.then(source => source.includes(`./${archiveFilename}`))
+			.catch(() => false);
+		console.error(`Native embedding for ${target.id}: ${archive} (${archiveState}); import matches: ${importState}`);
+		throw error;
+	}
 	// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 	if (shouldAdhocSignDarwinBinary(target)) {
 		await runCommand(

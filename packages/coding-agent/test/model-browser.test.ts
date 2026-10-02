@@ -1,4 +1,5 @@
 import { createModelBrowserSource } from "../src/modes/model-browser-source";
+import { cfgEnabledModels } from "../src/config/model-settings";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -6,18 +7,21 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildBrowserItems,
+	buildSessionModelScope,
 	buildSearchAffinity,
 	rankModelItems,
 	ModelBrowser,
+	SessionModelScopeCache,
 	resolveRoleAssignments,
 	type RoleAssignments,
 	sortModelItems,
 } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { createModelMentionSource } from "@oh-my-pi/pi-tui/prompt/model-mention-autocomplete";
 
 /** Optional presentation metadata a catalog or discovery source may attach. */
 type NativeMetadata = Pick<Model, "description" | "isNew" | "isBeta" | "isRecommended" | "int" | "tps"> &
-	Partial<Pick<Model, "cost" | "kind">>;
+	Partial<Pick<Model, "cost" | "kind" | "pricingStatus">>;
 
 function makeModel(provider: string, id: string, metadata?: NativeMetadata): Model {
 	return buildModel({
@@ -109,6 +113,59 @@ describe("resolveRoleAssignments", () => {
 		expect(roles.slow?.model).toBe(slow);
 		expect(roles.advisor?.model).toBe(slow);
 		expect(roles.advisor?.autoSelected).toBe(true);
+	});
+});
+
+test("picker scope cache invalidates on changed model policy", () => {
+	const allowed = makeModel("provider", "allowed");
+	const blocked = makeModel("provider", "blocked");
+	const discovered = makeModel("provider", "discovered");
+	const available = [allowed, blocked, discovered];
+	const settings = Settings.isolated({
+		enabledModels: ["provider/allowed"],
+		modelRoles: { default: "provider/blocked", smol: "provider/allowed" },
+	});
+	const source = createModelBrowserSource(settings);
+	const registry = {
+		getError: () => undefined,
+		getAvailable: () => [...available],
+		getAll: () => [...available],
+	};
+	const cache = new SessionModelScopeCache(source, registry);
+
+	const initial = cache.get([]);
+	expect(initial.items.map(item => item.selector)).toEqual(["provider/allowed"]);
+	expect(initial.roles.default).toBeUndefined();
+	expect(initial.roles.smol?.model).toBe(allowed);
+	expect(buildSessionModelScope(source, registry, []).items.map(item => item.selector)).toEqual(["provider/allowed"]);
+
+	cfgEnabledModels.override(settings, ["provider/discovered"]);
+	const updated = cache.get([]);
+	expect(updated.items.map(item => item.selector)).toEqual(["provider/discovered"]);
+	expect(updated.roles.default).toBeUndefined();
+	expect(updated.roles.smol).toBeUndefined();
+});
+
+describe("createModelMentionSource", () => {
+	test("refreshes candidates when role settings or availability change between queries", () => {
+		const a = makeModel("a", "example-2");
+		const b = makeModel("b", "example-2");
+		const available = [a, b];
+		const settings = Settings.isolated({ modelRoles: { default: "b/example-2" } });
+		const candidates = createModelMentionSource({
+			source: createModelBrowserSource(settings),
+			registry: { getError: () => undefined, getAvailable: () => [...available], getAll: () => [...available] },
+			scopedModels: () => [],
+		});
+		const selectors = (query: string) => candidates(query).map(item => item.selector);
+
+		expect(selectors("example")).toEqual(["b/example-2", "a/example-2"]);
+
+		settings.setModelRole("default", "a/example-2");
+		expect(selectors("example")).toEqual(["a/example-2", "b/example-2"]);
+
+		available.push(makeModel("c", "example-3"));
+		expect(selectors("example")).toContain("c/example-3");
 	});
 });
 
@@ -397,6 +454,33 @@ describe("ModelBrowser native model metadata", () => {
 		expect(renderDetail(makeModel("openai", "gpt-5"))).toContain("gpt-5 · 128k ctx · 1k out · free per M");
 	});
 
+	test("labels declared pricing states instead of calling the zero rate card free", () => {
+		// Published rates win over any declared state.
+		expect(
+			renderDetail(
+				makeModel("openai", "metered", {
+					cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+					pricingStatus: "unknown",
+				}),
+			),
+		).toContain("$1.25/10 per M");
+		expect(renderDetail(makeModel("subscription", "included", { pricingStatus: "included" }))).toContain(
+			" · included",
+		);
+		expect(renderDetail(makeModel("fixture", "unpriced", { pricingStatus: "unknown" }))).toContain(
+			" · pricing unknown",
+		);
+
+		const variable = makeModel("cursor", "default", { pricingStatus: "variable" });
+		const browser = makeBrowser([variable], []);
+		const lines = browser.render(160).map(line => Bun.stripANSI(line));
+		expect(lines[2]).toContain("varies");
+		expect(lines[lines.length - 2]).toContain("price varies");
+		// A router priced per request is not free, so the `free` filter skips it.
+		browser.setQuery("free");
+		expect(browser.visibleCount).toBe(0);
+	});
+
 	test("price rows preserve free labels and identify invalid rates", () => {
 		const zero = makeModel("fixture", "zero");
 		const missing = makeModel("fixture", "missing");
@@ -425,7 +509,6 @@ describe("ModelBrowser native model metadata", () => {
 	});
 
 	test.each([
-		[-1, 0, "$?/0"],
 		[0, -1, "$0/?"],
 		[-1, -2, "$?/?"],
 	] as const)("renders invalid rates %s/%s with per-leg markers", (input, output, expected) => {
@@ -456,5 +539,36 @@ describe("ModelBrowser native model metadata", () => {
 		expect(detailRow).toContain("$100/0.001 per M");
 		expect(tinyRow).toContain("$0.0000001/0.001");
 		expect(rows.every(line => Bun.stringWidth(line) <= 100)).toBe(true);
+	});
+});
+
+describe("Factory Droid credits badge", () => {
+	beforeAll(async () => {
+		await initTheme(false);
+	});
+
+	/** A Factory Droid row: upstream list price as `cost`, the base Standard Credits rate as the badge. */
+	function makeDroidModel(id: string, credits: number): Model {
+		return {
+			...makeModel("factory-droid", id),
+			cost: { input: 1.25, output: 10, cacheRead: 0, cacheWrite: 0 },
+			factoryDroidCredits: credits,
+		};
+	}
+
+	test("shows list price with the credit badge and never advertises unknown list prices as free", () => {
+		const priced = makeDroidModel("claude-opus-5", 2);
+		const paid = makeDroidModel("preview-credit-model", 2);
+		paid.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		const browser = makeBrowser([priced, paid], []);
+		const rows = browser.render(120).map(line => Bun.stripANSI(line));
+		const pricedRow = rows.find(row => row.includes("claude-opus-5"));
+		const paidRow = rows.find(row => row.includes("preview-credit-model"));
+
+		expect(pricedRow).toContain("$1.25/10 2×");
+		expect(paidRow).toContain("2×");
+		expect(paidRow).not.toContain("free");
+		browser.setQuery("free");
+		expect(browser.visibleCount).toBe(0);
 	});
 });

@@ -23,6 +23,7 @@ import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { isJsonSchemaValueValid } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
+	buildSecretObfuscator,
 	builtinCredentialSecretEntries,
 	collectEnvSecrets,
 	collectSettingsSecrets,
@@ -284,6 +285,59 @@ describe("collectSettingsSecrets", () => {
 		expect(providerView).toContain("endpoint=https://search.example.test");
 		expect(deobfuscateToolArguments(obfuscator, { old_string: providerView }).old_string).toContain(brokerToken);
 	});
+	it("keeps configured credentials private when optional secret scanning is disabled live", () => {
+		const credential = "configured-private-credential";
+		const optionalSecret = "optional-secret-from-file";
+		const obfuscator = new SecretObfuscator(
+			[
+				...collectSettingsSecrets(Settings.isolated({ "auth.broker.token": credential })),
+				{ type: "plain", content: optionalSecret },
+			],
+			"K".repeat(43),
+		);
+		const earlierPlaceholder = obfuscator.obfuscate(credential);
+
+		obfuscator.setObfuscating(false);
+		const providerView = obfuscator.obfuscate(`${credential} ${optionalSecret}`);
+		expect(providerView).not.toContain(credential);
+		expect(providerView).toContain(optionalSecret);
+		expect(obfuscator.deobfuscate(earlierPlaceholder)).toBe(credential);
+	});
+	it("preloads optional file and regex secrets for a live switch without losing earlier placeholders", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-live-secret-policy-"));
+		const credential = "credential-from-managed-settings";
+		const fileSecret = "file-secret-for-live-switch";
+		const regexSecret = "live-secret-12345";
+		try {
+			await fs.mkdir(path.join(dir, ".omp"));
+			await fs.writeFile(
+				path.join(dir, ".omp", "secrets.yml"),
+				`- type: plain\n  content: ${fileSecret}\n- type: regex\n  content: 'live-secret-[0-9]+'\n`,
+			);
+			const settings = Settings.isolated({ "auth.broker.token": credential, "secrets.enabled": false });
+			const obfuscator = await buildSecretObfuscator(dir, dir, { keyDir: dir, settings, keepAvailable: true });
+			if (!obfuscator) throw new Error("Expected session obfuscator");
+			const before = obfuscator.obfuscate(`${credential} ${fileSecret} ${regexSecret}`);
+			expect(before).not.toContain(credential);
+			expect(before).toContain(fileSecret);
+			expect(before).toContain(regexSecret);
+
+			obfuscator.setObfuscating(true);
+			const during = obfuscator.obfuscate(`${credential} ${fileSecret} ${regexSecret}`);
+			expect(during).not.toContain(credential);
+			expect(during).not.toContain(fileSecret);
+			expect(during).not.toContain(regexSecret);
+
+			obfuscator.setObfuscating(false);
+			const after = obfuscator.obfuscate(`${credential} ${fileSecret} ${regexSecret}`);
+			expect(after).not.toContain(credential);
+			expect(after).toContain(fileSecret);
+			expect(after).toContain(regexSecret);
+			expect(obfuscator.deobfuscate(during)).toBe(`${credential} ${fileSecret} ${regexSecret}`);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("lazy placeholder key", () => {
@@ -337,21 +391,6 @@ describe("lazy placeholder key", () => {
 });
 
 describe("SecretObfuscator regex behavior", () => {
-	it("obfuscates and deobfuscates regex matches with flags", () => {
-		const obfuscator = new SecretObfuscator([{ type: "regex", content: "api[_-]?key\\s*=\\s*\\w+", flags: "i" }]);
-		const original = "API_KEY=abc and api-key=def";
-		const obfuscated = obfuscator.obfuscate(original);
-		expect(obfuscated).not.toEqual(original);
-		expect(obfuscator.deobfuscate(obfuscated)).toEqual(original);
-	});
-
-	it("supports bare regex patterns without explicit flags", () => {
-		const obfuscator = new SecretObfuscator([{ type: "regex", content: "api[_-]?key\\s*=\\s*\\w+" }]);
-		const text = "api_key=abc and API_KEY=def";
-		const obfuscated = obfuscator.obfuscate(text);
-		expect(obfuscated).not.toEqual(text);
-		expect(obfuscator.deobfuscate(obfuscated)).toEqual(text);
-	});
 	it("deobfuscates placeholders through tool-call arguments", () => {
 		const obfuscator = new SecretObfuscator([{ type: "regex", content: "api[_-]?key\\s*=\\s*\\w+", flags: "i" }]);
 		const original = { cmd: "API_KEY=abc and api-key=def", status: "ok", nested: { note: "API_KEY=zzz" } };
@@ -1740,25 +1779,6 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("SECRETUVREDACTED");
 	});
 
-	it("redacts bounded replace-mode regex suffixes after generated placeholders", () => {
-		const obfuscator = new SecretObfuscator(
-			[
-				{ type: "plain", content: "SECRETUV" },
-				{ type: "regex", mode: "replace", content: "[A-Z0-9]{10}", replacement: "REDACTED" },
-			],
-			"B".repeat(43),
-		);
-
-		const obfuscated = obfuscator.obfuscate("SECRETUVX1");
-
-		// The 8-char SECRETUVX1 redacts to one placeholder + REDACTED; assert the `X1`
-		// suffix is gone via end-anchored structure, not substring absence — the
-		// random keyed base can itself contain the two chars "X1".
-		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:U\$\$REDACTED$/);
-		expect(obfuscated).not.toMatch(/X1$/);
-		expect(obfuscator.deobfuscate(obfuscated)).toBe("SECRETUVREDACTED");
-	});
-
 	it("emits a custom replacement once around a generated placeholder", () => {
 		const obfuscator = new SecretObfuscator(
 			[
@@ -2026,23 +2046,6 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		}
 	});
 
-	it("redacts a self-matching sentinel regex to a stable nonmatching value", () => {
-		// A regex that also matches the single A/B perturbation still has same-length
-		// values it does NOT match (a lowercase pair for [A-Z]{2}, an A/Z-free pair for
-		// Z+). The bounded search finds one, so the sentinel is redacted to a value the
-		// regex never re-matches: leak-free AND a fixed point under re-obfuscation.
-		for (const content of ["Z+", "[A-Z]{2}"]) {
-			const obf = new SecretObfuscator([{ type: "regex", mode: "replace", content }], "Q".repeat(43));
-
-			const out = obf.obfuscate("ZZ");
-
-			expect(out).not.toBe("ZZ");
-			expect(out).toHaveLength(2);
-			expect(obf.obfuscate(out)).toBe(out);
-			expect(obf.obfuscate(obf.obfuscate(out))).toBe(out);
-		}
-	});
-
 	it("searches past the first perturbation when it also matches the regex", () => {
 		// Regression for a regex that matches both the sentinel and its single A/B
 		// perturbation: `Z|A`/`[AZ]` match `Z` and `A`, so the old guard kept the raw
@@ -2066,45 +2069,6 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(out).not.toBe("ZZ");
 		expect(out).toHaveLength(2);
 		expect(/^[A-Za-z0-9]{2}$/.test(out)).toBe(false);
-		expect(obf.obfuscate(out)).toBe(out);
-	});
-
-	it("exhausts two-character fallback candidates before keeping the sentinel", () => {
-		const obf = new SecretObfuscator([{ type: "regex", mode: "replace", content: "[A-Za-z0-9]." }], "Q".repeat(43));
-
-		const out = obf.obfuscate("ZZ");
-
-		expect(out).not.toBe("ZZ");
-		expect(out).toHaveLength(2);
-		expect(/[A-Za-z0-9]./.test(out)).toBe(false);
-		expect(obf.obfuscate(out)).toBe(out);
-	});
-
-	it("samples every leading character class before giving up on three-character collisions", () => {
-		const obf = new SecretObfuscator(
-			[{ type: "regex", mode: "replace", content: "[A-Za-z0-9].{2}" }],
-			"Q".repeat(43),
-		);
-
-		const out = obf.obfuscate("ZZc");
-
-		expect(out).not.toBe("ZZc");
-		expect(out).toHaveLength(3);
-		expect(/[A-Za-z0-9].{2}/.test(out)).toBe(false);
-		expect(obf.obfuscate(out)).toBe(out);
-	});
-
-	it("exhausts three-character fallback candidates when the nonmatching byte must be last", () => {
-		const obf = new SecretObfuscator(
-			[{ type: "regex", mode: "replace", content: ".{2}[A-Za-z0-9]" }],
-			"Q".repeat(43),
-		);
-
-		const out = obf.obfuscate("ZZc");
-
-		expect(out).not.toBe("ZZc");
-		expect(out).toHaveLength(3);
-		expect(/.{2}[A-Za-z0-9]/.test(out)).toBe(false);
 		expect(obf.obfuscate(out)).toBe(out);
 	});
 

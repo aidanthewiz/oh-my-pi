@@ -28,6 +28,7 @@ import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 import { readShellWord } from "./shell-tokenize";
 import { OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { cfgToolsMaxTimeout } from "./settings";
 const MAX_AWS_OUTPUT_BYTES = 1024 * 1024;
 
 const PROFILE_CONTROL_RE = /[\u0000-\u001f\u007f]/u;
@@ -1197,7 +1198,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			const fingerprint = JSON.stringify(params);
 			const metadata = getOperationalAwsLaunchMetadata();
 			const credentialsFile = metadata?.sharedCredentialsFile ?? os.devNull;
-			const timeout = clampTimeout("aws", params.timeout, this.session.settings.get("tools.maxTimeout")) * 1000;
+			const timeout = clampTimeout("aws", params.timeout, cfgToolsMaxTimeout.get(this.session.settings)) * 1000;
 			const env = minimumAwsEnv(
 				prepared.loginProfile ?? params.profile,
 				prepared.region,
@@ -1387,7 +1388,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const prepared = cached?.fingerprint === fingerprint ? cached.call : await this.#prepare(params, signal);
 		const metadata = getOperationalAwsLaunchMetadata();
 		const credentialsFile = metadata?.sharedCredentialsFile ?? os.devNull;
-		const timeout = clampTimeout("aws", params.timeout, this.session.settings.get("tools.maxTimeout"));
+		const timeout = clampTimeout("aws", params.timeout, cfgToolsMaxTimeout.get(this.session.settings));
 		const executionEnv = minimumAwsEnv(
 			prepared.loginProfile ?? params.profile,
 			prepared.region,

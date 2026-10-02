@@ -34,6 +34,8 @@ import type {
 } from "./types";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS,
+	AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
@@ -41,14 +43,18 @@ import {
 	DEFAULT_SERVER_IDLE_TIMEOUT_S,
 	DEFAULT_STREAM_KEEPALIVE_MS,
 } from "./types";
+import { compareCredentialBlockSnapshots, parseGenerationTag } from "./protocol";
 import {
 	clientUsageReportRequestSchema,
+	credentialBlockDeleteRequestSchema,
+	credentialBlocksDeleteRequestSchema,
 	credentialBlockRequestSchema,
 	credentialDisableRequestSchema,
 	credentialUploadRequestSchema,
 } from "./wire-schemas";
 
 const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
+const AUTH_RECOVERY_REFRESH_OPTIONS = { reuseRecentMint: true } as const;
 
 export interface AuthBrokerServerOptions {
 	/** Underlying credential storage (wraps the local SQLite store on the broker). */
@@ -115,6 +121,24 @@ function supportsCodexMeterBlockScopes(req: Request): boolean {
 	);
 }
 
+function supportsBlockRevisions(req: Request): boolean {
+	return (
+		req.headers
+			.get(AUTH_BROKER_CAPABILITIES_HEADER)
+			?.split(",")
+			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS) ?? false
+	);
+}
+
+function supportsBlockMutationTokens(req: Request): boolean {
+	return (
+		req.headers
+			.get(AUTH_BROKER_CAPABILITIES_HEADER)
+			?.split(",")
+			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS) ?? false
+	);
+}
+
 /**
  * Parse + validate a JSON request body against an ArkType schema. Returns a
  * `Response` (400) on parse/validation failure so handlers can early-return.
@@ -163,18 +187,6 @@ function snapshotHeaders(generation: number): Record<string, string> {
 	};
 }
 
-function parseGenerationTag(header: string | null): number | undefined {
-	if (!header) return undefined;
-	let value = header.trim();
-	if (value.startsWith("W/")) value = value.slice(2).trim();
-	if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
-		value = value.slice(1, -1);
-	}
-	const generation = Number(value);
-	if (!Number.isInteger(generation) || generation < 0) return undefined;
-	return generation;
-}
-
 function parseWaitMs(url: URL): number {
 	const raw = url.searchParams.get("wait");
 	if (raw === null) return 0;
@@ -202,7 +214,7 @@ class GenerationGate {
 
 	constructor(storage: AuthStorage, pollIntervalMs: number) {
 		this.#storage = storage;
-		this.#unsubscribe = storage.onGenerationChanged(generation => this.#wake(generation));
+		this.#unsubscribe = storage.credentials.onGeneration(generation => this.#wake(generation));
 		this.#pollTimer = setInterval(() => {
 			void this.#pollExternalChanges();
 		}, pollIntervalMs);
@@ -211,7 +223,7 @@ class GenerationGate {
 	}
 
 	waitForChange(afterGeneration: number, signal: AbortSignal): Promise<"changed" | "aborted"> {
-		if (this.#storage.getGeneration() !== afterGeneration) return Promise.resolve("changed");
+		if (this.#storage.credentials.generation !== afterGeneration) return Promise.resolve("changed");
 		if (signal.aborted) return Promise.resolve("aborted");
 
 		const done = Promise.withResolvers<"changed" | "aborted">();
@@ -251,7 +263,7 @@ class GenerationGate {
 		if (this.#pollInFlight) return;
 		this.#pollInFlight = true;
 		try {
-			await this.#storage.pollExternalChanges();
+			await this.#storage.credentials.poll();
 		} catch (error) {
 			logger.debug("Auth broker external store change poll failed", { error: String(error) });
 		} finally {
@@ -314,14 +326,6 @@ function computeRotatesInMs(
 	return Math.max(0, rotatesAt - serverNowMs);
 }
 
-function compareCredentialBlockSnapshots(a: CredentialBlockSnapshot, b: CredentialBlockSnapshot): number {
-	const provider = a.providerKey.localeCompare(b.providerKey);
-	if (provider !== 0) return provider;
-	const scope = a.blockScope.localeCompare(b.blockScope);
-	if (scope !== 0) return scope;
-	return a.blockedUntilMs - b.blockedUntilMs;
-}
-
 const CODEX_BLOCK_PROVIDER_KEY = "openai-codex:oauth";
 const CODEX_LEGACY_PROJECTED_BLOCK_SCOPES = new Set(["chat", "spark", "shared"]);
 
@@ -362,6 +366,7 @@ function buildCredentialBlockGroups(
 	blocks: readonly StoredCredentialBlock[],
 	serverNowMs: number,
 	clientSupportsCodexMeterBlockScopes: boolean,
+	clientSupportsBlockMutationTokens: boolean,
 ): Map<number, CredentialBlockSnapshot[]> {
 	const byCredentialId = new Map<number, CredentialBlockSnapshot[]>();
 	for (const block of blocks) {
@@ -371,6 +376,7 @@ function buildCredentialBlockGroups(
 			blockScope: block.blockScope,
 			blockedUntilMs: block.blockedUntilMs,
 			updatedAtMs: block.updatedAtMs,
+			...(clientSupportsBlockMutationTokens && block.mutationToken ? { mutationToken: block.mutationToken } : {}),
 		};
 		const existing = byCredentialId.get(block.credentialId);
 		if (existing) {
@@ -393,15 +399,22 @@ function buildSnapshot(
 	storage: AuthStorage,
 	refresher: AuthBrokerRefresher | undefined,
 	clientSupportsCodexMeterBlockScopes: boolean,
+	clientSupportsBlockRevisions: boolean,
+	clientSupportsBlockMutationTokens: boolean,
 ): SnapshotResponse {
 	const serverNowMs = Date.now();
-	const base = storage.exportSnapshot();
+	const availableBlockRevision =
+		clientSupportsBlockRevisions || clientSupportsBlockMutationTokens ? storage.blocks.revision() : undefined;
+	const blockRevision = clientSupportsBlockRevisions ? availableBlockRevision : undefined;
+	const blockMutationTokens = clientSupportsBlockMutationTokens && availableBlockRevision !== undefined;
+	const base = storage.credentials.snapshot();
 	const { wire, nextSweepAt } = resolveRefresherSchedule(refresher, serverNowMs);
 	const credentialIds = base.credentials.map(entry => entry.id);
 	const blocksByCredentialId = buildCredentialBlockGroups(
-		storage.listCredentialBlocks(credentialIds),
+		storage.blocks.list(credentialIds),
 		serverNowMs,
 		clientSupportsCodexMeterBlockScopes,
+		blockMutationTokens,
 	);
 	const credentials: SnapshotEntry[] = base.credentials.map(entry => {
 		const blocks = blocksByCredentialId.get(entry.id);
@@ -410,6 +423,8 @@ function buildSnapshot(
 	});
 	return {
 		generation: base.generation,
+		...(blockRevision ? { blockRevision } : {}),
+		...(blockMutationTokens ? { blockMutationTokens: true as const } : {}),
 		generatedAt: base.generatedAt,
 		serverNowMs,
 		refresher: wire,
@@ -425,14 +440,22 @@ async function serveSnapshot(
 	refresher: AuthBrokerRefresher | undefined,
 	peer: string,
 ): Promise<Response> {
-	await storage.reload();
+	await storage.credentials.reload();
 	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
-	let currentGeneration = storage.getGeneration();
+	const clientSupportsBlockRevisions = supportsBlockRevisions(req);
+	const clientSupportsBlockMutationTokens = supportsBlockMutationTokens(req);
+	let currentGeneration = storage.credentials.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+		const body = buildSnapshot(
+			storage,
+			refresher,
+			clientSupportsCodexMeterBlockScopes,
+			clientSupportsBlockRevisions,
+			clientSupportsBlockMutationTokens,
+		);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -449,10 +472,16 @@ async function serveSnapshot(
 	waitController.abort();
 	if (result === "aborted" || req.signal.aborted) return empty(499, snapshotHeaders(currentGeneration));
 
-	await storage.reload();
-	currentGeneration = storage.getGeneration();
+	await storage.credentials.reload();
+	currentGeneration = storage.credentials.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+		const body = buildSnapshot(
+			storage,
+			refresher,
+			clientSupportsCodexMeterBlockScopes,
+			clientSupportsBlockRevisions,
+			clientSupportsBlockMutationTokens,
+		);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -499,6 +528,8 @@ function serveSnapshotStream(
 	const encoder = new TextEncoder();
 	const openedAt = Date.now();
 	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const clientSupportsBlockRevisions = supportsBlockRevisions(req);
+	const clientSupportsBlockMutationTokens = supportsBlockMutationTokens(req);
 	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let unsubscribe: (() => void) | null = null;
@@ -554,9 +585,15 @@ function serveSnapshotStream(
 		try {
 			do {
 				pendingBumps = 0;
-				await storage.reload();
+				await storage.credentials.reload();
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+				const snapshot = buildSnapshot(
+					storage,
+					refresher,
+					clientSupportsCodexMeterBlockScopes,
+					clientSupportsBlockRevisions,
+					clientSupportsBlockMutationTokens,
+				);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -577,6 +614,7 @@ function serveSnapshotStream(
 						kind: "entry",
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
+						...(snapshot.blockRevision ? { blockRevision: snapshot.blockRevision } : {}),
 						refresher: snapshot.refresher,
 						entry,
 					};
@@ -595,6 +633,7 @@ function serveSnapshotStream(
 						kind: "removed",
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
+						...(snapshot.blockRevision ? { blockRevision: snapshot.blockRevision } : {}),
 						refresher: snapshot.refresher,
 						id,
 					};
@@ -610,8 +649,14 @@ function serveSnapshotStream(
 	const stream = new ReadableStream<Uint8Array>({
 		async start(c) {
 			controller = c;
-			await storage.reload();
-			const initial = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
+			await storage.credentials.reload();
+			const initial = buildSnapshot(
+				storage,
+				refresher,
+				clientSupportsCodexMeterBlockScopes,
+				clientSupportsBlockRevisions,
+				clientSupportsBlockMutationTokens,
+			);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -620,7 +665,7 @@ function serveSnapshotStream(
 				write(": keepalive\n\n");
 			}, keepaliveMs);
 			keepaliveTimer.unref?.();
-			unsubscribe = storage.onGenerationChanged(() => {
+			unsubscribe = storage.credentials.onGeneration(() => {
 				void processGenerationBump();
 			});
 			abortHandler = (): void => cleanup();
@@ -693,7 +738,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						// last fetch instead of hitting provider endpoints repeatedly.
 						// `req.signal` propagates HTTP-client disconnects all the way to the
 						// per-caller cancel without touching the shared upstream fetch.
-						const reports = (await opts.storage.fetchUsageReports?.({ signal: req.signal })) ?? [];
+						const reports = (await opts.storage.usage.reports?.({ signal: req.signal })) ?? [];
 						// Drop the `raw` field — it's the provider-specific upstream body,
 						// large and unstable. Everything UI-relevant lives in `limits` and
 						// `metadata`.
@@ -712,7 +757,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const sinceMs =
 						sinceMsParsed !== undefined && Number.isFinite(sinceMsParsed) ? sinceMsParsed : undefined;
 					const provider = url.searchParams.get("provider") ?? undefined;
-					const entries = opts.storage.listUsageHistory({ sinceMs, provider });
+					const entries = opts.storage.usage.history({ sinceMs, provider });
 					logger.info("auth-broker usage history served", { peer, entries: entries.length, sinceMs, provider });
 					return json(200, { generatedAt: Date.now(), entries });
 				}
@@ -723,7 +768,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					// Array.prototype.entries; the schema already validated the shape.
 					const report = parsed.data as ClientUsageReportRequest;
 					try {
-						const recorded = opts.storage.recordClientUsage(report);
+						const recorded = opts.storage.usage.recordClient(report);
 						if (!recorded) return json(501, { error: "broker store does not persist client usage" });
 						logger.debug("auth-broker client usage recorded", {
 							peer,
@@ -741,12 +786,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (req.method === "GET" && pathname === "/v1/usage/clients") {
 					const sinceMsRaw = url.searchParams.get("sinceMs");
 					const sinceMsParsed = sinceMsRaw === null ? Number.NaN : Number.parseInt(sinceMsRaw, 10);
-					const summary = opts.storage.getClientUsageSummary(Number.isFinite(sinceMsParsed) ? sinceMsParsed : 0);
+					const summary = opts.storage.usage.clientSummary(Number.isFinite(sinceMsParsed) ? sinceMsParsed : 0);
 					return json(200, { generatedAt: Date.now(), clients: summary.clients });
 				}
 				if (req.method === "POST" && pathname === "/v1/usage/stale") {
 					try {
-						await opts.storage.invalidateUsageCache?.();
+						await opts.storage.usage.invalidate?.();
 						logger.info("auth-broker usage cache invalidated", { peer });
 						return json(200, { ok: true });
 					} catch (error) {
@@ -757,15 +802,20 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				}
 				if (req.method === "GET" && pathname === "/v1/credentials/disabled") {
 					const provider = url.searchParams.get("provider") ?? undefined;
-					const disabled = await opts.storage.listDisabledCredentials(provider, req.signal);
+					const disabled = await opts.storage.credentials.listDisabled(provider, req.signal);
 					const body: DisabledCredentialsResponse = { generatedAt: Date.now(), disabled };
 					return json(200, body);
 				}
 				const refreshMatch = req.method === "POST" ? pathname.match(REFRESH_ROUTE) : null;
 				if (refreshMatch) {
 					const id = Number.parseInt(refreshMatch[1], 10);
+					const authRecovery = url.searchParams.get("reason") === "auth-recovery";
 					try {
-						const entry = await opts.storage.refreshCredentialById(id, req.signal);
+						const entry = await opts.storage.oauth.refresh(
+							id,
+							req.signal,
+							authRecovery ? AUTH_RECOVERY_REFRESH_OPTIONS : undefined,
+						);
 						const body: CredentialRefreshResponse = { entry };
 						logger.info("auth-broker credential refreshed", {
 							id,
@@ -790,7 +840,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					if (!parsed.ok) return parsed.response;
 					const cause =
 						parsed.data.cause && parsed.data.cause.length > 0 ? parsed.data.cause : "disabled via auth-broker";
-					const ok = opts.storage.disableCredentialById(id, cause);
+					const ok = await opts.storage.credentials.disable(id, cause);
 					if (!ok) {
 						logger.info("auth-broker disable miss", { id, peer, cause });
 						return json(404, { error: `No credential with id=${id}` });
@@ -809,14 +859,16 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						providerKey: parsed.data.providerKey,
 						blockScope: parsed.data.blockScope,
 						blockedUntilMs: parsed.data.blockedUntilMs,
+						...(parsed.data.mutationToken ? { mutationToken: parsed.data.mutationToken } : {}),
 					};
-					if (!opts.storage.exportSnapshot().credentials.some(entry => entry.id === id)) {
+					if (!opts.storage.credentials.snapshot().credentials.some(entry => entry.id === id)) {
 						logger.info("auth-broker credential block miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
 					}
 					try {
-						opts.storage.upsertCredentialBlock(block);
-						const response: CredentialBlockResponse = { ok: true };
+						opts.storage.blocks.upsert(block);
+						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
+						const response: CredentialBlockResponse = { ok: true, ...(blockRevision ? { blockRevision } : {}) };
 						logger.info("auth-broker credential block upserted", {
 							id,
 							peer,
@@ -832,16 +884,71 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						return json(status, { error: message });
 					}
 				}
+				const blockDeleteMatch = req.method === "DELETE" ? pathname.match(BLOCK_ROUTE) : null;
+				if (blockDeleteMatch) {
+					const id = Number.parseInt(blockDeleteMatch[1], 10);
+					const parsed = await parseBody(req, credentialBlockDeleteRequestSchema);
+					if (!parsed.ok) return parsed.response;
+					if (!opts.storage.credentials.snapshot().credentials.some(entry => entry.id === id)) {
+						return json(404, { error: `No credential with id=${id}` });
+					}
+					try {
+						if (!parsed.data.mutationToken || parsed.data.blockedUntilMs === undefined) {
+							return json(409, { error: "Block delete requires the observed mutation token and deadline" });
+						}
+						const deleted = opts.storage.blocks.deleteIfMatches(
+							id,
+							parsed.data.providerKey,
+							parsed.data.blockScope,
+							parsed.data.mutationToken,
+							parsed.data.blockedUntilMs,
+						);
+						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
+						const response: CredentialBlocksDeleteResponse = {
+							ok: true,
+							...(blockRevision ? { blockRevision } : {}),
+							deleted,
+						};
+						logger.info("auth-broker credential block deleted", {
+							id,
+							peer,
+							providerKey: parsed.data.providerKey,
+							blockScope: parsed.data.blockScope,
+							deleted,
+						});
+						return json(200, response);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						logger.warn("auth-broker credential block delete failed", { id, peer, error: message });
+						return json(500, { error: message });
+					}
+				}
 				const blocksDeleteMatch = req.method === "DELETE" ? pathname.match(BLOCKS_ROUTE) : null;
 				if (blocksDeleteMatch) {
 					const id = Number.parseInt(blocksDeleteMatch[1], 10);
-					if (!opts.storage.exportSnapshot().credentials.some(entry => entry.id === id)) {
+					if (!opts.storage.credentials.snapshot().credentials.some(entry => entry.id === id)) {
 						logger.info("auth-broker credential blocks delete miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
 					}
 					try {
-						opts.storage.deleteCredentialBlocks(id);
-						const response: CredentialBlocksDeleteResponse = { ok: true };
+						if (!supportsBlockMutationTokens(req)) {
+							return json(409, { error: "Block delete requires the block-mutation-tokens capability" });
+						}
+						const parsed = await parseBody(req, credentialBlocksDeleteRequestSchema);
+						if (!parsed.ok) return parsed.response;
+						if (parsed.data.blocks.some(block => !block.mutationToken || block.blockedUntilMs === undefined)) {
+							return json(409, { error: "Block delete requires every observed mutation token and deadline" });
+						}
+						const deleted = opts.storage.blocks.deleteIfAllMatch(
+							id,
+							parsed.data.blocks as Parameters<typeof opts.storage.blocks.deleteIfAllMatch>[1],
+						);
+						const blockRevision = supportsBlockRevisions(req) ? opts.storage.blocks.revision() : undefined;
+						const response: CredentialBlocksDeleteResponse = {
+							ok: true,
+							...(blockRevision ? { blockRevision } : {}),
+							deleted,
+						};
 						logger.info("auth-broker credential blocks deleted", { id, peer });
 						return json(200, response);
 					} catch (error) {
@@ -856,7 +963,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					if (!parsed.ok) return parsed.response;
 					const { provider, credential } = parsed.data;
 					try {
-						const entries = opts.storage.upsertCredential(provider, credential);
+						const entries = await opts.storage.credentials.upsert(provider, credential);
 						const identity =
 							credential.type === "oauth"
 								? (credential.email ?? credential.accountId ?? credential.projectId ?? "(no identity)")

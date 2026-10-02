@@ -73,4 +73,31 @@ describe("WelcomeComponent", () => {
 		expect(plain).toMatch(/DeepSeek V4 [^│]*…/);
 		expect(plain).toContain("Recent sessions");
 	});
+
+	it("hides the LSP section only when LSP is disabled (null), not when no servers were detected", () => {
+		const [empty, disabled] = [[], null].map(servers =>
+			new WelcomeComponent("1.0.0", "model", "provider", [], servers)
+				.render(100)
+				.join("\n")
+				.replace(/\x1b\[[0-9;]*m/g, ""),
+		);
+
+		expect(empty).toContain("No LSP servers");
+		expect(disabled).not.toContain("LSP Servers");
+		expect(disabled).not.toContain("No LSP servers");
+		expect(disabled).toContain("Recent sessions");
+	});
+
+	it("keeps the Coreforge mark on wide native cards and the brand on narrow cards", () => {
+		const welcome = new WelcomeComponent("18.4.6", "model", "provider", [], [], "Coreforge", "Aidan");
+		const cx = { cols: 80, dark: true, reduceMotion: false, supports: () => true, feature: () => true };
+		const wide = JSON.stringify(welcome.describe(cx));
+		const narrow = JSON.stringify(welcome.describe({ ...cx, cols: 55 }));
+
+		expect(wide).toContain("⣠⠞⢁⣴⣦⡀");
+		expect(wide).toContain("Welcome back, Aidan!");
+		expect(wide).toContain("Coreforge v18.4.6");
+		expect(narrow).not.toContain("⣠⠞⢁⣴⣦⡀");
+		expect(narrow).toContain("Coreforge v18.4.6");
+	});
 });

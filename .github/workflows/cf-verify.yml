@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
       - name: Select native verification source
         id: native
         env:
@@ -70,7 +70,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            os: macos-14
+            os: xcode-27
             binary: omp-darwin-arm64
             native_targets: darwin-arm64
           - target: darwin-x64
@@ -85,6 +85,16 @@ jobs:
             os: ubuntu-24.04-arm
             binary: omp-linux-arm64
             native_targets: linux-arm64
+          - target: linux-musl-x64
+            os: ubuntu-22.04
+            cross: "1"
+            binary: omp-linux-musl-x64
+            native_targets: linux-musl-x64-baseline
+          - target: linux-musl-arm64
+            os: ubuntu-24.04-arm
+            cross: "1"
+            binary: omp-linux-musl-arm64
+            native_targets: linux-musl-arm64
           - target: win32-x64
             os: ubuntu-24.04
             cross: "1"
@@ -123,9 +133,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Require Apple Foundation Models toolchain
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          toolchain="$(/bin/sh crates/pi-natives/src/applefm/build-bridge.sh detect)"
+          if [ -z "$toolchain" ]; then
+            echo "::error::Darwin ARM64 verification requires Swift 6.4+ and macOS 27 SDK; refusing an addon without the Apple Foundation Models bridge"
+            exit 1
+          fi
+          printf 'Apple Foundation Models bridge: %s\n' "$toolchain"
+      - name: Test Apple Foundation Models gate
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          swiftc -swift-version 6 -parse-as-library -D APPLEFM_GATE_TEST \
+            crates/pi-natives/src/applefm/bridge.swift \
+            crates/pi-natives/src/applefm/gate-test.swift \
+            -o "$RUNNER_TEMP/applefm-gate-test"
+          "$RUNNER_TEMP/applefm-gate-test"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
       - name: Resolve verification version
         if: matrix.windows != '1'
         run: |
@@ -138,7 +165,7 @@ jobs:
           $pkg = (bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)').Trim()
           "VERIFY_VERSION=$pkg.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Reclaim disk for large native builds
-        if: needs.prepare.outputs.native_changed == 'true' && (matrix.target == 'win32-x64' || matrix.target == 'linux-x64')
+        if: needs.prepare.outputs.native_changed == 'true' && (matrix.target == 'win32-x64' || matrix.target == 'linux-x64' || matrix.target == 'linux-musl-x64')
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
@@ -182,12 +209,24 @@ jobs:
       - name: Install verified released native addon
         if: needs.prepare.outputs.native_changed != 'true'
         run: bun scripts/ci-released-native.ts install "${{ needs.prepare.outputs.release_tag }}" "${{ matrix.target }}" packages/natives/native "${{ runner.temp }}/released-native"
+      - name: Verify embedded Apple Foundation Models bridge
+        if: matrix.target == 'darwin-arm64'
+        run: |
+          addon=packages/natives/native/pi_natives.darwin-arm64.node
+          test -s "$addon"
+          grep -aqF OmpAppleFm "$addon" ||
+            { echo "::error::Darwin ARM64 addon lacks the embedded Apple Foundation Models bridge"; exit 1; }
+          if otool -L "$addon" | grep -E 'libswift|FoundationModels'; then
+            echo "::error::Darwin ARM64 addon directly links the Swift runtime or FoundationModels"; exit 1
+          fi
       - name: Package source-built native addon
         if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         run: |
           set -euo pipefail
           shopt -s nullglob
-          addons=(packages/natives/native/pi_natives."${{ matrix.target }}"*.node)
+          native_target="${{ matrix.target }}"
+          if [[ "$native_target" == linux-musl-* ]]; then native_target="${native_target/linux-musl-/linux-}"; fi
+          addons=(packages/natives/native/pi_natives."${native_target}"*.node)
           expected=1
           if [ "${{ matrix.target }}" = "linux-x64" ]; then expected=2; fi
           if [ "${#addons[@]}" -ne "$expected" ]; then
@@ -268,7 +307,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ">=1.4"
+          bun-version: "1.4.2"
       - run: bun install --frozen-lockfile
       - name: Build Coreforge Browser Relay extension
         run: |

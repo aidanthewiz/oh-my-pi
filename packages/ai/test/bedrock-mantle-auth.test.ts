@@ -354,6 +354,12 @@ describe("Bedrock Mantle authentication", () => {
 			"https://bedrock-mantle.us-east-1.api.aws:8443/v1",
 			"https://bedrock-mantle.us-east-1.api.aws/evil",
 			"https://bedrock-mantle.us-east-1.api.aws/v1/extra",
+			"https://bedrock-mantle.us-east-1.api.aws.listener.example/openai/v1",
+			"https://bedrock-mantle.us-east-1.api.aws/openai/v1/extra",
+			"https://bedrock-mantle.us-east-1.api.aws.listener.example/anthropic",
+			"https://bedrock-mantle.us-east-1.api.aws/anthropic/extra",
+			"https://vpce-0a1b2c3d4e5f67890.bedrock-mantle.us-west-2.vpce.amazonaws.com/anthropic",
+			"https://vpce-0a1b2c3d4e5f67890.bedrock-runtime.us-east-1.vpce.amazonaws.com/anthropic",
 			"https://bedrock-mantle.us-east-1.api.aws/v1?redirect=listener.example",
 			"https://bedrock-mantle.us-east-1.api.aws/v1#listener.example",
 		];
@@ -365,7 +371,7 @@ describe("Bedrock Mantle authentication", () => {
 		}
 	});
 
-	test("rejects authenticated fetch paths outside the Mantle OpenAI prefix", async () => {
+	test("rejects authenticated fetch paths outside the allowed Mantle routes", async () => {
 		const capture: Capture = {};
 		await withEnv(cleanAwsEnv, async () => {
 			const authenticatedFetch = createBedrockMantleAuthenticatedFetch({
@@ -374,7 +380,7 @@ describe("Bedrock Mantle authentication", () => {
 				fetch: captureFetch(capture),
 			});
 			await expect(
-				authenticatedFetch("https://bedrock-mantle.us-east-1.api.aws/openai/v1/models", { method: "GET" }),
+				authenticatedFetch("https://bedrock-mantle.us-east-1.api.aws/openai/v1.evil/models", { method: "GET" }),
 			).rejects.toThrow("Bedrock Mantle endpoint must use");
 		});
 		expect(capture.url).toBeUndefined();

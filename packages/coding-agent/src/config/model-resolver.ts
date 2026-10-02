@@ -41,6 +41,7 @@ import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	concreteThinkingLevel,
+	parseConfiguredThinkingLevel,
 	resolveThinkingLevelForModel,
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
@@ -55,6 +56,9 @@ import {
 	type ModelRole,
 } from "./model-roles";
 import type { Settings } from "./settings";
+
+import { cfgDisabledModels, cfgDisabledProviders, cfgEnabledModels, cfgModelProviderOrder } from "./model-settings";
+import { cfgRetryFallbackChains } from "../session/settings";
 
 function isKnownProvider(provider: string): provider is KnownProvider {
 	return provider in DEFAULT_MODEL_PER_PROVIDER;
@@ -507,6 +511,24 @@ type CliModelRegistry = Pick<ModelRegistry, "getAll" | "getAvailable">;
 type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "hasConcreteAuth">;
 type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "getApiKey" | "hasConcreteAuth">;
 
+const kModelOrderIndex = Symbol("model-resolver.modelOrderIndex");
+type ModelsWithOrderIndex = readonly Model<Api>[] & {
+	[kModelOrderIndex]?: Map<string, number>;
+};
+
+/** `provider/id` → last position in `availableModels`; cached on the array like the provider indexes. */
+function getModelOrderIndex(availableModels: readonly Model<Api>[]): Map<string, number> {
+	const tagged = availableModels as ModelsWithOrderIndex;
+	const cached = tagged[kModelOrderIndex];
+	if (cached) return cached;
+	const index = new Map<string, number>();
+	for (let i = 0; i < availableModels.length; i += 1) {
+		index.set(formatModelString(availableModels[i]), i);
+	}
+	tagged[kModelOrderIndex] = index;
+	return index;
+}
+
 interface ModelPreferenceContext {
 	modelUsageRank: Map<string, number>;
 	providerUsageRank: Map<string, number>;
@@ -534,20 +556,16 @@ function buildPreferenceContext(
 	}
 	const providerPriorityRank = buildModelProviderPriorityRank(preferences?.providerOrder);
 	const deprioritizedProviders = new Set(preferences?.deprioritizeProviders ?? []);
-	const modelOrder = new Map<string, number>();
-	for (let i = 0; i < availableModels.length; i += 1) {
-		modelOrder.set(formatModelString(availableModels[i]), i);
-	}
+	const modelOrder = getModelOrderIndex(availableModels);
 
 	return { modelUsageRank, providerUsageRank, providerPriorityRank, deprioritizedProviders, modelOrder };
 }
 
-export function getModelMatchPreferences(
-	settings?: Partial<Pick<Settings, "get" | "getStorage">>,
-): ModelMatchPreferences {
+export function getModelMatchPreferences(settings?: Settings): ModelMatchPreferences {
+	if (!settings) return { usageOrder: undefined, providerOrder: undefined };
 	return {
-		usageOrder: settings?.getStorage?.()?.getModelUsageOrder(),
-		providerOrder: settings?.get?.("modelProviderOrder"),
+		usageOrder: settings.getStorage()?.getModelUsageOrder(),
+		providerOrder: cfgModelProviderOrder.get(settings),
 	};
 }
 
@@ -841,6 +859,25 @@ function matchModel(
 	return pickPreferredModel(topCandidates, context);
 }
 
+/**
+ * Recover the effort a retired wire-tier id (e.g. `gemini-3.8-flash-high`) implied before it was
+ * collapsed into a logical model. Only a route owned by exactly one level carries intent: the
+ * model's default wire id and ids shared by several levels imply nothing, so the caller's level
+ * still applies.
+ */
+function inferWireRouteThinkingLevel(pattern: string, model: Model<Api>): ConfiguredThinkingLevel | undefined {
+	const routing = model.thinking?.effortRouting;
+	if (!routing) return undefined;
+	const normalized = pattern.trim().toLowerCase();
+	const providerPrefix = `${model.provider.toLowerCase()}/`;
+	const wireId = normalized.startsWith(providerPrefix) ? normalized.slice(providerPrefix.length) : normalized;
+	if (wireId === model.id.toLowerCase() || wireId === model.requestModelId?.toLowerCase()) return undefined;
+
+	const levels = [ThinkingLevel.Off, ...(model.thinking?.efforts ?? [])];
+	const matches = levels.filter(level => routing[level]?.toLowerCase() === wireId);
+	return matches.length === 1 ? parseConfiguredThinkingLevel(matches[0]) : undefined;
+}
+
 export interface ParsedModelResult {
 	model: Model<Api> | undefined;
 	/** Thinking level if explicitly specified in pattern, undefined otherwise */
@@ -855,12 +892,11 @@ export interface ParsedModelResult {
  * Parse a pattern to extract model and thinking level.
  * Handles models with colons in their IDs (e.g., OpenRouter's :exacto suffix).
  *
- * Algorithm:
- * 1. Try to match full pattern as a model
- * 2. If found, return it with undefined thinking level
- * 3. If not found and has colons, split on last colon:
- *    - If suffix is valid thinking level, use it and recurse on prefix
- *    - If suffix is invalid, warn and recurse on prefix
+ * 1. Try to match the full pattern as a model
+ * 2. If it names a collapsed wire route, preserve that route's thinking level
+ * 3. If not found and it has colons, split on the last colon:
+ *    - If the suffix is a valid thinking level, use it and recurse on the prefix
+ *    - If the suffix is invalid, warn and recurse on the prefix
  *
  * @internal Exported for testing
  */
@@ -873,7 +909,13 @@ function parseModelPatternWithContext(
 	// Exact match on the full pattern first (no fuzzy): a literal id that
 	const exactMatch = matchModel(pattern, availableModels, context, { exactOnly: true });
 	if (exactMatch) {
-		return { model: exactMatch, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
+		const thinkingLevel = inferWireRouteThinkingLevel(pattern, exactMatch);
+		return {
+			model: exactMatch,
+			thinkingLevel,
+			warning: undefined,
+			explicitThinkingLevel: thinkingLevel !== undefined,
+		};
 	}
 
 	// Prefer a fuzzy match whose actual id ends in the suffix, preserving
@@ -1505,16 +1547,11 @@ export interface RoleChainCandidate {
 }
 
 /** Resolve a role's primary and retry candidates in effective attempt order. */
-export function resolveRoleChain(
-	role: string,
-	settings: Settings,
-	pool: Model<Api>[],
-	options?: { hoistProvider?: string },
-): RoleChainCandidate[] {
+export function resolveRoleChain(role: string, settings: Settings, pool: Model<Api>[]): RoleChainCandidate[] {
 	const configuredRoles = settings.getModelRoles();
 	const configured = settings.getModelRole(role)?.trim();
 	const primarySelector = configured || formatModelRoleAlias(role);
-	const configuredFallbacks = settings.get("retry.fallbackChains")[role];
+	const configuredFallbacks = cfgRetryFallbackChains.get(settings)[role];
 	const hasConfiguredFallbackChain = Array.isArray(configuredFallbacks);
 	const fallbackSelectors = hasConfiguredFallbackChain ? configuredFallbacks : rolePriorityDefaults(role);
 	const selectors = [
@@ -1537,16 +1574,7 @@ export function resolveRoleChain(
 		candidateByRoute.set(key, candidate);
 		candidates.push(candidate);
 	}
-
-	const hoistProvider = options?.hoistProvider;
-	if (!hoistProvider) return candidates;
-	const nonExplicit = candidates.filter(candidate => !candidate.explicit);
-	const hoisted = nonExplicit.filter(candidate => candidate.model.provider === hoistProvider);
-	if (hoisted.length === 0) return candidates;
-	const remaining = nonExplicit.filter(candidate => candidate.model.provider !== hoistProvider);
-	const reordered = [...hoisted, ...remaining];
-	let reorderedIndex = 0;
-	return candidates.map(candidate => (candidate.explicit ? candidate : reordered[reorderedIndex++]!));
+	return candidates;
 }
 
 /**
@@ -1577,6 +1605,18 @@ export function resolveModelOverride(
 		if (!warning && patternWarning) warning = patternWarning;
 	}
 	return { explicitThinkingLevel: false, warning };
+}
+
+/**
+ * Provider ids turned off through the `disabledProviders` setting, already
+ * resolved for the current working directory's path scopes.
+ *
+ * A disabled provider is unreachable however a model is named — catalog
+ * listing, configured role, or an explicit `provider/id` pin — so every
+ * resolution path filters through this set.
+ */
+export function disabledProviderIds(settings?: Settings): ReadonlySet<string> {
+	return new Set(settings ? cfgDisabledProviders.get(settings) : undefined);
 }
 
 /**
@@ -1621,7 +1661,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	authFallbackUsed: boolean;
 	warning?: string;
 }> {
-	const disabledProviders = new Set(settings?.get("disabledProviders"));
+	const disabledProviders = disabledProviderIds(settings);
 	let lookupRegistry: ModelLookupRegistry = modelRegistry;
 	if (disabledProviders.size > 0) {
 		const enabledModels = modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider));
@@ -1803,22 +1843,9 @@ export async function resolveModelScope(
 export async function resolveAllowedModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 	settings: Settings | undefined,
-	preferences?: ModelMatchPreferences,
+	_preferences?: ModelMatchPreferences,
 ): Promise<Model<Api>[]> {
-	const available = modelRegistry.getAvailable();
-	const enabledPatterns = settings?.get("enabledModels") ?? [];
-	let allowed = available;
-	if (enabledPatterns.length > 0) {
-		const scoped = await resolveModelScope(enabledPatterns, modelRegistry, preferences, settings);
-		allowed =
-			scoped.length === 0
-				? []
-				: includeSyntheticAllowedModels(
-						available,
-						scoped.map(entry => entry.model),
-					);
-	}
-	return excludeModelsByDisabledPatterns(allowed, settings?.get("disabledModels") ?? []);
+	return filterModelsByConfiguredScope(modelRegistry.getAvailable(), settings);
 }
 
 /**
@@ -1896,10 +1923,10 @@ function excludeModelsByDisabledPatterns(models: Model<Api>[], patterns: readonl
 
 /** Apply the effective allowlist and denylist to any model inventory. */
 export function filterModelsByConfiguredScope(models: Model<Api>[], settings?: Settings): Model<Api>[] {
-	const enabledPatterns = settings?.get("enabledModels") ?? [];
+	const enabledPatterns = settings ? cfgEnabledModels.get(settings) : [];
 	const allowed =
 		enabledPatterns.length === 0 ? models : filterAvailableModelsByEnabledPatterns(models, enabledPatterns, settings);
-	return excludeModelsByDisabledPatterns(allowed, settings?.get("disabledModels") ?? []);
+	return excludeModelsByDisabledPatterns(allowed, settings ? cfgDisabledModels.get(settings) : []);
 }
 
 /** Available models eligible for a role after applying the effective model policy. */
@@ -1915,8 +1942,8 @@ export function isModelEnabledBySettings(
 	settings: Settings | undefined,
 	modelRegistry: Pick<ModelRegistry, "getAll">,
 ): boolean {
-	const enabledPatterns = settings?.get("enabledModels") ?? [];
-	const disabledPatterns = settings?.get("disabledModels") ?? [];
+	const enabledPatterns = settings ? cfgEnabledModels.get(settings) : [];
+	const disabledPatterns = settings ? cfgDisabledModels.get(settings) : [];
 	if (enabledPatterns.length === 0 && disabledPatterns.length === 0) return true;
 	const modelKey = formatModelString(model);
 	const registered = modelRegistry.getAll();
@@ -1990,14 +2017,16 @@ export interface ResolveCliModelResult {
 	/** True when the selector names a catalog model excluded by model policy. */
 	blockedByModelPolicy?: boolean;
 	error: string | undefined;
+	/**
+	 * Provider the selector wanted but that `disabledProviders` turns off. Set
+	 * only alongside `error`, so callers can refuse the selector outright
+	 * instead of deferring it to a later resolution pass.
+	 */
+	disabledProvider?: string;
 }
 
-/**
- * Resolve one CLI model selector. Exact selectors take precedence over roles,
- * and roles take precedence over unauthenticated catalog-only IDs. The active
- * `enabledModels` and `disabledModels` policy remains authoritative.
- */
-export function resolveCliModel(options: {
+/** Inputs accepted by {@link resolveCliModel}. */
+interface CliModelOptions {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: CliModelRegistry;
@@ -2005,25 +2034,89 @@ export function resolveCliModel(options: {
 	availableModels?: Model<Api>[];
 	settings?: Settings;
 	preferences?: ModelMatchPreferences;
-}): ResolveCliModelResult {
-	const { cliProvider, cliModel, modelRegistry, settings, preferences, availableModels: preferredModels } = options;
+}
+
+/**
+ * Catalog a CLI selector may bind to: the full set plus the preferred
+ * (authenticated, or `--models`-scoped) subset.
+ */
+interface CliModelScope {
+	all: Model<Api>[];
+	available: Model<Api>[];
+}
+
+/**
+ * Resolve a single model from CLI flags.
+ *
+ * Explicit `provider/id` references and authenticated bare ids take precedence
+ * over configured role names, which in turn take precedence over an
+ * unauthenticated catalog-only id (so a bundled `cursor/default` never shadows a
+ * configured `modelRoles.default`).
+ *
+ * Disabled providers are dropped from both halves of the scope before matching,
+ * so a selector naming one is refused rather than silently spending on it
+ * (issue #13079); an unqualified selector falls through to an enabled provider
+ * carrying the same id. The unfiltered catalog is consulted only after that
+ * failed, to report which disabled provider the selector wanted.
+ */
+export function resolveCliModel(options: CliModelOptions): ResolveCliModelResult {
+	const { cliProvider, cliModel, modelRegistry, settings, availableModels: preferredModels } = options;
 
 	if (!cliModel) {
 		return { model: undefined, selector: undefined, warning: undefined, error: undefined };
 	}
 
-	const catalogModels = modelRegistry.getAll();
-	if (catalogModels.length === 0) {
+	const scoped = { ...options, cliModel };
+	const scope: CliModelScope = {
+		all: filterModelsByConfiguredScope(modelRegistry.getAll(), settings),
+		available: filterModelsByConfiguredScope(preferredModels ?? modelRegistry.getAvailable(), settings),
+	};
+	const disabled = disabledProviderIds(settings);
+	if (disabled.size === 0) return resolveCliModelInScope(scoped, scope);
+
+	const enabled = resolveCliModelInScope(scoped, {
+		all: scope.all.filter(model => !disabled.has(model.provider)),
+		available: scope.available.filter(model => !disabled.has(model.provider)),
+	});
+	if (enabled.model) return enabled;
+
+	// Nothing enabled matched. An explicit `--provider` names its target
+	// directly; otherwise re-resolve unfiltered to see what the selector was
+	// aiming at, so the refusal names the provider instead of reading as a typo.
+	const blocked = cliProvider
+		? scope.all.find(model => model.provider.toLowerCase() === cliProvider.toLowerCase())?.provider
+		: resolveCliModelInScope(scoped, scope).model?.provider;
+	if (blocked === undefined || !disabled.has(blocked)) return enabled;
+	return {
+		model: undefined,
+		selector: undefined,
+		thinkingLevel: undefined,
+		warning: enabled.warning,
+		error: `Provider "${blocked}" is disabled. Remove "${blocked}" from disabledProviders to use "${cliModel.trim()}".`,
+		disabledProvider: blocked,
+	};
+}
+
+function resolveCliModelInScope(
+	options: CliModelOptions & { cliModel: string },
+	scope: CliModelScope,
+): ResolveCliModelResult {
+	const { cliProvider, cliModel, settings, preferences } = options;
+	const { all: allModels, available: availableModels } = scope;
+	const catalogModels = options.modelRegistry.getAll();
+	if (allModels.length === 0) {
 		return {
 			model: undefined,
 			selector: undefined,
 			warning: undefined,
-			error: "No models available. Check your installation or add models to models.json.",
+			error:
+				catalogModels.length === 0
+					? "No models available. Check your installation or add models to models.json."
+					: `Model "${cliModel.trim()}" is excluded by model policy (enabledModels/disabledModels).`,
+			...(catalogModels.length > 0 ? { blockedByModelPolicy: true } : {}),
 		};
 	}
 
-	const allModels = filterModelsByConfiguredScope(catalogModels, settings);
-	const availableModels = filterModelsByConfiguredScope(preferredModels ?? modelRegistry.getAvailable(), settings);
 	const providerMap = new Map<string, string>();
 	for (const model of catalogModels) {
 		providerMap.set(model.provider.toLowerCase(), model.provider);

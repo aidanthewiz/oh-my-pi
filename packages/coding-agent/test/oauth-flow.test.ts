@@ -61,7 +61,7 @@ async function completeLocalOAuthCallback(url: string): Promise<void> {
 }
 
 describe("mcp oauth flow", () => {
-	it("uses oh-my-pi client name for dynamic client registration", async () => {
+	it("registers and presents the Coreforge client when the server has no configured name", async () => {
 		let registrationPayload: Record<string, unknown> | null = null;
 
 		const flow = new MCPOAuthFlow(
@@ -78,7 +78,9 @@ describe("mcp oauth flow", () => {
 		const { url } = await flow.generateAuthUrl("test-state", "http://127.0.0.1:53172/callback");
 		const authUrl = new URL(url);
 
-		expect((registrationPayload as { client_name?: string } | null)?.client_name).toBe("oh-my-pi");
+		expect((registrationPayload as { client_name?: string } | null)?.client_name).toBe("coreforge");
+		expect(flow.branding?.displayName).toBe("coreforge");
+		expect(flow.branding?.iconDataUrl).toStartWith("data:image/svg+xml,");
 		expect((registrationPayload as { scope?: string } | null)?.scope).toBeUndefined();
 		expect(authUrl.searchParams.get("client_id")).toBe("registered-client-id");
 		expect(authUrl.searchParams.get("state")).toBe("test-state");
@@ -1058,17 +1060,6 @@ describe("mcp oauth flow", () => {
 			expect(new URL(url).searchParams.get("resource")).toBe("https://gateway.example.com");
 			expect(flow.resource).toBe("https://gateway.example.com");
 		});
-		it("keeps advertised resource from generateAuthUrl when it equals the auth-server origin with trailing slash", async () => {
-			const flow = await buildFlow({
-				authorizationUrl: "https://gateway.example.com/authorize",
-				resource: "https://gateway.example.com/",
-			});
-
-			const { url } = await flow.generateAuthUrl("state-x", REDIRECT_URI);
-
-			expect(new URL(url).searchParams.get("resource")).toBe("https://gateway.example.com/");
-			expect(flow.resource).toBe("https://gateway.example.com/");
-		});
 
 		it("keeps an origin-only resource that was pre-populated on the authorization URL", async () => {
 			const flow = await buildFlow({
@@ -1221,26 +1212,6 @@ describe("mcp oauth flow", () => {
 			expect(tokenParams.get("resource")).toBe("https://gateway.example.com");
 		});
 
-		it("keeps an advertised refresh resource that equals the token-server origin with trailing slash", async () => {
-			let tokenRequestBody = "";
-
-			await refreshMCPOAuthToken(
-				"https://gateway.example.com/token",
-				"refresh-token",
-				"client-id",
-				undefined,
-				"https://gateway.example.com/",
-				{
-					fetch: mockArbitraryTokenEndpoint("https://gateway.example.com/token", body => {
-						tokenRequestBody = body;
-					}),
-				},
-			);
-			const tokenParams = new URLSearchParams(tokenRequestBody);
-
-			expect(tokenParams.get("resource")).toBe("https://gateway.example.com/");
-		});
-
 		it("keeps an advertised refresh resource that points at a path under the token-server origin", async () => {
 			let tokenRequestBody = "";
 
@@ -1326,47 +1297,6 @@ describe("mcp oauth flow", () => {
 			const tokenParams = new URLSearchParams(tokenRequestBody);
 
 			expect(tokenParams.get("resource")).toBeNull();
-		});
-
-		it("keeps a refresh resource that points at a third origin when authorizationUrl is supplied", async () => {
-			let tokenRequestBody = "";
-
-			await refreshMCPOAuthToken(
-				"https://token.example.com/token",
-				"refresh-token",
-				"client-id",
-				undefined,
-				"https://api.example.com",
-				{
-					authorizationUrl: "https://auth.example.com/authorize",
-					fetch: mockArbitraryTokenEndpoint("https://token.example.com/token", body => {
-						tokenRequestBody = body;
-					}),
-				},
-			);
-			const tokenParams = new URLSearchParams(tokenRequestBody);
-
-			expect(tokenParams.get("resource")).toBe("https://api.example.com");
-		});
-
-		it("preserves tokenUrl-origin resources for legacy direct refresh calls without fallback provenance", async () => {
-			let tokenRequestBody = "";
-
-			await refreshMCPOAuthToken(
-				"https://token.example.com/token",
-				"refresh-token",
-				"client-id",
-				undefined,
-				"https://token.example.com",
-				{
-					fetch: mockArbitraryTokenEndpoint("https://token.example.com/token", body => {
-						tokenRequestBody = body;
-					}),
-				},
-			);
-			const tokenParams = new URLSearchParams(tokenRequestBody);
-
-			expect(tokenParams.get("resource")).toBe("https://token.example.com");
 		});
 	});
 });

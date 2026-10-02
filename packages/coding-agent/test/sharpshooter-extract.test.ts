@@ -43,18 +43,7 @@ function assistantResponse(content: AssistantMessage["content"]): AssistantMessa
 function extractionDependencies(cwd: string, messages: AgentMessage[], sessionId = "session-extract") {
 	const model = getBundledModel("anthropic", "claude-haiku-4-5");
 	if (!model) throw new Error("Expected bundled Claude Haiku model");
-	const settings = {
-		get(key: string) {
-			if (key === "sharpshooter.model") return `${model.provider}/${model.id}`;
-			return undefined;
-		},
-		getModelRole() {
-			return undefined;
-		},
-		getStorage() {
-			return undefined;
-		},
-	} as unknown as Settings;
+	const settings = Settings.isolated({ "sharpshooter.model": `${model.provider}/${model.id}` });
 	const modelRegistry = {
 		getAll: () => [model],
 		getAvailable: () => [model],

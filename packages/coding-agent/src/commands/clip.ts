@@ -10,6 +10,8 @@ import { uploadClip } from "../stream/clip-upload";
 import { latestRecording, recordingsDir } from "../stream/recording";
 import { StreamRedactor } from "../stream/redactor";
 
+import { cfgStreamRedactPatterns, cfgStreamServerUrl } from "../stream/settings";
+
 export default class Clip extends Command {
 	static description = commandHelp.description;
 
@@ -48,11 +50,11 @@ export default class Clip extends Command {
 		}
 
 		const settings = await Settings.loadReadOnly({ cwd: process.cwd() });
-		const serverUrl = flags.server?.trim() || (settings.get("stream.serverUrl") ?? "").trim();
+		const serverUrl = flags.server?.trim() || cfgStreamServerUrl.get(settings).trim();
 		if (!serverUrl) {
 			throw new CliUsageError("clip server required: use --server <url> or configure stream.serverUrl");
 		}
-		const redactor = await StreamRedactor.load(process.cwd(), settings.get("stream.redactPatterns"));
+		const redactor = await StreamRedactor.load(process.cwd(), cfgStreamRedactPatterns.get(settings));
 		const credential = new StencilCredential();
 		try {
 			const token = await credential.resolve();

@@ -21,24 +21,82 @@ import {
 import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
 import { findConfigFile } from "./config";
-import type { Personality, SkillsSettings } from "./config/settings";
+import type { SkillsSettings } from "./extensibility/settings";
+import type { Personality } from "./session/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { expandAtImports } from "./discovery/at-imports";
+import type { EvalPreludeDefinition } from "./eval/preludes";
+import { SkillDescriptionCatalog } from "./extensibility/skill-descriptions";
 import { loadSkills, type Skill } from "./extensibility/skills";
-import { hasObsidian } from "./internal-urls/vault-protocol";
+import { InternalUrlRouter } from "./internal-urls/router";
+import type { SchemeHost } from "./internal-urls/types";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
-import computerSafetyPrompt from "./prompts/system/computer-safety.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import defaultPersonality from "./prompts/system/personalities/default.md" with { type: "text" };
 import friendlyPersonality from "./prompts/system/personalities/friendly.md" with { type: "text" };
 import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
+import userAppendPromptTemplate from "./prompts/system/user-append.md" with { type: "text" };
 import { normalizeConcurrencyLimit } from "./task/parallel";
 import type { ActiveRepoContext } from "@oh-my-pi/pi-tui/status-line/host";
+import { XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
+import { combine } from "./config/registry";
+import { cfgBashAutoBackgroundEnabled } from "./exec/settings";
+import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
+import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
+import { cfgTuiReactions, cfgTuiRenderMermaid } from "./modes/settings";
+import { cfgSecretsEnabled } from "./secrets/settings";
+import { cfgToolsFormat } from "./session/context-settings";
+import {
+	cfgIncludeModelInPrompt,
+	cfgIncludeWorkspaceTree,
+	cfgInlineToolDescriptors,
+	cfgPersonality,
+} from "./session/settings";
+import { cfgTaskBatch, cfgTaskEager } from "./task/settings";
+import {
+	cfgAsyncEnabled,
+	cfgToolsIntentTracing,
+	cfgToolsXdevDocs,
+	cfgToolsXdevInlineDevices,
+	cfgVaultEnabled,
+} from "./tools/settings";
+
+/**
+ * Settings the system prompt renders from (`secrets.enabled` via the obfuscator state it
+ * reports). A session rebuilds its prompt once per coalesced change of this value, so a bulk
+ * settings change rebuilds once. Settings that change the tool set, skills, memory, or workspace
+ * roots rebuild through their own reconcile instead.
+ */
+export const cfgSystemPromptInputs = combine({
+	personality: cfgPersonality,
+	includeModelInPrompt: cfgIncludeModelInPrompt,
+	includeWorkspaceTree: cfgIncludeWorkspaceTree,
+	inlineToolDescriptors: cfgInlineToolDescriptors,
+	toolsFormat: cfgToolsFormat,
+	intentTracing: cfgToolsIntentTracing,
+	xdevDocs: cfgToolsXdevDocs,
+	xdevInlineDevices: cfgToolsXdevInlineDevices,
+	vaultEnabled: cfgVaultEnabled,
+	renderMermaid: cfgTuiRenderMermaid,
+	reactions: cfgTuiReactions,
+	// Rendered into the bash/eval/task tool descriptions (inline catalog) or read by
+	// the prompt builder (eager/batch delegation).
+	asyncEnabled: cfgAsyncEnabled,
+	bashAutoBackground: cfgBashAutoBackgroundEnabled,
+	evalAutoBackground: cfgEvalAutoBackgroundEnabled,
+	taskEager: cfgTaskEager,
+	taskBatch: cfgTaskBatch,
+	// Rule bucketing (TTSR registrations, rulebook, always-apply) runs at rebuild time.
+	ttsrEnabled: cfgTtsrEnabled,
+	ttsrBuiltinRules: cfgTtsrBuiltinRules,
+	ttsrDisabledRules: cfgTtsrDisabledRules,
+	secretsEnabled: cfgSecretsEnabled,
+});
 
 /** Bundled personality specs, keyed by the `personality` setting value. */
 const PERSONALITY_SPECS: Record<Exclude<Personality, "none">, string> = {
@@ -193,8 +251,6 @@ async function runGpuProbe(cmd: string[]): Promise<string | null> {
 			stderr: "ignore",
 			stdin: "ignore",
 			timeout: GPU_PROBE_TIMEOUT_MS,
-			// SIGKILL so a probe ignoring SIGTERM (PATH wrapper, wedged WMI) still
-			// dies at the deadline and lets getCachedGpu reach the null-cache write.
 			killSignal: "SIGKILL",
 		});
 		const stdoutReader = proc.stdout.getReader();
@@ -209,9 +265,7 @@ async function runGpuProbe(cmd: string[]): Promise<string | null> {
 			stdout += decoder.decode();
 		})();
 		const exitCode = await proc.exited;
-		// Even on exit 0, a probe wrapper can leave a descendant holding stdout open.
-		// Bound the EOF wait so getCachedGpu cannot outlive the probe in either path;
-		// keep whatever bytes the reader already captured before cancelling.
+		// A descendant can keep the pipe open after the probe exits.
 		const drained = await Promise.race([
 			stdoutDone.then(() => "ok" as const).catch(() => "err" as const),
 			Bun.sleep(GPU_PROBE_STDOUT_DRAIN_MS).then(() => "timeout" as const),
@@ -241,9 +295,7 @@ async function getGpuModel(): Promise<string | null> {
 				const parts = line.split(":");
 				const name = parts.length > 1 ? parts.slice(1).join(":").trim() : line.trim();
 				const nameLower = name.toLowerCase();
-				// Skip BMC/server management adapters
 				if (/aspeed|matrox g200|mgag200/i.test(name)) continue;
-				// Prioritize discrete GPUs
 				let priority = 0;
 				if (
 					nameLower.includes("nvidia") ||
@@ -276,30 +328,19 @@ function getTerminalName(): string | undefined {
 	if (termProgram) {
 		return termProgramVersion ? `${termProgram} ${termProgramVersion}` : termProgram;
 	}
-
 	if (Bun.env.WT_SESSION) return "Windows Terminal";
-
-	const term = firstNonEmpty(Bun.env.TERM, Bun.env.COLORTERM, Bun.env.TERMINAL_EMULATOR);
-	return term ?? undefined;
+	return firstNonEmpty(Bun.env.TERM, Bun.env.COLORTERM, Bun.env.TERMINAL_EMULATOR) ?? undefined;
 }
 
-/**
- * On-disk cache schema version. Bumped when detection logic changes so stored
- * selections from an older parser are rejected and re-probed instead of served
- * indefinitely — e.g. the Windows virtual-adapter filtering added for #9675,
- * which would otherwise keep returning a cached virtual GPU after upgrade.
- */
 const GPU_CACHE_VERSION = 1;
 
-/** Cached GPU probe result. */
 interface GpuCache {
 	gpu: string | null;
 }
 
 async function loadGpuCache(): Promise<GpuCache | null> {
 	try {
-		const cachePath = getGpuCachePath();
-		const content = await Bun.file(cachePath).json();
+		const content = await Bun.file(getGpuCachePath()).json();
 		if (content && typeof content === "object" && content.version === GPU_CACHE_VERSION && "gpu" in content) {
 			const gpu = content.gpu;
 			return { gpu: typeof gpu === "string" ? gpu : null };
@@ -312,10 +353,9 @@ async function loadGpuCache(): Promise<GpuCache | null> {
 
 async function saveGpuCache(info: GpuCache): Promise<void> {
 	try {
-		const cachePath = getGpuCachePath();
-		await Bun.write(cachePath, JSON.stringify({ version: GPU_CACHE_VERSION, gpu: info.gpu }, null, "\t"));
+		await Bun.write(getGpuCachePath(), JSON.stringify({ version: GPU_CACHE_VERSION, gpu: info.gpu }, null, "\t"));
 	} catch {
-		// Silently ignore cache write failures
+		// GPU detection remains best-effort if the cache is unwritable.
 	}
 }
 
@@ -341,14 +381,6 @@ async function getCpuModel(): Promise<string | undefined> {
 	}
 }
 
-/**
- * Kernel identity for the workstation block. Prefers the uname build string
- * from `os.version()`, but Bun on macOS 15+ (Darwin 24/25) returns the literal
- * `"unknown"` when `uv_os_uname()`'s `version` field is empty — which surfaces
- * `Kernel: unknown` in the system prompt and makes the model misidentify the
- * host as Windows (#4141). Fall back to `<type> <release>` (uname -s + -r) so
- * macOS is always tagged as `Darwin <release>` and Linux keeps its build info.
- */
 function getKernelIdentity(): string {
 	const version = os.version()?.trim();
 	if (version && version.toLowerCase() !== "unknown") return version;
@@ -368,7 +400,7 @@ function getEnvironmentInfo(
 		{ label: "GPU", value: gpu },
 		{ label: "Terminal", value: getTerminalName() },
 	];
-	return entries.filter((e): e is { label: string; value: string } => !!e.value);
+	return entries.filter((entry): entry is { label: string; value: string } => !!entry.value);
 }
 
 /** Discover TITLE_SYSTEM.md file for automatic session-title prompt overrides */
@@ -681,6 +713,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
 	skills?: readonly Skill[];
+	/** Session-scoped description snapshot; background cache writes apply only to the next session. */
+	skillDescriptions?: SkillDescriptionCatalog;
 	/** Pre-loaded rulebook rules (descriptions, excluding TTSR and always-apply). */
 	rules?: Array<{ name: string; description?: string; path: string; globs?: string[] }>;
 	/** Intent field name injected into every tool schema. If set, explains the field in the prompt. */
@@ -706,14 +740,18 @@ export interface BuildSystemPromptOptions {
 	secretsEnabled?: boolean;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
-	/** Whether the local memory://root summary is active. */
-	memoryRootEnabled?: boolean;
+	/** Active `memory.backend` id; undefined when memory is off. */
+	memoryBackend?: string;
 	/** Whether the read-only security:// resource namespace is active. */
 	securityEnabled?: boolean;
-	/** Whether the browser eval prelude is enabled for this session. */
-	browserEnabled?: boolean;
-	/** Whether the computer eval prelude is enabled for this session. */
-	computerEnabled?: boolean;
+	/** Whether the user approves `cfg://` writes for this session; gates advertising `cfg://`. */
+	settingsApproval?: boolean;
+	/**
+	 * Eval preludes advertised by this prompt. Each prelude's `guidance` is
+	 * appended as its own block after the rendered template, so custom templates
+	 * keep it; names also set the `browserEnabled`/`computerEnabled` template flags.
+	 */
+	evalPreludes?: readonly Pick<EvalPreludeDefinition, "name" | "guidance">[];
 	/** Active model identifier (e.g. "anthropic/claude-opus-4") surfaced in the workstation block. */
 	model?: string;
 	/** Whether to surface `model` in the workstation block. Default: true. */
@@ -752,22 +790,13 @@ export interface BuildSystemPromptResult {
 	xdevCatalogNames?: readonly string[];
 }
 
-/**
- * Heading that separates the user's append prompt (`APPEND_SYSTEM.md`,
- * `--append-system-prompt`) from the generated blocks that precede it.
- */
-export const USER_APPEND_HEADING =
-	"## User Instructions\n\nThe following instructions are user-authored (session configuration or CLI). They are authoritative and supersede conflicting guidance above.";
+/** Static wrapper; compiled (not rendered) so user-authored Markdown passes through byte-for-byte. */
+const renderUserAppend = prompt.compile(userAppendPromptTemplate.trimEnd());
 
 /**
  * Join generated append blocks (memory, auto-learn, `xd://` routes, MCP server
- * instructions) with the user's append prompt.
- *
- * The generated blocks end with `## MCP Server Instructions`, whose text tells
- * the model it is server-controlled and may not be verified. Concatenating the
- * user's append text directly behind it, with no heading of its own, rendered
- * user-authored instructions as a trailing paragraph of that section, so the
- * user's text gets a boundary heading whenever generated blocks precede it.
+ * instructions) with the user's append prompt. Keep the user text in its own
+ * section so it is not misclassified as MCP server-controlled instructions.
  */
 export function composeAppendPrompt(appendParts: readonly string[], appendSystemPrompt?: string): string | undefined {
 	const generated = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
@@ -777,7 +806,7 @@ export function composeAppendPrompt(appendParts: readonly string[], appendSystem
 	if (!generated) {
 		return appendSystemPrompt;
 	}
-	return `${generated}\n\n${USER_APPEND_HEADING}\n\n${appendSystemPrompt}`;
+	return renderUserAppend({ generatedAppend: generated, userAppend: appendSystemPrompt });
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -813,10 +842,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		workspaceTree: providedWorkspaceTree,
 		scoutAvailable = true,
 		delegationBias = "eager",
-		memoryRootEnabled = false,
+		memoryBackend,
 		securityEnabled = false,
-		browserEnabled = false,
-		computerEnabled = false,
+		settingsApproval = false,
+		evalPreludes = [],
 		model,
 		includeModelInPrompt = true,
 		personality = "default",
@@ -1046,10 +1075,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// Build tool descriptions for system prompt rendering.
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	// xd://-mounted tools count as present for prompt gates ({{#has tools "lsp"}})
-	// and resolve their own name as the reference — the xd:// section explains
-	// the access path. The Tool Inventory list stays limited to real defs.
+	// and resolve to their `xd://<name>` URL, the only way to reach them. The
+	// Tool Inventory list stays limited to real defs.
 	for (const mounted of xdevTools) {
-		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, mounted.name);
+		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, `${XD_URL_PREFIX}${mounted.name}`);
 	}
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
 	const xdevToolNames = new Set(xdevTools.map(mounted => mounted.name));
@@ -1093,7 +1122,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			: toolNames.some(name => toolReadsSkillUris(tools.get(name))) ||
 				xdevTools.some(entry => toolReadsSkillUris(tools.get(entry.name)));
 	const hasSkillUriAccess = hasSkillReader && skills.length > 0;
-	const filteredSkills = hasSkillReader ? skills.filter(skill => skill.hide !== true) : [];
+	const schemeHost: SchemeHost = {
+		skillUriAccess: hasSkillUriAccess,
+		ruleCount: rules?.length ?? 0,
+		memoryBackend,
+		securityEnabled,
+		settingsApproval,
+	};
+	const filteredSkills = (options.skillDescriptions ?? new SkillDescriptionCatalog()).render(
+		hasSkillReader ? skills.filter(skill => skill.hide !== true) : [],
+	);
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
@@ -1124,6 +1162,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
 		hasSkillUriAccess,
+		internalUrls: InternalUrlRouter.instance().describe(schemeHost),
 		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,
@@ -1136,16 +1175,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		intentField: intentField ?? "",
 		eagerTasks,
 		eagerTasksAlways,
+		// Restrained bias yields to an explicit eager-tasks mode.
+		inlineFirstDelegation: delegationBias === "restrained" && !eagerTasks,
 		taskBatch,
 		MAX_CONCURRENCY: normalizeConcurrencyLimit(taskMaxConcurrency),
 		scoutAvailable,
 		taskIrcEnabled,
 		secretsEnabled,
-		hasMemoryRoot: memoryRootEnabled,
-		securityEnabled,
-		browserEnabled,
-		computerEnabled,
-		hasObsidian: hasObsidian(),
+		browserEnabled: evalPreludes.some(prelude => prelude.name === "browser"),
+		computerEnabled: evalPreludes.some(prelude => prelude.name === "computer"),
 		includeWorkspaceTree,
 		renderMermaid,
 		reactions,
@@ -1173,19 +1211,20 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		rendered = prompt.render(systemPromptTemplate, data);
 	}
 	const systemPrompt = [rendered];
-	if (computerEnabled) {
-		systemPrompt.push(computerSafetyPrompt.trim());
+	for (const prelude of evalPreludes) {
+		const guidance = prelude.guidance?.trim();
+		if (guidance) systemPrompt.push(guidance);
 	}
-	// Literal overrides render context files and append text in their wrapper.
-	// Both the bundled template and user templates receive them in the footer.
+	// Working-directory content (context files with their paths, workspace
+	// tree/roots, active repo) and session append text form one trailing
+	// `<project-context>` block after every static block, so sessions in
+	// different directories share the static prefix and the Anthropic head
+	// cache breakpoint lands right before this block.
 	const projectPrompt = prompt
-		.render(projectPromptTemplate, resolvedCustomPrompt ? { ...data, contextFiles: [], appendPrompt: "" } : data)
+		.render(projectPromptTemplate, { ...data, activeRepoContext: activeRepoContextPrompt })
 		.trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
-	}
-	if (activeRepoContextPrompt) {
-		systemPrompt.push(activeRepoContextPrompt);
 	}
 
 	// Claim delivery only when the rendered block 0 actually carries the xd://
