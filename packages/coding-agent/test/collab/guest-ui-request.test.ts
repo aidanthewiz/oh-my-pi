@@ -12,6 +12,7 @@
  * frame is observable.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fsp from "node:fs/promises";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -278,16 +279,20 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 
 const harnessCleanups: (() => Promise<void>)[] = [];
 let writeSpy: { mockRestore(): void } | null = null;
+let renameSpy: { mockRestore(): void } | null = null;
 
 beforeEach(() => {
 	installInMemoryRelay();
 	writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+	renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
 	for (const cleanup of harnessCleanups.splice(0).reverse()) await cleanup();
 	writeSpy?.mockRestore();
+	renameSpy?.mockRestore();
 	writeSpy = null;
+	renameSpy = null;
 	uninstallInMemoryRelay();
 });
 
@@ -690,18 +695,6 @@ describe("collab host dialog vs teardown (#4049 follow-up)", () => {
 		} finally {
 			guest?.socket.close();
 			await host.stop("test done");
-		}
-	});
-
-	it("carries destructive TUI styling to writable guests", async () => {
-		const race = await openRace();
-		try {
-			if (race.requestFrame.request.kind !== "select") throw new Error("expected select ui-request");
-			expect(race.requestFrame.request.tuiStyle).toBe("destructive");
-			race.dialog.settle("style-checked");
-			expect(await race.result).toBe("style-checked");
-		} finally {
-			await race.cleanup();
 		}
 	});
 

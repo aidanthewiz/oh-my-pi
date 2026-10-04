@@ -11,7 +11,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import {
 	getAllowedAvailableModels,
 	resolveAgentAdvisorSelection,
-	resolveAgentModelPatterns,
+	resolveAgentModelSelection,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
 	resolveModelOverride,
@@ -82,14 +82,20 @@ export function createAgentsHubDeps(
 			});
 		},
 		getAvailableModels: () => getAllowedAvailableModels(modelRegistry, settings),
-		effectiveModelPatterns: agent =>
-			resolveAgentModelPatterns({
+		effectiveModelPatterns: agent => {
+			const selection = resolveAgentModelSelection({
 				settingsOverride: agent.overrideModel,
 				agentModel: agent.model,
 				settings,
 				activeModelPattern,
 				fallbackModelPattern: defaultModelPattern,
-			}),
+			});
+			if (!selection.requestedThinkingLevels) return selection.patterns;
+			return selection.patterns.map((pattern, index) => {
+				const level = selection.requestedThinkingLevels?.get(index);
+				return level === undefined ? pattern : `${pattern}:${level}`;
+			});
+		},
 		resolvePatterns: patterns => {
 			if (patterns.length === 0) return undefined;
 			const { model, thinkingLevel, explicitThinkingLevel } = resolveModelOverride(

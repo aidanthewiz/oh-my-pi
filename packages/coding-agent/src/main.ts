@@ -83,7 +83,6 @@ import { configurePersistentPluginPolicy } from "./extensibility/plugins/policy"
 import { setCoreforgeGreetingName } from "./identity/greeting";
 import { ensureCoreforgeIdentityAtStartup } from "./identity/startup";
 import { registerDaemonProjectPresence } from "./launch/presence";
-import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
 import { cfgMcpDiscoveryProviders, cfgMcpEnableProjectConfig } from "./mcp/settings";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -97,7 +96,6 @@ import { invokeSkillCommandFromText, isKnownSkillCommand } from "./modes/skill-c
 import {
 	applyStartupComposerPreferences,
 	type ComposerLease,
-	setStartupComposerLspServers,
 	stopPendingStartupComposer,
 	takeStartupComposerLease,
 } from "./modes/startup-composer";
@@ -125,7 +123,7 @@ import {
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
-import { ForkSourceNotFoundError, SessionManager } from "./session/session-manager";
+import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
 import { shouldShowStartupSplash } from "./startup-splash";
 import {
 	discoverSystemPromptOverride,
@@ -193,7 +191,6 @@ import {
 	cfgPluginsPersistentPolicy,
 	cfgSkillsIncludeSkills,
 } from "./extensibility/settings";
-import { cfgLspEnabled } from "./lsp/settings";
 import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
@@ -697,7 +694,6 @@ async function runInteractiveMode(
 				suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 				clearInitialTerminalHistory: true,
 				autoStartCollab: joinLink === undefined,
-				recentSessions: startupLease?.recentSessions,
 			}),
 		);
 		startDeferredStartupWork?.();
@@ -914,7 +910,17 @@ async function moveMissingCwdSessionIfNeeded(
 	// move target equals the current project dir. moveTo never chdirs, so the
 	// stale cwd is only a relocation source, not a directory we enter.
 	const manager = await SessionManager.open(session.path, sessionDir, undefined, { initialCwd: sourceCwd });
-	await manager.moveTo(cwd, sessionDir);
+	try {
+		await manager.moveTo(cwd, sessionDir);
+	} catch (err) {
+		if (!(err instanceof SessionMoveRefusedError)) throw err;
+		await manager.close();
+		// Its directory is gone, so it cannot be resumed in place either.
+		throw new SessionResolutionError(
+			err.message,
+			`Close the session in the other ${CF_COMMAND} process, then resume it again.`,
+		);
+	}
 	return { status: "moved", manager };
 }
 
@@ -1727,6 +1733,7 @@ export async function runRootCommand(
 ): Promise<void> {
 	logger.startTiming();
 	startStartupWatchdog();
+	let previousInteractiveHost: boolean | undefined;
 	try {
 		// Non-prepaint commands still need a default theme; an existing Composer
 		// already initialized its cached theme synchronously for the first frame.
@@ -1835,7 +1842,7 @@ export async function runRootCommand(
 		// Only the interactive host renders a focusable Agent Hub / subagent session
 		// tree; declare it so headless subagent optimizations (e.g. skipping replan
 		// title refresh) can tell a focusable process from a print/RPC/eval one.
-		setInteractiveHost(isInteractive);
+		previousInteractiveHost = setInteractiveHost(isInteractive);
 		if (!isInteractive) {
 			stopPendingStartupComposer();
 		}
@@ -1994,9 +2001,6 @@ export async function runRootCommand(
 				lightTheme: cfgThemeLight.get(settingsInstance),
 			},
 		});
-		setStartupComposerLspServers(
-			!parsedArgs.noLsp && cfgLspEnabled.get(settingsInstance) ? discoverStartupLspServers(cwd, "connecting") : null,
-		);
 
 		let scopedModels = await logger.time(
 			"resolveModelScope",
@@ -2655,6 +2659,8 @@ export async function runRootCommand(
 		stopPendingStartupComposer();
 		stopStartupWatchdog();
 		throw error;
+	} finally {
+		if (previousInteractiveHost !== undefined) setInteractiveHost(previousInteractiveHost);
 	}
 }
 

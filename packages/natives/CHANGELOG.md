@@ -5,6 +5,16 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+
+## [18.5.0] - 2026-10-03
+
+### Fixed
+
+- Fixed Ctrl+V on Windows sometimes pasting text with a few characters replaced by unrelated glyphs (for example `https://` turning into `՞ttp缀難//`); clipboard reads and writes no longer run at the same time ([#14144](https://github.com/can1357/oh-my-pi/pull/14144) by [@H4vC](https://github.com/H4vC))
+- Fixed native Git restore leaving clean CRLF checkouts marked modified. It refreshes matching index statistics without changing staged blobs or unrelated dirty files.
+- Fixed failed optional Git filters discarding staged or stashed edits. Failed filters now preserve original content and built-in conversions; required filters still fail, including repeated filter sections.
+- Fixed custom Bazel output prefixes installing stale native assets from another output base. Addon installation now uses the build execution root.
+
 ## [18.4.10] - 2026-10-02
 
 ### Fixed

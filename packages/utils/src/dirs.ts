@@ -1112,6 +1112,14 @@ export function getGlobalDaemonRuntimeDir(service: string): string {
 	return path.join(getGlobalDaemonRuntimeRoot(), service);
 }
 
+/**
+ * Session ownership leases share one home-rooted namespace across profiles,
+ * config directories, and XDG state selections.
+ */
+export function getSessionOwnersDir(): string {
+	return path.join(os.homedir(), CONFIG_DIR_NAME, "run", "session-owners");
+}
+
 /** Get the provider in-flight root directory (~/.omp/run/provider-inflight; XDG default: $XDG_STATE_HOME/omp/run/provider-inflight). */
 export function getProviderInFlightRoot(): string {
 	return dirs.rootSubdir(path.join("run", "provider-inflight"), "state");

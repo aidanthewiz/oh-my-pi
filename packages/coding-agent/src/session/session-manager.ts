@@ -82,6 +82,7 @@ import {
 	loadEntriesFromFile,
 	loadSessionFile,
 	parseSessionContent,
+	readSessionHeaderId,
 	resolveBlobRefsInEntries,
 	resolveBlobRefsInEntriesSync,
 	type SessionLoadResult,
@@ -127,8 +128,20 @@ const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
 
-function mintSessionId(): string {
+/** A fresh session id. */
+export function mintSessionId(): string {
 	return Bun.randomUUIDv7();
+}
+
+/**
+ * `moveTo` refused before anything moved: another live omp process writes the
+ * session, or the session file at the destination.
+ */
+export class SessionMoveRefusedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionMoveRefusedError";
+	}
 }
 
 function nowIso(): string {
@@ -151,7 +164,13 @@ function artifactsDirectoryFor(sessionFile: string | undefined): string | null {
  * Failures are logged, never thrown.
  */
 export async function copySessionArtifacts(sourceSessionFile: string, destinationSessionFile: string): Promise<void> {
-	const sourceArtifactsDir = artifactsDirectoryFor(sourceSessionFile);
+	// Artifacts sit beside the journal's real name: a session reached through a
+	// symlink keeps them next to the link's target, not next to the link.
+	let realSource = sourceSessionFile;
+	try {
+		realSource = await fs.promises.realpath(sourceSessionFile);
+	} catch {}
+	const sourceArtifactsDir = artifactsDirectoryFor(realSource);
 	const destinationArtifactsDir = artifactsDirectoryFor(destinationSessionFile);
 	if (!sourceArtifactsDir || !destinationArtifactsDir) return;
 	if (path.resolve(sourceArtifactsDir) === path.resolve(destinationArtifactsDir)) return;
@@ -937,11 +956,12 @@ export class SessionManager {
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
 	/**
-	 * This process's ownership claim on the file it last wrote (file storage
-	 * only). `release` is unset while another live process holds the file, and
+	 * This process's ownership claim on the session it last wrote (file storage
+	 * only), keyed by session id so every path to the journal meets it.
+	 * `release` is unset while another live process holds the session, and
 	 * after {@link close} gave the claim up.
 	 */
-	#sessionFileClaim: { sessionFile: string; release: (() => void) | undefined } | undefined;
+	#sessionClaim: { sessionId: string; release: (() => void) | undefined } | undefined;
 	/**
 	 * The background artifact copy a move or branch to `sessionFile` started (see
 	 * {@link #moveOffSessionFile}, {@link createBranchedSession}). Never rejects.
@@ -1022,33 +1042,37 @@ export class SessionManager {
 	}
 
 	/**
-	 * Hold this process's ownership claim on `#sessionFile`, moving it off a
-	 * previous path. Only write paths claim, so the first process to write a
-	 * file owns it and inspection (`omp share`, `--export`, `render`) never
+	 * Hold this process's ownership claim on `#sessionId`, moving it off a
+	 * previous session. Only write paths claim, so the first process to write a
+	 * session owns it and inspection (`omp share`, `--export`, `render`) never
 	 * does. A failed claim is retried on the next write, so a writer takes over
 	 * once the owner closed the session or exited.
 	 */
-	#claimSessionFile(): void {
+	#claimSession(): void {
+		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;
-		if (!this.#persist || !sessionFile || !this.#storage.claimSessionFile) return;
-		const current = this.#sessionFileClaim;
-		if (current?.sessionFile === sessionFile && current.release) return;
-		if (current && current.sessionFile !== sessionFile) current.release?.();
-		this.#sessionFileClaim = { sessionFile, release: this.#storage.claimSessionFile(sessionFile) ?? undefined };
+		if (!this.#persist || !sessionFile || !this.#storage.claimSession) return;
+		const current = this.#sessionClaim;
+		// The storage also checks that the path still holds this session: if
+		// another session was moved onto it, the claim fails and the next write
+		// moves this session to a sibling instead of appending into that journal.
+		const release = this.#storage.claimSession(sessionId, sessionFile) ?? undefined;
+		current?.release?.();
+		this.#sessionClaim = { sessionId, release };
 	}
 
 	/**
-	 * Whether another live omp process owns `#sessionFile`, claiming it first
-	 * when it is free. A non-owner never writes to that file: its next write
-	 * moves this session to a sibling instead, so two processes never mix their
-	 * entries in one journal and the owner's full rewrites never race the other
-	 * process's appends.
+	 * Whether another live omp process owns this session, claiming it first
+	 * when it is free. A non-owner never writes the session's file: its next
+	 * write moves this session to a sibling with a new id instead, so two
+	 * processes never mix their entries in one journal and the owner's full
+	 * rewrites never race the other process's appends.
 	 */
-	#sessionFileOwnedElsewhere(): boolean {
+	#sessionOwnedElsewhere(): boolean {
 		if (this.#released || this.#sessionFileRelocating) return false;
-		this.#claimSessionFile();
-		const claim = this.#sessionFileClaim;
-		return claim !== undefined && claim.sessionFile === this.#sessionFile && claim.release === undefined;
+		this.#claimSession();
+		const claim = this.#sessionClaim;
+		return claim !== undefined && claim.sessionId === this.#sessionId && claim.release === undefined;
 	}
 
 	/**
@@ -1241,7 +1265,7 @@ export class SessionManager {
 		this.#artifactManagerSessionFile = null;
 		this.#pendingArtifactCopy = { sessionFile: to, done: copySessionArtifacts(from, to) };
 		this.#rememberBreadcrumb(this.#cwd, to);
-		this.#claimSessionFile();
+		this.#claimSession();
 		this.#notifyPersistenceNotice({ reason, from, to });
 		return to;
 	}
@@ -1420,7 +1444,7 @@ export class SessionManager {
 		recoveries = 0,
 	): Promise<void> {
 		const target =
-			sessionFile === this.#sessionFile && this.#sessionFileOwnedElsewhere()
+			sessionFile === this.#sessionFile && this.#sessionOwnedElsewhere()
 				? this.#moveOffSessionFile("open-elsewhere")
 				: sessionFile;
 		const body = this.#fileBody();
@@ -1593,7 +1617,7 @@ export class SessionManager {
 		if (!targetPath) return;
 
 		try {
-			if (this.#sessionFileOwnedElsewhere()) targetPath = this.#moveOffSessionFile("open-elsewhere");
+			if (this.#sessionOwnedElsewhere()) targetPath = this.#moveOffSessionFile("open-elsewhere");
 			if (this.#expectedDiskSize !== null && !this.#expectedDiskFingerprint) {
 				throw new Error("Cannot rewrite session without a confirmed content fingerprint.");
 			}
@@ -1720,7 +1744,7 @@ export class SessionManager {
 			do {
 				this.#atomicRewriteDirty = false;
 				await this.#closeWriterHandle();
-				if (this.#sessionFileOwnedElsewhere()) this.#moveOffSessionFile("open-elsewhere");
+				if (this.#sessionOwnedElsewhere()) this.#moveOffSessionFile("open-elsewhere");
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
@@ -1830,7 +1854,7 @@ export class SessionManager {
 		// Cold/divergent: not on disk yet, in-memory entries diverged from the
 		// file, or another live process owns it → rewrite the whole file
 		// synchronously (to a sibling in the last case) and keep going.
-		if (!this.#fileIsCurrent || this.#rewriteRequired || this.#sessionFileOwnedElsewhere()) {
+		if (!this.#fileIsCurrent || this.#rewriteRequired || this.#sessionOwnedElsewhere()) {
 			this.#rewriteSynchronously();
 			return;
 		}
@@ -1902,7 +1926,7 @@ export class SessionManager {
 			this.#rewriteRequired ||
 			!this.#hasTitleSlot ||
 			!this.#storage.existsSync(this.#sessionFile) ||
-			this.#sessionFileOwnedElsewhere()
+			this.#sessionOwnedElsewhere()
 		) {
 			await this.#rewriteAtomically();
 			return;
@@ -2313,8 +2337,8 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = false;
 		// A switch gives up the previous file. Opening claims nothing: the first
 		// write does, so inspecting a session never counts as owning it.
-		this.#sessionFileClaim?.release?.();
-		this.#sessionFileClaim = undefined;
+		this.#sessionClaim?.release?.();
+		this.#sessionClaim = undefined;
 
 		const resolvedSessionFile = path.resolve(sessionFile);
 		const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
@@ -2488,6 +2512,52 @@ export class SessionManager {
 			return;
 		}
 
+		// A move writes both paths: it must neither move a session another live
+		// omp process writes nor replace a destination one writes. Checked before
+		// relocation starts (appends still go to the source) and before any
+		// directory is created, so a refusal touches nothing.
+		let destination: { id: string; release: () => void } | undefined;
+		// Hold the lease of the session in the destination file until the move
+		// settles, so its owner cannot start writing mid-move. Our own id is
+		// refcounted, never contended.
+		const claimDestination = async (file: string): Promise<void> => {
+			const id = await readSessionHeaderId(file);
+			if (id === undefined || id === destination?.id) return;
+			const release = this.#storage.claimSession?.(id, file);
+			if (release === null) {
+				throw new SessionMoveRefusedError(
+					`Cannot move session to "${file}": another live omp process writes the session there. Nothing was moved.`,
+				);
+			}
+			destination?.release();
+			destination = release ? { id, release } : undefined;
+		};
+		// The file at the source path must still be this session: if another
+		// session replaced it, moving it would carry that session away from its
+		// writer, whose lease our id never covered.
+		const assertSourceIsOurs = async (file: string): Promise<void> => {
+			const id = await readSessionHeaderId(file);
+			if (id !== undefined && id !== this.#sessionId) {
+				throw new SessionMoveRefusedError(
+					`Cannot move session "${file}": the file now holds a different session. Nothing was moved.`,
+				);
+			}
+		};
+		if (this.#persist && this.#sessionFile && this.#storage.claimSession) {
+			// Every persisted move rewrites the journal (at least its header cwd),
+			// even when the path stays the same.
+			await assertSourceIsOurs(this.#sessionFile);
+			this.#claimSession();
+			if (this.#sessionClaim?.release === undefined) {
+				throw new SessionMoveRefusedError(
+					`Cannot move session "${this.#sessionFile}": another live omp process writes it. Nothing was moved.`,
+				);
+			}
+			if (expectedSessionFile && path.resolve(this.#sessionFile) !== path.resolve(expectedSessionFile)) {
+				await claimDestination(expectedSessionFile);
+			}
+		}
+
 		let sessionFileExisted = false;
 		// Track source+dest for completed appends during relocation. A destination
 		// that already exists is never treated as ours before a move lands. Do not
@@ -2527,6 +2597,8 @@ export class SessionManager {
 
 				try {
 					if (sessionFileExisted && sessionPathChanged) {
+						await assertSourceIsOurs(oldSessionFile);
+						await claimDestination(newSessionFile);
 						if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
 						await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
 						sessionMoved = true;
@@ -2629,6 +2701,8 @@ export class SessionManager {
 			if (this.#sessionFile) this.#rememberBreadcrumb(resolvedCwd, this.#sessionFile);
 		} finally {
 			this.#sessionFileRelocating = null;
+			// The destination is ours or untouched now.
+			destination?.release();
 		}
 	}
 
@@ -2802,6 +2876,8 @@ export class SessionManager {
 		}
 		const draftPath = this.#draftPath();
 		if (draftPath && this.#storage.existsSync(draftPath)) return;
+		this.#claimSession();
+		if (this.#storage.claimSession && !this.#sessionClaim?.release) return;
 		if (!this.#entries.every(isDraftOnlyMetadataEntry)) {
 			await this.#clearDraftOnlySessionMarker();
 			this.#draftOnlySessionCleanupArmed = false;
@@ -2815,8 +2891,11 @@ export class SessionManager {
 		try {
 			const deleted = await this.#storage.deleteSessionWithArtifactsIf(sessionFile, content => {
 				const onDisk = parseSessionContent(content);
+				const header = onDisk.entries[0];
 				return (
 					!onDisk.invalidHeader &&
+					header?.type === "session" &&
+					header.id === this.#sessionId &&
 					onDisk.malformedRecords === 0 &&
 					(onDisk.entries.slice(1) as SessionEntry[]).every(isDraftOnlyMetadataEntry)
 				);
@@ -2841,8 +2920,7 @@ export class SessionManager {
 	async close(): Promise<void> {
 		if (!this.#persist) return;
 		try {
-			// Drain before giving up ownership: queued title writes and rewrites
-			// must not run after a second process claims this journal.
+			// Queued writes must finish before another process can claim the journal.
 			await this.#scheduleDiskWork(
 				async () => {
 					const hadWriter = this.#writer !== undefined;
@@ -2881,7 +2959,7 @@ export class SessionManager {
 			}
 			if (this.#diskFailure) throw this.#diskFailure;
 		} finally {
-			const claim = this.#sessionFileClaim;
+			const claim = this.#sessionClaim;
 			claim?.release?.();
 			if (claim) claim.release = undefined;
 		}
@@ -4228,10 +4306,21 @@ export class SessionManager {
 					const manager = await SessionManager.open(breadcrumb.sessionFile, undefined, storage, {
 						initialCwd: breadcrumbCwd,
 					});
-					await manager.moveTo(cwd, sessionDir);
-					return manager;
-				}
-				if (candidateForMove) {
+					try {
+						await manager.moveTo(cwd, sessionDir);
+						return manager;
+					} catch (err) {
+						if (!(err instanceof SessionMoveRefusedError)) throw err;
+						// Another live omp process still writes the session (the
+						// project was renamed under it): leave it there and continue
+						// as if no move were possible.
+						logger.warn("Not re-rooting moved session: it is open in another omp process", {
+							from: breadcrumbCwd,
+							to: resolvedCwd,
+						});
+						await manager.close();
+					}
+				} else if (candidateForMove) {
 					logger.warn(
 						"Not relocating session: project directory is unavailable and there is no evidence it moved here",
 						{ from: breadcrumbCwd, to: resolvedCwd },

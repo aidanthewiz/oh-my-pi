@@ -95,6 +95,27 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 		expect(await fileExists(sessionFile)).toBe(false);
 	});
 
+	for (const sealed of [false, true]) {
+		it(`keeps a replaced metadata-only session during ${sealed ? "disposal" : "close"}`, async () => {
+			using tempDir = TempDir.createSync("@pi-session-close-changed-id-");
+			const session = SessionManager.create(tempDir.path(), tempDir.path());
+			await session.saveDraft("draft");
+			await session.saveDraft("");
+			const original = session.getSessionFile();
+			if (!original) throw new Error("Expected a persistent session file");
+			const replacement = SessionManager.create(tempDir.path(), tempDir.path());
+			await replacement.ensureOnDisk();
+			const replacementFile = replacement.getSessionFile();
+			if (!replacementFile) throw new Error("Expected replacement session file");
+			await replacement.close();
+			fs.renameSync(replacementFile, original);
+			const replacementBytes = fs.readFileSync(original, "utf8");
+			if (sealed) session.seal();
+			await session.close();
+			expect(fs.readFileSync(original, "utf8")).toBe(replacementBytes);
+		});
+	}
+
 	// Issue #11497: terminal A materializes a draft-only file and arms the GC,
 	// terminal B resumes it, consumes the draft (removing the sidecar the GC
 	// keys off of), and persists a real conversation. Terminal A then closes

@@ -91,7 +91,7 @@ import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
-import { startCompletionProbe } from "./completion-probe";
+import { isCompletionProbeEnabled, startCompletionProbe } from "./completion-probe";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
@@ -125,7 +125,6 @@ import {
 	cfgTaskSoftRequestBudgetNotice,
 	cfgTaskSoftRequestBudget,
 	cfgTaskAgentIdleTtlMs,
-	cfgTaskCompletionProbeMs,
 	cfgTaskMaxRuntimeMs,
 	cfgTaskMaxRecursionDepth,
 	cfgTaskAgentAdvisor,
@@ -417,6 +416,12 @@ export interface ExecutorOptions {
 	 * if the resolved subagent model has no working credentials. See #985.
 	 */
 	parentActiveModelPattern?: string;
+	/** The selected model inherits live effort below {@link thinkingLevel}. */
+	modelInheritsLiveThinkingLevel?: boolean;
+	/** Bare inherited alternatives in a mixed ordered request. */
+	modelInheritedThinkingIndexes?: number[];
+	modelRequestedThinkingLevels?: ReadonlyMap<number, ConfiguredThinkingLevel>;
+	parentThinkingLevel?: ConfiguredThinkingLevel;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Caller-requested coarse effort (`lo`/`med`/`hi`); maps onto the resolved model's supported thinking range and wins over {@link thinkingLevel}. */
 	effort?: TaskEffort;
@@ -435,6 +440,8 @@ export interface ExecutorOptions {
 	outputSchemaOverridesAgent?: boolean;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** Whether the parent session has the interactive TUI surface. */
+	parentHasUI?: boolean;
 	/**
 	 * Override the `task.maxRuntimeMs` wall-clock cap for this run. When provided
 	 * it wins over the settings value; `0` disables the per-subagent wall-clock
@@ -1101,8 +1108,8 @@ interface RunMonitorArgs {
 	softRequestBudgetNotice: boolean;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
-	/** Completion self-estimate period in ms (`task.completionProbeMs`); 0 disables it. */
-	completionProbeMs: number;
+	/** Whether to periodically ask the agent for a completion estimate; see {@link isCompletionProbeEnabled}. */
+	completionProbe: boolean;
 	/** Fires each time a terminal `yield` is recorded for this run. */
 	onYieldAccepted?: () => void;
 }
@@ -1201,7 +1208,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
-		completionProbeMs,
+		completionProbe,
 	} = args;
 	const startTime = Date.now();
 
@@ -2153,10 +2160,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		setActiveSession: session => {
 			activeSession = session;
 			publishAdvisorState(session);
-			if (session && !completionProbeStarted) {
+			if (session && completionProbe && !completionProbeStarted) {
 				completionProbeStarted = true;
 				startCompletionProbe({
-					intervalMs: completionProbeMs,
 					session: () => activeSession,
 					signal: AbortSignal.any([listenerSignal, abortSignal]),
 					onEstimate: (percent, cost) => {
@@ -3040,7 +3046,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			softRequestBudgetNotice: false,
 			maxRuntimeMs,
 			// Autonomous wake turns answer a peer message; too short to probe.
-			completionProbeMs: 0,
+			completionProbe: false,
 			onYieldAccepted: registerWakeJob,
 		});
 
@@ -3330,8 +3336,8 @@ export interface FollowUpTurnOptions {
 	artifactsDir?: string;
 	/** Wall-clock cap in ms for this turn; 0 disables. */
 	maxRuntimeMs?: number;
-	/** Completion self-estimate period in ms for this turn; 0 or absent disables. */
-	completionProbeMs?: number;
+	/** Periodically ask for a completion estimate during this turn; see {@link isCompletionProbeEnabled}. */
+	completionProbe?: boolean;
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
 }
@@ -3418,7 +3424,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		softRequestBudget: 0,
 		softRequestBudgetNotice: false,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
-		completionProbeMs: options.completionProbeMs ?? 0,
+		completionProbe: options.completionProbe ?? false,
 	});
 
 	const startedPayload = {
@@ -3858,7 +3864,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
-		completionProbeMs: Math.max(0, Math.trunc(Number(cfgTaskCompletionProbeMs.get(settings)) || 0)),
+		completionProbe: isCompletionProbeEnabled(settings, parentDepth, options.parentHasUI === true),
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -3962,6 +3968,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				explicitThinkingLevel,
 				authFallbackUsed,
 				warning: modelResolutionWarning,
+				inheritsLiveThinkingLevel: selectedInheritsLiveThinkingLevel,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -3969,6 +3976,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					id,
+					options.modelInheritedThinkingIndexes,
+					options.modelRequestedThinkingLevels,
 				),
 			);
 			if (modelResolutionWarning) {
@@ -4028,8 +4037,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
 					: undefined;
+			const inheritedThinkingLevel =
+				authFallbackUsed ||
+				options.modelInheritsLiveThinkingLevel === true ||
+				selectedInheritsLiveThinkingLevel === true;
+			const requestedThinkingLevel =
+				explicitThinkingLevel && !inheritedThinkingLevel ? resolvedThinkingLevel : undefined;
+			// Precedence: caller `effort` > requested `:level` suffix on the resolved
+			// model pattern > agent-definition default (e.g. task's `auto`) >
+			// inherited parent effort / pattern-derived level.
+			const effectiveThinkingLevel =
+				effortLevel ??
+				requestedThinkingLevel ??
+				thinkingLevel ??
+				(inheritedThinkingLevel ? options.parentThinkingLevel : undefined) ??
+				resolvedThinkingLevel;
 			if (model) {
-				const displayLevel = effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : undefined);
+				const displayLevel =
+					effortLevel ?? requestedThinkingLevel ?? (inheritedThinkingLevel ? effectiveThinkingLevel : undefined);
 				progress.resolvedModelIdentity = formatModelStringWithRouting(model);
 				progress.resolvedThinkingLevel = displayLevel;
 				progress.resolvedModel =
@@ -4037,11 +4062,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						? formatModelSelectorValue(progress.resolvedModelIdentity, displayLevel)
 						: progress.resolvedModelIdentity;
 			}
-			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
-			// model pattern > agent-definition default (e.g. task's `auto`) >
-			// pattern-derived level.
-			const effectiveThinkingLevel =
-				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManagerPromise = sessionFile

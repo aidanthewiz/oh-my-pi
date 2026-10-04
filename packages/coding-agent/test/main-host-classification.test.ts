@@ -5,7 +5,7 @@ import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings"
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { getDbBusyTimeoutMs, setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
 
-it("classifies an interactive host before opening auth storage", async () => {
+it("classifies auth storage and restores headless database waits after a failed interactive launch", async () => {
 	const previous = setInteractiveHost(false);
 	const stop = new Error("stop after auth classification");
 	let observedTimeout: number | undefined;
@@ -24,6 +24,7 @@ it("classifies an interactive host before opening auth storage", async () => {
 				},
 			}),
 		).rejects.toBe(stop);
+		expect(getDbBusyTimeoutMs()).toBe(1000);
 	} finally {
 		Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
 		setInteractiveHost(previous);

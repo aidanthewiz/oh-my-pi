@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -749,4 +750,82 @@ describe("IndexedSessionStorage.writeTextAtomic commitGuard", () => {
 		expect(drained).toBe(true);
 		expect(backend.writeFullCalls.map(call => call.content)).toEqual(["pre-seal body"]);
 	});
+});
+
+it("excludes a second session owner across profile, config, and state roots and releases after process exit", async () => {
+	const root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-owner-roots-"));
+	let holder: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+	try {
+		const home = path.join(root, "home");
+		const id = randomUUID();
+		const journal = path.join(root, "session.jsonl");
+		const alias = path.join(root, "copy.jsonl");
+		const header = `${JSON.stringify({ type: "session", version: 3, id, timestamp: "t0", cwd: root })}\n`;
+		await Promise.all([
+			fsp.mkdir(home),
+			fsp.mkdir(path.join(root, "state-a", "omp"), { recursive: true }),
+			fsp.mkdir(path.join(root, "state-b", "omp"), { recursive: true }),
+			fsp.writeFile(journal, header),
+			fsp.writeFile(alias, header),
+		]);
+		const modulePath = Bun.resolveSync("@oh-my-pi/pi-coding-agent/session/session-storage", import.meta.dir);
+		const spawnOwner = (profile: string, file: string, hold: boolean) => {
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
+				HOME: home,
+				USERPROFILE: home,
+				PI_CONFIG_DIR: `.omp-${profile}`,
+				OMP_PROFILE: profile,
+				XDG_STATE_HOME: path.join(root, `state-${profile}`),
+			};
+			delete env.PI_TEST_SESSION_OWNERS_DIR;
+			delete env.PI_TEST_RUNTIME;
+			return Bun.spawn(
+				[
+					process.execPath,
+					"--eval",
+					`import { FileSessionStorage } from ${JSON.stringify(modulePath)};
+					const release = new FileSessionStorage().claimSession(${JSON.stringify(id)}, ${JSON.stringify(file)});
+					console.log(JSON.stringify(release !== null));
+					${hold ? "await Bun.stdin.text();" : ""}
+					release?.();`,
+				],
+				{ env, stdin: "pipe", stdout: "pipe", stderr: "pipe", timeout: 20_000 },
+			);
+		};
+		holder = spawnOwner("a", journal, true);
+		const reader = holder.stdout.getReader();
+		const decoder = new TextDecoder();
+		let handshake = "";
+		while (!handshake.includes("\n")) {
+			const chunk = await reader.read();
+			if (chunk.done) throw new Error("Owner exited before acquiring its lease");
+			handshake += decoder.decode(chunk.value, { stream: true });
+		}
+		expect(JSON.parse(handshake.trim())).toBe(true);
+		const claimOnce = async () => {
+			const child = spawnOwner("b", alias, false);
+			child.stdin.end();
+			const [output, error, exit] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			if (exit !== 0) throw new Error(error);
+			return JSON.parse(output.trim()) as boolean;
+		};
+		expect(await claimOnce()).toBe(false);
+		holder.kill();
+		await holder.exited;
+		holder = undefined;
+		expect(await claimOnce()).toBe(true);
+		expect(await fsp.readFile(journal, "utf8")).toBe(header);
+		expect(await fsp.readFile(alias, "utf8")).toBe(header);
+	} finally {
+		if (holder) {
+			holder.kill();
+			await holder.exited;
+		}
+		await fsp.rm(root, { recursive: true, force: true });
+	}
 });

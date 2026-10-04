@@ -441,6 +441,15 @@ async function main(): Promise<void> {
 			process.exit(build.exitCode || 1);
 		}
 
+		const executionRoot = await runBazel(
+			bazel,
+			[...startupArgs, "info", ...options.bazelArgs, "execution_root"],
+			"pipe",
+		);
+		if (executionRoot.exitCode !== 0) {
+			throw new Error(`bazel execution-root lookup failed: ${executionRoot.stderrTail}`);
+		}
+
 		// Same flags as the build so cquery resolves the identical configuration.
 		// cquery takes exactly one query expression, so multiple targets join
 		// into a single union rather than positional args.
@@ -449,12 +458,10 @@ async function main(): Promise<void> {
 			[...startupArgs, "cquery", ...options.bazelArgs, "--output=files", labels.join(" + ")],
 			"pipe",
 		);
-		if (cquery.exitCode === 0) {
-			outputs = parseBazelFilesOutput(cquery.stdout);
-		} else {
-			console.warn(`bazel cquery failed (exit ${cquery.exitCode}); falling back to bazel-bin path convention`);
-			outputs = conventionOutputPaths(options.targets, host);
+		if (cquery.exitCode !== 0) {
+			throw new Error(`bazel artifact lookup failed: ${cquery.stderrTail}`);
 		}
+		outputs = parseBazelFilesOutput(cquery.stdout).map(output => path.resolve(executionRoot.stdout.trim(), output));
 		if (outputs.length === 0) {
 			console.error("bazel build succeeded but no .node outputs were located");
 			process.exit(1);

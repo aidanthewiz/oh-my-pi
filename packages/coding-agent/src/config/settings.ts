@@ -3208,6 +3208,26 @@ export class Settings {
 			delete raw["advisor.subagents"];
 		}
 
+		// task.completionProbeMs (poll period, 0 = off) → task.completionProbe
+		// (on/off with a built-in backoff schedule). Mapped IN THE SAME LAYER so a
+		// project-level `0` keeps overriding a global period; an explicit new key wins.
+		{
+			const taskObj = isRecord(raw.task) ? raw.task : undefined;
+			const legacyProbeMs =
+				taskObj && "completionProbeMs" in taskObj ? taskObj.completionProbeMs : raw["task.completionProbeMs"];
+			const hasFlatProbe = Object.hasOwn(raw, "task.completionProbe");
+			if (typeof legacyProbeMs === "number" || hasFlatProbe) {
+				const target = taskObj ?? {};
+				if (!Object.hasOwn(target, "completionProbe")) {
+					target.completionProbe = hasFlatProbe ? raw["task.completionProbe"] : Number(legacyProbeMs) > 0;
+				}
+				raw.task = target;
+			}
+			if (taskObj) delete taskObj.completionProbeMs;
+			delete raw["task.completionProbeMs"];
+			delete raw["task.completionProbe"];
+		}
+
 		// Early per-agent toggles were persisted as booleans even though the
 		// runtime record contract is "on"/"off"/model pattern. Normalize each
 		// layer before merging so project-level false still overrides global true.

@@ -34,6 +34,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as fsp from "node:fs/promises";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 interface Harness {
@@ -202,6 +203,7 @@ afterEach(() => {
 describe("collab guest extension lifecycle mirror", () => {
 	it("keeps the pane working across a continuation and settles from an idle host snapshot", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		let pane = "idle";
 		const continuation = Promise.withResolvers<void>();
 		const settled = Promise.withResolvers<void>();
@@ -230,11 +232,13 @@ describe("collab guest extension lifecycle mirror", () => {
 		} finally {
 			await harness.cleanup();
 			writeSpy.mockRestore();
+			renameSpy.mockRestore();
 		}
 	});
 
 	it("resets turn numbering on each agent_start like a local session", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		const harness = await makeHarness("lifecycle-mirror-room-4");
 		try {
 			harness.runner.hasHandlers = type => type !== "turn_end";
@@ -284,12 +288,14 @@ describe("collab guest extension lifecycle mirror", () => {
 			expect(starts.map(event => event.turnIndex)).toEqual([0, 1, 0, 1]);
 		} finally {
 			writeSpy.mockRestore();
+			renameSpy.mockRestore();
 			await harness.cleanup();
 		}
 	});
 
 	it("detaches message_end payloads from the transcript's live reference", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		const harness = await makeHarness("lifecycle-mirror-room-5");
 		try {
 			const message: AgentMessage = {
@@ -328,12 +334,14 @@ describe("collab guest extension lifecycle mirror", () => {
 			expect(rendered.content[0].text).toBe("live");
 		} finally {
 			writeSpy.mockRestore();
+			renameSpy.mockRestore();
 			await harness.cleanup();
 		}
 	});
 
 	it("keeps terminal delivery behind a delayed start and survives its failure", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		// The mock runner resolves agent_start on an externally-gated promise;
 		// unordered fire-and-forget would let the agent_end handler complete
 		// first and relatch the pane to working after the host settled.
@@ -367,12 +375,14 @@ describe("collab guest extension lifecycle mirror", () => {
 		} finally {
 			gate.resolve();
 			writeSpy.mockRestore();
+			renameSpy.mockRestore();
 			await harness.cleanup();
 		}
 	});
 
 	it("drains delayed host handlers before releasing the guest paid-turn guard", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		const harness = await makeHarness("lifecycle-mirror-room-8");
 		const auth = await AuthStorage.create(":memory:");
 		const runtime = new ExtensionRuntime();
@@ -433,6 +443,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await session.dispose();
 			auth.close();
 			writeSpy.mockRestore();
+			renameSpy.mockRestore();
 		}
 	});
 });
