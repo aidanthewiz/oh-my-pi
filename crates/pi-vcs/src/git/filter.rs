@@ -532,7 +532,7 @@ enum Utf16 {
 }
 
 impl Utf16 {
-	fn for_label(label: &[u8]) -> Option<Self> {
+	const fn for_label(label: &[u8]) -> Option<Self> {
 		if label.eq_ignore_ascii_case(b"UTF-16") {
 			Some(Self::Bom)
 		} else if label.eq_ignore_ascii_case(b"UTF-16LE") {
@@ -546,7 +546,7 @@ impl Utf16 {
 		}
 	}
 
-	fn default_le() -> bool {
+	const fn default_le() -> bool {
 		// Apple's iconv emits big-endian UTF-16; GNU iconv uses native order.
 		cfg!(not(target_os = "macos")) && cfg!(target_endian = "little")
 	}
@@ -570,20 +570,20 @@ impl Utf16 {
 			Self::Le => (true, bytes),
 			Self::Be => (false, bytes),
 			Self::LeBom => {
-				(bom.unwrap_or(Self::default_le()), if bom.is_some() { &bytes[2..] } else { bytes })
+				(bom.unwrap_or_else(Self::default_le), if bom.is_some() { &bytes[2..] } else { bytes })
 			},
 		};
 		if bytes.len() % 2 != 0 {
 			return Err("UTF-16 contains an incomplete code unit");
 		}
-		let units = bytes.chunks_exact(2).map(|unit| {
+		let units = bytes.as_chunks::<2>().0.iter().map(|unit| {
 			if le {
-				u16::from_le_bytes([unit[0], unit[1]])
+				u16::from_le_bytes(*unit)
 			} else {
-				u16::from_be_bytes([unit[0], unit[1]])
+				u16::from_be_bytes(*unit)
 			}
 		});
-		let mut out = String::with_capacity(bytes.len());
+		let mut out = String::with_capacity(bytes.len() / 2 * 3);
 		for character in char::decode_utf16(units) {
 			out.push(character.map_err(|_| "UTF-16 contains an unpaired surrogate")?);
 		}
