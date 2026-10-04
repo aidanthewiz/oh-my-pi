@@ -412,8 +412,11 @@ describe("update-cli install target detection", () => {
 		"refuses a foreign native target that does not report an OMP version",
 		async () => {
 			const dir = await makeTempDir();
+			const foreignPath = path.join(dir, "foreign");
 			const aliasPath = path.join(dir, "omp");
-			await fs.symlink(process.execPath, aliasPath);
+			await fs.copyFile(process.execPath, foreignPath);
+			await fs.chmod(foreignPath, 0o755);
+			await fs.symlink(foreignPath, aliasPath);
 			const fetchImpl = vi.fn(async () => new Response());
 			const target = resolveUpdateTargetFromPath(aliasPath, undefined, {
 				allowPackageManagers: true,
@@ -1080,6 +1083,7 @@ describe("update-cli release binary integrity", () => {
 			updateViaBinaryAt(targetPath, "17.1.2", {
 				binaryName,
 				fetchImpl,
+				githubToken: "test-token",
 				validateExistingTarget,
 			}),
 		).rejects.toThrow("target ownership changed");
@@ -1249,8 +1253,20 @@ describe.skipIf(process.platform !== "darwin")("update-cli macOS live backup ima
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "omp");
 		await fs.copyFile(process.execPath, targetPath);
-		const live = Bun.spawn([targetPath, "-e", "await Bun.sleep(30000)"], { stdout: "ignore", stderr: "ignore" });
+		const live = Bun.spawn([targetPath, "-e", "console.log('ready'); await Bun.stdin.text()"], {
+			stdout: "pipe",
+			stdin: "pipe",
+			stderr: "inherit",
+		});
 		try {
+			const reader = live.stdout.getReader();
+			try {
+				const first = await reader.read();
+				expect(new TextDecoder().decode(first.value).trim()).toBe("ready");
+			} finally {
+				reader.releaseLock();
+			}
+			expect(live.exitCode, `live image exited with ${live.signalCode}`).toBeNull();
 			// Real-time waits, not fake timers: these wait on genuine kernel and
 			// process state (lsof visibility of the live image, vnode release
 			// after exit) that no in-test clock controls.
@@ -1282,6 +1298,7 @@ describe.skipIf(process.platform !== "darwin")("update-cli macOS live backup ima
 			expect(await Bun.file(targetPath).text()).toBe("new binary");
 			expect(await Bun.file(tempPath).exists()).toBe(false);
 			expect(await Bun.file(backupPath).exists()).toBe(true);
+			expect(live.exitCode, `live image exited with ${live.signalCode}`).toBeNull();
 
 			// A later sweep must spare it too.
 			await sweepStaleUpdateArtifacts(targetPath);

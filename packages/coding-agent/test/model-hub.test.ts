@@ -8,6 +8,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -66,7 +67,7 @@ function installTestTheme(): void {
 interface RegistryOverrides {
 	refresh?: (mode: string) => Promise<void>;
 	refreshProvider?: ModelRegistry["refreshProvider"];
-	getAvailable?: () => Model[];
+	getAvailable?: (kind?: ModelKind | "all") => Model[];
 	getAll?: () => Model[];
 	getDiscoverableProviders?: () => string[];
 	getProviderDiscoveryState?: (providerId: string) => unknown;
@@ -226,6 +227,108 @@ describe("ModelHub", () => {
 			expect(rendered).toContain("image-model");
 			expect(rendered).not.toContain("chat-model");
 		});
+
+		test("a chat-only --models scope keeps non-chat runners and their role assignments (#14016)", () => {
+			// The startup scope only ever holds chat models; judge/search/image
+			// runners must still be browsable and assignable from the catalog.
+			const chat = makeModel("test", "chat-model");
+			const judge = makeModel("openrouter", "~typesafe/jev-latest", 128_000, undefined, "judge");
+			const settings = Settings.isolated({ modelRoles: { judge: "openrouter/~typesafe/jev-latest" } });
+			const { hub } = createHub({
+				models: [chat],
+				scoped: true,
+				settings,
+				registry: {
+					getAvailable: kind => (kind === "all" ? [chat, judge] : [chat]),
+					getAll: () => [chat, judge],
+				},
+			});
+
+			hub.handleInput(UP); // All models → Roles.
+			hub.handleInput(OPTION_RIGHT_MAC);
+			hub.handleInput(OPTION_RIGHT_MAC); // Kind roles tab.
+			const judgeRow = hub
+				.render(220)
+				.map(line => stripVTControlCharacters(line))
+				.find(line => line.includes("JUDGE"));
+			expect(judgeRow).toContain("~typesafe/jev-latest");
+
+			hub.handleInput(DOWN); // Roles → All models.
+			for (const ch of "jev") hub.handleInput(ch);
+			const rendered = normalize(hub.render(220));
+			expect(rendered).not.toContain("No matching models");
+			expect(rendered).toContain("● judge");
+		});
+
+		test.each(["allowlist", "denylist", "role-alias"] as const)(
+			"a chat-only CLI scope preserves %s policy for non-chat roles and fallback candidates",
+			policy => {
+				const chat = makeModel("test", "chat-model");
+				const otherChat = makeModel("test", "outside-cli-chat");
+				const allowed = makeModel("test", "allowed-image", 128_000, undefined, "image");
+				const blocked = makeModel("test", "blocked-image", 128_000, undefined, "image");
+				const models = [chat, otherChat, allowed, blocked];
+				const settings = Settings.isolated({
+					modelRoles: {
+						image: "test/blocked-image,test/allowed-image",
+						smol: "test/outside-cli-chat,test/chat-model",
+					},
+					...(policy === "denylist"
+						? { disabledModels: ["test/blocked-image"] }
+						: { enabledModels: [policy === "role-alias" ? "@smol" : "test/chat-model", "test/allowed-image"] }),
+				});
+				const { hub, onAssign, onFallbackChainChange } = createHub({
+					models: [chat],
+					scoped: true,
+					settings,
+					registry: { getAvailable: () => models, getAll: () => models },
+				});
+
+				hub.handleInput(UP);
+				hub.handleInput(OPTION_RIGHT_MAC);
+				hub.handleInput(OPTION_RIGHT_MAC);
+				const imageRow = hub
+					.render(220)
+					.map(line => stripVTControlCharacters(line))
+					.find(line => line.includes("IMAGE"));
+				expect(imageRow).toContain("allowed-image");
+				expect(imageRow).not.toContain("blocked-image");
+
+				hub.handleInput(DOWN);
+				for (const ch of "blocked-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onAssign).not.toHaveBeenCalled();
+				expect(onFallbackChainChange).not.toHaveBeenCalled();
+				expect(normalize(hub.render(220))).not.toContain("blocked-image →");
+
+				hub.handleInput(ESC);
+				for (const ch of "outside-cli-chat") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onAssign).not.toHaveBeenCalled();
+				expect(normalize(hub.render(220))).not.toContain("outside-cli-chat →");
+
+				hub.handleInput(ESC);
+				if (policy === "role-alias") {
+					for (const ch of "chat-model") hub.handleInput(ch);
+					hub.handleInput("\n");
+					expect(onAssign).not.toHaveBeenCalled();
+					expect(footerLine(hub.render(220))).not.toContain("chat-model →");
+					hub.handleInput(ESC);
+				}
+				for (const ch of "allowed-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				hub.handleInput(LEFT);
+				hub.handleInput(LEFT);
+				hub.handleInput("\n");
+				for (const ch of "blocked-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onFallbackChainChange).not.toHaveBeenCalled();
+				for (const _ch of "blocked-image") hub.handleInput("\x7f");
+				for (const ch of "allowed-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onFallbackChainChange).toHaveBeenCalledWith("test/allowed-image", ["test/allowed-image"]);
+			},
+		);
 
 		test("tags the selected model's roles in the detail line, including custom roles", () => {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");

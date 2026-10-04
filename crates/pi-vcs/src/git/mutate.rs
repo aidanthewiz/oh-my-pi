@@ -21,7 +21,7 @@ use super::{
 use crate::{
 	error::{Error, Result},
 	types::{
-		CleanOptions, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
+		CleanOptions, CommitAuthor, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
 		WorktreeAddOptions, WorktreeAddResult, WorktreeClone,
 	},
 };
@@ -182,6 +182,42 @@ impl GitRepo {
 		self
 			.head_sha()?
 			.ok_or_else(|| Error::backend("git commit", "commit completed without HEAD"))
+	}
+
+	/// Write a commit object for `tree` on top of `parents` without touching
+	/// HEAD, the index, any ref, or the worktree (`git commit-tree`). No hooks
+	/// run. Returns the new commit id.
+	pub fn commit_tree(
+		&self,
+		tree: &str,
+		parents: &[String],
+		message: &str,
+		author: Option<&CommitAuthor>,
+	) -> Result<String> {
+		let repo = self.gix()?;
+		let tree = resolve_tree(&repo, tree)?;
+		let parents = parents
+			.iter()
+			.map(|parent| resolve_commit(&repo, parent))
+			.collect::<Result<Vec<_>>>()?;
+		let committer = repo
+			.committer()
+			.ok_or_else(|| Error::backend("git commit-tree", "committer identity is not configured"))?
+			.map_err(|err| Error::backend("git commit-tree", err))?;
+		let override_author = author.map(signature_for).transpose()?;
+		let mut author_time = gix::date::parse::TimeBuf::default();
+		let author = if let Some(author) = override_author.as_ref() {
+			author.to_ref(&mut author_time)
+		} else {
+			repo
+				.author()
+				.ok_or_else(|| Error::backend("git commit-tree", "author identity is not configured"))?
+				.map_err(|err| Error::backend("git commit-tree", err))?
+		};
+		let commit = repo
+			.new_commit_as(committer, author, message, tree, parents)
+			.map_err(|err| Error::backend("git commit-tree", err))?;
+		Ok(commit.id.to_hex().to_string())
 	}
 
 	/// Checkout a branch or detached revision without overwriting local changes.
@@ -921,6 +957,21 @@ pub fn detach_git_dir(
 		detached.read_tree("HEAD", None)?;
 	}
 	Ok(DetachGitDirResult::Detached)
+}
+
+/// Author signature for an explicit [`CommitAuthor`]; a missing date means now.
+fn signature_for(author: &CommitAuthor) -> Result<gix::actor::Signature> {
+	let time = match &author.date {
+		Some(date) => {
+			gix::date::parse(date, None).map_err(|err| Error::backend("git commit", err))?
+		},
+		None => gix::date::Time::now_local_or_utc(),
+	};
+	Ok(gix::actor::Signature {
+		name: author.name.clone().into(),
+		email: author.email.clone().into(),
+		time,
+	})
 }
 
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<gix::hash::ObjectId> {
@@ -1794,6 +1845,52 @@ mod tests {
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "A  new");
 		repo.unstage(&[]).unwrap();
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "?? new");
+	}
+
+	#[test]
+	fn commit_tree_preserves_checkout_and_skips_hooks() {
+		let (temp, repo) = fixture();
+		let root = temp.path();
+		let head = git(root, &["rev-parse", "HEAD"]);
+		fs::write(root.join("a"), "staged\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		let tree = repo.write_tree(None).unwrap();
+		fs::write(root.join("a"), "unstaged\n").unwrap();
+		fs::write(root.join("scratch"), "untracked\n").unwrap();
+		for name in ["pre-commit", "commit-msg", "post-commit"] {
+			write_hook(
+				&root.join(".git/hooks").join(name),
+				"echo invoked > .git/hook-invoked\nexit 1",
+				true,
+			);
+		}
+		let index = fs::read(root.join(".git/index")).unwrap();
+		let refs = git(root, &["show-ref"]);
+		let reflog = fs::read(root.join(".git/logs/HEAD")).unwrap();
+		let edit_message = fs::read(root.join(".git/COMMIT_EDITMSG")).unwrap();
+		let author = CommitAuthor {
+			name:  "Task Author".into(),
+			email: "task@example.com".into(),
+			date:  Some("2020-01-02T03:04:05Z".into()),
+		};
+		let sha = repo
+			.commit_tree(&tree, &[head.clone()], "task\n\nbody", Some(&author))
+			.unwrap();
+		assert_eq!(git(root, &["show", &format!("{sha}:a")]), "staged");
+		assert_eq!(git(root, &["show", "-s", "--format=%P", &sha]), head);
+		assert_eq!(
+			git(root, &["show", "-s", "--format=%an <%ae> %at", &sha]),
+			"Task Author <task@example.com> 1577934245"
+		);
+		assert_eq!(repo.commit_details(&sha).unwrap().message, "task\n\nbody");
+		assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+		assert_eq!(git(root, &["show-ref"]), refs);
+		assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+		assert_eq!(fs::read(root.join(".git/logs/HEAD")).unwrap(), reflog);
+		assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "unstaged\n");
+		assert_eq!(fs::read_to_string(root.join("scratch")).unwrap(), "untracked\n");
+		assert!(!root.join(".git/hook-invoked").exists());
+		assert_eq!(fs::read(root.join(".git/COMMIT_EDITMSG")).unwrap(), edit_message);
 	}
 
 	#[test]

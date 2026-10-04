@@ -14,7 +14,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/dap/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
-import { getAgentDir, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { type ChildProcess, getAgentDir, ptree, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 const ORIGINAL_AGENT_DIR = getAgentDir();
 let testHome: string | undefined;
@@ -530,81 +530,69 @@ describe("DAP launch failure handling", () => {
 		}
 	});
 
-	it("kills the detached adapter process when the Unix socket never appears (Linux)", async () => {
-		if (process.platform !== "linux") return;
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-unix-leak-"));
+	it.each([
+		{ platform: "linux", transport: "Unix socket", error: /Socket not ready/ },
+		{ platform: "darwin", transport: "TCP client-addr", error: /did not connect within/ },
+	])("kills a started detached adapter on $transport launch timeout", async ({ platform, error }) => {
+		if (platform === "linux" && process.platform !== "linux") return;
+		const originalPlatform = process.platform;
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-socket-leak-"));
+		let proc: ChildProcess | undefined;
+		let exited: Promise<PromiseSettledResult<number>[]> | undefined;
+		let restoreSpawn: (() => void) | undefined;
 		try {
-			const adapterPath = path.join(cwd, "wedged-unix-adapter.mjs");
-			const pidFilePath = path.join(cwd, "adapter.pid");
-			// Adapter records its pid and stays alive without ever creating the
-			// socket, forcing #spawnSocketUnix's readiness wait to time out.
-			await fs.writeFile(
-				adapterPath,
-				`await Bun.write(${JSON.stringify(pidFilePath)}, String(process.pid));\nawait Bun.sleep(60_000);\n`,
-			);
+			const adapterPath = path.join(cwd, "wedged-adapter.mjs");
+			await fs.writeFile(adapterPath, "console.log(process.pid);\nawait Bun.sleep(60_000);\n");
+			proc = ptree.spawn([process.execPath, adapterPath], { cwd, stdin: "pipe", detached: true });
+			exited = Promise.allSettled([proc.exited]);
+			const reader = proc.stdout.getReader();
+			try {
+				const ready = (async () => {
+					let output = "";
+					const decoder = new TextDecoder();
+					while (!output.includes("\n")) {
+						const chunk = await reader.read();
+						if (chunk.done) throw new Error(`Adapter exited before readiness: ${proc?.peekStderr()}`);
+						output += decoder.decode(chunk.value, { stream: true });
+					}
+					return Number(output.trim());
+				})();
+				expect(await withTimeout(ready, 5_000, "Adapter did not start")).toBe(proc.pid);
+			} finally {
+				await reader.cancel();
+				reader.releaseLock();
+			}
+			expect(proc.exitCode).toBeNull();
+			process.kill(proc.pid, 0);
+
+			// Start the launch deadline only after the real detached child is ready.
+			const spawnSpy = spyOn(ptree, "spawn").mockReturnValue(proc);
+			restoreSpawn = () => spawnSpy.mockRestore();
+			Object.defineProperty(process, "platform", { value: platform, configurable: true });
 			const adapter: DapResolvedAdapter = {
 				...TEST_ADAPTER,
-				name: "wedged-unix-adapter",
+				name: "wedged-adapter",
 				command: process.execPath,
 				args: [adapterPath],
 				resolvedCommand: process.execPath,
 				connectMode: "socket",
 			};
-			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(/Socket not ready/);
-			// Wait for the kill signal to propagate to the detached adapter.
-			await Bun.sleep(500);
-			const adapterPid = Number(await Bun.file(pidFilePath).text());
-			expect(Number.isFinite(adapterPid)).toBe(true);
-			let alive = true;
-			try {
-				process.kill(adapterPid, 0);
-			} catch {
-				alive = false;
-			}
-			expect(alive).toBe(false);
+			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(error);
+			const [outcome] = await withTimeout(exited, 5_000, "Detached adapter survived launch timeout");
+			if (outcome.status === "rejected") expect(outcome.reason.name).toBe("AbortError");
+			const adapterPid = proc.pid;
+			expect(() => process.kill(adapterPid, 0)).toThrow();
 		} finally {
-			await removeWithRetries(cwd);
-		}
-	});
-
-	it("kills the detached adapter process when it never dials back on the TCP client-addr path", async () => {
-		const originalPlatform = process.platform;
-		Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
-		try {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-tcp-leak-"));
+			restoreSpawn?.();
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 			try {
-				const adapterPath = path.join(cwd, "wedged-tcp-adapter.mjs");
-				const pidFilePath = path.join(cwd, "adapter.pid");
-				await fs.writeFile(
-					adapterPath,
-					`await Bun.write(${JSON.stringify(pidFilePath)}, String(process.pid));\nawait Bun.sleep(60_000);\n`,
-				);
-				const adapter: DapResolvedAdapter = {
-					...TEST_ADAPTER,
-					name: "wedged-tcp-adapter",
-					command: process.execPath,
-					args: [adapterPath],
-					resolvedCommand: process.execPath,
-					connectMode: "socket",
-				};
-				await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(
-					/did not connect within/,
-				);
-				await Bun.sleep(500);
-				const adapterPid = Number(await Bun.file(pidFilePath).text());
-				expect(Number.isFinite(adapterPid)).toBe(true);
-				let alive = true;
-				try {
-					process.kill(adapterPid, 0);
-				} catch {
-					alive = false;
+				if (proc && exited) {
+					proc.kill(undefined, -1);
+					await withTimeout(exited, 5_000, "Fixture adapter cleanup did not finish");
 				}
-				expect(alive).toBe(false);
 			} finally {
 				await removeWithRetries(cwd);
 			}
-		} finally {
-			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		}
 	});
 });

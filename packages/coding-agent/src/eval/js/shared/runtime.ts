@@ -29,6 +29,7 @@ export interface RuntimeHooks {
 	onText(chunk: string): void;
 	onDisplay(output: JsDisplayOutput): void;
 	callTool(name: string, args: unknown, identity?: RuntimeCallIdentity): Promise<unknown>;
+	onPendingHelper?(): () => void;
 }
 
 /**
@@ -379,12 +380,17 @@ export class JsRuntime {
 		this.#moduleLoader = new LocalModuleLoader(this.sessionId);
 		this.#moduleLoader.setPackageRoot(opts.packageRoot);
 		this.#localRoots = opts.localRoots ?? {};
-		this.helpers = createHelpers({
+		const helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
 			env: this.#env,
 			localRoots: () => this.#localRoots,
 			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),
 		});
+		this.helpers = {
+			...helpers,
+			read: (rawPath, options) => this.#retainHelper(helpers.read(rawPath, options)),
+			writeFile: (rawPath, data) => this.#retainHelper(helpers.writeFile(rawPath, data)),
+		};
 		this.#initialGlobalKeys = new Set(Object.getOwnPropertyNames(globalThis));
 		this.#install(opts.extraGlobals);
 	}
@@ -395,6 +401,15 @@ export class JsRuntime {
 
 	promiseRunOwner(promise: Promise<unknown> | undefined): string | undefined {
 		return promise ? this.#promiseOwners.get(promise) : undefined;
+	}
+
+	async #retainHelper<T>(promise: Promise<T>): Promise<T> {
+		const finish = this.#als.getStore()?.hooks.onPendingHelper?.();
+		try {
+			return await promise;
+		} finally {
+			finish?.();
+		}
 	}
 
 	#trackPromise<T>(promise: Promise<T>, runId = this.#als.getStore()?.runId): Promise<T> {

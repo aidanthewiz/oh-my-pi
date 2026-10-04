@@ -36,6 +36,7 @@
  */
 import { buildModel } from "../build";
 import { Effort, THINKING_EFFORTS } from "../effort";
+import { toModelSpec } from "../provider-models/bundled-references";
 import type { Api, Model, ModelSpec, Provider, ThinkingConfig } from "../types";
 import { resolveModelPolicy } from "./resolve";
 import { parseRevision, parseRevisionConstraint, type RevisionTerm, revisionSatisfies } from "./revision";
@@ -1120,19 +1121,7 @@ export function collapseVariants<TSpec extends VariantSpecLike>(
 export function collapseBuiltVariants<TApi extends Api>(models: readonly Model<TApi>[]): Model<TApi>[] {
 	const collapsed = collapseVariants(models);
 	const inputRefs = new Set<Model<TApi>>(models);
-	return collapsed.map(model => (inputRefs.has(model) ? model : buildModel(projectModelSpec(model))));
-}
-
-function projectModelSpec<TApi extends Api>(model: Model<TApi>): ModelSpec<TApi> {
-	const {
-		compat: _resolvedCompat,
-		compatConfig,
-		identity: _identity,
-		requiresGlyphTokenization: _requiresGlyphTokenization,
-		supportsComputerUseConfig: _supportsComputerUseConfig,
-		...spec
-	} = model;
-	return { ...spec, compat: compatConfig };
+	return collapsed.map(model => (inputRefs.has(model) ? model : buildModel(toModelSpec(model))));
 }
 
 /**

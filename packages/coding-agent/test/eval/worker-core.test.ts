@@ -707,12 +707,13 @@ send({
 	type: "run", runId: "register-tools", snapshot,
 	code: 'tool(() => { void read("."); return "floated"; }, { name: "floatedRead" });' +
 		'tool(async () => { try { await read("."); } catch { return "caught"; } }, { name: "caughtRead" });' +
-		'tool(async () => { await read("package.json"); return "awaited"; }, { name: "awaitedRead" });',
+		'tool(async () => { await read("package.json"); return "awaited"; }, { name: "awaitedRead" });' +
+		'tool(async () => { await read("."); return "unreachable"; }, { name: "failedRead" });',
 	filename: "[register-tools].js",
 });
 await registered;
 const results = {};
-for (const name of ["floatedRead", "caughtRead", "awaitedRead"]) {
+for (const name of ["floatedRead", "caughtRead", "awaitedRead", "failedRead"]) {
 	const pending = waitForMessage(message => message.type === "result" && message.runId === name);
 	send({ type: "tool", runId: name, op: "call", name, args: {} });
 	results[name] = await pending;
@@ -725,8 +726,10 @@ const result = {
 	awaitedValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "awaitedRead")?.output.data.value,
 	caughtOk: results.caughtRead.ok,
 	awaitedOk: results.awaitedRead.ok,
+	failedOk: results.failedRead.ok,
+	failedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "failedRead"),
 };
-await finish(result, result.floatedFailed && !result.floatedDisplayed && result.caughtOk && result.awaitedOk);
+await finish(result, result.floatedFailed && !result.floatedDisplayed && result.caughtOk && result.awaitedOk && !result.failedOk && !result.failedDisplayed);
 `);
 		expect(output).toEqual({
 			floatedFailed: true,
@@ -735,6 +738,8 @@ await finish(result, result.floatedFailed && !result.floatedDisplayed && result.
 			awaitedValue: "awaited",
 			caughtOk: true,
 			awaitedOk: true,
+			failedOk: false,
+			failedDisplayed: false,
 		});
 		expect(exitCode).toBe(0);
 		expect(stderr).not.toContain("[Unhandled Rejection]");

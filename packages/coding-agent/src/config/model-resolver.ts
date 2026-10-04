@@ -32,7 +32,9 @@ import { modelMatchesHost } from "@oh-my-pi/pi-catalog/hosts";
 import { buildModelProviderPriorityRank } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { type GeneratedProvider, getBundledModels, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
+import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
@@ -323,7 +325,7 @@ function applyUpstreamRouting(model: Model<Api>, upstream: string): Model<Api> {
 	const aggregatorModel = model as Model<"openai-completions">;
 	const routing = { only: [upstream] };
 	return buildModel({
-		...model,
+		...toModelSpec(model),
 		compat: modelMatchesHost(model, "vercelAIGateway")
 			? { ...aggregatorModel.compatConfig, vercelGatewayRouting: routing }
 			: { ...aggregatorModel.compatConfig, openRouterRouting: routing },
@@ -1762,6 +1764,22 @@ export async function resolveModelScope(
 			explicitThinkingLevel: explicit,
 		});
 	};
+	// The scope is chat-only (it feeds Ctrl+P cycling and the initial model). A
+	// pattern naming an available non-chat runner (judge, search, image, …) is
+	// not a typo: the model hub and role resolution use runners outside the scope.
+	let runnerModels: Model<Api>[] | undefined;
+	const reportUnmatched = (pattern: string, glob: boolean) => {
+		runnerModels ??= modelRegistry.getAvailable("all").filter(model => modelKind(model) !== "chat");
+		const namesRunner = glob
+			? resolveGlobScopePattern(pattern, runnerModels).models.length > 0
+			: parseModelPatternWithContext(pattern, runnerModels, buildPreferenceContext(runnerModels, preferences))
+					.model !== undefined;
+		if (namesRunner) {
+			logger.debug(`Scope pattern "${pattern}" names a non-chat model; it stays out of the chat scope`);
+			return;
+		}
+		logger.warn(`No models match pattern "${pattern}"`);
+	};
 
 	for (const pattern of patterns) {
 		// Check if pattern contains glob characters
@@ -1775,7 +1793,7 @@ export async function resolveModelScope(
 			} = resolveGlobScopePattern(pattern, availableModels);
 
 			if (matchingModels.length === 0) {
-				logger.warn(`No models match pattern "${pattern}"`);
+				reportUnmatched(pattern, true);
 				continue;
 			}
 
@@ -1815,7 +1833,7 @@ export async function resolveModelScope(
 		}
 
 		if (!model) {
-			logger.warn(`No models match pattern "${pattern}"`);
+			reportUnmatched(pattern, false);
 			continue;
 		}
 
@@ -2067,10 +2085,13 @@ export function resolveCliModel(options: CliModelOptions): ResolveCliModelResult
 	}
 
 	const scoped = { ...options, cliModel };
-	const scope: CliModelScope = {
-		all: filterModelsByConfiguredScope(modelRegistry.getAll(), settings),
-		available: filterModelsByConfiguredScope(preferredModels ?? modelRegistry.getAvailable(), settings),
-	};
+	const allModels = filterModelsByConfiguredScope(modelRegistry.getAll(), settings);
+	let availableModels = preferredModels ?? modelRegistry.getAvailable();
+	if (settings && (cfgEnabledModels.get(settings).length > 0 || cfgDisabledModels.get(settings).length > 0)) {
+		const allowedKeys = new Set(allModels.map(formatModelString));
+		availableModels = availableModels.filter(model => allowedKeys.has(formatModelString(model)));
+	}
+	const scope: CliModelScope = { all: allModels, available: availableModels };
 	const disabled = disabledProviderIds(settings);
 	if (disabled.size === 0) return resolveCliModelInScope(scoped, scope);
 

@@ -23,6 +23,7 @@ import type {
 import type { KeysApi, Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { MODEL_KINDS, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { Component, TUI } from "../tui";
@@ -483,6 +484,24 @@ export class ModelHubComponent implements Component {
 		return this.#settings.knownRoleIds.filter(role => !this.#settings.getRoleInfo(role).hidden);
 	}
 
+	/** Resolve fuzzy selectors and role aliases before intersecting a narrowed inventory. */
+	#applyConfiguredPolicy(models: Model[]): Model[] {
+		if (!this.#settings.scopeModels) return models;
+		const allowed = this.#settings.scopeModels(this.#registry.getAll("all"));
+		return models.filter(model => allowed.some(candidate => modelsAreEqual(candidate, model)));
+	}
+
+	/** CLI scope narrows chat cycling; managed policy still applies to every runner. */
+	#scopedPool(): Model[] {
+		const pool = this.#scopedModels.map(scoped => scoped.model);
+		for (const model of this.#registry.getAvailable("all")) {
+			if (modelKind(model) === "chat") continue;
+			if (this.#scopedModels.some(scoped => modelsAreEqual(scoped.model, model))) continue;
+			pool.push(model);
+		}
+		return this.#applyConfiguredPolicy(pool);
+	}
+
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
 	#reloadRoles(autoCandidates: ReadonlyArray<Model>): void {
 		const allModels =
@@ -502,9 +521,15 @@ export class ModelHubComponent implements Component {
 		let allModels: ReadonlyArray<Model>;
 		let availableModels: ReadonlyArray<Model>;
 		if (this.#scopedModels.length > 0) {
-			allModels = this.#scopedModels.map(scoped => scoped.model);
-			availableModels = allModels;
 			this.#configError = undefined;
+			try {
+				allModels = this.#scopedPool();
+			} catch (error) {
+				this.#configError = error instanceof Error ? error.message : String(error);
+				const scopedModels = this.#scopedModels.map(scoped => scoped.model);
+				allModels = this.#applyConfiguredPolicy(scopedModels);
+			}
+			availableModels = allModels;
 		} else {
 			const loadError = this.#registry.getError();
 			this.#configError = loadError ? String(loadError) : undefined;
@@ -1087,7 +1112,7 @@ export class ModelHubComponent implements Component {
 			scope === "project" ? this.#settings.getProjectModelRole(role) : this.#settings.getGlobalModelRole(role);
 		const allModels =
 			this.#scopedModels.length > 0
-				? this.#scopedModels.map(scoped => scoped.model)
+				? this.#scopedPool()
 				: (this.#settings.scopeModels?.(this.#registry.getAll("all")) ?? this.#registry.getAll("all"));
 		const roleLookup: ModelRoleLookup = {
 			getModelRole: scopedRole =>
@@ -1313,6 +1338,7 @@ export class ModelHubComponent implements Component {
 	#findFallbackModel(provider: string, id: string): ModelBrowserItem | undefined {
 		const model = this.#registry.find(provider, id);
 		if (!model) return undefined;
+		if (this.#applyConfiguredPolicy([model]).length === 0) return undefined;
 		return { provider: model.provider, id: model.id, model, selector: `${model.provider}/${model.id}` };
 	}
 

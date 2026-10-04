@@ -1,15 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Api, Model, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
+import { buildGeneratedModel } from "../scripts/generate-models";
 import {
-	applyAntigravityPricingFallback,
 	applyGeneratedModelPolicies,
 	applyOllamaCloudOutputCap,
+	applyPricingPeerFallback,
 	linkOpenAIPromotionTargets,
 } from "../scripts/generated-policies";
 import { buildModel } from "../src/build";
 import { resolveProviderModels } from "../src/model-manager";
 import { cursorModelManagerOptions } from "../src/provider-models/special";
+import { toModelSpec } from "../src/provider-models/bundled-references";
 
 function createSpec<TApi extends Api>(overrides: {
 	id: string;
@@ -53,6 +55,56 @@ function buildGenerated<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi> {
 }
 
 describe("generated model policies", () => {
+	it("rebuilds snapshot compatibility and endpoint capabilities without promoting inferred values", () => {
+		const directSpec = createSpec({
+			id: "gpt-5.4",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+		});
+		const snapshot = JSON.parse(JSON.stringify(buildModel(directSpec))) as Model<"openai-responses">;
+		const rebuilt = buildGeneratedModel(snapshot);
+		const proxy = buildModel({ ...toModelSpec(rebuilt), baseUrl: "https://gateway.example/v1" });
+		expect(rebuilt.supportsComputerUse).toBe(true);
+		expect(proxy.supportsComputerUse).toBe(false);
+		expect(proxy.compat).toMatchObject({ officialEndpoint: false, supportsDeveloperRole: false });
+
+		const pinned = buildGeneratedModel(
+			JSON.parse(
+				JSON.stringify(
+					buildModel({ ...directSpec, supportsComputerUse: true, compat: { supportsDeveloperRole: true } }),
+				),
+			) as Model<"openai-responses">,
+		);
+		const pinnedProxy = buildModel({ ...toModelSpec(pinned), baseUrl: "https://gateway.example/v1" });
+		expect(pinnedProxy.supportsComputerUse).toBe(true);
+		expect(pinnedProxy.compat).toMatchObject({ officialEndpoint: false, supportsDeveloperRole: true });
+
+		const chat = buildGeneratedModel(
+			buildModel(
+				createSpec({
+					id: "gpt-4o-mini",
+					api: "openai-completions",
+					provider: "openai",
+					baseUrl: "https://api.openai.com/v1",
+				}),
+			),
+		);
+		const moonshot = buildModel({
+			...toModelSpec(chat),
+			api: "openai-completions",
+			provider: "moonshot",
+			baseUrl: "https://api.moonshot.ai/v1",
+			id: "kimi-k2.6",
+		});
+		expect(moonshot.compat).toMatchObject({
+			thinkingFormat: "zai",
+			maxTokensField: "max_tokens",
+			supportsStore: false,
+			thinkingKeep: "all",
+		});
+	});
+
 	it("re-bakes thinking metadata and applies parsed catalog corrections", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({
@@ -918,7 +970,7 @@ describe("applyOllamaCloudOutputCap", () => {
 	});
 });
 
-describe("applyAntigravityPricingFallback", () => {
+describe("applyPricingPeerFallback", () => {
 	it("prices Gemini ids at Google API peers and Claude ids at Vertex, falling back to Anthropic", () => {
 		const googleCost = { input: 1.5, output: 9, cacheRead: 0.15, cacheWrite: 0 };
 		const previewCost = { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 };
@@ -946,7 +998,7 @@ describe("applyAntigravityPricingFallback", () => {
 			createSpec({ id: "claude-sonnet-4-6", api: "google-gemini-cli", provider: "google-antigravity" }),
 		];
 
-		const result = applyAntigravityPricingFallback(models);
+		const result = applyPricingPeerFallback(models);
 
 		expect(result[5]?.cost).toEqual(googleCost);
 		expect(result[6]?.cost).toEqual(previewCost);
@@ -977,12 +1029,34 @@ describe("applyAntigravityPricingFallback", () => {
 			}),
 		];
 
-		const result = applyAntigravityPricingFallback(models);
+		const result = applyPricingPeerFallback(models);
 
 		// No billable google peer (zero-cost peer is not a pricing source).
 		expect(result[1]?.cost).toEqual(zeroCost);
 		expect(result[2]?.cost).toEqual(zeroCost);
 		// Already-billable antigravity rows keep their own pricing.
 		expect(result[3]?.cost).toEqual(pricedCost);
+	});
+
+	it("prices MiniMax Token Plan rows at pay-as-you-go peers, M3.1 Flash Preview at the M3 rate", () => {
+		const m3Cost = { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 };
+		const m27Cost = { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0.375 };
+		const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		const models: ModelSpec<Api>[] = [
+			createSpec({ id: "MiniMax-M3", api: "anthropic-messages", provider: "minimax", cost: m3Cost }),
+			createSpec({ id: "MiniMax-M2.7", api: "anthropic-messages", provider: "minimax", cost: m27Cost }),
+			createSpec({ id: "MiniMax-M3.1-Flash-Preview", api: "anthropic-messages", provider: "minimax-code" }),
+			createSpec({ id: "MiniMax-M2.7", api: "anthropic-messages", provider: "minimax-code" }),
+			createSpec({ id: "MiniMax-M2.1-lightning", api: "anthropic-messages", provider: "minimax-code" }),
+			// No minimax-cn row: the China plan falls back to the international peer.
+			createSpec({ id: "MiniMax-M3.1-Flash-Preview", api: "anthropic-messages", provider: "minimax-code-cn" }),
+		];
+
+		const result = applyPricingPeerFallback(models);
+
+		expect(result[2]?.cost).toEqual(m3Cost);
+		expect(result[3]?.cost).toEqual(m27Cost);
+		expect(result[4]?.cost).toEqual(zeroCost);
+		expect(result[5]?.cost).toEqual(m3Cost);
 	});
 });
