@@ -5,6 +5,14 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+
+### Fixed
+
+- Native patch application and checks now convert only affected source and destination paths, ignoring unrelated required filter failures.
+- Cherry-picks use merged-tree attributes and finish content conversion before changing HEAD or writing worktree files.
+- UTF-16 worktree conversion now preserves byte order marks, rejects malformed input, and retains filters, line endings, and ident processing.
+- Native Git ident expansion now preserves foreign identifiers and matches Git's expanded keyword format.
+
 ## [18.5.1] - 2026-10-03
 
 ### Fixed

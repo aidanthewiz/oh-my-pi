@@ -42,6 +42,7 @@ pub(crate) struct WorktreeFilter<'repo> {
 	pipeline:         gix::filter::plumbing::Pipeline,
 	attributes:       gix::worktree::Stack,
 	optional_drivers: BTreeMap<BString, bool>,
+	encoding_attrs:   gix::attrs::search::Outcome,
 	/// Index consulted by the safer-autocrlf rule: a path whose index blob
 	/// already contains CR keeps its CRLFs (`git add` semantics). An empty
 	/// index renormalizes unconditionally (`git apply` semantics).
@@ -71,11 +72,21 @@ impl<'repo> WorktreeFilter<'repo> {
 			// gix-filter 0.32 checks a single-file child's exit only when required.
 			driver.required = true;
 		}
+		let mut encoding_attrs = gix::attrs::search::Outcome::default();
+		encoding_attrs.initialize_with_selection(&Default::default(), [
+			"crlf",
+			"ident",
+			"filter",
+			"eol",
+			"text",
+			"working-tree-encoding",
+		]);
 		Ok(Self {
 			repo,
 			pipeline,
 			attributes,
 			optional_drivers,
+			encoding_attrs,
 			index,
 			verbatim: BTreeSet::new(),
 			op,
@@ -86,6 +97,23 @@ impl<'repo> WorktreeFilter<'repo> {
 	pub(crate) fn staging(repo: &'repo gix::Repository, op: &'static str) -> Result<Self> {
 		let (index, _) = load_index_or_empty(repo, op)?.into_parts();
 		Self::new(repo, op, index)
+	}
+
+	pub(crate) fn for_tree(
+		repo: &'repo gix::Repository,
+		op: &'static str,
+		tree: gix::hash::ObjectId,
+	) -> Result<Self> {
+		let (index, _) = repo
+			.index_from_tree(&tree)
+			.map_err(|err| Error::backend(op, err))?
+			.into_parts();
+		let mut filter = Self::new(repo, op, index)?;
+		filter.attributes = repo
+			.attributes_only(&filter.index, gix::worktree::stack::state::attributes::Source::IdMapping)
+			.map_err(|err| Error::backend(op, err))?
+			.detach();
+		Ok(filter)
 	}
 
 	/// Filter with `git apply` semantics: line endings are renormalized
@@ -158,10 +186,25 @@ impl<'repo> WorktreeFilter<'repo> {
 		if self.verbatim.contains(path) {
 			return Ok(bytes);
 		}
-		let converted = match self.clean(path, &bytes) {
+		if let Some((encoding, driver)) = self.utf16_configuration(path)? {
+			let bytes = self.apply_encoding_driver(
+				path,
+				bytes,
+				driver,
+				gix::filter::plumbing::driver::Operation::Clean,
+			)?;
+			let decoded = encoding
+				.decode(&bytes)
+				.map_err(|err| Error::backend(self.op, err))?;
+			return Ok(self
+				.clean(path, &decoded, true)
+				.map_err(ConversionError::into_error)?
+				.unwrap_or(decoded));
+		}
+		let converted = match self.clean(path, &bytes, false) {
 			Err(ConversionError::OptionalDriver(_)) => {
 				let drivers = std::mem::take(&mut self.pipeline.options_mut().drivers);
-				let retry = self.clean(path, &bytes);
+				let retry = self.clean(path, &bytes, false);
 				self.pipeline.options_mut().drivers = drivers;
 				retry
 			},
@@ -175,10 +218,25 @@ impl<'repo> WorktreeFilter<'repo> {
 	/// Convert blob `bytes` destined for repo-relative `path` to worktree
 	/// content.
 	pub(crate) fn git_to_worktree(&mut self, path: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
-		let converted = match self.smudge(path, &bytes) {
+		if let Some((encoding, driver)) = self.utf16_configuration(path)? {
+			let bytes = self
+				.smudge(path, &bytes, true)
+				.map_err(ConversionError::into_error)?
+				.unwrap_or(bytes);
+			let encoded = encoding
+				.encode(&bytes)
+				.map_err(|err| Error::backend(self.op, err))?;
+			return self.apply_encoding_driver(
+				path,
+				encoded,
+				driver,
+				gix::filter::plumbing::driver::Operation::Smudge,
+			);
+		}
+		let converted = match self.smudge(path, &bytes, false) {
 			Err(ConversionError::OptionalDriver(_)) => {
 				let drivers = std::mem::take(&mut self.pipeline.options_mut().drivers);
-				let retry = self.smudge(path, &bytes);
+				let retry = self.smudge(path, &bytes, false);
 				self.pipeline.options_mut().drivers = drivers;
 				retry
 			},
@@ -189,16 +247,103 @@ impl<'repo> WorktreeFilter<'repo> {
 			.unwrap_or(bytes))
 	}
 
+	fn utf16_configuration(&mut self, path: &str) -> Result<Option<(Utf16, Option<usize>)>> {
+		let entry = self
+			.attributes
+			.at_entry(path.as_bytes().as_bstr(), None, &self.repo.objects)
+			.map_err(|err| Error::backend(self.op, err))?;
+		entry.matching_attributes(&mut self.encoding_attrs);
+		let encoding = match self
+			.encoding_attrs
+			.iter_selected()
+			.find(|attr| attr.assignment.name.as_str() == "working-tree-encoding")
+			.expect("encoding selection")
+			.assignment
+			.state
+		{
+			gix::attrs::StateRef::Value(name) => Utf16::for_label(name.as_bstr()),
+			_ => None,
+		};
+		let Some(encoding) = encoding else {
+			return Ok(None);
+		};
+		let driver = match self
+			.encoding_attrs
+			.iter_selected()
+			.find(|attr| attr.assignment.name.as_str() == "filter")
+			.expect("driver selection")
+			.assignment
+			.state
+		{
+			gix::attrs::StateRef::Value(name) => self
+				.pipeline
+				.options_mut()
+				.drivers
+				.iter()
+				.position(|driver| driver.name == name.as_bstr()),
+			_ => None,
+		};
+		Ok(Some((encoding, driver)))
+	}
+
+	fn apply_encoding_driver(
+		&mut self,
+		path: &str,
+		bytes: Vec<u8>,
+		driver: Option<usize>,
+		operation: gix::filter::plumbing::driver::Operation,
+	) -> Result<Vec<u8>> {
+		let Some(driver) = driver else {
+			return Ok(bytes);
+		};
+		let drivers = std::mem::take(&mut self.pipeline.options_mut().drivers);
+		let driver = &drivers[driver];
+		let optional = self.optional_drivers.get(driver.name.as_bstr()) == Some(&true);
+		let (ref_name, treeish, blob) = {
+			let context = self.pipeline.driver_context_mut();
+			(context.ref_name.take(), context.treeish, context.blob)
+		};
+		let context = gix::filter::plumbing::driver::apply::Context {
+			rela_path: path.as_bytes().as_bstr(),
+			ref_name: ref_name.as_ref().map(|name| name.as_bstr()),
+			treeish,
+			blob,
+		};
+		let converted = (|| {
+			let mut input = bytes.as_slice();
+			let output = self
+				.pipeline
+				.driver_state_mut()
+				.apply(driver, &mut input, operation, context)
+				.map_err(|err| Error::backend(self.op, err))?;
+			match output {
+				Some(mut output) => {
+					let mut out = Vec::new();
+					output
+						.read_to_end(&mut out)
+						.map_err(|err| Error::backend(self.op, err))?;
+					Ok(Some(out))
+				},
+				None => Ok(None),
+			}
+		})();
+		self.pipeline.options_mut().drivers = drivers;
+		self.pipeline.driver_context_mut().ref_name = ref_name;
+		match converted {
+			Ok(Some(out)) => Ok(out),
+			Ok(None) => Ok(bytes),
+			Err(_) if optional => Ok(bytes),
+			Err(err) => Err(err),
+		}
+	}
+
 	fn clean(
 		&mut self,
 		path: &str,
 		bytes: &[u8],
+		utf16: bool,
 	) -> std::result::Result<Option<Vec<u8>>, ConversionError> {
 		let repo = self.repo;
-		let entry = self
-			.attributes
-			.at_path(Path::new(path), None, &repo.objects)
-			.map_err(|err| ConversionError::Other(Error::backend(self.op, err)))?;
 		let mut optional = false;
 		let outcome = self
 			.pipeline
@@ -206,7 +351,10 @@ impl<'repo> WorktreeFilter<'repo> {
 				bytes,
 				Path::new(path),
 				&mut |_, attrs| {
-					entry.matching_attributes(attrs);
+					select_pipeline_attributes(attrs, utf16, false);
+					self
+						.encoding_attrs
+						.copy_into(self.attributes.attributes_collection(), attrs);
 					optional = attrs.iter_selected().any(|attr| {
 						attr.assignment.name.as_str() == "filter"
 							&& matches!(attr.assignment.state, gix::attrs::StateRef::Value(name)
@@ -257,19 +405,29 @@ impl<'repo> WorktreeFilter<'repo> {
 		&mut self,
 		path: &str,
 		bytes: &[u8],
+		utf16: bool,
 	) -> std::result::Result<Option<Vec<u8>>, ConversionError> {
-		let entry = self
-			.attributes
-			.at_entry(path.as_bytes().as_bstr(), None, &self.repo.objects)
-			.map_err(|err| ConversionError::Other(Error::backend(self.op, err)))?;
+		let ident = self
+			.encoding_attrs
+			.iter_selected()
+			.any(|attr| attr.assignment.name.as_str() == "ident" && attr.assignment.state.is_set());
+		let expanded = if ident {
+			expand_ident(bytes, self.repo.object_hash())
+				.map_err(|err| ConversionError::Other(Error::backend(self.op, err)))?
+		} else {
+			None
+		};
 		let mut optional = false;
 		let outcome = self
 			.pipeline
 			.convert_to_worktree(
-				bytes,
+				expanded.as_deref().unwrap_or(bytes),
 				path.as_bytes().as_bstr(),
 				&mut |_, attrs| {
-					entry.matching_attributes(attrs);
+					select_pipeline_attributes(attrs, utf16, true);
+					self
+						.encoding_attrs
+						.copy_into(self.attributes.attributes_collection(), attrs);
 					optional = attrs.iter_selected().any(|attr| {
 						attr.assignment.name.as_str() == "filter"
 							&& matches!(attr.assignment.state, gix::attrs::StateRef::Value(name)
@@ -288,7 +446,7 @@ impl<'repo> WorktreeFilter<'repo> {
 				}
 			})?;
 		match outcome {
-			ToWorktreeOutcome::Unchanged(_) => Ok(None),
+			ToWorktreeOutcome::Unchanged(_) => Ok(expanded),
 			ToWorktreeOutcome::Buffer(buf) => Ok(Some(buf.to_vec())),
 			mut outcome @ ToWorktreeOutcome::Process(_) => {
 				let mut out = Vec::new();
@@ -303,5 +461,155 @@ impl<'repo> WorktreeFilter<'repo> {
 				Ok(Some(out))
 			},
 		}
+	}
+}
+
+fn select_pipeline_attributes(attrs: &mut gix::attrs::search::Outcome, utf16: bool, smudge: bool) {
+	// gix-filter resolves these six attributes by position.
+	attrs.initialize_with_selection(&Default::default(), [
+		"crlf",
+		if smudge { "" } else { "ident" },
+		if utf16 { "" } else { "filter" },
+		"eol",
+		"text",
+		if utf16 { "" } else { "working-tree-encoding" },
+	]);
+}
+
+fn expand_ident(
+	bytes: &[u8],
+	hash: gix::hash::Kind,
+) -> std::result::Result<Option<Vec<u8>>, gix::hash::hasher::Error> {
+	let mut cursor = 0;
+	let mut copied = 0;
+	let mut output: Option<(Vec<u8>, gix::hash::ObjectId)> = None;
+	while let Some(offset) = bytes[cursor..].find_byte(b'$') {
+		let start = cursor + offset;
+		cursor = start + 1;
+		let end = if bytes[start..].starts_with(b"$Id$") {
+			start + 4
+		} else if bytes[start..].starts_with(b"$Id:") {
+			let Some(end) = bytes[start + 4..]
+				.find_byte(b'$')
+				.map(|offset| start + 4 + offset)
+			else {
+				break;
+			};
+			let content = &bytes[start + 4..end];
+			if content.contains(&b'\n')
+				|| content.len() > 2 && content[1..content.len() - 1].contains(&b' ')
+			{
+				continue;
+			}
+			end + 1
+		} else {
+			continue;
+		};
+		if output.is_none() {
+			let id = gix::objs::compute_hash(hash, gix::objs::Kind::Blob, bytes)?;
+			output = Some((Vec::with_capacity(bytes.len() + hash.len_in_hex() + 3), id));
+		}
+		let (out, id) = output.as_mut().expect("initialized");
+		out.extend_from_slice(&bytes[copied..start]);
+		out.extend_from_slice(b"$Id: ");
+		id.write_hex_to(&mut *out).expect("writing to memory");
+		out.extend_from_slice(b" $");
+		copied = end;
+		cursor = end;
+	}
+	Ok(output.map(|(mut out, _)| {
+		out.extend_from_slice(&bytes[copied..]);
+		out
+	}))
+}
+
+#[derive(Clone, Copy)]
+enum Utf16 {
+	Bom,
+	Le,
+	Be,
+	LeBom,
+}
+
+impl Utf16 {
+	fn for_label(label: &[u8]) -> Option<Self> {
+		if label.eq_ignore_ascii_case(b"UTF-16") {
+			Some(Self::Bom)
+		} else if label.eq_ignore_ascii_case(b"UTF-16LE") {
+			Some(Self::Le)
+		} else if label.eq_ignore_ascii_case(b"UTF-16BE") {
+			Some(Self::Be)
+		} else if label.eq_ignore_ascii_case(b"UTF-16LE-BOM") {
+			Some(Self::LeBom)
+		} else {
+			None
+		}
+	}
+
+	fn default_le() -> bool {
+		// Apple's iconv emits big-endian UTF-16; GNU iconv uses native order.
+		cfg!(not(target_os = "macos")) && cfg!(target_endian = "little")
+	}
+
+	fn decode(self, bytes: &[u8]) -> std::result::Result<Vec<u8>, &'static str> {
+		if bytes.is_empty() {
+			return Ok(Vec::new());
+		}
+		let bom = if bytes.starts_with(b"\xff\xfe") {
+			Some(true)
+		} else if bytes.starts_with(b"\xfe\xff") {
+			Some(false)
+		} else {
+			None
+		};
+		let (le, bytes) = match self {
+			Self::Bom => (bom.ok_or("UTF-16 requires a byte order mark")?, &bytes[2..]),
+			Self::Le | Self::Be if bom.is_some() => {
+				return Err("UTF-16LE/BE prohibits a byte order mark");
+			},
+			Self::Le => (true, bytes),
+			Self::Be => (false, bytes),
+			Self::LeBom => {
+				(bom.unwrap_or(Self::default_le()), if bom.is_some() { &bytes[2..] } else { bytes })
+			},
+		};
+		if bytes.len() % 2 != 0 {
+			return Err("UTF-16 contains an incomplete code unit");
+		}
+		let units = bytes.chunks_exact(2).map(|unit| {
+			if le {
+				u16::from_le_bytes([unit[0], unit[1]])
+			} else {
+				u16::from_be_bytes([unit[0], unit[1]])
+			}
+		});
+		let mut out = String::with_capacity(bytes.len());
+		for character in char::decode_utf16(units) {
+			out.push(character.map_err(|_| "UTF-16 contains an unpaired surrogate")?);
+		}
+		Ok(out.into_bytes())
+	}
+
+	fn encode(self, bytes: &[u8]) -> std::result::Result<Vec<u8>, &'static str> {
+		let text = std::str::from_utf8(bytes).map_err(|_| "blob is not valid UTF-8")?;
+		if text.is_empty() {
+			return Ok(Vec::new());
+		}
+		let le =
+			matches!(self, Self::Le | Self::LeBom) || matches!(self, Self::Bom) && Self::default_le();
+		let mut out = Vec::with_capacity(text.len() * 2 + 2);
+		match self {
+			Self::Bom => out.extend_from_slice(if le { b"\xff\xfe" } else { b"\xfe\xff" }),
+			Self::LeBom => out.extend_from_slice(b"\xff\xfe"),
+			_ => {},
+		}
+		for unit in text.encode_utf16() {
+			out.extend_from_slice(&if le {
+				unit.to_le_bytes()
+			} else {
+				unit.to_be_bytes()
+			});
+		}
+		Ok(out)
 	}
 }

@@ -119,7 +119,7 @@ impl GitRepo {
 			return write_index_map_at(&repo, &state, options.index_path.as_deref());
 		}
 		let mut filter = apply_filter(&repo, &patches, options.reverse)?;
-		let mut state = worktree_map(self, &repo, &mut filter)?;
+		let mut state = worktree_map(self, &repo, &mut filter, &patches, options.reverse)?;
 		augment_patch_sources(self, &repo, &mut filter, &mut state, &patches, options.reverse)?;
 		apply_patches_to_map(&repo, &mut state, &patches, options)?;
 		write_patch_worktree(self, &repo, &mut filter, &patches, options.reverse, &state)
@@ -138,7 +138,7 @@ impl GitRepo {
 			index_map_at(&repo, options.index_path.as_deref())?
 		} else {
 			let mut filter = apply_filter(&repo, &patches, options.reverse)?;
-			let mut state = worktree_map(self, &repo, &mut filter)?;
+			let mut state = worktree_map(self, &repo, &mut filter, &patches, options.reverse)?;
 			augment_patch_sources(self, &repo, &mut filter, &mut state, &patches, options.reverse)?;
 			state
 		};
@@ -332,6 +332,20 @@ impl GitRepo {
 			local_map = tree_map(&repo, tree)?;
 			&local_map
 		};
+		let mut checkout_filter = WorktreeFilter::for_tree(&repo, "git cherry-pick", merged_tree)?;
+		let mut prepared = BTreeMap::new();
+		for path in &changed {
+			if let Some(entry) = worktree.get(path) {
+				validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+				let bytes = blob_bytes(&repo, entry.id)?;
+				let bytes = if entry.mode == Mode::SYMLINK {
+					bytes
+				} else {
+					checkout_filter.git_to_worktree(path, bytes)?
+				};
+				prepared.insert(path.clone(), bytes);
+			}
+		}
 		let author = picked
 			.author()
 			.map_err(|err| Error::backend("git cherry-pick author", err))?;
@@ -346,7 +360,7 @@ impl GitRepo {
 		repo
 			.commit_as(committer, author, "HEAD", message.as_ref(), merged_tree, [head_id])
 			.map_err(|err| Error::backend("git cherry-pick commit", err))?;
-		checkout_changed_paths(self, &repo, &mut filter, &merged, worktree, &changed, &unstaged)
+		checkout_changed_paths(self, &repo, &prepared, &merged, worktree, &changed, &unstaged)
 	}
 
 	/// Clear cherry-pick state; fail-clean single-commit picks create none.
@@ -801,7 +815,7 @@ fn apply_patches_to_map(
 			patch_sides(patch, options.reverse);
 		// A create patch may land on an intent-to-add entry: git treats the
 		// promised path as absent and stages the real content over it.
-		if source_path.is_none()
+		if source_path != target_path
 			&& target_path
 				.and_then(|path| state.get(path))
 				.is_some_and(|entry| !entry.intent_to_add)
@@ -1315,8 +1329,18 @@ fn worktree_map(
 	repo: &GitRepo,
 	gix_repo: &gix::Repository,
 	filter: &mut WorktreeFilter<'_>,
+	patches: &[FilePatch],
+	reverse: bool,
 ) -> Result<BTreeMap<String, FileEntry>> {
-	let index = index_map(gix_repo)?;
+	let selected: BTreeSet<&str> = patches
+		.iter()
+		.flat_map(|patch| {
+			let (source, target, ..) = patch_sides(patch, reverse);
+			source.into_iter().chain(target)
+		})
+		.collect();
+	let mut index = index_map(gix_repo)?;
+	index.retain(|path, _| selected.contains(path.as_str()));
 	tracked_worktree_map(repo, gix_repo, filter, &index)
 }
 
@@ -1358,24 +1382,23 @@ fn augment_patch_sources(
 ) -> Result<()> {
 	for patch in patches {
 		let (source, target, source_mode, target_mode) = patch_sides(patch, reverse);
-		let path = if let Some(path) = source {
-			path
-		} else {
-			let Some(target) = target else {
-				continue;
-			};
+		for (path, mode) in source.into_iter().map(|path| (path, source_mode)).chain(
 			target
-		};
-		if state.contains_key(path) {
-			continue;
-		}
-		let mode = source_mode.or(target_mode).unwrap_or(Mode::FILE);
-		if let Some((bytes, mode)) = read_worktree_entry(repo, filter, path, mode)? {
-			let id = gix_repo
-				.write_blob(bytes)
-				.map_err(|err| Error::backend("git hash patch source", err))?
-				.detach();
-			state.insert(path.to_owned(), FileEntry::new(id, mode));
+				.filter(|path| Some(*path) != source)
+				.map(|path| (path, target_mode)),
+		) {
+			if state.contains_key(path) {
+				continue;
+			}
+			if let Some((bytes, mode)) =
+				read_worktree_entry(repo, filter, path, mode.unwrap_or(Mode::FILE))?
+			{
+				let id = gix_repo
+					.write_blob(bytes)
+					.map_err(|err| Error::backend("git hash patch source", err))?
+					.detach();
+				state.insert(path.to_owned(), FileEntry::new(id, mode));
+			}
 		}
 	}
 	Ok(())
@@ -1394,7 +1417,9 @@ fn tracked_worktree_map(
 				.write_blob(bytes)
 				.map_err(|err| Error::backend("git hash worktree blob", err))?
 				.detach();
-			map.insert(path.clone(), FileEntry::new(id, mode));
+			let mut current = FileEntry::new(id, mode);
+			current.intent_to_add = entry.intent_to_add;
+			map.insert(path.clone(), current);
 		}
 	}
 	Ok(map)
@@ -1745,7 +1770,7 @@ fn unstaged_changed_paths(
 fn checkout_changed_paths(
 	repo: &GitRepo,
 	gix_repo: &gix::Repository,
-	filter: &mut WorktreeFilter<'_>,
+	prepared: &BTreeMap<String, Vec<u8>>,
 	merged: &BTreeMap<String, FileEntry>,
 	worktree: &BTreeMap<String, FileEntry>,
 	changed: &BTreeSet<String>,
@@ -1761,7 +1786,7 @@ fn checkout_changed_paths(
 			if fs::symlink_metadata(repo.root().join(path)).is_ok_and(|metadata| metadata.is_dir()) {
 				remove_worktree_path(repo, path)?;
 			}
-			write_worktree_entry(repo, gix_repo, filter, path, entry)?;
+			write_worktree_bytes(repo, path, entry, &prepared[path])?;
 		}
 	}
 	let mut index = load_index_or_head(gix_repo, "git cherry-pick index")?;
@@ -1801,23 +1826,33 @@ fn write_worktree_entry(
 	entry: &FileEntry,
 ) -> Result<()> {
 	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	let bytes = blob_bytes(gix_repo, entry.id)?;
+	let bytes = if entry.mode == Mode::SYMLINK {
+		bytes
+	} else {
+		filter.git_to_worktree(path, bytes)?
+	};
+	write_worktree_bytes(repo, path, entry, &bytes)
+}
+
+fn write_worktree_bytes(repo: &GitRepo, path: &str, entry: &FileEntry, bytes: &[u8]) -> Result<()> {
+	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
 	let absolute = repo.root().join(path);
 	if let Some(parent) = absolute.parent() {
 		fs::create_dir_all(parent)?;
 	}
-	let bytes = blob_bytes(gix_repo, entry.id)?;
 	if entry.mode == Mode::SYMLINK {
 		let _ = fs::remove_file(&absolute);
 		#[cfg(unix)]
 		{
 			use std::os::unix::{ffi::OsStrExt, fs::symlink};
-			symlink(std::ffi::OsStr::from_bytes(&bytes), &absolute)?;
+			symlink(std::ffi::OsStr::from_bytes(bytes), &absolute)?;
 		}
 		#[cfg(not(unix))]
 		fs::write(&absolute, bytes)?;
 		return Ok(());
 	}
-	fs::write(&absolute, filter.git_to_worktree(path, bytes)?)?;
+	fs::write(&absolute, bytes)?;
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::PermissionsExt;
@@ -1942,6 +1977,387 @@ mod tests {
 	fn reset(path: &Path) {
 		git(path, &["reset", "--hard", "-q", "HEAD"]);
 		git(path, &["clean", "-fdq"]);
+	}
+
+	#[test]
+	fn patch_selected_paths_ignore_unrelated_required_clean_filter() {
+		let files: &[(&str, &[u8])] = &[
+			("a", b"one\ntwo\n"),
+			("b", b"untouched\n"),
+			("old", b"rename\n"),
+			("deleted", b"delete\n"),
+		];
+		let ours = init(files);
+		let oracle = init(files);
+		let patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\ndiff \
+		             --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new\ndiff \
+		             --git a/deleted b/deleted\ndeleted file mode 100644\n--- a/deleted\n+++ \
+		             /dev/null\n@@ -1 +0,0 @@\n-delete\ndiff --git a/created b/created\nnew file \
+		             mode 100644\n--- /dev/null\n+++ b/created\n@@ -0,0 +1 @@\n+create\n";
+		for temp in [&ours, &oracle] {
+			git(temp.path(), &["config", "filter.fail.clean", "cat >/dev/null; exit 1"]);
+			git(temp.path(), &["config", "filter.fail.required", "true"]);
+			fs::write(temp.path().join(".git/info/attributes"), "b filter=fail\n").unwrap();
+		}
+		let before_index = fs::read(ours.path().join(".git/index")).unwrap();
+		let repository = repo(ours.path());
+		for reverse in [false, true] {
+			let options = ApplyOptions { reverse, ..Default::default() };
+			assert!(repository.can_apply_patch(patch, &options).unwrap());
+			repository.apply_patch(patch, &options).unwrap();
+			fs::write(oracle.path().join("change.patch"), patch).unwrap();
+			let args = if reverse {
+				vec!["apply", "--reverse", "change.patch"]
+			} else {
+				vec!["apply", "change.patch"]
+			};
+			git(oracle.path(), &args);
+			fs::remove_file(oracle.path().join("change.patch")).unwrap();
+			for path in ["a", "b", "old", "new", "deleted", "created"] {
+				assert_eq!(
+					fs::read(ours.path().join(path)).ok(),
+					fs::read(oracle.path().join(path)).ok(),
+					"{path} reverse={reverse}"
+				);
+			}
+		}
+		let failing = "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-untouched\n+changed\n";
+		assert!(
+			repository
+				.can_apply_patch(failing, &Default::default())
+				.is_err()
+		);
+		assert!(
+			repository
+				.apply_patch(failing, &Default::default())
+				.is_err()
+		);
+		assert_eq!(fs::read(ours.path().join("a")).unwrap(), b"one\ntwo\n");
+		assert_eq!(fs::read(ours.path().join("b")).unwrap(), b"untouched\n");
+		assert_eq!(fs::read(ours.path().join(".git/index")).unwrap(), before_index);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn patch_selected_paths_preserve_intent_symlink_mode_and_collision_safety() {
+		use std::os::unix::fs::{PermissionsExt, symlink};
+		let temp = init(&[("a", b"base\n"), ("b", b"untouched\n")]);
+		let root = temp.path();
+		symlink("old-target", root.join("link")).unwrap();
+		git(root, &["add", "link"]);
+		git(root, &["commit", "-qm", "link"]);
+		fs::write(root.join("promised"), b"new\n").unwrap();
+		fs::write(root.join("other-promise"), b"other\n").unwrap();
+		git(root, &["add", "-N", "promised", "other-promise"]);
+		git(root, &["config", "filter.fail.clean", "cat >/dev/null; exit 1"]);
+		git(root, &["config", "filter.fail.required", "true"]);
+		fs::write(root.join(".git/info/attributes"), "b filter=fail\n").unwrap();
+		let patch = "diff --git a/a b/a\nold mode 100644\nnew mode 100755\ndiff --git a/link \
+		             b/link\n--- a/link\n+++ b/link\n@@ -1 +1 @@\n-old-target\n\\ No newline at end \
+		             of file\n+new-target\n\\ No newline at end of file\ndiff --git a/promised \
+		             b/promised\nnew file mode 100644\n--- /dev/null\n+++ b/promised\n@@ -0,0 +1 \
+		             @@\n+new\n";
+		let repository = repo(root);
+		let index = fs::read(root.join(".git/index")).unwrap();
+		assert!(
+			repository
+				.can_apply_patch(patch, &Default::default())
+				.unwrap()
+		);
+		repository.apply_patch(patch, &Default::default()).unwrap();
+		assert_eq!(fs::read(root.join("promised")).unwrap(), b"new\n");
+		assert_eq!(fs::read_link(root.join("link")).unwrap(), Path::new("new-target"));
+		assert_ne!(fs::metadata(root.join("a")).unwrap().permissions().mode() & 0o111, 0);
+		assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+		fs::write(root.join("collision"), b"protected\n").unwrap();
+		let rename =
+			"diff --git a/a b/collision\nsimilarity index 100%\nrename from a\nrename to collision\n";
+		assert!(
+			!repository
+				.can_apply_patch(rename, &Default::default())
+				.unwrap()
+		);
+		assert!(repository.apply_patch(rename, &Default::default()).is_err());
+		assert_eq!(fs::read(root.join("a")).unwrap(), b"base\n");
+		assert_eq!(fs::read(root.join("collision")).unwrap(), b"protected\n");
+	}
+
+	#[test]
+	fn patch_cherry_pick_uses_merged_attributes_and_preserves_unrelated_dirty_state() {
+		for (before, after) in [("crlf", Some("lf")), ("lf", Some("crlf")), ("crlf", None)] {
+			let attribute = format!("a.txt text eol={before}\n");
+			let files: &[(&str, &[u8])] = &[
+				(".gitattributes", attribute.as_bytes()),
+				("a.txt", b"base\n"),
+				("unrelated", b"base\n"),
+			];
+			let ours = init(files);
+			let oracle = init(files);
+			let mut picks = Vec::new();
+			for temp in [&ours, &oracle] {
+				let root = temp.path();
+				let base = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+				git(root, &["checkout", "-qb", "topic"]);
+				if let Some(after) = after {
+					fs::write(root.join(".gitattributes"), format!("a.txt text eol={after}\n")).unwrap();
+				} else {
+					fs::remove_file(root.join(".gitattributes")).unwrap();
+				}
+				fs::write(root.join("a.txt"), b"picked\n").unwrap();
+				git(root, &["add", "-A"]);
+				git(root, &["commit", "-qm", "pick attributes"]);
+				picks.push(git(root, &["rev-parse", "HEAD"]).trim().to_owned());
+				git(root, &["checkout", "-q", "--detach", &base]);
+				fs::write(root.join("unrelated"), b"staged\n").unwrap();
+				git(root, &["add", "unrelated"]);
+				fs::write(root.join("unrelated"), b"unstaged\n").unwrap();
+				fs::write(root.join("untracked"), b"preserved\n").unwrap();
+			}
+			repo(ours.path()).cherry_pick(&picks[0]).unwrap();
+			// --no-commit permits an unrelated staged index; commit only picked paths.
+			git(oracle.path(), &["cherry-pick", "--no-commit", &picks[1]]);
+			git(oracle.path(), &[
+				"commit",
+				"--only",
+				"-qm",
+				"pick attributes",
+				"--",
+				".gitattributes",
+				"a.txt",
+			]);
+			for path in ["a.txt", ".gitattributes", "unrelated", "untracked"] {
+				assert_eq!(
+					fs::read(ours.path().join(path)).ok(),
+					fs::read(oracle.path().join(path)).ok(),
+					"{before} -> {after:?}: {path}"
+				);
+			}
+			assert_eq!(git(ours.path(), &["write-tree"]), git(oracle.path(), &["write-tree"]));
+			assert_eq!(
+				git(ours.path(), &["status", "--porcelain"]),
+				git(oracle.path(), &["status", "--porcelain"])
+			);
+		}
+	}
+
+	#[test]
+	fn patch_cherry_pick_smudge_failure_does_not_advance_head_or_write_paths() {
+		let temp = init(&[("a", b"base\n"), ("z", b"base\n")]);
+		let root = temp.path();
+		let base = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(root, &["checkout", "-qb", "topic"]);
+		fs::write(root.join(".gitattributes"), "z filter=fail\n").unwrap();
+		fs::write(root.join("a"), b"picked\n").unwrap();
+		fs::write(root.join("z"), b"picked\n").unwrap();
+		git(root, &["add", "-A"]);
+		git(root, &["commit", "-qm", "pick"]);
+		let topic = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(root, &["checkout", "-q", "--detach", &base]);
+		git(root, &["config", "filter.fail.smudge", "cat >/dev/null; exit 1"]);
+		git(root, &["config", "filter.fail.required", "true"]);
+		let index = fs::read(root.join(".git/index")).unwrap();
+		assert!(repo(root).cherry_pick(&topic).is_err());
+		assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), base);
+		assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+		assert_eq!(fs::read(root.join("a")).unwrap(), b"base\n");
+		assert_eq!(fs::read(root.join("z")).unwrap(), b"base\n");
+		assert!(!root.join(".gitattributes").exists());
+	}
+
+	#[test]
+	fn native_ident_restore_matches_git_for_keywords_foreign_ids_and_other_encodings() {
+		use crate::types::RestoreOptions;
+		let stored =
+			"café\n$Id$\n$Id$$Id$\n$Id: oldhash $\n$Id:oldhash$\n$Id: foreign name $\n$Id:\nbroken$\n";
+		for attributes in [
+			"a ident\n",
+			"a ident text eol=crlf\n",
+			"a ident text eol=crlf working-tree-encoding=ISO-8859-1\n",
+		] {
+			let ours = init(&[("a", stored.as_bytes())]);
+			let oracle = init(&[("a", stored.as_bytes())]);
+			for temp in [&ours, &oracle] {
+				fs::write(temp.path().join(".git/info/attributes"), attributes).unwrap();
+				fs::write(temp.path().join("a"), b"dirty\n").unwrap();
+			}
+			repo(ours.path())
+				.restore(&RestoreOptions {
+					files: vec!["a".into()],
+					worktree: true,
+					..Default::default()
+				})
+				.unwrap();
+			git(oracle.path(), &["restore", "--worktree", "--", "a"]);
+			assert_eq!(
+				fs::read(ours.path().join("a")).unwrap(),
+				fs::read(oracle.path().join("a")).unwrap(),
+				"{attributes}"
+			);
+			assert_eq!(git(ours.path(), &["show", ":a"]), stored);
+			repo(ours.path()).stage_files(&["a".into()]).unwrap();
+			git(oracle.path(), &["add", "a"]);
+			assert_eq!(git(ours.path(), &["show", ":a"]), git(oracle.path(), &["show", ":a"]));
+		}
+	}
+
+	#[test]
+	fn native_restore_and_stage_utf16_match_git_with_eol_ident_and_drivers() {
+		use crate::types::RestoreOptions;
+		for label in ["UTF-16", "UTF-16LE", "UTF-16BE", "UTF-16LE-BOM"] {
+			for driver in ["cat", "cat >/dev/null; exit 1"] {
+				let ours = init(&[("a", "base 😀\n$Id$\n".as_bytes())]);
+				let oracle = init(&[("a", "base 😀\n$Id$\n".as_bytes())]);
+				for temp in [&ours, &oracle] {
+					git(temp.path(), &["config", "filter.pass.clean", driver]);
+					git(temp.path(), &["config", "filter.pass.smudge", driver]);
+					git(temp.path(), &["config", "filter.pass.required", "false"]);
+					fs::write(
+						temp.path().join(".git/info/attributes"),
+						format!("a text eol=crlf ident working-tree-encoding={label} filter=pass\n"),
+					)
+					.unwrap();
+					fs::write(temp.path().join("a"), b"dirty bytes\n").unwrap();
+				}
+				repo(ours.path())
+					.restore(&RestoreOptions {
+						files: vec!["a".into()],
+						worktree: true,
+						..Default::default()
+					})
+					.unwrap();
+				git(oracle.path(), &["restore", "--worktree", "--", "a"]);
+				let expected = fs::read(oracle.path().join("a")).unwrap();
+				assert_eq!(fs::read(ours.path().join("a")).unwrap(), expected, "{label} {driver}");
+				repo(ours.path()).stage_files(&["a".into()]).unwrap();
+				git(oracle.path(), &["add", "a"]);
+				assert_eq!(
+					git(ours.path(), &["show", ":a"]),
+					git(oracle.path(), &["show", ":a"]),
+					"{label} {driver}"
+				);
+				git(ours.path(), &["config", "filter.pass.required", "true"]);
+				if driver != "cat" {
+					let index = fs::read(ours.path().join(".git/index")).unwrap();
+					assert!(repo(ours.path()).stage_files(&["a".into()]).is_err());
+					assert!(
+						repo(ours.path())
+							.restore(&RestoreOptions {
+								files: vec!["a".into()],
+								worktree: true,
+								..Default::default()
+							})
+							.is_err()
+					);
+					assert_eq!(fs::read(ours.path().join("a")).unwrap(), expected);
+					assert_eq!(fs::read(ours.path().join(".git/index")).unwrap(), index);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn native_utf16_bom_endianness_and_empty_content_match_git() {
+		use crate::types::RestoreOptions;
+		for label in ["UTF-16", "UTF-16LE-BOM"] {
+			for bytes in [&b"\xff\xfex\0\r\0\n\0"[..], &b"\xfe\xff\0x\0\r\0\n"[..], &b""[..]] {
+				let ours = init(&[("a", b"base\n")]);
+				let oracle = init(&[("a", b"base\n")]);
+				for temp in [&ours, &oracle] {
+					fs::write(
+						temp.path().join(".git/info/attributes"),
+						format!("a text eol=crlf working-tree-encoding={label}\n"),
+					)
+					.unwrap();
+					fs::write(temp.path().join("a"), bytes).unwrap();
+				}
+				repo(ours.path()).stage_files(&["a".into()]).unwrap();
+				git(oracle.path(), &["add", "a"]);
+				assert_eq!(git(ours.path(), &["show", ":a"]), git(oracle.path(), &["show", ":a"]));
+				fs::write(ours.path().join("a"), b"dirty\n").unwrap();
+				fs::write(oracle.path().join("a"), b"dirty\n").unwrap();
+				repo(ours.path())
+					.restore(&RestoreOptions {
+						files: vec!["a".into()],
+						worktree: true,
+						..Default::default()
+					})
+					.unwrap();
+				git(oracle.path(), &["restore", "--worktree", "--", "a"]);
+				assert_eq!(
+					fs::read(ours.path().join("a")).unwrap(),
+					fs::read(oracle.path().join("a")).unwrap(),
+					"{label}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn native_utf16_restore_rejects_malformed_utf8_blob_without_writing() {
+		use crate::types::RestoreOptions;
+		let temp = init(&[("a", b"base\n")]);
+		let root = temp.path();
+		fs::write(root.join("raw"), b"\xff").unwrap();
+		let blob = git(root, &["hash-object", "-w", "raw"]).trim().to_owned();
+		git(root, &["update-index", "--cacheinfo", &format!("100644,{blob},a")]);
+		fs::write(root.join(".git/info/attributes"), "a working-tree-encoding=UTF-16\n").unwrap();
+		fs::write(root.join("a"), b"must survive\n").unwrap();
+		let index = fs::read(root.join(".git/index")).unwrap();
+		assert!(
+			repo(root)
+				.restore(&RestoreOptions {
+					files: vec!["a".into()],
+					worktree: true,
+					..Default::default()
+				})
+				.is_err()
+		);
+		assert_eq!(fs::read(root.join("a")).unwrap(), b"must survive\n");
+		assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+		let oracle = Command::new("git")
+			.current_dir(root)
+			.args(["restore", "--worktree", "--", "a"])
+			.output()
+			.unwrap();
+		assert!(String::from_utf8_lossy(&oracle.stderr).contains("failed to encode"));
+		assert_eq!(fs::read(root.join("a")).unwrap(), b"\xff");
+	}
+
+	#[test]
+	fn native_stage_rejects_malformed_utf16_without_index_changes() {
+		for (label, bytes) in [
+			("UTF-16", &b"x\0"[..]),
+			("UTF-16", &b"\xff\xfe\0\xd8"[..]),
+			("UTF-16LE", &b"x"[..]),
+			("UTF-16LE", &b"\0\xd8"[..]),
+			("UTF-16LE", &b"\xff\xfex\0"[..]),
+			("UTF-16BE", &b"\xd8\0"[..]),
+			("UTF-16BE", &b"\xfe\xff\0x"[..]),
+		] {
+			let ours = init(&[("a", b"base\n")]);
+			let oracle = init(&[("a", b"base\n")]);
+			for temp in [&ours, &oracle] {
+				fs::write(
+					temp.path().join(".git/info/attributes"),
+					format!("a working-tree-encoding={label}\n"),
+				)
+				.unwrap();
+				fs::write(temp.path().join("a"), bytes).unwrap();
+			}
+			let index = fs::read(ours.path().join(".git/index")).unwrap();
+			assert!(repo(ours.path()).stage_files(&["a".into()]).is_err(), "{label} {bytes:?}");
+			assert!(
+				!Command::new("git")
+					.current_dir(oracle.path())
+					.args(["add", "a"])
+					.output()
+					.unwrap()
+					.status
+					.success()
+			);
+			assert_eq!(fs::read(ours.path().join(".git/index")).unwrap(), index);
+			assert_eq!(fs::read(ours.path().join("a")).unwrap(), bytes);
+		}
 	}
 
 	#[test]
@@ -2407,10 +2823,13 @@ mod tests {
 
 	#[test]
 	fn patch_three_way_check_merges_drift_and_rejects_conflict() {
-		let temp = init(&[("file.txt", b"one\ntwo\nthree\n")]);
+		let temp = init(&[("file.txt", b"one\ntwo\nthree\n"), ("b", b"untouched\n")]);
 		fs::write(temp.path().join("file.txt"), b"one\nTWO\nthree\n").expect("patch edit");
 		let patch = git(temp.path(), &["diff", "--no-ext-diff", "--full-index"]);
 		reset(temp.path());
+		git(temp.path(), &["config", "filter.fail.clean", "cat >/dev/null; exit 1"]);
+		git(temp.path(), &["config", "filter.fail.required", "true"]);
+		fs::write(temp.path().join(".git/info/attributes"), "b filter=fail\n").unwrap();
 		fs::write(temp.path().join("file.txt"), b"ONE\ntwo\nthree\n").expect("drift");
 		let repository = repo(temp.path());
 		assert!(
@@ -2433,13 +2852,13 @@ mod tests {
 			b"ONE\nTWO\nthree\n"
 		);
 
-		reset(temp.path());
 		fs::write(temp.path().join("file.txt"), b"one\nOTHER\nthree\n").expect("conflict");
 		assert!(
 			!repository
 				.can_apply_patch(&patch, &three_way)
 				.expect("conflict check")
 		);
+		assert_eq!(fs::read(temp.path().join("b")).unwrap(), b"untouched\n");
 	}
 
 	#[test]
