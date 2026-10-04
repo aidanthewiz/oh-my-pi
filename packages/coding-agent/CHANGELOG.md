@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `grep` treating semicolon-separated internal URLs as one resource. Preserve per-resource selectors, mixed readable targets, and literal semicolons.
+- Fixed `wait` reporting broker abort errors when peer messages or job completions interrupt service discovery. Preserve user cancellation, broker errors, and exactly-once owned result delivery.
+
 ## [18.4.9] - 2026-10-01
 
 ### Added

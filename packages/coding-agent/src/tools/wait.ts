@@ -52,6 +52,19 @@ function takeQueuedMessage(messaging: WaitMessaging | undefined): IrcMessage | u
 	return drainPendingInbox(messaging.registry, messaging.senderId) ?? IrcBus.global().take(messaging.senderId);
 }
 
+function abortedWaitResult(signal: AbortSignal | undefined): AgentToolResult<CoordinationDetails> | undefined {
+	if (!signal?.aborted) return undefined;
+	if (signal.reason === TOOL_INTERRUPT_ABORT_REASON) {
+		return {
+			content: [{ type: "text", text: "Wait interrupted by message." }],
+			details: { op: "wait", jobs: [], interrupted: true },
+			useless: true,
+		};
+	}
+	throwIfAborted(signal);
+	return undefined;
+}
+
 /**
  * Jobs some agent's `wait` is blocked on right now, refcounted per shared job
  * manager. Delivery watches cannot answer "is the owner parked on this
@@ -136,6 +149,8 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<CoordinationDetails>,
 	): Promise<AgentToolResult<CoordinationDetails>> {
+		const interrupted = abortedWaitResult(signal);
+		if (interrupted) return interrupted;
 		const registry = this.session.agentRegistry;
 		const senderId = this.session.getAgentId?.() ?? undefined;
 		const messaging = registry && senderId ? { registry, senderId } : undefined;
@@ -144,7 +159,23 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 
 		const pending = takeQueuedMessage(messaging);
 		if (pending && messaging) return messageResult(messaging.senderId, pending);
-		if (cfgLaunchEnabled.get(this.session.settings)) await listServices(this.session, signal);
+		if (cfgLaunchEnabled.get(this.session.settings)) {
+			if (signal) {
+				const abort = Promise.withResolvers<void>();
+				const onAbort = () => abort.resolve();
+				signal.addEventListener("abort", onAbort, { once: true });
+				if (signal.aborted) onAbort();
+				try {
+					await Promise.race([listServices(this.session, signal), abort.promise]);
+				} finally {
+					signal.removeEventListener("abort", onAbort);
+				}
+			} else {
+				await listServices(this.session);
+			}
+		}
+		const interruptedAfterDiscovery = abortedWaitResult(signal);
+		if (interruptedAfterDiscovery) return interruptedAfterDiscovery;
 		const deadline = Date.now() + WAIT_MAX_MS;
 		// Opened by the first message-only block and kept across re-evaluations,
 		// so a peer stopping mid-window cannot restart it.
@@ -284,19 +315,8 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 				if (message) return messageResult(messaging.senderId, message);
 				if (error && !signal?.aborted) return undefined;
 			}
-			if (signal?.aborted) {
-				// Steering, a peer IRC, or a completion notice cut the wait short:
-				// the designed wake path, so the message injects after a normal
-				// result. Any other abort stops the run.
-				if (signal.reason === TOOL_INTERRUPT_ABORT_REASON) {
-					return {
-						content: [{ type: "text", text: "Wait interrupted by message." }],
-						details: { op: "wait", jobs: [], interrupted: true },
-						useless: true,
-					};
-				}
-				throwIfAborted(signal);
-			}
+			const interrupted = abortedWaitResult(signal);
+			if (interrupted) return interrupted;
 			if (manager && jobs.length > 0) return buildJobResult(this.session, manager, "wait", jobs, []);
 			if (wake === "timeout" && messageWindow) return noMessageResult(messaging, manager, messageWindow);
 			return {

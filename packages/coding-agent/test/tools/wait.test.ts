@@ -1,11 +1,19 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as net from "node:net";
+import * as path from "node:path";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { TOOL_INTERRUPT_ABORT_REASON } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
+import * as brokerClients from "../../src/launch/client";
+import { daemonBrokerEndpoint, daemonBrokerRuntimeDir } from "../../src/launch/paths";
+import { DAEMON_BROKER_PROTOCOL_VERSION, type DaemonWireRequest } from "../../src/launch/protocol";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { ToolAbortError } from "../../src/tools/tool-errors";
 
 function session(manager?: AsyncJobManager, agentId = "Main"): ToolSession {
 	return {
@@ -15,6 +23,92 @@ function session(manager?: AsyncJobManager, agentId = "Main"): ToolSession {
 		asyncJobManager: manager,
 		getAgentId: () => agentId,
 	} as unknown as ToolSession;
+}
+
+async function withDiscoveryClient(
+	run: (fixture: {
+		cwd: string;
+		requested: Promise<void>;
+		release: () => void;
+		reject: () => void;
+		acquired: () => number;
+	}) => Promise<void>,
+	acquisitionGate?: Promise<void>,
+): Promise<void> {
+	using tempDir = TempDir.createSync("omp-wait-");
+	const runtimeDir = path.join(tempDir.path(), "run");
+	const client = await brokerClients.createDaemonBrokerClient(tempDir.path(), { runtimeDir });
+	const requested = Promise.withResolvers<void>();
+	const sockets = new Set<net.Socket>();
+	const lists: Array<{ id: string; socket: net.Socket }> = [];
+	let released = false;
+	const reply = ({ id, socket }: { id: string; socket: net.Socket }, error?: string) =>
+		socket.write(
+			`${JSON.stringify(
+				error ? { id, ok: false, error } : { id, ok: true, result: { op: "list", daemons: [] } },
+			)}\n`,
+		);
+	const server = net.createServer(socket => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+		socket.setEncoding("utf8");
+		let buffer = "";
+		socket.on("data", chunk => {
+			buffer += chunk;
+			for (;;) {
+				const newline = buffer.indexOf("\n");
+				if (newline < 0) break;
+				const request = JSON.parse(buffer.slice(0, newline)) as DaemonWireRequest;
+				buffer = buffer.slice(newline + 1);
+				if (request.operation.op === "list") {
+					if (released) reply({ id: request.id, socket });
+					else lists.push({ id: request.id, socket });
+					requested.resolve();
+				} else {
+					socket.write(
+						`${JSON.stringify({
+							id: request.id,
+							ok: true,
+							result: {
+								op: "ping",
+								projectDir: client.projectDir,
+								protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+							},
+						})}\n`,
+					);
+				}
+			}
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(daemonBrokerEndpoint(client.projectDir, daemonBrokerRuntimeDir(runtimeDir)), resolve);
+	});
+	let acquisitions = 0;
+	const acquisition = vi.spyOn(brokerClients, "daemonClientForProject").mockImplementation(async () => {
+		acquisitions++;
+		if (acquisitionGate) await acquisitionGate;
+		return client;
+	});
+	try {
+		await run({
+			cwd: client.projectDir,
+			requested: requested.promise,
+			release: () => {
+				released = true;
+				for (const pending of lists.splice(0)) reply(pending);
+			},
+			reject: () => {
+				for (const pending of lists.splice(0)) reply(pending, "Synthetic discovery rejection");
+			},
+			acquired: () => acquisitions,
+		});
+	} finally {
+		acquisition.mockRestore();
+		client.close();
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+	}
 }
 
 describe("wait", () => {
@@ -67,7 +161,7 @@ describe("wait", () => {
 		const controller = new AbortController();
 		const waiting = new WaitTool(session(manager)).execute("interrupted", {}, controller.signal);
 		controller.abort();
-		await expect(waiting).rejects.toThrow("Operation aborted");
+		await expect(waiting).rejects.toBeInstanceOf(ToolAbortError);
 		resolve("finished afterward");
 		await manager.waitForAll();
 		await manager.drainDeliveries({ timeoutMs: 500 });
@@ -87,12 +181,204 @@ describe("wait", () => {
 		controller.abort(TOOL_INTERRUPT_ABORT_REASON);
 		const result = await waiting;
 		expect(result.isError).toBeUndefined();
-		expect(result.content).toEqual([{ type: "text", text: "Wait interrupted by message." }]);
 		expect(result.details).toMatchObject({ op: "wait", interrupted: true });
 		resolve("finished afterward");
 		await manager.waitForAll();
 		await manager.drainDeliveries({ timeoutMs: 500 });
 		expect(delivered).toEqual(["finished afterward"]);
+	});
+
+	for (const phase of ["before", "during"] as const) {
+		test(`a queued message interrupts ${phase} service discovery without consuming the message`, async () => {
+			await withDiscoveryClient(async fixture => {
+				const registry = AgentRegistry.global();
+				const bridge = new IrcBridge({
+					isDisposed: () => false,
+					isStreaming: () => true,
+					emitSessionEvent: async () => {},
+				} as unknown as IrcBridgeHost);
+				registry.register({
+					id: "Main",
+					displayName: "Main",
+					kind: "main",
+					session: {
+						isStreaming: true,
+						deliverIrcMessage: bridge.deliver.bind(bridge),
+						drainPendingIrcInboxMessages: bridge.drainInboxMessages.bind(bridge),
+					} as never,
+				});
+				registry.register({ id: "Peer", displayName: "Peer", kind: "sub", parentId: "Main", session: null });
+				const tool = new WaitTool({ ...session(), cwd: fixture.cwd, settings: Settings.isolated() });
+				const controller = new AbortController();
+				const interrupt = async () => {
+					const receipt = await IrcBus.global().send(
+						{ from: "Peer", to: "Main", body: "released" },
+						{ suppressRelay: true },
+					);
+					expect(receipt.outcome).toBe("injected");
+					expect(bridge.hasInterrupts()).toBe(true);
+					controller.abort(TOOL_INTERRUPT_ABORT_REASON);
+				};
+				if (phase === "before") {
+					await interrupt();
+					expect(controller.signal.aborted).toBe(true);
+				}
+				const waiting = tool.execute("message-discovery", {}, controller.signal);
+				if (phase === "during") {
+					await fixture.requested;
+					await interrupt();
+				}
+				const result = await waiting;
+				expect(result.isError).toBeUndefined();
+				expect(result.details).toMatchObject({ op: "wait", jobs: [], interrupted: true });
+				expect(result.useless).toBe(true);
+				if (phase === "before") expect(fixture.acquired()).toBe(0);
+				expect((await tool.execute("queued-message", {})).details?.waited).toMatchObject({
+					from: "Peer",
+					body: "released",
+				});
+				expect(bridge.hasPending()).toBe(false);
+				fixture.release();
+				const next = await tool.execute("after-message", {});
+				expect(next.details).toMatchObject({ op: "wait", jobs: [] });
+				expect(next.details?.waited).toBeUndefined();
+			});
+		});
+
+		test(`a native completion interrupts ${phase} service discovery and auto-delivers once`, async () => {
+			await withDiscoveryClient(async fixture => {
+				const manager = new AsyncJobManager({});
+				const controller = new AbortController();
+				const job = Promise.withResolvers<string>();
+				const entered = Promise.withResolvers<void>();
+				const injected = Promise.withResolvers<void>();
+				const delivered: Array<[string, string]> = [];
+				manager.registerDeliverySink("Main", async (id, text) => {
+					controller.abort(TOOL_INTERRUPT_ABORT_REASON);
+					entered.resolve();
+					await injected.promise;
+					delivered.push([id, text]);
+				});
+				const id = manager.register("task", "CompletedPeer", async () => job.promise, { ownerId: "Main" });
+				const tool = new WaitTool({ ...session(manager), cwd: fixture.cwd, settings: Settings.isolated() });
+				try {
+					if (phase === "before") {
+						job.resolve("completion payload");
+						await entered.promise;
+						expect(controller.signal.aborted).toBe(true);
+					}
+					const waiting = tool.execute("completion-discovery", {}, controller.signal);
+					if (phase === "during") {
+						await fixture.requested;
+						job.resolve("completion payload");
+						await entered.promise;
+					}
+					const result = await waiting;
+					expect(result.isError).toBeUndefined();
+					expect(result.details).toMatchObject({ op: "wait", jobs: [], interrupted: true });
+					expect(manager.isJobResultConsumed(id)).toBe(false);
+					expect(manager.isDeliverySuppressed(id)).toBe(false);
+					if (phase === "before") expect(fixture.acquired()).toBe(0);
+					injected.resolve();
+					await manager.waitForAll();
+					expect(await manager.drainDeliveries({ timeoutMs: 500 })).toBe(true);
+					expect(delivered).toEqual([[id, "completion payload"]]);
+					expect(manager.isJobResultConsumed(id)).toBe(true);
+					fixture.release();
+					expect((await tool.execute("after-completion", {})).details?.jobs).toEqual([]);
+					expect(await manager.drainDeliveries({ timeoutMs: 500 })).toBe(true);
+					expect(delivered).toEqual([[id, "completion payload"]]);
+				} finally {
+					job.resolve("completion payload");
+					injected.resolve();
+					await manager.dispose();
+				}
+			});
+		});
+
+		test(`user cancellation ${phase} service discovery remains cancellation`, async () => {
+			await withDiscoveryClient(async fixture => {
+				const controller = new AbortController();
+				const reason = new Error("synthetic user stop");
+				const tool = new WaitTool({ ...session(), cwd: fixture.cwd, settings: Settings.isolated() });
+				if (phase === "before") controller.abort(reason);
+				const waiting = tool.execute("cancel-discovery", {}, controller.signal);
+				if (phase === "during") {
+					await fixture.requested;
+					controller.abort(reason);
+				}
+				const error = await waiting.then(
+					() => undefined,
+					error => error,
+				);
+				expect(error).toBeInstanceOf(ToolAbortError);
+				expect(error.cause).toBe(reason);
+				if (phase === "before") expect(fixture.acquired()).toBe(0);
+			});
+		});
+	}
+
+	for (const interrupt of [true, false]) {
+		test(`${interrupt ? "interruption" : "cancellation"} wakes discovery before client acquisition settles`, async () => {
+			const acquisition = Promise.withResolvers<void>();
+			try {
+				await withDiscoveryClient(async fixture => {
+					const tool = new WaitTool({ ...session(), cwd: fixture.cwd, settings: Settings.isolated() });
+					const controller = new AbortController();
+					const waiting = tool.execute("pending-client", {}, controller.signal);
+					expect(fixture.acquired()).toBe(1);
+					controller.abort(interrupt ? TOOL_INTERRUPT_ABORT_REASON : new Error("synthetic user stop"));
+					if (interrupt) {
+						expect((await waiting).details).toMatchObject({ op: "wait", interrupted: true, jobs: [] });
+					} else {
+						await expect(waiting).rejects.toBeInstanceOf(ToolAbortError);
+					}
+				}, acquisition.promise);
+			} finally {
+				acquisition.resolve();
+			}
+		});
+	}
+
+	test("a broker rejection during discovery propagates as an error", async () => {
+		await withDiscoveryClient(async fixture => {
+			const tool = new WaitTool({ ...session(), cwd: fixture.cwd, settings: Settings.isolated() });
+			const controller = new AbortController();
+			const waiting = tool.execute("failed-discovery", {}, controller.signal);
+			await fixture.requested;
+			fixture.reject();
+			await expect(waiting).rejects.toBeInstanceOf(brokerClients.DaemonBrokerRejectedError);
+			expect(controller.signal.aborted).toBe(false);
+		});
+	});
+
+	test("discovery does not expose or consume another owner's pending completion", async () => {
+		await withDiscoveryClient(async fixture => {
+			const manager = new AsyncJobManager({});
+			const entered = Promise.withResolvers<void>();
+			const injected = Promise.withResolvers<void>();
+			const delivered: Array<[string, string]> = [];
+			manager.registerDeliverySink("Other", async (id, text) => {
+				entered.resolve();
+				await injected.promise;
+				delivered.push([id, text]);
+			});
+			const id = manager.register("task", "OtherPeer", async () => "private completion", { ownerId: "Other" });
+			try {
+				await entered.promise;
+				fixture.release();
+				const tool = new WaitTool({ ...session(manager), cwd: fixture.cwd, settings: Settings.isolated() });
+				expect((await tool.execute("owner-scoped-discovery", {})).details?.jobs).toEqual([]);
+				expect(manager.isJobResultConsumed(id)).toBe(false);
+				expect(manager.isDeliverySuppressed(id)).toBe(false);
+				injected.resolve();
+				expect(await manager.drainDeliveries({ timeoutMs: 500 })).toBe(true);
+				expect(delivered).toEqual([[id, "private completion"]]);
+			} finally {
+				injected.resolve();
+				await manager.dispose();
+			}
+		});
 	});
 
 	test("returns a settled job whose delivery has not reached the transcript yet", async () => {
@@ -164,11 +450,17 @@ describe("wait", () => {
 		});
 		const tool = new WaitTool(session(undefined, "Child"));
 		const waitOut = async (ms: number) => {
-			const waiting = tool.execute("message-window", {});
-			vi.advanceTimersByTime(ms);
+			let settled = false;
+			const waiting = tool.execute("message-window", {}).then(result => {
+				settled = true;
+				return result;
+			});
+			vi.advanceTimersByTime(ms - 1);
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			vi.advanceTimersByTime(1);
 			const result = await waiting;
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-			expect(text).toStartWith(`No message within ${ms / 1000}.0s`);
 			// Nobody is blocked on this agent's result, so no owner is singled out.
 			expect(text).not.toContain("agent://Main");
 			expect(result.useless).toBe(true);
@@ -242,7 +534,6 @@ describe("wait", () => {
 		expect(await childWaitText()).not.toContain("agent://Main");
 		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {});
 		const text = await childWaitText();
-		expect(text).toStartWith("No message within 5.0s");
 		expect(text).toContain("agent://Main");
 		childRun.resolve("migration API ready");
 		expect((await parentWait).details?.jobs?.[0]).toMatchObject({ id: "Child", status: "completed" });

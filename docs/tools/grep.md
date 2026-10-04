@@ -30,6 +30,8 @@
 
 `grep` is enabled by default (`grep.enabled = true`) and is discoverable rather than essential. Context defaults are configurable with `grep.contextBefore` and `grep.contextAfter`.
 
+Supported internal and external URL lists split before scope resolution. Each target keeps its own selectors. Existing literal paths and non-list URL semicolons remain intact.
+
 ## Outputs
 The tool returns a single text block in `content[0].text` plus structured `details`.
 
@@ -53,7 +55,7 @@ The tool returns a single text block in `content[0].text` plus structured `detai
    - rejects whitespace-only patterns while preserving the pattern verbatim;
    - defaults omitted or empty `path` to `["."]` (the workspace root);
    - normalizes `skip` to a non-negative integer;
-   - expands delimiter-flattened `path` entries with `expandDelimitedPathEntries()`, keeping existing delimiter-containing paths intact, splitting semicolon-delimited lists unconditionally, accepting comma splits when at least one part resolves, and accepting whitespace splits only when every part resolves;
+   - splits supported URL lists with `splitMixedUrlPathList()`, then expands delimiter-flattened host entries with `expandDelimitedPathEntries()` while preserving existing delimiter-containing paths;
    - peels any line-range selector from each resulting entry;
    - reads `grep.contextBefore` and `grep.contextAfter` from session settings (`1` and `3` by default);
    - enables multiline only when `pattern` contains `\n` or an actual newline.
