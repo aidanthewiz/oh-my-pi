@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
@@ -21,7 +21,8 @@ import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme"
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
-import { cfgCycleOrder } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { applyModelPreset, type ModelPresetSession } from "@oh-my-pi/pi-coding-agent/config/model-presets";
+import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 function normalize(lines: readonly string[]): string {
@@ -148,6 +149,7 @@ function createHub(options: {
 			onLoginRequest: options.callbacks?.onLoginRequest ?? onLoginRequest,
 			onCycleOrderChange: options.callbacks?.onCycleOrderChange,
 			onSavePreset: options.callbacks?.onSavePreset,
+			onSwitchPreset: options.callbacks?.onSwitchPreset,
 			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
 			onCancel: options.callbacks?.onCancel ?? onCancel,
 		},
@@ -163,6 +165,8 @@ const LEFT = "\x1b[D";
 const ALT_RIGHT = "\x1b[1;3C";
 /** What macOS terminals (ghostty, Terminal.app, iTerm) emit for Option+→. */
 const OPTION_RIGHT_MAC = "\x1bf";
+const CTRL_LEFT = "\x1b[1;5D";
+const CTRL_RIGHT = "\x1b[1;5C";
 const ESC = "\x1b";
 
 describe("ModelHub", () => {
@@ -702,8 +706,7 @@ describe("ModelHub", () => {
 			hub.handleInput("\n");
 			expect(normalize(hub.render(220))).toContain("Assigning reviewer");
 
-			hub.handleInput("\n"); // sidebar → model list
-			hub.handleInput("\n"); // pick the sole model for the new role
+			hub.handleInput("\n"); // focus already on the model rows: pick the sole model
 			expect(onAssign).toHaveBeenCalledTimes(1);
 			const call = onAssign.mock.calls[0];
 			expect(call?.[1]).toBe("reviewer");
@@ -741,6 +744,101 @@ describe("ModelHub", () => {
 
 			bareHub.handleInput("s");
 			expect(footerLine(bareHub.render(220))).not.toContain("Preset name:");
+		});
+
+		test("ctrl+←/→ and p/P switch roles, preserve overrides, and step past unavailable defaults", async () => {
+			const a = makeModel("test", "model-a");
+			const c = makeModel("test", "model-c");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a", smol: "test/model-a:low" },
+				defaultThinkingLevel: "low",
+			});
+			cfgModelPresets.setEntry(settings, "alpha", {
+				modelRoles: { default: "test/model-a", smol: "test/model-a:low" },
+				defaultThinkingLevel: Effort.Low,
+			});
+			cfgModelPresets.setEntry(settings, "beta", { modelRoles: { default: "test/missing" } });
+			cfgModelPresets.setEntry(settings, "gamma", {
+				modelRoles: { default: "test/model-c:high", slow: "test/model-a" },
+				defaultThinkingLevel: Effort.Medium,
+			});
+			let liveModel = a;
+			let liveThinking: unknown = "low";
+			const session = {
+				scopedModels: [],
+				getAvailableModels: () => [a, c],
+				modelRegistry: { hasConfiguredAuth: () => true, hasConcreteAuth: () => true },
+				setModel: async (model: Model) => {
+					liveModel = model;
+				},
+				setThinkingLevel: (level: unknown) => {
+					liveThinking = level;
+				},
+			} as unknown as ModelPresetSession;
+			let pending = Promise.resolve();
+			let lastSwitch: Awaited<ReturnType<typeof applyModelPreset>> | undefined;
+			const onSwitchPreset = (name: string) => {
+				pending = applyModelPreset(settings, session, name).then(result => {
+					lastSwitch = result;
+				});
+				return pending;
+			};
+			const { hub } = createHub({ models: [a, c], scoped: true, settings, callbacks: { onSwitchPreset } });
+			const step = async (key: string) => {
+				hub.handleInput(key);
+				await pending;
+			};
+			const expectAlpha = () => {
+				expect({ ...settings.getModelRoles() }).toEqual({ default: "test/model-a", smol: "test/model-a:low" });
+				expect(liveModel).toBe(a);
+				expect(liveThinking).toBe("low");
+			};
+			const expectGamma = () => {
+				expect({ ...settings.getModelRoles() }).toEqual({ default: "test/model-c:high", slow: "test/model-a" });
+				expect(liveModel).toBe(c);
+				expect(liveThinking).toBe("high");
+				expect(lastSwitch).toMatchObject({
+					kind: "switched",
+					thinkingLevel: Effort.High,
+					shadowedThinking: { expected: Effort.Medium, actual: Effort.Low, source: "runtime" },
+				});
+			};
+
+			hub.handleInput(UP);
+			await step(CTRL_RIGHT); // unavailable beta leaves the active setup intact
+			expectAlpha();
+			await step(CTRL_RIGHT); // the cursor advances past beta
+			expectGamma();
+			await step(CTRL_RIGHT);
+			expectAlpha();
+			await step(CTRL_LEFT);
+			expectGamma();
+			hub.handleInput("\n");
+			await step("p");
+			expectAlpha();
+			await step("P");
+			expectGamma();
+			hub.handleInput(LEFT);
+			hub.handleInput(DOWN);
+			await step(CTRL_RIGHT); // the catalog does not switch presets
+			expectGamma();
+		});
+
+		test("picking a role lands the arrows on the model rows, keeping the assignment flow", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const { hub, onAssign } = createHub({ models: [a, b], scoped: true });
+
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput("\n"); // dive into the rows
+			hub.handleInput("\n"); // pick a model for DEFAULT
+			expect(normalize(hub.render(220))).toContain("Assigning DEFAULT");
+
+			hub.handleInput(DOWN); // moves through the models, not the sidebar
+			hub.handleInput("\n");
+			expect(onAssign).toHaveBeenCalledTimes(1);
+			expect(onAssign.mock.calls[0]?.[1]).toBe("default");
+			expect(onAssign.mock.calls[0]?.[3]).toBe("test/model-b");
 		});
 	});
 
@@ -1216,8 +1314,7 @@ describe("ModelHub", () => {
 			hub.handleInput("f"); // add a fallback for the first role (default)
 			expect(normalize(hub.render(220))).toContain("Adding fallback for");
 
-			hub.handleInput("\n"); // Sidebar → model list.
-			hub.handleInput("\n"); // pick the only model
+			hub.handleInput("\n"); // focus already on the model rows: pick the only model
 			expect(onFallbackChainChange).toHaveBeenCalledWith("default", ["test/model-a"]);
 			expect(onAssign).not.toHaveBeenCalled(); // no role assignment, no thinking strip
 			expect(normalize(hub.render(220))).toContain("↳ test/model-a");

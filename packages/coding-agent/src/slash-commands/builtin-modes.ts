@@ -16,6 +16,7 @@ import {
 	deleteModelPreset,
 	formatModelPresetSwitch,
 	getModelPresetNames,
+	isCleanModelPresetSwitch,
 	isValidModelPresetName,
 	modelPresetSavedMessage,
 	type ModelPresetSession,
@@ -988,7 +989,7 @@ async function runPresetsCommand(
 			const wroteRoles = result.kind === "switched" || result.kind === "failed";
 			return {
 				message,
-				failed: result.kind !== "switched" || result.shadowed.length > 0 || result.shadowedThinking !== undefined,
+				failed: !isCleanModelPresetSwitch(result),
 				switched: result.kind === "switched",
 				changedConfig: wroteRoles,
 			};

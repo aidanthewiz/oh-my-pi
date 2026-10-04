@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { stripVTControlCharacters } from "node:util";
 import type { TspPickerGroup, TspPickerProps } from "@oh-my-pi/pi-wire";
 import type { DescribeContext, NativeChild, NativeNode } from "../src/native/node";
 import { ModelHubComponent, type ModelHubRegistry, type ModelHubSource } from "../src/overlays/model-hub";
@@ -285,6 +286,81 @@ test("pointer events drive the hub through the same paths as its keys", () => {
 	expect(calls.cancel).toBe(0);
 	act("close");
 	expect(calls.cancel).toBe(1);
+});
+
+test("preset cycling updates native and text role rows and preselects the assigned model", () => {
+	const presets = { names: ["fast", "slow"], active: "fast" as string | undefined };
+	const models = [MODELS[2]!, MODELS[3]!];
+	const roles: Record<string, string> = { default: "demo/demo" };
+	let revision = 0;
+	let thinking = "low";
+	const base = source(roles, []);
+	const hub = new ModelHubComponent(
+		ui,
+		{
+			...base,
+			get revision() {
+				return revision;
+			},
+			get defaultThinkingLevel() {
+				return thinking;
+			},
+			getModelPresets: () => presets,
+		},
+		registry(models),
+		models.map(entry => ({ model: entry })),
+		{
+			onAssign: () => {},
+			onUnassign: () => {},
+			onCancel: () => {},
+			onSwitchPreset: name => {
+				roles.default = name === "fast" ? "demo/demo" : "openai/gpt-5.6";
+				thinking = name === "fast" ? "low" : "medium";
+				presets.active = name;
+				revision++;
+			},
+		},
+	);
+	hubs.push(hub);
+	const checkRoles = (name: string, selector: string, level: string) => {
+		const p = props(hub.describe(withPicker));
+		const subtitle = p.subtitle;
+		const text = Array.isArray(subtitle) ? subtitle.map(part => part.t).join("") : subtitle;
+		expect(text).toContain(name);
+		expect(p.items?.find(entry => entry.id === "role:default")?.facts).toEqual({ model: selector, thinking: level });
+		const rendered = stripVTControlCharacters(hub.render(220).join("\n"));
+		expect(rendered).toContain(name);
+		expect(rendered).toContain(selector);
+		expect(rendered).toContain(level);
+	};
+	hub.handleInput("\x1b[A");
+	checkRoles("fast", "demo/demo", "low");
+	hub.handleInput("\x1b[1;5C");
+	checkRoles("slow", "openai/gpt-5.6", "medium");
+	hub.handleInput("\x1b[1;5D");
+	checkRoles("fast", "demo/demo", "low");
+	hub.handleInput("\n");
+	hub.handleInput("p");
+	checkRoles("slow", "openai/gpt-5.6", "medium");
+	hub.handleInput("P");
+	checkRoles("fast", "demo/demo", "low");
+
+	hub.handleNativeEvent({ type: "activate", key: "", item: "role:default" });
+	let p = props(hub.describe(withPicker));
+	expect(p.focus).toBe("list");
+	expect(p.selected).toBe("demo/demo");
+	hub.handleInput("\x1b[B");
+	p = props(hub.describe(withPicker));
+	expect(p.focus).toBe("list");
+	expect(p.selected).toBe("openai/gpt-5.6");
+	hub.handleInput("\x1b[D");
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "provider:openai", mods: [] });
+	hub.handleInput("\x1b[C");
+	p = props(hub.describe(withPicker));
+	expect(p.scope).toBe("provider:openai");
+	expect(p.focus).toBe("list");
+	expect(p.selected).toBe("openai/gpt-5.6");
+	expect(p.order?.filter(entry => typeof entry === "string")).toEqual(["openai/gpt-5.6"]);
 });
 
 test("the quick picker is an md sheet with the summary below and a task-model toggle", () => {
