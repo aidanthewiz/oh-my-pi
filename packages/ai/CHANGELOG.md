@@ -13,6 +13,13 @@
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
 - Kept Anthropic fallback-credit tokens and frozen request bodies on official API-key routes when retry models change endpoint.
+## [18.4.11] - 2026-10-02
+
+### Fixed
+
+- Fixed Cursor cached prompt token accounting to prevent duplicate input-token and cost reporting on cached turns.
+- Fixed auth-broker credential handling so late token-refresh responses cannot restore logged-out credentials or overwrite a newer login.
+
 ## [18.4.10] - 2026-10-02
 
 ### Fixed

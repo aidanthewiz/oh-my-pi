@@ -88,6 +88,7 @@ interface ReleaseInfo {
 	version: string;
 }
 
+/** A release binary the updater can download, resolved from published GitHub release metadata. */
 export interface ReleaseBinaryAsset {
 	url: string;
 	size: number;
@@ -1363,8 +1364,7 @@ let updateAttemptSeq = 0;
 
 /**
  * Download a release binary to a target path, replacing an existing file.
- * [coreforge patch: private-repo assets are fetched through the GitHub asset
- * API with auth - browser_download_url 404s without a session.]
+ * Private repository assets require the authenticated GitHub asset API.
  */
 export async function updateViaBinaryAt(
 	targetPath: string,
@@ -1436,8 +1436,6 @@ export async function updateViaBinaryAt(
 }
 
 /**
-
-
  * Run the update command.
  */
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {

@@ -15,6 +15,7 @@ import type { AgentSessionEvent, SessionStats } from "../../session/agent-sessio
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
+import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
@@ -754,6 +755,7 @@ export class RpcClient {
 			...state,
 			fastModeEnabled: state.fastModeEnabled === true,
 			fastModeActive: state.fastModeActive === true,
+			goal: state.goal ?? null,
 			tokensPerSecond:
 				typeof state.tokensPerSecond === "number" && Number.isFinite(state.tokensPerSecond)
 					? state.tokensPerSecond
@@ -774,6 +776,20 @@ export class RpcClient {
 	async setEventSubscription(level: RpcEventSubscriptionLevel): Promise<RpcEventSubscriptionLevel> {
 		const response = await this.#send({ type: "set_event_subscription", level });
 		return this.#getData<{ level: RpcEventSubscriptionLevel }>(response).level;
+	}
+
+	/**
+	 * Read or change goal mode. `get` never mutates or starts a turn; `create`/`resume`
+	 * start a turn only when the server enables `goal.continuationModes: ["rpc"]`.
+	 */
+	async goal(op: RpcGoalOp, options?: { objective?: string; tokenBudget?: number }): Promise<RpcGoalResult> {
+		const response = await this.#send({
+			type: "goal",
+			op,
+			objective: options?.objective,
+			token_budget: options?.tokenBudget,
+		});
+		return this.#getData(response);
 	}
 
 	/**
@@ -1012,6 +1028,16 @@ export class RpcClient {
 	 */
 	async branch(entryId: string): Promise<{ text: string; cancelled: boolean }> {
 		const response = await this.#send({ type: "branch", entryId });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Fork into a new session file and switch to it: history up to and including
+	 * `entryId`, or the whole session when omitted.
+	 * @returns Object with `cancelled: true` if an extension cancelled the fork
+	 */
+	async fork(entryId?: string): Promise<{ cancelled: boolean }> {
+		const response = await this.#send({ type: "fork", entryId });
 		return this.#getData(response);
 	}
 

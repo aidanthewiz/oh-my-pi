@@ -77,6 +77,18 @@ describe("RPC native input handlers", () => {
 		expect(userTexts(await client.getMessages())).toEqual(["after abort"]);
 	}, 30_000);
 
+	test("a pinned provider session id cannot admit input from a transcript replaced by its hook", async () => {
+		await client.promptAndWait("before replacement");
+		const providerSessionId = (await client.getState()).sessionId;
+
+		await client.promptAndWait("replace: old input");
+
+		expect((await client.getState()).sessionId).toBe(providerSessionId);
+		expect(userTexts(await client.getMessages())).toEqual([]);
+		await client.promptAndWait("after replacement");
+		expect(userTexts(await client.getMessages())).toEqual(["after replacement"]);
+	}, 30_000);
+
 	test("a prompt pipelined after new_session runs in the new session instead of being dropped", async () => {
 		await client.promptAndWait("before reset");
 		const [, events] = await Promise.all([client.newSession(), client.promptAndWait("after reset")]);

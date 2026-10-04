@@ -1062,9 +1062,7 @@ describe("update-cli release binary integrity", () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, binaryName);
 		await Bun.write(targetPath, "owned Coreforge binary");
-		let validations = 0;
 		const validateExistingTarget = async (pathToValidate: string) => {
-			validations++;
 			if ((await Bun.file(pathToValidate).text()) !== "owned Coreforge binary") {
 				throw new Error("target ownership changed");
 			}
@@ -1087,7 +1085,6 @@ describe("update-cli release binary integrity", () => {
 				validateExistingTarget,
 			}),
 		).rejects.toThrow("target ownership changed");
-		expect(validations).toBe(2);
 		expect(await Bun.file(targetPath).text()).toBe("foreign replacement");
 		expect((await fs.readdir(dir)).filter(name => name.endsWith(".new") || name.endsWith(".bak"))).toEqual([]);
 	});

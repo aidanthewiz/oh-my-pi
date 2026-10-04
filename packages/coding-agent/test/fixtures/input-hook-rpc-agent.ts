@@ -38,6 +38,10 @@ const extension = await loadExtensionFromFactory(
 				await Bun.write(path.join(process.cwd(), "hook-started"), "");
 				await waitForFile(path.join(process.cwd(), "hook-release"));
 			}
+			if (event.text.startsWith("replace:")) {
+				await session.newSession();
+				return { text: "input from the replaced transcript" };
+			}
 			return undefined;
 		});
 		pi.on("session_before_switch", async () => {
@@ -63,5 +67,6 @@ const session = new AgentSession({
 	settings: Settings.isolated({ "compaction.enabled": false }),
 	modelRegistry,
 	extensionRunner,
+	providerSessionId: "input-hook-pinned-session",
 });
 await runRpcMode(session);
