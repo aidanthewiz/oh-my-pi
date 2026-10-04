@@ -366,6 +366,12 @@ time on a client instance. If a host needs concurrent orchestration, use
 separate `RpcClient` instances instead of overlapping lifecycle waiters on one
 session.
 
+`stop()` closes lifecycle waiters and returns `True` only when every process
+owned by the client has exited. A `False` result retains surviving process
+handles across restarts. Keep the client while `survivor_pids` is non-empty.
+Call `reap()` or `stop()` again to retry teardown; `reap()` returns `True` when
+no survivor remains.
+
 ## Text Helpers
 
 `assistant_text()` and `message_text()` now return visible text blocks only.

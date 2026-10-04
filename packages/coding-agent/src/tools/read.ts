@@ -2605,8 +2605,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const resourceDetails: NonNullable<InternalResource["details"]> = resource.details ?? {};
 		const { display, ...render } = resourceDetails;
 		const details: ReadToolDetails = {
+			shape: resource.shape,
 			resolvedPath: resource.sourcePath,
 			contentType: resource.contentType,
+			notes: resource.notes,
 			...render,
 			...(display ? { displayContent: display } : {}),
 		};
@@ -2615,17 +2617,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (parsedSel.kind !== "none" && parsedSel.kind !== "raw") {
 				throw new ToolError("Cannot combine query extraction with line selectors");
 			}
-			return toolResult(details).text(resource.content).sourceInternal(url).done();
 		}
 
-		return buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
-			details,
-			sourcePath: resource.sourcePath,
-			sourceInternal: url,
-			entityLabel: "resource",
-			ignoreResultLimits: spec.unbounded === true,
-			immutable: resource.immutable,
-		});
+		const result =
+			resource.shape === "value"
+				? toolResult(details).text(resource.content).sourceInternal(url).done()
+				: buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
+						details,
+						sourcePath: resource.sourcePath,
+						sourceInternal: url,
+						entityLabel: "resource",
+						ignoreResultLimits: spec.unbounded === true,
+						immutable: resource.immutable,
+					});
+		if (resource.notes?.length) result.content.push({ type: "text", text: resource.notes.join("\n") });
+		return result;
 	}
 
 	/**

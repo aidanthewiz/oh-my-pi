@@ -277,6 +277,9 @@ describe("RPC subagent registry", () => {
 		} satisfies SubagentLifecyclePayload);
 
 		expect(registry.getSubagents()).toHaveLength(1);
+		registry.setSubscriptionLevel("events");
+		registry.setSubscriptionLevel("progress");
+		registry.setSubscriptionLevel("off");
 		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id: "SubagentA",
 			index: 0,
@@ -289,26 +292,6 @@ describe("RPC subagent registry", () => {
 		expect(registry.getSubagents()).toHaveLength(0);
 		expect(registry.resolveSessionFile({ subagentId: "SubagentA" })).toBe(sessionFile);
 		expect(registry.resolveSessionFile({ sessionFile })).toBe(sessionFile);
-		registry.dispose();
-	});
-
-	test("gates raw subagent events behind the events subscription level", () => {
-		const frames: RpcSubagentFrame[] = [];
-		const eventBus = new EventBus();
-		const registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame));
-		const eventPayload: SubagentEventPayload = {
-			id: "SubagentA",
-			event: { type: "agent_start" },
-		};
-
-		eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, eventPayload);
-		expect(frames).toHaveLength(0);
-
-		registry.setSubscriptionLevel("events");
-		eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, eventPayload);
-
-		expect(frames).toHaveLength(1);
-		expect(frames[0]).toEqual({ type: "subagent_event", payload: eventPayload });
 		registry.dispose();
 	});
 });

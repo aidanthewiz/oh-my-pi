@@ -143,24 +143,17 @@ import type {
 	ExtensionCommandContext,
 	ExtensionRunner,
 	ExtensionUIContext,
-	MessageEndEvent,
-	MessageStartEvent,
-	MessageUpdateEvent,
 	PreparedExtension,
 	SessionBeforeBranchResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionStopEventResult,
 	ToolCallEventResult,
-	ToolExecutionEndEvent,
-	ToolExecutionStartEvent,
-	ToolExecutionUpdateEvent,
 	ToolInfo,
 	TreePreparation,
-	TurnEndEvent,
-	TurnStartEvent,
 } from "../extensibility/extensions";
 import { emitSessionShutdownEvent, TOP_LEVEL_AGENT } from "../extensibility/extensions";
+import { extensionEventFromSessionEvent } from "../extensibility/extensions/lifecycle-mirror";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -648,35 +641,6 @@ type SetSessionNameWithTrigger = (
 
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
-
-/**
- * Clone one top-level notification field without ever returning an object owned
- * by the live session. Most values take the lossless structured-clone path. If
- * a third-party metadata object contains functions or other unsupported values,
- * JSON sanitization drops those values; a cyclic/non-JSON value finally degrades
- * to a descriptive string rather than retaining a shared mutable reference.
- */
-function cloneMessageEndNotificationField(value: unknown): unknown {
-	try {
-		return structuredClone(value);
-	} catch {}
-	try {
-		const json = JSON.stringify(value);
-		if (json !== undefined) return JSON.parse(json) as unknown;
-	} catch {}
-	return String(value);
-}
-
-/** Build a detached, notification-only snapshot of an AgentMessage. */
-function cloneMessageEndNotification(message: AgentMessage): AgentMessage {
-	const snapshot: Record<PropertyKey, unknown> = {};
-	for (const key of Reflect.ownKeys(message)) {
-		const descriptor = Object.getOwnPropertyDescriptor(message, key);
-		if (!descriptor?.enumerable) continue;
-		snapshot[key] = cloneMessageEndNotificationField(Reflect.get(message, key));
-	}
-	return snapshot as unknown as AgentMessage;
-}
 
 const INTERRUPTED_THINKING_MIN_CHARS = 60;
 const SESSION_CWD_CHANGE_REJECTED = Symbol("sessionCwdChangeRejected");
@@ -3035,15 +2999,36 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
-	#queuedExtensionEvents: Promise<void> = Promise.resolve();
+	#queuedExtensionEvents: AgentSessionEvent[] = [];
+	#drainingExtensionEvents = false;
+	#extensionEventsDrained: PromiseWithResolvers<void> | undefined;
 
-	#queueExtensionEvent(event: AgentSessionEvent): Promise<void> {
-		const emit = async () => {
-			await this.#emitExtensionEvent(event);
-		};
-		const queued = this.#queuedExtensionEvents.then(emit, emit);
-		this.#queuedExtensionEvents = queued.catch(() => {});
-		return queued;
+	#queueExtensionEvent(event: AgentSessionEvent): void {
+		this.#queuedExtensionEvents.push(event);
+		if (this.#drainingExtensionEvents) return;
+		this.#drainingExtensionEvents = true;
+		this.#extensionEventsDrained = Promise.withResolvers<void>();
+		queueMicrotask(() => void this.#drainExtensionEvents());
+	}
+
+	async #drainExtensionEvents(): Promise<void> {
+		try {
+			while (this.#queuedExtensionEvents.length > 0) {
+				const batch = this.#queuedExtensionEvents;
+				this.#queuedExtensionEvents = [];
+				for (const event of batch) {
+					try {
+						await this.#emitExtensionEvent(event);
+					} catch {
+						// A failed notification must not hold later updates in the queue.
+					}
+				}
+			}
+		} finally {
+			this.#drainingExtensionEvents = false;
+			this.#extensionEventsDrained?.resolve();
+			this.#extensionEventsDrained = undefined;
+		}
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
@@ -3057,9 +3042,9 @@ export class AgentSession implements SettingsScope {
 		}
 		if (event.type === "message_update") {
 			this.#emit(event);
-			// Per-delta hot path: only allocate and chain the serialized extension emit
-			// when something listens (`#emitExtensionEvent` would return immediately).
-			if (this.#extensionRunner?.hasHandlers("message_update")) void this.#queueExtensionEvent(event);
+			// Per-delta hot path: only queue the serialized extension emit when
+			// something listens (`#emitExtensionEvent` would return immediately).
+			if (this.#extensionRunner?.hasHandlers("message_update")) this.#queueExtensionEvent(event);
 			return;
 		}
 		// Deliver synchronously before awaiting extension notifications. This keeps
@@ -3071,6 +3056,15 @@ export class AgentSession implements SettingsScope {
 			this.#pendingAgentEndEmit = event;
 		} else {
 			this.#emit(event);
+		}
+		if (
+			this.#extensionEventsDrained &&
+			(event.type === "message_end" ||
+				event.type === "turn_end" ||
+				event.type === "tool_execution_end" ||
+				event.type === "agent_end")
+		) {
+			await this.#extensionEventsDrained.promise;
 		}
 		const extensionEmit = this.#emitExtensionEvent(event);
 		if (options.detachExtensions) {
@@ -3138,8 +3132,9 @@ export class AgentSession implements SettingsScope {
 	 * this never drains.
 	 */
 	async #drainInFlightEventHandlers(): Promise<void> {
-		while (this.#inFlightEventHandlers.size > 0) {
+		while (this.#inFlightEventHandlers.size > 0 || this.#extensionEventsDrained) {
 			await Promise.allSettled(this.#inFlightEventHandlers);
+			if (this.#extensionEventsDrained) await this.#extensionEventsDrained.promise;
 		}
 	}
 
@@ -4754,6 +4749,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+		if (this.#extensionEventsDrained) await this.#extensionEventsDrained.promise;
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
 			messages,
@@ -4825,143 +4821,18 @@ export class AgentSession implements SettingsScope {
 			return;
 		}
 
+		const turnIndex = this.#turnIndex;
+		if (event.type === "turn_end") this.#turnIndex++;
 		if (!this.#extensionRunner.hasHandlers(event.type)) return;
 		if (event.type === "agent_end") {
 			// `agent_end` extension notification is emitted from the settled
 			// agent_end maintenance path so `session_stop` control hooks are not
 			// blocked by unrelated notification-only work.
-		} else if (event.type === "turn_start") {
-			const hookEvent: TurnStartEvent = {
-				type: "turn_start",
-				turnIndex: this.#turnIndex,
-				timestamp: Date.now(),
-			};
-			await this.#extensionRunner.emit(hookEvent);
-		} else if (event.type === "turn_end") {
-			const hookEvent: TurnEndEvent = {
-				type: "turn_end",
-				turnIndex: this.#turnIndex,
-				message: event.message,
-				toolResults: event.toolResults,
-			};
-			await this.#extensionRunner.emit(hookEvent);
-			this.#turnIndex++;
-		} else if (event.type === "message_start") {
-			const extensionEvent: MessageStartEvent = {
-				type: "message_start",
-				message: event.message,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "message_update") {
-			const extensionEvent: MessageUpdateEvent = {
-				type: "message_update",
-				message: event.message,
-				assistantMessageEvent: event.assistantMessageEvent,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "message_end") {
-			// `message_end` is a notification, not a context-rewrite hook. Detach its
-			// payload from agent-owned history so an async observer that mutates the
-			// event after an `await` cannot race mid-run maintenance and enlarge (or
-			// otherwise rewrite) the next provider request after its threshold check.
-			// Explicit `tool_result` / `context` hooks remain the supported mutation
-			// surfaces. Third-party metadata that is not structured-cloneable is
-			// sanitized field-by-field without retaining nested live references.
-			const extensionEvent: MessageEndEvent = {
-				type: "message_end",
-				message: cloneMessageEndNotification(event.message),
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "tool_execution_start") {
-			const extensionEvent: ToolExecutionStartEvent = {
-				type: "tool_execution_start",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				intent: event.intent,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "tool_execution_update") {
-			const extensionEvent: ToolExecutionUpdateEvent = {
-				type: "tool_execution_update",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				partialResult: event.partialResult,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "tool_execution_end") {
-			const extensionEvent: ToolExecutionEndEvent = {
-				type: "tool_execution_end",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				result: event.result,
-				isError: event.isError ?? false,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "auto_compaction_start") {
-			await this.#extensionRunner.emit({
-				type: "auto_compaction_start",
-				reason: event.reason,
-				action: event.action,
-			});
-		} else if (event.type === "auto_compaction_end") {
-			await this.#extensionRunner.emit({
-				type: "auto_compaction_end",
-				action: event.action,
-				result: event.result,
-				aborted: event.aborted,
-				willRetry: event.willRetry,
-				errorMessage: event.errorMessage,
-				skipped: event.skipped,
-			});
-		} else if (event.type === "auto_retry_start") {
-			await this.#extensionRunner.emit({
-				type: "auto_retry_start",
-				attempt: event.attempt,
-				maxAttempts: event.maxAttempts,
-				delayMs: event.delayMs,
-				errorMessage: event.errorMessage,
-				errorId: event.errorId,
-			});
-		} else if (event.type === "auto_retry_end") {
-			await this.#extensionRunner.emit({
-				type: "auto_retry_end",
-				success: event.success,
-				attempt: event.attempt,
-				finalError: event.finalError,
-				retryErrors: event.retryErrors,
-			});
-		} else if (event.type === "retry_fallback_applied") {
-			await this.#extensionRunner.emit({
-				type: "retry_fallback_applied",
-				from: event.from,
-				to: event.to,
-				role: event.role,
-				reason: event.reason,
-			});
-		} else if (event.type === "retry_fallback_succeeded") {
-			await this.#extensionRunner.emit({
-				type: "retry_fallback_succeeded",
-				model: event.model,
-				role: event.role,
-			});
-		} else if (event.type === "ttsr_triggered") {
-			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
-		} else if (event.type === "todo_reminder") {
-			await this.#extensionRunner.emit({
-				type: "todo_reminder",
-				todos: event.todos,
-				attempt: event.attempt,
-				maxAttempts: event.maxAttempts,
-			});
-		} else if (event.type === "goal_updated") {
-			await this.#extensionRunner.emit({
-				type: "goal_updated",
-				goal: event.goal,
-				state: event.state,
-			});
+			return;
 		}
+		const mapped = extensionEventFromSessionEvent(event, turnIndex);
+		if (!mapped) return;
+		await this.#extensionRunner.emit(mapped);
 	}
 
 	/**

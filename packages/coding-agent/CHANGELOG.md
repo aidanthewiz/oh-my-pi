@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [18.4.12] - 2026-10-02
+
+### Added
+
+- Added `coreforge auth-gateway stdio`: an explicit JSON-lines inference gateway for one trusted parent process. It uses normal credential discovery, supports model selectors and fallback chains, and opens no listener or gateway token.
+
+### Changed
+
+- Reduced CPU use while streaming with several agents active: extension `message_update` handlers are delivered through a lighter queue, and RPC no longer processes subagent events unless a client subscribed to them ([#13244](https://github.com/can1357/oh-my-pi/pull/13244) by [@iliaal](https://github.com/iliaal)).
+
+### Fixed
+
+- Fixed web search stopping at Perplexity's anonymous signup wall instead of falling back to the next configured provider ([#12756](https://github.com/can1357/oh-my-pi/issues/12756)).
+- Fixed imported Claude Code sessions on Windows reporting the encoded `C--…` directory name instead of the registered project path when the transcript records no cwd ([#13363](https://github.com/can1357/oh-my-pi/pull/13363) by [@jchanghong023](https://github.com/jchanghong023)).
+- Fixed JavaScript eval `wait()`/`handle.wait()` ignoring a positional timeout; `h.wait(30)` now waits up to 30 seconds like `{ timeout: 30 }`, and mixing an options object with positional arguments throws a `TypeError` ([#12720](https://github.com/can1357/oh-my-pi/pull/12720) by [@F0Rextasy](https://github.com/F0Rextasy)).
+- Fixed Herdr and other lifecycle-tracking extensions showing a collab guest (`omp join`) as idle while the host is working; extension-initiated turns (`pi.sendMessage` with `triggerTurn`, `pi.sendUserMessage`) are refused as host-only while joined instead of running on the guest's local model ([#13156](https://github.com/can1357/oh-my-pi/pull/13156) by [@Fruitseller](https://github.com/Fruitseller)).
+- Fixed queued streaming handlers finishing after terminal lifecycle events or idle waits.
+- Fixed collab guest teardown releasing host-only guards before pending handlers completed. Ephemeral turns and compaction remain host-only.
+- Fixed extracted `agent://` JSON reads receiving freshness notes inside the Eval payload instead of separate metadata.
+- Fixed Python RPC teardown retaining all surviving processes across restarts and killing the process group even when closing stdin fails.
+- Fixed `wait` and `proc://` failing with "Daemon list request timed out" when the project daemon broker hangs; background jobs and agents are still reported, and `proc://` shows that services are unavailable ([#14120](https://github.com/can1357/oh-my-pi/pull/14120) by [@H4vC](https://github.com/H4vC)).
+- Fixed `agent://<id>` showing an agent's previous published output as current while that agent runs a follow-up or wake turn; the read now says the output is from the previous run ([#14120](https://github.com/can1357/oh-my-pi/pull/14120) by [@H4vC](https://github.com/H4vC)).
+- Fixed `proc://` listing agents as running when they have no turn in flight; their rows now say the run is stale or already finished, as the `jobs` tool does ([#14120](https://github.com/can1357/oh-my-pi/pull/14120) by [@H4vC](https://github.com/H4vC)).
+- Kept project-wide verification with the parent agent. Subagents run assigned scoped checks only when the parent permits them.
+
 ## [18.4.11] - 2026-10-02
 
 ### Added
@@ -17822,3 +17847,4 @@ Older entries are archived in [packages\coding-agent\CHANGELOG.md@7057eb9cdda9](
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@ddf916838520](https://github.com/can1357/oh-my-pi/blob/ddf916838520312aeee0448e398e108934a8b02a/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@06ca9883f7fd](https://github.com/can1357/oh-my-pi/blob/06ca9883f7fd9704932363a259eb2ed5f311bcbb/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@14c97b555b20](https://github.com/can1357/oh-my-pi/blob/14c97b555b206231290f46882794c8d8c3c024b1/packages/coding-agent/CHANGELOG.md).
+Older entries are archived in [packages/coding-agent/CHANGELOG.md@9564980a39cb](https://github.com/can1357/oh-my-pi/blob/9564980a39cb785a32bdca76de97e0b0cc58f20c/packages/coding-agent/CHANGELOG.md).

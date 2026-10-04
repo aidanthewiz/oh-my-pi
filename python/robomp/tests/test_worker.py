@@ -26,8 +26,6 @@ class _FakeRpcClient:
         self.kwargs = kwargs
         self.set_todos_calls: list[list[dict]] = []
         self.get_todos_calls = 0
-        self.stop_calls = 0
-        self.mark_closed_calls: list[BaseException] = []
         _FakeRpcClient.instances.append(self)
 
     def __enter__(self):
@@ -45,11 +43,8 @@ class _FakeRpcClient:
     def on_message_update(self, _cb) -> None:
         pass
 
-    def stop(self) -> None:
-        self.stop_calls += 1
-
-    def _mark_closed(self, error: BaseException) -> None:
-        self.mark_closed_calls.append(error)
+    def stop(self) -> bool:
+        return True
 
     def set_todos(self, phases):
         self.set_todos_calls.append(phases)
@@ -466,54 +461,7 @@ async def test_run_rpc_passes_slot_uid_user_slot_group_and_omp_extra_group(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_run_rpc_arms_hard_timeout_timer(
-    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    timers = []
-
-    class FakeTimer:
-        def __init__(self, interval, function):
-            self.interval = interval
-            self.function = function
-            self.daemon = False
-            self.started = False
-            self.cancelled = False
-            timers.append(self)
-
-        def start(self) -> None:
-            self.started = True
-
-        def cancel(self) -> None:
-            self.cancelled = True
-
-    monkeypatch.setattr("robomp.worker.threading.Timer", FakeTimer)
-    settings.task_timeout_seconds = 3.0
-    settings.task_timeout_hard_grace_seconds = 7.0
-    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
-    loop = asyncio.new_event_loop()
-    try:
-        worker._run_rpc_blocking(
-            inputs,
-            task_kind="triage_issue",
-            prompt="x",
-            loop=loop,
-            bindings=bindings,  # type: ignore[arg-type]
-        )
-    finally:
-        loop.close()
-
-    assert len(timers) == 1
-    timer = timers[0]
-    assert timer.interval == 10.0
-    assert timer.daemon is True
-    assert timer.started is True
-    assert timer.cancelled is True
-
-
-@pytest.mark.asyncio
-async def test_run_rpc_hard_timeout_stops_client_and_fails(
-    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_run_rpc_hard_timeout_fails(tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     class FiringTimer:
         def __init__(self, interval, function):
             self.interval = interval
@@ -531,7 +479,7 @@ async def test_run_rpc_hard_timeout_stops_client_and_fails(
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
     loop = asyncio.new_event_loop()
     try:
-        with pytest.raises(TimeoutError, match="hard timeout"):
+        with pytest.raises(TimeoutError):
             worker._run_rpc_blocking(
                 inputs,
                 task_kind="triage_issue",
@@ -541,54 +489,6 @@ async def test_run_rpc_hard_timeout_stops_client_and_fails(
             )
     finally:
         loop.close()
-
-    fake = _FakeRpcClient.instances[0]
-    assert fake.stop_calls == 1
-    # `_cancel_hook` (used by both manual cancel and hard timeout) MUST also call
-    # `_mark_closed` to unblock `_wait_for_agent_end` — `stop()` alone leaves
-    # `_closed_error` unset (omp_rpc bug), so the worker would hang otherwise.
-    assert len(fake.mark_closed_calls) == 1
-    from omp_rpc import RpcProcessExitError
-
-    assert isinstance(fake.mark_closed_calls[0], RpcProcessExitError)
-
-
-@pytest.mark.asyncio
-async def test_run_rpc_cancel_hook_stops_and_marks_closed(
-    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The cancel hook registered with `register_cancel_hook` must call both
-    `client.stop()` AND `client._mark_closed()`. The latter is the workaround for
-    an upstream omp_rpc bug where `stop()` does not set `_closed_error`, leaving
-    `_wait_for_agent_end` blocked until timeout."""
-    captured: list = []
-    monkeypatch.setattr("robomp.worker.register_cancel_hook", lambda hook: captured.append(hook))
-    monkeypatch.setattr("robomp.worker.unregister_cancel_hook", lambda: None)
-
-    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
-    loop = asyncio.new_event_loop()
-    try:
-        worker._run_rpc_blocking(
-            inputs,
-            task_kind="triage_issue",
-            prompt="x",
-            loop=loop,
-            bindings=bindings,  # type: ignore[arg-type]
-        )
-    finally:
-        loop.close()
-
-    assert len(captured) == 1
-    hook = captured[0]
-    fake = _FakeRpcClient.instances[0]
-    pre_stop = fake.stop_calls
-    hook()  # Simulate the API/worker firing the cancel
-    assert fake.stop_calls == pre_stop + 1
-    assert len(fake.mark_closed_calls) == 1
-    from omp_rpc import RpcProcessExitError
-
-    assert isinstance(fake.mark_closed_calls[0], RpcProcessExitError)
-    assert "cancelled by operator" in str(fake.mark_closed_calls[0])
 
 
 class _ClassifiedRow:

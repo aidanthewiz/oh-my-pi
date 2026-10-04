@@ -194,18 +194,27 @@ describe("proc:// background jobs", () => {
 		}
 	});
 
-	it.each([false, true])("kills only owned jobless agents (job manager: %s)", async withManager => {
+	it.each([
+		[false, "running"],
+		[true, "running"],
+		[false, "idle"],
+		[true, "idle"],
+		[false, "parked"],
+		[true, "parked"],
+	] as const)("kills only owned jobless agents (job manager: %s, status: %s)", async (withManager, status) => {
 		const manager = withManager ? new AsyncJobManager({}) : undefined;
 		const registry = new AgentRegistry();
 		registry.register({ id: "Worker", displayName: "Worker", kind: "sub", parentId: "Main", session: null });
 		registry.register({ id: "Foreign", displayName: "Foreign", kind: "sub", parentId: "Other", session: null });
+		registry.setStatus("Worker", status);
+		registry.setStatus("Foreign", status);
 		const session = toolSession(process.cwd(), manager, { launch: false });
 		session.agentRegistry = registry;
 		const write = new WriteTool(session);
 		try {
 			const denied = await write.execute("foreign", { path: "proc://Foreign/kill" });
 			expect(denied.details?.proc).toMatchObject({ cancelled: [{ id: "Foreign", status: "not_found" }] });
-			expect(registry.get("Foreign")?.status).toBe("running");
+			expect(registry.get("Foreign")?.status).toBe(status);
 			const killed = await write.execute("worker", { path: "proc://Worker/kill" });
 			expect(killed.details?.proc).toMatchObject({ cancelled: [{ id: "Worker", status: "cancelled" }] });
 			expect(registry.get("Worker")).toBeUndefined();
@@ -257,6 +266,67 @@ describe("proc:// background jobs", () => {
 			]);
 		} finally {
 			clock.mockRestore();
+			await manager.dispose();
+		}
+	});
+
+	it("keeps listing jobs and agents when the daemon broker hangs, flagging agents with no live turn", async () => {
+		const broker = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue({
+			request: async () => {
+				throw new Error("Daemon list request timed out");
+			},
+			onCompletion: () => () => {},
+		} as unknown as daemonClient.DaemonBrokerClient);
+		const manager = new AsyncJobManager({});
+		const blocked = Promise.withResolvers<string>();
+		manager.register(
+			"bash",
+			"long build",
+			async ({ signal }) => {
+				signal.addEventListener("abort", () => blocked.resolve("cancelled"), { once: true });
+				return blocked.promise;
+			},
+			{ id: "build-job", ownerId: "Main" },
+		);
+		const registry = new AgentRegistry();
+		// Claims `running` but no session is streaming: the run is over.
+		registry.register({ id: "Visuals", displayName: "Visuals", kind: "sub", parentId: "Main", session: null });
+		registry.register({ id: "Foreign", displayName: "Foreign", kind: "sub", parentId: "Other", session: null });
+		const session = toolSession(process.cwd(), manager, { launch: true });
+		session.agentRegistry = registry;
+		const proc = new ProcProtocolHandler();
+		try {
+			const list = await proc.resolve(parseInternalUrl("proc://"), { session });
+			expect(list.details?.proc?.jobs).toMatchObject([{ id: "build-job", status: "running" }]);
+			expect(list.details?.proc?.agents).toContainEqual(expect.objectContaining({ id: "Visuals", live: false }));
+			const single = await proc.resolve(parseInternalUrl("proc://Visuals"), { session });
+			expect(single.details?.proc?.agents).toMatchObject([{ id: "Visuals", live: false }]);
+			await expect(proc.resolve(parseInternalUrl("proc://web"), { session })).rejects.toThrow(
+				"services unavailable: Daemon list request timed out",
+			);
+			const denied = await proc.write(parseInternalUrl("proc://Foreign/kill"), "", { session });
+			expect(denied.details?.proc).toMatchObject({ cancelled: [{ id: "Foreign", status: "not_found" }] });
+			expect(registry.get("Foreign")?.status).toBe("running");
+			const cancelled = new AbortController();
+			cancelled.abort(new Error("caller cancelled"));
+			await expect(
+				proc.write(parseInternalUrl("proc://build-job/kill"), "", {
+					session,
+					signal: cancelled.signal,
+				}),
+			).rejects.toThrow();
+			expect(manager.getJob("build-job")?.status).toBe("running");
+			// The suggested kill works without the broker; service-only actions still surface its error.
+			const killed = await proc.write(parseInternalUrl("proc://Visuals/kill"), "", { session });
+			expect(killed.details?.proc).toMatchObject({ cancelled: [{ id: "Visuals", status: "cancelled" }] });
+			expect(registry.get("Visuals")).toBeUndefined();
+			const killedJob = await proc.write(parseInternalUrl("proc://build-job/kill"), "", { session });
+			expect(killedJob.details?.proc).toMatchObject({ cancelled: [{ id: "build-job", status: "cancelled" }] });
+			await expect(proc.write(parseInternalUrl("proc://web"), "go\n", { session })).rejects.toThrow(
+				"Daemon list request timed out",
+			);
+		} finally {
+			broker.mockRestore();
 			await manager.dispose();
 		}
 	});

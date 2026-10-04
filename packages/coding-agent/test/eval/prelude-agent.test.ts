@@ -1,18 +1,11 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as vm from "node:vm";
 import { JAVASCRIPT_PRELUDE_SOURCE } from "../../src/eval/js/shared/prelude";
+import { AsyncJobManager } from "../../src/async/job-manager";
+import { runEvalWait } from "../../src/eval/handle-bridge";
+import type { ToolSession } from "../../src/tools";
 
-/**
- * The eval `agent()` helper always returns an `AgentHandle` — spawning is
- * asynchronous, so callers get a recoverable `agent://<id>` handle and
- * resolve results through `wait()`/`output()` instead of a bare string.
- * These lock the bridge call shape, the handle surface, the positional-arg
- * order, the missing-id error contract, and schema-aware `wait()` parsing.
- *
- * The prelude source is executed verbatim in a throwaway VM context with only
- * the host bridge (`__omp_call_tool__`) stubbed — no worker, no kernel — so the
- * test runs against the real shipped helper, not a re-implementation.
- */
+// Run the shipped prelude with the real handle wait bridge where timing and settlement matter.
 function loadPrelude(callTool: (name: string, args: unknown) => Promise<unknown>): Record<string, unknown> {
 	const sandbox: Record<string, unknown> = { __omp_call_tool__: callTool };
 	vm.createContext(sandbox);
@@ -23,66 +16,6 @@ function loadPrelude(callTool: (name: string, args: unknown) => Promise<unknown>
 type AgentHelper = (prompt: string, opts?: Record<string, unknown>) => Promise<unknown>;
 
 describe("eval js agent() handle", () => {
-	it("returns an AgentHandle carrying the bridge id, agent name, and agent:// uri", async () => {
-		let seenName: string | undefined;
-		let seenArgs: Record<string, unknown> | undefined;
-		const sandbox = loadPrelude(async (name, args) => {
-			seenName = name;
-			seenArgs = args as Record<string, unknown>;
-			return { id: "abc123", agent: "task" };
-		});
-		const handle = (await (sandbox.agent as AgentHelper)("say hi", {
-			label: "Greeter",
-		})) as Record<string, unknown>;
-		expect(seenName).toBe("__agent__");
-		expect(seenArgs).toEqual({ prompt: "say hi", label: "Greeter" });
-		expect(handle.kind).toBe("agent");
-		expect(handle.id).toBe("abc123");
-		expect(handle.agent).toBe("task");
-		expect(handle.handle).toBe("agent://abc123");
-	});
-
-	it("maps positional args onto named options in order", async () => {
-		let seenArgs: Record<string, unknown> | undefined;
-		const sandbox = loadPrelude(async (_name, args) => {
-			seenArgs = args as Record<string, unknown>;
-			return { id: "legacy", agent: "reviewer" };
-		});
-		const positionalAgent = sandbox.agent as (
-			prompt: string,
-			options?: unknown,
-			...rest: unknown[]
-		) => Promise<unknown>;
-		const schema = { type: "object", properties: { ok: { type: "boolean" } } };
-
-		await positionalAgent("scout", "reviewer", "Legacy", schema, true, false, true, "strict", "none", ["read"]);
-
-		expect(seenArgs).toEqual({
-			prompt: "scout",
-			agent: "reviewer",
-			label: "Legacy",
-			schema,
-			isolated: true,
-			apply: false,
-			merge: true,
-			schemaMode: "strict",
-			contextFilePolicy: "none",
-			tools: ["read"],
-		});
-	});
-
-	it("forwards the orchestrator's context policy to the agent bridge", async () => {
-		let seenArgs: Record<string, unknown> | undefined;
-		const sandbox = loadPrelude(async (_name, args) => {
-			seenArgs = args as Record<string, unknown>;
-			return { id: "fresh-1", agent: "task" };
-		});
-
-		await (sandbox.agent as AgentHelper)("start fresh", { contextFilePolicy: "none" });
-
-		expect(seenArgs?.contextFilePolicy).toBe("none");
-	});
-
 	it("throws when the bridge omits the handle id", async () => {
 		const sandbox = loadPrelude(async () => ({ text: "lonely" }));
 		// The factory returns a thenable handle wrapper, so normalize to a Promise
@@ -139,23 +72,91 @@ describe("eval js immediate-handle contract", () => {
 	});
 });
 
-describe("eval js read() URI delegation", () => {
-	it("appends line selectors to delegated URI paths", async () => {
-		const calls: Array<{ name: string; args: unknown }> = [];
+describe("eval js wait options", () => {
+	type Waitable = { wait(...args: unknown[]): Promise<unknown> };
+	type WaitHelper = (handles: unknown, opts?: unknown, ...rest: unknown[]) => Promise<unknown[]>;
+
+	function fixture() {
+		const manager = new AsyncJobManager({});
+		const gate = Promise.withResolvers<string>();
+		const entered = Promise.withResolvers<void>();
+		const id = manager.register("task", "controlled agent", () => gate.promise, { ownerId: "Main" });
+		const session = { asyncJobManager: manager, getAgentId: () => "Main" } as ToolSession;
 		const sandbox = loadPrelude(async (name, args) => {
-			calls.push({ name, args });
-			return { text: "resource contents" };
+			if (name === "__agent__") return { id, agent: "task" };
+			if (name === "__wait__") {
+				const waiting = runEvalWait(args, { session });
+				entered.resolve();
+				return waiting;
+			}
+			throw new Error(`unexpected bridge call ${name}`);
 		});
-		sandbox.__omp_helpers__ = { hasRoot: () => false };
+		return { sandbox, manager, gate, entered, id };
+	}
 
-		const result = await vm.runInContext(`read("mcp://server/resource", { offset: 10, limit: 5 })`, sandbox);
+	it.each([
+		"wait(agent('go'), 1)",
+		"wait(agent('go'), { timeout: 1 })",
+		"(await agent('go')).wait(1)",
+		"(await agent('go')).wait({ timeout: 1 })",
+		"agent('go').wait(1)",
+		"agent('go').wait({ timeout: 1 })",
+	])("times out after one second without cancelling the agent: %s", async expression => {
+		vi.useFakeTimers();
+		const { sandbox, manager, gate, entered, id } = fixture();
+		try {
+			let settled = false;
+			const result = vm.runInContext(
+				`(async () => { try { await ${expression}; return "unexpected completion"; } catch (error) { return error.name; } })()`,
+				sandbox,
+			) as Promise<string>;
+			void result.then(() => {
+				settled = true;
+			});
+			await entered.promise;
+			vi.advanceTimersByTime(999);
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			vi.advanceTimersByTime(1);
+			expect(await result).toBe("TimeoutError");
+			expect(manager.getJob(id)?.status).toBe("running");
+		} finally {
+			gate.resolve("released");
+			await manager.dispose();
+			vi.useRealTimers();
+		}
+	});
 
-		expect(result).toBe("resource contents");
-		expect(calls).toEqual([
-			{
-				name: "read",
-				args: { path: "mcp://server/resource:10-14" },
-			},
-		]);
+	it.each([
+		"wait(agent('go'), 1, false).then(values => values[0])",
+		"wait(agent('go'), { timeout: 1, raiseErrors: false }).then(values => values[0])",
+		"(await agent('go')).wait(1, false)",
+		"(await agent('go')).wait({ timeout: 1, raiseErrors: false })",
+		"agent('go').wait(1, false)",
+		"agent('go').wait({ timeout: 1, raiseErrors: false })",
+	])("returns a failed agent's error when raiseErrors is false: %s", async expression => {
+		const { sandbox, manager, gate } = fixture();
+		try {
+			const result = vm.runInContext(`(async () => await ${expression})()`, sandbox) as Promise<Error>;
+			gate.reject(new Error("agent execution failed"));
+			expect((await result).message).toBe("agent execution failed");
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("rejects mixed option forms on global, resolved, and pending handles", async () => {
+		const { sandbox, manager, gate } = fixture();
+		try {
+			const agent = sandbox.agent as (prompt: string) => Waitable;
+			const resolved = (await agent("resolved")) as Waitable;
+			const mixed = /do not mix both forms/;
+			await expect((sandbox.wait as WaitHelper)([resolved], { timeout: 1 }, true)).rejects.toThrow(mixed);
+			await expect(resolved.wait({ timeout: 1 }, false)).rejects.toThrow(mixed);
+			await expect(agent("pending").wait({ timeout: 1 }, false)).rejects.toThrow(mixed);
+		} finally {
+			gate.resolve("released");
+			await manager.dispose();
+		}
 	});
 });

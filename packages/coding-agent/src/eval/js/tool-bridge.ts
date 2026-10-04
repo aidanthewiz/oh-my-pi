@@ -1,5 +1,6 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
@@ -171,7 +172,10 @@ export function bridgeValueFromToolResult(
 		(content): content is { type: "image"; mimeType: string; data: string } =>
 			content.type === "image" && typeof content.mimeType === "string" && typeof content.data === "string",
 	);
-	const text = textBlocks.map(block => block.text).join("");
+	const text =
+		name === "read" && (result.details as ReadToolDetails | undefined)?.shape === "value"
+			? (textBlocks[0]?.text ?? "")
+			: textBlocks.map(block => block.text).join("");
 	const hasError = toolResultHasError(result);
 	if (emitStatus) {
 		const event = summarize(name, args, result, text, hasError);
