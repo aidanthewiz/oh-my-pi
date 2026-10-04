@@ -170,6 +170,8 @@ describe("AgentSession.newSession boundary", () => {
 			const beforeRelease = Promise.withResolvers<void>();
 			const afterReached = Promise.withResolvers<void>();
 			const afterRelease = Promise.withResolvers<void>();
+			const reconcileReached = Promise.withResolvers<void>();
+			const reconcileRelease = Promise.withResolvers<void>();
 			const { session, sessionManager, agent } = await createHarness({
 				extension: {
 					name: `gate-${transition}-readiness`,
@@ -194,6 +196,10 @@ describe("AgentSession.newSession boundary", () => {
 			agent.replaceMessages(sessionManager.buildSessionContext().messages);
 			await sessionManager.flush();
 			const previousId = sessionManager.getSessionId();
+			session.setSessionBeforeSwitchReconciler(async () => {
+				reconcileReached.resolve();
+				await reconcileRelease.promise;
+			});
 			const operation =
 				transition === "new"
 					? session.newSession()
@@ -211,6 +217,14 @@ describe("AgentSession.newSession boundary", () => {
 					return { id: sessionManager.getSessionId(), messages: [...session.messages] };
 				});
 				beforeRelease.resolve();
+				await reconcileReached.promise;
+				expect(sessionManager.getSessionId()).toBe(previousId);
+				expect(session.sessionId).toBe(previousId);
+				expect(agent.sessionId).toBe(previousId);
+				expect(session.isSessionTransitioning).toBe(true);
+				expect(ready).toBe(false);
+				expect(session.messages).toEqual(sessionManager.buildSessionContext().messages);
+				reconcileRelease.resolve();
 				await afterReached.promise;
 				expect(sessionManager.getSessionId()).not.toBe(previousId);
 				expect(session.isSessionTransitioning).toBe(true);
@@ -241,6 +255,7 @@ describe("AgentSession.newSession boundary", () => {
 				).toEqual(expectedTexts);
 			} finally {
 				beforeRelease.resolve();
+				reconcileRelease.resolve();
 				afterRelease.resolve();
 				await operation;
 			}

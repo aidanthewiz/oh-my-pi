@@ -177,6 +177,56 @@ describe("proc:// background jobs", () => {
 		}
 	});
 
+	it.each([
+		{ label: "plan mode", deviceOnlyWrite: false },
+		{ label: "plan mode with device-only write", deviceOnlyWrite: true },
+	])("kills owned jobs under $label while stdin stays guarded (issue #13803)", async ({ deviceOnlyWrite }) => {
+		const manager = new AsyncJobManager({});
+		const pending = Promise.withResolvers<string>();
+		const id = manager.register(
+			"task",
+			"exploring the wrong track",
+			async ({ signal }) => {
+				signal.addEventListener("abort", () => pending.resolve("cancelled"), { once: true });
+				return pending.promise;
+			},
+			{ ownerId: "Main" },
+		);
+		const foreignPending = Promise.withResolvers<string>();
+		const foreignId = manager.register(
+			"bash",
+			"another agent's work",
+			async ({ signal }) => {
+				signal.addEventListener("abort", () => foreignPending.resolve("cancelled"), { once: true });
+				return foreignPending.promise;
+			},
+			{ ownerId: "Other" },
+		);
+		const session = toolSession(process.cwd(), manager, { launch: false });
+		session.getPlanModeState = () => ({
+			enabled: true,
+			planFilePath: "local://PLAN.md",
+			workflow: "parallel",
+			reentry: false,
+		});
+		session.deviceOnlyWrite = deviceOnlyWrite || undefined;
+		const write = new WriteTool(session);
+		try {
+			await expect(write.execute("foreign-kill", { path: `proc://${foreignId}/kill` })).rejects.toThrow("not found");
+			expect(manager.getJob(foreignId)?.status).toBe("running");
+			await expect(write.execute("stdin", { path: `proc://${id}`, content: "go" })).rejects.toThrow(
+				deviceOnlyWrite ? "limited to the xd:// device transport" : "Plan mode",
+			);
+			expect(manager.getJob(id)?.status).toBe("running");
+			const result = await write.execute("kill", write.parameters.assert({ path: `proc://${id}/kill` }));
+			await manager.getJob(id)?.promise;
+			expect(result.details?.proc).toMatchObject({ op: "cancel", cancelled: [{ id, status: "cancelled" }] });
+			expect(manager.getJob(id)?.status).toBe("cancelled");
+		} finally {
+			await manager.dispose();
+		}
+	});
+
 	it("scopes a caller without an agent id to unowned jobs and parentless agents", async () => {
 		const manager = new AsyncJobManager({});
 		const pending = Promise.withResolvers<string>();
@@ -351,6 +401,97 @@ describe("proc:// background jobs", () => {
 });
 
 describe("bash services via proc://", () => {
+	it.each([
+		{ plan: true, deviceOnly: false },
+		{ plan: false, deviceOnly: true },
+		{ plan: true, deviceOnly: true },
+	])(
+		"limits cancellation-only writes to the session's services ($plan/$deviceOnly)",
+		async ({ plan, deviceOnly }) => {
+			using temp = TempDir.createSync("@omp-proc-service-owner-");
+			const cwd = path.join(temp.path(), "project");
+			const runtimeDir = path.join(temp.path(), "runtime");
+			await fs.mkdir(cwd);
+			const script = path.join(cwd, "service.ts");
+			await Bun.write(script, 'process.stdin.resume(); process.stdout.write("READY\\n");');
+			const client = await createDaemonBrokerClient(cwd, { runtimeDir, idleGraceMs: 5_000 });
+			const spy = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+			const oldTitle = process.title;
+			const broker = startBroker(cwd, runtimeDir);
+			const session = toolSession(cwd);
+			session.getSessionId = () => "owner-session";
+			session.deviceOnlyWrite = deviceOnly || undefined;
+			if (plan) {
+				session.getPlanModeState = () => ({
+					enabled: true,
+					planFilePath: "local://PLAN.md",
+					workflow: "parallel",
+					reentry: false,
+				});
+			}
+			const foreignSession: ToolSession = { ...session, getSessionId: () => "foreign-session" };
+			const spec = {
+				name: "session-service",
+				application: process.execPath,
+				args: [script],
+				env: {},
+				cwd,
+				pty: false,
+				ready: { log: "READY", timeoutMs: 5_000 },
+				restart: "no" as const,
+				persist: false,
+				detached: false,
+			};
+			try {
+				const started = await client.request({ op: "start", spec, owner: "owner-session" });
+				if (started.op !== "start") throw new Error("unexpected start result");
+				expect(started.readyTimedOut).toBeFalse();
+				spy.mockImplementation(async () => {
+					foreignSession.deviceOnlyWrite = undefined;
+					foreignSession.getPlanModeState = () => ({
+						enabled: false,
+						planFilePath: "local://PLAN.md",
+						workflow: "parallel",
+						reentry: false,
+					});
+					return client;
+				});
+				expect(
+					await rejectionMessage(
+						new WriteTool(foreignSession).execute("foreign", { path: "proc://session-service/kill" }),
+					),
+				).toMatch(/another session/u);
+				const anonymousSession: ToolSession = {
+					...session,
+					getSessionId: () => null,
+					getAgentId: () => null,
+				};
+				expect(
+					await rejectionMessage(
+						new WriteTool(anonymousSession).execute("anonymous", { path: "proc://session-service/kill" }),
+					),
+				).toMatch(/requires a session owner/u);
+				const alive = await client.request({ op: "describe", name: spec.name });
+				if (alive.op !== "describe") throw new Error("unexpected describe result");
+				expect(alive.daemon.id).toBe(started.daemon.id);
+				expect(alive.daemon.state).toBe("ready");
+				const stopped = await new WriteTool(session).execute("owned", { path: "proc://session-service/kill" });
+				expect(stopped.details?.proc).toMatchObject({
+					action: "stop",
+					daemon: { name: spec.name, owner: "owner-session", state: "exited" },
+				});
+			} finally {
+				await client.request({ op: "stop", name: spec.name, timeoutMs: 1_000 }).catch(() => undefined);
+				await client.request({ op: "shutdown" }).catch(() => undefined);
+				client.close();
+				await broker;
+				setProcessName(oldTitle);
+				spy.mockRestore();
+			}
+		},
+		20_000,
+	);
+
 	it("starts at log readiness, delivers stdin, switches persistence, and restarts a live name", async () => {
 		using temp = TempDir.createSync("@omp-proc-service-");
 		const cwd = path.join(temp.path(), "project");

@@ -12,6 +12,7 @@ import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProvider
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
+import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-ai/stream";
 import type {
 	Api,
 	Context,
@@ -2038,12 +2039,32 @@ export class ModelRegistry {
 			fetch: this.#fetch,
 			getBearerApiKeyResolver: async provider => {
 				const apiKey = await this.getApiKeyForProvider(provider, undefined, { baseUrl });
-				if (!isDiscoveryBearerApiKey(apiKey)) {
+				const customCodexEndpoint = provider === "openai-codex" && !isOfficialCodexApiUrl(baseUrl);
+				if (
+					!isDiscoveryBearerApiKey(apiKey) ||
+					(customCodexEndpoint && this.#isOfficialCodexDiscoveryCredential(apiKey))
+				) {
 					return undefined;
 				}
-				return this.resolver(provider, { baseUrl });
+				const resolver = this.resolver(provider, { baseUrl });
+				if (!customCodexEndpoint) return resolver;
+				const guardedResolver: ApiKeyResolver = async context => {
+					const resolved = await resolver(context);
+					const bearer = typeof resolved === "string" ? resolved : resolved?.apiKey;
+					return bearer && this.#isOfficialCodexDiscoveryCredential(bearer) ? undefined : resolved;
+				};
+				return guardedResolver;
 			},
 		};
+	}
+
+	#isOfficialCodexDiscoveryCredential(accessToken: string): boolean {
+		return (
+			accessToken === getEnvApiKey("openai-codex") ||
+			getOAuthCredentialsForProvider(this.authStorage, "openai-codex").some(
+				credential => credential.access === accessToken,
+			)
+		);
 	}
 
 	#nonResolvingDiscoveryContext(): DiscoveryContext {
@@ -2211,11 +2232,28 @@ export class ModelRegistry {
 				providerId: "openai-codex",
 				authoritative: true,
 				resolveKey: value => value,
-				createOptions: accessToken =>
-					openaiCodexModelManagerOptions({
-						resolveAccounts: () => resolveCodexDiscoveryAccounts(this.authStorage, accessToken),
+				createOptions: accessToken => {
+					// A custom endpoint (models.yml `baseUrl`) receives only a configured,
+					// runtime, or command key. Official credentials (stored ChatGPT OAuth or
+					// the provider env token) keep discovering against chatgpt.com, as on a
+					// relay setup chat still works with them. The check looks at the token
+					// actually being sent: a runtime provider's command key is only a
+					// fallback behind a live OAuth token, which `peek` returns first.
+					const configuredBaseUrl = this.#descriptorBaseUrl("openai-codex");
+					const officialCredential = this.#isOfficialCodexDiscoveryCredential(accessToken);
+					if (officialCredential || isOfficialCodexApiUrl(configuredBaseUrl)) {
+						return openaiCodexModelManagerOptions({
+							baseUrl: officialCredential ? undefined : configuredBaseUrl,
+							resolveAccounts: () => resolveCodexDiscoveryAccounts(this.authStorage, accessToken),
+							fetch: this.#fetch,
+						});
+					}
+					return openaiCodexModelManagerOptions({
+						baseUrl: configuredBaseUrl,
+						resolveAccounts: async () => [{ accessToken }],
 						fetch: this.#fetch,
-					}),
+					});
+				},
 			},
 		];
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);

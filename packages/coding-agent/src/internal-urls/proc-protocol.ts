@@ -46,6 +46,11 @@ function target(url: InternalUrl): { id: string; action: "stdin" | "mode" | "kil
 	return { id, action: path === "/mode" ? "mode" : path === "/kill" ? "kill" : "stdin" };
 }
 
+/** `proc://<id>/kill`: cancels a job, agent, or service; needs no content and touches no files. */
+function isKill(url: InternalUrl): boolean {
+	return (url.rawPathname ?? url.pathname).endsWith("/kill");
+}
+
 function ownerJobs(session: ToolSession): AsyncJob[] {
 	return session.asyncJobManager?.getAllJobs({ ownerId: session.getAgentId?.() ?? undefined }) ?? [];
 }
@@ -80,7 +85,8 @@ export class ProcProtocolHandler implements ProtocolHandler {
 			payload: "verbatim",
 			scope: "workspace",
 			tier: () => "exec",
-			contentOptional: url => (url.rawPathname ?? url.pathname).endsWith("/kill"),
+			contentOptional: isKill,
+			cancels: isKill,
 		},
 	};
 
@@ -229,7 +235,14 @@ export class ProcProtocolHandler implements ProtocolHandler {
 			};
 		}
 		if (service) {
-			const updated = await stopService(session, id, context?.signal);
+			const cancellationOnly = session.deviceOnlyWrite === true || session.getPlanModeState?.()?.enabled === true;
+			const serviceOwner =
+				context?.cancellationOwner !== undefined
+					? context.cancellationOwner
+					: cancellationOnly
+						? (session.getSessionId?.() ?? ownerId ?? null)
+						: undefined;
+			const updated = await stopService(session, id, context?.signal, serviceOwner);
 			return {
 				content: [{ type: "text", text: `Stopped ${serviceStatus(updated)}` }],
 				details: { proc: { action: "stop", daemon: updated } },

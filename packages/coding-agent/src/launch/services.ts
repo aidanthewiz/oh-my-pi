@@ -268,8 +268,13 @@ export async function sendService(
 	return result.daemon;
 }
 
-export async function stopService(session: ToolSession, name: string, signal?: AbortSignal): Promise<DaemonSnapshot> {
-	const result = await request(session, { op: "stop", name, timeoutMs: 5_000 }, signal);
+export async function stopService(
+	session: ToolSession,
+	name: string,
+	signal?: AbortSignal,
+	owner?: string | null,
+): Promise<DaemonSnapshot> {
+	const result = await request(session, { op: "stop", name, timeoutMs: 5_000, owner }, signal);
 	if (result.op !== "stop") throw new Error("Unexpected daemon stop response");
 	return result.daemon;
 }

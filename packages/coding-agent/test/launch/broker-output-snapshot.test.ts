@@ -320,7 +320,13 @@ process.stdout.write("READY\\x1b[6n");
 				timeoutMs: 1_000,
 			});
 			if (logs.op !== "logs") throw new Error("unexpected logs result");
-			expect(logs.text).toContain("CPR:1:1");
+			// Coordinates come from whichever terminal answered the probe: on
+			// Windows ConPTY answers from the console's real cursor position,
+			// while on POSIX the broker's headless responder is the only thing
+			// that can answer, and it reports home (1;1). Pin that exactly — a
+			// POSIX regression where the responder stopped answering while
+			// something else did would otherwise pass.
+			expect(logs.text).toMatch(process.platform === "win32" ? /CPR:\d+:\d+/u : /CPR:1:1/u);
 			expect(logs.text).not.toContain("\x1b[1;1R");
 		} finally {
 			await client.request({ op: "stop", name: "terminal-query", timeoutMs: 2_000 }).catch(() => undefined);
@@ -442,14 +448,28 @@ process.stdin.on("data", chunk => process.stdout.write("got: " + chunk));
 		try {
 			const started = await client.request({ op: "start", spec, owner: "first-session" });
 			if (started.op !== "start") throw new Error("unexpected start result");
-			await expect(client.request({ op: "start", spec, owner: "second-session", replace: true })).rejects.toThrow(
-				/another session/u,
-			);
-			const current = await client.request({ op: "describe", name: spec.name });
-			if (current.op !== "describe") throw new Error("unexpected describe result");
-			expect(current.daemon.id).toBe(started.daemon.id);
-			expect(current.daemon.owner).toBe("first-session");
-			expect(current.daemon.state).not.toBe("exited");
+			await expect(
+				client.request({ op: "start", spec, owner: "second-session", replace: true }),
+			).rejects.toBeInstanceOf(Error);
+			for (const owner of ["second-session", null]) {
+				await expect(
+					client.request({ op: "stop", name: spec.name, timeoutMs: 2_000, owner }),
+				).rejects.toBeInstanceOf(Error);
+				const current = await client.request({ op: "describe", name: spec.name });
+				if (current.op !== "describe") throw new Error("unexpected describe result");
+				expect(current.daemon.id).toBe(started.daemon.id);
+				expect(current.daemon.pid).toBe(started.daemon.pid);
+				expect(current.daemon.owner).toBe("first-session");
+				expect(current.daemon.state).not.toBe("exited");
+			}
+			const stopped = await client.request({
+				op: "stop",
+				name: spec.name,
+				timeoutMs: 2_000,
+				owner: "first-session",
+			});
+			if (stopped.op !== "stop") throw new Error("unexpected stop result");
+			expect(stopped.daemon.state).toBe("exited");
 		} finally {
 			await client.request({ op: "stop", name: spec.name, timeoutMs: 2_000 }).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);

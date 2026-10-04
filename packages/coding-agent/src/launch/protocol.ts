@@ -12,7 +12,7 @@ import {
  * Wire and runtime namespace version. Increment for any compatibility or
  * security-boundary change that must not reuse brokers from older engines.
  */
-export const DAEMON_BROKER_PROTOCOL_VERSION = 3;
+export const DAEMON_BROKER_PROTOCOL_VERSION = 4;
 export { DAEMON_BROKER_WORKER_ARG } from "../cli/worker-selectors";
 
 /** Fixed dimensions negotiated with every supervised PTY. */
@@ -54,7 +54,7 @@ export type DaemonOperation =
 	  }
 	| { op: "wait"; name: string; for: "ready" | "exit"; pattern?: string; timeoutMs: number }
 	| { op: "send"; name: string; data?: string; signal?: DaemonSignal }
-	| { op: "stop"; name: string; timeoutMs: number }
+	| { op: "stop"; name: string; timeoutMs: number; owner?: string | null }
 	| { op: "restart"; name: string }
 	| { op: "mode"; name: string; mode: "persist" | "session" | "detached" }
 	| { op: "describe"; name: string }
@@ -372,6 +372,7 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				op,
 				name: stringValue(source.name, "operation.name"),
 				timeoutMs: numberValue(source.timeoutMs, "operation.timeoutMs"),
+				owner: source.owner === null ? null : optionalString(source.owner, "operation.owner"),
 			};
 		case "restart":
 		case "describe":

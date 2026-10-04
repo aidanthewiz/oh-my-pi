@@ -956,6 +956,7 @@ kbd {
 
 .btn[data-variant="accent"] {
 	background: var(--accent-gradient);
+	background-origin: border-box;
 	color: #fff;
 	border-color: transparent;
 }
