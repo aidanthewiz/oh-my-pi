@@ -3,7 +3,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { transaction } from "../../db";
 import { toUtcIso } from "../../util/datetime";
 import { generateId } from "../../util/ids";
-import { currentEmbeddingModel, embeddingsDisabled } from "../embeddings";
+import { currentEmbeddingIdentity, embeddingsDisabled } from "../embeddings";
 import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
@@ -347,24 +347,24 @@ const EMBED_REBUILD_BATCH = 128;
  * Reconcile stored embeddings against the active embedding model at store open.
  *
  * Every `memory_embeddings` row is stamped with the model that produced it (see
- * `runEmbedding` in `helpers.ts`). When the configured embedding model changes,
- * its vector dimension changes too, so the previously-stored vectors are no
- * longer comparable. On a mismatch we wipe every stored vector — the
+ * `runEmbedding` in `helpers.ts`). A model or pooling change makes the stored
+ * vectors no longer comparable, even when their dimensions match.
+ * On an identity mismatch we wipe every stored vector — the
  * `memory_embeddings` table, the `episodic_memory.binary_vector` column, and the
  * sqlite-vec `vec_episodes` index — then enqueue all live memories for
  * background re-embedding under the new model via `scheduleEmbedding`.
  *
- * Runs once per store open; a fresh store (no embeddings) or an already-current
- * store is a no-op. The destructive wipe is skipped whenever it could not be
+ * Runs once per store open; an already-current store is a no-op.
+ * The destructive wipe is skipped whenever it could not be
  * rebuilt — embeddings disabled via the runtime option OR the
  * `MNEMOPI_NO_EMBEDDINGS` env, or an unresolved (empty) active model — so a
  * stale-but-valid corpus is never destroyed without a replacement. MUST run
- * inside the active runtime-options scope so `currentEmbeddingModel()` /
+ * inside the active runtime-options scope so `currentEmbeddingIdentity()` /
  * `embeddingsDisabled()` reflect the per-instance configuration.
  */
 export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 	if (embeddingsDisabled()) return;
-	const active = currentEmbeddingModel().trim();
+	const active = currentEmbeddingIdentity().trim();
 	if (active === "") return;
 
 	// Re-embed in bounded batches so a corpus-wide rebuild never issues one giant

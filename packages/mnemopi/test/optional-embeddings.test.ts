@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import {
 	available,
 	embed,
@@ -18,6 +18,7 @@ const ENV_KEYS = [
 	"BUN_ENV",
 	"MNEMOPI_NO_EMBEDDINGS",
 	"MNEMOPI_EMBEDDING_MODEL",
+	"MNEMOPI_EMBEDDINGS_VIA_API",
 	"MNEMOPI_EMBEDDING_API_URL",
 	"MNEMOPI_EMBEDDING_API_KEY",
 	"OPENROUTER_BASE_URL",
@@ -233,4 +234,55 @@ describe("optional embeddings", () => {
 			},
 		);
 	});
+
+	it.each(["intfloat/multilingual-e5-large", "sentence-transformers/all-MiniLM-L6-v2"])(
+		"keeps local mean-pooling query vectors separate from API vectors for %s",
+		async model => {
+			await withEnv(
+				{
+					NODE_ENV: undefined,
+					BUN_ENV: undefined,
+					MNEMOPI_NO_EMBEDDINGS: undefined,
+					MNEMOPI_EMBEDDINGS_VIA_API: undefined,
+				},
+				async () => {
+					let localCalls = 0;
+					const requests: unknown[] = [];
+					setLocalModelInitializerForTests(async () => ({
+						embed: streamRows(texts => {
+							localCalls++;
+							return texts.map(() => [0, 1, 0]);
+						}),
+					}));
+					const fetchMock: typeof fetch = Object.assign(
+						async (_url: string | Request | URL, init?: BunFetchRequestInit | RequestInit) => {
+							requests.push(JSON.parse(String(init?.body)));
+							return new Response(JSON.stringify({ data: [{ embedding: [1, 0, 0] }] }), {
+								headers: { "Content-Type": "application/json" },
+							});
+						},
+						{ preconnect: () => {} },
+					);
+					const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+					try {
+						await withMnemopiRuntimeOptions(
+							{ embeddings: { model, apiUrl: "", apiKey: "", disabled: false } },
+							async () => {
+								expect(await embedQuery("same query")).toEqual(new Float32Array([0, 1, 0]));
+								process.env.MNEMOPI_EMBEDDINGS_VIA_API = "1";
+								expect(await embedQuery("same query")).toEqual(new Float32Array([1, 0, 0]));
+								expect(await embedQuery("same query")).toEqual(new Float32Array([1, 0, 0]));
+								delete process.env.MNEMOPI_EMBEDDINGS_VIA_API;
+								expect(await embed(["same query"])).toEqual([new Float32Array([0, 1, 0])]);
+							},
+						);
+						expect(localCalls).toBe(1);
+						expect(requests).toEqual([{ model, input: ["same query"] }]);
+					} finally {
+						fetchSpy.mockRestore();
+					}
+				},
+			);
+		},
+	);
 });

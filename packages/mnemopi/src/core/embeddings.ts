@@ -119,7 +119,7 @@ function activeEmbeddingOptions() {
 
 /**
  * Compose the per-query cache key. Includes the active provider's identity, the
- * resolved model name, and the API base URL so two `Mnemopi` instances in the same
+ * resolved semantic identity, and the API base URL so two `Mnemopi` instances in the same
  * process that point at different providers/models never share a cached query
  * vector. Provider identity comes from `providerIds` (WeakMap-assigned integer);
  * `0` is the sentinel for "no provider configured, fall back to env defaults".
@@ -137,7 +137,7 @@ function queryCacheKey(text: string): string {
 			providerId = existing;
 		}
 	}
-	const model = defaultModel();
+	const model = currentEmbeddingIdentity();
 	const apiUrl = active?.apiUrl ?? "";
 	return `${providerId}::${model}::${apiUrl}::${text}`;
 }
@@ -260,12 +260,26 @@ function defaultModel(): string {
  * Resolve the embedding model name for the currently active runtime scope.
  *
  * Reads (in order): the active provider's `model` from `withMnemopiRuntimeOptions`,
- * the `MNEMOPI_EMBEDDING_MODEL` env var, then the bundled fastembed default. Stored
- * alongside each row in `memory_embeddings.model` so migrations can re-embed when
- * the active model changes.
+ * the `MNEMOPI_EMBEDDING_MODEL` env var, then the bundled fastembed default.
+ * This configured name remains unchanged for public callers and API requests.
  */
 export function currentEmbeddingModel(): string {
 	return defaultModel();
+}
+
+/** Persisted vector identity; local fastembed 3 changed these models from CLS to mean pooling. */
+export function currentEmbeddingIdentity(): string {
+	const model = defaultModel();
+	if (activeEmbeddingOptions()?.provider !== undefined || providerOverride !== null || isApiModel(model)) {
+		return model;
+	}
+	switch (fastembedModelName(model)) {
+		case "fast-multilingual-e5-large":
+		case "fast-all-MiniLM-L6-v2":
+			return `${model}@fastembed3-mean`;
+		default:
+			return model;
+	}
 }
 
 export function isApiModel(modelName: string): boolean {
