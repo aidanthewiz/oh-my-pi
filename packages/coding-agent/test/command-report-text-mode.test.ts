@@ -110,6 +110,66 @@ describe("text-mode command reports on a real terminal core", () => {
 	});
 
 	it.each([
+		[120, 12],
+		[28, ROWS],
+	])("focuses an inline report when shrinking to %ix%i and preserves its unsent draft", async (columns, rows) => {
+		await mountTranscript(40);
+		const draft = "unsent draft [Image #1]";
+		const images = [{ type: "image" as const, mimeType: "image/png", data: "c3ludGhldGlj" }];
+		mode.editor.pendingImages = images;
+		mode.editor.pendingImageLinks = ["artifact://report-image"];
+		mode.editor.imageLinks = mode.editor.pendingImageLinks;
+		mode.editor.setText(draft);
+		const blocks = [...mode.chatContainer.children];
+		const entries = session.sessionManager.getEntries();
+		const body = new Text(
+			Array.from({ length: 14 }, (_, i) => `REPORT_ENTRY_${i.toString().padStart(2, "0")} ${".".repeat(40)}`).join(
+				"\n",
+			),
+			0,
+			0,
+		);
+		mode.showCommandReport({ title: "Resize report", body });
+		await term.waitForRender(() => screen(term).some(row => row.includes("REPORT_ENTRY_13")));
+		expect(mode.ui.getFocused()).toBe(mode.editor);
+		expect(mode.reportContainer.children).toHaveLength(1);
+
+		term.resize(columns, rows);
+		await term.waitForRender(() => mode.ui.hasOverlay() && mode.reportContainer.children.length === 0);
+		const report = mode.ui.getFocused();
+		expect(report).not.toBe(mode.editor);
+		term.sendInput("\x1b[F");
+		await term.waitForRender(() => screen(term).some(row => row.includes("REPORT_ENTRY_13")));
+		term.sendInput("\x1b[H");
+		await term.waitForRender(() => screen(term).some(row => row.includes("REPORT_ENTRY_00")));
+		term.sendInput("\x1b[6~");
+		await term.waitForRender(() => !screen(term).some(row => row.includes("REPORT_ENTRY_00")));
+		term.sendInput("x");
+		term.resize(120, ROWS);
+		await term.waitForRender();
+		expect(mode.ui.getFocused()).toBe(report);
+		term.sendInput(rows === 12 ? "\x1b" : "\x03");
+		await term.waitForRender(() => !mode.ui.hasOverlay());
+		expect(mode.ui.getFocused()).toBe(mode.editor);
+		expect(mode.editor.getText()).toBe(draft);
+		expect(mode.editor.pendingImages).toEqual(images);
+		expect(mode.editor.pendingImageLinks).toEqual(["artifact://report-image"]);
+		expect(mode.chatContainer.children).toEqual(blocks);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(session.messages).toEqual([]);
+
+		mode.showCommandReport({ title: "Reopened report", body });
+		await term.waitForRender(() => screen(term).some(row => row.includes("Reopened report")));
+		expect(mode.ui.getFocused()).toBe(mode.editor);
+		term.sendInput("\x1b");
+		await term.waitForRender(() => !screen(term).some(row => row.includes("Reopened report")));
+		term.resize(columns, rows);
+		await term.waitForRender();
+		expect(mode.ui.hasOverlay()).toBe(false);
+		expect(mode.editor.getText()).toBe(draft);
+	});
+
+	it.each([
 		["/mcp help", "MCP Server Management"],
 		["/mcp list", "MCP Servers"],
 		["/ssh help", "SSH Host Management"],

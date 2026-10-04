@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Reports that outgrow the available rows after terminal resizing now open as focused, scrollable pages while preserving drafts, attachments, and the transcript.
+
 ## [18.6.0] - 2026-10-03
 
 ### Added

@@ -110,6 +110,7 @@ function formatCreditValue(value: number): string {
 export class CommandController {
 	/** The open native report sheet. */
 	#reportSheet: OverlayHandle | undefined;
+	#reportPaintUnsubscribe: (() => void) | undefined;
 	/** The editor sat on the bottom row when the text-mode report above it opened. */
 	#reportOpenedAtBottom = false;
 
@@ -140,6 +141,8 @@ export class CommandController {
 	}
 
 	#clearReport(): boolean {
+		this.#reportPaintUnsubscribe?.();
+		this.#reportPaintUnsubscribe = undefined;
 		const docked = this.ctx.reportContainer;
 		if (docked.children.length === 0) return false;
 		docked.dispose();
@@ -162,8 +165,9 @@ export class CommandController {
 	 * fits the rows above the editor shows there like `/btw`: the editor keeps
 	 * focus and its Esc takes the report away. A taller one opens as a
 	 * full-screen page on the terminal's alternate screen, scrolled with the
-	 * arrow/page keys and the wheel, so the main screen is never touched and
-	 * Esc returns to it as it was. Natively it is a focused sheet like
+	 * arrow/page keys and the wheel, so paging leaves the main screen untouched.
+	 * An inline report moves to that page when it outgrows the available rows,
+	 * and keeps focus until closed. Natively it is a focused sheet like
 	 * `/usage`, its body scrolled by the terminal once it is long, closed by
 	 * Esc or Close.
 	 */
@@ -182,11 +186,7 @@ export class CommandController {
 			onClose: () => this.#closeReportSheet(),
 			maxRows: () => (fullScreen ? terminal.rows : this.ctx.commandReportRows()),
 		});
-		if (isNativeRendering()) {
-			report.holdFocus();
-			this.#reportSheet = this.ctx.ui.showOverlay(report, { anchor: "center", width: "90%", maxHeight: "90%" });
-			this.ctx.ui.setFocus(report);
-		} else if (report.heightAt(terminal.columns) > inline) {
+		const showFullscreen = () => {
 			fullScreen = true;
 			report.holdFocus();
 			this.#reportSheet = this.ctx.ui.showOverlay(report, {
@@ -197,9 +197,32 @@ export class CommandController {
 				fullscreen: true,
 			});
 			this.ctx.ui.setFocus(report);
+		};
+		if (isNativeRendering()) {
+			report.holdFocus();
+			this.#reportSheet = this.ctx.ui.showOverlay(report, { anchor: "center", width: "90%", maxHeight: "90%" });
+			this.ctx.ui.setFocus(report);
+		} else if (report.heightAt(terminal.columns) > inline) {
+			showFullscreen();
 		} else {
 			this.ctx.reportContainer.addChild(report);
 			this.#reportOpenedAtBottom = openedAtBottom;
+			let columns = terminal.columns;
+			let rows = inline;
+			this.#reportPaintUnsubscribe = this.ctx.ui.addPaintListener(() => {
+				if (this.ctx.ui.hasOverlay()) return;
+				const available = this.ctx.commandReportRows() ?? terminal.rows;
+				if (columns === terminal.columns && rows === available) return;
+				columns = terminal.columns;
+				rows = available;
+				if (report.heightAt(columns) <= available) return;
+				this.#reportPaintUnsubscribe?.();
+				this.#reportPaintUnsubscribe = undefined;
+				this.ctx.reportContainer.clear();
+				if (this.#reportOpenedAtBottom) this.ctx.pinComposerToBottom();
+				this.#reportOpenedAtBottom = false;
+				showFullscreen();
+			});
 		}
 		this.ctx.ui.requestRender();
 	}
