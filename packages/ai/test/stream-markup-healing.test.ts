@@ -514,15 +514,17 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		}
 	});
 
-	it("passes an unclosed, unquoted wrapper to leak recovery without losing later prose", () => {
-		const input = "Intro. <|DSML|tool_calls>broken call\n\nThe build passed.";
-		const healing = new StreamMarkupHealing({ pattern: "dsml" });
-		let visible = "";
-		for (let i = 0; i < input.length; i += 5) visible += healing.feed(input.slice(i, i + 5));
-		visible += healing.flushPending();
-		expect(visible).toBe(input);
-		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nThe build passed.");
-		expect(healing.drainCompleted()).toEqual([]);
+	it("preserves unclassified text after an unfinished wrapper without guessing a prose boundary", () => {
+		for (const newline of ["\n", "\r\n", "\n\n"]) {
+			const input = `Intro.<|DSML|tool_calls>broken${newline}The build passed.`;
+			const healing = new StreamMarkupHealing({ pattern: "dsml" });
+			let visible = "";
+			for (let i = 0; i < input.length; i += 5) visible += healing.feed(input.slice(i, i + 5));
+			visible += healing.flushPending();
+			expect(visible).toBe(input);
+			expect(stripDsmlToolMarkup(visible)).toBe(`Intro.\n\nbroken${newline}The build passed.`);
+			expect(healing.drainCompleted()).toEqual([]);
+		}
 	});
 
 	it("passes a closed wrapper without an invoke to leak recovery", () => {
@@ -556,7 +558,7 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		}
 		visible += healing.flushPending();
 		expect(visible).toBe(input);
-		expect(stripDsmlToolMarkup(visible)).toBe("Before.\n\nAfter.");
+		expect(stripDsmlToolMarkup(visible)).toBe(`Before.\n\n${"wrapper prose ".repeat(8192)}\n\nAfter.`);
 		expect(healing.drainCompleted()).toEqual([]);
 		expect(healing.flushPending()).toBe("");
 	});
@@ -564,11 +566,11 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 	it("retains exact incomplete invoke and parameter fragments without executing them", () => {
 		for (const pipe of ["|", "｜"]) {
 			const tag = `<${pipe}DSML${pipe}`;
-			for (const fragment of [
-				`${tag}invoke name="read`,
-				`${tag}invoke name="read"> \r\n  `,
-				`${tag}invoke name="read">${tag}parameter name="path`,
-				`${tag}invoke name="read">${tag}parameter name="path">fixture.txt`,
+			for (const [fragment, retained] of [
+				[`${tag}invoke name="read`, ""],
+				[`${tag}invoke name="read"> \r\n  `, ""],
+				[`${tag}invoke name="read">${tag}parameter name="path`, ""],
+				[`${tag}invoke name="read">${tag}parameter name="path">fixture.txt`, "fixture.txt"],
 			]) {
 				const input = `Before.\n${tag}tool_calls>\r\n ${fragment}`;
 				for (const chunkSize of [1, 7, input.length]) {
@@ -579,7 +581,7 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 					}
 					visible += healing.flushPending();
 					expect(visible).toBe(input);
-					expect(stripDsmlToolMarkup(visible)).toBe("Before.");
+					expect(stripDsmlToolMarkup(visible)).toBe(retained ? `Before.\n\n${retained}` : "Before.");
 					expect(healing.drainCompleted()).toEqual([]);
 					expect(healing.flushPending()).toBe("");
 				}
@@ -615,6 +617,13 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		expect(stripDsmlToolMarkup(leaked)).toBe("Before.\n\nAfter.");
 	});
 
+	it("removes complete closing markers whose final delimiter is on another line", () => {
+		for (const newline of ["\n", "\r\n"]) {
+			const input = `Before.<|DSML|parameter name="command">echo hi</|DSML|parameter${newline}>After.`;
+			expect(stripDsmlToolMarkup(input)).toBe("Before.\n\nAfter.");
+		}
+	});
+
 	it("keeps recovery separate from a completed call earlier in the same wrapper", () => {
 		const input =
 			"Before.<|DSML|tool_calls>" +
@@ -624,19 +633,28 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		let visible = "";
 		for (const char of input) visible += healing.feed(char);
 		visible += healing.flushPending();
-		expect(stripDsmlToolMarkup(visible)).toBe("Before.\n\nAfter.");
+		expect(stripDsmlToolMarkup(visible)).toBe("Before.\n\necho hi\n\nAfter.");
 		const calls = healing.drainCompleted();
 		expect(calls.map(call => ({ name: call.name, arguments: JSON.parse(call.arguments) }))).toEqual([
 			{ name: "read", arguments: { path: "fixture.txt" } },
 		]);
 	});
 
-	it("does not execute an incomplete call and retains its failed-call recovery boundary", () => {
+	it("keeps multiline arguments when an incomplete call has no trustworthy payload boundary", () => {
+		const input =
+			'<|DSML|tool_calls><|DSML|invoke name="bash"><|DSML|parameter name="command">echo first\necho second\nThe build passed.';
 		const healing = new StreamMarkupHealing({ pattern: "dsml" });
-		const truncated = REPORTED_DSML_LEAK.slice(0, REPORTED_DSML_LEAK.length - 30);
-		const visible = healing.feed(truncated) + healing.flushPending();
-		expect(stripDsmlToolMarkup(visible)).toBe("");
+		const visible = healing.feed(input) + healing.flushPending();
+		expect(stripDsmlToolMarkup(visible)).toBe("echo first\necho second\nThe build passed.");
 		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("does not let a later independent envelope swallow an earlier unfinished call's prose", () => {
+		const input =
+			'Before.<|DSML|tool_calls><|DSML|parameter name="command">echo first\nKeep this text.\n' +
+			'<|DSML|tool_calls><|DSML|invoke name="bash"><|DSML|parameter name="command">echo real' +
+			"</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>After.";
+		expect(stripDsmlToolMarkup(input)).toBe("Before.\n\necho first\nKeep this text.\n\nAfter.");
 	});
 
 	it("accepts the ASCII pipe variant", () => {

@@ -15,64 +15,53 @@ import type { AssistantMessage, Model } from "../types";
 // Structural DSML tags in either pipe spelling (fullwidth `｜` U+FF5C or ASCII),
 // tolerating stray whitespace inside the delimiter run.
 const DSML_TAG_PATTERN =
-	/<\s*(\/?)\s*[｜|]\s*DSML\s*[｜|]\s*(tool_calls|invoke|parameter)\b[^<>\r\n]*(?:\r?\n(?![ \t]*\r?\n)[^<>\r\n]*)*>?/gu;
+	/<\s*(\/?)\s*[｜|]\s*DSML\s*[｜|]\s*(tool_calls|invoke|parameter)\b(?:[ \t]*(?:\r?\n[ \t]*)?(?:name|string)[ \t]*=[ \t]*(?:"[^"<>\r\n]*"?|'[^'<>\r\n]*'?|[^\s<>]+))*(?:\s*>|[ \t]*)/gu;
 // Code the model deliberately quoted (fences, inline spans) is not a leak.
 const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|(?<!`)(`+)(?!`)[^\n]*?\2(?!`)/g;
 // The identifier-only line a degraded model writes in place of
 // `<｜DSML｜invoke name="…">` (e.g. `bash\n<｜DSML｜parameter …>`): part of the
 // broken call, so it goes with the markup.
 const TRAILING_TOOL_NAME_LINE = /(^|\n)[ \t]*[A-Za-z_][\w.-]*[ \t]*\r?\n[ \t]*$/;
-const BLANK_LINE_PATTERN = /\r?\n[ \t]*\r?\n/;
 
-/** Keep prose between independent broken calls, using retained closers as span boundaries. */
+/** Only a retained closer proves where a call's unquoted payload ends. */
 function stripUnquoted(text: string): string {
-	const tags = [...text.matchAll(DSML_TAG_PATTERN)];
-	if (tags.length === 0) return text;
 	const quoted = [...text.matchAll(QUOTED_CODE_PATTERN)];
+	const tags: RegExpExecArray[] = [];
 	let quoteIndex = 0;
-	let removed = false;
-	const parts: string[] = [];
-	let cursor = 0;
-	for (let index = 0; index < tags.length; index++) {
-		const first = tags[index]!;
-		if (first.index < cursor) continue;
-		while (quoteIndex < quoted.length && quoted[quoteIndex]!.index + quoted[quoteIndex]![0].length <= first.index) {
+	for (const tag of text.matchAll(DSML_TAG_PATTERN)) {
+		while (quoteIndex < quoted.length && quoted[quoteIndex]!.index + quoted[quoteIndex]![0].length <= tag.index) {
 			quoteIndex++;
 		}
 		const quote = quoted[quoteIndex];
-		if (quote && quote.index <= first.index) continue;
-		removed = true;
-		let start = first.index;
-		const nameLine =
-			!first[1] && first[2] === "parameter" ? TRAILING_TOOL_NAME_LINE.exec(text.slice(cursor, start)) : null;
-		if (nameLine) start = cursor + nameLine.index + nameLine[1]!.length;
-		let last = first;
-		const open = new Set<string>();
-		for (;;) {
-			if (last[1]) {
-				if (last[2] === "tool_calls") open.clear();
-				else {
-					open.delete(last[2]!);
-					if (last[2] === "invoke") open.delete("parameter");
-				}
-			} else open.add(last[2]!);
-			const next = tags[index + 1];
-			if (!next) break;
-			const gap = text.slice(last.index + last[0].length, next.index);
-			if (open.size === 0 && gap.trim().length > 0) break;
-			if (last[1] && last[2] === "tool_calls" && !next[1]) break;
-			last = next;
-			index++;
-		}
-		let end = last.index + last[0].length;
-		if (!last[1] || open.size > 0) {
-			const blankLine = text.slice(end).search(BLANK_LINE_PATTERN);
-			end = blankLine === -1 ? text.length : end + blankLine;
-		}
-		parts.push(text.slice(cursor, start).trim());
-		cursor = end;
+		if (!quote || quote.index > tag.index) tags.push(tag);
 	}
-	if (!removed) return text;
+	if (tags.length === 0) return text;
+
+	const open = new Map<string, number>();
+	const ends = new Map<number, number>();
+	for (let index = 0; index < tags.length; index++) {
+		const tag = tags[index]!;
+		const kind = tag[2]!;
+		for (const [name, opener] of open) {
+			if (name !== kind && kind !== "tool_calls" && !(kind === "invoke" && name === "parameter")) continue;
+			if (tag[1]) ends.set(opener, tag.index + tag[0].length);
+			open.delete(name);
+		}
+		if (!tag[1]) open.set(kind, index);
+	}
+
+	const parts: string[] = [];
+	let cursor = 0;
+	for (let index = 0; index < tags.length; index++) {
+		const tag = tags[index]!;
+		if (tag.index < cursor) continue;
+		let start = tag.index;
+		const nameLine =
+			!tag[1] && tag[2] === "parameter" ? TRAILING_TOOL_NAME_LINE.exec(text.slice(cursor, start)) : null;
+		if (nameLine) start = cursor + nameLine.index + nameLine[1]!.length;
+		parts.push(text.slice(cursor, start).trim());
+		cursor = ends.get(index) ?? tag.index + tag[0].length;
+	}
 	parts.push(text.slice(cursor).trim());
 	return parts.filter(part => part.length > 0).join("\n\n");
 }

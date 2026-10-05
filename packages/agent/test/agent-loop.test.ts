@@ -328,19 +328,47 @@ describe("agentLoop with AgentMessage", () => {
 		expect(mock.calls).toHaveLength(1);
 	});
 
-	it("ends a leaked call whose closers never arrived at the next blank line", async () => {
-		const truncated =
-			'Checking the build.\nbash\n<｜DSML｜parameter name="command" string="true">moon check --target native\n\nThe build passed.';
-		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
-		const mock = createMockModel({ id: deepseekId, responses: [{ content: [truncated] }, { content: ["Done."] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
-
-		const messages = await agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream).result();
-
-		expect((messages[1] as AssistantMessage).content).toEqual([
-			{ type: "text", text: "Checking the build.\n\nThe build passed." },
-		]);
-		expect(mock.calls).toHaveLength(2);
+	it("preserves unfinished-call text in visible events, saved history and recovery replay", async () => {
+		for (const leak of [
+			"Intro.<|DSML|tool_calls>broken\nThe build passed.",
+			'Intro.\nbash\n<｜DSML｜parameter name="command">echo first\r\necho second\r\nThe build passed.',
+			'Intro.<|DSML|tool_calls><|DSML|invoke name="read\nThe build passed.',
+		]) {
+			let replay: Message[] = [];
+			const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+			const mock = createMockModel({
+				id: deepseekId,
+				responses: [
+					{ content: [leak] },
+					context => {
+						replay = context.messages;
+						return { content: ["Done."] };
+					},
+				],
+			});
+			const stream = agentLoop(
+				[createUserMessage("Hello")],
+				context,
+				{ model: mock.model, convertToLlm: identityConverter },
+				undefined,
+				mock.stream,
+			);
+			const ended: AssistantMessage[] = [];
+			for await (const event of stream) {
+				if (event.type === "message_end" && event.message.role === "assistant") ended.push(event.message);
+			}
+			const messages = await stream.result();
+			for (const message of [ended[0], messages[1], replay[1]]) {
+				expect(JSON.stringify(message)).toContain("The build passed.");
+				expect(JSON.stringify(message)).not.toContain("DSML");
+				if (leak.includes("echo second")) {
+					expect(JSON.stringify(message)).toContain("echo first");
+					expect(JSON.stringify(message)).toContain("echo second");
+				}
+			}
+			expect(messages.filter(message => message.role === "toolResult")).toEqual([]);
+			expect(mock.calls).toHaveLength(2);
+		}
 	});
 
 	it("stops nudging after repeated DSML leaks", async () => {
