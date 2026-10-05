@@ -1,35 +1,98 @@
-/**
- * `omp read <image>?q=<question>` delegates to a vision model, which requires a
- * model registry to resolve modelRoles.vision / @default and fetch credentials.
- * The read CLI built a lightweight session with no registry, so the read tool
- * aborted with "Model registry is unavailable for image questions." before any
- * resolution (issue #11338). This drives the real `omp read` command in an
- * isolated agent dir carrying a custom vision provider and asserts it reaches
- * the completion attempt instead of the registry guard.
- */
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
-// 1x1 PNG so the read tool's image loader accepts the file.
 const PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const READ_CLI_URL = new URL("../src/cli/read-cli.ts", import.meta.url).href;
 
-// Custom vision provider with a real (dummy) inline key so it counts as
-// available; its baseUrl points at a dead local port, so the completion attempt
-// fails fast with a connection error — never the registry guard, and never a
-// real network call.
-const MODELS_YML = `providers:
+function createFixture(tempDir: TempDir): { agentDir: string; home: string; project: string; runnerPath: string } {
+	const agentDir = tempDir.join("agent");
+	const home = tempDir.join("home");
+	const project = tempDir.join("project");
+	fs.mkdirSync(agentDir, { recursive: true });
+	fs.mkdirSync(home, { recursive: true });
+	fs.mkdirSync(path.join(project, ".omp"), { recursive: true });
+	const runnerPath = tempDir.join("read-cli-runner.ts");
+	fs.writeFileSync(
+		runnerPath,
+		`import { runReadCommand } from ${JSON.stringify(READ_CLI_URL)};\nawait runReadCommand({ path: process.argv[2] });\n`,
+	);
+	return { agentDir, home, project, runnerPath };
+}
+
+async function runRead(
+	fixture: { agentDir: string; home: string; project: string; runnerPath: string },
+	target: string,
+): Promise<{ output: string; exitCode: number }> {
+	const child = Bun.spawn([process.execPath, fixture.runnerPath, target], {
+		cwd: fixture.project,
+		env: {
+			PATH: process.env.PATH ?? "",
+			HOME: fixture.home,
+			PI_CODING_AGENT_DIR: fixture.agentDir,
+			PI_TEST_RUNTIME: "1",
+			AWS_EC2_METADATA_DISABLED: "true",
+			AWS_SHARED_CREDENTIALS_FILE: path.join(fixture.home, "no-credentials"),
+			AWS_CONFIG_FILE: path.join(fixture.home, "no-config"),
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	return { output: `${stdout}\n${stderr}`, exitCode };
+}
+
+describe("read CLI query ownership", () => {
+	it("reads literal q filenames without opening unrelated vision credentials", async () => {
+		using tempDir = TempDir.createSync("@pi-read-cli-literal-q-");
+		const fixture = createFixture(tempDir);
+		fs.writeFileSync(path.join(fixture.agentDir, "auth.db"), "invalid SQLite credentials database");
+		fs.writeFileSync(path.join(fixture.project, "notes?q=literal"), "literal question filename contents\n");
+		fs.writeFileSync(path.join(fixture.project, "README"), "companion literal contents\n");
+		for (const target of ["notes?q=literal", "notes?q=literal;README"]) {
+			const result = await runRead(fixture, target);
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("literal question filename contents");
+			if (target.includes(";")) expect(result.output).toContain("companion literal contents");
+		}
+	}, 60_000);
+
+	it("keeps URL-looking image question text inside one real vision request", async () => {
+		using tempDir = TempDir.createSync("@pi-read-cli-imgq-");
+		const fixture = createFixture(tempDir);
+		const requests: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				requests.push(new URL(request.url).pathname);
+				return Response.json(
+					{ error: { message: "synthetic request rejection", type: "invalid_request_error" } },
+					{ status: 400 },
+				);
+			},
+		});
+		try {
+			fs.writeFileSync(
+				path.join(fixture.project, ".omp", "config.yml"),
+				'modelRoles:\n  vision: "testvision/vmodel"\nimages:\n  questionTimeoutMs: 3000\n',
+			);
+			fs.writeFileSync(
+				path.join(fixture.agentDir, "models.yml"),
+				`providers:
   testvision:
     api: openai-completions
-    baseUrl: http://127.0.0.1:1/v1
+    baseUrl: ${server.url.origin}/v1
     apiKey: "test-key"
     models:
       - id: vmodel
         name: Vision Test
-        input:
-          - text
-          - image
+        input: [text, image]
         contextWindow: 128000
         maxTokens: 4096
         cost:
@@ -37,65 +100,15 @@ const MODELS_YML = `providers:
           output: 0
           cacheRead: 0
           cacheWrite: 0
-`;
-
-const READ_CLI_URL = new URL("../src/cli/read-cli.ts", import.meta.url).href;
-
-describe("omp read <image>?q=", () => {
-	it("resolves a vision model instead of failing with the registry guard", async () => {
-		const tempDir = TempDir.createSync("@pi-read-cli-imgq-");
-		try {
-			const agentDir = tempDir.join("agent");
-			const home = tempDir.join("home");
-			const project = tempDir.join("project");
-			fs.mkdirSync(agentDir, { recursive: true });
-			fs.mkdirSync(home, { recursive: true });
-			fs.mkdirSync(path.join(project, ".omp"), { recursive: true });
-			// Bound the completion attempt so a dead endpoint aborts quickly instead
-			// of running the provider SDK's full connection backoff.
-			fs.writeFileSync(path.join(project, ".omp", "config.yml"), "images:\n  questionTimeoutMs: 3000\n");
-			fs.writeFileSync(path.join(agentDir, "models.yml"), MODELS_YML);
-			const pngPath = path.join(project, "test.png");
-			fs.writeFileSync(pngPath, Buffer.from(PNG_1X1, "base64"));
-
-			// The runner imports the CLI entry by file URL so it resolves
-			// independently of its own location; it lives in the TempDir (never
-			// the repo checkout) so a crash before cleanup leaves nothing
-			// behind in git status. cwd is the isolated project so
-			// getProjectDir() never picks up repo settings.
-			const runnerPath = tempDir.join(`read-cli-runner-${process.pid}.ts`);
-			fs.writeFileSync(
-				runnerPath,
-				`import { runReadCommand } from ${JSON.stringify(READ_CLI_URL)};\nawait runReadCommand({ path: process.argv[2] });\n`,
+`,
 			);
-			try {
-				const child = Bun.spawn(["bun", runnerPath, `${pngPath}?q=describe this image`], {
-					cwd: project,
-					env: {
-						...process.env,
-						HOME: home,
-						PI_CODING_AGENT_DIR: agentDir,
-						PI_TEST_RUNTIME: "1",
-					},
-					stdout: "pipe",
-					stderr: "pipe",
-				});
-				const [stdout, stderr, exitCode] = await Promise.all([
-					new Response(child.stdout).text(),
-					new Response(child.stderr).text(),
-					child.exited,
-				]);
-				const output = `${stdout}\n${stderr}`;
-				// The command fails (dead endpoint) but must get past the registry
-				// guard AND model resolution to an actual completion attempt.
-				expect(exitCode).not.toBe(0);
-				expect(output).not.toContain("Model registry is unavailable for image questions.");
-				expect(output).not.toContain("No models available for image questions.");
-			} finally {
-				fs.rmSync(runnerPath, { force: true });
-			}
+			const pngPath = path.join(fixture.project, "test.png");
+			fs.writeFileSync(pngPath, Buffer.from(PNG_1X1, "base64"));
+			const result = await runRead(fixture, `${pngPath}?q=look;${server.url.origin}/unexpected.sqlite?q=other`);
+			expect(requests, result.output).toEqual(["/v1/chat/completions"]);
+			expect(result.exitCode).not.toBe(0);
 		} finally {
-			tempDir.removeSync();
+			await server.stop(true);
 		}
 	}, 60_000);
 });

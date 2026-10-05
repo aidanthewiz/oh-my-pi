@@ -52,6 +52,38 @@ describe("read with a `;` list mixing URLs and local paths", () => {
 		expect(text).toContain("export const a = 1;");
 	});
 
+	it("reads literal question filenames in lists before interpreting SQLite queries", async () => {
+		const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "read-literal-question-lists-"));
+		const cases = [
+			{ filename: "a?b=c", marker: "literal equals file contents" },
+			{ filename: "notes?q=literal", marker: "literal q file contents" },
+			{ filename: "data.sqlite?q=SELECT name FROM t", marker: "literal sqlite file contents" },
+		];
+		try {
+			await Bun.write(path.join(fixtureDir, "README"), "companion file contents\n");
+			for (const { filename, marker } of cases) {
+				await Bun.write(path.join(fixtureDir, filename), `${marker}\n`);
+			}
+			const db = new Database(path.join(fixtureDir, "data.sqlite"));
+			try {
+				db.run("CREATE TABLE t (name TEXT)");
+				db.run("INSERT INTO t VALUES ('database-only contents')");
+			} finally {
+				db.close();
+			}
+			const tool = new ReadTool({ ...session, cwd: fixtureDir });
+			for (const { filename, marker } of cases) {
+				const result = await tool.execute("read-literal-question-list", { path: `${filename};README` });
+				const text = result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+				expect(text).toContain(marker);
+				expect(text).toContain("companion file contents");
+				expect(text).not.toContain("database-only contents");
+			}
+		} finally {
+			await removeWithRetries(fixtureDir);
+		}
+	});
+
 	it("splits an internal URL followed by a local path", async () => {
 		const text = await readText("omp://;a.ts:1-1");
 		expect(text).toContain("interpreted as 2 paths");

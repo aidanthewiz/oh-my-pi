@@ -192,6 +192,45 @@ describe("tool path arrays", () => {
 		}
 	});
 
+	it("searches semicolon lists with query-like literal filenames", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "grep-literal-question-lists-"));
+		const cases = [
+			{ filename: "a?b=c", marker: "needle literal equals" },
+			{ filename: "notes?q=literal", marker: "needle literal q" },
+			{ filename: "data.sqlite?q=SELECT name FROM t", marker: "needle literal sqlite" },
+		];
+		try {
+			await Bun.write(path.join(cwd, "README"), "needle companion\n");
+			await Bun.write(path.join(cwd, "data.sqlite"), "needle excluded database base\n");
+			for (const { filename, marker } of cases) {
+				await Bun.write(path.join(cwd, filename), `${marker}\n`);
+			}
+			const tools = await createTools(createTestSession(cwd));
+			const tool = tools.find(entry => entry.name === "grep");
+			if (!tool) throw new Error("Missing grep tool");
+
+			for (const { filename, marker } of cases) {
+				const result = await tool.execute("search-literal-question-list", {
+					pattern: "needle",
+					path: `${filename};README`,
+				});
+				const text = getText(result);
+				expect(text).toContain(marker);
+				expect(text).toContain("needle companion");
+				expect(text).not.toContain("needle excluded database base");
+				const details = result.details;
+				if (!details || typeof details !== "object") throw new Error("Missing grep details");
+				if (!("matchCount" in details) || !("fileCount" in details)) {
+					throw new Error("Missing grep result counts");
+				}
+				expect(details.matchCount).toBe(2);
+				expect(details.fileCount).toBe(2);
+			}
+		} finally {
+			await removeWithRetries(cwd);
+		}
+	});
+
 	it("recovers local selectors before opaque URI fallback while retaining their ranges", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "local-selector-lists-"));
 		try {

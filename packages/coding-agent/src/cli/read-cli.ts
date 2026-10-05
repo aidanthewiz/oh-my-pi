@@ -21,6 +21,7 @@ import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import type { AuthStorage } from "../session/auth-storage";
 import type { ToolSession } from "../tools";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
+import { probeLiteralPathExists, splitDelimitedPathEntry } from "../tools/path-utils";
 import { ReadTool, splitImageQuestionTarget } from "../tools/read";
 import { renderError } from "../tools/tool-errors";
 
@@ -105,7 +106,9 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 		// touch a model), so build one on demand — otherwise the tool aborts with
 		// "Model registry is unavailable for image questions." before resolving
 		// anything (issue #11338).
-		if (splitImageQuestionTarget(cmd.path).question) {
+		const imageQuestion = splitImageQuestionTarget(cmd.path);
+		const questionPaths = imageQuestion.question ? await splitDelimitedPathEntry(cmd.path, cwd) : null;
+		if (imageQuestion.question && (await probeLiteralPathExists(questionPaths?.[0] ?? cmd.path, cwd)) !== "exists") {
 			authStorage ??= await discoverAuthStorage(undefined, { settings });
 			const modelRegistry = new ModelRegistry(authStorage);
 			await modelRegistry.hydrateCredentialScopedModelCaches();

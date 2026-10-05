@@ -669,14 +669,14 @@ function specialFileKind(stat: Stats): string | undefined {
  * scheme declares {@link SchemeSpec.imageQuestion}; every other URL owns its query string.
  */
 export function splitImageQuestionTarget(readPath: string): { path: string; question?: string } {
-	if (readPath.includes("://")) {
+	const queryIndex = readPath.indexOf("?");
+	if (queryIndex === -1) return { path: readPath };
+	const uriIndex = readPath.indexOf("://");
+	if (uriIndex !== -1 && uriIndex < queryIndex) {
 		const scheme = extractUriScheme(readPath);
 		if (!scheme || !InternalUrlRouter.instance().spec(scheme)?.imageQuestion) return { path: readPath };
 	}
-	if (parseSqlitePathCandidates(readPath).length > 0) return { path: readPath };
-
-	const queryIndex = readPath.indexOf("?");
-	if (queryIndex === -1) return { path: readPath };
+	if (parseSqlitePathCandidates(readPath.slice(0, queryIndex)).length > 0) return { path: readPath };
 	const question = new URLSearchParams(readPath.slice(queryIndex + 1)).get("q");
 	return question ? { path: readPath.slice(0, queryIndex), question } : { path: readPath };
 }
@@ -1043,12 +1043,30 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			: undefined;
 	}
 
+	async #ownsQuery(readPath: string): Promise<boolean> {
+		const queryIndex = readPath.indexOf("?");
+		if (queryIndex === -1) return false;
+		if (
+			!parseSqlitePathCandidates(readPath).some(
+				candidate => candidate.sqlitePath.length <= queryIndex && candidate.queryString.length > 0,
+			) &&
+			splitImageQuestionTarget(readPath).question === undefined
+		) {
+			return false;
+		}
+		const literalParts = await splitDelimitedPathEntry(readPath, this.session.cwd);
+		return (await probeLiteralPathExists(literalParts?.[0] ?? readPath, this.session.cwd)) !== "exists";
+	}
+
 	async #tryReadDelimitedPaths(
 		readPath: string,
 		signal?: AbortSignal,
 		routedUrlPredicate?: (entry: string) => boolean,
 	): Promise<AgentToolResult<ReadToolDetails> | null> {
-		const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, { routedUrlPredicate });
+		const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, {
+			routedUrlPredicate,
+			queryOwner: entry => this.#ownsQuery(entry),
+		});
 		return parts ? this.#readDelimitedParts(parts, signal) : null;
 	}
 
@@ -1570,9 +1588,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			readPath,
 			this.session.cwd,
 			part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
+			entry => this.#ownsQuery(entry),
 		);
 		if (mixedParts) return this.#readDelimitedParts(mixedParts, signal);
-		const imageQuestion = splitImageQuestionTarget(readPath);
+		const literalQueryPath =
+			readPath.includes("?") &&
+			parseReadUrlTarget(readPath) === null &&
+			!InternalUrlRouter.instance().canResolve(readPath) &&
+			!(await this.#ownsQuery(readPath));
+		if (literalQueryPath) {
+			const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
+			if (delimitedResult) return delimitedResult;
+		}
+		const imageQuestion = literalQueryPath
+			? { path: readPath, question: undefined }
+			: splitImageQuestionTarget(readPath);
 		readPath = imageQuestion.path;
 		const question = imageQuestion.question;
 
@@ -1628,6 +1658,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			return this.#readFilesystemPath(readPath, {
 				dispatch,
 				question,
+				literalQueryPath,
 				signal,
 				onBufferedFile,
 				onConflictMarkers,
@@ -1670,6 +1701,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			dispatch: ReadDispatchState;
 			located?: LocatedRead;
 			question?: string;
+			literalQueryPath?: boolean;
 			/** Model-facing path for `?q=` hints; defaults to the displayed file path. */
 			questionPath?: string;
 			signal?: AbortSignal;
@@ -1683,6 +1715,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			question,
 			questionPath,
 			signal,
+			literalQueryPath = false,
 			onBufferedFile,
 			onConflictMarkers,
 			lexicalAbsolutePath,
@@ -1705,7 +1738,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			? { path: readPath, sel: located.sel }
 			: await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
 		const rawPathIsLiteral =
-			!located && literalSplit.sel === undefined && splitPathAndSel(readPath).sel !== undefined;
+			!located &&
+			literalSplit.sel === undefined &&
+			(literalQueryPath || splitPathAndSel(readPath).sel !== undefined);
 
 		let pdfImageRead: PdfImageReadTarget | null = null;
 

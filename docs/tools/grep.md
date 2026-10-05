@@ -36,6 +36,8 @@ Recognized URL starts or existing local filenames after a semicolon take precede
 
 Validated local comma or whitespace lists, including `Makefile:1-1, README:1-1`, recover before opaque custom-scheme fallback. This recovery does not split candidates containing recognized URL targets.
 
+Local `?key=value` text does not create a query suffix. `a?b=c;README` searches both files; SQLite and image-question query rules belong to `read`.
+
 ## Outputs
 The tool returns a single text block in `content[0].text` plus structured `details`.
 

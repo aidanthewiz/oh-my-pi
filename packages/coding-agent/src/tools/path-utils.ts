@@ -20,7 +20,6 @@ import { ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
-const QUERY_START_RE = /^\?[\w.-]*=/;
 
 /** POSIX absolute, Windows drive, or UNC (`\\server\share` / `//server/share`). */
 export function isFilesystemSourcePath(value: string): boolean {
@@ -596,11 +595,12 @@ function hasTopLevelPathDelimiter(entry: string): boolean {
 	return false;
 }
 
-function splitTopLevelDelimitedPath(
+async function splitTopLevelDelimitedPath(
 	entry: string,
 	mode: DelimitedPathSplitMode,
 	isUrl: (part: string) => boolean,
-): string[] {
+	queryOwner?: (part: string) => Promise<boolean>,
+): Promise<string[]> {
 	const parts: string[] = [];
 	let braceDepth = 0;
 	let start = 0;
@@ -619,13 +619,9 @@ function splitTopLevelDelimitedPath(
 			continue;
 		}
 		if (braceDepth !== 0) continue;
-		if (
-			ch === "?" &&
-			QUERY_START_RE.test(entry.slice(i)) &&
-			!isUrl(normalizePathLikeInput(entry.slice(start))) &&
-			!parts.some(part => isUrl(normalizePathLikeInput(part)))
-		) {
-			break;
+		if (queryOwner && ch === "?" && !parts.some(part => isUrl(normalizePathLikeInput(part)))) {
+			const part = normalizePathLikeInput(entry.slice(start));
+			if (!isUrl(part) && (await queryOwner(part))) break;
 		}
 		if (!isDelimitedPathSeparator(ch, mode)) continue;
 		parts.push(entry.slice(start, i));
@@ -669,8 +665,9 @@ async function tryDelimitedPathSplit(
 	requirement: DelimitedResolveRequirement,
 	isUrl: (part: string) => boolean,
 	localOnly = false,
+	queryOwner?: (part: string) => Promise<boolean>,
 ): Promise<string[] | null> {
-	const rawParts = splitTopLevelDelimitedPath(entry, mode, isUrl);
+	const rawParts = await splitTopLevelDelimitedPath(entry, mode, isUrl, queryOwner);
 	if (rawParts.length < 2) return null;
 
 	const parts = rawParts.map(normalizePathLikeInput).filter(part => part.length > 0);
@@ -697,6 +694,7 @@ export async function splitDelimitedPathEntry(
 	options: {
 		splitter?: PathEntrySplitter;
 		routedUrlPredicate?: (entry: string) => boolean;
+		queryOwner?: (part: string) => Promise<boolean>;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
@@ -706,7 +704,7 @@ export async function splitDelimitedPathEntry(
 		options.routedUrlPredicate ??
 		((part: string) =>
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
-	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isUrl);
+	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isUrl, options.queryOwner);
 	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
 	const opaqueUrl = isUrl(normalizedEntry);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
@@ -725,10 +723,48 @@ export async function splitDelimitedPathEntry(
 	}
 
 	return (
-		(opaqueUrl ? null : await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none", isUrl)) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "comma", "some", isUrl, opaqueUrl)) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "whitespace", "all", isUrl, opaqueUrl)) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", "all", isUrl, opaqueUrl))
+		(opaqueUrl
+			? null
+			: await tryDelimitedPathSplit(
+					normalizedEntry,
+					cwd,
+					splitter,
+					"semicolon",
+					"none",
+					isUrl,
+					false,
+					options.queryOwner,
+				)) ??
+		(await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"comma",
+			"some",
+			isUrl,
+			opaqueUrl,
+			options.queryOwner,
+		)) ??
+		(await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"whitespace",
+			"all",
+			isUrl,
+			opaqueUrl,
+			options.queryOwner,
+		)) ??
+		(await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"mixed",
+			"all",
+			isUrl,
+			opaqueUrl,
+			options.queryOwner,
+		))
 	);
 }
 
@@ -741,10 +777,11 @@ export async function splitMixedUrlPathList(
 	entry: string,
 	cwd: string,
 	isUrl: (part: string) => boolean,
+	queryOwner?: (part: string) => Promise<boolean>,
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
 	if (!normalizedEntry.includes(";")) return null;
-	const rawParts = splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl);
+	const rawParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, queryOwner);
 	if (rawParts.length < 2 || (!isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part)))))
 		return null;
 	if (!isInternalUrlPath(normalizedEntry)) {

@@ -61,6 +61,8 @@ Literal filesystem paths take precedence over selector interpretation, so an exi
 
 Validated comma or whitespace lists, including `Makefile:1-1, README:1-1`, recover before opaque custom-scheme fallback. Existing literal paths and recognized URL targets retain precedence.
 
+Only specialized readers own local query suffixes. Existing literal filenames containing `?key=value` retain precedence, including in path lists. The CLI does not load vision credentials for those literal paths.
+
 ## Outputs
 
 - Single-shot `AgentToolResult` built through `toolResult()` in `packages/coding-agent/src/tools/tool-result.ts`.
@@ -178,7 +180,7 @@ Validated comma or whitespace lists, including `Makefile:1-1, README:1-1`, recov
 ### SQLite databases
 
 - Database detection requires both a matching extension and a valid SQLite file header (`isSqliteFile()`).
-- Local `?key=value` suffixes stay atomic during path-list detection. SQL semicolons and URL-looking literals remain query data.
+- SQLite query syntax declares ownership during list parsing. Existing literal filenames win; otherwise SQL semicolons and URL-looking literals remain query data.
 - Selector forms from `parseSqliteSelector()`:
 
 #### `db.sqlite`
