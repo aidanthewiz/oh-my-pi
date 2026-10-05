@@ -333,6 +333,9 @@ describe("agentLoop with AgentMessage", () => {
 			"Intro.<|DSML|tool_calls>broken\nThe build passed.",
 			'Intro.\nbash\n<｜DSML｜parameter name="command">echo first\r\necho second\r\nThe build passed.',
 			'Intro.<|DSML|tool_calls><|DSML|invoke name="read\nThe build passed.',
+			'Intro.<|DSML|invoke name="read\nThe build passed.\n</|DSML|invoke>',
+			'Intro.<|DSML|tool_calls><|DSML|invoke name="bash"><|DSML|parameter name="command">echo first\nThe build passed.\n</|DSML|invoke></|DSML|tool_calls>',
+			"Intro.<|DSML|tool_calls>broken\nThe build passed.\n</|DSML|tool_calls>",
 		]) {
 			let replay: Message[] = [];
 			const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };

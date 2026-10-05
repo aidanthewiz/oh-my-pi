@@ -23,7 +23,19 @@ const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|(?<!`)(`+)(?!`)[^\n]*?\2(
 // broken call, so it goes with the markup.
 const TRAILING_TOOL_NAME_LINE = /(^|\n)[ \t]*[A-Za-z_][\w.-]*[ \t]*\r?\n[ \t]*$/;
 
-/** Only a retained closer proves where a call's unquoted payload ends. */
+function hasCompleteHeader(tag: RegExpExecArray): boolean {
+	const header = tag[0];
+	if (!header.endsWith(">")) return false;
+	let quote = 0;
+	for (let index = 0; index < header.length; index++) {
+		const char = header.charCodeAt(index);
+		if (char === quote) quote = 0;
+		else if (!quote && (char === 34 || char === 39)) quote = char;
+	}
+	return quote === 0;
+}
+
+/** Only a complete leaf's matching closer identifies its unquoted payload. */
 function stripUnquoted(text: string): string {
 	const quoted = [...text.matchAll(QUOTED_CODE_PATTERN)];
 	const tags: RegExpExecArray[] = [];
@@ -39,12 +51,23 @@ function stripUnquoted(text: string): string {
 
 	const open = new Map<string, number>();
 	const ends = new Map<number, number>();
+	let parameterizedInvoke: number | undefined;
 	for (let index = 0; index < tags.length; index++) {
 		const tag = tags[index]!;
 		const kind = tag[2]!;
+		if (kind === "parameter") parameterizedInvoke = open.get("invoke");
 		for (const [name, opener] of open) {
 			if (name !== kind && kind !== "tool_calls" && !(kind === "invoke" && name === "parameter")) continue;
-			if (tag[1]) ends.set(opener, tag.index + tag[0].length);
+			if (
+				tag[1] &&
+				name === kind &&
+				kind !== "tool_calls" &&
+				opener !== parameterizedInvoke &&
+				hasCompleteHeader(tags[opener]!) &&
+				hasCompleteHeader(tag)
+			) {
+				ends.set(opener, tag.index + tag[0].length);
+			}
 			open.delete(name);
 		}
 		if (!tag[1]) open.set(kind, index);

@@ -13,7 +13,7 @@
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
 - Kept Anthropic fallback-credit tokens and frozen request bodies on official API-key routes when retry models change endpoint.
-- Preserved visible text and history after unfinished DeepSeek DSML calls, including single-newline prose and ambiguous multiline arguments; only structural closing markers delimit removable payloads.
+- Preserved visible text and history after unfinished DeepSeek DSML calls, including late parent closers, incomplete quoted headers and ambiguous multiline arguments; only complete leaf calls delimit removable payloads.
 - Bounded stdio gateway admission through output completion and capped streamed response bodies, with cancellation and actionable size errors instead of unbounded reply buffers.
 
 ## [18.6.1] - 2026-10-04

@@ -527,14 +527,14 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		}
 	});
 
-	it("passes a closed wrapper without an invoke to leak recovery", () => {
+	it("preserves a closed wrapper's unclassified body during recovery", () => {
 		const input = "Intro.<|DSML|tool_calls>broken</|DSML|tool_calls>Outro.";
 		const healing = new StreamMarkupHealing({ pattern: "dsml" });
 		let visible = "";
 		for (let i = 0; i < input.length; i += 6) visible += healing.feed(input.slice(i, i + 6));
 		visible += healing.flushPending();
 		expect(visible).toBe(input);
-		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nOutro.");
+		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nbroken\n\nOutro.");
 		expect(healing.drainCompleted()).toEqual([]);
 	});
 
@@ -655,6 +655,39 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 			'<|DSML|tool_calls><|DSML|invoke name="bash"><|DSML|parameter name="command">echo real' +
 			"</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>After.";
 		expect(stripDsmlToolMarkup(input)).toBe("Before.\n\necho first\nKeep this text.\n\nAfter.");
+	});
+
+	it("retains unfinished child payloads when only a parent closes", () => {
+		for (const pipe of ["|", "｜"]) {
+			const tag = `<${pipe}DSML${pipe}`;
+			const close = `</${pipe}DSML${pipe}`;
+			const input =
+				`Before.${tag}tool_calls>${tag}invoke name="bash">${tag}parameter name="command">` +
+				`echo first\nThe build passed.\n${close}invoke>${close}tool_calls>After.`;
+			expect(stripDsmlToolMarkup(input)).toBe("Before.\n\necho first\nThe build passed.\n\nAfter.");
+		}
+	});
+
+	it("retains a broken child's prose before another invoke in the same closed wrapper", () => {
+		const input =
+			'Before.<|DSML|tool_calls><|DSML|invoke name="bash"><|DSML|parameter name="command">' +
+			'echo first\nThe build passed.\n<|DSML|invoke name="read"><|DSML|parameter name="path">file' +
+			"</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>After.";
+		expect(stripDsmlToolMarkup(input)).toBe("Before.\n\necho first\nThe build passed.\n\nAfter.");
+	});
+
+	it("does not pair incomplete headers or closing fragments with later markers", () => {
+		for (const newline of ["\n", "\r\n"]) {
+			for (const header of ['invoke name="read', 'parameter name="command']) {
+				const kind = header.split(" ", 1)[0]!;
+				for (const delimiter of ["", ">"]) {
+					const input = `Before.<|DSML|${header}${delimiter}${newline}The build passed.${newline}</|DSML|${kind}>After.`;
+					expect(stripDsmlToolMarkup(input)).toBe(`Before.\n\nThe build passed.\n\nAfter.`);
+				}
+			}
+			const input = `Before.<|DSML|parameter name="command">echo first${newline}The build passed.</|DSML|parameter${newline}After.`;
+			expect(stripDsmlToolMarkup(input)).toBe(`Before.\n\necho first${newline}The build passed.\n\nAfter.`);
+		}
 	});
 
 	it("accepts the ASCII pipe variant", () => {
