@@ -5,6 +5,8 @@
 ### Fixed
 
 - Reports that outgrow the available rows after terminal resizing now open as focused, scrollable pages while preserving drafts, attachments, and the transcript.
+- Fixed stdio gateway fallback accepting HTTP 200 before terminal SSE errors across Chat Completions, Responses, Anthropic Messages and pi-native; completed transient failures now try permitted candidates without leaking partial output or retrying invalid requests, cancellation or response-size failures.
+
 ## [18.6.1] - 2026-10-04
 
 ### Fixed
