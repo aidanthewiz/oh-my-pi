@@ -17,7 +17,8 @@
  * status 400 with the `id` it carried, if any. Serving ends once input ends
  * and every request has been answered.
  */
-import { logger, readLines, untilAborted } from "@oh-my-pi/pi-utils";
+import { ConcatSink, logger, readLines } from "@oh-my-pi/pi-utils";
+import { untilAborted } from "@oh-my-pi/pi-utils/abortable";
 
 /** Request ids are opaque to the transport: echoed back as received. */
 type StdioId = string | number;
@@ -35,12 +36,16 @@ export interface AuthGatewayStdioOptions {
 	input: ReadableStream<Uint8Array>;
 	/** Writes one response line, newline included. */
 	write(line: string): void | Promise<void>;
-	/** Answers one request; never rejects (the gateway router's `route`, or a wrapper around it). */
+	/** Answers one request; rejected attempts become per-request error replies. */
 	route(req: Request): Promise<Response>;
 	/** Reported on the ready line. */
 	version?: string;
 	/** Caller-owned shutdown; aborts input and pending request waits. */
 	signal?: AbortSignal;
+	/** Active requests, including responses waiting for output completion. Defaults to 4. */
+	maxConcurrentRequests?: number;
+	/** Maximum streamed response body size in bytes. Defaults to 16 MiB. */
+	maxResponseBytes?: number;
 }
 
 /** Origin of the `Request`s built from input lines; only the path reaches the routes. */
@@ -48,37 +53,72 @@ const STDIO_ORIGIN = "http://stdio";
 
 /** Serves `opts.input` until it ends and every request it carried is answered. */
 export async function serveAuthGatewayStdio(opts: AuthGatewayStdioOptions): Promise<void> {
-	const send = (response: StdioResponse): void | Promise<void> => opts.write(`${JSON.stringify(response)}\n`);
-	await opts.write(`${JSON.stringify({ ready: true, version: opts.version })}\n`);
+	const maxConcurrentRequests = opts.maxConcurrentRequests ?? 4;
+	const maxResponseBytes = opts.maxResponseBytes ?? 16 * 1024 * 1024;
+	if (!Number.isSafeInteger(maxConcurrentRequests) || maxConcurrentRequests < 1) {
+		throw new RangeError("maxConcurrentRequests must be a positive safe integer");
+	}
+	validateResponseLimit(maxResponseBytes);
 	const controller = new AbortController();
 	const signal = opts.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal;
 	const inFlight = new Set<Promise<void>>();
+	let writeFailed = false;
 	let writeFailure: unknown;
+	const failWrite = (error: unknown) => {
+		if (!writeFailed) {
+			writeFailed = true;
+			writeFailure = error;
+			controller.abort(error);
+		}
+	};
+	const writeLine = async (frame: unknown): Promise<void> => {
+		if (writeFailed) return;
+		let written: Promise<void>;
+		try {
+			written = Promise.resolve(opts.write(`${JSON.stringify(frame)}\n`));
+		} catch (error) {
+			failWrite(error);
+			throw error;
+		}
+		void written.catch(failWrite);
+		try {
+			await untilAborted(signal, written);
+		} catch (error) {
+			if (!signal.aborted) throw error;
+		}
+	};
 	const decoder = new TextDecoder();
 	try {
+		await writeLine({ ready: true, version: opts.version });
 		for await (const line of readLines(opts.input, signal)) {
+			if (signal.aborted) break;
 			const text = decoder.decode(line).trim();
 			if (!text) continue;
 			const request = parseRequest(text, signal);
 			if ("error" in request) {
-				await send({
+				await writeLine({
 					id: request.id,
 					status: 400,
 					body: { error: { message: request.error, type: "invalid_request_error" } },
 				});
 				continue;
 			}
-			const answered = untilAborted(signal, () => opts.route(request.req).then(readResponse)).then(
-				response => send({ id: request.id, ...response }),
+			const answered = untilAborted(signal, () =>
+				opts.route(request.req).then(response => readResponse(response, signal, maxResponseBytes)),
+			).then(
+				response => writeLine({ id: request.id, ...response }),
 				(error: unknown) => {
-					if (!signal.aborted) logger.error("auth-gateway stdio request failed", { error: String(error) });
-					return send({
+					const limited = error instanceof AuthGatewayStdioResponseLimitError;
+					if (!signal.aborted && !limited) {
+						logger.error("auth-gateway stdio request failed", { error: String(error) });
+					}
+					return writeLine({
 						id: request.id,
-						status: signal.aborted ? 499 : 500,
+						status: signal.aborted ? 499 : limited ? 502 : 500,
 						body: {
 							error: {
-								message: signal.aborted ? "request aborted" : "internal error",
-								type: signal.aborted ? "request_aborted" : "server_error",
+								message: signal.aborted ? "request aborted" : limited ? error.message : "internal error",
+								type: signal.aborted ? "request_aborted" : limited ? "response_limit_error" : "server_error",
 							},
 						},
 					});
@@ -89,18 +129,28 @@ export async function serveAuthGatewayStdio(opts: AuthGatewayStdioOptions): Prom
 				() => inFlight.delete(answered),
 				error => {
 					inFlight.delete(answered);
-					writeFailure ??= error;
-					controller.abort(error);
+					failWrite(error);
 				},
 			);
+			if (inFlight.size >= maxConcurrentRequests) {
+				try {
+					await untilAborted(signal, () => Promise.race(inFlight));
+				} catch (error) {
+					if (!signal.aborted) throw error;
+					break;
+				}
+			}
 		}
 	} catch (error) {
 		controller.abort(error);
 		throw error;
 	} finally {
+		if (signal.aborted && !opts.input.locked) {
+			void opts.input.cancel(signal.reason).catch(() => {});
+		}
 		await Promise.allSettled(inFlight);
 	}
-	if (writeFailure !== undefined) throw writeFailure;
+	if (writeFailed) throw writeFailure;
 }
 
 /** A request line as a `Request`, or why it isn't one (with its `id` when it had a usable one). */
@@ -138,10 +188,73 @@ function parseRequest(
 	}
 }
 
+export class AuthGatewayStdioResponseLimitError extends Error {
+	constructor(readonly maxBytes: number) {
+		super(`Response exceeds the ${maxBytes} byte stdio limit`);
+		this.name = "AuthGatewayStdioResponseLimitError";
+	}
+}
+
+function validateResponseLimit(maxBytes: number): void {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+		throw new RangeError("maxResponseBytes must be a non-negative safe integer");
+	}
+}
+
+/** Reads actual streamed bytes, cancelling and releasing the source on failure. */
+export async function readAuthGatewayStdioBody(
+	response: Response,
+	signal?: AbortSignal,
+	maxBytes = 16 * 1024 * 1024,
+): Promise<Uint8Array> {
+	validateResponseLimit(maxBytes);
+	if (!response.body) {
+		signal?.throwIfAborted();
+		return new Uint8Array(0);
+	}
+	const reader = response.body.getReader();
+	const buffer = new ConcatSink();
+	let size = 0;
+	let cancelled = false;
+	const cancel = (reason?: unknown) => {
+		if (cancelled) return;
+		cancelled = true;
+		void reader.cancel(reason).catch(() => {});
+	};
+	const onAbort = () => cancel(signal?.reason);
+	signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		for (;;) {
+			signal?.throwIfAborted();
+			const { done, value } = await untilAborted(signal, () => reader.read());
+			signal?.throwIfAborted();
+			if (done) {
+				return buffer.flush() ?? new Uint8Array(0);
+			}
+			if (value.byteLength > maxBytes - size) {
+				throw new AuthGatewayStdioResponseLimitError(maxBytes);
+			}
+			size += value.byteLength;
+			buffer.append(value);
+		}
+	} catch (error) {
+		const failure = signal?.aborted ? signal.reason : error;
+		cancel(failure);
+		throw failure;
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+		reader.releaseLock();
+	}
+}
+
 /** A whole response as a line's `status`/`body`/`encoding`. */
-async function readResponse(response: Response): Promise<Omit<StdioResponse, "id">> {
+async function readResponse(
+	response: Response,
+	signal: AbortSignal,
+	maxBytes: number,
+): Promise<Omit<StdioResponse, "id">> {
 	const type = response.headers.get("content-type") ?? "";
-	const bytes = new Uint8Array(await response.arrayBuffer());
+	const bytes = await readAuthGatewayStdioBody(response, signal, maxBytes);
 	if (bytes.length === 0) return { status: response.status, body: null };
 	if (type.includes("json")) {
 		const text = new TextDecoder().decode(bytes);
