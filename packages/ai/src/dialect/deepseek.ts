@@ -128,7 +128,8 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	#dsmlParamName = "";
 	#dsmlParamIsString = true;
 	#dsmlParamRaw = "";
-	#dsmlSectionOpen = "";
+	/** Wrapper text is retained until its first invoke completes or the section remains prose. */
+	#pendingDsmlSection: string | undefined;
 	#rawBlock = "";
 	#stripLeadingWhitespace = false;
 	/**
@@ -196,8 +197,14 @@ export class DeepSeekInbandScanner implements InbandScanner {
 		}
 		if (final && this.#state === "thinking") this.#endThinking(events);
 		if (final && (this.#state === "dsmlInvoke" || this.#state === "dsmlParam") && this.#rawBlock.length > 0) {
-			this.#emitText(this.#dsmlSectionOpen + this.#rawBlock, events);
+			this.#emitText((this.#pendingDsmlSection ?? "") + this.#rawBlock, events);
 			this.#resetDsmlTool();
+			this.#state = "outside";
+		}
+		if (final && this.#pendingDsmlSection !== undefined) {
+			this.#emitText(this.#pendingDsmlSection + this.#buffer, events);
+			this.#pendingDsmlSection = undefined;
+			this.#buffer = "";
 			this.#state = "outside";
 		}
 		if (final && this.#buffer.length === 0 && this.#rawBlock.length > 0) this.#rawBlock = "";
@@ -255,7 +262,7 @@ export class DeepSeekInbandScanner implements InbandScanner {
 					? DSML_TOOL_CALLS_OPEN_FULLWIDTH
 					: DSML_TOOL_CALLS_OPEN_ASCII;
 				this.#buffer = this.#buffer.slice(openToken.length);
-				this.#dsmlSectionOpen = openToken;
+				this.#pendingDsmlSection = openToken;
 				this.#state = "dsmlSection";
 				return;
 			}
@@ -390,16 +397,29 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	}
 
 	#consumeDsmlSection(final: boolean, events: InbandScanEvent[]): boolean {
+		const initial = this.#buffer;
 		while (this.#buffer.length > 0) {
 			this.#skipWhitespace();
 			const close = this.#matchingDsmlClose(DSML_TOOL_CALLS_CLOSE_FULLWIDTH, DSML_TOOL_CALLS_CLOSE_ASCII);
 			if (close) {
+				if (this.#pendingDsmlSection !== undefined) {
+					this.#emitText(
+						this.#pendingDsmlSection + initial.slice(0, initial.length - this.#buffer.length) + close,
+						events,
+					);
+					this.#pendingDsmlSection = undefined;
+				}
 				this.#buffer = this.#buffer.slice(close.length);
+				this.#bareDsmlOpenVisible = false;
+				this.#visibleTail = "";
 				this.#state = "outside";
 				return true;
 			}
 			const invoke = this.#matchDsmlOpen("invoke");
 			if (invoke) {
+				if (this.#pendingDsmlSection !== undefined) {
+					this.#pendingDsmlSection += initial.slice(0, initial.length - this.#buffer.length - invoke.raw.length);
+				}
 				this.#rawBlock = invoke.raw;
 				this.#name = invoke.name;
 				this.#id = mintToolCallId();
@@ -413,14 +433,14 @@ export class DeepSeekInbandScanner implements InbandScanner {
 					(this.#buffer.startsWith("<｜DSML｜invoke") || this.#buffer.startsWith("<|DSML|invoke")) &&
 					!this.#buffer.includes(">")
 				)
-					return false;
-				if (partialSuffixOverlapAny(this.#buffer, DSML_SECTION_TOKENS) === this.#buffer.length) return false;
+					break;
+				if (partialSuffixOverlapAny(this.#buffer, DSML_SECTION_TOKENS) === this.#buffer.length) break;
 			}
-			if (this.#buffer.length === 0) return false;
-			this.#emitText(this.#dsmlSectionOpen, events);
-			this.#bareDsmlOpenVisible = true;
-			this.#state = "outside";
-			return true;
+			if (this.#buffer.length === 0) break;
+			this.#buffer = this.#buffer.slice(1);
+		}
+		if (this.#pendingDsmlSection !== undefined) {
+			this.#pendingDsmlSection += initial.slice(0, initial.length - this.#buffer.length);
 		}
 		return final;
 	}
@@ -429,6 +449,7 @@ export class DeepSeekInbandScanner implements InbandScanner {
 		while (this.#buffer.length > 0) {
 			const skipped = this.#skipWhitespace();
 			if (skipped.length > 0) this.#rawBlock += skipped;
+			if (this.#buffer.length === 0) break;
 			const close = this.#matchingDsmlClose("</｜DSML｜invoke>", "</|DSML|invoke>");
 			if (close) {
 				this.#rawBlock += close;
@@ -596,6 +617,7 @@ export class DeepSeekInbandScanner implements InbandScanner {
 		this.#dsmlParamIsString = true;
 		this.#dsmlParamRaw = "";
 		this.#rawBlock = "";
+		this.#pendingDsmlSection = undefined;
 	}
 }
 

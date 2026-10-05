@@ -6700,7 +6700,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	async #promptCoreforgeReport(tool: string, report: string): Promise<boolean | null> {
 		const summary = truncateToWidth(report.replace(/\s+/g, " ").trim(), 120);
-		const choice = await this.showHookSelector(
+		const choice = await this.#extensionUiController.showCollabAwareSelector(
 			`Tool issue detected: ${tool}\nPrepare Coreforge /report with this failure?\n${summary}\nNothing is filed until you approve the issue draft.`,
 			["Prepare /report", "Dismiss"],
 		);
@@ -6724,8 +6724,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
-	 * Ask the user to approve one `cfg://` settings change. Dismissing the dialog denies it;
-	 * leaving it unanswered for {@link CFG_APPROVAL_TIMEOUT_MS} (any keypress restarts the
+	 * Ask the user to approve one `cfg://` settings change; writable `/collab` guests get the
+	 * same prompt and the first answer wins. Dismissing the dialog denies it; leaving it
+	 * unanswered for {@link CFG_APPROVAL_TIMEOUT_MS} (any host keypress restarts the
 	 * countdown) drops it as `timeout`.
 	 */
 	async #promptCfgChange(request: CfgChangeRequest): Promise<CfgApproval> {
@@ -6738,7 +6739,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				? `\nOverridden by ${request.shadowedBy}: the saved value will not take effect here.`
 				: "";
 		let timedOut = false;
-		const choice = await this.showHookSelector(
+		const choice = await this.#extensionUiController.showCollabAwareSelector(
 			`${headline}\n${request.previous} → ${request.value}${warning}`,
 			[CFG_APPROVE_SESSION, CFG_APPROVE_ONCE, CFG_DENY],
 			{
@@ -7899,8 +7900,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showModelSelector(options);
 	}
 
-	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void> {
-		return this.#selectorController.switchSessionModel(model, thinkingLevel);
+	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, role?: string): Promise<void> {
+		return this.#selectorController.switchSessionModel(model, thinkingLevel, role);
 	}
 
 	showPluginSelector(mode?: "install" | "uninstall"): void {

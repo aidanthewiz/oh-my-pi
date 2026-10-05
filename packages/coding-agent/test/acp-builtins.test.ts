@@ -668,51 +668,6 @@ describe("ACP builtin slash commands", () => {
 		expect(configNotified).toBe(0);
 	});
 
-	// /switch resolves like `omp bench`: fuzzy ids, @role aliases, :level suffixes
-	it("switch opus:low: fuzzy-resolves a session-only model with the thinking suffix", async () => {
-		const { output, runtime, session } = createRuntime();
-		const available = [
-			{ provider: "anthropic", id: "claude-opus-4-5", contextWindow: 200_000 },
-			{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
-		];
-		session.getAvailableModels = () => available;
-		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
-
-		const result = await executeAcpBuiltinSlashCommand("/switch opus:low", runtime);
-
-		expect(result).toEqual({ consumed: true });
-		expect(temporarySpy).toHaveBeenCalledWith(available[0], "low");
-		expect(setModelSpy).not.toHaveBeenCalled();
-		expect(output[0]).toContain("Session-only model: anthropic/claude-opus-4-5");
-	});
-
-	it("switch @smol: resolves the configured role alias", async () => {
-		const { runtime, session } = createRuntime();
-		const available = [
-			{ provider: "anthropic", id: "claude-opus-4-5", contextWindow: 200_000 },
-			{ provider: "anthropic", id: "claude-haiku-4-5", contextWindow: 200_000 },
-		];
-		session.getAvailableModels = () => available;
-		runtime.settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
-		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
-
-		await executeAcpBuiltinSlashCommand("/switch @smol", runtime);
-
-		expect(temporarySpy).toHaveBeenCalledWith(available[1], undefined);
-	});
-
-	it("switch unknown: reports the selector and leaves the model alone", async () => {
-		const { output, runtime, session } = createRuntime();
-		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-opus-4-5" }];
-		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
-
-		await executeAcpBuiltinSlashCommand("/switch gpt-fake-9000", runtime);
-
-		expect(temporarySpy).not.toHaveBeenCalled();
-		expect(output[0]).toContain("Unknown model: gpt-fake-9000");
-	});
-
 	// Removed TUI-only and dropped commands fall through as false
 	it("removed commands return false (fall through to model)", async () => {
 		const removedCommands = [

@@ -14,7 +14,8 @@ import type { AssistantMessage, Model } from "../types";
 
 // Structural DSML tags in either pipe spelling (fullwidth `｜` U+FF5C or ASCII),
 // tolerating stray whitespace inside the delimiter run.
-const DSML_TAG_PATTERN = /<\s*(\/?)\s*[｜|]\s*DSML\s*[｜|]\s*(tool_calls|invoke|parameter)\b[^<>]*>?/gu;
+const DSML_TAG_PATTERN =
+	/<\s*(\/?)\s*[｜|]\s*DSML\s*[｜|]\s*(tool_calls|invoke|parameter)\b[^<>\r\n]*(?:\r?\n(?![ \t]*\r?\n)[^<>\r\n]*)*>?/gu;
 // Code the model deliberately quoted (fences, inline spans) is not a leak.
 const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|`[^`\n]*`/g;
 // The identifier-only line a degraded model writes in place of

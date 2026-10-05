@@ -549,7 +549,11 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
 			if (!resolved.model) return usage(`Unknown model: ${selector}`, runtime);
 			try {
-				await runtime.session.setModelTemporary(resolved.model, resolved.thinkingLevel);
+				await runtime.session.setModelTemporary(
+					resolved.model,
+					resolved.thinkingLevel,
+					resolved.configuredRole ? { role: resolved.configuredRole } : undefined,
+				);
 				await runtime.output(`Session-only model: ${formatModelString(resolved.model)}.`);
 				await runtime.notifyTitleChanged?.();
 				await runtime.notifyConfigChanged?.();
@@ -571,7 +575,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (resolved.warning) runtime.ctx.showStatus(resolved.warning);
-			await runtime.ctx.switchSessionModel(resolved.model, resolved.thinkingLevel);
+			await runtime.ctx.switchSessionModel(resolved.model, resolved.thinkingLevel, resolved.configuredRole);
 		},
 	},
 	{

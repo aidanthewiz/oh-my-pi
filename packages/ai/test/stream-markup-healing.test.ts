@@ -468,6 +468,135 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		expect(after.text).toBe("\nAfter");
 	});
 
+	it("keeps quoted prose after an unclosed wrapper with no invoke", () => {
+		const input =
+			"之前这些源的完整 `<｜DSML｜tool_calls>` 信封显示为纯文本，工具从不执行。\n\n## Next section\nmore text";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < input.length; i += 7) visible += healing.feed(input.slice(i, i + 7));
+		visible += healing.flushPending();
+		expect(visible).toBe(input);
+		expect(stripDsmlToolMarkup(visible)).toBeUndefined();
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("passes an unclosed, unquoted wrapper to leak recovery without losing later prose", () => {
+		const input = "Intro. <|DSML|tool_calls>broken call\n\nThe build passed.";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < input.length; i += 5) visible += healing.feed(input.slice(i, i + 5));
+		visible += healing.flushPending();
+		expect(visible).toBe(input);
+		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nThe build passed.");
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("passes a closed wrapper without an invoke to leak recovery", () => {
+		const input = "Intro.<|DSML|tool_calls>broken</|DSML|tool_calls>Outro.";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < input.length; i += 6) visible += healing.feed(input.slice(i, i + 6));
+		visible += healing.flushPending();
+		expect(visible).toBe(input);
+		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nOutro.");
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("keeps a closed wrapper example quoted in a code fence", () => {
+		const input = "Before.\n```xml\n<|DSML|tool_calls>example</|DSML|tool_calls>\n```\nAfter.";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (const char of input) visible += healing.feed(char);
+		visible += healing.flushPending();
+		expect(visible).toBe(input);
+		expect(stripDsmlToolMarkup(visible)).toBeUndefined();
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("retains a long wrapper-only stream exactly through final flush", () => {
+		const input = `Before.<|DSML|tool_calls>${"wrapper prose ".repeat(8192)}\n\nAfter.`;
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let index = 0; index < input.length; index += 1024) {
+			visible += healing.feed(input.slice(index, index + 1024));
+		}
+		visible += healing.flushPending();
+		expect(visible).toBe(input);
+		expect(stripDsmlToolMarkup(visible)).toBe("Before.\n\nAfter.");
+		expect(healing.drainCompleted()).toEqual([]);
+		expect(healing.flushPending()).toBe("");
+	});
+
+	it("retains exact incomplete invoke and parameter fragments without executing them", () => {
+		for (const pipe of ["|", "｜"]) {
+			const tag = `<${pipe}DSML${pipe}`;
+			for (const fragment of [
+				`${tag}invoke name="read`,
+				`${tag}invoke name="read"> \r\n  `,
+				`${tag}invoke name="read">${tag}parameter name="path`,
+				`${tag}invoke name="read">${tag}parameter name="path">fixture.txt`,
+			]) {
+				const input = `Before.\n${tag}tool_calls>\r\n ${fragment}`;
+				for (const chunkSize of [1, 7, input.length]) {
+					const healing = new StreamMarkupHealing({ pattern: "dsml" });
+					let visible = "";
+					for (let index = 0; index < input.length; index += chunkSize) {
+						visible += healing.feed(input.slice(index, index + chunkSize));
+					}
+					visible += healing.flushPending();
+					expect(visible).toBe(input);
+					expect(stripDsmlToolMarkup(visible)).toBe("Before.");
+					expect(healing.drainCompleted()).toEqual([]);
+					expect(healing.flushPending()).toBe("");
+				}
+			}
+		}
+	});
+
+	it("preserves following prose after an unfinished multiline call header", () => {
+		for (const pipe of ["|", "｜"]) {
+			const tag = `<${pipe}DSML${pipe}`;
+			for (const newline of ["\n", "\r\n"]) {
+				for (const header of [`invoke name="read`, `parameter${newline} name="path`]) {
+					const input = `Before.${tag}tool_calls>${tag}${header}${newline}${newline}After.`;
+					for (const chunkSize of [1, 7, input.length]) {
+						const healing = new StreamMarkupHealing({ pattern: "dsml" });
+						let visible = "";
+						for (let index = 0; index < input.length; index += chunkSize) {
+							visible += healing.feed(input.slice(index, index + chunkSize));
+						}
+						visible += healing.flushPending();
+						expect(stripDsmlToolMarkup(visible)).toBe("Before.\n\nAfter.");
+						expect(healing.drainCompleted()).toEqual([]);
+					}
+				}
+			}
+		}
+	});
+
+	it("removes complete multiline call headers without consuming following prose", () => {
+		const leaked =
+			'Before.<|DSML|tool_calls><|DSML|invoke\n name="read"><|DSML|parameter\r\n name="path">fixture.txt' +
+			"</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>After.";
+		expect(stripDsmlToolMarkup(leaked)).toBe("Before.\n\nAfter.");
+	});
+
+	it("keeps recovery separate from a completed call earlier in the same wrapper", () => {
+		const input =
+			"Before.<|DSML|tool_calls>" +
+			'<|DSML|invoke name="read"><|DSML|parameter name="path">fixture.txt</|DSML|parameter></|DSML|invoke>' +
+			'<|DSML|invoke name="bash"><|DSML|parameter name="command">echo hi\n\nAfter.';
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (const char of input) visible += healing.feed(char);
+		visible += healing.flushPending();
+		expect(stripDsmlToolMarkup(visible)).toBe("Before.\n\nAfter.");
+		const calls = healing.drainCompleted();
+		expect(calls.map(call => ({ name: call.name, arguments: JSON.parse(call.arguments) }))).toEqual([
+			{ name: "read", arguments: { path: "fixture.txt" } },
+		]);
+	});
+
 	it("does not execute an incomplete call and retains its failed-call recovery boundary", () => {
 		const healing = new StreamMarkupHealing({ pattern: "dsml" });
 		const truncated = REPORTED_DSML_LEAK.slice(0, REPORTED_DSML_LEAK.length - 30);

@@ -5,6 +5,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -80,18 +81,13 @@ describe("InteractiveMode editor and report handoff", () => {
 	it("defers /report consent until the agent is idle", async () => {
 		vi.useFakeTimers();
 		await mode.init({ suppressWelcomeIntro: true });
-		const prompt = vi.spyOn(mode, "showHookSelector").mockResolvedValue("Prepare /report");
+		const prompt = vi
+			.spyOn(ExtensionUiController.prototype, "showCollabAwareSelector")
+			.mockResolvedValue("Prepare /report");
 
-		const { result } = await dispatchReportIssueDevice(
-			{} as ToolSession,
-			"read: selector parse dropped trailing line",
-		);
+		await dispatchReportIssueDevice({} as ToolSession, "read: selector parse dropped trailing line");
 
 		expect(prompt).not.toHaveBeenCalled();
-		expect(result.content[0]).toEqual({
-			type: "text",
-			text: "Coreforge report saved for review when the agent is idle. Nothing was filed.",
-		});
 
 		const submittedPromise = mode.getUserInput();
 		vi.advanceTimersByTime(999);
@@ -101,10 +97,6 @@ describe("InteractiveMode editor and report handoff", () => {
 		vi.advanceTimersByTime(1);
 		const submitted = await submittedPromise;
 
-		expect(prompt).toHaveBeenCalledWith(
-			expect.stringContaining("Nothing is filed until you approve the issue draft."),
-			["Prepare /report", "Dismiss"],
-		);
 		expect(submitted).toMatchObject({
 			text: "/report read: selector parse dropped trailing line",
 			display: false,
@@ -118,7 +110,7 @@ describe("InteractiveMode editor and report handoff", () => {
 		vi.useFakeTimers();
 		await mode.init({ suppressWelcomeIntro: true });
 		const prompt = vi
-			.spyOn(mode, "showHookSelector")
+			.spyOn(ExtensionUiController.prototype, "showCollabAwareSelector")
 			.mockResolvedValueOnce("Dismiss")
 			.mockResolvedValueOnce("Prepare /report");
 

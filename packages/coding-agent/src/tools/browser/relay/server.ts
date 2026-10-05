@@ -10,6 +10,7 @@
  * Binds loopback only. Every endpoint that can inspect or drive browser state
  * requires the machine-local shared secret.
  */
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { RelayBridge } from "./bridge";
 
 /** Options for {@link startRelayServer}. */
@@ -28,6 +29,8 @@ function authorized(url: URL, token: string): boolean {
 
 /** Body of the 503 `/json/version` answer while no extension is connected. */
 export interface RelayUnavailableInfo {
+	/** Version of the OMP binary serving this relay. */
+	ompRelayVersion: string;
 	error: string;
 	/** An extension completed the hello handshake at least once in this server's lifetime. */
 	extensionSeen: boolean;
@@ -111,6 +114,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 			if (path === "/json/version") {
 				if (!bridge.ready) {
 					const info: RelayUnavailableInfo = {
+						ompRelayVersion: VERSION,
 						error: "relay extension is not connected",
 						extensionSeen: bridge.extensionSeen,
 						uptimeMs: Date.now() - startedAt,

@@ -127,8 +127,9 @@ export class StreamMarkupHealing {
 
 	/**
 	 * Flush held-back stream-end fragments as ordered events. Incomplete DSML
-	 * calls remain text for recovery; other partial tool-call envelopes are dropped.
-	 * Unterminated thinking blocks remain thinking.
+	 * calls and wrappers without an invoke remain text for agent-layer recovery;
+	 * other partial tool-call envelopes are dropped. Unterminated thinking blocks
+	 * remain thinking.
 	 */
 	flushEvents(): StreamMarkupHealingEvent[] {
 		const tail = this.#toolScanner ? this.#healThinking(this.#toolScanner.flush()) : [];

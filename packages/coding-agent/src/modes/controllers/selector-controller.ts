@@ -641,12 +641,12 @@ export class SelectorController {
 	 * the target's context window, mirroring an over-context pick in the alt+p
 	 * picker. Failures surface as status errors.
 	 */
-	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void> {
+	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, role?: string): Promise<void> {
 		const contextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		const contextWindow = model.contextWindow ?? 0;
 		const overContext = contextWindow > 0 && contextTokens > contextWindow;
 		try {
-			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext);
+			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext, role);
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -666,10 +666,11 @@ export class SelectorController {
 		selector: string,
 		thinkingLevel: ConfiguredThinkingLevel | undefined,
 		compactFirst: boolean,
+		role?: string,
 	): Promise<void> {
 		const apply = async () => {
 			const level = thinkingLevel ?? this.ctx.session.resolveTemporaryModelThinkingLevel(model);
-			await this.ctx.session.setModelTemporary(model, level);
+			await this.ctx.session.setModelTemporary(model, level, role ? { role } : undefined);
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");

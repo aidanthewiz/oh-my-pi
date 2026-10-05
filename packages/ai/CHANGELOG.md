@@ -13,6 +13,13 @@
 - Allowed OAuth clients to brand the local callback completion page while preserving the existing oh my pi page by default.
 - Rejected malformed Regions and noncanonical Bedrock Mantle endpoints before bearer or SigV4 credentials can be attached.
 - Kept Anthropic fallback-credit tokens and frozen request bodies on official API-key routes when retry models change endpoint.
+## [18.6.1] - 2026-10-04
+
+### Fixed
+
+- Fixed compatibility with Command Code DeepSeek and other DeepSeek-family models by preserving the reasoning context required for warm OpenAI Responses sessions and correctly handling incomplete DSML tool-call wrappers in visible output.
+- Fixed unfinished DSML headers consuming prose after a blank line while preserving complete multiline attributes.
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed
