@@ -21,8 +21,8 @@ import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import type { AuthStorage } from "../session/auth-storage";
 import type { ToolSession } from "../tools";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
-import { probeLiteralPathExists, splitDelimitedPathEntry } from "../tools/path-utils";
-import { ReadTool, splitImageQuestionTarget } from "../tools/read";
+import { splitDelimitedPathEntry } from "../tools/path-utils";
+import { ownsReadQuery, ReadTool, splitImageQuestionTarget } from "../tools/read";
 import { renderError } from "../tools/tool-errors";
 
 import { cfgDisabledExtensions, cfgExtensions, cfgSkills } from "../extensibility/settings";
@@ -100,15 +100,19 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			MCPManager.setInstance(mcpManager);
 		}
 
-		// `read <image>?q=<question>` delegates to a vision model, which needs a
-		// model registry to resolve modelRoles.vision / @default and fetch its
-		// credentials. The lightweight session above omits it (plain reads never
-		// touch a model), so build one on demand — otherwise the tool aborts with
-		// "Model registry is unavailable for image questions." before resolving
-		// anything (issue #11338).
-		const imageQuestion = splitImageQuestionTarget(cmd.path);
-		const questionPaths = imageQuestion.question ? await splitDelimitedPathEntry(cmd.path, cwd) : null;
-		if (imageQuestion.question && (await probeLiteralPathExists(questionPaths?.[0] ?? cmd.path, cwd)) !== "exists") {
+		let needsVisionModel = false;
+		if (cmd.path.includes("?")) {
+			const readPaths = (await splitDelimitedPathEntry(cmd.path, cwd, {
+				queryOwner: entry => ownsReadQuery(entry, cwd),
+			})) ?? [cmd.path];
+			for (const entry of readPaths) {
+				if (splitImageQuestionTarget(entry).question !== undefined && (await ownsReadQuery(entry, cwd))) {
+					needsVisionModel = true;
+					break;
+				}
+			}
+		}
+		if (needsVisionModel) {
 			authStorage ??= await discoverAuthStorage(undefined, { settings });
 			const modelRegistry = new ModelRegistry(authStorage);
 			await modelRegistry.hydrateCredentialScopedModelCaches();

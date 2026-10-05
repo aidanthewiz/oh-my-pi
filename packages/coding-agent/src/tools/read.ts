@@ -681,6 +681,21 @@ export function splitImageQuestionTarget(readPath: string): { path: string; ques
 	return question ? { path: readPath.slice(0, queryIndex), question } : { path: readPath };
 }
 
+export async function ownsReadQuery(readPath: string, cwd: string): Promise<boolean> {
+	const queryIndex = readPath.indexOf("?");
+	if (queryIndex === -1) return false;
+	if (
+		!parseSqlitePathCandidates(readPath).some(
+			candidate => candidate.sqlitePath.length <= queryIndex && candidate.queryString.length > 0,
+		) &&
+		splitImageQuestionTarget(readPath).question === undefined
+	) {
+		return false;
+	}
+	const literalParts = await splitDelimitedPathEntry(readPath, cwd);
+	return (await probeLiteralPathExists(literalParts?.[0] ?? readPath, cwd)) !== "exists";
+}
+
 // Maximum image file size (20MB) - larger images will be rejected to prevent OOM during serialization
 const MAX_IMAGE_SIZE = MAX_IMAGE_INPUT_BYTES;
 
@@ -1043,21 +1058,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			: undefined;
 	}
 
-	async #ownsQuery(readPath: string): Promise<boolean> {
-		const queryIndex = readPath.indexOf("?");
-		if (queryIndex === -1) return false;
-		if (
-			!parseSqlitePathCandidates(readPath).some(
-				candidate => candidate.sqlitePath.length <= queryIndex && candidate.queryString.length > 0,
-			) &&
-			splitImageQuestionTarget(readPath).question === undefined
-		) {
-			return false;
-		}
-		const literalParts = await splitDelimitedPathEntry(readPath, this.session.cwd);
-		return (await probeLiteralPathExists(literalParts?.[0] ?? readPath, this.session.cwd)) !== "exists";
-	}
-
 	async #tryReadDelimitedPaths(
 		readPath: string,
 		signal?: AbortSignal,
@@ -1065,7 +1065,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	): Promise<AgentToolResult<ReadToolDetails> | null> {
 		const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, {
 			routedUrlPredicate,
-			queryOwner: entry => this.#ownsQuery(entry),
+			queryOwner: entry => ownsReadQuery(entry, this.session.cwd),
 		});
 		return parts ? this.#readDelimitedParts(parts, signal) : null;
 	}
@@ -1588,14 +1588,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			readPath,
 			this.session.cwd,
 			part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
-			entry => this.#ownsQuery(entry),
+			entry => ownsReadQuery(entry, this.session.cwd),
 		);
 		if (mixedParts) return this.#readDelimitedParts(mixedParts, signal);
 		const literalQueryPath =
 			readPath.includes("?") &&
 			parseReadUrlTarget(readPath) === null &&
 			!InternalUrlRouter.instance().canResolve(readPath) &&
-			!(await this.#ownsQuery(readPath));
+			!(await ownsReadQuery(readPath, this.session.cwd));
 		if (literalQueryPath) {
 			const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
 			if (delimitedResult) return delimitedResult;

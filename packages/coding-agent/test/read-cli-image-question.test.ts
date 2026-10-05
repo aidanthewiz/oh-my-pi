@@ -62,7 +62,7 @@ describe("read CLI query ownership", () => {
 		}
 	}, 60_000);
 
-	it("keeps URL-looking image question text inside one real vision request", async () => {
+	it("answers scalar and later-listed image questions without fetching caption URLs", async () => {
 		using tempDir = TempDir.createSync("@pi-read-cli-imgq-");
 		const fixture = createFixture(tempDir);
 		const requests: string[] = [];
@@ -71,10 +71,23 @@ describe("read CLI query ownership", () => {
 			port: 0,
 			fetch(request) {
 				requests.push(new URL(request.url).pathname);
-				return Response.json(
-					{ error: { message: "synthetic request rejection", type: "invalid_request_error" } },
-					{ status: 400 },
-				);
+				const sse =
+					`data: ${JSON.stringify({
+						id: "vision-test",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: "vmodel",
+						choices: [{ index: 0, delta: { role: "assistant", content: "synthetic vision answer" } }],
+					})}\n\n` +
+					`data: ${JSON.stringify({
+						id: "vision-test",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: "vmodel",
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					})}\n\n` +
+					"data: [DONE]\n\n";
+				return new Response(sse, { headers: { "content-type": "text/event-stream" } });
 			},
 		});
 		try {
@@ -102,11 +115,22 @@ describe("read CLI query ownership", () => {
           cacheWrite: 0
 `,
 			);
-			const pngPath = path.join(fixture.project, "test.png");
-			fs.writeFileSync(pngPath, Buffer.from(PNG_1X1, "base64"));
-			const result = await runRead(fixture, `${pngPath}?q=look;${server.url.origin}/unexpected.sqlite?q=other`);
-			expect(requests, result.output).toEqual(["/v1/chat/completions"]);
-			expect(result.exitCode).not.toBe(0);
+			for (const name of ["cat.png", "dog.png"]) {
+				fs.writeFileSync(path.join(fixture.project, name), Buffer.from(PNG_1X1, "base64"));
+			}
+			fs.writeFileSync(path.join(fixture.project, "notes?q=literal"), "literal question filename contents\n");
+			for (const target of [
+				`dog.png?q=look;${server.url.origin}/unexpected.sqlite?q=other`,
+				"cat.png;dog.png?q=What is shown",
+				"notes?q=literal;dog.png?q=What is shown",
+			]) {
+				requests.length = 0;
+				const result = await runRead(fixture, target);
+				expect(requests, result.output).toEqual(["/v1/chat/completions"]);
+				expect(result.exitCode, result.output).toBe(0);
+				expect(result.output).toContain("synthetic vision answer");
+				if (target.startsWith("notes")) expect(result.output).toContain("literal question filename contents");
+			}
 		} finally {
 			await server.stop(true);
 		}

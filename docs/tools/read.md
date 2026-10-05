@@ -63,6 +63,8 @@ Validated comma or whitespace lists, including `Makefile:1-1, README:1-1`, recov
 
 Only specialized readers own local query suffixes. Existing literal filenames containing `?key=value` retain precedence, including in path lists. The CLI does not load vision credentials for those literal paths.
 
+The CLI applies the same ownership rules to every list entry. `omp read 'cat.png;dog.png?q=What is shown'` loads vision support for `dog.png` even when `cat.png` exists.
+
 ## Outputs
 
 - Single-shot `AgentToolResult` built through `toolResult()` in `packages/coding-agent/src/tools/tool-result.ts`.
