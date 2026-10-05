@@ -7,6 +7,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { Database } from "bun:sqlite";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 let cwd: string;
 let session: ToolSession;
@@ -23,6 +24,7 @@ beforeAll(async () => {
 	db.run("CREATE TABLE t (name TEXT)");
 	db.run("INSERT INTO t VALUES ('row-one')");
 	db.close();
+	await fs.copyFile(path.join(cwd, "data.sqlite"), path.join(cwd, "data;local.sqlite"));
 	session = {
 		cwd,
 		hasUI: false,
@@ -74,9 +76,71 @@ describe("read with a `;` list mixing URLs and local paths", () => {
 		expect(text).toContain("row-one");
 	});
 
-	it("keeps an image question containing `; …?` whole", async () => {
-		const text = await readText("missing.png?q=is it a cat; or a dog?").catch((error: Error) => error.message);
-		expect(text).not.toContain("interpreted as");
+	it("keeps URL-looking SQL literals inside raw queries without fetching them", async () => {
+		let requests = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				requests++;
+				return new Response("unrequested fetch");
+			},
+		});
+		try {
+			const value = `a;${server.url.origin}/unexpected`;
+			for (const database of ["data.sqlite", "data;local.sqlite"]) {
+				const text = await readText(`${database}?q=SELECT '${value}' AS name`);
+				expect(text).toContain(value);
+			}
+			expect(requests).toBe(0);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("keeps URL-looking values inside SQLite table filters", async () => {
+		let requests = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				requests++;
+				return new Response("unrequested fetch");
+			},
+		});
+		const value = `a;${server.url.origin}/unexpected`;
+		const db = new Database(path.join(cwd, "data.sqlite"));
+		try {
+			db.run("INSERT INTO t VALUES (?)", [value]);
+			const text = await readText(`data.sqlite:t?where=name = '${value}'`);
+			expect(text).toContain(value);
+			expect(text).not.toContain("row-one");
+			expect(requests).toBe(0);
+		} finally {
+			db.run("DELETE FROM t WHERE name = ?", [value]);
+			db.close();
+			await server.stop(true);
+		}
+	});
+
+	it("does not fetch URL-looking text in a missing image's question", async () => {
+		let requests = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				requests++;
+				return new Response("unrequested fetch");
+			},
+		});
+		try {
+			await expect(readText(`missing.png?q=is it a cat; ${server.url.origin}/unexpected?`)).rejects.toBeInstanceOf(
+				ToolError,
+			);
+			expect(requests).toBe(0);
+		} finally {
+			await server.stop(true);
+		}
 	});
 
 	it("reads `a;b.md:1-1` as the literal file even when `a` and `b.md` exist", async () => {

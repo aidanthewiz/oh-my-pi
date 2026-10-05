@@ -59,6 +59,8 @@ Selector parsing intentionally falls through for unrecognized trailing `:...`; a
 URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts`, but use the same line-range parser for `:raw`, `:N`, `:A-B`, `:A+C`, `:5-10,20-30`, and `:range:raw` / `:raw:range`. Because URL ports also use `:`, add a trailing slash before a selector on a host/port URL, e.g. `https://example.com/:80`.
 Literal filesystem paths take precedence over selector interpretation, so an existing POSIX filename that ends in selector-looking text is read literally.
 
+Validated comma or whitespace lists, including `Makefile:1-1, README:1-1`, recover before opaque custom-scheme fallback. Existing literal paths and recognized URL targets retain precedence.
+
 ## Outputs
 
 - Single-shot `AgentToolResult` built through `toolResult()` in `packages/coding-agent/src/tools/tool-result.ts`.
@@ -176,6 +178,7 @@ Literal filesystem paths take precedence over selector interpretation, so an exi
 ### SQLite databases
 
 - Database detection requires both a matching extension and a valid SQLite file header (`isSqliteFile()`).
+- Local `?key=value` suffixes stay atomic during path-list detection. SQL semicolons and URL-looking literals remain query data.
 - Selector forms from `parseSqliteSelector()`:
 
 #### `db.sqlite`
@@ -202,7 +205,7 @@ Literal filesystem paths take precedence over selector interpretation, so an exi
 - Defaults: `limit = 20`, `offset = 0`.
 - `limit` is capped at `500`.
 - `order` accepts `column` or `column:asc|desc` and must name an existing column.
-- `where` is accepted only after `validateWhereClause()` rejects comments, semicolons, and control keywords like `LIMIT`, `OFFSET`, `UNION`, `ATTACH`, `PRAGMA`.
+- `where` is accepted only after `validateWhereClause()` rejects comments, semicolons, and control keywords such as `LIMIT`, `OFFSET`, `UNION`, `ATTACH`, and `PRAGMA`. Quoted text is excluded from those checks.
 - Unknown query parameters throw.
 
 #### `db.sqlite?q=SELECT ...`

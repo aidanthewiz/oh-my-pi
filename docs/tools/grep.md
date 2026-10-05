@@ -34,6 +34,8 @@ Supported internal and external URL lists split before scope resolution. Each ta
 
 Recognized URL starts or existing local filenames after a semicolon take precedence as list boundaries. Percent-encode a URL-owned semicolon as `%3B` when the following text would otherwise identify such a target. Existing literal filenames, escaped delimiters, and brace-enclosed delimiters remain intact.
 
+Validated local comma or whitespace lists, including `Makefile:1-1, README:1-1`, recover before opaque custom-scheme fallback. This recovery does not split candidates containing recognized URL targets.
+
 ## Outputs
 The tool returns a single text block in `content[0].text` plus structured `details`.
 

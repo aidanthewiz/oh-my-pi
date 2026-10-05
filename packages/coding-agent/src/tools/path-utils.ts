@@ -20,6 +20,7 @@ import { ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+const QUERY_START_RE = /^\?[\w.-]*=/;
 
 /** POSIX absolute, Windows drive, or UNC (`\\server\share` / `//server/share`). */
 export function isFilesystemSourcePath(value: string): boolean {
@@ -595,7 +596,11 @@ function hasTopLevelPathDelimiter(entry: string): boolean {
 	return false;
 }
 
-function splitTopLevelDelimitedPath(entry: string, mode: DelimitedPathSplitMode): string[] {
+function splitTopLevelDelimitedPath(
+	entry: string,
+	mode: DelimitedPathSplitMode,
+	isUrl: (part: string) => boolean,
+): string[] {
 	const parts: string[] = [];
 	let braceDepth = 0;
 	let start = 0;
@@ -613,7 +618,16 @@ function splitTopLevelDelimitedPath(entry: string, mode: DelimitedPathSplitMode)
 			if (braceDepth > 0) braceDepth--;
 			continue;
 		}
-		if (braceDepth !== 0 || !isDelimitedPathSeparator(ch, mode)) continue;
+		if (braceDepth !== 0) continue;
+		if (
+			ch === "?" &&
+			QUERY_START_RE.test(entry.slice(i)) &&
+			!isUrl(normalizePathLikeInput(entry.slice(start))) &&
+			!parts.some(part => isUrl(normalizePathLikeInput(part)))
+		) {
+			break;
+		}
+		if (!isDelimitedPathSeparator(ch, mode)) continue;
 		parts.push(entry.slice(start, i));
 		start = i + 1;
 	}
@@ -653,13 +667,16 @@ async function tryDelimitedPathSplit(
 	splitter: PathEntrySplitter,
 	mode: DelimitedPathSplitMode,
 	requirement: DelimitedResolveRequirement,
+	isUrl: (part: string) => boolean,
+	localOnly = false,
 ): Promise<string[] | null> {
-	const rawParts = splitTopLevelDelimitedPath(entry, mode);
+	const rawParts = splitTopLevelDelimitedPath(entry, mode, isUrl);
 	if (rawParts.length < 2) return null;
 
 	const parts = rawParts.map(normalizePathLikeInput).filter(part => part.length > 0);
 	if (parts.length === 0) return null;
 	if (parts.length < 2 && rawParts.length === parts.length) return null;
+	if (localOnly && parts.some(isUrl)) return null;
 
 	if (requirement !== "none") {
 		const resolved = await Promise.all(parts.map(part => delimitedPathPartResolves(part, cwd, splitter)));
@@ -690,7 +707,8 @@ export async function splitDelimitedPathEntry(
 		((part: string) =>
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
 	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isUrl);
-	if (urlParts || isUrl(normalizedEntry) || isInternalUrlPath(normalizedEntry)) return urlParts;
+	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
+	const opaqueUrl = isUrl(normalizedEntry);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
 	// (`a;b:1-2`, `a b:1-2`). Preserve the raw entry whenever the full literal
 	// resolves — or is only ambiguous — so downstream literal-preferring
@@ -707,10 +725,10 @@ export async function splitDelimitedPathEntry(
 	}
 
 	return (
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "comma", "some")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "whitespace", "all")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", "all"))
+		(opaqueUrl ? null : await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none", isUrl)) ??
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "comma", "some", isUrl, opaqueUrl)) ??
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "whitespace", "all", isUrl, opaqueUrl)) ??
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", "all", isUrl, opaqueUrl))
 	);
 }
 
@@ -726,7 +744,7 @@ export async function splitMixedUrlPathList(
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
 	if (!normalizedEntry.includes(";")) return null;
-	const rawParts = splitTopLevelDelimitedPath(normalizedEntry, "semicolon");
+	const rawParts = splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl);
 	if (rawParts.length < 2 || (!isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part)))))
 		return null;
 	if (!isInternalUrlPath(normalizedEntry)) {

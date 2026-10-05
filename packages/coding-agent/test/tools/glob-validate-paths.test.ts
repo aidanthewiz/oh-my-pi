@@ -123,6 +123,12 @@ describe("delimited path expansion", () => {
 		expect(await expandDelimitedPathEntries(["fixture:1;opaque"], tempDir)).toEqual(["fixture:1;opaque"]);
 	});
 
+	it("does not recover local files from commas inside scalar URLs or opaque resources", async () => {
+		for (const input of ["https://example.test/a?q=one, apps/a.txt", "urn:chapter, apps/a.txt"]) {
+			expect(await expandDelimitedPathEntries([input], tempDir)).toEqual([input]);
+		}
+	});
+
 	it("splits a semicolon list whose joined string exceeds NAME_MAX (issue #7597)", async () => {
 		// Bare filenames in one directory form a single slash-free run once joined,
 		// so ~12 short entries already push the run past NAME_MAX (255). lstat on

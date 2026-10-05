@@ -121,6 +121,29 @@ describe("search tools with external URL paths", () => {
 		}
 	});
 
+	it("keeps nested question marks inside URL query data after a local target", async () => {
+		await Bun.write(path.join(testDir, "local.txt"), "needle local\n");
+		const requests: string[] = [];
+		const server = serveTextTargets(
+			{ "/nested?x=1;y=2?z=3": "needle nested query\n", "/other": "needle other target\n" },
+			requests,
+		);
+		try {
+			const base = server.url.origin;
+			const result = await new GrepTool(createSession(testDir)).execute("local-nested-query", {
+				pattern: "needle",
+				path: `local.txt;${base}/nested?x=1;y=2?z=3;${base}/other`,
+			});
+			expect(requests.slice().sort()).toEqual(["/nested?x=1;y=2?z=3", "/other"]);
+			expect(resultText(result)).toContain("needle local");
+			expect(resultText(result)).toContain("needle nested query");
+			expect(resultText(result)).toContain("needle other target");
+			expect(result.details?.matchCount).toBe(3);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
 	it("searches a query URL and a literal semicolon filename with selectors in either order", async () => {
 		await Bun.write(path.join(testDir, "semi;colon.txt"), "needle excluded local\nneedle selected local\n");
 		const requests: string[] = [];

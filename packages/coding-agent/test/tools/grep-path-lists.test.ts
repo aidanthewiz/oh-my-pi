@@ -192,6 +192,39 @@ describe("tool path arrays", () => {
 		}
 	});
 
+	it("recovers local selectors before opaque URI fallback while retaining their ranges", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "local-selector-lists-"));
+		try {
+			await Bun.write(path.join(cwd, "Makefile"), "needle selected make\nneedle excluded make\n");
+			await Bun.write(path.join(cwd, "README"), "needle excluded readme\nneedle selected readme\n");
+			const tools = await createTools(createTestSession(cwd));
+			const tool = tools.find(entry => entry.name === "grep");
+			if (!tool) throw new Error("Missing grep tool");
+
+			for (const entry of ["Makefile:1-1, README:2-2", "Makefile:1-1 README:2-2"]) {
+				const result = await tool.execute("search-extensionless-selectors", { pattern: "needle", path: entry });
+				const text = getText(result);
+				const details = result.details as { matchCount?: number; fileCount?: number } | undefined;
+				expect(text).toContain("needle selected make");
+				expect(text).toContain("needle selected readme");
+				expect(text).not.toContain("needle excluded");
+				expect(details?.matchCount).toBe(2);
+				expect(details?.fileCount).toBe(2);
+			}
+
+			const surviving = await tool.execute("search-extensionless-missing", {
+				pattern: "needle",
+				path: "Makefile:1-1, ABSENT",
+			});
+			expect(getText(surviving)).toContain("needle selected make");
+			const details = surviving.details as { matchCount?: number; fileCount?: number } | undefined;
+			expect(details?.matchCount).toBe(1);
+			expect(details?.fileCount).toBe(1);
+		} finally {
+			await removeWithRetries(cwd);
+		}
+	});
+
 	it("search keeps comma-delimited surviving entries when peers are missing", async () => {
 		const tools = await createTools(createTestSession(tempDir));
 		const tool = tools.find(entry => entry.name === "grep");
