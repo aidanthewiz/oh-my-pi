@@ -44,6 +44,7 @@ import {
 	resolveReadPath,
 	resolveSearchResultPath,
 	resolveToolSearchScope,
+	splitMixedUrlPathList,
 	splitPathAndSelPreferringLiteral,
 } from "./path-utils";
 import { type LineRange, parseLineRanges, selectorLineRanges } from "@oh-my-pi/pi-tui/tools/line-ranges";
@@ -172,7 +173,11 @@ async function parsePathSpecs(rawEntries: readonly string[], cwd: string): Promi
 					`path entry "${entry}" — only line-range selectors like ":50-100" are supported (no ":raw"/":conflicts")`,
 				);
 			}
-			if (hasGlobPathChars(split.path) && (await probeLiteralPathExists(split.path, cwd)) === "missing") {
+			if (
+				hasGlobPathChars(split.path) &&
+				parseReadUrlTarget(split.path) === null &&
+				(await probeLiteralPathExists(split.path, cwd)) === "missing"
+			) {
 				throw new ToolError(`Line-range selector requires a single file, not a glob: ${entry}`);
 			}
 			clean = split.path;
@@ -407,7 +412,16 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			}
 			const scopedPaths = toPathList(rawPath);
 			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
-			const rawEntries = await expandDelimitedPathEntries(effectivePaths, this.session.cwd);
+			const urlSplitEntries: string[] = [];
+			for (const entry of effectivePaths) {
+				const parts = await splitMixedUrlPathList(
+					entry,
+					this.session.cwd,
+					part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
+				);
+				urlSplitEntries.push(...(parts ?? [entry]));
+			}
+			const rawEntries = await expandDelimitedPathEntries(urlSplitEntries, this.session.cwd);
 			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd);
 			const resolveContext = sessionResolveContext(this.session, { signal });
 			// Internal URLs resolve inside the native search, bounded by the tier this call was approved at.

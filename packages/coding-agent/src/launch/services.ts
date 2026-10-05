@@ -11,6 +11,7 @@ import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
+import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -31,19 +32,44 @@ export interface ServiceStart {
 }
 
 const serviceStateKey = Symbol("ownedServices");
-interface ServiceSession extends ToolSession {
-	[serviceStateKey]?: {
-		owned: Map<string, { id: string; startedAt: number }>;
-		listeners: Set<() => void>;
-		subscribed: Set<DaemonBrokerClient>;
-	};
+interface ServiceState {
+	owned: Map<string, { id: string; startedAt: number }>;
+	listeners: Set<() => void>;
+	subscribed: Map<DaemonBrokerClient, () => void>;
+	lifetime: AbortController;
+	disposed: boolean;
 }
-function serviceState(session: ToolSession): NonNullable<ServiceSession[typeof serviceStateKey]> {
-	return ((session as ServiceSession)[serviceStateKey] ??= {
+interface ServiceSession extends ToolSession {
+	[serviceStateKey]?: ServiceState;
+}
+function serviceState(session: ToolSession): ServiceState {
+	const existing = (session as ServiceSession)[serviceStateKey];
+	if (existing) return existing;
+	const state: ServiceState = {
 		owned: new Map(),
 		listeners: new Set(),
-		subscribed: new Set(),
+		subscribed: new Map(),
+		lifetime: new AbortController(),
+		disposed: false,
+	};
+	(session as ServiceSession)[serviceStateKey] = state;
+	const invalidate = (): void => {
+		state.lifetime.abort(new ToolAbortError("Service session is no longer active"));
+		for (const unsubscribe of state.subscribed.values()) unsubscribe();
+		state.subscribed.clear();
+		state.owned.clear();
+		for (const listener of state.listeners) listener();
+	};
+	const unregisterSessionChange = session.registerSessionChangeCallback?.(() => {
+		invalidate();
+		if (!state.disposed) state.lifetime = new AbortController();
 	});
+	session.registerDisposeCallback?.(() => {
+		state.disposed = true;
+		invalidate();
+		if (typeof unregisterSessionChange === "function") unregisterSessionChange();
+	});
+	return state;
 }
 
 export function hasLiveOwnedService(session: ToolSession): boolean {
@@ -76,34 +102,27 @@ function track(session: ToolSession, daemon: DaemonSnapshot): void {
 	else services.set(daemon.name, { id: daemon.id, startedAt: daemon.startedAt });
 }
 
-function subscribe(session: ToolSession, client: DaemonBrokerClient): void {
-	const owner = serviceOwner(session);
-	if (!owner) return;
-	const clients = serviceState(session).subscribed;
-	if (clients.has(client)) return;
-	clients.add(client);
+function subscribe(
+	session: ToolSession,
+	state: ServiceState,
+	client: DaemonBrokerClient,
+	owner: string | null | undefined,
+): void {
+	if (!owner || state.subscribed.has(client)) return;
+	const lifetime = state.lifetime.signal;
 	const unsubscribe = client.onCompletion(owner, notification => {
-		const tracked = serviceState(session).owned.get(notification.daemon.name);
+		throwIfAborted(lifetime);
+		if (session.isDisposed?.() || serviceOwner(session) !== owner)
+			throw new ToolAbortError("Service session is no longer active");
+		const tracked = state.owned.get(notification.daemon.name);
 		if (tracked?.id === notification.daemon.id && tracked.startedAt === notification.daemon.startedAt) {
 			track(session, notification.daemon);
-			for (const listener of serviceState(session).listeners) listener();
+			for (const listener of state.listeners) listener();
 		}
 		return session.queueLaunchCompletion?.(notification);
 	});
-	session.registerDisposeCallback?.(() => {
-		unsubscribe({ preservePending: true });
-		clients.delete(client);
-		serviceState(session).owned.clear();
-		for (const listener of serviceState(session).listeners) listener();
-	});
-	session.registerSessionChangeCallback?.(() => {
-		// The previous session stays resumable (`/resume`, fork parent), so keep its
-		// completions queued in the broker for replay when that session id re-subscribes.
-		unsubscribe({ preservePending: true });
-		clients.delete(client);
-		serviceState(session).owned.clear();
-		for (const listener of serviceState(session).listeners) listener();
-	});
+	// A switched or disposed session remains resumable; retain its broker replay.
+	state.subscribed.set(client, () => unsubscribe({ preservePending: true }));
 }
 
 async function request(
@@ -111,15 +130,34 @@ async function request(
 	operation: DaemonOperation,
 	signal?: AbortSignal,
 ): Promise<DaemonRpcResult> {
-	const client = await daemonClientForProject(session.cwd);
-	subscribe(session, client);
-	const result = await client.request(operation, signal);
-	if (result.op === "list") {
-		const owner = serviceOwner(session);
-		serviceState(session).owned.clear();
-		for (const daemon of result.daemons) if (daemon.owner === owner) track(session, daemon);
-	} else if ("daemon" in result) track(session, result.daemon);
-	return result;
+	throwIfAborted(signal);
+	if (session.isDisposed?.()) throw new ToolAbortError("Service session is no longer active");
+	const state = serviceState(session);
+	const owner = serviceOwner(session);
+	const lifetime = state.lifetime.signal;
+	const requestSignal = signal ? AbortSignal.any([signal, lifetime]) : lifetime;
+	const assertActive = (): void => {
+		throwIfAborted(requestSignal);
+		if (session.isDisposed?.() || serviceOwner(session) !== owner)
+			throw new ToolAbortError("Service session is no longer active");
+	};
+	assertActive();
+	try {
+		const client = await daemonClientForProject(session.cwd);
+		assertActive();
+		subscribe(session, state, client, owner);
+		assertActive();
+		const result = await client.request(operation, requestSignal);
+		assertActive();
+		if (result.op === "list") {
+			state.owned.clear();
+			for (const daemon of result.daemons) if (daemon.owner === owner) track(session, daemon);
+		} else if ("daemon" in result) track(session, result.daemon);
+		return result;
+	} catch (error) {
+		assertActive();
+		throw error;
+	}
 }
 
 export async function listServices(session: ToolSession, signal?: AbortSignal): Promise<DaemonSnapshot[]> {
@@ -141,7 +179,7 @@ export async function listServicesTolerant(
 	try {
 		return { services: await listServices(session, signal) };
 	} catch (error) {
-		if (signal?.aborted) throw error;
+		if (signal?.aborted || error instanceof ToolAbortError) throw error;
 		const message = error instanceof Error ? error.message : String(error);
 		logger.warn("Daemon broker list failed; continuing without service state", { error: message });
 		return { services: [], error: message };

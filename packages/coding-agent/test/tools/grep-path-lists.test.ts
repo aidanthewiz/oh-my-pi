@@ -192,6 +192,78 @@ describe("tool path arrays", () => {
 		}
 	});
 
+	it("searches semicolon lists with query-like literal filenames", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "grep-literal-question-lists-"));
+		const cases = [
+			{ filename: "a?b=c", marker: "needle literal equals" },
+			{ filename: "notes?q=literal", marker: "needle literal q" },
+			{ filename: "data.sqlite?q=SELECT name FROM t", marker: "needle literal sqlite" },
+		];
+		try {
+			await Bun.write(path.join(cwd, "README"), "needle companion\n");
+			await Bun.write(path.join(cwd, "data.sqlite"), "needle excluded database base\n");
+			for (const { filename, marker } of cases) {
+				await Bun.write(path.join(cwd, filename), `${marker}\n`);
+			}
+			const tools = await createTools(createTestSession(cwd));
+			const tool = tools.find(entry => entry.name === "grep");
+			if (!tool) throw new Error("Missing grep tool");
+
+			for (const { filename, marker } of cases) {
+				const result = await tool.execute("search-literal-question-list", {
+					pattern: "needle",
+					path: `${filename};README`,
+				});
+				const text = getText(result);
+				expect(text).toContain(marker);
+				expect(text).toContain("needle companion");
+				expect(text).not.toContain("needle excluded database base");
+				const details = result.details;
+				if (!details || typeof details !== "object") throw new Error("Missing grep details");
+				if (!("matchCount" in details) || !("fileCount" in details)) {
+					throw new Error("Missing grep result counts");
+				}
+				expect(details.matchCount).toBe(2);
+				expect(details.fileCount).toBe(2);
+			}
+		} finally {
+			await removeWithRetries(cwd);
+		}
+	});
+
+	it("recovers local selectors before opaque URI fallback while retaining their ranges", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "local-selector-lists-"));
+		try {
+			await Bun.write(path.join(cwd, "Makefile"), "needle selected make\nneedle excluded make\n");
+			await Bun.write(path.join(cwd, "README"), "needle excluded readme\nneedle selected readme\n");
+			const tools = await createTools(createTestSession(cwd));
+			const tool = tools.find(entry => entry.name === "grep");
+			if (!tool) throw new Error("Missing grep tool");
+
+			for (const entry of ["Makefile:1-1, README:2-2", "Makefile:1-1 README:2-2"]) {
+				const result = await tool.execute("search-extensionless-selectors", { pattern: "needle", path: entry });
+				const text = getText(result);
+				const details = result.details as { matchCount?: number; fileCount?: number } | undefined;
+				expect(text).toContain("needle selected make");
+				expect(text).toContain("needle selected readme");
+				expect(text).not.toContain("needle excluded");
+				expect(details?.matchCount).toBe(2);
+				expect(details?.fileCount).toBe(2);
+			}
+
+			const surviving = await tool.execute("search-extensionless-missing", {
+				pattern: "needle",
+				path: "Makefile:1-1, ABSENT",
+			});
+			expect(getText(surviving)).toContain("needle selected make");
+			const details = surviving.details as { matchCount?: number; fileCount?: number } | undefined;
+			expect(details?.matchCount).toBe(1);
+			expect(details?.fileCount).toBe(1);
+		} finally {
+			await removeWithRetries(cwd);
+		}
+	});
+
 	it("search keeps comma-delimited surviving entries when peers are missing", async () => {
 		const tools = await createTools(createTestSession(tempDir));
 		const tool = tools.find(entry => entry.name === "grep");

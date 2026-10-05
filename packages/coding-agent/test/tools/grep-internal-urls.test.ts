@@ -257,6 +257,132 @@ describe("GrepTool internal URL resolution", () => {
 		expect(text).not.toContain("INFO");
 	});
 
+	it("searches each artifact in a semicolon-delimited internal URL list", async () => {
+		await Bun.write(path.join(artifactsDir, "31.bash.log"), "needle first artifact\n");
+		await Bun.write(path.join(artifactsDir, "32.bash.log"), "needle second artifact\n");
+		await Bun.write(path.join(artifactsDir, "33.bash.log"), "needle unrelated artifact\n");
+
+		const result = await new GrepTool(createSession()).execute("artifact-list", {
+			pattern: "needle",
+			path: "artifact://31;artifact://32",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle first artifact");
+		expect(text).toContain("needle second artifact");
+		expect(text).not.toContain("needle unrelated artifact");
+		expect(result.details?.files?.slice().sort()).toEqual(["artifact://31", "artifact://32"]);
+		expect(result.details?.matchCount).toBe(2);
+	});
+
+	it("searches each agent output in a semicolon-delimited internal URL list", async () => {
+		await Bun.write(path.join(artifactsDir, "Alpha.md"), "needle alpha output\n");
+		await Bun.write(path.join(artifactsDir, "Beta.md"), "needle beta output\n");
+		await Bun.write(path.join(artifactsDir, "Other.md"), "needle unrelated output\n");
+
+		const result = await new GrepTool(createSession()).execute("agent-list", {
+			pattern: "needle",
+			path: "agent://Alpha;agent://Beta",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle alpha output");
+		expect(text).toContain("needle beta output");
+		expect(text).not.toContain("needle unrelated output");
+		expect(result.details?.files?.slice().sort()).toEqual(["agent://Alpha", "agent://Beta"]);
+		expect(result.details?.matchCount).toBe(2);
+	});
+
+	it("preserves each registered resource's ranges and compound selectors in URL lists", async () => {
+		registerVirtualDocs(
+			new Map([
+				["first.md", "needle excluded first\nneedle selected first\nneedle excluded last\n"],
+				["second.md", "needle selected second start\nneedle excluded middle\nneedle selected second end\n"],
+			]),
+		);
+
+		const result = await new GrepTool(createSession()).execute("virtual-range-list", {
+			pattern: "needle",
+			path: "virtual://first.md:2-2:raw;virtual://second.md:raw:1,3",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle selected first");
+		expect(text).toContain("needle selected second start");
+		expect(text).toContain("needle selected second end");
+		expect(text).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual(["virtual://first.md", "virtual://second.md"]);
+		expect(result.details?.matchCount).toBe(3);
+	});
+
+	it("searches semicolon-bearing internal URL paths before the next URL boundary", async () => {
+		registerVirtualDocs(
+			new Map([
+				["first;v=1.md", "needle excluded first\nneedle selected semicolon path\n"],
+				["second.md", "needle selected second\nneedle excluded second\n"],
+			]),
+		);
+		const result = await new GrepTool(createSession()).execute("virtual-semicolon-list", {
+			pattern: "needle",
+			path: "virtual://first;v=1.md:2-2;virtual://second.md:1-1",
+		});
+		expect(getResultText(result)).toContain("needle selected semicolon path");
+		expect(getResultText(result)).toContain("needle selected second");
+		expect(getResultText(result)).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual(["virtual://first;v=1.md", "virtual://second.md"]);
+		expect(result.details?.matchCount).toBe(2);
+	});
+
+	it("searches mixed internal URL and literal path lists in either order", async () => {
+		registerVirtualDocs(new Map([["doc.md", "needle excluded virtual\nneedle selected virtual\n"]]));
+		await Bun.write(path.join(tmpDir, "mixed.txt"), "needle selected local\nneedle excluded local\n");
+		await Bun.write(path.join(tmpDir, "other.txt"), "needle unrelated local\n");
+		const tool = new GrepTool(createSession());
+
+		for (const entry of ["virtual://doc.md:2-2;mixed.txt:1-1", "mixed.txt:1-1;virtual://doc.md:2-2"]) {
+			const result = await tool.execute("mixed-url-list", { pattern: "needle", path: entry });
+			const text = getResultText(result);
+			expect(text).toContain("needle selected virtual");
+			expect(text).toContain("needle selected local");
+			expect(text).not.toContain("needle excluded");
+			expect(text).not.toContain("needle unrelated");
+			expect(result.details?.matchCount).toBe(2);
+		}
+	});
+
+	it("keeps non-list semicolons in internal URL paths and queries intact", async () => {
+		await Bun.write(
+			path.join(artifactsDir, "Fields.md"),
+			JSON.stringify({ "a;b": "needle selected field\n", other: "needle excluded field\n" }),
+		);
+		const tool = new GrepTool(createSession());
+
+		for (const entry of ["agent://Fields/a;b", 'agent://Fields?q=.["a;b"]']) {
+			const result = await tool.execute("semicolon-resource", { pattern: "needle", path: entry });
+			const text = getResultText(result);
+			expect(text).toContain("needle selected field");
+			expect(text).not.toContain("needle excluded field");
+			expect(result.details?.matchCount).toBe(1);
+		}
+	});
+
+	it("keeps literal semicolon filenames ahead of list and selector interpretations", async () => {
+		await Bun.write(path.join(tmpDir, "a;b:1-2"), "first line\nsecond line\nneedle literal third line\n");
+		await Bun.write(path.join(tmpDir, "a"), "needle split first\n");
+		await Bun.write(path.join(tmpDir, "b"), "needle split second\n");
+
+		const result = await new GrepTool(createSession()).execute("literal-semicolon", {
+			pattern: "needle",
+			path: "a;b:1-2",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle literal third line");
+		expect(text).not.toContain("needle split");
+		expect(result.details?.files).toEqual(["a;b:1-2"]);
+		expect(result.details?.matchCount).toBe(1);
+	});
+
 	it("searches virtual internal URL content without a backing file", async () => {
 		registerVirtualDocs(new Map([["doc.md", "alpha line\nneedle in virtual content\ngamma line\n"]]));
 

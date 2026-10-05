@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Fixed `grep` and `read` path lists losing URL query or path semicolons. Preserve internal URL targets, per-target selectors, and literal filenames.
+- Fixed standalone SQLite queries and local image questions being split at semicolons before URL-looking text. Preserve query suffixes before detecting path-list targets.
+- Fixed extensionless files with line selectors in comma or whitespace lists being claimed as opaque resource URLs.
+- Fixed query-like literal filenames being lost in local path lists. Specialized readers now declare query ownership after literal-path validation; image-question URL text cannot change target classification.
+- Fixed read CLI image questions after earlier literal list entries. Share reader query ownership across every target before loading vision credentials.
+- Fixed `wait` interruptions during service discovery and late service subscriptions after cancellation, session switching, or disposal. Preserve user cancellation and exactly-once owned result delivery.
 - Reports that outgrow the available rows after terminal resizing now open as focused, scrollable pages while preserving drafts, attachments, and the transcript.
 - Fixed stdio gateway fallback accepting HTTP 200 before terminal SSE errors across Chat Completions, Responses, Anthropic Messages and pi-native; completed transient failures now try permitted candidates without leaking partial output or retrying invalid requests, cancellation or response-size failures.
 

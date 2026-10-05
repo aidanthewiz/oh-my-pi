@@ -595,7 +595,12 @@ function hasTopLevelPathDelimiter(entry: string): boolean {
 	return false;
 }
 
-function splitTopLevelDelimitedPath(entry: string, mode: DelimitedPathSplitMode): string[] {
+async function splitTopLevelDelimitedPath(
+	entry: string,
+	mode: DelimitedPathSplitMode,
+	isUrl: (part: string) => boolean,
+	queryOwner?: (part: string) => Promise<boolean>,
+): Promise<string[]> {
 	const parts: string[] = [];
 	let braceDepth = 0;
 	let start = 0;
@@ -613,7 +618,12 @@ function splitTopLevelDelimitedPath(entry: string, mode: DelimitedPathSplitMode)
 			if (braceDepth > 0) braceDepth--;
 			continue;
 		}
-		if (braceDepth !== 0 || !isDelimitedPathSeparator(ch, mode)) continue;
+		if (braceDepth !== 0) continue;
+		if (queryOwner && ch === "?" && !parts.some(part => isUrl(normalizePathLikeInput(part)))) {
+			const part = normalizePathLikeInput(entry.slice(start));
+			if (!isUrl(part) && (await queryOwner(part))) break;
+		}
+		if (!isDelimitedPathSeparator(ch, mode)) continue;
 		parts.push(entry.slice(start, i));
 		start = i + 1;
 	}
@@ -653,13 +663,17 @@ async function tryDelimitedPathSplit(
 	splitter: PathEntrySplitter,
 	mode: DelimitedPathSplitMode,
 	requirement: DelimitedResolveRequirement,
+	isUrl: (part: string) => boolean,
+	localOnly = false,
+	queryOwner?: (part: string) => Promise<boolean>,
 ): Promise<string[] | null> {
-	const rawParts = splitTopLevelDelimitedPath(entry, mode);
+	const rawParts = await splitTopLevelDelimitedPath(entry, mode, isUrl, queryOwner);
 	if (rawParts.length < 2) return null;
 
 	const parts = rawParts.map(normalizePathLikeInput).filter(part => part.length > 0);
 	if (parts.length === 0) return null;
 	if (parts.length < 2 && rawParts.length === parts.length) return null;
+	if (localOnly && parts.some(isUrl)) return null;
 
 	if (requirement !== "none") {
 		const resolved = await Promise.all(parts.map(part => delimitedPathPartResolves(part, cwd, splitter)));
@@ -680,16 +694,19 @@ export async function splitDelimitedPathEntry(
 	options: {
 		splitter?: PathEntrySplitter;
 		routedUrlPredicate?: (entry: string) => boolean;
+		queryOwner?: (part: string) => Promise<boolean>;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
 	if (!hasTopLevelPathDelimiter(normalizedEntry)) return null;
 	const splitter = options.splitter ?? parseSearchPath;
-	if (options.routedUrlPredicate?.(normalizedEntry)) {
-		const parts = await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none");
-		return parts?.every(options.routedUrlPredicate) ? parts : null;
-	}
-	if (isInternalUrlPath(normalizedEntry)) return null;
+	const isUrl =
+		options.routedUrlPredicate ??
+		((part: string) =>
+			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
+	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isUrl, options.queryOwner);
+	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
+	const opaqueUrl = isUrl(normalizedEntry);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
 	// (`a;b:1-2`, `a b:1-2`). Preserve the raw entry whenever the full literal
 	// resolves — or is only ambiguous — so downstream literal-preferring
@@ -706,29 +723,67 @@ export async function splitDelimitedPathEntry(
 	}
 
 	return (
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "comma", "some")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "whitespace", "all")) ??
-		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", "all"))
+		(opaqueUrl
+			? null
+			: await tryDelimitedPathSplit(
+					normalizedEntry,
+					cwd,
+					splitter,
+					"semicolon",
+					"none",
+					isUrl,
+					false,
+					options.queryOwner,
+				)) ??
+		(await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"comma",
+			"some",
+			isUrl,
+			opaqueUrl,
+			options.queryOwner,
+		)) ??
+		(await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"whitespace",
+			"all",
+			isUrl,
+			opaqueUrl,
+			options.queryOwner,
+		)) ??
+		(await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"mixed",
+			"all",
+			isUrl,
+			opaqueUrl,
+			options.queryOwner,
+		))
 	);
 }
 
 /**
- * Split a `;` list that names URLs alongside local paths
- * (`https://x;src/a.ts:1-20`, `omp://;Makefile:1-3`). Engages only when URL
- * detection would otherwise claim the whole entry; everything else keeps the
- * normal image/sqlite/archive/literal ordering. Every part must be a URL (per
- * `isUrl`) or an existing literal path without glob characters, so a URL that
- * merely contains `;` (`https://a/x;v=1`) and a literal file named with `;`
- * (including `a;b.md:1-2`, issue #4618) stay whole.
+ * Split a `;` list at recognized URL or existing literal-path boundaries.
+ * Unrecognized segments after a URL remain part of that URL. Literal paths
+ * and their selectors take precedence over delimiter recovery.
  */
 export async function splitMixedUrlPathList(
 	entry: string,
 	cwd: string,
 	isUrl: (part: string) => boolean,
+	queryOwner?: (part: string) => Promise<boolean>,
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
-	if (!normalizedEntry.includes(";") || !isUrl(normalizedEntry)) return null;
+	if (!normalizedEntry.includes(";")) return null;
+	const rawParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, queryOwner);
+	if (rawParts.length < 2 || (!isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part)))))
+		return null;
 	if (!isInternalUrlPath(normalizedEntry)) {
 		if ((await probeLiteralPathExists(normalizedEntry, cwd)) !== "missing") return null;
 		const selectorSplit = splitPathAndSel(normalizedEntry);
@@ -736,14 +791,57 @@ export async function splitMixedUrlPathList(
 			return null;
 		}
 	}
-	const parts = await tryDelimitedPathSplit(normalizedEntry, cwd, parseSearchPath, "semicolon", "none");
-	if (!parts) return null;
-	for (const part of parts) {
-		if (isUrl(part)) continue;
-		const partPath = splitPathAndSel(part).path;
-		if (hasGlobPathChars(partPath) || (await probeLiteralPathExists(partPath, cwd)) !== "exists") return null;
+	const parts: string[] = [];
+	let hasResolvedTarget = false;
+	let index = 0;
+	let pendingLiteral: { path: string; end: number } | null = null;
+	while (index < rawParts.length) {
+		const part = normalizePathLikeInput(rawParts[index]);
+		if (isUrl(part)) {
+			hasResolvedTarget = true;
+			let end = index + 1;
+			while (end < rawParts.length) {
+				if (isUrl(normalizePathLikeInput(rawParts[end]))) break;
+				pendingLiteral = await findLiteralPathListPart(rawParts, end, cwd, isUrl);
+				if (pendingLiteral) break;
+				end++;
+			}
+			parts.push(normalizePathLikeInput(rawParts.slice(index, end).join(";")));
+			index = end;
+		} else {
+			const literal = pendingLiteral ?? (await findLiteralPathListPart(rawParts, index, cwd, isUrl));
+			pendingLiteral = null;
+			if (literal) {
+				hasResolvedTarget = true;
+				parts.push(literal.path);
+				index = literal.end;
+			} else {
+				if (part) parts.push(part);
+				index++;
+			}
+		}
 	}
-	return parts;
+	return hasResolvedTarget && parts.length > 1 ? parts : null;
+}
+
+async function findLiteralPathListPart(
+	rawParts: readonly string[],
+	start: number,
+	cwd: string,
+	isUrl: (part: string) => boolean,
+): Promise<{ path: string; end: number } | null> {
+	let end = start + 1;
+	while (end < rawParts.length && !isUrl(normalizePathLikeInput(rawParts[end]))) end++;
+	for (; end > start; end--) {
+		const candidate = normalizePathLikeInput(rawParts.slice(start, end).join(";"));
+		if (!candidate) continue;
+		if ((await probeLiteralPathExists(candidate, cwd)) === "exists") return { path: candidate, end };
+		const peeled = splitPathAndSel(candidate);
+		if (peeled.sel !== undefined && (await probeLiteralPathExists(peeled.path, cwd)) === "exists") {
+			return { path: candidate, end };
+		}
+	}
+	return null;
 }
 
 /** Expand delimited entries in-place while preserving unsplit entries. */

@@ -23,12 +23,20 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `pattern` | `string` | Yes | Regex pattern. `grep.ts` rejects whitespace-only input but preserves it verbatim. The native matcher tries Rust regex first, then PCRE2 for features such as lookaround/backreferences, then targeted literal recovery for malformed braces/parentheses. Multiline is enabled only when the pattern contains a literal newline or the two-character sequence `\\n`. |
-| `path` | `string` | No | One file path, directory path, glob-like path, archive member, readable external URL, internal URL, or one-file line selector such as `src/foo.ts:50-100` — or several of those as a semicolon-delimited list (`"src; tests"`). Omitted or empty defaults to `.`. Empty entries are rejected. Semicolon-delimited lists split unconditionally; entries accidentally joined with comma or whitespace are expanded only after existence validation; existing paths containing delimiters stay intact. Internal URLs may glob below their root (`local://*.md`, `omp://**/*.md`). |
+| `path` | `string` | No | One file path, directory path, glob-like path, archive member, readable external URL, internal URL, or one-file line selector such as `src/foo.ts:50-100` — or several of those as a semicolon-delimited list (`"src; tests"`). Omitted or empty defaults to `.`. Empty entries are rejected. Host lists split on semicolons; URL lists split at recognized URL or existing literal-path boundaries. Comma or whitespace recovery requires existence validation; existing paths containing delimiters stay intact. Internal URLs may glob below their root (`local://*.md`, `omp://**/*.md`). |
 | `case` | `boolean` | No | Case-sensitive search. Defaults to `true`. Passed to native `ignoreCase`. |
 | `gitignore` | `boolean` | No | Respect `.gitignore` during directory scans. Defaults to `true`. |
 | `skip` | `number \| null` | No | File-page offset for multi-file results. Omitted or `null` means `0`; `grep.ts` floors finite numbers and rejects negative or non-finite values. Single-file searches ignore it because they do not paginate by file. |
 
 `grep` is enabled by default (`grep.enabled = true`) and is discoverable rather than essential. Context defaults are configurable with `grep.contextBefore` and `grep.contextAfter`.
+
+Supported internal and external URL lists split before scope resolution. Each target keeps its own selectors and URL query/path semicolons, including `https://example.test/a?x=1;y=2;https://example.test/b`.
+
+Recognized URL starts or existing local filenames after a semicolon take precedence as list boundaries. Percent-encode a URL-owned semicolon as `%3B` when the following text would otherwise identify such a target. Existing literal filenames, escaped delimiters, and brace-enclosed delimiters remain intact.
+
+Validated local comma or whitespace lists, including `Makefile:1-1, README:1-1`, recover before opaque custom-scheme fallback. This recovery does not split candidates containing recognized URL targets.
+
+Local `?key=value` text does not create a query suffix. `a?b=c;README` searches both files; SQLite and image-question query rules belong to `read`.
 
 ## Outputs
 The tool returns a single text block in `content[0].text` plus structured `details`.
@@ -53,7 +61,7 @@ The tool returns a single text block in `content[0].text` plus structured `detai
    - rejects whitespace-only patterns while preserving the pattern verbatim;
    - defaults omitted or empty `path` to `["."]` (the workspace root);
    - normalizes `skip` to a non-negative integer;
-   - expands delimiter-flattened `path` entries with `expandDelimitedPathEntries()`, keeping existing delimiter-containing paths intact, splitting semicolon-delimited lists unconditionally, accepting comma splits when at least one part resolves, and accepting whitespace splits only when every part resolves;
+   - splits supported URL lists with `splitMixedUrlPathList()`, then expands delimiter-flattened host entries with `expandDelimitedPathEntries()` while preserving existing delimiter-containing paths;
    - peels any line-range selector from each resulting entry;
    - reads `grep.contextBefore` and `grep.contextAfter` from session settings (`1` and `3` by default);
    - enables multiline only when `pattern` contains `\n` or an actual newline.

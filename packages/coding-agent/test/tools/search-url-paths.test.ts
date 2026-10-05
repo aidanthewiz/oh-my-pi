@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -49,6 +51,23 @@ function stubLoadPage(body: string, contentType: string) {
 	}));
 }
 
+function serveTextTargets(responses: Readonly<Record<string, string>>, requests: string[]) {
+	return Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			const url = new URL(request.url);
+			const target = url.pathname + url.search;
+			requests.push(target);
+			const body = responses[target];
+			return new Response(body ?? "Unexpected request target", {
+				status: body === undefined ? 404 : 200,
+				headers: { "Content-Type": "text/plain" },
+			});
+		},
+	});
+}
+
 describe("search tools with external URL paths", () => {
 	let testDir: string;
 
@@ -59,6 +78,126 @@ describe("search tools with external URL paths", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await removeWithRetries(testDir);
+	});
+
+	it("searches both HTTP targets without splitting semicolons inside the first query", async () => {
+		const requests: string[] = [];
+		const server = serveTextTargets(
+			{
+				"/a?x=1;y=2": "needle complete query\n",
+				"/b": "needle second target\n",
+			},
+			requests,
+		);
+		try {
+			const base = server.url.origin;
+			const result = await new GrepTool(createSession(testDir)).execute("query-url-list", {
+				pattern: "needle",
+				path: `${base}/a?x=1;y=2;${base}/b`,
+			});
+			expect(requests.slice().sort()).toEqual(["/a?x=1;y=2", "/b"]);
+			expect(resultText(result)).toContain("needle complete query");
+			expect(resultText(result)).toContain("needle second target");
+			expect(result.details?.matchCount).toBe(2);
+			expect(resultText(result)).not.toContain("missing");
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("searches a scalar HTTP URL with intact path and query semicolons", async () => {
+		const requests: string[] = [];
+		const server = serveTextTargets({ "/scalar;v=1?x=1;y=2": "needle scalar target\n" }, requests);
+		try {
+			const result = await new GrepTool(createSession(testDir)).execute("scalar-query-url", {
+				pattern: "needle",
+				path: `${server.url.origin}/scalar;v=1?x=1;y=2`,
+			});
+			expect(requests).toEqual(["/scalar;v=1?x=1;y=2"]);
+			expect(resultText(result)).toContain("needle scalar target");
+			expect(result.details?.matchCount).toBe(1);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("keeps nested question marks inside URL query data after a local target", async () => {
+		await Bun.write(path.join(testDir, "local.txt"), "needle local\n");
+		const requests: string[] = [];
+		const server = serveTextTargets(
+			{ "/nested?x=1;y=2?z=3": "needle nested query\n", "/other": "needle other target\n" },
+			requests,
+		);
+		try {
+			const base = server.url.origin;
+			const result = await new GrepTool(createSession(testDir)).execute("local-nested-query", {
+				pattern: "needle",
+				path: `local.txt;${base}/nested?x=1;y=2?z=3;${base}/other`,
+			});
+			expect(requests.slice().sort()).toEqual(["/nested?x=1;y=2?z=3", "/other"]);
+			expect(resultText(result)).toContain("needle local");
+			expect(resultText(result)).toContain("needle nested query");
+			expect(resultText(result)).toContain("needle other target");
+			expect(result.details?.matchCount).toBe(3);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("searches a query URL and a literal semicolon filename with selectors in either order", async () => {
+		await Bun.write(path.join(testDir, "semi;colon.txt"), "needle excluded local\nneedle selected local\n");
+		const requests: string[] = [];
+		const server = serveTextTargets(
+			{ "/mixed?x=1;y=2": "needle selected remote\nneedle excluded remote\n" },
+			requests,
+		);
+		try {
+			const remote = `${server.url.origin}/mixed?x=1;y=2:1-1`;
+			const local = "semi;colon.txt:2-2";
+			const tool = new GrepTool(createSession(testDir));
+			for (const input of [`${remote};${local}`, `${local};${remote}`]) {
+				const result = await tool.execute("mixed-query-url", { pattern: "needle", path: input });
+				expect(resultText(result)).toContain("needle selected remote");
+				expect(resultText(result)).toContain("needle selected local");
+				expect(resultText(result)).not.toContain("needle excluded");
+				expect(result.details?.matchCount).toBe(2);
+			}
+			expect(requests).toEqual(["/mixed?x=1;y=2", "/mixed?x=1;y=2"]);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("reads URL lists with intact query semicolons and compound range selectors", async () => {
+		const requests: string[] = [];
+		const server = serveTextTargets(
+			{
+				"/read?x=1;y=2": "excluded first\nselected first\nexcluded last\n",
+				"/other": "selected second start\nexcluded middle\nselected second end\n",
+			},
+			requests,
+		);
+		try {
+			const base = server.url.origin;
+			const tool = new ReadTool(createSession(testDir));
+			const first = resultText(await tool.execute("read-query-whole", { path: `${base}/read?x=1;y=2:raw` }));
+			const second = resultText(await tool.execute("read-other-whole", { path: `${base}/other:raw` }));
+			const firstLine = first.split("\n").findIndex(line => line === "selected first") + 1;
+			const secondLines = second
+				.split("\n")
+				.flatMap((line, index) => (line.startsWith("selected second") ? [index + 1] : []));
+			const result = await tool.execute("read-query-url-list", {
+				path: `${base}/read?x=1;y=2:raw:${firstLine}-${firstLine};${base}/other:${secondLines.join(",")}:raw`,
+			});
+			expect(requests).toEqual(["/read?x=1;y=2", "/other", "/read?x=1;y=2", "/other"]);
+			expect(resultText(result)).toContain("selected first");
+			expect(resultText(result)).toContain("selected second start");
+			expect(resultText(result)).toContain("selected second end");
+			expect(resultText(result)).not.toContain("excluded");
+			expect(resultText(result)).not.toContain("Could not read");
+		} finally {
+			await server.stop(true);
+		}
 	});
 
 	it("search fetches a URL and greps the rendered text", async () => {
