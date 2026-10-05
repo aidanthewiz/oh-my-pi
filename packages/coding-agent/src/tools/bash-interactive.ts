@@ -4,6 +4,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import { loadXtermTerminal } from "@oh-my-pi/pi-tui/tools/terminal-output";
 import { filterChildShellEnv } from "@oh-my-pi/pi-utils";
+import type { ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
@@ -18,11 +19,11 @@ export interface BashInteractiveResult extends OutputSummary {
 }
 
 export async function runInteractiveBashPty(
-	ui: NonNullable<AgentToolContext["ui"]>,
+	ui: Pick<NonNullable<AgentToolContext["ui"]>, "custom">,
 	options: {
 		command: string;
 		cwd: string;
-		shell: string;
+		shell: Pick<ShellConfig, "shell" | "env">;
 		timeoutMs?: number;
 		signal?: AbortSignal;
 		env?: Record<string, string>;
@@ -33,7 +34,8 @@ export async function runInteractiveBashPty(
 	const settings = await Settings.init();
 	// Load the xterm Terminal ctor here (async boundary) — the ui.custom factory below is sync.
 	const XtermTerminal = await loadXtermTerminal();
-	const resolvedShell = options.shell;
+	const { shell: resolvedShell, env: shellEnv } = options.shell;
+	const { GIT_EDITOR: _gitEditor, GPG_TTY: _gpgTty, CI: _ci, NO_COLOR: _noColor, ...interactiveShellEnv } = shellEnv;
 	const graphics = new TerminalGraphicsDecoder();
 	const sink = new OutputSink({
 		artifactPath: options.artifactPath,
@@ -104,10 +106,13 @@ export async function runInteractiveBashPty(
 							command: options.command,
 							cwd: options.cwd,
 							timeoutMs: options.timeoutMs,
-							// Native PTYs inherit the parent environment unless explicitly
-							// cleared. Pass the complete filtered child environment.
 							clearEnv: true,
-							env: filterChildShellEnv(Bun.env, options.cwd, { TERM: "xterm-256color" }, options.env),
+							env: filterChildShellEnv(
+								interactiveShellEnv,
+								options.cwd,
+								{ TERM: "xterm-256color" },
+								options.env,
+							),
 							signal: options.signal,
 							cols,
 							rows,

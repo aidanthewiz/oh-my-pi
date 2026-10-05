@@ -2,20 +2,24 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { normalizeModelPatternList, resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { MANAGED_CONFIG_FILE_ENV, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentCompactionThresholdOverride } from "@oh-my-pi/pi-coding-agent/config/compaction-threshold";
-import type { BeforeSubagentSpawnEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import {
 	artifactsDirsFromRegistry,
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import {
 	buildStructuredSubagentRecoveryHint,
+	invalidModelSelectorReason,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
 	StructuredSubagentError,
@@ -36,6 +40,20 @@ const AGENT: AgentDefinition = {
 	tools: ["read", "write", "ast_grep"],
 	output: { type: "object", properties: { agent: { type: "boolean" } } },
 };
+
+/** One catalog entry so a populated registry can reject an unmatchable selector. */
+const MODEL = buildModel({
+	id: "claude-sonnet-4-5",
+	name: "Claude Sonnet 4.5",
+	api: "anthropic-messages",
+	provider: "anthropic",
+	reasoning: false,
+	baseUrl: "https://api.anthropic.com",
+	input: ["text"],
+	cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+	contextWindow: 200000,
+	maxTokens: 8192,
+});
 
 function session(
 	options: {
@@ -259,6 +277,8 @@ describe("structured subagent primitive", () => {
 			expect(cfgRetryModelFallback.get(liveSettings)).toBe(false);
 		} finally {
 			liveSettings.cancelPendingSaves();
+			// `Settings.loadIsolated` opened `<agentDir>/agent.db`; Windows cannot delete it while open.
+			AgentStorage.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
@@ -313,6 +333,7 @@ describe("structured subagent primitive", () => {
 			expect(second.serviceTierOverride).toBe("none");
 		} finally {
 			liveSettings.cancelPendingSaves();
+			AgentStorage.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
@@ -413,15 +434,86 @@ describe("structured subagent primitive", () => {
 		);
 		expect(definitionPolicy.modelRole).toBe("definition");
 	});
-	it("falls through an empty request selector to the agent definition role", async () => {
-		const customAgent = { ...AGENT, model: ["@definition"] };
-		mockDiscovery(customAgent);
+	it("rejects blank selectors without demoting to the agent definition", async () => {
+		mockDiscovery({ ...AGENT, model: ["@definition"] });
+		const childSession = session({ modelRoles: { definition: "openai/gpt-4o" } });
+		for (const model of ["", " ", "openai/gpt-4o,", ["openai/gpt-4o", ""]]) {
+			await expect(resolveEffectiveSubagentPolicy(request({ session: childSession, model }))).rejects.toThrow(
+				/invalid `model`/,
+			);
+		}
+	});
+
+	it("rejects an ambiguous per-call selector instead of resolving it as the default role", async () => {
+		mockDiscovery({ ...AGENT, model: ["@definition"] });
 		const childSession = session({ modelRoles: { definition: "openai/gpt-4o" } });
 
-		const policy = await resolveEffectiveSubagentPolicy(request({ session: childSession, model: "" }));
+		await expect(
+			resolveEffectiveSubagentPolicy(request({ session: childSession, model: "default" })),
+		).rejects.toThrow(/"@default"/);
+		// The rule applies per pattern, not to the joined chain.
+		await expect(
+			resolveEffectiveSubagentPolicy(request({ session: childSession, model: "openai/gpt-4o,default" })),
+		).rejects.toThrow(/"@default"/);
+	});
 
-		expect(policy.modelRole).toBe("definition");
-		expect(policy.modelOverride).toEqual(["openai/gpt-4o"]);
+	it("rejects an ambiguous per-call selector carrying a thinking suffix", async () => {
+		mockDiscovery({ ...AGENT, model: ["@definition"] });
+		const childSession = session({ modelRoles: { definition: "openai/gpt-4o" } });
+
+		for (const model of ["default:high", "DEFAULT:high", "inherit:low"]) {
+			await expect(resolveEffectiveSubagentPolicy(request({ session: childSession, model }))).rejects.toThrow(
+				/"@default"/,
+			);
+		}
+	});
+
+	it("fails a per-call selector that expands to nothing rather than silently demoting it", async () => {
+		mockDiscovery({ ...AGENT, model: ["@definition"] });
+		const childSession = session({ modelRoles: { empty: "", definition: "openai/gpt-4o" } });
+
+		await expect(resolveEffectiveSubagentPolicy(request({ session: childSession, model: "@empty" }))).rejects.toThrow(
+			/No available model matches `model`/,
+		);
+	});
+
+	it("fails a per-call selector that matches no available model", async () => {
+		mockDiscovery({ ...AGENT, model: ["@definition"] });
+		const childSession = session({ modelRoles: { definition: "openai/gpt-4o" } });
+		const registry = { getAvailable: () => [MODEL] } as unknown as ToolSession["modelRegistry"];
+		const withRegistry = { ...childSession, modelRegistry: registry } as ToolSession;
+
+		await expect(
+			resolveEffectiveSubagentPolicy(request({ session: withRegistry, model: "openai/does-not-exist" })),
+		).rejects.toThrow(/No available model matches `model`/);
+
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({ session: withRegistry, model: "anthropic/claude-sonnet-4-5" }),
+		);
+		expect(policy.modelOverride).toEqual(["anthropic/claude-sonnet-4-5"]);
+	});
+
+	it("admits mixed inherited requests when configured role candidates are unavailable", async () => {
+		mockDiscovery({ ...AGENT, model: ["@definition"] });
+		const childSession = {
+			...session({
+				modelRoles: { default: "openai/gpt-4o", smol: "openai/gpt-4o", definition: "openai/gpt-4o" },
+			}),
+			getActiveModelString: () => "anthropic/claude-sonnet-4-5",
+			getModelString: () => "openai/gpt-4o",
+			modelRegistry: { getAvailable: () => [MODEL] },
+		} as ToolSession;
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({ session: childSession, model: "@default:high,@smol" }),
+		);
+		const selected = resolveModelOverride(
+			normalizeModelPatternList(policy.modelOverride),
+			{ getAvailable: () => [MODEL] },
+			childSession.settings,
+		);
+
+		expect(selected.model).toBe(MODEL);
+		expect(policy.modelRole).toBeUndefined();
 	});
 
 	it("falls through an empty configured override to the agent definition role", async () => {
@@ -447,40 +539,51 @@ describe("structured subagent primitive", () => {
 		expect(policy.modelOverride).toEqual(["openai/gpt-4o"]);
 	});
 
-	it("lets before_subagent_spawn replace model patterns at dispatch without dropping role identity", async () => {
-		mockDiscovery({ ...AGENT, model: ["@definition"] });
-		const childSession = session({ modelRoles: { definition: "anthropic/claude-opus-4-5" } });
-		const events: BeforeSubagentSpawnEvent[] = [];
-		childSession.emitBeforeSubagentSpawn = async event => {
-			events.push(event);
-			return { model: "openai/gpt-4o", note: "pool test" };
-		};
-		const dispatched: executorModule.ExecutorOptions[] = [];
-		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-			dispatched.push(options);
-			return result();
-		});
+	it("prevents extensions from replacing an explicitly selected model while retaining configured routing", async () => {
+		mockDiscovery({ ...AGENT, model: ["anthropic/claude-sonnet-4-5"] });
+		const replacement = getBundledModel("openai", "gpt-4o");
+		if (!replacement) throw new Error("Expected replacement model");
+		const registry = { getAvailable: () => [MODEL, replacement] } as unknown as ToolSession["modelRegistry"];
+		const childSession = { ...session(), modelRegistry: registry } as ToolSession;
+		childSession.emitBeforeSubagentSpawn = async () => ({ model: "openai/gpt-4o" });
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result());
+		for (const model of [undefined, "anthropic/claude-sonnet-4-5"]) {
+			const settled = await runStructuredSubagent(request({ session: childSession, model }));
+			const selected = resolveModelOverride(settled.policy.modelOverride ?? [], registry!, childSession.settings);
+			expect(selected.model).toBe(model === undefined ? replacement : MODEL);
+		}
+	});
 
-		// Frontend preflight is side-effect free: stateful routers must not advance.
-		await resolveEffectiveSubagentPolicy(request({ session: childSession }));
-		expect(events).toEqual([]);
-
-		const settled = await runStructuredSubagent(request({ session: childSession, retainArtifacts: true }));
-		expect(dispatched[0]).toMatchObject({
-			modelOverride: ["openai/gpt-4o"],
-			modelRole: "definition",
-			modelRoute: "pool test",
-		});
-		expect(events).toEqual([
-			{
-				type: "before_subagent_spawn",
-				agent: "worker",
-				invocationKind: "task",
-				modelRole: "definition",
-				patterns: ["anthropic/claude-opus-4-5"],
-			},
-		]);
-		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	it("does not let explicit or inherited selectors escape managed model policy", async () => {
+		mockDiscovery();
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "coreforge-selector-policy-"));
+		const previousManagedPath = Bun.env[MANAGED_CONFIG_FILE_ENV];
+		const managedPath = path.join(root, "managed.yml");
+		Bun.env[MANAGED_CONFIG_FILE_ENV] = managedPath;
+		try {
+			for (const policy of ["enabledModels: [openai/gpt-4o]", "disabledModels: [anthropic/claude-sonnet-4-5]"]) {
+				await Bun.write(managedPath, `${policy}\n`);
+				const settings = await Settings.loadReadOnly({ cwd: root, agentDir: root });
+				const childSession = {
+					...session({ settings }),
+					getActiveModelString: () => "anthropic/claude-sonnet-4-5",
+					modelRegistry: { getAvailable: () => [MODEL] },
+				} as ToolSession;
+				for (const model of [
+					"anthropic/claude-sonnet-4-5",
+					"@default",
+					["@default", "anthropic/claude-sonnet-4-5"],
+				]) {
+					await expect(resolveEffectiveSubagentPolicy(request({ session: childSession, model }))).rejects.toThrow(
+						/No available model matches/,
+					);
+				}
+			}
+		} finally {
+			if (previousManagedPath === undefined) delete Bun.env[MANAGED_CONFIG_FILE_ENV];
+			else Bun.env[MANAGED_CONFIG_FILE_ENV] = previousManagedPath;
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects dispatch before leasing artifacts when an extension blocks the spawn", async () => {
@@ -955,4 +1058,28 @@ describe("structured subagent primitive", () => {
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+});
+
+describe("per-call selector syntax", () => {
+	it("rejects a comma-only selector instead of treating it as no selector", () => {
+		expect(invalidModelSelectorReason(" , ", "The call")).toMatch(/invalid .*model/);
+	});
+
+	for (const model of [
+		"anthropic/claude-sonnet-4-5:heigh",
+		["anthropic/claude-sonnet-4-5:heigh", "anthropic/claude-sonnet-4-5"],
+		"@default,anthropic/claude-sonnet-4-5:heigh",
+	]) {
+		it(`rejects an invalid thinking suffix instead of silently dropping it: ${JSON.stringify(model)}`, async () => {
+			mockDiscovery();
+			const childSession = {
+				...session(),
+				getActiveModelString: () => "anthropic/claude-sonnet-4-5",
+				modelRegistry: { getAvailable: () => [MODEL] },
+			} as ToolSession;
+			await expect(resolveEffectiveSubagentPolicy(request({ session: childSession, model }))).rejects.toThrow(
+				/Invalid thinking suffix/,
+			);
+		});
+	}
 });

@@ -467,16 +467,18 @@ See [Models](./models.md) for the `models.yml` schema and custom-provider defini
 
 ### Advisor
 
-Advisors review completed primary turns and can inject advice. Enable them with `advisor.enabled`, `/advisor on`, or `--advisor`. For the default single advisor, `modelRoles.advisor` selects its model; when unset, resolution uses a configured `slow` role or the built-in slow-model priorities. An unavailable explicit advisor assignment does not silently select another model.
+Advisors review primary turns on a configurable cadence and can inject advice. Enable them with `advisor.enabled`, `/advisor on`, or `--advisor`. For the default single advisor, `modelRoles.advisor` selects its model; when unset, resolution uses a configured `slow` role or the built-in slow-model priorities. An unavailable explicit advisor assignment does not silently select another model.
 
-`WATCHDOG.yml` (or `WATCHDOG.yaml`) can define a roster of named advisors with their own models, tools, instructions, and note budgets. See [Advisor configuration](./advisor-watchdog.md) for that schema, shared `WATCHDOG.md` instructions, and bounded catch-up semantics.
+`WATCHDOG.yml` (or `WATCHDOG.yaml`) can define a roster of named advisors with their own models, tools, instructions, note budgets, review cadence, and catch-up policy. See [Advisor configuration](./advisor-watchdog.md) for that schema, shared `WATCHDOG.md` instructions, cadence controls, and catch-up semantics.
 
 | Key                   | Type    | Default | Notes                                                                                                                                                |
 | --------------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `advisor.enabled`     | boolean | `false` | Enable the advisor runtime when `modelRoles.advisor` resolves to an available model.                                                                 |
 | `task.agentAdvisor`   | record  | `{}`    | Per-agent subagent advisor: agent name → `"on"` / `"off"` / advisor model pattern. Overrides agent frontmatter `advisor`; configured from the `/agents` hub. |
-| `advisor.syncBacklog` | enum    | `off`   | Bounded advisor catch-up delay: `off`, `1`, `3`, or `5`. The primary waits up to 30 seconds only while advisor backlog is at or above the threshold. |
-| `advisor.immuneTurns` | number  | `3`     | After a `concern`/`blocker` interrupts, route further concerns/blockers as non-interrupting asides for this many completed primary turns.            |
+| `advisor.syncBacklog` | enum    | `off`   | Default catch-up policy. `off` never waits; `1`, `3`, or `5` wait up to 30 seconds at that backlog threshold; `strict` waits for scheduled reviews without a wall-clock cap. Abort, failure, quota pause, transition, and disposal release waits. Optional `WATCHDOG.yml` per-advisor `syncBacklog` overrides this policy; omission inherits it. |
+| `advisor.immuneTurns` | number  | `3`     | After a concern or blocker interrupts, route further concerns as non-interrupting asides for this many primary turns, including tool-loop continuations. Blockers remain exempt. |
+| `advisor.reviewMode` | enum | `turn` | Default advisor cadence when no `WATCHDOG.yml` roster exists: review every primary turn, or only final yields with `agent-end`. Roster entries set their own `reviewMode` (default `turn`). Applies live. |
+| `advisor.reviewInterval` | number | `1` | Default advisor only: review every Nth eligible update. Skipped updates are sent with the next scheduled review; pending advice delivery never depends on cadence. Applies live. |
 | `advisor.maxNotesPerUpdate` | number | `4` | Non-blocker notes accepted per advisor review, from 1–32. Higher-severity notes can replace only pending notes from the same review. `WATCHDOG.yml` top-level or per-advisor values override this default. |
 | `advisor.evictStaleResults` | boolean | `true` | Before each review, replace the advisor's `read`/`grep`/`glob` output from older reviews with a short placeholder. The latest review is kept. |
 
@@ -627,7 +629,9 @@ tools:
 
 Mounting still follows the session's explicit tool allow-list. A session that permits `read` but omits `write` can receive a device-only write transport; this does not grant filesystem writes.
 
-Individual built-in tools and Eval preludes are toggled by their own keys, e.g. `bash.enabled`, `launch.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `computer.enabled`, `ratchet.enabled` (default `false`; the `ratchet(flow)` eval/hillclimb prelude, which `/ratchet` turns on for the current session only), `astEdit.enabled`, `astGrep.enabled`, `find.enabled` (`auto`/`on`/`off`; `auto` enables `find` only when the `judge` role resolves to a native TypeSafe jev model), and `web_search.enabled`. Image questions use `read <image>?q=<question>` and honor `images.questionTimeoutMs`.
+Individual built-in tools and Eval preludes are toggled by their own keys, e.g. `bash.enabled`, `launch.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `computer.enabled`, `ratchet.enabled` (default `false`; the `ratchet(flow)` eval/hillclimb prelude, which `/ratchet` turns on for the current session only), `archive.enabled` (default `true`; the read-only `archive` eval prelude over prompt history, recent projects, past sessions, and recaps), `astEdit.enabled`, `astGrep.enabled`, `find.enabled` (`auto`/`on`/`off`; `auto` enables `find` only when the `judge` role resolves to a native TypeSafe jev model), and `web_search.enabled`. Image questions use `read <image>?q=<question>` and honor `images.questionTimeoutMs`.
+
+The `archive` global exposes session metadata, message counts, recaps, and stored prompts, not complete transcripts. Session and prompt queries default to the current project; `project: "*"` explicitly spans the active profile's projects. Host-prelude calls use the `read` approval category. Restricted tool allow-lists do not install the archive prelude. Disabling it rejects previously captured handles on their next call.
 
 ### Window-scoped computer use
 

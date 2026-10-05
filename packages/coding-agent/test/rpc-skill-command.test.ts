@@ -88,6 +88,52 @@ describe("tryRunRpcSkillCommand", () => {
 		}
 	});
 
+	test("preserves attached images in skill prompt messages", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-rpc-skill-${Snowflake.next()}-`));
+		const skillPath = path.join(dir, "SKILL.md");
+		await Bun.write(
+			skillPath,
+			"---\nname: reviewer\ndescription: Review code\n---\n\nReview the supplied code carefully.\n",
+		);
+
+		let message: Pick<CustomMessage, "attribution" | "content" | "customType" | "details" | "display"> | undefined;
+		const image = { type: "image" as const, data: "fake-png", mimeType: "image/png" };
+
+		try {
+			const handled = await tryRunRpcSkillCommand(
+				{
+					skillsSettings: { enableSkillCommands: true },
+					skills: [
+						{
+							name: "reviewer",
+							description: "Review code",
+							filePath: skillPath,
+							baseDir: dir,
+							source: "project",
+						},
+					],
+					async promptCustomMessage(nextMessage) {
+						message = nextMessage;
+						return true;
+					},
+				},
+				"/skill:reviewer inspect screenshot",
+				"steer",
+				[image],
+			);
+
+			expect(handled).toEqual({ agentInvoked: true });
+			expect(message?.customType).toBe(SKILL_PROMPT_MESSAGE_TYPE);
+			expect(Array.isArray(message?.content)).toBe(true);
+			expect(message?.content).toEqual([
+				{ type: "text", text: expect.stringContaining("Review the supplied code carefully.") },
+				image,
+			]);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
 	test("ignores unknown skill commands so normal prompt handling can continue", async () => {
 		const handled = await tryRunRpcSkillCommand(
 			{

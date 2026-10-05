@@ -1,25 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import {
-	resolveAgentModelPatterns,
-	resolveAgentModelSelection,
-	resolveModelOverride,
-} from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { resolveAgentModelSelection, resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { buildOutputValidator } from "@oh-my-pi/pi-coding-agent/tools/output-schema-validator";
-import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
 describe("bundled agent parsing", () => {
-	it("defaults the task agent to the auto thinking selector", () => {
-		const task = getBundledAgent("task");
-
-		expect(task).toBeDefined();
-		expect(task?.model).toEqual(["@task"]);
-		expect(task?.thinkingLevel).toBe(AUTO_THINKING);
-	});
-
 	it("accepts security-reviewer findings with optional remediation metadata", () => {
 		const securityReviewer = getBundledAgent("security-reviewer");
 		const findingValidator = buildOutputValidator(securityReviewer?.output).validator?.validateSection.get(
@@ -70,39 +57,11 @@ describe("bundled agent parsing", () => {
 
 		const agent = getBundledAgent("reviewer");
 		expect(agent?.thinkingLevel).toBeUndefined();
-		const patterns = resolveAgentModelPatterns({ agentModel: agent?.model, settings });
+		const { patterns } = resolveAgentModelSelection({ agentModel: agent?.model, settings });
 		const resolved = resolveModelOverride(patterns, registry, settings);
 		expect(resolved.model?.provider).toBe("openai-codex");
 		expect(resolved.model?.id).toBe("gpt-5.5");
 		expect(resolved.thinkingLevel).toBe(Effort.XHigh);
 		expect(resolved.explicitThinkingLevel).toBe(true);
-	});
-
-	// The alias is expanded before it reaches the executor, so the role identity
-	// only survives as the `role` half of the selection. A subagent's inherited
-	// `retry.fallbackChains` entry is keyed off it — lose it and every bundled
-	// agent silently retries on the `default` role's chain.
-	it("keeps the role identity of every alias-routed bundled agent through expansion", () => {
-		const settings = Settings.isolated({
-			modelRoles: {
-				default: "anthropic/opus",
-				task: "anthropic/sonnet",
-				smol: "fast/hy3",
-				slow: "codex/sol",
-			},
-		});
-
-		for (const [name, role, model] of [
-			["task", "task", "anthropic/sonnet"],
-			["sonic", "smol", "fast/hy3"],
-			["scout", "smol", "fast/hy3"],
-			["reviewer", "slow", "codex/sol"],
-		] as const) {
-			const agent = getBundledAgent(name);
-			expect(resolveAgentModelSelection({ agentModel: agent?.model, settings })).toEqual({
-				patterns: [model],
-				role,
-			});
-		}
 	});
 });

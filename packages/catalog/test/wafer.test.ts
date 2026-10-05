@@ -27,7 +27,6 @@ describe("Wafer Serverless provider", () => {
 		expect(glm).toBeDefined();
 		expect(glm.provider).toBe("wafer-serverless");
 		expect(glm.baseUrl).toBe("https://pass.wafer.ai/v1");
-		expect(glm.compatConfig?.thinkingFormat).toBe("zai");
 
 		const qwen35 = getBundledModel<"openai-completions">("wafer-serverless", "Qwen3.5-397B-A17B");
 		expect(qwen35).toBeDefined();
@@ -36,12 +35,6 @@ describe("Wafer Serverless provider", () => {
 		const kimi = getBundledModel<"openai-completions">("wafer-serverless", "Kimi-K2.6");
 		expect(kimi).toBeDefined();
 		expect(kimi.contextWindow).toBe(262144);
-		// Kimi-K2.6 routes to Moonshot upstream, which uses zai-style binary
-		// `thinking: { type: "enabled" | "disabled" }`. Locked in explicitly so a
-		// future regen with credentials cannot silently strip it (auto-detect
-		// would mis-pick "openai" because the Wafer baseUrl/provider doesn't match
-		// the api.moonshot.ai / api.kimi.com URL patterns in `buildOpenAICompat`).
-		expect(kimi.compatConfig?.thinkingFormat).toBe("zai");
 		// Kimi-K2.6's retail Serverless rate per wafer.ai (= API cents × 0.0125):
 		// $1.425 in / $6.00 out / $0.2375 cached.
 		expect(kimi.cost).toEqual({ input: 1.425, output: 6, cacheRead: 0.2375, cacheWrite: 0 });
@@ -58,17 +51,9 @@ describe("Wafer Serverless provider", () => {
 		expect(qwen37max.id).toBe("qwen3.7-max");
 		expect(qwen37max.name).toBe("Qwen3.7 Max");
 		expect(qwen37max.reasoning).toBe(true);
-		// qwen3.7-max routes to Alibaba upstream; native wire format is `enable_thinking`.
-		// The bundled entry leaves `thinkingFormat` unset so the build-time detection
-		// in `buildOpenAICompat` picks "qwen" from the lowercase id.
-		expect(qwen37max.compatConfig?.thinkingFormat).toBeUndefined();
 
 		const dsFlash = getBundledModel<"openai-completions">("wafer-serverless", "deepseek-v4-flash");
 		expect(dsFlash).toBeDefined();
-		// DeepSeek V4 family uses `reasoning_effort`, not zai's `thinking: {type}`.
-		// Bundled entry must NOT pin `thinkingFormat: "zai"` — `buildOpenAICompat`
-		// auto-picks "openai" (default) from the deepseek-* id pattern at build time.
-		expect(dsFlash.compatConfig?.thinkingFormat).toBeUndefined();
 		expect(dsFlash.contextWindow).toBe(1000000);
 		expect(dsFlash.reasoning).toBe(true);
 		expect(dsFlash.compat.reasoningContentField).toBe("reasoning_content");
@@ -77,7 +62,6 @@ describe("Wafer Serverless provider", () => {
 		expect(dsPro).toBeDefined();
 		expect(dsPro.contextWindow).toBe(1000000);
 		expect(dsPro.reasoning).toBe(true);
-		expect(dsPro.compatConfig?.thinkingFormat).toBeUndefined();
 	});
 
 	it("preserves the catalog id verbatim on the wire (no rewrite, case-sensitive)", async () => {

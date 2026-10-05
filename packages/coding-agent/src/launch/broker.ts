@@ -687,6 +687,10 @@ class DaemonBroker {
 				return this.#send(operation);
 			case "stop": {
 				const record = this.#record(operation.name);
+				if (operation.owner === null) throw new Error("Service cancellation requires a session owner");
+				if (operation.owner !== undefined && record.snapshot.owner !== operation.owner) {
+					throw new Error(`Daemon ${operation.name} belongs to another session`);
+				}
 				await this.#stopRecord(record, operation.timeoutMs);
 				return { op: "stop", daemon: record.snapshot };
 			}
@@ -852,7 +856,14 @@ class DaemonBroker {
 		// Nothing plays terminal for a supervised PTY, so a program probing for
 		// cursor position or device attributes would block on the reply. Answer
 		// the queries from the output stream and write the replies to its stdin.
-		const responder = new TerminalQueryResponder();
+		//
+		// Cursor reports are the exception on Windows: ConPTY is itself a
+		// terminal, answering a program's own probes from the console, so the
+		// only `CSI 6 n` on this stream is ConPTY's INHERIT_CURSOR handshake at
+		// session start — answered by the PTY layer before the child owns stdin
+		// (crates/pi-natives/src/pty.rs). Replying here would put a second report
+		// on the program's stdin, where the console decodes it as a keypress.
+		const responder = new TerminalQueryResponder({ cursorPosition: process.platform !== "win32" });
 		const onChunk = (error: Error | null, chunk: string): void => {
 			if (generation !== record.generation) return;
 			if (error) record.log?.append(`PTY output error: ${error.message}\n`);
@@ -1588,9 +1599,31 @@ export interface DaemonBrokerStartOptions {
 	onListening?: () => void;
 }
 
-async function migrateLegacyDaemonRecords(projectDir: string, runtimeDir: string): Promise<FileLock | undefined> {
-	const legacyRuntimeDir = path.dirname(runtimeDir);
-	if (daemonBrokerRuntimeDir(legacyRuntimeDir) !== runtimeDir) return undefined;
+async function migrateLegacyDaemonRecords(projectDir: string, runtimeDir: string): Promise<FileLock[]> {
+	const runtimeRoot = path.dirname(runtimeDir);
+	if (daemonBrokerRuntimeDir(runtimeRoot) !== runtimeDir) return [];
+	const entries = await fs.readdir(runtimeRoot, { withFileTypes: true });
+	const olderRuntimes = entries
+		.filter(entry => {
+			const version = /^broker-v(\d+)$/.exec(entry.name);
+			return entry.isDirectory() && version !== null && Number(version[1]) < DAEMON_BROKER_PROTOCOL_VERSION;
+		})
+		.map(entry => path.join(runtimeRoot, entry.name));
+	const locks: FileLock[] = [];
+	try {
+		for (const olderRuntime of [runtimeRoot, ...olderRuntimes]) {
+			const lock = await acquireLegacyRuntimeLease(projectDir, olderRuntime);
+			if (lock) locks.push(lock);
+		}
+		await migrateDaemonRecords([runtimeRoot, ...olderRuntimes], runtimeDir);
+		return locks;
+	} catch (error) {
+		for (const lock of locks) lock.release();
+		throw error;
+	}
+}
+
+async function acquireLegacyRuntimeLease(projectDir: string, legacyRuntimeDir: string): Promise<FileLock | undefined> {
 	const oldRecords = path.join(legacyRuntimeDir, "daemons");
 	const pidPath = path.join(legacyRuntimeDir, PID_FILE);
 	const clientsDir = path.join(legacyRuntimeDir, "clients");
@@ -1608,6 +1641,18 @@ async function migrateLegacyDaemonRecords(projectDir: string, runtimeDir: string
 		if (await hasLiveDaemonProjectPresence(legacyRuntimeDir)) {
 			throw new Error(`An older daemon client still owns ${legacyRuntimeDir}; close it before upgrading.`);
 		}
+		return lock;
+	} catch (error) {
+		lock.release();
+		throw error;
+	}
+}
+
+async function migrateDaemonRecords(legacyRuntimeDirs: string[], runtimeDir: string): Promise<void> {
+	const migrations: Array<{ source: string; destination: string }> = [];
+	const destinations = new Set<string>();
+	for (const legacyRuntimeDir of legacyRuntimeDirs) {
+		const oldRecords = path.join(legacyRuntimeDir, "daemons");
 		const entries = await fs.readdir(oldRecords, { withFileTypes: true }).catch(error => {
 			if (isEnoent(error)) return [];
 			throw error;
@@ -1622,24 +1667,27 @@ async function migrateLegacyDaemonRecords(projectDir: string, runtimeDir: string
 			if (snapshot.name !== entry.name || spec.name !== entry.name) {
 				throw new Error(`Cannot migrate mismatched legacy daemon ${entry.name}`);
 			}
+			const live =
+				!terminalState(snapshot.state) &&
+				snapshot.pid !== undefined &&
+				Process.fromPid(snapshot.pid)?.status() === "running";
+			if (live && !spec.detached) {
+				throw new Error(`Cannot migrate live non-detached daemon ${entry.name}; stop it before upgrading.`);
+			}
 			const destination = path.join(runtimeDir, "daemons", entry.name);
-			if (await fs.exists(destination)) {
-				if (
-					!terminalState(snapshot.state) &&
-					snapshot.pid !== undefined &&
-					Process.fromPid(snapshot.pid)?.status() === "running"
-				) {
+			if (destinations.has(destination) || (await fs.exists(destination))) {
+				if (live) {
 					throw new Error(`Cannot migrate live legacy daemon ${entry.name} over an existing broker record`);
 				}
 				continue;
 			}
-			await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
-			await fs.rename(source, destination);
+			destinations.add(destination);
+			migrations.push({ source, destination });
 		}
-		return lock;
-	} catch (error) {
-		lock.release();
-		throw error;
+	}
+	for (const { source, destination } of migrations) {
+		await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+		await fs.rename(source, destination);
 	}
 }
 
@@ -1665,9 +1713,9 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 	// releases on exit, so keeping `lease` referenced keeps the scope owned.
 	const lease = await acquireBrokerLease(runtimeDir, endpoint);
 	if (!lease) return;
-	let legacyLock: FileLock | undefined;
+	let legacyLocks: FileLock[] = [];
 	try {
-		legacyLock = await migrateLegacyDaemonRecords(projectDir, runtimeDir);
+		legacyLocks = await migrateLegacyDaemonRecords(projectDir, runtimeDir);
 		setProcessName("omp daemon broker");
 		// Record the scope's project dir so `omp ps` can map this hash-keyed runtime
 		// dir back to its project (and derive the Windows pipe name) offline.
@@ -1693,7 +1741,7 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 			cancelCleanup();
 		}
 	} finally {
-		legacyLock?.release();
+		for (const lock of legacyLocks) lock.release();
 		await releaseBrokerLease(lease);
 	}
 }

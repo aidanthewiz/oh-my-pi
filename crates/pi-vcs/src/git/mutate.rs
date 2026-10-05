@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
 	GitRepo,
 	cli::{RunOptions, run_checked},
+	filter::WorktreeFilter,
 	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
 	read::literal_pathspec,
@@ -21,7 +22,7 @@ use super::{
 use crate::{
 	error::{Error, Result},
 	types::{
-		CleanOptions, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
+		CleanOptions, CommitAuthor, CommitOptions, DetachGitDirResult, ResetMode, RestoreOptions,
 		WorktreeAddOptions, WorktreeAddResult, WorktreeClone,
 	},
 };
@@ -124,11 +125,9 @@ impl GitRepo {
 					.any(|wanted| stage_path_matches(&path, wanted)))
 				&& !selected.contains(path.as_ref())
 		});
-		let (mut filter, filter_index) = repo
-			.filter_pipeline(None)
-			.map_err(|err| Error::backend("git add", err))?;
+		let mut filter = WorktreeFilter::staging(&repo, "git add")?;
 		for path in selected {
-			stage_one(&mut filter, &filter_index, &mut index, &path)?;
+			stage_one(&mut filter, &mut index, &path)?;
 		}
 		index.sort_entries();
 		index
@@ -182,6 +181,42 @@ impl GitRepo {
 		self
 			.head_sha()?
 			.ok_or_else(|| Error::backend("git commit", "commit completed without HEAD"))
+	}
+
+	/// Write a commit object for `tree` on top of `parents` without touching
+	/// HEAD, the index, any ref, or the worktree (`git commit-tree`). No hooks
+	/// run. Returns the new commit id.
+	pub fn commit_tree(
+		&self,
+		tree: &str,
+		parents: &[String],
+		message: &str,
+		author: Option<&CommitAuthor>,
+	) -> Result<String> {
+		let repo = self.gix()?;
+		let tree = resolve_tree(&repo, tree)?;
+		let parents = parents
+			.iter()
+			.map(|parent| resolve_commit(&repo, parent))
+			.collect::<Result<Vec<_>>>()?;
+		let committer = repo
+			.committer()
+			.ok_or_else(|| Error::backend("git commit-tree", "committer identity is not configured"))?
+			.map_err(|err| Error::backend("git commit-tree", err))?;
+		let override_author = author.map(signature_for).transpose()?;
+		let mut author_time = gix::date::parse::TimeBuf::default();
+		let author = if let Some(author) = override_author.as_ref() {
+			author.to_ref(&mut author_time)
+		} else {
+			repo
+				.author()
+				.ok_or_else(|| Error::backend("git commit-tree", "author identity is not configured"))?
+				.map_err(|err| Error::backend("git commit-tree", err))?
+		};
+		let commit = repo
+			.new_commit_as(committer, author, message, tree, parents)
+			.map_err(|err| Error::backend("git commit-tree", err))?;
+		Ok(commit.id.to_hex().to_string())
 	}
 
 	/// Checkout a branch or detached revision without overwriting local changes.
@@ -288,12 +323,43 @@ impl GitRepo {
 				.map_err(|e| Error::backend("git restore", e))?;
 		}
 		if restore_worktree {
-			let source_index = if let Some(source) = options.source.as_deref() {
-				index_for_tree(&repo, Some(&resolve_tree(&repo, source)?))?
-			} else {
-				index
-			};
-			restore_index_paths(self.root(), &repo, &source_index, &options.files)?;
+			let source_index = options
+				.source
+				.as_deref()
+				.map(|source| index_for_tree(&repo, Some(&resolve_tree(&repo, source)?)))
+				.transpose()?;
+			restore_index_paths(
+				self.root(),
+				&repo,
+				source_index.as_ref().unwrap_or(&index),
+				&options.files,
+			)?;
+			// Smudge filters can change file size without changing the staged blob.
+			for (entry, path) in index.entries_mut_with_paths() {
+				if !options.files.is_empty()
+					&& !options
+						.files
+						.iter()
+						.any(|wanted| path_matches(&path.to_str_lossy(), wanted))
+				{
+					continue;
+				}
+				if source_index.as_ref().is_some_and(|source| {
+					source
+						.entry_by_path(path)
+						.is_none_or(|original| original.id != entry.id || original.mode != entry.mode)
+				}) {
+					continue;
+				}
+				let metadata = gix::index::fs::Metadata::from_path_no_follow(
+					&self.root().join(path.to_path_lossy()),
+				)?;
+				entry.stat = gix::index::entry::Stat::from_fs(&metadata)
+					.map_err(|err| Error::backend("git restore", err))?;
+			}
+			index
+				.write(INDEX_WRITE)
+				.map_err(|err| Error::backend("git restore", err))?;
 		}
 		Ok(())
 	}
@@ -923,6 +989,21 @@ pub fn detach_git_dir(
 	Ok(DetachGitDirResult::Detached)
 }
 
+/// Author signature for an explicit [`CommitAuthor`]; a missing date means now.
+fn signature_for(author: &CommitAuthor) -> Result<gix::actor::Signature> {
+	let time = match &author.date {
+		Some(date) => {
+			gix::date::parse(date, None).map_err(|err| Error::backend("git commit", err))?
+		},
+		None => gix::date::Time::now_local_or_utc(),
+	};
+	Ok(gix::actor::Signature {
+		name: author.name.clone().into(),
+		email: author.email.clone().into(),
+		time,
+	})
+}
+
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<gix::hash::ObjectId> {
 	let id = repo
 		.rev_parse_single(spec)
@@ -1116,17 +1197,13 @@ fn same_worktree_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
 /// replace its index entry. A path that vanished or is untrackable (socket,
 /// plain directory) is left out of the index, as `git add` would.
 fn stage_one(
-	filter: &mut gix::filter::Pipeline<'_>,
-	filter_index: &gix::index::State,
+	filter: &mut WorktreeFilter<'_>,
 	index: &mut gix::index::File,
 	path: &str,
 ) -> Result<()> {
 	use gix::objs::tree::EntryKind;
 	let rela_path = path.as_bytes().as_bstr();
-	let Some((id, kind, _)) = filter
-		.worktree_file_to_object(rela_path, filter_index)
-		.map_err(|err| Error::backend("git add", err))?
-	else {
+	let Some((id, kind)) = filter.worktree_file_to_object(path)? else {
 		index.remove_entries(|_, p, _| p == rela_path);
 		return Ok(());
 	};
@@ -1308,13 +1385,14 @@ fn checkout_conflicts(
 	target: &gix::index::File,
 ) -> Result<Vec<String>> {
 	let mut conflicts = Vec::new();
+	let mut filter = WorktreeFilter::staging(repo, "git checkout")?;
 	for entry in current.entries() {
 		let path = entry.path(current).to_str_lossy().into_owned();
 		let target_entry = target.entry_by_path(path.as_bytes().as_bstr());
 		if target_entry.is_some_and(|e| e.id == entry.id && e.mode == entry.mode) {
 			continue;
 		}
-		if worktree_id(repo, &root.join(&path), entry.mode)? != Some(entry.id) {
+		if worktree_id(repo, &mut filter, root, &path, entry.mode)? != Some(entry.id) {
 			conflicts.push(path);
 		}
 	}
@@ -1323,21 +1401,27 @@ fn checkout_conflicts(
 	Ok(conflicts)
 }
 
+/// Blob id the worktree entry at repo-relative `path` would be staged as —
+/// regular files pass through the clean filters, so a CRLF checkout under
+/// `core.autocrlf` matches its LF blob — or `None` when it is missing.
 fn worktree_id(
 	repo: &gix::Repository,
-	path: &Path,
+	filter: &mut WorktreeFilter<'_>,
+	root: &Path,
+	path: &str,
 	mode: gix::index::entry::Mode,
 ) -> Result<Option<gix::hash::ObjectId>> {
-	if !path.exists() && fs::symlink_metadata(path).is_err() {
+	let absolute = root.join(path);
+	if !absolute.exists() && fs::symlink_metadata(&absolute).is_err() {
 		return Ok(None);
 	}
 	let data = if mode == gix::index::entry::Mode::SYMLINK {
-		fs::read_link(path)?
+		fs::read_link(&absolute)?
 			.to_string_lossy()
 			.into_owned()
 			.into_bytes()
 	} else {
-		fs::read(path)?
+		filter.worktree_to_git(path, fs::read(&absolute)?)?
 	};
 	Ok(Some(
 		gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &data)
@@ -1377,20 +1461,27 @@ fn restore_index_paths(
 	index: &gix::index::File,
 	files: &[String],
 ) -> Result<()> {
+	let mut filter = WorktreeFilter::staging(repo, "git restore")?;
 	for entry in index.entries() {
 		let path = entry.path(index).to_str_lossy();
 		if files.is_empty() || files.iter().any(|wanted| path_matches(&path, wanted)) {
 			let object = repo
 				.find_object(entry.id)
 				.map_err(|e| Error::backend("git restore", e))?;
-			let blob = object
+			let mut blob = object
 				.try_into_blob()
 				.map_err(|e| Error::backend("git restore", e))?;
 			let full = root.join(path.as_ref());
 			if let Some(parent) = full.parent() {
 				fs::create_dir_all(parent)?;
 			}
-			fs::write(full, &blob.data)?;
+			let bytes = blob.take_data();
+			let bytes = if entry.mode == gix::index::entry::Mode::SYMLINK {
+				bytes
+			} else {
+				filter.git_to_worktree(&path, bytes)?
+			};
+			fs::write(full, bytes)?;
 		}
 	}
 	Ok(())
@@ -1639,13 +1730,10 @@ fn branch_is_checked_out(common: &Path, full_ref: &str) -> bool {
 fn tracked_worktree_dirty(repo: &GitRepo) -> Result<bool> {
 	let gix = repo.gix()?;
 	let index = load_index_or_head(&gix, "git worktree remove")?;
+	let mut filter = WorktreeFilter::staging(&gix, "git worktree remove")?;
 	for entry in index.entries() {
-		if worktree_id(
-			&gix,
-			&repo.root().join(entry.path(&index).to_str_lossy().as_ref()),
-			entry.mode,
-		)? != Some(entry.id)
-		{
+		let path = entry.path(&index).to_str_lossy();
+		if worktree_id(&gix, &mut filter, repo.root(), &path, entry.mode)? != Some(entry.id) {
 			return Ok(true);
 		}
 	}
@@ -1718,7 +1806,7 @@ mod tests {
 	use tempfile::TempDir;
 
 	use super::*;
-	use crate::types::CommitAuthor;
+	use crate::types::{CommitAuthor, StatusOptions};
 
 	fn git(dir: &Path, args: &[&str]) -> String {
 		let output = Command::new("git")
@@ -1741,12 +1829,93 @@ mod tests {
 		git(temp.path(), &["config", "user.email", "test@example.com"]);
 		git(temp.path(), &["config", "commit.gpgSign", "false"]);
 		git(temp.path(), &["config", "core.hooksPath", ".git/hooks"]);
+		// Assertions compare exact worktree bytes; Git for Windows' system
+		// `core.autocrlf=true` would check them out as CRLF. Tests covering
+		// line-ending conversion opt back in explicitly.
+		git(temp.path(), &["config", "core.autocrlf", "false"]);
 		fs::write(temp.path().join("a"), "one\n").unwrap();
 		fs::write(temp.path().join("b"), "two\n").unwrap();
 		git(temp.path(), &["add", "."]);
 		git(temp.path(), &["commit", "-qm", "base"]);
 		let repo = GitRepo::require(temp.path()).unwrap();
 		(temp, repo)
+	}
+
+	#[test]
+	fn optional_filter_failures_preserve_staged_and_stashed_edits() {
+		for clean in ["cat >/dev/null; exit 1", "cat; printf partial; exit 1"] {
+			let (temp, repo) = fixture();
+			git(temp.path(), &["config", "filter.bad.clean", clean]);
+			git(temp.path(), &["config", "filter.bad.smudge", "cat >/dev/null; exit 1"]);
+			git(temp.path(), &["config", "filter.bad.required", "false"]);
+			fs::write(temp.path().join(".git/info/attributes"), "a filter=bad\n").unwrap();
+			fs::write(temp.path().join("a"), "consumer edit\n").unwrap();
+			repo.stage_files(&["a".into()]).unwrap();
+			assert_eq!(git(temp.path(), &["show", ":a"]), "consumer edit");
+			fs::write(temp.path().join("a"), "later worktree edit\n").unwrap();
+			assert!(repo.stash_push(Some("optional driver")).unwrap());
+			assert_eq!(git(temp.path(), &["show", "refs/stash:a"]), "later worktree edit");
+			assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"one\n");
+			assert!(repo.stash_try_pop(true).unwrap());
+			assert_eq!(git(temp.path(), &["show", ":a"]), "consumer edit");
+			assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"later worktree edit\n");
+		}
+	}
+
+	#[test]
+	fn optional_filter_fallback_keeps_eol_conversion_and_required_failures() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "filter.bad.clean", "cat >/dev/null; exit 1"]);
+		git(temp.path(), &["config", "filter.bad.smudge", "cat >/dev/null; exit 1"]);
+		git(temp.path(), &["config", "filter.bad.required", "false"]);
+		fs::write(temp.path().join(".git/info/attributes"), "a filter=bad text eol=crlf\n").unwrap();
+		fs::write(temp.path().join("a"), b"edited\r\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		assert_eq!(git(temp.path(), &["show", ":a"]), "edited");
+		repo
+			.restore(&RestoreOptions { files: vec!["a".into()], worktree: true, ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"edited\r\n");
+		git(temp.path(), &["config", "filter.bad.required", "true"]);
+		let repo = GitRepo::require(temp.path()).unwrap();
+		fs::write(temp.path().join("a"), b"must survive\r\n").unwrap();
+		assert!(repo.stage_files(&["a".into()]).is_err());
+		assert_eq!(git(temp.path(), &["show", ":a"]), "edited");
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"must survive\r\n");
+	}
+
+	#[test]
+	fn successful_optional_drivers_keep_their_clean_and_smudge_output() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "filter.upper.clean", "tr '[:lower:]' '[:upper:]'"]);
+		git(temp.path(), &["config", "filter.upper.smudge", "tr '[:upper:]' '[:lower:]'"]);
+		git(temp.path(), &["config", "filter.upper.required", "false"]);
+		fs::write(temp.path().join(".git/info/attributes"), "a filter=upper text eol=crlf\n")
+			.unwrap();
+		fs::write(temp.path().join("a"), b"mixed\r\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		assert_eq!(git(temp.path(), &["show", ":a"]), "MIXED");
+		fs::write(temp.path().join("a"), b"dirty\r\n").unwrap();
+		repo
+			.restore(&RestoreOptions { files: vec!["a".into()], worktree: true, ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"mixed\r\n");
+	}
+
+	#[test]
+	fn repeated_filter_sections_do_not_downgrade_required_driver() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "filter.bad.clean", "cat >/dev/null; exit 1"]);
+		git(temp.path(), &["config", "filter.bad.required", "true"]);
+		let config_path = temp.path().join(".git/config");
+		let mut config = fs::read_to_string(&config_path).unwrap();
+		config.push_str("\n[filter \"bad\"]\n\tsmudge = cat\n");
+		fs::write(config_path, config).unwrap();
+		fs::write(temp.path().join(".git/info/attributes"), "a filter=bad\n").unwrap();
+		fs::write(temp.path().join("a"), "must survive\n").unwrap();
+		assert!(repo.stage_files(&["a".into()]).is_err());
+		assert_eq!(git(temp.path(), &["show", ":a"]), "one");
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"must survive\n");
 	}
 
 	#[tokio::test]
@@ -1794,6 +1963,52 @@ mod tests {
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "A  new");
 		repo.unstage(&[]).unwrap();
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "?? new");
+	}
+
+	#[test]
+	fn commit_tree_preserves_checkout_and_skips_hooks() {
+		let (temp, repo) = fixture();
+		let root = temp.path();
+		let head = git(root, &["rev-parse", "HEAD"]);
+		fs::write(root.join("a"), "staged\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		let tree = repo.write_tree(None).unwrap();
+		fs::write(root.join("a"), "unstaged\n").unwrap();
+		fs::write(root.join("scratch"), "untracked\n").unwrap();
+		for name in ["pre-commit", "commit-msg", "post-commit"] {
+			write_hook(
+				&root.join(".git/hooks").join(name),
+				"echo invoked > .git/hook-invoked\nexit 1",
+				true,
+			);
+		}
+		let index = fs::read(root.join(".git/index")).unwrap();
+		let refs = git(root, &["show-ref"]);
+		let reflog = fs::read(root.join(".git/logs/HEAD")).unwrap();
+		let edit_message = fs::read(root.join(".git/COMMIT_EDITMSG")).unwrap();
+		let author = CommitAuthor {
+			name:  "Task Author".into(),
+			email: "task@example.com".into(),
+			date:  Some("2020-01-02T03:04:05Z".into()),
+		};
+		let sha = repo
+			.commit_tree(&tree, &[head.clone()], "task\n\nbody", Some(&author))
+			.unwrap();
+		assert_eq!(git(root, &["show", &format!("{sha}:a")]), "staged");
+		assert_eq!(git(root, &["show", "-s", "--format=%P", &sha]), head);
+		assert_eq!(
+			git(root, &["show", "-s", "--format=%an <%ae> %at", &sha]),
+			"Task Author <task@example.com> 1577934245"
+		);
+		assert_eq!(repo.commit_details(&sha).unwrap().message, "task\n\nbody");
+		assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+		assert_eq!(git(root, &["show-ref"]), refs);
+		assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+		assert_eq!(fs::read(root.join(".git/logs/HEAD")).unwrap(), reflog);
+		assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "unstaged\n");
+		assert_eq!(fs::read_to_string(root.join("scratch")).unwrap(), "untracked\n");
+		assert!(!root.join(".git/hook-invoked").exists());
+		assert_eq!(fs::read(root.join(".git/COMMIT_EDITMSG")).unwrap(), edit_message);
 	}
 
 	#[test]
@@ -2170,6 +2385,91 @@ mod tests {
 		repo.reset(ResetMode::Hard, Some(&main)).unwrap();
 		assert!(repo.delete_branch("other", true).unwrap());
 		assert!(!repo.delete_branch("missing", true).unwrap());
+	}
+
+	#[tokio::test]
+	async fn checkout_restore_and_worktree_remove_honor_autocrlf() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "core.autocrlf", "true"]);
+		repo.create_branch("other", "HEAD", false).unwrap();
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		repo
+			.commit_create("main", &CommitOptions::default(), None)
+			.await
+			.unwrap();
+		repo.checkout("other").unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "one\r\n");
+		repo.checkout("main").unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "main\r\n");
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+
+		fs::write(temp.path().join("a"), "dirty\r\n").unwrap();
+		assert!(matches!(repo.checkout("other"), Err(Error::Conflict { .. })));
+		repo
+			.restore(&RestoreOptions { files: vec!["a".into()], ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "main\r\n");
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+
+		let linked_parent = tempfile::tempdir().unwrap();
+		let linked = linked_parent.path().join("linked-autocrlf");
+		repo
+			.worktree_add(&linked, "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap();
+		assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "main\r\n");
+		assert!(repo.worktree_remove(&linked, false).unwrap(), "clean CRLF checkout is not dirty");
+	}
+
+	#[test]
+	fn restore_smudged_files_refreshes_only_matching_index_entries() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["config", "core.autocrlf", "true"]);
+		repo
+			.restore(&RestoreOptions {
+				source: Some("HEAD".into()),
+				files: vec!["a".into()],
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"one\r\n");
+		assert_eq!(repo.status_porcelain(&StatusOptions::default()).unwrap(), "");
+
+		fs::write(temp.path().join("a"), b"staged\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		fs::write(temp.path().join("b"), b"unrelated dirty\n").unwrap();
+		repo
+			.restore(&RestoreOptions {
+				source: Some("HEAD".into()),
+				files: vec!["a".into()],
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", ":a"]), "staged");
+		assert_eq!(
+			repo
+				.status_porcelain(&StatusOptions::default())
+				.unwrap()
+				.trim_end(),
+			"MM a\n M b"
+		);
+		repo
+			.restore(&RestoreOptions { files: vec!["a".into()], ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"staged\r\n");
+		assert_eq!(git(temp.path(), &["show", ":a"]), "staged");
+		assert_eq!(
+			repo
+				.status_porcelain(&StatusOptions::default())
+				.unwrap()
+				.trim_end(),
+			"M  a\n M b"
+		);
+		assert_eq!(fs::read(temp.path().join("b")).unwrap(), b"unrelated dirty\n");
 	}
 
 	#[tokio::test]
@@ -2696,7 +2996,7 @@ mod tests {
 			.unwrap();
 		assert!(
 			git(temp.path(), &["worktree", "list", "--porcelain"])
-				.contains(linked.to_string_lossy().as_ref())
+				.contains(git_metadata_path(&linked).as_ref())
 		);
 		assert!(repo.worktree_remove(&linked, true).unwrap());
 
@@ -2718,7 +3018,7 @@ mod tests {
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), source_head);
 		assert!(
 			!git(temp.path(), &["worktree", "list", "--porcelain"])
-				.contains(linked.to_string_lossy().as_ref())
+				.contains(git_metadata_path(&linked).as_ref())
 		);
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);

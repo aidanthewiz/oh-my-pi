@@ -310,6 +310,16 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`,
 			);
 		}
+		if (outcome === "outdated-relay") {
+			throw new ToolError(
+				`The browser relay at ${cdpUrl} is out of date. Restart the relay under this ${CF_BRAND} version, then retry.`,
+			);
+		}
+		if (outcome === "outdated-extension") {
+			throw new ToolError(
+				`The ${CF_BRAND} Browser Relay extension is out of date. Run \`${CF_COMMAND} browser-relay install\` and reload the extension in Chrome.`,
+			);
+		}
 		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);
 		const puppeteer = await loadPuppeteer();
 		const browser = await puppeteer.connect({
@@ -420,7 +430,9 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 			// connection. `kill` is scoped to spawned-app browsers — stopping the
 			// shared daemon here would tear down every other session's tabs. The
 			// daemon dies with the last omp client in the project (broker idle
-			// teardown), or via an explicit stop (`write proc://<name>/kill`).
+			// teardown), when its CDP endpoint stops answering after a failed tab
+			// cleanup (`stopSharedBrowserIfUnreachable`), or via an explicit stop
+			// (`write proc://<name>/kill`).
 			if (handle.browser.connected) {
 				try {
 					handle.browser.disconnect();

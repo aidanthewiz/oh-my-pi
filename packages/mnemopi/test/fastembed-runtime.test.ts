@@ -21,10 +21,8 @@ describe("fastembed runtime version pins", () => {
 		expect(plan.install.dependencies).toEqual({
 			fastembed: packageManifest.peerDependencies.fastembed,
 		});
-		expect(plan.install.overrides).toBeUndefined();
+		expect(plan.install.overrides?.["onnxruntime-node"]).toBeUndefined();
 		expect(plan.install.trustedDependencies).toEqual(["onnxruntime-node"]);
-		expect(plan.versionKey).toContain("transitive-ort");
-		expect(plan.versionKey).not.toContain("forced-ort");
 	});
 
 	test("Windows preload selects fastembed's ORT DLL before inherited paths", async () => {

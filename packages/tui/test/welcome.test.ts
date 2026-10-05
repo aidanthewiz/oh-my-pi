@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { pickWeightedTip, WelcomeComponent } from "@oh-my-pi/pi-tui/prompt/welcome";
-import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
 
 describe("WelcomeComponent", () => {
 	beforeAll(async () => {
@@ -9,29 +10,6 @@ describe("WelcomeComponent", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-	});
-
-	it("selects standard tip when preset is not unicode", () => {
-		vi.spyOn(theme, "getSymbolPreset").mockReturnValue("nerd");
-
-		const welcome = new WelcomeComponent("1.0.0", "model", "provider");
-		expect(welcome.tip).not.toBe("Please use nerdfont 😭.");
-		expect(welcome.tip).toBeDefined();
-	});
-
-	it("selects nerdfont tip with 10% probability under unicode preset", () => {
-		vi.spyOn(theme, "getSymbolPreset").mockReturnValue("unicode");
-
-		// 9% chance => selects special tip
-		vi.spyOn(Math, "random").mockReturnValue(0.09);
-		const welcomeSpecial = new WelcomeComponent("1.0.0", "model", "provider");
-		expect(welcomeSpecial.tip).toBe("Please use nerdfont 😭.");
-
-		// 10% chance => selects regular tip
-		vi.spyOn(Math, "random").mockReturnValue(0.1);
-		const welcomeRegular = new WelcomeComponent("1.0.0", "model", "provider");
-		expect(welcomeRegular.tip).not.toBe("Please use nerdfont 😭.");
-		expect(welcomeRegular.tip).toBeDefined();
 	});
 
 	it("weights [NEW] tips above ordinary tips in selection", () => {
@@ -60,44 +38,28 @@ describe("WelcomeComponent", () => {
 		expect(pickWeightedTip([], 0.5)).toBe("");
 	});
 
-	it("truncates a long model name inside the fixed left column and keeps the right column", () => {
-		// Dynamic model labels must not influence the responsive breakpoint: a
-		// long name is truncated with an ellipsis instead of collapsing the right
-		// column or changing the box height when authoritative session data
-		// replaces the prepaint labels.
-		const modelName = "DeepSeek V4 Flash (2x usage)";
-		const output = new WelcomeComponent("17.3.4", modelName, "opencode-go").render(55).join("\n");
-		const plain = output.replace(/\x1b\[[0-9;]*m/g, "");
-
-		expect(plain).not.toContain(modelName);
-		expect(plain).toMatch(/DeepSeek V4 [^│]*…/);
-		expect(plain).toContain("Recent sessions");
-	});
-
-	it("hides the LSP section only when LSP is disabled (null), not when no servers were detected", () => {
-		const [empty, disabled] = [[], null].map(servers =>
-			new WelcomeComponent("1.0.0", "model", "provider", [], servers)
-				.render(100)
-				.join("\n")
-				.replace(/\x1b\[[0-9;]*m/g, ""),
-		);
-
-		expect(empty).toContain("No LSP servers");
-		expect(disabled).not.toContain("LSP Servers");
-		expect(disabled).not.toContain("No LSP servers");
-		expect(disabled).toContain("Recent sessions");
+	it("keeps the product identity visible without overflowing narrow or wide terminals", () => {
+		const welcome = new WelcomeComponent("18.5.0", "Coreforge", "Aidan");
+		for (const columns of [16, 24, 32, 50, 80, 140]) {
+			const rows = welcome.render(columns).map(row => Bun.stripANSI(row).trimEnd());
+			expect(rows.join("\n")).toContain("Coreforge");
+			expect(rows.join("\n")).toContain("v18.5.0");
+			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(columns);
+		}
 	});
 
 	it("keeps the Coreforge mark on wide native cards and the brand on narrow cards", () => {
-		const welcome = new WelcomeComponent("18.4.6", "model", "provider", [], [], "Coreforge", "Aidan");
+		const welcome = new WelcomeComponent("18.5.0", "Coreforge", "Aidan");
 		const cx = { cols: 80, dark: true, reduceMotion: false, supports: () => true, feature: () => true };
 		const wide = JSON.stringify(welcome.describe(cx));
-		const narrow = JSON.stringify(welcome.describe({ ...cx, cols: 55 }));
+		const narrow = JSON.stringify(welcome.describe({ ...cx, cols: 24 }));
 
 		expect(wide).toContain("⣠⠞⢁⣴⣦⡀");
 		expect(wide).toContain("Welcome back, Aidan!");
-		expect(wide).toContain("Coreforge v18.4.6");
+		expect(wide).toContain("Coreforge");
+		expect(wide).toContain("v18.5.0");
 		expect(narrow).not.toContain("⣠⠞⢁⣴⣦⡀");
-		expect(narrow).toContain("Coreforge v18.4.6");
+		expect(narrow).toContain("Coreforge");
+		expect(narrow).toContain("v18.5.0");
 	});
 });

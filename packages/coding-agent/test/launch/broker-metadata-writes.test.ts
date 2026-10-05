@@ -264,104 +264,127 @@ describe("daemon metadata writes", () => {
 		expect(await Bun.file(path.join(legacyDir, "spec.json")).json()).toMatchObject({ cwd: projectDir });
 		expect(await rows(undefined)).toEqual(expected(false));
 	}, 20_000);
-	it("adopts an old-scope detached daemon before allowing another process with the same name", async () => {
-		using tempDir = TempDir.createSync("@omp-broker-upgrade-");
-		const projectDir = path.join(tempDir.path(), "project");
-		const runtimeDir = path.join(tempDir.path(), "runtime");
-		await fs.mkdir(projectDir);
-		const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-		const spec = {
-			name: "survivor",
-			application: process.execPath,
-			args: ["-e", "setInterval(() => {}, 1000)"],
-			env: {},
-			cwd: projectDir,
-			pty: false,
-			restart: "no" as const,
-			persist: true,
-			detached: true,
-		};
-		const legacyDir = path.join(runtimeDir, "daemons", spec.name);
-		const versionedDir = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons", spec.name);
-		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		await Bun.write(
-			path.join(legacyDir, "meta.json"),
-			JSON.stringify({
-				daemon: {
-					name: spec.name,
-					id: crypto.randomUUID(),
-					state: "running",
-					pid: child.pid,
-					createdAt: Date.now(),
-					startedAt: Date.now(),
-					restartCount: 0,
-					outputBytes: 0,
-					persist: true,
-					detached: true,
-				},
-				spec,
-			}),
-		);
-		await Bun.write(path.join(legacyDir, "output.log"), "legacy output\n");
-		const broker = startBroker(projectDir, runtimeDir);
-		try {
-			await broker.listening;
-			const described = await client.request({ op: "describe", name: spec.name });
-			if (described.op !== "describe") throw new Error(`Unexpected response ${described.op}`);
-			expect(described.daemon.pid).toBe(child.pid);
-			expect(described.daemon.state).toBe("running");
-			expect(await fs.exists(legacyDir)).toBe(false);
-			expect(await fs.exists(versionedDir)).toBe(true);
-			const logs = await client.request({
-				op: "logs",
-				name: spec.name,
-				lines: 10,
-				head: false,
-				follow: false,
-				timeoutMs: 1_000,
+	it.each([
+		{ olderScope: "", detached: true },
+		{ olderScope: "broker-v3", detached: true },
+		{ olderScope: "broker-v3", detached: false },
+	])(
+		"preserves a live older daemon during upgrade ($olderScope/$detached)",
+		async ({ olderScope, detached }) => {
+			using tempDir = TempDir.createSync("@omp-broker-upgrade-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
 			});
-			if (logs.op !== "logs") throw new Error(`Unexpected response ${logs.op}`);
-			expect(logs.text).toContain("legacy output");
-			await expect(client.request({ op: "start", spec })).rejects.toThrow(/already running/);
-			const stopped = await client.request({ op: "stop", name: spec.name, timeoutMs: 2_000 });
-			if (stopped.op !== "stop") throw new Error(`Unexpected response ${stopped.op}`);
-			expect(stopped.daemon.state).toBe("exited");
-		} finally {
-			await client.request({ op: "shutdown" }).catch(() => undefined);
-			client.close();
-			await broker.finished;
-			child.kill();
-			await child.exited;
-		}
-	}, 20_000);
-	it("refuses a v3 broker while an older broker still owns its scope", async () => {
+			const spec = {
+				name: "survivor",
+				application: process.execPath,
+				args: ["-e", "setInterval(() => {}, 1000)"],
+				env: {},
+				cwd: projectDir,
+				pty: false,
+				restart: "no" as const,
+				persist: true,
+				detached,
+			};
+			const legacyDir = path.join(runtimeDir, olderScope, "daemons", spec.name);
+			const versionedDir = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons", spec.name);
+			const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+			await Bun.write(
+				path.join(legacyDir, "meta.json"),
+				JSON.stringify({
+					daemon: {
+						name: spec.name,
+						id: crypto.randomUUID(),
+						state: "running",
+						pid: child.pid,
+						createdAt: Date.now(),
+						startedAt: Date.now(),
+						restartCount: 0,
+						outputBytes: 0,
+						persist: true,
+						detached,
+					},
+					spec,
+				}),
+			);
+			await Bun.write(path.join(legacyDir, "output.log"), "legacy output\n");
+			const beforeMetadata = await Bun.file(path.join(legacyDir, "meta.json")).text();
+			const broker = startBroker(projectDir, runtimeDir);
+			try {
+				if (!detached) {
+					await expect(broker.finished).rejects.toThrow(/live non-detached daemon/u);
+					expect(await Bun.file(path.join(legacyDir, "meta.json")).text()).toBe(beforeMetadata);
+					expect(await Bun.file(path.join(legacyDir, "output.log")).text()).toBe("legacy output\n");
+					expect(await fs.exists(versionedDir)).toBe(false);
+					expect(child.exitCode).toBeNull();
+					return;
+				}
+				await broker.listening;
+				const described = await client.request({ op: "describe", name: spec.name });
+				if (described.op !== "describe") throw new Error(`Unexpected response ${described.op}`);
+				expect(described.daemon.pid).toBe(child.pid);
+				expect(described.daemon.state).toBe("running");
+				expect(await fs.exists(legacyDir)).toBe(false);
+				expect(await fs.exists(versionedDir)).toBe(true);
+				const logs = await client.request({
+					op: "logs",
+					name: spec.name,
+					lines: 10,
+					head: false,
+					follow: false,
+					timeoutMs: 1_000,
+				});
+				if (logs.op !== "logs") throw new Error(`Unexpected response ${logs.op}`);
+				expect(logs.text).toContain("legacy output");
+				await expect(client.request({ op: "start", spec })).rejects.toThrow(/already running/);
+				const stopped = await client.request({ op: "stop", name: spec.name, timeoutMs: 2_000 });
+				if (stopped.op !== "stop") throw new Error(`Unexpected response ${stopped.op}`);
+				expect(stopped.daemon.state).toBe("exited");
+			} finally {
+				if (detached) await client.request({ op: "shutdown" }).catch(() => undefined);
+				client.close();
+				if (detached) await broker.finished;
+				else await broker.finished.catch(() => undefined);
+				child.kill();
+				await child.exited;
+			}
+		},
+		20_000,
+	);
+	it.each(["", "broker-v3"])("refuses an upgrade while an older broker owns scope '%s'", async olderScope => {
 		using tempDir = TempDir.createSync("@omp-broker-upgrade-lease-");
 		const projectDir = path.join(tempDir.path(), "project");
 		const runtimeDir = path.join(tempDir.path(), "runtime");
 		await fs.mkdir(projectDir);
-		await fs.mkdir(runtimeDir);
-		const lock = FileLock.tryAcquire(path.join(runtimeDir, "broker.pid"));
+		const olderRuntimeDir = path.join(runtimeDir, olderScope);
+		await fs.mkdir(olderRuntimeDir, { recursive: true });
+		const untouchedRecord = path.join(runtimeDir, "daemons", "unversioned-record", "meta.json");
+		const untouchedContent = '{"mustRemainUnchanged":true}';
+		await Bun.write(untouchedRecord, untouchedContent);
+		const lock = FileLock.tryAcquire(path.join(olderRuntimeDir, "broker.pid"));
 		if (!lock.acquired) throw new Error("Expected isolated legacy broker lease");
 		try {
 			const broker = startBroker(projectDir, runtimeDir);
 			await expect(broker.finished).rejects.toThrow(/older daemon broker still owns/);
 			expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
+			expect(await Bun.file(untouchedRecord).text()).toBe(untouchedContent);
 		} finally {
 			lock.release();
 		}
 	});
 
-	it("waits for an older client even after its broker exits before transferring ownership", async () => {
+	it.each(["", "broker-v3"])("waits for an older client in scope '%s' after its broker exits", async olderScope => {
 		using tempDir = TempDir.createSync("@omp-broker-upgrade-client-");
 		const projectDir = path.join(tempDir.path(), "project");
 		const runtimeDir = path.join(tempDir.path(), "runtime");
 		await fs.mkdir(projectDir);
 		await Bun.write(
-			path.join(runtimeDir, "clients", `${process.pid}-old.json`),
+			path.join(runtimeDir, olderScope, "clients", `${process.pid}-old.json`),
 			JSON.stringify({ pid: process.pid, id: `${process.pid}-old`, projectDir }),
 		);
 		const broker = startBroker(projectDir, runtimeDir);

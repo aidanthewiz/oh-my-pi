@@ -13,8 +13,9 @@
  * arrows/PgUp/PgDn, vim motions (`j`/`k`/`h`/`l`/`g`/`G`), and mouse
  * clicks/wheel. All toolbar buttons are clickable and mirrored by keys:
  * `v` cycles the view (`1`–`4` pick one), `alt+↓`/`alt+↑` jump hunks and roll
- * into the adjacent file at the edges, `]`/`[` switch files, `s`/`u`
- * stage/unstage (hunk-aware), `x` discards a hunk, `delete` discards the
+ * into the adjacent file at the edges, `space` stages/unstages the focused
+ * diff row (the focused hunk in hunk view), `s`/`u` stage/unstage
+ * (hunk-aware), `x` discards a hunk, `delete` discards the
  * whole file (press twice to confirm), `w` wraps, `b` cycles
  * whitespace handling (exact → ignore whitespace → ignore
  * formatting/import-only changes), `c` jumps to the commit form, `r`
@@ -42,7 +43,6 @@ import type { AvatarSource } from "./avatar";
 import { pill, softPill, tintChip } from "./colors";
 import {
 	buildDiffDocument,
-	type DiffDocument,
 	buildLineSelectionPatch,
 	DiffPane,
 	type HunkAction,
@@ -186,7 +186,6 @@ class GitTuiComponent implements Component {
 	#disposed = false;
 	#help: OverlayHandle | null = null;
 	readonly #nativeBar = new Memo();
-	readonly #nativeBody = new Memo();
 	readonly #nativeRoot = new Memo();
 
 	constructor(ui: TUI, host: GitTuiHost) {
@@ -669,14 +668,20 @@ class GitTuiComponent implements Component {
 			else if (matchesKey(data, "up") || data === "k") this.#pane.moveCursor(-1, false);
 			else if (matchesKey(data, "down") || data === "j") this.#pane.moveCursor(1, false);
 			else if (matchesKey(data, "pageUp")) this.#pane.moveCursor(-Math.max(1, this.#contentHeight - 2), false);
-			else if (matchesKey(data, "pageDown") || data === " ")
-				this.#pane.moveCursor(Math.max(1, this.#contentHeight - 2), false);
+			else if (matchesKey(data, "pageDown")) this.#pane.moveCursor(Math.max(1, this.#contentHeight - 2), false);
 			else if (matchesKey(data, "left") || data === "h") this.#pane.scrollLeftBy(-8);
 			else if (matchesKey(data, "right") || data === "l") this.#pane.scrollLeftBy(8);
 			else if (matchesKey(data, "home") || data === "g") this.#pane.cursorToEdge("start");
 			else if (matchesKey(data, "end") || data === "G") this.#pane.cursorToEdge("end");
 			else if (matchesKey(data, "enter")) return this.#jumpHunkOrFile(1);
-			else if (data === "s" || data === "u") {
+			else if (matchesKey(data, "space")) {
+				// Hunk-view rows do not map back to document rows, so Space acts on the focused hunk there.
+				const target = this.#pane.patchTarget;
+				const hunk = this.#pane.mode === "hunk" ? this.#pane.currentHunk : null;
+				if (target && hunk) void this.#hunkAction(hunk, target);
+				else if (target && this.#pane.selection) void this.#lineAction(target);
+				return;
+			} else if (data === "s" || data === "u") {
 				if (this.#pane.selection?.explicit && this.#pane.patchTarget) {
 					void this.#lineAction(this.#pane.patchTarget);
 					return;
@@ -914,17 +919,7 @@ class GitTuiComponent implements Component {
 			],
 			() => this.#describeBar(narrow),
 		);
-		const body = this.#nativeBody.get(
-			[
-				this.#pane.state,
-				this.#pane.doc,
-				this.#pane.mode,
-				this.#contents,
-				this.#currentFile,
-				this.#pane.emptyMessage,
-			],
-			() => this.#describeBody(),
-		);
+		const body = this.#describeBody(cx, narrow);
 		const side = this.#sidebar.describe(cx);
 		return this.#nativeRoot.get([bar, body, side, narrow, status, this.#status, this.#statusTone], () => {
 			const main = col(
@@ -1079,21 +1074,32 @@ class GitTuiComponent implements Component {
 	}
 
 	/** The diff for the view mode, or the loading, empty and media states. */
-	#describeBody(): NativeNode {
+	#describeBody(cx: DescribeContext, narrow: boolean): NativeNode {
 		const doc = this.#pane.doc;
 		const file = this.#currentFile;
 		if (doc && this.#pane.state === "ready") {
-			return node(
-				"diff",
-				{
-					text: unifiedDiff(doc, this.#pane.mode === "file"),
-					path: doc.filePath,
-					mode: this.#pane.mode === "split" ? "split" : "unified",
-					role: "omp.app.git.diff",
-				},
-				undefined,
-				"diff",
-			);
+			const sidebarWidth = Math.max(30, Math.min(48, Math.floor(cx.cols * 0.3)));
+			const width = Math.max(1, narrow ? cx.cols : cx.cols - sidebarWidth - 1);
+			this.#contentHeight = Math.max(1, this.#ui.terminal.rows - (narrow ? 12 : 4));
+			const hunk = this.#pane.mode === "hunk" ? this.#pane.currentHunk : null;
+			const lines = this.#pane.render(width, this.#contentHeight);
+			return {
+				...col(
+					compact([
+						hunk &&
+							text([
+								span(
+									`Selected hunk ${this.#pane.selectedHunk + 1}/${doc.hunks.length}: ${hunk.header}`,
+									"strong",
+								),
+							]),
+						node("rows", { cols: width, lines }, undefined, "viewport"),
+					]),
+					{ role: "omp.app.git.diff" },
+				),
+				key: `diff:${doc.filePath}:${this.#focus}:${this.#pane.mode}:${this.#pane.cursor}:${this.#pane.anchor}:${this.#pane.selectedHunk}`,
+				reveal: "nearest",
+			};
 		}
 		const contents = this.#contents;
 		if (this.#pane.state === "asset" && file && contents?.kind === "asset") {
@@ -1140,47 +1146,6 @@ class GitTuiComponent implements Component {
 			"empty",
 		);
 	}
-}
-
-/**
- * A unified diff of `doc` for the `diff` kind: the tight hunks (Tern folds
- * the unchanged lines between them), or with `whole` one hunk spanning the
- * file. Paired changes go out as their `-` block then their `+` block, so the
- * terminal pairs them for word emphasis.
- */
-function unifiedDiff(doc: DiffDocument, whole: boolean): string {
-	const out: string[] = [];
-	const emit = (rows: DiffDocument["rows"]): void => {
-		let dels: string[] = [];
-		let adds: string[] = [];
-		const flush = (): void => {
-			out.push(...dels, ...adds);
-			dels = [];
-			adds = [];
-		};
-		for (const diffRow of rows) {
-			if (diffRow.kind === "context") {
-				flush();
-				out.push(` ${diffRow.newText}`);
-				continue;
-			}
-			if (diffRow.oldNum !== undefined) dels.push(`-${diffRow.oldText}`);
-			if (diffRow.newNum !== undefined) adds.push(`+${diffRow.newText}`);
-		}
-		flush();
-	};
-	if (whole) {
-		const oldCount = doc.rows.filter(diffRow => diffRow.oldNum !== undefined).length;
-		const newCount = doc.rows.filter(diffRow => diffRow.newNum !== undefined).length;
-		out.push(`@@ -1,${oldCount} +1,${newCount} @@`);
-		emit(doc.rows);
-	} else {
-		for (const hunk of doc.hunks) {
-			out.push(hunk.header);
-			emit(hunk.rows);
-		}
-	}
-	return out.join("\n");
 }
 
 /** One side of a media/binary change as a short fact line. */

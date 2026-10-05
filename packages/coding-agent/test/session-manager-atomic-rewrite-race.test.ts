@@ -335,13 +335,7 @@ describe("SessionManager atomic rewrite race", () => {
 class PausedTitleMoveStorage extends MemorySessionStorage {
 	readonly titleAppendStarted = Promise.withResolvers<void>();
 	readonly resumeTitleAppend = Promise.withResolvers<void>();
-	readonly titleUpdatePaths: string[] = [];
-	readonly releasedClaims: string[] = [];
 	failNextHotAppend = false;
-	claimSessionFile(sessionPath: string): () => void {
-		return () => this.releasedClaims.push(sessionPath);
-	}
-
 	override openWriter(
 		sessionPath: string,
 		options?: { flags?: "a" | "w"; onError?: (err: Error) => void },
@@ -369,11 +363,6 @@ class PausedTitleMoveStorage extends MemorySessionStorage {
 			getError: () => writer.getError(),
 		};
 	}
-
-	override async updateSessionTitle(sessionPath: string, update: SessionTitleUpdate): Promise<Hash> {
-		this.titleUpdatePaths.push(sessionPath);
-		return super.updateSessionTitle(sessionPath, update);
-	}
 }
 
 class PausedTitleAcknowledgementStorage extends MemorySessionStorage {
@@ -396,7 +385,7 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		);
 	const ourTurnsAfter = Array.from({ length: 5 }, (_, turn) => `our turn ${turn} after the conflict`);
 
-	/** Reports `ownedElsewhere` as held by another live process, as `claimSessionFile` does for a file a second omp writes. */
+	/** Reports session `ownedElsewhere` as held by another live process, as `claimSession` does for a session a second omp writes. */
 	class OwnedElsewhereStorage extends FileSessionStorage {
 		readonly #ownedElsewhere: string;
 
@@ -405,8 +394,8 @@ describe("SessionManager cross-process rewrite freshness", () => {
 			this.#ownedElsewhere = ownedElsewhere;
 		}
 
-		override claimSessionFile(sessionPath: string): (() => void) | null {
-			return sessionPath === this.#ownedElsewhere ? null : super.claimSessionFile(sessionPath);
+		override claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+			return sessionId === this.#ownedElsewhere ? null : super.claimSession(sessionId, sessionPath);
 		}
 	}
 
@@ -554,10 +543,8 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		manager.appendMessage(userTurn("trigger sibling"));
 		const sibling = manager.getSessionFile();
 		if (!sibling || sibling === contested) throw new Error("Expected a sibling session");
-		expect(storage.releasedClaims).toContain(contested);
 		storage.resumeTitleAppend.resolve();
 		await rename;
-		expect(storage.titleUpdatePaths).not.toContain(contested);
 		expect(await storage.readText(contested)).toBe(replaced);
 		expect(await storage.readText(sibling)).toContain('"content":"trigger sibling"');
 		await manager.rewriteEntries();
@@ -719,11 +706,12 @@ describe("SessionManager cross-process rewrite freshness", () => {
 			creator.appendMessage(userTurn("our turn before the conflict"));
 			const artifactId = await creator.saveArtifact("tool output", "bash");
 			const owned = creator.getSessionFile();
+			const ownedId = creator.getSessionId();
 			if (!owned || !artifactId) throw new Error("Expected session file and artifact");
 			await creator.close();
 			const ownedBytes = await Bun.file(owned).text();
 
-			const storage = new OwnedElsewhereStorage(owned);
+			const storage = new OwnedElsewhereStorage(ownedId);
 			const ours = await SessionManager.open(owned, tempDir.path(), storage, { suppressBreadcrumb: true });
 			const ownedSessionId = ours.getSessionId();
 			const notices: SessionPersistenceNotice[] = [];

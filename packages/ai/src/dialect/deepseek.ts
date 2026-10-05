@@ -1,5 +1,6 @@
 import { parseJsonWithRepair } from "@oh-my-pi/pi-utils";
 import type { Message, ToolCall } from "../types";
+import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { asRecord, mintToolCallId, partialSuffixOverlapAny } from "./coercion";
 import dialectPrompt from "./deepseek.md" with { type: "text" };
 import { assistantTranscriptParts, collectToolResultRun, messageContentText, stringifyJson } from "./rendering";
@@ -98,6 +99,11 @@ const DSML_INVOKE_TOKENS = [
 ] as const;
 const DSML_PARAMETER_CLOSE_TOKENS = [DSML_PARAMETER_CLOSE_FULLWIDTH, DSML_PARAMETER_CLOSE_ASCII] as const;
 
+// A DSML invoke/parameter opener in visible text: a call whose `tool_calls`
+// wrapper is missing, so the envelope scanner never consumed it.
+const BARE_DSML_OPEN = /<[｜|]DSML[｜|](?:invoke|parameter)\b/u;
+const VISIBLE_TAIL_LIMIT = 48;
+
 type State =
 	| "outside"
 	| "thinking"
@@ -122,8 +128,24 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	#dsmlParamName = "";
 	#dsmlParamIsString = true;
 	#dsmlParamRaw = "";
+	/** Wrapper text is retained until its first invoke completes or the section remains prose. */
+	#pendingDsmlSection: string | undefined;
 	#rawBlock = "";
 	#stripLeadingWhitespace = false;
+	/**
+	 * Visible text already carries a bare DSML `invoke`/`parameter` opener (a
+	 * malformed call missing its `tool_calls` wrapper). Its closers are then kept
+	 * verbatim instead of stripped as orphans, so the agent loop can find where
+	 * the broken call ends and remove exactly that span, keeping prose after it.
+	 */
+	#bareDsmlOpenVisible = false;
+	/** Last few visible characters, so a bare opener split across chunks is still seen. */
+	#visibleTail = "";
+	/** Markdown code delimiters, retained across chunks before DSML wrapper detection. */
+	#codeDelimiter = "";
+	#codeLength = 0;
+	#codeRunDelimiter = "";
+	#codeRunLength = 0;
 
 	constructor(options: InbandScannerOptions = {}) {
 		this.#parseThinking = options.parseThinking ?? true;
@@ -179,6 +201,17 @@ export class DeepSeekInbandScanner implements InbandScanner {
 			if (!this.#consumeDsmlParam(final, events)) break;
 		}
 		if (final && this.#state === "thinking") this.#endThinking(events);
+		if (final && (this.#state === "dsmlInvoke" || this.#state === "dsmlParam") && this.#rawBlock.length > 0) {
+			this.#emitText((this.#pendingDsmlSection ?? "") + this.#rawBlock, events);
+			this.#resetDsmlTool();
+			this.#state = "outside";
+		}
+		if (final && this.#pendingDsmlSection !== undefined) {
+			this.#emitText(this.#pendingDsmlSection + this.#buffer, events);
+			this.#pendingDsmlSection = undefined;
+			this.#buffer = "";
+			this.#state = "outside";
+		}
 		if (final && this.#buffer.length === 0 && this.#rawBlock.length > 0) this.#rawBlock = "";
 		return events;
 	}
@@ -200,13 +233,18 @@ export class DeepSeekInbandScanner implements InbandScanner {
 			const match = findEarliestToken(this.#buffer, OUTSIDE_TOKENS);
 			if (!match) {
 				const hold = final ? 0 : partialSuffixOverlapAny(this.#buffer, OUTSIDE_TOKENS);
-				const emit = this.#buffer.slice(0, this.#buffer.length - hold);
-				if (emit.length > 0) events.push({ type: "text", text: emit });
+				this.#emitText(this.#buffer.slice(0, this.#buffer.length - hold), events);
 				this.#buffer = this.#buffer.slice(this.#buffer.length - hold);
 				return;
 			}
-			if (match.index > 0) events.push({ type: "text", text: this.#buffer.slice(0, match.index) });
+			this.#emitText(this.#buffer.slice(0, match.index), events);
 			this.#buffer = this.#buffer.slice(match.index);
+			this.#finishCodeRun();
+			if (this.#codeLength > 0 && match.token.includes("DSML")) {
+				this.#emitText(match.token, events);
+				this.#buffer = this.#buffer.slice(match.token.length);
+				continue;
+			}
 			if (this.#buffer.startsWith(DEEPSEEK_TOOL_CALLS_BEGIN)) {
 				this.#buffer = this.#buffer.slice(DEEPSEEK_TOOL_CALLS_BEGIN.length);
 				this.#inToolSection = true;
@@ -235,22 +273,76 @@ export class DeepSeekInbandScanner implements InbandScanner {
 					? DSML_TOOL_CALLS_OPEN_FULLWIDTH
 					: DSML_TOOL_CALLS_OPEN_ASCII;
 				this.#buffer = this.#buffer.slice(openToken.length);
+				this.#pendingDsmlSection = openToken;
 				this.#state = "dsmlSection";
 				return;
 			}
 			const orphanClose = this.#matchingOrphanDsmlClose();
 			if (orphanClose) {
+				if (this.#bareDsmlOpenVisible) this.#emitText(orphanClose, events);
 				this.#buffer = this.#buffer.slice(orphanClose.length);
 				continue;
 			}
 			const control = this.#matchingControlToken();
 			if (control) {
 				this.#buffer = this.#buffer.slice(control.length);
+				if (
+					this.#bareDsmlOpenVisible &&
+					(control === DSML_TOOL_CALLS_CLOSE_FULLWIDTH || control === DSML_TOOL_CALLS_CLOSE_ASCII)
+				) {
+					// Closes the malformed call: keep it as its end marker.
+					this.#emitText(control, events);
+					this.#bareDsmlOpenVisible = false;
+					this.#visibleTail = "";
+					continue;
+				}
 				this.#stripLeadingWhitespace = true;
 				continue;
 			}
 			this.#buffer = this.#buffer.slice(match.token.length);
 		}
+	}
+
+	#emitText(text: string, events: InbandScanEvent[]): void {
+		if (text.length === 0) return;
+		events.push({ type: "text", text });
+		this.#trackVisibleCode(text);
+		const visible = this.#visibleTail + text;
+		if (!this.#bareDsmlOpenVisible && BARE_DSML_OPEN.test(visible)) this.#bareDsmlOpenVisible = true;
+		this.#visibleTail = visible.slice(-VISIBLE_TAIL_LIMIT);
+	}
+
+	#trackVisibleCode(text: string): void {
+		for (const char of text) {
+			if (char === "`" || char === "~") {
+				if (this.#codeRunDelimiter !== char) {
+					this.#finishCodeRun();
+					this.#codeRunDelimiter = char;
+				}
+				this.#codeRunLength++;
+				continue;
+			}
+			this.#finishCodeRun();
+		}
+	}
+
+	#finishCodeRun(): void {
+		if (this.#codeRunLength === 0) return;
+		const delimiter = this.#codeRunDelimiter;
+		const length = this.#codeRunLength;
+		if (this.#codeLength === 0) {
+			if (delimiter === "`" || length >= 3) {
+				this.#codeDelimiter = delimiter;
+				this.#codeLength = length;
+			}
+		} else if (delimiter === this.#codeDelimiter) {
+			if (length === this.#codeLength || (this.#codeLength >= 3 && length >= this.#codeLength)) {
+				this.#codeDelimiter = "";
+				this.#codeLength = 0;
+			}
+		}
+		this.#codeRunDelimiter = "";
+		this.#codeRunLength = 0;
 	}
 
 	#consumeThinking(final: boolean, events: InbandScanEvent[]): void {
@@ -350,16 +442,29 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	}
 
 	#consumeDsmlSection(final: boolean, events: InbandScanEvent[]): boolean {
+		const initial = this.#buffer;
 		while (this.#buffer.length > 0) {
 			this.#skipWhitespace();
 			const close = this.#matchingDsmlClose(DSML_TOOL_CALLS_CLOSE_FULLWIDTH, DSML_TOOL_CALLS_CLOSE_ASCII);
 			if (close) {
+				if (this.#pendingDsmlSection !== undefined) {
+					this.#emitText(
+						this.#pendingDsmlSection + initial.slice(0, initial.length - this.#buffer.length) + close,
+						events,
+					);
+					this.#pendingDsmlSection = undefined;
+				}
 				this.#buffer = this.#buffer.slice(close.length);
+				this.#bareDsmlOpenVisible = false;
+				this.#visibleTail = "";
 				this.#state = "outside";
 				return true;
 			}
 			const invoke = this.#matchDsmlOpen("invoke");
 			if (invoke) {
+				if (this.#pendingDsmlSection !== undefined) {
+					this.#pendingDsmlSection += initial.slice(0, initial.length - this.#buffer.length - invoke.raw.length);
+				}
 				this.#rawBlock = invoke.raw;
 				this.#name = invoke.name;
 				this.#id = mintToolCallId();
@@ -373,11 +478,14 @@ export class DeepSeekInbandScanner implements InbandScanner {
 					(this.#buffer.startsWith("<｜DSML｜invoke") || this.#buffer.startsWith("<|DSML|invoke")) &&
 					!this.#buffer.includes(">")
 				)
-					return false;
-				if (partialSuffixOverlapAny(this.#buffer, DSML_SECTION_TOKENS) === this.#buffer.length) return false;
+					break;
+				if (partialSuffixOverlapAny(this.#buffer, DSML_SECTION_TOKENS) === this.#buffer.length) break;
 			}
-			if (this.#buffer.length === 0) return false;
+			if (this.#buffer.length === 0) break;
 			this.#buffer = this.#buffer.slice(1);
+		}
+		if (this.#pendingDsmlSection !== undefined) {
+			this.#pendingDsmlSection += initial.slice(0, initial.length - this.#buffer.length);
 		}
 		return final;
 	}
@@ -386,6 +494,7 @@ export class DeepSeekInbandScanner implements InbandScanner {
 		while (this.#buffer.length > 0) {
 			const skipped = this.#skipWhitespace();
 			if (skipped.length > 0) this.#rawBlock += skipped;
+			if (this.#buffer.length === 0) break;
 			const close = this.#matchingDsmlClose("</｜DSML｜invoke>", "</|DSML|invoke>");
 			if (close) {
 				this.#rawBlock += close;
@@ -431,7 +540,6 @@ export class DeepSeekInbandScanner implements InbandScanner {
 			const chunk = this.#buffer.slice(0, this.#buffer.length - hold);
 			this.#streamDsmlParam(chunk, events);
 			this.#buffer = this.#buffer.slice(this.#buffer.length - hold);
-			if (final) this.#resetDsmlTool();
 			return false;
 		}
 		this.#streamDsmlParam(this.#buffer.slice(0, close.index), events);
@@ -477,11 +585,7 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	#parseArgs(rawArgs: string): Record<string, unknown> {
 		const trimmed = rawArgs.trim();
 		if (trimmed.length === 0) return {};
-		try {
-			return asRecord(parseJsonWithRepair<unknown>(trimmed));
-		} catch {
-			return {};
-		}
+		return asRecord(parseToolCallArguments(trimmed));
 	}
 
 	#skipWhitespace(): string {
@@ -558,6 +662,7 @@ export class DeepSeekInbandScanner implements InbandScanner {
 		this.#dsmlParamIsString = true;
 		this.#dsmlParamRaw = "";
 		this.#rawBlock = "";
+		this.#pendingDsmlSection = undefined;
 	}
 }
 

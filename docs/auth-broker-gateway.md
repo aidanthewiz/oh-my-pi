@@ -4,10 +4,11 @@ The auth broker centralizes credential storage and OAuth refreshes. The auth gat
 
 - **`omp auth-broker serve`** holds the canonical SQLite credential vault, performs OAuth refreshes, and exposes snapshot, credential, block, usage, and health APIs under `/v1`.
 - **`omp auth-gateway serve`** is a forward-proxy. It accepts OpenAI Chat Completions, Anthropic Messages, OpenAI Responses, pi-native stream, TypeSafe System One judgment, and OpenAI/OpenRouter-style image, speech, transcription, embedding, rerank, and video requests, resolves the broker-backed credential, and dispatches through `pi-ai` provider logic. Clients (containerised omp, llm-git, the macOS usage widget, …) never see the access token.
+- **`coreforge auth-gateway stdio`** serves the same inference routes to a trusted parent through JSON lines. It uses CLI credentials and model roles; see [stdio](#stdio).
 
-Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token by default. The gateway also answers CORS `OPTIONS` preflights without authentication; `--no-auth` disables inbound gateway authentication.
+Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every HTTP endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token by default. The gateway also answers CORS `OPTIONS` preflights without authentication; `--no-auth` disables inbound HTTP gateway authentication.
 
-Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packages/ai/src/auth/`, `packages/coding-agent/src/cli/auth-broker-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-cli.ts`, `packages/coding-agent/src/session/auth-broker-config.ts`.
+Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packages/ai/src/auth/`, `packages/coding-agent/src/cli/auth-broker-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-stdio.ts`, `packages/coding-agent/src/session/auth-broker-config.ts`.
 
 ## Data flow
 
@@ -157,6 +158,7 @@ The CLI broker refresh hook also handles managed `mcp_oauth:*` credentials using
 
 ```
 omp auth-gateway serve   [--bind=host:port] [--no-auth] [--trust-proxy-headers]
+coreforge auth-gateway stdio
 omp auth-gateway token   [--regenerate] [--json]
 omp auth-gateway status  [--json]
 omp auth-gateway check   [--strict] [--json]
@@ -166,6 +168,26 @@ omp auth-gateway check   [--strict] [--json]
 - Logs attribute requests to the socket peer address. Behind a trusted reverse proxy, pass `--trust-proxy-headers` to use `X-Forwarded-For` / `X-Real-IP` for authenticated requests; unauthorized requests are always logged with the socket peer. An authenticated request that also carries the gateway token in its URL or in a forwarded, logged, or identity header is rejected with `400` before any credential lookup.
 - `token` manages the token file; `--regenerate` requires a running gateway to restart before accepting the replacement. `status` checks the local token file and an authenticated broker snapshot; it does not probe the gateway listener.
 - `check` constructs its own broker-backed store and probes the credentials the gateway would use, without calling a running gateway. Without `--strict` it uses provider usage probes. `--strict` additionally tries suitable bundled chat models and can consume quota; providers with no suitable candidate (including pi-native forwarding, Bedrock, Vertex, and Cursor transports) cannot be completion-probed.
+
+### stdio
+
+`coreforge auth-gateway stdio` explicitly enables the gateway for one trusted parent process. It opens no listener and requires no gateway token. It uses normal CLI credential discovery: the configured broker, otherwise local storage. Account pools, managed AWS identity, provider credential provenance, and model policy remain effective. Extension providers and `models.yml` participate in discovery. Requests and responses use JSON lines:
+
+```
+→ {"id": 1, "path": "/v1/chat/completions", "body": {"model": "@commit,@smol", "messages": [...]}}
+← {"ready": true, "version": "18.4.12"}
+← {"id": 1, "status": 200, "body": {"object": "chat.completion", "choices": [...]}}
+```
+
+- The first output line is `{"ready": true, "version": …}`. `method` defaults to `POST` when the request has a `body`, else `GET`; every route in [Endpoints](#endpoints-1) except `/healthz` is served.
+- At most four requests run concurrently and answer in completion order; `id` (string or number) matches them up. A slot remains occupied until its output write drains. Further input waits for capacity instead of entering an unbounded request queue. A line that is not a request answers `400` with its `id` when it had one.
+- A JSON response body is embedded as JSON; a text body (the SSE of a `stream: true` request) as one string once the stream ends; anything else (audio, video) as base64 with `"encoding": "base64"`.
+- Each response is limited to 16 MiB of actual streamed bytes, regardless of `Content-Length`. Overflow cancels the response body and answers `502` with `error.type: "response_limit_error"`; later requests remain usable. Programmatic `serveAuthGatewayStdio` callers can set `maxConcurrentRequests` and `maxResponseBytes`. The completed-response protocol does not send progress chunks.
+- Inference requests accept `--model` selectors: `provider/id`, a fuzzy name, a role (`@smol`), or a comma list. The first resolvable entry wins. Native `/v1/pi/stream` reads `modelId`, then `model` as a string, then `model.id`; each attempt receives its resolved `modelId`. Non-inference and unknown routes do not resolve selectors.
+- Before emitting a reply, a status above `400`, except `499`, tries the selected model's `retry.fallbackChains`. Streamed Chat Completions, Responses, Anthropic Messages and pi-native attempts also finish within the byte limit before acceptance; terminal model errors inside SSE trigger fallback, and discarded partial content does not enter the next reply. HTTP `408`, `429` and upstream server errors remain retryable. Successful streams and the final failed stream retain their wire payloads. Caller abort, invalid streamed requests and local response-size failures do not trigger another model. Role selectors use their role's chain. Allowlist, denylist, disabled-provider policy, and `retry.modelFallback` constrain every candidate.
+- `/v1/models` lists permitted available models across all supported modalities. A persisted video job can be polled without submitting it again.
+- Stdout contains protocol JSON only. Startup and extension output use stderr. Responses retain the provider's credential handling; provider credentials are not returned to the parent.
+- When stdin ends, the process answers pending requests, drains response writes, closes provider state and credential storage, then exits. Caller shutdown cancels pending waits; provider-owned inference deadlines remain unchanged.
 
 ### Endpoints
 

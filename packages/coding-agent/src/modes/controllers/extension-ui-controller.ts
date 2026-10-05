@@ -19,6 +19,7 @@ import type {
 	ExtensionUiComponent,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
+	SendMessageHandler,
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
@@ -186,18 +187,7 @@ export class ExtensionUiController {
 		}
 
 		const actions: ExtensionActions = {
-			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
-				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
-					.catch((err: unknown) => {
-						this.ctx.showError(
-							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					});
-			},
+			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
@@ -231,7 +221,10 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
-			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			runEphemeralTurn: async args => {
+				if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot run a local turn");
+				return this.ctx.session.runEphemeralTurn(args);
+			},
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -419,17 +412,7 @@ export class ExtensionUiController {
 		}
 
 		const actions: ExtensionActions = {
-			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
-				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
-					.catch((err: unknown) => {
-						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
-						this.ctx.showError(errorText);
-					});
-			},
+			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
@@ -463,7 +446,10 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
-			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			runEphemeralTurn: async args => {
+				if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot run a local turn");
+				return this.ctx.session.runEphemeralTurn(args);
+			},
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -1265,10 +1251,12 @@ export class ExtensionUiController {
 		this.ctx.present(errorText);
 	}
 	async #handleInteractiveCompact(instructionsOrOptions: string | CompactOptions | undefined): Promise<void> {
+		if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot compact the replica");
 		await this.ctx.executeCompaction(instructionsOrOptions, false);
 	}
 
 	async #compactSession(instructionsOrOptions: string | CompactOptions | undefined): Promise<void> {
+		if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot compact the replica");
 		const instructions = typeof instructionsOrOptions === "string" ? instructionsOrOptions : undefined;
 		const options =
 			instructionsOrOptions && typeof instructionsOrOptions === "object" ? instructionsOrOptions : undefined;
@@ -1279,7 +1267,39 @@ export class ExtensionUiController {
 		await this.ctx.sessionManager.setSessionName(name, "user");
 	}
 
+	/**
+	 * Collab guest: the replica session only mirrors the host, and mirrored host
+	 * lifecycle events (`agent_end`, `turn_end`, …) reach guest extensions. An
+	 * extension reacting to them must not start or queue a turn on the replica —
+	 * it would run on the guest's local model and diverge from the host. Refuse
+	 * like typed prompts are refused (input-controller); true when dropped.
+	 */
+	#rejectGuestExtensionTurn(): boolean {
+		if (!this.ctx.collabGuest) return false;
+		this.ctx.showStatus("Extension-initiated turns are host-only during a collab session");
+		return true;
+	}
+
+	#sendExtensionMessage: SendMessageHandler = (message, options) => {
+		const startsTurn =
+			options?.triggerTurn === true ||
+			options?.deliverAs === "steer" ||
+			options?.deliverAs === "followUp" ||
+			options?.deliverAs === "aside";
+		if (startsTurn && this.#rejectGuestExtensionTurn()) return;
+		const wasStreaming = this.ctx.session.isStreaming;
+		const normalized = normalizeCustomMessagePayload(message);
+		this.ctx.session
+			.sendCustomMessage(normalized, options)
+			.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+			.catch((err: unknown) => {
+				this.ctx.showError(`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+			});
+	};
+
+	/** Every `sendUserMessage` form prompts or queues a user turn (see `AgentSession.sendUserMessage`). */
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
+		if (this.#rejectGuestExtensionTurn()) return;
 		this.ctx.session.sendUserMessage(content, options).catch((err: unknown) => {
 			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		});

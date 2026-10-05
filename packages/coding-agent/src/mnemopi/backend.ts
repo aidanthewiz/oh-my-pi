@@ -9,6 +9,7 @@ import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleChain, roleCandidatePool } from "../config/model-resolver";
+import { type JudgmentUsageLedger, journalJudgmentUsage } from "../judgment";
 import type {
 	MemoryBackend,
 	MemoryBackendSaveInput,
@@ -120,7 +121,13 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 
 		try {
-			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
+			const config = await loadMnemopiConfigWithProviders(
+				settings,
+				agentDir,
+				modelRegistry,
+				sessionId,
+				session.sessionManager,
+			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 			await installMnemopiState(session, config);
 		} catch (error) {
@@ -202,6 +209,7 @@ export const mnemopiBackend: MemoryBackend = {
 					agentDir,
 					session.modelRegistry,
 					session.sessionId,
+					session.sessionManager,
 				);
 				signal?.throwIfAborted();
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
@@ -503,9 +511,16 @@ async function loadMnemopiConfigWithProviders(
 	agentDir: string,
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	usageLedger: Partial<JudgmentUsageLedger>,
 ): Promise<MnemopiBackendConfig> {
 	const config = loadMnemopiConfig(settings, agentDir);
-	config.providerOptions = await resolveMnemopiProviderOptions(config, settings, modelRegistry, sessionId);
+	config.providerOptions = await resolveMnemopiProviderOptions(
+		config,
+		settings,
+		modelRegistry,
+		sessionId,
+		usageLedger,
+	);
 	return config;
 }
 
@@ -533,6 +548,7 @@ async function resolveMnemopiProviderOptions(
 	settings: MemoryBackendStartOptions["settings"],
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	usageLedger: Partial<JudgmentUsageLedger>,
 ): Promise<MnemopiProviderOptions> {
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
@@ -572,6 +588,10 @@ async function resolveMnemopiProviderOptions(
 		}
 
 		const complete = async (prompt: string, opts?: MnemopiLlmCompleteOptions): Promise<string | null> => {
+			// journalJudgmentUsage snapshots the session id. /new, fork, and session
+			// switch keep this function, so bind inside each call. An in-flight call
+			// keeps the callback it already created and still journals to its start.
+			const onUsage = journalJudgmentUsage(usageLedger);
 			const request = resolveMemoryCompletionInput(prompt, opts);
 			const signal =
 				typeof opts?.timeout === "number" && Number.isFinite(opts.timeout) && opts.timeout > 0
@@ -618,6 +638,17 @@ async function resolveMnemopiProviderOptions(
 									maxTokens: opts?.maxTokens,
 									temperature: opts?.temperature,
 									signal,
+									onAttempt: message =>
+										onUsage?.({
+											purpose: "memory",
+											role: "memory",
+											api: model.api,
+											provider: model.provider,
+											model: model.id,
+											usage: message.usage,
+											stopReason: message.stopReason,
+											errorMessage: message.errorMessage,
+										}),
 								},
 							),
 						{ provider: model.provider, signal },

@@ -123,6 +123,10 @@ A nonblank `name` routes to `startService()` before finite-command timeout, asyn
 
 The result carries `details.service` (`name`, `state`, `ready`, `timedOut`, optional `pid`), not finite-command timeout/async metadata.
 
+Restricted plan-mode and device-only cancellation captures the calling session's owner before asynchronous lookup. The broker checks the persisted service owner immediately before stopping it. Missing or foreign owners fail without stopping the service. Approved unrestricted cancellation keeps its existing behavior.
+
+Broker protocol 4 stores runtime state under `broker-v4`. Close older clients and stop older brokers before upgrading. Stale detached services retain their PID and logs during migration; live non-detached services must stop first. Migration validates all records and refuses active leases or colliding live records before moving service metadata.
+
 ## Non-interactive execution engine (`executeBash`)
 
 ## Shell session reuse model
@@ -198,7 +202,7 @@ Behavior highlights:
 - `esc` while running kills the PTY session,
 - terminal resize propagates to PTY (`session.resize(cols, rows)`).
 
-Unlike the non-PTY engine, the interactive PTY path does **not** apply the non-interactive hardening. It inherits the user's environment and sets a real `TERM=xterm-256color` (applied as an override on the Rust side) so editors, pagers, and TUIs behave like a normal terminal.
+Interactive PTYs use the selected shell and a complete, filtered child environment with `clearEnv: true`. They remove `GIT_EDITOR`, `GPG_TTY`, `CI`, and `NO_COLOR` from the selected shell's base environment, then set `TERM=xterm-256color`. Session and direnv overrides pass through the same child-environment filter. Native environment inheritance is disabled, so omitted parent values cannot reappear.
 
 PTY output is normalized (`CRLF`/`CR` to `LF`, `sanitizeText`) and written into `OutputSink`, including artifact spill support.
 

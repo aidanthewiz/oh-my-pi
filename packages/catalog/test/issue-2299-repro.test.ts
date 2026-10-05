@@ -71,7 +71,6 @@ describe("issue #2299 — NVIDIA NIM qwen thinking format", () => {
 		expect(model.provider).toBe("nvidia");
 		expect(model.baseUrl).toBe("https://integrate.api.nvidia.com/v1");
 		expect(model.reasoning).toBe(true);
-		expect(model.compatConfig?.thinkingFormat).toBeUndefined();
 
 		const captured: { body: string | null } = { body: null };
 		const fetchMock: FetchImpl = async (_input, init) => {

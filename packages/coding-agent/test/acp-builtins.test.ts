@@ -14,6 +14,7 @@ import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins";
 import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { SessionDumpArchive } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { getProjectDir, removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
@@ -43,6 +44,7 @@ interface FakeAcpBuiltinSession {
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
 	formatSessionAsText: () => string;
 	dumpLlmRequestToTmpDir: () => Promise<string | undefined>;
+	dumpSessionArchiveToTmpDir: () => Promise<SessionDumpArchive | undefined>;
 	getLastAssistantText: () => string | undefined;
 	messages: unknown[];
 	settings: Settings;
@@ -161,6 +163,7 @@ function createRuntime() {
 		getAsyncJobSnapshot: () => null,
 		formatSessionAsText: () => "",
 		dumpLlmRequestToTmpDir: async () => undefined,
+		dumpSessionArchiveToTmpDir: async () => undefined,
 		getLastAssistantText: () => undefined,
 		messages: [],
 		model: undefined,
@@ -538,6 +541,42 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("Recent Jobs");
 	});
 
+	it("jobs full: shows the untruncated command instead of the label", async () => {
+		const { output, runtime } = createRuntime();
+		const command = `pytest ${"tests/a ".repeat(40)}-q`;
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [
+				{ id: "j1", type: "bash", status: "running", label: "pytest tests/a...", command, startTime: Date.now() },
+			],
+			recent: [{ id: "j2", type: "task", status: "completed", label: "build done", startTime: Date.now() - 60_000 }],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+
+		await executeAcpBuiltinSlashCommand("/jobs", runtime);
+		await executeAcpBuiltinSlashCommand("/jobs full", runtime);
+		await executeAcpBuiltinSlashCommand("/jobs bogus", runtime);
+
+		expect(output[0]).not.toContain(command);
+		expect(output[1]).toContain(command);
+		expect(output[1]).toContain("build done");
+		expect(output[2]).toContain("Usage: /jobs [full]");
+	});
+
+	it("jobs full: strips control sequences and fences the command", async () => {
+		const { output, runtime } = createRuntime();
+		const command = `printf ${"x".repeat(150)} \x1b[2J\`\`\`\n# heading TAIL`;
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [{ id: "j1", type: "bash", status: "running", label: "printf x...", command, startTime: Date.now() }],
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+
+		await executeAcpBuiltinSlashCommand("/jobs full", runtime);
+
+		expect(output[0]).not.toContain("\x1b");
+		expect(output[0]).toContain(`\`\`\`\`\nprintf ${"x".repeat(150)} \`\`\`\n# heading TAIL\n\`\`\`\``);
+	});
+
 	// /dump
 	it("dump: outputs transcript with LLM request JSON path when sidecar succeeds", async () => {
 		const { output, runtime } = createRuntime();
@@ -627,51 +666,6 @@ describe("ACP builtin slash commands", () => {
 		await executeAcpBuiltinSlashCommand("/model nonexistent", runtime);
 
 		expect(configNotified).toBe(0);
-	});
-
-	// /switch resolves like `omp bench`: fuzzy ids, @role aliases, :level suffixes
-	it("switch opus:low: fuzzy-resolves a session-only model with the thinking suffix", async () => {
-		const { output, runtime, session } = createRuntime();
-		const available = [
-			{ provider: "anthropic", id: "claude-opus-4-5", contextWindow: 200_000 },
-			{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
-		];
-		session.getAvailableModels = () => available;
-		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
-
-		const result = await executeAcpBuiltinSlashCommand("/switch opus:low", runtime);
-
-		expect(result).toEqual({ consumed: true });
-		expect(temporarySpy).toHaveBeenCalledWith(available[0], "low");
-		expect(setModelSpy).not.toHaveBeenCalled();
-		expect(output[0]).toContain("Session-only model: anthropic/claude-opus-4-5");
-	});
-
-	it("switch @smol: resolves the configured role alias", async () => {
-		const { runtime, session } = createRuntime();
-		const available = [
-			{ provider: "anthropic", id: "claude-opus-4-5", contextWindow: 200_000 },
-			{ provider: "anthropic", id: "claude-haiku-4-5", contextWindow: 200_000 },
-		];
-		session.getAvailableModels = () => available;
-		runtime.settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
-		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
-
-		await executeAcpBuiltinSlashCommand("/switch @smol", runtime);
-
-		expect(temporarySpy).toHaveBeenCalledWith(available[1], undefined);
-	});
-
-	it("switch unknown: reports the selector and leaves the model alone", async () => {
-		const { output, runtime, session } = createRuntime();
-		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-opus-4-5" }];
-		const temporarySpy = spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
-
-		await executeAcpBuiltinSlashCommand("/switch gpt-fake-9000", runtime);
-
-		expect(temporarySpy).not.toHaveBeenCalled();
-		expect(output[0]).toContain("Unknown model: gpt-fake-9000");
 	});
 
 	// Removed TUI-only and dropped commands fall through as false
@@ -1062,6 +1056,9 @@ describe("wave 3 commands", () => {
 			await git("init", "-q", "-b", "main");
 			await git("config", "user.email", "t@example.com");
 			await git("config", "user.name", "t");
+			// The reset source is compared byte-for-byte; Git for Windows'
+			// system `core.autocrlf=true` would restore it as CRLF.
+			await git("config", "core.autocrlf", "false");
 			await Bun.write(path.join(repoDir, "tracked.txt"), "committed\n");
 			await Bun.write(path.join(repoDir, ".gitignore"), "build/\n");
 			await git("add", "-A");

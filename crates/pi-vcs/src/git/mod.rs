@@ -12,6 +12,7 @@
 
 mod cli;
 mod diff;
+mod filter;
 mod mutate;
 mod open;
 mod patch;

@@ -23,6 +23,7 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 {{/if}}- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
 - `contextFilePolicy`: `"inherit"` (default) forwards ordered instruction files; `"none"` omits them, but still inherits managed settings and tool policy.
+- `model`: Selector or ordered array overriding the agent's model for this spawn (`provider/model[:level]`, role alias like `@smol`, `@default` = parent's live model){{#if batchEnabled}}; set per `tasks[]` item, never top-level{{/if}}. Omit unless a specific model is needed. Requested model unavailable → stop and report; NEVER substitute another.
 {{#if isolationEnabled}}{{#if applyIsolatedChanges}}- `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
 {{else}}- `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
 {{/if}}{{/if}}Children start without conversation history;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.

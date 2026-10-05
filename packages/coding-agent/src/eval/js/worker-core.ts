@@ -19,6 +19,7 @@ interface ActiveRun {
 	runId: string;
 	filename: string;
 	pendingTools: Map<string, PendingTool>;
+	pendingHelpers: number;
 	toolDrain?: PromiseWithResolvers<void>;
 	/** Rejections floated by this run's cell code, captured before its result was sent. */
 	floatingRejections: unknown[];
@@ -373,12 +374,19 @@ export class WorkerCore {
 	}
 
 	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
-		const active: ActiveRun = { runId, filename, pendingTools: new Map(), floatingRejections: [] };
+		const active: ActiveRun = { runId, filename, pendingTools: new Map(), pendingHelpers: 0, floatingRejections: [] };
 		this.#runs.set(runId, active);
 		const hooks: RuntimeHooks = {
 			onText: chunk => this.#transport.send({ type: "text", runId, chunk }),
 			onDisplay: output => this.#transport.send({ type: "display", runId, output }),
 			callTool: (name, args, identity) => this.#callTool(active, name, args, identity),
+			onPendingHelper: () => {
+				active.pendingHelpers++;
+				return () => {
+					active.pendingHelpers--;
+					this.#notifyToolDrain(active);
+				};
+			},
 		};
 		let result: RunResult;
 		try {
@@ -406,6 +414,7 @@ export class WorkerCore {
 			runId: msg.runId,
 			filename: `tool-${msg.runId}`,
 			pendingTools: new Map(),
+			pendingHelpers: 0,
 			floatingRejections: [],
 		};
 		this.#runs.set(msg.runId, active);
@@ -413,6 +422,13 @@ export class WorkerCore {
 			onText: chunk => this.#transport.send({ type: "text", runId: msg.runId, chunk }),
 			onDisplay: output => this.#transport.send({ type: "display", runId: msg.runId, output }),
 			callTool: (name, args) => this.#callTool(active, name, args),
+			onPendingHelper: () => {
+				active.pendingHelpers++;
+				return () => {
+					active.pendingHelpers--;
+					this.#notifyToolDrain(active);
+				};
+			},
 		};
 
 		let result: RunResult;
@@ -469,17 +485,18 @@ export class WorkerCore {
 
 	async #drainTools(active: ActiveRun): Promise<void> {
 		do {
-			if (active.pendingTools.size > 0) {
+			if (this.#runs.get(active.runId) !== active) return;
+			if (active.pendingTools.size > 0 || active.pendingHelpers > 0) {
 				active.toolDrain ??= Promise.withResolvers<void>();
 				await active.toolDrain.promise;
 			}
-			// Reply continuations can start more calls or float rejections.
+			// Settled helpers and reply continuations can start calls or float rejections.
 			await Bun.sleep(0);
-		} while (active.pendingTools.size > 0);
+		} while (active.pendingTools.size > 0 || active.pendingHelpers > 0);
 	}
 
 	#notifyToolDrain(active: ActiveRun): void {
-		if (active.pendingTools.size > 0) return;
+		if (active.pendingTools.size > 0 || active.pendingHelpers > 0) return;
 		active.toolDrain?.resolve();
 		active.toolDrain = undefined;
 	}
@@ -528,7 +545,7 @@ export class WorkerCore {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
-			this.#notifyToolDrain(active);
+			active.toolDrain?.resolve();
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();
@@ -545,7 +562,7 @@ export class WorkerCore {
 				pending.reject(new ToolError("JS worker closed"));
 			}
 			active.pendingTools.clear();
-			this.#notifyToolDrain(active);
+			active.toolDrain?.resolve();
 		}
 		this.#runs.clear();
 		this.#runtime?.dispose?.();

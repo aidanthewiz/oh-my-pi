@@ -651,31 +651,6 @@ describe("InteractiveMode vibe mode toggle", () => {
 		}
 	});
 
-	it("passes the session's active model into vibe rehydration on resume", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
-		await mode.handleVibeModeCommand();
-		await session.sessionManager.ensureOnDisk();
-		const sessionFile = session.sessionFile;
-		if (!sessionFile) throw new Error("Expected persisted session file");
-		const expectedModel = session.model;
-		if (!expectedModel) throw new Error("Expected an active session model");
-		const registry = VibeSessionRegistry.global();
-		let rehydrateCalled = false;
-		let activeModelDuringRehydrate: string | undefined;
-		vi.spyOn(registry, "rehydrate").mockImplementation(async parent => {
-			rehydrateCalled = true;
-			activeModelDuringRehydrate = parent.getActiveModelString?.();
-			return 0;
-		});
-
-		expect(await session.switchSession(sessionFile)).toBe(true);
-
-		// Rehydration must resolve workers against the reopened session's active
-		// model (so the `good`/pi/task worker tracks it), not the settings default.
-		expect(rehydrateCalled).toBe(true);
-		expect(activeModelDuringRehydrate).toBe(`${expectedModel.provider}/${expectedModel.id}`);
-	});
-
 	it("suspends the old scope without tombstones when switching to another vibe parent", async () => {
 		await mode.init({ suppressWelcomeIntro: true });
 		await mode.handleVibeModeCommand();
@@ -734,10 +709,12 @@ describe("InteractiveMode vibe mode toggle", () => {
 		await session.sessionManager.ensureOnDisk();
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) throw new Error("Expected persisted session file");
+		const entryId = session.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
 
 		await expect(session.newSession()).rejects.toThrow("Exit vibe mode first");
 		await expect(session.newSession({ drop: true })).rejects.toThrow("Exit vibe mode first");
 		await expect(session.fork()).rejects.toThrow("Exit vibe mode first");
+		await expect(session.fork(entryId)).rejects.toThrow("Exit vibe mode first");
 		await expect(session.moveSession(path.join(tempDir.path(), "other-project"))).rejects.toThrow(
 			"Exit vibe mode first",
 		);

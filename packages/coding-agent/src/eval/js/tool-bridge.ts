@@ -1,5 +1,6 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
@@ -38,7 +39,6 @@ export interface ToolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
-	defaultIntent?: string;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
 }
@@ -71,15 +71,6 @@ function getTool(session: ToolSession, name: string): AgentTool {
 		throw new ToolError(`Unknown tool from js runtime: ${name}`);
 	}
 	return tool;
-}
-
-function normalizeArgs(args: unknown, defaultIntent?: string): unknown {
-	if (!isRecord(args)) return args;
-	const record = { ...args };
-	if (defaultIntent !== undefined && !(INTENT_FIELD in record)) {
-		record[INTENT_FIELD] = defaultIntent;
-	}
-	return record;
 }
 
 function parsePreludeRequest(args: unknown): { name: string; parameters: unknown } {
@@ -171,7 +162,10 @@ export function bridgeValueFromToolResult(
 		(content): content is { type: "image"; mimeType: string; data: string } =>
 			content.type === "image" && typeof content.mimeType === "string" && typeof content.data === "string",
 	);
-	const text = textBlocks.map(block => block.text).join("");
+	const text =
+		name === "read" && (result.details as ReadToolDetails | undefined)?.shape === "value"
+			? (textBlocks[0]?.text ?? "")
+			: textBlocks.map(block => block.text).join("");
 	const hasError = toolResultHasError(result);
 	if (emitStatus) {
 		const event = summarize(name, args, result, text, hasError);
@@ -276,8 +270,9 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	const toolCallId = `js-${name}-${crypto.randomUUID()}`;
 	// A schema-owned name stays tool data across alternatives. Deleting an
 	// invalid value to make another branch match could select a different operation.
+	// Harness `i` is dropped here exactly as `extractIntent` drops it on the direct
+	// path, so tools see identical args from both entry points.
 	const intentIsDeclared = schemaDeclaresIntentField(toolWireSchema(tool));
-	const suppliedIntent = isRecord(args) ? args[INTENT_FIELD] : undefined;
 	const validationArgs = isRecord(args) ? { ...args } : args;
 	if (isRecord(validationArgs) && !intentIsDeclared) delete validationArgs[INTENT_FIELD];
 	let validatedArgs: unknown;
@@ -305,26 +300,19 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			validatedArgs = validationArgs;
 		}
 	}
-	if (isRecord(validatedArgs) && !intentIsDeclared && suppliedIntent !== undefined) {
-		validatedArgs[INTENT_FIELD] = suppliedIntent;
-	}
-	const normalizedArgs = normalizeArgs(
-		validatedArgs,
-		!intentIsDeclared ? (options.defaultIntent ?? "js prelude") : undefined,
-	);
 	const shadowCell = options.shadowCell ?? getActiveEvalShadowCell();
 	if (shadowCell && options.identity) {
 		const claimed = await waitForSpeculativeClaim(
-			shadowCell.claim(name, normalizedArgs, options.identity, Number.MAX_SAFE_INTEGER, options.signal),
+			shadowCell.claim(name, validatedArgs, options.identity, Number.MAX_SAFE_INTEGER, options.signal),
 			options.signal,
 		);
 		options.signal?.throwIfAborted();
-		if (claimed) return bridgeValueFromToolResult(name, normalizedArgs, claimed, options.emitStatus);
+		if (claimed) return bridgeValueFromToolResult(name, validatedArgs, claimed, options.emitStatus);
 	}
 	try {
 		const result = await tool.execute(
 			toolCallId,
-			normalizedArgs,
+			validatedArgs,
 			options.signal,
 			undefined,
 			options.session.getToolContext?.(),
@@ -336,7 +324,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			const phases = committedTodoPhases(result);
 			if (phases) options.session.persistTodoPhases?.(phases);
 		}
-		return bridgeValueFromToolResult(name, normalizedArgs, result, options.emitStatus);
+		return bridgeValueFromToolResult(name, validatedArgs, result, options.emitStatus);
 	} catch (error) {
 		options.emitStatus?.({
 			op: name,

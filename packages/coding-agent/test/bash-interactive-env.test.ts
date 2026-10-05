@@ -26,7 +26,7 @@ test("interactive PTY commands receive only the filtered replacement environment
 	const original = Bun.env.MANAGED_PROFILE_SECRET;
 	try {
 		Bun.env.MANAGED_PROFILE_SECRET = "parent-secret";
-		const shell = (await Settings.init()).getShellConfig().shell;
+		const shell = (await Settings.init()).getShellConfig();
 		const result = await runInteractiveBashPty(headlessUi(), {
 			command: `printf "%s|%s" "\${MANAGED_PROFILE_SECRET-unset}" "\${EXPLICIT_SAFE-unset}"`,
 			shell,

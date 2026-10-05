@@ -5,9 +5,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -20,7 +21,8 @@ import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme"
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
-import { cfgCycleOrder } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { applyModelPreset, type ModelPresetSession } from "@oh-my-pi/pi-coding-agent/config/model-presets";
+import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 function normalize(lines: readonly string[]): string {
@@ -66,7 +68,7 @@ function installTestTheme(): void {
 interface RegistryOverrides {
 	refresh?: (mode: string) => Promise<void>;
 	refreshProvider?: ModelRegistry["refreshProvider"];
-	getAvailable?: () => Model[];
+	getAvailable?: (kind?: ModelKind | "all") => Model[];
 	getAll?: () => Model[];
 	getDiscoverableProviders?: () => string[];
 	getProviderDiscoveryState?: (providerId: string) => unknown;
@@ -147,6 +149,7 @@ function createHub(options: {
 			onLoginRequest: options.callbacks?.onLoginRequest ?? onLoginRequest,
 			onCycleOrderChange: options.callbacks?.onCycleOrderChange,
 			onSavePreset: options.callbacks?.onSavePreset,
+			onSwitchPreset: options.callbacks?.onSwitchPreset,
 			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
 			onCancel: options.callbacks?.onCancel ?? onCancel,
 		},
@@ -162,6 +165,8 @@ const LEFT = "\x1b[D";
 const ALT_RIGHT = "\x1b[1;3C";
 /** What macOS terminals (ghostty, Terminal.app, iTerm) emit for Option+→. */
 const OPTION_RIGHT_MAC = "\x1bf";
+const CTRL_LEFT = "\x1b[1;5D";
+const CTRL_RIGHT = "\x1b[1;5C";
 const ESC = "\x1b";
 
 describe("ModelHub", () => {
@@ -177,6 +182,26 @@ describe("ModelHub", () => {
 		for (const hub of openHubs.splice(0)) {
 			hub.dispose();
 		}
+	});
+
+	describe("responsive layout", () => {
+		test("keeps model scopes and names visible at phone-sized widths", () => {
+			const { hub } = createHub({ models: [makeModel("test", "phone-model")] });
+			const lines = hub.render(36).map(line => stripVTControlCharacters(line));
+
+			expect(lines.some(line => line.includes("Models"))).toBe(true);
+			expect(lines.some(line => line.includes("All models"))).toBe(true);
+			expect(lines.some(line => line.includes("test/ph"))).toBe(true);
+		});
+
+		test("shrinks a wide provider sidebar so model rows stay readable", () => {
+			const { hub } = createHub({ models: [makeModel("github-copilot-enterprise", "phone-model")] });
+			const lines = hub.render(36).map(line => stripVTControlCharacters(line));
+
+			expect(lines[0]).toStartWith("╭─ Models ───────────┬");
+			// Body row (not the sidebar's "● github-…" entry) keeps the provider-qualified name.
+			expect(lines.some(line => /│ {2,}github-/.test(line))).toBe(true);
+		});
 	});
 
 	describe("role chips and roles view", () => {
@@ -226,6 +251,108 @@ describe("ModelHub", () => {
 			expect(rendered).toContain("image-model");
 			expect(rendered).not.toContain("chat-model");
 		});
+
+		test("a chat-only --models scope keeps non-chat runners and their role assignments (#14016)", () => {
+			// The startup scope only ever holds chat models; judge/search/image
+			// runners must still be browsable and assignable from the catalog.
+			const chat = makeModel("test", "chat-model");
+			const judge = makeModel("openrouter", "~typesafe/jev-latest", 128_000, undefined, "judge");
+			const settings = Settings.isolated({ modelRoles: { judge: "openrouter/~typesafe/jev-latest" } });
+			const { hub } = createHub({
+				models: [chat],
+				scoped: true,
+				settings,
+				registry: {
+					getAvailable: kind => (kind === "all" ? [chat, judge] : [chat]),
+					getAll: () => [chat, judge],
+				},
+			});
+
+			hub.handleInput(UP); // All models → Roles.
+			hub.handleInput(OPTION_RIGHT_MAC);
+			hub.handleInput(OPTION_RIGHT_MAC); // Kind roles tab.
+			const judgeRow = hub
+				.render(220)
+				.map(line => stripVTControlCharacters(line))
+				.find(line => line.includes("JUDGE"));
+			expect(judgeRow).toContain("~typesafe/jev-latest");
+
+			hub.handleInput(DOWN); // Roles → All models.
+			for (const ch of "jev") hub.handleInput(ch);
+			const rendered = normalize(hub.render(220));
+			expect(rendered).not.toContain("No matching models");
+			expect(rendered).toContain("● judge");
+		});
+
+		test.each(["allowlist", "denylist", "role-alias"] as const)(
+			"a chat-only CLI scope preserves %s policy for non-chat roles and fallback candidates",
+			policy => {
+				const chat = makeModel("test", "chat-model");
+				const otherChat = makeModel("test", "outside-cli-chat");
+				const allowed = makeModel("test", "allowed-image", 128_000, undefined, "image");
+				const blocked = makeModel("test", "blocked-image", 128_000, undefined, "image");
+				const models = [chat, otherChat, allowed, blocked];
+				const settings = Settings.isolated({
+					modelRoles: {
+						image: "test/blocked-image,test/allowed-image",
+						smol: "test/outside-cli-chat,test/chat-model",
+					},
+					...(policy === "denylist"
+						? { disabledModels: ["test/blocked-image"] }
+						: { enabledModels: [policy === "role-alias" ? "@smol" : "test/chat-model", "test/allowed-image"] }),
+				});
+				const { hub, onAssign, onFallbackChainChange } = createHub({
+					models: [chat],
+					scoped: true,
+					settings,
+					registry: { getAvailable: () => models, getAll: () => models },
+				});
+
+				hub.handleInput(UP);
+				hub.handleInput(OPTION_RIGHT_MAC);
+				hub.handleInput(OPTION_RIGHT_MAC);
+				const imageRow = hub
+					.render(220)
+					.map(line => stripVTControlCharacters(line))
+					.find(line => line.includes("IMAGE"));
+				expect(imageRow).toContain("allowed-image");
+				expect(imageRow).not.toContain("blocked-image");
+
+				hub.handleInput(DOWN);
+				for (const ch of "blocked-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onAssign).not.toHaveBeenCalled();
+				expect(onFallbackChainChange).not.toHaveBeenCalled();
+				expect(normalize(hub.render(220))).not.toContain("blocked-image →");
+
+				hub.handleInput(ESC);
+				for (const ch of "outside-cli-chat") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onAssign).not.toHaveBeenCalled();
+				expect(normalize(hub.render(220))).not.toContain("outside-cli-chat →");
+
+				hub.handleInput(ESC);
+				if (policy === "role-alias") {
+					for (const ch of "chat-model") hub.handleInput(ch);
+					hub.handleInput("\n");
+					expect(onAssign).not.toHaveBeenCalled();
+					expect(footerLine(hub.render(220))).not.toContain("chat-model →");
+					hub.handleInput(ESC);
+				}
+				for (const ch of "allowed-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				hub.handleInput(LEFT);
+				hub.handleInput(LEFT);
+				hub.handleInput("\n");
+				for (const ch of "blocked-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onFallbackChainChange).not.toHaveBeenCalled();
+				for (const _ch of "blocked-image") hub.handleInput("\x7f");
+				for (const ch of "allowed-image") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(onFallbackChainChange).toHaveBeenCalledWith("test/allowed-image", ["test/allowed-image"]);
+			},
+		);
 
 		test("tags the selected model's roles in the detail line, including custom roles", () => {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -579,8 +706,7 @@ describe("ModelHub", () => {
 			hub.handleInput("\n");
 			expect(normalize(hub.render(220))).toContain("Assigning reviewer");
 
-			hub.handleInput("\n"); // sidebar → model list
-			hub.handleInput("\n"); // pick the sole model for the new role
+			hub.handleInput("\n"); // focus already on the model rows: pick the sole model
 			expect(onAssign).toHaveBeenCalledTimes(1);
 			const call = onAssign.mock.calls[0];
 			expect(call?.[1]).toBe("reviewer");
@@ -618,6 +744,101 @@ describe("ModelHub", () => {
 
 			bareHub.handleInput("s");
 			expect(footerLine(bareHub.render(220))).not.toContain("Preset name:");
+		});
+
+		test("ctrl+←/→ and p/P switch roles, preserve overrides, and step past unavailable defaults", async () => {
+			const a = makeModel("test", "model-a");
+			const c = makeModel("test", "model-c");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a", smol: "test/model-a:low" },
+				defaultThinkingLevel: "low",
+			});
+			cfgModelPresets.setEntry(settings, "alpha", {
+				modelRoles: { default: "test/model-a", smol: "test/model-a:low" },
+				defaultThinkingLevel: Effort.Low,
+			});
+			cfgModelPresets.setEntry(settings, "beta", { modelRoles: { default: "test/missing" } });
+			cfgModelPresets.setEntry(settings, "gamma", {
+				modelRoles: { default: "test/model-c:high", slow: "test/model-a" },
+				defaultThinkingLevel: Effort.Medium,
+			});
+			let liveModel = a;
+			let liveThinking: unknown = "low";
+			const session = {
+				scopedModels: [],
+				getAvailableModels: () => [a, c],
+				modelRegistry: { hasConfiguredAuth: () => true, hasConcreteAuth: () => true },
+				setModel: async (model: Model) => {
+					liveModel = model;
+				},
+				setThinkingLevel: (level: unknown) => {
+					liveThinking = level;
+				},
+			} as unknown as ModelPresetSession;
+			let pending = Promise.resolve();
+			let lastSwitch: Awaited<ReturnType<typeof applyModelPreset>> | undefined;
+			const onSwitchPreset = (name: string) => {
+				pending = applyModelPreset(settings, session, name).then(result => {
+					lastSwitch = result;
+				});
+				return pending;
+			};
+			const { hub } = createHub({ models: [a, c], scoped: true, settings, callbacks: { onSwitchPreset } });
+			const step = async (key: string) => {
+				hub.handleInput(key);
+				await pending;
+			};
+			const expectAlpha = () => {
+				expect({ ...settings.getModelRoles() }).toEqual({ default: "test/model-a", smol: "test/model-a:low" });
+				expect(liveModel).toBe(a);
+				expect(liveThinking).toBe("low");
+			};
+			const expectGamma = () => {
+				expect({ ...settings.getModelRoles() }).toEqual({ default: "test/model-c:high", slow: "test/model-a" });
+				expect(liveModel).toBe(c);
+				expect(liveThinking).toBe("high");
+				expect(lastSwitch).toMatchObject({
+					kind: "switched",
+					thinkingLevel: Effort.High,
+					shadowedThinking: { expected: Effort.Medium, actual: Effort.Low, source: "runtime" },
+				});
+			};
+
+			hub.handleInput(UP);
+			await step(CTRL_RIGHT); // unavailable beta leaves the active setup intact
+			expectAlpha();
+			await step(CTRL_RIGHT); // the cursor advances past beta
+			expectGamma();
+			await step(CTRL_RIGHT);
+			expectAlpha();
+			await step(CTRL_LEFT);
+			expectGamma();
+			hub.handleInput("\n");
+			await step("p");
+			expectAlpha();
+			await step("P");
+			expectGamma();
+			hub.handleInput(LEFT);
+			hub.handleInput(DOWN);
+			await step(CTRL_RIGHT); // the catalog does not switch presets
+			expectGamma();
+		});
+
+		test("picking a role lands the arrows on the model rows, keeping the assignment flow", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const { hub, onAssign } = createHub({ models: [a, b], scoped: true });
+
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput("\n"); // dive into the rows
+			hub.handleInput("\n"); // pick a model for DEFAULT
+			expect(normalize(hub.render(220))).toContain("Assigning DEFAULT");
+
+			hub.handleInput(DOWN); // moves through the models, not the sidebar
+			hub.handleInput("\n");
+			expect(onAssign).toHaveBeenCalledTimes(1);
+			expect(onAssign.mock.calls[0]?.[1]).toBe("default");
+			expect(onAssign.mock.calls[0]?.[3]).toBe("test/model-b");
 		});
 	});
 
@@ -1093,8 +1314,7 @@ describe("ModelHub", () => {
 			hub.handleInput("f"); // add a fallback for the first role (default)
 			expect(normalize(hub.render(220))).toContain("Adding fallback for");
 
-			hub.handleInput("\n"); // Sidebar → model list.
-			hub.handleInput("\n"); // pick the only model
+			hub.handleInput("\n"); // focus already on the model rows: pick the only model
 			expect(onFallbackChainChange).toHaveBeenCalledWith("default", ["test/model-a"]);
 			expect(onAssign).not.toHaveBeenCalled(); // no role assignment, no thinking strip
 			expect(normalize(hub.render(220))).toContain("↳ test/model-a");

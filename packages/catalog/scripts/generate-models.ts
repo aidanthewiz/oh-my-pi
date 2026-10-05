@@ -34,7 +34,6 @@ import {
 import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { filterModelsDevCatalogRows } from "../src/provider-models/models-dev-policies";
 import {
-	applyXaiCatalogPricing,
 	buildFireworksFastSeed,
 	buildXaiOAuthStaticSeed,
 	clampFireworksKimiMaxTokens,
@@ -54,10 +53,10 @@ import type { Api, Model, ModelSpec } from "../src/types";
 import { cleanModelName } from "../src/utils";
 import { mergeCopilotApiHeaders } from "../src/wire/github-copilot";
 import {
-	applyAntigravityPricingFallback,
 	applyCanonicalLimitFallback,
 	applyGeneratedModelPolicies,
 	applyOllamaCloudOutputCap,
+	applyPricingPeerFallback,
 	hasBillableCost,
 	linkOpenAIPromotionTargets,
 } from "./generated-policies";
@@ -678,9 +677,8 @@ async function generateModels() {
 	}
 	allModels = applyUmansPricingFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
-	allModels = applyXaiCatalogPricing(allModels);
 	allModels = applyCodexPricingFallback(allModels);
-	allModels = applyAntigravityPricingFallback(allModels);
+	allModels = applyPricingPeerFallback(allModels);
 	allModels = applyKimiMaxTokensCap(allModels);
 	allModels = applyFireworksDeepSeekReasoningShape(allModels);
 	allModels = filterModelsDevCatalogRows(allModels);
@@ -740,7 +738,7 @@ async function generateModels() {
 	const MODELS: Record<string, Record<string, Model<Api>>> = {};
 	for (const [provider, models] of Object.entries(modelSpecs)) {
 		MODELS[provider] = Object.fromEntries(
-			Object.entries(sortObj(models)).map(([id, model]) => [id, buildModel(model)]),
+			Object.entries(sortObj(models)).map(([id, model]) => [id, buildGeneratedModel(model)]),
 		);
 	}
 
@@ -777,6 +775,18 @@ function canonicalizeModelCompat(model: ModelSpec<Api>): void {
 	if (!hasKeys) {
 		delete model.compat;
 	}
+}
+
+/**
+ * Materialize an authored spec or rebuild a bundled row from its authored
+ * overrides. Prompt-cache lifetimes are rule-owned output, not snapshot input;
+ * drop stale lifetimes and provenance so `buildModel` reapplies current KDL.
+ */
+export function buildGeneratedModel(model: ModelSpec<Api> | Model<Api>): Model<Api> {
+	const spec = "identity" in model ? toModelSpec(model) : { ...model };
+	delete spec.promptCache;
+	delete spec.promptCacheConfig;
+	return buildModel(spec);
 }
 
 if (import.meta.main) {

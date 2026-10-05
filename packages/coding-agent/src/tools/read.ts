@@ -1,4 +1,5 @@
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type EditStore, notebookToEditableText } from "@oh-my-pi/pi-natives";
@@ -648,6 +649,19 @@ function formatLocatedFileNotice(url: string, backingPath: string, size: number,
 	return rawBlocked
 		? `Unbounded raw read blocked for ${url} (${formatBytes(size)}). Reading the whole file verbatim can exhaust memory. ${workflows}: ${shortenPath(backingPath)}`
 		: `Backing file: ${shortenPath(backingPath)} (${formatBytes(size)}). ${workflows}.`;
+}
+
+/**
+ * Kind of a non-regular, non-directory file, or undefined. Reading one in-process can block
+ * forever (a FIFO, `/dev/stdin` on the TUI's terminal) or never end (`/dev/zero`).
+ */
+function specialFileKind(stat: Stats): string | undefined {
+	if (stat.isFile() || stat.isDirectory()) return undefined;
+	if (stat.isCharacterDevice()) return "character device";
+	if (stat.isBlockDevice()) return "block device";
+	if (stat.isFIFO()) return "FIFO";
+	if (stat.isSocket()) return "socket";
+	return "special file";
 }
 
 /**
@@ -1634,6 +1648,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// Protocol reads render Markdown regardless of `read.renderMarkdown`, as their resources always did.
 		if (!details.contentType && isMarkdownPath(located.path)) details.contentType = "text/markdown";
 		details.meta = { ...details.meta, source: { type: "internal", value: located.url } };
+		// Nested skill reads need their own provenance: the outer invocation may belong to another plugin.
+		if (extractUriScheme(located.url) === "skill" && !isRawSelector(parseSel(located.sel))) {
+			const provenance = `[Skill file: ${located.path}]`;
+			const firstText = result.content.find((block): block is TextContent => block.type === "text");
+			// The TUI falls back to this block when no structured display content exists.
+			if (firstText) firstText.text = `${provenance}\n${firstText.text}`;
+			else result.content.unshift({ type: "text", text: provenance });
+		}
 		return { ...result, details };
 	}
 
@@ -1739,10 +1761,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		let isDirectory = false;
 		let fileSize = 0;
+		let specialKind: string | undefined;
 		try {
 			const stat = await Bun.file(absolutePath).stat();
 			fileSize = stat.size;
 			isDirectory = stat.isDirectory();
+			specialKind = specialFileKind(stat);
 		} catch (error) {
 			// A located file vanished after routing: the handler owns the canonical not-found error.
 			if (located && isNotFoundError(error)) {
@@ -1767,6 +1791,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							absolutePath = suffixMatch.absolutePath;
 							fileSize = retryStat.size;
 							isDirectory = retryStat.isDirectory();
+							specialKind = specialFileKind(retryStat);
 							suffixResolution = { from: localReadPath, to: suffixMatch.displayPath };
 						} catch {
 							// Suffix match candidate no longer stats — continue through
@@ -1784,6 +1809,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							absolutePath = approvedPlanPath;
 							fileSize = approvedPlanStat.size;
 							isDirectory = approvedPlanStat.isDirectory();
+							specialKind = specialFileKind(approvedPlanStat);
 							recoveredApprovedPlan = true;
 						} catch {
 							// The referenced plan disappeared after resolution; continue through
@@ -1800,6 +1826,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			} else {
 				throw error;
 			}
+		}
+		if (specialKind) {
+			throw new ToolError(
+				`Cannot read '${localReadPath}': it is a ${specialKind}, not a regular file or directory.`,
+			);
 		}
 		// Speculative reads open the authorized resolved target (absolutePath)
 		// but must behave exactly like an ordinary read of the requested
@@ -2582,8 +2613,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const resourceDetails: NonNullable<InternalResource["details"]> = resource.details ?? {};
 		const { display, ...render } = resourceDetails;
 		const details: ReadToolDetails = {
+			shape: resource.shape,
 			resolvedPath: resource.sourcePath,
 			contentType: resource.contentType,
+			notes: resource.notes,
 			...render,
 			...(display ? { displayContent: display } : {}),
 		};
@@ -2592,17 +2625,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (parsedSel.kind !== "none" && parsedSel.kind !== "raw") {
 				throw new ToolError("Cannot combine query extraction with line selectors");
 			}
-			return toolResult(details).text(resource.content).sourceInternal(url).done();
 		}
 
-		return buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
-			details,
-			sourcePath: resource.sourcePath,
-			sourceInternal: url,
-			entityLabel: "resource",
-			ignoreResultLimits: spec.unbounded === true,
-			immutable: resource.immutable,
-		});
+		const result =
+			resource.shape === "value"
+				? toolResult(details).text(resource.content).sourceInternal(url).done()
+				: buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
+						details,
+						sourcePath: resource.sourcePath,
+						sourceInternal: url,
+						entityLabel: "resource",
+						ignoreResultLimits: spec.unbounded === true,
+						immutable: resource.immutable,
+					});
+		if (resource.notes?.length) result.content.push({ type: "text", text: resource.notes.join("\n") });
+		return result;
 	}
 
 	/**

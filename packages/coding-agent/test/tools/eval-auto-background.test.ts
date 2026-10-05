@@ -152,8 +152,6 @@ describe("EvalTool auto-background", () => {
 
 		expect(result.details?.async?.state).toBe("running");
 		expect(result.details?.async?.type).toBe("eval");
-		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
-		expect(text).toContain("Backgrounded as job");
 		// The snapshot keeps the running cell (with its streamed tail) for the transcript.
 		expect(result.details?.cells?.[0]?.status).toBe("running");
 

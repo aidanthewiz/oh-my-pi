@@ -9,7 +9,15 @@ import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { resolveAgentModelSelection, resolveConfiguredModelPatterns } from "../config/model-resolver";
+import {
+	formatModelStringWithRouting,
+	modelSelectionInheritsSessionModel,
+	normalizeModelPatternList,
+	resolveAgentModelSelection,
+	resolveConfiguredModelPatterns,
+	resolveModelOverride,
+	splitRoleAliasThinkingSuffix,
+} from "../config/model-resolver";
 import {
 	type CompactionThresholdPair,
 	validateAgentCompactionThresholdOverrides,
@@ -25,7 +33,7 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import salvagedChildHintTemplate from "../prompts/tools/salvaged-child-hint.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import type { ConfiguredThinkingLevel, TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
@@ -165,7 +173,13 @@ export interface EffectiveSubagentPolicy {
 	serviceTierOverride?: ServiceTierInheritSettingValue;
 	/** Exact-name entry normalized to both child compaction threshold fields. */
 	compactionThresholdOverride?: CompactionThresholdPair;
+	/** Implicit parent credential fallback for configured models; explicit requests use only their expanded candidates. */
 	parentActiveModelPattern?: string;
+	/** The selected patterns inherit live effort below the agent's own thinking level. */
+	modelInheritsLiveThinkingLevel?: boolean;
+	modelInheritedThinkingIndexes?: number[];
+	modelRequestedThinkingLevels?: Map<number, ConfiguredThinkingLevel>;
+	parentThinkingLevel?: ConfiguredThinkingLevel;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
 	isIsolated: boolean;
@@ -288,6 +302,38 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 }
 
 /**
+ * Reason a per-spawn `model` selector cannot mean anything useful, or
+ * `undefined` when it is usable. The literal `"default"` (with or without a
+ * `:level` suffix) is singled out because it reads as "leave the agent's
+ * model alone" while resolving as the `default` role — the ambiguity that got
+ * the previous per-call override removed (#6438). `@default` states the
+ * inherit intent explicitly.
+ * Shared so task, eval `agent()` and `workpool()` reject malformed input
+ * identically before dispatch.
+ */
+export function invalidModelSelectorReason(model: unknown, label: string): string | undefined {
+	if (model === undefined) return undefined;
+	const values: unknown[] = Array.isArray(model) ? model : [model];
+	const patterns: string[] = [];
+	const invalid = `${label} has an invalid \`model\` value ${JSON.stringify(model)}. Use a selector or a non-empty array of selectors such as "openai/gpt-5.4:high" or "@smol".`;
+	for (const value of values) {
+		if (typeof value !== "string") return invalid;
+		const selectors = value.split(",").map(selector => selector.trim());
+		if (selectors.some(selector => selector.length === 0)) return invalid;
+		patterns.push(...selectors);
+	}
+	if (patterns.length === 0) return invalid;
+	if (
+		patterns.some(pattern =>
+			["default", "inherit"].includes(splitRoleAliasThinkingSuffix(pattern).base.toLowerCase()),
+		)
+	) {
+		return `${label} has an ambiguous \`model\` value ${JSON.stringify(model)}. Use "@default" to inherit the parent session's model, or name a model explicitly.`;
+	}
+	return undefined;
+}
+
+/**
  * Resolve every policy shared by task and eval before allocating artifacts or
  * dispatching work. Callers translate {@link StructuredSubagentError} into
  * their own wire-level error surface.
@@ -301,6 +347,8 @@ export async function resolveEffectiveSubagentPolicy(
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
+	const selectorProblem = invalidModelSelectorReason(request.model, "The call");
+	if (selectorProblem) throw new StructuredSubagentError("preflight", selectorProblem);
 
 	const discovery = await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.());
 	const agents = [...discovery.agents, ...(request.session.getSessionAgents?.() ?? [])];
@@ -347,7 +395,11 @@ export async function resolveEffectiveSubagentPolicy(
 	const compactionThresholdOverride = Object.hasOwn(compactionThresholdOverrides, agentName)
 		? compactionThresholdOverrides[agentName]
 		: undefined;
-	const parentActiveModelPattern = request.session.getActiveModelString?.();
+	const parentActiveModel = request.session.getActiveModel?.();
+	const parentActiveModelPattern = parentActiveModel
+		? formatModelStringWithRouting(parentActiveModel)
+		: request.session.getActiveModelString?.();
+	const parentThinkingLevel = request.session.getActiveThinkingLevel?.();
 	const modelResolution = {
 		requestModel: request.model,
 		settingsOverride: agentModelOverrides[agentName],
@@ -359,7 +411,52 @@ export async function resolveEffectiveSubagentPolicy(
 	// Role identity and patterns come from one call so they cannot be derived
 	// from different sources: the expansion below discards the alias, and the
 	// child's inherited retry-fallback chain is keyed off the role.
-	const { patterns: modelOverride, role: modelRole } = resolveAgentModelSelection(modelResolution);
+	const {
+		patterns: modelOverride,
+		role: modelRole,
+		inheritsLiveThinkingLevel: modelInheritsLiveThinkingLevel,
+		inheritedThinkingIndexes: modelInheritedThinkingIndexes,
+		requestedThinkingLevels: modelRequestedThinkingLevels,
+	} = resolveAgentModelSelection(modelResolution);
+	const requestPatterns = normalizeModelPatternList(request.model);
+	if (requestPatterns.length > 0) {
+		const { settings, modelRegistry } = request.session;
+		// A cold registry (discovery races startup) must never reject a valid
+		// selector; only syntax and empty expansions are judged without one.
+		const warmRegistry = modelRegistry && modelRegistry.getAvailable().length > 0 ? modelRegistry : undefined;
+		for (const pattern of requestPatterns) {
+			// `@default` asks for the parent's live model, not a pattern to look up.
+			if (!warmRegistry || modelSelectionInheritsSessionModel(pattern)) continue;
+			// Validate every concrete candidate, even beside @default or another
+			// usable candidate: a successful alternative must not hide a typo'd
+			// suffix that the resolver would otherwise recover from with a warning.
+			for (const candidate of resolveConfiguredModelPatterns(pattern, settings)) {
+				const strict = resolveModelOverride([candidate], warmRegistry, settings, {
+					allowInvalidThinkingSelectorFallback: false,
+				});
+				if (strict.model) continue;
+				const recovered = resolveModelOverride([candidate], warmRegistry, settings);
+				if (recovered.model && recovered.warning) {
+					throw new StructuredSubagentError(
+						"preflight",
+						`Invalid thinking suffix in model selector ${JSON.stringify(candidate)}. Use a supported thinking level or a literal model ID.`,
+					);
+				}
+			}
+		}
+		const unmatched =
+			modelOverride.length === 0 ||
+			(warmRegistry !== undefined &&
+				!resolveModelOverride(modelOverride, warmRegistry, settings, {
+					allowInvalidThinkingSelectorFallback: false,
+				}).model);
+		if (unmatched) {
+			throw new StructuredSubagentError(
+				"preflight",
+				`No available model matches \`model\`: ${JSON.stringify(request.model)}. \`omp models find <query> --json\` lists selectors, but only fix the spelling of the same model. Do NOT substitute a different model or drop \`model\` unless the user allowed it: stop and report that the requested model is unavailable.`,
+			);
+		}
+	}
 	const isolationEnabled = cfgTaskIsolationEnabled.get(request.session.settings);
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && !isolationEnabled) {
@@ -377,7 +474,11 @@ export async function resolveEffectiveSubagentPolicy(
 		modelRole,
 		serviceTierOverride,
 		compactionThresholdOverride,
-		parentActiveModelPattern,
+		parentActiveModelPattern: request.model !== undefined ? undefined : parentActiveModelPattern,
+		modelInheritsLiveThinkingLevel,
+		modelInheritedThinkingIndexes,
+		modelRequestedThinkingLevels,
+		parentThinkingLevel,
 		schema,
 		planMode,
 		isIsolated,
@@ -426,10 +527,17 @@ async function applySpawnHook(
 	if (spawnResult?.block) {
 		throw new StructuredSubagentError("preflight", spawnResult.reason ?? "Subagent spawn blocked by extension.");
 	}
-	if (spawnResult?.model === undefined) return policy;
+	if (spawnResult?.model === undefined || request.model !== undefined) return policy;
 	const replacement = resolveConfiguredModelPatterns(spawnResult.model, request.session.settings);
 	if (replacement.length === 0) return policy;
-	return { ...policy, modelOverride: replacement, modelRoute: spawnResult.note };
+	return {
+		...policy,
+		modelOverride: replacement,
+		modelRoute: spawnResult.note,
+		modelInheritsLiveThinkingLevel: undefined,
+		modelInheritedThinkingIndexes: undefined,
+		modelRequestedThinkingLevels: undefined,
+	};
 }
 
 /** Reserve a session-global agent id only after preflight has succeeded. */
@@ -505,6 +613,7 @@ function buildExecutorOptions(
 		detached: request.detached,
 		id,
 		taskDepth: session.taskDepth ?? 0,
+		parentHasUI: session.hasUI,
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
@@ -513,6 +622,10 @@ function buildExecutorOptions(
 		serviceTierOverride: policy.serviceTierOverride,
 		compactionThresholdOverride: policy.compactionThresholdOverride,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
+		modelInheritsLiveThinkingLevel: policy.modelInheritsLiveThinkingLevel,
+		modelInheritedThinkingIndexes: policy.modelInheritedThinkingIndexes,
+		modelRequestedThinkingLevels: policy.modelRequestedThinkingLevels,
+		parentThinkingLevel: policy.parentThinkingLevel,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
 		solutionSpace: request.solutionSpace?.trim() || undefined,

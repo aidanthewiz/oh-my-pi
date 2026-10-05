@@ -60,11 +60,12 @@ export function sessionResolveContext(
 /** The single WriteContext builder for a tool session; replaces per-tool literal assembly. */
 export function sessionWriteContext(
 	session: ToolSession,
-	options: { signal?: AbortSignal; toolCall?: WriteContext["toolCall"] } = {},
+	options: Pick<WriteContext, "signal" | "toolCall" | "cancellationOwner"> = {},
 ): WriteContext {
 	return {
 		cwd: session.cwd,
 		signal: options.signal,
+		cancellationOwner: options.cancellationOwner,
 		localProtocolOptions: contextLocalProtocolOptions(session),
 		session,
 		toolCall: options.toolCall,

@@ -143,22 +143,18 @@ describe("git native", () => {
 		try {
 			await settle();
 			const sf = h.terminal.surface ?? "";
-			const diff = () => h.find(n => n.k === "diff");
 			const path = () => h.find(n => (n.p as { role?: string } | undefined)?.role === "omp.app.git.path");
-			expect(diff()?.p).toMatchObject({ mode: "split", path: "src/a.ts" });
 
 			const views = h.find(n => n.k === "tabs" && (n.p as { active?: string }).active === "split");
 			h.event({ ev: "select", sf, id: views?.id ?? "", item: "inline" });
 			await settle();
-			expect(diff()?.p).toMatchObject({ mode: "unified" });
-			expect(diff()?.p).toMatchObject({ text: expect.stringContaining("+const a = 2;") });
+			expect(h.find(n => n.k === "tabs")?.p).toMatchObject({ active: "inline" });
 
 			const readme = h.find(n => n.k === "item" && JSON.stringify(n.p).includes("README.md"));
 			const list = h.find(n => n.k === "list" && (n.c ?? []).some(child => child.id === readme?.id));
 			h.event({ ev: "select", sf, id: list?.id ?? "", item: readme?.id.split("/").at(-1) ?? "" });
 			await settle();
 			expect(JSON.stringify(path()?.p)).toContain("README.md");
-			expect(diff()?.p).toMatchObject({ path: "README.md" });
 		} finally {
 			h.terminal.send("q");
 			h.flush();

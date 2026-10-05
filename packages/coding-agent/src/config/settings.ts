@@ -297,6 +297,9 @@ interface OwnLayers {
 	overrides: RawSettings;
 }
 
+/** The layers an {@link Settings.overlay} child writes locally; see {@link Settings.overlayLayers}. */
+export type OverlayLayers = Readonly<Pick<OwnLayers, "global" | "overrides">>;
+
 /** A persisted layer re-read from disk: its new value, the file(s) it came from, and the read-side state it commits. */
 interface LayerRefresh {
 	layer: "global" | "project" | "configOverlay" | "managed";
@@ -792,6 +795,24 @@ export class Settings {
 			target.#applyParentChange(setting);
 		};
 		this.#childForwarders.add(forward);
+		return child;
+	}
+
+	/**
+	 * Deep copy of this {@link overlay}'s own layers (its `set` and `override` writes). Passing it to
+	 * {@link restoreOverlay} on the same parent rebuilds an equivalent child, so a holder can keep
+	 * this plain data instead of the live child with its merged view, memoized values and listeners.
+	 */
+	overlayLayers(): OverlayLayers {
+		return structuredClone({ global: this.#global, overrides: this.#overrides });
+	}
+
+	/** {@link overlay} of this instance whose own layers are `layers` (from {@link overlayLayers}). */
+	restoreOverlay(layers: OverlayLayers): Settings {
+		const child = this.overlay();
+		child.#global = structuredClone(layers.global);
+		child.#overrides = structuredClone(layers.overrides);
+		child.#rebuildMerged();
 		return child;
 	}
 
@@ -3185,6 +3206,26 @@ export class Settings {
 			}
 			if (advisorObj) delete advisorObj.subagents;
 			delete raw["advisor.subagents"];
+		}
+
+		// task.completionProbeMs (poll period, 0 = off) → task.completionProbe
+		// (on/off with a built-in backoff schedule). Mapped IN THE SAME LAYER so a
+		// project-level `0` keeps overriding a global period; an explicit new key wins.
+		{
+			const taskObj = isRecord(raw.task) ? raw.task : undefined;
+			const legacyProbeMs =
+				taskObj && "completionProbeMs" in taskObj ? taskObj.completionProbeMs : raw["task.completionProbeMs"];
+			const hasFlatProbe = Object.hasOwn(raw, "task.completionProbe");
+			if (typeof legacyProbeMs === "number" || hasFlatProbe) {
+				const target = taskObj ?? {};
+				if (!Object.hasOwn(target, "completionProbe")) {
+					target.completionProbe = hasFlatProbe ? raw["task.completionProbe"] : Number(legacyProbeMs) > 0;
+				}
+				raw.task = target;
+			}
+			if (taskObj) delete taskObj.completionProbeMs;
+			delete raw["task.completionProbeMs"];
+			delete raw["task.completionProbe"];
 		}
 
 		// Early per-agent toggles were persisted as booleans even though the
