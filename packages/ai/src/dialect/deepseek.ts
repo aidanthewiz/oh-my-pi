@@ -141,6 +141,11 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	#bareDsmlOpenVisible = false;
 	/** Last few visible characters, so a bare opener split across chunks is still seen. */
 	#visibleTail = "";
+	/** Markdown code delimiters, retained across chunks before DSML wrapper detection. */
+	#codeDelimiter = "";
+	#codeLength = 0;
+	#codeRunDelimiter = "";
+	#codeRunLength = 0;
 
 	constructor(options: InbandScannerOptions = {}) {
 		this.#parseThinking = options.parseThinking ?? true;
@@ -234,6 +239,12 @@ export class DeepSeekInbandScanner implements InbandScanner {
 			}
 			this.#emitText(this.#buffer.slice(0, match.index), events);
 			this.#buffer = this.#buffer.slice(match.index);
+			this.#finishCodeRun();
+			if (this.#codeLength > 0 && match.token.includes("DSML")) {
+				this.#emitText(match.token, events);
+				this.#buffer = this.#buffer.slice(match.token.length);
+				continue;
+			}
 			if (this.#buffer.startsWith(DEEPSEEK_TOOL_CALLS_BEGIN)) {
 				this.#buffer = this.#buffer.slice(DEEPSEEK_TOOL_CALLS_BEGIN.length);
 				this.#inToolSection = true;
@@ -295,9 +306,43 @@ export class DeepSeekInbandScanner implements InbandScanner {
 	#emitText(text: string, events: InbandScanEvent[]): void {
 		if (text.length === 0) return;
 		events.push({ type: "text", text });
+		this.#trackVisibleCode(text);
 		const visible = this.#visibleTail + text;
 		if (!this.#bareDsmlOpenVisible && BARE_DSML_OPEN.test(visible)) this.#bareDsmlOpenVisible = true;
 		this.#visibleTail = visible.slice(-VISIBLE_TAIL_LIMIT);
+	}
+
+	#trackVisibleCode(text: string): void {
+		for (const char of text) {
+			if (char === "`" || char === "~") {
+				if (this.#codeRunDelimiter !== char) {
+					this.#finishCodeRun();
+					this.#codeRunDelimiter = char;
+				}
+				this.#codeRunLength++;
+				continue;
+			}
+			this.#finishCodeRun();
+		}
+	}
+
+	#finishCodeRun(): void {
+		if (this.#codeRunLength === 0) return;
+		const delimiter = this.#codeRunDelimiter;
+		const length = this.#codeRunLength;
+		if (this.#codeLength === 0) {
+			if (delimiter === "`" || length >= 3) {
+				this.#codeDelimiter = delimiter;
+				this.#codeLength = length;
+			}
+		} else if (delimiter === this.#codeDelimiter) {
+			if (length === this.#codeLength || (this.#codeLength >= 3 && length >= this.#codeLength)) {
+				this.#codeDelimiter = "";
+				this.#codeLength = 0;
+			}
+		}
+		this.#codeRunDelimiter = "";
+		this.#codeRunLength = 0;
 	}
 
 	#consumeThinking(final: boolean, events: InbandScanEvent[]): void {

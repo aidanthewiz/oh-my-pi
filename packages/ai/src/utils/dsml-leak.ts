@@ -17,7 +17,7 @@ import type { AssistantMessage, Model } from "../types";
 const DSML_TAG_PATTERN =
 	/<\s*(\/?)\s*[｜|]\s*DSML\s*[｜|]\s*(tool_calls|invoke|parameter)\b[^<>\r\n]*(?:\r?\n(?![ \t]*\r?\n)[^<>\r\n]*)*>?/gu;
 // Code the model deliberately quoted (fences, inline spans) is not a leak.
-const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|`[^`\n]*`/g;
+const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|(?<!`)(`+)(?!`)[^\n]*?\2(?!`)/g;
 // The identifier-only line a degraded model writes in place of
 // `<｜DSML｜invoke name="…">` (e.g. `bash\n<｜DSML｜parameter …>`): part of the
 // broken call, so it goes with the markup.

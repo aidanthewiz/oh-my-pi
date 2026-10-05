@@ -480,6 +480,40 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		expect(healing.drainCompleted()).toEqual([]);
 	});
 
+	it("keeps quoted DSML examples visible before a later real call across chunk boundaries", () => {
+		for (const pipe of ["|", "｜"]) {
+			const tag = `<${pipe}DSML${pipe}`;
+			const close = `</${pipe}DSML${pipe}`;
+			const envelope =
+				`${tag}tool_calls>${tag}invoke\n name="read">` +
+				`${tag}parameter\r\n name="path" string="true">fixture.txt${close}parameter>` +
+				`${close}invoke>${close}tool_calls>`;
+			for (const prose of [
+				`The marker \`${tag}tool_calls>\` starts a call.\n`,
+				`The marker \`\`${tag}tool_calls>\`\` starts a call.\n`,
+				`The marker \`\`literal \`${tag}tool_calls>\`\` starts a call.\n`,
+				`Before.\n\`\`\`xml\n${tag}tool_calls>\n\`\`\`\n`,
+				`Before.\n~~~xml\n${tag}tool_calls>\n~~~\n`,
+				`Before.\n\`\`\`xml\n${envelope}\n\`\`\`\n`,
+			]) {
+				const input = `${prose}${envelope}\nAfter.`;
+				for (const chunkSize of [1, 7, input.length]) {
+					const healing = new StreamMarkupHealing({ pattern: "dsml" });
+					let visible = "";
+					for (let index = 0; index < input.length; index += chunkSize) {
+						visible += healing.feed(input.slice(index, index + chunkSize));
+					}
+					visible += healing.flushPending();
+					expect(visible).toBe(`${prose}\nAfter.`);
+					expect(stripDsmlToolMarkup(visible)).toBeUndefined();
+					expect(
+						healing.drainCompleted().map(call => ({ name: call.name, arguments: JSON.parse(call.arguments) })),
+					).toEqual([{ name: "read", arguments: { path: "fixture.txt" } }]);
+				}
+			}
+		}
+	});
+
 	it("passes an unclosed, unquoted wrapper to leak recovery without losing later prose", () => {
 		const input = "Intro. <|DSML|tool_calls>broken call\n\nThe build passed.";
 		const healing = new StreamMarkupHealing({ pattern: "dsml" });
