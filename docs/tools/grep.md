@@ -23,14 +23,16 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `pattern` | `string` | Yes | Regex pattern. `grep.ts` rejects whitespace-only input but preserves it verbatim. The native matcher tries Rust regex first, then PCRE2 for features such as lookaround/backreferences, then targeted literal recovery for malformed braces/parentheses. Multiline is enabled only when the pattern contains a literal newline or the two-character sequence `\\n`. |
-| `path` | `string` | No | One file path, directory path, glob-like path, archive member, readable external URL, internal URL, or one-file line selector such as `src/foo.ts:50-100` — or several of those as a semicolon-delimited list (`"src; tests"`). Omitted or empty defaults to `.`. Empty entries are rejected. Semicolon-delimited lists split unconditionally; entries accidentally joined with comma or whitespace are expanded only after existence validation; existing paths containing delimiters stay intact. Internal URLs may glob below their root (`local://*.md`, `omp://**/*.md`). |
+| `path` | `string` | No | One file path, directory path, glob-like path, archive member, readable external URL, internal URL, or one-file line selector such as `src/foo.ts:50-100` — or several of those as a semicolon-delimited list (`"src; tests"`). Omitted or empty defaults to `.`. Empty entries are rejected. Host lists split on semicolons; URL lists split at recognized URL or existing literal-path boundaries. Comma or whitespace recovery requires existence validation; existing paths containing delimiters stay intact. Internal URLs may glob below their root (`local://*.md`, `omp://**/*.md`). |
 | `case` | `boolean` | No | Case-sensitive search. Defaults to `true`. Passed to native `ignoreCase`. |
 | `gitignore` | `boolean` | No | Respect `.gitignore` during directory scans. Defaults to `true`. |
 | `skip` | `number \| null` | No | File-page offset for multi-file results. Omitted or `null` means `0`; `grep.ts` floors finite numbers and rejects negative or non-finite values. Single-file searches ignore it because they do not paginate by file. |
 
 `grep` is enabled by default (`grep.enabled = true`) and is discoverable rather than essential. Context defaults are configurable with `grep.contextBefore` and `grep.contextAfter`.
 
-Supported internal and external URL lists split before scope resolution. Each target keeps its own selectors. Existing literal paths and non-list URL semicolons remain intact.
+Supported internal and external URL lists split before scope resolution. Each target keeps its own selectors and URL query/path semicolons, including `https://example.test/a?x=1;y=2;https://example.test/b`.
+
+Recognized URL starts or existing local filenames after a semicolon take precedence as list boundaries. Percent-encode a URL-owned semicolon as `%3B` when the following text would otherwise identify such a target. Existing literal filenames, escaped delimiters, and brace-enclosed delimiters remain intact.
 
 ## Outputs
 The tool returns a single text block in `content[0].text` plus structured `details`.

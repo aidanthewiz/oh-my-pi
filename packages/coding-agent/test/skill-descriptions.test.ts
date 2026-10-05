@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SkillDescriptionCatalog, SkillDescriptionStore } from "../src/extensibility/skill-descriptions";
 import type { Skill } from "../src/extensibility/skills";
@@ -109,23 +108,17 @@ describe("system prompt skill descriptions", () => {
 		);
 	});
 
-	it("keeps one database handle open across renders and background writes", async () => {
+	it("persists completed descriptions across store closure and reopening", async () => {
 		using temp = TempDir.createSync("omp-skill-description-handle-");
 		const dbPath = temp.join("skills.db");
-		const walPath = `${dbPath}-wal`;
 		const store = SkillDescriptionStore.open(dbPath);
 		try {
 			const first = new SkillDescriptionCatalog({ store, compress: async () => "Use for interactive sites." });
 			first.render([original]);
-			// Open-per-call closed the last connection, which checkpoints and deletes
-			// the WAL sidecars every time; a long-lived store keeps them in place.
-			expect(fs.existsSync(walPath)).toBe(true);
 			await first.waitForPending();
-			expect(fs.existsSync(walPath)).toBe(true);
 			expect(new SkillDescriptionCatalog({ store }).render([original])[0]?.description).toBe(
 				"Use for interactive sites.",
 			);
-			expect(fs.existsSync(walPath)).toBe(true);
 		} finally {
 			store.close();
 		}

@@ -1,4 +1,5 @@
 import type { ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
 import { filterModelsByConfiguredScope, resolveModelRoleValue, rolePriorityDefaults } from "../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -52,5 +53,6 @@ export function createModelBrowserSource(settings: Settings): ModelHubSource {
 		defaultRoleChain: role => rolePriorityDefaults(role),
 		resolveRoleValue: (value, models, roleLookup) => resolveModelRoleValue(value, models, { settings, roleLookup }),
 		scopeModels: models => filterModelsByConfiguredScope([...models], settings),
+		getModelPresets: () => ({ names: getModelPresetNames(settings), active: findActiveModelPreset(settings) }),
 	};
 }

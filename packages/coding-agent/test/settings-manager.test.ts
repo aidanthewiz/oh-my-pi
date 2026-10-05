@@ -69,6 +69,7 @@ import {
 	cfgTaskMaxConcurrency,
 	cfgTaskEnableEffort,
 	cfgTaskAgentModelOverrides,
+	cfgTaskCompletionProbe,
 } from "@oh-my-pi/pi-coding-agent/task/settings";
 import {
 	cfgMnemopiDbPath,
@@ -2297,6 +2298,45 @@ describe("Settings", () => {
 		});
 	});
 	describe("migrations", () => {
+		for (const legacy of [0, 120_000]) {
+			for (const flat of [false, true]) {
+				it(`migrates task completion probing idempotently (legacy=${legacy}, flat=${flat})`, async () => {
+					await writeSettings(
+						flat ? { "task.completionProbeMs": legacy } : { task: { completionProbeMs: legacy } },
+					);
+					const settings = await Settings.init({ cwd: projectDir, agentDir });
+					expect(cfgTaskCompletionProbe.get(settings)).toBe(legacy > 0);
+					cfgDisplayShowTokenUsage.set(settings, true);
+					await settings.flush();
+					const saved = await readSettings();
+					expect((saved.task as Record<string, unknown>).completionProbe).toBe(legacy > 0);
+					expect((saved.task as Record<string, unknown>).completionProbeMs).toBeUndefined();
+					expect(saved["task.completionProbeMs"]).toBeUndefined();
+					await settings.reloadFromDisk();
+					expect(cfgTaskCompletionProbe.get(settings)).toBe(legacy > 0);
+					cfgDisplayShowTokenUsage.set(settings, false);
+					await settings.flush();
+					expect((await readSettings()).task).toEqual(saved.task);
+				});
+			}
+		}
+
+		it("keeps explicit probe settings and project disablement above migrated legacy periods", async () => {
+			await writeSettings({ task: { completionProbeMs: 120_000 }, "task.completionProbe": false });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(cfgTaskCompletionProbe.get(settings)).toBe(false);
+			cfgDisplayShowTokenUsage.set(settings, true);
+			await settings.flush();
+			const saved = await readSettings();
+			expect((saved.task as Record<string, unknown>).completionProbe).toBe(false);
+			expect(saved["task.completionProbe"]).toBeUndefined();
+			await writeSettings({ task: { completionProbeMs: 120_000 } });
+			await fsp.mkdir(getProjectAgentDir(projectDir), { recursive: true });
+			await Bun.write(path.join(getProjectAgentDir(projectDir), "config.yml"), "task:\n  completionProbeMs: 0\n");
+			await settings.reloadFromDisk();
+			expect(cfgTaskCompletionProbe.get(settings)).toBe(false);
+		});
+
 		it("preserves current ask timeout seconds in overrides and persisted config", async () => {
 			expect(cfgAskTimeout.get(Settings.isolated({ "ask.timeout": 2000 }))).toBe(2000);
 

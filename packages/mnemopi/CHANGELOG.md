@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Rebuild stored local E5-large and all-MiniLM vectors after fastembed's CLS-to-mean pooling change, without deleting memories or changing configured model names.
+- Keep cached query vectors isolated between local mean-pooling models and API or custom providers.
+
+## [18.5.1] - 2026-10-03
+
+### Changed
+
+- Upgraded local embedding support to fastembed 3.0.0. Models now download from Hugging Face into the updated cache layout, with interrupted downloads resuming automatically. BGE vectors remain unchanged; E5-large and all-MiniLM now use mean pooling instead of CLS pooling.
+
+### Fixed
+
+- Fixed enhanced recall returning cached results from an unrelated longer query when answering a shorter query.
+- Fixed local embedding setup on fresh caches and Linux ARM64, including compatibility with current model downloads and ARM64 tokenization support.
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

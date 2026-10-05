@@ -315,6 +315,24 @@ describe("GrepTool internal URL resolution", () => {
 		expect(result.details?.matchCount).toBe(3);
 	});
 
+	it("searches semicolon-bearing internal URL paths before the next URL boundary", async () => {
+		registerVirtualDocs(
+			new Map([
+				["first;v=1.md", "needle excluded first\nneedle selected semicolon path\n"],
+				["second.md", "needle selected second\nneedle excluded second\n"],
+			]),
+		);
+		const result = await new GrepTool(createSession()).execute("virtual-semicolon-list", {
+			pattern: "needle",
+			path: "virtual://first;v=1.md:2-2;virtual://second.md:1-1",
+		});
+		expect(getResultText(result)).toContain("needle selected semicolon path");
+		expect(getResultText(result)).toContain("needle selected second");
+		expect(getResultText(result)).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual(["virtual://first;v=1.md", "virtual://second.md"]);
+		expect(result.details?.matchCount).toBe(2);
+	});
+
 	it("searches mixed internal URL and literal path lists in either order", async () => {
 		registerVirtualDocs(new Map([["doc.md", "needle excluded virtual\nneedle selected virtual\n"]]));
 		await Bun.write(path.join(tmpDir, "mixed.txt"), "needle selected local\nneedle excluded local\n");
@@ -816,8 +834,9 @@ describe("GrepTool internal URL resolution", () => {
 			},
 		});
 		const tool = new GrepTool(createSession());
+		// Unix natives surface the real errno text; elsewhere the provider message rides along.
 		await expect(tool.execute("dir-search", { pattern: "x", path: "dirstub://host/dir" })).rejects.toThrow(
-			/dirstub:\/\/host\/dir: Operation not supported/,
+			/dirstub:\/\/host\/dir(: Operation not supported| lists only through the read tool)/,
 		);
 	});
 
@@ -833,7 +852,7 @@ describe("GrepTool internal URL resolution", () => {
 		const listSpy = vi.spyOn(sshFileTransfer, "listRemoteDir").mockResolvedValue([]);
 		const tool = new GrepTool(createSession());
 		await expect(tool.execute("ssh-dir-search", { pattern: "x", path: "ssh://h/etc" })).rejects.toThrow(
-			/ssh:\/\/h\/etc: Operation not supported/,
+			/ssh:\/\/h\/etc(: Operation not supported| lists only through the read tool)/,
 		);
 		expect(listSpy).not.toHaveBeenCalled();
 	});

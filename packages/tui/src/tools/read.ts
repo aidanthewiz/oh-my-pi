@@ -47,6 +47,7 @@ export type ReadTruncationStats = Omit<TruncationResult, "content">;
 /** Display metadata for file and URL reads. */
 export interface ReadToolDetails {
 	kind?: "file" | "url";
+	shape?: "document" | "value";
 	proc?: ProcReadDetails;
 	cfg?: CfgReadDetails;
 	/** Filesystem hyperlink target resolved by the executing tool. */

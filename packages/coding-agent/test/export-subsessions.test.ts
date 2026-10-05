@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { collectSubSessions, exportFromFile } from "../src/export/html";
+import { exportFromFile } from "../src/export/html";
+import { collectSubSessions } from "../src/session/sub-sessions";
 
 /**
  * Contract: a session at `<dir>/<name>.jsonl` embeds subagent transcripts from
@@ -67,6 +68,14 @@ describe("collectSubSessions", () => {
 		expect(subs.Beta).toMatchObject({ agentId: "Beta", parent: null, leafId: "b1" });
 	});
 
+	test("retains a transcript whose agent ID is an object prototype key", async () => {
+		await Bun.write(path.join(root, "main/__proto__.jsonl"), sessionJsonl("prototype-agent", ["p1"]));
+		const subs = await collectSubSessions(mainFile);
+		expect(Object.keys(subs)).toEqual(["__proto__"]);
+		expect(subs.__proto__.header?.id).toBe("prototype-agent");
+		expect(subs.__proto__.leafId).toBe("p1");
+	});
+
 	test("omits internal move history from standalone HTML", async () => {
 		const mainPreviousPath = "/Users/private/main.jsonl";
 		const subPreviousPath = "/Users/private/Alpha.jsonl";
@@ -108,6 +117,52 @@ describe("collectSubSessions", () => {
 		const subs = await collectSubSessions(mainFile);
 
 		expect(Object.keys(subs)).toEqual(["Good"]);
+	});
+
+	test("skips advisor transcripts stored alongside subagent sessions", async () => {
+		await Bun.write(path.join(root, "main/Scout.jsonl"), sessionJsonl("scout", ["s1"]));
+		await Bun.write(path.join(root, "main/__advisor.jsonl"), sessionJsonl("adv", ["v1"]));
+		await Bun.write(path.join(root, "main/__advisor.reviewer.jsonl"), sessionJsonl("adv2", ["v2"]));
+		await Bun.write(path.join(root, "main/Scout/__advisor.jsonl"), sessionJsonl("adv3", ["v3"]));
+
+		const subs = await collectSubSessions(mainFile);
+
+		expect(Object.keys(subs)).toEqual(["Scout"]);
+	});
+
+	test("skips transcript stems that would create traversal archive members", async () => {
+		// "..jsonl" has the stem "."; descending into `<dir>/.` used to rescan the same directory forever.
+		await Bun.write(path.join(root, "main/..jsonl"), sessionJsonl("dot", ["d1"]));
+		await Bun.write(path.join(root, "main/...jsonl"), sessionJsonl("dotdot", ["d2"]));
+		await Bun.write(path.join(root, "main/Scout.jsonl"), sessionJsonl("scout", ["s1"]));
+
+		const subs = await collectSubSessions(mainFile);
+
+		expect(Object.keys(subs)).toEqual(["Scout"]);
+	});
+
+	test("flags subagents killed with a tombstone sidecar as aborted", async () => {
+		await Bun.write(path.join(root, "main/Killed.jsonl"), sessionJsonl("killed", ["k1"]));
+		await Bun.write(path.join(root, "main/Killed.jsonl.tombstone"), "");
+		await Bun.write(path.join(root, "main/Live.jsonl"), sessionJsonl("live", ["l1"]));
+
+		const subs = await collectSubSessions(mainFile);
+
+		expect(subs.Killed.aborted).toBe(true);
+		expect(subs.Live.aborted).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")("does not traverse linked transcript files or directories", async () => {
+		const external = path.join(root, "external");
+		await Bun.write(path.join(external, "Secret.jsonl"), sessionJsonl("secret", ["s1"]));
+		await fs.symlink(external, path.join(root, "main"), "dir");
+		expect(await collectSubSessions(mainFile)).toEqual({});
+		await fs.unlink(path.join(root, "main"));
+		await fs.mkdir(path.join(root, "main"));
+		await Bun.write(path.join(root, "main/Scout.jsonl"), sessionJsonl("scout", ["s1"]));
+		await fs.symlink(external, path.join(root, "main/Scout"), "dir");
+		await fs.symlink(path.join(external, "Secret.jsonl"), path.join(root, "main/Secret.jsonl"));
+		expect(Object.keys(await collectSubSessions(mainFile))).toEqual(["Scout"]);
 	});
 
 	test("returns empty record when no subagent dir exists", async () => {

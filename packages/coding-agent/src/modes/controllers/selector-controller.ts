@@ -26,7 +26,14 @@ import { reset as resetCapabilities } from "../../capability";
 import type { AdvisorConfigScope } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { showGitOverlay } from "../../cli/git-tui";
 import { formatLoginIdentity } from "../../cli/oauth-terminal";
-import { acquireModelRoleMutation, modelPresetSavedMessage, saveModelPreset } from "../../config/model-presets";
+import {
+	acquireModelRoleMutation,
+	applyModelPreset,
+	formatModelPresetSwitch,
+	isCleanModelPresetSwitch,
+	modelPresetSavedMessage,
+	saveModelPreset,
+} from "../../config/model-presets";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import {
 	getAllowedAvailableModels,
@@ -121,10 +128,12 @@ import { SessionSelectorComponent, type SessionSelectorOptions } from "@oh-my-pi
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
+import { ThinkingSelectorComponent } from "@oh-my-pi/pi-tui/overlays/thinking-selector";
 import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 
+import { cfgAdvisorSyncBacklog } from "../../advisor/settings";
 import { cfgBranchSummaryEnabled } from "../../session/context-settings";
 import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../../session/settings";
@@ -435,6 +444,7 @@ export class SelectorController {
 				},
 				scopedModels: this.ctx.session.scopedModels,
 				availableToolNames: this.ctx.session.getAdvisorAvailableToolNames(),
+				syncBacklog: cfgAdvisorSyncBacklog.get(this.ctx.settings),
 				defaultModelLabel: defaultAdvisorModel
 					? `${defaultAdvisorModel.provider}/${defaultAdvisorModel.id}`
 					: undefined,
@@ -631,12 +641,12 @@ export class SelectorController {
 	 * the target's context window, mirroring an over-context pick in the alt+p
 	 * picker. Failures surface as status errors.
 	 */
-	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void> {
+	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, role?: string): Promise<void> {
 		const contextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		const contextWindow = model.contextWindow ?? 0;
 		const overContext = contextWindow > 0 && contextTokens > contextWindow;
 		try {
-			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext);
+			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext, role);
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -656,10 +666,11 @@ export class SelectorController {
 		selector: string,
 		thinkingLevel: ConfiguredThinkingLevel | undefined,
 		compactFirst: boolean,
+		role?: string,
 	): Promise<void> {
 		const apply = async () => {
 			const level = thinkingLevel ?? this.ctx.session.resolveTemporaryModelThinkingLevel(model);
-			await this.ctx.session.setModelTemporary(model, level);
+			await this.ctx.session.setModelTemporary(model, level, role ? { role } : undefined);
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");
@@ -990,6 +1001,22 @@ export class SelectorController {
 						this.ctx.showStatus(modelPresetSavedMessage(this.ctx.settings, name));
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				onSwitchPreset: async name => {
+					try {
+						const result = await applyModelPreset(this.ctx.settings, this.ctx.session, name);
+						const message = formatModelPresetSwitch(name, result);
+						if (result.kind === "switched") {
+							this.ctx.statusLine.invalidate();
+							this.ctx.updateEditorBorderColor();
+						}
+						if (isCleanModelPresetSwitch(result)) this.ctx.showStatus(message);
+						else this.ctx.showWarning(message);
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					} finally {
+						hub?.refreshAfterExternalMutation();
 					}
 				},
 				onCancel: () => done(),
@@ -2177,6 +2204,27 @@ export class SelectorController {
 		this.showSelector(done => {
 			const selector = new DebugSelectorComponent(this.ctx, done);
 			return { component: selector, focus: selector };
+		});
+	}
+
+	showThinkingSelector(): void {
+		const configured = this.ctx.session.configuredThinkingLevel();
+		this.showSelector(done => {
+			const selector = new ThinkingSelectorComponent(
+				configured === ThinkingLevel.Inherit ? ThinkingLevel.Off : configured,
+				this.ctx.session.getAvailableEffortSelectors(),
+				level => {
+					done();
+					// thinking_level_changed refreshes the status line and editor border.
+					this.ctx.session.setThinkingLevel(level);
+					this.ctx.ui.requestRender();
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector.getSelectList() };
 		});
 	}
 

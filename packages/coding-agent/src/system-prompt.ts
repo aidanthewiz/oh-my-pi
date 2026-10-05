@@ -774,6 +774,8 @@ export interface BuildSystemPromptOptions {
 	coreforgeReportEnabled?: boolean;
 	/** Whether active `write` is restricted to xd:// dispatch and the plan artifact sandbox. */
 	writeTransportOnly?: boolean;
+	/** Assign project-wide verification to the parent while allowing assignment-scoped proof. */
+	subagent?: boolean;
 }
 
 /** Result of building provider-facing system prompt messages. */
@@ -856,6 +858,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs = "",
 		coreforgeReportEnabled = false,
 		writeTransportOnly = false,
+		subagent = false,
 		activeRepoContext: providedActiveRepoContext,
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
@@ -1192,6 +1195,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs,
 		coreforgeReportEnabled,
 		writeTransportOnly,
+		subagent,
 	};
 	const selectedTemplate = resolvedCustomPrompt
 		? customSystemPromptTemplate

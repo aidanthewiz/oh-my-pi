@@ -5,6 +5,7 @@ import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
 import { readModelCache, writeModelCache } from "./model-cache";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import { isTimeBasedCost } from "./pricing";
+import { toModelSpec } from "./provider-models/bundled-references";
 import {
 	type Api,
 	type Model,
@@ -584,7 +585,7 @@ function retainModelIds<TApi extends Api>(
 	return models.filter(model => modelKind(model) !== "chat" || retainedIds.has(model.id));
 }
 
-const MODEL_CACHE_FINGERPRINT_VERSION = `merge-v5:${VERSION}`;
+const MODEL_CACHE_FINGERPRINT_VERSION = `merge-v6:${VERSION}`;
 
 /**
  * Return the versioned content identity for a static provider slice. Callers
@@ -653,10 +654,12 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 	// rows carry `supportsReasoningEffort: false`, which would silently strip
 	// the effort dial once the id is pinned to Responses (#12901).
 	const compat =
-		dynamicModel.compatConfig ?? (dynamicModel.api === existingModel.api ? existingModel.compatConfig : undefined);
+		dynamicModel.api === existingModel.api && existingModel.compatConfig !== undefined
+			? { ...existingModel.compatConfig, ...dynamicModel.compatConfig }
+			: dynamicModel.compatConfig;
 	return buildModel({
-		...existingModel,
-		...dynamicModel,
+		...toModelSpec(existingModel),
+		...toModelSpec(dynamicModel),
 		name: preferDiscoveryName(dynamicModel.name, existingModel.name, dynamicModel.id),
 		reasoning,
 		input: supportsImage ? ["text", "image"] : ["text"],

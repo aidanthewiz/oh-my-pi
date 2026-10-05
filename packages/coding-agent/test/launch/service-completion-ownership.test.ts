@@ -13,8 +13,15 @@ import {
 	DAEMON_RUNTIME_DIR_ENV,
 	type DaemonCompletionNotification,
 } from "../../src/launch/protocol";
-import { listServices, sendService, startService, waitForOwnedServiceCompletion } from "../../src/launch/services";
+import {
+	hasLiveOwnedService,
+	listServices,
+	sendService,
+	startService,
+	waitForOwnedServiceCompletion,
+} from "../../src/launch/services";
 import type { ToolSession } from "../../src/tools";
+import { ToolAbortError } from "../../src/tools/tool-errors";
 
 interface EmbeddedBroker {
 	/** Settles once this in-process broker has shut down and flushed its metadata. */
@@ -48,6 +55,235 @@ async function startBroker(projectDir: string, runtimeDir: string): Promise<Embe
 }
 
 describe("session-owned supervised services", () => {
+	it("does not begin broker acquisition or register callbacks for an already disposed session", async () => {
+		const registerDisposeCallback = vi.fn();
+		const registerSessionChangeCallback = vi.fn();
+		const acquisition = vi.spyOn(brokerClients, "daemonClientForProject");
+		try {
+			await expect(
+				listServices({
+					cwd: process.cwd(),
+					hasUI: false,
+					settings: Settings.isolated(),
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					isDisposed: () => true,
+					registerDisposeCallback,
+					registerSessionChangeCallback,
+				}),
+			).rejects.toBeInstanceOf(ToolAbortError);
+			expect(acquisition).not.toHaveBeenCalled();
+			expect(registerDisposeCallback).not.toHaveBeenCalled();
+			expect(registerSessionChangeCallback).not.toHaveBeenCalled();
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("does not launch a service when cancellation occurs during broker connection", async () => {
+		using tempDir = TempDir.createSync("@omp-service-connect-abort-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const client = await brokerClients.createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = await startBroker(projectDir, runtimeDir);
+		try {
+			const controller = new AbortController();
+			const pending = client.request(
+				{
+					op: "start",
+					owner: "cancelled-session",
+					spec: {
+						name: "cancelled-service",
+						application: "/bin/sh",
+						args: ["-c", "exit 3"],
+						env: {},
+						cwd: projectDir,
+						pty: false,
+						restart: "no",
+						persist: false,
+						detached: false,
+					},
+				},
+				controller.signal,
+			);
+			controller.abort();
+			await expect(pending).rejects.toThrow("Daemon broker request aborted");
+			const result = await client.request({ op: "list" });
+			if (result.op !== "list") throw new Error("Expected daemon list");
+			expect(result.daemons.find(daemon => daemon.name === "cancelled-service")).toBeUndefined();
+		} finally {
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}, 15_000);
+
+	for (const invalidation of ["cancel", "dispose", "switch"] as const) {
+		it(`does not attach an owner or send RPC when acquisition finishes after ${invalidation}`, async () => {
+			using tempDir = TempDir.createSync("@omp-service-acquisition-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			const client = await brokerClients.createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+			const previousTitle = process.title;
+			const broker = await startBroker(projectDir, runtimeDir);
+			let sessionId = "original-session";
+			const disposeCallbacks = new Set<() => void>();
+			const changeCallbacks = new Set<() => void>();
+			const session: ToolSession = {
+				cwd: projectDir,
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				getSessionId: () => sessionId,
+				registerDisposeCallback: callback => {
+					disposeCallbacks.add(callback);
+					return () => disposeCallbacks.delete(callback);
+				},
+				registerSessionChangeCallback: callback => {
+					changeCallbacks.add(callback);
+					return () => changeCallbacks.delete(callback);
+				},
+			};
+			const acquired = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const controller = new AbortController();
+			try {
+				const subscribe = vi.spyOn(client, "onCompletion");
+				const rpc = vi.spyOn(client, "request");
+				const acquisition = vi.spyOn(brokerClients, "daemonClientForProject").mockImplementation(async () => {
+					acquired.resolve();
+					await release.promise;
+					return client;
+				});
+				const pending = listServices(session, invalidation === "cancel" ? controller.signal : undefined);
+				const rejected = pending.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await acquired.promise;
+				expect(disposeCallbacks.size).toBe(1);
+				expect(changeCallbacks.size).toBe(1);
+				if (invalidation === "cancel") controller.abort();
+				else if (invalidation === "dispose") {
+					for (const callback of disposeCallbacks) callback();
+					disposeCallbacks.clear();
+				} else {
+					sessionId = "other-session";
+					for (const callback of changeCallbacks) callback();
+					sessionId = "original-session";
+					for (const callback of changeCallbacks) callback();
+				}
+				release.resolve();
+				expect(await rejected).toBeInstanceOf(ToolAbortError);
+				expect(subscribe).not.toHaveBeenCalled();
+				expect(rpc).not.toHaveBeenCalled();
+				expect(hasLiveOwnedService(session)).toBe(false);
+				if (invalidation === "dispose") {
+					await expect(listServices(session)).rejects.toBeInstanceOf(ToolAbortError);
+					expect(acquisition).toHaveBeenCalledTimes(1);
+					expect(disposeCallbacks.size).toBe(0);
+					expect(changeCallbacks.size).toBe(0);
+				} else {
+					await listServices(session);
+					await listServices(session);
+					expect(subscribe).toHaveBeenCalledTimes(1);
+					expect(disposeCallbacks.size).toBe(1);
+					expect(changeCallbacks.size).toBe(1);
+				}
+				await listServices({
+					cwd: projectDir,
+					hasUI: false,
+					settings: Settings.isolated(),
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					getSessionId: () => "live-session",
+				});
+				expect(subscribe).toHaveBeenCalledTimes(invalidation === "dispose" ? 1 : 2);
+			} finally {
+				release.resolve();
+				vi.restoreAllMocks();
+				await client.request({ op: "shutdown" }).catch(() => undefined);
+				client.close();
+				await broker.finished;
+				process.title = previousTitle;
+			}
+		}, 15_000);
+	}
+
+	it("does not restore old ownership from a response that finishes after switching sessions", async () => {
+		using tempDir = TempDir.createSync("@omp-service-stale-list-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const client = await brokerClients.createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = await startBroker(projectDir, runtimeDir);
+		let sessionId = "original-session";
+		const changeCallbacks = new Set<() => void>();
+		const session: ToolSession = {
+			cwd: projectDir,
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getSessionId: () => sessionId,
+			registerSessionChangeCallback: callback => {
+				changeCallbacks.add(callback);
+				return () => changeCallbacks.delete(callback);
+			},
+		};
+		const received = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+			await startService(session, {
+				name: "still-running",
+				command: "echo service-ready; read answer",
+				shell: { shell: "/bin/sh", args: ["-c"], env: {} },
+				ready: { log: "service-ready", timeout: 5 },
+			});
+			expect(hasLiveOwnedService(session)).toBe(true);
+			const request = client.request.bind(client);
+			const delayed = vi.spyOn(client, "request").mockImplementation(async (operation, signal) => {
+				const result = await request(operation, signal);
+				if (operation.op === "list") {
+					received.resolve();
+					await release.promise;
+				}
+				return result;
+			});
+			const pending = listServices(session);
+			const rejected = pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await received.promise;
+			sessionId = "other-session";
+			for (const callback of changeCallbacks) callback();
+			sessionId = "original-session";
+			for (const callback of changeCallbacks) callback();
+			expect(hasLiveOwnedService(session)).toBe(false);
+			release.resolve();
+			expect(await rejected).toBeInstanceOf(ToolAbortError);
+			expect(hasLiveOwnedService(session)).toBe(false);
+			delayed.mockRestore();
+			await listServices(session);
+			expect(hasLiveOwnedService(session)).toBe(true);
+		} finally {
+			release.resolve();
+			vi.restoreAllMocks();
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}, 15_000);
+
 	it("delivers a failed service only to its session when another session shares the broker", async () => {
 		using tempDir = TempDir.createSync("@omp-service-completion-");
 		const projectDir = path.join(tempDir.path(), "project");
@@ -157,6 +393,7 @@ describe("session-owned supervised services", () => {
 			expect(
 				deliveries.map(([receiver, { owner, daemon }]) => [receiver, owner, daemon.name, daemon.state]),
 			).toEqual([["old-session", "old-session", "old-service", "failed"]]);
+			expect(callbacks).toHaveLength(1);
 			await client.request({ op: "shutdown" });
 			await broker.finished;
 			const metadata = (await Bun.file(

@@ -13,6 +13,9 @@ import {
 } from "@oh-my-pi/pi-tui/apps/git/diff-pane";
 import { GitModel } from "../src/cli/git-tui/state";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { showGitOverlay } from "@oh-my-pi/pi-tui/apps/git/git-tui";
+import { selectionBgAnsi } from "@oh-my-pi/pi-tui/apps/git/colors";
+import { TspHarness } from "../../tui/test/native/tsp-harness";
 
 const RED_PNG = Buffer.from(
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
@@ -80,6 +83,58 @@ describe("git TUI streamed document", () => {
 			expect(contents.newText).toBe("export const added = true;\n");
 			expect(contents.streamResult.runs.length).toBeGreaterThan(0);
 			expect(updates).toBeGreaterThan(0);
+		});
+	});
+
+	test("applies only the selected adjacent change to the index and reverses it", async () => {
+		await withReviewRepo(async repo => {
+			const filePath = path.join(repo, "seed.txt");
+			const original = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n";
+			const modified = original.replace("line 5\nline 6", "changed 5\nchanged 6");
+			await Bun.write(filePath, original);
+			await $`git add seed.txt`.cwd(repo).quiet();
+			await $`git commit -m lines`.cwd(repo).quiet();
+			await Bun.write(filePath, modified);
+
+			const model = new GitModel(repo);
+			const doc = buildDiffDocument(original, modified, "seed.txt");
+			const row = doc.rows.findIndex(item => item.newRaw === "changed 5");
+			expect(row).toBeGreaterThanOrEqual(0);
+			const patch = buildLineSelectionPatch(doc, row, row, "apply");
+			if (!patch) throw new Error("selected row produced no patch");
+			await model.applyPatch(patch, { cached: true });
+			expect((await $`git show :seed.txt`.cwd(repo).quiet().text()).split("\n").slice(4, 6)).toEqual([
+				"changed 5",
+				"line 6",
+			]);
+			expect(await Bun.file(filePath).text()).toBe(modified);
+
+			const staged = buildDiffDocument(original, await $`git show :seed.txt`.cwd(repo).quiet().text(), "seed.txt");
+			const stagedRow = staged.rows.findIndex(item => item.newRaw === "changed 5");
+			const undo = buildLineSelectionPatch(staged, stagedRow, stagedRow, "revert");
+			if (!undo) throw new Error("staged row produced no reverse patch");
+			await model.applyPatch(undo, { cached: true });
+			expect(await $`git show :seed.txt`.cwd(repo).quiet().text()).toBe(original);
+			expect(await Bun.file(filePath).text()).toBe(modified);
+		});
+	});
+
+	test("applies a later hunk without staging an earlier hunk", async () => {
+		await withReviewRepo(async repo => {
+			const filePath = path.join(repo, "seed.txt");
+			const original = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join("\n") + "\n";
+			const expected = original.replace("line 40\n", "changed 40\n");
+			const modified = expected.replace("line 5\n", "changed 5\n");
+			await Bun.write(filePath, original);
+			await $`git add seed.txt`.cwd(repo).quiet();
+			await $`git commit -m lines`.cwd(repo).quiet();
+			await Bun.write(filePath, modified);
+
+			const doc = buildDiffDocument(original, modified, "seed.txt");
+			expect(doc.hunks).toHaveLength(2);
+			await new GitModel(repo).applyPatch(doc.hunks[1].patch, { cached: true });
+			expect(await $`git show :seed.txt`.cwd(repo).quiet().text()).toBe(expected);
+			expect(await Bun.file(filePath).text()).toBe(modified);
 		});
 	});
 
@@ -309,5 +364,159 @@ describe("formatting-ignore whitespace mode", () => {
 	test("streamed formatting document matches the synchronous builder", async () => {
 		const streamed = await streamedDocument(SPLIT_OLD, SPLIT_NEW, FMT);
 		expect(streamed).toEqual(buildDiffDocument(SPLIT_OLD, SPLIT_NEW, "fixture.ts", FMT));
+	});
+});
+
+describe("native Git selection and index", () => {
+	const original = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join("\n") + "\n";
+	const changed = original.replace("line 5\nline 6", "changed 5\nchanged 6").replace("line 40\n", "changed 40\n");
+
+	async function waitFor(h: TspHarness, predicate: () => boolean | Promise<boolean>): Promise<void> {
+		const deadline = performance.now() + 5_000;
+		while (performance.now() < deadline) {
+			await h.render();
+			if (await predicate()) return;
+			// Filesystem completion uses the event loop, not the harness's manual scheduler.
+			await Bun.sleep(5);
+		}
+		throw new Error("Git fixture did not settle");
+	}
+
+	function visibleDiff(h: TspHarness): string {
+		return JSON.stringify(h.find(node => node.p?.role === "omp.app.git.diff") ?? {}, (_key, value: unknown) =>
+			typeof value === "string" ? sanitizeText(value) : value,
+		);
+	}
+
+	async function withNativeGit(
+		repo: string,
+		area: "staged" | "unstaged",
+		run: (h: TspHarness, key: (input: string) => Promise<void>) => Promise<void>,
+	): Promise<void> {
+		const h = await TspHarness.start(undefined, { cols: 150, rows: 24 });
+		const closed = showGitOverlay(h.tui, {
+			model: new GitModel(repo),
+			createAvatarSource: () => ({ get: () => null }),
+			aiStage: async () => {
+				throw new Error("AI staging is not used by this fixture");
+			},
+			generateCommitMessage: async () => {
+				throw new Error("Commit generation is not used by this fixture");
+			},
+		});
+		try {
+			await waitFor(h, () =>
+				Boolean(
+					h.find(
+						node =>
+							node.k === "list" &&
+							node.id.endsWith(`/${area}`) &&
+							(node.c?.some(child => child.p?.title?.endsWith(": lines.txt")) ?? false),
+					),
+				),
+			);
+			const list = h.find(node => node.k === "list" && node.id.endsWith(`/${area}`));
+			const item = list?.c?.find(node => node.p?.title?.endsWith(": lines.txt"));
+			if (!list || !item) throw new Error("Git fixture file was not listed");
+			h.event({ ev: "select", sf: h.terminal.surface ?? "", id: list.id, item: item.id });
+			await waitFor(h, () => visibleDiff(h).includes("changed 5"));
+			const key = async (input: string): Promise<void> => {
+				h.terminal.send(input);
+				h.flush();
+				await h.render();
+			};
+			await key("\t");
+			await run(h, key);
+			expect(h.errors).toEqual([]);
+		} finally {
+			h.terminal.send("\x03");
+			h.flush();
+			await closed;
+			h.stop();
+		}
+	}
+
+	test("reveals the selected hunk and stages and unstages only that target after refresh", async () => {
+		await withReviewRepo(async repo => {
+			await Bun.write(path.join(repo, "lines.txt"), original);
+			await $`git add lines.txt`.cwd(repo).quiet();
+			await $`git commit -m fixture`.cwd(repo).quiet();
+			await Bun.write(path.join(repo, "lines.txt"), changed);
+			const lastOnly = original.replace("line 40\n", "changed 40\n");
+			const firstOnly = original.replace("line 5\nline 6", "changed 5\nchanged 6");
+			await withNativeGit(repo, "unstaged", async (h, key) => {
+				await key("4");
+				await key("G");
+				expect(visibleDiff(h)).toContain("Selected hunk 2/2: @@ -37,7 +37,7 @@");
+				expect(visibleDiff(h)).toContain("changed 40");
+				expect(h.frames.at(-1)?.ops.some(op => op[0] === "reveal")).toBe(true);
+				await key("r");
+				await waitFor(h, () => visibleDiff(h).includes("Selected hunk 1/2"));
+				await key("G");
+				expect(visibleDiff(h)).toContain("Selected hunk 2/2: @@ -37,7 +37,7 @@");
+				await key(" ");
+				await waitFor(h, async () => (await $`git show :lines.txt`.cwd(repo).text()) === lastOnly);
+				await waitFor(h, () => visibleDiff(h).includes("changed 5") && !visibleDiff(h).includes("changed 40"));
+				expect(visibleDiff(h)).toContain("Selected hunk 1/1");
+				await key(" ");
+				await waitFor(h, async () => (await $`git show :lines.txt`.cwd(repo).text()) === changed);
+			});
+			await withNativeGit(repo, "staged", async (h, key) => {
+				await key("4");
+				await key("G");
+				expect(visibleDiff(h)).toContain("Selected hunk 2/2: @@ -37,7 +37,7 @@");
+				expect(visibleDiff(h)).toContain("changed 40");
+				await key(" ");
+				await waitFor(h, async () => (await $`git show :lines.txt`.cwd(repo).text()) === firstOnly);
+				await waitFor(h, () => visibleDiff(h).includes("changed 5") && !visibleDiff(h).includes("changed 40"));
+				expect(visibleDiff(h)).toContain("Selected hunk 1/1");
+				await key(" ");
+				await waitFor(h, async () => (await $`git show :lines.txt`.cwd(repo).text()) === original);
+			});
+			expect(await fs.readFile(path.join(repo, "lines.txt"), "utf8")).toBe(changed);
+		});
+	});
+
+	test("shows the cursor band on the exact staged row without staging its adjacent change", async () => {
+		await withReviewRepo(async repo => {
+			await Bun.write(path.join(repo, "lines.txt"), original);
+			await $`git add lines.txt`.cwd(repo).quiet();
+			await $`git commit -m fixture`.cwd(repo).quiet();
+			await Bun.write(path.join(repo, "lines.txt"), changed);
+			await withNativeGit(repo, "unstaged", async (h, key) => {
+				await key("2");
+				await key("g");
+				for (let step = 0; step < 4; step++) await key("j");
+				const selected = h.find(
+					node => node.k === "rows" && Boolean(node.p?.lines?.some(line => line.startsWith(selectionBgAnsi()))),
+				);
+				const band =
+					selected?.k === "rows" ? selected.p?.lines?.find(line => line.startsWith(selectionBgAnsi())) : undefined;
+				expect(sanitizeText(band ?? "")).toContain("changed 5");
+				expect(sanitizeText(band ?? "")).not.toContain("changed 6");
+				await key(" ");
+				const firstRow = original.replace("line 5\n", "changed 5\n");
+				await waitFor(h, async () => (await $`git show :lines.txt`.cwd(repo).text()) === firstRow);
+				await waitFor(h, () =>
+					Boolean(
+						h.find(
+							node =>
+								node.k === "rows" &&
+								Boolean(
+									node.p?.lines?.some(
+										line => line.startsWith(selectionBgAnsi()) && sanitizeText(line).includes("changed 6"),
+									),
+								),
+						),
+					),
+				);
+				await key("g");
+				for (let step = 0; step < 5; step++) await key("j");
+				await key(" ");
+				const firstTwo = original.replace("line 5\nline 6", "changed 5\nchanged 6");
+				await waitFor(h, async () => (await $`git show :lines.txt`.cwd(repo).text()) === firstTwo);
+				expect(await fs.readFile(path.join(repo, "lines.txt"), "utf8")).toBe(changed);
+			});
+		});
 	});
 });

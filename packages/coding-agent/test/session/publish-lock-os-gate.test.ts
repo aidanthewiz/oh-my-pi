@@ -149,7 +149,7 @@ describe("publish lock OS gate", () => {
 			throw new Error("OS locks unavailable");
 		});
 		try {
-			expect(() => storage.claimSessionFile(sessionPath)).toThrow(SessionLockError);
+			expect(() => storage.claimSession("unsupported-session", sessionPath)).toThrow(SessionLockError);
 			expect(() => storage.writeTextSync(sessionPath, "not published\n")).toThrow(SessionLockError);
 			expect(fs.existsSync(sessionPath)).toBe(false);
 		} finally {

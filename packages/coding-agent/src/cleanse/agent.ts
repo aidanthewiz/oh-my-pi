@@ -1,6 +1,6 @@
 import { getProjectDir, isRecord, prompt } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
-import { formatModelString, resolveCliModel } from "../config/model-resolver";
+import { formatModelString, formatModelStringWithRouting, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { IrcBus } from "../irc/bus";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -113,7 +113,7 @@ export async function createCleanseAgentRuntime(options: {
 		getAgentId: () => MAIN_AGENT_ID,
 		getSessionSpawns: () => "sonic,task",
 		getModelString: () => modelSelector,
-		getActiveModelString: () => modelSelector,
+		getActiveModelString: () => (resolved.model ? formatModelStringWithRouting(resolved.model) : undefined),
 		getActiveModel: () => resolved.model,
 		sessionManager,
 		settings,

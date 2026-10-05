@@ -14,7 +14,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/dap/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
-import { getAgentDir, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { type ChildProcess, getAgentDir, ptree, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 const ORIGINAL_AGENT_DIR = getAgentDir();
 let testHome: string | undefined;
@@ -530,81 +530,148 @@ describe("DAP launch failure handling", () => {
 		}
 	});
 
-	it("kills the detached adapter process when the Unix socket never appears (Linux)", async () => {
-		if (process.platform !== "linux") return;
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-unix-leak-"));
+	it("rejects the request instead of emitting an unhandled rejection when a pending stdin write fails", async () => {
+		const exited = Promise.withResolvers<number>();
+		const proc = {
+			exited: exited.promise,
+			exitCode: null,
+			stdin: { write: () => 0, flush: () => undefined },
+			stdout: new ReadableStream<Uint8Array>(),
+			stderr: new ReadableStream<Uint8Array>(),
+			peekStderr: () => "",
+			kill: () => {
+				exited.resolve(-1);
+				return true;
+			},
+		} as unknown as DapClientState["proc"];
+		// A pending FileSink write returns a promise; on Windows it rejects with
+		// EPIPE once the adapter's end of the pipe is gone.
+		const writeSink = {
+			write: (_data: string | Uint8Array) => Promise.reject(new Error("EPIPE: broken pipe, write")),
+			flush: () => undefined,
+		};
+		const client = new DapClient(TEST_ADAPTER, process.cwd(), proc, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink,
+		});
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
 		try {
-			const adapterPath = path.join(cwd, "wedged-unix-adapter.mjs");
-			const pidFilePath = path.join(cwd, "adapter.pid");
-			// Adapter records its pid and stays alive without ever creating the
-			// socket, forcing #spawnSocketUnix's readiness wait to time out.
-			await fs.writeFile(
-				adapterPath,
-				`await Bun.write(${JSON.stringify(pidFilePath)}, String(process.pid));\nawait Bun.sleep(60_000);\n`,
-			);
+			// A failed write marks the client broken, so the request fails well before its own timeout.
+			const start = Date.now();
+			await expect(client.sendRequest("evaluate", {}, undefined, 5_000)).rejects.toThrow();
+			expect(Date.now() - start).toBeLessThan(1_000);
+			expect(await exited.promise).toBe(-1);
+			// Unhandled rejections are reported once the microtask queue drains; one macrotask turn suffices.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await client.dispose();
+		}
+	});
+
+	it("disposes the client when the stdin flush throws synchronously", async () => {
+		const exited = Promise.withResolvers<number>();
+		const proc = {
+			exited: exited.promise,
+			exitCode: null,
+			stdin: { write: () => 0, flush: () => undefined },
+			stdout: new ReadableStream<Uint8Array>(),
+			stderr: new ReadableStream<Uint8Array>(),
+			peekStderr: () => "",
+			kill: () => {
+				exited.resolve(-1);
+				return true;
+			},
+		} as unknown as DapClientState["proc"];
+		const writeSink = {
+			write: (_data: string | Uint8Array) => 0,
+			flush: () => {
+				throw new Error("EPIPE: broken pipe, write");
+			},
+		};
+		const client = new DapClient(TEST_ADAPTER, process.cwd(), proc, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink,
+		});
+		try {
+			await expect(client.sendRequest("evaluate", {}, undefined, 5_000)).rejects.toThrow();
+			// The broken pipe is terminal: later requests fail fast instead of reusing the dead sink.
+			await expect(client.sendRequest("evaluate", {}, undefined, 5_000)).rejects.toThrow(/not running/);
+			expect(await exited.promise).toBe(-1);
+		} finally {
+			await client.dispose();
+		}
+	});
+
+	it.each([
+		{ platform: "linux", transport: "Unix socket", error: /Socket not ready/ },
+		{ platform: "darwin", transport: "TCP client-addr", error: /did not connect within/ },
+	])("kills a started detached adapter on $transport launch timeout", async ({ platform, error }) => {
+		if (platform === "linux" && process.platform !== "linux") return;
+		const originalPlatform = process.platform;
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-socket-leak-"));
+		let proc: ChildProcess | undefined;
+		let exited: Promise<PromiseSettledResult<number>[]> | undefined;
+		let restoreSpawn: (() => void) | undefined;
+		try {
+			const adapterPath = path.join(cwd, "wedged-adapter.mjs");
+			await fs.writeFile(adapterPath, "console.log(process.pid);\nawait Bun.sleep(60_000);\n");
+			proc = ptree.spawn([process.execPath, adapterPath], { cwd, stdin: "pipe", detached: true });
+			exited = Promise.allSettled([proc.exited]);
+			const reader = proc.stdout.getReader();
+			try {
+				const ready = (async () => {
+					let output = "";
+					const decoder = new TextDecoder();
+					while (!output.includes("\n")) {
+						const chunk = await reader.read();
+						if (chunk.done) throw new Error(`Adapter exited before readiness: ${proc?.peekStderr()}`);
+						output += decoder.decode(chunk.value, { stream: true });
+					}
+					return Number(output.trim());
+				})();
+				expect(await withTimeout(ready, 5_000, "Adapter did not start")).toBe(proc.pid);
+			} finally {
+				await reader.cancel();
+				reader.releaseLock();
+			}
+			expect(proc.exitCode).toBeNull();
+			process.kill(proc.pid, 0);
+
+			// Start the launch deadline only after the real detached child is ready.
+			const spawnSpy = spyOn(ptree, "spawn").mockReturnValue(proc);
+			restoreSpawn = () => spawnSpy.mockRestore();
+			Object.defineProperty(process, "platform", { value: platform, configurable: true });
 			const adapter: DapResolvedAdapter = {
 				...TEST_ADAPTER,
-				name: "wedged-unix-adapter",
+				name: "wedged-adapter",
 				command: process.execPath,
 				args: [adapterPath],
 				resolvedCommand: process.execPath,
 				connectMode: "socket",
 			};
-			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(/Socket not ready/);
-			// Wait for the kill signal to propagate to the detached adapter.
-			await Bun.sleep(500);
-			const adapterPid = Number(await Bun.file(pidFilePath).text());
-			expect(Number.isFinite(adapterPid)).toBe(true);
-			let alive = true;
-			try {
-				process.kill(adapterPid, 0);
-			} catch {
-				alive = false;
-			}
-			expect(alive).toBe(false);
+			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(error);
+			const [outcome] = await withTimeout(exited, 5_000, "Detached adapter survived launch timeout");
+			if (outcome.status === "rejected") expect(outcome.reason.name).toBe("AbortError");
+			const adapterPid = proc.pid;
+			expect(() => process.kill(adapterPid, 0)).toThrow();
 		} finally {
-			await removeWithRetries(cwd);
-		}
-	});
-
-	it("kills the detached adapter process when it never dials back on the TCP client-addr path", async () => {
-		const originalPlatform = process.platform;
-		Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
-		try {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-tcp-leak-"));
+			restoreSpawn?.();
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 			try {
-				const adapterPath = path.join(cwd, "wedged-tcp-adapter.mjs");
-				const pidFilePath = path.join(cwd, "adapter.pid");
-				await fs.writeFile(
-					adapterPath,
-					`await Bun.write(${JSON.stringify(pidFilePath)}, String(process.pid));\nawait Bun.sleep(60_000);\n`,
-				);
-				const adapter: DapResolvedAdapter = {
-					...TEST_ADAPTER,
-					name: "wedged-tcp-adapter",
-					command: process.execPath,
-					args: [adapterPath],
-					resolvedCommand: process.execPath,
-					connectMode: "socket",
-				};
-				await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(
-					/did not connect within/,
-				);
-				await Bun.sleep(500);
-				const adapterPid = Number(await Bun.file(pidFilePath).text());
-				expect(Number.isFinite(adapterPid)).toBe(true);
-				let alive = true;
-				try {
-					process.kill(adapterPid, 0);
-				} catch {
-					alive = false;
+				if (proc && exited) {
+					proc.kill(undefined, -1);
+					await withTimeout(exited, 5_000, "Fixture adapter cleanup did not finish");
 				}
-				expect(alive).toBe(false);
 			} finally {
 				await removeWithRetries(cwd);
 			}
-		} finally {
-			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		}
 	});
 });

@@ -75,7 +75,10 @@ export type CommandMetadataChangedListener = () => void | Promise<void>;
 export type AsyncJobSnapshotItem = Pick<
 	AsyncJob,
 	"id" | "type" | "status" | "label" | "startTime" | "endTime" | "agentId"
->;
+> & {
+	/** Full command line of a job that runs a process; `label` is cut to 120 characters. */
+	command?: string;
+};
 
 /** One async job as a job inspector (the jobs sheet) shows it beyond its snapshot row. */
 export interface AsyncJobInspection {
@@ -567,6 +570,8 @@ export interface EphemeralTurnOptions {
 	onTextDelta?: (delta: string) => void | Promise<void>;
 	signal?: AbortSignal;
 	dedupeReply?: boolean;
+	/** UTF-8 byte cap of the deduped reply (default 4 KiB); `Infinity` keeps a long answer whole. */
+	replyMaxBytes?: number;
 }
 
 /** A side-turn response that is not appended to session history. */

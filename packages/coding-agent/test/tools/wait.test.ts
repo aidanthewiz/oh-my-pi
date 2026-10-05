@@ -14,11 +14,12 @@ import { DAEMON_BROKER_PROTOCOL_VERSION, type DaemonWireRequest } from "../../sr
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { ToolAbortError } from "../../src/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
-function session(manager?: AsyncJobManager, agentId = "Main"): ToolSession {
+function session(manager?: AsyncJobManager, agentId = "Main", launch = false): ToolSession {
 	return {
 		cwd: process.cwd(),
-		settings: Settings.isolated({ "launch.enabled": false }),
+		settings: Settings.isolated({ "launch.enabled": launch }),
 		agentRegistry: AgentRegistry.global(),
 		asyncJobManager: manager,
 		getAgentId: () => agentId,
@@ -118,6 +119,7 @@ describe("wait", () => {
 	});
 	afterEach(() => {
 		vi.useRealTimers();
+		vi.restoreAllMocks();
 		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 	});
@@ -134,20 +136,29 @@ describe("wait", () => {
 		expect(manager.isDeliverySuppressed(id)).toBe(true);
 	});
 
-	test("returns immediately when no job, running peer, or owned service can wake it", async () => {
+	test("errors for a subagent whose only running work is its parent's job on it", async () => {
 		const registry = AgentRegistry.global();
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null });
+		const streaming = { isStreaming: true } as never;
+		registry.register({ id: "Main", displayName: "Main", kind: "main", session: streaming, status: "running" });
 		registry.register({
-			id: "Idle",
-			displayName: "Idle",
+			id: "Child",
+			displayName: "Child",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
-			status: "idle",
+			session: streaming,
+			status: "running",
 		});
-		const result = await new WaitTool(session()).execute("wait-2", {});
-		expect(result.details).toMatchObject({ op: "wait", jobs: [] });
-		expect(result.useless).toBe(true);
+		// Subagents share the process job manager with their owner.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const childRun = Promise.withResolvers<string>();
+		manager.register("task", "Child", async () => childRun.promise, {
+			id: "Child",
+			agentId: "Child",
+			ownerId: "Main",
+		});
+		const waiting = new WaitTool(session(manager, "Child")).execute("child-wait", {});
+		await expect(waiting).rejects.toBeInstanceOf(ToolError);
+		childRun.resolve("done");
 	});
 
 	test("an interrupted wait leaves later job completion auto-deliverable", async () => {
@@ -239,9 +250,6 @@ describe("wait", () => {
 				});
 				expect(bridge.hasPending()).toBe(false);
 				fixture.release();
-				const next = await tool.execute("after-message", {});
-				expect(next.details).toMatchObject({ op: "wait", jobs: [] });
-				expect(next.details?.waited).toBeUndefined();
 			});
 		});
 
@@ -285,7 +293,6 @@ describe("wait", () => {
 					expect(delivered).toEqual([[id, "completion payload"]]);
 					expect(manager.isJobResultConsumed(id)).toBe(true);
 					fixture.release();
-					expect((await tool.execute("after-completion", {})).details?.jobs).toEqual([]);
 					expect(await manager.drainDeliveries({ timeoutMs: 500 })).toBe(true);
 					expect(delivered).toEqual([[id, "completion payload"]]);
 				} finally {
@@ -340,15 +347,23 @@ describe("wait", () => {
 		});
 	}
 
-	test("a broker rejection during discovery propagates as an error", async () => {
+	test("a broker rejection during discovery leaves owned job results available", async () => {
 		await withDiscoveryClient(async fixture => {
-			const tool = new WaitTool({ ...session(), cwd: fixture.cwd, settings: Settings.isolated() });
-			const controller = new AbortController();
-			const waiting = tool.execute("failed-discovery", {}, controller.signal);
-			await fixture.requested;
-			fixture.reject();
-			await expect(waiting).rejects.toBeInstanceOf(brokerClients.DaemonBrokerRejectedError);
-			expect(controller.signal.aborted).toBe(false);
+			const manager = new AsyncJobManager({ onJobComplete: () => {} });
+			const job = Promise.withResolvers<string>();
+			const id = manager.register("bash", "build", async () => job.promise, { ownerId: "Main" });
+			const tool = new WaitTool({ ...session(manager), cwd: fixture.cwd, settings: Settings.isolated() });
+			try {
+				const waiting = tool.execute("failed-discovery", {});
+				await fixture.requested;
+				fixture.reject();
+				job.resolve("build complete");
+				const result = await waiting;
+				expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "build complete" });
+			} finally {
+				job.resolve("build complete");
+				await manager.dispose();
+			}
 		});
 	});
 
@@ -368,7 +383,7 @@ describe("wait", () => {
 				await entered.promise;
 				fixture.release();
 				const tool = new WaitTool({ ...session(manager), cwd: fixture.cwd, settings: Settings.isolated() });
-				expect((await tool.execute("owner-scoped-discovery", {})).details?.jobs).toEqual([]);
+				await expect(tool.execute("owner-scoped-discovery", {})).rejects.toBeInstanceOf(ToolError);
 				expect(manager.isJobResultConsumed(id)).toBe(false);
 				expect(manager.isDeliverySuppressed(id)).toBe(false);
 				injected.resolve();
@@ -400,160 +415,6 @@ describe("wait", () => {
 		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "received=kestrel42" });
 		expect(manager.isDeliverySuppressed(id)).toBe(true);
 		injected.resolve();
-	});
-
-	test("blocks on a peer's completion job registered after the wait started", async () => {
-		const registry = AgentRegistry.global();
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null });
-		registry.register({
-			id: "EchoPeer",
-			displayName: "EchoPeer",
-			kind: "sub",
-			parentId: "Main",
-			session: { isStreaming: true } as never,
-			status: "running",
-		});
-		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		const waiting = new WaitTool(session(manager)).execute("wait-peer-yield", {});
-		// The peer's yield is accepted mid-turn: its completion job exists before the ref goes idle.
-		const finalized = Promise.withResolvers<string>();
-		const id = manager.register("task", "EchoPeer", async () => finalized.promise, {
-			ownerId: "Main",
-			agentId: "EchoPeer",
-		});
-		registry.setStatus("EchoPeer", "idle");
-		finalized.resolve("followup-done");
-		const result = await waiting;
-		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "followup-done" });
-	});
-
-	test("a message-only wait hands the turn back on a growing window while its parent streams", async () => {
-		vi.useFakeTimers();
-		const registry = AgentRegistry.global();
-		const streaming = { isStreaming: true } as never;
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: streaming, status: "running" });
-		registry.register({
-			id: "Child",
-			displayName: "Child",
-			kind: "sub",
-			parentId: "Main",
-			session: streaming,
-			status: "running",
-		});
-		registry.register({
-			id: "Sibling",
-			displayName: "Sibling",
-			kind: "sub",
-			parentId: "Main",
-			session: null,
-			status: "idle",
-		});
-		const tool = new WaitTool(session(undefined, "Child"));
-		const waitOut = async (ms: number) => {
-			let settled = false;
-			const waiting = tool.execute("message-window", {}).then(result => {
-				settled = true;
-				return result;
-			});
-			vi.advanceTimersByTime(ms - 1);
-			await Promise.resolve();
-			expect(settled).toBe(false);
-			vi.advanceTimersByTime(1);
-			const result = await waiting;
-			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-			// Nobody is blocked on this agent's result, so no owner is singled out.
-			expect(text).not.toContain("agent://Main");
-			expect(result.useless).toBe(true);
-		};
-		await waitOut(5_000);
-		await waitOut(10_000);
-		await waitOut(30_000);
-		// Stepping away from the wait loop restarts the ladder at its floor.
-		vi.advanceTimersByTime(60_000);
-		await waitOut(5_000);
-	});
-
-	test("an owned job that appears mid-wait is not cut off by the message window", async () => {
-		vi.useFakeTimers();
-		const registry = AgentRegistry.global();
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null });
-		registry.register({
-			id: "EchoPeer",
-			displayName: "EchoPeer",
-			kind: "sub",
-			parentId: "Main",
-			session: { isStreaming: true } as never,
-			status: "running",
-		});
-		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		const waiting = new WaitTool(session(manager)).execute("message-then-job", {});
-		vi.advanceTimersByTime(1_000);
-		const finalized = Promise.withResolvers<string>();
-		const id = manager.register("task", "EchoPeer", async () => finalized.promise, {
-			ownerId: "Main",
-			agentId: "EchoPeer",
-		});
-		registry.setStatus("EchoPeer", "idle");
-		await Promise.resolve();
-		// Past the top message rung: only the job-wait cap may end this wait.
-		vi.advanceTimersByTime(300_000);
-		finalized.resolve("late result");
-		const result = await waiting;
-		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "late result" });
-	});
-
-	test("points a message-only wait at an owner blocked in wait on its result, not at a delivery watch", async () => {
-		vi.useFakeTimers();
-		const registry = AgentRegistry.global();
-		const streaming = { isStreaming: true } as never;
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: streaming, status: "running" });
-		registry.register({
-			id: "Child",
-			displayName: "Child",
-			kind: "sub",
-			parentId: "Main",
-			session: streaming,
-			status: "running",
-		});
-		// Subagents share the process job manager with their owner.
-		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		const childRun = Promise.withResolvers<string>();
-		manager.register("task", "Child", async () => childRun.promise, {
-			id: "Child",
-			agentId: "Child",
-			ownerId: "Main",
-		});
-		const childWaitText = async () => {
-			const waiting = new WaitTool(session(manager, "Child")).execute("child-wait", {});
-			vi.advanceTimersByTime(5_000);
-			const result = await waiting;
-			return result.content[0]?.type === "text" ? result.content[0].text : "";
-		};
-		// A workpool watches each member turn to suppress auto-delivery while its owner keeps working.
-		manager.watchJobs(["Child"]);
-		expect(await childWaitText()).not.toContain("agent://Main");
-		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {});
-		const text = await childWaitText();
-		expect(text).toContain("agent://Main");
-		childRun.resolve("migration API ready");
-		expect((await parentWait).details?.jobs?.[0]).toMatchObject({ id: "Child", status: "completed" });
-	});
-
-	test("returns an incoming peer message without any background jobs", async () => {
-		const registry = AgentRegistry.global();
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null });
-		registry.register({
-			id: "Peer",
-			displayName: "Peer",
-			kind: "sub",
-			parentId: "Main",
-			session: { isStreaming: true } as never,
-			status: "running",
-		});
-		const waiting = new WaitTool(session()).execute("message-only", {});
-		await IrcBus.global().send({ from: "Peer", to: "Main", body: "shared file released" });
-		const result = await waiting;
-		expect(result.details?.waited).toMatchObject({ from: "Peer", body: "shared file released" });
 	});
 
 	test("returns an incoming peer message while the watched job remains live", async () => {

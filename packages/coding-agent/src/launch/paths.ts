@@ -94,7 +94,8 @@ export function daemonBrokerEndpoint(projectDir: string, runtimeDir: string): st
 			.wyhash(`${path.resolve(projectDir)}\0${path.resolve(runtimeDir)}`)
 			.toString(16)
 			.padStart(16, "0");
-		return `\\\\.\\pipe\\omp-daemon-v${DAEMON_BROKER_PROTOCOL_VERSION}-${key}`;
+		const version = /^broker-v(\d+)$/.exec(path.basename(runtimeDir))?.[1] ?? DAEMON_BROKER_PROTOCOL_VERSION;
+		return `\\\\.\\pipe\\omp-daemon-v${version}-${key}`;
 	}
 	return path.join(runtimeDir, "broker.sock");
 }

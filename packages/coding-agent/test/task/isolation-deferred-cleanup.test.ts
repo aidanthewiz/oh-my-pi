@@ -62,6 +62,7 @@ describe("deferred isolation cleanup", () => {
 			fellBack: false,
 			fallbackReason: null,
 		});
+		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline("/repo"));
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			options.onCleanupDeferred?.(cleanupGate.promise);
 			return result({ exitCode: 1, aborted: true, error: "cleanup exceeded its deadline" });
@@ -79,7 +80,7 @@ describe("deferred isolation cleanup", () => {
 				index: 0,
 				id: "DeferredCleanup",
 			},
-			context: { repoRoot: "/repo", baseline: baseline("/repo") },
+			context: { repoRoot: "/repo" },
 			preferredBackend: undefined,
 			agentId: "DeferredCleanup",
 			mergeMode: "patch",
@@ -116,6 +117,7 @@ describe("deferred isolation cleanup", () => {
 			fellBack: false,
 			fallbackReason: null,
 		});
+		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(initial);
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(options => {
 			options.onCleanupDeferred?.(cleanupGate.promise);
 			subprocessStarted.resolve();
@@ -137,7 +139,7 @@ describe("deferred isolation cleanup", () => {
 				index: 0,
 				id: "DeferredFailure",
 			},
-			context: { repoRoot, baseline: initial },
+			context: { repoRoot },
 			preferredBackend: undefined,
 			agentId: "DeferredFailure",
 			mergeMode: "patch",
@@ -158,7 +160,6 @@ describe("deferred isolation cleanup", () => {
 		expect(outcome.exitCode).toBe(1);
 		expect(outcome.patchPath).toBe(patchPath);
 		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
-		expect(captureSpy).toHaveBeenCalledWith(isolationDir, initial);
 		await cleanupFinished.promise;
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);
 	});
@@ -177,6 +178,7 @@ describe("deferred isolation cleanup", () => {
 			fellBack: false,
 			fallbackReason: null,
 		});
+		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(initial);
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(options => {
 			options.onCleanupDeferred?.(cleanupGate.promise);
 			subprocessStarted.resolve();
@@ -196,7 +198,7 @@ describe("deferred isolation cleanup", () => {
 				index: 0,
 				id: "DeferredSuccess",
 			},
-			context: { repoRoot: "/repo", baseline: initial },
+			context: { repoRoot: "/repo" },
 			preferredBackend: undefined,
 			agentId: "DeferredSuccess",
 			mergeMode: "patch",
@@ -216,7 +218,6 @@ describe("deferred isolation cleanup", () => {
 		expect(outcome.exitCode).toBe(0);
 		expect(outcome.patchPath).toBe(patchPath);
 		expect(await Bun.file(patchPath).text()).toBe(rootPatch);
-		expect(captureSpy).toHaveBeenCalledWith("/repo/isolated", initial);
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(cleanupSpy).toHaveBeenCalledTimes(1);

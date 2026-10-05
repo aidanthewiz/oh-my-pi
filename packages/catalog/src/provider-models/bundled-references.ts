@@ -13,6 +13,11 @@ export function toModelSpec<TApi extends Api>(model: Model<TApi>): ModelSpec<TAp
 	const {
 		compat: _compat,
 		compatConfig,
+		identity: _identity,
+		requiresGlyphTokenization: _requiresGlyphTokenization,
+		requiresCursorToolSchemaProjection: _requiresCursorToolSchemaProjection,
+		requiresToolResultImageHoisting: _requiresToolResultImageHoisting,
+		supportsAssistantPrefill: _supportsAssistantPrefill,
 		supportsComputerUse: _derivedComputerUse,
 		supportsComputerUseConfig,
 		...rest

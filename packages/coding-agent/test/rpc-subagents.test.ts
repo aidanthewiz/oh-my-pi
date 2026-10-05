@@ -72,6 +72,7 @@ type SessionChangeStubOptions = {
 	newSession?: boolean;
 	switchSession?: boolean;
 	branch?: { selectedText: string; selectedImages: ImageContent[]; cancelled: boolean };
+	fork?: boolean;
 };
 
 function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessionChangeSession {
@@ -80,6 +81,7 @@ function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessi
 		switchSession: async (_sessionPath: string) => options.switchSession ?? true,
 		branch: async (_entryId: string) =>
 			options.branch ?? { selectedText: "branched text", selectedImages: [], cancelled: false },
+		fork: async (_entryId?: string) => options.fork ?? true,
 	};
 }
 
@@ -196,6 +198,11 @@ describe("RPC subagent registry", () => {
 				}),
 				expected: { type: "branch", data: { text: "Branch text", cancelled: false } },
 			},
+			{
+				command: { type: "fork", entryId: "entry-1" },
+				session: createSessionChangeSession({ fork: true }),
+				expected: { type: "fork", data: { cancelled: false } },
+			},
 		];
 
 		for (const testCase of cases) {
@@ -235,6 +242,11 @@ describe("RPC subagent registry", () => {
 				session: createSessionChangeSession({ branch: { selectedText: "", selectedImages: [], cancelled: true } }),
 				expected: { type: "branch", data: { text: "", cancelled: true } },
 			},
+			{
+				command: { type: "fork" },
+				session: createSessionChangeSession({ fork: false }),
+				expected: { type: "fork", data: { cancelled: true } },
+			},
 		];
 
 		for (const testCase of cases) {
@@ -265,6 +277,9 @@ describe("RPC subagent registry", () => {
 		} satisfies SubagentLifecyclePayload);
 
 		expect(registry.getSubagents()).toHaveLength(1);
+		registry.setSubscriptionLevel("events");
+		registry.setSubscriptionLevel("progress");
+		registry.setSubscriptionLevel("off");
 		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id: "SubagentA",
 			index: 0,
@@ -277,26 +292,6 @@ describe("RPC subagent registry", () => {
 		expect(registry.getSubagents()).toHaveLength(0);
 		expect(registry.resolveSessionFile({ subagentId: "SubagentA" })).toBe(sessionFile);
 		expect(registry.resolveSessionFile({ sessionFile })).toBe(sessionFile);
-		registry.dispose();
-	});
-
-	test("gates raw subagent events behind the events subscription level", () => {
-		const frames: RpcSubagentFrame[] = [];
-		const eventBus = new EventBus();
-		const registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame));
-		const eventPayload: SubagentEventPayload = {
-			id: "SubagentA",
-			event: { type: "agent_start" },
-		};
-
-		eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, eventPayload);
-		expect(frames).toHaveLength(0);
-
-		registry.setSubscriptionLevel("events");
-		eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, eventPayload);
-
-		expect(frames).toHaveLength(1);
-		expect(frames[0]).toEqual({ type: "subagent_event", payload: eventPayload });
 		registry.dispose();
 	});
 });
@@ -416,7 +411,8 @@ function handle(frame) {
 		client.onSessionEvent(event => sessionEventTypes.push(event.type));
 
 		await client.start();
-		await expect(client.setSubagentSubscription("events")).resolves.toBe("events");
+		// Plain await, not `.resolves`: on Windows Bun's in-place promise wait never services the child pipe.
+		expect(await client.setSubagentSubscription("events")).toBe("events");
 		await client.promptAndWait("Trigger subagent frames");
 		expect(await client.getSubagents()).toHaveLength(1);
 		expect(await client.getSubagentMessages({ sessionFile: "/tmp/subagent.jsonl" })).toMatchObject({

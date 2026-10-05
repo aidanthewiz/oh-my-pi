@@ -107,6 +107,22 @@ describe("delimited path expansion", () => {
 		).toEqual(["apps/**/*.txt", "packages/**/*.txt"]);
 	});
 
+	it("retains query fragments when a missing local target precedes a URL and an existing local target follows", async () => {
+		expect(
+			await expandDelimitedPathEntries(["missing.txt;https://example.com/a?x=1;y=2;apps/a.txt"], tempDir),
+		).toEqual(["missing.txt", "https://example.com/a?x=1;y=2", "apps/a.txt"]);
+	});
+
+	it("splits URL boundaries without treating escaped or brace-enclosed semicolons as list delimiters", async () => {
+		expect(
+			await expandDelimitedPathEntries(["https://example.com/a\\;segment?x={1;2};https://example.com/b"], tempDir),
+		).toEqual(["https://example.com/a\\;segment?x={1;2}", "https://example.com/b"]);
+	});
+
+	it("keeps an opaque resource URI whole when no list boundary resolves", async () => {
+		expect(await expandDelimitedPathEntries(["fixture:1;opaque"], tempDir)).toEqual(["fixture:1;opaque"]);
+	});
+
 	it("splits a semicolon list whose joined string exceeds NAME_MAX (issue #7597)", async () => {
 		// Bare filenames in one directory form a single slash-free run once joined,
 		// so ~12 short entries already push the run past NAME_MAX (255). lstat on

@@ -5,6 +5,45 @@
 ### Added
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
+
+### Fixed
+
+- Native patch application and checks now convert only affected source and destination paths, ignoring unrelated required filter failures.
+- Cherry-picks use merged-tree attributes and finish content conversion before changing HEAD or writing worktree files.
+- UTF-16 worktree conversion now preserves byte order marks, rejects malformed input, and retains filters, line endings, and ident processing.
+- Native Git ident expansion now preserves foreign identifiers and matches Git's expanded keyword format.
+## [18.6.1] - 2026-10-04
+
+### Fixed
+
+- Fixed concurrent searches through host-provided filesystem callbacks so they no longer starve other asynchronous filesystem operations, and ensured canceled searches release promptly.
+
+## [18.5.1] - 2026-10-03
+
+### Fixed
+
+- Fixed macOS computer-use scrolling so takeover and desktop scroll actions move iPhone Mirroring and other pixel-forwarding windows reliably, with smooth mouse-like wheel steps.
+- Fixed macOS computer-use value entry for date and time controls, including Calendar date pickers, with support for ISO 8601 dates and date-times and clear validation for unsupported formats.
+- Fixed macOS computer-use value entry for popup buttons, allowing options to be selected by title with confirmation and reporting available options when a title is not found.
+- Fixed macOS accessibility values for checkboxes, radio buttons, and radio groups so snapshots, attributes, and window information return usable numbers, titles, and referenced element values instead of debug representations.
+
+## [18.5.0] - 2026-10-03
+
+### Fixed
+
+- Fixed Ctrl+V on Windows sometimes pasting text with a few characters replaced by unrelated glyphs (for example `https://` turning into `՞ttp缀難//`); clipboard reads and writes no longer run at the same time ([#14144](https://github.com/can1357/oh-my-pi/pull/14144) by [@H4vC](https://github.com/H4vC))
+- Fixed native Git restore leaving clean CRLF checkouts marked modified. It refreshes matching index statistics without changing staged blobs or unrelated dirty files.
+- Fixed failed optional Git filters discarding staged or stashed edits. Failed filters now preserve original content and built-in conversions; required filters still fail, including repeated filter sections.
+- Fixed custom Bazel output prefixes installing stale native assets from another output base. Addon installation now uses the build execution root.
+
+## [18.4.10] - 2026-10-02
+
+### Fixed
+
+- Fixed cherry-picks replacing files and directories while preserving unrelated staged and unstaged changes.
+- Directory replacements now reject untracked, ignored, or newly staged descendants before changing HEAD instead of discarding protected content.
+- Fixed the embedded shell sometimes hanging on a pipeline with a stage that stopped (for example with `kill -STOP $$`) before the shell began waiting on it; the pipeline now becomes a stopped job ([#14023](https://github.com/can1357/oh-my-pi/pull/14023) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.4.9] - 2026-10-01
 
 ### Added

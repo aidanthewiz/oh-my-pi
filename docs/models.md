@@ -296,6 +296,10 @@ selection, even when the runtime `promptCache` is omitted: the actual effective
 model's catalog defaults apply instead of the YAML lifetime. Without a runtime
 replacement, the matching YAML lifetime applies, or catalog defaults if absent.
 
+The ordinary `bun run gen:models` command recomputes bundled prompt-cache
+lifetimes from current catalog policy; there is no separate cache-regeneration
+command.
+
 Direct Anthropic keeps its existing 5 min / 1 h lifetimes (`short: 300`, `long: 3600`),
 defaulting to 5 min for API keys and 1 h for OAuth subscriber sessions; API keys can
 explicitly select `long`. Claude on native Amazon Bedrock Converse has a 5 min TTL; 1 h is
@@ -404,10 +408,14 @@ If every metadata route is unavailable, discovery falls back to the OpenAI-compa
 
 `openai-models-list` reads `{baseUrl}/v1/models` by default (without adding a second `/v1`).
 `discovery.injectV1: false` treats the configured URL as the complete API root. Reported
-`max_model_len` wins over `context_length`; silent endpoints can inherit bundled-reference limits,
-reasoning, and input modalities, with 128,000 context and 32,768 output as generic chat defaults.
-Output caps are bounded by the discovered context; Anthropic-routed models use an 8,192-token
-fallback output cap.
+`max_model_len` wins over `context_length`. If both are absent, nested
+`limits.max_input_tokens` and `limits.max_output_tokens` supply their sum as context only when both
+are positive safe integers and the sum is safe. A valid `max_output_tokens` independently sets the
+chat output cap, clamped to the resolved context; an incomplete or invalid context pair does not
+discard a valid output limit. Otherwise, context follows the existing native/reference/default fallback.
+Silent endpoints can inherit bundled-reference limits, reasoning, and input modalities; unknown models
+use 128,000 context and 32,768 output as generic chat defaults. Output caps are bounded by the resolved context;
+Anthropic-routed models use an 8,192-token fallback output cap.
 
 A row advertising only image output becomes an image-generation runner; embedding-only output
 becomes an embedding runner. Mixed outputs remain chat models. These runners are visible with
@@ -660,6 +668,10 @@ surface; the denylist then removes matching models. The policy applies to
 initial selection, role and temporary switches, retry fallbacks, secondary
 agents, compaction, memory processing, and restored sessions. CLI `--models`
 can narrow the allowed set but cannot override either configured list.
+
+Policy selectors resolve against the full catalog before provider, kind, or
+preferred-model filtering. Narrowed candidate lists intersect that allowed set;
+they never reinterpret a selector as a nearby model.
 
 `enabledModels`, `disabledModels`, `enabledProviders`, and `disabledProviders` entries may also be scoped to a path prefix:
 
@@ -976,7 +988,7 @@ not acquire that capability just from `bedrockMessagesApi`.
 
 ### Strict tool schemas (`disableStrictTools`)
 
-Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. OMP enables it by default for a small allowlist of high-frequency built-in `anthropic-messages` tools (`bash`, `python`, `edit`, and `find`) whose schemas fit Anthropic's strict grammar limits; other tools still send normalized schemas but omit `strict`.
+Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. OMP enables it by default for a small allowlist of high-frequency built-in `anthropic-messages` tools (`python`, `edit`, and `find`) whose schemas fit Anthropic's strict grammar limits; other tools still send normalized schemas but omit `strict`. `bash` is left out: strict decoding fixes property order, so once a call has written `async`, the `timeout` declared before it can no longer be emitted.
 
 Third-party providers that front the Anthropic API (AWS Bedrock, Azure, self-hosted proxies) do not always implement this field and will reject requests that include it. Set `disableStrictTools: true` at the provider level to opt out of strict mode for the allowlisted tools:
 

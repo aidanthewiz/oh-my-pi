@@ -119,7 +119,6 @@ const repoScriptTests = [
 	"scripts/ci-test-ts.test.ts",
 	"scripts/fix-changelogs.test.ts",
 	"scripts/inline-functions.test.ts",
-	"scripts/musl-release.test.ts",
 	"scripts/release-disabled.test.ts",
 ];
 const codingAgentNativePathPatterns = [

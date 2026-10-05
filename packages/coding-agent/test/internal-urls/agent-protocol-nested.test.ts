@@ -3,15 +3,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
+import { bridgeValueFromToolResult } from "../../src/eval/js/tool-bridge";
 import { IrcBus } from "../../src/irc/bus";
 import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
+import { InternalUrlRouter } from "../../src/internal-urls/router";
 import { resetRegisteredArtifactDirsForTests } from "../../src/internal-urls/registry-helpers";
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { AgentSession } from "../../src/session/agent-session";
 import type { ToolSession } from "../../src/tools";
 import { ArtifactManager } from "../../src/session/artifacts";
 
+import { ReadTool } from "../../src/tools/read";
 const tempDir = TempDir.createSync("omp-nested-agent-repro-");
 afterEach(() => {
 	AgentRegistry.resetGlobalForTests();
@@ -234,3 +237,92 @@ it("agent:// writes deliver peer messages but reject JSON paths and disabled IRC
 	);
 	expect(delivered).toEqual(["Check context"]);
 });
+
+it.each(["Visuals", "Parent.Child"])(
+	"agent:// marks superseded output for %s without breaking extraction",
+	async id => {
+		const root = tempDir.path();
+		const rootSessionFile = path.join(root, "superseded-session.jsonl");
+		const rootArtifactsDir = rootSessionFile.slice(0, -6);
+		await fs.mkdir(rootArtifactsDir, { recursive: true });
+		const sharedArtifactManager = new ArtifactManager(rootArtifactsDir);
+		const published = JSON.stringify({ status: "partial", summary: "run budget ran out" });
+		await fs.writeFile(path.join(rootArtifactsDir, `${id}.md`), published);
+
+		const mainSession = {
+			sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
+		} as unknown as AgentSession;
+		const wokenSession = {
+			sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
+			isStreaming: true,
+		} as unknown as AgentSession;
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "Main",
+			displayName: "main",
+			kind: "main",
+			session: mainSession,
+			sessionFile: rootSessionFile,
+		});
+		registry.register({ id, displayName: "sub", kind: "sub", parentId: "Main", session: wokenSession });
+
+		const handler = new AgentProtocolHandler();
+		const url = `agent://${id}`;
+		const superseded = `Superseded: ${id} is running a newer turn`;
+		const whileRunning = await handler.resolve(parseInternalUrl(url));
+		expect(whileRunning.content.endsWith(published)).toBe(true);
+		expect(whileRunning.content).not.toBe(published);
+		expect(whileRunning.notes).toContain(superseded);
+		// `read` reads a located file directly, skipping resolve(): a superseded
+		// output must route as a resource so the banner reaches the reader.
+		const router = InternalUrlRouter.instance();
+		expect((await router.target(url))?.kind).toBe("resource");
+		// JSON-path reads stay machine-parseable.
+		const field = await handler.resolve(parseInternalUrl(`${url}/status`));
+		expect(field.content).toBe("partial");
+		const queried = await handler.resolve(parseInternalUrl(`${url}?q=.status`));
+		expect(queried.content).toBe("partial");
+		expect(field.notes).toContain(superseded);
+		expect(queried.notes).toContain(superseded);
+		const reader = new ReadTool({
+			cwd: root,
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => rootSessionFile,
+			getSessionSpawns: () => "*",
+		});
+		for (const extractedUrl of [`${url}/status`, `${url}?q=.status`]) {
+			const output = await reader.execute("superseded-output", { path: extractedUrl });
+			expect(output.content[0]).toEqual({ type: "text", text: "partial" });
+			expect(output.details?.notes).toContain(superseded);
+			expect(
+				output.content
+					.slice(1)
+					.map(block => (block.type === "text" ? block.text : ""))
+					.join("\n"),
+			).toContain(superseded);
+		}
+		const extractedArgs = { path: `${url}?q=.` };
+		const extracted = bridgeValueFromToolResult(
+			"read",
+			extractedArgs,
+			await reader.execute("superseded-json", extractedArgs),
+		);
+		if (typeof extracted === "string" || !("text" in extracted) || typeof extracted.text !== "string") {
+			throw new Error("Expected structured read metadata");
+		}
+		expect(JSON.parse(extracted.text)).toEqual({ status: "partial", summary: "run budget ran out" });
+
+		// Once the turn ends, the file is the current result again.
+		registry.setStatus(id, "idle");
+		const settled = await handler.resolve(parseInternalUrl(url));
+		expect(settled.content).toBe(published);
+		expect((await router.target(url))?.kind).toBe("file");
+
+		const scopedRegistry = new AgentRegistry();
+		scopedRegistry.register({ id, displayName: "scoped", kind: "sub", parentId: "Main", session: wokenSession });
+		const context = { session: { agentRegistry: scopedRegistry } as ToolSession };
+		expect(await handler.locate(parseInternalUrl(url), context)).toBeNull();
+		expect((await handler.resolve(parseInternalUrl(url), context)).notes).toContain(superseded);
+	},
+);

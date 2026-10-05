@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
@@ -10,7 +11,7 @@ import {
 	DAEMON_RUNTIME_DIR_ENV,
 	type DaemonOperation,
 } from "../../src/launch/protocol";
-import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
+import { daemonBrokerEndpoint, daemonBrokerRuntimeDir } from "../../src/launch/paths";
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];
@@ -54,6 +55,36 @@ describe("broker unknown operations", () => {
 			expect((error as Error).message).toBe("Unknown daemon operation: from-a-newer-omp");
 
 			// The rejection is scoped to that request; the connection keeps serving known operations.
+			expect((await client.request({ op: "ping" })).op).toBe("ping");
+			const brokerRuntimeDir = daemonBrokerRuntimeDir(runtimeDir);
+			const token = await Bun.file(path.join(brokerRuntimeDir, "broker.token")).text();
+			const response = await new Promise<{ id: string; ok: boolean; error: string }>((resolve, reject) => {
+				const socket = net.createConnection(daemonBrokerEndpoint(projectDir, brokerRuntimeDir));
+				let buffer = "";
+				socket.once("error", reject);
+				socket.setTimeout(2_000, () => {
+					socket.destroy();
+					reject(new Error("Legacy handshake timed out"));
+				});
+				socket.once("connect", () => {
+					socket.write(
+						`${JSON.stringify({
+							id: "legacy-shutdown",
+							protocolVersion: 3,
+							token: token.trim(),
+							operation: { op: "shutdown" },
+						})}\n`,
+					);
+				});
+				socket.on("data", chunk => {
+					buffer += chunk.toString();
+					if (!buffer.includes("\n")) return;
+					socket.destroy();
+					resolve(JSON.parse(buffer.slice(0, buffer.indexOf("\n"))));
+				});
+			});
+			expect(response).toMatchObject({ id: "legacy-shutdown", ok: false });
+			expect(response.error).toMatch(/protocol 3; expected 4/iu);
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
 		} finally {
 			await client.request({ op: "shutdown" }).catch(() => undefined);

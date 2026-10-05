@@ -1,16 +1,16 @@
-/**
- * Wipe-and-rebuild reconcile: each `memory_embeddings` row is stamped with the
- * model that produced it. When the configured embedding model changes the vector
- * dimension changes too, so on store open `reconcileEmbeddingModel` (wired into
- * the `Mnemopi` constructor) wipes every stale vector and enqueues all live
- * memories for re-embedding under the new model. A matching model is a no-op.
- */
+/** Store opens reconcile semantic vector identities, including same-dimensional pooling changes. */
 
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 
 import { initBeam } from "@oh-my-pi/pi-mnemopi/core/beam";
+import {
+	currentEmbeddingModel,
+	resetEmbeddingProviderForTests,
+	setLocalModelInitializerForTests,
+} from "@oh-my-pi/pi-mnemopi/core/embeddings";
 import { Mnemopi } from "@oh-my-pi/pi-mnemopi/core/memory";
+import { withMnemopiRuntimeOptions } from "@oh-my-pi/pi-mnemopi/core/runtime-options";
 
 const OLD_MODEL = "BAAI/bge-small-en-v1.5";
 const NEW_MODEL = "intfloat/multilingual-e5-large";
@@ -188,5 +188,217 @@ describe("reconcileEmbeddingModel on store open", () => {
 			memory.close();
 			db.close();
 		}
+	});
+});
+
+const MEAN_MODELS = [
+	{ model: "intfloat/multilingual-e5-large", dim: 1024 },
+	{ model: "sentence-transformers/all-MiniLM-L6-v2", dim: 384 },
+];
+
+async function withLocalEmbeddings(fn: () => Promise<void>): Promise<void> {
+	const keys = [
+		"NODE_ENV",
+		"BUN_ENV",
+		"MNEMOPI_EMBEDDING_API_URL",
+		"OPENROUTER_BASE_URL",
+		"MNEMOPI_EMBEDDINGS_VIA_API",
+		"MNEMOPI_NO_EMBEDDINGS",
+	] as const;
+	const previous = keys.map(key => process.env[key]);
+	try {
+		for (const key of keys) delete process.env[key];
+		resetEmbeddingProviderForTests();
+		await fn();
+	} finally {
+		resetEmbeddingProviderForTests();
+		for (let i = 0; i < keys.length; i++) {
+			const value = previous[i];
+			if (value === undefined) delete process.env[keys[i]];
+			else process.env[keys[i]] = value;
+		}
+	}
+}
+
+describe("local fastembed pooling identity reconciliation", () => {
+	it.each(MEAN_MODELS)("rebuilds legacy $model vectors without changing source memories", async ({ model, dim }) => {
+		await withLocalEmbeddings(async () => {
+			const { db } = seedDb(model);
+			const legacy = JSON.stringify(Array.from({ length: dim }, (_, i) => Number(i === 0)));
+			db.run("UPDATE memory_embeddings SET embedding_json = ?", [legacy]);
+			db.run("UPDATE working_memory SET embed_text = 'alpha retrieval context' WHERE id = 'wm-1'");
+			db.run("CREATE TABLE vec_episodes (rowid INTEGER PRIMARY KEY, embedding BLOB)");
+			db.run("INSERT INTO vec_episodes (embedding) VALUES (?)", [new Uint8Array([1, 2, 3, 4])]);
+			const working = db.query("SELECT * FROM working_memory").all();
+			const episodic = db.query("SELECT content, source, timestamp, session_id FROM episodic_memory").all();
+			const batches: string[][] = [];
+			let initCalls = 0;
+			setLocalModelInitializerForTests(async () => {
+				initCalls++;
+				return {
+					embed: async function* (texts) {
+						batches.push([...texts]);
+						yield texts.map(() => Array.from({ length: dim }, (_, i) => Number(i === 1)));
+					},
+				};
+			});
+			const memory = new Mnemopi({ db, embeddings: { model, disabled: false, apiUrl: "" } });
+			try {
+				expect(countEmbeddings(memory)).toBe(0);
+				expect(db.query("SELECT binary_vector FROM episodic_memory").get()).toEqual({ binary_vector: null });
+				expect(db.query("SELECT * FROM vec_episodes").all()).toEqual([]);
+				expect(db.query("SELECT * FROM working_memory").all()).toEqual(working);
+				expect(db.query("SELECT content, source, timestamp, session_id FROM episodic_memory").all()).toEqual(
+					episodic,
+				);
+				expect(db.query("SELECT id FROM fts_working WHERE fts_working MATCH 'alpha'").all()).toEqual([
+					{ id: "wm-1" },
+				]);
+				expect(db.query("SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH 'beta'").all()).toEqual([
+					{ rowid: 1 },
+				]);
+				expect(withMnemopiRuntimeOptions(memory.runtimeOptions, currentEmbeddingModel)).toBe(model);
+				await memory.flushExtractions();
+				expect(batches.flat().sort()).toEqual(["alpha retrieval context", "beta episodic memory"]);
+				const rows = db
+					.query("SELECT memory_id, embedding_json, model FROM memory_embeddings ORDER BY memory_id")
+					.all();
+				expect(rows).toEqual(
+					["ep-1", "wm-1"].map(memoryId => ({
+						memory_id: memoryId,
+						embedding_json: JSON.stringify(Array.from({ length: dim }, (_, i) => Number(i === 1))),
+						model: `${model}@fastembed3-mean`,
+					})),
+				);
+				const reopened = new Mnemopi({ db, embeddings: { model, disabled: false, apiUrl: "" } });
+				try {
+					expect(reopened.beam.pendingExtractions.size).toBe(0);
+					expect(
+						db.query("SELECT memory_id, embedding_json, model FROM memory_embeddings ORDER BY memory_id").all(),
+					).toEqual(rows);
+					expect(initCalls).toBe(1);
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				memory.close();
+				db.close();
+			}
+		});
+	});
+
+	it("preserves BGE, API, and custom provider vectors and identities", async () => {
+		await withLocalEmbeddings(async () => {
+			let initCalls = 0;
+			let providerCalls = 0;
+			setLocalModelInitializerForTests(async () => {
+				initCalls++;
+				throw new Error("a current store must not load a model");
+			});
+			const provider = {
+				embed: async function* (texts: readonly string[]) {
+					providerCalls++;
+					yield texts.map(() => [1, 0, 0, 0]);
+				},
+			};
+			const cases = [
+				{ model: OLD_MODEL, disabled: false, apiUrl: "" },
+				{ model: NEW_MODEL, disabled: false, apiUrl: "http://offline.invalid/v1" },
+				{ model: MEAN_MODELS[1].model, disabled: false, apiUrl: "http://offline.invalid/v1" },
+				{ model: NEW_MODEL, disabled: false, apiUrl: "", provider },
+				{ model: MEAN_MODELS[1].model, disabled: false, apiUrl: "", provider },
+				{ model: "custom-semantic-model", disabled: false, apiUrl: "", provider },
+			];
+			for (const embeddings of cases) {
+				const { db } = seedDb(embeddings.model);
+				const before = db.query("SELECT * FROM memory_embeddings ORDER BY memory_id").all();
+				const memory = new Mnemopi({ db, embeddings });
+				try {
+					expect(memory.beam.pendingExtractions.size).toBe(0);
+					expect(db.query("SELECT * FROM memory_embeddings ORDER BY memory_id").all()).toEqual(before);
+					expect(db.query("SELECT binary_vector FROM episodic_memory").get()).toEqual({
+						binary_vector: new Uint8Array([1, 2, 3, 4]),
+					});
+				} finally {
+					memory.close();
+					db.close();
+				}
+			}
+			expect(initCalls).toBe(0);
+			expect(providerCalls).toBe(0);
+		});
+	});
+
+	it("preserves legacy pooling vectors on disabled, read-only, and empty-model opens", async () => {
+		await withLocalEmbeddings(async () => {
+			let initCalls = 0;
+			setLocalModelInitializerForTests(async () => {
+				initCalls++;
+				throw new Error("guarded opens must not load a model");
+			});
+			const cases = [
+				{ embeddings: { model: NEW_MODEL, disabled: true, apiUrl: "" } },
+				{ embeddings: { model: NEW_MODEL, disabled: false, apiUrl: "" }, reconcile: false },
+				{ embeddings: { model: "", disabled: false, apiUrl: "" } },
+			];
+			for (const options of cases) {
+				const { db } = seedDb(NEW_MODEL);
+				const before = db.query("SELECT * FROM memory_embeddings ORDER BY memory_id").all();
+				const memory = new Mnemopi({ db, ...options });
+				try {
+					expect(memory.beam.pendingExtractions.size).toBe(0);
+					expect(db.query("SELECT * FROM memory_embeddings ORDER BY memory_id").all()).toEqual(before);
+					expect(db.query("SELECT binary_vector FROM episodic_memory").get()).toEqual({
+						binary_vector: new Uint8Array([1, 2, 3, 4]),
+					});
+				} finally {
+					memory.close();
+					db.close();
+				}
+			}
+			expect(initCalls).toBe(0);
+		});
+	});
+
+	it("resumes only missing live rows after an interrupted bounded rebuild", async () => {
+		await withLocalEmbeddings(async () => {
+			const { db } = seedDb(`${NEW_MODEL}@fastembed3-mean`);
+			db.run("DELETE FROM memory_embeddings WHERE memory_id = 'ep-1'");
+			db.run("UPDATE episodic_memory SET binary_vector = NULL");
+			db.run("UPDATE working_memory SET embed_text = 'alpha retrieval context' WHERE id = 'wm-1'");
+			const insert = db.prepare(
+				"INSERT INTO working_memory (id, content, source, timestamp, session_id, superseded_by) VALUES (?, ?, 'test', ?, 'default', ?)",
+			);
+			for (let i = 0; i < 129; i++)
+				insert.run(`missing-${i}`, `missing content ${i}`, "2026-10-04T00:00:00.000Z", null);
+			insert.run("retired", "retired content", "2026-10-04T00:00:00.000Z", "wm-1");
+			const retained = db.query("SELECT * FROM memory_embeddings WHERE memory_id = 'wm-1'").get();
+			const batches: string[][] = [];
+			setLocalModelInitializerForTests(async () => ({
+				embed: async function* (texts) {
+					batches.push([...texts]);
+					yield texts.map(() => [0, 1, 0, 0]);
+				},
+			}));
+			const memory = new Mnemopi({ db, embeddings: { model: NEW_MODEL, disabled: false, apiUrl: "" } });
+			try {
+				expect(memory.beam.pendingExtractions.size).toBe(2);
+				expect(db.query("SELECT * FROM memory_embeddings WHERE memory_id = 'wm-1'").get()).toEqual(retained);
+				await memory.flushExtractions();
+				expect(batches.map(batch => batch.length)).toEqual([128, 2]);
+				expect(batches.flat().sort()).toEqual(
+					["beta episodic memory", ...Array.from({ length: 129 }, (_, i) => `missing content ${i}`)].sort(),
+				);
+				expect(db.query("SELECT * FROM memory_embeddings WHERE memory_id = 'retired'").get()).toBeNull();
+				expect(db.query("SELECT * FROM memory_embeddings WHERE memory_id = 'wm-1'").get()).toEqual(retained);
+				expect(db.query("SELECT DISTINCT model FROM memory_embeddings").all()).toEqual([
+					{ model: `${NEW_MODEL}@fastembed3-mean` },
+				]);
+				expect(countEmbeddings(memory)).toBe(131);
+			} finally {
+				memory.close();
+				db.close();
+			}
+		});
 	});
 });
