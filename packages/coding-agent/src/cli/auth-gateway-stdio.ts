@@ -5,16 +5,24 @@
  *
  * Unlike `serve` it runs on this omp's own credentials (the broker when one is
  * configured, else the local store), models (`models.yml` and extension
- * providers included) and settings. A request's `model` is an omp model
- * selector, as `--model` takes it ({@link selectorCandidates}); an attempt
- * that fails before its reply starts moves on to the next candidate. Serving
- * ends when stdin does.
+ * providers included) and settings. Request model IDs are omp selectors, as
+ * `--model` takes them ({@link selectorCandidates}). Streaming replies complete
+ * within the byte limit before acceptance; model failures use the next
+ * permitted candidate. Serving ends when stdin does.
  */
 import { Console } from "node:console";
 import { writeSync } from "node:fs";
 import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
-import { type AuthGatewayRouter, createAuthGatewayRouter, serveAuthGatewayStdio } from "@oh-my-pi/pi-ai/auth-gateway";
-import { getProjectDir, isRecord, logger, postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import {
+	AuthGatewayStdioResponseLimitError,
+	type AuthGatewayRouter,
+	createAuthGatewayRouter,
+	readAuthGatewayStdioBody,
+	serveAuthGatewayStdio,
+} from "@oh-my-pi/pi-ai/auth-gateway";
+import { isTransientStatus } from "@oh-my-pi/pi-ai/error";
+import { classifyGatewayError, type GatewayErrorClassification } from "@oh-my-pi/pi-ai/error/gateway";
+import { getProjectDir, isRecord, logger, postmortem, readSseEvents, VERSION } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	disabledProviderIds,
@@ -68,6 +76,64 @@ export function selectorCandidates(
 	return [];
 }
 
+async function streamFailure(
+	bytes: Uint8Array,
+	pathname: string,
+	signal: AbortSignal,
+): Promise<GatewayErrorClassification | undefined> {
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(bytes);
+			controller.close();
+		},
+	});
+	for await (const event of readSseEvents(stream, signal)) {
+		if (!event.data || event.data === "[DONE]") continue;
+		let data: unknown;
+		try {
+			data = JSON.parse(event.data);
+		} catch {
+			continue;
+		}
+		if (!isRecord(data)) continue;
+		let error: unknown;
+		if (pathname === "/v1/pi/stream" && event.event === null && data.type === "error") {
+			const nativeError = isRecord(data.error) ? data.error : undefined;
+			const message =
+				typeof nativeError?.errorMessage === "string"
+					? nativeError.errorMessage
+					: typeof data.errorMessage === "string"
+						? data.errorMessage
+						: "Upstream request failed";
+			if (data.reason === "aborted" || nativeError?.stopReason === "aborted") {
+				return { status: 499, type: "request_aborted", message };
+			}
+			return classifyGatewayError(
+				typeof nativeError?.errorClassificationMessage === "string"
+					? nativeError.errorClassificationMessage
+					: message,
+			);
+		}
+		if (pathname === "/v1/chat/completions" && event.event === null) {
+			error = data.error;
+		} else if (pathname === "/v1/messages" && event.event === "error" && data.type === "error") {
+			error = data.error;
+		} else if (
+			pathname === "/v1/responses" &&
+			event.event === "response.failed" &&
+			data.type === "response.failed" &&
+			isRecord(data.response)
+		) {
+			error = data.response.error;
+		}
+		if (isRecord(error) && typeof error.message === "string") {
+			return classifyGatewayError(error.message);
+		}
+	}
+	signal.throwIfAborted();
+	return undefined;
+}
+
 /** Selector dispatch over one router, with request-local model resolution. */
 export function createAuthGatewayStdioRouter(
 	storage: AuthStorage,
@@ -88,8 +154,18 @@ export function createAuthGatewayStdioRouter(
 					.json()
 					.catch(() => undefined)
 			: undefined;
-		if (!isRecord(body) || typeof body.model !== "string") return router.route(req, STDIO_PEER);
-		const selector = body.model;
+		if (!isRecord(body)) return router.route(req, STDIO_PEER);
+		const pathname = new URL(req.url).pathname;
+		const native = pathname === "/v1/pi/stream";
+		const selector =
+			native && typeof body.modelId === "string" && body.modelId.length > 0
+				? body.modelId
+				: typeof body.model === "string"
+					? body.model
+					: native && isRecord(body.model) && typeof body.model.id === "string"
+						? body.model.id
+						: undefined;
+		if (selector === undefined || (native && selector.length === 0)) return router.route(req, STDIO_PEER);
 		const candidates = selectorCandidates(selector, settings, registry);
 		let response = Response.json(
 			{ error: { message: `No available model matches "${selector}"`, type: "invalid_request_error" } },
@@ -101,13 +177,47 @@ export function createAuthGatewayStdioRouter(
 			const attempt = new Request(req.url, {
 				method: req.method,
 				headers: req.headers,
-				body: JSON.stringify({ ...body, model: key }),
+				body: JSON.stringify(native ? { ...body, modelId: key } : { ...body, model: key }),
 				signal: req.signal,
 			});
 			response = await router.route(attempt, STDIO_PEER, id => (id === key ? model : undefined));
-			// 400 is the request's own fault and 499 its caller's: another model would fare no better.
-			if (response.status <= 400 || response.status === 499 || index === candidates.length - 1) return response;
-			logger.warn("auth-gateway stdio attempt failed", { selector, model: key, status: response.status });
+			let failureStatus = response.status >= 400 ? response.status : undefined;
+			let invalidStreamRequest = false;
+			if (response.ok && response.headers.get("content-type")?.split(";", 1)[0]?.trim() === "text/event-stream") {
+				try {
+					const bytes = await readAuthGatewayStdioBody(response, req.signal);
+					const failure = await streamFailure(bytes, pathname, req.signal);
+					failureStatus = failure?.status;
+					invalidStreamRequest = failure?.type === "invalid_request_error" && !isTransientStatus(failure.status);
+					response = new Response(bytes, response);
+				} catch (error) {
+					req.signal.throwIfAborted();
+					if (error instanceof AuthGatewayStdioResponseLimitError) throw error;
+					const classified = classifyGatewayError(error);
+					failureStatus = classified.status;
+					invalidStreamRequest =
+						classified.type === "invalid_request_error" && !isTransientStatus(classified.status);
+					response = Response.json(
+						{ error: { message: classified.message, type: classified.type } },
+						{ status: classified.status },
+					);
+				}
+			}
+			if (req.signal.aborted) {
+				await response.body?.cancel(req.signal.reason);
+				req.signal.throwIfAborted();
+			}
+			// Request failures and caller cancellation cannot improve on another model.
+			if (
+				failureStatus === undefined ||
+				failureStatus <= 400 ||
+				invalidStreamRequest ||
+				failureStatus === 499 ||
+				index === candidates.length - 1
+			) {
+				return response;
+			}
+			logger.warn("auth-gateway stdio attempt failed", { selector, model: key, status: failureStatus });
 			await response.body?.cancel();
 		}
 		return response;
