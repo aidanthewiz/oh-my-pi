@@ -5,6 +5,7 @@
 ### Fixed
 
 - Lifecycle integrations can identify delayed completions without clearing a newer turn's state or pending decision.
+- Guest lifecycle integrations no longer remain Working when an inferred start precedes the host's real start.
 - Fixed `grep` and `read` path lists losing URL query or path semicolons. Preserve internal URL targets, per-target selectors, and literal filenames.
 - Fixed standalone SQLite queries and local image questions being split at semicolons before URL-looking text. Preserve query suffixes before detecting path-list targets.
 - Fixed extensionless files with line selectors in comma or whitespace lists being claimed as opaque resource URLs.

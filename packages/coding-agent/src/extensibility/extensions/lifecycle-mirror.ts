@@ -258,6 +258,7 @@ export class GuestLifecycleEmitter {
 	#chain: Promise<void> = Promise.resolve();
 	/** True until a terminal host settle, including scheduled continuations. */
 	#active = false;
+	#loopOpen = false;
 
 	get sawAgentStart(): boolean {
 		return this.#active;
@@ -265,10 +266,13 @@ export class GuestLifecycleEmitter {
 
 	emit(runner: ExtensionRunner, event: AgentSessionEvent): void {
 		if (event.type === "agent_start") {
+			if (this.#loopOpen) return;
 			this.#turnIndex = 0;
 			this.#runId = Bun.randomUUIDv7();
 			this.#active = true;
+			this.#loopOpen = true;
 		} else if (event.type === "agent_end") {
+			this.#loopOpen = false;
 			this.#active = event.isTerminal === false;
 		}
 		const turnIndex = this.#turnIndex;

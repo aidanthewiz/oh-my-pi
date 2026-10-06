@@ -201,18 +201,25 @@ afterEach(() => {
 });
 
 describe("collab guest extension lifecycle mirror", () => {
-	it("keeps the pane working across a continuation and settles from an idle host snapshot", async () => {
+	it("settles after an inferred start, duplicate real start, and a fresh continuation", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		let pane = "idle";
+		const activeRuns = new Set<string>();
+		let lastEndedRunId: string | undefined;
 		const continuation = Promise.withResolvers<void>();
 		const settled = Promise.withResolvers<void>();
 		const harness = await makeHarness("lifecycle-mirror-room-2", {
 			isStreaming: true,
 			onLifecycle: event => {
-				if (event.type === "agent_start") pane = "working";
+				if (event.type === "agent_start") {
+					activeRuns.add(event.runId);
+					pane = "working";
+				}
 				if (event.type === "agent_end") {
-					pane = event.willContinue ? "working" : "idle";
+					activeRuns.delete(event.runId);
+					lastEndedRunId = event.runId;
+					pane = event.willContinue || activeRuns.size > 0 ? "working" : "idle";
 					if (event.willContinue) continuation.resolve();
 					else settled.resolve();
 				}
@@ -220,12 +227,18 @@ describe("collab guest extension lifecycle mirror", () => {
 		});
 		try {
 			expect(pane).toBe("working");
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			await harness.barrier();
 			harness.hostSocket.send({
 				t: "event",
 				event: { type: "agent_end", messages: [], isTerminal: false },
 			} as CollabFrame);
 			await continuation.promise;
 			expect(pane).toBe("working");
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			await harness.barrier();
+			expect(activeRuns.size).toBe(1);
+			expect(activeRuns.has(lastEndedRunId!)).toBe(false);
 			harness.hostSocket.send({ t: "state", state: makeState() } as CollabFrame);
 			await settled.promise;
 			expect(pane).toBe("idle");
