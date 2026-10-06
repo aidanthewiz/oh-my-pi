@@ -31,6 +31,7 @@ import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ExtensionRunner } from "./runner";
 import type {
 	AgentEndEvent,
+	AgentStartEvent,
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
@@ -82,7 +83,7 @@ function cloneMessageNotification(message: AgentMessage): AgentMessage {
 
 /** Extension events `extensionEventFromSessionEvent` maps onto. */
 export type MappedExtensionEvent =
-	| { type: "agent_start" }
+	| AgentStartEvent
 	| AgentEndEvent
 	| TurnStartEvent
 	| TurnEndEvent
@@ -115,13 +116,15 @@ export type MappedExtensionEvent =
 export function extensionEventFromSessionEvent(
 	event: AgentSessionEvent,
 	turnIndex: number,
+	runId: string,
 ): MappedExtensionEvent | null {
 	switch (event.type) {
 		case "agent_start":
-			return { type: "agent_start" };
+			return { type: "agent_start", runId };
 		case "agent_end":
 			return {
 				type: "agent_end",
+				runId,
 				messages: event.messages,
 				willContinue: event.isTerminal === false ? true : undefined,
 			};
@@ -251,6 +254,7 @@ export function extensionEventFromSessionEvent(
  */
 export class GuestLifecycleEmitter {
 	#turnIndex = 0;
+	#runId = "";
 	#chain: Promise<void> = Promise.resolve();
 	/** True until a terminal host settle, including scheduled continuations. */
 	#active = false;
@@ -262,6 +266,7 @@ export class GuestLifecycleEmitter {
 	emit(runner: ExtensionRunner, event: AgentSessionEvent): void {
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
+			this.#runId = Bun.randomUUIDv7();
 			this.#active = true;
 		} else if (event.type === "agent_end") {
 			this.#active = event.isTerminal === false;
@@ -269,7 +274,7 @@ export class GuestLifecycleEmitter {
 		const turnIndex = this.#turnIndex;
 		if (event.type === "turn_end") this.#turnIndex++;
 		if (event.type !== "agent_start" && !runner.hasHandlers(event.type)) return;
-		const mapped = extensionEventFromSessionEvent(event, turnIndex);
+		const mapped = extensionEventFromSessionEvent(event, turnIndex, this.#runId);
 		if (!mapped) return;
 		this.#chain = this.#chain
 			.then(() => runner.emit(mapped))

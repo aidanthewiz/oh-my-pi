@@ -3121,6 +3121,8 @@ export class AgentSession implements SettingsScope {
 	 * memory release, never after it.
 	 */
 	#inFlightEventHandlers = new Set<Promise<void>>();
+	#agentRunId = "";
+	readonly #lifecycleRunIds = new WeakMap<AgentEvent, string>();
 
 	/**
 	 * Subscriber entry point. Delegates to {@link #dispatchAgentEvent} and
@@ -3129,6 +3131,10 @@ export class AgentSession implements SettingsScope {
 	 * event/persistence pipeline during teardown.
 	 */
 	#handleAgentEvent = (event: AgentEvent): Promise<void> => {
+		if (event.type === "agent_start") this.#agentRunId = Bun.randomUUIDv7();
+		if (event.type === "agent_start" || event.type === "agent_end") {
+			this.#lifecycleRunIds.set(event, this.#agentRunId);
+		}
 		const processing = this.#dispatchAgentEvent(event);
 		this.#inFlightEventHandlers.add(processing);
 		void processing.finally(() => this.#inFlightEventHandlers.delete(processing)).catch(() => {});
@@ -4786,15 +4792,22 @@ export class AgentSession implements SettingsScope {
 			yielded: !options?.willContinue || awaitingAsyncWork,
 			...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
 		});
-		void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
-			logger.error("Agent end extension notification failed", { err });
-		});
+		void this.#emitAgentEndNotification(this.#lifecycleRunIds.get(event)!, [...activeMessages], options).catch(
+			err => {
+				logger.error("Agent end extension notification failed", { err });
+			},
+		);
 	}
 
-	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+	async #emitAgentEndNotification(
+		runId: string,
+		messages: AgentMessage[],
+		options?: { willContinue?: boolean },
+	): Promise<void> {
 		if (this.#extensionEventsDrained) await this.#extensionEventsDrained.promise;
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
+			runId,
 			messages,
 			willContinue: options?.willContinue,
 		});
@@ -4860,7 +4873,7 @@ export class AgentSession implements SettingsScope {
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
-			await this.#extensionRunner.emit({ type: "agent_start" });
+			await this.#extensionRunner.emit({ type: "agent_start", runId: this.#lifecycleRunIds.get(event)! });
 			return;
 		}
 
@@ -4873,7 +4886,7 @@ export class AgentSession implements SettingsScope {
 			// blocked by unrelated notification-only work.
 			return;
 		}
-		const mapped = extensionEventFromSessionEvent(event, turnIndex);
+		const mapped = extensionEventFromSessionEvent(event, turnIndex, this.#agentRunId);
 		if (!mapped) return;
 		await this.#extensionRunner.emit(mapped);
 	}

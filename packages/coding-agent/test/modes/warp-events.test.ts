@@ -269,10 +269,11 @@ describe("Warp CLI-agent events", () => {
 		expect(handlers.has("agent_start")).toBe(false);
 		const writesAfterSubmit = write.mock.calls.length;
 		const agentStart = handlers.get("agent_start") as never as ((event: AgentStartEvent) => void) | undefined;
-		agentStart?.({ type: "agent_start" });
+		agentStart?.({ type: "agent_start", runId: "continuation" });
 		expect(write.mock.calls.length).toBe(writesAfterSubmit);
 		agentEnd({
 			type: "agent_end",
+			runId: "continuation",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] } as never],
 		});
 
@@ -310,6 +311,7 @@ describe("Warp CLI-agent events", () => {
 		input?.({ type: "input", text: "prompt B", source: "interactive" });
 		agentEnd({
 			type: "agent_end",
+			runId: "turn-a",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "answer A" }] } as never],
 		});
 
@@ -324,6 +326,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt B"));
 		agentEnd({
 			type: "agent_end",
+			runId: "turn-b",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "answer B" }] } as never],
 		});
 		bodies = parseBodies(write);
@@ -338,6 +341,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt D"));
 		agentEnd({
 			type: "agent_end",
+			runId: "turn-d",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "answer D" }] } as never],
 		});
 		bodies = parseBodies(write);
@@ -368,6 +372,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("agent steer", { attribution: "agent" }));
 		agentEnd({
 			type: "agent_end",
+			runId: "turn-a",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "answer A" }] } as never],
 		});
 
@@ -402,6 +407,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(skillPromptStart("skill body as query", "user"));
 		agentEnd({
 			type: "agent_end",
+			runId: "skill-turn",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "skill answer" }] } as never],
 		});
 
@@ -422,6 +428,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(skillPromptStart("auto skill", "agent"));
 		agentEnd({
 			type: "agent_end",
+			runId: "turn-a",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "answer A" }] } as never],
 		});
 		bodies = parseBodies(write);
@@ -455,6 +462,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt error"));
 		agentEnd({
 			type: "agent_end",
+			runId: "error-turn",
 			messages: [
 				{
 					role: "assistant",
@@ -476,6 +484,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt text"));
 		agentEnd({
 			type: "agent_end",
+			runId: "text-turn",
 			messages: [
 				{
 					role: "assistant",
@@ -497,6 +506,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt silent"));
 		agentEnd({
 			type: "agent_end",
+			runId: "silent-turn",
 			messages: [
 				{
 					role: "assistant",
@@ -518,6 +528,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt interrupt"));
 		agentEnd({
 			type: "agent_end",
+			runId: "visible-abort",
 			messages: [
 				{
 					role: "assistant",
@@ -537,6 +548,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("prompt aborted"));
 		agentEnd({
 			type: "agent_end",
+			runId: "empty-turn",
 			messages: [
 				{
 					role: "assistant",
@@ -574,6 +586,7 @@ describe("Warp CLI-agent events", () => {
 		const afterSubmit = write.mock.calls.length;
 		agentEnd({
 			type: "agent_end",
+			runId: "retry-turn",
 			willContinue: true,
 			messages: [
 				{
@@ -592,6 +605,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart("final error"));
 		agentEnd({
 			type: "agent_end",
+			runId: "final-turn",
 			messages: [
 				{
 					role: "assistant",
@@ -629,6 +643,7 @@ describe("Warp CLI-agent events", () => {
 		messageStart(userMessageStart(query));
 		agentEnd({
 			type: "agent_end",
+			runId: "encoded-turn",
 			messages: [{ role: "assistant", content: [{ type: "text", text: response }] } as never],
 		});
 
@@ -673,6 +688,7 @@ describe("Warp CLI-agent events", () => {
 		sessionSwitch({ type: "session_switch", reason: "new", previousSessionFile: undefined }, context);
 		agentEnd({
 			type: "agent_end",
+			runId: "orphan-turn",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "orphan stop" }] } as never],
 		});
 
@@ -720,6 +736,7 @@ describe("Warp CLI-agent events", () => {
 		sessionBranch({ type: "session_branch", reason: "branch", previousSessionFile: undefined }, context);
 		agentEnd({
 			type: "agent_end",
+			runId: "orphan-turn",
 			messages: [{ role: "assistant", content: [{ type: "text", text: "orphan stop" }] } as never],
 		});
 
