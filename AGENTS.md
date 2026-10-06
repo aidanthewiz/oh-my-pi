@@ -32,11 +32,10 @@ This repo contains multiple packages, but **`packages/coding-agent/`** is the pr
 
 ### Pull requests
 
-When authorized to create or edit a contributor-submitted PR, follow the checklist below. RoboOMP-managed PRs follow their dedicated workflow and enforced body format in `python/robomp/src/prompts/system_append.md` instead.
+Follow this fork's `CONTRIBUTING.md` and `.github/PULL_REQUEST_TEMPLATE.md`. Upstream contributor admission, human-authored explanations, and manual contribution approval requirements do not apply to this fork.
 
 - MUST read `CONTRIBUTING.md` and `.github/PULL_REQUEST_TEMPLATE.md` first. Preserve the template sections and checklist, including when shortening an existing description.
-- MUST obtain at least one sentence written by the contributor in their own words explaining what changed and why, as required by `CONTRIBUTING.md`. If it is missing, ask the contributor; NEVER generate a substitute. Preserve that sentence during edits.
-- For user-facing changes, MUST follow the [Changelog](#changelog) attribution rules. Internal issue fixes keep their issue links. For external contributions, add the PR link and contributor credit after GitHub assigns the number, then push the entry before marking the changelog checklist item complete.
+- For user-facing changes, update the affected package's `[Unreleased]` changelog. Preserve required attribution from imported changes.
 - MUST read back the published PR description after creating or editing it. Check only verified checklist items; explain skipped or inapplicable checks in `Testing`.
 
 ## Code Quality
@@ -50,16 +49,16 @@ When authorized to create or edit a contributor-submitted PR, follow the checkli
 - **Promises**: use `Promise.withResolvers()` instead of `new Promise((resolve, reject) => ...)`.
 - **Prompts**: never build prompts in code (no inline strings, template literals, or concatenation). Prompts live in static `.md` files; use Handlebars for dynamic content. Import them via `import content from "./prompt.md" with { type: "text" }` — not `readFile`.
 - **Worker scripts**: workers re-enter the CLI entrypoint; never spawn separate worker entry modules. `cli.ts` declares itself as the worker host at startup (`declareWorkerHostEntry()` from `@oh-my-pi/pi-utils/env`) and dispatches hidden argv selectors (`__omp_worker_stats_sync`, `__omp_worker_tab`, `__omp_worker_js_eval`, `__omp_worker_tiny_inference`) before loading the command registry. Spawn sites use:
-  ```ts
-  import { workerHostEntry } from "@oh-my-pi/pi-utils";
-  const hostEntry = workerHostEntry();
-  const worker = hostEntry
-  	? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_<name>"] })
-  	: new Worker(new URL("./<worker>.ts", import.meta.url).href, { type: "module" });
-  ```
-  When the process was started from the omp CLI — source `cli.ts`, npm-bundle `dist/cli.js`, or compiled binary — `workerHostEntry()` is `Bun.main` and the worker re-enters the single entry module, so no per-worker `--compile` entrypoints or bundle entries exist. Outside a CLI host (`bun test`, SDK embedding, standalone `omp-stats`) it returns `null` and the direct-module fallback loads the worker source. New worker kinds MUST add their selector to the dispatch table in `cli.ts` and keep the fallback branch.
-  History: `with { type: "file" }` only copied the entry as a raw asset (workers crashed silently in compiled binaries — issues #1011, #1027), and the later literal-path + extra-entrypoint pattern required keeping spawn literals and two build scripts in sync (issue #1150). The smoke probe below is the live validation of this contract.
-  Validate any new worker with the dedicated smoke probe: `omp --smoke-test` spawns the stats sync worker and the tiny-model subprocess, pings them, and exits — it's wired into `ci:test:smoke` and `scripts/install-tests/run-ci.sh` so binary, source-link, and tarball installs all exercise it. Add a sibling smoke if the new worker is on a different module graph.
+   ```ts
+   import { workerHostEntry } from "@oh-my-pi/pi-utils";
+   const hostEntry = workerHostEntry();
+   const worker = hostEntry
+   	? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_<name>"] })
+   	: new Worker(new URL("./<worker>.ts", import.meta.url).href, { type: "module" });
+   ```
+   When the process was started from the omp CLI — source `cli.ts`, npm-bundle `dist/cli.js`, or compiled binary — `workerHostEntry()` is `Bun.main` and the worker re-enters the single entry module, so no per-worker `--compile` entrypoints or bundle entries exist. Outside a CLI host (`bun test`, SDK embedding, standalone `omp-stats`) it returns `null` and the direct-module fallback loads the worker source. New worker kinds MUST add their selector to the dispatch table in `cli.ts` and keep the fallback branch.
+   History: `with { type: "file" }` only copied the entry as a raw asset (workers crashed silently in compiled binaries — issues #1011, #1027), and the later literal-path + extra-entrypoint pattern required keeping spawn literals and two build scripts in sync (issue #1150). The smoke probe below is the live validation of this contract.
+   Validate any new worker with the dedicated smoke probe: `omp --smoke-test` spawns the stats sync worker and the tiny-model subprocess, pings them, and exits — it's wired into `ci:test:smoke` and `scripts/install-tests/run-ci.sh` so binary, source-link, and tarball installs all exercise it. Add a sibling smoke if the new worker is on a different module graph.
 
 ## Central Utilities
 
@@ -146,15 +145,15 @@ Use `node:fs/promises` for directory ops (`fs.mkdir`, `fs.rm`, `fs.readdir`) —
 - `existsSync`/`readFileSync`/`writeFileSync` in async code → `Bun.file()` APIs.
 - `mkdir(dirname(path), …)` before `Bun.write(path, …)` → redundant; `Bun.write` handles it.
 - `if (await file.exists()) { await file.json() }` → two syscalls plus race. Use try-catch with `isEnoent`:
-  ```typescript
-  import { isEnoent } from "@oh-my-pi/pi-utils";
-  try {
-  	return await Bun.file(path).json();
-  } catch (err) {
-  	if (isEnoent(err)) return null;
-  	throw err;
-  }
-  ```
+   ```typescript
+   import { isEnoent } from "@oh-my-pi/pi-utils";
+   try {
+   	return await Bun.file(path).json();
+   } catch (err) {
+   	if (isEnoent(err)) return null;
+   	throw err;
+   }
+   ```
 - Multiple `Bun.file(path)` handles for the same path (including across `checkX`/`loadX` helpers).
 - `Buffer.from(await Bun.file(x).arrayBuffer())` → `await fs.readFile(path)`.
 - Existence check + try-catch around the same read → drop the existence check.
@@ -257,21 +256,21 @@ For the bash tool specifically:
 
 ## Commands
 
-- NEVER commit unless asked.
 - Never use `tsc`/`npx tsc` — always `bun check`.
 - Never run `cargo test` directly for Rust tests — use `bun run test:rs`. It runs `cargo nextest run` (config: `.config/nextest.toml`) followed by a `cargo test --doc` pass, because nextest does not execute doctests. The doctest pass runs every runnable doctest in the workspace's lib crates; today that is tree-sitter-go's one example (pi-natives is a `cdylib`, which rustdoc skips; pi-builtins' examples are `ignore`d vendored uutils docs).
 - Merge commits (maintainer merges of PRs) follow: `Merge PR #<number>: <conventional PR subject> (@<author>)` — e.g. `Merge PR #6386: feat(catalog): add native Meta Model API provider (@eggpeat)`.
+
 ## Rust Build Profiles
 
 Profiles live in the root `Cargo.toml`; `.cargo/config.toml` carries the settings Cargo.toml cannot express. Both are committed, so no local `~/.cargo/config.toml` is required.
 
-| Profile | Use |
-| --- | --- |
-| `dev` | Default. Line tables for our crates, no debuginfo for deps, deps at `opt-level = 2`. |
-| `release` | Shipping build: fat LTO, 1 codegen unit, stripped. |
-| `local` | Fast local release iteration: thin LTO, 16 codegen units, incremental. |
-| `profiling` | `release` codegen with symbols kept, for `perf`/`samply`/Instruments. |
-| `ci` | Thin LTO, no debuginfo, stripped. |
+| Profile     | Use                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------ |
+| `dev`       | Default. Line tables for our crates, no debuginfo for deps, deps at `opt-level = 2`. |
+| `release`   | Shipping build: fat LTO, 1 codegen unit, stripped.                                   |
+| `local`     | Fast local release iteration: thin LTO, 16 codegen units, incremental.               |
+| `profiling` | `release` codegen with symbols kept, for `perf`/`samply`/Instruments.                |
+| `ci`        | Thin LTO, no debuginfo, stripped.                                                    |
 
 **Never set `split-debuginfo = "off"` on a profile that has debuginfo.** On Mach-O the linker never merges DWARF into the executable — it writes a debug map (`N_OSO`) pointing at the `.o` files, and `"unpacked"` is what keeps those files. With `"off"` every backtrace frame in our own crates silently loses `file:line`; the `panicked at foo.rs:3` header still prints (that is `#[track_caller]`, not debuginfo), which makes the loss easy to miss. `ci` may use `"off"` only because it sets `debug = false`.
 
@@ -334,12 +333,14 @@ Location: `packages/*/CHANGELOG.md` (per package).
 
 **Attribution:**
 
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/can1357/oh-my-pi/issues/123))`.
-- External contributions: `Added feature X ([#456](https://github.com/can1357/oh-my-pi/pull/456) by [@username](https://github.com/username))`.
+- Link the actual issue or PR in `Coreforce-CAD/oh-my-pi` when relevant. Preserve attribution required by imported changes and licenses.
 
 ## Releasing
 
-1. Ensure all changes since last release are in each affected package's `[Unreleased]` section.
-2. Run `bun run release`.
+Fork dependency releases use `.github/workflows/cf-release.yml`, not upstream's `bun run release`.
 
-The script handles version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+1. Keep each affected package's changes in its `[Unreleased]` section.
+2. Merge a verified PR into `coreforge` only when authorized. The workflow publishes the next `v<upstream>.<roll>` dependency release.
+3. Update Coreforge's `engine.lock` from the published release assets and checksums.
+
+`main` mirrors upstream. Do not change it for fork work.
