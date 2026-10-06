@@ -411,6 +411,7 @@ describe("collab guest extension lifecycle mirror", () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		let pane = "idle";
+		let completionActions = 0;
 		const activeRuns = new Set<string>();
 		const settled = Promise.withResolvers<void>();
 		const harness = await makeHarness("lifecycle-mirror-room-2", {
@@ -421,6 +422,7 @@ describe("collab guest extension lifecycle mirror", () => {
 					pane = "working";
 				}
 				if (event.type === "agent_end") {
+					completionActions++;
 					activeRuns.delete(event.runId);
 					pane = event.willContinue || activeRuns.size > 0 ? "working" : "idle";
 					settled.resolve();
@@ -433,8 +435,17 @@ describe("collab guest extension lifecycle mirror", () => {
 			await harness.barrier();
 			expect([...activeRuns]).toEqual(["inferred-run"]);
 			expect(harness.emitted.filter(event => event.type === "agent_start")).toHaveLength(1);
-			harness.hostSocket.send({ t: "state", state: makeState() } as CollabFrame);
+			harness.hostSocket.send({
+				t: "state",
+				state: { ...makeState(), lifecycle: { runId: "inferred-run", phase: "idle" } },
+			});
 			await settled.promise;
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "inferred-run", messages: [], isTerminal: true },
+			});
+			await harness.barrier();
+			expect(completionActions).toBe(1);
 			expect(pane).toBe("idle");
 			expect(activeRuns.size).toBe(0);
 			const end = harness.emitted.find(event => event.type === "agent_end");
@@ -494,7 +505,7 @@ describe("collab guest extension lifecycle mirror", () => {
 		}
 	});
 
-	it("keeps the newer loop working when an older completion arrives late", async () => {
+	it("delivers an older completion once while the newer loop stays working across a snapshot", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		const activeRuns = new Set<string>();
@@ -515,6 +526,10 @@ describe("collab guest extension lifecycle mirror", () => {
 		try {
 			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "old" } });
 			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "new" } });
+			harness.hostSocket.send({
+				t: "state",
+				state: { ...makeState(), isStreaming: true, lifecycle: { runId: "new", phase: "running" } },
+			});
 			harness.hostSocket.send({
 				t: "event",
 				event: { type: "agent_end", runId: "old", messages: [], isTerminal: true },

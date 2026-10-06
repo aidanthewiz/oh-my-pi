@@ -5,7 +5,8 @@
 ### Fixed
 
 - Lifecycle integrations can reject delayed starts and completions without clearing a newer loop's state or pending decision.
-- Collaboration guests preserve Working across host continuations, reset turn counters per loop, and settle matching ownership after reconnects.
+- Collaboration guests preserve Working across host continuations, reset turn counters per loop, and reject duplicate completion after snapshot recovery.
+- Collaboration state timers preserve newer-loop updates across delayed ends and stop when retained ownership becomes idle.
 - Fixed `grep` and `read` path lists losing URL query or path semicolons. Preserve internal URL targets, per-target selectors, and literal filenames.
 - Fixed standalone SQLite queries and local image questions being split at semicolons before URL-looking text. Preserve query suffixes before detecting path-list targets.
 - Fixed extensionless files with line selectors in comma or whitespace lists being claimed as opaque resource URLs.

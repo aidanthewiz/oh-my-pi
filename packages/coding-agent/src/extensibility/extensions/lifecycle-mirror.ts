@@ -259,14 +259,16 @@ export class GuestLifecycleEmitter {
 	#loopOpen = false;
 
 	reconcile(runner: ExtensionRunner, state: AgentLifecycleState, messages: AgentMessage[]): void {
-		for (const runId of this.#openRuns) {
-			if (runId !== state?.runId) {
-				this.emit(runner, {
-					type: "agent_end",
-					runId,
-					messages,
-					isTerminal: state === null || state.phase === "idle",
-				});
+		if (state === null || state.phase === "idle") {
+			for (const runId of this.#openRuns) {
+				if (runId !== state?.runId) {
+					this.emit(runner, {
+						type: "agent_end",
+						runId,
+						messages,
+						isTerminal: state === null && runId === this.#runId,
+					});
+				}
 			}
 		}
 		if (state && state.phase !== "idle") {
@@ -299,7 +301,14 @@ export class GuestLifecycleEmitter {
 			this.#openRuns.add(event.runId);
 		} else if (event.type === "agent_end") {
 			if (this.#runId === null) this.emit(runner, { type: "agent_start", runId: event.runId });
-			this.#openRuns.delete(event.runId);
+			if (event.isTerminal && event.runId === this.#runId) {
+				for (const runId of this.#openRuns) {
+					if (runId !== event.runId)
+						this.emit(runner, { type: "agent_end", runId, messages: event.messages, isTerminal: false });
+				}
+			}
+			const wasOpen = this.#openRuns.delete(event.runId);
+			if (!wasOpen && !(event.isTerminal && event.runId === this.#runId && this.#active)) return;
 			if (event.runId === this.#runId) {
 				this.#inferredRunId = null;
 				this.#loopOpen = false;

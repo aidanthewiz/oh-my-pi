@@ -1038,12 +1038,6 @@ export class CollabHost {
 	#onEventForState(event: AgentSessionEvent): void {
 		if (!STATE_TRIGGER_EVENTS[event.type]) return;
 		this.#scheduleStateBroadcast();
-		if (event.type === "agent_start" && !this.#streamingInterval) {
-			this.#streamingInterval = setInterval(() => this.#scheduleStateBroadcast(), STREAMING_STATE_INTERVAL_MS);
-		} else if (event.type === "agent_end" && event.isTerminal !== false && this.#streamingInterval) {
-			clearInterval(this.#streamingInterval);
-			this.#streamingInterval = null;
-		}
 	}
 
 	#snapshotAgents(): AgentSnapshot[] {
@@ -1174,7 +1168,10 @@ export class CollabHost {
 		this.#stateDebounce = setTimeout(() => {
 			this.#stateDebounce = null;
 			const state = this.#buildState();
-			if (!state.lifecycle && this.#streamingInterval) {
+			const active = state.isStreaming || (state.lifecycle !== null && state.lifecycle.phase !== "idle");
+			if (active && !this.#streamingInterval) {
+				this.#streamingInterval = setInterval(() => this.#scheduleStateBroadcast(), STREAMING_STATE_INTERVAL_MS);
+			} else if (!active && this.#streamingInterval) {
 				clearInterval(this.#streamingInterval);
 				this.#streamingInterval = null;
 			}
