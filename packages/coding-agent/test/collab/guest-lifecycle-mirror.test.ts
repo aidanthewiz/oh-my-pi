@@ -17,11 +17,14 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -38,11 +41,18 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { disposeTerminalTitleState, initTerminalTitleState } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
+import { mockWindowsConsoleTitle } from "../terminal-title-test-utils";
 import { refreshDirsFromEnv, TempDir } from "@oh-my-pi/pi-utils";
+import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 interface Harness {
 	guest: CollabGuestLink;
+	link: string;
 	ctx: InteractiveModeContext;
 	hostSocket: CollabSocket;
 	/** Mock runner receiving the mirrored events; per-test overrides allowed. */
@@ -75,6 +85,7 @@ async function makeHarness(
 		onLifecycle?: (event: MappedExtensionEvent) => void;
 		hostSession?: AgentSession;
 		guestSession?: AgentSession;
+		guestContext?: InteractiveModeContext;
 	} = {},
 ): Promise<Harness> {
 	const roomKey = generateRoomKey();
@@ -126,7 +137,7 @@ async function makeHarness(
 		await hostOpen.promise;
 	}
 
-	const ctx = {
+	const ctx = (options.guestContext ?? {
 		collabGuest: undefined as CollabGuestLink | undefined,
 		settings: Settings.isolated(),
 		sessionManager: {
@@ -191,7 +202,7 @@ async function makeHarness(
 		syncRunningSubagentBadge: () => {},
 		syncComposerShape: () => {},
 		eventBus: new EventBus(),
-	} as unknown as InteractiveModeContext;
+	}) as unknown as InteractiveModeContext;
 	if (options.guestSession) {
 		ctx.session = options.guestSession;
 		ctx.sessionManager = options.guestSession.sessionManager;
@@ -215,13 +226,14 @@ async function makeHarness(
 	const guest = new CollabGuestLink(ctx);
 	const harness: Harness = {
 		guest,
+		link,
 		ctx,
 		hostSocket,
 		runner,
 		emitted,
 		barrier,
 		cleanup: async () => {
-			await guest.leave("test cleanup").catch(() => {});
+			await harness.guest.leave("test cleanup").catch(() => {});
 			hostSocket.close();
 			await host?.stop("test cleanup");
 		},
@@ -232,12 +244,14 @@ async function makeHarness(
 
 beforeEach(() => {
 	AgentRegistry.resetGlobalForTests();
+	AsyncJobManager.resetForTests();
 	installInMemoryRelay();
 });
 
 afterEach(() => {
 	uninstallInMemoryRelay();
 	AgentRegistry.resetGlobalForTests();
+	AsyncJobManager.resetForTests();
 });
 
 describe("collab guest extension lifecycle mirror", () => {
@@ -401,6 +415,166 @@ describe("collab guest extension lifecycle mirror", () => {
 			await hostSession.dispose();
 			auth.close();
 			bus.clear();
+			homedirSpy.mockRestore();
+			refreshDirsFromEnv();
+			await home.remove();
+		}
+	});
+
+	it("keeps a host-owned async wait authoritative across guest completion and reconnect", async () => {
+		const home = TempDir.createSync("@pi-guest-async-authority-");
+		const homedirSpy = spyOn(os, "homedir").mockReturnValue(home.path());
+		refreshDirsFromEnv();
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const auth = await AuthStorage.create(":memory:");
+		const model = getBundledModel("openai", "gpt-5");
+		if (!model) throw new Error("Missing bundled test model");
+		auth.keys.setRuntime(model.provider, "synthetic-key");
+		const registry = new ModelRegistry(auth, undefined, { ignoreLocalModelConfig: true });
+		const jobs = new AsyncJobManager({});
+		AsyncJobManager.setInstance(jobs);
+		const bus = new EventBus();
+		const runtime = new ExtensionRuntime();
+		const manager = SessionManager.inMemory(home.path());
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"todo.enabled": false,
+			"todo.reminders": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const paused = Promise.withResolvers<AgentSession["lifecycleState"]>();
+		let pane = "idle";
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_end", (event, ctx) => {
+					if (!event.willContinue) return;
+					const state = ctx.getLifecycleState();
+					pane = state?.phase === "continuing" ? "working" : "idle";
+					paused.resolve(state);
+				});
+			},
+			home.path(),
+			bus,
+			runtime,
+		);
+		const runner = new ExtensionRunner([extension], runtime, home.path(), manager, registry, undefined, settings);
+		const makeSession = (agentId: string, extensionRunner?: ExtensionRunner): AgentSession => {
+			const mock = createMockModel({ handler: () => ({ content: ["done"], stopReason: "stop" }) });
+			return new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "synthetic-key",
+					initialState: { model, systemPrompt: [], tools: [], messages: [] },
+					streamFn: mock.stream,
+					convertToLlm,
+				}),
+				agentId,
+				asyncJobManager: jobs,
+				sessionManager: extensionRunner ? manager : SessionManager.inMemory(home.path()),
+				settings,
+				modelRegistry: registry,
+				extensionRunner,
+			});
+		};
+		const hostSession = makeSession("host-async-owner");
+		const guestSession = makeSession("guest-async-owner", runner);
+		await initializeExtensions(guestSession, {
+			reportSendError: (_action, error) => {
+				throw error;
+			},
+			reportRuntimeError: error => {
+				throw new Error(error.error);
+			},
+		});
+		await initTheme(false);
+		const guestContext = createInteractiveModeContext({
+			session: guestSession,
+			sessionManager: manager,
+			settings,
+			statusLine: { setCollabStatus: () => {}, resetActiveTime: () => {} },
+			resetObserverRegistry: () => {},
+			syncRunningSubagentBadge: () => {},
+			syncComposerShape: () => {},
+			eventBus: bus,
+		});
+		const controller = new EventController(guestContext);
+		const handleEvent = controller.handleEvent.bind(controller);
+		spyOn(controller, "handleEvent").mockImplementation(event =>
+			event.type === "agent_start" || event.type === "agent_end" ? handleEvent(event) : Promise.resolve(),
+		);
+		guestContext.eventController = controller;
+		const previousHeadless = setTerminalHeadless(false);
+		const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		const windowsTitle = mockWindowsConsoleTitle();
+		windowsTitle.succeeds = true;
+		const titles: string[] = [];
+		const stdoutSpy = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			const payload = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array);
+			const title = /\x1b\]0;([\s\S]*?)\x07/.exec(payload)?.[1];
+			if (title !== undefined) titles.push(title);
+			return true;
+		});
+		initTerminalTitleState();
+		const hostWork = Promise.withResolvers<string>();
+		const localWork = Promise.withResolvers<string>();
+		let harness: Harness | undefined;
+		try {
+			harness = await makeHarness("host-async-authority", { hostSession, guestSession, guestContext });
+			jobs.register("bash", "held host background work", () => hostWork.promise, {
+				id: "host-background",
+				ownerId: "host-async-owner",
+			});
+			await hostSession.prompt("Finish the foreground while the background job is held.");
+			const observed = await paused.promise;
+			expect(hostSession.hasPendingAsyncWork()).toBe(true);
+			expect(guestSession.hasPendingAsyncWork()).toBe(false);
+			expect(hostSession.lifecycleState?.phase).toBe("continuing");
+			expect(observed).toEqual(hostSession.lifecycleState);
+			expect(pane).toBe("working");
+			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
+
+			await harness.guest.leave("exercise continuing snapshot");
+			harness.guest = new CollabGuestLink(guestContext);
+			await harness.guest.join(harness.link);
+			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
+
+			await harness.guest.leave("return to a local loop");
+			guestSession.setMirroredLifecycleState({ runId: "previous-host", phase: "continuing" });
+			jobs.register("bash", "held local background work", () => localWork.promise, {
+				id: "local-background",
+				ownerId: "guest-async-owner",
+			});
+			await guestSession.prompt("Finish this local foreground.");
+			const localState = guestSession.lifecycleState;
+			if (!localState) throw new Error("Local run lost lifecycle ownership");
+			expect(localState.phase).toBe("continuing");
+			expect(localState.runId).not.toBe("previous-host");
+			jobs.acknowledgeDeliveries(["local-background"]);
+			jobs.cancel("local-background", { ownerId: "guest-async-owner" });
+			localWork.resolve("cancelled");
+			await jobs.getJob("local-background")?.promise;
+			await guestSession.settleAsyncWork();
+			expect(guestSession.lifecycleState).toEqual({ runId: localState.runId, phase: "idle" });
+		} finally {
+			jobs.acknowledgeDeliveries(["host-background", "local-background"]);
+			jobs.cancelAll();
+			hostWork.resolve("cancelled");
+			localWork.resolve("cancelled");
+			await harness?.cleanup();
+			await guestSession.dispose();
+			await hostSession.dispose();
+			auth.close();
+			bus.clear();
+			controller.dispose();
+			disposeTerminalTitleState();
+			stdoutSpy.mockRestore();
+			windowsTitle.restore();
+			if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			setTerminalHeadless(previousHeadless);
+			resetSettingsForTest();
 			homedirSpy.mockRestore();
 			refreshDirsFromEnv();
 			await home.remove();

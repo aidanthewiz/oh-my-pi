@@ -760,6 +760,7 @@ export class AgentSession implements SettingsScope {
 	#eventListeners: AgentSessionEventListener[] = [];
 	#lifecycleListeners: AgentSessionLifecycleListener[] = [];
 	#lifecycleState: AgentLifecycleState = null;
+	#lifecycleIsMirrored = false;
 	#activeToolExecutionUpdates = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_update" }>>();
 	#runStateListeners = new Set<(state: "running" | "idle") => void>();
 	/** Epoch ms the current run went `running`; undefined while idle. */
@@ -3153,6 +3154,7 @@ export class AgentSession implements SettingsScope {
 		if (event.type === "agent_start") {
 			this.#agentRunId = Bun.randomUUIDv7();
 			this.#lifecycleState = { runId: this.#agentRunId, phase: "running" };
+			this.#lifecycleIsMirrored = false;
 		}
 		if (event.type === "agent_start" || event.type === "agent_end") {
 			this.#lifecycleRunIds.set(event, this.#agentRunId);
@@ -4816,6 +4818,8 @@ export class AgentSession implements SettingsScope {
 			...event,
 			runId,
 			isTerminal: !options?.willContinue,
+			yielded: !options?.willContinue || awaitingAsyncWork,
+			...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
 		});
 		await this.#emitSessionEvent({
 			...event,
@@ -4954,6 +4958,7 @@ export class AgentSession implements SettingsScope {
 
 	get lifecycleState(): AgentLifecycleState {
 		if (
+			!this.#lifecycleIsMirrored &&
 			this.#lifecycleState?.phase === "continuing" &&
 			!this.isStreaming &&
 			!this.hasPostPromptWork &&
@@ -4967,6 +4972,7 @@ export class AgentSession implements SettingsScope {
 
 	setMirroredLifecycleState(state: AgentLifecycleState): void {
 		this.#lifecycleState = state ? { ...state } : null;
+		this.#lifecycleIsMirrored = state !== null;
 	}
 
 	/**
@@ -5576,6 +5582,7 @@ export class AgentSession implements SettingsScope {
 		this.#eventListeners = [];
 		this.#lifecycleListeners = [];
 		this.#lifecycleState = null;
+		this.#lifecycleIsMirrored = false;
 		this.#runStateListeners.clear();
 		this.#sessionChangeCallbacks.clear();
 
@@ -5649,6 +5656,7 @@ export class AgentSession implements SettingsScope {
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
 		this.#lifecycleState = null;
+		this.#lifecycleIsMirrored = false;
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
@@ -5749,6 +5757,7 @@ export class AgentSession implements SettingsScope {
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
 		this.#lifecycleState = null;
+		this.#lifecycleIsMirrored = false;
 		this.#pendingNextTurnMessages = [];
 		this.#experimentalContextNotesReminder = undefined;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -9407,6 +9416,7 @@ export class AgentSession implements SettingsScope {
 				this.#releaseQueuedTtsrReservations();
 				this.agent.reset();
 				this.#lifecycleState = null;
+				this.#lifecycleIsMirrored = false;
 				this.tokenRate.reset();
 				if (options?.drop && previousSessionFile) {
 					try {
@@ -10880,6 +10890,7 @@ export class AgentSession implements SettingsScope {
 		await this.abort({ goalReason: "internal" });
 		await this.#sessionBeforeSwitchReconciler?.();
 		this.#lifecycleState = null;
+		this.#lifecycleIsMirrored = false;
 
 		await this.#bash.flushPending();
 		// Flush pending writes before switching so restore snapshots reflect committed state.
