@@ -122,6 +122,7 @@ export class GuestClient {
 	#streamDone = false;
 	#activeTools: ReadonlyMap<string, ActiveTool> = new Map();
 	#working = false;
+	#activeRunId: string | null = null;
 	#readOnly = false;
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
@@ -324,7 +325,9 @@ export class GuestClient {
 				this.#activeTools = new Map();
 				this.#progress = new Map();
 				this.#lifecycle = new Map();
-				this.#working = frame.state.isStreaming;
+				this.#activeRunId = frame.state.lifecycle?.runId ?? null;
+				this.#working =
+					frame.state.isStreaming || (frame.state.lifecycle !== null && frame.state.lifecycle.phase !== "idle");
 				this.#readOnly = frame.readOnly === true;
 				this.#clearUiRequests();
 				this.#welcomed = true;
@@ -382,7 +385,9 @@ export class GuestClient {
 				// payload is built at fire time, so `isStreaming` is never stale.
 				// This covers a connected guest that misses the discrete `agent_start`
 				// without receiving a new `welcome` (for example, mid-stream).
-				this.#working = frame.state.isStreaming;
+				this.#activeRunId = frame.state.lifecycle?.runId ?? null;
+				this.#working =
+					frame.state.isStreaming || (frame.state.lifecycle !== null && frame.state.lifecycle.phase !== "idle");
 				if (!frame.state.isStreaming) {
 					// Host idle implies no tool can be running, so clear any card
 					// pinned by a dropped `tool_execution_end` off this signal.
@@ -494,10 +499,14 @@ export class GuestClient {
 				break;
 			}
 			case "agent_start":
+				this.#activeRunId = event.runId;
 				this.#working = true;
 				break;
 			case "agent_end":
-				this.#working = false;
+				if (event.runId === this.#activeRunId) {
+					this.#working = !event.isTerminal;
+					if (event.isTerminal) this.#activeRunId = null;
+				}
 				break;
 			case "notice":
 				this.#pushNotice(event.level, event.message);

@@ -100,7 +100,8 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			sessionName: "registry-test",
 			model: undefined,
 			thinkingLevel: undefined,
-			subscribe: (cb: HostContextState["subscribed"]) => {
+			lifecycleState: null,
+			subscribeLifecycle: (cb: HostContextState["subscribed"]) => {
 				state.subscribed = cb;
 				return () => {};
 			},

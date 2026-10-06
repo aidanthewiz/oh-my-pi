@@ -626,7 +626,7 @@ export function makeScriptedTurn(seq: number, parentId: string | null): Scripted
 	};
 
 	return [
-		{ kind: "event", event: { type: "agent_start" } },
+		{ kind: "event", event: { type: "agent_start", runId: `mock-turn-${seq}` } },
 		{ kind: "state", streaming: true },
 		{ kind: "event", event: { type: "turn_start" } },
 		{ kind: "event", event: { type: "message_start", message: partial([]) } },
@@ -708,7 +708,7 @@ export function makeScriptedTurn(seq: number, parentId: string | null): Scripted
 		{ kind: "event", event: { type: "message_end", message: a2Final } },
 		{ kind: "entry", entry: { id: a2Id, parentId: r1Id, timestamp: iso(ts), type: "message", message: a2Final } },
 		{ kind: "event", event: { type: "turn_end" } },
-		{ kind: "event", event: { type: "agent_end" } },
+		{ kind: "event", event: { type: "agent_end", runId: `mock-turn-${seq}`, isTerminal: true, messages: [] } },
 		{ kind: "state", streaming: false },
 	];
 }

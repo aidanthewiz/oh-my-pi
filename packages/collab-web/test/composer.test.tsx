@@ -15,7 +15,13 @@ function snapshot(uiRequest: GuestSnapshot["uiRequest"]): GuestSnapshot {
 		endedReason: null,
 		header: null,
 		entries: [],
-		state: { isStreaming: true, queuedMessageCount: 0, cwd: "/work", participants: [] },
+		state: {
+			isStreaming: true,
+			lifecycle: { runId: "run", phase: "running" },
+			queuedMessageCount: 0,
+			cwd: "/work",
+			participants: [],
+		},
 		agents: [],
 		progress: new Map(),
 		lifecycle: new Map(),
@@ -52,7 +58,10 @@ describe("Composer host UI requests", () => {
 
 	it("renders a submit field for custom ask responses", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />,
+			<Composer
+				client={client}
+				snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })}
+			/>,
 		);
 
 		expect(html).toContain("Other");

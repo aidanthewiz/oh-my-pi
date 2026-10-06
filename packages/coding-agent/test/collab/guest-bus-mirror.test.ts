@@ -9,6 +9,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // The guest mirrors host EventBus traffic onto the local session and
@@ -18,6 +19,7 @@ import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memor
 function makeState(): Extract<CollabFrame, { t: "welcome" }>["state"] {
 	return {
 		isStreaming: false,
+		lifecycle: null,
 		queuedMessageCount: 0,
 		sessionName: "host session",
 		cwd: "/tmp",
@@ -35,6 +37,10 @@ function makeGuestContext(eventBus: EventBus): InteractiveModeContext {
 			getCwd: () => "/local",
 		},
 		session: {
+			lifecycleState: null as AgentLifecycleState,
+			setMirroredLifecycleState(state: AgentLifecycleState) {
+				this.lifecycleState = state;
+			},
 			messages: [],
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),

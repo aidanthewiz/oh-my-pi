@@ -258,7 +258,12 @@ import { resumeCommand } from "../utils/resume-command";
 import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
 import type { VibeModeState } from "../vibe/state";
-import type { AgentSessionEvent, AgentSessionEventListener } from "./agent-session-events";
+import type {
+	AgentLifecycleState,
+	AgentSessionEvent,
+	AgentSessionEventListener,
+	AgentSessionLifecycleListener,
+} from "./agent-session-events";
 import type {
 	AgentSessionConfig,
 	AgentSessionDisposeOptions,
@@ -753,6 +758,8 @@ export class AgentSession implements SettingsScope {
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
+	#lifecycleListeners: AgentSessionLifecycleListener[] = [];
+	#lifecycleState: AgentLifecycleState = null;
 	#activeToolExecutionUpdates = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_update" }>>();
 	#runStateListeners = new Set<(state: "running" | "idle") => void>();
 	/** Epoch ms the current run went `running`; undefined while idle. */
@@ -2911,9 +2918,15 @@ export class AgentSession implements SettingsScope {
 
 	/** Emit an event to all listeners */
 	#emit(event: AgentSessionEvent): void {
+		if (event.type !== "agent_start" && event.type !== "agent_end") {
+			this.#notifyEventListeners(this.#lifecycleListeners, event);
+		}
+		this.#notifyEventListeners(this.#eventListeners, event);
+	}
+
+	#notifyEventListeners<T>(listeners: readonly ((event: T) => void)[], event: T): void {
 		// Copy array before iteration to avoid mutation during iteration.
-		const listeners = [...this.#eventListeners];
-		for (const l of listeners) {
+		for (const l of listeners.slice()) {
 			try {
 				const result = l(event) as unknown;
 				// Listener may be an async function whose returned Promise we don't await;
@@ -3054,6 +3067,12 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
+		if (event.type === "agent_start") {
+			this.#notifyEventListeners(this.#lifecycleListeners, {
+				type: "agent_start",
+				runId: this.#lifecycleRunIds.get(event)!,
+			});
+		}
 		if (event.type === "tool_execution_update") {
 			// Returned background calls have no later tool result to persist their
 			// terminal frame. Keep the latest update for future focus rebuilds;
@@ -3131,7 +3150,10 @@ export class AgentSession implements SettingsScope {
 	 * event/persistence pipeline during teardown.
 	 */
 	#handleAgentEvent = (event: AgentEvent): Promise<void> => {
-		if (event.type === "agent_start") this.#agentRunId = Bun.randomUUIDv7();
+		if (event.type === "agent_start") {
+			this.#agentRunId = Bun.randomUUIDv7();
+			this.#lifecycleState = { runId: this.#agentRunId, phase: "running" };
+		}
 		if (event.type === "agent_start" || event.type === "agent_end") {
 			this.#lifecycleRunIds.set(event, this.#agentRunId);
 		}
@@ -4786,6 +4808,15 @@ export class AgentSession implements SettingsScope {
 		// `yielded` alone also covers queued steer/follow-up and IRC continuations,
 		// which `#flushPendingAgentEnd` re-tags non-terminal.
 		const awaitingAsyncWork = options?.willContinue === true && options.awaitingAsyncWork === true;
+		const runId = this.#lifecycleRunIds.get(event)!;
+		if (this.#lifecycleState?.runId === runId) {
+			this.#lifecycleState = { runId, phase: options?.willContinue ? "continuing" : "idle" };
+		}
+		this.#notifyEventListeners(this.#lifecycleListeners, {
+			...event,
+			runId,
+			isTerminal: !options?.willContinue,
+		});
 		await this.#emitSessionEvent({
 			...event,
 			isTerminal: !options?.willContinue,
@@ -4906,6 +4937,36 @@ export class AgentSession implements SettingsScope {
 				this.#eventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Observe every physical loop and its settled continuation decision.
+	 * Unlike subscribe(), completion is not deferred until prompt unwind.
+	 * Other session events retain their ordinary emission order.
+	 */
+	subscribeLifecycle(listener: AgentSessionLifecycleListener): () => void {
+		this.#lifecycleListeners.push(listener);
+		return () => {
+			const index = this.#lifecycleListeners.indexOf(listener);
+			if (index !== -1) this.#lifecycleListeners.splice(index, 1);
+		};
+	}
+
+	get lifecycleState(): AgentLifecycleState {
+		if (
+			this.#lifecycleState?.phase === "continuing" &&
+			!this.isStreaming &&
+			!this.hasPostPromptWork &&
+			!this.#queuedMessageDrainScheduled &&
+			!this.hasPendingAsyncWork()
+		) {
+			return { runId: this.#lifecycleState.runId, phase: "idle" };
+		}
+		return this.#lifecycleState ? { ...this.#lifecycleState } : null;
+	}
+
+	setMirroredLifecycleState(state: AgentLifecycleState): void {
+		this.#lifecycleState = state ? { ...state } : null;
 	}
 
 	/**
@@ -5513,6 +5574,8 @@ export class AgentSession implements SettingsScope {
 		// beginDispose() drained the rest; this catches registrations made during teardown.
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#eventListeners = [];
+		this.#lifecycleListeners = [];
+		this.#lifecycleState = null;
 		this.#runStateListeners.clear();
 		this.#sessionChangeCallbacks.clear();
 
@@ -5585,6 +5648,7 @@ export class AgentSession implements SettingsScope {
 	#releaseRetainedSessionMemory(): void {
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
+		this.#lifecycleState = null;
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
@@ -5684,6 +5748,7 @@ export class AgentSession implements SettingsScope {
 		// calls, and error state. agent.reset() keeps the model and system prompt.
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
+		this.#lifecycleState = null;
 		this.#pendingNextTurnMessages = [];
 		this.#experimentalContextNotesReminder = undefined;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -7820,6 +7885,7 @@ export class AgentSession implements SettingsScope {
 			model: this.model ?? undefined,
 			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined),
 			isIdle: () => !this.isStreaming,
+			getLifecycleState: () => this.lifecycleState,
 			abort: () => {
 				void this.abort();
 			},
@@ -9340,6 +9406,7 @@ export class AgentSession implements SettingsScope {
 			try {
 				this.#releaseQueuedTtsrReservations();
 				this.agent.reset();
+				this.#lifecycleState = null;
 				this.tokenRate.reset();
 				if (options?.drop && previousSessionFile) {
 					try {
@@ -10812,6 +10879,7 @@ export class AgentSession implements SettingsScope {
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
 		await this.#sessionBeforeSwitchReconciler?.();
+		this.#lifecycleState = null;
 
 		await this.#bash.flushPending();
 		// Flush pending writes before switching so restore snapshots reflect committed state.

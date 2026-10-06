@@ -63,6 +63,7 @@ const transcriptDecoder = new TextDecoder();
 
 let lastEntryId: string | null = entries[entries.length - 1]?.id ?? null;
 let streaming = false;
+let lifecycle: SessionState["lifecycle"] = null;
 let queuedPrompts = 0;
 let turnSeq = 0;
 let liveEntrySeq = 0;
@@ -98,6 +99,7 @@ function buildState(): SessionState {
 	const tokens = 51_000 + entries.length * 120;
 	return {
 		isStreaming: streaming,
+		lifecycle,
 		queuedMessageCount: queuedPrompts,
 		sessionName: fixtureHeader.title,
 		cwd: fixtureHeader.cwd,
@@ -156,6 +158,10 @@ function scheduleStep(): void {
 function applyStep(step: ScriptedStep): void {
 	switch (step.kind) {
 		case "event":
+			if (step.event.type === "agent_start") lifecycle = { runId: step.event.runId, phase: "running" };
+			else if (step.event.type === "agent_end") {
+				lifecycle = step.event.isTerminal ? null : { runId: step.event.runId, phase: "continuing" };
+			}
 			sendFrame({ t: "event", event: step.event });
 			break;
 		case "entry":
@@ -233,7 +239,10 @@ function handleAbort(fromPeer: number): void {
 	cancelReplay();
 	queuedPrompts = 0;
 	notice("info", `${peerName(fromPeer)} interrupted`);
-	if (wasReplaying) sendFrame({ t: "event", event: { type: "agent_end" } });
+	if (wasReplaying && lifecycle) {
+		sendFrame({ t: "event", event: { type: "agent_end", runId: lifecycle.runId, isTerminal: true, messages: [] } });
+	}
+	lifecycle = null;
 	streaming = false;
 	broadcastState();
 }

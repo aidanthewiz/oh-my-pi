@@ -202,6 +202,7 @@ describe("extension provider registration rollback", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,

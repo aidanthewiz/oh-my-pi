@@ -142,6 +142,7 @@ describe("ExtensionRunner", () => {
 		};
 		const contextActions = {
 			getModel: () => undefined,
+			getLifecycleState: () => null,
 			isIdle: () => true,
 			abort: () => {},
 			hasPendingMessages: () => false,
@@ -193,6 +194,7 @@ describe("ExtensionRunner", () => {
 			},
 			{
 				getModel: () => undefined,
+				getLifecycleState: () => null,
 				isIdle: () => true,
 				abort: () => {},
 				hasPendingMessages: () => false,
@@ -886,6 +888,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => primaryModel,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -1101,6 +1104,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => primaryModel,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -1322,6 +1326,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => controller.abort(),
 					hasPendingMessages: () => false,
@@ -1652,6 +1657,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -2324,6 +2330,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -2405,6 +2412,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -2472,6 +2480,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -2528,6 +2537,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -3237,6 +3247,7 @@ describe("ExtensionRunner", () => {
 				} as never,
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -4224,6 +4235,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -4296,6 +4308,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					getModel: () => undefined,
+					getLifecycleState: () => null,
 					isIdle: () => true,
 					abort: () => {},
 					hasPendingMessages: () => false,
@@ -4387,6 +4400,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					getLifecycleState: () => null,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},

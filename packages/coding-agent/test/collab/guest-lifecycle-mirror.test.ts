@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -27,6 +28,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
+import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, formatCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { MappedExtensionEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/lifecycle-mirror";
@@ -35,6 +37,8 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import { refreshDirsFromEnv, TempDir } from "@oh-my-pi/pi-utils";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 interface Harness {
@@ -56,6 +60,7 @@ interface Harness {
 function makeState(): Extract<CollabFrame, { t: "welcome" }>["state"] {
 	return {
 		isStreaming: false,
+		lifecycle: null,
 		queuedMessageCount: 0,
 		sessionName: "host session",
 		cwd: "/tmp",
@@ -65,11 +70,16 @@ function makeState(): Extract<CollabFrame, { t: "welcome" }>["state"] {
 
 async function makeHarness(
 	roomId: string,
-	options: { isStreaming?: boolean; onLifecycle?: (event: MappedExtensionEvent) => void } = {},
+	options: {
+		isStreaming?: boolean;
+		onLifecycle?: (event: MappedExtensionEvent) => void;
+		hostSession?: AgentSession;
+		guestSession?: AgentSession;
+	} = {},
 ): Promise<Harness> {
 	const roomKey = generateRoomKey();
 	const cryptoKey = await importRoomKey(roomKey);
-	const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
+	let link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
 
 	const emitted: MappedExtensionEvent[] = [];
 	const runner = {
@@ -101,14 +111,20 @@ async function makeHarness(
 				t: "welcome",
 				proto: COLLAB_PROTO,
 				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-				state: { ...makeState(), isStreaming: options.isStreaming ?? false },
+				state: {
+					...makeState(),
+					isStreaming: options.isStreaming ?? false,
+					lifecycle: options.isStreaming ? { runId: "inferred-run", phase: "running" } : null,
+				},
 				agents: [],
 				entryCount: 0,
 			} as CollabFrame);
 		}
 	};
-	hostSocket.connect();
-	await hostOpen.promise;
+	if (!options.hostSession) {
+		hostSocket.connect();
+		await hostOpen.promise;
+	}
 
 	const ctx = {
 		collabGuest: undefined as CollabGuestLink | undefined,
@@ -120,6 +136,10 @@ async function makeHarness(
 		},
 		session: {
 			messages: [],
+			lifecycleState: null as AgentSession["lifecycleState"],
+			setMirroredLifecycleState(state: AgentSession["lifecycleState"]) {
+				this.lifecycleState = state;
+			},
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),
 			agent: {
@@ -172,6 +192,25 @@ async function makeHarness(
 		syncComposerShape: () => {},
 		eventBus: new EventBus(),
 	} as unknown as InteractiveModeContext;
+	if (options.guestSession) {
+		ctx.session = options.guestSession;
+		ctx.sessionManager = options.guestSession.sessionManager;
+	}
+	let host: CollabHost | undefined;
+	if (options.hostSession) {
+		const hostCtx = {
+			...ctx,
+			session: options.hostSession,
+			sessionManager: options.hostSession.sessionManager,
+			statusLine: {
+				...ctx.statusLine,
+				getCachedContextBreakdown: () => ({ usedTokens: 0, contextWindow: 0 }),
+			},
+		} as unknown as InteractiveModeContext;
+		host = new CollabHost(hostCtx);
+		await host.start("ws://localhost:8788");
+		link = host.link;
+	}
 
 	const guest = new CollabGuestLink(ctx);
 	const harness: Harness = {
@@ -184,6 +223,7 @@ async function makeHarness(
 		cleanup: async () => {
 			await guest.leave("test cleanup").catch(() => {});
 			hostSocket.close();
+			await host?.stop("test cleanup");
 		},
 	};
 	await guest.join(link);
@@ -201,13 +241,177 @@ afterEach(() => {
 });
 
 describe("collab guest extension lifecycle mirror", () => {
-	it("settles after an inferred start, duplicate real start, and a fresh continuation", async () => {
+	it("mirrors a real session_stop continuation through host and guest links", async () => {
+		const home = TempDir.createSync("@pi-guest-loop-transport-");
+		const homedirSpy = spyOn(os, "homedir").mockReturnValue(home.path());
+		refreshDirsFromEnv();
+		const auth = await AuthStorage.create(":memory:");
+		const model = getBundledModel("openai", "gpt-5");
+		if (!model) throw new Error("Missing bundled test model");
+		auth.keys.setRuntime(model.provider, "synthetic-key");
+		const registry = new ModelRegistry(auth, undefined, { ignoreLocalModelConfig: true });
+		const makeSettings = (): Settings => {
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"todo.enabled": false,
+				"todo.reminders": false,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			return settings;
+		};
+		const hostSettings = makeSettings();
+		const guestSettings = makeSettings();
+		const hostManager = SessionManager.inMemory(home.path());
+		const guestManager = SessionManager.inMemory(home.path());
+		const hostRuntime = new ExtensionRuntime();
+		const guestRuntime = new ExtensionRuntime();
+		const bus = new EventBus();
+		const hostEvents: MappedExtensionEvent[] = [];
+		const guestEvents: MappedExtensionEvent[] = [];
+		const publicBoundaries: string[] = [];
+		const activeRuns = new Set<string>();
+		const paneStates: string[] = [];
+		let pane = "idle";
+		let stopCalls = 0;
+		let modelCalls = 0;
+		const secondResponse = Promise.withResolvers<void>();
+		const secondStart = Promise.withResolvers<void>();
+		const continuing = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<void>();
+		const hostExtension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("session_stop", () =>
+					++stopCalls === 1 ? { continue: true, additionalContext: "Continue once." } : undefined,
+				);
+				pi.on("agent_start", event => {
+					hostEvents.push(event);
+				});
+				pi.on("agent_end", event => {
+					hostEvents.push(event);
+				});
+			},
+			home.path(),
+			bus,
+			hostRuntime,
+		);
+		const guestExtension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_start", event => {
+					guestEvents.push(event);
+					activeRuns.add(event.runId);
+					pane = "working";
+					paneStates.push(pane);
+					if (guestEvents.filter(item => item.type === "agent_start").length === 2) secondStart.resolve();
+				});
+				pi.on("turn_end", event => {
+					guestEvents.push(event);
+				});
+				pi.on("agent_end", event => {
+					guestEvents.push(event);
+					activeRuns.delete(event.runId);
+					pane = event.willContinue || activeRuns.size > 0 ? "working" : "idle";
+					paneStates.push(pane);
+					if (event.willContinue) continuing.resolve();
+					else completed.resolve();
+				});
+			},
+			home.path(),
+			bus,
+			guestRuntime,
+		);
+		const hostRunner = new ExtensionRunner(
+			[hostExtension],
+			hostRuntime,
+			home.path(),
+			hostManager,
+			registry,
+			undefined,
+			hostSettings,
+		);
+		const guestRunner = new ExtensionRunner(
+			[guestExtension],
+			guestRuntime,
+			home.path(),
+			guestManager,
+			registry,
+			undefined,
+			guestSettings,
+		);
+		const mock = createMockModel({
+			handler: async () => {
+				if (++modelCalls === 2) await secondResponse.promise;
+				return { content: ["done"], stopReason: "stop" };
+			},
+		});
+		const hostSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "synthetic-key",
+				initialState: { model, systemPrompt: [], tools: [], messages: [] },
+				streamFn: mock.stream,
+				convertToLlm,
+			}),
+			sessionManager: hostManager,
+			settings: hostSettings,
+			modelRegistry: registry,
+			extensionRunner: hostRunner,
+		});
+		const guestSession = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: [], tools: [], messages: [] }, convertToLlm }),
+			sessionManager: guestManager,
+			settings: guestSettings,
+			modelRegistry: registry,
+			extensionRunner: guestRunner,
+		});
+		hostSession.subscribe(event => {
+			if (event.type === "agent_start" || event.type === "agent_end") publicBoundaries.push(event.type);
+		});
+		let harness: Harness | undefined;
+		try {
+			harness = await makeHarness("real-loop-transport", { hostSession, guestSession });
+			const prompting = hostSession.prompt("Complete one continuation.");
+			await continuing.promise;
+			await secondStart.promise;
+			expect(pane).toBe("working");
+			expect(activeRuns.size).toBe(1);
+			secondResponse.resolve();
+			await prompting;
+			await hostSession.waitForIdle();
+			await completed.promise;
+			const starts = guestEvents.filter(event => event.type === "agent_start");
+			const ends = guestEvents.filter(event => event.type === "agent_end");
+			expect(starts).toHaveLength(2);
+			expect(starts[0].runId).not.toBe(starts[1].runId);
+			expect(ends.map(event => event.runId)).toEqual(starts.map(event => event.runId));
+			expect(starts.map(event => event.runId)).toEqual(
+				hostEvents.filter(event => event.type === "agent_start").map(event => event.runId),
+			);
+			expect(ends.map(event => event.willContinue === true)).toEqual([true, false]);
+			expect(guestEvents.filter(event => event.type === "turn_end").map(event => event.turnIndex)).toEqual([0, 0]);
+			expect(paneStates).toEqual(["working", "working", "working", "idle"]);
+			expect(pane).toBe("idle");
+			expect(activeRuns.size).toBe(0);
+			expect(publicBoundaries).toEqual(["agent_start", "agent_start", "agent_end"]);
+			expect(hostSession.isStreaming).toBe(false);
+			expect(stopCalls).toBe(2);
+		} finally {
+			secondResponse.resolve();
+			await harness?.cleanup();
+			await guestSession.dispose();
+			await hostSession.dispose();
+			auth.close();
+			bus.clear();
+			homedirSpy.mockRestore();
+			refreshDirsFromEnv();
+			await home.remove();
+		}
+	});
+
+	it("confirms an inferred start with the host ID and recovers a missed completion", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 		let pane = "idle";
 		const activeRuns = new Set<string>();
-		let lastEndedRunId: string | undefined;
-		const continuation = Promise.withResolvers<void>();
 		const settled = Promise.withResolvers<void>();
 		const harness = await makeHarness("lifecycle-mirror-room-2", {
 			isStreaming: true,
@@ -218,30 +422,160 @@ describe("collab guest extension lifecycle mirror", () => {
 				}
 				if (event.type === "agent_end") {
 					activeRuns.delete(event.runId);
-					lastEndedRunId = event.runId;
 					pane = event.willContinue || activeRuns.size > 0 ? "working" : "idle";
-					if (event.willContinue) continuation.resolve();
-					else settled.resolve();
+					settled.resolve();
 				}
 			},
 		});
 		try {
 			expect(pane).toBe("working");
-			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "inferred-run" } });
 			await harness.barrier();
-			harness.hostSocket.send({
-				t: "event",
-				event: { type: "agent_end", messages: [], isTerminal: false },
-			} as CollabFrame);
-			await continuation.promise;
-			expect(pane).toBe("working");
-			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
-			await harness.barrier();
-			expect(activeRuns.size).toBe(1);
-			expect(activeRuns.has(lastEndedRunId!)).toBe(false);
+			expect([...activeRuns]).toEqual(["inferred-run"]);
+			expect(harness.emitted.filter(event => event.type === "agent_start")).toHaveLength(1);
 			harness.hostSocket.send({ t: "state", state: makeState() } as CollabFrame);
 			await settled.promise;
 			expect(pane).toBe("idle");
+			expect(activeRuns.size).toBe(0);
+			const end = harness.emitted.find(event => event.type === "agent_end");
+			expect(end?.runId).toBe("inferred-run");
+		} finally {
+			await harness.cleanup();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
+	it("reconciles a different loop without confusing it with inferred confirmation", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const activeRuns = new Set<string>();
+		const states: string[] = [];
+		const completed = Promise.withResolvers<void>();
+		const harness = await makeHarness("lifecycle-new-inferred-loop", {
+			isStreaming: true,
+			onLifecycle: event => {
+				if (event.type === "agent_start") {
+					activeRuns.add(event.runId);
+					states.push("working");
+				} else if (event.type === "agent_end") {
+					activeRuns.delete(event.runId);
+					states.push(event.willContinue || activeRuns.size > 0 ? "working" : "idle");
+					if (!event.willContinue) completed.resolve();
+				}
+			},
+		});
+		try {
+			harness.hostSocket.send({
+				t: "state",
+				state: { ...makeState(), isStreaming: true, lifecycle: { runId: "new-loop", phase: "running" } },
+			});
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "new-loop" } });
+			await harness.barrier();
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "new-loop", messages: [], isTerminal: true },
+			});
+			await completed.promise;
+			expect(harness.emitted.filter(event => event.type === "agent_start").map(event => event.runId)).toEqual([
+				"inferred-run",
+				"new-loop",
+			]);
+			expect(harness.emitted.filter(event => event.type === "agent_end").map(event => event.runId)).toEqual([
+				"inferred-run",
+				"new-loop",
+			]);
+			expect(states).toEqual(["working", "working", "working", "idle"]);
+			expect(activeRuns.size).toBe(0);
+		} finally {
+			await harness.cleanup();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
+	it("keeps the newer loop working when an older completion arrives late", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const activeRuns = new Set<string>();
+		const paneStates: string[] = [];
+		const completed = Promise.withResolvers<void>();
+		const harness = await makeHarness("lifecycle-delayed-completion", {
+			onLifecycle: event => {
+				if (event.type === "agent_start") {
+					activeRuns.add(event.runId);
+					paneStates.push("working");
+				} else if (event.type === "agent_end") {
+					activeRuns.delete(event.runId);
+					paneStates.push(event.willContinue || activeRuns.size > 0 ? "working" : "idle");
+					if (event.runId === "new") completed.resolve();
+				}
+			},
+		});
+		try {
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "old" } });
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "new" } });
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "old", messages: [], isTerminal: true },
+			});
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "new", messages: [], isTerminal: true },
+			});
+			await completed.promise;
+			expect(paneStates).toEqual(["working", "working", "working", "idle"]);
+			expect(harness.emitted.filter(event => event.type === "agent_start").map(event => event.runId)).toEqual([
+				"old",
+				"new",
+			]);
+			expect(harness.emitted.filter(event => event.type === "agent_end").map(event => event.runId)).toEqual([
+				"old",
+				"new",
+			]);
+			expect(activeRuns.size).toBe(0);
+		} finally {
+			await harness.cleanup();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
+	it("recovers a continuation snapshot and closes its ownership on idle", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const activeRuns = new Set<string>();
+		const states: string[] = [];
+		const completed = Promise.withResolvers<void>();
+		const harness = await makeHarness("lifecycle-continuing-snapshot", {
+			onLifecycle: event => {
+				if (event.type === "agent_start") {
+					activeRuns.add(event.runId);
+					states.push("working");
+				} else if (event.type === "agent_end") {
+					activeRuns.delete(event.runId);
+					states.push(event.willContinue ? "working" : "idle");
+					if (!event.willContinue) completed.resolve();
+				}
+			},
+		});
+		try {
+			harness.hostSocket.send({
+				t: "state",
+				state: { ...makeState(), isStreaming: true, lifecycle: { runId: "paused", phase: "continuing" } },
+			});
+			await harness.barrier();
+			harness.hostSocket.send({ t: "state", state: makeState() });
+			await completed.promise;
+			expect(states).toEqual(["working", "working", "idle"]);
+			expect(harness.emitted.filter(event => event.type === "agent_start").map(event => event.runId)).toEqual([
+				"paused",
+			]);
+			expect(harness.emitted.filter(event => event.type === "agent_end").map(event => event.runId)).toEqual([
+				"paused",
+				"paused",
+			]);
+			expect(activeRuns.size).toBe(0);
 		} finally {
 			await harness.cleanup();
 			writeSpy.mockRestore();
@@ -281,19 +615,19 @@ describe("collab guest extension lifecycle mirror", () => {
 			};
 			// Two host prompts, two turns each: a local session numbers both
 			// runs 0,1 — the mirror must not keep counting across agent_start.
-			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "first" } });
 			runTurns();
 			runTurns();
 			harness.hostSocket.send({
 				t: "event",
-				event: { type: "agent_end", messages: [], isTerminal: true },
+				event: { type: "agent_end", runId: "first", messages: [], isTerminal: true },
 			} as CollabFrame);
-			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "second" } });
 			runTurns();
 			runTurns();
 			harness.hostSocket.send({
 				t: "event",
-				event: { type: "agent_end", messages: [], isTerminal: true },
+				event: { type: "agent_end", runId: "second", messages: [], isTerminal: true },
 			} as CollabFrame);
 			await harness.barrier();
 
@@ -372,10 +706,10 @@ describe("collab guest extension lifecycle mirror", () => {
 				if (event.type === "agent_end") agentEndDelivered.resolve();
 				return Promise.resolve(undefined);
 			};
-			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "delayed" } });
 			harness.hostSocket.send({
 				t: "event",
-				event: { type: "agent_end", messages: [], isTerminal: true },
+				event: { type: "agent_end", runId: "delayed", messages: [], isTerminal: true },
 			} as CollabFrame);
 			await harness.barrier();
 
@@ -433,10 +767,10 @@ describe("collab guest extension lifecycle mirror", () => {
 		harness.ctx.sessionManager = manager;
 		new ExtensionUiController(harness.ctx).initializeHookRunner({} as ExtensionUIContext, false);
 		try {
-			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "guarded" } });
 			harness.hostSocket.send({
 				t: "event",
-				event: { type: "agent_end", messages: [], isTerminal: true },
+				event: { type: "agent_end", runId: "guarded", messages: [], isTerminal: true },
 			} as CollabFrame);
 			await started.promise;
 			const leaving = harness.guest.leave("mid-handler");

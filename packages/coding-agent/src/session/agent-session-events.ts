@@ -1,6 +1,7 @@
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import type { Rule } from "../capability/rule";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
@@ -89,3 +90,12 @@ export type AgentSessionEvent =
 
 /** Listener function for agent session events. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+/** Physical loop boundaries, without public completion coalescing. */
+export type AgentSessionLifecycleEvent =
+	| Exclude<AgentSessionEvent, { type: "agent_start" | "agent_end" }>
+	| { type: "agent_start"; runId: string }
+	| (Extract<AgentSessionEvent, { type: "agent_end" }> & { runId: string; isTerminal: boolean });
+
+export type AgentSessionLifecycleListener = (event: AgentSessionLifecycleEvent) => void;
+export type { AgentLifecycleState };

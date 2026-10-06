@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Browser guests remain Working across host continuations and ignore older loop completions while a newer loop runs.
+
 ## [18.4.10] - 2026-10-02
 
 ### Fixed

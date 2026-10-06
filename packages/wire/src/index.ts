@@ -179,8 +179,8 @@ export interface CollabPromptDetails {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export type AgentEvent =
-	| { type: "agent_start" }
-	| { type: "agent_end" }
+	| { type: "agent_start"; runId: string }
+	| { type: "agent_end"; runId: string; isTerminal: boolean; messages: WireMessage[] }
 	| { type: "turn_start" }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: WireMessage }
@@ -221,9 +221,13 @@ export interface Participant {
 	readOnly?: boolean;
 }
 
+export type AgentLifecycleState = { runId: string; phase: "running" | "continuing" | "idle" } | null;
+
 /** Debounced footer snapshot broadcast by the host. */
 export interface SessionState {
 	isStreaming: boolean;
+	/** Authoritative loop ownership, independent of prompt setup/unwind. */
+	lifecycle: AgentLifecycleState;
 	queuedMessageCount: number;
 	sessionName?: string;
 	/** Host cwd — display only; the guest never chdirs. */
@@ -398,8 +402,10 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: every physical loop boundary carries host ownership; snapshots carry
+ *   the running or continuing loop. Older peers cannot reconcile these IDs.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

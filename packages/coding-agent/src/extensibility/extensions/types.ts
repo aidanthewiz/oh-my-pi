@@ -37,6 +37,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import type {
 	Api,
 	AssistantMessage,
@@ -493,6 +494,8 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/** Current loop ownership, evaluated when called, including its terminal settle. */
+	getLifecycleState(): AgentLifecycleState;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -1882,6 +1885,7 @@ export interface ExtensionActions {
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
+	getLifecycleState: () => AgentLifecycleState;
 	abort: () => void;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;

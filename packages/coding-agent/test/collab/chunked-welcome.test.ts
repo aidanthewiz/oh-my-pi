@@ -19,6 +19,7 @@ import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
@@ -70,7 +71,8 @@ function makeHostContext(snapshot: SizedSnapshot): InteractiveModeContext {
 			sessionName: "large",
 			model: undefined,
 			thinkingLevel: undefined,
-			subscribe: () => () => {},
+			lifecycleState: null,
+			subscribeLifecycle: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: () => Promise.resolve(),
 			abort: () => Promise.resolve(),
@@ -96,6 +98,10 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 			switchSession: () => Promise.reject(failure),
 		},
 		session: {
+			lifecycleState: null as AgentLifecycleState,
+			setMirroredLifecycleState(state: AgentLifecycleState) {
+				this.lifecycleState = state;
+			},
 			newSession: () => Promise.resolve(),
 			messages: [],
 		},
@@ -138,6 +144,10 @@ function makeCancelledSwitchGuestContext(
 			getCwd: () => process.cwd(),
 		},
 		session: {
+			lifecycleState: null as AgentLifecycleState,
+			setMirroredLifecycleState(state: AgentLifecycleState) {
+				this.lifecycleState = state;
+			},
 			switchSession,
 			newSession: () => Promise.resolve(),
 			messages: [],

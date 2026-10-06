@@ -119,8 +119,9 @@ describe("collab guest extension turn guard", () => {
 
 		const mirror = new GuestLifecycleEmitter();
 		const mirrorHostRun = async (): Promise<void> => {
-			mirror.emit(runner, { type: "agent_start" });
-			mirror.emit(runner, { type: "agent_end", messages: [], isTerminal: true });
+			const runId = Bun.randomUUIDv7();
+			mirror.emit(runner, { type: "agent_start", runId });
+			mirror.emit(runner, { type: "agent_end", runId, messages: [], isTerminal: true });
 			await handled.promise;
 			await mirror.drain();
 			// Every turn-starting action is admitted synchronously; wait for any

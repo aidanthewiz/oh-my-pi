@@ -20,6 +20,7 @@ const HEADER: SessionHeader = { type: "session", id: "s1", timestamp: "2026-06-1
 
 const STATE: SessionState = {
 	isStreaming: false,
+	lifecycle: null,
 	queuedMessageCount: 0,
 	cwd: "/work",
 	participants: [{ name: "host", role: "host" }],
@@ -52,7 +53,7 @@ function messageEntry(id: string, message: WireMessage): SessionEntry {
 	return { type: "message", id, parentId: null, timestamp: "2026-06-12T00:00:01Z", message };
 }
 
-function welcomeFrame(entryCount = 0, readOnly?: boolean): HostFrame {
+function welcomeFrame(entryCount = 0, readOnly?: boolean): Extract<HostFrame, { t: "welcome" }> {
 	return { t: "welcome", proto: COLLAB_PROTO, header: HEADER, state: STATE, agents: AGENTS, entryCount, readOnly };
 }
 
@@ -84,6 +85,21 @@ describe("GuestClient frame apply", () => {
 		expect(snap.working).toBe(false);
 		expect(snap.stream).toBeNull();
 		expect(snap.activeTools.size).toBe(0);
+	});
+
+	it("does not display retained terminal ownership as Working on join or resync", () => {
+		const client = new GuestClient(LINK, "tester");
+		const idleState: SessionState = { ...STATE, lifecycle: { runId: "completed-A", phase: "idle" } };
+		client.applyFrameForTest({ ...welcomeFrame(), state: idleState });
+		expect(client.getSnapshot().working).toBe(false);
+
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start", runId: "run-B" } });
+		expect(client.getSnapshot().working).toBe(true);
+		client.applyFrameForTest({
+			t: "state",
+			state: { ...STATE, lifecycle: { runId: "run-B", phase: "idle" } },
+		});
+		expect(client.getSnapshot().working).toBe(false);
 	});
 
 	it("welcome readOnly flag lands in the snapshot", () => {
@@ -250,9 +266,58 @@ describe("GuestClient frame apply", () => {
 
 	it("agent_start/agent_end and state reconcile the working flag", () => {
 		const client = liveClient();
-		client.applyFrameForTest({ t: "event", event: { type: "agent_start" } });
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start", runId: "run" } });
 		expect(client.getSnapshot().working).toBe(true);
 		client.applyFrameForTest({ t: "state", state: { ...STATE, isStreaming: false } });
+		expect(client.getSnapshot().working).toBe(false);
+	});
+	it("keeps working across physical continuation boundaries", () => {
+		const client = liveClient();
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start", runId: "first" } });
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "agent_end", runId: "first", isTerminal: false, messages: [] },
+		});
+		expect(client.getSnapshot().working).toBe(true);
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start", runId: "second" } });
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "agent_end", runId: "second", isTerminal: true, messages: [] },
+		});
+		expect(client.getSnapshot().working).toBe(false);
+	});
+	it("does not let a delayed completion clear a newer loop's working state", () => {
+		const client = liveClient();
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start", runId: "old" } });
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start", runId: "new" } });
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "agent_end", runId: "old", isTerminal: true, messages: [] },
+		});
+		expect(client.getSnapshot().working).toBe(true);
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "agent_end", runId: "new", isTerminal: true, messages: [] },
+		});
+		expect(client.getSnapshot().working).toBe(false);
+	});
+	it("uses snapshot ownership to settle a loop whose start was missed", () => {
+		const client = liveClient();
+		client.applyFrameForTest({
+			t: "state",
+			state: { ...STATE, lifecycle: { runId: "inferred", phase: "running" }, isStreaming: true },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "agent_end", runId: "inferred", isTerminal: false, messages: [] },
+		});
+		expect(client.getSnapshot().working).toBe(true);
+		client.applyFrameForTest({
+			t: "state",
+			state: { ...STATE, lifecycle: { runId: "inferred", phase: "continuing" } },
+		});
+		expect(client.getSnapshot().working).toBe(true);
+		client.applyFrameForTest({ t: "state", state: STATE });
 		expect(client.getSnapshot().working).toBe(false);
 	});
 	it("a state frame recovers a stuck-idle guest when agent_start was dropped", () => {

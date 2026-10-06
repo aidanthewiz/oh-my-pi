@@ -18,16 +18,12 @@
  * simply never sees those events (see `WIRE_AGENT_EVENT_TYPES` in
  * `collab/host.ts`).
  *
- * The `agent_end` shape mirrors the session's public-notification shape
- * (`#emitAgentEndNotification`): `messages` plus the continuation flag. The
- * session-layer `isTerminal` flag marks a non-final settle — `isTerminal:
- * false` means a continuation is already scheduled on the host and maps to
- * `willContinue: true`; older hosts omit the flag and such settles map without
- * one, matching the pre-flag notification.
+ * Physical loop completions carry the host's ownership and continuation
+ * decision independently of the public session completion stream.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentLifecycleState, AgentSessionEvent, AgentSessionLifecycleEvent } from "../../session/agent-session";
 import type { ExtensionRunner } from "./runner";
 import type {
 	AgentEndEvent,
@@ -254,31 +250,67 @@ export function extensionEventFromSessionEvent(
  */
 export class GuestLifecycleEmitter {
 	#turnIndex = 0;
-	#runId = "";
+	#runId: string | null = null;
+	#inferredRunId: string | null = null;
+	#openRuns = new Set<string>();
 	#chain: Promise<void> = Promise.resolve();
 	/** True until a terminal host settle, including scheduled continuations. */
 	#active = false;
 	#loopOpen = false;
 
-	get sawAgentStart(): boolean {
-		return this.#active;
+	reconcile(runner: ExtensionRunner, state: AgentLifecycleState, messages: AgentMessage[]): void {
+		for (const runId of this.#openRuns) {
+			if (runId !== state?.runId) {
+				this.emit(runner, {
+					type: "agent_end",
+					runId,
+					messages,
+					isTerminal: state === null || state.phase === "idle",
+				});
+			}
+		}
+		if (state && state.phase !== "idle") {
+			if (this.#runId !== state.runId || (state.phase === "running" && !this.#loopOpen)) {
+				this.emit(runner, { type: "agent_start", runId: state.runId });
+				this.#inferredRunId = state.runId;
+			}
+			if (state.phase === "continuing" && this.#loopOpen) {
+				this.emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: false });
+			}
+		} else if (state && (this.#active || this.#runId !== state.runId)) {
+			if (this.#runId !== state.runId) this.emit(runner, { type: "agent_start", runId: state.runId });
+			this.emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: true });
+		} else if (this.#active && this.#runId) {
+			this.emit(runner, { type: "agent_end", runId: this.#runId, messages, isTerminal: true });
+		}
 	}
 
-	emit(runner: ExtensionRunner, event: AgentSessionEvent): void {
+	emit(runner: ExtensionRunner, event: AgentSessionLifecycleEvent): void {
 		if (event.type === "agent_start") {
-			if (this.#loopOpen) return;
+			if (this.#inferredRunId === event.runId) {
+				this.#inferredRunId = null;
+				return;
+			}
 			this.#turnIndex = 0;
-			this.#runId = Bun.randomUUIDv7();
+			this.#runId = event.runId;
+			this.#inferredRunId = null;
 			this.#active = true;
 			this.#loopOpen = true;
+			this.#openRuns.add(event.runId);
 		} else if (event.type === "agent_end") {
-			this.#loopOpen = false;
-			this.#active = event.isTerminal === false;
+			if (this.#runId === null) this.emit(runner, { type: "agent_start", runId: event.runId });
+			this.#openRuns.delete(event.runId);
+			if (event.runId === this.#runId) {
+				this.#inferredRunId = null;
+				this.#loopOpen = false;
+				this.#active = !event.isTerminal;
+			}
 		}
 		const turnIndex = this.#turnIndex;
 		if (event.type === "turn_end") this.#turnIndex++;
 		if (event.type !== "agent_start" && !runner.hasHandlers(event.type)) return;
-		const mapped = extensionEventFromSessionEvent(event, turnIndex, this.#runId);
+		const runId = event.type === "agent_end" ? event.runId : (this.#runId ?? "");
+		const mapped = extensionEventFromSessionEvent(event, turnIndex, runId);
 		if (!mapped) return;
 		this.#chain = this.#chain
 			.then(() => runner.emit(mapped))
