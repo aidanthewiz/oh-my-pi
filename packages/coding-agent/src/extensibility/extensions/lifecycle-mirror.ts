@@ -235,7 +235,7 @@ export function extensionEventFromSessionEvent(
 }
 
 /**
- * Mirrors lifecycle-relevant collab guest events into an `ExtensionRunner`.
+ * Deduplicates guest lifecycle boundaries for UI and extension consumers.
  *
  * Owns the per-join turn index the session maintains for its own extension
  * events (`#turnIndex`): the wire's turn_start/turn_end carry no counter, so
@@ -243,7 +243,8 @@ export function extensionEventFromSessionEvent(
  * own (zero-based, reset on `agent_start`, incremented after each
  * `turn_end`).
  *
- * Emissions share one promise queue so handler completion order matches event
+ * UI consumers receive accepted boundaries synchronously.
+ * Extension emissions share one promise queue so handler completion order matches event
  * order even when a handler awaits. Delivery is never awaited
  * inline: a slow extension handler must not stall the guest's frame
  * application.
@@ -257,37 +258,52 @@ export class GuestLifecycleEmitter {
 	/** True until a terminal host settle, including scheduled continuations. */
 	#active = false;
 	#loopOpen = false;
+	readonly #onEvent?: (event: AgentSessionLifecycleEvent) => void;
 
-	reconcile(runner: ExtensionRunner, state: AgentLifecycleState, messages: AgentMessage[]): void {
+	constructor(onEvent?: (event: AgentSessionLifecycleEvent) => void) {
+		this.#onEvent = onEvent;
+	}
+
+	reconcile(runner: ExtensionRunner | undefined, state: AgentLifecycleState, messages: AgentMessage[]): void {
+		// A null owner abandons mirror tracking without proving host completion.
 		if (state === null || state.phase === "idle") {
 			for (const runId of this.#openRuns) {
 				if (runId !== state?.runId) {
-					this.emit(runner, {
-						type: "agent_end",
-						runId,
-						messages,
-						isTerminal: state === null && runId === this.#runId,
-					});
+					this.#emit(
+						runner,
+						{
+							type: "agent_end",
+							runId,
+							messages,
+							isTerminal: state === null && runId === this.#runId,
+						},
+						state !== null,
+					);
 				}
 			}
 		}
 		if (state && state.phase !== "idle") {
 			if (this.#runId !== state.runId || (state.phase === "running" && !this.#loopOpen)) {
-				this.emit(runner, { type: "agent_start", runId: state.runId });
+				this.#emit(runner, { type: "agent_start", runId: state.runId }, state.phase === "running");
 				this.#inferredRunId = state.runId;
 			}
 			if (state.phase === "continuing" && this.#loopOpen) {
-				this.emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: false });
+				this.#emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: false }, false);
 			}
 		} else if (state && (this.#active || this.#runId !== state.runId)) {
-			if (this.#runId !== state.runId) this.emit(runner, { type: "agent_start", runId: state.runId });
-			this.emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: true });
+			const render = this.#active;
+			if (this.#runId !== state.runId) this.#emit(runner, { type: "agent_start", runId: state.runId }, render);
+			this.#emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: true }, render);
 		} else if (this.#active && this.#runId) {
-			this.emit(runner, { type: "agent_end", runId: this.#runId, messages, isTerminal: true });
+			this.#emit(runner, { type: "agent_end", runId: this.#runId, messages, isTerminal: true }, false);
 		}
 	}
 
-	emit(runner: ExtensionRunner, event: AgentSessionLifecycleEvent): void {
+	emit(runner: ExtensionRunner | undefined, event: AgentSessionLifecycleEvent): void {
+		this.#emit(runner, event, true);
+	}
+
+	#emit(runner: ExtensionRunner | undefined, event: AgentSessionLifecycleEvent, render: boolean): void {
 		if (event.type === "agent_start") {
 			if (this.#inferredRunId === event.runId) {
 				this.#inferredRunId = null;
@@ -300,11 +316,11 @@ export class GuestLifecycleEmitter {
 			this.#loopOpen = true;
 			this.#openRuns.add(event.runId);
 		} else if (event.type === "agent_end") {
-			if (this.#runId === null) this.emit(runner, { type: "agent_start", runId: event.runId });
+			if (this.#runId === null) this.#emit(runner, { type: "agent_start", runId: event.runId }, render);
 			if (event.isTerminal && event.runId === this.#runId) {
 				for (const runId of this.#openRuns) {
 					if (runId !== event.runId)
-						this.emit(runner, { type: "agent_end", runId, messages: event.messages, isTerminal: false });
+						this.#emit(runner, { type: "agent_end", runId, messages: event.messages, isTerminal: false }, render);
 				}
 			}
 			const wasOpen = this.#openRuns.delete(event.runId);
@@ -315,9 +331,10 @@ export class GuestLifecycleEmitter {
 				this.#active = !event.isTerminal;
 			}
 		}
+		if (render) this.#onEvent?.(event);
 		const turnIndex = this.#turnIndex;
 		if (event.type === "turn_end") this.#turnIndex++;
-		if (event.type !== "agent_start" && !runner.hasHandlers(event.type)) return;
+		if (!runner || (event.type !== "agent_start" && !runner.hasHandlers(event.type))) return;
 		const runId = event.type === "agent_end" ? event.runId : (this.#runId ?? "");
 		const mapped = extensionEventFromSessionEvent(event, turnIndex, runId);
 		if (!mapped) return;

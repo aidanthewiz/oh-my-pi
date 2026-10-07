@@ -42,6 +42,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { cfgCompletionNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { settings as runtimeSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeTerminalTitleState, initTerminalTitleState } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
@@ -185,17 +188,7 @@ async function makeHarness(
 		renderInitialMessages: () => {},
 		reloadTodos: () => Promise.resolve(),
 		showStatus: () => {},
-		showError: (message: string) => {
-			// The guest prefixes host error frames ("Collab host: <message>");
-			// match the embedded sentinel.
-			for (const [sentinel, waiter] of errorWaiters) {
-				if (message.includes(sentinel)) {
-					errorWaiters.delete(sentinel);
-					waiter();
-					return;
-				}
-			}
-		},
+		showError: () => {},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
@@ -203,6 +196,17 @@ async function makeHarness(
 		syncComposerShape: () => {},
 		eventBus: new EventBus(),
 	}) as unknown as InteractiveModeContext;
+	const showError = ctx.showError.bind(ctx);
+	ctx.showError = message => {
+		for (const [sentinel, waiter] of errorWaiters) {
+			if (message.includes(sentinel)) {
+				errorWaiters.delete(sentinel);
+				waiter();
+				return;
+			}
+		}
+		showError(message);
+	};
 	if (options.guestSession) {
 		ctx.session = options.guestSession;
 		ctx.sessionManager = options.guestSession.sessionManager;
@@ -427,6 +431,7 @@ describe("collab guest extension lifecycle mirror", () => {
 		refreshDirsFromEnv();
 		resetSettingsForTest();
 		await Settings.init({ inMemory: true });
+		cfgCompletionNotify.set(runtimeSettings, "on");
 		const auth = await AuthStorage.create(":memory:");
 		const model = getBundledModel("openai", "gpt-5");
 		if (!model) throw new Error("Missing bundled test model");
@@ -479,6 +484,7 @@ describe("collab guest extension lifecycle mirror", () => {
 		};
 		const hostSession = makeSession("host-async-owner");
 		const guestSession = makeSession("guest-async-owner", runner);
+		const guestWithoutExtensions = makeSession("guest-without-extensions");
 		await initializeExtensions(guestSession, {
 			reportSendError: (_action, error) => {
 				throw error;
@@ -500,9 +506,12 @@ describe("collab guest extension lifecycle mirror", () => {
 		});
 		const controller = new EventController(guestContext);
 		const handleEvent = controller.handleEvent.bind(controller);
-		spyOn(controller, "handleEvent").mockImplementation(event =>
-			event.type === "agent_start" || event.type === "agent_end" ? handleEvent(event) : Promise.resolve(),
-		);
+		let renderedBoundary = Promise.resolve();
+		spyOn(controller, "handleEvent").mockImplementation(event => {
+			if (event.type !== "agent_start" && event.type !== "agent_end") return Promise.resolve();
+			renderedBoundary = handleEvent(event);
+			return renderedBoundary;
+		});
 		guestContext.eventController = controller;
 		const previousHeadless = setTerminalHeadless(false);
 		const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -517,6 +526,12 @@ describe("collab guest extension lifecycle mirror", () => {
 			return true;
 		});
 		initTerminalTitleState();
+		const notifications: Parameters<typeof TERMINAL.sendNotification>[0][] = [];
+		const completedNotification = Promise.withResolvers<void>();
+		const notificationSpy = spyOn(TERMINAL, "sendNotification").mockImplementation(notification => {
+			notifications.push(notification);
+			completedNotification.resolve();
+		});
 		const hostWork = Promise.withResolvers<string>();
 		const localWork = Promise.withResolvers<string>();
 		let harness: Harness | undefined;
@@ -528,17 +543,32 @@ describe("collab guest extension lifecycle mirror", () => {
 			});
 			await hostSession.prompt("Finish the foreground while the background job is held.");
 			const observed = await paused.promise;
+			if (!observed) throw new Error("Host pause lost lifecycle ownership");
 			expect(hostSession.hasPendingAsyncWork()).toBe(true);
 			expect(guestSession.hasPendingAsyncWork()).toBe(false);
 			expect(hostSession.lifecycleState?.phase).toBe("continuing");
-			expect(observed).toEqual(hostSession.lifecycleState);
+			expect(hostSession.lifecycleState).toEqual(observed);
 			expect(pane).toBe("working");
 			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
+			await renderedBoundary;
+			expect(notifications).toEqual([]);
 
 			await harness.guest.leave("exercise continuing snapshot");
 			harness.guest = new CollabGuestLink(guestContext);
 			await harness.guest.join(harness.link);
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
+			await renderedBoundary;
+			expect(notifications).toEqual([]);
+			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
+			jobs.acknowledgeDeliveries(["host-background"]);
+			jobs.cancel("host-background", { ownerId: "host-async-owner" });
+			hostWork.resolve("cancelled without wake");
+			await jobs.getJob("host-background")?.promise;
+			await hostSession.settleAsyncWork();
+			await completedNotification.promise;
+			expect(hostSession.lifecycleState).toEqual({ runId: observed.runId, phase: "idle" });
+			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
+			expect(notifications).toEqual([expect.objectContaining({ type: "completion" })]);
 
 			await harness.guest.leave("return to a local loop");
 			guestSession.setMirroredLifecycleState({ runId: "previous-host", phase: "continuing" });
@@ -557,6 +587,56 @@ describe("collab guest extension lifecycle mirror", () => {
 			await jobs.getJob("local-background")?.promise;
 			await guestSession.settleAsyncWork();
 			expect(guestSession.lifecycleState).toEqual({ runId: localState.runId, phase: "idle" });
+
+			await harness.cleanup();
+			guestContext.session = guestWithoutExtensions;
+			guestContext.sessionManager = guestWithoutExtensions.sessionManager;
+			harness = await makeHarness("notifications-without-extensions", {
+				guestSession: guestWithoutExtensions,
+				guestContext,
+			});
+			const sendState = (runId: string, phase: "continuing" | "idle"): void => {
+				harness?.hostSocket.send({ t: "state", state: { ...makeState(), lifecycle: { runId, phase } } });
+			};
+			sendState("already-idle", "idle");
+			await harness.barrier();
+			await renderedBoundary;
+			expect(notifications).toEqual([expect.objectContaining({ type: "completion" })]);
+
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "older" } });
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "current" } });
+			sendState("current", "continuing");
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "older", messages: [], isTerminal: true },
+			});
+			await harness.barrier();
+			await renderedBoundary;
+			expect(guestWithoutExtensions.lifecycleState).toEqual({ runId: "current", phase: "continuing" });
+			expect(notifications).toEqual([expect.objectContaining({ type: "completion" })]);
+
+			sendState("current", "idle");
+			await harness.barrier();
+			await renderedBoundary;
+			expect(notifications).toEqual([
+				expect.objectContaining({ type: "completion" }),
+				expect.objectContaining({ type: "completion" }),
+			]);
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "current", messages: [], isTerminal: true },
+			});
+			await harness.barrier();
+			await renderedBoundary;
+			expect(notifications).toHaveLength(2);
+
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "abandoned" } });
+			sendState("abandoned", "continuing");
+			await harness.barrier();
+			await renderedBoundary;
+			await harness.guest.leave("abandon host ownership");
+			await renderedBoundary;
+			expect(notifications).toHaveLength(2);
 		} finally {
 			jobs.acknowledgeDeliveries(["host-background", "local-background"]);
 			jobs.cancelAll();
@@ -564,12 +644,14 @@ describe("collab guest extension lifecycle mirror", () => {
 			localWork.resolve("cancelled");
 			await harness?.cleanup();
 			await guestSession.dispose();
+			await guestWithoutExtensions.dispose();
 			await hostSession.dispose();
 			auth.close();
 			bus.clear();
 			controller.dispose();
 			disposeTerminalTitleState();
 			stdoutSpy.mockRestore();
+			notificationSpy.mockRestore();
 			windowsTitle.restore();
 			if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
 			else Reflect.deleteProperty(process.stdout, "isTTY");

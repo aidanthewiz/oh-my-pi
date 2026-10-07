@@ -2183,6 +2183,8 @@ export class EventController {
 		// the loader and finalizes it at its own agent_end (isStreaming === false by
 		// then). Mirrors the collab guest's !isStreaming loader reconciler.
 		if (this.ctx.session.isStreaming) return;
+		if (this.ctx.collabGuest && (!("runId" in event) || event.runId !== this.ctx.session.lifecycleState?.runId))
+			return;
 		// A non-terminal settle (`isTerminal: false`) is a scheduling pause, not the
 		// end of the run: the agent's own continuation (reminder, retry, queued
 		// steer/follow-up, IRC wake) follows, or background work may re-wake it.
@@ -2202,7 +2204,7 @@ export class EventController {
 			// work instead of a terminal `agent_end` that may never come.
 			if (event.awaitingAsyncWork === true) {
 				setTerminalTitleState("idle");
-				void this.#finishWhenAsyncWorkDrains(event);
+				if (!this.ctx.collabGuest) void this.#finishWhenAsyncWorkDrains(event);
 			}
 			await this.ctx.flushPendingModelSwitch();
 			// Reaching here means the first guard passed, so `isStreaming` is already

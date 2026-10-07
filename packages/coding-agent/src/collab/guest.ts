@@ -217,8 +217,7 @@ export class CollabGuestLink {
 	#readOnly = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
-	/** Mirrors host lifecycle events into the local extension runner while joined. */
-	#lifecycleEmitter = new GuestLifecycleEmitter();
+	#lifecycleEmitter = new GuestLifecycleEmitter(event => this.#renderEvent(event));
 	state: CollabSessionState | null = null;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
 	readonly agentRegistry = new AgentRegistry();
@@ -673,6 +672,10 @@ export class CollabGuestLink {
 				session.setMirroredLifecycleState({ runId: event.runId, phase: event.isTerminal ? "idle" : "continuing" });
 			}
 		}
+		this.#lifecycleEmitter.emit(this.#ctx.session.extensionRunner, event);
+	}
+
+	#renderEvent(event: AgentSessionLifecycleEvent): void {
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
 		// carries the full accumulating message, so synthesize the missing start
@@ -689,15 +692,6 @@ export class CollabGuestLink {
 			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
 		}
 		void this.#ctx.eventController.handleEvent(event);
-		// Lifecycle mirror: the guest's own agent loop never runs, so the session's
-		// extension-event path stays silent. Route the mirrored wire event through
-		// the same mapping the session uses so extension-installed lifecycle
-		// integrations (Herdr pane state, RPC trackers, stats) observe host
-		// working/idle transitions while joined. Emissions chain (ordered but never
-		// awaited inline) so a slow extension handler neither stalls frame
-		// application nor completes out of order.
-		const runner = this.#ctx.session.extensionRunner;
-		if (runner) this.#lifecycleEmitter.emit(runner, event);
 	}
 
 	/** Reconcile missed physical boundaries using authoritative host ownership. */
@@ -706,8 +700,7 @@ export class CollabGuestLink {
 		this.#ctx.session.setMirroredLifecycleState(
 			state ?? (previous ? { runId: previous.runId, phase: "idle" } : null),
 		);
-		const runner = this.#ctx.session.extensionRunner;
-		if (runner) this.#lifecycleEmitter.reconcile(runner, state, [...this.#ctx.session.messages]);
+		this.#lifecycleEmitter.reconcile(this.#ctx.session.extensionRunner, state, [...this.#ctx.session.messages]);
 	}
 
 	/**
