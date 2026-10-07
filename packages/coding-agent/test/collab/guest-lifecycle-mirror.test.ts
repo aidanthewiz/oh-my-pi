@@ -91,6 +91,7 @@ async function makeHarness(
 		hostSession?: AgentSession;
 		guestSession?: AgentSession;
 		guestContext?: InteractiveModeContext;
+		beforeGuestJoin?: () => Promise<void>;
 	} = {},
 ): Promise<Harness> {
 	const roomKey = generateRoomKey();
@@ -244,6 +245,7 @@ async function makeHarness(
 			await host?.stop("test cleanup");
 		},
 	};
+	await options.beforeGuestJoin?.();
 	await guest.join(link);
 	return harness;
 }
@@ -467,8 +469,20 @@ describe("collab guest extension lifecycle mirror", () => {
 			runtime,
 		);
 		const runner = new ExtensionRunner([extension], runtime, home.path(), manager, registry, undefined, settings);
+		const foregroundStarted = Promise.withResolvers<void>();
+		const foregroundResponse = Promise.withResolvers<void>();
+		let hostModelCalls = 0;
 		const makeSession = (agentId: string, extensionRunner?: ExtensionRunner): AgentSession => {
-			const mock = createMockModel({ handler: () => ({ content: ["done"], stopReason: "stop" }) });
+			const mock = createMockModel({
+				handler: async () => {
+					if (agentId === "host-async-owner") {
+						hostModelCalls++;
+						foregroundStarted.resolve();
+						await foregroundResponse.promise;
+					}
+					return { content: ["done"], stopReason: "stop" };
+				},
+			});
 			return new AgentSession({
 				agent: new Agent({
 					getApiKey: () => "synthetic-key",
@@ -508,10 +522,11 @@ describe("collab guest extension lifecycle mirror", () => {
 		});
 		const controller = new EventController(guestContext);
 		const handleEvent = controller.handleEvent.bind(controller);
+		const modelWorking = Promise.withResolvers<void>();
 		let renderedBoundary = Promise.resolve();
 		spyOn(controller, "handleEvent").mockImplementation(event => {
-			if (event.type !== "agent_start" && event.type !== "agent_end") return Promise.resolve();
 			renderedBoundary = handleEvent(event);
+			if (event.type === "agent_start") void renderedBoundary.then(() => modelWorking.resolve());
 			return renderedBoundary;
 		});
 		guestContext.eventController = controller;
@@ -536,15 +551,71 @@ describe("collab guest extension lifecycle mirror", () => {
 		});
 		const hostWork = Promise.withResolvers<string>();
 		const localWork = Promise.withResolvers<string>();
+		const originalSend = CollabSocket.prototype.send;
+		let guestSocket: CollabSocket | undefined;
+		let hostSocket: CollabSocket | undefined;
+		let physicalPause: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> | undefined;
+		let dropPause = false;
+		const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(
+			function (this: CollabSocket, frame, peer) {
+				if (frame.t === "hello") guestSocket = this;
+				if (dropPause && frame.t === "event" && frame.event.type === "agent_end") {
+					physicalPause = frame.event;
+					hostSocket = this;
+					return;
+				}
+				if (dropPause && frame.t === "state" && frame.state.lifecycle?.phase === "continuing") return;
+				originalSend.call(this, frame, peer);
+			},
+		);
+		let snapshotApplied = Promise.withResolvers<void>();
+		const renderSpy = spyOn(guestContext, "renderInitialMessages").mockImplementation(async () => {
+			snapshotApplied.resolve();
+		});
+		const latePauseApplied = Promise.withResolvers<void>();
+		const showError = guestContext.showError.bind(guestContext);
+		const errorSpy = spyOn(guestContext, "showError").mockImplementation(message => {
+			if (message.includes("__late_pause_applied__")) latePauseApplied.resolve();
+			else showError(message);
+		});
 		let harness: Harness | undefined;
+		let prompting: Promise<boolean> | undefined;
 		try {
-			harness = await makeHarness("host-async-authority", { hostSession, guestSession, guestContext });
 			jobs.register("bash", "held host background work", () => hostWork.promise, {
 				id: "host-background",
 				ownerId: "host-async-owner",
 			});
-			await hostSession.prompt("Finish the foreground while the background job is held.");
+			harness = await makeHarness("host-async-authority", {
+				hostSession,
+				guestSession,
+				guestContext,
+				beforeGuestJoin: async () => {
+					prompting = hostSession.prompt("Finish the foreground while the background job is held.");
+					await foregroundStarted.promise;
+				},
+			});
+			if (!prompting) throw new Error("Host foreground did not start before guest join");
+			await modelWorking.promise;
+			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π [⠁-⣿:]/);
+			if (!guestSocket?.onOpen) throw new Error("Missing guest reconnect handshake");
+			snapshotApplied = Promise.withResolvers<void>();
+			guestSocket.onOpen();
+			await snapshotApplied.promise;
+			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
+			expect(guestSession.lifecycleState?.phase).toBe("running");
+			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π [⠁-⣿:]/);
+			dropPause = true;
+			foregroundResponse.resolve();
+			await prompting;
+			expect(hostSession.lifecycleState).toMatchObject({ phase: "continuing", awaitingAsyncWork: true });
+			expect(guestSession.lifecycleState?.phase).toBe("running");
+			expect(notifications).toEqual([]);
+			dropPause = false;
+			snapshotApplied = Promise.withResolvers<void>();
+			guestSocket.onOpen();
 			const observed = await paused.promise;
+			await snapshotApplied.promise;
+			await renderedBoundary;
 			if (!observed) throw new Error("Host pause lost lifecycle ownership");
 			expect(hostSession.hasPendingAsyncWork()).toBe(true);
 			expect(guestSession.hasPendingAsyncWork()).toBe(false);
@@ -555,13 +626,24 @@ describe("collab guest extension lifecycle mirror", () => {
 			await renderedBoundary;
 			expect(notifications).toEqual([]);
 
-			await harness.guest.leave("exercise continuing snapshot");
-			harness.guest = new CollabGuestLink(guestContext);
-			await harness.guest.join(harness.link);
+			snapshotApplied = Promise.withResolvers<void>();
+			guestSocket.onOpen();
+			await snapshotApplied.promise;
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
 			await renderedBoundary;
 			expect(notifications).toEqual([]);
 			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
+			if (!physicalPause || !hostSocket) throw new Error("Missing intercepted physical async pause");
+			expect(physicalPause.awaitingAsyncWork).toBe(true);
+			originalSend.call(hostSocket, { t: "event", event: physicalPause });
+			originalSend.call(hostSocket, { t: "event", event: physicalPause });
+			originalSend.call(hostSocket, { t: "error", message: "__late_pause_applied__" });
+			await latePauseApplied.promise;
+			await renderedBoundary;
+			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
+			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
+			expect(notifications).toEqual([]);
+			expect(hostModelCalls).toBe(1);
 			jobs.acknowledgeDeliveries(["host-background"]);
 			jobs.cancel("host-background", { ownerId: "host-async-owner" });
 			hostWork.resolve("cancelled without wake");
@@ -622,6 +704,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await renderedBoundary;
 			expect(guestWithoutExtensions.lifecycleState).toEqual({ runId: "current", phase: "continuing" });
 			expect(notifications).toEqual([expect.objectContaining({ type: "completion" })]);
+			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π [⠁-⣿:]/);
 
 			sendState("current", "idle");
 			await harness.barrier();
@@ -646,6 +729,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await renderedBoundary;
 			expect(notifications).toHaveLength(2);
 		} finally {
+			foregroundResponse.resolve();
 			jobs.acknowledgeDeliveries(["host-background", "local-background"]);
 			jobs.cancelAll();
 			hostWork.resolve("cancelled");
@@ -657,6 +741,9 @@ describe("collab guest extension lifecycle mirror", () => {
 			auth.close();
 			bus.clear();
 			controller.dispose();
+			sendSpy.mockRestore();
+			renderSpy.mockRestore();
+			errorSpy.mockRestore();
 			disposeTerminalTitleState();
 			stdoutSpy.mockRestore();
 			notificationSpy.mockRestore();
@@ -671,7 +758,7 @@ describe("collab guest extension lifecycle mirror", () => {
 		}
 	});
 
-	it.each(["error", "success", "aborted", "unknown"] as const)(
+	it.each(["error", "retry-error", "success", "aborted", "unknown"] as const)(
 		"recovers a real host %s outcome once through the notification controller",
 		async outcome => {
 			const home = TempDir.createSync("@pi-guest-outcome-");
@@ -689,14 +776,16 @@ describe("collab guest extension lifecycle mirror", () => {
 			const registry = new ModelRegistry(auth, undefined, { ignoreLocalModelConfig: true });
 			const settings = Settings.isolated({
 				"compaction.enabled": false,
-				"retry.enabled": false,
+				"retry.enabled": outcome === "retry-error",
 				"retry.modelFallback": false,
+				"retry.baseDelayMs": 0,
+				"retry.maxRetries": 1,
 				"todo.enabled": false,
 				"todo.reminders": false,
 			});
 			settings.setModelRole("default", `${model.provider}/${model.id}`);
 			const response: MockResponse =
-				outcome === "error"
+				outcome === "error" || outcome === "retry-error"
 					? {
 							stopReason: "error",
 							stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
@@ -705,7 +794,18 @@ describe("collab guest extension lifecycle mirror", () => {
 					: outcome === "aborted"
 						? { stopReason: "aborted" }
 						: { content: ["Completed offline"], stopReason: "stop" };
-			const mock = createMockModel({ responses: [response] });
+			const retryResponse = Promise.withResolvers<void>();
+			let modelCalls = 0;
+			const mock = createMockModel({
+				handler: async () => {
+					modelCalls++;
+					if (outcome === "retry-error" && modelCalls === 1) {
+						return { throw: "503 service unavailable: overloaded_error" };
+					}
+					if (outcome === "retry-error") await retryResponse.promise;
+					return response;
+				},
+			});
 			const hostSession = new AgentSession({
 				agent: new Agent({
 					getApiKey: () => "synthetic-key",
@@ -736,10 +836,13 @@ describe("collab guest extension lifecycle mirror", () => {
 			const controller = new EventController(guestContext);
 			guestContext.eventController = controller;
 			const recovered = Promise.withResolvers<void>();
+			const retryStarted = Promise.withResolvers<void>();
+			const renderedEvents: string[] = [];
 			const handleEvent = controller.handleEvent.bind(controller);
 			const controllerSpy = spyOn(controller, "handleEvent").mockImplementation(async event => {
-				if (event.type !== "agent_start" && event.type !== "agent_end") return;
+				renderedEvents.push(event.type);
 				await handleEvent(event);
+				if (event.type === "auto_retry_start") retryStarted.resolve();
 				if (event.type === "agent_end" && event.isTerminal) recovered.resolve();
 			});
 			const notifications: Parameters<typeof TERMINAL.sendNotification>[0][] = [];
@@ -753,8 +856,22 @@ describe("collab guest extension lifecycle mirror", () => {
 			const originalSend = CollabSocket.prototype.send;
 			let physical: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> | undefined;
 			let hostSocket: CollabSocket | undefined;
+			let guestSocket: CollabSocket | undefined;
+			let disconnected = false;
 			const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(
 				function (this: CollabSocket, frame, peer) {
+					if (frame.t === "hello") guestSocket = this;
+					if (
+						outcome === "retry-error" &&
+						((frame.t === "event" && frame.event.type === "auto_retry_end") ||
+							(disconnected && (frame.t === "event" || frame.t === "state" || frame.t === "entry")))
+					) {
+						if (frame.t === "event" && frame.event.type === "agent_end") {
+							physical = frame.event;
+							hostSocket = this;
+						}
+						return;
+					}
 					if (frame.t === "event" && frame.event.type === "agent_end") {
 						physical = frame.event;
 						hostSocket = this;
@@ -771,19 +888,34 @@ describe("collab guest extension lifecycle mirror", () => {
 			let harness: Harness | undefined;
 			try {
 				harness = await makeHarness(`real-outcome-${outcome}`, { hostSession, guestSession, guestContext });
-				await hostSession.prompt("Complete one offline turn.");
+				const prompting = hostSession.prompt("Complete one offline turn.");
+				if (outcome === "retry-error") {
+					await retryStarted.promise;
+					expect(notifications).toEqual([]);
+					disconnected = true;
+					retryResponse.resolve();
+				}
+				await prompting;
 				await hostSession.waitForIdle();
+				if (outcome === "retry-error") {
+					expect(hostSession.lifecycleState?.phase).toBe("idle");
+					expect(notifications).toEqual([]);
+					disconnected = false;
+					if (!guestSocket?.onOpen) throw new Error("Missing guest reconnect handshake");
+					guestSocket.onOpen();
+				}
 				await recovered.promise;
 				if (!physical || !hostSocket) throw new Error("Missing intercepted physical completion");
-				if (outcome === "error") {
+				if (outcome === "error" || outcome === "retry-error") {
 					expect(physical.messages.findLast(message => message.role === "assistant")).toMatchObject({
 						stopReason: "error",
 						stopDetails: { type: "refusal" },
 					});
-					expect(hostSession.sessionManager.buildSessionContext().messages.map(message => message.role)).toEqual([
-						"user",
-					]);
-					expect(guestSession.messages.some(message => message.role === "assistant")).toBe(false);
+					expect(
+						guestSession.messages.some(
+							message => message.role === "assistant" && message.stopDetails?.type === "refusal",
+						),
+					).toBe(false);
 				}
 				if (outcome === "unknown") {
 					expect(guestSession.messages.findLast(message => message.role === "assistant")).toMatchObject({
@@ -791,16 +923,22 @@ describe("collab guest extension lifecycle mirror", () => {
 					});
 				}
 				const expected =
-					outcome === "error"
+					outcome === "error" || outcome === "retry-error"
 						? [expect.objectContaining({ type: "error" })]
 						: outcome === "success"
 							? [expect.objectContaining({ type: "completion" })]
 							: [];
 				expect(notifications).toEqual(expected);
+				if (outcome === "retry-error") {
+					expect(modelCalls).toBe(2);
+					expect(renderedEvents.filter(type => type === "auto_retry_start")).toHaveLength(1);
+					expect(renderedEvents).not.toContain("auto_retry_end");
+					expect(guestContext.retryLoader).toBeUndefined();
+				}
 				expect(guestSession.lifecycleState).toEqual(
 					outcome === "unknown"
 						? { runId: physical.runId, phase: "idle" }
-						: { runId: physical.runId, phase: "idle", outcome },
+						: { runId: physical.runId, phase: "idle", outcome: outcome === "retry-error" ? "error" : outcome },
 				);
 				originalSend.call(hostSocket, { t: "event", event: physical });
 				originalSend.call(hostSocket, { t: "event", event: physical });
@@ -809,6 +947,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				expect(notifications).toEqual(expected);
 				expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
 			} finally {
+				retryResponse.resolve();
 				await harness?.cleanup();
 				await guestSession.dispose();
 				await hostSession.dispose();

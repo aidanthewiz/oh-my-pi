@@ -6,7 +6,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -210,6 +210,91 @@ describe("EventController — notifications through the real turn-end path (#han
 });
 
 describe("EventController — error toast gated while auto-retry is pending", () => {
+	it.each(["local-idle", "continuing", "stale-owner", "streaming"] as const)(
+		"preserves pending retry suppression at a %s boundary",
+		async boundary => {
+			const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			cfgErrorNotify.override(settings, "on");
+			cfgCompletionNotify.override(settings, "on");
+			let streaming = boundary === "streaming";
+			const ctx = createInteractiveModeContext({
+				session: {
+					lifecycleState: {
+						runId: "current",
+						phase: boundary === "continuing" ? "continuing" : "idle",
+						outcome: "error",
+					},
+					get isStreaming() {
+						return streaming;
+					},
+				},
+			});
+			if (boundary !== "local-idle") ctx.collabGuest = {} as NonNullable<typeof ctx.collabGuest>;
+			const controller = new EventController(ctx);
+			try {
+				await controller.handleEvent({
+					type: "auto_retry_start",
+					attempt: 1,
+					maxAttempts: 3,
+					delayMs: 0,
+					errorMessage: "overloaded",
+				});
+				const end: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> = {
+					...makeAgentEndEvent([makeAssistantMessage("error")]),
+					runId: boundary === "stale-owner" ? "older" : "current",
+					isTerminal: boundary !== "continuing",
+					outcome: "error",
+				};
+				await controller.handleEvent(end);
+				expect(spy).not.toHaveBeenCalled();
+				streaming = false;
+				ctx.collabGuest = undefined;
+				await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+				expect(spy).not.toHaveBeenCalled();
+			} finally {
+				controller.dispose();
+			}
+		},
+	);
+
+	it("settles retry suppression and its loader only at accepted matching-host terminal idle", async () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgErrorNotify.override(settings, "on");
+		cfgCompletionNotify.override(settings, "on");
+		const ctx = createInteractiveModeContext({
+			session: { lifecycleState: { runId: "current", phase: "idle", outcome: "error" } },
+		});
+		ctx.collabGuest = {} as NonNullable<typeof ctx.collabGuest>;
+		const controller = new EventController(ctx);
+		try {
+			await controller.handleEvent({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 0,
+				errorMessage: "overloaded",
+			});
+			const loader = ctx.retryLoader;
+			if (!loader) throw new Error("Retry loader was not created");
+			const end: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> = {
+				type: "agent_end",
+				runId: "current",
+				messages: [],
+				isTerminal: true,
+				outcome: "error",
+			};
+			await controller.handleEvent(end);
+			expect(ctx.retryLoader).toBeUndefined();
+			expect(
+				spy.mock.calls.map(([notification]) =>
+					typeof notification === "string" ? notification : notification.type,
+				),
+			).toEqual(["error"]);
+		} finally {
+			controller.dispose();
+		}
+	});
+
 	it("keeps retry suppression when the next attempt starts before a deferred failed agent_end settles", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		cfgErrorNotify.override(settings, "on");

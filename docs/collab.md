@@ -215,13 +215,16 @@ Running snapshots do not invent older completions. Terminal snapshot recovery ig
 Periodic state updates follow authoritative streaming and lifecycle activity. They stop at idle, even when the last `runId` remains available.
 
 Guests retain host `continuing` ownership during background work, even when their local job queue is empty.
-Their model title stays idle during an async pause and after reconnect.
+Lifecycle snapshots retain `awaitingAsyncWork: true` for async-only pauses.
+Guests use it to recover the idle model title after missing a physical pause.
 Completion notifications require the host's terminal boundary or retained-idle snapshot.
 Snapshot recovery and later physical delivery produce one completion.
 Leaving or losing host ownership does not announce host completion.
 Protocol v5 carries the owner-bound loop outcome in physical completions and lifecycle snapshots.
 Recovery uses that outcome instead of the persisted transcript, which can exclude provider refusals.
 An absent outcome is unknown; it cannot authorize a success notification.
+An accepted matching-owner idle snapshot clears retry suppression left by a missed `auto_retry_end`.
+Local retries and continuing owners keep suppression.
 
 Guest→host: `hello`, `prompt`, `abort`, `agent-cmd` (hub chat/kill/revive), `fetch-transcript` (incremental subagent-transcript reads answered by targeted `transcript` frames), and `ui-response`. The replica loads through the regular `/resume` machinery, so theming, ctrl+o, and transcript behavior are native by construction; the guest process never chdirs to host paths.
 

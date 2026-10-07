@@ -673,6 +673,7 @@ export class CollabGuestLink {
 					runId: event.runId,
 					phase: event.isTerminal ? "idle" : "continuing",
 					outcome: event.outcome,
+					...(event.isTerminal === false && event.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
 				});
 			}
 		}
@@ -701,7 +702,9 @@ export class CollabGuestLink {
 	/** Reconcile missed physical boundaries using authoritative host ownership. */
 	#reconcileLifecycle(state: AgentLifecycleState): void {
 		const previous = this.#ctx.session.lifecycleState;
-		this.#ctx.session.setMirroredLifecycleState(state ?? (previous ? { ...previous, phase: "idle" } : null));
+		this.#ctx.session.setMirroredLifecycleState(
+			state ?? (previous ? { runId: previous.runId, phase: "idle", outcome: previous.outcome } : null),
+		);
 		this.#lifecycleEmitter.reconcile(this.#ctx.session.extensionRunner, state, [...this.#ctx.session.messages]);
 	}
 

@@ -217,14 +217,8 @@ export class EventController {
 	#restorePinnedErrorInline = true;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
-	// Set when `auto_retry_start` fires and cleared by `auto_retry_end` (both
-	// outcomes) — true for exactly the window a retry is outstanding. Gates
-	// `sendErrorNotification`: the wire-level `agent_end` for a retryable
-	// failure is coalesced with every other attempt in the same saga while the
-	// prompt is in flight (see `AgentSession#emitSessionEvent`), so the single
-	// `agent_end` that survives to reach this controller can be either a
-	// mid-retry blip or the final settle — only the retry lifecycle events
-	// (never deferred) can tell them apart.
+	// Retry events own local suppression. A guest can miss auto_retry_end while
+	// disconnected; accepted matching-host idle also settles its retry window.
 	#retryPending = false;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
@@ -2215,6 +2209,14 @@ export class EventController {
 			this.ctx.flushPendingCommandOutput();
 			return;
 		}
+		if (this.ctx.collabGuest && event.isTerminal === true && this.ctx.session.lifecycleState?.phase === "idle") {
+			this.#retryPending = false;
+			if (this.ctx.retryLoader) {
+				this.ctx.retryLoader.stop();
+				this.ctx.retryLoader = undefined;
+				this.ctx.statusContainer.disposeChildren();
+			}
+		}
 		setTerminalTitleState("idle");
 
 		await this.#finishAgentEnd(event);
@@ -2748,16 +2750,8 @@ export class EventController {
 		// dispatching the deferred event; do not infer it from mutable job state.
 		if (event.isTerminal === false) return;
 
-		// `AgentSession` defers and coalesces the wire-level `agent_end` while a
-		// prompt is still in flight (see `#emitSessionEvent` in agent-session.ts):
-		// every mid-retry attempt's own settle is superseded, so this method often
-		// sees only ONE `agent_end` for an entire multi-attempt retry saga — which
-		// can be the final failure, not an intermediate one. Gate purely on the
-		// retry lifecycle (`auto_retry_start`/`auto_retry_end`, which are never
-		// deferred) rather than consuming this flag against whichever `agent_end`
-		// happens to arrive first: `#retryPending` is true only for the actual
-		// window a retry is outstanding, so the settled failure that survives
-		// coalescing is never mistaken for a mid-retry blip.
+		// Coalesced local agent_end does not prove retry settlement. Retry events
+		// settle local suppression; accepted host idle settles guest suppression.
 		if (this.#retryPending) return;
 
 		// Warp structured OSC 777 already drives native completion UX when the

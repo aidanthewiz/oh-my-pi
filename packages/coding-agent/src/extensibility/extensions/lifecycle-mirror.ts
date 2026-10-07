@@ -291,8 +291,16 @@ export class GuestLifecycleEmitter {
 			if (state.phase === "continuing" && this.#loopOpen) {
 				this.#emit(
 					runner,
-					{ type: "agent_end", runId: state.runId, messages, isTerminal: false, outcome: state.outcome },
-					false,
+					{
+						type: "agent_end",
+						runId: state.runId,
+						messages,
+						isTerminal: false,
+						outcome: state.outcome,
+						yielded: state.awaitingAsyncWork === true,
+						...(state.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
+					},
+					state.awaitingAsyncWork === true,
 				);
 			}
 		} else if (state && (this.#active || this.#runId !== state.runId)) {

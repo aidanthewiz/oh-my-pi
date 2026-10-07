@@ -4816,7 +4816,12 @@ export class AgentSession implements SettingsScope {
 		)?.stopReason;
 		const outcome = stopReason === "error" || stopReason === "aborted" ? stopReason : "success";
 		if (this.#lifecycleState?.runId === runId) {
-			this.#lifecycleState = { runId, phase: options?.willContinue ? "continuing" : "idle", outcome };
+			this.#lifecycleState = {
+				runId,
+				phase: options?.willContinue ? "continuing" : "idle",
+				outcome,
+				...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
+			};
 		}
 		this.#notifyEventListeners(this.#lifecycleListeners, {
 			...event,
@@ -4971,7 +4976,7 @@ export class AgentSession implements SettingsScope {
 			!this.#queuedMessageDrainScheduled &&
 			!this.hasPendingAsyncWork()
 		) {
-			return { ...this.#lifecycleState, phase: "idle" };
+			return { runId: this.#lifecycleState.runId, phase: "idle", outcome: this.#lifecycleState.outcome };
 		}
 		return this.#lifecycleState ? { ...this.#lifecycleState } : null;
 	}

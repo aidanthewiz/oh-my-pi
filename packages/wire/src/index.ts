@@ -233,6 +233,8 @@ export type AgentLifecycleState = {
 	runId: string;
 	phase: "running" | "continuing" | "idle";
 	outcome?: AgentLifecycleOutcome;
+	/** The owner physically settled into an async-only pause. */
+	awaitingAsyncWork?: boolean;
 } | null;
 
 /** Debounced footer snapshot broadcast by the host. */
