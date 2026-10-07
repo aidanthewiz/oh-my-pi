@@ -10,6 +10,7 @@
 - Collaboration guest lifecycle reads retain host authority during background work and after reconnecting.
 - Physical lifecycle completions preserve async-wait metadata so terminal guests clear working titles without requiring another turn.
 - Collaboration guests wait for host completion before notifying. Snapshot recovery delivers one completion without reactivating working titles after reconnect.
+- Collaboration snapshot recovery preserves host outcomes, so pruned provider refusals report errors instead of success. Unknown recovered outcomes never announce success.
 - Fixed `grep` and `read` path lists losing URL query or path semicolons. Preserve internal URL targets, per-target selectors, and literal filenames.
 - Fixed standalone SQLite queries and local image questions being split at semicolons before URL-looking text. Preserve query suffixes before detecting path-list targets.
 - Fixed extensionless files with line selectors in comma or whitespace lists being claimed as opaque resource URLs.

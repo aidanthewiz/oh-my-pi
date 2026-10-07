@@ -180,7 +180,13 @@ export interface CollabPromptDetails {
 
 export type AgentEvent =
 	| { type: "agent_start"; runId: string }
-	| { type: "agent_end"; runId: string; isTerminal: boolean; messages: WireMessage[] }
+	| {
+			type: "agent_end";
+			runId: string;
+			isTerminal: boolean;
+			messages: WireMessage[];
+			outcome?: AgentLifecycleOutcome;
+	  }
 	| { type: "turn_start" }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: WireMessage }
@@ -221,7 +227,13 @@ export interface Participant {
 	readOnly?: boolean;
 }
 
-export type AgentLifecycleState = { runId: string; phase: "running" | "continuing" | "idle" } | null;
+export type AgentLifecycleOutcome = "success" | "error" | "aborted" | "unknown";
+
+export type AgentLifecycleState = {
+	runId: string;
+	phase: "running" | "continuing" | "idle";
+	outcome?: AgentLifecycleOutcome;
+} | null;
 
 /** Debounced footer snapshot broadcast by the host. */
 export interface SessionState {
@@ -404,8 +416,10 @@ export type WireFrame = GuestFrame | HostFrame;
  *   host), so they must be rejected at hello.
  * - `4`: every physical loop boundary carries host ownership; snapshots carry
  *   the running or continuing loop. Older peers cannot reconcile these IDs.
+ * - `5`: loop ends and retained lifecycle state carry owner-bound outcomes.
+ *   Older guests could mistake recovered refusals for successful completion.
  */
-export const COLLAB_PROTO = 4;
+export const COLLAB_PROTO = 5;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

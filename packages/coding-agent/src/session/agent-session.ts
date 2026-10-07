@@ -4811,18 +4811,24 @@ export class AgentSession implements SettingsScope {
 		// which `#flushPendingAgentEnd` re-tags non-terminal.
 		const awaitingAsyncWork = options?.willContinue === true && options.awaitingAsyncWork === true;
 		const runId = this.#lifecycleRunIds.get(event)!;
+		const stopReason = event.messages.findLast(
+			(message): message is AssistantMessage => message.role === "assistant",
+		)?.stopReason;
+		const outcome = stopReason === "error" || stopReason === "aborted" ? stopReason : "success";
 		if (this.#lifecycleState?.runId === runId) {
-			this.#lifecycleState = { runId, phase: options?.willContinue ? "continuing" : "idle" };
+			this.#lifecycleState = { runId, phase: options?.willContinue ? "continuing" : "idle", outcome };
 		}
 		this.#notifyEventListeners(this.#lifecycleListeners, {
 			...event,
 			runId,
+			outcome,
 			isTerminal: !options?.willContinue,
 			yielded: !options?.willContinue || awaitingAsyncWork,
 			...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
 		});
 		await this.#emitSessionEvent({
 			...event,
+			outcome,
 			isTerminal: !options?.willContinue,
 			yielded: !options?.willContinue || awaitingAsyncWork,
 			...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
@@ -4965,7 +4971,7 @@ export class AgentSession implements SettingsScope {
 			!this.#queuedMessageDrainScheduled &&
 			!this.hasPendingAsyncWork()
 		) {
-			return { runId: this.#lifecycleState.runId, phase: "idle" };
+			return { ...this.#lifecycleState, phase: "idle" };
 		}
 		return this.#lifecycleState ? { ...this.#lifecycleState } : null;
 	}

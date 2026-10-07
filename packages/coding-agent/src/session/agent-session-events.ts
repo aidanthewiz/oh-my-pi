@@ -1,7 +1,7 @@
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
-import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
+import type { AgentLifecycleOutcome, AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import type { Rule } from "../capability/rule";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
@@ -15,6 +15,8 @@ import type { CacheWarmingRefreshEnd, CacheWarmingRefreshStart } from "./cache-w
 export type AgentSessionEvent =
 	| Exclude<AgentEvent, { type: "agent_end" }>
 	| (Extract<AgentEvent, { type: "agent_end" }> & {
+			/** Outcome of this physical loop, independent of persisted transcript messages. */
+			outcome?: AgentLifecycleOutcome;
 			/** False when an async delivery will resume the session before its true final settle. */
 			isTerminal?: boolean;
 			/**
@@ -98,4 +100,4 @@ export type AgentSessionLifecycleEvent =
 	| (Extract<AgentSessionEvent, { type: "agent_end" }> & { runId: string; isTerminal: boolean });
 
 export type AgentSessionLifecycleListener = (event: AgentSessionLifecycleEvent) => void;
-export type { AgentLifecycleState };
+export type { AgentLifecycleOutcome, AgentLifecycleState };

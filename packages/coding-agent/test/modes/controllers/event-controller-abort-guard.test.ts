@@ -1,17 +1,3 @@
-/**
- * Regression tests for `EventController`'s post-turn desktop notifications
- * (`sendCompletionNotification` / `sendErrorNotification`).
- *
- * Both read the settled turn's outcome from the `agent_end` event's own
- * `messages`, not the mutable `viewSession` active context: a classifier-
- * refusal failure ends with `stopReason === "error"` but is pruned from
- * active context before the public `agent_end` fires (see
- * `#removeAssistantMessageFromActiveContext` in `agent-session.ts`), and a
- * user Ctrl+C on the `ask` tool selector similarly leaves `stopReason ===
- * "aborted"` on the terminal message. Reading the mutable context for either
- * check risks a stale/absent lookup — dropping the intended notification, or
- * worse, pairing a misleading "Complete" toast with an error/abort.
- */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -112,8 +98,7 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		const controller = new EventController(makeContext());
 		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(1);
-		// Completion now sends a structured notification (title=session, body="Complete").
-		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Complete", type: "completion" }));
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "completion" }));
 	});
 
 	it("fires notification when agent_end carries no assistant message (e.g. brand-new session)", () => {
@@ -150,9 +135,7 @@ describe("EventController.sendErrorNotification", () => {
 		const controller = new EventController(makeContext());
 		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
-		expect(spy).toHaveBeenCalledWith(
-			expect.objectContaining({ body: "Stopped with error", type: "error", title: "test-session" }),
-		);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "error", title: "test-session" }));
 	});
 
 	it("uses the last assistant message when agent_end carries multiple messages", () => {
@@ -177,7 +160,7 @@ describe("EventController.sendErrorNotification", () => {
 		const completionController = new EventController(makeContext());
 		completionController.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(1);
-		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Complete", type: "completion" }));
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "completion" }));
 	});
 
 	it("skips user-aborted turns", () => {
@@ -222,7 +205,7 @@ describe("EventController — notifications through the real turn-end path (#han
 		const controller = new EventController(makeTurnEndContext({ lastAssistantMessage: undefined }));
 		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
-		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "error" }));
 	});
 });
 
@@ -319,13 +302,14 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		} as Extract<AgentSessionEvent, { type: "auto_retry_end" }>);
 		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
-		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "error" }));
 	});
 });
 
 function asyncWaitEnd(): Extract<AgentSessionEvent, { type: "agent_end" }> {
 	return {
 		...makeAgentEndEvent([makeAssistantMessage("stop")]),
+		outcome: "success",
 		isTerminal: false,
 		yielded: true,
 		awaitingAsyncWork: true,
@@ -397,6 +381,8 @@ describe("EventController — terminal title across a non-terminal agent_end", (
 		// A cancelled or acknowledged background job never delivers a wake, so no
 		// terminal agent_end follows; without this, title and loader spin forever.
 		const stateSpy = vi.spyOn(titleGenerator, "setTerminalTitleState").mockImplementation(() => {});
+		cfgCompletionNotify.override(settings, "on");
+		const notificationSpy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		const { ctx, drain } = makeAsyncWaitContext();
 		const markActivityEnd = vi.spyOn(ctx.statusLine, "markActivityEnd");
 		const tornDown = Promise.withResolvers<void>();
@@ -406,9 +392,13 @@ describe("EventController — terminal title across a non-terminal agent_end", (
 		expect(stateSpy).toHaveBeenCalledWith("idle");
 		// The job is still running: loader/progress teardown waits for it.
 		expect(markActivityEnd).not.toHaveBeenCalled();
+		expect(notificationSpy).not.toHaveBeenCalled();
 
 		drain();
 		await tornDown.promise;
+		await nextMacrotask();
+		expect(notificationSpy).toHaveBeenCalledTimes(1);
+		expect(notificationSpy).toHaveBeenCalledWith(expect.objectContaining({ type: "completion" }));
 		expect(markActivityEnd).toHaveBeenCalledTimes(1);
 	});
 

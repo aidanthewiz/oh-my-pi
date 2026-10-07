@@ -685,6 +685,8 @@ export type CacheWarmingOutcome = "hit" | "miss" | "error" | "aborted";
 
 export type NotifyType = "info" | "warning" | "error";
 
+export type AgentLifecycleOutcome = "success" | "error" | "aborted" | "unknown";
+
 export interface AgentStartEvent {
 	type: "agent_start";
 }
@@ -695,6 +697,8 @@ export interface AgentEndEvent {
 	messages: AgentMessage[];
 	/** Original message count when the frame was compacted. */
 	messageCount?: number;
+	/** This loop's outcome, independent of persisted transcript messages. */
+	outcome?: AgentLifecycleOutcome;
 	/** False when a continuation or async delivery remains. */
 	isTerminal?: boolean;
 	/** The agent finished its turn and resumes only for queued input or background-job results. */

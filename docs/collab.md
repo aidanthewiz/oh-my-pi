@@ -219,6 +219,9 @@ Their model title stays idle during an async pause and after reconnect.
 Completion notifications require the host's terminal boundary or retained-idle snapshot.
 Snapshot recovery and later physical delivery produce one completion.
 Leaving or losing host ownership does not announce host completion.
+Protocol v5 carries the owner-bound loop outcome in physical completions and lifecycle snapshots.
+Recovery uses that outcome instead of the persisted transcript, which can exclude provider refusals.
+An absent outcome is unknown; it cannot authorize a success notification.
 
 Guest→host: `hello`, `prompt`, `abort`, `agent-cmd` (hub chat/kill/revive), `fetch-transcript` (incremental subagent-transcript reads answered by targeted `transcript` frames), and `ui-response`. The replica loads through the regular `/resume` machinery, so theming, ctrl+o, and transcript behavior are native by construction; the guest process never chdirs to host paths.
 

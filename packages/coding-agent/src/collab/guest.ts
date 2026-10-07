@@ -669,7 +669,11 @@ export class CollabGuestLink {
 		} else if (event.type === "agent_end") {
 			const current = session.lifecycleState;
 			if (!current || current.runId === event.runId) {
-				session.setMirroredLifecycleState({ runId: event.runId, phase: event.isTerminal ? "idle" : "continuing" });
+				session.setMirroredLifecycleState({
+					runId: event.runId,
+					phase: event.isTerminal ? "idle" : "continuing",
+					outcome: event.outcome,
+				});
 			}
 		}
 		this.#lifecycleEmitter.emit(this.#ctx.session.extensionRunner, event);
@@ -697,9 +701,7 @@ export class CollabGuestLink {
 	/** Reconcile missed physical boundaries using authoritative host ownership. */
 	#reconcileLifecycle(state: AgentLifecycleState): void {
 		const previous = this.#ctx.session.lifecycleState;
-		this.#ctx.session.setMirroredLifecycleState(
-			state ?? (previous ? { runId: previous.runId, phase: "idle" } : null),
-		);
+		this.#ctx.session.setMirroredLifecycleState(state ?? (previous ? { ...previous, phase: "idle" } : null));
 		this.#lifecycleEmitter.reconcile(this.#ctx.session.extensionRunner, state, [...this.#ctx.session.messages]);
 	}
 

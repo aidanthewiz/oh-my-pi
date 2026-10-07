@@ -2767,14 +2767,13 @@ export class EventController {
 		const notify = cfgErrorNotify.get(settings);
 		if (notify === "off") return;
 
-		// Read the turn's own outcome from `agent_end.messages`, not the mutable
-		// active context: a classifier-refusal failure is final (stopReason ===
-		// "error") but gets pruned from `viewSession`'s active context before this
-		// handler runs (see `#removeAssistantMessageFromActiveContext` in
-		// agent-session.ts), so `getLastAssistantMessage()` would see a stale or
-		// absent assistant and silently drop the notification.
-		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
-		if (last?.stopReason !== "error") return;
+		// Retained host outcomes survive transcript pruning and take precedence over replayed messages.
+		if (event.outcome !== undefined) {
+			if (event.outcome !== "error") return;
+		} else {
+			const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+			if (last?.stopReason !== "error") return;
+		}
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
 		TERMINAL.sendNotification({
@@ -2793,13 +2792,12 @@ export class EventController {
 		// protocol is negotiated — avoid a second legacy desktop/OSC-9 toast.
 		if (isWarpCliAgentProtocolActive()) return;
 
-		// Read the turn's own outcome from `agent_end.messages`, not the mutable
-		// active context (see `sendErrorNotification` above for why `viewSession`'s
-		// snapshot can be stale): an aborted or errored turn is not "Task
-		// complete", and using the same event `sendErrorNotification` just read
-		// keeps the two notifications mutually exclusive for one settled turn.
-		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
-		if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
+		if (event.outcome !== undefined) {
+			if (event.outcome !== "success") return;
+		} else {
+			const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+			if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
+		}
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
 		TERMINAL.sendNotification({

@@ -276,6 +276,7 @@ export class GuestLifecycleEmitter {
 							runId,
 							messages,
 							isTerminal: state === null && runId === this.#runId,
+							outcome: "unknown",
 						},
 						state !== null,
 					);
@@ -288,14 +289,26 @@ export class GuestLifecycleEmitter {
 				this.#inferredRunId = state.runId;
 			}
 			if (state.phase === "continuing" && this.#loopOpen) {
-				this.#emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: false }, false);
+				this.#emit(
+					runner,
+					{ type: "agent_end", runId: state.runId, messages, isTerminal: false, outcome: state.outcome },
+					false,
+				);
 			}
 		} else if (state && (this.#active || this.#runId !== state.runId)) {
 			const render = this.#active;
 			if (this.#runId !== state.runId) this.#emit(runner, { type: "agent_start", runId: state.runId }, render);
-			this.#emit(runner, { type: "agent_end", runId: state.runId, messages, isTerminal: true }, render);
+			this.#emit(
+				runner,
+				{ type: "agent_end", runId: state.runId, messages, isTerminal: true, outcome: state.outcome ?? "unknown" },
+				render,
+			);
 		} else if (this.#active && this.#runId) {
-			this.#emit(runner, { type: "agent_end", runId: this.#runId, messages, isTerminal: true }, false);
+			this.#emit(
+				runner,
+				{ type: "agent_end", runId: this.#runId, messages, isTerminal: true, outcome: "unknown" },
+				false,
+			);
 		}
 	}
 

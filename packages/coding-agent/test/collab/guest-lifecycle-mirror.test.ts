@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import type { MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -26,6 +27,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -43,7 +45,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
-import { cfgCompletionNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { settings as runtimeSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeTerminalTitleState, initTerminalTitleState } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
@@ -566,7 +568,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await jobs.getJob("host-background")?.promise;
 			await hostSession.settleAsyncWork();
 			await completedNotification.promise;
-			expect(hostSession.lifecycleState).toEqual({ runId: observed.runId, phase: "idle" });
+			expect(hostSession.lifecycleState).toEqual({ runId: observed.runId, phase: "idle", outcome: "success" });
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
 			expect(notifications).toEqual([expect.objectContaining({ type: "completion" })]);
 
@@ -586,7 +588,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			localWork.resolve("cancelled");
 			await jobs.getJob("local-background")?.promise;
 			await guestSession.settleAsyncWork();
-			expect(guestSession.lifecycleState).toEqual({ runId: localState.runId, phase: "idle" });
+			expect(guestSession.lifecycleState).toEqual({ runId: localState.runId, phase: "idle", outcome: "success" });
 
 			await harness.cleanup();
 			guestContext.session = guestWithoutExtensions;
@@ -596,7 +598,13 @@ describe("collab guest extension lifecycle mirror", () => {
 				guestContext,
 			});
 			const sendState = (runId: string, phase: "continuing" | "idle"): void => {
-				harness?.hostSocket.send({ t: "state", state: { ...makeState(), lifecycle: { runId, phase } } });
+				harness?.hostSocket.send({
+					t: "state",
+					state: {
+						...makeState(),
+						lifecycle: { runId, phase, ...(phase === "idle" ? { outcome: "success" as const } : {}) },
+					},
+				});
 			};
 			sendState("already-idle", "idle");
 			await harness.barrier();
@@ -662,6 +670,161 @@ describe("collab guest extension lifecycle mirror", () => {
 			await home.remove();
 		}
 	});
+
+	it.each(["error", "success", "aborted", "unknown"] as const)(
+		"recovers a real host %s outcome once through the notification controller",
+		async outcome => {
+			const home = TempDir.createSync("@pi-guest-outcome-");
+			const homedirSpy = spyOn(os, "homedir").mockReturnValue(home.path());
+			refreshDirsFromEnv();
+			resetSettingsForTest();
+			await Settings.init({ inMemory: true });
+			cfgCompletionNotify.set(runtimeSettings, "on");
+			cfgErrorNotify.set(runtimeSettings, "on");
+			await initTheme(false);
+			const auth = await AuthStorage.create(":memory:");
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Missing bundled test model");
+			auth.keys.setRuntime(model.provider, "synthetic-key");
+			const registry = new ModelRegistry(auth, undefined, { ignoreLocalModelConfig: true });
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"retry.modelFallback": false,
+				"todo.enabled": false,
+				"todo.reminders": false,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const response: MockResponse =
+				outcome === "error"
+					? {
+							stopReason: "error",
+							stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
+							errorMessage: "Refusal (cyber): Declined.",
+						}
+					: outcome === "aborted"
+						? { stopReason: "aborted" }
+						: { content: ["Completed offline"], stopReason: "stop" };
+			const mock = createMockModel({ responses: [response] });
+			const hostSession = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "synthetic-key",
+					initialState: { model, systemPrompt: [], tools: [], messages: [] },
+					streamFn: mock.stream,
+					convertToLlm,
+				}),
+				sessionManager: SessionManager.inMemory(home.path()),
+				settings,
+				modelRegistry: registry,
+			});
+			const guestSession = new AgentSession({
+				agent: new Agent({ initialState: { model, systemPrompt: [], tools: [], messages: [] }, convertToLlm }),
+				sessionManager: SessionManager.inMemory(home.path()),
+				settings,
+				modelRegistry: registry,
+			});
+			const guestContext = createInteractiveModeContext({
+				session: guestSession,
+				sessionManager: guestSession.sessionManager,
+				settings,
+				statusLine: { setCollabStatus: () => {}, resetActiveTime: () => {} },
+				resetObserverRegistry: () => {},
+				syncRunningSubagentBadge: () => {},
+				syncComposerShape: () => {},
+				eventBus: new EventBus(),
+			});
+			const controller = new EventController(guestContext);
+			guestContext.eventController = controller;
+			const recovered = Promise.withResolvers<void>();
+			const handleEvent = controller.handleEvent.bind(controller);
+			const controllerSpy = spyOn(controller, "handleEvent").mockImplementation(async event => {
+				if (event.type !== "agent_start" && event.type !== "agent_end") return;
+				await handleEvent(event);
+				if (event.type === "agent_end" && event.isTerminal) recovered.resolve();
+			});
+			const notifications: Parameters<typeof TERMINAL.sendNotification>[0][] = [];
+			const notificationSpy = spyOn(TERMINAL, "sendNotification").mockImplementation(notification => {
+				notifications.push(notification);
+			});
+			const barrier = Promise.withResolvers<void>();
+			const showErrorSpy = spyOn(guestContext, "showError").mockImplementation(message => {
+				if (message.includes("__late_end_applied__")) barrier.resolve();
+			});
+			const originalSend = CollabSocket.prototype.send;
+			let physical: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> | undefined;
+			let hostSocket: CollabSocket | undefined;
+			const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(
+				function (this: CollabSocket, frame, peer) {
+					if (frame.t === "event" && frame.event.type === "agent_end") {
+						physical = frame.event;
+						hostSocket = this;
+						return;
+					}
+					if (outcome === "unknown" && frame.t === "state" && frame.state.lifecycle) {
+						const { outcome: _outcome, ...lifecycle } = frame.state.lifecycle;
+						originalSend.call(this, { ...frame, state: { ...frame.state, lifecycle } }, peer);
+						return;
+					}
+					originalSend.call(this, frame, peer);
+				},
+			);
+			let harness: Harness | undefined;
+			try {
+				harness = await makeHarness(`real-outcome-${outcome}`, { hostSession, guestSession, guestContext });
+				await hostSession.prompt("Complete one offline turn.");
+				await hostSession.waitForIdle();
+				await recovered.promise;
+				if (!physical || !hostSocket) throw new Error("Missing intercepted physical completion");
+				if (outcome === "error") {
+					expect(physical.messages.findLast(message => message.role === "assistant")).toMatchObject({
+						stopReason: "error",
+						stopDetails: { type: "refusal" },
+					});
+					expect(hostSession.sessionManager.buildSessionContext().messages.map(message => message.role)).toEqual([
+						"user",
+					]);
+					expect(guestSession.messages.some(message => message.role === "assistant")).toBe(false);
+				}
+				if (outcome === "unknown") {
+					expect(guestSession.messages.findLast(message => message.role === "assistant")).toMatchObject({
+						stopReason: "stop",
+					});
+				}
+				const expected =
+					outcome === "error"
+						? [expect.objectContaining({ type: "error" })]
+						: outcome === "success"
+							? [expect.objectContaining({ type: "completion" })]
+							: [];
+				expect(notifications).toEqual(expected);
+				expect(guestSession.lifecycleState).toEqual(
+					outcome === "unknown"
+						? { runId: physical.runId, phase: "idle" }
+						: { runId: physical.runId, phase: "idle", outcome },
+				);
+				originalSend.call(hostSocket, { t: "event", event: physical });
+				originalSend.call(hostSocket, { t: "event", event: physical });
+				originalSend.call(hostSocket, { t: "error", message: "__late_end_applied__" });
+				await barrier.promise;
+				expect(notifications).toEqual(expected);
+				expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
+			} finally {
+				await harness?.cleanup();
+				await guestSession.dispose();
+				await hostSession.dispose();
+				controller.dispose();
+				controllerSpy.mockRestore();
+				notificationSpy.mockRestore();
+				showErrorSpy.mockRestore();
+				sendSpy.mockRestore();
+				auth.close();
+				resetSettingsForTest();
+				homedirSpy.mockRestore();
+				refreshDirsFromEnv();
+				await home.remove();
+			}
+		},
+	);
 
 	it("confirms an inferred start with the host ID and recovers a missed completion", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);

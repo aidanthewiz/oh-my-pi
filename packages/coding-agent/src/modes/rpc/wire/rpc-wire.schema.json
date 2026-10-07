@@ -3185,6 +3185,15 @@
 			],
 			"type": "string"
 		},
+		"AgentLifecycleOutcome": {
+			"enum": [
+				"success",
+				"error",
+				"aborted",
+				"unknown"
+			],
+			"type": "string"
+		},
 		"AgentStartEvent": {
 			"type": "object",
 			"properties": {
@@ -3212,6 +3221,10 @@
 				"messageCount": {
 					"type": "integer",
 					"description": "Original message count when the frame was compacted."
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome",
+					"description": "This loop's outcome, independent of persisted transcript messages."
 				},
 				"isTerminal": {
 					"type": "boolean",
