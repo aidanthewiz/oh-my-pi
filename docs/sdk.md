@@ -206,6 +206,22 @@ Configured values are resolved asynchronously through the registry-installed res
 
 Subscribe with `session.subscribe(listener)`; it returns an unsubscribe function.
 
+Public `agent_end` delivery waits for the owning prompt to unwind. Intermediate
+ends can be coalesced while a continuation remains in flight.
+
+Use `session.subscribeLifecycle(listener)` to observe every settled physical loop,
+including intermediate continuations. It returns an unsubscribe function. Its
+`agent_start` and `agent_end` events include the host-owned `runId`; ends also
+include `isTerminal`. This stream does not authorize a new prompt before idle.
+
+`session.lifecycleState` identifies the latest loop as `{ runId, phase }`.
+The phase is `"running"`, `"continuing"`, or `"idle"`; `null` means no loop
+belongs to the current session. Terminal ownership remains available to identify
+delayed notifications. New sessions and switches clear it; active branches retain it.
+
+Extension handlers can call `ctx.getLifecycleState()` for the same live snapshot.
+Read it when handling an event, not before an asynchronous wait.
+
 ```ts
 const unsubscribe = session.subscribe((event) => {
   switch (event.type) {

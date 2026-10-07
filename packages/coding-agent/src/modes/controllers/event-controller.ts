@@ -217,14 +217,8 @@ export class EventController {
 	#restorePinnedErrorInline = true;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
-	// Set when `auto_retry_start` fires and cleared by `auto_retry_end` (both
-	// outcomes) — true for exactly the window a retry is outstanding. Gates
-	// `sendErrorNotification`: the wire-level `agent_end` for a retryable
-	// failure is coalesced with every other attempt in the same saga while the
-	// prompt is in flight (see `AgentSession#emitSessionEvent`), so the single
-	// `agent_end` that survives to reach this controller can be either a
-	// mid-retry blip or the final settle — only the retry lifecycle events
-	// (never deferred) can tell them apart.
+	// Retry events own local suppression. A guest can miss auto_retry_end while
+	// disconnected; accepted matching-host idle also settles its retry window.
 	#retryPending = false;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
@@ -2183,6 +2177,8 @@ export class EventController {
 		// the loader and finalizes it at its own agent_end (isStreaming === false by
 		// then). Mirrors the collab guest's !isStreaming loader reconciler.
 		if (this.ctx.session.isStreaming) return;
+		if (this.ctx.collabGuest && (!("runId" in event) || event.runId !== this.ctx.session.lifecycleState?.runId))
+			return;
 		// A non-terminal settle (`isTerminal: false`) is a scheduling pause, not the
 		// end of the run: the agent's own continuation (reminder, retry, queued
 		// steer/follow-up, IRC wake) follows, or background work may re-wake it.
@@ -2202,7 +2198,7 @@ export class EventController {
 			// work instead of a terminal `agent_end` that may never come.
 			if (event.awaitingAsyncWork === true) {
 				setTerminalTitleState("idle");
-				void this.#finishWhenAsyncWorkDrains(event);
+				if (!this.ctx.collabGuest) void this.#finishWhenAsyncWorkDrains(event);
 			}
 			await this.ctx.flushPendingModelSwitch();
 			// Reaching here means the first guard passed, so `isStreaming` is already
@@ -2212,6 +2208,14 @@ export class EventController {
 			// quiescent at a settle, which is the condition #4806 wanted.
 			this.ctx.flushPendingCommandOutput();
 			return;
+		}
+		if (this.ctx.collabGuest && event.isTerminal === true && this.ctx.session.lifecycleState?.phase === "idle") {
+			this.#retryPending = false;
+			if (this.ctx.retryLoader) {
+				this.ctx.retryLoader.stop();
+				this.ctx.retryLoader = undefined;
+				this.ctx.statusContainer.disposeChildren();
+			}
 		}
 		setTerminalTitleState("idle");
 
@@ -2746,16 +2750,8 @@ export class EventController {
 		// dispatching the deferred event; do not infer it from mutable job state.
 		if (event.isTerminal === false) return;
 
-		// `AgentSession` defers and coalesces the wire-level `agent_end` while a
-		// prompt is still in flight (see `#emitSessionEvent` in agent-session.ts):
-		// every mid-retry attempt's own settle is superseded, so this method often
-		// sees only ONE `agent_end` for an entire multi-attempt retry saga — which
-		// can be the final failure, not an intermediate one. Gate purely on the
-		// retry lifecycle (`auto_retry_start`/`auto_retry_end`, which are never
-		// deferred) rather than consuming this flag against whichever `agent_end`
-		// happens to arrive first: `#retryPending` is true only for the actual
-		// window a retry is outstanding, so the settled failure that survives
-		// coalescing is never mistaken for a mid-retry blip.
+		// Coalesced local agent_end does not prove retry settlement. Retry events
+		// settle local suppression; accepted host idle settles guest suppression.
 		if (this.#retryPending) return;
 
 		// Warp structured OSC 777 already drives native completion UX when the
@@ -2765,14 +2761,13 @@ export class EventController {
 		const notify = cfgErrorNotify.get(settings);
 		if (notify === "off") return;
 
-		// Read the turn's own outcome from `agent_end.messages`, not the mutable
-		// active context: a classifier-refusal failure is final (stopReason ===
-		// "error") but gets pruned from `viewSession`'s active context before this
-		// handler runs (see `#removeAssistantMessageFromActiveContext` in
-		// agent-session.ts), so `getLastAssistantMessage()` would see a stale or
-		// absent assistant and silently drop the notification.
-		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
-		if (last?.stopReason !== "error") return;
+		// Retained host outcomes survive transcript pruning and take precedence over replayed messages.
+		if (event.outcome !== undefined) {
+			if (event.outcome !== "error") return;
+		} else {
+			const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+			if (last?.stopReason !== "error") return;
+		}
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
 		TERMINAL.sendNotification({
@@ -2791,13 +2786,12 @@ export class EventController {
 		// protocol is negotiated — avoid a second legacy desktop/OSC-9 toast.
 		if (isWarpCliAgentProtocolActive()) return;
 
-		// Read the turn's own outcome from `agent_end.messages`, not the mutable
-		// active context (see `sendErrorNotification` above for why `viewSession`'s
-		// snapshot can be stale): an aborted or errored turn is not "Task
-		// complete", and using the same event `sendErrorNotification` just read
-		// keeps the two notifications mutually exclusive for one settled turn.
-		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
-		if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
+		if (event.outcome !== undefined) {
+			if (event.outcome !== "success") return;
+		} else {
+			const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+			if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
+		}
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
 		TERMINAL.sendNotification({

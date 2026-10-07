@@ -12,7 +12,7 @@
  * the `publishCollabHost` export redirects discovery metadata into a temp dir,
  * so the registry's real Unix-socket IPC is exercised without touching ~/.omp.
  */
-import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -41,6 +41,8 @@ interface HostContextState {
 	sessionId: string;
 	/** Whether the mirrored session is mid-turn; drives the snapshot's `busy`. */
 	isStreaming: boolean;
+	lifecycle: AgentSession["lifecycleState"];
+	usedTokens: number;
 	transition?: Promise<void>;
 	showStatus: string[];
 	/** Guest prompts the host forwarded into the session. */
@@ -61,6 +63,8 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 	const state: HostContextState = {
 		sessionId: `sess-${crypto.randomUUID()}`,
 		isStreaming: false,
+		lifecycle: null,
+		usedTokens: 0,
 		showStatus: [],
 		prompts: [],
 		subscribed: null,
@@ -100,7 +104,10 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			sessionName: "registry-test",
 			model: undefined,
 			thinkingLevel: undefined,
-			subscribe: (cb: HostContextState["subscribed"]) => {
+			get lifecycleState() {
+				return state.lifecycle;
+			},
+			subscribeLifecycle: (cb: HostContextState["subscribed"]) => {
 				state.subscribed = cb;
 				return () => {};
 			},
@@ -117,7 +124,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				if (status === null) state.tornDown.resolve();
 			},
 			invalidate: () => {},
-			getCachedContextBreakdown: () => ({ usedTokens: 0, contextWindow: 0 }),
+			getCachedContextBreakdown: () => ({ usedTokens: state.usedTokens, contextWindow: 0 }),
 		},
 		ui: { requestRender: () => {} },
 		showStatus: (message: string) => {
@@ -165,6 +172,77 @@ afterEach(async () => {
 });
 
 describe("collab host registry lifecycle (#6099)", () => {
+	it.each(["older-completion", "abandoned-continuation"] as const)(
+		"ties periodic guest context updates to authoritative activity after %s",
+		async scenario => {
+			vi.useFakeTimers();
+			try {
+				const { ctx, state } = makeHostContext();
+				host = new CollabHost(ctx);
+				await host.start(RELAY_URL, WEB_URL);
+				const parsed = parseCollabLink(host.link);
+				if ("error" in parsed) throw new Error(parsed.error);
+				const key = await importRoomKey(parsed.key);
+				const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+				guestCleanups.push(() => guest.close());
+				const welcomed = Promise.withResolvers<void>();
+				let latest: Extract<CollabFrame, { t: "state" }>["state"] | undefined;
+				let barrier = Promise.withResolvers<void>();
+				guest.onFrame = frame => {
+					if (frame.t === "welcome") welcomed.resolve();
+					if (frame.t === "state") latest = frame.state;
+					if (frame.t === "event" && frame.event.type === "notice" && frame.event.message === "barrier")
+						barrier.resolve();
+				};
+				guest.onOpen = () => guest.send({ t: "hello", proto: COLLAB_PROTO, name: "viewer" });
+				guest.connect();
+				await welcomed.promise;
+				const flush = async (milliseconds: number): Promise<void> => {
+					barrier = Promise.withResolvers<void>();
+					vi.advanceTimersByTime(milliseconds);
+					state.subscribed!({ type: "notice", level: "info", message: "barrier", source: "test" });
+					await barrier.promise;
+				};
+				state.isStreaming = true;
+				state.lifecycle = { runId: "first", phase: "running" };
+				state.usedTokens = 64;
+				state.subscribed!({ type: "agent_start", runId: "first" });
+				await flush(100);
+				expect(latest?.contextUsage?.tokens).toBe(64);
+				if (scenario === "older-completion") {
+					state.lifecycle = { runId: "second", phase: "running" };
+					state.subscribed!({ type: "agent_start", runId: "second" });
+					state.subscribed!({ type: "agent_end", runId: "first", messages: [], isTerminal: true });
+					await flush(100);
+					state.usedTokens = 128;
+					await flush(2_200);
+					expect(latest?.contextUsage?.tokens).toBe(128);
+					expect(latest?.lifecycle).toEqual({ runId: "second", phase: "running" });
+					state.isStreaming = false;
+					state.lifecycle = { runId: "second", phase: "idle" };
+					state.subscribed!({ type: "agent_end", runId: "second", messages: [], isTerminal: true });
+					await flush(100);
+				} else {
+					state.lifecycle = { runId: "first", phase: "continuing" };
+					state.subscribed!({ type: "agent_end", runId: "first", messages: [], isTerminal: false });
+					await flush(100);
+					state.isStreaming = false;
+					state.lifecycle = { runId: "first", phase: "idle" };
+					state.usedTokens = 128;
+					await flush(2_200);
+					expect(latest?.contextUsage?.tokens).toBe(128);
+				}
+				expect(latest?.lifecycle?.phase).toBe("idle");
+				state.usedTokens = 256;
+				await flush(4_200);
+				expect(latest?.contextUsage?.tokens).toBe(128);
+			} finally {
+				await host?.stop("test cleanup");
+				vi.useRealTimers();
+			}
+		},
+	);
+
 	it.each(["navigateTree", "fork"] as const)(
 		"notifies the submitting guest when %s discards an admitted prompt",
 		async transition => {

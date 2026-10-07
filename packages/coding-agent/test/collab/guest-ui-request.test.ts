@@ -32,6 +32,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
@@ -81,6 +82,7 @@ interface GuestUiHarness {
 function makeState(): CollabSessionState {
 	return {
 		isStreaming: false,
+		lifecycle: null,
 		queuedMessageCount: 0,
 		sessionName: "host session",
 		cwd: "/tmp",
@@ -198,6 +200,10 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 			getCwd: () => "/local",
 		},
 		session: {
+			lifecycleState: null as AgentLifecycleState,
+			setMirroredLifecycleState(state: AgentLifecycleState) {
+				this.lifecycleState = state;
+			},
 			messages: [],
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),
@@ -468,7 +474,8 @@ function makeHostContext(): InteractiveModeContext {
 			sessionName: "proto test",
 			model: undefined,
 			thinkingLevel: undefined,
-			subscribe: () => () => {},
+			lifecycleState: null,
+			subscribeLifecycle: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: () => Promise.resolve(),
 			abort: () => Promise.resolve(),

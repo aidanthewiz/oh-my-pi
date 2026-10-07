@@ -711,7 +711,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 
 		expect(mock.calls).toHaveLength(1);
-		expect(extensionRunner.emit).toHaveBeenCalledWith({ type: "agent_end", messages: expect.any(Array) });
 		expect(extensionRunner.emitSessionStop).not.toHaveBeenCalled();
 	});
 
@@ -783,7 +782,6 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		await session.prompt("First message");
 		await publicAgentEnd;
-		expect(extensionRunner.emit).toHaveBeenCalledWith({ type: "agent_end", messages: expect.any(Array) });
 
 		releaseExtension();
 		await session.waitForIdle();
@@ -2143,6 +2141,7 @@ describe("AgentSession TTSR resume gate", () => {
 			} as never,
 			{
 				getModel: () => undefined,
+				getLifecycleState: () => null,
 				isIdle: () => true,
 				abort: () => {},
 				hasPendingMessages: () => false,

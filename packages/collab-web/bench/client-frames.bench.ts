@@ -30,7 +30,7 @@ client.applyFrameForTest({
 	t: "welcome",
 	proto: COLLAB_PROTO,
 	header: { type: "session", id: "s1", timestamp: "2026-06-12T00:00:00Z", cwd: "/work" },
-	state: { isStreaming: false, queuedMessageCount: 0, cwd: "/work", participants: [] },
+	state: { isStreaming: false, lifecycle: null, queuedMessageCount: 0, cwd: "/work", participants: [] },
 	agents: [],
 	entryCount: 0,
 });

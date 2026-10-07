@@ -61,6 +61,7 @@ function initializeRunnerForTest(runner: ExtensionRunner | undefined): void {
 	};
 	const contextActions: ExtensionContextActions = {
 		getModel: () => undefined,
+		getLifecycleState: () => null,
 		isIdle: () => true,
 		abort: () => {},
 		hasPendingMessages: () => false,

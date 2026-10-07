@@ -200,11 +200,15 @@ export interface ContextEvent {
  */
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** Opaque identifier shared with this loop's agent_end notification. */
+	runId: string;
 }
 
 /** Fired when an agent loop ends */
 export interface AgentEndEvent {
 	type: "agent_end";
+	/** Identifies the owning loop even when notification delivery is delayed. */
+	runId: string;
 	messages: AgentMessage[];
 	/**
 	 * When true, the session has already scheduled an automatic continuation

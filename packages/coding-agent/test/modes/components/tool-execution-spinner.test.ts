@@ -13,7 +13,7 @@ import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/eve
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
-import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../../collab/helpers/in-memory-relay";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -368,6 +368,10 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				sessionManager: { getSessionFile: () => null, getSessionName: () => "local", getCwd: () => "/local" },
 				session: {
 					messages: [],
+					lifecycleState: null as AgentSession["lifecycleState"],
+					setMirroredLifecycleState(state: AgentSession["lifecycleState"]) {
+						this.lifecycleState = state;
+					},
 					switchSession: () => Promise.resolve(),
 					newSession: () => Promise.resolve(),
 					agent: {
@@ -462,6 +466,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 					header: { type: "session", id: "resync-session", timestamp: "2026-06-26T00:00:00Z", cwd: "/tmp" },
 					state: {
 						isStreaming: false,
+						lifecycle: null,
 						queuedMessageCount: 0,
 						sessionName: "host session",
 						cwd: "/tmp",
@@ -561,6 +566,10 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				sessionManager: { getSessionFile: () => null, getSessionName: () => "local", getCwd: () => "/local" },
 				session: {
 					messages: [],
+					lifecycleState: null as AgentSession["lifecycleState"],
+					setMirroredLifecycleState(state: AgentSession["lifecycleState"]) {
+						this.lifecycleState = state;
+					},
 					switchSession: () => Promise.resolve(),
 					newSession: () => Promise.resolve(),
 					agent: {
@@ -654,6 +663,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 					},
 					state: {
 						isStreaming: false,
+						lifecycle: null,
 						queuedMessageCount: 0,
 						sessionName: "host session",
 						cwd: "/tmp",
@@ -749,6 +759,10 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				sessionManager: { getSessionFile: () => null, getSessionName: () => "local", getCwd: () => "/local" },
 				session: {
 					messages: [],
+					lifecycleState: null as AgentSession["lifecycleState"],
+					setMirroredLifecycleState(state: AgentSession["lifecycleState"]) {
+						this.lifecycleState = state;
+					},
 					switchSession: () => Promise.resolve(),
 					newSession: () => Promise.resolve(),
 					agent: {
@@ -835,6 +849,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 					header: { type: "session", id: "resync-seal-session", timestamp: "2026-06-26T00:00:00Z", cwd: "/tmp" },
 					state: {
 						isStreaming: false,
+						lifecycle: null,
 						queuedMessageCount: 0,
 						sessionName: "host session",
 						cwd: "/tmp",

@@ -26,7 +26,7 @@ import { createRelayIdentityTokenProvider } from "../identity/relay";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
-import type { AgentSessionEvent } from "../session/agent-session";
+import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
@@ -111,7 +111,7 @@ const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 ] as const satisfies readonly BusChannel[];
 
-function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent & WireAgentEvent {
+function isWireAgentEvent(event: AgentSessionLifecycleEvent): event is AgentSessionLifecycleEvent & WireAgentEvent {
 	return event.type in WIRE_AGENT_EVENT_TYPES;
 }
 
@@ -455,7 +455,7 @@ export class CollabHost {
 		// the link is visible (auto-start installs the room before this
 		// resolves), and anything that happens after its welcome snapshot must
 		// reach it; the local registry work below is independent of that.
-		this.#unsubscribe = this.#ctx.session.subscribe(event => {
+		this.#unsubscribe = this.#ctx.session.subscribeLifecycle(event => {
 			if (isWireAgentEvent(event)) this.#send({ t: "event", event: shrinkReplicatedEvent(event) });
 			this.#onEventForState(event);
 		});
@@ -1019,6 +1019,7 @@ export class CollabHost {
 		const tokens = breakdown.usedTokens ?? 0;
 		return {
 			isStreaming: session.isStreaming,
+			lifecycle: session.lifecycleState,
 			isAborting: session.isAborting,
 			queuedMessageCount: session.queuedMessageCount,
 			sessionName: session.sessionName,
@@ -1037,12 +1038,6 @@ export class CollabHost {
 	#onEventForState(event: AgentSessionEvent): void {
 		if (!STATE_TRIGGER_EVENTS[event.type]) return;
 		this.#scheduleStateBroadcast();
-		if (event.type === "agent_start" && !this.#streamingInterval) {
-			this.#streamingInterval = setInterval(() => this.#scheduleStateBroadcast(), STREAMING_STATE_INTERVAL_MS);
-		} else if (event.type === "agent_end" && this.#streamingInterval) {
-			clearInterval(this.#streamingInterval);
-			this.#streamingInterval = null;
-		}
 	}
 
 	#snapshotAgents(): AgentSnapshot[] {
@@ -1173,6 +1168,13 @@ export class CollabHost {
 		this.#stateDebounce = setTimeout(() => {
 			this.#stateDebounce = null;
 			const state = this.#buildState();
+			const active = state.isStreaming || (state.lifecycle !== null && state.lifecycle.phase !== "idle");
+			if (active && !this.#streamingInterval) {
+				this.#streamingInterval = setInterval(() => this.#scheduleStateBroadcast(), STREAMING_STATE_INTERVAL_MS);
+			} else if (!active && this.#streamingInterval) {
+				clearInterval(this.#streamingInterval);
+				this.#streamingInterval = null;
+			}
 			const json = JSON.stringify(state);
 			if (json === this.#lastStateJson) return;
 			this.#lastStateJson = json;

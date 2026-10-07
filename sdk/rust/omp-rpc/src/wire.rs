@@ -3429,6 +3429,30 @@ impl NotifyType {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentLifecycleOutcome {
+	#[serde(rename = "success")]
+	Success,
+	#[serde(rename = "error")]
+	Error,
+	#[serde(rename = "aborted")]
+	Aborted,
+	#[serde(rename = "unknown")]
+	Unknown,
+}
+
+impl AgentLifecycleOutcome {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Success => "success",
+			Self::Error => "error",
+			Self::Aborted => "aborted",
+			Self::Unknown => "unknown",
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentStartEvent {}
 
@@ -3439,6 +3463,9 @@ pub struct AgentEndEvent {
 	/// Original message count when the frame was compacted.
 	#[serde(rename = "messageCount", default, skip_serializing_if = "Option::is_none")]
 	pub message_count: Option<i64>,
+	/// This loop's outcome, independent of persisted transcript messages.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	/// False when a continuation or async delivery remains.
 	#[serde(rename = "isTerminal", default, skip_serializing_if = "Option::is_none")]
 	pub is_terminal: Option<bool>,

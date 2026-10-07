@@ -379,15 +379,15 @@ export function oversizedEntryNotice(entryType: string): Extract<AgentSessionEve
 /**
  * Bound one replicated agent event under {@link MAX_REPLICATED_PAYLOAD_BYTES}.
  *
- * Events carry no identity to preserve, so an event that survives the
- * shape-preserving passes is replaced by a `notice` naming the omitted type —
- * notices never enter agent state and never reach the model, which keeps the
- * substitution out of the guest's context instead of silently diverging from
- * the host's view.
+ * Oversized notifications become a notice. Loop completions retain ownership
+ * and continuation state even when their message snapshot must be omitted.
  */
-export function shrinkReplicatedEvent(event: AgentSessionEvent): AgentSessionEvent {
+export function shrinkReplicatedEvent<T extends AgentSessionEvent>(
+	event: T,
+): T | Extract<AgentSessionEvent, { type: "notice" }> {
 	const shrunk = shrinkPayloadShape(event);
 	if (fitsUnderCeiling(shrunk)) return shrunk;
+	if (event.type === "agent_end") return { ...event, messages: [] };
 	return {
 		type: "notice",
 		level: "warning",

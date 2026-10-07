@@ -2638,6 +2638,7 @@ export class AcpAgent implements Agent {
 			{
 				getModel: () => record.session.model,
 				isIdle: () => !record.session.isStreaming,
+				getLifecycleState: () => record.session.lifecycleState,
 				abort: () => {
 					void record.session.abort({ reason: USER_INTERRUPT_LABEL });
 				},

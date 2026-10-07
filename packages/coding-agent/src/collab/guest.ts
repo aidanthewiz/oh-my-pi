@@ -27,7 +27,7 @@ import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/
 import { createRelayIdentityTokenProvider } from "../identity/relay";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
-import type { AgentSessionEvent } from "../session/agent-session";
+import type { AgentLifecycleState, AgentSessionLifecycleEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { mintSessionId } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
@@ -217,8 +217,7 @@ export class CollabGuestLink {
 	#readOnly = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
-	/** Mirrors host lifecycle events into the local extension runner while joined. */
-	#lifecycleEmitter = new GuestLifecycleEmitter();
+	#lifecycleEmitter = new GuestLifecycleEmitter(event => this.#renderEvent(event));
 	state: CollabSessionState | null = null;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
 	readonly agentRegistry = new AgentRegistry();
@@ -513,7 +512,7 @@ export class CollabGuestLink {
 		this.#clearAgentMirror();
 		this.state = pending.state;
 		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
-		this.#reconcileLifecycle(pending.state.isStreaming);
+		this.#reconcileLifecycle(pending.state.lifecycle);
 		this.#applyHostState(pending.state);
 		this.#ctx.resetObserverRegistry();
 		this.#applyAgentSnapshots(pending.agents);
@@ -621,7 +620,7 @@ export class CollabGuestLink {
 				setSessionTerminalTitle(frame.state.sessionName, frame.state.cwd);
 				this.#updateStatusSegment();
 				reconcileGuestSnapshotHostState(this.#ctx, frame.state.isStreaming);
-				this.#reconcileLifecycle(frame.state.isStreaming);
+				this.#reconcileLifecycle(frame.state.lifecycle);
 				this.#ctx.statusLine.invalidate();
 				this.#ctx.ui.requestRender();
 				break;
@@ -663,7 +662,25 @@ export class CollabGuestLink {
 		}
 	}
 
-	#applyEvent(event: AgentSessionEvent): void {
+	#applyEvent(event: AgentSessionLifecycleEvent): void {
+		const session = this.#ctx.session;
+		if (event.type === "agent_start") {
+			session.setMirroredLifecycleState({ runId: event.runId, phase: "running" });
+		} else if (event.type === "agent_end") {
+			const current = session.lifecycleState;
+			if (!current || current.runId === event.runId) {
+				session.setMirroredLifecycleState({
+					runId: event.runId,
+					phase: event.isTerminal ? "idle" : "continuing",
+					outcome: event.outcome,
+					...(event.isTerminal === false && event.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
+				});
+			}
+		}
+		this.#lifecycleEmitter.emit(this.#ctx.session.extensionRunner, event);
+	}
+
+	#renderEvent(event: AgentSessionLifecycleEvent): void {
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
 		// carries the full accumulating message, so synthesize the missing start
@@ -680,42 +697,15 @@ export class CollabGuestLink {
 			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
 		}
 		void this.#ctx.eventController.handleEvent(event);
-		// Lifecycle mirror: the guest's own agent loop never runs, so the session's
-		// extension-event path stays silent. Route the mirrored wire event through
-		// the same mapping the session uses so extension-installed lifecycle
-		// integrations (Herdr pane state, RPC trackers, stats) observe host
-		// working/idle transitions while joined. Emissions chain (ordered but never
-		// awaited inline) so a slow extension handler neither stalls frame
-		// application nor completes out of order.
-		const runner = this.#ctx.session.extensionRunner;
-		if (runner) this.#lifecycleEmitter.emit(runner, event);
 	}
 
-	/**
-	 * Reconcile the lifecycle mirror with a host activity snapshot. A guest that
-	 * joins (or resyncs) mid-run missed the host's `agent_start`, and the mirror
-	 * must not assume the wire's first event after (re)sync carries the boundary;
-	 * a host that reports `isStreaming === false` may equally have settled before
-	 * the guest ever saw a start. Synthesize the missing edge so extension
-	 * handlers never miss a working/idle transition. This is not an exact replay
-	 * of a local session: a `state` frame landing during host prompt setup
-	 * synthesizes an `agent_start` that the real one then repeats, and the
-	 * host's intermediate `willContinue` settles never reach the wire.
-	 */
-	#reconcileLifecycle(isStreaming: boolean): void {
-		const runner = this.#ctx.session.extensionRunner;
-		if (!runner) return;
-		if (isStreaming) {
-			if (!this.#lifecycleEmitter.sawAgentStart) {
-				this.#lifecycleEmitter.emit(runner, { type: "agent_start" });
-			}
-		} else if (this.#lifecycleEmitter.sawAgentStart) {
-			this.#lifecycleEmitter.emit(runner, {
-				type: "agent_end",
-				messages: [...this.#ctx.session.messages],
-				isTerminal: true,
-			});
-		}
+	/** Reconcile missed physical boundaries using authoritative host ownership. */
+	#reconcileLifecycle(state: AgentLifecycleState): void {
+		const previous = this.#ctx.session.lifecycleState;
+		this.#ctx.session.setMirroredLifecycleState(
+			state ?? (previous ? { runId: previous.runId, phase: "idle", outcome: previous.outcome } : null),
+		);
+		this.#lifecycleEmitter.reconcile(this.#ctx.session.extensionRunner, state, [...this.#ctx.session.messages]);
 	}
 
 	/**
@@ -894,7 +884,7 @@ export class CollabGuestLink {
 		// An already-running switch cannot be cancelled halfway through. Drain
 		// it before rollback; no queued frame may reactivate the replica later.
 		await this.#applyChain;
-		this.#reconcileLifecycle(false);
+		this.#reconcileLifecycle(null);
 		// Keep the guest turn guard and replica lease active until host handlers finish.
 		await this.#lifecycleEmitter.drain();
 		try {

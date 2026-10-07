@@ -16,6 +16,7 @@ import {
 } from "@oh-my-pi/pi-tui/overlays/running-subagent-badge";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
@@ -24,6 +25,7 @@ import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memor
 function makeState(): Extract<CollabFrame, { t: "welcome" }>["state"] {
 	return {
 		isStreaming: false,
+		lifecycle: null,
 		queuedMessageCount: 0,
 		sessionName: "host session",
 		cwd: "/tmp",
@@ -55,6 +57,10 @@ function makeGuestContext(): InteractiveModeContext {
 			getCwd: () => "/local",
 		},
 		session: {
+			lifecycleState: null as AgentLifecycleState,
+			setMirroredLifecycleState(state: AgentLifecycleState) {
+				this.lifecycleState = state;
+			},
 			messages: [],
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),

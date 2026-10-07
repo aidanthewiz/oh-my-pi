@@ -56,7 +56,8 @@ function makeHostContext(): HostHarness {
 			sessionName: "test",
 			model: undefined,
 			thinkingLevel: undefined,
-			subscribe: () => () => {},
+			lifecycleState: null,
+			subscribeLifecycle: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: (message: { details?: { from?: string } }) => {
 				const details = message.details ?? {};

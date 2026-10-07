@@ -50,7 +50,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
@@ -219,7 +219,8 @@ function makeHostHarness(sessionManager: HostReplicationSource): HostHarness {
 			sessionName: "big",
 			model: undefined,
 			thinkingLevel: undefined,
-			subscribe: () => () => {},
+			lifecycleState: null,
+			subscribeLifecycle: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: () => Promise.resolve(),
 			abort: () => Promise.resolve(),
@@ -523,11 +524,22 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 });
 
 describe("shrinkReplicatedEvent (#11433)", () => {
-	it("does not substitute a notice for an event that already fits", () => {
-		const event: AgentSessionEvent = { type: "agent_end", messages: [] } as unknown as AgentSessionEvent;
+	it("retains completion ownership when an oversized message snapshot cannot be replicated", () => {
+		const giantKey = "k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES);
+		const event: AgentSessionLifecycleEvent = {
+			type: "agent_end",
+			runId: "continuing-loop",
+			isTerminal: false,
+			messages: [{ role: "user", content: "", timestamp: 0 }],
+		};
+		Object.assign(event.messages[0], { [giantKey]: 1 });
 		const shrunk = shrinkReplicatedEvent(event);
+		expectBounded(shrunk);
 		expect(shrunk.type).toBe("agent_end");
-		expect(JSON.stringify(shrunk)).not.toContain("Host event omitted");
+		if (shrunk.type !== "agent_end") throw new Error("Missing loop completion");
+		expect(shrunk.runId).toBe("continuing-loop");
+		expect(shrunk.isTerminal).toBe(false);
+		expect(shrunk.messages).toEqual([]);
 	});
 
 	it("still shrinks an event whose size lives in a string leaf", () => {

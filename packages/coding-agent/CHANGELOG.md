@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- Lifecycle integrations can reject delayed starts and completions without clearing a newer loop's state or pending decision.
+- Collaboration guests preserve Working across host continuations, reset turn counters per loop, and reject duplicate completion after snapshot recovery.
+- Collaboration state timers preserve newer-loop updates across delayed ends and stop when retained ownership becomes idle.
+- Collaboration guest lifecycle reads retain host authority during background work and after reconnecting.
+- Physical lifecycle completions and snapshots preserve host-owned async-wait metadata, so guests recover idle model titles after missing a pause without closing continuing ownership.
+- Collaboration guests wait for host completion before notifying. Snapshot recovery delivers one completion without reactivating working titles after reconnect.
+- Collaboration snapshot recovery preserves host outcomes, so pruned provider refusals report errors instead of success. Unknown recovered outcomes never announce success.
+- Collaboration terminal-idle recovery clears stale retry suppression, so host failures notify once even when the guest missed the retry-end event.
 - Fixed `grep` and `read` path lists losing URL query or path semicolons. Preserve internal URL targets, per-target selectors, and literal filenames.
 - Fixed standalone SQLite queries and local image questions being split at semicolons before URL-looking text. Preserve query suffixes before detecting path-list targets.
 - Fixed extensionless files with line selectors in comma or whitespace lists being claimed as opaque resource URLs.

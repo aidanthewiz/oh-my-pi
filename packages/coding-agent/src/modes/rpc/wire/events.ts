@@ -14,6 +14,7 @@ export const eventDefs = {
 	CacheWarmingPhase: "'streaming' | 'idle'",
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",
+	AgentLifecycleOutcome: "'success' | 'error' | 'aborted' | 'unknown'",
 
 	AgentStartEvent: { type: "'agent_start'" },
 	AgentEndEvent: {
@@ -23,6 +24,7 @@ export const eventDefs = {
 			"Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`).",
 		),
 		"messageCount?": doc("number.integer", "Original message count when the frame was compacted."),
+		"outcome?": doc("AgentLifecycleOutcome", "This loop's outcome, independent of persisted transcript messages."),
 		"isTerminal?": doc("boolean", "False when a continuation or async delivery remains."),
 		"yielded?": doc(
 			"boolean",

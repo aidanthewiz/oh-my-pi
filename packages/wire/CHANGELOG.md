@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Collaboration protocol version 4 requires loop ownership on lifecycle events and activity snapshots. Version 3 peers are rejected during the handshake.
+
 ## [18.5.1] - 2026-10-03
 
 ### Added

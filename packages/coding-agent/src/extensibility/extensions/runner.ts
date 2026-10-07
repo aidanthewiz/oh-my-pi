@@ -27,6 +27,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
 import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -500,6 +501,7 @@ export class ExtensionRunner {
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
+	#getLifecycleStateFn: () => AgentLifecycleState = () => null;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void = () => {};
 	#hasPendingMessagesFn: () => boolean = () => false;
@@ -801,6 +803,7 @@ export class ExtensionRunner {
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
 		this.#isIdleFn = contextActions.isIdle;
+		this.#getLifecycleStateFn = contextActions.getLifecycleState;
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
@@ -1381,6 +1384,7 @@ export class ExtensionRunner {
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
 			isIdle: () => this.#isIdleFn(),
+			getLifecycleState: () => this.#getLifecycleStateFn(),
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),

@@ -3213,6 +3213,28 @@ func (v *NotifyType) UnmarshalJSON(data []byte) error {
 	return unknownValue("NotifyType", s)
 }
 
+type AgentLifecycleOutcome string
+
+const (
+	AgentLifecycleOutcomeSuccess AgentLifecycleOutcome = "success"
+	AgentLifecycleOutcomeError   AgentLifecycleOutcome = "error"
+	AgentLifecycleOutcomeAborted AgentLifecycleOutcome = "aborted"
+	AgentLifecycleOutcomeUnknown AgentLifecycleOutcome = "unknown"
+)
+
+func (v *AgentLifecycleOutcome) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "AgentLifecycleOutcome")
+	if err != nil {
+		return err
+	}
+	switch value := AgentLifecycleOutcome(s); value {
+	case AgentLifecycleOutcomeSuccess, AgentLifecycleOutcomeError, AgentLifecycleOutcomeAborted, AgentLifecycleOutcomeUnknown:
+		*v = value
+		return nil
+	}
+	return unknownValue("AgentLifecycleOutcome", s)
+}
+
 type AgentStartEvent struct{}
 
 func (v *AgentStartEvent) UnmarshalJSON(data []byte) error {
@@ -3240,6 +3262,8 @@ type AgentEndEvent struct {
 	Messages []AgentMessage `json:"messages"`
 	// Original message count when the frame was compacted.
 	MessageCount *int64 `json:"messageCount,omitempty"`
+	// This loop's outcome, independent of persisted transcript messages.
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// False when a continuation or async delivery remains.
 	IsTerminal *bool `json:"isTerminal,omitempty"`
 	// The agent finished its turn and resumes only for queued input or background-job results.
@@ -3260,6 +3284,7 @@ func (v *AgentEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "agent_end")
 	d.required("messages", &out.Messages)
 	d.optional("messageCount", &out.MessageCount)
+	d.optional("outcome", &out.Outcome)
 	d.optional("isTerminal", &out.IsTerminal)
 	d.optional("yielded", &out.Yielded)
 	d.optional("awaitingAsyncWork", &out.AwaitingAsyncWork)

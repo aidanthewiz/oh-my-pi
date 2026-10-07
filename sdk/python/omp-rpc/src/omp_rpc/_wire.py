@@ -159,6 +159,11 @@ _NOTIFY_TYPE_VALUES: Final[frozenset[str]] = frozenset({"info", "warning", "erro
 _decode_notify_type = cast("Decoder[NotifyType]", literal(_NOTIFY_TYPE_VALUES))
 
 
+AgentLifecycleOutcome: TypeAlias = Literal["success", "error", "aborted", "unknown"]
+_AGENT_LIFECYCLE_OUTCOME_VALUES: Final[frozenset[str]] = frozenset({"success", "error", "aborted", "unknown"})
+_decode_agent_lifecycle_outcome = cast("Decoder[AgentLifecycleOutcome]", literal(_AGENT_LIFECYCLE_OUTCOME_VALUES))
+
+
 EventSubscriptionLevel: TypeAlias = Literal["control", "full"]
 _EVENT_SUBSCRIPTION_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"control", "full"})
 _decode_event_subscription_level = cast("Decoder[EventSubscriptionLevel]", literal(_EVENT_SUBSCRIPTION_LEVEL_VALUES))
@@ -869,6 +874,8 @@ class AgentEndEvent:
     """Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`)."""
     message_count: int | None = None
     """Original message count when the frame was compacted."""
+    outcome: AgentLifecycleOutcome | None = None
+    """This loop's outcome, independent of persisted transcript messages."""
     is_terminal: bool | None = None
     """False when a continuation or async delivery remains."""
     yielded: bool | None = None
@@ -2151,6 +2158,7 @@ def parse_agent_end_event(value: object, path: str = "AgentEndEvent") -> AgentEn
     return AgentEndEvent(
         messages=required(payload, "messages", array(parse_agent_message), path),
         message_count=optional(payload, "messageCount", decode_int, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         is_terminal=optional(payload, "isTerminal", decode_bool, path),
         yielded=optional(payload, "yielded", decode_bool, path),
         awaiting_async_work=optional(payload, "awaitingAsyncWork", decode_bool, path),
@@ -3604,6 +3612,7 @@ __all__ = [
     "AdvisorCostChangedEvent",
     "AdvisorYieldedEvent",
     "AgentEndEvent",
+    "AgentLifecycleOutcome",
     "AgentMessage",
     "AgentSource",
     "AgentStartEvent",
