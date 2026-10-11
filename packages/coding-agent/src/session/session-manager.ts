@@ -1,3 +1,4 @@
+import * as buffer from "node:buffer";
 import { createHash, type Hash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -710,6 +711,7 @@ export type ReadonlySessionManager = Pick<
 	| "allocateArtifactPath"
 	| "saveArtifact"
 	| "getArtifactPath"
+	| "getArtifactContent"
 	| "getLeafId"
 	| "getLeafEntry"
 	| "getEntry"
@@ -739,6 +741,8 @@ interface SessionManagerStateSnapshot {
 	needsRewrite: boolean;
 	draftOnlySessionCleanupArmed: boolean;
 	fallbackRuntimeOnly: boolean;
+	inMemoryArtifacts: ReadonlyMap<string, string> | null;
+	inMemoryArtifactCounter: number;
 	header: SessionHeader;
 	entries: SessionEntry[];
 }
@@ -2217,6 +2221,8 @@ export class SessionManager {
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
 			fallbackRuntimeOnly: this.#fallbackRuntimeOnly,
+			inMemoryArtifacts: this.#inMemoryArtifacts ? new Map(this.#inMemoryArtifacts) : null,
+			inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
 			// Entries are snapshotted by reference (switch/reload replaces the
 			// array wholesale). The header is cloned: moveTo mutates it in place
 			// (cwd, additionalDirectories), so a by-reference capture would let
@@ -2265,6 +2271,8 @@ export class SessionManager {
 		this.#forceFileCreation = snapshot.onDisk;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
+		this.#inMemoryArtifacts = snapshot.inMemoryArtifacts ? new Map(snapshot.inMemoryArtifacts) : null;
+		this.#inMemoryArtifactCounter = snapshot.inMemoryArtifactCounter;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
@@ -3222,6 +3230,69 @@ export class SessionManager {
 
 	async getArtifactPath(id: string): Promise<string | null> {
 		return (await this.#artifactManagerForSession()?.getPath(id)) ?? null;
+	}
+
+	/** Read only this live owner's artifact, with a UTF-8 byte limit. */
+	async getArtifactContent(id: string, maxBytes: number): Promise<string | null> {
+		if (this.#released || !/^(0|[1-9]\d*)$/.test(id) || !Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+			return null;
+		}
+		const manager = this.#artifactManagerForSession();
+		if (!manager) {
+			const content = this.#inMemoryArtifacts?.get(id);
+			return content !== undefined && Buffer.byteLength(content, "utf8") <= maxBytes ? content : null;
+		}
+		const sessionId = this.#sessionId;
+		const ownerStillCurrent = (): boolean =>
+			!this.#released && this.#sessionId === sessionId && this.#artifactManagerForSession() === manager;
+		try {
+			const prefix = `${id}.`;
+			const filename = (await manager.listFiles()).find(
+				name => name.startsWith(prefix) && /^\d+\.[A-Za-z0-9_-]{1,64}\.log$/.test(name),
+			);
+			if (!filename || !ownerStillCurrent()) return null;
+			const directory = await fs.promises.lstat(manager.dir);
+			if (!directory.isDirectory() || !ownerStillCurrent()) return null;
+			const artifactPath = path.join(manager.dir, filename);
+			const expected = await fs.promises.lstat(artifactPath);
+			if (!ownerStillCurrent() || !expected.isFile() || expected.size > maxBytes) return null;
+			const file = await fs.promises.open(artifactPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			let content: string | null = null;
+			try {
+				const stat = await file.stat();
+				if (
+					!ownerStillCurrent() ||
+					!stat.isFile() ||
+					!Number.isSafeInteger(stat.size) ||
+					stat.size > maxBytes ||
+					stat.dev !== expected.dev ||
+					stat.ino !== expected.ino
+				) {
+					return null;
+				}
+				const bytes = Buffer.alloc(stat.size);
+				let readBytes = 0;
+				while (readBytes < bytes.length) {
+					const read = await file.read(bytes, readBytes, bytes.length - readBytes, readBytes);
+					if (read.bytesRead === 0) return null;
+					readBytes += read.bytesRead;
+				}
+				const finalStat = await file.stat();
+				if (!ownerStillCurrent() || finalStat.size !== bytes.length) return null;
+				if (buffer.isUtf8(bytes)) content = bytes.toString("utf8");
+			} finally {
+				await file.close();
+			}
+			const finalDirectory = await fs.promises.lstat(manager.dir);
+			return ownerStillCurrent() &&
+				finalDirectory.isDirectory() &&
+				finalDirectory.dev === directory.dev &&
+				finalDirectory.ino === directory.ino
+				? content
+				: null;
+		} catch {
+			return null;
+		}
 	}
 
 	async saveDraft(text: string): Promise<void> {

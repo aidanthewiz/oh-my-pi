@@ -1013,6 +1013,7 @@ export class AgentSession implements SettingsScope {
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
+	#sessionStopEventDepth = 0;
 	#obfuscator: SecretObfuscator | undefined;
 	/** Last `skillful` value applied to this session; dedupes {@link setSkillful} and its setting watch. */
 	#skillfulApplied = false;
@@ -4872,15 +4873,21 @@ export class AgentSession implements SettingsScope {
 			return false;
 		}
 		const generation = this.#promptGeneration;
-		const result = await this.#extensionRunner.emitSessionStop({
-			messages,
-			turn_id: Math.max(0, this.#turnIndex - 1),
-			last_assistant_message: lastAssistantMessage,
-			session_id: this.sessionId,
-			session_file: this.sessionFile,
-			stop_hook_active: this.#sessionStopHookActive,
-			signal: this.#postPromptTasksAbortController.signal,
-		});
+		let result: SessionStopEventResult | undefined;
+		this.#sessionStopEventDepth++;
+		try {
+			result = await this.#extensionRunner.emitSessionStop({
+				messages,
+				turn_id: Math.max(0, this.#turnIndex - 1),
+				last_assistant_message: lastAssistantMessage,
+				session_id: this.sessionId,
+				session_file: this.sessionFile,
+				stop_hook_active: this.#sessionStopHookActive,
+				signal: this.#postPromptTasksAbortController.signal,
+			});
+		} finally {
+			this.#sessionStopEventDepth--;
+		}
 		if (this.#promptGeneration !== generation || this.#abortInProgress || this.#isDisposed) {
 			this.#resetSessionStopContinuationState();
 			return false;
@@ -8285,13 +8292,14 @@ export class AgentSession implements SettingsScope {
 		// queued follow-up waits for an explicit resume — even if an interleaving IRC wake turn has
 		// since left a provider-valid tail.
 		if (this.#advisors.autoResumeSuppressed) return false;
-		// Follow-up-only resume has no steer to inject, so Agent.continue() continues from the
-		// existing context tail — which must itself be a valid provider tail. An injected
-		// non-conversational tail (advisor card → `developer`, bash/python execution) would make
-		// the first model call invalid, so leave the follow-up queued for the next explicit resume.
+		// Agent.continue() injects queued follow-ups before custom records reach the provider.
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
-		return last?.role === "assistant" || last?.role === "toolResult";
+		return (
+			last?.role === "assistant" ||
+			last?.role === "toolResult" ||
+			(last?.role === "custom" && this.agent.peekFollowUpQueue().length > 0)
+		);
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -8563,6 +8571,9 @@ export class AgentSession implements SettingsScope {
 	): Promise<boolean> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
+		const promptGeneration = this.#promptGeneration;
+		const stopHookAppend =
+			this.#sessionStopEventDepth > 0 && options?.triggerTurn === false && options.deliverAs === undefined;
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const suppressQueueChip = options?.deliverAs === "nextTurn" || options?.deliverAs === "aside";
 		const details =
@@ -8584,7 +8595,12 @@ export class AgentSession implements SettingsScope {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
-		if (this.isStreaming) {
+		const appendAtStop =
+			stopHookAppend &&
+			sessionGeneration === this.#sessionGeneration &&
+			promptGeneration === this.#promptGeneration &&
+			!this.agent.state.isStreaming;
+		if (this.isStreaming && !appendAtStop) {
 			// Queued into a turn the agent owns: that turn holds the session. Busy only
 			// from another prompt's setup claims nothing (that prompt decides).
 			outcome.sessionClaimed = this.agent.state.isStreaming;

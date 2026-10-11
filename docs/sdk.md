@@ -134,6 +134,18 @@ console.log(session.sessionFile); // undefined
 - Useful for tests, ephemeral workers, request-scoped agents.
 - Session methods still work, but persistence-specific behaviors (file resume/fork paths) are naturally limited.
 
+### Bounded artifact content
+
+`await session.sessionManager.getArtifactContent(id, maxBytes)` reads a tool-output spill from the current session, including in-memory sessions.
+
+- Use the spill's numeric artifact ID. IDs are session-relative, not global.
+- Set `maxBytes` to a nonnegative safe integer measured in UTF-8 bytes, not characters.
+- The result is the complete string or `null`; the method never returns a truncated prefix.
+- Missing, oversized, unpublished, invalid UTF-8, or symlinked artifacts return `null`.
+- Session changes, owner replacement during disk reads, and terminal artifact release invalidate access.
+- Memory snapshots restore their captured artifact namespace and ID counter.
+
+
 ### Resume/open/list helpers
 
 ```ts

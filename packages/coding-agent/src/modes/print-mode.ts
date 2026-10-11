@@ -19,7 +19,7 @@ import {
 	formatPersistenceFailure,
 	formatPersistenceNotice,
 } from "./persistence-failure";
-import { initializeExtensions } from "./runtime-init";
+import { HeadlessShutdownCoordinator, initializeExtensions } from "./runtime-init";
 
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 
@@ -157,18 +157,6 @@ async function runPrintModeCore(
 			writeStdoutLine(`${JSON.stringify(header)}\n`);
 		}
 	}
-	// Set up extensions for print mode (no UI, no command context)
-	await initializeExtensions(session, {
-		mode: mode === "json" ? "json" : "print",
-		reportSendError: (action, err) => {
-			process.stderr.write(
-				`Extension ${action === "extension_send" ? "sendMessage" : "sendUserMessage"} failed: ${err.message}\n`,
-			);
-		},
-		reportRuntimeError: err => {
-			process.stderr.write(`Extension error (${err.extensionPath}): ${err.error}\n`);
-		},
-	});
 
 	// `plan.defaultOnStartup` opens fresh *interactive* sessions in plan mode so a
 	// human can review the plan before it executes. Headless print mode has no
@@ -218,6 +206,20 @@ async function runPrintModeCore(
 			.catch(() => {});
 	};
 
+	let extensionFailure = false;
+	let extensionSendsObserved = false;
+	let extensionShutdownRequested = false;
+	const extensionSends = new HeadlessShutdownCoordinator({
+		isShutdownRequested: () => false,
+		performShutdown: async () => {},
+	});
+	const drainExtensionWork = async (): Promise<void> => {
+		do {
+			await extensionSends.drain();
+			if (extensionSendsObserved) await session.waitForIdle();
+		} while (extensionSends.hasPendingTasks);
+	};
+
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
 	session.sessionManager.onPersistenceError(error => {
@@ -238,6 +240,27 @@ async function runPrintModeCore(
 			// hidden behind a sibling account that quietly answers the prompt.
 			writeStderrLine(`Warning: ${event.message}`);
 		}
+	});
+
+	await initializeExtensions(session, {
+		mode: mode === "json" ? "json" : "print",
+		trackExtensionSend: task => {
+			extensionSendsObserved = true;
+			extensionSends.track(task);
+		},
+		onShutdown: () => {
+			extensionShutdownRequested = true;
+		},
+		reportSendError: (action, err) => {
+			extensionFailure = true;
+			writeStderrLine(
+				`Extension ${action === "extension_send" ? "sendMessage" : "sendUserMessage"} failed: ${singleLine(err.message)}`,
+			);
+		},
+		reportRuntimeError: err => {
+			extensionFailure = true;
+			writeStderrLine(`Extension error (${singleLine(err.extensionPath)}): ${singleLine(err.error)}`);
+		},
 	});
 
 	const timeoutMs = resolveMCPTimeoutMs();
@@ -276,20 +299,24 @@ async function runPrintModeCore(
 	};
 
 	// Send initial message with attachments
-	if (!strictMCPFailure && initialMessage !== undefined) {
+	if (!strictMCPFailure && !extensionShutdownRequested && initialMessage !== undefined) {
 		writeTextWorkingIndicator();
 		if (mode === "text") session.setTextOutputCommitted(false);
 		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
+		await drainExtensionWork();
 	}
 
 	// Send remaining messages
 	if (!strictMCPFailure) {
 		for (const message of messages) {
+			if (extensionShutdownRequested) break;
 			writeTextWorkingIndicator();
 			if (mode === "text") session.setTextOutputCommitted(false);
 			await logger.time("print:prompt:next", () => session.prompt(message));
+			await drainExtensionWork();
 		}
 	}
+	await drainExtensionWork();
 
 	// From this point onward a late blocker must be recorded without starting a
 	// primary turn whose response print mode would never emit.
@@ -347,6 +374,7 @@ async function runPrintModeCore(
 			{ waitThroughRecovery: true, strictWithoutDeadline: true },
 		);
 	}
+	await drainExtensionWork();
 	// Error spans must reach the exporter; the postmortem `exit` handler can't await.
 	if (terminalFailure) await flushTelemetryExport();
 
@@ -372,6 +400,8 @@ async function runPrintModeCore(
 		await stderrTail;
 	}
 
+	await extensionSends.drain();
+	await stdoutTail;
 	// Text mode reports the terminal failure on stderr exactly as before: same
 	// line, same ordering after dispose, without terminating the process here.
 	if (mode === "text" && terminalFailure && assistantMsg) {
@@ -384,5 +414,5 @@ async function runPrintModeCore(
 	}
 
 	await stderrTail;
-	return terminalFailure || durabilityFailure || strictMCPFailure ? 1 : 0;
+	return terminalFailure || durabilityFailure || strictMCPFailure || extensionFailure ? 1 : 0;
 }
