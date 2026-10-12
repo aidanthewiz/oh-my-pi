@@ -20,6 +20,15 @@
 - Fixed `wait` interruptions during service discovery and late service subscriptions after cancellation, session switching, or disposal. Preserve user cancellation and exactly-once owned result delivery.
 - Reports that outgrow the available rows after terminal resizing now open as focused, scrollable pages while preserving drafts, attachments, and the transcript.
 - Fixed stdio gateway fallback accepting HTTP 200 before terminal SSE errors across Chat Completions, Responses, Anthropic Messages and pi-native; completed transient failures now try permitted candidates without leaking partial output or retrying invalid requests, cancellation or response-size failures.
+- Source checkouts no longer track machine-specific Bazel output links; all root Bazel outputs are ignored.
+
+## [18.6.2] - 2026-10-04
+
+### Fixed
+
+- Fixed snapcompact's short final frames preventing vision-backed sessions from continuing on backends that reject 32px-or-smaller images ([#14355](https://github.com/can1357/oh-my-pi/issues/14355)).
+- Fixed the agent's `goal` calls asking for approval under `--approval-mode write`, which paused goal-mode loops at `complete`; `always-ask` still prompts for goal changes but not `get` ([#14368](https://github.com/can1357/oh-my-pi/issues/14368))
+- Fixed MCP server connection progress popping up a toast for every server that connects or fails in native terminals such as Tern; it now shows only in the classic terminal transcript
 
 ## [18.6.1] - 2026-10-04
 

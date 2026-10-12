@@ -4,7 +4,6 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
-	formatMCPConnectionStatusMessage,
 	MCP_CONNECTION_STATUS_EVENT_CHANNEL,
 	type McpConnectionStatusEvent,
 } from "@oh-my-pi/pi-coding-agent/mcp/startup-events";
@@ -14,31 +13,28 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
-
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { TspHarness } from "../../tui/test/native/tsp-harness";
 import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
-/**
- * Behavioral wiring guard for MCP startup status (mirrors
- * interactive-mode-lsp-startup.test.ts). The SDK emits connection lifecycle
- * events, and InteractiveMode aggregates them into one live status line. This
- * pins the constructor-time subscription and the update path that replaces the
- * stale "Connecting…" banner when servers connect or fail.
- */
 describe("InteractiveMode MCP connection status", () => {
 	let authStorage: AuthStorage;
 	let eventBus: EventBus;
 	let mode: InteractiveMode;
 	let session: AgentSession;
 	let tempDir: TempDir;
+	let harness: TspHarness | undefined;
 
-	beforeAll(() => {
-		initTheme();
+	const transcript = (): string => Bun.stripANSI(mode.chatContainer.render(160).join("\n"));
+	const emit = (event: McpConnectionStatusEvent): void => {
+		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, event);
+	};
+
+	beforeAll(async () => {
+		await initTheme();
 	});
 
 	beforeEach(async () => {
-		// Keep ProcessTerminal.start() from probing the real terminal; the test
-		// only drives the event bus and spies on showStatus.
 		vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		vi.spyOn(process.stdin, "resume").mockReturnValue(process.stdin);
 		vi.spyOn(process.stdin, "pause").mockReturnValue(process.stdin);
@@ -53,31 +49,24 @@ describe("InteractiveMode MCP connection status", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
-		if (!model) {
-			throw new Error("Expected claude-sonnet-4-5 to exist in registry");
-		}
-
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
 		session = new AgentSession({
 			agent: new Agent({
-				initialState: {
-					model,
-					systemPrompt: ["Test"],
-					tools: [],
-					messages: [],
-				},
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			}),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
+		cfgStartupQuiet.set(session.settings, false);
 		eventBus = new EventBus();
 		mode = new InteractiveMode(session, "test", undefined, () => {}, [], undefined, eventBus);
-		// This contract is the banner wiring, not git branch watching; a real
-		// fs.watch in a parallel Bun worker can trip an unrelated-worker SIGTRAP.
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 	});
 
 	afterEach(async () => {
+		harness?.stop();
+		harness = undefined;
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
@@ -86,126 +75,71 @@ describe("InteractiveMode MCP connection status", () => {
 		resetSettingsForTest();
 	});
 
-	it("routes a mcp:connection-status event through the constructor-registered subscriber, before init()", () => {
-		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+	it("retains MCP progress in the classic transcript without native toasts", async () => {
+		harness = await TspHarness.start(tui => tui.addChild(mode.chatContainer));
+		emit({ type: "connecting", serverNames: ["mcp-pending-control", "mcp-failure-control"] });
+		expect(transcript()).toContain("mcp-pending-control");
+		expect(transcript()).toContain("mcp-failure-control");
+		await harness.render();
+		expect(harness.find(node => node.k === "toast")).toBeUndefined();
 
-		const serverNames = ["sequential", "critic", "shannon"];
-		const event = { type: "connecting", serverNames } satisfies McpConnectionStatusEvent;
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, event);
+		emit({ type: "failed", serverName: "mcp-failure-control", error: "mcp-error-control" });
+		expect(transcript()).toContain("mcp-error-control");
+		await harness.render();
+		expect(harness.find(node => node.k === "toast")).toBeUndefined();
 
-		expect(showStatusSpy).toHaveBeenCalledWith(
-			formatMCPConnectionStatusMessage({
-				pendingServers: serverNames,
-				connectedServers: [],
-				failedServers: [],
-			}),
-		);
+		mode.showStatus("unrelated-status-control");
+		await harness.render();
+		expect(harness.find(node => node.k === "toast")?.p).toMatchObject({ text: "unrelated-status-control" });
+		expect(transcript()).not.toContain("mcp-error-control");
 	});
 
-	it("does not render the mcp:connection-status status when startup.quiet is enabled", () => {
+	it("keeps MCP progress out of the transcript when startup.quiet is enabled", () => {
 		cfgStartupQuiet.set(session.settings, true);
-		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
-
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connecting",
-			serverNames: ["sequential", "critic"],
-		} satisfies McpConnectionStatusEvent);
-
-		expect(showStatusSpy).not.toHaveBeenCalled();
+		emit({ type: "connecting", serverNames: ["mcp-quiet-control"] });
+		expect(transcript()).not.toContain("mcp-quiet-control");
 	});
 
-	it("updates the live MCP status as servers connect and fail", () => {
-		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
-
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connecting",
-			serverNames: ["alpha", "broken", "slow"],
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connected",
-			serverName: "alpha",
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "failed",
-			serverName: "broken",
-			error: "missing command",
-			sourcePath: "/tmp/codex/config.toml",
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connected",
-			serverName: "slow",
-		} satisfies McpConnectionStatusEvent);
-
-		expect(showStatusSpy.mock.calls.map(call => call[0])).toEqual([
-			"Connecting to MCP servers: alpha, broken, slow…",
-			"Connected: alpha. Still connecting: broken, slow…",
-			"Connected: alpha. Failed: broken [config: /tmp/codex/config.toml]: missing command. Still connecting: slow…",
-			"MCP finished with failures. Connected: alpha, slow. Failed: broken [config: /tmp/codex/config.toml]: missing command",
-		]);
+	it("preserves connection outcomes while replacing pending progress", () => {
+		emit({ type: "connecting", serverNames: ["alpha", "broken", "slow"] });
+		emit({ type: "connected", serverName: "alpha" });
+		emit({ type: "failed", serverName: "broken", error: "failure-control", sourcePath: "/tmp/source-control.toml" });
+		expect(transcript()).toContain("alpha");
+		expect(transcript()).toContain("slow");
+		expect(transcript()).toContain("failure-control");
+		expect(transcript()).toContain("/tmp/source-control.toml");
+		emit({ type: "connected", serverName: "slow" });
+		expect(transcript()).toContain("alpha");
+		expect(transcript()).toContain("slow");
+		expect(transcript()).toContain("failure-control");
+		expect(mode.chatContainer.children).toHaveLength(1);
 	});
 
-	it("removes cancelled servers without rendering them as failures", () => {
-		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
-
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connecting",
-			serverNames: ["rootly", "sentry"],
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "cancelled",
-			serverName: "rootly",
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connected",
-			serverName: "sentry",
-		} satisfies McpConnectionStatusEvent);
-
-		expect(showStatusSpy.mock.calls.map(call => call[0])).toEqual([
-			"Connecting to MCP servers: rootly, sentry…",
-			"Connected to MCP server: sentry.",
-		]);
+	it("removes canceled servers without presenting them as failures", () => {
+		emit({ type: "connecting", serverNames: ["canceled-control", "connected-control"] });
+		emit({ type: "cancelled", serverName: "canceled-control" });
+		emit({ type: "connected", serverName: "connected-control" });
+		expect(transcript()).not.toContain("canceled-control");
+		expect(transcript()).toContain("connected-control");
 	});
 
-	it("retries one server without erasing other startup outcomes", () => {
-		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
-
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connecting",
-			serverNames: ["alpha", "retry", "broken"],
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "connected",
-			serverName: "alpha",
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "failed",
-			serverName: "broken",
-			error: "bad config",
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "failed",
-			serverName: "retry",
-			error: "timed out",
-		} satisfies McpConnectionStatusEvent);
-		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, {
-			type: "reconnecting",
-			serverName: "retry",
-		} satisfies McpConnectionStatusEvent);
-
-		expect(showStatusSpy).toHaveBeenLastCalledWith(
-			"Connected: alpha. Failed: broken: bad config. Still connecting: retry…",
-		);
+	it("keeps other server outcomes visible when retrying one server", () => {
+		emit({ type: "connecting", serverNames: ["alpha", "retry", "broken"] });
+		emit({ type: "connected", serverName: "alpha" });
+		emit({ type: "failed", serverName: "broken", error: "retained-error-control" });
+		emit({ type: "failed", serverName: "retry", error: "retired-error-control" });
+		emit({ type: "reconnecting", serverName: "retry" });
+		expect(transcript()).toContain("alpha");
+		expect(transcript()).toContain("retained-error-control");
+		expect(transcript()).toContain("retry");
+		expect(transcript()).not.toContain("retired-error-control");
 	});
 
-	it("rejects a malformed mcp:connection-status payload via the guard instead of letting it throw", () => {
-		const showStatusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
-		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
-
+	it("preserves the last valid status when a malformed event follows", () => {
+		emit({ type: "connecting", serverNames: ["valid-status-control"] });
+		const before = transcript();
 		eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, { wrong: "shape" });
-
-		expect(showStatusSpy).not.toHaveBeenCalled();
-		expect(warnSpy).toHaveBeenCalled();
-		expect(errorSpy).not.toHaveBeenCalled();
+		expect(transcript()).toBe(before);
+		expect(transcript()).toContain("valid-status-control");
 	});
 });
