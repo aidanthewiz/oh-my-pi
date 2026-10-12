@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
+
 ## [18.6.1] - 2026-10-04
 
 ### Fixed

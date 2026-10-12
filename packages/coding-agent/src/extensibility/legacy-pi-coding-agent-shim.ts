@@ -60,6 +60,7 @@ import {
 	truncateTail,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { SessionEntry } from "../session/session-entries";
+import { markStopHookResult } from "../session/messages";
 import type { Tool, ToolSession } from "../tools";
 import { BashTool } from "../tools/bash";
 import { GlobTool } from "../tools/glob";
@@ -1593,16 +1594,16 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		return [message];
 	}
 	if (entry.type === "custom_message") {
-		return [
-			createCustomMessage(
-				entry.customType,
-				entry.content ?? [],
-				entry.display,
-				entry.details,
-				entry.timestamp,
-				entry.attribution,
-			),
-		];
+		const message = createCustomMessage(
+			entry.customType,
+			entry.content ?? [],
+			entry.display,
+			entry.details,
+			entry.timestamp,
+			entry.attribution,
+		);
+		if (entry.stopHookAssistantEntryId) markStopHookResult(message, entry.stopHookAssistantEntryId);
+		return [message];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];

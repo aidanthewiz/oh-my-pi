@@ -297,6 +297,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	display: boolean;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
+	/** Persisted assistant entry that owns this passive session-stop result. */
+	stopHookAssistantEntryId?: string;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */

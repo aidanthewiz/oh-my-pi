@@ -13,7 +13,6 @@ import {
 	type RpcInputFrameDeps,
 	rpcControlEventFrame,
 	RpcPendingExtensionRequests,
-	RpcShutdownCoordinator,
 	startRpcPromptWithModelFence,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type {
@@ -23,6 +22,7 @@ import type {
 	RpcHostToolCancelRequest,
 	RpcResponse,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { HeadlessShutdownCoordinator } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -955,7 +955,7 @@ describe("RpcInputDispatcher", () => {
 	});
 });
 
-describe("RpcShutdownCoordinator", () => {
+describe("HeadlessShutdownCoordinator", () => {
 	/** performShutdown spy that records call count and outputs.length at the moment it ran. */
 	const makeShutdownRecorder = (outputs: OutputFrame[]) => {
 		const state = { calls: 0, outputsAtShutdown: -1 };
@@ -979,7 +979,7 @@ describe("RpcShutdownCoordinator", () => {
 		});
 		const shutdown = { requested: false };
 		const recorder = makeShutdownRecorder(outputs);
-		const coordinator = new RpcShutdownCoordinator({
+		const coordinator = new HeadlessShutdownCoordinator({
 			isShutdownRequested: () => shutdown.requested,
 			performShutdown: recorder.performShutdown,
 		});
@@ -1040,7 +1040,7 @@ describe("RpcShutdownCoordinator", () => {
 	test("concurrent triggers are latched: performShutdown runs exactly once", async () => {
 		const outputs: OutputFrame[] = [];
 		const recorder = makeShutdownRecorder(outputs);
-		const coordinator = new RpcShutdownCoordinator({
+		const coordinator = new HeadlessShutdownCoordinator({
 			isShutdownRequested: () => true,
 			performShutdown: recorder.performShutdown,
 		});
@@ -1067,7 +1067,7 @@ describe("RpcShutdownCoordinator", () => {
 	test("no-op when shutdown was not requested", async () => {
 		const outputs: OutputFrame[] = [];
 		const recorder = makeShutdownRecorder(outputs);
-		const coordinator = new RpcShutdownCoordinator({
+		const coordinator = new HeadlessShutdownCoordinator({
 			isShutdownRequested: () => false,
 			performShutdown: recorder.performShutdown,
 		});
@@ -1085,7 +1085,7 @@ describe("RpcShutdownCoordinator", () => {
 	});
 
 	test("drain() waits for tasks tracked while draining", async () => {
-		const coordinator = new RpcShutdownCoordinator({
+		const coordinator = new HeadlessShutdownCoordinator({
 			isShutdownRequested: () => false,
 			performShutdown: async () => {},
 		});

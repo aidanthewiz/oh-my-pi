@@ -134,6 +134,19 @@ console.log(session.sessionFile); // undefined
 - Useful for tests, ephemeral workers, request-scoped agents.
 - Session methods still work, but persistence-specific behaviors (file resume/fork paths) are naturally limited.
 
+### Bounded artifact content
+
+`await session.sessionManager.getArtifactContent(id, maxBytes)` reads a tool-output spill from the current session, including in-memory sessions.
+
+- Use the spill's numeric artifact ID. IDs are session-relative, not global.
+- Set `maxBytes` to a nonnegative safe integer measured in UTF-8 bytes, not characters.
+- The result is the complete string or `null`; the method never returns a truncated prefix.
+- Reads await pending session artifact copies before capturing directory identity; ownership must remain current during that wait.
+- Missing, oversized, unpublished, invalid UTF-8, or symlinked artifacts return `null`.
+- Session changes, owner or directory replacement during lookup, reading, or file close, and terminal artifact release invalidate access.
+- Memory snapshots restore their captured artifact namespace and ID counter.
+
+
 ### Resume/open/list helpers
 
 ```ts
@@ -293,9 +306,13 @@ Related APIs:
 
 `deliverAs: "aside"` (both APIs) delivers at the next agent step boundary without interrupting the current tool batch, instead of steering (which skips remaining tools) or waiting for the run to finish. When the session is idle both start a turn instead (in plan mode the custom message is folded into context without a turn).
 
+During `session_stop`, `triggerTurn: false` without an explicit delivery mode appends an outcome without starting another turn. Passive diagnostics do not prevent manual retry, including after reopening the session. The failed attempt's transcript retains its diagnostics. Explicit delivery modes retain their queue semantics.
+
 ## `AgentSession` lifecycle and disposal
 
 Call `await session.dispose()` when the embedder is completely done with a session. `dispose()` starts disposal itself and is idempotent: repeated or concurrent calls receive the same teardown promise, so shutdown events and owned resources are not drained twice.
+
+Before normal headless shutdown, await `session.waitForIdle()` to settle the agent, persistence, recovery, and detached event observers. Print mode also drains extension sends before disposal. Call `waitForIdle()` outside callbacks whose completion the session awaits.
 
 `beginDispose()` is the synchronous admission barrier for wrappers that must await their own teardown before calling `dispose()`. Call it before the wrapper's first `await`; otherwise deferred work can enter the gap. It immediately marks the session disposed, cancels memory startup, title generation, and auto-learn capture, clears queued yield/asides, stops advisor runtime, detaches aside delivery, and rejects new eval executions. Deferred session work checks the disposed state and is dropped or skipped. `beginDispose()` is also idempotent, and the later `dispose()` call remains required to finish asynchronous cleanup.
 

@@ -1600,7 +1600,8 @@ export class Agent {
 				}
 				throw new Error("No messages to continue from");
 			}
-			if (messages[messages.length - 1].role === "assistant") {
+			const last = messages[messages.length - 1];
+			if (last.role === "assistant" || (last.role === "custom" && this.hasQueuedMessages())) {
 				// A tail with unpaired runnable tool calls resumes by re-executing
 				// them (see `unpairedToolCallTail` in agent-loop). This must win over
 				// queued-message delivery: injecting a message between the tool_use
@@ -1624,7 +1625,7 @@ export class Agent {
 					return;
 				}
 
-				throw new Error("Cannot continue from message role: assistant");
+				throw new Error(`Cannot continue from message role: ${last.role}`);
 			}
 
 			await this.#runLoop(undefined, undefined, signal, true);

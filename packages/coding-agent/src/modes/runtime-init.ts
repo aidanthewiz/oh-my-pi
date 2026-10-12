@@ -212,3 +212,52 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 	runner.onError(reportRuntimeError);
 	await runner.emit({ type: "session_start" });
 }
+
+/** Drains accepted headless work before honoring a shutdown request. */
+export class HeadlessShutdownCoordinator {
+	#tasks = new Set<Promise<void>>();
+	#shutdown: Promise<void> | undefined;
+	readonly #isShutdownRequested: () => boolean;
+	readonly #performShutdown: () => Promise<void>;
+
+	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
+		this.#isShutdownRequested = options.isShutdownRequested;
+		this.#performShutdown = options.performShutdown;
+	}
+
+	/** Callers report task failures; rejected tasks must still release shutdown. */
+	track(task: Promise<unknown>): void {
+		const settled = task.then(
+			() => {},
+			() => {},
+		);
+		this.#tasks.add(settled);
+		void settled.then(() => {
+			this.#tasks.delete(settled);
+			void this.checkShutdownRequested();
+		});
+	}
+
+	get hasPendingTasks(): boolean {
+		return this.#tasks.size > 0;
+	}
+
+	/** Await every tracked task, including tasks tracked while draining. */
+	async drain(): Promise<void> {
+		while (this.#tasks.size > 0) {
+			await Promise.allSettled(Array.from(this.#tasks));
+		}
+	}
+
+	/**
+	 * If shutdown was requested, drain background tasks (so every owed
+	 * response frame is written) before running the shutdown sequence.
+	 */
+	checkShutdownRequested(): Promise<void> {
+		if (!this.#shutdown) {
+			if (!this.#isShutdownRequested()) return Promise.resolve();
+			this.#shutdown = this.drain().then(() => this.#performShutdown());
+		}
+		return this.#shutdown;
+	}
+}
