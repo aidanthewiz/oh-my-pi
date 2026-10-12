@@ -5,7 +5,7 @@
 ### Fixed
 
 - Drain extension-generated print/JSON work before exiting, including non-triggering session-stop outcomes and queued follow-ups.
-- Expose bounded, session-owned artifact content, including memory-only sessions. Reject unpublished, invalid UTF-8, and replaced-owner disk payloads.
+- Expose bounded, session-owned artifact content, including memory-only sessions. Reject unpublished, invalid UTF-8, and replaced-owner disk payloads, including directory replacement during artifact lookup.
 - Lifecycle integrations can reject delayed starts and completions without clearing a newer loop's state or pending decision.
 - Collaboration guests preserve Working across host continuations, reset turn counters per loop, and reject duplicate completion after snapshot recovery.
 - Collaboration state timers preserve newer-loop updates across delayed ends and stop when retained ownership becomes idle.

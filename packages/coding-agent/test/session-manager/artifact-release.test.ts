@@ -297,6 +297,40 @@ describe("SessionManager artifact terminal release", () => {
 		expect(await manager.getArtifactContent("0", 1024)).toBe("renamed payload");
 	});
 
+	for (const replaceDirectory of [false, true]) {
+		it(`returns ${replaceDirectory ? "null" : "owned bytes"} when the directory is ${replaceDirectory ? "replaced" : "unchanged"} during lookup`, async () => {
+			const manager = inMemory();
+			const ownerDir = tempDir.join("lookup-owner");
+			const artifacts = new ArtifactManager(ownerDir);
+			manager.adoptArtifactManager(artifacts);
+			const ownedContent = '{"owner":"original"}';
+			const id = await manager.saveArtifact(ownedContent, "mcp");
+			if (id === undefined) throw new Error("Expected disk artifact ID");
+			const lookupEntered = Promise.withResolvers<void>();
+			const releaseLookup = Promise.withResolvers<void>();
+			const listFiles = artifacts.listFiles.bind(artifacts);
+			vi.spyOn(artifacts, "listFiles").mockImplementation(async () => {
+				lookupEntered.resolve();
+				await releaseLookup.promise;
+				return listFiles();
+			});
+			const reading = manager.getArtifactContent(id, 1024);
+			try {
+				await withTimeout(lookupEntered.promise, 2_000, "Owned artifact never reached lookup");
+				if (replaceDirectory) {
+					await fs.promises.rename(ownerDir, tempDir.join("displaced-lookup-owner"));
+					await fs.promises.mkdir(ownerDir);
+					await Bun.write(path.join(ownerDir, `${id}.mcp.log`), '{"owner":"replacement"}');
+				}
+				releaseLookup.resolve();
+				expect(await reading).toBe(replaceDirectory ? null : ownedContent);
+			} finally {
+				releaseLookup.resolve();
+				await reading;
+			}
+		});
+	}
+
 	it("discards an admitted disk read when its owner switches before the artifact lookup completes", async () => {
 		const manager = inMemory();
 		const artifactDir = tempDir.join("old-owner");

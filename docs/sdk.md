@@ -142,7 +142,7 @@ console.log(session.sessionFile); // undefined
 - Set `maxBytes` to a nonnegative safe integer measured in UTF-8 bytes, not characters.
 - The result is the complete string or `null`; the method never returns a truncated prefix.
 - Missing, oversized, unpublished, invalid UTF-8, or symlinked artifacts return `null`.
-- Session changes, owner replacement during disk reads, and terminal artifact release invalidate access.
+- Session changes, owner or directory replacement during lookup, reading, or file close, and terminal artifact release invalidate access.
 - Memory snapshots restore their captured artifact namespace and ID counter.
 
 

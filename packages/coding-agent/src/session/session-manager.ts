@@ -3246,13 +3246,13 @@ export class SessionManager {
 		const ownerStillCurrent = (): boolean =>
 			!this.#released && this.#sessionId === sessionId && this.#artifactManagerForSession() === manager;
 		try {
+			const directory = await fs.promises.lstat(manager.dir);
+			if (!directory.isDirectory() || !ownerStillCurrent()) return null;
 			const prefix = `${id}.`;
 			const filename = (await manager.listFiles()).find(
 				name => name.startsWith(prefix) && /^\d+\.[A-Za-z0-9_-]{1,64}\.log$/.test(name),
 			);
 			if (!filename || !ownerStillCurrent()) return null;
-			const directory = await fs.promises.lstat(manager.dir);
-			if (!directory.isDirectory() || !ownerStillCurrent()) return null;
 			const artifactPath = path.join(manager.dir, filename);
 			const expected = await fs.promises.lstat(artifactPath);
 			if (!ownerStillCurrent() || !expected.isFile() || expected.size > maxBytes) return null;
