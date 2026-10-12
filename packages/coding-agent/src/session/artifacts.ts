@@ -90,6 +90,10 @@ export class ArtifactManager {
 		this.#ready = ready;
 	}
 
+	get ready(): Promise<void> | undefined {
+		return this.#ready;
+	}
+
 	/**
 	 * Artifact directory path.
 	 * Directory may not exist until first artifact is saved.

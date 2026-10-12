@@ -141,6 +141,7 @@ console.log(session.sessionFile); // undefined
 - Use the spill's numeric artifact ID. IDs are session-relative, not global.
 - Set `maxBytes` to a nonnegative safe integer measured in UTF-8 bytes, not characters.
 - The result is the complete string or `null`; the method never returns a truncated prefix.
+- Reads await pending session artifact copies before capturing directory identity; ownership must remain current during that wait.
 - Missing, oversized, unpublished, invalid UTF-8, or symlinked artifacts return `null`.
 - Session changes, owner or directory replacement during lookup, reading, or file close, and terminal artifact release invalidate access.
 - Memory snapshots restore their captured artifact namespace and ID counter.

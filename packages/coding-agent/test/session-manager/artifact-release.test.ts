@@ -297,6 +297,59 @@ describe("SessionManager artifact terminal release", () => {
 		expect(await manager.getArtifactContent("0", 1024)).toBe("renamed payload");
 	});
 
+	for (const ownerChange of ["unchanged", "switch", "release", "adopt"] as const) {
+		it(`waits for a branch artifact copy (owner: ${ownerChange})`, async () => {
+			const manager = SessionManager.create(tempDir.path(), tempDir.path());
+			managers.push(manager);
+			const content = "retained branch payload";
+			const id = await manager.saveArtifact(content, "mcp");
+			if (!id) throw new Error("Expected a persisted artifact id");
+			const leafId = manager.appendMessage({
+				role: "user",
+				content: `Retain artifact://${id}`,
+				timestamp: 1,
+			});
+			await manager.ensureOnDisk();
+			const copying = Promise.withResolvers<void>();
+			const releaseCopy = Promise.withResolvers<void>();
+			const mkdir = fs.promises.mkdir.bind(fs.promises);
+			const lstat = fs.promises.lstat.bind(fs.promises);
+			const branchFile = manager.createBranchedSession(leafId, { copyArtifacts: true });
+			if (!branchFile) throw new Error("Expected a persisted branch");
+			const destinationDir = manager.getArtifactsDir();
+			if (!destinationDir) throw new Error("Expected the branch artifact directory");
+			const artifacts = manager.getArtifactManager();
+			if (!artifacts) throw new Error("Expected the branch artifact manager");
+			vi.spyOn(fs.promises, "mkdir").mockImplementation((async (target, options) => {
+				if (target.toString() === destinationDir) {
+					copying.resolve();
+					await releaseCopy.promise;
+				}
+				return mkdir(target, options);
+			}) as typeof fs.promises.mkdir);
+			vi.spyOn(fs.promises, "lstat").mockImplementation((async (target, options) => {
+				if (target.toString() === destinationDir) return fs.lstatSync(target, options);
+				return lstat(target, options);
+			}) as typeof fs.promises.lstat);
+			let reading: Promise<string | null> | undefined;
+			try {
+				await withTimeout(copying.promise, 2_000, "Branch artifact copy never reached its destination");
+				expect(fs.existsSync(destinationDir)).toBe(false);
+				reading = manager.getArtifactContent(id, 1024);
+				if (ownerChange === "switch") await manager.newSession();
+				else if (ownerChange === "release") manager.releaseRetainedEntries();
+				else if (ownerChange === "adopt")
+					manager.adoptArtifactManager(new ArtifactManager(tempDir.join("adopted")));
+				releaseCopy.resolve();
+				expect(await reading).toBe(ownerChange === "unchanged" ? content : null);
+			} finally {
+				releaseCopy.resolve();
+				await reading;
+				await artifacts.listFiles();
+			}
+		});
+	}
+
 	for (const replaceDirectory of [false, true]) {
 		it(`returns ${replaceDirectory ? "null" : "owned bytes"} when the directory is ${replaceDirectory ? "replaced" : "unchanged"} during lookup`, async () => {
 			const manager = inMemory();

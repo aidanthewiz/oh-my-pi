@@ -3246,6 +3246,8 @@ export class SessionManager {
 		const ownerStillCurrent = (): boolean =>
 			!this.#released && this.#sessionId === sessionId && this.#artifactManagerForSession() === manager;
 		try {
+			await manager.ready;
+			if (!ownerStillCurrent()) return null;
 			const directory = await fs.promises.lstat(manager.dir);
 			if (!directory.isDirectory() || !ownerStillCurrent()) return null;
 			const prefix = `${id}.`;
