@@ -1,16 +1,23 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 function lastAgentMessage(session: AgentSession): AssistantMessage {
 	const message = session.agent.state.messages.at(-1);
@@ -44,6 +51,216 @@ describe("AgentSession manual retry", () => {
 		authStorage.close();
 		tempDir.removeSync();
 	});
+
+	async function createWithStopDiagnostic(responses: MockResponseSource, tools: AgentTool[] = []) {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		const manager = SessionManager.inMemory(tempDir.path());
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("session_stop", event => {
+					const assistant = event.last_assistant_message;
+					if (assistant?.role !== "assistant" || assistant.stopReason !== "error") return;
+					pi.sendMessage(
+						{
+							customType: "retry-diagnostic",
+							content: "The attempt failed; manual retry remains available",
+							display: true,
+							details: { failedAttempt: true },
+						},
+						{ triggerTurn: false },
+					);
+				});
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"manual-retry-stop",
+		);
+		const provider = createMockModel({ responses });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools },
+			streamFn: provider.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			modelRegistry,
+			extensionRunner: new ExtensionRunner([extension], runtime, tempDir.path(), manager, modelRegistry),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"plan.defaultOnStartup": false,
+			}),
+		});
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => {
+				throw error;
+			},
+			reportRuntimeError: error => {
+				throw new Error(error.error);
+			},
+		});
+		session.subscribe(() => {});
+		return { active: session, manager, provider, model };
+	}
+
+	it.each(["live", "copied", "reopened"] as const)(
+		"retries a failed %s turn after a passive stop diagnostic",
+		async state => {
+			const { active, manager, provider, model } = await createWithStopDiagnostic([
+				{ throw: "stop diagnostic retry failure" },
+				context => {
+					expect(context.messages.some(message => message.role === "assistant")).toBe(false);
+					return { content: ["recovered with diagnostic retained"] };
+				},
+			]);
+			await active.prompt("fail once");
+			await active.waitForIdle();
+			expect(active.agent.state.messages.at(-1)).toMatchObject({
+				role: "custom",
+				customType: "retry-diagnostic",
+				details: { failedAttempt: true },
+			});
+			expect(active.hasAbortedToolCallTail).toBe(false);
+			if (state === "copied") {
+				active.agent.replaceMessages(active.agent.state.messages.map(message => ({ ...message })));
+			}
+			let currentManager = manager;
+			if (state === "reopened") {
+				const sessionFile = path.join(tempDir.path(), "reopened-diagnostic.jsonl");
+				fs.writeFileSync(
+					sessionFile,
+					[manager.getHeader(), ...manager.getEntries()].map(entry => JSON.stringify(entry)).join("\n") + "\n",
+				);
+				await active.dispose();
+				currentManager = await SessionManager.open(sessionFile, tempDir.path());
+				session = new AgentSession({
+					agent: new Agent({
+						getApiKey: () => "test-key",
+						initialState: {
+							model,
+							systemPrompt: ["Test"],
+							tools: [],
+							messages: currentManager.buildSessionContext().messages,
+						},
+						streamFn: provider.stream,
+						convertToLlm,
+					}),
+					sessionManager: currentManager,
+					modelRegistry,
+					settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+				});
+				session.subscribe(() => {});
+			}
+			if (!session) throw new Error("Expected retry session");
+			await expect(session.retry()).resolves.toBe(true);
+			await session.waitForIdle();
+			expect(provider.calls).toHaveLength(2);
+			expect(
+				session.agent.state.messages.some(
+					message => message.role === "assistant" && message.stopReason === "error",
+				),
+			).toBe(false);
+			expect(lastAgentMessage(session).content).toContainEqual({
+				type: "text",
+				text: "recovered with diagnostic retained",
+			});
+			expect(currentManager.buildSessionContext({ transcript: true }).messages).toContainEqual(
+				expect.objectContaining({
+					role: "custom",
+					customType: "retry-diagnostic",
+					details: { failedAttempt: true },
+				}),
+			);
+			await expect(session.retry()).resolves.toBe(false);
+			expect(provider.calls).toHaveLength(2);
+		},
+	);
+
+	it("does not retry an older failure through an unrelated custom message", async () => {
+		const { active, provider } = await createWithStopDiagnostic([{ throw: "original failure" }]);
+		await active.prompt("fail once");
+		await active.waitForIdle();
+		await active.sendCustomMessage(
+			{ customType: "unrelated-context", content: "A different context update", display: false },
+			{ triggerTurn: false },
+		);
+		await expect(active.retry()).resolves.toBe(false);
+		expect(active.hasAbortedToolCallTail).toBe(false);
+		expect(provider.calls).toHaveLength(1);
+	});
+
+	it.each([false, true])(
+		"preserves tool replay safety with a passive diagnostic and partial success=%s",
+		async partial => {
+			const schema = type({ value: type("string") });
+			const executed: string[] = [];
+			let failingCalls = 0;
+			const probe: AgentTool<typeof schema> = {
+				name: "probe",
+				label: "Probe",
+				description: "Retry probe",
+				parameters: schema,
+				async execute(_id, params) {
+					executed.push(params.value);
+					const isError = params.value === "fail" && ++failingCalls === 1;
+					return { content: [{ type: "text", text: isError ? "failed" : `ok:${params.value}` }], isError };
+				},
+			};
+			const { active, manager, provider } = await createWithStopDiagnostic(
+				[
+					{
+						content: [
+							{ type: "toolCall", id: "failed-call", name: "probe", arguments: { value: "fail" } },
+							...(partial
+								? [
+										{
+											type: "toolCall" as const,
+											id: "successful-call",
+											name: "probe",
+											arguments: { value: "success" },
+										},
+									]
+								: []),
+						],
+						stopReason: "toolUse",
+					},
+					{ throw: "provider failed after tool execution" },
+					context => {
+						const results = context.messages.filter(message => message.role === "toolResult");
+						expect(results.map(result => result.toolCallId).sort()).toEqual(
+							partial ? ["failed-call", "successful-call"] : ["failed-call"],
+						);
+						expect(results.find(result => result.toolCallId === "failed-call")?.isError).toBe(partial);
+						return { content: ["tool retry recovered"] };
+					},
+				],
+				[probe],
+			);
+			await active.prompt("run the probe");
+			await active.waitForIdle();
+			const failedLeaf = manager.getLeafId();
+			expect(active.hasAbortedToolCallTail).toBe(!partial);
+			await expect(active.retry()).resolves.toBe(true);
+			await active.waitForIdle();
+			expect(executed).toEqual(partial ? ["fail", "success"] : ["fail", "fail"]);
+			expect(provider.calls).toHaveLength(3);
+			expect(lastAgentMessage(active).content).toContainEqual({ type: "text", text: "tool retry recovered" });
+			expect(
+				buildSessionContext(manager.getEntries(), failedLeaf, undefined, { transcript: true }).messages,
+			).toContainEqual(
+				expect.objectContaining({
+					role: "custom",
+					customType: "retry-diagnostic",
+					details: { failedAttempt: true },
+				}),
+			);
+		},
+	);
 
 	it("removes the failed assistant turn and continues with a fresh attempt", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");

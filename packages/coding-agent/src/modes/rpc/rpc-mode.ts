@@ -62,7 +62,7 @@ import {
 	formatPersistenceFailure,
 	formatPersistenceNotice,
 } from "../persistence-failure";
-import { initializeExtensions } from "../runtime-init";
+import { HeadlessShutdownCoordinator, initializeExtensions } from "../runtime-init";
 import { cfgSpellingAutocomplete } from "../settings";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
@@ -769,66 +769,6 @@ export class RpcInputDispatcher {
 			if (!backgroundStarted) onPromptSettled?.();
 			await this.#afterSerialCommand?.();
 		}
-	}
-}
-
-/**
- * Coordinates deferred shutdown with in-flight background input tasks.
- *
- * `pi.shutdown()` from an extension only *requests* shutdown; the process must
- * not exit while a background-dispatched command (`bash`, `predict_word`,
- * `prompt` or `steer_subagent`, see
- * {@link dispatchRpcInputFrame}) still owes the client a response frame. The
- * coordinator tracks those tasks, re-checks the shutdown request whenever one
- * settles (covering a shutdown requested mid-command with no follow-up client
- * frame), and drains every tracked task before invoking `performShutdown`.
- * The shutdown sequence is latched so concurrent triggers (input loop and
- * settling tasks) run it exactly once.
- */
-export class RpcShutdownCoordinator {
-	#tasks = new Set<Promise<void>>();
-	#shutdown: Promise<void> | undefined;
-	readonly #isShutdownRequested: () => boolean;
-	readonly #performShutdown: () => Promise<void>;
-
-	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
-		this.#isShutdownRequested = options.isShutdownRequested;
-		this.#performShutdown = options.performShutdown;
-	}
-
-	/**
-	 * Track a background input task. When it settles it is untracked and the
-	 * shutdown request is re-checked, so a deferred shutdown fires even when
-	 * no further client frames arrive.
-	 */
-	track(task: Promise<void>): void {
-		this.#tasks.add(task);
-		void task.finally(() => {
-			this.#tasks.delete(task);
-			// Fire-and-forget: performShutdown ends the process. Rejections are
-			// not expected — hook errors are caught inside extensionRunner.emit,
-			// and background tasks catch their own dispatch errors.
-			void this.checkShutdownRequested();
-		});
-	}
-
-	/** Await every tracked task, including tasks tracked while draining. */
-	async drain(): Promise<void> {
-		while (this.#tasks.size > 0) {
-			await Promise.allSettled(Array.from(this.#tasks));
-		}
-	}
-
-	/**
-	 * If shutdown was requested, drain background tasks (so every owed
-	 * response frame is written) before running the shutdown sequence.
-	 */
-	checkShutdownRequested(): Promise<void> {
-		if (!this.#shutdown) {
-			if (!this.#isShutdownRequested()) return Promise.resolve();
-			this.#shutdown = this.drain().then(() => this.#performShutdown());
-		}
-		return this.#shutdown;
 	}
 }
 
@@ -2605,7 +2545,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// process while a background-dispatched bash still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
 	// re-checks the request as each task settles.
-	const shutdownCoordinator = new RpcShutdownCoordinator({
+	const shutdownCoordinator = new HeadlessShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
 		performShutdown: async () => {
 			// Route through the idempotent session.dispose() so the browser

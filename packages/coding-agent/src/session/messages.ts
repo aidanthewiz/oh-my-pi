@@ -69,6 +69,17 @@ export {
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { titleTextFromSkillPrompt } from "@oh-my-pi/pi-tui/chat/skill-title-input";
 
+const kStopHookAssistantEntryId = Symbol("stopHookAssistantEntryId");
+type StopHookResultMessage = AgentMessage & { [kStopHookAssistantEntryId]?: string };
+
+export function markStopHookResult(message: AgentMessage, assistantEntryId: string): void {
+	(message as StopHookResultMessage)[kStopHookAssistantEntryId] = assistantEntryId;
+}
+
+export function getStopHookAssistantEntryId(message: AgentMessage): string | undefined {
+	return (message as StopHookResultMessage)[kStopHookAssistantEntryId];
+}
+
 /**
  * Logs provider-error turns so their actual cause is available outside the
  * session transcript. No-op for non-error stop reasons.

@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -359,6 +360,7 @@ import {
 	demoteInterruptedThinking,
 	didSessionMessagesChange,
 	type FileMentionMessage,
+	getStopHookAssistantEntryId,
 	type HookMessage,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	type InterruptedThinkingDetails,
@@ -367,6 +369,7 @@ import {
 	isUserInterruptAbort,
 	isUserInvokedSkillPrompt,
 	logProviderTurnError,
+	markStopHookResult,
 	normalizeCustomMessagePayload,
 	type PythonExecutionMessage,
 	SILENT_ABORT_MARKER,
@@ -1013,6 +1016,13 @@ export class AgentSession implements SettingsScope {
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
+	readonly #sessionStopContext = new AsyncLocalStorage<{
+		sessionGeneration: number;
+		promptGeneration: number;
+		runId: string;
+		assistantEntryId: string | undefined;
+		active: boolean;
+	}>();
 	#obfuscator: SecretObfuscator | undefined;
 	/** Last `skillful` value applied to this session; dedupes {@link setSkillful} and its setting watch. */
 	#skillfulApplied = false;
@@ -3110,12 +3120,14 @@ export class AgentSession implements SettingsScope {
 		}
 		const extensionEmit = this.#emitExtensionEvent(event);
 		if (options.detachExtensions) {
-			void extensionEmit.catch(error => {
+			const processing = extensionEmit.catch(error => {
 				logger.warn("Detached session event extension emit failed", {
 					type: event.type,
 					error: error instanceof Error ? error.message : String(error),
 				});
 			});
+			this.#inFlightEventHandlers.add(processing);
+			void processing.finally(() => this.#inFlightEventHandlers.delete(processing)).catch(() => {});
 		} else {
 			await extensionEmit;
 		}
@@ -3458,6 +3470,7 @@ export class AgentSession implements SettingsScope {
 					// otherwise records emission time, which on rebuild excludes
 					// provider preparation / hook time from the prompt→yield anchor.
 					message.timestamp,
+					getStopHookAssistantEntryId(message),
 				);
 			}
 			if (message.role === "custom" && message.customType === "ttsr-injection") {
@@ -4868,19 +4881,36 @@ export class AgentSession implements SettingsScope {
 			this.#resetSessionStopContinuationState();
 			return false;
 		}
-		if (this.#agentKind === "sub" || !this.#extensionRunner?.hasHandlers("session_stop")) {
+		const extensionRunner = this.#extensionRunner;
+		if (this.#agentKind === "sub" || !extensionRunner?.hasHandlers("session_stop")) {
 			return false;
 		}
 		const generation = this.#promptGeneration;
-		const result = await this.#extensionRunner.emitSessionStop({
-			messages,
-			turn_id: Math.max(0, this.#turnIndex - 1),
-			last_assistant_message: lastAssistantMessage,
-			session_id: this.sessionId,
-			session_file: this.sessionFile,
-			stop_hook_active: this.#sessionStopHookActive,
-			signal: this.#postPromptTasksAbortController.signal,
-		});
+		const stopContext = {
+			sessionGeneration: this.#sessionGeneration,
+			promptGeneration: generation,
+			runId: this.#agentRunId,
+			assistantEntryId: lastAssistantMessage
+				? (lastAssistantMessage as PersistedAssistantMessage)[kPersistedSessionEntryId]
+				: undefined,
+			active: true,
+		};
+		let result: SessionStopEventResult | undefined;
+		try {
+			result = await this.#sessionStopContext.run(stopContext, () =>
+				extensionRunner.emitSessionStop({
+					messages,
+					turn_id: Math.max(0, this.#turnIndex - 1),
+					last_assistant_message: lastAssistantMessage,
+					session_id: this.sessionId,
+					session_file: this.sessionFile,
+					stop_hook_active: this.#sessionStopHookActive,
+					signal: this.#postPromptTasksAbortController.signal,
+				}),
+			);
+		} finally {
+			stopContext.active = false;
+		}
 		if (this.#promptGeneration !== generation || this.#abortInProgress || this.#isDisposed) {
 			this.#resetSessionStopContinuationState();
 			return false;
@@ -4919,7 +4949,9 @@ export class AgentSession implements SettingsScope {
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
-			await this.#extensionRunner.emit({ type: "agent_start", runId: this.#lifecycleRunIds.get(event)! });
+			await this.#sessionStopContext.exit(() =>
+				this.#extensionRunner!.emit({ type: "agent_start", runId: this.#lifecycleRunIds.get(event)! }),
+			);
 			return;
 		}
 
@@ -4934,7 +4966,7 @@ export class AgentSession implements SettingsScope {
 		}
 		const mapped = extensionEventFromSessionEvent(event, turnIndex, this.#agentRunId);
 		if (!mapped) return;
-		await this.#extensionRunner.emit(mapped);
+		await this.#sessionStopContext.exit(() => this.#extensionRunner!.emit(mapped));
 	}
 
 	/**
@@ -8285,13 +8317,14 @@ export class AgentSession implements SettingsScope {
 		// queued follow-up waits for an explicit resume — even if an interleaving IRC wake turn has
 		// since left a provider-valid tail.
 		if (this.#advisors.autoResumeSuppressed) return false;
-		// Follow-up-only resume has no steer to inject, so Agent.continue() continues from the
-		// existing context tail — which must itself be a valid provider tail. An injected
-		// non-conversational tail (advisor card → `developer`, bash/python execution) would make
-		// the first model call invalid, so leave the follow-up queued for the next explicit resume.
+		// Agent.continue() injects queued follow-ups before custom records reach the provider.
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
-		return last?.role === "assistant" || last?.role === "toolResult";
+		return (
+			last?.role === "assistant" ||
+			last?.role === "toolResult" ||
+			(last?.role === "custom" && this.agent.peekFollowUpQueue().length > 0)
+		);
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -8563,6 +8596,21 @@ export class AgentSession implements SettingsScope {
 	): Promise<boolean> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
+		const promptGeneration = this.#promptGeneration;
+		const stopContext = this.#sessionStopContext.getStore();
+		const stopHookAppend =
+			stopContext !== undefined &&
+			stopContext.active &&
+			options?.triggerTurn === false &&
+			options.deliverAs === undefined;
+		if (
+			stopHookAppend &&
+			(stopContext.sessionGeneration !== sessionGeneration ||
+				stopContext.promptGeneration !== promptGeneration ||
+				stopContext.runId !== this.#agentRunId)
+		) {
+			return false;
+		}
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const suppressQueueChip = options?.deliverAs === "nextTurn" || options?.deliverAs === "aside";
 		const details =
@@ -8584,7 +8632,23 @@ export class AgentSession implements SettingsScope {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
-		if (this.isStreaming) {
+		if (
+			stopHookAppend &&
+			(stopContext.sessionGeneration !== this.#sessionGeneration ||
+				stopContext.promptGeneration !== this.#promptGeneration ||
+				stopContext.runId !== this.#agentRunId)
+		) {
+			return false;
+		}
+		const appendAtStop =
+			stopHookAppend &&
+			sessionGeneration === this.#sessionGeneration &&
+			promptGeneration === this.#promptGeneration &&
+			!this.agent.state.isStreaming;
+		if (appendAtStop && stopContext.assistantEntryId) {
+			markStopHookResult(normalizedAppMessage, stopContext.assistantEntryId);
+		}
+		if (this.isStreaming && !appendAtStop) {
 			// Queued into a turn the agent owns: that turn holds the session. Busy only
 			// from another prompt's setup claims nothing (that prompt decides).
 			outcome.sessionClaimed = this.agent.state.isStreaming;
@@ -8680,6 +8744,8 @@ export class AgentSession implements SettingsScope {
 			normalizedAppMessage.display,
 			normalizedAppMessage.details,
 			normalizedAppMessage.attribution,
+			normalizedAppMessage.timestamp,
+			getStopHookAssistantEntryId(normalizedAppMessage),
 		);
 		if (normalizedAppMessage.display === true) {
 			// Idle display append with no turn: notify session listeners so the interactive

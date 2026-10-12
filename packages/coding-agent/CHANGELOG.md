@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Drain extension-generated print/JSON work and detached terminal-message observers before exiting, including non-triggering session-stop outcomes and queued follow-ups.
+- Preserve manual retry after passive session-stop diagnostics, including reopened sessions, without replaying successful tool calls or losing the failed attempt's transcript.
+- Expose bounded, session-owned artifact content, including memory-only sessions. Wait for pending branch/move artifact copies before capturing directory identity. Reject unpublished, invalid UTF-8, and replaced-owner disk payloads, including directory replacement during artifact lookup.
 - Lifecycle integrations can reject delayed starts and completions without clearing a newer loop's state or pending decision.
 - Collaboration guests preserve Working across host continuations, reset turn counters per loop, and reject duplicate completion after snapshot recovery.
 - Collaboration state timers preserve newer-loop updates across delayed ends and stop when retained ownership becomes idle.

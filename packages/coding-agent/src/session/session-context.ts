@@ -15,6 +15,7 @@ import {
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	isEmptyErrorTurn,
 	PREWALK_PLAN_MESSAGE_TYPE,
+	markStopHookResult,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
 import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
@@ -406,7 +407,10 @@ export function buildSessionContext(
 				return;
 			}
 			const message = customMessageEntryMessage(entry);
-			if (message) pushMessage(message);
+			if (message) {
+				if (entry.stopHookAssistantEntryId) markStopHookResult(message, entry.stopHookAssistantEntryId);
+				pushMessage(message);
+			}
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			pushMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 		}
