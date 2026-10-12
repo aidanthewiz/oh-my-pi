@@ -306,9 +306,13 @@ Related APIs:
 
 `deliverAs: "aside"` (both APIs) delivers at the next agent step boundary without interrupting the current tool batch, instead of steering (which skips remaining tools) or waiting for the run to finish. When the session is idle both start a turn instead (in plan mode the custom message is folded into context without a turn).
 
+During `session_stop`, `triggerTurn: false` without an explicit delivery mode appends an outcome without starting another turn. Passive diagnostics do not prevent manual retry, including after reopening the session. The failed attempt's transcript retains its diagnostics. Explicit delivery modes retain their queue semantics.
+
 ## `AgentSession` lifecycle and disposal
 
 Call `await session.dispose()` when the embedder is completely done with a session. `dispose()` starts disposal itself and is idempotent: repeated or concurrent calls receive the same teardown promise, so shutdown events and owned resources are not drained twice.
+
+Before normal headless shutdown, await `session.waitForIdle()` to settle the agent, persistence, recovery, and detached event observers. Print mode also drains extension sends before disposal. Call `waitForIdle()` outside callbacks whose completion the session awaits.
 
 `beginDispose()` is the synchronous admission barrier for wrappers that must await their own teardown before calling `dispose()`. Call it before the wrapper's first `await`; otherwise deferred work can enter the gap. It immediately marks the session disposed, cancels memory startup, title generation, and auto-learn capture, clears queued yield/asides, stops advisor runtime, detaches aside delivery, and rejects new eval executions. Deferred session work checks the disposed state and is dropped or skipped. `beginDispose()` is also idempotent, and the later `dispose()` call remains required to finish asynchronous cleanup.
 

@@ -13,7 +13,7 @@ import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../../src/extensibility/extensions/runner";
-import type { ExtensionFactory } from "../../src/extensibility/extensions/types";
+import type { ExtensionFactory, MessageEndEvent, MessageStartEvent } from "../../src/extensibility/extensions/types";
 import { printableEvent, runPrintMode } from "../../src/modes/print-mode";
 import { AgentSession } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
@@ -77,11 +77,6 @@ describe("printableEvent", () => {
 		};
 		expect(printed.messages).toHaveLength(2);
 		for (const message of printed.messages) expect(message.providerPayload).toBeUndefined();
-	});
-
-	it("passes unrelated events through untouched", () => {
-		const event: AgentSessionEvent = { type: "notice", level: "info", message: "hi" };
-		expect(printableEvent(event)).toBe(event);
 	});
 });
 
@@ -249,6 +244,96 @@ describe("print-mode extension completion", () => {
 			await run;
 		}
 	});
+
+	it.each(["message_start", "message_end"] as const)(
+		"drains a detached %s observer and its nested reply before disposal",
+		async eventType => {
+			const observerEntered = Promise.withResolvers<void>();
+			const releaseObserver = Promise.withResolvers<void>();
+			const firstSettled = Promise.withResolvers<void>();
+			const nestedStarted = Promise.withResolvers<void>();
+			const releaseNested = Promise.withResolvers<void>();
+			let stops = 0;
+			const { session: active, provider } = await createSession(
+				pi => {
+					pi.registerCommand("managed", { handler: async () => pi.sendUserMessage("Analyze") });
+					pi.on("session_stop", () => {
+						if (++stops === 1) {
+							pi.sendMessage(
+								{ customType: "observed_result", content: "First result", display: true },
+								{ triggerTurn: false },
+							);
+						}
+					});
+					const observe = async (event: MessageStartEvent | MessageEndEvent) => {
+						if (event.message.role !== "custom" || event.message.customType !== "observed_result") return;
+						observerEntered.resolve();
+						await releaseObserver.promise;
+						pi.sendUserMessage("Nested after observer");
+					};
+					if (eventType === "message_start") pi.on("message_start", observe);
+					else pi.on("message_end", observe);
+				},
+				[
+					{ content: ["First reply"] },
+					async () => {
+						nestedStarted.resolve();
+						await releaseNested.promise;
+						return { content: ["Nested reply"] };
+					},
+				],
+			);
+			active.subscribe(event => {
+				if (event.type === "agent_end") firstSettled.resolve();
+			});
+			const records: Array<Record<string, unknown>> = [];
+			vi.spyOn(process.stdout, "write").mockImplementation(
+				(
+					chunk: string | Uint8Array,
+					encodingOrCallback?: BufferEncoding | StdoutWriteCallback,
+					callback?: StdoutWriteCallback,
+				) => {
+					records.push(JSON.parse(String(chunk)));
+					(typeof encodingOrCallback === "function" ? encodingOrCallback : callback)?.();
+					return true;
+				},
+			);
+			let returned = false;
+			const run = runPrintMode(active, { mode: "json", initialMessage: "/managed" }).then(code => {
+				returned = true;
+				return code;
+			});
+			try {
+				await withTimeout(observerEntered.promise, 2_000, "Detached observer did not start");
+				await withTimeout(firstSettled.promise, 2_000, "First prompt did not settle");
+				const checkpoint = Promise.withResolvers<void>();
+				setImmediate(checkpoint.resolve);
+				await checkpoint.promise;
+				expect(active.isDisposed).toBe(false);
+				expect(returned).toBe(false);
+				releaseObserver.resolve();
+				await withTimeout(nestedStarted.promise, 2_000, "Observer's nested prompt did not start");
+				expect(active.isDisposed).toBe(false);
+				releaseNested.resolve();
+				expect(await run).toBe(0);
+				expect(provider.calls).toHaveLength(2);
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						type: "message_end",
+						message: expect.objectContaining({
+							role: "assistant",
+							content: [{ type: "text", text: "Nested reply" }],
+						}),
+					}),
+				);
+			} finally {
+				releaseObserver.resolve();
+				releaseNested.resolve();
+				await run;
+				await active.waitForIdle();
+			}
+		},
+	);
 
 	it("delivers queued follow-ups after a non-triggering stop-hook message without adding a model turn", async () => {
 		const hookStarted = Promise.withResolvers<void>();

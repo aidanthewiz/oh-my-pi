@@ -3698,6 +3698,7 @@ export class SessionManager {
 		details?: T,
 		attribution: MessageAttribution | undefined = "agent",
 		timestamp?: number,
+		stopHookAssistantEntryId?: string,
 	): string {
 		const normalized = normalizeCustomMessagePayload<T>({ customType, content, display, details, attribution });
 		const fresh = this.#freshEntryFields();
@@ -3714,6 +3715,7 @@ export class SessionManager {
 			// records the emission time, which on rebuild excludes provider
 			// preparation / hook time from the prompt→yield anchor.
 			timestamp: timestamp !== undefined ? new Date(timestamp).toISOString() : fresh.timestamp,
+			...(stopHookAssistantEntryId ? { stopHookAssistantEntryId } : {}),
 		};
 		this.#recordEntry(entry);
 		return entry.id;

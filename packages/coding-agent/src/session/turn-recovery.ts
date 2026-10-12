@@ -51,7 +51,12 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
-import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn } from "./messages";
+import {
+	assistantTurnProducedOutput,
+	getStopHookAssistantEntryId,
+	isEmptyAssistantStop,
+	isEmptyErrorTurn,
+} from "./messages";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
@@ -3024,6 +3029,56 @@ export class TurnRecovery {
 			cfgRetryEnabled.override(this.#host.settings, enabled);
 		}
 	}
+	#withoutPassiveStopResults(messages: AgentMessage[]): AgentMessage[] {
+		const assistantEntryId =
+			messages.length > 0 ? getStopHookAssistantEntryId(messages[messages.length - 1]) : undefined;
+		if (!assistantEntryId) return messages;
+		let end = messages.length;
+		while (end > 0 && getStopHookAssistantEntryId(messages[end - 1]) === assistantEntryId) end--;
+		const branch = this.#host.sessionManager.getBranch();
+		const entry = branch.find(candidate => candidate.id === assistantEntryId);
+		if (entry?.type !== "message" || entry.message.role !== "assistant") return messages;
+		if (entry.message.stopReason !== "error" && entry.message.stopReason !== "aborted") return messages;
+		const transcript = this.#host.sessionManager.buildSessionContext({ transcript: true }).messages;
+		let transcriptEnd = transcript.length;
+		while (transcriptEnd > 0 && getStopHookAssistantEntryId(transcript[transcriptEnd - 1]) === assistantEntryId) {
+			transcriptEnd--;
+		}
+		const transcriptTurnEnd = retryableAssistantTurnEnd(transcript.slice(0, transcriptEnd));
+		if (transcriptTurnEnd === undefined) return messages;
+		const transcriptFailure = transcript[transcriptTurnEnd - 1];
+		if (transcriptFailure.role !== "assistant" || !this.#isSameAssistantMessage(transcriptFailure, entry.message)) {
+			return messages;
+		}
+		const context = messages.slice(0, end);
+		const activeTurnEnd = retryableAssistantTurnEnd(context);
+		if (activeTurnEnd !== undefined) {
+			const failure = context[activeTurnEnd - 1];
+			return failure.role === "assistant" && this.#isSameAssistantMessage(failure, entry.message)
+				? context
+				: messages;
+		}
+		const restored = this.#host.sessionManager.buildSessionContext().messages;
+		let restoredEnd = restored.length;
+		while (restoredEnd > 0 && getStopHookAssistantEntryId(restored[restoredEnd - 1]) === assistantEntryId)
+			restoredEnd--;
+		if (context.length !== restoredEnd) return messages;
+		for (let index = 0; index < context.length; index++) {
+			const left = context[index];
+			const right = restored[index];
+			if (left === right) continue;
+			if (
+				left.role !== right.role ||
+				left.timestamp !== right.timestamp ||
+				sessionMessagePersistenceKey(left) !== sessionMessagePersistenceKey(right) ||
+				!sameMessageContent(left, right)
+			) {
+				return messages;
+			}
+		}
+		return context;
+	}
+
 	/**
 	 * Whether the transcript tail is a failed/aborted assistant turn whose most
 	 * recent activity was a tool call: synthetic placeholder results trail the
@@ -3033,7 +3088,7 @@ export class TurnRecovery {
 	 * {@link retry} is the matching action.
 	 */
 	get hasAbortedToolCallTail(): boolean {
-		const active = this.#host.agent.state.messages;
+		const active = this.#withoutPassiveStopResults(this.#host.agent.state.messages);
 		if (abortedToolCallTail(active)) return true;
 		// A trailing assistant message is authoritative for a live session: a
 		// settled successful turn leaves nothing to retry.
@@ -3041,7 +3096,9 @@ export class TurnRecovery {
 		// A restored session omits the failed turn (and its synthetic results)
 		// from provider context, so — mirroring retry() — the persisted display
 		// transcript decides whether a retryable tool-call tail exists.
-		return abortedToolCallTail(this.#host.sessionManager.buildSessionContext({ transcript: true }).messages);
+		return abortedToolCallTail(
+			this.#withoutPassiveStopResults(this.#host.sessionManager.buildSessionContext({ transcript: true }).messages),
+		);
 	}
 	/**
 	 * Manually retry the last failed assistant turn.
@@ -3073,7 +3130,7 @@ export class TurnRecovery {
 	async retry(): Promise<boolean> {
 		if (this.#host.isStreaming() || this.#host.isCompacting() || this.isRetrying) return false;
 
-		const messages = this.#host.agent.state.messages;
+		const messages = this.#withoutPassiveStopResults(this.#host.agent.state.messages);
 		const activeTurnEnd = retryableAssistantTurnEnd(messages);
 		if (activeTurnEnd !== undefined) {
 			const replayStart = toolReplayStart(messages);
@@ -3088,8 +3145,11 @@ export class TurnRecovery {
 			// A restored session already dropped the failed assistant turn (and its
 			// paired synthetic tool results) from provider context, so the persisted
 			// display transcript is the source of truth for a retryable failed tail.
-			const transcriptMessages = this.#host.sessionManager.buildSessionContext({ transcript: true }).messages;
+			const transcriptMessages = this.#withoutPassiveStopResults(
+				this.#host.sessionManager.buildSessionContext({ transcript: true }).messages,
+			);
 			if (retryableAssistantTurnEnd(transcriptMessages) === undefined) return false;
+			if (messages !== this.#host.agent.state.messages) this.#host.agent.replaceMessages(messages);
 			// The boundary is already gone from active context; when the intact
 			// failed batch is still the tail, replay the tools directly.
 			const replayStart = toolReplayStart(messages);
