@@ -19,9 +19,9 @@
  * failed with the error reported in the issue.
  *
  * The fix is to make the loader's compiled-binary detection authoritative on
- * the embedded-addon module presence (the embedded-addon stub exports `null`
- * outside of `--compile`, and is regenerated to a populated object during the
- * standalone build), and to expose the candidate-path computation as a pure
+ * the embedded-addon module presence (the source stub exports `null`, and
+ * in-memory compile overrides supply a populated manifest), and to expose
+ * the candidate-path computation as a pure
  * helper so it can be tested host-agnostically.
  */
 
@@ -44,9 +44,7 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		// - `process.env.PI_COMPILED` is undefined (the build flag does not substitute property accesses).
 		// - `import.meta.url` points at `$bunfs` for bundled modules; the old CJS
 		//   loader used `__filename`, which is NOT rewritten.
-		// The embedded-addon module is the authoritative compiled-mode signal: it is `null` in
-		// development (the stub) and a populated object in the standalone build (after
-		// `embed:native` runs), and is bundled into the binary by `bun build --compile`.
+		// The source stub exports `null`; in-memory compile overrides supply the manifest.
 		expect(
 			detectCompiledBinary({
 				embeddedAddon: {

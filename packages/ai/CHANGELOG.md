@@ -17,6 +17,19 @@
 - Bounded stdio gateway admission through output completion and capped streamed response bodies, with cancellation and actionable size errors instead of unbounded reply buffers.
 - Preserved account-bound OAuth routing during strict gateway probes, including Snowflake's stored account and provider-owned credential encoding.
 
+## [18.7.0] - 2026-10-06
+
+### Added
+
+- Added `getOAuthCredentialProvider()` to resolve login aliases, such as `openai-codex-device`, to the provider where their credentials are stored.
+
+### Fixed
+
+- Fixed Ultrafast service-tier billing and usage accounting: GPT-6 Astra now applies its published premium rates—6× on the OpenAI API and 8× included usage on Codex—and is counted toward the premium-request limit.
+- Fixed Vertex AI authentication on Windows when credentials are created with `gcloud auth application-default login`.
+- Fixed selecting Cursor accounts by email through `auth.accountPolicies` and `/session pin`; newly refreshed and existing accounts now retain the account email.
+- Preserved route-aware Coreforge AWS credentials while using the platform-specific Vertex ADC location.
+
 ## [18.6.3] - 2026-10-06
 
 ### Added

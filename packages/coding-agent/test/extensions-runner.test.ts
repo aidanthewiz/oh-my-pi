@@ -766,12 +766,12 @@ describe("ExtensionRunner", () => {
 		});
 
 		it("returns completed rewrites without awaiting or accepting a handler after abort", async () => {
-			const startedPath = path.join(tempDir.path(), "assistant-message-started.txt");
-			const skippedPath = path.join(tempDir.path(), "assistant-message-skipped.txt");
+			const signals = { started: Promise.withResolvers<void>(), skippedRan: false };
+			const globalState = globalThis as typeof globalThis & { __assistantMessageAbort?: typeof signals };
+			globalState.__assistantMessageAbort = signals;
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-abort.ts"),
 				`
-				import * as fs from "node:fs";
 				export default function(pi) {
 					pi.on("assistant_message", event => ({
 						content: event.message.content.map(block =>
@@ -779,11 +779,11 @@ describe("ExtensionRunner", () => {
 						),
 					}));
 					pi.on("assistant_message", async () => {
-						fs.writeFileSync(${JSON.stringify(startedPath)}, "started");
+						globalThis.__assistantMessageAbort.started.resolve();
 						await Promise.withResolvers().promise;
 					});
 					pi.on("assistant_message", () => {
-						fs.writeFileSync(${JSON.stringify(skippedPath)}, "ran");
+						globalThis.__assistantMessageAbort.skippedRan = true;
 					});
 				}
 				`,
@@ -799,12 +799,11 @@ describe("ExtensionRunner", () => {
 			const controller = new AbortController();
 			const message = createAssistantMessage("original");
 			const emission = runner.emitAssistantMessage(message, controller.signal);
-			const deadline = Date.now() + 10_000;
-			while (!fs.existsSync(startedPath) && Date.now() < deadline) await Bun.sleep(5);
-			expect(await Bun.file(startedPath).text()).toBe("started");
+			await signals.started.promise;
 			controller.abort(new Error("cancelled"));
 			await expect(emission).resolves.toEqual([{ type: "text", text: "accepted" }]);
-			expect(await Bun.file(skippedPath).exists()).toBe(false);
+			expect(signals.skippedRan).toBe(false);
+			delete globalState.__assistantMessageAbort;
 		});
 
 		it("rejects attempts to change tool calls", async () => {

@@ -6,14 +6,17 @@ import {
 	filterChildShellEnv,
 	getProjectDir,
 	getPuppeteerDir,
+	isRecord,
 	logger,
 	removeWithRetries,
+	toError,
 	untilAborted,
 } from "@oh-my-pi/pi-utils";
 import type * as BrowsersNs from "@oh-my-pi/pi-utils/browsers";
 import type {
 	Browser,
 	CDPSession,
+	ConnectOptions,
 	Device,
 	JSHandle,
 	NetworkConditions,
@@ -189,6 +192,30 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 	const loaded = await loadPuppeteerImport(safeDir, false);
 	puppeteerModuleWorker = loaded;
 	return loaded;
+}
+
+/** Normalize transport event rejections before they cross browser or worker boundaries. */
+export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: ConnectOptions): Promise<Browser> {
+	try {
+		return await puppeteer.connect(options);
+	} catch (error) {
+		const normalized =
+			!(error instanceof Error) && isRecord(error) && typeof error.message === "string"
+				? new Error(error.message)
+				: toError(error);
+		const endpoint = options.browserWSEndpoint;
+		const token = endpoint ? new URL(endpoint).searchParams.get("token") : null;
+		if (token) {
+			const message = normalized.message
+				.replaceAll(token, "[REDACTED]")
+				.replaceAll(encodeURIComponent(token), "[REDACTED]")
+				.replaceAll(encodeURIComponent(token).replaceAll("%20", "+"), "[REDACTED]");
+			const sanitized = new Error(message);
+			sanitized.name = normalized.name;
+			throw sanitized;
+		}
+		throw normalized;
+	}
 }
 
 /** Return device descriptors from the already-loaded Puppeteer module. */

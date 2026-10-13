@@ -28,8 +28,8 @@ import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionSta
  * so a runtime read of the env var returns `undefined`. Older CommonJS loader
  * code also saw the original build-host absolute path in `__filename`; ESM
  * `import.meta.url` is rewritten to the bunfs URL. The embedded-addon
- * presence (true iff the build pipeline ran `embed:native`, false in the
- * post-build `--reset` stub) is the authoritative compiled-mode signal.
+ * manifest supplied by in-memory compile overrides is the authoritative
+ * compiled-mode signal; the source module exports `null`.
  */
 
 const SUPPORTED_PLATFORMS = [

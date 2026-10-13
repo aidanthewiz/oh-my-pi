@@ -2,9 +2,8 @@
  * Manual end-to-end smoke for the relay: replicates the omp browser tool's
  * connection pattern against a live relay + extension.
  *
- * The tool opens TWO puppeteer connections per driven tab — the supervisor
- * (`puppeteer.connect({browserURL})`, picks a target) and a tab worker
- * (`puppeteer.connect({browserWSEndpoint})`, adopts that target by id) — so
+ * The tool opens TWO authenticated puppeteer connections per driven tab — the
+ * supervisor picks a target, and a tab worker adopts that target by id — so
  * this script does exactly that, then exercises evaluate/navigate/screenshot,
  * an extra CDP session, and the createTarget/closeTarget path.
  *
@@ -12,8 +11,23 @@
  */
 import type { Target } from "puppeteer-core";
 import puppeteer from "puppeteer-core";
+import { isLoopbackRelayUrl } from "../../coding-agent/src/tools/browser/relay/daemon";
+import { resolveRelayWebSocketEndpoint } from "../../coding-agent/src/tools/browser/relay/kind";
+import { ensureBrowserRelayToken } from "../../coding-agent/src/tools/browser/relay/token";
 
-const relayUrl = Bun.argv[2] ?? "http://127.0.0.1:9224";
+const relayUrl = new URL(Bun.argv[2] ?? "http://127.0.0.1:9224");
+const configuredToken = relayUrl.searchParams.get("token")?.trim();
+relayUrl.searchParams.delete("token");
+const token =
+	configuredToken || (isLoopbackRelayUrl(relayUrl.toString()) ? await ensureBrowserRelayToken() : undefined);
+if (!token) throw new Error("A remote relay smoke requires an explicit token.");
+const versionUrl = new URL(relayUrl);
+versionUrl.pathname = `${versionUrl.pathname.replace(/\/+$/, "")}/json/version`;
+const versionResponse = await fetch(versionUrl, { signal: AbortSignal.timeout(20_000) });
+if (!versionResponse.ok) throw new Error(`Relay discovery failed (HTTP ${versionResponse.status}).`);
+const version = (await versionResponse.json()) as { webSocketDebuggerUrl?: unknown };
+if (typeof version.webSocketDebuggerUrl !== "string") throw new Error("Relay discovery omitted its CDP endpoint.");
+const browserWSEndpoint = resolveRelayWebSocketEndpoint(relayUrl.toString(), version.webSocketDebuggerUrl, token);
 const matcher = Bun.argv[3] ?? "Relay Smoke Page";
 
 /** Puppeteer keeps the CDP target id on an internal field; same access the omp tab supervisor uses (`targetIdForPage`). */
@@ -27,8 +41,12 @@ function step(name: string): void {
 	console.log(`\n== ${name}`);
 }
 
-step("supervisor: connect via browserURL");
-const supervisor = await puppeteer.connect({ browserURL: relayUrl, defaultViewport: null, protocolTimeout: 20_000 });
+step("supervisor: connect via authenticated browserWSEndpoint");
+const supervisor = await puppeteer
+	.connect({ browserWSEndpoint, defaultViewport: null, protocolTimeout: 20_000 })
+	.catch(() => {
+		throw new Error("Authenticated supervisor connection failed.");
+	});
 console.log("version:", await supervisor.version());
 
 step("supervisor: discover targets");
@@ -53,14 +71,18 @@ for (const page of pages) {
 if (!picked) throw new Error(`no page matching ${JSON.stringify(matcher)}`);
 const targetId = targetIdOf(picked.target());
 const wsEndpoint = supervisor.wsEndpoint();
-console.log("picked target:", targetId, "ws:", wsEndpoint);
+console.log("picked target:", targetId);
 
 step("worker: second connection via browserWSEndpoint");
-const worker = await puppeteer.connect({
-	browserWSEndpoint: wsEndpoint,
-	defaultViewport: null,
-	protocolTimeout: 20_000,
-});
+const worker = await puppeteer
+	.connect({
+		browserWSEndpoint: wsEndpoint,
+		defaultViewport: null,
+		protocolTimeout: 20_000,
+	})
+	.catch(() => {
+		throw new Error("Authenticated worker connection failed.");
+	});
 const workerTarget = await worker.waitForTarget(target => targetIdOf(target) === targetId, { timeout: 10_000 });
 const page = await workerTarget.page();
 if (!page) throw new Error("worker could not adopt page");

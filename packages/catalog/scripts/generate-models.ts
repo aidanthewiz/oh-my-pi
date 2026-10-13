@@ -786,6 +786,7 @@ export function buildGeneratedModel(model: ModelSpec<Api> | Model<Api>): Model<A
 	const spec = "identity" in model ? toModelSpec(model) : { ...model };
 	delete spec.promptCache;
 	delete spec.promptCacheConfig;
+	delete spec.kindConfig;
 	return buildModel(spec);
 }
 

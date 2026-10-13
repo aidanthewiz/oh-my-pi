@@ -1580,8 +1580,7 @@ function safeSend(tab: WorkerTabSession, msg: WorkerInbound): void {
 }
 
 async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number): Promise<void> {
-	// Same deadline carry-over as acquireTabImpl: the inline-fallback retry
-	// must not restart the recycle's init budget.
+	// Worker initialization uses the original deadline across retries.
 	const startedAt = performance.now();
 	const oldWorker = tab.worker;
 	await oldWorker.terminate().catch(() => undefined);

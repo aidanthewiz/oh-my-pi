@@ -117,7 +117,7 @@ mod tests {
 	/// Contract: bash's echo option rules — combined and repeated flags
 	/// apply in order, and option parsing stops at the first other word.
 	#[test]
-	fn leading_neE_words_are_options_until_the_first_other_word() {
+	fn leading_ne_e_words_are_options_until_the_first_other_word() {
 		assert_eq!(parse(&["-ne", "a\\tb"]), (true, true, vec!["a\\tb".to_owned()]));
 		assert_eq!(parse(&["-e", "-E", "x"]), (false, false, vec!["x".to_owned()]));
 		assert_eq!(parse(&["-n", "a", "-n"]), (true, false, vec!["a".to_owned(), "-n".to_owned()]));

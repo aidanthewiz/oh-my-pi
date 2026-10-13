@@ -103,12 +103,15 @@ The CLI applies the same ownership rules to every list entry. `omp read 'cat.png
 6. It tries SQLite resolution with `resolveSqliteReadPath()` in `read-sqlite.ts`.
    - `parseSqlitePathCandidates()` scans for `.sqlite`, `.sqlite3`, `.db`, `.db3` before any `:table`, `:key`, or `?query` suffix.
    - `readSqlite()` dispatches on `parseSqliteSelector()`. Executable/IDA database view targets are then handled by `resolveBinaryViewPath()` and `readBinary()`.
-7. Otherwise it treats the input as a local filesystem path.
+7. It resolves JSON query suffixes with `resolveJsonReadPath()` in `read-json.ts` before ordinary filesystem reads.
+   - `.json`, `.jsonl`, and `.ndjson` files accept `?q=<jq-filter>` or `?query=<jq-filter>`.
+   - Existing literal query-looking filenames retain precedence. Query punctuation remains data during path-list parsing.
+8. Otherwise it treats the input as a local filesystem path.
    - `resolveReadPath()` expands `~`, resolves relative to session cwd, treats bare `/` as session cwd, and retries macOS screenshot/NFD/curly-quote variants.
    - If the path does not exist, `findUniqueWorkspaceSuffix()` attempts a workspace-wide unique suffix match (skipped for remote mounts). A cwd-root filename matching the active `local://` plan basename may recover that plan. As a final guarded recovery, a mistakenly delimited list of existing paths is read part by part; callers should still issue one `read` per path.
    - A resolved target that is neither a regular file nor a directory (character or block device, FIFO, socket) is rejected with a `ToolError` naming its kind. Reads run in-process, so reading `/dev/stdin` or a FIFO would block, and `/dev/zero` would never finish, on a native thread that no timeout or abort can cancel.
-8. Directories go through `#readDirectory()`.
-9. Non-directories branch by content type:
+9. Directories go through `#readDirectory()`.
+10. Non-directories branch by content type:
    - image metadata / inline image
    - summarized macOS `sample` or V8 `.cpuprofile` report
    - editable notebook text
@@ -223,6 +226,18 @@ The CLI applies the same ownership rules to every list entry. `omp read 'cat.png
    - ASCII table width `120` (`MAX_RENDER_WIDTH`)
    - per-column width `40` (`MAX_COLUMN_WIDTH`)
 - `openSqliteReadConnection()` in `sqlite-reader.ts` uses strict Bun SQLite with `PRAGMA query_only = ON` and `busy_timeout = 3000`. It normally opens read-only; missing WAL sidecars or `SQLITE_CANTOPEN` trigger a read-write connection (`create: false`) solely to initialize sidecars.
+
+### JSON queries
+
+- Use `file.json?q=.items[]` or `events.jsonl?q=select(.status=="ok")`.
+- Queries run through bundled jaq and tail, even when Bash builtin execution is disabled. Filters are quoted positional arguments, not shell code.
+- The query shell replaces its inherited environment using the existing child policy. `env` and `$ENV` exclude managed credentials and value aliases.
+- `raw=true` returns unquoted strings. `compact=true` renders each result on one line.
+- `offset` and `limit` select whole results. A single array result pages its elements; other results form a stream.
+- The page limit defaults to `100` and is capped at `1000`. Continuation hints preserve the filter and formatting flags.
+- A trailing line selector selects lines from query output.
+- Queries have a 30-second deadline and a 5,242,880-character stdout capture cap. Caller cancellation stops the query.
+- A bounded stderr pipe retains the final 8 KiB of diagnostics. Its private temporary file is removed after each run.
 
 ### Documents
 

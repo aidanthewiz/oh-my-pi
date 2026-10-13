@@ -1146,9 +1146,9 @@ struct CopyState {
 	copied_files:        FxHashMap<FileId, PathBuf>,
 	/// `-g` progress over the total source size.
 	progress_bar:        Option<ProgressBar>,
-	#[cfg(any(target_os = "linux", target_os = "android", windows))]
 	/// Source devices whose filesystem refused to clone: later files from
 	/// them skip straight to copying the data.
+	#[cfg(any(target_os = "linux", target_os = "android", windows))]
 	clone_unsupported:   FxHashSet<u64>,
 }
 

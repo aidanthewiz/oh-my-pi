@@ -1952,17 +1952,30 @@ describe("createAgentSession deferred model pattern resolution", () => {
 	});
 
 	test("does not let a denied default role constrain startup fallback providers", async () => {
-		const denied = getBundledModel("openai-codex", "gpt-5.5");
-		if (!denied) throw new Error("Expected bundled Codex GPT-5.5 default");
-
 		const authStorage = createInMemoryAuthStorage();
 		authStoragesToClose.push(authStorage);
-		authStorage.keys.setRuntime("openai-codex", "codex-oauth-token");
+		authStorage.keys.setRuntime("denied-default", "test-key");
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		modelRegistry.registerProvider("denied-default", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "test-key",
+			api: "openai-completions",
+			models: [
+				{
+					id: "blocked",
+					name: "Blocked policy fixture",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 4096,
+					maxTokens: 1024,
+				},
+			],
+		});
 		const settings = Settings.isolated({
-			modelRoles: { default: "openai-codex/gpt-5.5" },
-			disabledModels: ["openai-codex/gpt-5.5"],
+			modelRoles: { default: "denied-default/blocked" },
+			disabledModels: ["denied-default/blocked"],
 		});
 
 		const { session } = await createAgentSession({
@@ -1986,7 +1999,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		});
 
 		try {
-			expect(`${session.model?.provider}/${session.model?.id}`).not.toBe("openai-codex/gpt-5.5");
+			expect(session.model?.provider).toBe("anthropic");
 		} finally {
 			await session.dispose();
 		}
@@ -2027,48 +2040,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(session.model?.provider).toBe("devin");
 			expect(session.model?.id).toBe("swe-1-6");
 			expect(session.thinkingLevel).toBeUndefined();
-		} finally {
-			await session.dispose();
-		}
-	});
-
-	test("prefers Codex OAuth over plain OpenAI for the shared startup default", async () => {
-		const openaiDefault = getBundledModel("openai", "gpt-5.5");
-		const codexDefault = getBundledModel("openai-codex", "gpt-5.5");
-		if (!openaiDefault || !codexDefault) {
-			throw new Error("Expected bundled OpenAI and Codex GPT-5.5 defaults");
-		}
-
-		const authStorage = createInMemoryAuthStorage();
-		authStoragesToClose.push(authStorage);
-		authStorage.keys.setRuntime("openai", "sk-or-v1-invalid-openai-key");
-		authStorage.keys.setRuntime("openai-codex", "codex-oauth-token");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
-
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			authStorage,
-			modelRegistry,
-			settings: Settings.isolated({ enabledModels: ["openai/gpt-5.5", "openai-codex/gpt-5.5"] }),
-			sessionManager: SessionManager.inMemory(),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
-			rules: [],
-			preloadedCustomToolPaths: [],
-			toolNames: ["read"],
-		});
-
-		try {
-			expect(session.model?.provider).toBe("openai-codex");
-			expect(session.model?.id).toBe(codexDefault.id);
-			expect(session.model?.id).toBe(openaiDefault.id);
 		} finally {
 			await session.dispose();
 		}

@@ -372,7 +372,8 @@ impl GitRepo {
 				source_index.as_ref().unwrap_or(&index),
 				&options.files,
 			)?;
-			// Smudge filters can change file size without changing the staged blob.
+			// Smudge filters can change file size without changing the staged
+			// blob.
 			for (entry, path) in index.entries_mut_with_paths() {
 				if !options.files.is_empty()
 					&& !options
@@ -2635,8 +2636,8 @@ mod tests {
 		fs::write(temp.path().join("parent-untracked.txt"), "delete\n").unwrap();
 
 		// 4. Global excludesfile (core.excludesFile), configured *after* `repo`'s
-		//    cached gix handle was opened by the staging calls above. The clean below
-		//    must observe it or `global.env` is deleted.
+		//    cached gix handle was opened by the staging calls above. The clean
+		//    below must observe it or `global.env` is deleted.
 		let global_exclude = outside.path().join("global-excludes");
 		fs::write(&global_exclude, "global.env\n").unwrap();
 		git(temp.path(), &["config", "core.excludesFile", global_exclude.to_str().unwrap()]);
@@ -2701,8 +2702,8 @@ mod tests {
 			initially_empty.exists(),
 			"pathspec-scoped clean leaves directories outside the pathspec"
 		);
-		// 10. Pathspec scoping: cleaning with a pathspec prunes empty dirs inside the
-		//     pathspec but preserves the parent
+		// 10. Pathspec scoping: cleaning with a pathspec prunes empty dirs inside
+		//     the pathspec but preserves the parent
 		let pathspec_dir = temp.path().join("pathspec-parent/child/grandchild");
 		fs::create_dir_all(&pathspec_dir).unwrap();
 		fs::write(pathspec_dir.join("leaf.txt"), "leaf\n").unwrap();

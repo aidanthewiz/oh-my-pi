@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Authenticated the manual relay smoke against the configured authority and removed tokenized endpoint output.
+
 ## [18.6.3] - 2026-10-06
 
 ### Fixed

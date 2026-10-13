@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Model, ServiceTier } from "@oh-my-pi/pi-ai";
 import type { AgentsHubDeps } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isEnoent, prompt } from "@oh-my-pi/pi-utils";
@@ -10,6 +11,7 @@ import { getConfigDirs } from "../config";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	getAllowedAvailableModels,
+	pickDefaultAvailableModel,
 	resolveAgentAdvisorSelection,
 	resolveAgentModelSelection,
 	resolveAgentPrewalkPattern,
@@ -60,9 +62,10 @@ export function createAgentsHubDeps(
 	extensionRoots: () => EffectiveExtensionRoots,
 	activeModelPattern?: string,
 	defaultModelPattern?: string,
+	sessionServiceTier?: (model: Model) => ServiceTier | undefined,
 ): AgentsHubDeps {
 	return {
-		browserSource: createModelBrowserSource(settings),
+		browserSource: createModelBrowserSource(settings, sessionServiceTier),
 		loadAgents: async () => {
 			const { agents } = await discoverAgents(cwd, undefined, extensionRoots());
 			const disabled = new Set(cfgTaskDisabledAgents.get(settings));
@@ -151,7 +154,7 @@ export function createAgentsHubDeps(
 				settings,
 			);
 			const { model } = resolveModelOverride(patterns, modelRegistry, settings);
-			const selectedModel = model ?? getAllowedAvailableModels(modelRegistry, settings)[0];
+			const selectedModel = model ?? pickDefaultAvailableModel(getAllowedAvailableModels(modelRegistry, settings));
 			if (!selectedModel) throw new Error("No available model to generate agent specification.");
 			const { session } = await createAgentSession({
 				cwd,

@@ -1,0 +1,342 @@
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { Settings } from "../../src/config/settings";
+import { ReadTool } from "../../src/tools/read";
+
+type ToolTextResult = {
+	content: Array<{ type: string; text?: string }>;
+};
+
+type SessionLike = ConstructorParameters<typeof ReadTool>[0];
+
+function getText(result: ToolTextResult): string {
+	return result.content
+		.filter(block => block.type === "text")
+		.map(block => block.text ?? "")
+		.join("\n");
+}
+
+function createSession(cwd: string, overrides: Partial<SessionLike> = {}): SessionLike {
+	return {
+		cwd,
+		hasUI: false,
+		enableLsp: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		settings: Settings.isolated(),
+		...overrides,
+	} as SessionLike;
+}
+
+describe("JSON query in read tool", () => {
+	let tempDir: string;
+	let jsonFile: string;
+	let jsonlFile: string;
+	let numbersFile: string;
+	let mixedFile: string;
+	let session: SessionLike;
+	let readTool: ReadTool;
+
+	beforeAll(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-json-test-"));
+		jsonFile = path.join(tempDir, "data.json");
+		jsonlFile = path.join(tempDir, "events.jsonl");
+		numbersFile = path.join(tempDir, "numbers.json");
+		mixedFile = path.join(tempDir, "mixed.json");
+
+		const testData = {
+			name: "my-project",
+			version: "1.2.3",
+			active: true,
+			items: [
+				{ id: 1, name: "item-one", active: true },
+				{ id: 2, name: "item-two", active: false },
+				{ id: 3, name: "item-three", active: true },
+			],
+			metadata: {
+				tags: ["alpha", "beta", "gamma"],
+				nested: { deep: "secret-value" },
+			},
+		};
+
+		const testLines = [
+			JSON.stringify({ timestamp: "2026-10-01", status: "ok", user: "alice" }),
+			JSON.stringify({ timestamp: "2026-10-02", status: "error", user: "bob" }),
+			JSON.stringify({ timestamp: "2026-10-03", status: "ok", user: "charlie" }),
+		];
+
+		await fs.writeFile(jsonFile, JSON.stringify(testData, null, 2), "utf-8");
+		await fs.writeFile(jsonlFile, testLines.join("\n") + "\n", "utf-8");
+		// Literals JS numbers cannot hold; jaq prints them verbatim.
+		await fs.writeFile(numbersFile, '{"ids":[12345678901234567890,1.0,3]}', "utf-8");
+		// `.name` fails on the third element.
+		await fs.writeFile(mixedFile, '[{"name":"a"},{"name":"b"},3]', "utf-8");
+
+		session = createSession(tempDir);
+		readTool = new ReadTool(session);
+	});
+
+	afterAll(async () => {
+		await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+	});
+
+	it("keeps caller credentials and value aliases out of env and $ENV while retaining safe settings", async () => {
+		const values: Record<string, string> = {
+			COREFORGE_JSON_QUERY_TEST_API_KEY: "synthetic-json-query-credential",
+			COREFORGE_JSON_QUERY_TEST_ALIAS: "synthetic-json-query-credential",
+			"COREFORGE_JSON_QUERY_TEST_ALIAS.VALUE": "synthetic-json-query-credential",
+			COREFORGE_JSON_QUERY_TEST_FLAG: "safe-json-setting",
+		};
+		const previous = Object.keys(values).map(key => ({ key, process: process.env[key], bun: Bun.env[key] }));
+		try {
+			for (const [key, value] of Object.entries(values)) {
+				process.env[key] = value;
+				Bun.env[key] = value;
+			}
+			const query =
+				'{secret: env.COREFORGE_JSON_QUERY_TEST_API_KEY, inherited: $ENV.COREFORGE_JSON_QUERY_TEST_API_KEY, alias: env.COREFORGE_JSON_QUERY_TEST_ALIAS, unusual: env["COREFORGE_JSON_QUERY_TEST_ALIAS.VALUE"], safe: env.COREFORGE_JSON_QUERY_TEST_FLAG}';
+			const result = await readTool.execute("credential-boundary", { path: `${jsonFile}?q=${query}` });
+			expect(JSON.parse(getText(result))).toEqual({
+				secret: null,
+				inherited: null,
+				alias: null,
+				unusual: null,
+				safe: "safe-json-setting",
+			});
+		} finally {
+			for (const entry of previous) {
+				if (entry.process === undefined) delete process.env[entry.key];
+				else process.env[entry.key] = entry.process;
+				if (entry.bun === undefined) delete Bun.env[entry.key];
+				else Bun.env[entry.key] = entry.bun;
+			}
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"keeps query execution on bundled builtins despite an external PATH override",
+		async () => {
+			const binDir = path.join(tempDir, "external-query-bin");
+			const marker = path.join(binDir, "executed");
+			await fs.mkdir(binDir);
+			const script = `#!/bin/sh\nprintf invoked > '${marker}'\nprintf external-query-output\n`;
+			await fs.writeFile(path.join(binDir, "jq"), script, { mode: 0o700 });
+			await fs.writeFile(path.join(binDir, "tail"), script, { mode: 0o700 });
+			const values = { PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`, PI_DISABLE_UUTILS_BUILTINS: "1" };
+			const previous = Object.keys(values).map(key => ({ key, process: process.env[key], bun: Bun.env[key] }));
+			try {
+				for (const [key, value] of Object.entries(values)) {
+					process.env[key] = value;
+					Bun.env[key] = value;
+				}
+				const result = await readTool.execute("builtin-owner", { path: `${jsonFile}?q=.items[0].id` });
+				expect(getText(result)).toBe("1");
+				expect(await Bun.file(marker).exists()).toBe(false);
+			} finally {
+				for (const entry of previous) {
+					if (entry.process === undefined) delete process.env[entry.key];
+					else process.env[entry.key] = entry.process;
+					if (entry.bun === undefined) delete Bun.env[entry.key];
+					else Bun.env[entry.key] = entry.bun;
+				}
+			}
+		},
+	);
+
+	it("preserves JSON query punctuation when a local path precedes it in a read list", async () => {
+		const note = path.join(tempDir, "before-query.txt");
+		await fs.writeFile(note, "list-prefix");
+		const result = await readTool.execute("query-list", {
+			path: `${note};${jsonFile}?q=def names: .items[] | .name; names, .version&raw=true`,
+		});
+		const text = getText(result);
+		expect(text).toContain("list-prefix");
+		expect(text).toContain("item-one");
+		expect(text).toContain("item-two");
+		expect(text).toContain("item-three");
+		expect(text).toContain("1.2.3");
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"reads a literal query-looking filename instead of querying its JSON prefix",
+		async () => {
+			const literal = `${jsonFile}?q=.name`;
+			await fs.writeFile(literal, "literal-json-query-filename");
+			try {
+				const result = await readTool.execute("literal-query", { path: literal });
+				expect(getText(result)).toContain("literal-json-query-filename");
+				expect(getText(result)).not.toContain("my-project");
+			} finally {
+				await fs.rm(literal);
+			}
+		},
+	);
+
+	it("queries a simple property from a JSON file", async () => {
+		const result = await readTool.execute("call_1", { path: `${jsonFile}?q=.name` });
+		const text = getText(result);
+		expect(text).toContain('"my-project"');
+	});
+
+	it("queries with pipes in jq filter expression", async () => {
+		const result = await readTool.execute("call_2", { path: `${jsonFile}?q=.items[] | select(.active) | .name` });
+		const text = getText(result);
+		expect(text).toContain('"item-one"');
+		expect(text).toContain('"item-three"');
+		expect(text).not.toContain('"item-two"');
+	});
+
+	it("supports raw unquoted output and preserves trailing whitespace", async () => {
+		const result = await readTool.execute("call_3", { path: `${jsonFile}?q="foo  "&raw=true` });
+		const text = getText(result);
+		expect(text).toBe("foo  ");
+	});
+
+	it("supports compact output via compact=true parameter", async () => {
+		const result = await readTool.execute("call_4", { path: `${jsonFile}?q=.metadata.tags&compact=true` });
+		const text = getText(result);
+		expect(text.trim()).toBe('["alpha","beta","gamma"]');
+	});
+
+	it("queries JSONL stream lines with filtering", async () => {
+		const result = await readTool.execute("call_5", {
+			path: `${jsonlFile}?q=select(.status == "ok") | .user&raw=true`,
+		});
+		const text = getText(result);
+		const lines = text.trim().split("\n");
+		expect(lines).toEqual(["alice", "charlie"]);
+	});
+
+	it("rejects invalid jq syntax as a tool error", async () => {
+		await expect(readTool.execute("call_6", { path: `${jsonFile}?q=invalid [[[` })).rejects.toThrow(ToolError);
+	});
+
+	it("retains a bounded diagnostic tail without mixing debug output into query results", async () => {
+		const query = 'range(0;5000) | debug | if . == 4999 then error("diagnostic-end-marker") else empty end';
+		const error = await readTool
+			.execute("bounded-diagnostics", { path: `${jsonFile}?q=${query}` })
+			.catch(error => error);
+		expect(error).toBeInstanceOf(Error);
+		expect(error.message).toContain("diagnostic-end-marker");
+		expect(error.message.length).toBeLessThan(10_000);
+		const result = await readTool.execute("debug-stdout", { path: `${jsonFile}?q=.items[0].id | debug` });
+		expect(getText(result)).toBe("1");
+	});
+
+	it("reads the file normally without jq query when ?q= is omitted", async () => {
+		const result = await readTool.execute("call_7", { path: jsonFile });
+		const text = getText(result);
+		expect(text).toContain('"my-project"');
+		expect(text).toContain('"secret-value"');
+	});
+
+	it("supports offset and limit pagination on JSON arrays with repeatable continuation hint", async () => {
+		const result = await readTool.execute("call_p1", { path: `${jsonFile}?q=.items&offset=1&limit=1` });
+		const text = getText(result);
+		expect(text).toContain('"item-two"');
+		expect(text).not.toContain('"item-one"');
+		expect(text).not.toContain('"item-three"');
+		const suffix = /append (\?.*) to continue\]$/.exec(text)?.[1];
+		const nextResult = await readTool.execute("call_p1_cont", { path: `${jsonFile}${suffix}` });
+		const nextText = getText(nextResult);
+		expect(nextText).toContain('"item-three"');
+		expect(nextText).not.toContain('"item-two"');
+	});
+
+	it("preserves compact format when paging an array with compact=true", async () => {
+		const result = await readTool.execute("call_compact_page", {
+			path: `${jsonFile}?q=.items&compact=true&offset=1&limit=1`,
+		});
+		const text = getText(result);
+		expect(text).toContain('[{"id":2,"name":"item-two","active":false}]');
+	});
+
+	it("does not slice a single JSON object mid-syntax when limit is supplied", async () => {
+		const result = await readTool.execute("call_obj_limit", {
+			path: `${jsonFile}?q=.metadata&limit=2`,
+		});
+		const text = getText(result);
+		expect(JSON.parse(text)).toEqual({
+			tags: ["alpha", "beta", "gamma"],
+			nested: { deep: "secret-value" },
+		});
+	});
+
+	it("preserves arithmetic + operator in jq filters without URL corruption", async () => {
+		const result = await readTool.execute("call_plus", {
+			path: `${jsonFile}?q=.items | length + 1`,
+		});
+		const text = getText(result);
+		expect(text.trim()).toBe("4");
+	});
+
+	it("supports offset and limit pagination on JSONL streams with continuation hint", async () => {
+		const result = await readTool.execute("call_p2", {
+			path: `${jsonlFile}?q=.user&raw=true&offset=1&limit=1`,
+		});
+		const text = getText(result);
+		expect(text).toContain("bob");
+		expect(text).not.toContain("alice");
+		expect(text).not.toContain("charlie");
+		const suffix = /append (\?.*) to continue\]$/.exec(text)?.[1];
+		const next = await readTool.execute("call_p2_cont", { path: `${jsonlFile}${suffix}` });
+		expect(getText(next)).toBe("charlie");
+	});
+
+	it("keeps number literals verbatim when paging an array", async () => {
+		const result = await readTool.execute("call_big", { path: `${numbersFile}?q=.ids&limit=2` });
+		const text = getText(result);
+		expect(text).toContain("12345678901234567890");
+		expect(text).toContain("1.0");
+		expect(text).not.toContain("12345678901234567000");
+		const suffix = /append (\?.*) to continue\]$/.exec(text)?.[1];
+		const next = await readTool.execute("call_big_next", { path: `${numbersFile}${suffix}` });
+		expect(JSON.parse(getText(next))).toEqual([3]);
+	});
+
+	it("pages pretty streams by whole value and the hint round-trips the filter", async () => {
+		const first = getText(
+			await readTool.execute("call_mixed", { path: `${jsonFile}?q=.items[] | .id, {name}&limit=3` }),
+		);
+		const firstValues = first.slice(0, first.lastIndexOf("\n[")).replace(/\n(?=[{\d])/g, ",");
+		expect(JSON.parse(`[${firstValues}]`)).toEqual([1, { name: "item-one" }, 2]);
+
+		const suffix = /append (\?.*) to continue\]$/.exec(first)?.[1];
+		const next = getText(await readTool.execute("call_mixed_next", { path: `${jsonFile}${suffix}` }));
+		expect(JSON.parse(`[${next.trim().replace(/\n(?=[{\d])/g, ",")}]`)).toEqual([
+			{ name: "item-two" },
+			3,
+			{ name: "item-three" },
+		]);
+	});
+
+	it("pages raw streams of objects by whole value", async () => {
+		const result = await readTool.execute("call_raw_objects", { path: `${jsonFile}?q=.items[]&raw=true&limit=1` });
+		const text = getText(result);
+		const output = text.slice(0, text.lastIndexOf("\n["));
+		expect(JSON.parse(output)).toEqual({ id: 1, name: "item-one", active: true });
+	});
+
+	it("stops jq once the page is full, before later results fail", async () => {
+		const result = await readTool.execute("call_early_stop", { path: `${mixedFile}?q=.[] | .name&raw=true&limit=1` });
+		expect(getText(result).split("\n")[0]).toBe("a");
+	});
+
+	it("treats a filter starting with - as a filter, not jq flags", async () => {
+		const result = await readTool.execute("call_negate", { path: `${jsonFile}?q=-.items[0].id` });
+		expect(getText(result)).toBe("-1");
+	});
+
+	it("applies trailing line range selectors over query output", async () => {
+		const result = await readTool.execute("call_sel", {
+			path: `${jsonFile}?q=.items[] | .name&raw=true:raw:1-2`,
+		});
+		const text = getText(result);
+		expect(text).toContain("item-one");
+		expect(text).toContain("item-two");
+		expect(text).not.toContain("item-three");
+	});
+});

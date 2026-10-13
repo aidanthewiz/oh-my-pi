@@ -112,6 +112,8 @@ impl From<MinimizerOptions> for minimizer::MinimizerOptions {
 pub struct ShellOptions {
 	/// Environment variables to apply once per session.
 	pub session_env:   Option<HashMap<String, String>>,
+	/// Do not inherit process environment variables or builtin switches.
+	pub clear_env:     Option<bool>,
 	/// Optional snapshot file to source on session creation.
 	pub snapshot_path: Option<String>,
 	/// Optional per-command output minimizer configuration.
@@ -124,12 +126,10 @@ impl From<ShellOptions> for CoreShellOptions {
 	fn from(value: ShellOptions) -> Self {
 		Self {
 			session_env:   value.session_env,
+			clear_env:     value.clear_env.unwrap_or(false),
 			snapshot_path: value.snapshot_path,
 			minimizer:     value.minimizer.map(Into::into),
-			filesystem:    value
-				.filesystem
-				.map(ShellFilesystem::into_fs)
-				.unwrap_or_default(),
+			filesystem:    value.filesystem.map_or_default(ShellFilesystem::into_fs),
 		}
 	}
 }
@@ -163,6 +163,8 @@ pub struct ShellExecuteOptions<'env> {
 	pub env:           Option<HashMap<String, String>>,
 	/// Environment variables to apply once per session.
 	pub session_env:   Option<HashMap<String, String>>,
+	/// Do not inherit process environment variables or builtin switches.
+	pub clear_env:     Option<bool>,
 	/// Timeout in milliseconds before cancelling the command.
 	pub timeout_ms:    Option<u32>,
 	/// Optional snapshot file to source on session creation.
@@ -340,13 +342,11 @@ pub fn execute_shell<'env>(
 		cwd:           options.cwd,
 		env:           options.env,
 		session_env:   options.session_env,
+		clear_env:     options.clear_env.unwrap_or(false),
 		timeout_ms:    options.timeout_ms,
 		snapshot_path: options.snapshot_path,
 		minimizer:     options.minimizer.map(Into::into),
-		filesystem:    options
-			.filesystem
-			.map(ShellFilesystem::into_fs)
-			.unwrap_or_default(),
+		filesystem:    options.filesystem.map_or_default(ShellFilesystem::into_fs),
 	};
 	task::future(env, "shell.execute", async move {
 		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
@@ -427,7 +427,7 @@ impl BridgeItem for String {
 /// `busy` is held from the moment a chunk is taken until its batch has been
 /// forwarded, so an empty queue with `busy` clear really means no output is
 /// in transit (the PTY's stuck-open-slave check).
-pub(crate) async fn pump_chunks<T: BridgeItem>(
+pub(crate) async fn pump_chunks<T: BridgeItem + Send>(
 	rx: flume::Receiver<T>,
 	stall_timeout: Duration,
 	busy: Option<&AtomicBool>,

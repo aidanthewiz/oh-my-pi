@@ -105,6 +105,7 @@ async fn set_shell_working_dir_if_changed(shell: &mut BrushShell, cwd: &str) -> 
 #[derive(Clone)]
 struct ShellConfig {
 	session_env:   Option<HashMap<String, String>>,
+	clear_env:     bool,
 	snapshot_path: Option<String>,
 	minimizer:     Option<minimizer::MinimizerConfig>,
 	filesystem:    Fs,
@@ -113,6 +114,8 @@ struct ShellConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
 	pub session_env:   Option<HashMap<String, String>>,
+	/// Do not inherit process environment variables or builtin switches.
+	pub clear_env:     bool,
 	pub snapshot_path: Option<String>,
 	pub minimizer:     Option<minimizer::MinimizerOptions>,
 	/// Filesystem backing every run of the session (native by default).
@@ -162,6 +165,8 @@ pub struct ShellExecuteOptions {
 	pub cwd:           Option<String>,
 	pub env:           Option<HashMap<String, String>>,
 	pub session_env:   Option<HashMap<String, String>>,
+	/// Do not inherit process environment variables or builtin switches.
+	pub clear_env:     bool,
 	pub timeout_ms:    Option<u32>,
 	pub snapshot_path: Option<String>,
 	pub minimizer:     Option<minimizer::MinimizerOptions>,
@@ -208,6 +213,7 @@ impl Shell {
 		let config = match options {
 			None => ShellConfig {
 				session_env:   None,
+				clear_env:     false,
 				snapshot_path: None,
 				minimizer:     None,
 				filesystem:    Fs::native(),
@@ -219,6 +225,7 @@ impl Shell {
 					.map(minimizer::MinimizerConfig::from_options);
 				ShellConfig {
 					session_env: opt.session_env,
+					clear_env: opt.clear_env,
 					snapshot_path: opt.snapshot_path,
 					minimizer,
 					filesystem: opt.filesystem,
@@ -316,6 +323,7 @@ pub async fn execute_shell(
 		.map(minimizer::MinimizerConfig::from_options);
 	let config = ShellConfig {
 		session_env:   options.session_env,
+		clear_env:     options.clear_env,
 		snapshot_path: options.snapshot_path,
 		minimizer:     minimizer.clone(),
 		filesystem:    options.filesystem,
@@ -354,6 +362,7 @@ pub async fn execute_shell_streams(
 ) -> Result<ShellExecuteResult> {
 	let config = ShellConfig {
 		session_env:   options.session_env,
+		clear_env:     options.clear_env,
 		snapshot_path: options.snapshot_path,
 		minimizer:     None,
 		filesystem:    options.filesystem,
@@ -871,7 +880,9 @@ async fn create_session_for_run(
 		shell.register_builtin("git", git_builtin());
 	}
 
-	copy_env_into_shell(&mut shell, std::env::vars_os())?;
+	if !config.clear_env {
+		copy_env_into_shell(&mut shell, std::env::vars_os())?;
+	}
 
 	if let Some(env) = config.session_env.as_ref() {
 		for (key, value) in env {
@@ -2183,7 +2194,11 @@ fn env_flag(config: &ShellConfig, key: &str) -> bool {
 		.session_env
 		.as_ref()
 		.and_then(|env| env.get(key).cloned())
-		.or_else(|| std::env::var(key).ok());
+		.or_else(|| {
+			(!config.clear_env)
+				.then(|| std::env::var(key).ok())
+				.flatten()
+		});
 	matches!(raw.as_deref(), Some(value) if !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"))
 }
 
@@ -2196,6 +2211,93 @@ mod tests {
 	use tokio::process::Command;
 
 	use super::*;
+
+	#[tokio::test]
+	async fn clear_environment_blocks_credentials_aliases_and_ambient_builtin_flags() {
+		const MARKER: &str = "COREFORGE_CLEAR_ENV_TEST";
+		if std::env::var_os(MARKER).is_none() {
+			let output = std::process::Command::new(std::env::current_exe().unwrap())
+				.args([
+					"--exact",
+					"shell::tests::clear_environment_blocks_credentials_aliases_and_ambient_builtin_flags",
+					"--nocapture",
+				])
+				.env_clear()
+				.env("PATH", std::env::var_os("PATH").unwrap_or_default())
+				.env(MARKER, "1")
+				.env("COREFORGE_TEST_SECRET", "ambient")
+				.env("COREFORGE.TEST.SECRET", "alias")
+				.env("PI_SMART_GIT", "1")
+				.output()
+				.unwrap();
+			assert!(
+				output.status.success(),
+				"{}{}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			);
+			return;
+		}
+
+		let safe = HashMap::from([("SAFE_MARKER".to_owned(), "allowed".to_owned())]);
+		let command =
+			r#"jq -n -c '[env.COREFORGE_TEST_SECRET, env["COREFORGE.TEST.SECRET"], env.SAFE_MARKER]'"#;
+		for clear_env in [false, true] {
+			let config = ShellConfig {
+				session_env: Some(safe.clone()),
+				clear_env,
+				snapshot_path: None,
+				minimizer: None,
+				filesystem: Fs::native(),
+			};
+			let mut session = create_session(&config).await.unwrap();
+			assert_eq!(session.shell.builtin_mut("git").is_some(), !clear_env);
+			let explicit = ShellConfig {
+				session_env: Some(HashMap::from([("PI_SMART_GIT".to_owned(), "1".to_owned())])),
+				..config
+			};
+			let mut session = create_session(&explicit).await.unwrap();
+			assert!(session.shell.builtin_mut("git").is_some());
+
+			let expected = if clear_env {
+				"[null,null,\"allowed\"]\n"
+			} else {
+				"[\"ambient\",\"alias\",\"allowed\"]\n"
+			};
+			let shell = Shell::new(Some(ShellOptions {
+				clear_env,
+				session_env: Some(safe.clone()),
+				..Default::default()
+			}));
+			let (tx, rx) = flume::unbounded();
+			let result = shell
+				.run(
+					ShellRunOptions { command: command.to_owned(), ..Default::default() },
+					Some(tx),
+					CancelToken::default(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(result.exit_code, Some(0));
+			assert_eq!(rx.try_iter().collect::<String>(), expected);
+
+			let (tx, rx) = flume::unbounded();
+			let result = execute_shell(
+				ShellExecuteOptions {
+					command: command.to_owned(),
+					clear_env,
+					session_env: Some(safe.clone()),
+					..Default::default()
+				},
+				Some(tx),
+				CancelToken::default(),
+			)
+			.await
+			.unwrap();
+			assert_eq!(result.exit_code, Some(0));
+			assert_eq!(rx.try_iter().collect::<String>(), expected);
+		}
+	}
 
 	/// 8.3 short spelling of `path` (`GetShortPathNameW`).
 	#[cfg(windows)]
@@ -2364,6 +2466,7 @@ mod tests {
 			.collect();
 		let config = ShellConfig {
 			session_env:   Some(env),
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -2431,6 +2534,7 @@ mod tests {
 	async fn kill_test_context() -> (ShellSessionCore, ExecutionParameters) {
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -2492,6 +2596,7 @@ mod tests {
 	) -> (ShellSessionCore, ExecutionParameters) {
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -2563,6 +2668,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -2702,6 +2808,7 @@ mod tests {
 		env.insert("OMP_GIT_ENV_PROBE".to_string(), "kept".to_string());
 		let config = ShellConfig {
 			session_env:   Some(env),
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4257,6 +4364,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4299,6 +4407,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4381,6 +4490,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4450,6 +4560,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4502,6 +4613,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4566,6 +4678,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4701,6 +4814,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4780,6 +4894,7 @@ mod tests {
 		env.insert("HOME".to_string(), home.to_string_lossy().to_string());
 		let config = ShellConfig {
 			session_env:   Some(env),
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4828,6 +4943,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4880,6 +4996,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4940,6 +5057,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -4991,6 +5109,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5097,6 +5216,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5175,6 +5295,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5288,6 +5409,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5347,6 +5469,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5411,6 +5534,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5460,6 +5584,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5500,6 +5625,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5592,6 +5718,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5700,7 +5827,8 @@ mod tests {
 			std::fs::metadata(dir.path().join(name))
 				.expect("created file")
 				.permissions()
-				.mode() & 0o777
+				.mode()
+				& 0o777
 		};
 		assert_eq!(mode("redirect"), 0o600, "redirections use the shell umask");
 		assert_eq!(mode("builtin"), 0o600, "builtins use the shell umask");
@@ -5733,6 +5861,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5788,6 +5917,7 @@ mod tests {
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5835,6 +5965,7 @@ mod tests {
 	async fn uutils_head_stdin_read_is_cancellable() {
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -5889,6 +6020,7 @@ mod tests {
 				.collect();
 			ShellConfig {
 				session_env:   Some(map),
+				clear_env:     false,
 				snapshot_path: None,
 				minimizer:     None,
 				filesystem:    Fs::native(),
@@ -5897,6 +6029,7 @@ mod tests {
 
 		let mut default = create_session(&ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -6592,6 +6725,7 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		// Build the same kind of session pi-natives uses in production.
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),
@@ -6910,6 +7044,7 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 
 		let config = ShellConfig {
 			session_env:   None,
+			clear_env:     false,
 			snapshot_path: None,
 			minimizer:     None,
 			filesystem:    Fs::native(),

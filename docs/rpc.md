@@ -256,11 +256,21 @@ The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messa
 
 - `{ id?, type: "get_login_providers" }`
 - `{ id?, type: "login", providerId: string }`
+- `{ id?, type: "get_logout_accounts", providerId: string }` → `data: { accounts: LogoutAccount[] }`
+- `{ id?, type: "logout", providerId: string, credentialId: number }` → `data: { remainingSource?: string }`
 
 Login forwards ordinary OAuth input prompts only after the provider emits an
 authorization URL. Prompts marked `secret: true` are always rejected with a
 failed `login` response directing the user to the terminal UI; no ordinary
 `input` request is emitted. RPC does not negotiate secret-input support.
+
+Logout works per stored credential, as `/logout` does in the TUI, because one
+provider can hold several accounts. `get_logout_accounts` lists them (`credentialId`,
+`provider`, `label`, `detail`, `type`, and `active` for credentials the session may
+be using), active first. `logout` removes one and refreshes that provider's models;
+it fails when the credential is no longer stored. `remainingSource` names the source
+that still authenticates the provider: another stored credential, an environment
+variable, or a config key.
 
 ### Word prediction
 
@@ -420,6 +430,8 @@ Take queued user input back and abort, atomically — the RPC equivalent of pres
 Before aborting, the server withdraws every user-authored steering and follow-up message, including input the run already took from the queue but never recorded in the transcript: steering the aborted response claimed live, and steering or follow-ups dequeued for its next model call. Non-user internal steers (goal/plan/budget notices, IRC and extension asides) are dropped, except advisor cards, which the abort keeps as visible advice. Nothing withdrawn runs after the abort, so no new turn starts from the old queue. A plain `abort` instead requeues stranded steers and drains them into a fresh turn; withdrawing them first with `remove_queued_message` races the agent loop.
 
 `data.steering` and `data.followUp` list the withdrawn messages oldest first, as `{ text, images? }` with `text` being the queue-chip text, so a client can put them back in its editor. The command otherwise behaves like `abort`: it stops goal continuation, cancels input received before it that is not yet admitted (that input is dropped, not returned), and responds after the abort completes. Older runtimes reject this command. The TypeScript client exposes `abortAndRestoreQueue(): Promise<{ steering, followUp }>`.
+
+Cancellation during context preparation persists an aborted assistant boundary, even before provider streaming begins. The boundary remains available after reopening the session for manual retry. Passive stop-hook diagnostics retain their failed-attempt identity; they do not block that retry. Withdrawn queue input and its prepared context remain absent from the transcript.
 
 The response always succeeds, even when the withdrawn input is too large for one response under the negotiated protocol (1 MiB per frame on v1, 64 MiB reassembled on v2). Instead of failing with a transport-limit error, which would lose the already-withdrawn input, the server first omits every entry's `images` and sets `data.imagesDropped: true`, keeping all texts. If the texts alone still do not fit, it returns only the oldest entries that fit (steering first, then follow-ups) and sets `data.truncated: true`; entries after the last one listed are gone. Neither flag is present when the full result fits.
 
@@ -1643,7 +1655,7 @@ Current helper characteristics:
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
 - Drives live voice sessions with `liveStart()`, `liveStop()`, `liveMute()`, and delivers live frames through `onLive()`
 - `promptAndWait()` waits for that prompt's result (or synchronous local completion); `waitForSettled()` also waits for session quiescence. `waitForIdle()` and `collectEvents()` stop at the next `agent_end`, including a non-terminal one, and are not settle barriers.
-- Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
+- Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)` and `getLogoutAccounts(...)` / `logout(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
 
 ### Python package
 

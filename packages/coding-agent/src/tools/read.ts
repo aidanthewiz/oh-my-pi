@@ -1,5 +1,4 @@
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
-import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type EditStore, notebookToEditableText } from "@oh-my-pi/pi-natives";
@@ -90,6 +89,7 @@ import {
 	formatPathRelativeToCwd,
 	probeLiteralPathExists,
 	resolveReadPathAsync,
+	specialFileKind,
 	splitDelimitedPathEntry,
 	splitMixedUrlPathList,
 	splitPathAndSelPreferringLiteral,
@@ -154,6 +154,7 @@ import {
 import { splitAddressableFileLines } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { readBinary, resolveBinaryViewPath } from "./read-binary";
 import { readSqlite, resolveSqliteReadPath } from "./read-sqlite";
+import { readJson, resolveJsonReadPath, splitJsonQueryTarget } from "./read-json";
 import {
 	getReadTextFileBridge,
 	isProseSummaryPath,
@@ -657,19 +658,6 @@ function formatLocatedFileNotice(url: string, backingPath: string, size: number,
 }
 
 /**
- * Kind of a non-regular, non-directory file, or undefined. Reading one in-process can block
- * forever (a FIFO, `/dev/stdin` on the TUI's terminal) or never end (`/dev/zero`).
- */
-function specialFileKind(stat: Stats): string | undefined {
-	if (stat.isFile() || stat.isDirectory()) return undefined;
-	if (stat.isCharacterDevice()) return "character device";
-	if (stat.isBlockDevice()) return "block device";
-	if (stat.isFIFO()) return "FIFO";
-	if (stat.isSocket()) return "socket";
-	return "special file";
-}
-
-/**
  * Peel `?q=<question>` (ask a vision model about an image) from a plain path or a URL whose
  * scheme declares {@link SchemeSpec.imageQuestion}; every other URL owns its query string.
  */
@@ -682,6 +670,7 @@ export function splitImageQuestionTarget(readPath: string): { path: string; ques
 		if (!scheme || !InternalUrlRouter.instance().spec(scheme)?.imageQuestion) return { path: readPath };
 	}
 	if (parseSqlitePathCandidates(readPath.slice(0, queryIndex)).length > 0) return { path: readPath };
+	if (splitJsonQueryTarget(readPath)) return { path: readPath };
 	const question = new URLSearchParams(readPath.slice(queryIndex + 1)).get("q");
 	return question ? { path: readPath.slice(0, queryIndex), question } : { path: readPath };
 }
@@ -693,6 +682,7 @@ export async function ownsReadQuery(readPath: string, cwd: string): Promise<bool
 		!parseSqlitePathCandidates(readPath).some(
 			candidate => candidate.sqlitePath.length <= queryIndex && candidate.queryString.length > 0,
 		) &&
+		!splitJsonQueryTarget(readPath) &&
 		splitImageQuestionTarget(readPath).question === undefined
 	) {
 		return false;
@@ -1773,6 +1763,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const sqlitePath = await resolveSqliteReadPath(this.session, readPath, suffixCache, signal);
 			if (sqlitePath) {
 				return readSqlite(sqlitePath, signal);
+			}
+			const jsonPath = await resolveJsonReadPath(this.session, literalSplit.path, suffixCache, signal);
+			if (jsonPath) {
+				return readJson(this.session, jsonPath, literalSplit.sel, signal);
 			}
 
 			const pdfCandidate = literalSplit.sel === undefined ? splitPdfImageReadPath(readPath) : null;

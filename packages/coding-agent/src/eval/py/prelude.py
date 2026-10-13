@@ -4,7 +4,7 @@ from __future__ import annotations
 if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
-    import asyncio, collections.abc, contextvars, inspect, os, json, math, re, time, types, typing
+    import asyncio, collections.abc, contextvars, inspect, os, json, math, re, sys, time, types, typing
     from urllib.parse import unquote
 
 
@@ -523,7 +523,7 @@ if "__omp_prelude_loaded__" not in globals():
 
         origin = typing.get_origin(annotation)
         args = typing.get_args(annotation)
-        if origin is typing.Annotated:
+        if origin is not None and origin is getattr(typing, "Annotated", None):
             schema = _annotation_schema(args[0])
             description = next((item for item in args[1:] if isinstance(item, str)), None)
             if description is not None:
@@ -531,7 +531,9 @@ if "__omp_prelude_loaded__" not in globals():
             return schema
         if origin is typing.Literal:
             return {"enum": list(args)}
-        if origin in (typing.Union, types.UnionType):
+        if origin is typing.Union or (
+            origin is not None and origin is getattr(types, "UnionType", None)
+        ):
             non_null = [item for item in args if item is not type(None)]
             if len(non_null) == 1 and len(non_null) != len(args):
                 return {
@@ -578,7 +580,11 @@ if "__omp_prelude_loaded__" not in globals():
         """Infer one eval-defined tool's object schema from its signature."""
         signature = inspect.signature(fn)
         try:
-            hints = typing.get_type_hints(fn, include_extras=True)
+            hints = (
+                typing.get_type_hints(fn, include_extras=True)
+                if sys.version_info >= (3, 9)
+                else typing.get_type_hints(fn)
+            )
         except Exception:
             hints = getattr(fn, "__annotations__", {})
         properties = {}
