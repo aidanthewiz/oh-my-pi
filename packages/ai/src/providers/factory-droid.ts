@@ -400,6 +400,7 @@ type ForwardedOptions = Pick<
 	| "streamIdleTimeoutMs"
 	| "streamFirstEventTimeoutMs"
 	| "maxTokens"
+	| "waitForTerminalDrain"
 > & { apiKey: string; headers: Record<string, string> };
 
 /** One resolved request attempt, shared by every wire encoder. */
@@ -623,6 +624,7 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
+					waitForTerminalDrain: options?.waitForTerminalDrain,
 					headers: {
 						...callerHeaders,
 						...buildIdentityHeaders({

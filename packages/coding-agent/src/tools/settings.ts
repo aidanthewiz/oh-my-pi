@@ -656,12 +656,12 @@ export const cfgArchiveEnabled = register({
 export const cfgComputerDisplay = register({
 	id: "computer.display",
 	type: "string",
-	default: "all",
+	default: "active",
 	ui: {
 		tab: "tools",
 		group: "Computer",
 		label: "Computer Display",
-		description: "Composite all displays or select a native display id",
+		description: "Active window's display (active), all displays (all), or a native display id",
 	},
 });
 
@@ -673,7 +673,7 @@ export const cfgComputerMaxWidth = register({
 		tab: "tools",
 		group: "Computer",
 		label: "Computer Screenshot Width",
-		description: "Maximum composite screenshot width in pixels",
+		description: "Maximum screenshot width in pixels",
 	},
 });
 
@@ -685,7 +685,7 @@ export const cfgComputerMaxHeight = register({
 		tab: "tools",
 		group: "Computer",
 		label: "Computer Screenshot Height",
-		description: "Maximum composite screenshot height in pixels",
+		description: "Maximum screenshot height in pixels",
 	},
 });
 

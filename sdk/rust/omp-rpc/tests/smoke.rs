@@ -1,10 +1,10 @@
 //! Real-server smoke runs: `cargo test -- --ignored --nocapture` from this
 //! crate. Spawn the repository's `omp --mode rpc` with an isolated agent dir:
-//! `smoke_real_server` never calls a model; `smoke_scripted_model` talks to the
-//! scripted OpenAI-compatible server in `test/rpc-wire/fake-openai-server.ts`.
+//! `smoke_real_server` configures an auth:none loopback model but never calls
+//! it; `smoke_scripted_model` talks to `test/rpc-wire/fake-openai-server.ts`.
 
 use std::{
-	io::{BufRead, BufReader},
+	io::{BufRead, BufReader, Read},
 	path::{Path, PathBuf},
 	process::{Command as Process, Stdio},
 	sync::{Arc, Mutex, mpsc::Receiver},
@@ -78,9 +78,29 @@ fn smoke_real_server() {
 	let repo = repo_root();
 	let agent_dir = std::env::temp_dir().join(format!("omp-rpc-rust-smoke-{}", std::process::id()));
 	std::fs::create_dir_all(&agent_dir).unwrap();
+	let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+	listener.set_nonblocking(true).unwrap();
+	std::fs::write(
+		agent_dir.join("models.yml"),
+		format!(
+			"providers:\n  metadata-fixture:\n    baseUrl: http://{}/v1\n    auth: none\n    api: \
+			 openai-completions\n    models:\n      - id: metadata-only\n        reasoning: false\n",
+			listener.local_addr().unwrap()
+		),
+	)
+	.unwrap();
 	let mut process = Process::new("bun");
 	process
-		.args(["packages/coding-agent/src/cli.ts", "--mode", "rpc", "--no-session"])
+		.args([
+			"packages/coding-agent/src/cli.ts",
+			"--mode",
+			"rpc",
+			"--no-session",
+			"--provider",
+			"metadata-fixture",
+			"--model",
+			"metadata-only",
+		])
 		.current_dir(&repo)
 		.env("PI_CODING_AGENT_DIR", &agent_dir);
 	let (client, events) = Client::spawn(process, ClientOptions::default()).expect("spawn + ready");
@@ -197,6 +217,21 @@ fn smoke_real_server() {
 		std::thread::sleep(Duration::from_millis(20));
 	}
 	println!("server group gone {:?} after drop", dropped.elapsed());
+	loop {
+		match listener.accept() {
+			Ok((mut stream, _)) => {
+				stream.set_nonblocking(true).unwrap();
+				let mut byte = [0_u8; 1];
+				match stream.read(&mut byte) {
+					Ok(0) => {},
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {},
+					result => panic!("metadata smoke sent model request bytes: {result:?}"),
+				}
+			},
+			Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+			Err(error) => panic!("metadata fixture accept failed: {error}"),
+		}
+	}
 	let _ = std::fs::remove_dir_all(&agent_dir);
 }
 

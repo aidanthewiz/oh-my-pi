@@ -310,6 +310,11 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`,
 			);
 		}
+		if (outcome === "extension-gone") {
+			throw new ToolError(
+				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension disconnected and has not come back. Open Chrome with the ${CF_BRAND} Browser Relay extension and check the toolbar badge shows "on".`,
+			);
+		}
 		if (outcome === "outdated-relay") {
 			throw new ToolError(
 				`The browser relay at ${cdpUrl} is out of date. Restart the relay under this ${CF_BRAND} version, then retry.`,

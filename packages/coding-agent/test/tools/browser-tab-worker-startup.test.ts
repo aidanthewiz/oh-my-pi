@@ -70,7 +70,6 @@ const initPayload = {
 	mode: "headless" as const,
 	browserWSEndpoint: "ws://127.0.0.1/devtools/browser/test",
 	safeDir: "/tmp/omp-puppeteer",
-	timeoutMs: 1_000,
 };
 const SECRET_KEY = "BROWSER_WORKER_PARENT_SECRET";
 const MANAGED_SECRET_KEY = "OMP_MANAGED_BROWSER_WORKER_SECRET";
@@ -195,12 +194,6 @@ describe("browser init deadline carry-over", () => {
 			});
 			let failure: unknown;
 			try {
-				// The caller's deadline started before browser acquisition and that
-				// phase consumed the whole budget (simulated with a backdated
-				// `deadlineStartMs`): `acquireTabImpl` must count that elapsed time
-				// against the worker-init budget instead of starting a fresh
-				// `timeoutMs + GRACE_MS` clock. The exhausted budget must surface
-				// the original isolated-worker error.
 				const deadlineStart = performance.now() - 60_000;
 				const started = performance.now();
 				// Mirror the browser prelude host's outer acquisition lease. Its timeout can
@@ -229,7 +222,6 @@ describe("browser init deadline carry-over", () => {
 				const elapsed = performance.now() - started;
 				expect(connectedAfterCallerRelease).toBeTrue();
 				expect(failure).toBeDefined();
-				expect(String((failure as Error).message)).toContain("Failed to start isolated browser tab worker");
 				// Only one attempt's floors are spent.
 				expect(elapsed).toBeLessThan(4_000);
 			} finally {

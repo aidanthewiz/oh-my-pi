@@ -48,9 +48,7 @@ GOAL = {
 
 class ProtocolParsingTests(unittest.TestCase):
     def test_control_frames_preserve_terminal_and_tool_failure_state(self) -> None:
-        ended = parse_notification(
-            {"type": "rpc_control", "event": "agent_end", "terminal": False}
-        )
+        ended = parse_notification({"type": "rpc_control", "event": "agent_end", "terminal": False})
         self.assertIsInstance(ended, ControlAgentEndEvent)
         self.assertFalse(ended.terminal)
         tool = parse_notification(
@@ -63,9 +61,7 @@ class ProtocolParsingTests(unittest.TestCase):
             }
         )
         self.assertIsInstance(tool, ControlToolExecutionEndEvent)
-        self.assertEqual(
-            (tool.tool_call_id, tool.tool_name, tool.failed), ("call-1", "bash", True)
-        )
+        self.assertEqual((tool.tool_call_id, tool.tool_name, tool.failed), ("call-1", "bash", True))
         with self.assertRaises(ValueError):
             parse_notification({"type": "rpc_control", "event": "agent_end"})
 
@@ -94,9 +90,7 @@ class ProtocolParsingTests(unittest.TestCase):
         base = {"sessionId": "s", "goal": None}
         self.assertIsNone(parse_session_state(base).goal)
 
-        state = parse_session_state(
-            {**base, "goal": {"enabled": False, "mode": "active", "goal": GOAL}}
-        )
+        state = parse_session_state({**base, "goal": {"enabled": False, "mode": "active", "goal": GOAL}})
         assert state.goal is not None
         self.assertEqual(
             (state.goal.enabled, state.goal.goal.status, state.goal.goal.token_budget),
@@ -196,7 +190,13 @@ class ProtocolParsingTests(unittest.TestCase):
             (
                 {
                     "type": "irc_message",
-                    "message": {"role": "custom", "customType": "irc", "content": "hi", "display": True, "timestamp": 1},
+                    "message": {
+                        "role": "custom",
+                        "customType": "irc",
+                        "content": "hi",
+                        "display": True,
+                        "timestamp": 1,
+                    },
                 },
                 IrcMessageEvent,
                 lambda e: e.message["customType"],
@@ -238,9 +238,7 @@ class ProtocolParsingTests(unittest.TestCase):
 
     def test_parse_live_frames(self) -> None:
         self.assertEqual(
-            parse_notification(
-                {"type": "live_transcript", "role": "user", "turn": 3, "text": "hello", "final": False}
-            ),
+            parse_notification({"type": "live_transcript", "role": "user", "turn": 3, "text": "hello", "final": False}),
             LiveTranscriptEvent(role="user", turn=3, text="hello", final=False),
         )
         with self.assertRaises(ValueError):
@@ -287,20 +285,14 @@ class ProtocolParsingTests(unittest.TestCase):
             "assistantMessageEvent": {"type": "start", "partial": assistant},
         }
         events = [
-            parse_notification(
-                {"type": "message_start", "message": assistant, "messageId": "m-7"}
-            ),
+            parse_notification({"type": "message_start", "message": assistant, "messageId": "m-7"}),
             parse_notification(update),
-            parse_notification(
-                {"type": "message_end", "message": assistant, "messageId": "m-7"}
-            ),
+            parse_notification({"type": "message_end", "message": assistant, "messageId": "m-7"}),
         ]
 
         self.assertIsInstance(events[0], MessageStartEvent)
         self.assertIsInstance(events[2], MessageEndEvent)
-        self.assertEqual(
-            [getattr(event, "message_id") for event in events], ["m-7"] * 3
-        )
+        self.assertEqual([event.message_id for event in events], ["m-7"] * 3)
         legacy = parse_notification({"type": "message_end", "message": assistant})
         assert isinstance(legacy, MessageEndEvent)
         self.assertIsNone(legacy.message_id)
@@ -341,9 +333,7 @@ class ProtocolParsingTests(unittest.TestCase):
         )
 
     def test_parse_session_settled_notification(self) -> None:
-        self.assertEqual(
-            parse_notification({"type": "session_settled"}), SessionSettledEvent()
-        )
+        self.assertEqual(parse_notification({"type": "session_settled"}), SessionSettledEvent())
 
     def test_parse_prompt_result_rejects_unknown_status(self) -> None:
         with self.assertRaises(ValueError):
@@ -397,6 +387,14 @@ class ProtocolParsingTests(unittest.TestCase):
                 "fastModeEnabled": False,
                 "fastModeActive": True,
                 "tokensPerSecond": 12.5,
+                "slowModeSupported": True,
+                "slowModeEnabled": True,
+                "slowModeScope": "global",
+                "usageLimit": {
+                    "stage": "low_priority",
+                    "resetsAtSec": 1770000000,
+                    "allowanceLeftPercent": 62,
+                },
                 "autoCompactionEnabled": True,
                 "messageCount": 4,
                 "queuedMessageCount": 1,
@@ -443,9 +441,7 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(state.context_usage.context_window, 200000)
         self.assertEqual(state.context_usage.percent, 6.1725)
         assert state.model is not None and state.model.thinking is not None
-        self.assertEqual(
-            state.model.thinking.efforts, ("minimal", "low", "medium", "high")
-        )
+        self.assertEqual(state.model.thinking.efforts, ("minimal", "low", "medium", "high"))
         self.assertEqual(state.model.thinking.mode, "effort")
         self.assertEqual(state.model.thinking.default_level, "medium")
         self.assertEqual(state.model.thinking.effort_map, {"high": "xhigh"})
@@ -453,8 +449,49 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertFalse(state.fast_mode_enabled)
         self.assertTrue(state.fast_mode_active)
         self.assertEqual(state.tokens_per_second, 12.5)
+        self.assertTrue(state.slow_mode_supported)
+        self.assertTrue(state.slow_mode_enabled)
+        self.assertEqual(state.slow_mode_scope, "global")
+        assert state.usage_limit is not None
+        self.assertEqual(state.usage_limit.stage, "low_priority")
+        self.assertEqual(state.usage_limit.resets_at_sec, 1770000000)
+        self.assertEqual(state.usage_limit.allowance_left_percent, 62)
         self.assertTrue(state.has_pending_async_work)
         self.assertFalse(state.is_settled)
+
+    def test_parse_session_state_validates_usage_limit_variants(self) -> None:
+        base = {
+            "sessionId": "session-123",
+            "steeringMode": "one-at-a-time",
+            "followUpMode": "all",
+            "interruptMode": "immediate",
+        }
+        wrap_up = parse_session_state(
+            {
+                **base,
+                "usageLimit": {
+                    "stage": "wrap_up",
+                    "extraUsage": True,
+                },
+            }
+        ).usage_limit
+        assert wrap_up is not None
+        self.assertEqual(wrap_up.stage, "wrap_up")
+        self.assertTrue(wrap_up.extra_usage)
+        self.assertIsNone(wrap_up.resets_at_sec)
+        self.assertIsNone(parse_session_state(base).usage_limit)
+        self.assertFalse(parse_session_state(base).slow_mode_supported)
+
+        invalid = (
+            ({"stage": "low_priority"}, "resetsAtSec"),
+            ({"stage": "wrap_up"}, "extraUsage"),
+            ({"stage": "wrap_up", "extraUsage": "false"}, "extraUsage"),
+            ({"stage": "unknown"}, "stage"),
+        )
+        for slow_mode, field in invalid:
+            with self.subTest(slow_mode=slow_mode):
+                with self.assertRaisesRegex(ValueError, field):
+                    parse_session_state({**base, "usageLimit": slow_mode})
 
     def test_parse_session_state_defaults_missing_fast_mode_and_throughput(
         self,
@@ -760,9 +797,7 @@ class ProtocolParsingTests(unittest.TestCase):
 
     def test_parse_extension_ui_request_rejects_invalid_method(self) -> None:
         with self.assertRaises(ValueError):
-            parse_notification(
-                {"type": "extension_ui_request", "id": "ui-1", "method": "launch"}
-            )
+            parse_notification({"type": "extension_ui_request", "id": "ui-1", "method": "launch"})
 
     def test_parse_notification_deep_clones_nested_messages(self) -> None:
         payload = {

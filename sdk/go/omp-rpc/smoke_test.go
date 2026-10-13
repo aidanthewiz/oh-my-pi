@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,8 +24,8 @@ import (
 //	OMP_RPC_SMOKE=1 go test -run TestSmoke -v ./...
 //
 // PI_CODING_AGENT_DIR points at a fresh directory so no user configuration
-// applies. TestSmoke has no model and never prompts; TestSmokeModel prompts a
-// scripted local model (packages/coding-agent/test/rpc-wire/fake-openai-server.ts).
+// applies. TestSmoke selects an auth:none loopback model and never calls it;
+// TestSmokeModel prompts the scripted local model in test/rpc-wire.
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
@@ -117,7 +119,17 @@ func TestSmoke(t *testing.T) {
 	root := repoRoot(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	client, log, finish := startServer(t, root, t.TempDir(), nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("metadata smoke unexpectedly requested the model: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+	agentDir := t.TempDir()
+	models := "providers:\n  metadata-fixture:\n    baseUrl: " + server.URL + "/v1\n    auth: none\n    api: openai-completions\n    models:\n      - id: metadata-only\n        reasoning: false\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "models.yml"), []byte(models), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client, log, finish := startServer(t, root, agentDir, []string{"--provider", "metadata-fixture", "--model", "metadata-only"})
 
 	state, err := client.GetState(ctx)
 	if err != nil {

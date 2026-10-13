@@ -196,11 +196,15 @@ const { session } = await createAgentSession({
 
 When no explicit `model`/`modelPattern` is provided:
 
-1. restore model from existing session (if restorable + key available)
+1. restore a saved session model that has configured credentials and passes the model policy
 2. settings default model role (`default`)
 3. an authenticated provider-default model in availability order (falling back to the first authenticated available model when no provider default is present)
 
-If restore fails, `modelFallbackMessage` explains fallback.
+Saved selectors retain their thinking suffix. Restoration respects `enabledModels`, `disabledModels`, and `disabledProviders`, including after extension discovery.
+
+If no saved model can be restored, startup rejects by default. A UI-enabled session with `allowSessionModelFallback` and `retry.modelFallback` may use the settings fallback; `modelFallbackMessage` explains it.
+
+`session.switchSession(path)` applies the same restoration policy and restores the previous session if restoration fails. An explicit `model` option must also pass the model policy.
 
 ### Auth priority
 

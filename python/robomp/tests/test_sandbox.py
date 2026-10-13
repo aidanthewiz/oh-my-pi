@@ -835,6 +835,7 @@ def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_chown(
 
 
 def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    os.chown(tmp_path, -1, os.getgid())
     repo_dir = tmp_path / "workspaces" / "octo__widget__43" / "repo"
     repo_dir.mkdir(parents=True)
     common_dir = tmp_path / "workspaces" / "_pool" / "octo__widget" / ".git"

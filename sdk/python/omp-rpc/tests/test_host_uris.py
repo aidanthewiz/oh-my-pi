@@ -8,7 +8,6 @@ import unittest
 from omp_rpc import RpcClient, host_uri
 from omp_rpc.host_uris import normalize_read_result
 
-
 URI_SERVER = textwrap.dedent(
     """
     import json
@@ -113,9 +112,7 @@ class HostUriHelperTests(unittest.TestCase):
 
     def test_normalize_read_result_rejects_invalid_content_type(self) -> None:
         with self.assertRaises(ValueError):
-            normalize_read_result(
-                {"content": "x", "content_type": "application/octet-stream"}
-            )  # type: ignore[arg-type]
+            normalize_read_result({"content": "x", "content_type": "application/octet-stream"})  # type: ignore[arg-type]
 
     def test_host_uri_helper_normalizes_scheme(self) -> None:
         uri = host_uri(scheme="  DB  ", read=lambda url, ctx: "x")
@@ -126,9 +123,7 @@ class HostUriHelperTests(unittest.TestCase):
             host_uri(scheme="", read=lambda url, ctx: "x")
 
     def test_host_uri_writable_when_write_supplied(self) -> None:
-        uri = host_uri(
-            scheme="db", read=lambda url, ctx: "x", write=lambda url, content, ctx: None
-        )
+        uri = host_uri(scheme="db", read=lambda url, ctx: "x", write=lambda url, content, ctx: None)
         self.assertTrue(uri.writable)
 
 
@@ -171,9 +166,7 @@ class RpcHostUriBridgeTests(unittest.TestCase):
                 "immutable": True,
             }
 
-        with self._make_client(
-            host_uris=(host_uri(scheme="db", read=read_db),)
-        ) as client:
+        with self._make_client(host_uris=(host_uri(scheme="db", read=read_db),)) as client:
             client._request("trigger_read", url="db://users/42")  # type: ignore[attr-defined]
             frame = self._await_echo(client)
             self.assertEqual(frame["content"], '{"name":"Alice"}')
@@ -217,9 +210,7 @@ class RpcHostUriBridgeTests(unittest.TestCase):
         def read_db(_url: str, _ctx) -> str:
             raise RuntimeError("boom")
 
-        with self._make_client(
-            host_uris=(host_uri(scheme="db", read=read_db),)
-        ) as client:
+        with self._make_client(host_uris=(host_uri(scheme="db", read=read_db),)) as client:
             client._request("trigger_read", url="db://users/42")  # type: ignore[attr-defined]
             frame = self._await_echo(client)
             self.assertTrue(frame.get("isError"))

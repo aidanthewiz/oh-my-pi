@@ -22,13 +22,24 @@ provides:
 ## Generated from the wire schema
 
 Protocol types, their decoders, every command method, and every `on_<frame type>`
-listener live in `omp_rpc/_wire.py`, generated from the RPC wire schema in
+listener live in `omp_rpc/_wire.py`. Generated public exports live in
+`omp_rpc/__init__.py`. Both files use the RPC wire schema in
 `packages/coding-agent/src/modes/rpc/wire` (also emitted as the language-neutral
 `rpc-wire.schema.json`). After changing the schema, regenerate from the repo root:
 
 ```bash
 bun run gen:rpc
 ```
+
+Install `uv` before regeneration. The command supplies Ruff 0.17.0 and formats
+both Python artifacts with this package's `pyproject.toml`. Direct callers of
+`emitPython` or `generateRpcArtifacts` must use the same environment:
+
+```bash
+uv run --no-project --with ruff==0.17.0 bun path/to/generator-consumer.ts
+```
+
+Ruff is a generator dependency, not an SDK runtime or build dependency.
 
 `packages/coding-agent/test/rpc-wire` fails when the committed outputs are stale or
 when the schema drifts from the server's own types. Decoding follows the schema:
@@ -86,10 +97,12 @@ way to seed todos before the first prompt:
 ```python
 from omp_rpc import MessageUpdateEvent, RpcClient
 
+
 def on_message_update(event: MessageUpdateEvent) -> None:
     assistant_event = event.assistant_message_event
     if assistant_event.get("type") == "text_delta":
         print(assistant_event["delta"], end="", flush=True)
+
 
 with RpcClient(model="openrouter/anthropic/claude-sonnet-4.6", no_session=True) as client:
     client.on_message_update(on_message_update)
@@ -143,9 +156,11 @@ request id, and `on_prompt_result()` delivers each typed `PromptResultEvent`:
 ```python
 from omp_rpc import PromptResultEvent, RpcClient
 
+
 def on_result(result: PromptResultEvent) -> None:
     if result.status == "error" and result.error is not None:
         print(result.id, result.error.message, result.error.http_status, result.error.retryable)
+
 
 with RpcClient(no_session=True) as client:
     client.on_prompt_result(on_result)
@@ -207,7 +222,10 @@ with RpcClient() as client:
 ```
 
 `open_session()` continues the newest non-empty session in the directory or
-starts a fresh one there (`resumed=False`). The event filter applies only to
+starts a fresh one there (`resumed=False`). Pass `provider=` and `model_id=` to
+use that model instead of the session's saved one; without them, a saved model
+that can no longer be restored fails the call with `RpcCommandError` and the
+previous session stays active. The event filter applies only to
 session events; responses, `prompt_result`, and UI/host frames always arrive,
 so `prompt_and_wait()` still completes when `agent_end` is filtered out.
 
@@ -384,27 +402,27 @@ rows: dict[str, str] = {"42": "id=42\nname=Alice\n"}
 
 
 def read_row(url: str, _ctx) -> str:
-	row_id = url.removeprefix("db://users/")
-	return rows[row_id]
+    row_id = url.removeprefix("db://users/")
+    return rows[row_id]
 
 
 def write_row(url: str, content: str, _ctx) -> None:
-	row_id = url.removeprefix("db://users/")
-	rows[row_id] = content
+    row_id = url.removeprefix("db://users/")
+    rows[row_id] = content
 
 
 with RpcClient(
-	no_session=True,
-	host_uris=(
-		host_uri(
-			scheme="db",
-			description="Virtual db row files",
-			read=read_row,
-			write=write_row,
-		),
-	),
+    no_session=True,
+    host_uris=(
+        host_uri(
+            scheme="db",
+            description="Virtual db row files",
+            read=read_row,
+            write=write_row,
+        ),
+    ),
 ) as client:
-	client.prompt_and_wait("Read db://users/42 and rewrite it with name=Bob")
+    client.prompt_and_wait("Read db://users/42 and rewrite it with name=Bob")
 ```
 
 Schemes registered as read-only (no `write=`) reject `write` calls with a
@@ -443,8 +461,10 @@ from omp_rpc import AskAnswer
 if request.method == "ask":
     client.send_ui_answers(
         request.id,
-        [AskAnswer(id=question.id, selected_options=(question.options[0].label,))
-         for question in request.questions or ()],
+        [
+            AskAnswer(id=question.id, selected_options=(question.options[0].label,))
+            for question in request.questions or ()
+        ],
     )
 ```
 

@@ -18,11 +18,11 @@ from unittest import mock
 from omp_rpc import (
     AgentEndEvent,
     AskAnswer,
-    HostTool,
-    HostToolCompletedEvent,
     AvailableCommandsUpdateEvent,
     GoalResult,
     HandoffResult,
+    HostTool,
+    HostToolCompletedEvent,
     LivePhaseEvent,
     OpenSessionResult,
     PromptResultEvent,
@@ -35,13 +35,11 @@ from omp_rpc import (
     SubagentLifecycleEvent,
     host_tool,
 )
-
 from omp_rpc.client import (
-    _RpcFrameDecoder,
     _process_group_id,
+    _RpcFrameDecoder,
     _terminate_process_group,
 )
-
 
 FAKE_SERVER = textwrap.dedent(
     """
@@ -477,20 +475,29 @@ FAKE_SERVER = textwrap.dedent(
             respond(request_id, "export_html", {"path": command.get("outputPath") or "/tmp/session.html"})
         elif command_type == "new_session":
             respond(request_id, "new_session", {"cancelled": False})
-        elif command_type == "switch_session":
-            respond(request_id, "switch_session", {"cancelled": False})
-        elif command_type == "open_session":
-            session_dir = command["sessionDir"]
-            respond(
-                request_id,
-                "open_session",
-                {
-                    "cancelled": False,
-                    "resumed": True,
-                    "sessionId": "resumed-session",
-                    "sessionFile": f"{session_dir}/resumed.jsonl",
-                },
-            )
+        elif command_type in {"open_session", "switch_session"}:
+            session_path = command["sessionDir" if command_type == "open_session" else "sessionPath"]
+            if session_path.startswith("/tmp/unavailable") and "provider" not in command:
+                respond(
+                    request_id, command_type, success=False,
+                    error="Could not restore model local/missing-model",
+                )
+                continue
+            if "provider" in command:
+                model_provider = command["provider"]
+                model_id = command["modelId"]
+            if command_type == "switch_session":
+                respond(request_id, command_type, {"cancelled": False})
+            else:
+                respond(
+                    request_id, command_type,
+                    {
+                        "cancelled": False,
+                        "resumed": True,
+                        "sessionId": "resumed-session",
+                        "sessionFile": f"{session_path}/resumed.jsonl",
+                    },
+                )
         elif command_type == "set_event_filter":
             event_filter = command["events"]
             respond(request_id, "set_event_filter", {"events": event_filter})
@@ -1201,15 +1208,12 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(live, [LivePhaseEvent(phase="listening")])
         self.assertEqual(turn.assistant_text, "pong")
         self.assertFalse(
-            {"available_commands_update", "subagent_lifecycle", "live_phase"}
-            & {event.type for event in turn.events}
+            {"available_commands_update", "subagent_lifecycle", "live_phase"} & {event.type for event in turn.events}
         )
 
     def test_set_todos_accepts_blocked_tasks(self) -> None:
         with self.make_client() as client:
-            phases = client.set_todos(
-                [{"content": "Ship", "status": "blocked", "blocker": "waiting on review"}]
-            )
+            phases = client.set_todos([{"content": "Ship", "status": "blocked", "blocker": "waiting on review"}])
         task = phases[0].tasks[0]
         self.assertEqual((task.status, task.blocker), ("blocked", "waiting on review"))
 
@@ -1286,7 +1290,7 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(client.get_state().queued_message_count, 1)
 
     def test_remove_queued_message_rejects_missing_result(self) -> None:
-        server = FAKE_SERVER.replace('{"removed": removed}', '{}')
+        server = FAKE_SERVER.replace('{"removed": removed}', "{}")
         with self.make_client(server) as client:
             with self.assertRaises(ValueError):
                 client.remove_queued_message("missing", "steering")
@@ -1406,9 +1410,7 @@ class RpcClientTests(unittest.TestCase):
         with self.make_client() as client:
             state = client.get_state()
             self.assertEqual(state.session_id, "fake-session")
-            self.assertEqual(
-                state.model.id if state.model else None, "claude-sonnet-4-5"
-            )
+            self.assertEqual(state.model.id if state.model else None, "claude-sonnet-4-5")
             self.assertFalse(state.fast_mode_enabled)
             self.assertTrue(state.fast_mode_active)
             self.assertEqual(state.tokens_per_second, 7.25)
@@ -1485,6 +1487,34 @@ class RpcClientTests(unittest.TestCase):
             ),
         )
 
+    def test_session_commands_preserve_restore_failure_and_bind_replacement_model(self) -> None:
+        for command in ("open_session", "switch_session"):
+            for code in (None, "model_unavailable"):
+                with self.subTest(command=command, code=code):
+                    server = FAKE_SERVER
+                    if code is not None:
+                        server = server.replace(
+                            'payload["error"] = error',
+                            f'payload["error"] = error; payload["code"] = {code!r}',
+                        )
+                    with self.make_client(server) as client:
+                        target = Path("/tmp/unavailable-session")
+                        before = client.get_state()
+                        change = client.open_session if command == "open_session" else client.switch_session
+                        with self.assertRaises(RpcCommandError) as ctx:
+                            change(target)
+                        self.assertEqual(ctx.exception.command, command)
+                        self.assertEqual(ctx.exception.error, "Could not restore model local/missing-model")
+                        self.assertEqual(ctx.exception.code, code)
+                        self.assertEqual(client.get_state(), before)
+
+                        result = change(target, provider="local", model_id="renamed-model")
+                        self.assertFalse(result.cancelled)
+                        state = client.get_state()
+                        self.assertIsNotNone(state.model)
+                        assert state.model is not None
+                        self.assertEqual((state.model.provider, state.model.id), ("local", "renamed-model"))
+
     def test_wait_for_settled_outlasts_prompt_yield_until_background_work_drains(
         self,
     ) -> None:
@@ -1546,21 +1576,11 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(state.dump_tools[-1].name, "echo_host")
 
             turn = client.prompt_and_wait("needs host tool", timeout=2.0)
-            update_events = [
-                event
-                for event in turn.events
-                if getattr(event, "type", None) == "tool_execution_update"
-            ]
-            end_events = [
-                event
-                for event in turn.events
-                if getattr(event, "type", None) == "tool_execution_end"
-            ]
+            update_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_update"]
+            end_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_end"]
 
             self.assertEqual(len(update_events), 1)
-            self.assertEqual(
-                update_events[0].partial_result["content"][0]["text"], "working:hello"
-            )
+            self.assertEqual(update_events[0].partial_result["content"][0]["text"], "working:hello")
             self.assertEqual(len(end_events), 1)
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
 
@@ -1597,25 +1617,13 @@ class RpcClientTests(unittest.TestCase):
         ) as client:
             turn = client.prompt_and_wait("needs xd host tool", timeout=2.0)
             start_names = [
-                event.tool_name
-                for event in turn.events
-                if getattr(event, "type", None) == "tool_execution_start"
+                event.tool_name for event in turn.events if getattr(event, "type", None) == "tool_execution_start"
             ]
-            update_events = [
-                event
-                for event in turn.events
-                if getattr(event, "type", None) == "tool_execution_update"
-            ]
-            end_events = [
-                event
-                for event in turn.events
-                if getattr(event, "type", None) == "tool_execution_end"
-            ]
+            update_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_update"]
+            end_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_end"]
 
             self.assertEqual(start_names, ["write"])
-            self.assertEqual(
-                [event.tool_name for event in update_events], ["echo_host"]
-            )
+            self.assertEqual([event.tool_name for event in update_events], ["echo_host"])
             self.assertEqual([event.tool_name for event in end_events], ["echo_host"])
             self.assertEqual(end_events[0].tool_call_id, "toolu_write_1")
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
@@ -1648,11 +1656,7 @@ class RpcClientTests(unittest.TestCase):
             client.on_host_tool_completed(completed.append)
             turn = client.prompt_and_wait("needs eval host tool", timeout=2.0)
 
-        end_names = [
-            event.tool_name
-            for event in turn.events
-            if getattr(event, "type", None) == "tool_execution_end"
-        ]
+        end_names = [event.tool_name for event in turn.events if getattr(event, "type", None) == "tool_execution_end"]
         self.assertEqual(end_names, ["eval"])
         self.assertEqual(
             completed,
@@ -1668,11 +1672,7 @@ class RpcClientTests(unittest.TestCase):
             client.on_host_tool_completed(completed.append)
             turn = client.prompt_and_wait("needs eval host tool", timeout=2.0)
 
-        end_events = [
-            event
-            for event in turn.events
-            if getattr(event, "type", None) == "tool_execution_end"
-        ]
+        end_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_end"]
         self.assertTrue(end_events[0].is_error)
         self.assertEqual(completed, [])
 
@@ -1689,9 +1689,7 @@ class RpcClientTests(unittest.TestCase):
         seen_methods: list[str] = []
 
         with self.make_client() as client:
-            client.install_headless_ui(
-                on_request=lambda request: seen_methods.append(request.method)
-            )
+            client.install_headless_ui(on_request=lambda request: seen_methods.append(request.method))
             client.prompt_and_wait("needs ui", timeout=2.0)
 
         self.assertEqual(seen_methods, ["input"])
@@ -1702,9 +1700,7 @@ class RpcClientTests(unittest.TestCase):
         notification_types: list[str] = []
         client = self.make_client()
         client.on_ready(lambda event: ready_types.append(event.type))
-        client.on_notification(
-            lambda notification: notification_types.append(notification.type)
-        )
+        client.on_notification(lambda notification: notification_types.append(notification.type))
         client.on_turn_start(lambda event: event_types.append(event.type))
         client.on_message_update(lambda event: event_types.append(event.type))
         client.on_agent_end(lambda event: event_types.append(event.type))
@@ -1823,12 +1819,8 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(len(messages[0]["content"][0]["text"]), 1024 * 1024)
 
     def test_protocol_v2_get_messages_falls_back_to_streaming_snapshot(self) -> None:
-        with self.make_client(
-            server=V2_MESSAGES_SERVER, env={"V2_MESSAGES_BUSY": "1"}
-        ) as client:
-            with self.assertRaisesRegex(
-                RpcCommandError, "Cannot page messages while the session is changing"
-            ):
+        with self.make_client(server=V2_MESSAGES_SERVER, env={"V2_MESSAGES_BUSY": "1"}) as client:
+            with self.assertRaisesRegex(RpcCommandError, "Cannot page messages while the session is changing"):
                 client.get_messages_page()
             messages = client.get_messages()
 
@@ -1836,9 +1828,7 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(messages[0]["content"][0]["text"], "streaming snapshot")
 
     def test_protocol_v2_get_messages_discards_stale_page_walk(self) -> None:
-        with self.make_client(
-            server=V2_MESSAGES_SERVER, env={"V2_MESSAGES_STALE": "1"}
-        ) as client:
+        with self.make_client(server=V2_MESSAGES_SERVER, env={"V2_MESSAGES_STALE": "1"}) as client:
             with self.assertRaisesRegex(RpcCommandError, "RPC message cursor is stale"):
                 client.get_messages_page(cursor="page-two")
             messages = client.get_messages()
@@ -1904,12 +1894,8 @@ class RpcClientTests(unittest.TestCase):
         seen_unknown: list[str] = []
 
         with self.make_client() as client:
-            client.on_extension_error(
-                lambda event: seen_extension_errors.append(event.error)
-            )
-            client.on_unknown_notification(
-                lambda event: seen_unknown.append(str(event.payload.get("type")))
-            )
+            client.on_extension_error(lambda event: seen_extension_errors.append(event.error))
+            client.on_unknown_notification(lambda event: seen_unknown.append(str(event.payload.get("type"))))
             client.prompt_and_wait("notifications", timeout=2.0)
 
         self.assertEqual(seen_extension_errors, ["boom"])
@@ -1919,17 +1905,11 @@ class RpcClientTests(unittest.TestCase):
         unknown_errors: list[str | None] = []
 
         with self.make_client(server=FORWARD_COMPAT_SERVER) as client:
-            client.on_unknown_notification(
-                lambda event: unknown_errors.append(event.parse_error)
-            )
+            client.on_unknown_notification(lambda event: unknown_errors.append(event.parse_error))
             turn = client.prompt_and_wait("forward compatible", timeout=2.0)
 
-        terminal_events = [
-            event for event in turn.events if isinstance(event, AgentEndEvent)
-        ]
-        self.assertEqual(
-            [event.is_terminal for event in terminal_events], [False, True]
-        )
+        terminal_events = [event for event in turn.events if isinstance(event, AgentEndEvent)]
+        self.assertEqual([event.is_terminal for event in terminal_events], [False, True])
         self.assertEqual(len(unknown_errors), 1)
         self.assertIn("auto_compaction_start.reason", unknown_errors[0] or "")
 
@@ -1937,12 +1917,8 @@ class RpcClientTests(unittest.TestCase):
         unknown_errors: list[str | None] = []
 
         with self.make_client(server=FORWARD_COMPAT_SERVER) as client:
-            client.on_unknown_notification(
-                lambda event: unknown_errors.append(event.parse_error)
-            )
-            with self.assertRaisesRegex(
-                RpcError, "Failed to parse terminal agent_end"
-            ):
+            client.on_unknown_notification(lambda event: unknown_errors.append(event.parse_error))
+            with self.assertRaisesRegex(RpcError, "Failed to parse terminal agent_end"):
                 client.prompt_and_wait("malformed terminal", timeout=1.0)
 
         self.assertEqual(len(unknown_errors), 1)
@@ -1970,29 +1946,18 @@ class RpcClientTests(unittest.TestCase):
 
             def run_prompt() -> None:
                 try:
-                    results.append(
-                        client.prompt_and_wait(
-                            "slow", timeout=2.0
-                        ).require_assistant_text()
-                    )
-                except (
-                    BaseException
-                ) as exc:  # pragma: no cover - defensive thread capture
+                    results.append(client.prompt_and_wait("slow", timeout=2.0).require_assistant_text())
+                except BaseException as exc:  # pragma: no cover - defensive thread capture
                     errors.append(exc)
 
             thread = threading.Thread(target=run_prompt)
             thread.start()
 
             deadline = time.time() + 1.0
-            while (
-                client._prompt_lifecycle.active_operation != "prompt_and_wait"
-                and time.time() < deadline
-            ):
+            while client._prompt_lifecycle.active_operation != "prompt_and_wait" and time.time() < deadline:
                 time.sleep(0.01)
 
-            self.assertEqual(
-                client._prompt_lifecycle.active_operation, "prompt_and_wait"
-            )
+            self.assertEqual(client._prompt_lifecycle.active_operation, "prompt_and_wait")
             with self.assertRaises(RpcConcurrencyError):
                 client.collect_events(timeout=1.0)
 
@@ -2005,9 +1970,7 @@ class RpcClientTests(unittest.TestCase):
     def test_listener_mutation_does_not_change_retained_turn(self) -> None:
         with self.make_client() as client:
             client.on_message_end(
-                lambda event: event.message["content"].__setitem__(
-                    0, {"type": "text", "text": "mutated"}
-                )
+                lambda event: event.message["content"].__setitem__(0, {"type": "text", "text": "mutated"})
             )
             turn = client.prompt_and_wait("say hello", timeout=2.0)
             messages = client.get_messages()
@@ -2046,15 +2009,11 @@ class RpcClientTests(unittest.TestCase):
         client = self.make_client()
         client.on_notification(
             lambda notification: (
-                (_ for _ in ()).throw(RuntimeError("boom"))
-                if notification.type == "turn_start"
-                else None
+                (_ for _ in ()).throw(RuntimeError("boom")) if notification.type == "turn_start" else None
             )
         )
         client.on_listener_error(
-            lambda event: listener_errors.append(
-                (event.listener_kind, event.source_type, str(event.error))
-            )
+            lambda event: listener_errors.append((event.listener_kind, event.source_type, str(event.error)))
         )
 
         try:
@@ -2158,26 +2117,17 @@ class StopUnblocksPromptAndWaitTests(unittest.TestCase):
 
             # Wait until the prompt is in flight.
             deadline = time.time() + 2.0
-            while (
-                client._prompt_lifecycle.active_operation != "prompt_and_wait"
-                and time.time() < deadline
-            ):
+            while client._prompt_lifecycle.active_operation != "prompt_and_wait" and time.time() < deadline:
                 time.sleep(0.01)
-            self.assertEqual(
-                client._prompt_lifecycle.active_operation, "prompt_and_wait"
-            )
+            self.assertEqual(client._prompt_lifecycle.active_operation, "prompt_and_wait")
 
             t0 = time.time()
             client.stop()
             thread.join(timeout=2.0)
             elapsed = time.time() - t0
 
-            self.assertFalse(
-                thread.is_alive(), "prompt_and_wait did not return after stop()"
-            )
-            self.assertLess(
-                elapsed, 2.0, f"stop() took {elapsed:.2f}s to unblock prompt_and_wait"
-            )
+            self.assertFalse(thread.is_alive(), "prompt_and_wait did not return after stop()")
+            self.assertLess(elapsed, 2.0, f"stop() took {elapsed:.2f}s to unblock prompt_and_wait")
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], RpcProcessExitError)
         finally:

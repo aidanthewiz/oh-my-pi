@@ -112,4 +112,4 @@ Once the server sends `host_uri_cancel`, nothing is sent for that request, even 
 
 `cargo test` runs the wire tests and the transport tests, which use a scripted server on in-memory pipes.
 
-`cargo test -- --ignored --nocapture` also runs two smoke tests against the repository's server (`bun packages/coding-agent/src/cli.ts --mode rpc`). The first never calls a model. The second uses the scripted model in `packages/coding-agent/test/rpc-wire/fake-openai-server.ts`.
+`cargo test -- --ignored --nocapture` also runs two smoke tests against the repository's server (`bun packages/coding-agent/src/cli.ts --mode rpc`). The metadata test configures an `auth: none` loopback model and verifies that it receives no request. The second uses the scripted model in `packages/coding-agent/test/rpc-wire/fake-openai-server.ts`. Neither test uses external model credentials.

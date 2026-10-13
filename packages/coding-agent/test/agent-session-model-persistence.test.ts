@@ -4,6 +4,11 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { type Api, type AssistantMessage, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import {
+	cfgDisabledModels,
+	cfgDisabledProviders,
+	cfgEnabledModels,
+} from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -94,11 +99,12 @@ describe("AgentSession model persistence", () => {
 	}
 	async function createSession(options?: {
 		initialModel?: Model<Api>;
+		modelRegistry?: ModelRegistry;
 		selectInitialModel?: (availableModels: Model<Api>[]) => Model<Api>;
 		modelRoles?: Record<string, string>;
 		persist?: boolean;
 	}): Promise<{ modelRegistry: ModelRegistry; settings: Settings; session: AgentSession }> {
-		const modelRegistry = sharedModelRegistry;
+		const modelRegistry = options?.modelRegistry ?? sharedModelRegistry;
 		const model =
 			options?.initialModel ??
 			options?.selectInitialModel?.(modelRegistry.getAvailable()) ??
@@ -304,6 +310,65 @@ describe("AgentSession model persistence", () => {
 
 		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
 		expect(created.session.model?.id).toBe(smolModel.id);
+	});
+
+	it.each(["allowlist", "model", "provider"] as const)(
+		"rejects saved and explicit session models excluded by %s policy without switching",
+		async policy => {
+			const currentModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+			const excludedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+			const targetSessionFile = await writeRoleModelSession(modelValue(excludedModel), modelValue(excludedModel));
+			const created = await createSession({ initialModel: currentModel, persist: true });
+			const previousFile = created.session.sessionFile;
+			const previousId = created.session.sessionId;
+			if (policy === "allowlist") cfgEnabledModels.override(created.settings, [modelValue(currentModel)]);
+			if (policy === "model") cfgDisabledModels.override(created.settings, [modelValue(excludedModel)]);
+			if (policy === "provider") cfgDisabledProviders.override(created.settings, [excludedModel.provider]);
+
+			await expect(created.session.switchSession(targetSessionFile)).rejects.toThrow("Could not restore model");
+			expect(created.session.sessionFile).toBe(previousFile);
+			expect(created.session.sessionId).toBe(previousId);
+			expect(created.session.model?.id).toBe(currentModel.id);
+			await expect(created.session.switchSession(targetSessionFile, { model: excludedModel })).rejects.toThrow(
+				"excluded by model policy",
+			);
+			expect(created.session.sessionFile).toBe(previousFile);
+			expect(created.session.model?.id).toBe(currentModel.id);
+		},
+	);
+
+	it("restores a permitted saved default instead of an excluded saved role", async () => {
+		const currentModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const excludedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const targetSessionFile = await writeRoleModelSession(modelValue(currentModel), modelValue(excludedModel));
+		const created = await createSession({ initialModel: currentModel, persist: true });
+		cfgEnabledModels.override(created.settings, [modelValue(currentModel)]);
+
+		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
+		expect(created.session.sessionFile).toBe(targetSessionFile);
+		expect(created.session.model?.id).toBe(currentModel.id);
+	});
+
+	it("restores the authenticated saved provider selected by an unqualified allowlist", async () => {
+		const model = getBundledModel("openai", "gpt-5.5");
+		if (!model) throw new Error("Expected openai/gpt-5.5 to exist");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "scoped-auth.db"));
+		authStorage.keys.setRuntime("openai", "synthetic-openai-key");
+		try {
+			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "scoped-models.yml"));
+			const targetSessionFile = await writeRoleModelSession(modelValue(model), modelValue(model));
+			const created = await createSession({ initialModel: model, modelRegistry, persist: true });
+			cfgEnabledModels.override(created.settings, ["gpt-5.5"]);
+
+			await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
+			expect(created.session.sessionFile).toBe(targetSessionFile);
+			expect(created.session.model?.provider).toBe("openai");
+			expect(created.session.model?.id).toBe("gpt-5.5");
+		} finally {
+			await session?.dispose();
+			session = undefined;
+			authStorage.close();
+		}
 	});
 
 	it("restores the last active role model during startup resume", async () => {

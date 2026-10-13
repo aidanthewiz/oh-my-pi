@@ -10,6 +10,7 @@
  * and re-dials after Chrome reaps it while disconnected.
  */
 import type { ExtToRelayMessage, RelayToExtMessage, TabSnapshot } from "../../coding-agent/src/tools/browser/relay/protocol";
+import { ownedDebuggerTabs } from "./debugger-ownership";
 
 const DEFAULT_PORT = 9224;
 const INJECTED_TOKEN = "__COREFORGE_BROWSER_RELAY_TOKEN__";
@@ -157,10 +158,10 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 		const snap = snapshot(tab);
 		if (snap) snapshots.push(snap);
 	}
-	const attachedTabIds: number[] = [];
-	for (const target of targets) {
-		if (target.attached && target.tabId !== undefined) attachedTabIds.push(target.tabId);
-	}
+	// `attached` is true for DevTools or another extension too; only our own attachment answers a command.
+	const attachedTabIds = await ownedDebuggerTabs(targets, tabId =>
+		chrome.debugger.sendCommand({ tabId }, "Target.getTargetInfo"),
+	);
 	const versionMatch = /Chrome\/[\d.]+/.exec(navigator.userAgent);
 	return {
 		t: "hello",
