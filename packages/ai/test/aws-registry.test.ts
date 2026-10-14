@@ -67,6 +67,59 @@ describe("AWS provider availability", () => {
 		}
 	});
 
+	test("retains usable shared credentials when the config path has a non-directory parent", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aws-registry-config-path-"));
+		try {
+			const credentialsPath = path.join(tmp, "credentials");
+			const nonDirectory = path.join(tmp, "not-a-directory");
+			await Bun.write(credentialsPath, "[default]\naws_access_key_id = test\naws_secret_access_key = test-secret\n");
+			await Bun.write(nonDirectory, "not a directory");
+			for (const loadConfig of [undefined, "1"]) {
+				await withEnv(
+					{
+						...EMPTY_AWS_ENV,
+						AWS_SHARED_CREDENTIALS_FILE: credentialsPath,
+						AWS_CONFIG_FILE: path.join(nonDirectory, "config"),
+						AWS_SDK_LOAD_CONFIG: loadConfig,
+						AWS_EC2_METADATA_DISABLED: "true",
+					},
+					async () => expect(getEnvApiKey("bedrock-mantle")).toBe("<authenticated>"),
+				);
+			}
+		} finally {
+			await removeWithRetries(tmp);
+		}
+	});
+
+	test("treats an unusable credentials path as unavailable and observes its replacement", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aws-registry-credentials-path-"));
+		try {
+			const parent = path.join(tmp, "credentials-parent");
+			const credentialsPath = path.join(parent, "credentials");
+			await Bun.write(parent, "not a directory");
+			await withEnv(
+				{
+					...EMPTY_AWS_ENV,
+					AWS_SHARED_CREDENTIALS_FILE: credentialsPath,
+					AWS_CONFIG_FILE: path.join(tmp, "missing-config"),
+					AWS_EC2_METADATA_DISABLED: "true",
+				},
+				async () => {
+					expect(getEnvApiKey("bedrock-mantle")).toBeUndefined();
+					await fs.unlink(parent);
+					await fs.mkdir(parent);
+					await Bun.write(
+						credentialsPath,
+						"[default]\naws_access_key_id = test\naws_secret_access_key = test-secret\n",
+					);
+					expect(getEnvApiKey("bedrock-mantle")).toBe("<authenticated>");
+				},
+			);
+		} finally {
+			await removeWithRetries(tmp);
+		}
+	});
+
 	test("ignores profile files without a usable credential mechanism", async () => {
 		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aws-registry-empty-"));
 		try {

@@ -16,6 +16,8 @@
 - Preserved visible text and history after unfinished DeepSeek DSML calls, including late parent closers, incomplete quoted headers and ambiguous multiline arguments; only complete leaf calls delimit removable payloads.
 - Bounded stdio gateway admission through output completion and capped streamed response bodies, with cancellation and actionable size errors instead of unbounded reply buffers.
 - Preserved account-bound OAuth routing during strict gateway probes, including Snowflake's stored account and provider-owned credential encoding.
+- Treat unavailable AWS credential/config file paths as absent, and do not stat shared configuration unless loading it is enabled.
+
 ## [18.8.1] - 2026-10-07
 
 ### Added

@@ -51,32 +51,37 @@ function isEc2Host(): boolean {
 
 let awsProfileProbe: { key: string; value: boolean } | undefined;
 
-/** Change stamp of one shared INI file; a missing file has its own stamp. */
+/** Change stamp of one shared INI file; an unavailable file has its own stamp. */
 function awsFileStamp(filePath: string): string {
-	const stat = fs.statSync(filePath, { throwIfNoEntry: false });
-	return stat ? `${stat.mtimeMs}:${stat.size}` : "-";
+	try {
+		const stat = fs.statSync(filePath, { throwIfNoEntry: false });
+		return stat ? `${stat.mtimeMs}:${stat.size}` : "-";
+	} catch {
+		return "-";
+	}
 }
 
 /**
- * `hasConfiguredAwsProfile` re-reads and re-parses both shared INI files, and
+ * `hasConfiguredAwsProfile` re-reads and re-parses active shared INI files, and
  * availability checks run per request. The result is reused while every
- * environment input and both files' stat stamps are unchanged, so edits from
+ * environment input and active file's stat stamp is unchanged, so edits from
  * `aws configure` / `aws sso login` are seen on the next call.
  */
 function hasCachedAwsProfile(): boolean {
 	const { credentialsPath, configPath } = awsSharedFilePaths();
+	const loadConfig = shouldLoadAwsSharedConfig();
 	const key = [
 		allowAmbientAwsModelCredentials(),
 		resolveAwsProfile(),
-		shouldLoadAwsSharedConfig(),
+		loadConfig,
 		// `credential_source` profiles resolve against these.
 		!!($env.AWS_ACCESS_KEY_ID && $env.AWS_SECRET_ACCESS_KEY),
 		!!($env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || $env.AWS_CONTAINER_CREDENTIALS_FULL_URI),
 		$env.AWS_EC2_METADATA_DISABLED?.toLowerCase() === "true",
 		credentialsPath,
 		awsFileStamp(credentialsPath),
-		configPath,
-		awsFileStamp(configPath),
+		loadConfig ? configPath : "",
+		loadConfig ? awsFileStamp(configPath) : "",
 	].join("\u0000");
 	if (awsProfileProbe?.key === key) return awsProfileProbe.value;
 	const value = hasConfiguredAwsProfile();
