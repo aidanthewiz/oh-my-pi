@@ -117,6 +117,9 @@ export function createSessionStub(
 		getLastAssistantMessage: () => undefined,
 		agent: {
 			state: { streamMessage: null },
+			setModel: () => {},
+			setThinkingLevel: () => {},
+			setDisableReasoning: () => {},
 			getPendingToolResults: () => [],
 			metadataForProvider: () => undefined,
 		},

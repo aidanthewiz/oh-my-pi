@@ -13,7 +13,7 @@ export default class Usage extends Command {
 		action: Args.string({
 			description: "Optional subcommand to execute",
 			required: false,
-			options: ["invalidate", "clients"],
+			options: ["invalidate", "clients", "accounts"],
 		}),
 	};
 
@@ -47,6 +47,7 @@ export default class Usage extends Command {
 		`# Machine-readable output\n  ${CF_COMMAND} usage --json`,
 		`# Usage-limit trend over the last 30 days\n  ${CF_COMMAND} usage --history --days 30`,
 		`# Per-client token burn (which machine/app spent what) over the last 30 days\n  ${CF_COMMAND} usage clients --days 30`,
+		`# OAuth identity keys for task.agentAccountPools (no tokens)\n  ${CF_COMMAND} usage accounts`,
 		`# Invalidate cached usage reports for all providers\n  ${CF_COMMAND} usage invalidate`,
 		`# Invalidate cached usage reports for a specific provider\n  ${CF_COMMAND} usage invalidate --provider anthropic`,
 	];

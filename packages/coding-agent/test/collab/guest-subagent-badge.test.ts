@@ -103,6 +103,7 @@ function makeGuestContext(): InteractiveModeContext {
 		updateEditorBorderColor: () => {},
 		eventController: {
 			dispatchSessionEvent: () => Promise.resolve(),
+			drainSessionEvents: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
 			resetTranscriptAnchors: () => {},
 		},

@@ -65,6 +65,8 @@ A room can also end on its own: the relay closes it for good, or the host's send
 
 Guest ownership begins before replica activation and lasts through restoration of the previous local session. Neither joining, resynchronizing, nor a failed join may publish the replica as a local host. Leaving waits for restoration; a restoration failure is reported and keeps hosting blocked. An explicit stop during restoration suppresses its pending automatic restart without cancelling the restoration itself.
 
+Before resynchronizing or restoring the local session, guests finish queued host rendering, including pending link lookups and coalesced updates. Host dialogs close before that wait. Old events cannot append rows or change activity controls after transcript replacement. If a local lookup is still pending, restoration waits for it before releasing guest ownership.
+
 ### Listing active local hosts
 
 Suspension suppresses session data, joins, and guest actions; it does not suppress termination of an existing room-local dialog. An ended dialog carries only its request ID, so guests can dismiss it even if `/resume` later rolls back. The first authenticated answer to an existing dialog is retained while the target session is provisional and applied only if the original room resumes with the writer still authorized. Commit, stop, and local cancellation cannot apply that answer to another session. Joins during that provisional window must be retried once it settles. `/collab status` prints the room's published access level, so a view-only room never exposes its internal control link through status.

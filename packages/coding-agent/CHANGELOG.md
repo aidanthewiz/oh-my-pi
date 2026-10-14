@@ -29,6 +29,45 @@
 - Preserve inferred Python tool schemas on interpreters without `types.UnionType` or `typing.Annotated`.
 - Capture JSON query output and bounded diagnostics without unsupported shell descriptor commands.
 - Generate embedded stats assets before loading the standalone compiler, so clean builds include the stats client archive.
+- Avoid an account-pool import cycle during settings and MCP startup.
+- Preserve current inherited account pools when cold-reviving nested agents, and reject unrecoverable required ancestry.
+- Reject superseded or released account-pool scopes before returning credentials, including delayed acquisitions.
+
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added account pools for task agents, allowing an agent and its related work—including advisors, title generation, subagents, and resumed sessions—to use only specified OAuth accounts and fail rather than fall back to another account or an API key.
+- Added `omp usage accounts` to list OAuth account provider and identity keys without exposing tokens, making account-pool configuration easier.
+
+### Changed
+
+- Generated session titles now include their card icon and short code, so the `/resume` picker and session listings show this context; `title.icons` applies to newly generated titles.
+- Symlinked routing configurations now reload when an intermediate file or profile-directory link is replaced, without requiring a session restart.
+
+### Fixed
+
+- Improved Tern `ask` questions so the question no longer obscures the transcript and can be answered while reviewing and scrolling through the relevant context.
+- Added warnings for unrecognized `compat` keys in `models.yml` while continuing to load the configuration; warnings identify the file and key path.
+- Fixed `/new` so new sessions reset plan and goal modes, todo state, and related planning configuration instead of carrying stale state forward; fresh prewalk behavior is also restored after handoffs, cancellations, or automatic recovery.
+- Fixed OAuth alias login and logout flows so they refresh the underlying provider's models, report authentication state correctly, and list and remove the accounts associated with that provider.
+- Fixed model speed statistics so throughput from non-default OpenAI or Codex service tiers is kept separate and displayed for the tier used by the session.
+- Fixed stale model catalogs remaining in memory after provider or catalog refreshes.
+- Fixed `write` and `edit` from hanging or exhausting memory when given FIFOs, terminals, device files, or other non-regular targets; unsupported targets are now rejected safely.
+- Fixed long conversations from losing user and tool-result images when the conversation also contained assistant-generated images.
+- Fixed `local://` session paths from escaping their intended storage directory when given `.` or `..` session identifiers.
+- Fixed `omp gc --archive --apply` from leaving orphaned session-title records behind.
+- Fixed `/retry` after an interrupted reopened `ask` prompt when an extension had registered a context handler.
+- Fixed browser relay sessions from missing cross-origin iframe content that loaded before the tab was opened.
+- Fixed browser clicks on invisible native radio and checkbox inputs, including controls commonly used by GOV.UK forms.
+- Fixed `/model` so selecting the model already assigned to a project's default role still switches to that model correctly.
+- Fixed `wait` and background task state when a completion has already been consumed elsewhere, preventing premature interruption and incorrect idle detection.
+- Fixed repeated coding-plan fallback confirmations after declining a fallback in cases involving changing thinking settings, unavailable quota data, or account recovery.
+- Fixed Python evaluation when the shared runner temporary directory was created by another user.
+- Added RPC support for completing multi-select `ask` questions without relying on TUI keyboard navigation.
+- Corrected tool behavior and configuration documentation for `read`, background `bash`, Python evaluation, replace editing, goal removal, and `advisor.immuneTurns`.
+- Fixed custom glob backends from hanging indefinitely; scans now respect the tool deadline and report incomplete results when necessary.
+- Fixed `--resume <path>` from silently creating a new session for a missing path; it now reports the missing path, consistent with `--fork <path>` and `--resume <id>`.
 
 ## [18.8.0] - 2026-10-07
 

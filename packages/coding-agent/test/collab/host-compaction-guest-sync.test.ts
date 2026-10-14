@@ -110,6 +110,7 @@ function makeGuestHarness(model: Model, modelRegistry: ModelRegistry): GuestHarn
 		showError: () => {},
 		eventController: {
 			dispatchSessionEvent: () => Promise.resolve(),
+			drainSessionEvents: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
 			resetTranscriptAnchors: () => {},
 		},

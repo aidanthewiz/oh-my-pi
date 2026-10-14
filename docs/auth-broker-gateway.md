@@ -268,7 +268,7 @@ Broker clients can restrict their visible OAuth accounts by setting `OMP_AUTH_BR
 }
 ```
 
-`identityKey` is the token-free identity field already carried by each authenticated `/v1/snapshot` credential entry. Operator tooling should project only `provider` and `identityKey`; it must not retain or print the accompanying credential payload. A dedicated account-listing CLI is intentionally outside this routing feature's scope.
+`identityKey` is the token-free identity field already carried by each authenticated `/v1/snapshot` credential entry. `omp usage accounts` lists visible OAuth identity keys and organization names without tokens. Operator tooling must not retain or print the accompanying credential payload.
 
 SDK hosts can supply the same provider-to-identity mapping as `accountPool` in `discoverAuthStorage()` or `RemoteAuthCredentialStore`. An explicit programmatic pool takes precedence over the environment file.
 
@@ -282,6 +282,16 @@ The file is parsed once when broker-backed auth storage starts. An unreadable fi
 This is a **trusted-client routing policy, not an authorization boundary**. The client still holds a broker bearer token, receives raw broker responses before applying its local view, and can call broker endpoints directly. Use server-side authorization—not account pools—when clients must be prevented from retrieving other credentials.
 
 The broker bearer token authorizes the trusted transport and can expose the broker's full credential snapshot to its holder. The client-side pool filters which OAuth identities that client selects for requests; it does not constrain what the bearer holder can retrieve from the broker.
+
+### Per-agent and per-session pools
+
+A session pool narrows the process-visible accounts using the same identity keys. Set `task.agentAccountPools` by exact agent name ([Settings](./settings.md#providers-and-services)), pass `oauthAccountPools` to `createAgentSession()`, or call `authStorage.sessions.restrict(provider, sessionId, identityKeys)` directly.
+
+For each listed provider, selection, pins, fallback, and rotation use only listed OAuth accounts. An empty list denies every account. Stored, runtime, config, and environment API keys never supply a fallback. Requests that require environment credentials fail. A `models.yml` `apiKey` also blocks pooled requests, so pooled OAuth tokens cannot reach its configured endpoint.
+
+SDK session pools cover every model registry key route, including auxiliary session ids and lookups without an id. Nested sessions with their own pools use those pools instead of the parent's. Disposal releases restrictions only after in-flight work settles; startup failure also releases them.
+
+Direct callers must pass the returned lease to `authStorage.sessions.unrestrict(provider, sessionId, lease)`. A stale lease cannot release a newer restriction. Inherited credential affinity does not copy restrictions. Session pools remain trusted-client routing policy, not an authorization boundary.
 
 ## Operator opt-in
 

@@ -158,7 +158,12 @@ export class CredentialSelector {
 					credential: Extract<AuthCredential, { type: T }>;
 					index: number;
 				} => {
-					if (entry.credential.type !== type) return false;
+					if (
+						entry.credential.type !== type ||
+						!this.#deps.affinity.allows(provider, sessionId, entry.credential)
+					) {
+						return false;
+					}
 					return filter?.(entry.credential) ?? true;
 				},
 			);
@@ -297,7 +302,12 @@ export class CredentialSelector {
 			.credentials(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is ApiKeySelection => {
-				if (entry.credential.type !== "api_key") return false;
+				if (
+					entry.credential.type !== "api_key" ||
+					!this.#deps.affinity.allows(provider, sessionId, entry.credential)
+				) {
+					return false;
+				}
 				return filter?.(entry.credential) ?? true;
 			});
 
@@ -516,14 +526,17 @@ export class CredentialSelector {
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
 		await this.#deps.pool.adoptExternalChanges();
-		const credentials = this.#deps.pool
+		const stored = this.#deps.pool
 			.credentials(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
 		this.#deps.policies.validateFor(
 			provider,
-			credentials.map(entry => entry.credential),
+			stored.map(entry => entry.credential),
 		);
+		// A session restriction drops every other account before ranking, pins,
+		// and the fallback passes below, so none of them can route back to it.
+		const credentials = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
 
 		if (credentials.length === 0) return undefined;
 		this.#deps.policies.validateUsageCapability(provider, this.#deps.usage.canFetchOAuthUsage(provider));

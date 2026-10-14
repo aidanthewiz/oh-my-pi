@@ -2,6 +2,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
+import type { OAuthAccountPools } from "../config/account-pools";
+import { validateAgentAccountPools } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -23,6 +25,7 @@ import {
 	followMCPTools,
 	subagentRetryFallbackRole,
 } from "./executor";
+import { cfgTaskAgentAccountPools } from "./settings";
 import type { AgentDefinition } from "./types";
 
 /**
@@ -142,6 +145,43 @@ export function createPersistedSubagentReviverFactory(
 			if (init.retryFallback) {
 				installRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(ref.id), init.retryFallback);
 			}
+			// Reconstruct inheritance from durable definition names and current owner policy.
+			// Display labels and historical policy snapshots cannot grant credentials.
+			let oauthAccountPools: OAuthAccountPools | undefined;
+			try {
+				const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(ctx.settings));
+				if (Object.keys(agentAccountPools).length > 0) {
+					let ancestor = ref;
+					let ancestorInit = init;
+					const visited = new Set<string>();
+					while (ancestor.id !== MAIN_AGENT_ID) {
+						if (visited.has(ancestor.id) || !ancestorInit.agent) {
+							throw new Error(`Cannot revive subagent "${ref.id}": account pool ancestry is cyclic or unnamed.`);
+						}
+						visited.add(ancestor.id);
+						if (Object.hasOwn(agentAccountPools, ancestorInit.agent)) {
+							oauthAccountPools = agentAccountPools[ancestorInit.agent];
+							break;
+						}
+						const ancestorParentId = ancestor.parentId;
+						if (!ancestorParentId || ancestorParentId === MAIN_AGENT_ID) break;
+						const parent = registry.get(ancestorParentId);
+						const parentContract = parent?.sessionFile
+							? await SessionManager.peekSessionInit(parent.sessionFile)
+							: undefined;
+						if (!parent || !parentContract?.init) {
+							throw new Error(
+								`Cannot revive subagent "${ref.id}": account pool ancestry is missing or unreadable.`,
+							);
+						}
+						ancestor = parent;
+						ancestorInit = parentContract.init;
+					}
+				}
+			} catch (error) {
+				await reopened.close();
+				throw error;
+			}
 			const persistedModelPattern =
 				init.modelRole && init.modelRole !== "default"
 					? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
@@ -197,6 +237,7 @@ export function createPersistedSubagentReviverFactory(
 							: ref.displayName,
 					parentTaskPrefix: ref.id,
 					parentAgentId: ref.parentId,
+					oauthAccountPools,
 					expectedAgentRef: expectedRef,
 					taskDepth,
 					toolNames: revivedToolNames,

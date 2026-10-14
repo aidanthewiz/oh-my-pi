@@ -222,6 +222,16 @@ the V1 `/responses/compact` request. See [compaction](./compaction.md).
 - custom `models` entries require positive `contextWindow` and `maxTokens` when provided; the current auxiliary positivity check does not cover `modelOverrides`
 - on both custom models and overrides, `maxContextWindow` must be a positive safe integer no smaller than `contextWindow` when both are set
 
+### Unknown compatibility keys
+
+Unknown keys in provider, model, and `modelOverrides` `compat` blocks produce non-fatal warnings. Interactive startup shows a notification. Print mode, RPC mode, and model listings write warnings to stderr, including JSON listings; stdout remains unchanged. Each warning names the configuration file and dotted key path. Model array entries use zero-based indices, as schema errors do. Configuration still loads, and unknown keys remain intact for forward compatibility.
+
+The user `models.yml` and organization-managed `models.managed.yml` use the same validation schema. Diagnostics inspect each source before merging, so managed overrides cannot hide user typos. A registry reports each unknown key once per source file, including after forced refreshes or unchanged file reads. Managed metadata retains precedence.
+
+Known record-level keys, at the top level of `compat` and inside its `whenThinking` override, come from both the models.yml compatibility schemas and the runtime compatibility vocabulary (wire axes). The schemas validate only a curated subset, so a runtime-recognized key such as `streamFirstEventTimeoutMs` does not warn merely because the file schema omits it. A nested `whenThinking.whenThinking` still warns: a thinking override cannot contain another thinking override. Thinking and catalog axes belong outside `compat` and are not included. Other nested checking follows only schema-declared fixed-field objects, including routing blocks and `reasoningEffortMap`; open maps such as `extraBody` accept arbitrary keys and nested payloads. Runtime extension provider registrations are not checked against the file schema: they can register custom APIs with their own compatibility fields.
+
+The runtime vocabulary is not filtered by the provider's `api`: a wire key that only another API family reads (for example an Anthropic-only key in an `openai-completions` provider) does not warn, even though it has no effect there.
+
 ### Command-resolved secrets
 
 Provider `apiKey` values and provider/model `headers` values may start with `!` to read a secret from command stdout. Commands run asynchronously with a 10 s timeout; stdout is trimmed, and empty/failing commands are omitted. Loading or inspecting the catalog does not execute them: credentials resolve when a request or online credential probe needs them.
@@ -722,9 +732,11 @@ Both surfaces keep provider-prefixed concrete models visible and selectable.
 - `omp models` (default `ls` action) prints provider-grouped tables of available **chat** models; `--kind <kind>` selects another catalog kind and `--kind all` includes every kind.
 - `omp models find <substring>` filters by provider, id, or name; `omp models refresh` forces an online catalog re-fetch ignoring the model cache TTL; a provider name doubles as an `ls` filter (e.g. `omp models openai-codex`).
 - Other flags: `--json`, `-e <path>` / `--extension <path>` (repeatable), `--no-extensions` (skip ambient discovery; explicit `-e` still loads), and `--config <overlay>` (repeatable).
+- Listings apply `enabledModels`, `disabledModels`, and `disabledProviders`; diagnostics do not widen this scope.
 
 JSON includes `provider`, `kind`, `id`, `selector`, `name`, limits, reasoning/thinking metadata,
-declared `input`, and `cost`; it does not expose the model's transport `api`.
+declared `input`, `cost`, and `pricingStatus`; it does not expose the model's transport `api`.
+The separate `providerDiscovery` array reports provider discovery status and whether its cached data is stale.
 
 Selecting a provider row stores its explicit `provider/modelId`.
 

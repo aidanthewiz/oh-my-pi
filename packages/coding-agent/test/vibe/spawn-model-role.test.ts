@@ -10,14 +10,21 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 function makeParentSession(settings: Settings): ToolSession {
 	return {
@@ -104,5 +111,53 @@ describe("vibe worker spawn model role", () => {
 
 		expect(options.modelOverride).toEqual(["openai-codex/sol"]);
 		expect(options.modelRole).toBeUndefined();
+	});
+
+	it("keeps a worker's first session inside its exact-agent account pool", async () => {
+		const tempDir = TempDir.createSync("@pi-vibe-account-pool-");
+		const authStorage = createInMemoryAuthStorage();
+		let worker: AgentSession | undefined;
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled model");
+			await authStorage.credentials.set("anthropic", {
+				type: "oauth",
+				access: "worker-access",
+				refresh: "worker-refresh",
+				expires: Date.now() + 60 * 60_000,
+				email: "a@example.com",
+				orgId: "org-a",
+			});
+			authStorage.keys.setRuntime("anthropic", "runtime-key");
+			const settings = Settings.isolated({
+				"async.enabled": false,
+				"compaction.enabled": false,
+				modelRoles: { default: "anthropic/opus", task: "anthropic/sonnet" },
+				"task.agentAccountPools": {
+					task: { anthropic: ["email:a@example.com|org:org-a"] },
+					sonic: { anthropic: [] },
+				},
+			});
+			const options = await spawnAndCaptureOptions("good", settings);
+			({ session: worker } = await createAgentSession({
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
+				settings,
+				model,
+				oauthAccountPools: options.oauthAccountPools,
+				toolNames: ["read"],
+				disableExtensionDiscovery: true,
+			}));
+			expect(await worker.modelRegistry.getApiKey(model)).toBe("worker-access");
+			await authStorage.credentials.set("anthropic", { type: "api_key", key: "stored-key" });
+			await expect(worker.modelRegistry.getApiKey(model)).rejects.toThrow("restricted to its OAuth account pool");
+		} finally {
+			await worker?.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
 	});
 });

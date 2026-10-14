@@ -250,6 +250,7 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 		updateEditorBorderColor: () => {},
 		eventController: {
 			dispatchSessionEvent: () => Promise.resolve(),
+			drainSessionEvents: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
 			resetTranscriptAnchors: () => {},
 		},

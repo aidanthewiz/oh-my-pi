@@ -40,6 +40,7 @@ import {
 	type ServiceTierInheritSettingValue,
 } from "../config/service-tier";
 import type { CompactionThresholdPair } from "../config/compaction-threshold";
+import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
 import { type OverlayLayers, Settings } from "../config/settings";
 
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
@@ -133,6 +134,7 @@ import {
 	cfgTaskMaxRuntimeMs,
 	cfgTaskMaxRecursionDepth,
 	cfgTaskAgentAdvisor,
+	cfgTaskAgentAccountPools,
 } from "./settings";
 import {
 	cfgTierSubagent,
@@ -535,6 +537,8 @@ export interface ExecutorOptions {
 	serviceTierOverride?: ServiceTierInheritSettingValue;
 	/** Exact-name `task.agentCompactionThresholdOverrides` pair selected by dispatch. */
 	compactionThresholdOverride?: CompactionThresholdPair;
+	/** Exact-name `task.agentAccountPools` entry selected by dispatch; see `CreateAgentSessionOptions.oauthAccountPools`. */
+	oauthAccountPools?: OAuthAccountPools;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -3772,6 +3776,8 @@ interface WarmReviveCapture {
 	/** Todos are parent-owned and stripped from subagents, except under prewalk (its todo gate needs them). */
 	keepTodo: boolean;
 	wake: IrcWakeTurnMonitorOptions;
+	/** Exact agent name the live `task.agentAccountPools` entry is looked up by on revive. */
+	agentName: string;
 }
 
 /** Keeps `capture.settings` current with `session`'s overlay writes until the session is disposed. */
@@ -3810,15 +3816,21 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 		const mcpManager = capture.spec.options.mcpManager;
 		const mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
 		let revived: AgentSession;
+		// Account pools are owner policy: take the live exact-name entry, as
+		// dispatch and persisted revival do, never the spawn-time copy.
+		const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
 		try {
-			({ session: revived } = await createAgentSession(
-				buildSubagentSessionOptions(
+			({ session: revived } = await createAgentSession({
+				...buildSubagentSessionOptions(
 					capture.spec,
 					restoreSubagentSettings(capture.settings),
 					reopened,
 					expectedAgentRef,
 				),
-			));
+				oauthAccountPools: Object.hasOwn(agentAccountPools, capture.agentName)
+					? agentAccountPools[capture.agentName]
+					: undefined,
+			}));
 		} catch (error) {
 			mcpFollower?.dispose();
 			throw error;
@@ -4300,6 +4312,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					getApiKey: options.getApiKey,
 					credentialSourceSessionId: options.credentialSourceSessionId,
+					oauthAccountPools: options.oauthAccountPools,
 					inheritedSessionAgents: options.inheritedSessionAgents,
 					model,
 					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
@@ -4450,6 +4463,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					parentArtifactManager: options.parentArtifactManager,
 					keepTodo: prewalk !== undefined,
 					wake: wakeOptions,
+					agentName: agent.name,
 				};
 				trackSubagentSettings(session, reviveCapture);
 				reviveSession = createWarmSubagentReviver(reviveCapture);

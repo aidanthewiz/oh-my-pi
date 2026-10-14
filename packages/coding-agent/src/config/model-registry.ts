@@ -129,6 +129,7 @@ export {
 } from "./model-provider-discovery";
 
 import {
+	getUnknownCompatKeys,
 	MANAGED_MODELS_FILENAME,
 	ManagedModelsConfigFile,
 	ModelsConfigFile,
@@ -294,6 +295,8 @@ export class ModelRegistry {
 	// every rebuild does not log the same ignored override again.
 	#warnedUnservedOverrideKinds: Set<string> = new Set();
 	#configError: ConfigError | undefined = undefined;
+	#warnedCompatKeys = new Set<string>();
+	#configWarnings: string[] = [];
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#managedModelsConfigFile: ConfigFile<ModelsConfig>;
 	#lastStaticLoadMtime: string | null = null;
@@ -921,6 +924,13 @@ export class ModelRegistry {
 	 */
 	getError(): ConfigError | undefined {
 		return this.#configError;
+	}
+
+	/** Drain non-fatal file diagnostics, reporting each key path once per registry. */
+	drainConfigWarnings(): string[] {
+		const warnings = this.#configWarnings;
+		this.#configWarnings = [];
+		return warnings;
 	}
 
 	#loadModels() {
@@ -1641,6 +1651,18 @@ export class ModelRegistry {
 		}
 
 		const merged = mergeModelsConfig(status === "ok" ? value : undefined, managedConfig);
+		for (const [config, path] of [
+			[status === "ok" ? value : undefined, this.#modelsConfigFile.path()],
+			[managedConfig, this.#managedModelsConfigFile.path()],
+		] as const) {
+			if (!config) continue;
+			for (const keyPath of getUnknownCompatKeys(config)) {
+				const warningKey = `${path}:${keyPath}`;
+				if (this.#warnedCompatKeys.has(warningKey)) continue;
+				this.#warnedCompatKeys.add(warningKey);
+				this.#configWarnings.push(`Unknown compat key in ${path}: ${keyPath} (configuration still loaded).`);
+			}
+		}
 
 		const overrides = new Map<string, ProviderOverride>();
 		const allModelOverrides = new Map<string, Map<string, ModelOverride>>();

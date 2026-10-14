@@ -16,6 +16,17 @@
 - Preserved visible text and history after unfinished DeepSeek DSML calls, including late parent closers, incomplete quoted headers and ambiguous multiline arguments; only complete leaf calls delimit removable payloads.
 - Bounded stdio gateway admission through output completion and capped streamed response bodies, with cancellation and actionable size errors instead of unbounded reply buffers.
 - Preserved account-bound OAuth routing during strict gateway probes, including Snowflake's stored account and provider-owned credential encoding.
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added session restrictions for OAuth account pools via `AuthStorage.sessions.restrict`, limiting selection, fallback, rotation, and authentication to specified accounts until the returned lease is released with `sessions.unrestrict`. API keys and other accounts are not used when a session is restricted.
+- Exported `resolveCredentialIdentityKey` for determining the identity key used to match credentials with broker account pools and session restrictions.
+
+### Fixed
+
+- Fixed Codex Fast (`priority`) and Ultrafast usage being recorded, billed, and reported as Standard when the backend echoed a default service tier; the requested tier is now preserved in usage and performance records.
+
 ## [18.8.0] - 2026-10-07
 
 ### Breaking Changes

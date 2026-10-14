@@ -293,7 +293,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 | `stats` | View usage statistics. | |
 | `stream` | Broadcast local OMP session screens and chat to a public live channel. | |
 | `update` | Check for and install updates; `--canary`/`--stable` switch release channels. | |
-| `usage` | Show provider usage limits for every authenticated account; `usage clients` breaks token burn down per client (with `--days`), `usage invalidate` drops cached reports. | |
+| `usage` | Show provider usage limits for every authenticated account; `usage clients` breaks token burn down per client (with `--days`), `usage invalidate` drops cached reports, and `usage accounts` lists each OAuth account's provider and identity key (the key `task.agentAccountPools` and broker account pools take; no tokens, `--json` supported). | [Task agent discovery](./task-agent-discovery.md#model-and-structured-output-precedence) |
 | `tiny-models` | Download tiny local models for session titles, memory, and word completion. | [local models](./local-models.md) |
 | `token` | Get the API key or OAuth token for a provider. | [secrets](./secrets.md) |
 | `toks` | Count file or text tokens with the embedded offline tokenizers. | |
@@ -305,5 +305,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 > reachable through related mechanisms (the `plugin` command, the `/join` slash
 > command, and so on). The table lists each as it is registered in
 > `packages/coding-agent/src/cli-commands.ts`.
+
+`usage accounts` refreshes credential metadata before listing identity keys. If refresh fails, it retains cached identities and warns on stderr that they may be stale. JSON stdout remains parseable and contains no tokens. `--redact` is rejected because account pools require exact identity keys.
 
 `__complete` is an internal, hidden subcommand used by shell completion scripts.

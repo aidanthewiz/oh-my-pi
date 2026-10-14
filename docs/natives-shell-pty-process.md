@@ -101,6 +101,15 @@ Persistent shell (`Shell.run`) uses this state machine:
 
 One-shot shell (`executeShell`) always creates and drops a fresh session per call.
 
+Brush job handles own shell-internal tasks through `AbortOnDropHandle`, including asynchronous lists and coprocesses.
+Dropping a subshell or its job table aborts those tasks; `ShellSessionCore` has no separate task-cleanup destructor.
+Cancellation aborts internal jobs before process-group cleanup, while existing descendant cleanup and bounded reader shutdown remain active.
+
+For internal jobs, `kill -0 %N` probes without stopping work; terminating signals abort the task.
+Unix stop, continue, and default-ignored signals fail instead of reporting delivery or terminating internal work.
+These include `CHLD`, `CONT`, `STOP`, `TSTP`, `TTIN`, `TTOU`, `URG`, and `WINCH`, plus `INFO` and `IO` on macOS.
+External jobs retain platform process-signal behavior and host-process protection.
+
 ### Streaming/output and minimizer behavior
 
 - Stdout/stderr are routed into a shared pipe and read concurrently.

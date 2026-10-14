@@ -115,6 +115,7 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		eventController: {
 			handleEvent: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
+			drainSessionEvents: () => Promise.resolve(),
 			resetTranscriptAnchors: () => {},
 		},
 		loadingAnimation: undefined,
@@ -172,6 +173,7 @@ function makeCancelledSwitchGuestContext(
 		eventController: {
 			handleEvent: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
+			drainSessionEvents: () => Promise.resolve(),
 			resetTranscriptAnchors: () => {},
 		},
 		loadingAnimation: undefined,

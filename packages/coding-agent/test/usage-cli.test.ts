@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { UsageReport } from "@oh-my-pi/pi-ai";
@@ -8,12 +8,16 @@ import {
 	computeProviderWindowStats,
 	formatUsageBreakdown,
 	formatUsageHistory,
+	runUsageCommand,
 	type UsagePolicyDiagnosticsOptions,
 } from "@oh-my-pi/pi-coding-agent/cli/usage-cli";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import {
 	collectUnreportedAccounts,
 	type UsageAccountIdentity,
 } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/usage-accounts";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const HOUR = 3_600_000;
 const FIVE_HOURS = 5 * HOUR;
@@ -1047,5 +1051,161 @@ describe("usage command configuration", () => {
 		expect(error).toBe("");
 		expect(exitCode).toBe(0);
 		expect(output).toBe("Invalidated cached usage reports for all providers.\n");
+	});
+});
+
+describe("omp usage accounts", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("lists the identity keys that restrict a session, and no token material", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		const oauth = (
+			suffix: string,
+			identity: { email?: string; accountId?: string; orgId?: string; orgName?: string },
+		) => ({
+			type: "oauth" as const,
+			access: `access-${suffix}`,
+			refresh: `refresh-${suffix}`,
+			expires: Date.now() + 60 * 60_000,
+			...identity,
+		});
+		await authStorage.credentials.set("anthropic", [
+			oauth("team", { email: "dev@example.com", orgId: "org-team", orgName: "Team" }),
+			oauth("personal", { email: "dev@example.com", orgId: "org-personal" }),
+			{ type: "api_key", key: "sk-stored" },
+		]);
+		await authStorage.credentials.set("openai-codex", oauth("codex", { accountId: "acct-codex" }));
+		vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
+		vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
+		// The command closes the storage it discovered; keep it open to check the keys after.
+		vi.spyOn(authStorage, "close").mockImplementation(() => {});
+		const output: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output.push(String(chunk));
+			return true;
+		});
+
+		try {
+			await runUsageCommand({ action: "accounts", json: true });
+			const listed = JSON.parse(output.join("")) as {
+				accounts: Array<{ provider: string; identityKey: string; orgName?: string }>;
+			};
+			expect(listed.accounts).toEqual([
+				{ provider: "anthropic", identityKey: "email:dev@example.com|org:org-team", orgName: "Team" },
+				{ provider: "anthropic", identityKey: "email:dev@example.com|org:org-personal" },
+				{ provider: "openai-codex", identityKey: "account:acct-codex" },
+			]);
+
+			// Each listed key, used as a pool, routes a session to exactly that account.
+			for (const [index, account] of listed.accounts.entries()) {
+				authStorage.sessions.restrict(account.provider, `pooled-${index}`, [account.identityKey]);
+			}
+			expect(await authStorage.keys.get("anthropic", "pooled-0")).toBe("access-team");
+			expect(await authStorage.keys.get("anthropic", "pooled-1")).toBe("access-personal");
+
+			output.length = 0;
+			await runUsageCommand({ action: "accounts" });
+			const text = stripVTControlCharacters(output.join(""));
+			for (const account of listed.accounts) expect(text).toContain(account.identityKey);
+			expect(text).not.toMatch(/access-|refresh-|sk-stored/);
+		} finally {
+			vi.restoreAllMocks();
+			authStorage.close();
+		}
+	});
+
+	it("keeps cached identities usable but marks failed roster refreshes without leaking the error", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		await authStorage.credentials.set("openai-codex", {
+			type: "oauth",
+			access: "synthetic-access-secret",
+			refresh: "synthetic-refresh-secret",
+			expires: Date.now() + 60 * 60_000,
+			accountId: "cached-account",
+		});
+		vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
+		vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
+		vi.spyOn(authStorage.credentials, "revalidate").mockRejectedValue(new Error("synthetic-upstream-secret"));
+		let output = "";
+		let diagnostics = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += String(chunk);
+			return true;
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			diagnostics += String(chunk);
+			return true;
+		});
+
+		await runUsageCommand({ action: "accounts", json: true, provider: "OPENAI-CODEX" });
+		expect(JSON.parse(output)).toEqual({
+			accounts: [{ provider: "openai-codex", identityKey: "account:cached-account" }],
+		});
+		expect(diagnostics).toMatch(/cached|stale/i);
+		expect(output + diagnostics).not.toContain("synthetic-access-secret");
+		expect(output + diagnostics).not.toContain("synthetic-refresh-secret");
+		expect(output + diagnostics).not.toContain("synthetic-upstream-secret");
+	});
+
+	it("lists the refreshed roster instead of identities removed from the snapshot", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		const credential = (accountId: string) => ({
+			type: "oauth" as const,
+			access: "synthetic-access",
+			refresh: "synthetic-refresh",
+			expires: Date.now() + 60 * 60_000,
+			accountId,
+		});
+		await authStorage.credentials.set("openai-codex", credential("removed-account"));
+		vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
+		vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
+		vi.spyOn(authStorage.credentials, "revalidate").mockImplementation(async () => {
+			await authStorage.credentials.set("openai-codex", credential("current-account"));
+		});
+		let output = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += String(chunk);
+			return true;
+		});
+
+		await runUsageCommand({ action: "accounts", json: true });
+		expect(JSON.parse(output)).toEqual({
+			accounts: [{ provider: "openai-codex", identityKey: "account:current-account" }],
+		});
+	});
+
+	it("rejects redacted inventory without emitting account identifiers", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		await authStorage.credentials.set("openai-codex", {
+			type: "oauth",
+			access: "synthetic-access",
+			refresh: "synthetic-refresh",
+			expires: Date.now() + 60 * 60_000,
+			accountId: "private-account",
+		});
+		vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
+		vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
+		let output = "";
+		let diagnostics = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += String(chunk);
+			return true;
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			diagnostics += String(chunk);
+			return true;
+		});
+		const previousExitCode = process.exitCode;
+		try {
+			await runUsageCommand({ action: "accounts", json: true, redact: true });
+			expect(process.exitCode).toBe(1);
+			expect(output).toBe("");
+			expect(diagnostics).toContain("--redact");
+			expect(diagnostics).not.toContain("private-account");
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
+		}
 	});
 });

@@ -18,6 +18,7 @@ import {
 	resolveModelOverride,
 	splitRoleAliasThinkingSuffix,
 } from "../config/model-resolver";
+import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
 import {
 	type CompactionThresholdPair,
 	validateAgentCompactionThresholdOverrides,
@@ -68,6 +69,7 @@ import { parseIsolationBackend } from "./worktree";
 
 import {
 	cfgIsolationBackend,
+	cfgTaskAgentAccountPools,
 	cfgTaskAgentCompactionThresholdOverrides,
 	cfgTaskAgentModelOverrides,
 	cfgTaskAgentServiceTierOverrides,
@@ -175,6 +177,8 @@ export interface EffectiveSubagentPolicy {
 	serviceTierOverride?: ServiceTierInheritSettingValue;
 	/** Exact-name entry normalized to both child compaction threshold fields. */
 	compactionThresholdOverride?: CompactionThresholdPair;
+	/** Exact-name `task.agentAccountPools` entry: the only OAuth accounts the child may use, per listed provider. */
+	oauthAccountPools?: OAuthAccountPools;
 	/** Implicit parent credential fallback for configured models; explicit requests use only their expanded candidates. */
 	parentActiveModelPattern?: string;
 	/** The selected patterns inherit live effort below the agent's own thinking level. */
@@ -430,6 +434,8 @@ export async function resolveEffectiveSubagentPolicy(
 	const compactionThresholdOverride = Object.hasOwn(compactionThresholdOverrides, agentName)
 		? compactionThresholdOverrides[agentName]
 		: undefined;
+	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(request.session.settings));
+	const oauthAccountPools = Object.hasOwn(agentAccountPools, agentName) ? agentAccountPools[agentName] : undefined;
 	const parentActiveModel = request.session.getActiveModel?.();
 	const parentActiveModelPattern = parentActiveModel
 		? formatModelStringWithRouting(parentActiveModel)
@@ -509,6 +515,7 @@ export async function resolveEffectiveSubagentPolicy(
 		modelRole,
 		serviceTierOverride,
 		compactionThresholdOverride,
+		oauthAccountPools,
 		parentActiveModelPattern: request.model !== undefined ? undefined : parentActiveModelPattern,
 		modelInheritsLiveThinkingLevel,
 		modelInheritedThinkingIndexes,
@@ -656,6 +663,7 @@ function buildExecutorOptions(
 		modelRoute: policy.modelRoute,
 		serviceTierOverride: policy.serviceTierOverride,
 		compactionThresholdOverride: policy.compactionThresholdOverride,
+		oauthAccountPools: policy.oauthAccountPools,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		modelInheritsLiveThinkingLevel: policy.modelInheritsLiveThinkingLevel,
 		modelInheritedThinkingIndexes: policy.modelInheritedThinkingIndexes,

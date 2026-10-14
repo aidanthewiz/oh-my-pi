@@ -10,6 +10,12 @@
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
 - Scoped Google OAuth model caches to credentials and discovery endpoints, plus Gemini CLI projects. Startup restores only the current credential's cached catalog.
+## [18.8.1] - 2026-10-07
+
+### Fixed
+
+- Fixed Codex Fast (`priority`) pricing to use OpenAI’s 2.5× included-usage rate for supported models, excluding GPT-5.5 and GPT-6 Astra.
+- Fixed GitHub Copilot models with tier-specific prompt limits incorrectly defaulting to the long-context window.
 
 ## [18.8.0] - 2026-10-07
 

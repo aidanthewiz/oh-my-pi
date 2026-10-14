@@ -8,6 +8,7 @@ import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/c
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
+import type { OAuthAccountPools } from "@oh-my-pi/pi-coding-agent/config/account-pools";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -17,7 +18,7 @@ import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-sub
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -37,6 +38,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
+import { cfgTaskAgentAccountPools } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -566,6 +568,231 @@ describe("persisted subagent revival", () => {
 		// Restricted") for a cold-revived ref, not the durable agent definition
 		// name. `agents: [scout]` rule scoping must key on the latter.
 		expect(capturedOptions?.agentName).toBe("scout");
+	});
+
+	it("uses the live exact-agent pool on cold revival rather than the discovered policy snapshot", async () => {
+		const cwd = makeTempDir("@pi-revive-account-pool-");
+		const sessionFile = await createPersistedSession(cwd, true, "default", undefined, { agent: "scout" });
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		let revived: AgentSession | undefined;
+		try {
+			await authStorage.credentials.set(
+				"anthropic",
+				["a", "b"].map(suffix => ({
+					type: "oauth" as const,
+					access: `access-${suffix}`,
+					refresh: `refresh-${suffix}`,
+					expires: Date.now() + 60 * 60_000,
+					email: `${suffix}@example.com`,
+					orgId: `org-${suffix}`,
+				})),
+			);
+			authStorage.keys.setRuntime("anthropic", "runtime-key");
+			const settings = Settings.isolated({
+				"async.enabled": false,
+				"compaction.enabled": false,
+				"task.agentAccountPools": {
+					scout: { anthropic: ["email:a@example.com|org:org-a"] },
+					other: { anthropic: [] },
+				},
+			});
+			const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+			const ref = AgentRegistry.global().register(createRef(sessionFile));
+			const reviver = await createFactory(cwd, undefined, { settings, authStorage, modelRegistry })(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			cfgTaskAgentAccountPools.override(settings, { scout: { anthropic: ["email:b@example.com|org:org-b"] } });
+			revived = await reviver(ref);
+			expect(await revived.modelRegistry.getApiKeyForProvider("anthropic")).toBe("access-b");
+			expect(await modelRegistry.getApiKeyForProvider("anthropic", "unrestricted")).toBe("runtime-key");
+		} finally {
+			await revived?.dispose();
+			authStorage.close();
+			AgentRegistry.resetGlobalForTests();
+			AgentLifecycleManager.resetGlobalForTests();
+		}
+	});
+
+	describe("inherited account pools", () => {
+		const allowA = { anthropic: ["email:a@example.com|org:org-a"] };
+		const allowB = { anthropic: ["email:b@example.com|org:org-b"] };
+		const deny = { anthropic: [] };
+		const cases: Array<{
+			name: string;
+			parentAgent: string;
+			grandAgent?: string;
+			pools: Record<string, OAuthAccountPools>;
+			currentPools?: Record<string, OAuthAccountPools>;
+			expectedKey?: string;
+		}> = [
+			{
+				name: "uses the current parent policy at invocation",
+				parentAgent: "scout",
+				pools: { scout: allowA },
+				currentPools: { scout: allowB },
+				expectedKey: "access-b",
+			},
+			{
+				name: "inherits through multiple unconfigured ancestors",
+				parentAgent: "reviewer",
+				grandAgent: "scout",
+				pools: { scout: allowB },
+				expectedKey: "access-b",
+			},
+			{
+				name: "uses the nearest explicit ancestor instead of a union",
+				parentAgent: "reviewer",
+				grandAgent: "scout",
+				pools: { reviewer: allowB, scout: allowA },
+				expectedKey: "access-b",
+			},
+			{
+				name: "lets the child's explicit policy override its ancestor",
+				parentAgent: "scout",
+				pools: { task: allowA, scout: allowB },
+				expectedKey: "access-a",
+			},
+			{
+				name: "preserves the child's explicit deny-all pool",
+				parentAgent: "scout",
+				pools: { task: deny, scout: allowB },
+			},
+			{
+				name: "inherits an ancestor's explicit deny-all pool",
+				parentAgent: "reviewer",
+				grandAgent: "scout",
+				pools: { reviewer: deny, scout: allowB },
+			},
+			{
+				name: "resolves a removed nearest policy through the current grandparent policy",
+				parentAgent: "reviewer",
+				grandAgent: "scout",
+				pools: { reviewer: allowA, scout: allowA },
+				currentPools: { scout: allowB },
+				expectedKey: "access-b",
+			},
+			{
+				name: "does not use an unrestricted key when the inherited identity is unavailable",
+				parentAgent: "scout",
+				pools: { scout: { anthropic: ["email:missing@example.com|org:missing"] } },
+			},
+			{
+				name: "does not treat an ancestor display label as its definition name",
+				parentAgent: "unconfigured",
+				grandAgent: "reviewer",
+				pools: { scout: allowA, reviewer: allowB },
+				expectedKey: "access-b",
+			},
+		];
+
+		it.each(cases)("$name", async scenario => {
+			const cwd = makeTempDir("@pi-revive-inherited-pool-");
+			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			let revived: AgentSession | undefined;
+			try {
+				await authStorage.credentials.set(
+					"anthropic",
+					["a", "b"].map(suffix => ({
+						type: "oauth" as const,
+						access: `access-${suffix}`,
+						refresh: `refresh-${suffix}`,
+						expires: Date.now() + 60 * 60_000,
+						email: `${suffix}@example.com`,
+						orgId: `org-${suffix}`,
+					})),
+				);
+				authStorage.keys.setRuntime("anthropic", "runtime-key");
+				const registry = AgentRegistry.global();
+				const registerAncestor = async (id: string, agent: string, parentId: string) =>
+					registry.register({
+						...createRef(await createPersistedSession(cwd, true, "default", undefined, { agent })),
+						id,
+						displayName: "scout",
+						parentId,
+					});
+				const grandparent = scenario.grandAgent
+					? await registerAncestor("pool-grandparent", scenario.grandAgent, MAIN_AGENT_ID)
+					: undefined;
+				const parent = await registerAncestor(
+					"pool-parent",
+					scenario.parentAgent,
+					grandparent?.id ?? MAIN_AGENT_ID,
+				);
+				const sessionFile = await createPersistedSession(cwd, true, "default", undefined, { agent: "task" });
+				const ref = registry.register({ ...createRef(sessionFile), parentId: parent.id });
+				const settings = Settings.isolated({
+					"async.enabled": false,
+					"compaction.enabled": false,
+					"task.agentAccountPools": scenario.pools,
+				});
+				const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+				const reviver = await createFactory(cwd, undefined, { settings, authStorage, modelRegistry })(ref);
+				if (!reviver) throw new Error("Expected a persisted reviver");
+				if (scenario.currentPools) cfgTaskAgentAccountPools.override(settings, scenario.currentPools);
+				if (scenario.expectedKey === undefined) {
+					await expect(reviver(ref)).rejects.toThrow("restricted to its OAuth account pool");
+					expect(ref.session).toBeNull();
+					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
+						suppressBreadcrumb: true,
+						throwIfMissing: true,
+					});
+					await reopened.close();
+				} else {
+					revived = await reviver(ref);
+					expect(await revived.modelRegistry.getApiKeyForProvider("anthropic")).toBe(scenario.expectedKey);
+				}
+				expect(await modelRegistry.getApiKeyForProvider("anthropic", "unrestricted")).toBe("runtime-key");
+			} finally {
+				await revived?.dispose();
+				authStorage.close();
+				AgentRegistry.resetGlobalForTests();
+				AgentLifecycleManager.resetGlobalForTests();
+			}
+		});
+
+		it.each(["missing", "unreadable", "unnamed", "cycle"] as const)(
+			"rejects %s required ancestry and releases the reopened writer",
+			async fault => {
+				const cwd = makeTempDir("@pi-revive-invalid-pool-ancestry-");
+				const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+				try {
+					authStorage.keys.setRuntime("anthropic", "runtime-key");
+					const registry = AgentRegistry.global();
+					const sessionFile = await createPersistedSession(cwd, true, "default", undefined, { agent: "task" });
+					const ref = registry.register({ ...createRef(sessionFile), parentId: "pool-parent" });
+					if (fault !== "missing") {
+						const parentFile =
+							fault === "unreadable"
+								? path.join(cwd, "missing-parent.jsonl")
+								: await createPersistedSession(cwd, true, "default", undefined, {
+										agent: fault === "unnamed" ? undefined : "reviewer",
+									});
+						registry.register({
+							...createRef(parentFile),
+							id: "pool-parent",
+							displayName: "scout",
+							parentId: fault === "cycle" ? ref.id : MAIN_AGENT_ID,
+							history: { agent: "scout" },
+						});
+					}
+					const settings = Settings.isolated({ "task.agentAccountPools": { scout: allowA } });
+					const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+					const reviver = await createFactory(cwd, undefined, { settings, authStorage, modelRegistry })(ref);
+					if (!reviver) throw new Error("Expected a persisted reviver");
+					await expect(reviver(ref)).rejects.toThrow("account pool ancestry");
+					expect(ref.session).toBeNull();
+					expect(await modelRegistry.getApiKeyForProvider("anthropic", "unrestricted")).toBe("runtime-key");
+					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
+						suppressBreadcrumb: true,
+						throwIfMissing: true,
+					});
+					await reopened.close();
+				} finally {
+					authStorage.close();
+					AgentRegistry.resetGlobalForTests();
+					AgentLifecycleManager.resetGlobalForTests();
+				}
+			},
+		);
 	});
 
 	it("falls back to the ref display name reviving a legacy session file without a persisted agent name", async () => {

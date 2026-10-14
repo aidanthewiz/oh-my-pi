@@ -17,6 +17,16 @@
 - Resolve both lexical and canonical native archive imports during in-memory embedding without writing generated archives to disk.
 - Build development-profile addons from Cargo's `debug` output directory.
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added the `PI_NATIVES_DIR` configuration option to control native addon extraction and Windows staging. Values must be absolute after trimming and optional `~` expansion; relative values retain the existing XDG/HOME cache. The version-specific subdirectory and native artifact validation remain unchanged.
+
+### Fixed
+
+- Fixed background shell builtins and other in-process commands so they terminate when their subshell exits and can be stopped with `kill %N`, matching the behavior of external commands.
+- Shell-internal tasks now abort when their owning Brush job handle drops, replacing the separate session destructor. `kill -0 %N` probes without stopping internal jobs; nonterminating Unix signals fail without aborting them.
 
 ## [18.7.0] - 2026-10-06
 
