@@ -91,6 +91,7 @@ With the default batched task schema, supply shared `context` and per-item `task
 
 `/model`'s Roles view can assign and persist custom role mappings such as `review`, `fast`, and `good`. Changing only the active or default session selection does not remap those roles.
 
+
 ## User-tagged model agents
 
 Type `^` in the composer to choose a model from the same scope and ranking as the `Alt+P` session picker. Accepting a completion inserts an atomic chip showing its display name. For example, type `Have ^`, pick a model, then finish with `review this change`.
@@ -124,6 +125,8 @@ modelRoles:
 ```
 
 The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model.
+
+Without an agent model override or configured role, workers inherit the active model identity and its single upstream route (`@upstream`). They do not inherit live thinking-level metadata.
 
 ## Bundled agents
 
@@ -222,18 +225,11 @@ A missing name fails preflight with `Unknown agent "...". Available: ...`; no su
 
 For task dispatch, model precedence is:
 
-1. the call's own `model` selector (task item / flat call, or eval `agent(model=…)`)
-2. `task.agentModelOverrides[agentName]`
-3. the agent frontmatter's prioritized `model` list
-4. the parent's active model, then its configured/default model fallback
+1. `task.agentModelOverrides[agentName]`
+2. the agent frontmatter's prioritized `model` list
+3. the parent's active model, then its configured/default model fallback
 
-Role aliases in any of the first three sources are expanded through `modelRoles`, except `@default`
-(equivalently `*`), which names step 4 itself: it resolves to the parent's active model rather than
-to `modelRoles.default`, so a child asked for `@default` runs whatever its parent switched to. A
-per-call `model` is validated before dispatch: the ambiguous literals `default`/`inherit` are
-rejected in favor of an explicit `@default`, and a selector that expands to nothing or matches no
-available model fails the spawn naming the selector rather than silently falling through to a
-lower-precedence source.
+Role aliases in either of the first two sources are expanded through `modelRoles`. Eval `agent()` and `workpool()` use this same settings and agent-definition precedence; callers cannot override the worker model per invocation.
 
 After policy resolution, the `before_subagent_spawn` extension hook runs once for the actual dispatch. It can block the spawn or replace the resolved model patterns; a routing note is carried into progress metadata.
 

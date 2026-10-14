@@ -10,23 +10,14 @@ Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scou
 Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate via `write agent://<id>`{{/if}}. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
 
 # Inputs
-{{#if batchEnabled}}
-- `context`: Shared project state, constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks.
-- `tasks[]`: Array of subagents to spawn.
-{{/if}}
-- `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
-- `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`). Omit only when the default (`{{defaultAgent}}`) fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
-- `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-- `solutionSpace`: Describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `single-flight cache load; races easy to miss`; `deadlock cause open, no repro`)
-{{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent; each runs inside your kernel when the subagent calls it.
-{{/if}}{{#if effortEnabled}}- `effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
-{{/if}}- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
-- `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
-- `contextFilePolicy`: `"inherit"` (default) forwards ordered instruction files; `"none"` omits them, but still inherits managed settings and tool policy.
-- `model`: Selector or ordered array overriding the agent's model for this spawn (`provider/model[:level]`, role alias like `@smol`, `@default` = parent's live model){{#if batchEnabled}}; set per `tasks[]` item, never top-level{{/if}}. Omit unless a specific model is needed. Requested model unavailable → stop and report; NEVER substitute another.
-{{#if isolationEnabled}}{{#if applyIsolatedChanges}}- `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
-{{else}}- `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
-{{/if}}{{/if}}Children start without conversation history;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+`name`: CamelCase ≤32, auto-generated if omitted; address agent by name. `outputSchema` overrides agent/session schemas.
+`solutionSpace`: describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
+{{#if evalToolsEnabled}}`tools`: eval-defined, run in your kernel.
+{{/if}}{{#if effortEnabled}}`effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
+{{/if}}`schemaMode`: default permissive warns after retries; strict fails.
+{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
+{{else}}`isolated`: worktree; changes retained, not applied.
+{{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Constraints`, `# Contract` interfaces); NEVER repeat per task.

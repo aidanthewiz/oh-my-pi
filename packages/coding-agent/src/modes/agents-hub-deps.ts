@@ -93,11 +93,7 @@ export function createAgentsHubDeps(
 				activeModelPattern,
 				fallbackModelPattern: defaultModelPattern,
 			});
-			if (!selection.requestedThinkingLevels) return selection.patterns;
-			return selection.patterns.map((pattern, index) => {
-				const level = selection.requestedThinkingLevels?.get(index);
-				return level === undefined ? pattern : `${pattern}:${level}`;
-			});
+			return selection.patterns;
 		},
 		resolvePatterns: patterns => {
 			if (patterns.length === 0) return undefined;

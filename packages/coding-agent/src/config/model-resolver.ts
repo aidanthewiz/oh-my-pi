@@ -1088,68 +1088,15 @@ export function resolveExplicitModelRole(
 	return undefined;
 }
 
-/**
- * Split an optional `:<level>` suffix off a role-alias-shaped pattern.
- *
- * The colon floor is the matched alias prefix (so `pi/default` keeps its
- * slash-prefixed shape and `*:high` splits after the one-character token);
- * non-alias patterns fall back to the legacy prefix length, which is what the
- * role expansion below already does.
- */
-export function splitRoleAliasThinkingSuffix(value: string): { base: string; level?: ConfiguredThinkingLevel } {
-	return splitThinkingSuffix(
-		value,
-		modelRoleAliasPrefixLength(value) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
-		MAX_THINKING_SUFFIX_OPTIONS,
-	);
-}
-
-/** The `default` role written as a pattern: names the session's model, not a configured list. */
-function isDefaultRolePattern(value: string): boolean {
+function isSessionInheritedAgentPattern(value: string): boolean {
 	return (
 		value === DEFAULT_MODEL_ROLE ||
 		value === formatModelRoleAlias(DEFAULT_MODEL_ROLE) ||
 		value === DEFAULT_MODEL_ROLE_ALIAS ||
-		value === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}${DEFAULT_MODEL_ROLE}`
+		value === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}${DEFAULT_MODEL_ROLE}` ||
+		value === formatModelRoleAlias("task") ||
+		value === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
 	);
-}
-
-/**
- * A selection that means "run whatever the parent session is running", carrying
- * the thinking level it asked for. Role aliases take `:level` suffixes
- * everywhere else, so `@default:high` is the session's model at `high` — not an
- * expansion of `modelRoles.default`.
- */
-interface SessionModelInheritance {
-	level?: ConfiguredThinkingLevel;
-}
-
-/**
- * Whether a single pattern names the session's model rather than a configured
- * list. `@default` (and its `*` / `pi/default` / bare spellings) is the explicit
- * spelling of that intent, so it must resolve through the session's active model
- * instead of expanding `modelRoles.default` — a parent that switched models
- * mid-session would otherwise hand its child a different model than its own.
- * Agent definitions additionally inherit through `@task`.
- */
-function matchSessionInheritedPattern(
-	value: string,
-	options?: { includeTaskAlias?: boolean },
-): SessionModelInheritance | undefined {
-	const { base, level } = splitRoleAliasThinkingSuffix(value);
-	if (isDefaultRolePattern(base)) return { level };
-	if (
-		options?.includeTaskAlias === true &&
-		(base === formatModelRoleAlias("task") || base === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`)
-	) {
-		return { level };
-	}
-	return undefined;
-}
-
-/** {@link matchSessionInheritedPattern} for a whole selection, without the level. */
-export function modelSelectionInheritsSessionModel(value: string | string[] | undefined): boolean {
-	return normalizeModelPatternList(value).some(pattern => matchSessionInheritedPattern(pattern) !== undefined);
 }
 
 function shouldInheritDefaultBeforePriority(role: ModelRole): boolean {
@@ -1204,7 +1151,11 @@ function resolveNestedRolePatterns(
 ): string[] {
 	const resolved: string[] = [];
 	for (const pattern of normalizeModelPatternList(value)) {
-		const { base: aliasCandidate, level: thinkingLevel } = splitRoleAliasThinkingSuffix(pattern);
+		const { base: aliasCandidate, level: thinkingLevel } = splitThinkingSuffix(
+			pattern,
+			modelRoleAliasPrefixLength(pattern) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
 		const aliasRole = getModelRoleAlias(aliasCandidate, settings);
 		if (!aliasRole) {
 			resolved.push(pattern);
@@ -1244,7 +1195,11 @@ function resolveConfiguredRolePattern(
 	const normalized = value.trim();
 	if (!normalized) return undefined;
 
-	const { base: aliasCandidate, level: thinkingLevel } = splitRoleAliasThinkingSuffix(normalized);
+	const { base: aliasCandidate, level: thinkingLevel } = splitThinkingSuffix(
+		normalized,
+		modelRoleAliasPrefixLength(normalized) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
+		MAX_THINKING_SUFFIX_OPTIONS,
+	);
 	const role = getModelRoleAlias(aliasCandidate, settings);
 	if (!role) return [normalized];
 	if (visited.has(role)) return undefined;
@@ -1301,7 +1256,6 @@ export function resolveConfiguredModelPatterns(
 	});
 }
 export interface AgentModelPatternResolutionOptions {
-	/** Highest-priority request selector, when supplied by a caller. */
 	requestModel?: string | string[];
 	settingsOverride?: string | string[];
 	agentModel?: string | string[];
@@ -1313,68 +1267,16 @@ export interface AgentModelPatternResolutionOptions {
 interface EffectiveAgentModelSelection {
 	source?: string | string[];
 	patterns: string[];
-	/** Set when every pattern inherits the parent's effective thinking level. */
-	inheritsLiveThinkingLevel?: true;
-	inheritedThinkingIndexes?: number[];
-	requestedThinkingLevels?: Map<number, ConfiguredThinkingLevel>;
 }
 
 function resolveEffectiveAgentModelSelection(
 	options: AgentModelPatternResolutionOptions,
 ): EffectiveAgentModelSelection {
 	const { requestModel, settingsOverride, agentModel, settings, activeModelPattern, fallbackModelPattern } = options;
-	const inheritSessionModel = (requested?: SessionModelInheritance): EffectiveAgentModelSelection => {
-		const active = activeModelPattern?.trim();
-		const fallback = active || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
-		const patterns = resolveConfiguredModelPatterns(fallback, settings);
-		const level = requested?.level;
-		if (level) {
-			return { patterns, requestedThinkingLevels: new Map(patterns.map((_, index) => [index, level])) };
-		}
-		return active ? { patterns, inheritsLiveThinkingLevel: true } : { patterns };
-	};
 
-	let requestSource = requestModel;
-	let requestedInheritance = false;
-	let everyRequestPatternInheritsLiveLevel = true;
-	let patternOffset = 0;
-	const inheritedThinkingIndexes: number[] = [];
-	let requestedThinkingLevels: Map<number, ConfiguredThinkingLevel> | undefined;
-	const requestPatterns = normalizeModelPatternList(requestModel).flatMap((pattern, index, patterns) => {
-		const inheritance = matchSessionInheritedPattern(pattern);
-		if (!inheritance) {
-			everyRequestPatternInheritsLiveLevel = false;
-			const expanded = resolveConfiguredModelPatterns(pattern, settings);
-			patternOffset += expanded.length;
-			return expanded;
-		}
-		if (!requestedInheritance) requestSource = index === 0 ? undefined : patterns.slice(0, index);
-		requestedInheritance = true;
-		const inherited = inheritSessionModel(inheritance);
-		if (!inherited.inheritsLiveThinkingLevel) everyRequestPatternInheritsLiveLevel = false;
-		if (inherited.inheritsLiveThinkingLevel) {
-			for (let index = 0; index < inherited.patterns.length; index++) {
-				inheritedThinkingIndexes.push(patternOffset + index);
-			}
-		}
-		if (inherited.requestedThinkingLevels) {
-			requestedThinkingLevels ??= new Map();
-			for (const [index, level] of inherited.requestedThinkingLevels) {
-				requestedThinkingLevels.set(patternOffset + index, level);
-			}
-		}
-		patternOffset += inherited.patterns.length;
-		return inherited.patterns;
-	});
-	if (requestModel !== undefined) {
-		return requestedInheritance && everyRequestPatternInheritsLiveLevel
-			? { source: requestSource, patterns: requestPatterns, inheritsLiveThinkingLevel: true }
-			: {
-					source: requestSource,
-					patterns: requestPatterns,
-					...(inheritedThinkingIndexes.length > 0 ? { inheritedThinkingIndexes } : {}),
-					...(requestedThinkingLevels ? { requestedThinkingLevels } : {}),
-				};
+	const requestPatterns = resolveConfiguredModelPatterns(requestModel, settings);
+	if (requestPatterns.length > 0) {
+		return { source: requestModel, patterns: requestPatterns };
 	}
 
 	const overridePatterns = resolveConfiguredModelPatterns(settingsOverride, settings);
@@ -1385,16 +1287,20 @@ function resolveEffectiveAgentModelSelection(
 	const normalizedAgentPatterns = normalizeModelPatternList(agentModel);
 	const configuredAgentPatterns = resolveConfiguredModelPatterns(agentModel, settings);
 	const singleAgentPattern = normalizedAgentPatterns.length === 1 ? normalizedAgentPatterns[0] : undefined;
-	const agentInheritance = singleAgentPattern
-		? matchSessionInheritedPattern(singleAgentPattern, { includeTaskAlias: true })
-		: undefined;
+	const agentInheritsSessionModel = singleAgentPattern ? isSessionInheritedAgentPattern(singleAgentPattern) : false;
 	if (configuredAgentPatterns.length > 0) {
-		if (!agentInheritance || resolveExplicitModelRole(singleAgentPattern, settings) === "task") {
+		if (
+			singleAgentPattern === formatModelRoleAlias("task") ||
+			singleAgentPattern === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
+		) {
 			return { source: agentModel, patterns: configuredAgentPatterns };
 		}
+		if (!agentInheritsSessionModel) return { source: agentModel, patterns: configuredAgentPatterns };
 	}
 
-	return inheritSessionModel(agentInheritance);
+	const fallback =
+		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
+	return { patterns: resolveConfiguredModelPatterns(fallback, settings) };
 }
 
 /** Effective agent model patterns paired with the pre-expansion role alias behind them. */
@@ -1403,15 +1309,6 @@ export interface AgentModelSelection {
 	patterns: string[];
 	/** Role alias the patterns came from (`@task` -> `task`), when the source named one. */
 	role: string | undefined;
-	/**
-	 * Set when the patterns inherit the parent's effective thinking level,
-	 * which an agent definition's own `thinking-level` outranks.
-	 */
-	inheritsLiveThinkingLevel?: true;
-	/** Bare inherited alternatives in a mixed ordered request. */
-	inheritedThinkingIndexes?: number[];
-	/** Explicit requested levels, separate from inherited routing identities. */
-	requestedThinkingLevels?: Map<number, ConfiguredThinkingLevel>;
 }
 
 /**
@@ -1421,16 +1318,13 @@ export interface AgentModelSelection {
  * discards, and deriving the two halves separately is how they drift apart.
  */
 export function resolveAgentModelSelection(options: AgentModelPatternResolutionOptions): AgentModelSelection {
-	const { source, patterns, inheritsLiveThinkingLevel, inheritedThinkingIndexes, requestedThinkingLevels } =
-		resolveEffectiveAgentModelSelection(options);
-	const role = resolveExplicitModelRole(source, options.settings);
-	return {
-		patterns,
-		role,
-		...(inheritsLiveThinkingLevel ? { inheritsLiveThinkingLevel } : {}),
-		...(inheritedThinkingIndexes ? { inheritedThinkingIndexes } : {}),
-		...(requestedThinkingLevels ? { requestedThinkingLevels } : {}),
-	};
+	const { source, patterns } = resolveEffectiveAgentModelSelection(options);
+	return { patterns, role: resolveExplicitModelRole(source, options.settings) };
+}
+
+/** Effective agent model patterns alone, for callers with no interest in role identity. */
+export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOptions): string[] {
+	return resolveEffectiveAgentModelSelection(options).patterns;
 }
 
 /** Default prewalk hand-off target when no explicit target is configured. */
@@ -1516,12 +1410,7 @@ export interface ResolvedModelRoleValue {
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],
-	options?: {
-		settings?: Settings;
-		roleLookup?: ModelRoleLookup;
-		matchPreferences?: ModelMatchPreferences;
-		allowInvalidThinkingSelectorFallback?: boolean;
-	},
+	options?: { settings?: Settings; roleLookup?: ModelRoleLookup; matchPreferences?: ModelMatchPreferences },
 ): ResolvedModelRoleValue {
 	if (!roleValue) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -1544,7 +1433,7 @@ export function resolveModelRoleValue(
 	// rebuilding it per pattern inside parseModelPattern.
 	const preferenceContext = buildPreferenceContext(availableModels, matchPreferences);
 	for (const [patternIndex, effectivePattern] of effectivePatterns.entries()) {
-		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext, options);
+		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext);
 		if (resolved.model) {
 			return {
 				model: resolved.model,
@@ -1700,7 +1589,6 @@ export function resolveModelOverride(
 	modelPatterns: string[],
 	modelRegistry: ModelLookupRegistry,
 	settings?: Settings,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean },
 ): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean; warning?: string } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
 	const availableModels = getAllowedAvailableModels(modelRegistry, settings);
@@ -1713,7 +1601,6 @@ export function resolveModelOverride(
 			explicitThinkingLevel,
 			warning: patternWarning,
 		} = resolveModelRoleValue(pattern, availableModels, {
-			...options,
 			settings,
 			matchPreferences,
 		});
@@ -1818,15 +1705,12 @@ export async function resolveModelOverrideWithAuthFallback(
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
-	inheritedThinkingIndexes?: readonly number[],
-	requestedThinkingLevels?: ReadonlyMap<number, ConfiguredThinkingLevel>,
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
 	authFallbackUsed: boolean;
 	warning?: string;
-	inheritsLiveThinkingLevel?: true;
 }> {
 	const disabledProviders = disabledProviderIds(settings);
 	let lookupRegistry: ModelLookupRegistry = modelRegistry;
@@ -1834,46 +1718,15 @@ export async function resolveModelOverrideWithAuthFallback(
 		const enabledModels = modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider));
 		lookupRegistry = { getAvailable: () => enabledModels };
 	}
-	// Expand first: a role (or comma-separated item) may contain several
-	// requested alternatives that must be tried before the parent model.
-	const patterns = resolveConfiguredModelPatterns(modelPatterns, settings);
-	const resolveCandidate = (index: number) => {
-		const pattern = patterns[index];
-		const candidate = resolveModelOverride(pattern === undefined ? [] : [pattern], lookupRegistry, settings);
-		const requestedLevel = requestedThinkingLevels?.get(index);
-		return {
-			...candidate,
-			...(candidate.model && requestedLevel !== undefined
-				? { thinkingLevel: requestedLevel, explicitThinkingLevel: true }
-				: {}),
-			...(inheritedThinkingIndexes?.includes(index) ? { inheritsLiveThinkingLevel: true as const } : {}),
-		};
-	};
-	let primaryIndex = 0;
-	let primary = resolveCandidate(primaryIndex);
-	while (!primary.model && primaryIndex + 1 < patterns.length) {
-		const warning = primary.warning;
-		primary = resolveCandidate(++primaryIndex);
-		primary.warning ??= warning;
-	}
-	// Without an alternative there is no routing decision to make. Let the
-	// child session resolve credentials through its normal execution path.
-	if (!primary.model || (!parentActiveModelPattern && patterns.length === 1)) {
+	const primary = resolveModelOverride(modelPatterns, lookupRegistry, settings);
+	if (!primary.model || !parentActiveModelPattern) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
-	for (let index = primaryIndex; index < patterns.length; index++) {
-		const candidate = index === primaryIndex ? primary : resolveCandidate(index);
-		if (!candidate.model) continue;
-		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
-		if (key === kNoAuth || isAuthenticated(key)) {
-			return {
-				...candidate,
-				authFallbackUsed: false,
-			};
-		}
+	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
+	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
+		return { ...primary, authFallbackUsed: false };
 	}
-	if (!parentActiveModelPattern) return { ...primary, authFallbackUsed: false };
 
 	const fallback = resolveModelOverride([parentActiveModelPattern], lookupRegistry, settings);
 	if (!fallback.model) {
@@ -1883,7 +1736,7 @@ export async function resolveModelOverrideWithAuthFallback(
 		return { ...primary, authFallbackUsed: false };
 	}
 	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
-	if (fallbackKey !== kNoAuth && !isAuthenticated(fallbackKey)) {
+	if (!isAuthenticated(fallbackKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}
 

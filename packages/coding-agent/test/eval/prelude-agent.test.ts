@@ -145,18 +145,39 @@ describe("eval js wait options", () => {
 		}
 	});
 
-	it("rejects mixed option forms on global, resolved, and pending handles", async () => {
+	it("rejects mixing an options object with positional args", async () => {
 		const { sandbox, manager, gate } = fixture();
 		try {
 			const agent = sandbox.agent as (prompt: string) => Waitable;
 			const resolved = (await agent("resolved")) as Waitable;
 			const mixed = /do not mix both forms/;
-			await expect((sandbox.wait as WaitHelper)([resolved], { timeout: 1 }, true)).rejects.toThrow(mixed);
-			await expect(resolved.wait({ timeout: 1 }, false)).rejects.toThrow(mixed);
-			await expect(agent("pending").wait({ timeout: 1 }, false)).rejects.toThrow(mixed);
+			await expect((sandbox.wait as WaitHelper)([resolved], { timeout: 10 }, true)).rejects.toThrow(mixed);
+			await expect(resolved.wait({ timeout: 1 }, 2)).rejects.toThrow(mixed);
+			await expect(agent("pending").wait({ timeout: 1 }, 2)).rejects.toThrow(mixed);
 		} finally {
 			gate.resolve("released");
 			await manager.dispose();
 		}
+	});
+});
+
+describe("eval js read() URI delegation", () => {
+	it("appends line selectors to delegated URI paths", async () => {
+		const calls: Array<{ name: string; args: unknown }> = [];
+		const sandbox = loadPrelude(async (name, args) => {
+			calls.push({ name, args });
+			return { text: "resource contents" };
+		});
+		sandbox.__omp_helpers__ = { hasRoot: () => false };
+
+		const result = await vm.runInContext(`read("mcp://server/resource", { offset: 10, limit: 5 })`, sandbox);
+
+		expect(result).toBe("resource contents");
+		expect(calls).toEqual([
+			{
+				name: "read",
+				args: { path: "mcp://server/resource:10-14" },
+			},
+		]);
 	});
 });

@@ -17,6 +17,7 @@ import type { Theme } from "../theme/theme";
 import type { Component } from "../tui";
 import { replaceTabs, sliceByColumn, truncateToWidth, visibleWidth } from "../utils";
 import { Hasher } from "./utils";
+import { parseConfiguredThinkingLevel } from "../thinking";
 
 export { Ellipsis } from "@oh-my-pi/pi-natives";
 export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "../utils";
@@ -137,6 +138,16 @@ export function setFeedModelBadgeEnabled(enabled: boolean): void {
 /** Return whether resolved model badges are enabled. */
 export function isFeedModelBadgeEnabled(): boolean {
 	return feedModelBadgeEnabled;
+}
+
+export function resolveModelSelectorThinkingLevel(
+	modelIdentity: string | undefined,
+	selector: string | undefined,
+): ConfiguredThinkingLevel | undefined {
+	if (!modelIdentity || !selector || selector[modelIdentity.length] !== ":" || !selector.startsWith(modelIdentity)) {
+		return undefined;
+	}
+	return parseConfiguredThinkingLevel(selector.slice(modelIdentity.length + 1));
 }
 
 /** Compact glyph for a configured thinking level; empty for `inherit` (nothing to show). */

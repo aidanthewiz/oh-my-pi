@@ -2,7 +2,7 @@ import * as os from "node:os";
 import { setFeedModelBadgeEnabled } from "../src/render/render-utils";
 import { setShimmerMode } from "../src/theme/shimmer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { type RenderResultOptions, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type RenderResultOptions } from "@oh-my-pi/pi-agent-core";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import { taskToolRenderer } from "@oh-my-pi/pi-tui/tools/task";
 import { getSubprocessToolRenderer } from "@oh-my-pi/pi-tui/tools/subprocess";
@@ -184,7 +184,6 @@ describe("task progress rendering", () => {
 			description: "Inspect rendering",
 			resolvedModel: "openai/gpt-5:high",
 			resolvedModelIdentity: "openai/gpt-5",
-			resolvedThinkingLevel: ThinkingLevel.High,
 			advisor: true,
 			requests: 3,
 			cost: 0.25,
@@ -226,7 +225,6 @@ describe("task progress rendering", () => {
 										description: "Inspect rendering",
 										resolvedModel: "openai/gpt-5:high",
 										resolvedModelIdentity: "openai/gpt-5",
-										resolvedThinkingLevel: ThinkingLevel.High,
 										advisor,
 										durationMs: 1000,
 										requests: 3,
@@ -256,7 +254,6 @@ describe("task progress rendering", () => {
 			agent: "scout",
 			description: "Inspect rendering boundaries",
 			resolvedModelIdentity: "openai/custom-architecture-model:high",
-			resolvedThinkingLevel: ThinkingLevel.High,
 			advisor: true,
 		};
 		const snapshots: { details: TaskToolDetails; status?: string }[] = [
@@ -295,12 +292,10 @@ describe("task progress rendering", () => {
 				}
 				expect(plainRows.join("\n")).toContain(metadata.description);
 				if (width === 160) {
-					const thinkingGlyph = theme.thinking.high.split(" ")[0];
 					expect(firstStatusRow).toContain("openai/");
 					expect(firstStatusRow).toContain(":high");
-					expect(firstStatusRow).toContain(thinkingGlyph);
 					const badge = firstStatusRow!
-						.slice(firstStatusRow!.indexOf(thinkingGlyph), firstStatusRow!.indexOf(metadata.id))
+						.slice(firstStatusRow!.indexOf("openai/"), firstStatusRow!.indexOf(metadata.id))
 						.trimEnd();
 					expect(visibleWidth(badge)).toBeLessThanOrEqual(FEED_MODEL_BADGE_WIDTH);
 					expect(firstStatusRow).toContain(theme.icon.advisor);
@@ -316,7 +311,6 @@ describe("task progress rendering", () => {
 			id: "HiddenBadge",
 			resolvedModel: "openai/gpt-5:high",
 			resolvedModelIdentity: "openai/gpt-5",
-			resolvedThinkingLevel: ThinkingLevel.High,
 			advisor: true,
 		};
 		const snapshots: TaskToolDetails[] = [

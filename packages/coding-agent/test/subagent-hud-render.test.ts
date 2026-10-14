@@ -7,7 +7,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resetHangulCompatibilityJamoWidthForTests, setHangulCompatibilityJamoWidth } from "@oh-my-pi/pi-tui";
@@ -124,7 +124,6 @@ describe("subagent HUD lines", () => {
 					id: "BadgeWorker",
 					resolvedModel: "openai/gpt-5:high",
 					resolvedModelIdentity: "openai/gpt-5",
-					resolvedThinkingLevel: ThinkingLevel.High,
 					advisor: true,
 				}),
 			});
@@ -137,7 +136,6 @@ describe("subagent HUD lines", () => {
 				id: "BadgeWorker",
 				resolvedModel: "openai/gpt-5:high",
 				resolvedModelIdentity: "openai/gpt-5",
-				resolvedThinkingLevel: ThinkingLevel.High,
 				advisor: false,
 			});
 			const withoutAdvisor = render([session]);
@@ -154,7 +152,6 @@ describe("subagent HUD lines", () => {
 						id: "HiddenBadge",
 						resolvedModel: "openai/gpt-5:high",
 						resolvedModelIdentity: "openai/gpt-5",
-						resolvedThinkingLevel: ThinkingLevel.High,
 						advisor: true,
 					}),
 				}),
@@ -173,7 +170,6 @@ describe("subagent HUD lines", () => {
 			const metadata = {
 				resolvedModel: `provider/${"shared-prefix-".repeat(8)}variant-z:high`,
 				resolvedModelIdentity: `provider/${"shared-prefix-".repeat(8)}variant-z`,
-				resolvedThinkingLevel: ThinkingLevel.High,
 				advisor: true,
 			};
 			const sessions = [

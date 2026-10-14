@@ -53,7 +53,6 @@ export const taskItemSchema = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -65,7 +64,6 @@ const taskItemSchemaIsolated = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -79,7 +77,6 @@ export const taskSchema = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -92,7 +89,6 @@ const taskSchemaNoIsolation = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
-	"model?": "string | string[]",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -101,13 +97,11 @@ const taskSchemaNoIsolation = type({
 });
 const taskSchemaBatch = type({
 	context: "string",
-	"model?": "never",
 	tasks: taskItemSchemaIsolated.array(),
 	"+": "delete",
 });
 const taskSchemaBatchNoIsolation = type({
 	context: "string",
-	"model?": "never",
 	tasks: taskItemSchema.array(),
 	"+": "delete",
 });
@@ -147,7 +141,6 @@ function createTaskSchema(options: {
 				task: "string",
 				solutionSpace: "string",
 				...effortField,
-				"model?": "string | string[]",
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
 				"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -157,7 +150,6 @@ function createTaskSchema(options: {
 			});
 			return type.raw({
 				context: "string",
-				"model?": "never",
 				tasks: item.array(),
 				"+": "delete",
 			});
@@ -168,7 +160,6 @@ function createTaskSchema(options: {
 			task: "string",
 			solutionSpace: "string",
 			...effortField,
-			"model?": "string | string[]",
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -177,7 +168,6 @@ function createTaskSchema(options: {
 		});
 		return type.raw({
 			context: "string",
-			"model?": "never",
 			tasks: item.array(),
 			"+": "delete",
 		});
@@ -189,7 +179,6 @@ function createTaskSchema(options: {
 			task: "string",
 			solutionSpace: "string",
 			...effortField,
-			"model?": "string | string[]",
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
@@ -204,7 +193,6 @@ function createTaskSchema(options: {
 		task: "string",
 		solutionSpace: "string",
 		...effortField,
-		"model?": "string | string[]",
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,

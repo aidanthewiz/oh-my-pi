@@ -35,6 +35,19 @@
 - Prevent remote plan-proposal results from starting local approval or model execution.
 - Preserve current inherited account pools when cold-reviving nested agents, and reject unrecoverable required ancestry.
 - Reject superseded or released account-pool scopes before returning credentials, including delayed acquisitions.
+- Preserve a selected OpenRouter or Vercel upstream route when Vibe workers inherit the active session model.
+- Keep task effort glyphs derived from configured selectors after removing per-call model and live-thinking metadata.
+
+## [18.8.2] - 2026-10-07
+
+### Fixed
+
+- Fixed long Anthropic sessions with repeated tool screenshots exceeding the request-size limit; live images are now trimmed by bytes, recoverable 413s may compact older history, and terminal subagent failures reach the parent ([#14453](https://github.com/can1357/oh-my-pi/issues/14453)).
+- Fixed Tern browser tabs opened with a `url` returning before the page loaded, which made the first `observe()` or `title()` read the blank page.
+
+### Removed
+
+- Removed per-call `model` overrides from `task`, eval `agent()`, and `workpool()`; subagents use configured agent models and settings.
 
 ## [18.8.1] - 2026-10-07
 

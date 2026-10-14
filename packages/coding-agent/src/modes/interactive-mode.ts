@@ -74,7 +74,7 @@ import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
-import { formatModelStringWithRouting, type ResolvedModelRoleValue } from "../config/model-resolver";
+import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
 import { isSettingsInitialized, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
@@ -172,6 +172,7 @@ import {
 	shortenPath,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
+	resolveModelSelectorThinkingLevel,
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setCoreforgeReportHandler } from "../tools/report-tool-issue";
 import { type CfgApproval, type CfgChangeRequest, setCfgApprovalHost } from "../internal-urls/cfg-protocol";
@@ -1080,7 +1081,10 @@ export function renderSubagentHudLines(
 				const modelBadge = showModelBadge
 					? formatFeedModelBadge(
 							session.progress?.resolvedModelIdentity ?? session.progress?.resolvedModel,
-							session.progress?.resolvedThinkingLevel,
+							resolveModelSelectorThinkingLevel(
+								session.progress?.resolvedModelIdentity,
+								session.progress?.resolvedModel,
+							),
 							session.progress?.advisor,
 							theme,
 							Math.min(FEED_MODEL_BADGE_WIDTH, Math.max(0, titleBudget - 1)),
@@ -4613,9 +4617,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			sessionManager: this.sessionManager,
 			asyncJobManager: this.session.asyncJobManager,
 			settings: this.session.settings,
-			getActiveModelString: () =>
-				this.session.model ? formatModelStringWithRouting(this.session.model) : undefined,
-			getActiveThinkingLevel: () => this.session.thinkingLevel,
+			// Resolve restored/switched-to workers against this session's active model
+			// (same as the spawn-path ToolSession), not the settings default. This is
+			// the primary fallback in resolveAgentModelPatterns, so the `good` worker's
+			// pi/task inheritance tracks the reopened session's model.
+			getActiveModelString: () => (this.session.model ? formatModelString(this.session.model) : undefined),
 		};
 	}
 

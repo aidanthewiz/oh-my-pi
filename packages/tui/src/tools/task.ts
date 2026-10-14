@@ -1,7 +1,6 @@
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ThemeColor } from "../theme/theme";
-import type { ConfiguredThinkingLevel } from "../render/render-utils";
 import type { ToolRenderer } from "./renderer";
 /**
  * TUI rendering for task tool.
@@ -39,6 +38,7 @@ import {
 	type ToolUIStatus,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
+	resolveModelSelectorThinkingLevel,
 } from "../render/render-utils";
 import { renderStatusLine } from "../render/index";
 import { framedToolCard } from "../render/tool-card";
@@ -736,7 +736,7 @@ function renderAgentProgress(
 			id: formatTaskId(progress.id),
 			width: maxWidth,
 			model: progress.resolvedModelIdentity ?? progress.resolvedModel,
-			thinkingLevel: progress.resolvedThinkingLevel,
+			thinkingLevel: resolveModelSelectorThinkingLevel(progress.resolvedModelIdentity, progress.resolvedModel),
 			advisor: progress.advisor,
 			spinnerFrame,
 			frozen,
@@ -1076,7 +1076,7 @@ function renderAgentResult(
 	const modelBadge = isFeedModelBadgeEnabled()
 		? formatFeedModelBadge(
 				result.resolvedModelIdentity ?? result.resolvedModel,
-				result.resolvedThinkingLevel,
+				resolveModelSelectorThinkingLevel(result.resolvedModelIdentity, result.resolvedModel),
 				result.advisor,
 				theme,
 				Math.min(
@@ -1397,7 +1397,7 @@ export function renderResult(
 	const aborted = abortedCount > 0;
 	const failed = failCount > 0;
 	const mergeFailed = mergeFailedCount > 0;
-	const isError = result.isError === true || aborted || failed;
+	const isError = aborted || failed;
 	const agentCount = hasResults ? details.results.length : (details.progress?.length ?? 0);
 	const icon: ToolUIStatus = options.isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
 	// Header meta is the spawn count only; each row carries its own ⟨agent⟩
@@ -1764,25 +1764,6 @@ function renderNestedTaskTree(
 // Native (TSP) description: one `agent` node per subagent (§7.6)
 // =============================================================================
 
-/** Theme token for a thinking level's model-chip dot. */
-function thinkingToken(level: ConfiguredThinkingLevel | undefined): string | undefined {
-	switch (level) {
-		case "minimal":
-			return "thinkingMinimal";
-		case "low":
-			return "thinkingLow";
-		case "medium":
-			return "thinkingMedium";
-		case "high":
-			return "thinkingHigh";
-		case "xhigh":
-		case "max":
-			return "thinkingXhigh";
-		default:
-			return undefined;
-	}
-}
-
 /** The shared batch context as one quiet line above the agents. */
 function describeContext(raw: unknown): NativeNode | undefined {
 	const source = typeof raw === "string" ? sanitizeText(repairDoubleEncodedJsonString(raw)) : "";
@@ -1888,7 +1869,6 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 			task: taskSummary(progress.description || progress.assignment || progress.task) || undefined,
 			status,
 			model: progress.resolvedModelIdentity ?? progress.resolvedModel,
-			thinking: thinkingToken(progress.resolvedThinkingLevel),
 			tool,
 			stats: {
 				tools: progress.toolCount || undefined,
@@ -1947,7 +1927,6 @@ function describeResultAgent(result: SingleResult, state: AgentDescribeState, de
 			task: taskSummary(result.description || result.assignment || result.task) || undefined,
 			status,
 			model: result.resolvedModelIdentity ?? result.resolvedModel,
-			thinking: thinkingToken(result.resolvedThinkingLevel),
 			tool: null,
 			stats: {
 				requests: result.requests || undefined,
@@ -2212,8 +2191,6 @@ export interface TaskItem {
 	solutionSpace?: string;
 	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
 	effort?: "lo" | "med" | "hi";
-	/** Per-spawn model selector or ordered selector array; overrides agent and settings preferences. */
-	model?: string | string[];
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -2243,8 +2220,6 @@ export interface TaskParams {
 	solutionSpace?: string;
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: "lo" | "med" | "hi";
-	/** Per-spawn model selector or ordered selector array; overrides agent and settings preferences. */
-	model?: string | string[];
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -2373,8 +2348,6 @@ export interface AgentProgress {
 	resolvedModel?: string;
 	/** Provider/id including routing, with no added thinking suffix. */
 	resolvedModelIdentity?: string;
-	/** Explicit thinking metadata; never inferred from the model identity. */
-	resolvedThinkingLevel?: ConfiguredThinkingLevel;
 	/** True when {@link resolvedModel} is the target of an active retry fallback (not the originally configured model). Lets observer-only UIs (collab guests, Agent Hub rows with no live session) flag the fallback and keep the provider. */
 	resolvedModelIsFallback?: boolean;
 	/** Extension routing note (e.g. model-pools) explaining why {@link resolvedModel} was chosen. */
@@ -2454,8 +2427,6 @@ export interface SingleResult {
 	resolvedModel?: string;
 	/** Retains the unambiguous identity from {@link AgentProgress.resolvedModelIdentity}. */
 	resolvedModelIdentity?: string;
-	/** Retains {@link AgentProgress.resolvedThinkingLevel} after settlement. */
-	resolvedThinkingLevel?: ConfiguredThinkingLevel;
 	/** True when {@link resolvedModel} is the target of an active retry fallback. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */
 	resolvedModelIsFallback?: boolean;
 	/** Mirrors {@link AgentProgress.resolvedModelRoute} onto the settled result. */

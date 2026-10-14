@@ -423,12 +423,7 @@ export interface ExecutorOptions {
 	 * if the resolved subagent model has no working credentials. See #985.
 	 */
 	parentActiveModelPattern?: string;
-	/** The selected model inherits live effort below {@link thinkingLevel}. */
-	modelInheritsLiveThinkingLevel?: boolean;
-	/** Bare inherited alternatives in a mixed ordered request. */
-	modelInheritedThinkingIndexes?: number[];
-	modelRequestedThinkingLevels?: ReadonlyMap<number, ConfiguredThinkingLevel>;
-	parentThinkingLevel?: ConfiguredThinkingLevel;
+
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Caller-requested coarse effort (`lo`/`med`/`hi`); maps onto the resolved model's supported thinking range and wins over {@link thinkingLevel}. */
 	effort?: TaskEffort;
@@ -2110,7 +2105,6 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			if (
 				serving.selector === progress.resolvedModel &&
 				serving.modelIdentity === progress.resolvedModelIdentity &&
-				serving.thinkingLevel === progress.resolvedThinkingLevel &&
 				(progress.resolvedModelIsFallback ?? false) === isFallback &&
 				contextWindow === progress.contextWindow
 			) {
@@ -2118,7 +2112,6 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			}
 			progress.resolvedModel = serving.selector;
 			progress.resolvedModelIdentity = serving.modelIdentity;
-			progress.resolvedThinkingLevel = serving.thinkingLevel;
 			progress.resolvedModelIsFallback = isFallback;
 			progress.contextWindow = contextWindow;
 			scheduleProgress(true);
@@ -2865,7 +2858,6 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		modelRole,
 		resolvedModel: progress.resolvedModel,
 		resolvedModelIdentity: progress.resolvedModelIdentity,
-		resolvedThinkingLevel: progress.resolvedThinkingLevel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
 		resolvedModelRoute: progress.resolvedModelRoute,
 		advisor: progress.advisor,
@@ -4122,7 +4114,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				explicitThinkingLevel,
 				authFallbackUsed,
 				warning: modelResolutionWarning,
-				inheritsLiveThinkingLevel: selectedInheritsLiveThinkingLevel,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -4130,8 +4121,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					id,
-					options.modelInheritedThinkingIndexes,
-					options.modelRequestedThinkingLevels,
 				),
 			);
 			if (modelResolutionWarning) {
@@ -4191,31 +4180,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
 					: undefined;
-			const inheritedThinkingLevel =
-				authFallbackUsed ||
-				options.modelInheritsLiveThinkingLevel === true ||
-				selectedInheritsLiveThinkingLevel === true;
-			const requestedThinkingLevel =
-				explicitThinkingLevel && !inheritedThinkingLevel ? resolvedThinkingLevel : undefined;
-			// Precedence: caller `effort` > requested `:level` suffix on the resolved
-			// model pattern > agent-definition default (e.g. task's `auto`) >
-			// inherited parent effort / pattern-derived level.
-			const effectiveThinkingLevel =
-				effortLevel ??
-				requestedThinkingLevel ??
-				thinkingLevel ??
-				(inheritedThinkingLevel ? options.parentThinkingLevel : undefined) ??
-				resolvedThinkingLevel;
+
 			if (model) {
-				const displayLevel =
-					effortLevel ?? requestedThinkingLevel ?? (inheritedThinkingLevel ? effectiveThinkingLevel : undefined);
+				const displayLevel = effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : undefined);
 				progress.resolvedModelIdentity = formatModelStringWithRouting(model);
-				progress.resolvedThinkingLevel = displayLevel;
 				progress.resolvedModel =
 					displayLevel !== undefined
 						? formatModelSelectorValue(progress.resolvedModelIdentity, displayLevel)
 						: progress.resolvedModelIdentity;
 			}
+			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
+			// model pattern > agent-definition default (e.g. task's `auto`) >
+			// pattern-derived level.
+			const effectiveThinkingLevel =
+				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManagerPromise = sessionFile

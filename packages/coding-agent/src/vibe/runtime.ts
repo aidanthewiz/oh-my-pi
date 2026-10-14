@@ -42,7 +42,6 @@ import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
@@ -106,7 +105,6 @@ export interface VibeParentSession {
 	asyncJobManager?: AsyncJobManager;
 	settings: ToolSession["settings"];
 	getActiveModelString?: () => string | undefined;
-	getActiveThinkingLevel?: ToolSession["getActiveThinkingLevel"];
 	getModelString?: () => string | undefined;
 }
 
@@ -123,10 +121,6 @@ interface ResolvedVibeWorker {
 	modelOverride?: string | string[];
 	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
 	modelRole?: string;
-	/** Inherited live effort ranks below the agent's own level. */
-	modelInheritsLiveThinkingLevel?: boolean;
-	modelRequestedThinkingLevels?: Map<number, ConfiguredThinkingLevel>;
-	parentThinkingLevel?: ConfiguredThinkingLevel;
 }
 
 interface VibeTurn {
@@ -150,10 +144,7 @@ interface VibeRecord {
 	modelOverride?: string | string[];
 	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
 	modelRole?: string;
-	/** Inherited live effort ranks below the agent's own level. */
-	modelInheritsLiveThinkingLevel?: boolean;
-	modelRequestedThinkingLevels?: Map<number, ConfiguredThinkingLevel>;
-	parentThinkingLevel?: ConfiguredThinkingLevel;
+
 	state: VibeSessionState;
 	createdAt: number;
 	lastActivityAt: number;
@@ -370,21 +361,14 @@ export class VibeSessionRegistry {
 		// Same contract as the task spawn path: the expansion discards the role
 		// alias (`@task`, `@smol`), so patterns and role identity come from one
 		// call — the child's inherited retry-fallback chain is keyed off the role.
-		const { patterns, role, inheritsLiveThinkingLevel, requestedThinkingLevels } = resolveAgentModelSelection({
+		const { patterns, role } = resolveAgentModelSelection({
 			settingsOverride: agentModelOverrides[agentName],
 			agentModel: agent.model,
 			settings: session.settings,
 			activeModelPattern: session.getActiveModelString?.(),
 			fallbackModelPattern: session.getModelString?.(),
 		});
-		return {
-			agent,
-			modelOverride: patterns,
-			modelRole: role,
-			modelInheritsLiveThinkingLevel: inheritsLiveThinkingLevel,
-			modelRequestedThinkingLevels: requestedThinkingLevels,
-			parentThinkingLevel: session.getActiveThinkingLevel?.(),
-		};
+		return { agent, modelOverride: patterns, modelRole: role };
 	}
 
 	async #appendLifecycleEvent(
@@ -776,14 +760,7 @@ export class VibeSessionRegistry {
 				existing.sessionFile === childSessionFile &&
 				(existing.status === "idle" || existing.status === "parked");
 			const blockedByCollision = Boolean(existing && !existingIsResumable);
-			const {
-				agent,
-				modelOverride,
-				modelRole,
-				modelInheritsLiveThinkingLevel,
-				modelRequestedThinkingLevels,
-				parentThinkingLevel,
-			} = this.#resolveWorker(session, spawn.cli);
+			const { agent, modelOverride, modelRole } = this.#resolveWorker(session, spawn.cli);
 			if (!existing) {
 				AgentRegistry.global().register({
 					id: spawn.id,
@@ -805,9 +782,7 @@ export class VibeSessionRegistry {
 				agent,
 				modelOverride,
 				modelRole,
-				modelInheritsLiveThinkingLevel,
-				modelRequestedThinkingLevels,
-				parentThinkingLevel,
+
 				state: "idle",
 				createdAt: spawn.createdAt,
 				lastActivityAt: candidate.lastActivityAt,
@@ -842,14 +817,7 @@ export class VibeSessionRegistry {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
 		}
 		const manager = this.#manager(session);
-		const {
-			agent,
-			modelOverride,
-			modelRole,
-			modelInheritsLiveThinkingLevel,
-			modelRequestedThinkingLevels,
-			parentThinkingLevel,
-		} = this.#resolveWorker(session, args.cli);
+		const { agent, modelOverride, modelRole } = this.#resolveWorker(session, args.cli);
 		if (!session.agentOutputManager) {
 			session.agentOutputManager = new AgentOutputManager(session.getArtifactsDir ?? (() => null));
 		}
@@ -874,9 +842,7 @@ export class VibeSessionRegistry {
 			agent,
 			modelOverride,
 			modelRole,
-			modelInheritsLiveThinkingLevel,
-			modelRequestedThinkingLevels,
-			parentThinkingLevel,
+
 			state: "starting",
 			createdAt,
 			lastActivityAt: createdAt,
@@ -1333,9 +1299,7 @@ export class VibeSessionRegistry {
 			detached: true,
 			modelOverride: record.modelOverride,
 			modelRole: record.modelRole,
-			modelInheritsLiveThinkingLevel: record.modelInheritsLiveThinkingLevel,
-			modelRequestedThinkingLevels: record.modelRequestedThinkingLevels,
-			parentThinkingLevel: record.parentThinkingLevel,
+
 			parentActiveModelPattern: session.getActiveModelString?.(),
 			thinkingLevel: record.agent.thinkingLevel,
 			sessionFile,

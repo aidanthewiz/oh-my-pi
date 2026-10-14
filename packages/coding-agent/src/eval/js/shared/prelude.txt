@@ -467,20 +467,18 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		judgeBatchFrom(await globalThis.__omp_call_tool__("__judge_batch__", { op: "attach", id: String(id) }));
 
 	const agent = (prompt, opts, ...rest) => {
-		const promise = trackPromise(
-			(async () => {
-				const options = optionsArg(
-					"agent",
-					opts,
-					rest,
-					["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "contextFilePolicy", "tools", "model"],
-					"{ agent, label, schema, schemaMode, contextFilePolicy, isolated, apply, merge, tools, model }",
-				);
-				const result = await globalThis.__omp_call_tool__("__agent__", { prompt, ...options });
-				if (!result || typeof result.id !== "string") throw new Error("agent() did not return a handle");
-				return new AgentHandle(result.id, result.agent, options.schema);
-			})(),
-		);
+		const promise = (async () => {
+			const options = optionsArg(
+				"agent",
+				opts,
+				rest,
+				["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "tools"],
+				"{ agent, label, schema, schemaMode, isolated, apply, merge, tools }",
+			);
+			const result = await globalThis.__omp_call_tool__("__agent__", { prompt, ...options });
+			if (!result || typeof result.id !== "string") throw new Error("agent() did not return a handle");
+			return new AgentHandle(result.id, result.agent, options.schema);
+		})();
 		return new PendingHandle(promise);
 	};
 
@@ -540,8 +538,8 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			"workpool",
 			opts,
 			rest,
-			["name", "context", "tools", "model"],
-			"{ name, context, tools, model }",
+			["name", "context", "tools"],
+			"{ name, context, tools }",
 		);
 		const result = await globalThis.__omp_call_tool__("__workpool__", {
 			op: "create",
