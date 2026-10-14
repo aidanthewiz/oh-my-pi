@@ -515,7 +515,10 @@ export interface ModelMatchPreferences {
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable">;
 type CliModelRegistry = Pick<ModelRegistry, "getAll" | "getAvailable">;
 type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "hasConcreteAuth">;
-type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "getApiKey" | "hasConcreteAuth">;
+type RestorableModelRegistry = Pick<
+	ModelRegistry,
+	"getAvailable" | "find" | "getApiKeyForProvider" | "hasConcreteAuth"
+>;
 
 const kModelOrderIndex = Symbol("model-resolver.modelOrderIndex");
 type ModelsWithOrderIndex = readonly Model<Api>[] & {
@@ -1690,7 +1693,7 @@ export function sessionModelDiscoveryProviders(
  * the credential is usable once the subagent session starts — see #5325.
  *
  * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
- * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
+ * `kNoAuth` sentinel from `getApiKeyForProvider` to signal that they do not require
  * credentials. Those are treated as authenticated here so an explicitly
  * configured local model is never silently rerouted to the parent's remote
  * provider (see #1008).
@@ -1702,7 +1705,7 @@ export function sessionModelDiscoveryProviders(
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
 	parentActiveModelPattern: string | undefined,
-	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
+	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKeyForProvider">,
 	settings?: Settings,
 	sessionId?: string,
 ): Promise<{
@@ -1723,7 +1726,10 @@ export async function resolveModelOverrideWithAuthFallback(
 		return { ...primary, authFallbackUsed: false };
 	}
 
-	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
+	const primaryKey = await modelRegistry.getApiKeyForProvider(primary.model.provider, sessionId, {
+		baseUrl: primary.model.baseUrl,
+		modelId: primary.model.id,
+	});
 	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}
@@ -1735,7 +1741,10 @@ export async function resolveModelOverrideWithAuthFallback(
 	if (modelsAreEqual(fallback.model, primary.model)) {
 		return { ...primary, authFallbackUsed: false };
 	}
-	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
+	const fallbackKey = await modelRegistry.getApiKeyForProvider(fallback.model.provider, sessionId, {
+		baseUrl: fallback.model.baseUrl,
+		modelId: fallback.model.id,
+	});
 	if (!isAuthenticated(fallbackKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}
@@ -2483,7 +2492,12 @@ export async function restoreModelFromSession(
 	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
 
 	// Check if restored model exists and has a valid API key
-	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel)) : false;
+	const hasApiKey = restoredModel
+		? !!(await modelRegistry.getApiKeyForProvider(restoredModel.provider, undefined, {
+				baseUrl: restoredModel.baseUrl,
+				modelId: restoredModel.id,
+			}))
+		: false;
 
 	if (restoredModel && hasApiKey) {
 		if (shouldPrintMessages) {

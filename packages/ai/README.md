@@ -1176,6 +1176,13 @@ const response = await complete(
 );
 ```
 
+For multi-account `AuthStorage`, use `keys.getWithCredential` or `oauth.access`
+for request authentication. Transient OAuth refresh failures reject with
+`OAuthRefreshUnavailableError`, which carries the retryable `Transient` flag.
+Use `keys.get` for availability probes; it returns `undefined` for these failures.
+Transient failures retain the stored credential. A restricted session cannot
+use another account or a static key to bypass its account pool.
+
 When an auth-broker client requests recovery after a provider rejects an OAuth
 bearer, the broker may reuse a still-fresh token that it minted in the previous
 five minutes instead of rotating the refresh token again. The process-local

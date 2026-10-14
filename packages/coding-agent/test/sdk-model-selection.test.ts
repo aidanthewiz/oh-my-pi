@@ -705,11 +705,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		authStoragesToClose.push(authStorage);
 		authStorage.keys.setRuntime(parentModel.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "fallback-models.yml"));
-		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested => {
-			if (requested.provider === "runtime-provider") return undefined;
-			if (requested.provider === parentModel.provider) return "test-key";
-			return undefined;
-		});
 		const { session, modelFallbackMessage } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -717,7 +712,29 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
 			disableExtensionDiscovery: true,
-			extensions: [providerExtension],
+			extensions: [
+				pi => {
+					pi.registerProvider("runtime-provider", {
+						baseUrl: "https://runtime.example.com/v1",
+						apiKey:
+							process.platform === "win32"
+								? `!${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('')")}`
+								: "!printf ''",
+						api: "openai-completions",
+						models: [
+							{
+								id: "runtime-model",
+								name: "Runtime Model",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					});
+				},
+			],
 			skills: [],
 			contextFiles: [],
 			promptTemplates: [],
@@ -738,7 +755,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(modelFallbackMessage).toBeUndefined();
 		} finally {
 			await session.dispose();
-			getApiKeySpy.mockRestore();
 		}
 	});
 

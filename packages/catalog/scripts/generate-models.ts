@@ -23,6 +23,7 @@ import { providerEntries, providerEntry, seedModels } from "../src/compat/provid
 import type { CompiledProvider } from "../src/compat/types";
 import { ANTIGRAVITY_PRIMARY_ENDPOINT, fetchAntigravityDiscoveryModels } from "../src/discovery/antigravity";
 import { createModelManager } from "../src/model-manager";
+import { resolveModelTokenizer } from "../src/model-tokenizer";
 import prevModelsJson from "../src/models.json" with { type: "json" };
 import { toModelSpec } from "../src/provider-models/bundled-references";
 import {
@@ -779,11 +780,12 @@ function canonicalizeModelCompat(model: ModelSpec<Api>): void {
 
 /**
  * Materialize an authored spec or rebuild a bundled row from its authored
- * overrides. Prompt-cache lifetimes are rule-owned output, not snapshot input;
- * drop stale lifetimes and provenance so `buildModel` reapplies current KDL.
+ * overrides. Prompt-cache lifetimes and classified tokenizers are policy output,
+ * not snapshot input. Preserve copied tokenizers only for unclassified ids.
  */
 export function buildGeneratedModel(model: ModelSpec<Api> | Model<Api>): Model<Api> {
 	const spec = "identity" in model ? toModelSpec(model) : { ...model };
+	if (resolveModelTokenizer(spec.requestModelId ?? spec.id, spec.provider) !== undefined) delete spec.tokenizer;
 	delete spec.promptCache;
 	delete spec.promptCacheConfig;
 	delete spec.kindConfig;

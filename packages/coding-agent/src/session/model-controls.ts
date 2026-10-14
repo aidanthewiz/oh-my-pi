@@ -479,7 +479,10 @@ export class ModelControls {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const apiKey = await this.#host.modelRegistry.getApiKey(nextModel, this.#host.sessionId());
+		const apiKey = await this.#host.modelRegistry.getApiKeyForProvider(nextModel.provider, this.#host.sessionId(), {
+			baseUrl: nextModel.baseUrl,
+			modelId: nextModel.id,
+		});
 		if (!apiKey) {
 			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
 		}

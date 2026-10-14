@@ -4,7 +4,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type FetchImpl, type Model, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resolveMaxContextWindow } from "@oh-my-pi/pi-catalog/compat/context-window";
@@ -2320,6 +2322,65 @@ describe("ModelRegistry", () => {
 				kind: "embedding",
 				name: "Small embeddings",
 			});
+		});
+	});
+
+	describe("transient OAuth request authentication", () => {
+		test("preserves retryable request failures while availability skips them and later refresh recovers", async () => {
+			const envNames = [
+				"ANTHROPIC_API_KEY",
+				"ANTHROPIC_OAUTH_TOKEN",
+				"ANTHROPIC_BASE_URL",
+				"ANTHROPIC_WORKSPACE_ID",
+				"ANTHROPIC_AWS_WORKSPACE_ID",
+				"CLAUDE_CODE_USE_FOUNDRY",
+				"FOUNDRY_BASE_URL",
+			] as const;
+			const previous = envNames.map(name => ({ name, process: process.env[name], bun: Bun.env[name] }));
+			const refresh = spyOn(oauthUtils, "refreshOAuthToken").mockRejectedValue(
+				new Error("fetch failed: ECONNRESET"),
+			);
+			try {
+				for (const name of envNames) {
+					delete process.env[name];
+					delete Bun.env[name];
+				}
+				await authStorage.credentials.set("anthropic", {
+					type: "oauth",
+					access: "expired-access",
+					refresh: "synthetic-refresh",
+					expires: Date.now() - 60_000,
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const model = registry.getProviderModels("anthropic")[0];
+				if (!model) throw new Error("expected bundled Anthropic model");
+
+				const error = await registry.getApiKey(model, "request").catch((err: unknown) => err);
+				expect(error).toBeInstanceOf(AIError.OAuthRefreshUnavailableError);
+				expect(AIError.retriable(AIError.classify(error))).toBe(true);
+				expect(
+					await registry.getApiKeyForProvider(model.provider, "probe", {
+						baseUrl: model.baseUrl,
+						modelId: model.id,
+					}),
+				).toBeUndefined();
+				expect(authStorage.credentials.hasOAuth("anthropic")).toBe(true);
+
+				refresh.mockResolvedValue({
+					access: "recovered-access",
+					refresh: "rotated-synthetic-refresh",
+					expires: Date.now() + 3_600_000,
+				});
+				expect(await registry.getApiKey(model, "request")).toBe("recovered-access");
+			} finally {
+				refresh.mockRestore();
+				for (const value of previous) {
+					if (value.process === undefined) delete process.env[value.name];
+					else process.env[value.name] = value.process;
+					if (value.bun === undefined) delete Bun.env[value.name];
+					else Bun.env[value.name] = value.bun;
+				}
+			}
 		});
 	});
 

@@ -9,10 +9,17 @@ import {
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { logger } from "@oh-my-pi/pi-utils";
 
-// Env vars short-circuit AuthStorage.keys.get before the OAuth refresh path runs; suppress
-// them for every test in this file so the credential-disable code path can be exercised.
-const SUPPRESS_ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
+const SUPPRESS_ANTHROPIC_ENV = [
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_OAUTH_TOKEN",
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_WORKSPACE_ID",
+	"ANTHROPIC_AWS_WORKSPACE_ID",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"FOUNDRY_BASE_URL",
+] as const;
 const savedEnv: Partial<Record<(typeof SUPPRESS_ANTHROPIC_ENV)[number], string | undefined>> = {};
+const savedBunEnv: Partial<Record<(typeof SUPPRESS_ANTHROPIC_ENV)[number], string | undefined>> = {};
 
 const expiredOAuth = () =>
 	({
@@ -132,7 +139,9 @@ describe("AuthStorage credential_disabled subscriptions", () => {
 	beforeEach(() => {
 		for (const key of SUPPRESS_ANTHROPIC_ENV) {
 			savedEnv[key] = process.env[key];
+			savedBunEnv[key] = Bun.env[key];
 			delete process.env[key];
+			delete Bun.env[key];
 		}
 	});
 
@@ -147,7 +156,10 @@ describe("AuthStorage credential_disabled subscriptions", () => {
 			} else {
 				process.env[key] = savedEnv[key];
 			}
+			if (savedBunEnv[key] === undefined) delete Bun.env[key];
+			else Bun.env[key] = savedBunEnv[key];
 			delete savedEnv[key];
+			delete savedBunEnv[key];
 		}
 	});
 
@@ -207,7 +219,9 @@ describe("AuthStorage credential_disabled subscriptions", () => {
 			await authStorage.credentials.set("anthropic", [expiredOAuth()]);
 			failOAuthRefresh("fetch failed: ECONNRESET");
 
-			await authStorage.keys.get("anthropic", "session-transient-failure");
+			await expect(authStorage.keys.getWithCredential("anthropic", "session-transient-failure")).rejects.toThrow(
+				"ECONNRESET",
+			);
 			expect(events).toHaveLength(0);
 		});
 

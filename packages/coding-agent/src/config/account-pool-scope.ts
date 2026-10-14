@@ -146,9 +146,12 @@ export class SessionAccountPoolScope {
 			getApiKeyWithCredentialForProvider,
 			getApiKeyForProvider: async (provider, sessionId, options) => {
 				const scopedSessionId = this.#sessionIdFor(provider, sessionId);
-				const resolved = await getApiKeyWithCredentialForProvider(provider, scopedSessionId, options);
+				const apiKey = await target.getApiKeyForProvider(provider, scopedSessionId, options);
 				this.#assertOwnsRestriction(provider, scopedSessionId);
-				return resolved?.apiKey;
+				if (Object.hasOwn(this.#pools, provider) && apiKey === kNoAuth) {
+					throw new MissingApiKeyError(provider, "OAuth account pools cannot use keyless authentication");
+				}
+				return apiKey;
 			},
 			getApiKeyAndHeaders: async model => {
 				try {

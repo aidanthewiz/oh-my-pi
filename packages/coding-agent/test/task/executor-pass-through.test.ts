@@ -97,14 +97,14 @@ const baseOptions = {
 
 function createModelRegistry(
 	models: Model | Model[],
-	getApiKey: (model: Model) => Promise<string | undefined> = async () => "test-key",
+	getApiKeyForProvider: ModelRegistry["getApiKeyForProvider"] = async () => "test-key",
 ): ModelRegistry {
 	const available = Array.isArray(models) ? models : [models];
 	return {
 		authStorage: {},
 		refresh: async () => {},
 		getAvailable: () => available,
-		getApiKey,
+		getApiKeyForProvider,
 	} as unknown as ModelRegistry;
 }
 
@@ -464,8 +464,8 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 		// The requested Anthropic model has no working credentials; the parent's OpenAI model does.
-		const modelRegistry = createModelRegistry([requested, parentModel], async model =>
-			model.provider === parentModel.provider ? "test-key" : undefined,
+		const modelRegistry = createModelRegistry([requested, parentModel], async provider =>
+			provider === parentModel.provider ? "test-key" : undefined,
 		);
 
 		const result = await runSubprocess({

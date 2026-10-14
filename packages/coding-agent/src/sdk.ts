@@ -3118,7 +3118,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 				let authFallbackUsed = false;
 				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
+					const primaryKey = await modelRegistry.getApiKeyForProvider(primary.model.provider, undefined, {
+						baseUrl: primary.model.baseUrl,
+						modelId: primary.model.id,
+					});
 					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
 						const fallback = parseModelPattern(
 							options.modelPatternAuthFallback,
@@ -3126,7 +3129,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							matchPreferences,
 						);
 						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
+							const fallbackKey = await modelRegistry.getApiKeyForProvider(fallback.model.provider, undefined, {
+								baseUrl: fallback.model.baseUrl,
+								modelId: fallback.model.id,
+							});
 							if (isAuthenticated(fallbackKey)) {
 								selectedModel = fallback.model;
 								selectedThinkingLevel = fallback.thinkingLevel;
@@ -5114,7 +5120,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							? // `getApiKey` returns a value-or-promise union; unwrap the promise,
 								// then resolve the result if it is itself an ApiKeyResolver.
 								await resolveApiKeyOnce(await options.getApiKey(codexModel))
-							: await modelRegistry.getApiKey(codexModel, providerSessionId);
+							: await modelRegistry.getApiKeyForProvider(codexModel.provider, providerSessionId, {
+									baseUrl: codexModel.baseUrl,
+									modelId: codexModel.id,
+								});
 						if (!codexPrewarmApiKey) return;
 						await logger.time("prewarmOpenAICodexResponses", prewarmOpenAICodexResponses, codexModel, {
 							apiKey: codexPrewarmApiKey,

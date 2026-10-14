@@ -37,7 +37,14 @@
 - Reject superseded or released account-pool scopes before returning credentials, including delayed acquisitions.
 - Preserve a selected OpenRouter or Vercel upstream route when Vibe workers inherit the active session model.
 - Keep task effort glyphs derived from configured selectors after removing per-call model and live-thinking metadata.
+- Preserve retryable OAuth refresh errors during request admission and branch summaries while keeping model availability probes separate.
 - Give nested agents independent OAuth account-pool leases, preserving inherited authorization after their parent parks and across warm revival.
+
+## [18.8.3] - 2026-10-07
+
+### Fixed
+
+- Fixed repeat opens of the model picker, model hub, or agents views stacking duplicates; the open one is brought forward instead ([#14846](https://github.com/can1357/oh-my-pi/pull/14846) by [@H4vC](https://github.com/H4vC))
 
 ## [18.8.2] - 2026-10-07
 

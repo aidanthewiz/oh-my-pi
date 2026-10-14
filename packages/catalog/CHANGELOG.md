@@ -11,6 +11,11 @@
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
 - Scoped Google OAuth model caches to credentials and discovery endpoints, plus Gemini CLI projects. Startup restores only the current credential's cached catalog.
 - Keep the Anthropic inline-image byte budget off custom endpoints, including legacy models with official-endpoint compatibility rules.
+## [18.8.3] - 2026-10-07
+
+### Added
+
+- Added Claude Haiku 5.5 with adaptive thinking (low through max effort), image input, a 1M-token context window, 128K output, and its tiered pricing above 100K input tokens.
 
 ## [18.8.2] - 2026-10-07
 

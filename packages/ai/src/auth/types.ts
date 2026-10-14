@@ -896,9 +896,20 @@ export interface KeysApi {
 	 * 4. API key persisted by a successful `/login`
 	 * 5. Environment variable
 	 * 6. Stored API key (e.g. a broker-migrated copy) — last resort, so an explicit env var wins
+	 *
+	 * Resolves `undefined` when no permitted credential can serve, including when
+	 * OAuth refresh failed transiently (network, timeout, 5xx), so availability
+	 * probes move on to their next candidate. Request paths use
+	 * {@link KeysApi.getWithCredential}, which surfaces that failure.
 	 */
 	get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined>;
-	/** Resolve a bearer together with its durable stored credential row id, when known. */
+	/**
+	 * Resolve a bearer together with its durable stored credential row id, when known.
+	 * Same precedence as {@link KeysApi.get}, but rejects with
+	 * `OAuthRefreshUnavailableError` (transient, retryable) when OAuth refresh failed
+	 * with a retryable error and no other permitted source could serve the request;
+	 * the stored credential is kept.
+	 */
 	getWithCredential(
 		provider: string,
 		sessionId?: string,
@@ -1011,18 +1022,20 @@ export interface OAuthApi {
 	login(provider: OAuthProviderId, ctrl: OAuthLoginController): Promise<OAuthLoginIdentity | undefined>;
 	/**
 	 * Resolve the OAuth credential for `provider`, refreshing through the same
-	 * pipeline as {@link AuthStorage.keys.get} but returning the refreshed
+	 * pipeline as {@link AuthStorage.keys.getWithCredential} but returning the refreshed
 	 * {@link OAuthAccess} (raw access token + identity metadata) instead of
 	 * the API-key bytes.
 	 *
 	 * Use this when the caller needs to inject identity headers alongside the
 	 * bearer (Codex `chatgpt-account-id`, Google `project`, GitHub
 	 * `enterpriseUrl`). For pure "give me the bytes for `Authorization`"
-	 * scenarios, prefer {@link AuthStorage.keys.get}.
+	 * scenarios, prefer {@link AuthStorage.keys.getWithCredential}.
 	 *
-	 * Returns `undefined` when no OAuth credential is available, the
-	 * credential fails to refresh, or runtime/config overrides have replaced
-	 * OAuth with an explicit API key.
+	 * Returns `undefined` when no usable OAuth credential is available (none
+	 * stored, or every one definitively failed to refresh) or runtime/config
+	 * overrides have replaced OAuth with an explicit API key. Rejects with
+	 * `OAuthRefreshUnavailableError` (transient, retryable) when a retryable
+	 * refresh failure left no usable credential.
 	 */
 	access(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<OAuthAccess | undefined>;
 	/**
