@@ -115,6 +115,7 @@ export function useQuery<T>(key: readonly unknown[], fetcher: QueryFetcher<T>, o
 	const leave = useCallback(() => {
 		const current = waiting.current;
 		waiting.current = null;
+		setRefreshing(false);
 		if (current) releaseQuery(current.key, current.request);
 	}, []);
 

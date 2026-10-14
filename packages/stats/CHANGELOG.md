@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed dashboard controls remaining busy after a cached query's refresh is abandoned by hiding the page or switching keys.
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

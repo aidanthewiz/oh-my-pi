@@ -118,12 +118,108 @@ describe("useQuery request release", () => {
 		const view = mount();
 		await act(async () => view.render(<RequestProbe enabled />));
 		await act(async () => view.render(<RequestProbe enabled={false} />));
+		expect(results.at(-1)?.loading).toBe(true);
+		expect(results.at(-1)?.refreshing).toBe(false);
 		await act(async () => view.render(<RequestProbe enabled />));
 		await act(async () => abandoned.resolve(7));
 		expect(results.at(-1)?.data).toBeNull();
 		expect(results.at(-1)?.refreshing).toBe(true);
 		await act(async () => replacement.resolve(42));
 		expect(results.at(-1)?.data).toBe(42);
+		expect(results.at(-1)?.refreshing).toBe(false);
+	});
+
+	it.each(["resolve", "reject"] as const)(
+		"clears a cached query's busy state on disable without letting an old %s clear its replacement",
+		async completion => {
+			const abandoned = Promise.withResolvers<number>();
+			const replacement = Promise.withResolvers<number>();
+			const results: QueryResult<number>[] = [];
+			const key = freshKey();
+			const responses = [Promise.resolve(1), abandoned.promise, replacement.promise];
+			const fetcher = () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected query request");
+				return response;
+			};
+			function RequestProbe({ enabled }: { enabled: boolean }) {
+				const query = useQuery([key], fetcher, { enabled });
+				results.push(query);
+				return (
+					<button type="button" disabled={query.refreshing}>
+						{query.data}
+					</button>
+				);
+			}
+			const view = mount();
+			const button = () => document.querySelector("button") as HTMLButtonElement;
+			await act(async () => view.render(<RequestProbe enabled />));
+			expect(results.at(-1)?.data).toBe(1);
+			expect(results.at(-1)?.loading).toBe(false);
+			expect(button().hasAttribute("disabled")).toBe(false);
+
+			await act(async () => results.at(-1)?.refetch());
+			expect(results.at(-1)?.refreshing).toBe(true);
+			expect(button().hasAttribute("disabled")).toBe(true);
+			await act(async () => view.render(<RequestProbe enabled={false} />));
+			expect(results.at(-1)?.data).toBe(1);
+			expect(results.at(-1)?.loading).toBe(false);
+			expect(results.at(-1)?.refreshing).toBe(false);
+			expect(button().hasAttribute("disabled")).toBe(false);
+
+			await act(async () => view.render(<RequestProbe enabled />));
+			expect(results.at(-1)?.data).toBe(1);
+			expect(results.at(-1)?.refreshing).toBe(false);
+			expect(button().hasAttribute("disabled")).toBe(false);
+			await act(async () => results.at(-1)?.refetch());
+			expect(results.at(-1)?.refreshing).toBe(true);
+			if (completion === "resolve") await act(async () => abandoned.resolve(7));
+			else await act(async () => abandoned.reject(new Error("Abandoned request")));
+			expect(results.at(-1)?.data).toBe(1);
+			expect(results.at(-1)?.error).toBeNull();
+			expect(results.at(-1)?.loading).toBe(false);
+			expect(results.at(-1)?.refreshing).toBe(true);
+			expect(button().hasAttribute("disabled")).toBe(true);
+
+			await act(async () => replacement.resolve(42));
+			expect(results.at(-1)?.data).toBe(42);
+			expect(results.at(-1)?.loading).toBe(false);
+			expect(results.at(-1)?.refreshing).toBe(false);
+			expect(button().textContent).toBe("42");
+			expect(button().hasAttribute("disabled")).toBe(false);
+		},
+	);
+
+	it("stops refreshing when switching from a cached key's pending refresh to another current cached key", async () => {
+		const abandoned = Promise.withResolvers<number>();
+		const results: QueryResult<number>[] = [];
+		const firstKey = freshKey();
+		const secondKey = freshKey();
+		const responses = [Promise.resolve(1), Promise.resolve(2), abandoned.promise];
+		const fetcher = () => {
+			const response = responses.shift();
+			if (!response) throw new Error("Unexpected query request");
+			return response;
+		};
+		function RequestProbe({ queryKey }: { queryKey: string }) {
+			results.push(useQuery([queryKey], fetcher));
+			return null;
+		}
+		const view = mount();
+		await act(async () => view.render(<RequestProbe queryKey={secondKey} />));
+		await act(async () => view.render(<RequestProbe queryKey={firstKey} />));
+		expect(results.at(-1)?.data).toBe(2);
+		await act(async () => results.at(-1)?.refetch());
+		expect(results.at(-1)?.refreshing).toBe(true);
+
+		await act(async () => view.render(<RequestProbe queryKey={secondKey} />));
+		expect(results.at(-1)?.data).toBe(1);
+		expect(results.at(-1)?.loading).toBe(false);
+		expect(results.at(-1)?.stale).toBe(false);
+		expect(results.at(-1)?.refreshing).toBe(false);
+		await act(async () => abandoned.resolve(7));
+		expect(results.at(-1)?.data).toBe(1);
+		expect(results.at(-1)?.error).toBeNull();
 		expect(results.at(-1)?.refreshing).toBe(false);
 	});
 
