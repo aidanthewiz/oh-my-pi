@@ -272,6 +272,7 @@ async function runJq(
 	signal?.addEventListener("abort", onAbort, { once: true });
 
 	try {
+		throwIfAborted(signal);
 		const result = await new Shell({ clearEnv: true, sessionEnv: env }).run(
 			{ command, timeoutMs: JSON_QUERY_TIMEOUT_MS, signal: run.signal },
 			(err, chunk) => {

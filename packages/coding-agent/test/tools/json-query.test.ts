@@ -1,10 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { Settings } from "../../src/config/settings";
 import { ReadTool } from "../../src/tools/read";
+import { ToolAbortError } from "../../src/tools/tool-errors";
 
 type ToolTextResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -82,6 +83,59 @@ describe("JSON query in read tool", () => {
 	afterAll(async () => {
 		await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
 	});
+
+	it("cancels during scratch creation without waiting for the JSON query timeout", async () => {
+		const entered = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const originalMkdtemp = fs.mkdtemp;
+		let scratch: string | undefined;
+		const mkdtemp = spyOn(fs, "mkdtemp").mockImplementation(
+			new Proxy(originalMkdtemp, {
+				async apply(target, receiver, args) {
+					const directory = await Reflect.apply(target, receiver, args);
+					if (String(args[0]).startsWith(path.join(os.tmpdir(), "omp-jq-"))) {
+						scratch = String(directory);
+						entered.resolve();
+						await resume.promise;
+					}
+					return directory;
+				},
+			}),
+		);
+		const controller = new AbortController();
+		const operation = readTool
+			.execute(
+				"cancel-during-scratch",
+				{ path: `${jsonFile}?q=reduce range(0;1000000000) as $i (0; . + $i)` },
+				controller.signal,
+			)
+			.then(
+				result => result,
+				error => error,
+			);
+		let deadline: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await entered.promise;
+			controller.abort();
+			resume.resolve();
+			const outcome = await Promise.race([
+				operation,
+				// Native jq uses Tokio; fake JavaScript timers cannot bound a lost abort.
+				new Promise<symbol>(resolve => {
+					deadline = setTimeout(() => resolve(Symbol("query still running")), 1_000);
+				}),
+			]);
+			expect(outcome).toBeInstanceOf(ToolAbortError);
+			expect(outcome.name).toBe("ToolAbortError");
+			await expect(fs.access(scratch!)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			clearTimeout(deadline);
+			controller.abort();
+			resume.resolve();
+			mkdtemp.mockRestore();
+			await operation;
+		}
+	}, 40_000);
 
 	it("keeps caller credentials and value aliases out of env and $ENV while retaining safe settings", async () => {
 		const values: Record<string, string> = {
