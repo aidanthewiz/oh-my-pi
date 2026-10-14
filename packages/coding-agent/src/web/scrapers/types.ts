@@ -206,17 +206,24 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 				const { done, value } = await reader.read();
 				if (done) break;
 
-				chunks.push(value);
-				totalSize += value.length;
-
-				if (totalSize > maxBytes) {
+				const remaining = maxBytes - totalSize;
+				if (value.length > remaining) {
+					if (remaining > 0) chunks.push(value.subarray(0, remaining));
+					totalSize += Math.max(0, remaining);
 					truncated = true;
 					void reader.cancel().catch(() => {});
 					break;
 				}
+				chunks.push(value);
+				totalSize += value.length;
 			}
 
-			const content = decodeBody(Buffer.concat(chunks), rawContentType);
+			// A single chunk is decoded in place; only multi-chunk bodies need a concat copy.
+			const bytes =
+				chunks.length === 1
+					? Buffer.from(chunks[0].buffer, chunks[0].byteOffset, chunks[0].byteLength)
+					: Buffer.concat(chunks, totalSize);
+			const content = decodeBody(bytes, rawContentType);
 			if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
 				continue;
 			}
@@ -344,7 +351,8 @@ export function getLocalizedText(value: LocalizedText, defaultLocale?: string): 
  * Check if content looks like HTML by inspecting the leading tag.
  */
 export function looksLikeHtml(content: string): boolean {
-	const trimmed = content.trim().toLowerCase();
+	// Only the leading tag matters; lowercase a short prefix instead of the whole body.
+	const trimmed = content.trimStart().slice(0, 16).toLowerCase();
 	return (
 		trimmed.startsWith("<!doctype") ||
 		trimmed.startsWith("<html") ||

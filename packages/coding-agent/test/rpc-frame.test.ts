@@ -20,26 +20,81 @@ function oversizedMessageHistory(prefix: string) {
 }
 
 describe("RPC frame encoding", () => {
-	it("preserves fitting frames and serializes stateful message frames once", () => {
+	it("preserves fitting response frames", () => {
 		const frame = { id: "request-1", type: "response", command: "get_state", success: true, data: { ok: true } };
 		expect(encodeRpcFrame(frame)).toBe(`${JSON.stringify(frame)}\n`);
+	});
 
-		for (const version of [1, 2] as const) {
-			let messageReads = 0;
-			const message = { role: "assistant", content: [{ type: "text", text: "done" }] };
-			const event = {
-				type: "message_end",
-				get message() {
-					messageReads++;
-					return message;
+	it("encodes a message_update sharing its snapshot exactly like JSON.stringify", () => {
+		const tricky = "replace $& and $1 and $$ then \u2028 line \u2029 sep";
+		const snapshot = (blockCount: number) => ({
+			role: "assistant",
+			content: Array.from({ length: blockCount }, (_, index) =>
+				index % 2 === 0
+					? { type: "text", text: `${index}: ${tricky}` }
+					: {
+							type: "toolCall",
+							id: `call-${index}`,
+							name: "edit",
+							arguments: { path: tricky, skipped: undefined },
+						},
+			),
+			usage: { input: 1, output: 2 },
+			errorMessage: undefined,
+			timestamp: 1,
+		});
+
+		for (const blockCount of [2, 16, 32]) {
+			const message = snapshot(blockCount);
+			const event = { type: "text_delta", contentIndex: 0, delta: tricky, partial: message };
+			const frames = [
+				{ type: "message_update", message, assistantMessageEvent: event },
+				{ assistantMessageEvent: event, type: "message_update", trailing: tricky, message },
+				{
+					type: "message_update",
+					message,
+					assistantMessageEvent: { ...event, partial: { ...message, timestamp: 2 } },
 				},
-			};
-			const encoder = new RpcFrameEncoder();
-			encoder.setProtocolVersion(version);
-
-			expect(decode(encoder.encode(event))).toEqual({ type: "message_end", message });
-			expect(messageReads).toBe(1);
+			];
+			for (const frame of frames) {
+				const expected = `${JSON.stringify(frame)}\n`;
+				expect(encodeRpcFrame(frame)).toBe(expected);
+				for (const version of [1, 2] as const) {
+					const encoder = new RpcFrameEncoder();
+					encoder.setProtocolVersion(version);
+					expect(encoder.encode(frame)).toBe(expected);
+				}
+			}
 		}
+	});
+
+	it("preserves shared snapshot frame bounds and lossless protocol v2 reassembly", () => {
+		const message = {
+			role: "assistant",
+			content: Array.from({ length: 2048 }, (_, index) => ({
+				type: "text",
+				text: `${index}:${"é".repeat(150)}`,
+			})),
+		};
+		const frame = {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", partial: message },
+		};
+		expect(Buffer.byteLength(JSON.stringify(frame), "utf8")).toBeGreaterThan(MAX_RPC_FRAME_BYTES);
+		const bounded = encodeRpcFrame(frame);
+		expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
+		expect(decode(bounded).type).toBe("message_update");
+
+		const encoder = new RpcFrameEncoder();
+		encoder.setProtocolVersion(2);
+		const decoder = new RpcFrameDecoder();
+		let decoded: object | undefined;
+		for (const line of encoder.encodeFrames(frame)) {
+			expect(Buffer.byteLength(line, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
+			decoded = decoder.push(JSON.parse(line));
+		}
+		expect(decoded).toEqual(frame);
 	});
 
 	it("compacts agent_end after message events have streamed", () => {

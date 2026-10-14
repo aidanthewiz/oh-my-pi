@@ -25,6 +25,9 @@ import {
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import * as completionProbeModule from "@oh-my-pi/pi-coding-agent/task/completion-probe";
+import type { CompletionProbeOptions } from "@oh-my-pi/pi-coding-agent/task/completion-probe";
+import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 const AGENT_ID = "accepted-result";
@@ -287,6 +290,52 @@ describe("runSubprocess result acceptance", () => {
 		expect(settled?.lifecycle?.acceptedAt).toBeNumber();
 		expect(settled?.lifecycle?.terminalAt).toBeNumber();
 	});
+
+	for (const enabled of [false, true]) {
+		it(`keeps accepted yield presentation probe-gated (${enabled}) without settling unfinished work`, async () => {
+			const harness = createHarness();
+			registerRunning(harness.session);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let probe: CompletionProbeOptions | undefined;
+			vi.spyOn(completionProbeModule, "startCompletionProbe").mockImplementation(options => {
+				probe = options;
+			});
+			harness.session.prompt = async () => {
+				entered.resolve();
+				await release.promise;
+				return true;
+			};
+			const progress: AgentProgress[] = [];
+			let settled = false;
+			const run = runSubagentFollowUpTurn({
+				id: AGENT_ID,
+				agent: baseAgent,
+				message: "continue",
+				completionProbe: enabled,
+				onProgress: update => progress.push({ ...update }),
+			});
+			void run.then(() => {
+				settled = true;
+			});
+			try {
+				await entered.promise;
+				probe?.onEstimate(42, 0.1);
+				harness.emitTerminalYield({ report: "submitted" });
+				probe?.onEstimate(15, 0.3);
+				expect(progress.at(-1)?.completionPercent).toBe(enabled ? 99 : undefined);
+				expect(progress.at(-1)?.cost).toBeCloseTo(enabled ? 0.4 : 0);
+				await Promise.resolve();
+				expect(settled).toBe(false);
+				release.resolve();
+				expect((await run).exitCode).toBe(0);
+				expect(probe !== undefined).toBe(enabled);
+			} finally {
+				release.resolve();
+				await run;
+			}
+		});
+	}
 
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();

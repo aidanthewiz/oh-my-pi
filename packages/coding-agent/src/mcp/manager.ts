@@ -339,6 +339,11 @@ export class MCPManager {
 	 */
 	#pendingNotifications: Array<{ server: string; method: string; params: unknown }> = [];
 	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void | Promise<void>;
+	/** In-flight owner-handler run; changes arriving while it runs coalesce into one trailing call. */
+	#ownerToolsRun?: Promise<void>;
+	#ownerToolsDirty = false;
+	/** Per-server single-flight `tools/list` refresh with a trailing re-run flag. */
+	#toolRefreshes = new Map<string, { connection: MCPServerConnection; dirty: boolean; promise: Promise<void> }>();
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
 	#onPromptsChanged?: (serverName: string) => void;
 	#notificationsEnabled = false;
@@ -516,11 +521,55 @@ export class MCPManager {
 	 * `notifications/tools/list_changed`) observe not just the manager's
 	 * refreshed tool set but also any session-level rebind driven by the
 	 * handler (`session.refreshMCPTools`). Other callsites (initial connect,
-	 * disconnect, reconnect) invoke the handler synchronously — their downstream
-	 * chains don't need to serialize on the rebind.
+	 * disconnect, reconnect) do not await it — their downstream chains don't
+	 * need to serialize on the rebind.
+	 *
+	 * Calls are coalesced latest-wins: while the handler is running, further
+	 * tool-set changes collapse into a single trailing call that receives the
+	 * current tool list.
 	 */
 	setOnToolsChanged(handler: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void | Promise<void>): void {
 		this.#onToolsChanged = handler;
+	}
+
+	/**
+	 * Invoke the owner {@link setOnToolsChanged} handler, coalescing bursts.
+	 * The returned promise settles once the handler has observed a tool set at
+	 * least as new as the one current at call time; it rejects only when the
+	 * last (newest) handler call failed.
+	 */
+	#notifyOwnerToolsChanged(): Promise<void> {
+		if (!this.#onToolsChanged) return Promise.resolve();
+		if (this.#ownerToolsRun) {
+			this.#ownerToolsDirty = true;
+			return this.#ownerToolsRun;
+		}
+		let settled = false;
+		const run = (async () => {
+			try {
+				// A failed call must not swallow a call queued while it ran.
+				let failure: unknown;
+				let failed = false;
+				do {
+					this.#ownerToolsDirty = false;
+					try {
+						await this.#onToolsChanged?.(this.#tools);
+						failed = false;
+					} catch (error) {
+						failure = error;
+						failed = true;
+					}
+				} while (this.#ownerToolsDirty);
+				if (failed) throw failure;
+			} finally {
+				settled = true;
+				this.#ownerToolsRun = undefined;
+			}
+		})();
+		// The first handler call starts synchronously above; a synchronous throw
+		// settles the run before this line, so only publish it while pending.
+		if (!settled) this.#ownerToolsRun = run;
+		return run;
 	}
 
 	/**
@@ -947,7 +996,7 @@ export class MCPManager {
 					name,
 					DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
 				);
-				void this.#onToolsChanged?.(this.#tools);
+				this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
 			}
 
 			statusServerNames.push(name);
@@ -1086,7 +1135,7 @@ export class MCPManager {
 						this.#reconnectServerForTool(name, options);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
-					await this.#onToolsChanged?.(this.#tools);
+					await this.#notifyOwnerToolsChanged();
 					void this.toolCache?.set(name, connectionConfig, serverTools);
 
 					notify({ type: "connected", serverName: name });
@@ -1528,6 +1577,7 @@ export class MCPManager {
 		connection.transport.onClose = undefined;
 		if (this.#connections.get(name) === connection) {
 			this.#connections.delete(name);
+			if (this.#toolRefreshes.get(name)?.connection === connection) this.#toolRefreshes.delete(name);
 		}
 	}
 
@@ -1581,7 +1631,7 @@ export class MCPManager {
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
 		if (hadTools) {
 			this.#emitToolsChanged();
-			void this.#onToolsChanged?.(this.#tools);
+			this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
 		}
 
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
@@ -1967,7 +2017,7 @@ export class MCPManager {
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
-			void this.#onToolsChanged?.(this.#tools);
+			this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
 			void this.#loadServerResourcesAndPrompts(name, connection);
 			return connection;
 		} catch (error) {
@@ -2003,16 +2053,53 @@ export class MCPManager {
 
 	/**
 	 * Refresh tools from a specific server.
+	 *
+	 * Single-flight per server: a refresh requested while one is running marks
+	 * it dirty and shares its promise, so a `tools/list_changed` burst costs at
+	 * most one in-flight plus one trailing `tools/list`.
 	 */
-	async refreshServerTools(name: string): Promise<void> {
+	refreshServerTools(name: string): Promise<void> {
 		const connection = this.#connections.get(name);
-		if (!connection) return;
+		if (!connection) return Promise.resolve();
+		const existing = this.#toolRefreshes.get(name);
+		if (existing?.connection === connection) {
+			existing.dirty = true;
+			return existing.promise;
+		}
+		const entry = { connection, dirty: false, promise: Promise.resolve() };
+		entry.promise = (async () => {
+			try {
+				// A failed pass must not swallow a refresh queued while it ran.
+				let failure: unknown;
+				let failed = false;
+				do {
+					entry.dirty = false;
+					try {
+						await this.#refreshServerToolsOnce(name, connection);
+						failed = false;
+					} catch (error) {
+						failure = error;
+						failed = true;
+					}
+				} while (entry.dirty && this.#connections.get(name) === connection);
+				if (failed) throw failure;
+			} finally {
+				if (this.#toolRefreshes.get(name) === entry) this.#toolRefreshes.delete(name);
+			}
+		})();
+		this.#toolRefreshes.set(name, entry);
+		return entry.promise;
+	}
+
+	async #refreshServerToolsOnce(name: string, connection: MCPServerConnection): Promise<void> {
+		if (this.#connections.get(name) !== connection) return;
 
 		// Clear cached tools
 		connection.tools = undefined;
 
 		// Reload tools
 		const serverTools = await listTools(connection);
+		if (this.#connections.get(name) !== connection) return;
 		const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 			this.#reconnectServerForTool(name, options);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
@@ -2020,7 +2107,7 @@ export class MCPManager {
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);
-		await this.#onToolsChanged?.(this.#tools);
+		await this.#notifyOwnerToolsChanged();
 	}
 
 	/**

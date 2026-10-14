@@ -504,6 +504,7 @@ export class ChatTranscriptBuilder {
 					// Stable ids and Kitty placeholder cells keep images anchored
 					// while the transcript viewport scrolls and reflows.
 					showImages: displayPreferences.showImages,
+					showFigures: this.#deps.tableCharts !== false,
 				},
 				this.#deps.getTool?.(content.name),
 				this.#deps.ui,

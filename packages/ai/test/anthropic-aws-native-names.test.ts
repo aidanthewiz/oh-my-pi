@@ -5,7 +5,7 @@ import {
 	resolveAnthropicAwsApiKey,
 	resolveAnthropicAwsWorkspaceId,
 } from "@oh-my-pi/pi-ai/registry/anthropic-aws-env";
-import { getEnvApiKey } from "@oh-my-pi/pi-ai/stream";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
 import type { Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 

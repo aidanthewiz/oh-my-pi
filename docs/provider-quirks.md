@@ -42,7 +42,7 @@ The OpenAI Chat Completions provider implements HTTP POST JSON body streaming ov
 
 ### Auth & usage
 - **API-Key Validation**: `validateOpenAICompatibleApiKey` in `packages/ai/src/registry/api-key-validation.ts` validates API credentials by issuing a lightweight `POST /chat/completions` request with `messages: [{ role: "user", content: "ping" }]`, `max_tokens: 1`, `temperature: 0`, and `Authorization: Bearer ${apiKey}`.
-- **Credential resolution**: `getEnvApiKey` in `packages/ai/src/stream.ts` delegates to the compiled auth registry. Provider environment keys and hooks are declared in `packages/catalog/src/compat/rules/auth/*.kdl`; explicit request credentials and custom provider configuration can supply keys independently.
+- **Credential resolution**: `getEnvApiKey` in `packages/ai/src/env-api-key.ts` delegates to the compiled auth registry. Provider environment keys and hooks are declared in `packages/catalog/src/compat/rules/auth/*.kdl`; explicit request credentials and custom provider configuration can supply keys independently.
 - **Usage Accounting & Quota Surfacing**: `calculateOpenAIUsageAccounting` (`packages/ai/src/providers/openai-shared.ts`) reconciles input, output, cache-read, and cache-write tokens into standard `Usage` records. OpenRouter and ClinePass authoritative gateway charges are populated into `output.usage.cost` via `applyProviderReportedCost`. Copilot request counts are stored in `output.usage.premiumRequests`. Transport HTTP errors (e.g. 429 Rate Limit, 408 Timeout, 5xx Server Error) are thrown as `OpenAIHttpError` (`packages/ai/src/utils/openai-http.ts`), capturing status, headers, and error envelope details for upstream error mapping in `AIError.finalize`.
 
 ### Catalog model handling
@@ -147,7 +147,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/azur
 - **Reasoning effort fallback**: Catches `OpenAIHttpError` during stream initiation. If the endpoint rejects the requested reasoning effort (e.g. `xhigh`), `resolveOpenAIReasoningEffortFallback` determines a lower effort level, steps down `params.reasoning`, and retries the request using `createOpenAIReasoningEffortFallbackKey("azure-responses", url, model)`.
 
 ### Auth & usage
-- **Credential source**: Sourced from `options.apiKey` or `$env.AZURE_OPENAI_API_KEY` (retrieved via `getEnvApiKey(model.provider)` in `packages/ai/src/stream.ts` or `buildAzureResponsesRequest`). Sent as the `api-key` header.
+- **Credential source**: Sourced from `options.apiKey` or `$env.AZURE_OPENAI_API_KEY` (retrieved via `getEnvApiKey(model.provider)` in `packages/ai/src/env-api-key.ts` or `buildAzureResponsesRequest`). Sent as the `api-key` header.
 - **Usage tracking**: Extracted directly from terminal `response.completed` / `response.incomplete` stream events (`input_tokens`, `output_tokens`, `reasoning_tokens`, `cached_tokens`) by `processResponsesStream`. No separate usage tracker exists under `packages/ai/src/usage/`.
 - **Prompt caching controls**: `prompt_cache_key` is generated via `getOpenAIPromptCacheKey(options)`. Explicit prompt caching mode is rejected (`AIError.ConfigurationError`) because Azure Responses does not support explicit cache control headers or retention directives.
 
@@ -673,7 +673,7 @@ ai& (`aiand`) is an OpenAI-compatible inference API provider (aiand.com) offerin
 - **Base URL Normalization**: `normalizeAiandBaseUrl` in `packages/catalog/src/provider-models/openai-compat.ts` trims base URLs, defaults to `https://api.aiand.com/v1`, strips trailing slashes, and appends `/v1` if omitted. Nothing beyond the OpenAI Chat Completions pipeline.
 
 ### Auth & usage
-- **API-Key Authentication**: Supports API key authentication configured via the `AIAND_API_KEY` environment variable (resolved via `getEnvApiKey("aiand")` in `packages/ai/src/stream.ts`) or explicit `apiKey` options.
+- **API-Key Authentication**: Supports API key authentication configured via the `AIAND_API_KEY` environment variable (resolved via `getEnvApiKey("aiand")` in `packages/ai/src/env-api-key.ts`) or explicit `apiKey` options.
 - **Console Login & Validation**: Declared in `packages/catalog/src/compat/rules/auth/aiand.kdl` as a `login "api-key"` rule (`packages/ai/src/registry/engine/api-key.ts`), prompting for an API key from `https://console.aiand.com/api-keys` and validating credentials against `https://api.aiand.com/v1/models` (`validate "models-endpoint"`). Registered in `packages/ai/src/registry/registry.ts`.
 
 ### Catalog model handling
@@ -830,7 +830,7 @@ CoreWeave Serverless Inference provides hosted AI model inference powered by Wei
 - **GPT-OSS Reasoning Transformation**: In `openAiCompletionsDescriptor` (`packages/catalog/src/provider-models/openai-compat.ts`), models starting with `openai/gpt-oss-` are transformed to set `reasoning: true` and configured with effort-based thinking (`Effort.Low`, `Effort.Medium`, `Effort.High`).
 
 ### Auth & usage
-- **API Key & Environment Resolution**: Authenticates via `COREWEAVE_API_KEY`, falling back to `WANDB_API_KEY` (`descriptors.ts`, `getEnvApiKey` in `packages/ai/src/stream.ts`).
+- **API Key & Environment Resolution**: Authenticates via `COREWEAVE_API_KEY`, falling back to `WANDB_API_KEY` (`descriptors.ts`, `getEnvApiKey` in `packages/ai/src/env-api-key.ts`).
 - **Login Flow & Project Validation**: Interactive login is declared in `packages/catalog/src/compat/rules/auth/coreweave.kdl` as a `login "api-key"` rule (`packages/ai/src/registry/engine/api-key.ts`), referencing settings at `https://wandb.ai/settings`. `requireCoreWeaveProjectHeaders` (`packages/ai/src/registry/oauth/coreweave.ts`) enforces that a valid `OpenAI-Project` header can be constructed from environment variables before validating credentials against `https://api.inference.wandb.ai/v1/models`.
 
 ### Catalog model handling
@@ -907,7 +907,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/fire
 - **Service Tier / Priority Control**: `excludesInferredOpenAIServiceTier` and `shouldSendServiceTier` (`packages/ai/src/types.ts`) allow `fireworks` requests to send `service_tier: "priority"` when `providers.fireworksTier: priority` (or `/fast` mode) is enabled, suppressing unneeded tier defaults.
 
 ### Auth & usage
-- **API Key Authentication**: Authenticates with HTTP Bearer tokens (`Authorization: Bearer ${apiKey}`) configured via `FIREWORKS_API_KEY` (resolved via `getEnvApiKey` in `packages/ai/src/stream.ts`).
+- **API Key Authentication**: Authenticates with HTTP Bearer tokens (`Authorization: Bearer ${apiKey}`) configured via `FIREWORKS_API_KEY` (resolved via `getEnvApiKey` in `packages/ai/src/env-api-key.ts`).
 - **Control-Plane Login Validation**: `/login fireworks` (declared in `packages/catalog/src/compat/rules/auth/fireworks.kdl` as a `login "api-key"` rule, `packages/ai/src/registry/engine/api-key.ts`) validates credentials against the static control-plane catalog `GET /v1/accounts/fireworks/models?filter=supports_serverless%3Dtrue&pageSize=1` rather than `/v1/models` (the inference endpoint serves per-account deployments and returns 500 for accounts without active deployments).
 - **Usage Accounting**: Token usage is processed via standard `openai-completions` accounting in `calculateOpenAIUsageAccounting` (`packages/ai/src/providers/openai-shared.ts`), extracting `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`, and `completion_tokens_details.reasoning_tokens`.
 
@@ -1371,7 +1371,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/nano
 - **Indexed Tool Delta Preservation**: Relies on `tool_calls[].index` tracking in `streamOpenAICompletionsOnce` (`packages/ai/src/providers/openai-completions.ts`) to ensure parallel streaming tool calls from NanoGPT do not merge or drop arguments across deltas.
 
 ### Auth & usage
-- **API Key & Environment Variables**: Authenticates via `NANO_GPT_API_KEY` (resolved via `getEnvApiKey` in `packages/ai/src/stream.ts` and configured in catalog descriptors `packages/catalog/src/compat/rules/providers/nanogpt.kdl`).
+- **API Key & Environment Variables**: Authenticates via `NANO_GPT_API_KEY` (resolved via `getEnvApiKey` in `packages/ai/src/env-api-key.ts` and configured in catalog descriptors `packages/catalog/src/compat/rules/providers/nanogpt.kdl`).
 - **Interactive Login**: Declared in `packages/catalog/src/compat/rules/auth/nanogpt.kdl` as a `login "api-key"` rule (`packages/ai/src/registry/engine/api-key.ts`), prompting for an API key linked from `https://nano-gpt.com/api` and validating credentials via `validate "models-endpoint"` against `https://nano-gpt.com/api/v1/models`.
 
 ### Catalog model handling
@@ -1463,7 +1463,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/olla
 
 ### Auth & usage
 - **Interactive Key Authentication**: Declared in `packages/catalog/src/compat/rules/auth/ollama-cloud.kdl` as a `login "api-key"` rule (`packages/ai/src/registry/engine/api-key.ts`), prompting for an API key generated at `https://ollama.com/settings/keys`, rejecting empty input with `ApiKeyRequiredError`.
-- **Environment Variable Resolution**: `descriptors.ts` (`packages/catalog/src/compat/rules/providers/ollama-cloud.kdl`) and `getEnvApiKey` (`packages/ai/src/stream.ts`) resolve credentials via `OLLAMA_CLOUD_API_KEY`.
+- **Environment Variable Resolution**: `descriptors.ts` (`packages/catalog/src/compat/rules/providers/ollama-cloud.kdl`) and `getEnvApiKey` (`packages/ai/src/env-api-key.ts`) resolve credentials via `OLLAMA_CLOUD_API_KEY`.
 - **Usage Accounting**: `ollamaCloudUsageProvider` (`packages/ai/src/usage/ollama.ts`) handles usage for `ollama-cloud` using `fetchOllamaUsage`. Because Ollama Cloud has no standalone quota API (`validatesCredentials: false`), usage is tracked per-response via `prompt_eval_count` and `eval_count` stream metrics.
 
 ### Catalog model handling
@@ -1588,7 +1588,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/open
 - **Custom Request Headers**: `getOpenRouterHeaders` in `packages/ai/src/utils/openrouter-headers.ts` attaches `User-Agent: omp/<ver>`, `HTTP-Referer: https://omp.sh/`, `X-OpenRouter-Title: omp`, `X-OpenRouter-Categories: cli-agent`, `X-OpenRouter-Cache: true`, and `X-OpenRouter-Cache-TTL: 3600` to all requests for edge response caching.
 
 ### Auth & usage
-- **Auth Key Validation via `/api/v1/auth/key`**: Declared in `packages/catalog/src/compat/rules/auth/openrouter.kdl` as a `login "oauth-code"` rule (`packages/ai/src/registry/engine/oauth-code.ts`) with `paste-key` validation targeted at `https://openrouter.ai/api/v1/auth/key`. Public `/api/v1/models` returns HTTP 200 for unauthenticated requests, so `/api/v1/auth/key` is used as the canonical identity check (returning 200 for valid keys, 401 otherwise). Key resolution checks `OPENROUTER_API_KEY` via `getEnvApiKey` in `packages/ai/src/stream.ts`.
+- **Auth Key Validation via `/api/v1/auth/key`**: Declared in `packages/catalog/src/compat/rules/auth/openrouter.kdl` as a `login "oauth-code"` rule (`packages/ai/src/registry/engine/oauth-code.ts`) with `paste-key` validation targeted at `https://openrouter.ai/api/v1/auth/key`. Public `/api/v1/models` returns HTTP 200 for unauthenticated requests, so `/api/v1/auth/key` is used as the canonical identity check (returning 200 for valid keys, 401 otherwise). Key resolution checks `OPENROUTER_API_KEY` via `getEnvApiKey` in `packages/ai/src/env-api-key.ts`.
 - **Authoritative Reported Cost Reconciling**: `applyProviderReportedCost` in `packages/ai/src/providers/openai-shared.ts` extracts `rawUsage.cost` echoed by OpenRouter and ClinePass. If estimated token cost is finite and positive, input, output, cache-read, and cache-write costs are scaled by `reportedCost / estimatedCost` to match the exact billable total; otherwise, `usage.cost.input` is assigned the reported cost directly.
 
 ### Catalog model handling
@@ -2078,7 +2078,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/zenm
 - **Dual Transport Base URL Normalization**: `normalizeZenMuxOpenAiBaseUrl` and `toZenMuxAnthropicBaseUrl` (`packages/catalog/src/provider-models/openai-compat.ts`) translate between endpoint URLs. OpenAI endpoints default to `https://zenmux.ai/api/v1` and Anthropic routes to `https://zenmux.ai/api/anthropic`, automatically converting paths when custom base URLs are specified.
 
 ### Auth & usage
-- **API Key Resolution**: `ZENMUX_API_KEY` is registered in `descriptors.ts` (`packages/catalog/src/compat/rules/providers/zenmux.kdl`) and resolved via `getEnvApiKey("zenmux")` in `packages/ai/src/stream.ts`.
+- **API Key Resolution**: `ZENMUX_API_KEY` is registered in `descriptors.ts` (`packages/catalog/src/compat/rules/providers/zenmux.kdl`) and resolved via `getEnvApiKey("zenmux")` in `packages/ai/src/env-api-key.ts`.
 - **Key Validation & Login**: Declared in `packages/catalog/src/compat/rules/auth/zenmux.kdl` as a `login "api-key"` rule (`packages/ai/src/registry/engine/api-key.ts`), directing users to `https://zenmux.ai/settings/keys` and validating credentials via `validate "models-endpoint"` against `https://zenmux.ai/api/v1/models`.
 - **Unauthenticated Discovery**: `allowUnauthenticated: true` in `descriptors.ts` enables model catalog discovery without requiring an API key.
 

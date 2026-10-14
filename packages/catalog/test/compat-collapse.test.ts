@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -32,6 +32,7 @@ import {
 	googleGeminiCliModelManagerOptions,
 } from "@oh-my-pi/pi-catalog/provider-models/google";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
+import { removeWithRetries } from "@oh-my-pi/pi-utils/temp";
 
 function requireReviewedTable(provider: string): VariantCollapseTable {
 	const table = reviewedCollapseTable(provider);
@@ -1454,8 +1455,15 @@ describe("resolveWireModelId", () => {
 });
 
 describe("merge-point collapsing (resolveProviderModels)", () => {
+	const tempDirs: string[] = [];
+	afterEach(async () => {
+		for (const dir of tempDirs) await removeWithRetries(dir);
+		tempDirs.length = 0;
+	});
+
 	async function tempDb(): Promise<string> {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "variant-collapse-"));
+		tempDirs.push(dir);
 		return path.join(dir, "models.db");
 	}
 
@@ -1675,16 +1683,23 @@ describe("antigravity discovery collapsing", () => {
 		};
 		const resolve = async (discovery: () => Response) => {
 			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-roster-"));
-			const fetcher = Object.assign(
-				(input: string | URL | Request, _init?: RequestInit) =>
-					Promise.resolve(
-						String(input).includes(":fetchAvailableModels") ? discovery() : new Response("version: 2.19.1\n"),
-					),
-				{ preconnect: fetch.preconnect },
-			);
-			const options = googleAntigravityModelManagerOptions({ oauthToken: "t", fetch: fetcher });
-			const result = await resolveProviderModels({ ...options, cacheDbPath: path.join(dir, "models.db") }, "online");
-			return result.models.map(m => m.id);
+			try {
+				const fetcher = Object.assign(
+					(input: string | URL | Request, _init?: RequestInit) =>
+						Promise.resolve(
+							String(input).includes(":fetchAvailableModels") ? discovery() : new Response("version: 2.19.1\n"),
+						),
+					{ preconnect: fetch.preconnect },
+				);
+				const options = googleAntigravityModelManagerOptions({ oauthToken: "t", fetch: fetcher });
+				const result = await resolveProviderModels(
+					{ ...options, cacheDbPath: path.join(dir, "models.db") },
+					"online",
+				);
+				return result.models.map(m => m.id);
+			} finally {
+				await removeWithRetries(dir);
+			}
 		};
 
 		// Bundled Claude 5.5 rows 404 on accounts whose roster omits them (#14328).

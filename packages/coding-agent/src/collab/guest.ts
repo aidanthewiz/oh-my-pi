@@ -509,6 +509,10 @@ export class CollabGuestLink {
 			...this.#ctx.pendingTools.values(),
 			...this.#ctx.eventController.takeDisplaceableComponents(),
 		];
+		// Drop turn-scoped controller state (coalesced message_update timer,
+		// in-flight anchors) so a pending pre-boundary snapshot cannot flush
+		// into the replacement transcript.
+		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
 		this.state = pending.state;
@@ -695,9 +699,15 @@ export class CollabGuestLink {
 			!this.#assistantStreamSynced
 		) {
 			this.#assistantStreamSynced = true;
-			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+			this.#dispatchEvent({ type: "message_start", message: event.message });
 		}
-		void this.#ctx.eventController.handleEvent(event);
+		this.#dispatchEvent(event);
+	}
+
+	#dispatchEvent(event: AgentSessionLifecycleEvent): void {
+		this.#ctx.eventController.dispatchSessionEvent(event).catch(err => {
+			logger.warn("collab guest event dispatch failed", { type: event.type, error: String(err) });
+		});
 	}
 
 	/** Reconcile missed physical boundaries using authoritative host ownership. */
@@ -903,6 +913,8 @@ export class CollabGuestLink {
 	async #resumeLocalSession(): Promise<void> {
 		this.#ctx.statusLine.setCollabStatus(null);
 		this.#flushPendingTranscripts();
+		// A pending coalesced mirror message_update must not flush after leave.
+		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearAgentMirror();
 		this.#ctx.syncRunningSubagentBadge();
 		this.#ctx.resetObserverRegistry();

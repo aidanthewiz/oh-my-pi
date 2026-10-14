@@ -6,6 +6,13 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { normalizeModelPatternList, resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { MANAGED_CONFIG_FILE_ENV, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	disableProvider,
+	enableProvider,
+	getDisabledProviders,
+	isProviderEnabled,
+	setDisabledProviders,
+} from "@oh-my-pi/pi-coding-agent/capability";
 import type { AgentCompactionThresholdOverride } from "@oh-my-pi/pi-coding-agent/config/compaction-threshold";
 import {
 	artifactsDirsFromRegistry,
@@ -156,6 +163,102 @@ describe("structured subagent primitive", () => {
 		taggedSession.getSessionAgents = () => [{ ...AGENT, name: "m1", model: ["a/x"] }];
 		const policy = await resolveEffectiveSubagentPolicy(request({ session: taggedSession, agent: "m1" }));
 		expect(policy.modelOverride).toEqual(["b/y"]);
+	});
+
+	it("rescans agents when a plugin provider is disabled while an earlier discovery is in flight", async () => {
+		const previouslyDisabled = getDisabledProviders();
+		enableProvider("omp-plugins");
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		let scans = 0;
+		vi.spyOn(discoveryModule, "discoverAgents").mockImplementation(async () => {
+			const pluginsEnabled = isProviderEnabled("omp-plugins");
+			if (++scans === 1) {
+				firstEntered.resolve();
+				await releaseFirst.promise;
+			}
+			const agents = pluginsEnabled ? [AGENT, { ...AGENT, name: "plugin-worker" }] : [AGENT];
+			return { agents, projectAgentsDir: null };
+		});
+		try {
+			const first = resolveEffectiveSubagentPolicy(request({ agent: "plugin-worker" }));
+			await firstEntered.promise;
+			disableProvider("omp-plugins");
+			const second = resolveEffectiveSubagentPolicy(request({ agent: "plugin-worker" }));
+			releaseFirst.resolve();
+
+			expect((await first).agent.name).toBe("plugin-worker");
+			await expect(second).rejects.toThrow('Unknown agent "plugin-worker"');
+		} finally {
+			setDisabledProviders(previouslyDisabled);
+		}
+	});
+
+	it("shares a simultaneous discovery snapshot but rescans before a later dispatch", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const secondEntered = Promise.withResolvers<void>();
+		let firstScan = true;
+		vi.spyOn(discoveryModule, "discoverAgents").mockImplementation(async () => {
+			if (!firstScan) return { agents: [], projectAgentsDir: null };
+			firstScan = false;
+			entered.resolve();
+			await release.promise;
+			return { agents: [AGENT], projectAgentsDir: null };
+		});
+		const secondSession = session();
+		secondSession.getPlanModeState = () => {
+			secondEntered.resolve();
+			return undefined;
+		};
+		const first = resolveEffectiveSubagentPolicy(request());
+		await entered.promise;
+		const second = resolveEffectiveSubagentPolicy(request({ session: secondSession }));
+		await secondEntered.promise;
+		release.resolve();
+		const policies = await Promise.all([first, second]);
+		expect(policies.map(policy => policy.agent.name)).toEqual(["worker", "worker"]);
+		const execute = vi.spyOn(executorModule, "runSubprocess");
+		await expect(runStructuredSubagent(request())).rejects.toThrow('Unknown agent "worker"');
+		expect(artifactsDirsFromRegistry()).toEqual([]);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("does not share inflight discovery across different extension roots", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(discoveryModule, "discoverAgents").mockImplementation(async (_cwd, _home, roots) => {
+			if (roots?.explicit[0] === "/first") {
+				entered.resolve();
+				await release.promise;
+				return { agents: [AGENT], projectAgentsDir: null };
+			}
+			return { agents: [], projectAgentsDir: null };
+		});
+		const firstSession = session();
+		firstSession.effectiveExtensionRoots = () => ({
+			explicit: ["/first"],
+			mode: "explicit-only",
+			configured: [],
+			configuredLevel: "user",
+		});
+		const secondSession = session();
+		secondSession.effectiveExtensionRoots = () => ({
+			explicit: ["/second"],
+			mode: "explicit-only",
+			configured: [],
+			configuredLevel: "user",
+		});
+		const first = resolveEffectiveSubagentPolicy(request({ session: firstSession }));
+		await entered.promise;
+		try {
+			await expect(resolveEffectiveSubagentPolicy(request({ session: secondSession }))).rejects.toThrow(
+				'Unknown agent "worker"',
+			);
+		} finally {
+			release.resolve();
+			await first;
+		}
 	});
 
 	it("uses caller, agent, then session schemas in precedence order", async () => {

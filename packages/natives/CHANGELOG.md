@@ -16,6 +16,7 @@
 - Native Git ident expansion now preserves foreign identifiers and matches Git's expanded keyword format.
 - Resolve both lexical and canonical native archive imports during in-memory embedding without writing generated archives to disk.
 - Build development-profile addons from Cargo's `debug` output directory.
+- Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
 
 ## [18.7.0] - 2026-10-06
 

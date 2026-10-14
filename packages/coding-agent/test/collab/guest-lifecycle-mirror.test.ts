@@ -12,7 +12,7 @@
  * apply strictly in arrival order, so a barrier after the event frames proves
  * they applied.
  */
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -22,7 +22,6 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
@@ -37,10 +36,13 @@ import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, formatCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { MappedExtensionEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/lifecycle-mirror";
+import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -49,10 +51,8 @@ import { cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/m
 import { settings as runtimeSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeTerminalTitleState, initTerminalTitleState } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
-import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 import { mockWindowsConsoleTitle } from "../terminal-title-test-utils";
 import { refreshDirsFromEnv, TempDir } from "@oh-my-pi/pi-utils";
-import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 interface Harness {
@@ -92,6 +92,7 @@ async function makeHarness(
 		guestSession?: AgentSession;
 		guestContext?: InteractiveModeContext;
 		beforeGuestJoin?: () => Promise<void>;
+		eventController?: EventController;
 	} = {},
 ): Promise<Harness> {
 	const roomKey = generateRoomKey();
@@ -194,7 +195,11 @@ async function makeHarness(
 		showError: () => {},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: options.eventController ?? {
+			dispatchSessionEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			resetTranscriptAnchors: () => {},
+		},
 		syncRunningSubagentBadge: () => {},
 		syncComposerShape: () => {},
 		eventBus: new EventBus(),
@@ -557,7 +562,8 @@ describe("collab guest extension lifecycle mirror", () => {
 		let physicalPause: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> | undefined;
 		let dropPause = false;
 		const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(
-			function (this: CollabSocket, frame, peer) {
+			function (this: CollabSocket, wireFrame, peer) {
+				const frame: CollabFrame = typeof wireFrame === "string" ? JSON.parse(wireFrame) : wireFrame;
 				if (frame.t === "hello") guestSocket = this;
 				if (dropPause && frame.t === "event" && frame.event.type === "agent_end") {
 					physicalPause = frame.event;
@@ -565,7 +571,7 @@ describe("collab guest extension lifecycle mirror", () => {
 					return;
 				}
 				if (dropPause && frame.t === "state" && frame.state.lifecycle?.phase === "continuing") return;
-				originalSend.call(this, frame, peer);
+				originalSend.call(this, wireFrame, peer);
 			},
 		);
 		let snapshotApplied = Promise.withResolvers<void>();
@@ -859,7 +865,8 @@ describe("collab guest extension lifecycle mirror", () => {
 			let guestSocket: CollabSocket | undefined;
 			let disconnected = false;
 			const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(
-				function (this: CollabSocket, frame, peer) {
+				function (this: CollabSocket, wireFrame, peer) {
+					const frame: CollabFrame = typeof wireFrame === "string" ? JSON.parse(wireFrame) : wireFrame;
 					if (frame.t === "hello") guestSocket = this;
 					if (
 						outcome === "retry-error" &&
@@ -882,7 +889,7 @@ describe("collab guest extension lifecycle mirror", () => {
 						originalSend.call(this, { ...frame, state: { ...frame.state, lifecycle } }, peer);
 						return;
 					}
-					originalSend.call(this, frame, peer);
+					originalSend.call(this, wireFrame, peer);
 				},
 			);
 			let harness: Harness | undefined;
@@ -1236,7 +1243,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				timestamp: Date.now(),
 			};
 			let rendered: AgentMessage | undefined;
-			harness.ctx.eventController.handleEvent = async event => {
+			harness.ctx.eventController.dispatchSessionEvent = async event => {
 				if (event.type === "message_end") rendered = event.message;
 			};
 			harness.hostSocket.send({ t: "event", event: { type: "message_end", message } } as CollabFrame);
@@ -1366,4 +1373,174 @@ describe("collab guest extension lifecycle mirror", () => {
 			renameSpy.mockRestore();
 		}
 	});
+
+	it("applies a mirrored stream tail in order through the event controller", async () => {
+		// The controller reads global settings (speech) when it enqueues a stream delta.
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const controller = new EventController(createInteractiveModeContext());
+		const updateGate = Promise.withResolvers<void>();
+		const handled: string[] = [];
+		const handleEvent = spyOn(controller, "handleEvent").mockImplementation(async (event: AgentSessionEvent) => {
+			// A slow streaming rebuild: later events must queue behind it, not overtake it.
+			if (event.type === "message_update") await updateGate.promise;
+			handled.push(event.type);
+		});
+		const harness = await makeHarness("lifecycle-mirror-room-9", { eventController: controller });
+		try {
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "stream-tail" } });
+			await harness.barrier();
+			await controller.dispatchSessionEvent({ type: "turn_start" } as AgentSessionEvent);
+			handled.length = 0;
+			const message: AgentMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "tok" }],
+				api: "mock",
+				provider: "mock",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+			harness.hostSocket.send({
+				t: "event",
+				event: {
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "tok", partial: message },
+				},
+			} as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "message_end", message } } as CollabFrame);
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "stream-tail", messages: [message], isTerminal: true },
+			} as CollabFrame);
+			await harness.barrier();
+			updateGate.resolve();
+			// A trailing dispatch settles only after every event queued ahead of it.
+			await controller.dispatchSessionEvent({ type: "turn_start" } as AgentSessionEvent);
+
+			expect(handled.filter(type => type !== "message_start" && type !== "turn_start")).toEqual([
+				"message_update",
+				"message_end",
+				"agent_end",
+			]);
+		} finally {
+			handleEvent.mockRestore();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+			await harness.cleanup();
+			resetSettingsForTest();
+		}
+	});
+
+	it("coalesces a mirrored message_update burst into one handled latest snapshot", async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const controller = new EventController(createInteractiveModeContext());
+		const handledUpdates: string[] = [];
+		const handleEvent = spyOn(controller, "handleEvent").mockImplementation(async (event: AgentSessionEvent) => {
+			if (event.type === "message_update") handledUpdates.push(messageText(event.message));
+		});
+		const harness = await makeHarness("lifecycle-mirror-room-10", { eventController: controller });
+		// Hold the coalescing window open: only message_end may flush the burst.
+		vi.useFakeTimers();
+		try {
+			for (const text of ["a", "ab", "abc"]) sendUpdate(harness, makeAssistant(text));
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "message_end", message: makeAssistant("abc") },
+			} as CollabFrame);
+			await harness.barrier();
+			await controller.dispatchSessionEvent({ type: "turn_start" } as AgentSessionEvent);
+
+			expect(handledUpdates).toEqual(["abc"]);
+		} finally {
+			vi.useRealTimers();
+			handleEvent.mockRestore();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+			await harness.cleanup();
+			resetSettingsForTest();
+		}
+	});
+
+	it("drops a pending coalesced message_update when the guest leaves", async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const controller = new EventController(createInteractiveModeContext());
+		const handled: string[] = [];
+		const handleEvent = spyOn(controller, "handleEvent").mockImplementation(async (event: AgentSessionEvent) => {
+			handled.push(event.type);
+		});
+		const harness = await makeHarness("lifecycle-mirror-room-11", { eventController: controller });
+		vi.useFakeTimers();
+		try {
+			sendUpdate(harness, makeAssistant("tok"));
+			await harness.barrier();
+			await harness.guest.leave("mid-stream");
+			// The coalescing window elapses after the boundary: nothing may flush.
+			vi.advanceTimersByTime(1_000);
+			await controller.dispatchSessionEvent({ type: "turn_start" } as AgentSessionEvent);
+
+			expect(handled).not.toContain("message_update");
+		} finally {
+			vi.useRealTimers();
+			handleEvent.mockRestore();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+			await harness.cleanup();
+			resetSettingsForTest();
+		}
+	});
 });
+
+function makeAssistant(text: string): AgentMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "mock",
+		provider: "mock",
+		model: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 0,
+	};
+}
+
+function messageText(message: AgentMessage): string {
+	if (message.role !== "assistant") return "";
+	return message.content.map(block => (block.type === "text" ? block.text : "")).join("");
+}
+
+function sendUpdate(harness: Harness, message: AgentMessage): void {
+	if (message.role !== "assistant") return;
+	harness.hostSocket.send({
+		t: "event",
+		event: {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "", partial: message },
+		},
+	} as CollabFrame);
+}

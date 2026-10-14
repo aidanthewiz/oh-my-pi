@@ -9,6 +9,11 @@
 ### Fixed
 
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved catalog performance by speeding up model cache reads and repeated catalog-wide model builds, especially for large catalogs.
 
 ## [18.7.0] - 2026-10-06
 

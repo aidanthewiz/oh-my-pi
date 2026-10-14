@@ -189,10 +189,12 @@ export class ChildProcess<In extends InMask = InMask> {
 	#stderrDone: Promise<void>;
 	#exited: Promise<number>;
 	#openPipeReaders = 1;
-	// Pipe reads race this cutoff only when attachTimeout() configures a
-	// command deadline. Untimed commands preserve complete EOF-based capture.
-	#drainCutoff: Promise<void>;
-	#resolveDrainCutoff: () => void;
+	// Set by attachTimeout() at the command deadline; untimed commands keep
+	// complete EOF-based capture. Active pipe readers are cancelled at cutoff so
+	// their pending read() settles as done and partial output is kept.
+	#cutoff = false;
+	/** Readers of piped stdio; the timeout cancels them so pending reads settle. */
+	#pipeReaders = new Set<{ cancel(reason?: unknown): Promise<void> }>();
 	#timeoutTimer?: NodeJS.Timeout;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
@@ -230,31 +232,24 @@ export class ChildProcess<In extends InMask = InMask> {
 		// Normalize Bun's exited promise into our exitReason / exitedCleanly model.
 		const { promise, resolve, reject } = Promise.withResolvers<number>();
 		this.#exited = promise;
-		const drainCutoff = Promise.withResolvers<void>();
-		this.#drainCutoff = drainCutoff.promise;
-		this.#resolveDrainCutoff = drainCutoff.resolve;
-		// The cutoff remains pending for untimed commands, preserving complete
-		// EOF-based capture. attachTimeout() resolves it at the command deadline.
 
-		const pipeCutoff = this.#drainCutoff;
 		this.#stderrDone = (async () => {
 			const reader = stderrStream.getReader();
+			this.#pipeReaders.add(reader);
 			try {
 				for (;;) {
-					const chunk = await Promise.race([
-						reader.read().then(r => ({ cutoff: false as const, r })),
-						pipeCutoff.then(() => ({ cutoff: true as const })),
-					]);
-					if (chunk.cutoff) {
+					if (this.#cutoff) {
 						await reader.cancel().catch(() => {});
 						break;
 					}
-					if (chunk.r.done) break;
-					this.#stderrChunks?.push(chunk.r.value);
-					this.#stderrTail += dec.decode(chunk.r.value, { stream: true });
+					const r = await reader.read();
+					if (r.done) break;
+					this.#stderrChunks?.push(r.value);
+					this.#stderrTail += dec.decode(r.value, { stream: true });
 					trim();
 				}
 			} catch {}
+			this.#pipeReaders.delete(reader);
 			this.#openPipeReaders--;
 			this.#stderrTail += dec.decode();
 			trim();
@@ -450,26 +445,22 @@ export class ChildProcess<In extends InMask = InMask> {
 	): Promise<string> {
 		this.#openPipeReaders++;
 		const reader = stream.getReader();
+		this.#pipeReaders.add(reader);
 		const dec = new TextDecoder();
 		let out = "";
 		let bytes = 0;
 		try {
 			for (;;) {
-				const chunk = await Promise.race([
-					reader.read().then(r => ({ cutoff: false as const, r })),
-					this.#drainCutoff.then(() => ({ cutoff: true as const })),
-				]);
-				if (chunk.cutoff) {
+				if (this.#cutoff) {
 					await reader.cancel().catch(() => {});
 					break;
 				}
-				if (chunk.r.done) break;
-				const remaining =
-					maxOutputBytes === undefined ? chunk.r.value.byteLength : Math.max(0, maxOutputBytes - bytes);
-				if (remaining < chunk.r.value.byteLength) this.#stdoutTruncated = true;
+				const r = await reader.read();
+				if (r.done) break;
+				const remaining = maxOutputBytes === undefined ? r.value.byteLength : Math.max(0, maxOutputBytes - bytes);
+				if (remaining < r.value.byteLength) this.#stdoutTruncated = true;
 				if (remaining > 0) {
-					const retained =
-						remaining >= chunk.r.value.byteLength ? chunk.r.value : chunk.r.value.subarray(0, remaining);
+					const retained = remaining >= r.value.byteLength ? r.value : r.value.subarray(0, remaining);
 					const text = dec.decode(retained, { stream: true });
 					out += text;
 					onStdout?.(text);
@@ -479,6 +470,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		} catch {
 			// A cancelled or failed read keeps whatever was already collected.
 		}
+		this.#pipeReaders.delete(reader);
 		this.#openPipeReaders--;
 		const tail = dec.decode();
 		if (tail) onStdout?.(tail);
@@ -488,29 +480,27 @@ export class ChildProcess<In extends InMask = InMask> {
 	async #readBytes(): Promise<Uint8Array<ArrayBuffer>> {
 		const reader = this.proc.stdout.getReader();
 		this.#openPipeReaders++;
+		this.#pipeReaders.add(reader);
 		const chunks: Uint8Array[] = [];
 		let length = 0;
 		try {
 			for (;;) {
-				const chunk = await Promise.race([
-					reader.read().then(r => ({ cutoff: false as const, r })),
-					this.#drainCutoff.then(() => ({ cutoff: true as const })),
-				]);
-				if (chunk.cutoff) {
+				if (this.#cutoff) {
 					await reader.cancel().catch(() => {});
 					break;
 				}
-				if (chunk.r.done) break;
-				chunks.push(chunk.r.value);
-				length += chunk.r.value.byteLength;
+				const r = await reader.read();
+				if (r.done) break;
+				chunks.push(r.value);
+				length += r.value.byteLength;
 			}
 		} catch {
 			// A cancelled or failed read keeps whatever was already collected.
 		} finally {
+			this.#pipeReaders.delete(reader);
 			this.#openPipeReaders--;
 			reader.releaseLock();
 		}
-
 		const bytes = new Uint8Array(length);
 		let offset = 0;
 		for (const chunk of chunks) {
@@ -626,7 +616,8 @@ export class ChildProcess<In extends InMask = InMask> {
 			) {
 				this.kill(new TimeoutError(ms, this.#stderrTail), -1);
 			}
-			this.#resolveDrainCutoff();
+			this.#cutoff = true;
+			for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
 		}, ms);
 		timer.unref?.();
 		this.#timeoutTimer = timer;

@@ -875,46 +875,27 @@ mod chunks {
 			Self { bytes: 0, num_print, chunks: VecDeque::new() }
 		}
 
-		/// Fills this buffer with chunks and consumes the reader completely. This
-		/// method ensures that there are exactly as many chunks as needed to match
-		/// `self.num_print` bytes, so there are in sum exactly `self.num_print`
-		/// bytes stored in all chunks. The method returns an iterator over these
-		/// chunks. If there are no chunks, for example because the piped stdin
-		/// contained no bytes, or `num_print = 0` then `iterator.next` returns
-		/// None.
-		///
-		/// # Examples
-		///
-		/// ```rust,ignore
-		/// use crate::tail::chunks::BytesChunkBuffer;
-		/// use std::io::{BufReader, Cursor};
-		///
-		/// let mut reader = BufReader::new(Cursor::new(""));
-		/// let num_print = 0;
-		/// let mut chunks = BytesChunkBuffer::new(num_print);
-		/// chunks.fill(&mut reader).unwrap();
-		///
-		/// let mut reader = BufReader::new(Cursor::new("a"));
-		/// let num_print = 1;
-		/// let mut chunks = BytesChunkBuffer::new(num_print);
-		/// chunks.fill(&mut reader).unwrap();
-		/// ```
+		/// Consume the reader, retaining the requested suffix and at most one partial leading chunk.
 		pub fn fill(&mut self, reader: &mut impl BufRead) -> io::Result<()> {
 			let mut chunk = Box::new(BytesChunk::new());
 
-			// fill chunks with all bytes from reader and reuse already instantiated chunks
-			// if possible
 			while chunk.fill(reader)?.is_some() {
 				self.bytes += chunk.bytes as u64;
-				self.chunks.push_back(chunk.clone());
+				self.chunks.push_back(chunk);
 
-				let first = &self.chunks[0];
-				if self.bytes - first.bytes as u64 > self.num_print {
-					chunk = self.chunks.pop_front().unwrap();
-					self.bytes -= chunk.bytes as u64;
-				} else {
-					*chunk = BytesChunk::new();
+				let mut reusable = None;
+				while self
+					.chunks
+					.front()
+					.is_some_and(|first| self.bytes - first.bytes as u64 >= self.num_print)
+				{
+					let discarded = self.chunks.pop_front().unwrap();
+					self.bytes -= discarded.bytes as u64;
+					if reusable.is_none() {
+						reusable = Some(discarded);
+					}
 				}
+				chunk = reusable.unwrap_or_else(|| Box::new(BytesChunk::new()));
 			}
 
 			// quit early if there are no chunks for example in case the pipe was empty
@@ -3903,7 +3884,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::{ffi::OsString, fs, io::Cursor};
+	use std::{ffi::OsString, fs, io::{self, BufReader, Cursor, Read}};
 
 	use clap::Parser;
 
@@ -3916,6 +3897,32 @@ mod tests {
 			.into_iter()
 			.map(|arg| arg.to_str().unwrap().to_owned())
 			.collect()
+	}
+
+	#[test]
+	fn retains_exact_byte_suffix_across_uneven_pipe_reads() {
+		struct Fragmented<'a> {
+			remaining: &'a [u8],
+			reads: usize,
+		}
+
+		impl Read for Fragmented<'_> {
+			fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+				let limit = [1, 17, 8192, 3, 2048][self.reads % 5].min(buffer.len());
+				self.reads += 1;
+				self.remaining.read(&mut buffer[..limit])
+			}
+		}
+
+		let input: Vec<u8> = (0..24_629).map(|index| (index % 251) as u8).collect();
+		for count in [0, 1, 17, 8192, 9000, input.len() + 1] {
+			let mut reader = BufReader::new(Fragmented { remaining: &input, reads: 0 });
+			let mut chunks = super::chunks::BytesChunkBuffer::new(count as u64);
+			chunks.fill(&mut reader).unwrap();
+			let mut output = Vec::new();
+			chunks.print(&mut output).unwrap();
+			assert_eq!(output, input[input.len().saturating_sub(count)..], "count={count}");
+		}
 	}
 
 	#[test]

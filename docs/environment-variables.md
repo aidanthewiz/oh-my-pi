@@ -30,7 +30,7 @@ Variables declared on a setting definition (see [settings precedence](./settings
 
 ## 1) Model/provider authentication
 
-These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless noted otherwise.
+These are consumed via `getEnvApiKey()` (`packages/ai/src/env-api-key.ts`) unless noted otherwise.
 
 Plain provider credential names come from `env` entries in `packages/catalog/src/compat/rules/providers/*.kdl` and `auth/*.kdl`; `packages/ai/src/registry/hooks/env.ts` supplies computed Foundry, Bedrock, and Vertex resolvers.
 

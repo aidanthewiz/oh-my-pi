@@ -1,17 +1,12 @@
 import * as path from "node:path";
-import {
-	type ApiKeyResolver,
-	type FetchImpl,
-	getEnvApiKey,
-	type ResolvedApiKey,
-	type UsageProvider,
-} from "@oh-my-pi/pi-ai";
+import { type ApiKeyResolver, type FetchImpl, type ResolvedApiKey, type UsageProvider } from "@oh-my-pi/pi-ai";
 import type { AuthApiKeyOptions } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
 import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-ai/stream";
 import type {
 	Api,

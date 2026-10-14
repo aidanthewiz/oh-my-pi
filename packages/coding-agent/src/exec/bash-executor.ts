@@ -41,6 +41,12 @@ export interface BashExecutorOptions {
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
 	timeout?: number;
 	onChunk?: (chunk: string) => void;
+	/**
+	 * Receives the sink's current inline view ({@link OutputSink.preview}: the
+	 * body the final result will carry so far) at the `onChunk` cadence. Use it
+	 * for live previews instead of re-buffering `onChunk` chunks.
+	 */
+	onPreview?: (text: string) => void;
 	chunkThrottleMs?: number;
 	signal?: AbortSignal;
 	/** Session key suffix to isolate shell sessions per agent */
@@ -534,8 +540,6 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		supportsAutoUserShell(shell) &&
 		$env.PI_NO_PTY !== "1" &&
 		!isPersistentShellCdCommand(command);
-	const snapshotPath = bashShell ? await getOrCreateSnapshot(shell, shellEnv) : null;
-
 	const minimizer = buildMinimizerOptions(cfgShellMinimizer.get(settings));
 
 	const commandCwd = resolveShellCwd(options?.cwd);
@@ -543,18 +547,19 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	if (virtualCwd && (usePty || !options?.filesystem)) {
 		throw new Error(`Working directory ${commandCwd} needs the embedded shell with an injected filesystem`);
 	}
-	// The bash tool supplies an already reviewed command after direnv and prefix transformation.
-	// Other callers prepare those values here; do not transform an approved command twice.
-	const preflight =
+	// Reviewed commands must not repeat direnv or prefix transformation.
+	const [snapshotPath, preflight] = await Promise.all([
+		bashShell ? getOrCreateSnapshot(shell, shellEnv) : null,
 		options?.preflight ??
-		(await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
-			callerEnv: options?.env,
-			signal: options?.signal,
-			timeoutMs: cfgBashDirenvLoadTimeoutMs.get(settings),
-			callerTimeoutMs: options?.timeout,
-			direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
-			commandPrefix: prefix,
-		}));
+			applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
+				callerEnv: options?.env,
+				signal: options?.signal,
+				timeoutMs: cfgBashDirenvLoadTimeoutMs.get(settings),
+				callerTimeoutMs: options?.timeout,
+				direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
+				commandPrefix: prefix,
+			}),
+	]);
 	const commandEnv = buildNonInteractiveEnv(preflight.env);
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
@@ -566,14 +571,22 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	// Create output sink for truncation and artifact handling
 	const graphics = new TerminalGraphicsDecoder();
-	const sink = new OutputSink({
-		onChunk: usePty ? undefined : options?.onChunk,
+	const onChunk = usePty ? undefined : options?.onChunk;
+	const onPreview = usePty ? undefined : options?.onPreview;
+	const sink: OutputSink = new OutputSink({
+		onChunk:
+			onChunk || onPreview
+				? chunk => {
+						onChunk?.(chunk);
+						onPreview?.(sink.preview());
+					}
+				: undefined,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
 		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
-		chunkThrottleMs: !usePty && options?.onChunk ? (options.chunkThrottleMs ?? 50) : 0,
+		chunkThrottleMs: onChunk || onPreview ? (options?.chunkThrottleMs ?? 50) : 0,
 	});
 
 	// sink.push() is synchronous — buffer management, counters, and onChunk

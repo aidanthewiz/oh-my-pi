@@ -3,7 +3,6 @@
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
 
 export interface BinaryTarget {
 	id: string;
@@ -124,6 +123,8 @@ async function runCommand(command: string[], cwd: string): Promise<void> {
 
 async function buildBinary(target: BinaryTarget): Promise<void> {
 	console.log(`Building ${target.outfile}...`);
+	const { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } =
+		await import("../packages/coding-agent/scripts/compile-binary");
 	if (isDryRun) {
 		console.log(
 			`DRY RUN Bun.build target=${target.target} outfile=${target.outfile} external=${COMPILED_EXTERNAL_DEPENDENCIES.join(",")}`,

@@ -62,6 +62,9 @@ describe("CodingAgentSpeculativeExecutionHost", () => {
 		const host = new CodingAgentSpeculativeExecutionHost(session.settings, session, { hasHandlers: () => false });
 
 		expect(await host.authorize(context)).toMatchObject({ allowed: true });
+		expect(await host.captureEvidence(context)).toBe(true);
+		const physicalOutcome = await tool.speculation.finalized!.execute(context, new AbortController().signal);
+		expect(await host.validate({ ...context, physicalOutcome })).toBe(true);
 		await fs.writeFile(target, "update");
 		await fs.utimes(target, originalState.atime, originalState.mtime);
 		const rewrittenState = await fs.stat(target);
@@ -72,7 +75,7 @@ describe("CodingAgentSpeculativeExecutionHost", () => {
 		}).toEqual({ inode: originalState.ino, mtimeMs: originalState.mtimeMs, size: originalState.size });
 		const commit: SpeculativeCommitContext = {
 			...context,
-			physicalOutcome: { kind: "result", result: { content: [{ type: "text", text: "before" }] }, isError: false },
+			physicalOutcome,
 		};
 		expect(await host.validate(commit)).toBe(false);
 	});
@@ -104,6 +107,7 @@ describe("CodingAgentSpeculativeExecutionHost", () => {
 		const host = new CodingAgentSpeculativeExecutionHost(session.settings, session, { hasHandlers: () => false });
 
 		expect(await host.authorize(context)).toMatchObject({ allowed: true });
+		expect(await host.captureEvidence(context)).toBe(true);
 		await fs.writeFile(target, "during");
 		const physicalOutcome = await policy.execute(context, new AbortController().signal);
 		await fs.writeFile(target, "before");
@@ -154,6 +158,44 @@ describe("CodingAgentSpeculativeExecutionHost", () => {
 			kind: "committed",
 		});
 		expect(await host.validate(commitContext)).toBe(false);
+		await expect(
+			host.commit(commitContext, async () => {
+				throw new Error("consumed evidence must not execute another commit");
+			}),
+		).resolves.toMatchObject({ kind: "fallback" });
+	});
+
+	it("rejects a different lexical path even when it resolves to the captured file", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "speculative-host-"));
+		temporaryDirectories.push(directory);
+		await fs.writeFile(path.join(directory, "note.txt"), "same bytes");
+		await fs.symlink(path.join(directory, "note.txt"), path.join(directory, "alias.txt"));
+		const session = createSession(directory);
+		const tool = new ReadTool(session);
+		const policy = tool.speculation.finalized;
+		if (!policy) throw new Error("read tool has no finalized speculation policy");
+		const args = { path: "note.txt" };
+		const assessment = await policy.assess({ args });
+		if (!assessment.eligible) throw new Error("expected local read assessment");
+		const host = new CodingAgentSpeculativeExecutionHost(session.settings, session, { hasHandlers: () => false });
+		const context: SpeculativeOperationContext = {
+			candidateId: "lexical-read",
+			source: "direct",
+			dependencies: [],
+			tool,
+			toolCall: { type: "toolCall", id: "lexical-read", name: "read", arguments: args },
+			args,
+			effect: assessment.effect,
+		};
+		expect(await host.authorize(context)).toMatchObject({ allowed: true });
+		expect(await host.captureEvidence(context)).toBe(true);
+		const physicalOutcome = await policy.execute(context, new AbortController().signal);
+		expect(await host.validate({ ...context, physicalOutcome })).toBe(true);
+		const aliasArgs = { path: "alias.txt" };
+		const alias = await policy.assess({ args: aliasArgs });
+		if (!alias.eligible) throw new Error("expected alias read assessment");
+		expect(await host.validate({ ...context, args: aliasArgs, effect: alias.effect, physicalOutcome })).toBe(false);
+		await policy.discard?.({ ...context, reason: "test complete" });
 	});
 
 	it("remains usable after one coordinator closes", async () => {
@@ -245,6 +287,15 @@ describe("CodingAgentSpeculativeExecutionHost", () => {
 		await expect(
 			denyingPolicyHost.authorize(operationContext("denied-binary", "blob.dat", binary.effect)),
 		).resolves.toEqual({ allowed: false, reason: "tool approval is not auto-allow" });
+		const deniedContext = operationContext("denied-capture", "blob.dat", binary.effect);
+		const readFile = spyOn(fs, "readFile");
+		try {
+			expect(await denyingHost.captureEvidence(deniedContext)).toBe(false);
+			expect(await denyingPolicyHost.captureEvidence(deniedContext)).toBe(false);
+			expect(readFile).not.toHaveBeenCalled();
+		} finally {
+			readFile.mockRestore();
+		}
 
 		const host = new CodingAgentSpeculativeExecutionHost(session.settings, session, { hasHandlers: () => false });
 		// Content inspection runs at pre-execution capture (after the hook gate),

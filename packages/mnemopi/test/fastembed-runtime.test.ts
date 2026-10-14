@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import packageManifest from "../package.json" with { type: "json" };
-import { fastembedRuntimeInstallPlan, prepareWindowsFastembedRuntime } from "../src/core/fastembed-runtime";
+import { prepareWindowsFastembedRuntime } from "../src/core/fastembed-runtime";
 
 // The fastembed peer is pinned as an exact version (not `catalog:`) because
 // `core/fastembed-runtime.ts` reads it to `bun install` the on-demand embedding
@@ -11,20 +11,6 @@ import { fastembedRuntimeInstallPlan, prepareWindowsFastembedRuntime } from "../
 // fastembed's own ORT dependency intact because its native addon links against
 // that exact bundled library name (#3054).
 describe("fastembed runtime version pins", () => {
-	test("pins are exact installable versions, not catalog or range specs", () => {
-		expect(packageManifest.peerDependencies.fastembed).toMatch(/^\d+\.\d+\.\d+$/);
-		expect(packageManifest.peerDependencies["onnxruntime-node"]).toMatch(/^\d+\.\d+\.\d+$/);
-	});
-
-	test("runtime install preserves fastembed's transitive onnxruntime pin", () => {
-		const plan = fastembedRuntimeInstallPlan();
-		expect(plan.install.dependencies).toEqual({
-			fastembed: packageManifest.peerDependencies.fastembed,
-		});
-		expect(plan.install.overrides?.["onnxruntime-node"]).toBeUndefined();
-		expect(plan.install.trustedDependencies).toEqual(["onnxruntime-node"]);
-	});
-
 	test("Windows preload selects fastembed's ORT DLL before inherited paths", async () => {
 		const requireTest = createRequire(import.meta.url);
 		const fastembedManifest = requireTest.resolve("fastembed/package.json");

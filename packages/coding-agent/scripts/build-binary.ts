@@ -2,7 +2,6 @@
 
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { compileCodingAgent } from "./compile-binary";
 
 const packageDir = path.join(import.meta.dir, "..");
 const repoRoot = path.join(packageDir, "..", "..");
@@ -85,6 +84,7 @@ async function main(): Promise<void> {
 		// Rebuild it before compilation so clean checkouts that skipped install
 		// hooks still contain that generated bundle.
 		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:tool-views"]);
+		const { compileCodingAgent } = await import("./compile-binary");
 		await compileCodingAgent({
 			repoRoot,
 			entrypoint: path.join(packageDir, "src", "cli.ts"),

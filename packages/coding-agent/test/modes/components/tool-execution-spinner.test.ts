@@ -405,7 +405,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				ui: { requestRender: () => {} },
 				chatContainer,
 				resetObserverRegistry: () => {},
-				eventController: { takeDisplaceableComponents: () => [] },
+				eventController: { takeDisplaceableComponents: () => [], resetTranscriptAnchors: () => {} },
 				// The real transcript-commit path is the contract under test: the
 				// guest resync performs no eager teardown, so the orphaned live
 				// block's ticker registration must drop exactly when
@@ -796,7 +796,10 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				ui: { requestRender: () => {} },
 				chatContainer,
 				resetObserverRegistry: () => {},
-				eventController: { takeDisplaceableComponents: () => [displaceableBlock] },
+				eventController: {
+					takeDisplaceableComponents: () => [displaceableBlock],
+					resetTranscriptAnchors: () => {},
+				},
 				renderInitialMessages: (options?: { clearTerminalHistory?: boolean }) =>
 					uiHelpers.renderInitialMessages(options),
 				renderSessionContext: (context: unknown, options: unknown) =>

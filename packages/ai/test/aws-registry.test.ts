@@ -8,7 +8,7 @@ import {
 	AWS_MODEL_REGION_ENV,
 	MANAGED_AWS_MODEL_AUTH_MODE,
 } from "@oh-my-pi/pi-ai";
-import { getEnvApiKey } from "@oh-my-pi/pi-ai/stream";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
 import { removeWithRetries } from "../../utils/src/temp";
 import { withEnv } from "./helpers";
 
@@ -212,6 +212,31 @@ describe("AWS provider availability", () => {
 			await withEnv({ ...baseEnv, AWS_EC2_METADATA_DISABLED: "false" }, async () =>
 				expect(getEnvApiKey("bedrock-mantle")).toBeDefined(),
 			);
+		} finally {
+			await removeWithRetries(tmp);
+		}
+	});
+
+	test("sees shared config edits on the next availability check", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aws-registry-edit-"));
+		try {
+			const configPath = path.join(tmp, "config");
+			await Bun.write(configPath, "[default]\nregion = us-east-1\n");
+			const env = {
+				...EMPTY_AWS_ENV,
+				AWS_PROFILE: "default",
+				AWS_SHARED_CREDENTIALS_FILE: path.join(tmp, "missing-credentials"),
+				AWS_CONFIG_FILE: configPath,
+				AWS_EC2_METADATA_DISABLED: "true",
+			};
+			await withEnv(env, async () => {
+				expect(getEnvApiKey("bedrock-mantle")).toBeUndefined();
+				// What `aws configure` / `aws sso login` in another terminal does.
+				await Bun.write(configPath, "[default]\nregion = us-east-1\ncredential_process = /bin/true\n");
+				expect(getEnvApiKey("bedrock-mantle")).toBeDefined();
+				await Bun.write(configPath, "[default]\nregion = us-east-1\n");
+				expect(getEnvApiKey("bedrock-mantle")).toBeUndefined();
+			});
 		} finally {
 			await removeWithRetries(tmp);
 		}

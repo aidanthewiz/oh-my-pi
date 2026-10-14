@@ -242,6 +242,61 @@ describe("BlobRegistry persistence", () => {
 		// Same content address: registration reused the existing blob file.
 		expect(await sessionStore.has(hash)).toBe(true);
 	});
+
+	it("keeps the flushed index when a background save that started earlier finishes later", async () => {
+		const persist = makePersist(60_000);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const finished = Promise.withResolvers<void>();
+		const realWrite = fs.promises.writeFile;
+		const realRemove = fs.promises.rm;
+		const realRename = fs.renameSync;
+		let stagingPath = "";
+		const write = vi.spyOn(fs.promises, "writeFile").mockImplementation(async (...args) => {
+			await realWrite(...args);
+			if (typeof args[0] === "string" && args[0].startsWith(`${persist.indexPath}.`) && args[0].endsWith(".tmp")) {
+				stagingPath = args[0];
+				started.resolve();
+				await release.promise;
+			}
+		});
+		const remove = vi.spyOn(fs.promises, "rm").mockImplementation(async (...args) => {
+			await realRemove(...args);
+			if (typeof args[0] === "string" && args[0].startsWith(`${persist.indexPath}.`) && args[0].endsWith(".tmp"))
+				finished.resolve();
+		});
+		const rename = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+			realRename(source, destination);
+			if (source === stagingPath) finished.resolve();
+		});
+		vi.useFakeTimers();
+		try {
+			const registry = new BlobRegistry({ persist });
+			const bytes = new Uint8Array(Buffer.from("shared-index"));
+			await registry.registerBytes("first-image", "image/png", bytes);
+			// Start the debounced background save, then register again and flush before it lands.
+			vi.advanceTimersByTime(1_000);
+			await started.promise;
+			if (process.platform !== "win32") {
+				expect(fs.statSync(stagingPath).mode & 0o777).toBe(0o600);
+				expect(fs.statSync(path.dirname(stagingPath)).mode & 0o777).toBe(0o700);
+			}
+			await registry.registerBytes("second-image", "image/png", bytes);
+			registry.flush();
+			release.resolve();
+			await finished.promise;
+		} finally {
+			release.resolve();
+			vi.useRealTimers();
+			write.mockRestore();
+			remove.mockRestore();
+			rename.mockRestore();
+		}
+
+		const reloaded = new BlobRegistry({ persist });
+		expect(reloaded.lookup("first-image")).not.toBeNull();
+		expect(reloaded.lookup("second-image")).not.toBeNull();
+	});
 });
 
 describe("ImageUrlService", () => {

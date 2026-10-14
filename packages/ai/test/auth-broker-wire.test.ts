@@ -903,6 +903,79 @@ describe("auth-broker wire surface", () => {
 		}
 	});
 
+	test("SSE fan-out isolates block revision and mutation-token capabilities between clients", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+		const id = initial.snapshot.credentials[0]!.id;
+		const modes = [
+			{ revisions: true, tokens: true },
+			{ revisions: true, tokens: false },
+			{ revisions: false, tokens: true },
+			{ revisions: false, tokens: false },
+		];
+		const streams = modes.map(mode => {
+			const capabilities = [
+				AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+				...(mode.revisions ? [AUTH_BROKER_CAPABILITY_BLOCK_REVISIONS] : []),
+				...(mode.tokens ? [AUTH_BROKER_CAPABILITY_BLOCK_MUTATION_TOKENS] : []),
+			];
+			const fetchImpl = Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					const headers = new Headers(init?.headers);
+					headers.set(AUTH_BROKER_CAPABILITIES_HEADER, capabilities.join(","));
+					return fetch(input, { ...init, headers });
+				},
+				{ preconnect: fetch.preconnect },
+			);
+			const controller = new AbortController();
+			const iter = new AuthBrokerClient({ url: handle!.url, token, fetchImpl }).openSnapshotStream({
+				signal: controller.signal,
+			});
+			return { ...mode, controller, iter };
+		});
+		try {
+			await Promise.all(
+				streams.map(async ({ iter }) => {
+					const first = await iter.next();
+					if (first.done || first.value.kind !== "snapshot") throw new Error("expected initial snapshot frame");
+				}),
+			);
+			const blockedUntilMs = Date.now() + 60_000;
+			const acknowledged = await client.upsertCredentialBlock(id, {
+				providerKey: "anthropic:oauth",
+				blockScope: "tier:fable",
+				blockedUntilMs,
+			});
+			await Promise.all(
+				streams.map(async ({ revisions, tokens, iter }) => {
+					const delta = await nextMatching(iter, event => event.kind === "entry" && event.entry.id === id);
+					if (delta.kind !== "entry") throw new Error("expected entry frame");
+					expect(delta.entry.blocks).toEqual([
+						{
+							providerKey: "anthropic:oauth",
+							blockScope: "tier:fable",
+							blockedUntilMs,
+							updatedAtMs: expect.any(Number),
+							...(tokens ? { mutationToken: expect.stringMatching(/^[0-9a-f]{32}$/) } : {}),
+						},
+					]);
+					expect(delta.blockRevision).toEqual(revisions ? acknowledged.blockRevision : undefined);
+				}),
+			);
+			await client.disableCredential(id, "capability test removal");
+			await Promise.all(
+				streams.map(async ({ revisions, iter }) => {
+					const removed = await nextMatching(iter, event => event.kind === "removed" && event.id === id);
+					expect(removed.blockRevision).toEqual(revisions ? storage!.blocks.revision() : undefined);
+				}),
+			);
+		} finally {
+			for (const { controller } of streams) controller.abort();
+			await Promise.all(streams.map(({ iter }) => iter.return(undefined).catch(() => {})));
+		}
+	});
+
 	test("SSE stream projects Codex meter blocks only for clients without the capability", async () => {
 		const credential = (
 			await storage!.credentials.upsert("openai-codex", {

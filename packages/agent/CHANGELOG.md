@@ -5,6 +5,12 @@
 ### Fixed
 
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved performance when pruning tool output and capturing telemetry messages during long-running sessions.
+
 ## [18.7.0] - 2026-10-06
 
 ### Fixed

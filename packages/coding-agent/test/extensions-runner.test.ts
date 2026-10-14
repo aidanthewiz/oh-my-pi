@@ -460,6 +460,49 @@ describe("ExtensionRunner", () => {
 			await expect(pending).rejects.toThrow("caller aborted");
 		});
 
+		it("rejects an already aborted context request even when no extension handles context", async () => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const controller = new AbortController();
+			controller.abort(new Error("caller aborted"));
+			await expect(
+				runner.emitContext([{ role: "user", content: "private context", timestamp: 1 }], controller.signal),
+			).rejects.toThrow("caller aborted");
+		});
+
+		it("isolates in-place context edits from the persisted messages", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "context-edit.ts"),
+				`
+				export default function(pi) {
+					pi.on("context", event => {
+						event.messages[0].content[0].text = "redacted request";
+					});
+				}
+			`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: [{ type: "text", text: "persisted context" }], timestamp: 1 },
+			];
+			const transformed = await runner.emitContext(messages);
+			expect(transformed[0]).toMatchObject({ content: [{ type: "text", text: "redacted request" }] });
+			expect(messages[0]).toMatchObject({ content: [{ type: "text", text: "persisted context" }] });
+		});
+
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
 				export default function(pi) {

@@ -621,6 +621,7 @@ export class UiHelpers {
 						{
 							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
 							showImages: cfgTerminalShowImages.get(settings),
+							showFigures: this.ctx.tableChartsVisible,
 						},
 						tool,
 						this.ctx.ui,

@@ -5,6 +5,11 @@
 ### Breaking Changes
 
 - Collaboration protocol version 4 requires loop ownership on lifecycle events and activity snapshots. Version 3 peers are rejected during the handshake.
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Updated `TspEditorProps.placeholder` and `TspInputProps.placeholder` to accept `TspText`, enabling styled placeholder text.
 
 ## [18.5.1] - 2026-10-03
 
