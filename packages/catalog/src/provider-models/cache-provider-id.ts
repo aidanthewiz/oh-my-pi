@@ -12,6 +12,7 @@ import {
 export interface ModelCacheProviderIdOptions extends AccountScope {
 	apiKey?: string;
 	baseUrl?: string;
+	projectId?: string;
 }
 
 const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = {
@@ -21,6 +22,8 @@ const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = 
 	"muse-code": true,
 	cursor: true,
 	"factory-droid": true,
+	"google-antigravity": true,
+	"google-gemini-cli": true,
 	// Both SingularityAPI rosters are issued per key, so the namespace must be
 	// resolved with the credential (`hydrateCredentialScopedModelCaches`) rather
 	// than from the synchronous, credential-less startup read.
@@ -37,6 +40,10 @@ export function getDefaultModelDiscoveryBaseUrl(providerId: string): string | un
 	switch (providerId) {
 		case "charm-hyper":
 			return CHARM_HYPER_API_BASE_URL;
+		case "google-antigravity":
+			return "https://daily-cloudcode-pa.googleapis.com";
+		case "google-gemini-cli":
+			return "https://cloudcode-pa.googleapis.com";
 		case "meta":
 		case "muse-code":
 			return "https://api.meta.ai/v1";
@@ -102,6 +109,13 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 		}
 		case "ollama":
 			return resolveOllamaModelCacheProviderId(providerId, options.baseUrl);
+		case "google-antigravity":
+		case "google-gemini-cli": {
+			const baseUrl = (options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!).replace(/\/+$/, "");
+			const projectId = providerId === "google-gemini-cli" ? (options.projectId ?? "") : "";
+			const scope = `${options.apiKey ?? ""}\u0000${baseUrl}\u0000${projectId}`;
+			return `${providerId}:oauth-models-v1:${Bun.hash(scope).toString(36)}`;
+		}
 		case "cursor": {
 			// Cursor catalogs are entitlement-, admin-policy-, and privacy-mode
 			// scoped. A credential switch must never reuse another account's

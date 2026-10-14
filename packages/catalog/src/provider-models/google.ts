@@ -6,6 +6,7 @@ import { fetchGeminiModels } from "../discovery/gemini";
 import { fetchGeminiCliQuotaModels } from "../discovery/gemini-cli";
 import type { ModelManagerOptions } from "../model-manager";
 import type { FetchImpl } from "../types";
+import { resolveModelCacheProviderId, getDefaultModelDiscoveryBaseUrl } from "./cache-provider-id";
 
 export interface GoogleModelManagerConfig {
 	apiKey?: string;
@@ -34,7 +35,6 @@ export interface GoogleGeminiCliModelManagerConfig {
 	fetch?: FetchImpl;
 }
 
-const CLOUD_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 /** Rows whose cached effort ladder predates the native `minimal` drop (#10543). */
 const GEMINI_FLASH_CACHE_MIGRATION_MODEL_IDS = ["gemini-3.7-flash", "gemini-3.8-flash"] as const;
 
@@ -74,6 +74,10 @@ export function googleAntigravityModelManagerOptions(
 	const token = config?.oauthToken;
 	return {
 		providerId: "google-antigravity",
+		cacheProviderId: resolveModelCacheProviderId("google-antigravity", {
+			apiKey: token,
+			baseUrl: config?.endpoint,
+		}),
 		dynamicModelsAuthoritative: providerEntry("google-antigravity")?.dynamicModelsAuthoritative === true,
 		...(token
 			? {
@@ -92,9 +96,14 @@ export function googleGeminiCliModelManagerOptions(
 	config?: GoogleGeminiCliModelManagerConfig,
 ): ModelManagerOptions<"google-gemini-cli"> {
 	const token = config?.oauthToken;
-	const endpoint = config?.endpoint ?? CLOUD_CODE_ASSIST_ENDPOINT;
+	const endpoint = config?.endpoint ?? getDefaultModelDiscoveryBaseUrl("google-gemini-cli")!;
 	return {
 		providerId: "google-gemini-cli",
+		cacheProviderId: resolveModelCacheProviderId("google-gemini-cli", {
+			apiKey: token,
+			baseUrl: endpoint,
+			projectId: config?.projectId,
+		}),
 		...(token
 			? {
 					fetchDynamicModels: async () => {

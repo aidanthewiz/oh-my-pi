@@ -303,6 +303,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/goog
 - **Provider entry (`google-antigravity`)**: `packages/catalog/src/compat/rules/providers/google-antigravity.kdl` declares default model `gemini-3.1-pro`.
 - **Authored seeds**: `gemini-3-pro-image`; bundle policy `always`. Limits, capabilities, and prices are authored alongside these rows.
 - **Model Resolution & Discovery**: `googleAntigravityModelManagerOptions` & `googleGeminiCliModelManagerOptions` (`packages/catalog/src/provider-models/google.ts`) invoke `fetchAntigravityDiscoveryModels` (`packages/catalog/src/discovery/antigravity.ts`).
+- **Model cache scope**: Google OAuth discovery hashes the resolved token and endpoint into its cache namespace. Gemini CLI also includes the project id. Startup hydrates these caches after resolving credentials and never reads the old unscoped rows. Token rotation starts a new cache scope.
 - **Variant Collapsing**: Effort-tier variants are collapsed into logical specs at discovery (`packages/catalog/src/compat/collapse.ts`):
   - `gemini-3.5-flash`: collapses `gemini-3.5-flash-extra-low`, `gemini-3.5-flash-low`, `gemini-3-flash-agent`. Antigravity budget mode maps Minimal/Low → `extra-low` (1000 tokens), Medium → `low` (4000 tokens), High → `agent` (10000 tokens). Gemini CLI maps to level transport. Alias: `gemini-3-flash`.
   - `gemini-3.6-flash`: collapses `gemini-3.6-flash-low`, `-medium`, `-high`, `-tiered` into `gemini-3.6-flash` with `google-level` mode.

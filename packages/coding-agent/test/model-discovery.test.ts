@@ -445,6 +445,41 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(refreshCalls).toEqual([]);
 		expect(authStorage.credentials.getOAuth("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
 	});
+	test("Antigravity startup hydrates only the current credential's model cache", async () => {
+		const modelA = "gemini-2.5-account-a";
+		const modelB = "gemini-2.5-account-b";
+		const useAccount = (access: string) =>
+			authStorage.credentials.set("google-antigravity", {
+				type: "oauth",
+				access,
+				refresh: `refresh-${access}`,
+				expires: Date.now() + 3_600_000,
+			});
+		const fetcher: FetchImpl = async (input, init) => {
+			if (!String(input).includes(":fetchAvailableModels")) return new Response("version: 2.19.1\n");
+			const modelId = new Headers(init?.headers).get("Authorization") === "Bearer account-a" ? modelA : modelB;
+			return Response.json({
+				models: { [modelId]: { displayName: modelId, supportsThinking: true } },
+			});
+		};
+		const registry = () => new ModelRegistry(authStorage, modelsJsonPath, { cacheDbPath, fetch: fetcher });
+
+		await useAccount("account-a");
+		await registry().refreshProvider("google-antigravity", "online");
+		const restartedA = registry();
+		await restartedA.hydrateCredentialScopedModelCaches();
+		expect(restartedA.find("google-antigravity", modelA)?.id).toBe(modelA);
+
+		await useAccount("account-b");
+		const restartedB = registry();
+		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
+		await restartedB.hydrateCredentialScopedModelCaches();
+		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
+		await restartedB.refreshProvider("google-antigravity", "online-if-uncached");
+		expect(restartedB.find("google-antigravity", modelB)?.id).toBe(modelB);
+		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
+	});
+
 	test("online-if-uncached refreshes expired OAuth when the discovery cache is stale for the model manager", async () => {
 		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
 		await authStorage.credentials.set("anthropic", {

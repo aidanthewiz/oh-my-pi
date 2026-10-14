@@ -13,6 +13,7 @@ import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import { calculateUsageCost, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { finalizeCustomModel } from "@oh-my-pi/pi-coding-agent/config/custom-models";
 import { applyModelPatch, mergeDiscoveredModel } from "@oh-my-pi/pi-coding-agent/config/model-patch";
@@ -3672,22 +3673,37 @@ describe("ModelRegistry", () => {
 			expect(vertexAuthoritative.find("google-vertex", "gemini-1.5-pro")).toBeUndefined();
 		});
 
-		test("does not offer bundled Antigravity chat ids absent from a fresh account roster after restart", () => {
+		test("does not offer bundled Antigravity chat ids absent from a fresh account roster after restart", async () => {
+			const oauthToken = "antigravity-roster-token";
+			await authStorage.credentials.set("google-antigravity", {
+				type: "oauth",
+				access: oauthToken,
+				refresh: "antigravity-roster-refresh",
+				expires: Date.now() + 3_600_000,
+			});
 			const served = getBundledModels("google-antigravity").find(model => model.id === "claude-sonnet-4-6");
 			if (!served) throw new Error("Missing bundled Antigravity control model");
 			writeModelCache(
-				"google-antigravity",
+				resolveModelCacheProviderId("google-antigravity", { apiKey: oauthToken }),
 				Date.now(),
 				[served],
 				true,
 				fingerprintStaticModels(getBundledModels("google-antigravity"), true),
 				path.join(tempDir, "models.db"),
 			);
-			const restarted = new ModelRegistry(authStorage, modelsJsonPath);
+			let fetchCalls = 0;
+			const restarted = new ModelRegistry(authStorage, modelsJsonPath, {
+				fetch: async () => {
+					fetchCalls++;
+					throw new Error("Offline cache hydration must not fetch");
+				},
+			});
+			await restarted.hydrateCredentialScopedModelCaches();
 
 			expect(restarted.find("google-antigravity", "claude-sonnet-4-6")).toBeDefined();
 			expect(restarted.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
 			expect(restarted.find("google-antigravity", "gemini-3-pro-image")).toBeDefined();
+			expect(fetchCalls).toBe(0);
 		});
 
 		test("does not re-add bundled synthetic models after authoritative cache load", () => {
