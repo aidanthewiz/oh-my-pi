@@ -474,6 +474,9 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
+		this.#clearUiRequests();
+		await this.#ctx.eventController.drainSessionEvents();
+		if (this.#left) return;
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}-${this.#replicaId}.jsonl`);
 		// A child of the host's session, as a sibling move is.
 		const header = {
@@ -524,6 +527,8 @@ export class CollabGuestLink {
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
 		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
+		await this.#ctx.eventController.drainSessionEvents();
+		if (this.#left) return;
 		// No eager teardown here: renderInitialMessages() stages the replacement
 		// transcript and disposes the visible children only when the staged tree
 		// commits (ui-helpers), which both preserves its atomicity/rollback
@@ -886,6 +891,7 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#socket?.close();
 		this.#socket = null;
+		this.#clearUiRequests();
 		this.#restoration = this.#runRestoreLocalSession();
 		this.#ctx.collabController?.resumeAfterGuest(this.#restoration);
 		return this.#restoration;
@@ -898,6 +904,7 @@ export class CollabGuestLink {
 		this.#reconcileLifecycle(null);
 		// Keep the guest turn guard and replica lease active until host handlers finish.
 		await this.#lifecycleEmitter.drain();
+		await this.#ctx.eventController.drainSessionEvents();
 		try {
 			if (this.#replicaActivated) await this.#resumeLocalSession();
 		} finally {

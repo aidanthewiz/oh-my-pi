@@ -31,6 +31,8 @@
 - Generate embedded stats assets before loading the standalone compiler, so clean builds include the stats client archive.
 - Avoid an account-pool import cycle during settings and MCP startup.
 - Cancel JSON queries if their signal aborts during scratch-directory creation, without starting a shell.
+- Drain queued collaboration frames before replacing guest replicas or restoring local session ownership.
+- Prevent remote plan-proposal results from starting local approval or model execution.
 - Preserve current inherited account pools when cold-reviving nested agents, and reject unrecoverable required ancestry.
 - Reject superseded or released account-pool scopes before returning credentials, including delayed acquisitions.
 

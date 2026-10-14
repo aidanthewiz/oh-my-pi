@@ -770,6 +770,11 @@ export class EventController {
 		});
 	}
 
+	/** Settle queued handlers and the final coalesced update before replacing their transcript. */
+	async drainSessionEvents(): Promise<void> {
+		await this.#runSerialized(() => this.#flushPendingMessageUpdate());
+	}
+
 	/**
 	 * Run `run` in the serialized dispatch chain: every run is its own link on
 	 * the tail, so a burst of events queued behind an in-flight run start one
@@ -2150,7 +2155,7 @@ export class EventController {
 		}
 		// Plan approval rides a `write` to xd://propose: the dispatch metadata on
 		// the write details carries the approval payload as `inner`.
-		if (!event.isError) {
+		if (!event.isError && !this.ctx.collabGuest) {
 			const dispatch = writeDeviceDispatch(event.toolName, event.result);
 			const details =
 				dispatch?.tool === PROPOSE_DEVICE_NAME && dispatch.mode === "execute" ? dispatch.inner : undefined;
