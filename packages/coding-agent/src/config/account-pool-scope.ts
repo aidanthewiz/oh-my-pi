@@ -6,8 +6,8 @@ import type { OAuthAccountPools } from "./account-pools";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
 import { kNoAuth, type ModelRegistry } from "./model-registry";
 
-/** Unscoped registry behind each registry {@link SessionAccountPoolScope.registry} returned. */
-const scopedRegistryTargets = new WeakMap<ModelRegistry, ModelRegistry>();
+/** Rebuildable authorization behind each session-scoped registry. */
+const scopedRegistries = new WeakMap<ModelRegistry, { target: ModelRegistry; pools: OAuthAccountPools }>();
 
 /**
  * One agent session's OAuth account pools, enforced at its key lookups.
@@ -25,6 +25,18 @@ const scopedRegistryTargets = new WeakMap<ModelRegistry, ModelRegistry>();
  * the same id since, such as a revived session's, stays.
  */
 export class SessionAccountPoolScope {
+	/** Explicit pools replace inherited policy; inherited policy gets a new session-owned lease. */
+	static create(
+		registry: ModelRegistry,
+		pools: OAuthAccountPools | undefined,
+		primarySessionId: string,
+	): SessionAccountPoolScope | undefined {
+		const inherited = scopedRegistries.get(registry);
+		const effectivePools = pools ?? inherited?.pools;
+		if (effectivePools === undefined) return undefined;
+		return new SessionAccountPoolScope((inherited?.target ?? registry).authStorage, effectivePools, primarySessionId);
+	}
+
 	readonly #authStorage: Pick<AuthStorage, "sessions">;
 	readonly #pools: OAuthAccountPools;
 	/** Provider id → restriction lease, by restricted provider session id. */
@@ -34,7 +46,9 @@ export class SessionAccountPoolScope {
 
 	constructor(authStorage: Pick<AuthStorage, "sessions">, pools: OAuthAccountPools, primarySessionId: string) {
 		this.#authStorage = authStorage;
-		this.#pools = pools;
+		this.#pools = Object.fromEntries(
+			Object.entries(pools).map(([provider, identities]) => [provider, [...identities]]),
+		);
 		this.#primarySessionId = primarySessionId;
 		this.restrict(primarySessionId);
 	}
@@ -104,7 +118,7 @@ export class SessionAccountPoolScope {
 	 * them, not its parent's.
 	 */
 	registry(registry: ModelRegistry): ModelRegistry {
-		const target = scopedRegistryTargets.get(registry) ?? registry;
+		const target = scopedRegistries.get(registry)?.target ?? registry;
 		const getApiKey = async (model: Model<Api>, sessionId?: string, options?: { signal?: AbortSignal }) => {
 			const scopedSessionId = this.#sessionIdFor(model.provider, sessionId);
 			const apiKey = await target.getApiKey(model, scopedSessionId, options);
@@ -194,7 +208,7 @@ export class SessionAccountPoolScope {
 				return method;
 			},
 		});
-		scopedRegistryTargets.set(proxy, target);
+		scopedRegistries.set(proxy, { target, pools: this.#pools });
 		return proxy;
 	}
 }

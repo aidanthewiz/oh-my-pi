@@ -578,8 +578,9 @@ export interface CreateAgentSessionOptions {
 	 * when none of them can serve. Applied after {@link credentialSourceSessionId}
 	 * affinity is copied, and enforced on every key lookup through the session's
 	 * model registry, whatever provider session id it carries (title generation,
-	 * advisors, subagents this session spawns). A custom {@link getApiKey}
-	 * bypasses it.
+	 * advisors, subagents this session spawns). Without an explicit pool, a scoped
+	 * model registry supplies its inherited pool with an independent session lifetime.
+	 * A custom {@link getApiKey} bypasses it.
 	 */
 	oauthAccountPools?: OAuthAccountPools;
 
@@ -1900,9 +1901,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	}
 	// From here on the session resolves every key through its pools; see
 	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
-	const accountPoolScope = options.oauthAccountPools
-		? new SessionAccountPoolScope(modelRegistry.authStorage, options.oauthAccountPools, providerSessionId)
-		: undefined;
+	const accountPoolScope = SessionAccountPoolScope.create(modelRegistry, options.oauthAccountPools, providerSessionId);
 	let accountPoolOwnedBySession = false;
 	if (accountPoolScope) {
 		modelRegistry = accountPoolScope.registry(modelRegistry);

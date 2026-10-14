@@ -1,14 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { getOAuthProvider, registerOAuthProvider, unregisterOAuthProvider } from "@oh-my-pi/pi-ai/registry/oauth";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { SessionAccountPoolScope } from "@oh-my-pi/pi-coding-agent/config/account-pool-scope";
+import type { OAuthAccountPools } from "@oh-my-pi/pi-coding-agent/config/account-pools";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { type AgentRef, AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -18,7 +23,7 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const PROVIDER_SESSION_ID = "pooled-provider-session";
 
@@ -312,5 +317,231 @@ describe("AgentSession account pools after a dispose deadline", () => {
 			await released.promise;
 		}
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
+	});
+});
+
+describe("SDK inherited account-pool lifetime", () => {
+	const provider = "unit-inherited-pool-lifetime";
+	const api = "unit-inherited-pool-stream";
+	const sourceId = "test/inherited-pool-lifetime";
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let shared: ModelRegistry;
+	let model: Model<Api>;
+	let outsideCredentialId: number;
+	let sessions: AgentSession[];
+	let requests: Array<{ sessionId: string | undefined; key: string | undefined }>;
+
+	function registerModel(registry: ModelRegistry): void {
+		registry.registerProvider(provider, {
+			api,
+			baseUrl: "https://example.test/v1",
+			oauth: getOAuthProvider(provider),
+			models: [
+				{
+					id: "inherited-model",
+					name: "Inherited pool fixture",
+					api,
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 8192,
+					maxTokens: 1024,
+				},
+			],
+		});
+	}
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@omp-inherited-pool-");
+		authStorage = createInMemoryAuthStorage();
+		sessions = [];
+		requests = [];
+		registerOAuthProvider({
+			id: provider,
+			name: "Inherited pool fixture",
+			sourceId,
+			login: async () => {
+				throw new Error("Login is not used");
+			},
+			refreshToken: async credentials => ({ ...credentials, expires: Date.now() + 3_600_000 }),
+			getApiKey: credentials => credentials.access,
+		});
+		registerCustomApi(
+			api,
+			(requestModel, _context, options) => {
+				requests.push({
+					sessionId: options?.sessionId,
+					key: typeof options?.apiKey === "string" ? options.apiKey : undefined,
+				});
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = {
+						...createAssistantMessage("accepted"),
+						api: requestModel.api,
+						provider,
+						model: requestModel.id,
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+			sourceId,
+		);
+		await authStorage.credentials.set(
+			provider,
+			["a", "b", "c"].map(accountId => ({
+				type: "oauth" as const,
+				accountId,
+				access: `synthetic-${accountId}`,
+				refresh: "synthetic-refresh",
+				expires: Date.now() + 3_600_000,
+			})),
+		);
+		const outside = authStorage.oauth.accounts(provider).find(row => row.accountId === "b");
+		if (!outside) throw new Error("Expected outside account");
+		outsideCredentialId = outside.credentialId;
+		authStorage.keys.setRuntime(provider, "synthetic-runtime");
+		const modelsPath = tempDir.join("models.yml");
+		await Bun.write(
+			modelsPath,
+			`providers:\n  ${provider}:\n    baseUrl: https://example.test/v1\n    api: openai-completions\n    auth: oauth\n    models:\n      - id: inherited-model\n`,
+		);
+		shared = new ModelRegistry(authStorage, modelsPath);
+		registerModel(shared);
+		const configured = shared.find(provider, "inherited-model");
+		if (!configured) throw shared.getError() ?? new Error("Expected inherited pool model");
+		model = configured;
+	});
+
+	afterEach(async () => {
+		for (const session of sessions.reverse()) await session.dispose();
+		unregisterCustomApis(sourceId);
+		unregisterOAuthProvider(provider);
+		authStorage.close();
+		AsyncJobManager.resetForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+		tempDir.removeSync();
+	});
+
+	async function createSession(
+		id: string,
+		modelRegistry: ModelRegistry,
+		oauthAccountPools?: OAuthAccountPools,
+		sessionManager = SessionManager.inMemory(tempDir.path()),
+		expectedAgentRef?: AgentRef,
+	): Promise<AgentSession> {
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			authStorage,
+			modelRegistry,
+			oauthAccountPools,
+			sessionManager,
+			expectedAgentRef,
+			agentId: id,
+			taskDepth: 1,
+			providerSessionId: `pool-${id}`,
+			model,
+			settings: Settings.isolated({
+				"async.enabled": false,
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"advisor.enabled": false,
+				"todo.enabled": false,
+			}),
+			cacheWarming: false,
+			toolNames: ["read"],
+			disableExtensionDiscovery: true,
+			enableLsp: false,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			rules: [],
+		});
+		sessions.push(session);
+		return session;
+	}
+
+	async function request(session: AgentSession, account: string): Promise<void> {
+		const before = requests.length;
+		await session.prompt("Authorize this request.");
+		expect(requests.slice(before)).toEqual([{ sessionId: session.agent.sessionId, key: `synthetic-${account}` }]);
+	}
+
+	it("keeps child requests and warm revival authorized after the parent parks, without affecting siblings", async () => {
+		const identities = ["account:a"];
+		const parent = await createSession("PoolParent", shared, { [provider]: identities });
+		const inherited = parent.modelRegistry;
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		const child = await createSession("PoolChild", inherited, undefined, manager);
+		const sibling = await createSession("PoolSibling", inherited);
+		const childFile = manager.getSessionFile();
+		if (!childFile) throw new Error("Expected child transcript");
+		const lifecycle = AgentLifecycleManager.global();
+		AgentRegistry.global().setStatus("PoolParent", "idle");
+		lifecycle.adopt("PoolParent", { idleTtlMs: 0 });
+		await lifecycle.park("PoolParent");
+		expect(AgentRegistry.global().get("PoolParent")).toMatchObject({ status: "parked", session: null });
+		identities[0] = "account:b";
+		await request(child, "a");
+		await request(sibling, "a");
+		const retired = child.modelRegistry.resolver(model, child.agent.sessionId);
+		AgentRegistry.global().setStatus("PoolChild", "idle");
+		lifecycle.adopt("PoolChild", {
+			idleTtlMs: 0,
+			revive: async expected =>
+				createSession("PoolChild", inherited, undefined, await SessionManager.open(childFile), expected),
+		});
+		await lifecycle.park("PoolChild");
+		await expect(resolveApiKeyOnce(retired)).rejects.toThrow();
+		const revived = await lifecycle.ensureLive("PoolChild");
+		await request(revived, "a");
+		const revivedSessionId = revived.agent.sessionId;
+		if (!revivedSessionId) throw new Error("Expected revived provider session ID");
+		expect(authStorage.sessions.pin(provider, revivedSessionId, outsideCredentialId)).toBe(false);
+		await expect(resolveApiKeyOnce(retired)).rejects.toThrow();
+		const revivedResolver = revived.modelRegistry.resolver(model, revived.agent.sessionId);
+		await lifecycle.release("PoolChild");
+		await expect(resolveApiKeyOnce(revivedResolver)).rejects.toThrow();
+		await request(sibling, "a");
+	});
+
+	it("uses explicit child authorization rather than the released inherited pool", async () => {
+		const parent = await createSession("ExplicitParent", shared, { [provider]: ["account:a"] });
+		const child = await createSession("ExplicitChild", parent.modelRegistry, { [provider]: ["account:b"] });
+		await parent.dispose();
+		await request(child, "b");
+		const inheritedChild = await createSession("ExplicitGrandchild", child.modelRegistry);
+		await child.dispose();
+		await request(inheritedChild, "b");
+	});
+
+	it("keeps inherited deny-all pools closed after parent disposal and rejects sibling rotation", async () => {
+		const parent = await createSession("DeniedParent", shared, { [provider]: [] });
+		const child = await createSession("DeniedChild", parent.modelRegistry);
+		await parent.dispose();
+		const resolver = child.modelRegistry.resolver(model, child.agent.sessionId);
+		await expect(resolveApiKeyOnce(resolver)).rejects.toThrow();
+		await expect(resolver({ lastChance: true, error: new Error("synthetic unauthorized") })).rejects.toThrow();
+		expect(requests).toEqual([]);
+	});
+
+	it("fails inherited authorization rather than using a configured provider key", async () => {
+		const configPath = tempDir.join("configured-models.yml");
+		await Bun.write(
+			configPath,
+			`providers:\n  ${provider}:\n    baseUrl: https://example.test/v1\n    api: openai-completions\n    auth: oauth\n    apiKey: synthetic-config\n    models:\n      - id: inherited-model\n`,
+		);
+		const configuredRegistry = new ModelRegistry(authStorage, configPath);
+		registerModel(configuredRegistry);
+		const parent = await createSession("ConfiguredParent", configuredRegistry, { [provider]: ["account:a"] });
+		const child = await createSession("ConfiguredChild", parent.modelRegistry);
+		await parent.dispose();
+		await expect(resolveApiKeyOnce(child.modelRegistry.resolver(model, child.agent.sessionId))).rejects.toThrow();
+		expect(requests).toEqual([]);
 	});
 });

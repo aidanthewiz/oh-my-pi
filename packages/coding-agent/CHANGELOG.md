@@ -37,6 +37,7 @@
 - Reject superseded or released account-pool scopes before returning credentials, including delayed acquisitions.
 - Preserve a selected OpenRouter or Vercel upstream route when Vibe workers inherit the active session model.
 - Keep task effort glyphs derived from configured selectors after removing per-call model and live-thinking metadata.
+- Give nested agents independent OAuth account-pool leases, preserving inherited authorization after their parent parks and across warm revival.
 
 ## [18.8.2] - 2026-10-07
 
