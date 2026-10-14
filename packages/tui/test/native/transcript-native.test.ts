@@ -20,8 +20,9 @@ import { CollapsedSyntheticMessageComponent, UserMessageComponent } from "@oh-my
 import { text } from "@oh-my-pi/pi-tui/native/describe";
 import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { TspNode, TspOp } from "@oh-my-pi/pi-wire";
+import type { TspAgentProps, TspNode, TspOp } from "@oh-my-pi/pi-wire";
 import { TspHarness } from "./tsp-harness";
+import type { AgentProgress, SingleResult } from "../../src/tools/task";
 
 beforeAll(async () => {
 	await initTheme(false);
@@ -172,6 +173,70 @@ describe("native transcript", () => {
 			tool.dispose();
 		}
 	});
+
+	it.each([
+		["configured high", "openai/gpt-5", "openai/gpt-5:high", "thinkingHigh"],
+		["configured max", "openai/gpt-5", "openai/gpt-5:max", "thinkingXhigh"],
+		["literal model suffix", "custom/model:high", "custom/model:high", undefined],
+		["legacy selector", undefined, "custom/model:high", undefined],
+		["different identity", "custom/model", "other/model:high", undefined],
+		["invalid effort", "custom/model", "custom/model:invalid", undefined],
+	] as const)(
+		"derives native task effort for %s across running and settled frames",
+		async (_case, identity, selector, token) => {
+			const progress: AgentProgress = {
+				index: 0,
+				id: "ConfiguredWorker",
+				agent: "scout",
+				agentSource: "bundled",
+				status: "running",
+				task: "Inspect synthetic input",
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 0,
+				requests: 1,
+				tokens: 0,
+				cost: 0,
+				durationMs: 1,
+				resolvedModelIdentity: identity,
+				resolvedModel: selector,
+			};
+			const ui = {
+				requestRender: () => harness?.tui.requestRender(),
+				requestComponentRender: () => harness?.tui.requestRender(),
+				resetDisplay: () => {},
+			};
+			const tool = new ToolExecutionComponent("task", { agent: "scout", task: progress.task }, {}, undefined, ui);
+			try {
+				tool.setArgsComplete("task-effort");
+				tool.setExecutionStarted("task-effort");
+				const h = await startWith(h => h.tui.addChild(tool));
+				tool.updateResult(
+					{
+						content: [],
+						details: { projectAgentsDir: null, results: [], progress: [progress], totalDurationMs: 1 },
+					},
+					true,
+				);
+				await h.render();
+				const row = () =>
+					h.find(node => node.k === "agent" && node.p?.name === progress.id)?.p as TspAgentProps | undefined;
+				expect(row()).toMatchObject({ model: identity ?? selector, status: "running" });
+				expect(row()?.thinking).toBe(token);
+				const result: SingleResult = { ...progress, exitCode: 0, output: "Complete", stderr: "", truncated: false };
+				tool.updateResult({
+					content: [],
+					details: { projectAgentsDir: null, results: [result], totalDurationMs: 1 },
+				});
+				await h.render();
+				expect(row()).toMatchObject({ model: identity ?? selector, status: "done" });
+				expect(row()?.thinking).toBe(token);
+				expect(h.errors).toEqual([]);
+			} finally {
+				tool.dispose();
+			}
+		},
+	);
 
 	it("describes a custom tool (MCP) through the tool's own describe hooks", async () => {
 		const tool = {

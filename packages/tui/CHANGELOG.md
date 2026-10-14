@@ -4,6 +4,10 @@
 
 ## [18.8.2] - 2026-10-07
 
+### Fixed
+
+- Preserve configured effort on native task model chips for running, nested and completed subagents without interpreting literal model-ID suffixes.
+
 ### Removed
 
 - Removed per-call `model` fields from task parameter types.

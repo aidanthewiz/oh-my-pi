@@ -20,6 +20,7 @@ import { getMarkdownTheme, type Theme } from "../theme/theme";
 import { stripGeneratedOutputNotice, stripRawOutputArtifactNotice, stripTrailingNotice } from "./output-meta";
 import {
 	capPreviewLines,
+	type ConfiguredThinkingLevel,
 	FEED_MODEL_BADGE_WIDTH,
 	formatBadge,
 	formatDuration,
@@ -1764,6 +1765,24 @@ function renderNestedTaskTree(
 // Native (TSP) description: one `agent` node per subagent (§7.6)
 // =============================================================================
 
+function thinkingToken(level: ConfiguredThinkingLevel | undefined): string | undefined {
+	switch (level) {
+		case "minimal":
+			return "thinkingMinimal";
+		case "low":
+			return "thinkingLow";
+		case "medium":
+			return "thinkingMedium";
+		case "high":
+			return "thinkingHigh";
+		case "xhigh":
+		case "max":
+			return "thinkingXhigh";
+		default:
+			return undefined;
+	}
+}
+
 /** The shared batch context as one quiet line above the agents. */
 function describeContext(raw: unknown): NativeNode | undefined {
 	const source = typeof raw === "string" ? sanitizeText(repairDoubleEncodedJsonString(raw)) : "";
@@ -1869,6 +1888,9 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 			task: taskSummary(progress.description || progress.assignment || progress.task) || undefined,
 			status,
 			model: progress.resolvedModelIdentity ?? progress.resolvedModel,
+			thinking: thinkingToken(
+				resolveModelSelectorThinkingLevel(progress.resolvedModelIdentity, progress.resolvedModel),
+			),
 			tool,
 			stats: {
 				tools: progress.toolCount || undefined,
@@ -1927,6 +1949,7 @@ function describeResultAgent(result: SingleResult, state: AgentDescribeState, de
 			task: taskSummary(result.description || result.assignment || result.task) || undefined,
 			status,
 			model: result.resolvedModelIdentity ?? result.resolvedModel,
+			thinking: thinkingToken(resolveModelSelectorThinkingLevel(result.resolvedModelIdentity, result.resolvedModel)),
 			tool: null,
 			stats: {
 				requests: result.requests || undefined,

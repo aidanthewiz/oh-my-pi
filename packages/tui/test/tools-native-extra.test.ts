@@ -123,7 +123,7 @@ describe("native task", () => {
 			projectAgentsDir: null,
 			results: [],
 			totalDurationMs: 0,
-			progress: [progress("Child")],
+			progress: [progress("Child", { resolvedModelIdentity: "openai/gpt-5", resolvedModel: "openai/gpt-5:max" })],
 		};
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
@@ -135,7 +135,7 @@ describe("native task", () => {
 		const parent = view?.body?.find(n => "k" in n && n.k === "agent" && n.key === "Parent") as NativeNode;
 		expect(parent).toBeDefined();
 		const nested = nodes(parent.c).find(n => n.k === "agent" && n.key === "Child");
-		expect(nested?.p).toMatchObject({ status: "running", depth: 1 });
+		expect(nested?.p).toMatchObject({ status: "running", depth: 1, thinking: "thinkingXhigh" });
 	});
 });
 
