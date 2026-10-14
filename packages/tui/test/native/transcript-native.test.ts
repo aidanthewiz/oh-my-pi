@@ -119,6 +119,152 @@ describe("native transcript", () => {
 		expect(h.errors).toEqual([]);
 	});
 
+	it("hands the terminal session-resolved targets for relative links once the segment closes", async () => {
+		const component = new AssistantMessageComponent();
+		const h = await startWith(h => h.tui.addChild(component));
+		const source = [
+			"| Board | Shot |",
+			"|---|---|",
+			"| 10×10 | [Open screenshot](artifacts/10x10.png) |",
+			"",
+			"See [the log][log] and [the crop](crop.png).",
+			"Code `[x](artifacts/10x10.png)` stays, [web](https://x.dev) and [gone](missing.md) too.",
+			"![image](artifacts/10x10.png), <https://x.dev> and [mail](mailto:me@example.com) stay authored.",
+			"",
+			"```md",
+			"[not a link](logs/run.txt)",
+			"```",
+			"",
+			"[log]: logs/run.txt",
+		].join("\n");
+		const wt = "file:///C:/Users/me/.omp/wt/cr2-43939c6";
+		component.setLinkTargets(
+			new Map([
+				["artifacts/10x10.png", `${wt}/artifacts/10x10.png`],
+				["logs/run.txt", `${wt}/logs/run.txt`],
+				["crop.png", `${wt}/crop(1).png`],
+			]),
+		);
+		component.updateContent(assistant([{ type: "text", text: source }]), { transient: true });
+		await h.render();
+		expect(h.find(node => node.k === "md")?.p).toMatchObject({ text: source, stream: true });
+
+		component.updateContent(assistant([{ type: "text", text: source }]));
+		component.markTranscriptBlockFinalized();
+		await h.render();
+		expect(h.find(node => node.k === "md")?.p).toMatchObject({
+			text: [
+				"| Board | Shot |",
+				"|---|---|",
+				`| 10×10 | [Open screenshot](${wt}/artifacts/10x10.png) |`,
+				"",
+				`See [the log][log] and [the crop](<${wt}/crop(1).png>).`,
+				"Code `[x](artifacts/10x10.png)` stays, [web](https://x.dev) and [gone](missing.md) too.",
+				"![image](artifacts/10x10.png), <https://x.dev> and [mail](mailto:me@example.com) stay authored.",
+				"",
+				"```md",
+				"[not a link](logs/run.txt)",
+				"```",
+				"",
+				`[log]: ${wt}/logs/run.txt`,
+			].join("\n"),
+		});
+		expect(h.errors).toEqual([]);
+	});
+
+	it.each(["blockquote", "list"] as const)(
+		"keeps matching literal links inside %s code when resolving a later heading",
+		async container => {
+			const prefix = container === "blockquote" ? "> " : "  ";
+			const source = [
+				container === "blockquote" ? "> ```md" : "- ```md",
+				`${prefix}[x](note.md)`,
+				`${prefix}\`\`\``,
+				"# [x](note.md)",
+			].join("\n");
+			const component = new AssistantMessageComponent();
+			component.setLinkTargets(new Map([["note.md", "file:///session/note.md"]]));
+			component.updateContent(assistant([{ type: "text", text: source }]));
+			component.markTranscriptBlockFinalized();
+			const h = await startWith(h => h.tui.addChild(component));
+			expect(h.find(node => node.k === "md")?.p).toMatchObject({
+				text: source.replace("\n# [x](note.md)", "\n# [x](file:///session/note.md)"),
+			});
+			expect(h.errors).toEqual([]);
+		},
+	);
+
+	it("preserves authored CRLF and tabs when resolving native link destinations", async () => {
+		const component = new AssistantMessageComponent();
+		component.setLinkTargets(new Map([["note.md", "file:///session/note.md"]]));
+		component.updateContent(assistant([{ type: "text", text: "prefix\tliteral\r\n#\t[x](note.md)" }]));
+		component.markTranscriptBlockFinalized();
+		const h = await startWith(h => h.tui.addChild(component));
+		expect(h.find(node => node.k === "md")?.p).toMatchObject({
+			text: "prefix\tliteral\r\n#\t[x](file:///session/note.md)",
+		});
+		expect(h.errors).toEqual([]);
+	});
+
+	it("resolves nested quote and task-list links without changing quoted code", async () => {
+		const component = new AssistantMessageComponent();
+		const source = [
+			"> > ```md",
+			"> > [x](note.md)",
+			"> > ```",
+			"> > # [x](note.md)",
+			"",
+			"- [x] [task](note.md)",
+		].join("\n");
+		component.setLinkTargets(new Map([["note.md", "file:///session/note.md"]]));
+		component.updateContent(assistant([{ type: "text", text: source }]));
+		component.markTranscriptBlockFinalized();
+		const h = await startWith(h => h.tui.addChild(component));
+		expect(h.find(node => node.k === "md")?.p).toMatchObject({
+			text: [
+				"> > ```md",
+				"> > [x](note.md)",
+				"> > ```",
+				"> > # [x](file:///session/note.md)",
+				"",
+				"- [x] [task](file:///session/note.md)",
+			].join("\n"),
+		});
+		expect(h.errors).toEqual([]);
+	});
+
+	it.each(["child transcript", "images hidden"] as const)(
+		"keeps SVG source inert and resolves completed prose links for %s",
+		async mode => {
+			const component = new AssistantMessageComponent();
+			if (mode === "child transcript") {
+				component.setSvgFiguresVisible(false);
+				component.setTableChartsVisible(false);
+			} else {
+				component.setImagesVisible(false);
+			}
+			const svg = '<svg xmlns="http://www.w3.org/2000/svg"><text>[raw](note.md)</text></svg>\n';
+			component.setLinkTargets(new Map([["note.md", "file:///session/first/note.md"]]));
+			component.updateContent(
+				assistant([{ type: "text", text: `Read [note](note.md).\n\n\`\`\`svg\n${svg}\`\`\`` }]),
+			);
+			component.markTranscriptBlockFinalized();
+			const h = await startWith(h => h.tui.addChild(component));
+			expect(h.find(node => node.k === "code")?.p).toMatchObject({ text: svg });
+			expect(h.find(node => node.k === "image")).toBeUndefined();
+			expect(h.find(node => node.k === "md")?.p).toMatchObject({
+				text: "Read [note](file:///session/first/note.md).",
+			});
+			component.setLinkTargets(new Map([["note.md", "file:///session/current/note.md"]]));
+			await h.render();
+			expect(h.find(node => node.k === "md")?.p).toMatchObject({
+				text: "Read [note](file:///session/current/note.md).",
+			});
+			expect(h.find(node => node.k === "code")?.p).toMatchObject({ text: svg });
+			expect(h.errors).toEqual([]);
+		},
+	);
+
 	it("mirrors a native toggle into the tool card and re-collapses it on a transcript-wide collapse", async () => {
 		let builder: ChatTranscriptBuilder | undefined;
 		const h = await startWith(h => {

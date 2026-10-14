@@ -2763,6 +2763,24 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(272_000);
 		});
 
+		test("restores Haiku 5.5 premium capacity across extended-context toggles", async () => {
+			const testSettings = Settings.isolated();
+			cfgExtendedContext.set(testSettings, false);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			expect(registry.find("anthropic", "claude-haiku-5-5")?.contextWindow).toBe(100_000);
+
+			for (const extendedContext of [true, false, true, false]) {
+				cfgExtendedContext.set(testSettings, extendedContext);
+				await registry.reapplyModelPolicies();
+				const expectedWindow = extendedContext ? 1_000_000 : 100_000;
+				expect(registry.find("anthropic", "claude-haiku-5-5")?.contextWindow).toBe(expectedWindow);
+
+				await registry.refresh("offline");
+				expect(registry.getError()).toBeUndefined();
+				expect(registry.find("anthropic", "claude-haiku-5-5")?.contextWindow).toBe(expectedWindow);
+			}
+		});
+
 		test("keeps bundled Astra at its default window without a settings source", () => {
 			// `beforeEach` leaves global settings uninitialized, so this
 			// reaches the no-settings fallback: it must match the schema

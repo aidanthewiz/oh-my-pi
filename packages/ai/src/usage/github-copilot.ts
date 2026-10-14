@@ -272,7 +272,7 @@ function normalizeBillingUsage(data: BillingUsageResponse): UsageLimit[] {
 		? `${data.timePeriod.year}-${String(data.timePeriod.month).padStart(2, "0")}`
 		: `${data.timePeriod.year}`;
 	const window: UsageWindow = {
-		id: "billing-period",
+		id: "monthly",
 		label: periodLabel,
 	};
 
@@ -388,13 +388,10 @@ export const githubCopilotUsageProvider: UsageProvider = {
 			}
 		} else {
 			const { refreshToken, accessToken } = params.credential;
-			if (!refreshToken && !accessToken) return null;
 			const oauthToken = refreshToken || accessToken;
 			if (!oauthToken) return null;
-			const githubToken = refreshToken ?? accessToken;
-			if (!githubToken) return null;
 			try {
-				const usage = await fetchInternalUsage(ctx, githubApiBaseUrl, githubToken, params.signal);
+				const usage = await fetchInternalUsage(ctx, githubApiBaseUrl, oauthToken, params.signal);
 				let accountId = params.credential.accountId;
 				if (!accountId && refreshToken) {
 					accountId = await resolveGitHubUsername(ctx, githubApiBaseUrl, refreshToken, params.signal);

@@ -2,7 +2,7 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import { type Component, Container } from "../tui";
 import { Image, type ImageBudget } from "../components/image";
 import { ImageProtocol, TERMINAL } from "../terminal-capabilities";
-import { Markdown, type MarkdownTheme } from "../components/markdown";
+import { Markdown, type MarkdownTheme, rewriteMarkdownLinkDestinations } from "../components/markdown";
 import { Spacer } from "../components/spacer";
 import { Text } from "../components/text";
 import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
@@ -371,6 +371,8 @@ export class AssistantMessageComponent extends Container {
 	#textColorTransform?: (text: string) => string;
 	#linkTargets: ReadonlyMap<string, string> = EMPTY_LINK_TARGETS;
 	#markdownTheme: MarkdownTheme | undefined;
+	/** Text-block sources with {@link #linkTargets} applied, for the native `md` nodes; reset with the targets. */
+	#nativeLinkSources = new Map<string, string>();
 	/** Block this reply reacts to; undefined when the preceding block takes no reactions. */
 	#reactionTarget: ReactionTarget | undefined;
 	/** Reaction lifted from the reply's opening emoji, once resolved. */
@@ -422,6 +424,8 @@ export class AssistantMessageComponent extends Container {
 		this.#fastPathKey = undefined;
 		this.#fastPathItems = undefined;
 		for (const block of this.#figureBlocks.values()) block.restyle();
+		this.#nativeLinkSources.clear();
+		this.#nativeViewVersion++;
 		if (this.#lastMessage) {
 			this.updateContent(this.#lastMessage, { transient: this.#lastUpdateTransient });
 		}
@@ -849,11 +853,23 @@ export class AssistantMessageComponent extends Container {
 				const streaming = live && index === tailIndex;
 				if (content.type === "text" && canonicalizeMessage(content.text)) {
 					const source = content.text.trim();
+					// The terminal renders this source itself and would resolve a relative
+					// link against its own idea of the cwd: hand it the session-resolved
+					// targets (resolved once the segment closes, so never while streaming).
+					const linked = (text: string, live: boolean): string => {
+						if (live || this.#linkTargets.size === 0) return text;
+						const targets = this.#linkTargets;
+						const resolved =
+							this.#nativeLinkSources.get(text) ??
+							rewriteMarkdownLinkDestinations(text, href => targets.get(href));
+						this.#nativeLinkSources.set(text, resolved);
+						return resolved;
+					};
 					const hideSvg =
 						(!this.#showSvgFigures || !svgFigureRendering() || !this.#showImages) && hasSvgFence(source);
 					const chartTables = this.#showImages && this.#showTableCharts && hasChartTable(source);
 					if (!hideSvg && !chartTables) {
-						children.push(markdown(`t${index}`, `t${index}`, source, streaming));
+						children.push(markdown(`t${index}`, `t${index}`, linked(source, streaming), streaming));
 						continue;
 					}
 					const prose: FigureSegment[] = hideSvg ? splitSvgFences(source) : [{ kind: "markdown", text: source }];
@@ -871,9 +887,8 @@ export class AssistantMessageComponent extends Container {
 							return;
 						}
 						if (segment.kind === "markdown") {
-							children.push(
-								markdown(slot, slot, segment.text.trim(), streaming && part === segments.length - 1),
-							);
+							const live = streaming && part === segments.length - 1;
+							children.push(markdown(slot, slot, linked(segment.text.trim(), live), live));
 							return;
 						}
 						const chart = lookupTableChart(segment.table);

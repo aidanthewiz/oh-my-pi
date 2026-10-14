@@ -17,6 +17,12 @@
 - Resolve both lexical and canonical native archive imports during in-memory embedding without writing generated archives to disk.
 - Build development-profile addons from Cargo's `debug` output directory.
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
+## [18.8.4] - 2026-10-08
+
+### Fixed
+
+- Fixed long output from a failing `jq` command hiding its error message: the output minimizer now shortens `jq` output only when the command succeeded ([#14657](https://github.com/can1357/oh-my-pi/pull/14657) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.8.1] - 2026-10-07
 
 ### Added
