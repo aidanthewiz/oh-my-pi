@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
@@ -9,7 +9,7 @@ import { createAuthStorageSettingsSync } from "@oh-my-pi/pi-coding-agent/session
 import { getRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { cfgRetryUsageReservePct } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
@@ -167,13 +167,21 @@ describe("live routing config files", () => {
 		const second = tempDir.join("profile-b");
 		await Bun.write(path.join(first, "routing.yml"), YAML.stringify(routing("first")));
 		await Bun.write(path.join(second, "routing.yml"), "modelRoles: [\n");
+		await Bun.write(
+			path.join(first, "config.yml"),
+			YAML.stringify({ modelRoles: { default: "anthropic/profile-first" } }),
+		);
+		await Bun.write(
+			path.join(second, "config.yml"),
+			YAML.stringify({ modelRoles: { default: "anthropic/profile-second" } }),
+		);
 		const profile = tempDir.join("profile");
 		await fs.symlink(first, profile, "dir");
-		await start(path.join(profile, "routing.yml"));
+		await start(path.join(profile, "routing.yml"), profile);
 		cfgTaskAgentModelOverrides.override(settings, { worker: "anthropic/runtime" });
-		const warnings = vi.spyOn(logger, "warn");
+		expect(settings.getModelRole("default")).toBe("anthropic/profile-first");
 		await retargetDirLink(profile, second);
-		await waitFor(() => warnings.mock.calls.some(([message]) => message.includes("keeping last good config")));
+		await waitFor(() => settings.getModelRole("default") === "anthropic/profile-second");
 		expect(settings.getModelRole("smol")).toBe("anthropic/first");
 		expect(await Bun.file(path.join(second, "routing.yml")).text()).toBe("modelRoles: [\n");
 		await Bun.write(path.join(second, "routing.yml"), YAML.stringify(routing("recovered")));
