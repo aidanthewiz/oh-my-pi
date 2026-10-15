@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import type { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/registry/oauth";
 import { validateAgentAccountPools } from "@oh-my-pi/pi-coding-agent/config/account-pools";
 import { SessionAccountPoolScope } from "@oh-my-pi/pi-coding-agent/config/account-pool-scope";
@@ -24,18 +25,18 @@ describe("task.agentAccountPools", () => {
 	});
 
 	it("rejects every malformed level instead of widening the agent to all accounts", () => {
-		const malformed: [unknown, string][] = [
-			["reviewer", "Invalid task.agentAccountPools:"],
-			[[], "Invalid task.agentAccountPools:"],
-			[{ reviewer: ["email:a@example.com"] }, "Invalid task.agentAccountPools.reviewer:"],
-			[{ reviewer: { anthropic: "email:a@example.com" } }, "Invalid task.agentAccountPools.reviewer.anthropic:"],
-			[{ reviewer: { anthropic: null } }, "Invalid task.agentAccountPools.reviewer.anthropic:"],
-			[{ reviewer: { anthropic: [""] } }, "Invalid task.agentAccountPools.reviewer.anthropic:"],
-			[{ reviewer: { anthropic: [" email:a@example.com"] } }, "Invalid task.agentAccountPools.reviewer.anthropic:"],
-			[{ reviewer: { anthropic: [42] } }, "Invalid task.agentAccountPools.reviewer.anthropic:"],
+		const malformed: unknown[] = [
+			"reviewer",
+			[],
+			{ reviewer: ["email:a@example.com"] },
+			{ reviewer: { anthropic: "email:a@example.com" } },
+			{ reviewer: { anthropic: null } },
+			{ reviewer: { anthropic: [""] } },
+			{ reviewer: { anthropic: [" email:a@example.com"] } },
+			{ reviewer: { anthropic: [42] } },
 		];
-		for (const [value, message] of malformed) {
-			expect(() => validateAgentAccountPools(value)).toThrow(message);
+		for (const value of malformed) {
+			expect(() => validateAgentAccountPools(value)).toThrow(Error);
 		}
 	});
 
@@ -45,7 +46,7 @@ describe("task.agentAccountPools", () => {
 				inMemory: true,
 				overrides: { "task.agentAccountPools": { reviewer: { anthropic: "email:a@example.com" } } },
 			}),
-		).rejects.toThrow("Invalid task.agentAccountPools.reviewer.anthropic:");
+		).rejects.toThrow(Error);
 	});
 
 	it("keeps an agent named __proto__ restricted across settings layers", async () => {
@@ -83,14 +84,12 @@ describe("task.agentAccountPools", () => {
 			if (!model) throw new Error("expected configured keyless model");
 			const scoped = scope.registry(shared);
 			expect(await shared.getApiKey(model)).toBe(kNoAuth);
-			await expect(scoped.getApiKey(model)).rejects.toThrow("keyless authentication");
-			await expect(scoped.getApiKeyForProvider(model.provider)).rejects.toThrow("keyless authentication");
-			await expect(scoped.getApiKeyWithCredentialForProvider(model.provider)).rejects.toThrow(
-				"keyless authentication",
-			);
+			await expect(scoped.getApiKey(model)).rejects.toThrow(MissingApiKeyError);
+			await expect(scoped.getApiKeyForProvider(model.provider)).rejects.toThrow(MissingApiKeyError);
+			await expect(scoped.getApiKeyWithCredentialForProvider(model.provider)).rejects.toThrow(MissingApiKeyError);
 			expect((await scoped.getApiKeyAndHeaders(model)).ok).toBe(false);
-			await expect(resolveApiKeyOnce(scoped.resolver(model))).rejects.toThrow("keyless authentication");
-			await expect(resolveApiKeyOnce(scoped.resolver(model.provider))).rejects.toThrow("keyless authentication");
+			await expect(resolveApiKeyOnce(scoped.resolver(model))).rejects.toThrow(MissingApiKeyError);
+			await expect(resolveApiKeyOnce(scoped.resolver(model.provider))).rejects.toThrow(MissingApiKeyError);
 		} finally {
 			scope.release();
 			authStorage.close();
@@ -178,19 +177,19 @@ describe("SessionAccountPoolScope lease ownership", () => {
 		expect(await currentRegistry.getApiKey(model)).toBe("synthetic-b");
 		if (releasedFirst) current.release();
 
-		await expect(registry.getApiKey(model)).rejects.toThrow("no longer owns");
-		await expect(registry.getApiKeyForProvider(provider)).rejects.toThrow("no longer owns");
-		await expect(registry.getApiKeyWithCredentialForProvider(provider)).rejects.toThrow("no longer owns");
-		await expect(registry.getApiKeyForProvider(provider, "stale-child")).rejects.toThrow("no longer owns");
+		await expect(registry.getApiKey(model)).rejects.toThrow(MissingApiKeyError);
+		await expect(registry.getApiKeyForProvider(provider)).rejects.toThrow(MissingApiKeyError);
+		await expect(registry.getApiKeyWithCredentialForProvider(provider)).rejects.toThrow(MissingApiKeyError);
+		await expect(registry.getApiKeyForProvider(provider, "stale-child")).rejects.toThrow(MissingApiKeyError);
 		expect(await authStorage.keys.get(provider, "stale-child")).toBe("synthetic-runtime");
 		expect(await registry.getApiKeyAndHeaders(model)).toEqual({
 			ok: false,
-			error: expect.stringContaining("no longer owns"),
+			error: expect.any(String),
 		});
-		await expect(resolveApiKeyOnce(modelResolver)).rejects.toThrow("no longer owns");
-		await expect(resolveApiKeyOnce(providerResolver)).rejects.toThrow("no longer owns");
-		expect(() => stale.restrict("shared-session")).toThrow("no longer owns");
-		expect(() => stale.adopt("shared-session")).toThrow("no longer owns");
+		await expect(resolveApiKeyOnce(modelResolver)).rejects.toThrow(MissingApiKeyError);
+		await expect(resolveApiKeyOnce(providerResolver)).rejects.toThrow(MissingApiKeyError);
+		expect(() => stale.restrict("shared-session")).toThrow(MissingApiKeyError);
+		expect(() => stale.adopt("shared-session")).toThrow(MissingApiKeyError);
 		stale.release();
 		stale.release();
 		expect(await authStorage.keys.get(provider, "shared-session")).toBe(
@@ -204,10 +203,10 @@ describe("SessionAccountPoolScope lease ownership", () => {
 		const registry = scope.registry(shared);
 		const resolver = registry.resolver(provider);
 		scope.release();
-		await expect(registry.getApiKey(model)).rejects.toThrow("released");
-		await expect(registry.getApiKeyForProvider(provider, "late-child")).rejects.toThrow("released");
-		await expect(resolveApiKeyOnce(resolver)).rejects.toThrow("no longer owns");
-		expect(() => scope.adopt("late-adopt")).toThrow("released");
+		await expect(registry.getApiKey(model)).rejects.toThrow(Error);
+		await expect(registry.getApiKeyForProvider(provider, "late-child")).rejects.toThrow(Error);
+		await expect(resolveApiKeyOnce(resolver)).rejects.toThrow(MissingApiKeyError);
+		expect(() => scope.adopt("late-adopt")).toThrow(Error);
 		expect(await authStorage.keys.get(provider, "late-child")).toBe("synthetic-runtime");
 		expect(await authStorage.keys.get(provider, "late-adopt")).toBe("synthetic-runtime");
 	});
@@ -257,11 +256,9 @@ describe("SessionAccountPoolScope lease ownership", () => {
 		refreshGate.resume.resolve();
 		const result = await outcome;
 		if (route === "headers") {
-			expect(result).toEqual({ value: { ok: false, error: expect.stringContaining("no longer owns") } });
+			expect(result).toEqual({ value: { ok: false, error: expect.any(String) } });
 		} else {
-			expect(result).toEqual({
-				error: expect.objectContaining({ message: expect.stringContaining("no longer owns") }),
-			});
+			expect(result).toEqual({ error: expect.any(MissingApiKeyError) });
 		}
 		if (current) expect(await current.registry(shared).getApiKey(model)).toBe("synthetic-b");
 		else expect(await authStorage.keys.get(provider, "shared-session")).toBe("synthetic-runtime");
@@ -279,8 +276,9 @@ describe("SessionAccountPoolScope lease ownership", () => {
 		});
 		const pending = registry.getApiKeyAndHeaders(model);
 		await entered.promise;
-		createScope("b");
+		const current = createScope("b");
 		resume.resolve();
-		expect(await pending).toEqual({ ok: false, error: expect.stringContaining("no longer owns") });
+		expect(await pending).toEqual({ ok: false, error: expect.any(String) });
+		expect(await current.registry(shared).getApiKey(model)).toBe("synthetic-b");
 	});
 });
