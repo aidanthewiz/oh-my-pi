@@ -233,6 +233,71 @@ describe("native transcript", () => {
 		expect(h.errors).toEqual([]);
 	});
 
+	it("resolves table links within normalized cells and after escaped pipes without moving duplicate cells", async () => {
+		const component = new AssistantMessageComponent();
+		const source = [
+			"| [Head\\|er](header.md) | Link | Again |",
+			"| --- | --- | --- |",
+			"| a \\| b | [open](note.md) | [open](note.md) |",
+			"c \\| **[cell](cell.md)** | `[open](note.md)` | [pipe](pipe\\|name.md)",
+			"| ![image](note.md) | [open](note.md) | <https://x.dev> |",
+		].join("\n");
+		component.setLinkTargets(
+			new Map([
+				["header.md", "file:///session/header.md"],
+				["note.md", "file:///session/note.md"],
+				["cell.md", "file:///session/cell.md"],
+				["pipe|name.md", "file:///session/pipe|name.md"],
+			]),
+		);
+		component.updateContent(assistant([{ type: "text", text: source }]));
+		component.markTranscriptBlockFinalized();
+		const h = await startWith(h => h.tui.addChild(component));
+		expect(h.find(node => node.k === "md")?.p).toMatchObject({
+			text: [
+				"| [Head\\|er](file:///session/header.md) | Link | Again |",
+				"| --- | --- | --- |",
+				"| a \\| b | [open](file:///session/note.md) | [open](file:///session/note.md) |",
+				"c \\| **[cell](file:///session/cell.md)** | `[open](note.md)` | [pipe](file:///session/pipe\\|name.md)",
+				"| ![image](note.md) | [open](file:///session/note.md) | <https://x.dev> |",
+			].join("\n"),
+		});
+		expect(h.errors).toEqual([]);
+	});
+
+	it("projects escaped-pipe table cells through quoted lists while retaining CRLF, tabs and reference uses", async () => {
+		const component = new AssistantMessageComponent();
+		const source = [
+			"> - Text | Link",
+			">   --- | ---",
+			">   a\t\\| [inside](nested.md) | [open][ref]",
+			">   `[inside](nested.md)` | [later](later.md)",
+			">",
+			"> [ref]: refs.md",
+		].join("\r\n");
+		component.setLinkTargets(
+			new Map([
+				["nested.md", "file:///session/nested.md"],
+				["later.md", "file:///session/later.md"],
+				["refs.md", "file:///session/refs.md"],
+			]),
+		);
+		component.updateContent(assistant([{ type: "text", text: source }]));
+		component.markTranscriptBlockFinalized();
+		const h = await startWith(h => h.tui.addChild(component));
+		expect(h.find(node => node.k === "md")?.p).toMatchObject({
+			text: [
+				"> - Text | Link",
+				">   --- | ---",
+				">   a\t\\| [inside](file:///session/nested.md) | [open][ref]",
+				">   `[inside](nested.md)` | [later](file:///session/later.md)",
+				">",
+				"> [ref]: file:///session/refs.md",
+			].join("\r\n"),
+		});
+		expect(h.errors).toEqual([]);
+	});
+
 	it.each(["child transcript", "images hidden"] as const)(
 		"keeps SVG source inert and resolves completed prose links for %s",
 		async mode => {

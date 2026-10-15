@@ -5,6 +5,7 @@
 ### Fixed
 
 - Preserve quoted code and authored whitespace when resolving native Markdown links across quote and list containers.
+- Preserve session-relative native table links across escaped pipes and normalized cells.
 
 ## [18.8.4] - 2026-10-08
 

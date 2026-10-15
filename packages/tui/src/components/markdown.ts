@@ -1269,7 +1269,13 @@ export function rewriteMarkdownLinkDestinations(text: string, resolve: (href: st
 			return project(base + rawStart + prefix + offset - contentStart);
 		};
 	};
-	const rewrite = (token: Token, at: number, labelEnd: number | undefined, project: ProjectOffset): void => {
+	const rewrite = (
+		token: Token,
+		at: number,
+		labelEnd: number | undefined,
+		project: ProjectOffset,
+		tableCell: boolean,
+	): void => {
 		const href = "href" in token && typeof token.href === "string" ? token.href : "";
 		if (!href || labelEnd === undefined) return;
 		const target = resolve(href);
@@ -1278,7 +1284,10 @@ export function rewriteMarkdownLinkDestinations(text: string, resolve: (href: st
 		if (!dest) return;
 		const start = project(at + dest.start);
 		const end = project(at + dest.end);
-		if (start !== undefined && end !== undefined) edits.push({ start, end, target });
+		if (start !== undefined && end !== undefined) {
+			const destination = formatLinkDestination(target);
+			edits.push({ start, end, target: tableCell ? destination.replaceAll("|", "\\|") : destination });
+		}
 	};
 	const walk = (
 		tokens: readonly Token[] | undefined,
@@ -1286,6 +1295,7 @@ export function rewriteMarkdownLinkDestinations(text: string, resolve: (href: st
 		project: ProjectOffset,
 		start = 0,
 		end = input.length,
+		tableCell = false,
 	): number => {
 		let cursor = start;
 		if (!tokens) return cursor;
@@ -1296,12 +1306,12 @@ export function rewriteMarkdownLinkDestinations(text: string, resolve: (href: st
 			cursor = at + token.raw.length;
 			if (token.type === "link") {
 				const label = "text" in token && typeof token.text === "string" ? `[${token.text}](` : undefined;
-				rewrite(token, at, label && token.raw.startsWith(label) ? label.length : undefined, project);
+				rewrite(token, at, label && token.raw.startsWith(label) ? label.length : undefined, project, tableCell);
 				continue;
 			}
 			if (token.type === "def") {
 				const close = token.raw.indexOf("]:");
-				rewrite(token, at, close < 0 ? undefined : close + 2, project);
+				rewrite(token, at, close < 0 ? undefined : close + 2, project, tableCell);
 				continue;
 			}
 			const children = "tokens" in token && Array.isArray(token.tokens) ? token.tokens : undefined;
@@ -1309,13 +1319,50 @@ export function rewriteMarkdownLinkDestinations(text: string, resolve: (href: st
 			if (token.type === "blockquote" || token.type === "list_item") {
 				walk(children, token.text, projectContent(token.raw, token.text, at, project));
 			} else {
-				walk(children, input, project, at, cursor);
+				walk(children, input, project, at, cursor, tableCell);
 				if (isListToken(token)) walk(token.items, input, project, at, cursor);
 				if (isTableToken(token)) {
-					let cellCursor = at;
-					for (const cell of token.header) cellCursor = walk(cell.tokens, input, project, cellCursor, cursor);
-					for (const row of token.rows) {
-						for (const cell of row) cellCursor = walk(cell.tokens, input, project, cellCursor, cursor);
+					let rowStart = at;
+					let rowIndex = 0;
+					while (rowStart < cursor) {
+						const newline = input.indexOf("\n", rowStart);
+						const rowEnd = newline < 0 || newline > cursor ? cursor : newline;
+						const cells = rowIndex === 0 ? token.header : token.rows[rowIndex - 2];
+						if (cells) {
+							const line = input.slice(rowStart, rowEnd);
+							let value = line.trim();
+							let base = rowStart + line.length - line.trimStart().length;
+							// Match Marked's splitTableRow: trim, optional outer pipes, then \| normalization.
+							if (value.startsWith("|")) {
+								value = value.slice(1);
+								base++;
+							}
+							if (value.endsWith("|") && !value.endsWith("\\|")) value = value.slice(0, -1);
+							let cellStart = 0;
+							let column = 0;
+							for (let i = 0; i <= value.length && column < cells.length; i++) {
+								if (i < value.length && (value[i] !== "|" || value[i - 1] === "\\")) continue;
+								const authored = value.slice(cellStart, i);
+								const raw = authored.trim();
+								const cellBase = base + cellStart + authored.length - authored.trimStart().length;
+								const cell = cells[column++]!;
+								cellStart = i + 1;
+								if (raw.replace(/\\\|/g, "|") !== cell.text) continue;
+								let rawOffset = 0;
+								let cellOffset = 0;
+								const projectCell: ProjectOffset = offset => {
+									if (offset < cellOffset || offset > cell.text.length) return undefined;
+									while (cellOffset < offset) {
+										rawOffset += raw.startsWith("\\|", rawOffset) ? 2 : 1;
+										cellOffset++;
+									}
+									return project(cellBase + rawOffset);
+								};
+								walk(cell.tokens, cell.text, projectCell, 0, cell.text.length, true);
+							}
+						}
+						rowStart = rowEnd + 1;
+						rowIndex++;
 					}
 				}
 			}
@@ -1327,7 +1374,7 @@ export function rewriteMarkdownLinkDestinations(text: string, resolve: (href: st
 	let out = "";
 	let last = 0;
 	for (const edit of edits) {
-		out += text.slice(last, edit.start) + formatLinkDestination(edit.target);
+		out += text.slice(last, edit.start) + edit.target;
 		last = edit.end;
 	}
 	return out + text.slice(last);
