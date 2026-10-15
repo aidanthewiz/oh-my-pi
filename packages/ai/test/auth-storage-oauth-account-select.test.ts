@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { withOAuthAccess } from "@oh-my-pi/pi-ai/auth-retry";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import { MissingApiKeyError } from "../src/error/auth";
 
 const PROVIDER = "unit-oauth-select";
 
@@ -76,6 +77,64 @@ describe("AuthStorage OAuth account selection", () => {
 		expect(
 			await storage.keys.getWithCredential(PROVIDER, "reordered-model", { accountIds: ["acc-b"] }),
 		).toMatchObject({ apiKey: "access-b-rotated", credentialId: accountB.credentialId });
+	});
+
+	test.each([
+		["disappears", "preflight"],
+		["changes identity", "preflight"],
+		["changes identity", "request preparation"],
+		["changes identity", "credential refresh"],
+	] as const)("hard pools reject a permitted row that %s during %s", async (transition, phase) => {
+		let storage = authStorage;
+		const credentialStore = store;
+		if (!storage || !credentialStore) throw new Error("test setup failed");
+		let armed = false;
+		let changed = false;
+		if (phase === "request preparation") {
+			storage = new AuthStorage(
+				new Proxy(credentialStore, {
+					get(target, key) {
+						if (key === "prepareForRequest") {
+							return async () => {
+								if (armed) changed = true;
+								return true;
+							};
+						}
+						const value = Reflect.get(target, key, target);
+						return typeof value === "function" ? value.bind(target) : value;
+					},
+				}),
+			);
+			authStorage = storage;
+		}
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = armed && phase === "credential refresh" ? oauthCredential("c") : credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		await storage.credentials.set(PROVIDER, [oauthCredential("b"), oauthCredential("a")]);
+		const accountB = storage.oauth.accounts(PROVIDER)[0];
+		if (!accountB) throw new Error("expected permitted OAuth account");
+		const listCredentials = credentialStore.listAuthCredentials.bind(credentialStore);
+		vi.spyOn(credentialStore, "listAuthCredentials").mockImplementation(provider => {
+			const rows = listCredentials(provider);
+			if (armed && phase === "preflight" && provider === PROVIDER) changed = true;
+			if (!changed) return rows;
+			return transition === "disappears"
+				? rows.filter(row => row.id !== accountB.credentialId)
+				: rows.map(row => (row.id === accountB.credentialId ? { ...row, credential: oauthCredential("c") } : row));
+		});
+		const sessionId = `preflight-${transition}`;
+		const lease = storage.sessions.restrict(PROVIDER, sessionId, ["account:acc-b"]);
+		try {
+			expect(await storage.keys.getWithCredential(PROVIDER, sessionId)).toMatchObject({
+				apiKey: "access-b",
+				credentialId: accountB.credentialId,
+			});
+			armed = true;
+			await expect(storage.keys.getWithCredential(PROVIDER, sessionId)).rejects.toBeInstanceOf(MissingApiKeyError);
+		} finally {
+			storage.sessions.unrestrict(PROVIDER, sessionId, lease);
+		}
 	});
 
 	test("sessions.pin selects and restores the exact stored account", async () => {

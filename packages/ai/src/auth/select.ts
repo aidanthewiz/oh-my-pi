@@ -731,7 +731,13 @@ export class CredentialSelector {
 				if (initialCredentialId !== undefined) {
 					const beforeSync = candidate.selection.credential;
 					preflightRows ??= this.#reloadProviderRows(provider);
-					if (!this.#rebindOAuthSelection(preflightRows, candidate.selection, initialCredentialId)) return;
+					if (
+						!this.#rebindOAuthSelection(preflightRows, candidate.selection, initialCredentialId) ||
+						!this.#deps.affinity.allows(provider, sessionId, candidate.selection.credential)
+					) {
+						preflightFailures.add(candidate);
+						return;
+					}
 					syncedPeerCredential = !authCredentialEquals(beforeSync, candidate.selection.credential);
 				}
 				const hasFreshAccess = Date.now() + OAUTH_REFRESH_SKEW_MS < candidate.selection.credential.expires;
@@ -997,7 +1003,10 @@ export class CredentialSelector {
 			return undefined;
 		}
 
-		if (!(await this.#prepareOAuthCredentialForRequest(provider, selection, options))) {
+		if (
+			!(await this.#prepareOAuthCredentialForRequest(provider, selection, options)) ||
+			!this.#deps.affinity.allows(provider, sessionId, selection.credential)
+		) {
 			return undefined;
 		}
 		// Capture the row id once, immediately after #prepareOAuthCredentialForRequest
@@ -1076,6 +1085,7 @@ export class CredentialSelector {
 			}
 			if (!result) return undefined;
 			const updated = mergeRefreshedCredential(selection.credential, result.newCredentials);
+			if (!this.#deps.affinity.allows(provider, sessionId, updated)) return undefined;
 			if (credentialId !== undefined) {
 				const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
 				if (idx !== -1) selection.index = idx;
