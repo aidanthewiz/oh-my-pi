@@ -8,7 +8,7 @@ import { DEFAULT_MAX_LINES, truncateHead, truncateTail } from "@oh-my-pi/pi-tui/
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { filterChildShellEnv, isEnoent } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../sdk";
-import { quotePosixPath } from "../ssh/utils";
+import { quotePosixArgument } from "../utils/shell-quote";
 import { resolveReadPath } from "./path-utils";
 import { buildInMemorySelectorResult, prependSuffixResolutionNotice, toReadTruncationStats } from "./read-format";
 import {
@@ -255,7 +255,7 @@ async function runJq(
 	const env = { ...filterChildShellEnv(Bun.env, cwd), PI_DISABLE_UUTILS_BUILTINS: "0" };
 	// jaq parses any argument starting with `-` as flags even when shell-quoted;
 	// `--` keeps filters such as `-.price` positional.
-	const command = `set -o pipefail; { jq ${flags.join(" ")} -- ${quotePosixPath(query)} ${quotePosixPath(filePath)} 2>&1 1>&3 | tail -c ${JSON_QUERY_ERROR_MAX_BYTES} >${quotePosixPath(stderrPath)}; } 3>&1`;
+	const command = `set -o pipefail; { jq ${flags.join(" ")} -- ${quotePosixArgument(query)} ${quotePosixArgument(filePath)} 2>&1 1>&3 | tail -c ${JSON_QUERY_ERROR_MAX_BYTES} >${quotePosixArgument(stderrPath)}; } 3>&1`;
 
 	let output = "";
 	let lines = 0;

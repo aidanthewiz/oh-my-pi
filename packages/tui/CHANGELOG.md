@@ -6,6 +6,18 @@
 
 - Preserve quoted code and authored whitespace when resolving native Markdown links across quote and list containers.
 - Preserve session-relative native table links across escaped pipes and normalized cells.
+- Show per-model compaction triggers in classic model previews after edits and resets.
+
+## [18.8.5] - 2026-10-08
+
+### Added
+
+- Added a **Compacts at** fact to the model hub preview and a Roles-view **Compaction limit** action (`k`) that edits the selected row's model limit through the new `ModelBrowserSource.compactionPointFor` and `ModelHubCallbacks.onCompactionPointChange` hooks ([#14952](https://github.com/can1357/oh-my-pi/pull/14952) by [@H4vC](https://github.com/H4vC))
+
+### Fixed
+
+- Fixed `/usage` dashboard cards reordering their limit rows by usage; rows now keep the provider's window order (e.g. 5 hour → weekly → monthly) ([#14953](https://github.com/can1357/oh-my-pi/pull/14953) by [@H4vC](https://github.com/H4vC))
+- Fixed Cmd+A, Cmd+C, Cmd+X and Shift+arrow selection doing nothing in the Tern prompt while Vim mode is in Insert mode ([#14954](https://github.com/can1357/oh-my-pi/pull/14954) by [@H4vC](https://github.com/H4vC))
 
 ## [18.8.4] - 2026-10-08
 

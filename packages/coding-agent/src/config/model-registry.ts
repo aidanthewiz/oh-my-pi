@@ -1,6 +1,6 @@
 import * as path from "node:path";
-import { type ApiKeyResolver, type FetchImpl, type ResolvedApiKey, type UsageProvider } from "@oh-my-pi/pi-ai";
-import type { AuthApiKeyOptions } from "@oh-my-pi/pi-ai/auth-storage";
+import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
+import { type AuthApiKeyOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
@@ -115,7 +115,7 @@ import {
 	type ProviderDiscoveryState,
 	type ProviderDiscoveryStatus,
 	RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS,
-	resolveCodexDiscoveryAccounts,
+	resolveOAuthDiscoveryAccounts,
 	SPECIAL_MODEL_MANAGER_PROVIDER_IDS,
 	STARTUP_MODEL_CACHE_PROVIDER_IDS,
 	withModelDiscoveryTimeout,
@@ -2228,12 +2228,41 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
-					googleAntigravityModelManagerOptions({
-						oauthToken,
-						endpoint: this.#descriptorBaseUrl("google-antigravity"),
-						fetch: this.#fetch,
-					}),
+				createOptions: oauthToken => {
+					const providerId = "google-antigravity";
+					const endpoint = this.#descriptorBaseUrl(providerId);
+					const credentials = getOAuthCredentialsForProvider(this.authStorage, providerId);
+					const source = this.authStorage.keys.source(providerId, { env: "none" });
+					const included = source?.kind === "oauth" ? credentials : [];
+					const accountKeys = included.map(credential => {
+						const accountKey = oauthAccountKey(credential);
+						return accountKey === undefined ? `token:${credential.access}` : `account:${accountKey}`;
+					});
+					if (!included.some(credential => credential.access === oauthToken)) {
+						const matching = credentials.find(credential => credential.access === oauthToken);
+						const accountKey = matching && oauthAccountKey(matching);
+						accountKeys.push(accountKey === undefined ? `token:${oauthToken}` : `account:${accountKey}`);
+					}
+					return {
+						...googleAntigravityModelManagerOptions({
+							resolveAccounts: async () => {
+								const accounts = await resolveOAuthDiscoveryAccounts(this.authStorage, providerId, oauthToken);
+								return (
+									accounts?.map(account => ({
+										accessToken: account.accessToken,
+										accountKey: oauthAccountKey(account),
+									})) ?? null
+								);
+							},
+							endpoint,
+							fetch: this.#fetch,
+						}),
+						cacheProviderId: `${resolveModelCacheProviderId(providerId, {
+							apiKey: JSON.stringify([...new Set(accountKeys)].sort()),
+							baseUrl: endpoint,
+						})}:union-v2`,
+					};
+				},
 			},
 			{
 				providerId: "google-gemini-cli",
@@ -2261,7 +2290,8 @@ export class ModelRegistry {
 					if (officialCredential || isOfficialCodexApiUrl(configuredBaseUrl)) {
 						return openaiCodexModelManagerOptions({
 							baseUrl: officialCredential ? undefined : configuredBaseUrl,
-							resolveAccounts: () => resolveCodexDiscoveryAccounts(this.authStorage, accessToken),
+							resolveAccounts: () =>
+								resolveOAuthDiscoveryAccounts(this.authStorage, "openai-codex", accessToken),
 							fetch: this.#fetch,
 						});
 					}

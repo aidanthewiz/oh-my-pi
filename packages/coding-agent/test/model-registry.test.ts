@@ -15,7 +15,6 @@ import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import { calculateUsageCost, getBundledModels } from "@oh-my-pi/pi-catalog/models";
-import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { finalizeCustomModel } from "@oh-my-pi/pi-coding-agent/config/custom-models";
 import { applyModelPatch, mergeDiscoveredModel } from "@oh-my-pi/pi-coding-agent/config/model-patch";
@@ -3760,16 +3759,16 @@ describe("ModelRegistry", () => {
 				refresh: "antigravity-roster-refresh",
 				expires: Date.now() + 3_600_000,
 			});
-			const served = getBundledModels("google-antigravity").find(model => model.id === "claude-sonnet-4-6");
-			if (!served) throw new Error("Missing bundled Antigravity control model");
-			writeModelCache(
-				resolveModelCacheProviderId("google-antigravity", { apiKey: oauthToken }),
-				Date.now(),
-				[served],
-				true,
-				fingerprintStaticModels(getBundledModels("google-antigravity"), true),
-				path.join(tempDir, "models.db"),
-			);
+			const discovering = new ModelRegistry(authStorage, modelsJsonPath, {
+				fetch: async input => {
+					const url = input instanceof Request ? input.url : String(input);
+					if (!url.endsWith("/v1internal:fetchAvailableModels")) return new Response(null, { status: 404 });
+					return Response.json({ models: { "claude-sonnet-4-6": {} } });
+				},
+			});
+			await discovering.refreshProvider("google-antigravity", "online");
+			expect(discovering.find("google-antigravity", "claude-sonnet-4-6")).toBeDefined();
+			expect(discovering.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
 			let fetchCalls = 0;
 			const restarted = new ModelRegistry(authStorage, modelsJsonPath, {
 				fetch: async () => {

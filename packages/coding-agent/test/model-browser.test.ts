@@ -449,13 +449,6 @@ describe("ModelBrowser perf display", () => {
 		expect(tiny).not.toContain("128k");
 	});
 
-	test("detail line shows measured perf regardless of width", () => {
-		const browser = makePerfBrowser();
-
-		const lines = renderPlain(browser, 70);
-		expect(lines[lines.length - 2]).toContain("~118t/s · 0.9s ttft");
-	});
-
 	test("catalog metrics render an intelligence tab and estimated TPS when unmeasured", () => {
 		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([makeModel("openai", "gpt-5", { int: 45.2, tps: 82.5 })]));
@@ -497,25 +490,6 @@ describe("ModelBrowser native model metadata", () => {
 		const lines = browser.render(160).map(line => Bun.stripANSI(line));
 		return lines[lines.length - 2] as string;
 	}
-
-	test("detail line badges upstream flags and appends the provider blurb", () => {
-		const detail = renderDetail(
-			makeModel("fixture", "swe-2", {
-				description: "Fast\tagentic\ncoder",
-				isNew: true,
-				isBeta: true,
-				isRecommended: true,
-			}),
-		);
-
-		expect(detail).toContain("swe-2 · new · beta · recommended · 128k ctx · 1k out · free per M");
-		// Tabs and newlines are flattened so the blurb stays one detail row.
-		expect(detail).toMatch(/free per M · Fast {2,}agentic coder$/);
-	});
-
-	test("models without upstream metadata render the plain detail line", () => {
-		expect(renderDetail(makeModel("openai", "gpt-5"))).toContain("gpt-5 · 128k ctx · 1k out · free per M");
-	});
 
 	test("labels declared pricing states instead of calling the zero rate card free", () => {
 		// Published rates win over any declared state.

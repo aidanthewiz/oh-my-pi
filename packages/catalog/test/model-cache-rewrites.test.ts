@@ -7,6 +7,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
+import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
@@ -294,21 +295,28 @@ describe("model cache write churn", () => {
 	it.each(["google-antigravity", "google-gemini-cli"] as const)(
 		"isolates %s cached model rosters across credentials and endpoints",
 		async providerId => {
-			const createOptions =
-				providerId === "google-antigravity"
-					? googleAntigravityModelManagerOptions
-					: googleGeminiCliModelManagerOptions;
 			const options = (oauthToken: string, roster: string, endpoint?: string) => {
 				const modelId = `gemini-2.5-${roster}`;
+				const fetcher: FetchImpl = async input =>
+					String(input).includes(":fetchAvailableModels")
+						? Response.json({ models: { [modelId]: { displayName: modelId, supportsThinking: true } } })
+						: new Response("version: 2.19.1\n");
+				const managerOptions =
+					providerId === "google-antigravity"
+						? {
+								...googleAntigravityModelManagerOptions({
+									resolveAccounts: async () => [{ accessToken: oauthToken }],
+									endpoint,
+									fetch: fetcher,
+								}),
+								cacheProviderId: `${resolveModelCacheProviderId(providerId, {
+									apiKey: JSON.stringify([`token:${oauthToken}`]),
+									baseUrl: endpoint,
+								})}:union-v2`,
+							}
+						: googleGeminiCliModelManagerOptions({ oauthToken, endpoint, fetch: fetcher });
 				return {
-					...createOptions({
-						oauthToken,
-						endpoint,
-						fetch: async input =>
-							String(input).includes(":fetchAvailableModels")
-								? Response.json({ models: { [modelId]: { displayName: modelId, supportsThinking: true } } })
-								: new Response("version: 2.19.1\n"),
-					}),
+					...managerOptions,
 					cacheDbPath: dbPath,
 				};
 			};

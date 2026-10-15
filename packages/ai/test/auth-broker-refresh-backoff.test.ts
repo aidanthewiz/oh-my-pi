@@ -130,21 +130,56 @@ describe("auth broker OAuth refresh backoff", () => {
 		expect(refreshCalls).toBe(2);
 	});
 
-	test("delegated durable refresh does not establish a local mint cooldown", async () => {
-		if (!store) throw new Error("test setup failed");
-		let delegatedCalls = 0;
-		clientStorage = new AuthStorage(store, {
-			async refreshOAuthCredential(_provider, _id, credential) {
-				delegatedCalls += 1;
-				return { ...credential, access: `delegated-${delegatedCalls}`, expires: Date.now() + HOUR_MS };
-			},
-		});
+	test.each([
+		{ mintsLocally: false, recoveredAccess: "delegated-2", recoveredCalls: 2 },
+		{ mintsLocally: true, recoveredAccess: "delegated-1", recoveredCalls: 1 },
+	])(
+		"refresh override local mint=$mintsLocally determines auth-recovery reuse",
+		async ({ mintsLocally, recoveredAccess, recoveredCalls }) => {
+			if (!store) throw new Error("test setup failed");
+			let delegatedCalls = 0;
+			clientStorage = new AuthStorage(store, {
+				refreshOAuthCredentialMints: mintsLocally,
+				async refreshOAuthCredential(_provider, _id, credential) {
+					delegatedCalls += 1;
+					return { ...credential, access: `delegated-${delegatedCalls}`, expires: Date.now() + HOUR_MS };
+				},
+			});
+			await clientStorage.credentials.reload();
+			const id = store.listAuthCredentials(PROVIDER)[0]!.id;
+			await clientStorage.oauth.refresh(id);
+			const recovered = await clientStorage.oauth.refresh(id, undefined, {
+				reuseRecentMint: true,
+				reason: "auth-recovery",
+			});
+			expect(recovered.credential.type === "oauth" && recovered.credential.access).toBe(recoveredAccess);
+			expect(delegatedCalls).toBe(recoveredCalls);
+			const generic = await clientStorage.oauth.refresh(id);
+			expect(generic.credential.type === "oauth" && generic.credential.access).toBe(
+				`delegated-${recoveredCalls + 1}`,
+			);
+		},
+	);
+
+	test("auth-recovery refresh by id on a broker client reuses the broker's recent mint", async () => {
+		if (!handle) throw new Error("test setup failed");
+		const client = new AuthBrokerClient({ url: handle.url, token: TOKEN });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected broker snapshot");
+		const id = initial.snapshot.credentials[0]!.id;
+		await client.refreshCredential(id);
+		const minted = await client.fetchSnapshot();
+		if (minted.status !== 200) throw new Error("expected minted snapshot");
+		remote = new RemoteAuthCredentialStore({ client, initialSnapshot: minted.snapshot, streamSnapshots: false });
+		clientStorage = new AuthStorage(remote);
 		await clientStorage.credentials.reload();
-		const id = store.listAuthCredentials(PROVIDER)[0]!.id;
-		await clientStorage.oauth.refresh(id);
-		const recovered = await clientStorage.oauth.refresh(id, undefined, { reuseRecentMint: true });
-		expect(recovered.credential.type === "oauth" && recovered.credential.access).toBe("delegated-2");
-		expect(delegatedCalls).toBe(2);
+
+		const recovered = await clientStorage.oauth.refresh(id, undefined, { reason: "auth-recovery" });
+		expect(recovered.credential.type === "oauth" && recovered.credential.access).toBe("access-1");
+		expect(refreshCalls).toBe(1);
+		const generic = await clientStorage.oauth.refresh(id);
+		expect(generic.credential.type === "oauth" && generic.credential.access).toBe("access-2");
+		expect(refreshCalls).toBe(2);
 	});
 
 	test("generic forced refresh mints while only a provider 401 opts into reuse", async () => {

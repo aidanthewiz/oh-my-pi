@@ -4,12 +4,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import { oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId, resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import { googleAntigravityModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/google";
 import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import {
@@ -17,7 +19,10 @@ import {
 	discoverOpenAIModelsList,
 	discoveryProbeTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
-import { RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
+import {
+	RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS,
+	resolveOAuthDiscoveryAccounts,
+} from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -480,6 +485,50 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
 	});
 
+	test("Antigravity cache follows the account union and explicit credential authority", async () => {
+		const credential = (account: string, access = account): OAuthCredentials & { type: "oauth" } => ({
+			type: "oauth",
+			access,
+			refresh: `refresh-${account}`,
+			expires: Date.now() + 3_600_000,
+			email: `${account}@example.com`,
+		});
+		let rosterCalls = 0;
+		const fetcher: FetchImpl = async (input, init) => {
+			if (!String(input).includes(":fetchAvailableModels")) return new Response("version: 2.19.1\n");
+			rosterCalls++;
+			const token = new Headers(init?.headers).get("Authorization")?.replace("Bearer ", "");
+			const id = `gemini-2.5-${token}`;
+			return Response.json({ models: { [id]: { displayName: id, supportsThinking: true } } });
+		};
+		const registry = () => new ModelRegistry(authStorage, modelsJsonPath, { cacheDbPath, fetch: fetcher });
+		await authStorage.credentials.set("google-antigravity", credential("a"));
+		await registry().refreshProvider("google-antigravity", "online");
+
+		await authStorage.credentials.set("google-antigravity", [credential("a"), credential("b")]);
+		const expanded = registry();
+		await expanded.refreshProvider("google-antigravity", "online-if-uncached");
+		expect(expanded.find("google-antigravity", "gemini-2.5-a")?.accountAccess).toEqual({ "a@example.com": {} });
+		expect(expanded.find("google-antigravity", "gemini-2.5-b")?.accountAccess).toEqual({ "b@example.com": {} });
+
+		await authStorage.credentials.set("google-antigravity", [
+			credential("b", "b-refreshed"),
+			credential("a", "a-refreshed"),
+		]);
+		const callsBeforeHydration = rosterCalls;
+		const restarted = registry();
+		await restarted.hydrateCredentialScopedModelCaches();
+		expect(restarted.find("google-antigravity", "gemini-2.5-b")?.accountAccess).toEqual({ "b@example.com": {} });
+		expect(rosterCalls).toBe(callsBeforeHydration);
+
+		authStorage.keys.setRuntime("google-antigravity", "external");
+		const external = registry();
+		await external.refreshProvider("google-antigravity", "online-if-uncached");
+		expect(external.find("google-antigravity", "gemini-2.5-external")?.id).toBe("gemini-2.5-external");
+		expect(external.find("google-antigravity", "gemini-2.5-a")).toBeUndefined();
+		expect(external.find("google-antigravity", "gemini-2.5-b")).toBeUndefined();
+	});
+
 	test("online-if-uncached refreshes expired OAuth when the discovery cache is stale for the model manager", async () => {
 		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
 		await authStorage.credentials.set("anthropic", {
@@ -818,6 +867,185 @@ describe("ModelRegistry runtime discovery", () => {
 
 		expect(modelListCalls).toBe(0);
 		expect(getModelsForProvider(registry, "openai-codex").length).toBeGreaterThan(0);
+	});
+
+	test("Antigravity discovery unions every account's roster and routes each model to an account serving it", async () => {
+		// Account A's plan omits Claude 5.5; account B's serves it. Discovery is
+		// authoritative, so reading only one account's roster would prune Claude
+		// 5.5 for both whenever A is the account discovery happens to pick.
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				email: "b@example.com",
+				projectId: "project-b",
+			},
+		]);
+		const gemini = { "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", supportsThinking: true } };
+		const claude = Object.fromEntries(
+			["low", "medium", "high"].map(tier => [`claude-opus-5-5-${tier}`, { supportsThinking: true }]),
+		);
+		const rosters: Record<string, object> = {
+			"Bearer token-a": { models: gemini },
+			"Bearer token-b": { models: { ...gemini, ...claude } },
+		};
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.includes(":fetchAvailableModels")) {
+				const roster = rosters[new Headers(init?.headers).get("authorization") ?? ""];
+				return roster ? Response.json(roster) : new Response("Unauthorized", { status: 401 });
+			}
+			return new Response("version: 2.19.1\n");
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-antigravity", "online");
+
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		expect(opus?.accountAccess).toEqual({ "b@example.com": {} });
+		expect(registry.find("google-antigravity", "gemini-3.1-pro")?.accountAccess).toEqual({
+			"a@example.com": {},
+			"b@example.com": {},
+		});
+		// Bundled rows that no account serves stay pruned.
+		expect(registry.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
+
+		// A session pinned to account A moves to B for a model only B serves.
+		const sessionId = "antigravity-claude-session";
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
+		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity routing still works for an account whose login stored no email", async () => {
+		// Google's userinfo lookup is optional at login; such a credential keeps
+		// only its project id, which must still tag and select the account.
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				projectId: "project-b",
+			},
+		]);
+		const gemini = { "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", supportsThinking: true } };
+		const claude = Object.fromEntries(
+			["low", "medium", "high"].map(tier => [`claude-opus-5-5-${tier}`, { supportsThinking: true }]),
+		);
+		const rosters: Record<string, object> = {
+			"Bearer token-a": { models: gemini },
+			"Bearer token-b": { models: { ...gemini, ...claude } },
+		};
+		const fetchMock: FetchImpl = async (input, init) => {
+			if (String(input).includes(":fetchAvailableModels")) {
+				const roster = rosters[new Headers(init?.headers).get("authorization") ?? ""];
+				return roster ? Response.json(roster) : new Response("Unauthorized", { status: 401 });
+			}
+			return new Response("version: 2.19.1\n");
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-antigravity", "online");
+
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		expect(opus?.accountAccess).toEqual({ "project-b": {} });
+		const sessionId = "antigravity-emailless-session";
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
+		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity discovery retains the project identity of a token override matching a stored account", async () => {
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				projectId: "project-b",
+			},
+		]);
+		authStorage.keys.setRuntime("google-antigravity", "token-b");
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async input =>
+				String(input).includes(":fetchAvailableModels")
+					? Response.json({ models: { "claude-opus-5-5-low": { supportsThinking: true } } })
+					: new Response("version: 2.19.1\n"),
+		});
+		await registry.refreshProvider("google-antigravity", "online");
+		authStorage.keys.removeRuntime("google-antigravity");
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and discovered Claude Opus 5.5");
+		expect(
+			authStorage.sessions.pin("google-antigravity", "antigravity-override-session", accountA.credentialId),
+		).toBe(true);
+		expect(opus.accountAccess).toEqual({ "project-b": {} });
+		expect(await registry.getApiKey(opus, "antigravity-override-session")).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity discovery does not append a stale preflight token after its stored account refreshes", async () => {
+		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
+		await authStorage.credentials.set("google-antigravity", {
+			type: "oauth",
+			access: "expired-antigravity",
+			refresh: "refresh-antigravity",
+			expires: Date.now() - 60_000,
+			projectId: "project-only",
+		});
+		const options = googleAntigravityModelManagerOptions({
+			resolveAccounts: async () => {
+				const accounts = await resolveOAuthDiscoveryAccounts(
+					authStorage,
+					"google-antigravity",
+					"expired-antigravity",
+				);
+				return (
+					accounts?.map(account => ({ accessToken: account.accessToken, accountKey: oauthAccountKey(account) })) ??
+					null
+				);
+			},
+			endpoint: "https://antigravity.test",
+			fetch: async (input, init) => {
+				if (!String(input).includes(":fetchAvailableModels")) return new Response("version: 2.19.1\n");
+				if (new Headers(init?.headers).get("Authorization") !== ["Bearer", "fresh-google-antigravity"].join(" ")) {
+					return new Response("Unavailable", { status: 503 });
+				}
+				return Response.json({ models: { "claude-opus-5-5-low": { supportsThinking: true } } });
+			},
+		});
+		const models = await options.fetchDynamicModels?.();
+		expect(models?.find(model => model.id === "claude-opus-5-5")?.accountAccess).toEqual({ "project-only": {} });
+		expect(refreshCalls).toEqual(["google-antigravity"]);
 	});
 
 	test("Gemini CLI discovery forwards a stored OAuth project id to the quota fallback", async () => {

@@ -423,3 +423,71 @@ test("shows a non-default service tier's own speed aggregate", () => {
 	// Only a tier aggregate exists: show it rather than nothing.
 	expect(speed("openai/gpt-5.6-mini")).toBe("90 priority");
 });
+
+test("a rejected compaction edit remains editable in the model hub until corrected or cancelled", () => {
+	let rejected = true;
+	const hub = new ModelHubComponent(
+		ui,
+		source({ default: "demo/demo" }, []),
+		registry(MODELS),
+		MODELS.map(entry => ({ model: entry })),
+		{
+			onAssign: () => {},
+			onUnassign: () => {},
+			onCancel: () => {},
+			onCompactionPointChange: () => (rejected ? "synthetic project shadow" : undefined),
+		},
+	);
+	hubs.push(hub);
+	const act = (act: string, value?: string) =>
+		hub.handleNativeEvent({ type: "action", key: "", act, value, mods: [] });
+	act("scope", "roles");
+	hub.handleNativeEvent({ type: "select", key: "", item: "role:default" });
+	act("roles:compaction");
+	hub.handleInput("90k");
+	act("compactionPoint");
+	expect(props(hub.describe(withPicker)).focus).toBe("strip");
+	const rejectedText = stripVTControlCharacters(hub.render(120).join("\n"));
+	expect(rejectedText).toContain("synthetic project shadow");
+	expect(rejectedText).toContain("90k");
+
+	rejected = false;
+	hub.handleInput("\r");
+	expect(props(hub.describe(withPicker)).focus).toBe("list");
+	expect(props(hub.describe(withPicker)).selected).toBe("role:default");
+	act("roles:compaction");
+	act("cancel");
+	expect(props(hub.describe(withPicker)).focus).toBe("list");
+	expect(props(hub.describe(withPicker)).selected).toBe("role:default");
+});
+
+test("classic model previews track compaction trigger changes", () => {
+	let tokens = 90_000;
+	let revision = 0;
+	const settings = {
+		...source({ default: "demo/demo" }, []),
+		get revision() {
+			return revision;
+		},
+		compactionPointFor: () => ({ tokens, source: "global", draft: String(tokens) }),
+	};
+	const selected = MODELS[2]!;
+	const hub = new ModelHubComponent(
+		ui,
+		settings,
+		registry([selected]),
+		[{ model: selected }],
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+		{ currentSelector: "demo/demo" },
+	);
+	hubs.push(hub);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "all", mods: [] });
+	hub.handleNativeEvent({ type: "select", key: "", item: "demo/demo" });
+	const rendered = () => stripVTControlCharacters(hub.render(240).join("\n"));
+	expect(rendered()).toMatch(/\b(?:90,?000|90(?:\.0)?k)\b/i);
+
+	tokens = 160_000;
+	revision++;
+	expect(rendered()).toMatch(/\b(?:160,?000|160(?:\.0)?k)\b/i);
+	expect(rendered()).not.toMatch(/\b(?:90,?000|90(?:\.0)?k)\b/i);
+});

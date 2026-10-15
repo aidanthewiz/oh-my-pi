@@ -1588,7 +1588,8 @@ describe("antigravity discovery collapsing", () => {
 	);
 
 	it("returns collapsed logical entries and keeps the denylist", async () => {
-		const models = await fetchAntigravityDiscoveryModels({ token: "t", endpoint: "https://cca.test", fetcher });
+		const models = (await fetchAntigravityDiscoveryModels({ token: "t", endpoint: "https://cca.test", fetcher }))
+			?.models;
 
 		expect(models?.map(m => m.id).sort()).toEqual([
 			"claude-sonnet-4-6",
@@ -1663,10 +1664,12 @@ describe("antigravity discovery collapsing", () => {
 			{ preconnect: fetch.preconnect },
 		);
 
-		const models = await fetchAntigravityDiscoveryModels({
-			token: "t",
-			fetcher: defaultFetcher,
-		});
+		const models = (
+			await fetchAntigravityDiscoveryModels({
+				token: "t",
+				fetcher: defaultFetcher,
+			})
+		)?.models;
 
 		const discoveryUrl = requestedUrls.find(url => url.includes("/v1internal:fetchAvailableModels"));
 		expect(discoveryUrl).toBeDefined();
@@ -1691,9 +1694,12 @@ describe("antigravity discovery collapsing", () => {
 						),
 					{ preconnect: fetch.preconnect },
 				);
-				const options = googleAntigravityModelManagerOptions({ oauthToken: "t", fetch: fetcher });
+				const options = googleAntigravityModelManagerOptions({
+					resolveAccounts: async () => [{ accessToken: "t" }],
+					fetch: fetcher,
+				});
 				const result = await resolveProviderModels(
-					{ ...options, cacheDbPath: path.join(dir, "models.db") },
+					{ ...options, cacheProviderId: "antigravity-roster-test", cacheDbPath: path.join(dir, "models.db") },
 					"online",
 				);
 				return result.models.map(m => m.id);
@@ -1714,6 +1720,79 @@ describe("antigravity discovery collapsing", () => {
 		const unreachable = await resolve(() => new Response("Forbidden", { status: 403 }));
 		expect(unreachable).toContain("claude-sonnet-5-5");
 		expect(unreachable).toContain("claude-opus-5-5");
+	});
+
+	it("skips rejected Antigravity accounts while installing the healthy sibling's roster", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-rejected-roster-"));
+		const fetcher = Object.assign(
+			(input: string | URL | Request, init?: RequestInit) => {
+				if (!String(input).includes(":fetchAvailableModels"))
+					return Promise.resolve(new Response("version: 2.19.1\n"));
+				const token = new Headers(init?.headers).get("Authorization");
+				if (token === "Bearer revoked") return Promise.resolve(new Response("Unauthorized", { status: 401 }));
+				if (token === "Bearer forbidden") return Promise.resolve(new Response("Forbidden", { status: 403 }));
+				return Promise.resolve(
+					Response.json({
+						models: { "claude-opus-5-5-low": { displayName: "Claude Opus 5.5", supportsThinking: true } },
+					}),
+				);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const options = googleAntigravityModelManagerOptions({
+			resolveAccounts: async () => [
+				{ accessToken: "revoked", accountKey: "revoked@example.com" },
+				{ accessToken: "forbidden", accountKey: "forbidden@example.com" },
+				{ accessToken: "healthy", accountKey: "healthy@example.com" },
+			],
+			endpoint: "https://cca.test",
+			fetch: fetcher,
+		});
+		try {
+			const result = await resolveProviderModels(
+				{ ...options, cacheProviderId: "antigravity-rejected-test", cacheDbPath: path.join(dir, "models.db") },
+				"online",
+			);
+			expect(result.models.find(model => model.id === "claude-opus-5-5")?.accountAccess).toEqual({
+				"healthy@example.com": {},
+			});
+			expect(result.models.some(model => model.id === "claude-sonnet-5-5")).toBe(false);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("keeps the previous Antigravity catalog when a sibling fetch fails transiently", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-transient-roster-"));
+		const fetcher = Object.assign(
+			(input: string | URL | Request, init?: RequestInit) => {
+				if (!String(input).includes(":fetchAvailableModels"))
+					return Promise.resolve(new Response("version: 2.19.1\n"));
+				if (new Headers(init?.headers).get("Authorization") === "Bearer unavailable") {
+					return Promise.resolve(
+						new Response("Unavailable", { status: String(input).includes(".sandbox.") ? 503 : 401 }),
+					);
+				}
+				return Promise.resolve(Response.json({ models: { "gemini-3.1-pro-low": { supportsThinking: true } } }));
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const options = googleAntigravityModelManagerOptions({
+			resolveAccounts: async () => [
+				{ accessToken: "unavailable", accountKey: "unavailable@example.com" },
+				{ accessToken: "healthy", accountKey: "healthy@example.com" },
+			],
+			fetch: fetcher,
+		});
+		try {
+			const result = await resolveProviderModels(
+				{ ...options, cacheProviderId: "antigravity-transient-test", cacheDbPath: path.join(dir, "models.db") },
+				"online",
+			);
+			expect(result.models.some(model => model.id === "claude-opus-5-5")).toBe(true);
+		} finally {
+			await removeWithRetries(dir);
+		}
 	});
 });
 
