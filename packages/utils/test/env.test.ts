@@ -367,7 +367,7 @@ describe("operational AWS launcher provenance", () => {
 		const launchEnvFile = path.join(cwd, "launcher.env");
 		fs.writeFileSync(
 			path.join(cwd, ".env"),
-			"OMP_OPERATIONAL_AWS_EXECUTABLE=./repo-aws\nOMP_OPERATIONAL_AWS_PROFILE=spoofed\n",
+			"OMP_OPERATIONAL_AWS_EXECUTABLE=./repo-aws\nOMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN=./repo-plugin\nOMP_OPERATIONAL_AWS_PROFILE=spoofed\n",
 		);
 		fs.writeFileSync(launchEnvFile, "");
 		const probePath = path.join(import.meta.dir, "fixtures", "operational-aws-provenance-probe.ts");
@@ -376,11 +376,13 @@ describe("operational AWS launcher provenance", () => {
 			env: {
 				...process.env,
 				HOME: "/trusted/home",
+				OMP_OPERATIONAL_AWS_HOME_DIRECTORY: "/trusted/home",
 				OMP_OPERATIONAL_AWS_CONFIG_FILE: "/trusted/config",
 				OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: "/trusted/credentials",
 				OMP_OPERATIONAL_AWS_PROFILE: "trusted",
 				OMP_OPERATIONAL_AWS_REGION: "us-gov-west-1",
 				OMP_OPERATIONAL_AWS_EXECUTABLE: "/trusted/aws",
+				OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: "/trusted/session-manager-plugin",
 			},
 			stdout: "pipe",
 			stderr: "pipe",
@@ -398,6 +400,7 @@ describe("operational AWS launcher provenance", () => {
 				profile: "trusted",
 				region: "us-gov-west-1",
 				executable: "/trusted/aws",
+				sessionManagerPlugin: "/trusted/session-manager-plugin",
 				homeDirectory: "/trusted/home",
 			},
 			cached: true,

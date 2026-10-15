@@ -216,6 +216,7 @@ export const OPERATIONAL_AWS_LAUNCH_ENV_NAMES = [
 	"OMP_OPERATIONAL_AWS_PROFILE",
 	"OMP_OPERATIONAL_AWS_REGION",
 	"OMP_OPERATIONAL_AWS_EXECUTABLE",
+	"OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN",
 	"OMP_OPERATIONAL_AWS_HOME_DIRECTORY",
 	"OMP_OPERATIONAL_AWS_RESERVED_PROFILES",
 ] as const;
@@ -226,6 +227,7 @@ export interface OperationalAwsLaunchMetadata {
 	profile?: string;
 	region?: string;
 	executable?: string;
+	sessionManagerPlugin?: string;
 	homeDirectory: string;
 }
 
@@ -271,6 +273,7 @@ const operationalAwsLaunchMetadata: Readonly<OperationalAwsLaunchMetadata> | und
 		profile: launchValue("OMP_OPERATIONAL_AWS_PROFILE"),
 		region: launchValue("OMP_OPERATIONAL_AWS_REGION"),
 		executable: launchValue("OMP_OPERATIONAL_AWS_EXECUTABLE"),
+		sessionManagerPlugin: launchValue("OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN"),
 		homeDirectory,
 	});
 })();

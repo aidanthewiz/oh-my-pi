@@ -182,6 +182,15 @@ globalThis.fetch = Object.assign(
 	},
 	{ preconnect: nativeFetch.preconnect },
 );
+if (process.env.NATIVE_AWS_EXPECT_NO_PLUGIN) {
+	const before = (await calls()).length;
+	await assert.rejects(
+		() => tool.execute("missing-plugin", { profile: "government", service: "ecs", operation: "execute-command" }),
+		error => error instanceof ToolError && error.context?.code === "AWS_SESSION_MANAGER_UNAVAILABLE",
+	);
+	assert.equal((await calls()).length, before);
+	process.exit(0);
+}
 const modelEnvironment: Record<string, string | undefined> = {};
 restoreCoreforgeOperationalAwsEnvironment(modelEnvironment);
 assert.equal(modelEnvironment.OMP_MODEL_AWS_PROFILE, undefined);
@@ -723,6 +732,27 @@ try {
 	Bun.env.PATH = originalPath;
 	delete Bun.env.OMP_OPERATIONAL_AWS_EXECUTABLE;
 }
+for (const [service, operation] of [
+	["ecs", "execute-command"],
+	["ssm", "start-session"],
+] as const) {
+	const args = { profile: "government", service, operation, parameters: { Target: "fixture" } };
+	Bun.env.OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN = path.join(repository, "untrusted-plugin");
+	const approval = await tool.prepareRuntimeApproval(`session-${service}`, args);
+	assert.match(approval!.prompt, /Account: 123456789012/);
+	await assert.rejects(() => tool.execute(`session-denied-${service}`, args), /approval/);
+	tool.approveRuntimeApproval(`session-${service}`, args);
+	const result = await tool.execute(`session-${service}`, args);
+	assert.notEqual(result.isError, true, text(result));
+	assert.match(text(result), /REMOTE_COMMAND_OK/);
+	assert.ok(!text(result).includes("fixture-token"));
+	const call = (await calls()).findLast(call => call.argv.includes(operation));
+	assert.ok(call.env.PATH);
+	assert.notEqual(call.env.PATH, originalPath);
+	assert.notEqual(call.env.PATH, repository);
+	await assert.rejects(() => fs.stat(call.env.PATH), { code: "ENOENT" });
+}
+delete Bun.env.OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN;
 const cancel = new AbortController();
 const hanging = tool.execute("cancel", { ...read, parameters: { Prefix: "hang" } }, cancel.signal);
 for (let attempt = 0; attempt < 200; attempt++) {

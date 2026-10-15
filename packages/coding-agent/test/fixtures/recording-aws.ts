@@ -79,6 +79,19 @@ if (argv.includes("--fixture-child")) {
 		console.log(
 			JSON.stringify({ Account: account, Arn: `arn:${partition}:iam::${account}:user/fixture`, UserId: "fixture" }),
 		);
+	} else if (
+		(service === "ecs" && operation === "execute-command") ||
+		(service === "ssm" && operation === "start-session")
+	) {
+		const helper = Bun.spawnSync(["session-manager-plugin", "--version"], { env: process.env });
+		if (helper.exitCode !== 0 || helper.stdout.toString().trim() !== Bun.version) {
+			console.error("SessionManagerPlugin is not found or the wrong executable was selected");
+			process.exitCode = 1;
+		} else {
+			console.log("Starting session with SessionId: fixture");
+			console.log("REMOTE_COMMAND_OK");
+			console.log("SessionToken: fixture-token");
+		}
 	} else if (argv.includes("--prefix=hang")) {
 		Bun.spawn(
 			process.platform === "win32"

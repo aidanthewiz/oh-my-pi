@@ -140,6 +140,7 @@ interface PreparedAwsCall {
 	loginProfile?: string;
 	configPath: string;
 	tempDir: string;
+	sessionManagerBin?: string;
 	dcg?: DcgDecision;
 	expectedIdentity?: AwsIdentity;
 }
@@ -653,6 +654,7 @@ function minimumAwsEnv(
 	region: string,
 	configFile: string,
 	credentialsFile: string,
+	sessionManagerBin?: string,
 ): Record<string, string> {
 	const inherited = filterProcessEnv(Bun.env);
 	const env: Record<string, string> = {};
@@ -664,6 +666,7 @@ function minimumAwsEnv(
 		env.HOME = home;
 		env.USERPROFILE = home;
 	}
+	if (sessionManagerBin) env.PATH = sessionManagerBin;
 	env.AWS_CONFIG_FILE = configFile;
 	env.AWS_SHARED_CREDENTIALS_FILE = credentialsFile;
 	env.AWS_PROFILE = profile;
@@ -1081,8 +1084,37 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const mutation = !login && this.approval(params) !== "read";
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-aws-"));
 		const configPath = path.join(tempDir, "config");
+		const sessionManager =
+			(params.service === "ecs" && params.operation === "execute-command") ||
+			(params.service === "ssm" && params.operation === "start-session");
+		let sessionManagerBin: string | undefined;
 		try {
 			await fs.writeFile(configPath, serialiseSafeConfig(reachable, config), { mode: 0o600 });
+			if (sessionManager) {
+				const plugin = metadata.sessionManagerPlugin;
+				if (!plugin || !path.isAbsolute(plugin)) {
+					throw new AwsToolError(
+						"AWS_SESSION_MANAGER_UNAVAILABLE: install session-manager-plugin on your launcher PATH and restart Coreforge",
+					);
+				}
+				const resolved = await fs.realpath(plugin);
+				if (
+					!(await fs.stat(resolved)).isFile() ||
+					(process.platform === "win32" && path.extname(resolved).toLowerCase() !== ".exe")
+				) {
+					throw new AwsToolError("AWS_SESSION_MANAGER_UNAVAILABLE: the captured plugin is not executable");
+				}
+				await fs.access(resolved, fs.constants.X_OK);
+				const bin = path.join(tempDir, "bin");
+				await fs.mkdir(bin, { mode: 0o700 });
+				const target = path.join(
+					bin,
+					process.platform === "win32" ? "session-manager-plugin.exe" : "session-manager-plugin",
+				);
+				if (process.platform === "win32") await fs.copyFile(resolved, target);
+				else await fs.symlink(resolved, target);
+				sessionManagerBin = bin;
+			}
 		} catch (error) {
 			await fs.rm(tempDir, { force: true, recursive: true });
 			throw error;
@@ -1097,6 +1129,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			...(loginProfile ? { loginProfile } : {}),
 			configPath,
 			tempDir,
+			...(sessionManagerBin ? { sessionManagerBin } : {}),
 			...(dcg ? { dcg } : {}),
 		};
 	}
@@ -1204,6 +1237,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 				prepared.region,
 				prepared.configPath,
 				credentialsFile,
+				prepared.sessionManagerBin,
 			);
 			if (prepared.mutation && !prepared.login) {
 				prepared.expectedIdentity = await this.#verifyIdentityWithRecovery(
@@ -1394,6 +1428,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			prepared.region,
 			prepared.configPath,
 			credentialsFile,
+			prepared.sessionManagerBin,
 		);
 		try {
 			if (prepared.login) {
@@ -1496,7 +1531,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 				sink.push(
 					result.stdoutTruncated
 						? "AWS output withheld: truncated response"
-						: redactAwsOutput(result.stdout, true),
+						: redactAwsOutput(result.stdout, !prepared.sessionManagerBin),
 				);
 			if (result.stderr) sink.push(redactAwsOutput(result.stderr));
 			const timedOut = result.exitError instanceof ptree.TimeoutError;

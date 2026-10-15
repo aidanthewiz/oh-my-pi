@@ -28,11 +28,17 @@ For example, `{"profile":"employee-gov","service":"sts","operation":"get-caller-
 3. Destructive Command Guard applies to every call. Operations outside the explicit read-only allowlist require mutation approval and a verified STS account, ARN, Region, and partition. A changed identity after approval stops execution.
 4. When an SSO session has expired, an interactive session can offer one approved sign-in and retry. A noninteractive session returns an explicit login command. An explicit `sso login` call also requires approval.
 
+ECS `execute-command` and SSM `start-session` require the Session Manager plugin.
+Install `session-manager-plugin` on your employee PATH, then restart Coreforge.
+The launcher captures its absolute path before adding repository tools.
+Each session call exposes only that helper through a private temporary PATH.
+The native route does not inherit the repository PATH or ambient credentials.
+
 ## Results and limits
 
 The result includes redacted AWS output, profile, operation, Region, exit code, and failure code.
-Valid JSON up to 1 MiB may also produce a redacted artifact.
-Invalid, oversized, or truncated JSON is withheld from both the result and artifact.
+Output and artifacts are capped at 1 MiB. Invalid or truncated JSON is withheld.
+Session commands preserve redacted terminal text instead of requiring JSON.
 
 This route uses the employee's IAM permissions and AWS audit logs.
 Direct CLI calls do not carry MCP-specific IAM condition keys.

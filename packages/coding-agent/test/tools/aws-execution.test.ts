@@ -83,6 +83,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 			OMP_OPERATIONAL_AWS_CONFIG_FILE: config,
 			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "credentials"),
 			OMP_OPERATIONAL_AWS_EXECUTABLE: executable,
+			OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: process.execPath,
 			OMP_OPERATIONAL_AWS_PROFILE: "commercial",
 			OMP_OPERATIONAL_AWS_REGION: "us-east-1",
 			OMP_DCG_PATH: executable,
@@ -101,7 +102,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 			ANTHROPIC_API_KEY: "unrelated-anthropic",
 			OPENAI_API_KEY: "unrelated-openai",
 		};
-		for (const missingCli of [false, true]) {
+		for (const scenario of ["normal", "missing-cli", "missing-plugin"]) {
 			const probe = Bun.spawn(
 				[
 					process.execPath,
@@ -111,9 +112,16 @@ test("native AWS enforces process, account approval, authentication, and output 
 				{
 					cwd: root,
 					signal: AbortSignal.timeout(60_000),
-					env: missingCli
-						? { ...env, OMP_OPERATIONAL_AWS_EXECUTABLE: undefined, NATIVE_AWS_EXPECT_NO_CLI: "1" }
-						: env,
+					env:
+						scenario === "missing-cli"
+							? { ...env, OMP_OPERATIONAL_AWS_EXECUTABLE: undefined, NATIVE_AWS_EXPECT_NO_CLI: "1" }
+							: scenario === "missing-plugin"
+								? {
+										...env,
+										OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: undefined,
+										NATIVE_AWS_EXPECT_NO_PLUGIN: "1",
+									}
+								: env,
 					stdout: "pipe",
 					stderr: "pipe",
 				},
