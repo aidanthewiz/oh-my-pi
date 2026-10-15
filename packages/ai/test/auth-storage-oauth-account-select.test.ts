@@ -56,6 +56,28 @@ describe("AuthStorage OAuth account selection", () => {
 		expect(refreshSpy).not.toHaveBeenCalled();
 	});
 
+	test("model account restrictions preserve row identity after credentials reorder", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		const credentialA = oauthCredential("a");
+		const credentialB = oauthCredential("b");
+		await storage.credentials.set(PROVIDER, [credentialA, credentialB]);
+		const [accountA, accountB] = storage.oauth.accounts(PROVIDER);
+		if (!accountA || !accountB) throw new Error("expected two OAuth accounts");
+		await storage.credentials.set(PROVIDER, [
+			{ ...credentialB, access: "access-b-rotated" },
+			{ ...credentialA, access: "access-a-rotated" },
+		]);
+		expect(storage.sessions.pin(PROVIDER, "reordered-model", accountA.credentialId)).toBe(true);
+		expect(
+			await storage.keys.getWithCredential(PROVIDER, "reordered-model", { accountIds: ["acc-b"] }),
+		).toMatchObject({ apiKey: "access-b-rotated", credentialId: accountB.credentialId });
+	});
+
 	test("sessions.pin selects and restores the exact stored account", async () => {
 		const storage = authStorage;
 		const credentialStore = store;

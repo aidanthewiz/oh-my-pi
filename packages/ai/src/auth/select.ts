@@ -528,9 +528,9 @@ export class CredentialSelector {
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
 		await this.#deps.pool.adoptExternalChanges();
-		const stored = this.#deps.pool
-			.credentials(provider)
-			.map((credential, index) => ({ credential, index }))
+		const storedEntries = this.#deps.pool.entries(provider);
+		const stored = storedEntries
+			.map(({ credential }, index) => ({ credential, index }))
 			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
 		this.#deps.policies.validateFor(
 			provider,
@@ -726,7 +726,7 @@ export class CredentialSelector {
 		await Promise.all(
 			candidates.map(async candidate => {
 				const force = forceRefreshIndex !== undefined && candidate.selection.index === forceRefreshIndex;
-				const initialCredentialId = this.#deps.pool.entries(provider)[candidate.selection.index]?.id;
+				const initialCredentialId = storedEntries[candidate.selection.index]?.id;
 				let syncedPeerCredential = false;
 				if (initialCredentialId !== undefined) {
 					const beforeSync = candidate.selection.credential;
