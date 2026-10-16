@@ -22,7 +22,12 @@ import {
 import type { ToolSession } from ".";
 import awsDescription from "../prompts/tools/aws.md" with { type: "text" };
 import { enforceDestructiveCommandGuard, type DcgDecision } from "./destructive-command-guard";
-import { type RuntimeToolApprovalRequest, truncateForPrompt } from "./approval";
+import {
+	type RuntimeToolApprovalRequest,
+	resolveApproval,
+	resolveApprovalFromContext,
+	truncateForPrompt,
+} from "./approval";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -130,6 +135,10 @@ interface AwsIdentity {
 	partition: AwsPartition;
 }
 
+export interface AwsAuthenticationRecoveryBudget {
+	attempted: boolean;
+}
+
 interface PreparedAwsCall {
 	params: AwsToolParams;
 	profile: AwsProfileCatalogEntry;
@@ -143,6 +152,7 @@ interface PreparedAwsCall {
 	sessionManagerBin?: string;
 	dcg?: DcgDecision;
 	expectedIdentity?: AwsIdentity;
+	authRecovery: AwsAuthenticationRecoveryBudget;
 }
 
 interface AwsToolDetails {
@@ -731,13 +741,19 @@ export class AwsSessionAuthGroups {
 	#states = new Map<string, AwsAuthGroupState>();
 	#inFlight = new Map<string, Promise<AwsApprovedLoginResult>>();
 	#recoveries = new Map<string, Promise<boolean>>();
+	#generations = new Map<string, number>();
 
 	status(group: string): AwsAuthGroupState {
 		return this.#states.get(group) ?? "unknown";
 	}
 
+	generation(group: string): number {
+		return this.#generations.get(group) ?? 0;
+	}
+
 	markAuthenticated(group: string): void {
 		this.#states.set(group, "authenticated");
+		this.#generations.set(group, this.generation(group) + 1);
 	}
 
 	markDeclined(group: string): void {
@@ -749,17 +765,24 @@ export class AwsSessionAuthGroups {
 	}
 
 	reserveLogin(group: string): boolean {
-		if (this.status(group) !== "unknown") return false;
+		return !this.#recoveries.has(group) && this.#reserveLogin(group);
+	}
+
+	#reserveLogin(group: string): boolean {
+		const state = this.status(group);
+		if (state === "offered" || state === "approved" || this.#inFlight.has(group)) return false;
 		this.#states.set(group, "offered");
 		return true;
 	}
 
-	async recoverOnce(group: string, recover: () => Promise<boolean>): Promise<boolean> {
+	async recoverOnce(group: string, recover: (reserveLogin: () => boolean) => Promise<boolean>): Promise<boolean> {
 		const pending = this.#recoveries.get(group);
 		if (pending) return await pending;
-		if (this.status(group) === "authenticated") return true;
-		if (this.status(group) !== "unknown") return false;
-		const recovery = Promise.resolve().then(recover);
+		const login = this.#inFlight.get(group);
+		if (login) return (await login).authenticated;
+		const state = this.status(group);
+		if (state !== "unknown" && state !== "authenticated") return false;
+		const recovery = Promise.resolve().then(() => recover(() => this.#reserveLogin(group)));
 		this.#recoveries.set(group, recovery);
 		try {
 			const authenticated = await recovery;
@@ -773,10 +796,7 @@ export class AwsSessionAuthGroups {
 		}
 	}
 
-	/**
-	 * Run an externally supplied login handler only after a first-use approval.
-	 * Unknown and declined groups never execute the handler.
-	 */
+	/** Run an approved login once for all callers sharing the authentication group. */
 	async runApprovedLogin(group: string, login: () => Promise<boolean | void>): Promise<AwsApprovedLoginResult> {
 		const state = this.status(group);
 		if (state === "declined") return { authenticated: false, declined: true };
@@ -805,6 +825,7 @@ export class AwsSessionAuthGroups {
 let trustedAwsProfiles: AwsProfileCatalogEntry[] | undefined;
 let trustedAwsReservedProfiles: readonly string[] | undefined;
 
+const sessionApprovals = new WeakMap<ToolSession["settings"], Set<string>>();
 function cacheAwsProfiles(config: AwsIni, credentials: AwsIni): AwsProfileCatalogEntry[] {
 	const reserved = getReservedManagedAwsProfiles();
 	if (!trustedAwsProfiles || trustedAwsReservedProfiles !== reserved) {
@@ -848,13 +869,14 @@ export async function describeTrustedAwsLogin(profile: string): Promise<string> 
 	const loginProfile = await resolveTrustedAwsLoginProfile(profile);
 	const executable = getOperationalAwsLaunchMetadata()?.executable;
 	const group = (await resolveTrustedAwsProfile(profile))?.ssoGroup;
-	if (group && awsSessionAuthGroups.status(group) === "declined") {
-		return "AWS sign-in was declined or failed for this authentication group. No further login will be offered in this session.";
-	}
+	const retryHint =
+		group && awsSessionAuthGroups.status(group) === "declined"
+			? "Automatic AWS sign-in is paused after a declined or failed attempt. Request an explicit AWS SSO login to retry. "
+			: "";
 	if (!loginProfile || !executable || !path.isAbsolute(executable)) {
 		return "AUTH_REQUIRED: no AWS IAM Identity Center login route is configured for this profile.";
 	}
-	return `Native action: aws(${JSON.stringify({ profile, service: "sso", operation: "login" })}); trusted CLI argv: ${JSON.stringify([executable, "sso", "login", "--profile", loginProfile])}.`;
+	return `${retryHint}Native action: aws(${JSON.stringify({ profile, service: "sso", operation: "login" })}); trusted CLI argv: ${JSON.stringify([executable, "sso", "login", "--profile", loginProfile])}.`;
 }
 /** Resolve one profile's shared SSO group from immutable launcher-selected AWS files. */
 export async function resolveTrustedAwsSsoAuthGroup(profile: string): Promise<string | undefined> {
@@ -877,32 +899,70 @@ export async function recoverTrustedAwsAuthentication(
 	context: AgentToolContext | undefined,
 	signal?: AbortSignal,
 	region?: string,
+	existingTool?: AwsTool,
 ): Promise<boolean> {
 	if (!context?.hasUI || !context.ui || !context.settings) return false;
 	const group = (await resolveTrustedAwsProfile(profile))?.ssoGroup;
 	if (!group) return false;
 	const { ui, settings } = context;
 	return await untilAborted(signal, () =>
-		awsSessionAuthGroups.recoverOnce(group, async () => {
-			const tool = new AwsTool({
-				cwd: context.sessionManager.getCwd(),
-				hasUI: true,
-				settings,
-				getSessionFile: () => null,
-				getSessionSpawns: () => null,
-			});
+		awsSessionAuthGroups.recoverOnce(group, async reserveLogin => {
+			if (awsSessionAuthGroups.status(group) === "authenticated") {
+				const probe = new AwsTool({
+					cwd: context.sessionManager.getCwd(),
+					hasUI: false,
+					settings,
+					getSessionFile: () => null,
+					getSessionSpawns: () => null,
+				});
+				const validation = await probe.execute(
+					"aws-renewal-authentication-check",
+					{ profile, service: "sts", operation: "get-caller-identity", region, timeout: 15 },
+					signal,
+				);
+				if (!validation.isError) return true;
+				if (validation.details?.code !== "AUTH_REQUIRED") return false;
+			}
+			const tool =
+				existingTool ??
+				new AwsTool({
+					cwd: context.sessionManager.getCwd(),
+					hasUI: true,
+					settings,
+					getSessionFile: () => null,
+					getSessionSpawns: () => null,
+				});
 			const params: AwsToolParams = { profile, service: "sso", operation: "login", region, timeout: 120 };
-			const callId = "aws-first-use-login";
+			const { approvalMode, userPolicies } = resolveApprovalFromContext(context);
+			if (resolveApproval(tool, params, approvalMode, userPolicies).policy === "deny") return false;
+			const callId = `aws-sso-login-${crypto.randomUUID()}`;
 			try {
-				const request = await tool.prepareRuntimeApproval(callId, params, signal);
-				if (
-					!request ||
-					!(await ui.confirm(request.reason, `${request.prompt}\nSource: ${source}`, { signal, timeout: 120_000 }))
-				) {
-					tool.denyRuntimeApproval(callId, params);
-					return false;
+				const request = await tool.prepareRuntimeApproval(callId, params, signal, context, reserveLogin);
+				if (request) {
+					const capability =
+						existingTool && request.allowSessionApproval === true ? tool.sessionApproval : undefined;
+					const message = `${request.prompt}\nSource: ${source}`;
+					let approveSession = false;
+					let approved: boolean;
+					if (existingTool) {
+						const choice = await ui.select(
+							message,
+							capability ? ["Deny", "Approve once", capability.label] : ["Deny", "Approve once"],
+							{ signal, timeout: 120_000, tuiStyle: request.tuiStyle },
+						);
+						approveSession = capability !== undefined && choice === capability.label;
+						approved = choice === "Approve once" || approveSession;
+					} else {
+						approved = await ui.confirm(request.reason, message, { signal, timeout: 120_000 });
+					}
+					signal?.throwIfAborted();
+					if (!approved) {
+						tool.denyRuntimeApproval(callId, params);
+						return false;
+					}
+					tool.approveRuntimeApproval(callId, params);
+					if (approveSession) capability!.approve();
 				}
-				tool.approveRuntimeApproval(callId, params);
 				return !(await tool.execute(callId, params, signal, undefined, context)).isError;
 			} catch (error) {
 				tool.denyRuntimeApproval(callId, params);
@@ -922,10 +982,41 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 	#parameters?: typeof awsSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable";
-	#prepared = new Map<string, { fingerprint: string; call: PreparedAwsCall }>();
+	#prepared = new Map<string, { fingerprint: string; sessionId: string | null; call: PreparedAwsCall }>();
 	#approved = new Map<string, string>();
 	#access = new AwsOperationAccess();
 	#classifications = new Map<string, { read: boolean; expiresAt: number }>();
+	#instanceApproval = false;
+
+	#getSessionId(): string | null {
+		return this.session.getSessionId?.() ?? this.session.sessionManager?.getSessionId?.() ?? null;
+	}
+
+	#hasSessionApproval(): boolean {
+		const sessionId = this.#getSessionId();
+		return sessionId === null
+			? this.#instanceApproval
+			: sessionApprovals.get(this.session.settings)?.has(sessionId) === true;
+	}
+
+	get sessionApproval() {
+		const sessionId = this.#getSessionId();
+		return {
+			label: "Allow for the rest of this session",
+			approve: (): void => {
+				if (sessionId !== this.#getSessionId()) {
+					throw new AwsToolError("AUTH_REQUIRED: session changed while awaiting AWS approval");
+				}
+				if (sessionId === null) {
+					this.#instanceApproval = true;
+					return;
+				}
+				let approved = sessionApprovals.get(this.session.settings);
+				if (!approved) sessionApprovals.set(this.session.settings, (approved = new Set()));
+				approved.add(sessionId);
+			},
+		};
+	}
 
 	get parameters(): typeof awsSchema {
 		const reserved = getReservedManagedAwsProfiles();
@@ -944,7 +1035,10 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		return this.#description!;
 	}
 
-	constructor(private readonly session: ToolSession) {
+	constructor(
+		private readonly session: ToolSession,
+		private readonly authenticationRecovery?: AwsAuthenticationRecoveryBudget,
+	) {
 		session.registerDisposeCallback?.(() => {
 			for (const callId of this.#prepared.keys()) {
 				void this.#discardPrepared(callId).catch(error =>
@@ -962,6 +1056,11 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 	}
 
 	readonly approval = (args: unknown): ToolApprovalDecision => {
+		const tier = this.#approvalTier(args);
+		return this.#hasSessionApproval() ? { tier, policy: "allow" } : tier;
+	};
+
+	#approvalTier(args: unknown): "read" | "exec" {
 		const input = args as Partial<AwsToolParams>;
 		if (
 			(input.service === "sso" && input.operation === "login") ||
@@ -972,7 +1071,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const key = `${input.service}\0${input.operation}`;
 		const classification = this.#classifications.get(key);
 		return classification?.read && classification.expiresAt > Date.now() ? "read" : "exec";
-	};
+	}
 	async prepareApprovalTier(args: unknown, signal?: AbortSignal): Promise<void> {
 		const input = args as Partial<AwsToolParams>;
 		if (
@@ -982,7 +1081,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			!COMMAND_NAME_RE.test(input.operation) ||
 			Object.hasOwn(BLOCKED_AWS_SERVICES, input.service) ||
 			input.service === "sso" ||
-			this.approval(input) === "read"
+			this.#approvalTier(input) === "read"
 		) {
 			return;
 		}
@@ -1081,7 +1180,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		];
 		const dcg = await enforceDestructiveCommandGuard(redactedArgv(argv, false), this.session.cwd, "posix", signal);
 		await this.prepareApprovalTier(params, signal);
-		const mutation = !login && this.approval(params) !== "read";
+		const mutation = !login && this.#approvalTier(params) !== "read";
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-aws-"));
 		const configPath = path.join(tempDir, "config");
 		const sessionManager =
@@ -1126,6 +1225,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			argv,
 			mutation,
 			login,
+			authRecovery: this.authenticationRecovery ?? { attempted: false },
 			...(loginProfile ? { loginProfile } : {}),
 			configPath,
 			tempDir,
@@ -1223,8 +1323,11 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		toolCallId: string,
 		args: unknown,
 		signal?: AbortSignal,
+		context?: AgentToolContext,
+		reserveLogin?: () => boolean,
 	): Promise<RuntimeToolApprovalRequest | undefined> {
 		const params = args as AwsToolParams;
+		const sessionId = this.#getSessionId();
 		await this.#discardPrepared(toolCallId);
 		const prepared = await this.#prepare(params, signal);
 		try {
@@ -1245,23 +1348,31 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					env,
 					timeout,
 					signal,
-					this.session.getToolContext?.(),
+					context ?? this.session.getToolContext?.(),
 				);
 			}
-			this.#prepared.set(toolCallId, { fingerprint, call: prepared });
+			if (sessionId !== this.#getSessionId()) {
+				throw new AwsToolError("AUTH_REQUIRED: session changed while preparing AWS approval");
+			}
+			this.#prepared.set(toolCallId, { fingerprint, sessionId, call: prepared });
 			if (prepared.login) {
 				const group = prepared.profile.ssoGroup;
 				if (!group) throw new AwsToolError("AUTH_REQUIRED: selected profile does not use AWS IAM Identity Center");
-				if (!awsSessionAuthGroups.reserveLogin(group))
+				if (!(reserveLogin ? reserveLogin() : awsSessionAuthGroups.reserveLogin(group)))
 					throw new AwsToolError(
-						"AUTH_REQUIRED: AWS SSO login was already offered, declined, or completed for this session; do not start another login",
+						"AUTH_REQUIRED: AWS SSO sign-in is already awaiting approval or running for this authentication group",
 					);
+				if (this.#hasSessionApproval() && prepared.dcg?.decision !== "ask") {
+					this.approveRuntimeApproval(toolCallId, params);
+					return undefined;
+				}
 				return {
 					reason: "AWS IAM Identity Center sign-in",
 					prompt: `Sign in to AWS SSO for profile ${prepared.profile.name}?\nAWS command: ${redactedArgv(prepared.argv)}`,
+					allowSessionApproval: prepared.dcg?.decision !== "ask",
 				};
 			}
-			if (prepared.mutation || prepared.dcg?.decision === "ask") {
+			if (prepared.dcg?.decision === "ask" || (prepared.mutation && !this.#hasSessionApproval())) {
 				return {
 					reason:
 						prepared.dcg?.decision === "ask"
@@ -1269,6 +1380,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 							: "AWS mutation requires verified account approval",
 					prompt: `AWS command: ${redactedArgv(prepared.argv)}\nAccount: ${prepared.expectedIdentity?.account ?? "not verified"}\nARN: ${prepared.expectedIdentity?.arn ?? "not verified"}\nRegion: ${prepared.region}\nPartition: ${prepared.expectedIdentity?.partition ?? "unknown"}`,
 					tuiStyle: "destructive",
+					allowSessionApproval: prepared.dcg?.decision !== "ask",
 				};
 			}
 			return undefined;
@@ -1284,7 +1396,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const params = args as AwsToolParams;
 		const fingerprint = JSON.stringify(params);
 		const prepared = this.#prepared.get(toolCallId);
-		if (prepared?.fingerprint !== fingerprint) return;
+		if (prepared?.fingerprint !== fingerprint || prepared.sessionId !== this.#getSessionId()) return;
 		this.#approved.set(toolCallId, fingerprint);
 		if (params.service === "sso" && params.operation === "login") {
 			const group = prepared.call.profile.ssoGroup;
@@ -1324,6 +1436,27 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		});
 	}
 
+	async #recoverAuthentication(
+		prepared: PreparedAwsCall,
+		source: string,
+		context: AgentToolContext | undefined,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		if (prepared.authRecovery.attempted) {
+			if (prepared.profile.ssoGroup) awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup);
+			return false;
+		}
+		prepared.authRecovery.attempted = true;
+		return await recoverTrustedAwsAuthentication(
+			prepared.params.profile,
+			source,
+			context,
+			signal,
+			prepared.region,
+			this.authenticationRecovery ? undefined : this,
+		);
+	}
+
 	async #verifyIdentityWithRecovery(
 		prepared: PreparedAwsCall,
 		env: Record<string, string>,
@@ -1336,13 +1469,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		} catch (error) {
 			if (!(error instanceof ToolError) || error.context?.code !== "AUTH_REQUIRED") throw error;
 			if (
-				!(await recoverTrustedAwsAuthentication(
-					prepared.params.profile,
-					"native AWS mutation identity verification",
-					context,
-					signal,
-					prepared.region,
-				))
+				!(await this.#recoverAuthentication(prepared, "native AWS mutation identity verification", context, signal))
 			) {
 				throw new AwsToolError(`${error.message}\n${await describeTrustedAwsLogin(prepared.params.profile)}`);
 			}
@@ -1417,9 +1544,13 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AwsToolDetails>> {
 		const fingerprint = JSON.stringify(params);
-		const cached = this.#prepared.get(toolCallId);
-		if (cached && cached.fingerprint !== fingerprint) await this.#discardPrepared(toolCallId);
-		const prepared = cached?.fingerprint === fingerprint ? cached.call : await this.#prepare(params, signal);
+		const sessionId = this.#getSessionId();
+		let cached = this.#prepared.get(toolCallId);
+		if (cached && (cached.fingerprint !== fingerprint || cached.sessionId !== sessionId)) {
+			await this.#discardPrepared(toolCallId);
+			cached = undefined;
+		}
+		const prepared = cached?.call ?? (await this.#prepare(params, signal));
 		const metadata = getOperationalAwsLaunchMetadata();
 		const credentialsFile = metadata?.sharedCredentialsFile ?? os.devNull;
 		const timeout = clampTimeout("aws", params.timeout, cfgToolsMaxTimeout.get(this.session.settings));
@@ -1431,8 +1562,24 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			prepared.sessionManagerBin,
 		);
 		try {
+			signal?.throwIfAborted();
+			if (sessionId !== this.#getSessionId()) {
+				throw new AwsToolError("AUTH_REQUIRED: session changed before AWS execution");
+			}
 			if (prepared.login) {
 				const group = prepared.profile.ssoGroup;
+				if (
+					group &&
+					this.#hasSessionApproval() &&
+					prepared.dcg?.decision !== "ask" &&
+					!this.#approved.has(toolCallId)
+				) {
+					if (!awsSessionAuthGroups.reserveLogin(group)) {
+						throw new AwsToolError("AUTH_REQUIRED: AWS SSO sign-in is already awaiting approval or running");
+					}
+					awsSessionAuthGroups.markApproved(group);
+					this.#approved.set(toolCallId, fingerprint);
+				}
 				if (
 					!group ||
 					awsSessionAuthGroups.status(group) !== "approved" ||
@@ -1476,7 +1623,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					.done();
 			}
 			if (
-				(prepared.mutation || prepared.dcg?.decision === "ask") &&
+				(prepared.dcg?.decision === "ask" || (prepared.mutation && !this.#hasSessionApproval())) &&
 				this.#approved.get(toolCallId) !== fingerprint
 			) {
 				throw new AwsToolError("INVALID_OPERATION: AWS operation requires Destructive Command Guard approval");
@@ -1502,20 +1649,28 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			}
 			const allocation = await this.session.allocateOutputArtifact?.("aws");
 			const sink = new OutputSink({ artifactPath: allocation?.path, artifactId: allocation?.id });
+			if (sessionId !== this.#getSessionId()) {
+				throw new AwsToolError("AUTH_REQUIRED: session changed before AWS execution");
+			}
 			let result = await this.#run(prepared.argv, executionEnv, timeout * 1000, signal);
 			if (
 				!result.ok &&
 				awsFailureCode(result.stderr, result.exitError instanceof ptree.TimeoutError) === "AUTH_REQUIRED" &&
-				(await recoverTrustedAwsAuthentication(
-					params.profile,
+				(await this.#recoverAuthentication(
+					prepared,
 					`native AWS: ${params.service} ${params.operation}`,
 					context ?? this.session.getToolContext?.(),
 					signal,
-					prepared.region,
 				))
 			) {
 				if (prepared.mutation) {
-					const refreshedIdentity = await this.#verifyIdentity(prepared, executionEnv, timeout * 1000, signal);
+					const refreshedIdentity = await this.#verifyIdentityWithRecovery(
+						prepared,
+						executionEnv,
+						timeout * 1000,
+						signal,
+						context ?? this.session.getToolContext?.(),
+					);
 					if (!identity || refreshedIdentity.arn !== identity.arn) {
 						throw new AwsToolError(
 							"AUTH_REQUIRED: AWS identity changed after sign-in; review and retry the operation",

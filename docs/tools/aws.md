@@ -25,8 +25,13 @@ For example, `{"profile":"employee-gov","service":"sts","operation":"get-caller-
 
 1. The launcher captures a trusted AWS CLI executable and profile file paths. Discovery reads profile metadata, not credentials or remote STS identity.
 2. The tool validates the explicit profile, Region, partition, parameters, and credential-process path. It runs the executable directly with a minimal environment and temporary configuration. Generic Bash does not inherit operational AWS credentials.
-3. Destructive Command Guard applies to every call. Operations outside the explicit read-only allowlist require mutation approval and a verified STS account, ARN, Region, and partition. A changed identity after approval stops execution.
-4. When an SSO session has expired, an interactive session can offer one approved sign-in and retry. A noninteractive session returns an explicit login command. An explicit `sso login` call also requires approval.
+3. Destructive Command Guard applies to every call. Mutations and unclassified operations require verified STS account, ARN, Region, and partition checks. A changed identity after approval stops execution.
+4. Ordinary approvals offer **Deny**, approval for one call, or **Allow for the rest of this session**. The session grant covers later native AWS operations and profiles, including SSO renewal. It remains in memory, survives tool reconstruction within that session, and does not apply to another session or managed MCP commands.
+5. Session approval never overrides explicit tool-policy denies, mandatory per-command Destructive Command Guard asks or denies, identity checks, or provider safety checks. Guard asks still require approval for the exact command and cannot grant session access.
+6. When SSO credentials expire, an interactive session can renew authentication and retry the operation once. Native and managed MCP calls share pending sign-ins for the same SSO group. Each call has one automatic recovery budget across identity checks, operation retries, and managed reconnects.
+7. A declined or failed sign-in pauses automatic recovery for that SSO group. A user-requested `sso login` can retry after a decline, failure, or earlier successful sign-in. A pending sign-in prevents duplicate login processes. Without an interactive surface, the tool returns an explicit login command.
+
+The session grant removes ordinary command consent prompts; it does not authenticate to AWS. The user must still complete browser SSO authentication when required. Grants are not saved to configuration or restored in a new process.
 
 ECS `execute-command` and SSM `start-session` require the Session Manager plugin.
 Install `session-manager-plugin` on your employee PATH, then restart Coreforge.

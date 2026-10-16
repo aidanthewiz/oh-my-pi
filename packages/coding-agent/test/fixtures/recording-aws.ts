@@ -48,6 +48,7 @@ if (argv.includes("--fixture-child")) {
 		}
 	} else if (
 		profile === "still-expired" ||
+		(profile === "mutation-reexpires" && service !== "sts") ||
 		(profile === "mutating-changed" && existsSync(join(root, "expire-mutation")) && !existsSync(token)) ||
 		((profile.startsWith("expired") ||
 			[
@@ -58,6 +59,7 @@ if (argv.includes("--fixture-child")) {
 				"firstuse-declined",
 				"government-expired",
 				"mutating-expired",
+				"mutation-reexpires",
 			].includes(profile)) &&
 			!existsSync(token))
 	) {

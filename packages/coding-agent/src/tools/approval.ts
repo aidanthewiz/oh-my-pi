@@ -20,9 +20,15 @@ export interface RuntimeToolApprovalRequest {
 	prompt: string;
 	/** Interactive TUI style for this runtime approval. */
 	tuiStyle?: "destructive";
+	/** Only explicitly eligible runtime requests may grant session access. */
+	allowSessionApproval?: boolean;
 }
 
 export interface RuntimeApprovalCapableTool {
+	sessionApproval?: {
+		label: string;
+		approve(): void;
+	};
 	prepareRuntimeApproval?(
 		toolCallId: string,
 		args: unknown,

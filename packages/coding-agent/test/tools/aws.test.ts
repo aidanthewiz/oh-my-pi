@@ -155,7 +155,7 @@ describe("native AWS output redaction", () => {
 });
 
 describe("native AWS SSO approvals", () => {
-	it("deduplicates concurrent approved logins and retains a decline for the session", async () => {
+	it("deduplicates concurrent approved logins and requires explicit approval after a decline", async () => {
 		const groups = new AwsSessionAuthGroups();
 		groups.markApproved("https://example.awsapps.com/start|us-west-2");
 		let logins = 0;
@@ -175,6 +175,106 @@ describe("native AWS SSO approvals", () => {
 			authenticated: false,
 			declined: true,
 		});
+		expect(logins).toBe(1);
+		expect(groups.reserveLogin("https://example.awsapps.com/declined|us-west-2")).toBe(true);
+		expect(groups.reserveLogin("https://example.awsapps.com/declined|us-west-2")).toBe(false);
+		groups.markApproved("https://example.awsapps.com/declined|us-west-2");
+		expect(
+			(await groups.runApprovedLogin("https://example.awsapps.com/declined|us-west-2", login)).authenticated,
+		).toBe(true);
+		expect(logins).toBe(2);
+	});
+
+	it("renews an authenticated group once for concurrent expired operations", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "shared";
+		let logins = 0;
+		const { promise: barrier, resolve: finishLogin } = Promise.withResolvers<void>();
+		const recover = async (reserveLogin: () => boolean) => {
+			expect(reserveLogin()).toBe(true);
+			groups.markApproved(group);
+			return (
+				await groups.runApprovedLogin(group, async () => {
+					logins++;
+					if (logins === 2) await barrier;
+					return true;
+				})
+			).authenticated;
+		};
+		expect(await groups.recoverOnce(group, recover)).toBe(true);
+		const firstRenewal = groups.recoverOnce(group, recover);
+		const concurrentRenewal = groups.recoverOnce(group, recover);
+		await Promise.resolve();
+		expect(logins).toBe(2);
+		expect(groups.reserveLogin(group)).toBe(false);
+		finishLogin();
+		expect(await firstRenewal).toBe(true);
+		expect(await concurrentRenewal).toBe(true);
+		expect(logins).toBe(2);
+	});
+
+	it("suppresses automatic renewal after failure until an explicit retry", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "failed";
+		groups.markAuthenticated(group);
+		let attempts = 0;
+		const failedRenewal = async (reserveLogin: () => boolean) => {
+			attempts++;
+			expect(reserveLogin()).toBe(true);
+			groups.markApproved(group);
+			return (await groups.runApprovedLogin(group, async () => false)).authenticated;
+		};
+		expect(await groups.recoverOnce(group, failedRenewal)).toBe(false);
+		expect(await groups.recoverOnce(group, failedRenewal)).toBe(false);
+		expect(attempts).toBe(1);
+		expect(groups.reserveLogin(group)).toBe(true);
+		groups.markApproved(group);
+		expect((await groups.runApprovedLogin(group, async () => true)).authenticated).toBe(true);
+	});
+
+	it("blocks an explicit reservation during renewal and allows an explicit retry after renewal failure", async () => {
+		const groups = new AwsSessionAuthGroups();
+		groups.markAuthenticated("shared");
+		const probe = Promise.withResolvers<void>();
+		const releaseProbe = Promise.withResolvers<void>();
+		const recovery = groups.recoverOnce("shared", async reserveLogin => {
+			probe.resolve();
+			await releaseProbe.promise;
+			expect(reserveLogin()).toBe(true);
+			groups.markApproved("shared");
+			return (await groups.runApprovedLogin("shared", async () => false)).authenticated;
+		});
+		await probe.promise;
+		expect(groups.reserveLogin("shared")).toBe(false);
+		releaseProbe.resolve();
+		expect(await recovery).toBe(false);
+		expect(groups.reserveLogin("shared")).toBe(true);
+		groups.markApproved("shared");
+		expect((await groups.runApprovedLogin("shared", async () => true)).authenticated).toBe(true);
+	});
+
+	it("allows explicit retry after an interrupted login without running unapproved handlers", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "interrupted";
+		expect(groups.reserveLogin(group)).toBe(true);
+		groups.markApproved(group);
+		await expect(
+			groups.runApprovedLogin(group, async () => {
+				throw new Error("interrupted");
+			}),
+		).rejects.toThrow("interrupted");
+		let logins = 0;
+		const login = async () => {
+			logins++;
+			return true;
+		};
+		expect(
+			await groups.recoverOnce(group, async () => (await groups.runApprovedLogin(group, login)).authenticated),
+		).toBe(false);
+		expect(logins).toBe(0);
+		expect(groups.reserveLogin(group)).toBe(true);
+		groups.markApproved(group);
+		expect((await groups.runApprovedLogin(group, login)).authenticated).toBe(true);
 		expect(logins).toBe(1);
 	});
 });

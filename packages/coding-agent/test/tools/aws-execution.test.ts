@@ -37,6 +37,15 @@ test("native AWS enforces process, account approval, authentication, and output 
 			["government-expired", "government-expired", "us-gov-west-1"],
 			["mutating-expired", "mutating-expired", "us-east-1"],
 			["mutating-changed", "mutating-changed", "us-east-1"],
+			["mutation-reexpires", "mutation-reexpires", "us-east-1"],
+			["expired-session", "session", "us-east-1"],
+			["expired-session-other", "session-other", "us-east-1"],
+			["expired-session-login", "session-login", "us-east-1"],
+			["expired-session-first", "session-first", "us-east-1"],
+			["expired-managed-direct-preflight", "managed-direct-preflight", "us-east-1"],
+			["expired-managed-deferred-preflight", "managed-deferred-preflight", "us-east-1"],
+			["expired-managed-direct-reconnect", "managed-direct-reconnect", "us-east-1"],
+			["expired-managed-deferred-reconnect", "managed-deferred-reconnect", "us-east-1"],
 		]) {
 			await fs.appendFile(
 				config,

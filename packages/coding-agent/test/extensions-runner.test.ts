@@ -34,6 +34,7 @@ import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { mcpToolEventIdentity } from "@oh-my-pi/pi-coding-agent/extensibility/tool-event-input";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { RuntimeApprovalCapableTool } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -2586,6 +2587,238 @@ describe("ExtensionRunner", () => {
 			approval: "exec" as const,
 			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
 		};
+
+		describe("session approval", () => {
+			const sessionLabel = "Allow for the rest of this session";
+			const createHarness = (
+				runtime: boolean,
+				request: { allowSessionApproval?: boolean } = { allowSessionApproval: true },
+			) => {
+				const runner = new ExtensionRunner(
+					[],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const select = vi.fn(async (_title: string, _options: string[]): Promise<string | undefined> => undefined);
+				initializeRunner(runner, select);
+				let sessionGranted = false;
+				const pendingCalls = new Set<string>();
+				const approvedCalls = new Set<string>();
+				const completed: string[] = [];
+				const tool: AgentTool & RuntimeApprovalCapableTool = {
+					...approvalTool,
+					approval: () => (sessionGranted ? { tier: "exec", policy: "allow" } : runtime ? "read" : "exec"),
+					sessionApproval: {
+						label: sessionLabel,
+						approve: () => {
+							sessionGranted = true;
+						},
+					},
+					...(runtime
+						? {
+								prepareRuntimeApproval: async (id: string) => {
+									if (sessionGranted) return undefined;
+									pendingCalls.add(id);
+									return { reason: "Review command", prompt: "Review this command", ...request };
+								},
+								approveRuntimeApproval: (id: string) => {
+									approvedCalls.add(id);
+								},
+								denyRuntimeApproval: (id: string) => {
+									pendingCalls.delete(id);
+									approvedCalls.delete(id);
+								},
+							}
+						: {}),
+					execute: async id => {
+						if (pendingCalls.delete(id) && !approvedCalls.delete(id)) {
+							throw new Error("Missing approval for this call");
+						}
+						completed.push(id);
+						return { content: [{ type: "text", text: `completed ${id}` }] };
+					},
+				};
+				const wrapper = new ExtensionToolWrapper(tool, runner);
+				const execute = (id: string, context: Partial<AgentToolContext> = {}, signal?: AbortSignal) =>
+					wrapper.execute(id, {}, signal, undefined, {
+						settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+						...context,
+					} as AgentToolContext);
+				return { runner, select, tool, execute, completed };
+			};
+
+			for (const runtime of [false, true]) {
+				describe(runtime ? "runtime requests" : "tier requests", () => {
+					it("grants later calls only for this tool and keeps explicit denies authoritative", async () => {
+						const harness = createHarness(runtime);
+						harness.select.mockImplementation(async (_title, options) =>
+							options.includes(sessionLabel) ? sessionLabel : "Deny",
+						);
+						expect((await harness.execute("first")).content).toEqual([{ type: "text", text: "completed first" }]);
+						expect((await harness.execute("later")).content).toEqual([{ type: "text", text: "completed later" }]);
+						expect(harness.select).toHaveBeenCalledTimes(1);
+
+						const other = new ExtensionToolWrapper(
+							{ ...approvalTool, name: "other_tool" } as AgentTool,
+							harness.runner,
+						);
+						harness.select.mockResolvedValue("Deny");
+						await expect(other.execute("other", {})).rejects.toThrow("denied by user");
+						await expect(
+							harness.execute("policy-denied", {
+								settings: Settings.isolated({ "tools.approval": { dangerous_tool: "deny" } }),
+							}),
+						).rejects.toThrow("blocked by user policy");
+						harness.tool.approval = { tier: "exec", policy: "deny", reason: "safety block" };
+						await expect(harness.execute("tool-denied")).rejects.toThrow("safety block");
+						expect(harness.completed).toEqual(["first", "later"]);
+						expect(harness.select).toHaveBeenCalledTimes(2);
+					});
+
+					it("approves once without approving the next call", async () => {
+						const harness = createHarness(runtime);
+						harness.select.mockResolvedValueOnce(runtime ? "Approve once" : "Approve").mockResolvedValue("Deny");
+						expect((await harness.execute("once")).content).toEqual([{ type: "text", text: "completed once" }]);
+						await expect(harness.execute("next")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual(["once"]);
+						expect(harness.select).toHaveBeenCalledTimes(2);
+					});
+
+					it.each(["Deny", undefined, "unrecognized choice"] as const)(
+						"does not grant access for %s",
+						async choice => {
+							const harness = createHarness(runtime);
+							harness.select.mockResolvedValueOnce(choice).mockResolvedValue("Deny");
+							await expect(harness.execute("rejected")).rejects.toThrow("denied by user");
+							await expect(harness.execute("next")).rejects.toThrow("denied by user");
+							expect(harness.completed).toEqual([]);
+							expect(harness.select).toHaveBeenCalledTimes(2);
+						},
+					);
+
+					it("does not grant access when the dialog throws or the call is aborted", async () => {
+						const harness = createHarness(runtime);
+						harness.select.mockRejectedValueOnce(new Error("dialog aborted"));
+						await expect(harness.execute("thrown")).rejects.toThrow("dialog aborted");
+						const controller = new AbortController();
+						harness.select.mockImplementationOnce(async () => {
+							controller.abort(new Error("call aborted"));
+							return sessionLabel;
+						});
+						await expect(harness.execute("aborted", {}, controller.signal)).rejects.toThrow("call aborted");
+						harness.select.mockResolvedValue("Deny");
+						await expect(harness.execute("next")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual([]);
+						expect(harness.select).toHaveBeenCalledTimes(3);
+					});
+
+					it("does not grant access when approval resolution fails", async () => {
+						const harness = createHarness(runtime);
+						harness.select.mockResolvedValue(sessionLabel);
+						const emit = harness.runner.emit.bind(harness.runner);
+						harness.runner.hasHandlers = event => event === "tool_approval_resolved";
+						harness.runner.emit = async event => {
+							if (event.type === "tool_approval_resolved") throw new Error("resolution failed");
+							return emit(event);
+						};
+						await expect(harness.execute("failed")).rejects.toThrow("resolution failed");
+						harness.runner.hasHandlers = () => false;
+						harness.select.mockResolvedValue("Deny");
+						await expect(harness.execute("next")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual([]);
+						expect(harness.select).toHaveBeenCalledTimes(2);
+					});
+
+					it("does not grant access without an interactive UI", async () => {
+						const harness = createHarness(runtime);
+						harness.runner.hasUI = () => false;
+						await expect(harness.execute("headless")).rejects.toThrow("no interactive UI");
+						harness.runner.hasUI = () => true;
+						harness.select.mockResolvedValue("Deny");
+						await expect(harness.execute("next")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual([]);
+						expect(harness.select).toHaveBeenCalledTimes(1);
+					});
+
+					it("never converts provider safety approval into session access", async () => {
+						const harness = createHarness(runtime);
+						harness.select
+							.mockResolvedValueOnce(sessionLabel)
+							.mockResolvedValueOnce(runtime ? "Approve once" : "Approve");
+						const safetyContext: Partial<AgentToolContext> = {
+							toolCall: {
+								batchId: "safety-batch",
+								index: 0,
+								total: 1,
+								toolCalls: [],
+								providerMetadata: {
+									type: "computer",
+									providerItemId: "computer-call",
+									actions: [],
+									pendingSafetyChecks: [{ id: "safety-check" }],
+								},
+							},
+						};
+						await expect(harness.execute("forged-session", safetyContext)).rejects.toThrow("denied by user");
+						expect((await harness.execute("safety-once", safetyContext)).content).toEqual([
+							{ type: "text", text: "completed safety-once" },
+						]);
+						harness.select.mockResolvedValue("Deny");
+						await expect(harness.execute("next")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual(["safety-once"]);
+						expect(harness.select).toHaveBeenCalledTimes(3);
+					});
+
+					it("does not accept a session choice from a tool without the capability", async () => {
+						const harness = createHarness(runtime);
+						delete harness.tool.sessionApproval;
+						harness.select.mockResolvedValue(sessionLabel);
+						await expect(harness.execute("forged-session")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual([]);
+					});
+
+					it("does not interpret a reserved Deny label as a session grant", async () => {
+						const harness = createHarness(runtime);
+						harness.tool.sessionApproval!.label = "Deny";
+						harness.select.mockResolvedValue("Deny");
+						await expect(harness.execute("denied")).rejects.toThrow("denied by user");
+						harness.select.mockResolvedValue(undefined);
+						await expect(harness.execute("next")).rejects.toThrow("denied by user");
+						expect(harness.completed).toEqual([]);
+						expect(harness.select).toHaveBeenCalledTimes(2);
+					});
+				});
+			}
+
+			it.each([false, undefined])("keeps runtime opt-out %s approvals command-specific", async allow => {
+				const harness = createHarness(true, { allowSessionApproval: allow });
+				harness.select
+					.mockResolvedValueOnce(sessionLabel)
+					.mockResolvedValueOnce("Approve once")
+					.mockResolvedValue("Deny");
+				await expect(harness.execute("forged-session")).rejects.toThrow("denied by user");
+				expect((await harness.execute("exact-command")).content).toEqual([
+					{ type: "text", text: "completed exact-command" },
+				]);
+				await expect(harness.execute("different-command")).rejects.toThrow("denied by user");
+				expect(harness.completed).toEqual(["exact-command"]);
+				expect(harness.select).toHaveBeenCalledTimes(3);
+			});
+
+			it("does not grant session access when the concrete runtime grant fails", async () => {
+				const harness = createHarness(true);
+				harness.tool.approveRuntimeApproval = () => {
+					throw new Error("runtime grant failed");
+				};
+				harness.select.mockResolvedValueOnce(sessionLabel).mockResolvedValue("Deny");
+				await expect(harness.execute("failed")).rejects.toThrow("runtime grant failed");
+				await expect(harness.execute("next")).rejects.toThrow("denied by user");
+				expect(harness.completed).toEqual([]);
+				expect(harness.select).toHaveBeenCalledTimes(2);
+			});
+		});
 
 		it("emits requested before waiting and resolved after approval", async () => {
 			const events: Array<{ type: string; approved?: boolean }> = [];
