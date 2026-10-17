@@ -15,6 +15,7 @@ import type { SearchProviderId, SearchResponse, SearchSource } from "@oh-my-pi/p
 import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgModelProviderOrder } from "../../../src/config/model-settings";
 
 const SOURCES: SearchSource[] = [
 	{ title: "Docs page", url: "https://docs.example.com/guide" },
@@ -41,7 +42,7 @@ async function stubRoleProvider(id: SearchProviderId, behaviour: (params: Search
 		if (requested !== id) throw new Error(`Unexpected provider: ${requested}`);
 		return stub;
 	});
-	return { authStorage, modelRegistry, getProvider };
+	return { settings, authStorage, modelRegistry, getProvider };
 }
 
 describe("web search directive pipeline", () => {
@@ -78,6 +79,50 @@ describe("web search directive pipeline", () => {
 			"Note: no results matched `site:nowhere.example`; the constraint was relaxed",
 		);
 	});
+
+	it.each<[string, string, SearchProviderId]>([
+		["routes an X-only query to xAI ahead of the role's engine", "tern site:x.com", "xai"],
+		["keeps the role's engine for queries that are not X-only", "tern site:x.com site:github.com", "brave"],
+	])("%s", async (_caseName, query, expectedProvider) => {
+		const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));
+		context.authStorage.keys.setRuntime("xai", "test-xai-key");
+		cfgRetryFallbackChains.set(context.settings, { web: ["xai/grok-4.7"] });
+		vi.spyOn(provider, "getGroundedSearchProvider").mockImplementation(async grounding => ({
+			id: "xai",
+			label: grounding,
+			isAvailable: () => true,
+			isExplicitlyAvailable: () => true,
+			search: async () => ({ provider: "xai", sources: [{ title: "Post", url: "https://x.com/jack/status/20" }] }),
+		}));
+
+		const result = await runSearchQuery({ query }, context);
+
+		expect(result.details.response.provider).toBe(expectedProvider);
+	});
+
+	it.each(["xai", "xai-oauth"])(
+		"does not authorize automatic X search from a stored %s credential",
+		async credentialProvider => {
+			const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));
+			if (credentialProvider === "xai-oauth") {
+				await context.authStorage.credentials.set(credentialProvider, {
+					type: "oauth",
+					access: "test-oauth-token",
+					refresh: "test-oauth-refresh",
+					expires: Date.now() + 86400000,
+				});
+			} else {
+				context.authStorage.keys.setRuntime(credentialProvider, "test-xai-key");
+			}
+			cfgModelProviderOrder.set(context.settings, [credentialProvider]);
+			const grounded = vi.spyOn(provider, "getGroundedSearchProvider");
+
+			const result = await runSearchQuery({ query: "tern site:x.com" }, context);
+
+			expect(result.details.response.provider).toBe("brave");
+			expect(grounded).not.toHaveBeenCalled();
+		},
+	);
 
 	it("uses a request model override instead of modelRoles.web", async () => {
 		const context = await stubRoleProvider("jina", async params => ({

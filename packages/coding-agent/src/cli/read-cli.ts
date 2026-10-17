@@ -20,10 +20,12 @@ import { MCPManager } from "../mcp/manager";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import type { AuthStorage } from "../session/auth-storage";
 import type { ToolSession } from "../tools";
+import { parseReadUrlTarget } from "../tools/fetch";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { splitDelimitedPathEntry } from "../tools/path-utils";
 import { ownsReadQuery, ReadTool, splitImageQuestionTarget } from "../tools/read";
 import { renderError } from "../tools/tool-errors";
+import { parseXUrl } from "../web/x";
 
 import { cfgDisabledExtensions, cfgExtensions, cfgSkills } from "../extensibility/settings";
 import { cfgMcpEnableProjectConfig } from "../mcp/settings";
@@ -100,19 +102,21 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			MCPManager.setInstance(mcpManager);
 		}
 
-		let needsVisionModel = false;
-		if (cmd.path.includes("?")) {
-			const readPaths = (await splitDelimitedPathEntry(cmd.path, cwd, {
-				queryOwner: entry => ownsReadQuery(entry, cwd),
-			})) ?? [cmd.path];
-			for (const entry of readPaths) {
-				if (splitImageQuestionTarget(entry).question !== undefined && (await ownsReadQuery(entry, cwd))) {
-					needsVisionModel = true;
-					break;
-				}
+		let needsModelRegistry = false;
+		const readPaths = (await splitDelimitedPathEntry(cmd.path, cwd, {
+			queryOwner: entry => ownsReadQuery(entry, cwd),
+		})) ?? [cmd.path];
+		for (const entry of readPaths) {
+			const urlTarget = parseReadUrlTarget(entry);
+			if (
+				(urlTarget && parseXUrl(urlTarget.path)) ||
+				(splitImageQuestionTarget(entry).question !== undefined && (await ownsReadQuery(entry, cwd)))
+			) {
+				needsModelRegistry = true;
+				break;
 			}
 		}
-		if (needsVisionModel) {
+		if (needsModelRegistry) {
 			authStorage ??= await discoverAuthStorage(undefined, { settings });
 			const modelRegistry = new ModelRegistry(authStorage);
 			await modelRegistry.hydrateCredentialScopedModelCaches();

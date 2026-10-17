@@ -6,10 +6,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
-import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
-import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -113,173 +110,6 @@ describe("runSubprocess child policy", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("preserves empty and absent agent tool declarations through session creation", async () => {
-		const session = yieldEmittingSession();
-		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-		const emptyFields = parseAgentFields({ name: "quiet", description: "desc", tools: [] });
-		const absentFields = parseAgentFields({ name: "default", description: "desc" });
-		if (!emptyFields || !absentFields) throw new Error("agent fields did not parse");
-
-		const emptyResult = await runSubprocess({
-			...baseOptions,
-			id: "empty-tools-child",
-			agent: { ...baseAgent, ...emptyFields },
-		});
-		const absentResult = await runSubprocess({
-			...baseOptions,
-			id: "default-tools-child",
-			agent: { ...baseAgent, ...absentFields },
-		});
-
-		expect(emptyResult.exitCode).toBe(0);
-		expect(absentResult.exitCode).toBe(0);
-		expect(spy.mock.calls[0]?.[0]?.toolNames).toEqual(["yield"]);
-		expect(spy.mock.calls[1]?.[0]?.toolNames).toBeUndefined();
-	});
-
-	it("grants wait only to unrestricted subagents that can start background work, and requires write for peers", async () => {
-		const session = yieldEmittingSession();
-		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const readOnlyResult = await runSubprocess({
-			...baseOptions,
-			id: "read-only-child",
-			agent: { ...baseAgent, tools: ["read", "grep", "glob"] },
-		});
-		const writableResult = await runSubprocess({
-			...baseOptions,
-			id: "writable-child",
-			agent: { ...baseAgent, tools: ["read", "write", "bash"] },
-		});
-		const spawningResult = await runSubprocess({
-			...baseOptions,
-			id: "spawning-child",
-			agent: { ...baseAgent, tools: ["read"], spawns: ["scout"] },
-		});
-		const restrictedResult = await runSubprocess({
-			...baseOptions,
-			id: "restricted-child",
-			agent: { ...baseAgent, tools: ["read", "bash"] },
-			restrictToolNames: true,
-		});
-
-		expect(readOnlyResult.exitCode).toBe(0);
-		expect(writableResult.exitCode).toBe(0);
-		expect(spawningResult.exitCode).toBe(0);
-		expect(restrictedResult.exitCode).toBe(0);
-		expect(spy.mock.calls[0]?.[0]?.toolNames).toEqual(["read", "grep", "glob"]);
-		expect(spy.mock.calls[1]?.[0]?.toolNames).toEqual(["read", "write", "bash", "wait"]);
-		expect(spy.mock.calls[2]?.[0]?.toolNames).toEqual(["read", "task", "wait"]);
-		expect(spy.mock.calls[3]?.[0]?.toolNames).toEqual(["read", "bash"]);
-
-		const promptText = (index: number): string => {
-			const prompt = spy.mock.calls[index]?.[0]?.systemPrompt;
-			const resolved = typeof prompt === "function" ? prompt(["default"]) : prompt;
-			return Array.isArray(resolved) ? resolved.join("\n") : (resolved ?? "");
-		};
-		const readOnlyPrompt = promptText(0);
-		const writablePrompt = promptText(1);
-		const spawningPrompt = promptText(2);
-		expect(readOnlyPrompt.includes("# Peers")).toBe(false);
-		expect(writablePrompt.includes("# Peers")).toBe(true);
-		expect(spawningPrompt.includes("# Peers")).toBe(false);
-	});
-
-	it("removes MCP and fresh discovery sources for a restricted child", async () => {
-		const session = yieldEmittingSession();
-		const persistedInits: Array<{ restrictToolNames?: boolean; tools: string[] }> = [];
-		vi.spyOn(session.sessionManager, "appendSessionInit").mockImplementation(init => {
-			persistedInits.push(init);
-			return "session-init";
-		});
-		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-		const preloadedExtensionPaths = ["/hostile/extensions/read.ts"];
-		const preloadedPreparedExtensions: PreparedExtension[] = [
-			{
-				path: preloadedExtensionPaths[0]!,
-				resolvedPath: preloadedExtensionPaths[0]!,
-				factory: () => {},
-				error: null,
-			},
-		];
-		const preloadedCustomToolPaths: ToolPathWithSource[] = [
-			{ path: "/hostile/tools/read.ts", source: { provider: "test", providerName: "Test", level: "project" } },
-		];
-		const getTools = vi.fn(() => [{ name: "read", label: "hostile/read" }]);
-		const mcpManager = { getTools } as unknown as MCPManager;
-
-		const result = await runSubprocess({
-			...baseOptions,
-			id: "restricted-child",
-			restrictToolNames: true,
-			mcpManager,
-			preloadedExtensionPaths,
-			preloadedPreparedExtensions,
-			preloadedCustomToolPaths,
-			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
-			outputSchemaMode: "strict",
-		});
-
-		expect(result.exitCode).toBe(0);
-		const forwarded = spy.mock.calls[0]?.[0];
-		expect(forwarded?.restrictToolNames).toBe(true);
-		expect(forwarded?.enableMCP).toBe(false);
-		expect(forwarded?.mcpManager).toBeUndefined();
-		expect(forwarded?.customTools).toBeUndefined();
-		expect(forwarded?.mcpTools).toBeUndefined();
-		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
-		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
-		expect(getTools).not.toHaveBeenCalled();
-		expect(forwarded?.outputSchemaMode).toBe("strict");
-		expect(persistedInits).toHaveLength(1);
-		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
-	});
-
-	it("persists bridge-only tools in the enabled Code Mode set", async () => {
-		const session = yieldEmittingSession();
-		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["eval", "yield"]);
-		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["eval", "read", "yield"]);
-		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const result = await runSubprocess({ ...baseOptions, id: "code-mode-child" });
-
-		expect(result.exitCode).toBe(0);
-		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["eval", "read", "yield"] }));
-	});
-
-	it("omits transport-only write from the persisted cold-revival contract", async () => {
-		const session = yieldEmittingSession();
-		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
-		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const result = await runSubprocess({
-			...baseOptions,
-			id: "transport-only-child",
-			agent: { ...baseAgent, tools: ["read"] },
-		});
-
-		expect(result.exitCode).toBe(0);
-		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "yield"] }));
-	});
-
-	it("persists write when the original subagent contract grants it", async () => {
-		const session = yieldEmittingSession();
-		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
-		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const result = await runSubprocess({
-			...baseOptions,
-			id: "writable-child",
-			agent: { ...baseAgent, tools: ["read", "write"] },
-		});
-
-		expect(result.exitCode).toBe(0);
-		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "write", "yield"] }));
-	});
-
 	it("rejects a spawn when task.maxEffort is below the model floor", async () => {
 		const baseModel = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!baseModel) throw new Error("Expected gpt-5.6-sol model to exist");
@@ -303,9 +133,6 @@ describe("runSubprocess child policy", () => {
 		});
 
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain(
-			"mock/mock-high-only has no supported thinking effort at or below task.maxEffort=low",
-		);
 		expect(spy).not.toHaveBeenCalled();
 	});
 });

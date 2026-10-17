@@ -5,6 +5,13 @@
 ### Fixed
 
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
+## [18.8.6] - 2026-10-08
+
+### Added
+
+- Added support for warm-cache-aware conversation pruning, keeping pruned history within the model’s prompt-cache lookback window while preserving Anthropic prompt-cache efficiency.
+- Added `AgentLoopConfig.hasQueuedAsides` (also available on `Agent`) to allow interruptible waits to detect queued asides without consuming them or signaling other tools.
+
 ## [18.8.1] - 2026-10-07
 
 ### Added

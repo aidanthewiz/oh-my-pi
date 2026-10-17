@@ -22,3 +22,10 @@ fail-fast = false
 # No retries: a flaky test is a bug we want to see, not paper over.
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+[test-groups.desktop-control]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(pi-natives) & test(desktop::control::tests::)'
+test-group = 'desktop-control'

@@ -1484,14 +1484,19 @@ export class CommandController {
 
 	/**
 	 * `/wt [<branch>]` — fork the checkout into a new linked git worktree on
-	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along,
-	 * then relocate the session there like `/move`.
+	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along
+	 * unless `keepChanges` is false, then relocate the session there like `/move`.
+	 * Returns the worktree only when the session now lives in it.
 	 */
-	async handleWorktreeCommand(branch?: string): Promise<void> {
+	async handleWorktreeCommand(
+		branch?: string,
+		options: { keepChanges?: boolean } = {},
+	): Promise<SessionWorktree | undefined> {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before creating a worktree.");
-			return;
+			return undefined;
 		}
+		let created: SessionWorktree | undefined;
 		await this.#withSessionMove(async () => {
 			const branchName = branch?.trim() || defaultSessionWorktreeBranch();
 			const cwd = this.ctx.sessionManager.getCwd();
@@ -1507,7 +1512,7 @@ export class CommandController {
 			this.ctx.ui.requestRender();
 			let worktree: SessionWorktree;
 			try {
-				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName);
+				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName, options);
 			} catch (err) {
 				this.ctx.showError(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
 				return false;
@@ -1522,7 +1527,10 @@ export class CommandController {
 				});
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
-			const cleanup = await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings);
+			created = worktree;
+			const cleanup = worktree.keptChanges
+				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+				: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
@@ -1536,6 +1544,7 @@ export class CommandController {
 			]);
 			return true;
 		});
+		return created;
 	}
 
 	/** Save source settings before acquiring the gate for a complete relocation operation. */

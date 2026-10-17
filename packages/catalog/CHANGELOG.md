@@ -11,6 +11,18 @@
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
 - Scoped Google OAuth model caches to credentials and discovery endpoints, plus Gemini CLI projects. Startup restores only the current credential's cached catalog.
 - Keep the Anthropic inline-image byte budget off custom endpoints, including legacy models with official-endpoint compatibility rules.
+- Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
+
+## [18.8.6] - 2026-10-08
+
+### Added
+
+- Added prompt-cache lookback support for Claude models across all hosts, including the public `prompt-cache-lookback` catalog axis and `resolvePromptCacheLookback` API.
+
+### Fixed
+
+- Fixed model discovery when providers publish models before they are recognized by the catalog; unsupported models are now skipped with a warning so other available models remain discoverable.
+
 ## [18.8.5] - 2026-10-08
 
 ### Breaking Changes

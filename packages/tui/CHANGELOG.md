@@ -7,6 +7,19 @@
 - Preserve quoted code and authored whitespace when resolving native Markdown links across quote and list containers.
 - Preserve session-relative native table links across escaped pipes and normalized cells.
 - Show per-model compaction triggers in classic model previews after edits and resets.
+- Preserve Coreforge wordmarks and personalized greetings in native welcome cards.
+
+## [18.8.6] - 2026-10-08
+
+### Changed
+
+- Improved rendering performance for streaming long Markdown lists while preserving nested items, numbering, and reference links.
+
+### Fixed
+
+- Added package exports for the native Tern/TSP modules, allowing extensions in compiled `omp` binaries to import them.
+- Fixed the Tern `/model` picker's Roles tab so typing and Backspace consistently edit the search field without triggering role commands.
+- Fixed the session picker so sessions retain and display their directory when switching between the current folder and all-project views.
 
 ## [18.8.5] - 2026-10-08
 

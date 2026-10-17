@@ -1948,6 +1948,10 @@ export class AgentSession implements SettingsScope {
 		this.agent.hasBackgroundCompletions = () =>
 			this.yieldQueue.hasDeliverable(LAUNCH_COMPLETION_MESSAGE_TYPE) ||
 			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE);
+		// Passive asides (`deliverAs: "aside"`) also end an interruptible `wait`
+		// instead of sitting behind it. Deferred wakes are not peeked: no
+		// boundary injection would drain them. Foreground tools are unaffected.
+		this.agent.hasQueuedAsides = () => this.#irc.hasAsides();
 		this.agent.setAsideMessageProvider(() => {
 			const thunks: AsideMessage[] = this.#irc.drainPending().map(record => () => record);
 			thunks.push(...this.yieldQueue.drainLazy());
@@ -2044,7 +2048,10 @@ export class AgentSession implements SettingsScope {
 			cancel: toolCallId => this.#ttsr.cancelBridgedToolCall(toolCallId),
 		});
 		this.agent.setOnBeforeYield(() => this.#ttsr.settleJudgments());
-		this.agent.setOnModelCallSystemPrompt(prompt => this.#recordModelCallSystemPrompt(prompt));
+		this.agent.setOnModelCallSystemPrompt(prompt => {
+			this.#tools.recordPrimaryModelCall(prompt);
+			this.#recordModelCallSystemPrompt(prompt);
+		});
 		this.#obfuscator = config.obfuscator;
 		const providerBoundaryHost: SessionProviderBoundaryHost = {
 			agent: this.agent,
@@ -3556,6 +3563,8 @@ export class AgentSession implements SettingsScope {
 	): string {
 		const cache = this.#persistedMessageKeys;
 		const wasFresh = cache !== undefined && cache.anchor === this.#persistedMessageKeysAnchor();
+		// A digest entry carries no persistence key, so the memo stays valid across it.
+		if (message.role === "assistant") this.#tools.recordReplyPrompt(message);
 		const entryId = this.sessionManager.appendMessage(message);
 		if (message.role === "assistant") {
 			(message as PersistedAssistantMessage)[kPersistedSessionEntryId] = entryId;
@@ -3897,6 +3906,7 @@ export class AgentSession implements SettingsScope {
 		// request start. Persisted with the message and read on rebuild.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			event.message.completedAt = Date.now();
+			this.#tools.bindReplyToCapturedPrompt(event.message);
 		}
 		// Turn-boundary maintenance awaits this commit before draining steering;
 		// extension notifications must not own or delay the persistence work.
@@ -5610,6 +5620,7 @@ export class AgentSession implements SettingsScope {
 		this.agent.setAsideMessageProvider(undefined);
 		this.agent.hasIrcInterrupts = undefined;
 		this.agent.hasBackgroundCompletions = undefined;
+		this.agent.hasQueuedAsides = undefined;
 		this.#advisors.stopRuntime();
 		this.#eval.beginDispose();
 	}
@@ -5919,6 +5930,7 @@ export class AgentSession implements SettingsScope {
 		this.agent.reset();
 		this.#lifecycleState = null;
 		this.#lifecycleIsMirrored = false;
+		this.#tools.releaseRestoredTranscript();
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
@@ -10692,6 +10704,8 @@ export class AgentSession implements SettingsScope {
 		if (!checkpointState) {
 			return;
 		}
+		// The rewound turn's reply is the exploration branch's newest, so this records its prompt.
+		const explorationPromptDigest = this.#tools.recordedPromptDigest();
 		this.#bash.withBranchTransition(() => {
 			try {
 				this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
@@ -10728,6 +10742,8 @@ export class AgentSession implements SettingsScope {
 				);
 				if (calls.length > 0) {
 					const callIds = new Set(calls.map(call => call.id));
+					// The rewind branch ends at the checkpoint, whose recorded prompt may predate this reply's.
+					this.#tools.recordPromptDigest(explorationPromptDigest);
 					this.sessionManager.appendMessage(
 						sanitizeAssistantForReparentedHistory({ ...turn.message, content: calls }),
 					);

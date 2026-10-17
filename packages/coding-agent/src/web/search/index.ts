@@ -32,6 +32,7 @@ import {
 	getSearchProvider,
 	type SearchProvider,
 } from "./provider";
+import { rankXAIProviders, targetsX } from "./providers/xai";
 import { applyQueryConstraints, parseSearchQuery } from "./query";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -157,6 +158,12 @@ function expandHostedCandidate(
 	return models.map(model => ({ ...candidate, model }));
 }
 
+/** Promote only xAI candidates already admitted by the role chain. */
+function preferXAI(chain: RoleChainCandidate[]): RoleChainCandidate[] {
+	const xai = chain.filter(candidate => candidate.model.webSearch === "xai");
+	return xai.length > 0 ? [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")] : chain;
+}
+
 /** Execute web search */
 async function executeSearch(
 	_toolCallId: string,
@@ -174,9 +181,13 @@ async function executeSearch(
 					: [];
 			})()
 		: resolveRoleChain("web", settings, pool);
-	const expanded = candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool));
-
 	const parsedQuery = parseSearchQuery(params.query);
+	let expanded = rankXAIProviders(
+		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),
+		candidate => candidate.model,
+		settings,
+	);
+	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded);
 
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
