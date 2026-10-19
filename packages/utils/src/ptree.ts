@@ -696,15 +696,30 @@ export function spawn<In extends InMask = InMask>(cmd: string[], opts?: ChildSpa
 /** Options for exec. */
 export interface ExecOptions extends Omit<ChildSpawnOptions, "stderr" | "stdin">, WaitOptions {
 	input?: string | Buffer | Uint8Array;
+	/** Keep a private stdin pipe open until completion. A finite `input` payload takes precedence. */
+	keepStdinOpen?: boolean;
 }
 
 /** Spawn, wait, and return captured output. */
 export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
-	const { input, stderr, allowAbort, allowNonZero, maxOutputBytes, onStdout, ...spawnOpts } = opts ?? {};
-	const stdin = typeof input === "string" ? Buffer.from(input) : input;
+	const {
+		input,
+		keepStdinOpen = false,
+		stderr,
+		allowAbort,
+		allowNonZero,
+		maxOutputBytes,
+		onStdout,
+		...spawnOpts
+	} = opts ?? {};
+	const stdin = (typeof input === "string" ? Buffer.from(input) : input) ?? (keepStdinOpen ? "pipe" : undefined);
 	const resolved: ChildSpawnOptions = stdin === undefined ? spawnOpts : { ...spawnOpts, stdin };
 	using child = spawnInternal(cmd, resolved, stderr === "full");
-	return await child.wait({ stderr, allowAbort, allowNonZero, maxOutputBytes, onStdout });
+	try {
+		return await child.wait({ stderr, allowAbort, allowNonZero, maxOutputBytes, onStdout });
+	} finally {
+		if (stdin === "pipe" && typeof child.stdin === "object") child.stdin.end();
+	}
 }
 
 // ── Signal combinators ───────────────────────────────────────────────────────

@@ -170,7 +170,7 @@ describe("native AWS SSO approvals", () => {
 		expect(first.authenticated).toBe(true);
 		expect(second.authenticated).toBe(true);
 		expect(logins).toBe(1);
-		groups.markDeclined("https://example.awsapps.com/declined|us-west-2");
+		groups.markDeclined("https://example.awsapps.com/declined|us-west-2", 0);
 		expect(await groups.runApprovedLogin("https://example.awsapps.com/declined|us-west-2", login)).toEqual({
 			authenticated: false,
 			declined: true,
@@ -276,5 +276,39 @@ describe("native AWS SSO approvals", () => {
 		groups.markApproved(group);
 		expect((await groups.runApprovedLogin(group, login)).authenticated).toBe(true);
 		expect(logins).toBe(1);
+	});
+
+	it("keeps a newer approved sign-in available when an older operation fails", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "newer-login";
+		groups.markAuthenticated(group);
+		const failedGeneration = groups.generation(group);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const delayedFailure = (async () => {
+			started.resolve();
+			await release.promise;
+			groups.markDeclined(group, failedGeneration);
+		})();
+		await started.promise;
+		expect(groups.reserveLogin(group)).toBe(true);
+		groups.markApproved(group);
+		release.resolve();
+		await delayedFailure;
+		let logins = 0;
+		const login = async () => {
+			logins++;
+			return true;
+		};
+		expect((await groups.runApprovedLogin(group, login)).authenticated).toBe(true);
+		expect(logins).toBe(1);
+		expect(
+			await groups.recoverOnce(group, async reserveLogin => {
+				expect(reserveLogin()).toBe(true);
+				groups.markApproved(group);
+				return (await groups.runApprovedLogin(group, login)).authenticated;
+			}),
+		).toBe(true);
+		expect(logins).toBe(2);
 	});
 });

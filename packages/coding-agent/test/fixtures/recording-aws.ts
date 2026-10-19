@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = process.env.HOME ?? process.env.USERPROFILE!;
@@ -65,6 +65,17 @@ if (argv.includes("--fixture-child")) {
 	) {
 		console.error("SSO token expired; login required");
 		process.exitCode = 254;
+	} else if (existsSync(join(root, `auth-race-${profile}-${service}-${operation}.armed`))) {
+		const barrier = join(root, `auth-race-${profile}-${service}-${operation}`);
+		unlinkSync(`${barrier}.armed`);
+		writeFileSync(`${barrier}.started`, "yes");
+		const deadline = Date.now() + 10_000;
+		while (!existsSync(`${barrier}.release`)) {
+			if (Date.now() >= deadline) throw new Error("Authentication race barrier was not released");
+			await Bun.sleep(10);
+		}
+		console.error("SSO token expired; login required");
+		process.exitCode = 254;
 	} else if (service === "configure" && operation === "export-credentials") {
 		console.log(
 			JSON.stringify({
@@ -85,15 +96,15 @@ if (argv.includes("--fixture-child")) {
 		(service === "ecs" && operation === "execute-command") ||
 		(service === "ssm" && operation === "start-session")
 	) {
-		const helper = Bun.spawnSync(["session-manager-plugin", "--version"], { env: process.env });
-		if (helper.exitCode !== 0 || helper.stdout.toString().trim() !== Bun.version) {
-			console.error("SessionManagerPlugin is not found or the wrong executable was selected");
-			process.exitCode = 1;
-		} else {
-			console.log("Starting session with SessionId: fixture");
-			console.log("REMOTE_COMMAND_OK");
-			console.log("SessionToken: fixture-token");
-		}
+		const modes = ["fixture-fail", "fixture-zero-error", "fixture-hang"];
+		const mode = modes.find(value => argv.some(arg => arg === value || arg.endsWith(`=${value}`)));
+		const helper = Bun.spawn(["session-manager-plugin", mode ?? "fixture-complete"], {
+			env: process.env,
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+		process.exitCode = await helper.exited;
 	} else if (argv.includes("--prefix=hang")) {
 		Bun.spawn(
 			process.platform === "win32"

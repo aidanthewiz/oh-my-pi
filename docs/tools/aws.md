@@ -31,6 +31,8 @@ For example, `{"profile":"employee-gov","service":"sts","operation":"get-caller-
 6. When SSO credentials expire, an interactive session can renew authentication and retry the operation once. Native and managed MCP calls share pending sign-ins for the same SSO group. Each call has one automatic recovery budget across identity checks, operation retries, and managed reconnects.
 7. A declined or failed sign-in pauses automatic recovery for that SSO group. A user-requested `sso login` can retry after a decline, failure, or earlier successful sign-in. A pending sign-in prevents duplicate login processes. Without an interactive surface, the tool returns an explicit login command.
 
+A delayed failure from an older operation does not invalidate a newer sign-in or its pending approval.
+
 The session grant removes ordinary command consent prompts; it does not authenticate to AWS. The user must still complete browser SSO authentication when required. Grants are not saved to configuration or restored in a new process.
 
 ECS `execute-command` and SSM `start-session` require the Session Manager plugin.
@@ -38,6 +40,8 @@ Install `session-manager-plugin` on your employee PATH, then restart Coreforge.
 The launcher captures its absolute path before adding repository tools.
 Each session call exposes only that helper through a private temporary PATH.
 The native route does not inherit the repository PATH or ambient credentials.
+
+Session commands keep a private input channel open until remote completion, cancellation, or timeout. They do not read from the interactive terminal. Helper startup diagnostics are reported as errors even when the helper exits with code 0.
 
 ## Results and limits
 

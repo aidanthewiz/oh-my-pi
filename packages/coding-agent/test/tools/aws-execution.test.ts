@@ -8,18 +8,24 @@ test("native AWS enforces process, account approval, authentication, and output 
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "native-aws-execution-"));
 	try {
 		const executable = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");
-		const fixture = path.resolve(import.meta.dir, "../fixtures/recording-aws.ts");
-		if (process.platform === "win32") {
-			const build = Bun.spawn([process.execPath, "build", "--compile", fixture, "--outfile", executable], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const [buildError, buildExit] = await Promise.all([new Response(build.stderr).text(), build.exited]);
-			expect(buildExit, buildError).toBe(0);
-		} else {
-			await fs.writeFile(executable, `#!${process.execPath}\n${await fs.readFile(fixture, "utf8")}`, {
-				mode: 0o755,
-			});
+		const sessionHelper = path.join(root, process.platform === "win32" ? "session-helper.exe" : "session-helper");
+		for (const [fixtureName, target] of [
+			["recording-aws.ts", executable],
+			["session-manager-helper.ts", sessionHelper],
+		] as const) {
+			const fixture = path.resolve(import.meta.dir, "../fixtures", fixtureName);
+			if (process.platform === "win32") {
+				const build = Bun.spawn([process.execPath, "build", "--compile", fixture, "--outfile", target], {
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [buildError, buildExit] = await Promise.all([new Response(build.stderr).text(), build.exited]);
+				expect(buildExit, buildError).toBe(0);
+			} else {
+				await fs.writeFile(target, `#!${process.execPath}\n${await fs.readFile(fixture, "utf8")}`, {
+					mode: 0o755,
+				});
+			}
 		}
 		const config = path.join(root, "config");
 		await fs.writeFile(
@@ -92,7 +98,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 			OMP_OPERATIONAL_AWS_CONFIG_FILE: config,
 			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "credentials"),
 			OMP_OPERATIONAL_AWS_EXECUTABLE: executable,
-			OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: process.execPath,
+			OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: sessionHelper,
 			OMP_OPERATIONAL_AWS_PROFILE: "commercial",
 			OMP_OPERATIONAL_AWS_REGION: "us-east-1",
 			OMP_DCG_PATH: executable,

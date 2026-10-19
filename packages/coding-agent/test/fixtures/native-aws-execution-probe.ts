@@ -9,6 +9,7 @@ import { DeferredMCPTool, MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../../src/mcp/types";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import {
 	getOperationalAwsLaunchMetadata,
 	isCoreforgeManagedLaunch,
@@ -823,6 +824,158 @@ for (const deferred of [false, true]) {
 	}
 }
 
+const raceToken = path.join(root, "authenticated-expired");
+const raceLoginCount = async () =>
+	(await calls()).filter(call => call.argv.includes("expired") && call.argv.includes("login")).length;
+const explicitRaceLogin = async (id: string) => {
+	await tool.prepareRuntimeApproval(id, login);
+	tool.approveRuntimeApproval(id, login);
+	assert.notEqual((await tool.execute(id, login)).isError, true);
+};
+const waitForAuthBarrier = async (barrier: string) => {
+	const deadline = Date.now() + 10_000;
+	while (!(await Bun.file(`${barrier}.started`).exists())) {
+		assert.ok(Date.now() < deadline, "Authentication race did not reach its barrier");
+		await Bun.sleep(10);
+	}
+};
+for (const stage of ["operation", "identity", "exhausted-budget"] as const) {
+	const id = `native-generation-${stage}`;
+	await explicitRaceLogin(`${id}-initial`);
+	const before = await raceLoginCount();
+	const beforePrompts: number = confirmations;
+	await fs.rm(raceToken);
+	const raceMutation = { ...mutation, profile: "expired" };
+	const operation =
+		stage === "identity"
+			? "sts-get-caller-identity"
+			: stage === "operation"
+				? "s3api-list-buckets"
+				: "ec2-terminate-instances";
+	const barrier = path.join(root, `auth-race-expired-${operation}`);
+	await fs.rm(`${barrier}.started`, { force: true });
+	await fs.rm(`${barrier}.release`, { force: true });
+	await Bun.write(`${barrier}.armed`, "yes");
+	let failed: Promise<boolean>;
+	if (stage === "identity") {
+		failed = tool.prepareRuntimeApproval(id, raceMutation, undefined, context).then(
+			() => false,
+			error => error instanceof ToolError && error.context?.code === "AUTH_REQUIRED",
+		);
+	} else {
+		if (stage === "exhausted-budget") {
+			await tool.prepareRuntimeApproval(id, raceMutation, undefined, context);
+			tool.approveRuntimeApproval(id, raceMutation);
+		}
+		failed = tool
+			.execute(
+				id,
+				stage === "operation" ? { ...read, profile: "expired" } : raceMutation,
+				undefined,
+				undefined,
+				context,
+			)
+			.then(result => result.isError === true && /AUTH_REQUIRED/.test(text(result)));
+	}
+	await waitForAuthBarrier(barrier);
+	assert.equal(await raceLoginCount(), before + 1, `${stage} did not renew before its retry`);
+	await explicitRaceLogin(`${id}-newer-login`);
+	await Bun.write(`${barrier}.release`, "yes");
+	assert.equal(await failed, true, `${stage} did not surface the old authentication failure`);
+	await fs.rm(raceToken);
+	const afterExpiry = await tool.execute(
+		`${id}-real-expiry`,
+		{ ...read, profile: "expired" },
+		undefined,
+		undefined,
+		context,
+	);
+	assert.notEqual(afterExpiry.isError, true, text(afterExpiry));
+	assert.equal(await raceLoginCount(), before + 3, `${stage} suppressed or repeated the next renewal`);
+	assert.equal(confirmations, beforePrompts + 2);
+	await fs.rm(`${barrier}.started`);
+	await fs.rm(`${barrier}.release`);
+}
+for (const deferred of [false, true]) {
+	for (const failure of ["result", "exception", "probe"] as const) {
+		const id = `managed-generation-${deferred ? "deferred" : "direct"}-${failure}`;
+		await explicitRaceLogin(`${id}-initial`);
+		const before = await raceLoginCount();
+		const beforePrompts: number = confirmations;
+		const retryStarted = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const probeBarrier = path.join(root, "auth-race-expired-sts-get-caller-identity");
+		let requests = 0;
+		const definition: MCPToolDefinition = {
+			name: "aws___run_script",
+			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["expired"] } } },
+		};
+		const raceConnection = {
+			name: "coreforge-aws-agent-toolkit",
+			config: { command: "unused" },
+			capabilities: { tools: {} },
+			awsPreferredProfile: "expired",
+			transport: {
+				request: async (method: string) => {
+					if (method === "tools/list") return { tools: [definition] };
+					requests++;
+					if (requests === 1) {
+						await fs.rm(raceToken);
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					}
+					if (requests === 2) {
+						retryStarted.resolve();
+						if (failure === "probe") {
+							await Bun.write(`${probeBarrier}.armed`, "yes");
+							return {
+								isError: true,
+								content: [
+									{ type: "text", text: "Tool call failed due to expired or invalid AWS credentials." },
+								],
+							};
+						}
+						await releaseRetry.promise;
+						if (failure === "exception") throw new Error("AUTH_REQUIRED: SSO token expired");
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					}
+					if (!(await Bun.file(raceToken).exists()))
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					return { content: [{ type: "text", text: "managed operation completed after real expiry" }] };
+				},
+			},
+		} as unknown as MCPServerConnection;
+		const raceManaged = deferred
+			? new DeferredMCPTool(raceConnection.name, definition, async () => raceConnection)
+			: new MCPTool(raceConnection, definition);
+		const pending = raceManaged.execute(id, { aws_profile: "expired" }, undefined, context);
+		await retryStarted.promise;
+		if (failure === "probe") await waitForAuthBarrier(probeBarrier);
+		assert.equal(await raceLoginCount(), before + 1);
+		await explicitRaceLogin(`${id}-newer-login`);
+		if (failure === "probe") await Bun.write(`${probeBarrier}.release`, "yes");
+		else releaseRetry.resolve();
+		const oldFailure = await pending;
+		assert.equal(oldFailure.isError, true);
+		assert.match(text(oldFailure), /AUTH_REQUIRED/);
+		await fs.rm(raceToken);
+		const afterExpiry = await raceManaged.execute(
+			`${id}-real-expiry`,
+			{ aws_profile: "expired" },
+			undefined,
+			context,
+		);
+		assert.notEqual(afterExpiry.isError, true, text(afterExpiry));
+		assert.match(text(afterExpiry), /managed operation completed after real expiry/);
+		assert.equal(await raceLoginCount(), before + 3);
+		assert.equal(confirmations, beforePrompts + 2);
+		assert.equal(requests, 4);
+		if (failure === "probe") {
+			await fs.rm(`${probeBarrier}.started`);
+			await fs.rm(`${probeBarrier}.release`);
+		}
+	}
+}
+
 const sessionLabel = "Allow for the rest of this session";
 const sessionSettings = Settings.isolated({
 	"tools.approvalMode": "always-ask",
@@ -1117,7 +1270,18 @@ for (const [service, operation] of [
 	["ecs", "execute-command"],
 	["ssm", "start-session"],
 ] as const) {
-	const args = { profile: "government", service, operation, parameters: { Target: "fixture" } };
+	const parameters: Record<string, unknown> =
+		service === "ecs"
+			? {
+					Cluster: "synthetic-cluster",
+					Task: "synthetic-task",
+					Container: "synthetic-container",
+					Command: "fixture-complete",
+					Interactive: true,
+				}
+			: { Target: "i-synthetic", DocumentName: "fixture-complete" };
+	const args = { profile: "government", service, operation, parameters };
+	const modeParameter = service === "ecs" ? "Command" : "DocumentName";
 	Bun.env.OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN = path.join(repository, "untrusted-plugin");
 	const approval = await tool.prepareRuntimeApproval(`session-${service}`, args);
 	assert.match(approval!.prompt, /Account: 123456789012/);
@@ -1132,6 +1296,47 @@ for (const [service, operation] of [
 	assert.notEqual(call.env.PATH, originalPath);
 	assert.notEqual(call.env.PATH, repository);
 	await assert.rejects(() => fs.stat(call.env.PATH), { code: "ENOENT" });
+	for (const mode of ["fixture-fail", "fixture-zero-error"]) {
+		const failedArgs = { ...args, parameters: { ...parameters, [modeParameter]: mode } };
+		const id = `session-${service}-${mode}`;
+		await tool.prepareRuntimeApproval(id, failedArgs);
+		tool.approveRuntimeApproval(id, failedArgs);
+		const failed = await tool.execute(id, failedArgs);
+		assert.equal(failed.isError, true);
+		assert.equal(failed.details?.code, "AWS_ERROR");
+		assert.equal(failed.details?.exitCode, mode === "fixture-fail" ? 23 : 0);
+		assert.match(text(failed), /fixture helper failure/);
+		assert.ok(!text(failed).includes("REMOTE_COMMAND_OK"));
+	}
+	const hangingArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-hang" } };
+	const hangingId = `session-${service}-cancel`;
+	await tool.prepareRuntimeApproval(hangingId, hangingArgs);
+	tool.approveRuntimeApproval(hangingId, hangingArgs);
+	const descendantPath = path.join(root, "session-helper-descendant.pid");
+	await fs.rm(descendantPath, { force: true });
+	const controller = new AbortController();
+	const hangingSession = tool.execute(hangingId, hangingArgs, controller.signal);
+	try {
+		for (let attempt = 0; attempt < 500; attempt++) {
+			if (await Bun.file(descendantPath).exists()) break;
+			await Bun.sleep(10);
+		}
+		const helperPid = Number(await Bun.file(path.join(root, "session-helper.pid")).text());
+		const descendantPid = Number(await Bun.file(descendantPath).text());
+		const helperProcess = Process.fromPid(helperPid);
+		const descendantProcess = Process.fromPid(descendantPid);
+		assert.equal(helperProcess?.status(), ProcessStatus.Running);
+		assert.equal(descendantProcess?.status(), ProcessStatus.Running);
+		controller.abort();
+		const cancelled = await hangingSession;
+		assert.equal(cancelled.isError, true);
+		assert.ok(!text(cancelled).includes("REMOTE_COMMAND_OK"));
+		assert.equal(helperProcess?.status(), ProcessStatus.Exited);
+		assert.equal(descendantProcess?.status(), ProcessStatus.Exited);
+	} finally {
+		controller.abort();
+		await hangingSession.catch(() => {});
+	}
 }
 delete Bun.env.OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN;
 const cancel = new AbortController();

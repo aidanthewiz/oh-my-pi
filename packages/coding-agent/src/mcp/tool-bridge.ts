@@ -445,7 +445,7 @@ async function callProfileAwareTool(
 				continue;
 			}
 		}
-		if (authenticationRecovery.attempted && group) awsSessionAuthGroups.markDeclined(group);
+		if (authenticationRecovery.attempted && group) awsSessionAuthGroups.markDeclined(group, authenticationGeneration);
 		throw new Error(
 			`AUTH_REQUIRED: commercial MCP profile authentication is unavailable. ${await describeTrustedAwsLogin(profile)}`,
 		);
