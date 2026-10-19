@@ -688,7 +688,9 @@ class DaemonBroker {
 				if (operation.owner !== undefined && record.snapshot.owner !== operation.owner) {
 					throw new Error(`Daemon ${operation.name} belongs to another session`);
 				}
-				await this.#stopRecord(record, operation.timeoutMs);
+				if (operation.id === undefined || operation.id === record.snapshot.id) {
+					await this.#stopRecord(record, operation.timeoutMs);
+				}
 				return { op: "stop", daemon: record.snapshot };
 			}
 			case "restart":

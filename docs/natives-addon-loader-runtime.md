@@ -5,7 +5,7 @@ This page documents `packages/natives/native/loader-state.js`, the runtime betwe
 ## Entrypoints and eager/lazy loading
 
 - `native/index.js` calls `loadNative()` at module evaluation and exposes the generated root API.
-- `native/desktop.js`, `native/clipboard.js`, `native/path.js`, and `native/vcs.js` defer native loading. Desktop, path, and VCS wrappers cache their selected class/bindings; clipboard calls `loadNative()` on each invocation. Path helpers return their input unchanged without loading on non-Windows platforms.
+- `native/desktop.js`, `native/clipboard.js`, `native/path.js`, `native/vcs.js`, and `native/mermaid.js` defer native loading. Desktop, path, and VCS wrappers cache their selected class/bindings; clipboard and Mermaid call `loadNative()` on invocation. Path helpers return their input unchanged without loading on non-Windows platforms.
 - Pure loader helpers are exported for focused tests and do not perform detection or filesystem probing until `loadNative()` or `initLoaderContext()` is called.
 
 A successful call is not memoized by JS. Repeated calls rely on the runtime's `require(...)` module cache, while post-load setup is idempotent or best-effort.
@@ -90,8 +90,7 @@ A successfully selected embedded candidate is prepended. Windows staging is disa
 `embedded-addon.js` is always `embeddedAddon = null` on disk, including the published core. Standalone binary builds replace it in memory with a manifest from `scripts/embed-native.ts` containing:
 
 - `platformTag` and package `version`;
-- a gzip-compressed tar archive reference;
-- `files[]` with `variant`, basename-only `filename`, and `size`.
+- `files[]` with `variant`, basename-only `filename`, decompressed `size`, and `zstdPath`, the embedded `<filename>.zst` zstd frame holding that addon.
 
 Extraction runs only for compiled mode with matching platform and version and a selectable file. Selection is:
 
@@ -99,9 +98,31 @@ Extraction runs only for compiled mode with matching platform and version and a 
 - modern x64: `modern`, then `baseline`;
 - baseline x64: `baseline` only.
 
-The loader creates `versionedDir`. If every manifest file that needs extraction is already a regular file with the declared size, it reuses them. Otherwise it gunzips and parses the tar archive, rejecting unsafe names and non-regular entries, validating sizes for pending manifest files, and writing those files through a temporary file plus rename. Safe regular entries not pending in the manifest are ignored. Missing, truncated, unsafe, wrong-type, and wrong-size entries are errors. Older manifests without an archive can still provide per-file `filePath` metadata.
+The loader creates `versionedDir` and rejects any manifest filename that is not a bare basename. Each manifest file that is already a regular file with the declared size is reused; every other one is decompressed from its zstd frame, checked against the declared size, and written through a temporary file plus rename. Unreadable frames, corrupt frames, and size mismatches are errors.
 
 Extraction errors are accumulated; the loader continues to ordinary candidates.
+
+## On-demand tree-sitter grammars
+
+The loader initially calls `__ompSetGrammarDir(<nativesDir>/grammars)` after loading the addon.
+The coding-agent host sets this to `getNativeGrammarsDir()` before resolving grammars.
+That host directory follows the agent's profile/config root and XDG cache selection, unless `PI_NATIVES_DIR` overrides it.
+Source and compiled hosts use the same directory; standalone native consumers retain the loader's machine-level default.
+Repeated lazy addon loads do not replace a host's selected grammar directory.
+Release-cache cleanup preserves `grammars/`.
+
+`wasmGrammarFor({ lang, path })` returns pinned release, filename, decompressed size, SHA-256, and installation status.
+An installed grammar has verified cache bytes or an already loaded language.
+The native owner bounds reads to the pinned size plus one byte and verifies size and SHA-256 before Wasmtime loads the module.
+Loaded languages remain resident for the process lifetime.
+
+Only an explicit AST need activates the agent's downloader; importing the addon does not download grammars.
+The default source is `https://github.com/stencil-hq/wasm-grammars/releases/download/<release>/<file>.zst`.
+`PI_GRAMMARS_URL` selects an operator-managed mirror with the same layout and pinned contents.
+Requests contain the grammar asset name, not source text, credentials, or model data.
+The agent verifies cached files and downloads, serializes installs with a file lock, and atomically renames verified bytes.
+Network or integrity failures return unavailable and apply a five-minute retry delay.
+Missing grammars make summary/block operations unsupported and AST searches report `missingGrammars`; they do not silently substitute a parser.
 
 ## Candidate validation and post-load setup
 
@@ -111,8 +132,9 @@ For each candidate:
 2. `require(candidate)`.
 3. Unless this is workspace development, require `__piNativesBuildVersion()` or the matching legacy `__piNativesV<version_with_underscores>` export to identify the package release. The build pipeline writes the current version into a fixed 64-byte slot (`PI_NATIVES_VERSION_STAMP:<version>` + NUL padding) after linking (`scripts/stamp-native-version.ts`, called from every `scripts/bazel-natives.ts` install, the local cargo build, and the Nix package build), so a release bump edits no Rust input. An addon from before release identities existed is accepted only when it has the legacy core and desktop ABI and the on-disk file lacks the current stamp.
 4. Call `__ompInstallTokioRuntime()` if the addon provides it.
-5. Best-effort remove valid semantic-version cache directories older than the current version.
-6. Return the bindings.
+5. Configure the on-demand grammar directory.
+6. Best-effort remove valid semantic-version cache directories older than the current version.
+7. Return the bindings.
 
 The version error distinguishes a previous addon still resident in the current process from a stale file on disk. If the loaded exports report an older release but the candidate bytes contain the current stamp (`PI_NATIVES_VERSION_STAMP:<packageVersion>\0`), the diagnostic says to restart. Otherwise it says to reinstall. The loader does not validate all public exports. As a compatibility exception, an addon with no release identity is accepted if it has `countTokens`, `executeShell`, `visibleWidth`, and a `DesktopSession` with `capture`, `execute`, and `close`, and the candidate bytes do not carry the expected current stamp. An unstamped current addon that exposes the stamp reader is not eligible.
 
@@ -129,14 +151,14 @@ If no candidate succeeds:
 - an unsupported tag throws `Unsupported platform: <tag>`, the supported list, and issue guidance;
 - a supported tag throws `Failed to load pi_natives native addon for <tag>` (including the x64 variant), followed by every candidate/preparation error and mode-specific help.
 
-Compiled help lists expected cache paths, suggests deleting the versioned directory, and prints release-download `curl` commands. Installed-package help suggests reinstalling, the local host build (`bun --cwd=packages/natives run build`), and explicit `scripts/bazel-natives.ts <target> --dest packages/natives/native` builds.
+Compiled help lists expected cache paths and suggests removing the versioned directory or reinstalling from the same Coreforce release channel. It never directs Coreforge binaries to upstream native releases. Installed-package help suggests reinstalling, the local host build (`bun --cwd=packages/natives run build`), and explicit `scripts/bazel-natives.ts <target> --dest packages/natives/native` builds.
 
 ## Lifecycle
 
 ```text
 entrypoint evaluates or lazy wrapper is invoked
   -> initialize loader context
-  -> extract matching embedded archive, if any
+  -> extract matching embedded addons, if any
   -> otherwise stage Windows node_modules addon, if applicable
   -> require candidates in deterministic order
        -> validate release stamp outside workspace development

@@ -870,6 +870,15 @@ export function getFastembedRuntimeDir(): string {
 	return dirs.rootSubdir(path.join("cache", "fastembed-runtime"), "cache");
 }
 
+/**
+ * Get the agent's on-demand tree-sitter grammar directory.
+ * The agent configures the addon with this path before resolving grammars.
+ * It follows the agent's native cache profile and XDG cache selection.
+ */
+export function getNativeGrammarsDir(): string {
+	return path.join(getNativesDir(), "grammars");
+}
+
 /** Get the natives directory. PI_NATIVES_DIR overrides the usual cache root; relative values are ignored. */
 export function getNativesDir(): string {
 	return resolveAbsoluteDir(process.env.PI_NATIVES_DIR) ?? dirs.rootSubdir("natives", "cache");

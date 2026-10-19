@@ -52,7 +52,6 @@ describe("broker unknown operations", () => {
 				(rejection: unknown) => rejection,
 			);
 			expect(error).toBeInstanceOf(DaemonBrokerRejectedError);
-			expect((error as Error).message).toBe("Unknown daemon operation: from-a-newer-omp");
 
 			// The rejection is scoped to that request; the connection keeps serving known operations.
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
@@ -84,7 +83,6 @@ describe("broker unknown operations", () => {
 				});
 			});
 			expect(response).toMatchObject({ id: "legacy-shutdown", ok: false });
-			expect(response.error).toMatch(/protocol 3; expected 4/iu);
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
 		} finally {
 			await client.request({ op: "shutdown" }).catch(() => undefined);

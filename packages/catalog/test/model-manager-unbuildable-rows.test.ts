@@ -63,6 +63,22 @@ describe("discovery rows that fail to build", () => {
 		expect(result.models.map(model => model.id)).toEqual(["catalog-only-model"]);
 	});
 
+	it("keeps a successful roster authoritative when only an unsupported row cannot build", async () => {
+		const result = await resolveProviderModels(
+			{
+				providerId: "synthetic",
+				staticModels: [spec("retired-static-model")],
+				dynamicModelsAuthoritative: true,
+				fetchDynamicModels: async () => [spec("live-model"), spec(UNBUILDABLE)],
+				cacheDbPath: dbPath,
+			},
+			"online",
+		);
+
+		expect(result.models.map(model => model.id)).toEqual(["live-model"]);
+		expect(result.stale).toBe(false);
+	});
+
 	it("fails the fetch when no row builds, so authoritative discovery keeps static models", async () => {
 		const result = await resolveProviderModels(
 			{

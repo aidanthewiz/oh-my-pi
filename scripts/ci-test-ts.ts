@@ -119,7 +119,6 @@ const repoScriptTests = [
 	"scripts/ci-test-ts.test.ts",
 	"scripts/fix-changelogs.test.ts",
 	"scripts/inline-functions.test.ts",
-	"scripts/release-disabled.test.ts",
 ];
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,

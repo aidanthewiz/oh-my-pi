@@ -209,6 +209,29 @@ describe("AuthStorage session account restrictions", () => {
 		expect(allowedKeys).toContain((await storage.keys.get(PROVIDER, "session")) ?? "");
 	});
 
+	test("honors a blocked explicit pin without escaping the permitted pool", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		storage.sessions.restrict(PROVIDER, "session", ["account:acc-a", "account:acc-b"]);
+		const [accountA, accountB] = storage.oauth.accounts(PROVIDER);
+		if (!accountA || !accountB) throw new Error("expected stored accounts");
+		await storage.limits.markReached(PROVIDER, "session", {
+			credentialId: accountA.credentialId,
+			retryAfterMs: 60_000,
+		});
+		await storage.limits.markReached(PROVIDER, "session", {
+			credentialId: accountB.credentialId,
+			retryAfterMs: 120_000,
+		});
+		expect(storage.sessions.pin(PROVIDER, "session", accountB.credentialId)).toBe(true);
+
+		expect(await storage.keys.getWithCredential(PROVIDER, "session")).toMatchObject({
+			apiKey: "access-b",
+			credentialId: accountB.credentialId,
+		});
+		expect(storage.oauth.identity(PROVIDER, "session")?.accountId).toBe("acc-b");
+		expect(exchanged).toEqual(["access-b"]);
+	});
+
 	test("keeps restrictions across a credential store replacement", async () => {
 		const lease = storage.sessions.restrict(PROVIDER, "session", ["account:acc-b"]);
 		const replacement = await SqliteAuthCredentialStore.open(path.join(tempDir, "replacement.db"));

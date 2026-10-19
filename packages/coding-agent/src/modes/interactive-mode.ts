@@ -210,6 +210,7 @@ import { resumeCommand } from "../utils/resume-command";
 import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-tui/theme/session-color";
 import { messageHasDisplayableThinking } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import type { TokenRateMeter } from "../utils/token-rate";
+import { disposeProgramStatus, initProgramStatus, setProgramStatusEnabled } from "../utils/run-status";
 import {
 	disposeTerminalTitleState,
 	initTerminalTitleState,
@@ -370,6 +371,7 @@ import {
 	cfgStatusLineShowHookStatus,
 	cfgStatusLineTransparent,
 	cfgSymbolPreset,
+	cfgTerminalProgramStatus,
 	cfgTerminalShowImages,
 	cfgTuiHyperlinks,
 	cfgTuiImeSafeCursor,
@@ -434,6 +436,7 @@ const cfgLiveUiSettings = combine({
 	"compaction.methodOrder": cfgCompactionMethodOrder,
 	"display.hideToolActivity": cfgDisplayHideToolActivity,
 	"terminal.showImages": cfgTerminalShowImages,
+	"terminal.programStatus": cfgTerminalProgramStatus,
 	hideThinkingBlock: cfgHideThinkingBlock,
 	proseOnlyThinking: cfgProseOnlyThinking,
 	expandThinkingBlocks: cfgExpandThinkingBlocks,
@@ -2300,6 +2303,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		initTerminalTitleState();
 		setTerminalTitleStateEnabled(cfgTuiTitleState.get(this.settings));
 		setTerminalTitleSpinnerStyle(cfgTuiTitleSpinner.get(this.settings));
+		initProgramStatus();
+		setProgramStatusEnabled(cfgTerminalProgramStatus.get(this.settings));
 		setTerminalSessionSource({
 			file: () => this.sessionManager.getSessionFile(),
 			cwd: () => this.sessionManager.getCwd(),
@@ -3635,6 +3640,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (any("tui.titleState")) setTerminalTitleStateEnabled(cfgTuiTitleState.get(this.settings));
 		if (any("tui.titleSpinner")) setTerminalTitleSpinnerStyle(cfgTuiTitleSpinner.get(this.settings));
+		if (any("terminal.programStatus")) setProgramStatusEnabled(cfgTerminalProgramStatus.get(this.settings));
 
 		if (
 			any(
@@ -7086,6 +7092,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// pending tick cannot re-emit an OSC title after `popTerminalTitle` hands the
 		// terminal back (which would leave the parent shell with a `π ⠋ …` tab).
 		disposeTerminalTitleState();
+		disposeProgramStatus();
 		popTerminalTitle();
 		this.stop();
 	}

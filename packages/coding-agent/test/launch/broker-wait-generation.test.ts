@@ -137,4 +137,53 @@ describe("daemon wait generation binding", () => {
 			process.title = previousTitle;
 		}
 	}, 25_000);
+
+	it("leaves a successor running after a stale stop and still enforces its session owner", async () => {
+		using tempDir = TempDir.createSync("@omp-stop-generation-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = startBroker(projectDir, daemonBrokerRuntimeDir(runtimeDir));
+		const spec: DaemonSpec = {
+			...exitingSpec("owned", projectDir, "no"),
+			args: ["-e", "process.stdin.resume(); console.log('ready')"],
+			ready: { log: "ready", timeoutMs: 5_000 },
+		};
+		try {
+			const first = await client.request({ op: "start", spec, owner: "owner" });
+			if (first.op !== "start") throw new Error("unexpected first start result");
+			await client.request({ op: "stop", name: "owned", timeoutMs: 2_000, owner: "owner", id: first.daemon.id });
+			const second = await client.request({ op: "start", spec, owner: "owner", replace: true });
+			if (second.op !== "start") throw new Error("unexpected second start result");
+			expect(second.daemon.id).not.toBe(first.daemon.id);
+			const stale = await client.request({
+				op: "stop",
+				name: "owned",
+				timeoutMs: 2_000,
+				owner: "owner",
+				id: first.daemon.id,
+			});
+			if (stale.op !== "stop") throw new Error("unexpected stop result");
+			expect(stale.daemon.id).toBe(second.daemon.id);
+			expect(stale.daemon.state).toBe("ready");
+			await expect(
+				client.request({
+					op: "stop",
+					name: "owned",
+					timeoutMs: 2_000,
+					owner: "foreign",
+					id: second.daemon.id,
+				}),
+			).rejects.toThrow("belongs to another session");
+			const described = await client.request({ op: "describe", name: "owned" });
+			if (described.op !== "describe") throw new Error("unexpected describe result");
+			expect(described.daemon.id).toBe(second.daemon.id);
+			expect(described.daemon.state).toBe("ready");
+		} finally {
+			await shutdown(client, broker, "owned");
+			process.title = previousTitle;
+		}
+	}, 25_000);
 });

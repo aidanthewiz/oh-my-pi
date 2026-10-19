@@ -15,7 +15,7 @@ import type { ToolSession } from "../../src/tools";
 import { ArtifactManager } from "../../src/session/artifacts";
 
 import { ReadTool } from "../../src/tools/read";
-const tempDir = TempDir.createSync("omp-nested-agent-repro-");
+const tempDir = TempDir.createSync("@omp-nested-agent-repro-");
 afterEach(() => {
 	AgentRegistry.resetGlobalForTests();
 	IrcBus.resetGlobalForTests();

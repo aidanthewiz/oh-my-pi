@@ -19,6 +19,7 @@ export type KnownProvider =
 	| "cline-pass"
 	| "cloudflare-ai-gateway"
 	| "commandcode"
+	| "coralbricks"
 	| "coreweave"
 	| "cursor"
 	| "deepinfra"

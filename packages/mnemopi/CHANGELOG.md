@@ -6,6 +6,12 @@
 
 - Rebuild stored local E5-large and all-MiniLM vectors after fastembed's CLS-to-mean pooling change, without deleting memories or changing configured model names.
 - Keep cached query vectors isolated between local mean-pooling models and API or custom providers.
+## [18.8.7] - 2026-10-09
+
+### Fixed
+
+- Fixed proactive linking freezing the host for seconds per stored memory on large banks; a memory's graph links are now written in one commit instead of one per link ([#14998](https://github.com/can1357/oh-my-pi/issues/14998)).
+
 ## [18.8.5] - 2026-10-08
 
 ### Fixed

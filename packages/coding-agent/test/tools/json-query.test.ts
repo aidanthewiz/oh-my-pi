@@ -38,6 +38,7 @@ describe("JSON query in read tool", () => {
 	let jsonlFile: string;
 	let numbersFile: string;
 	let mixedFile: string;
+	let failingLineFile: string;
 	let session: SessionLike;
 	let readTool: ReadTool;
 
@@ -47,6 +48,7 @@ describe("JSON query in read tool", () => {
 		jsonlFile = path.join(tempDir, "events.jsonl");
 		numbersFile = path.join(tempDir, "numbers.json");
 		mixedFile = path.join(tempDir, "mixed.json");
+		failingLineFile = path.join(tempDir, "failing.jsonl");
 
 		const testData = {
 			name: "my-project",
@@ -75,6 +77,8 @@ describe("JSON query in read tool", () => {
 		await fs.writeFile(numbersFile, '{"ids":[12345678901234567890,1.0,3]}', "utf-8");
 		// `.name` fails on the third element.
 		await fs.writeFile(mixedFile, '[{"name":"a"},{"name":"b"},3]', "utf-8");
+		// `.n + 1` fails on the second line only.
+		await fs.writeFile(failingLineFile, '{"n":1}\n{"n":"x"}\n{"n":3}\n', "utf-8");
 
 		session = createSession(tempDir);
 		readTool = new ReadTool(session);
@@ -268,7 +272,7 @@ describe("JSON query in read tool", () => {
 		await expect(readTool.execute("call_6", { path: `${jsonFile}?q=invalid [[[` })).rejects.toThrow(ToolError);
 	});
 
-	it("retains a bounded diagnostic tail without mixing debug output into query results", async () => {
+	it("bounds diagnostics while retaining successful values", async () => {
 		const query = 'range(0;5000) | debug | if . == 4999 then error("diagnostic-end-marker") else empty end';
 		const error = await readTool
 			.execute("bounded-diagnostics", { path: `${jsonFile}?q=${query}` })
@@ -276,8 +280,12 @@ describe("JSON query in read tool", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect(error.message).toContain("diagnostic-end-marker");
 		expect(error.message.length).toBeLessThan(10_000);
-		const result = await readTool.execute("debug-stdout", { path: `${jsonFile}?q=.items[0].id | debug` });
-		expect(getText(result)).toBe("1");
+		const result = await readTool.execute("diagnostic-stdout", {
+			path: `${jsonFile}?q=.items[0].id as $id | "kept-diagnostic-marker" | stderr | $id`,
+		});
+		const lines = getText(result).split("\n");
+		expect(lines.pop()).toBe("1");
+		expect(lines.join("\n")).toContain("kept-diagnostic-marker");
 	});
 
 	it("reads the file normally without jq query when ?q= is omitted", async () => {
@@ -376,7 +384,26 @@ describe("JSON query in read tool", () => {
 
 	it("stops jq once the page is full, before later results fail", async () => {
 		const result = await readTool.execute("call_early_stop", { path: `${mixedFile}?q=.[] | .name&raw=true&limit=1` });
-		expect(getText(result).split("\n")[0]).toBe("a");
+		expect(getText(result).split("\n").slice(-2, -1)).toEqual(["a"]);
+	});
+
+	// Holds for the bundled jq and, with PI_DISABLE_UUTILS_BUILTINS set, for a system jq.
+	it("reports a line that fails mid-file alongside the other lines' results", async () => {
+		const text = getText(await readTool.execute("call_mid_error", { path: `${failingLineFile}?q=.n + 1` }));
+		expect(text).toStartWith("[jq stderr: ");
+		expect(text.split("\n").slice(1)).toEqual(["2", "4"]);
+
+		const paged = getText(
+			await readTool.execute("call_mid_error_page", { path: `${failingLineFile}?q=.n + 1&limit=1` }),
+		);
+		expect(paged).toStartWith("[jq stderr: ");
+		expect(paged.split("\n").slice(-2, -1)).toEqual(["2"]);
+	});
+
+	it("strips terminal controls from jq's stderr", async () => {
+		const query = String.raw`.name as $name | "\u001b[31mred\u0000" | stderr | $name`;
+		const text = getText(await readTool.execute("call_stderr_controls", { path: `${jsonFile}?q=${query}` }));
+		expect(text).toBe('[jq stderr: red]\n"my-project"');
 	});
 
 	it("treats a filter starting with - as a filter, not jq flags", async () => {

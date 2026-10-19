@@ -386,6 +386,28 @@ function tryRealpath(p: string): string | undefined {
 	}
 }
 
+/**
+ * Name of the app that manages the omp at `binaryPath`, or undefined when none does.
+ *
+ * A manager (Tern) keeps `manager.json` (`{"manager": "tern", "name": "Tern"}`) two
+ * directories above every binary it installs (`<root>/versions/<version>`,
+ * `<root>/bin/omp.exe`) and updates them itself, so `omp update` must leave them alone.
+ * A missing or unreadable manifest means unmanaged.
+ */
+export async function managedInstallName(binaryPath: string): Promise<string | undefined> {
+	const resolved = tryRealpath(binaryPath);
+	if (!resolved) return undefined;
+	let manifest: unknown;
+	try {
+		manifest = await Bun.file(path.join(path.dirname(path.dirname(resolved)), "manager.json")).json();
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(manifest)) return undefined;
+	const name = typeof manifest.name === "string" && manifest.name ? manifest.name : manifest.manager;
+	return typeof name === "string" && name ? name : undefined;
+}
+
 function isSymlinkPath(p: string): boolean {
 	try {
 		return fs.lstatSync(p).isSymbolicLink();
@@ -1439,6 +1461,14 @@ export async function updateViaBinaryAt(
  * Run the update command.
  */
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
+	const ompPath = resolveOmpPath();
+	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
+	if (manager) {
+		console.log(
+			chalk.yellow(`${ompPath} is installed and kept up to date by ${manager}; update it from ${manager}.`),
+		);
+		return;
+	}
 	console.log(chalk.dim(`Current version: ${CF_VERSION}`));
 
 	// Check for updates

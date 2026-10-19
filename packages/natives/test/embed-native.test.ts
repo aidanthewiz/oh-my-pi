@@ -3,8 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { embeddedAddonFiles } from "../scripts/embed-native";
-import type { EmbeddedAddon } from "../native/loader-state.js";
-import { extractEmbeddedAddonArchive } from "../native/loader-state.js";
+import { type EmbeddedAddon, extractEmbeddedAddons } from "../native/loader-state.js";
 
 describe("native addon embedding", () => {
 	for (const [label, contents] of [
@@ -26,7 +25,24 @@ describe("native addon embedding", () => {
 		});
 	}
 
-	it("emits a manifest whose archive the loader extracts back to the addon", async () => {
+	it("embeds identical addon bytes identically", async () => {
+		const nativeDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-embed-"));
+		try {
+			const stamp = "PI_NATIVES_VERSION_STAMP:18.1.1\0";
+			await Bun.write(path.join(nativeDir, "pi_natives.linux-x64-modern.node"), `modern ${stamp}`.repeat(64));
+			await Bun.write(path.join(nativeDir, "pi_natives.linux-x64-baseline.node"), `baseline ${stamp}`.repeat(64));
+			const first = await embeddedAddonFiles({ platform: "linux", arch: "x64", nativeDir, version: "18.1.1" });
+			// Distinct mtimes must not leak into the embedded bytes.
+			await fs.utimes(path.join(nativeDir, "pi_natives.linux-x64-modern.node"), 1, 1);
+			const second = await embeddedAddonFiles({ platform: "linux", arch: "x64", nativeDir, version: "18.1.1" });
+
+			expect(second).toEqual(first);
+		} finally {
+			await fs.rm(nativeDir, { recursive: true, force: true });
+		}
+	});
+
+	it("emits a manifest whose zstd frames the loader extracts back to the addon", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-embed-"));
 		const nativeDir = path.join(root, "native");
 		const outDir = path.join(root, "out");
@@ -45,20 +61,17 @@ describe("native addon embedding", () => {
 			const { embeddedAddon }: { embeddedAddon: EmbeddedAddon } = await import(
 				path.join(outDir, "embedded-addon.js")
 			);
-			expect(embeddedAddon.platformTag).toBe("win32-arm64");
-			expect(embeddedAddon.version).toBe("18.1.1");
-			extractEmbeddedAddonArchive({
-				archivePath: embeddedAddon.archive?.filePath ?? "",
-				files: embeddedAddon.files,
-				targetDir: cacheDir,
-			});
+			expect(extractEmbeddedAddons({ files: embeddedAddon.files, targetDir: cacheDir })).toEqual([
+				path.join(cacheDir, "pi_natives.win32-arm64.node"),
+			]);
 			expect(await Bun.file(path.join(cacheDir, "pi_natives.win32-arm64.node")).text()).toBe(addon);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
-	it("bundles both x64 variants after the null manifest was already imported", async () => {
+	it("bundles both x64 variants through a symlink after the null manifest was already imported", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-embed-bundle-"));
+		const sourceDir = path.join(root, "source");
 		const nativeDir = path.join(root, "native");
 		const outDir = path.join(root, "out");
 		const cacheDir = path.join(root, "cache");
@@ -69,6 +82,8 @@ describe("native addon embedding", () => {
 			"pi_natives.linux-x64-baseline.node": "baseline__piNativesV18_1_1\0",
 		};
 		try {
+			await fs.mkdir(sourceDir);
+			await fs.symlink(sourceDir, nativeDir, process.platform === "win32" ? "junction" : "dir");
 			await Bun.write(manifestPath, stub);
 			for (const [filename, bytes] of Object.entries(addons)) {
 				await Bun.write(path.join(nativeDir, filename), bytes);
@@ -81,11 +96,10 @@ describe("native addon embedding", () => {
 			await Bun.write(
 				entrypoint,
 				`import { embeddedAddon } from ${JSON.stringify(manifestPath)};
-import { extractEmbeddedAddonArchive } from ${JSON.stringify(loaderPath)};
+import { extractEmbeddedAddons } from ${JSON.stringify(loaderPath)};
 import * as fs from "node:fs";
 fs.mkdirSync(${JSON.stringify(cacheDir)});
-extractEmbeddedAddonArchive({
-	archivePath: embeddedAddon.archive.filePath,
+extractEmbeddedAddons({
 	files: embeddedAddon.files,
 	targetDir: ${JSON.stringify(cacheDir)},
 });

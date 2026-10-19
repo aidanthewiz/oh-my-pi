@@ -268,6 +268,8 @@ describe("daemon metadata writes", () => {
 		{ olderScope: "", detached: true },
 		{ olderScope: "broker-v3", detached: true },
 		{ olderScope: "broker-v3", detached: false },
+		{ olderScope: "broker-v4", detached: true },
+		{ olderScope: "broker-v4", detached: false },
 	])(
 		"preserves a live older daemon during upgrade ($olderScope/$detached)",
 		async ({ olderScope, detached }) => {
@@ -356,41 +358,107 @@ describe("daemon metadata writes", () => {
 		},
 		20_000,
 	);
-	it.each(["", "broker-v3"])("refuses an upgrade while an older broker owns scope '%s'", async olderScope => {
-		using tempDir = TempDir.createSync("@omp-broker-upgrade-lease-");
-		const projectDir = path.join(tempDir.path(), "project");
-		const runtimeDir = path.join(tempDir.path(), "runtime");
-		await fs.mkdir(projectDir);
-		const olderRuntimeDir = path.join(runtimeDir, olderScope);
-		await fs.mkdir(olderRuntimeDir, { recursive: true });
-		const untouchedRecord = path.join(runtimeDir, "daemons", "unversioned-record", "meta.json");
-		const untouchedContent = '{"mustRemainUnchanged":true}';
-		await Bun.write(untouchedRecord, untouchedContent);
-		const lock = FileLock.tryAcquire(path.join(olderRuntimeDir, "broker.pid"));
-		if (!lock.acquired) throw new Error("Expected isolated legacy broker lease");
-		try {
-			const broker = startBroker(projectDir, runtimeDir);
-			await expect(broker.finished).rejects.toThrow(/older daemon broker still owns/);
-			expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
-			expect(await Bun.file(untouchedRecord).text()).toBe(untouchedContent);
-		} finally {
-			lock.release();
-		}
-	});
+	it.each(["", "broker-v3", "broker-v4"])(
+		"refuses an upgrade while an older broker owns scope '%s'",
+		async olderScope => {
+			using tempDir = TempDir.createSync("@omp-broker-upgrade-lease-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			const olderRuntimeDir = path.join(runtimeDir, olderScope);
+			await fs.mkdir(olderRuntimeDir, { recursive: true });
+			const untouchedRecord = path.join(runtimeDir, "daemons", "unversioned-record", "meta.json");
+			const untouchedContent = '{"mustRemainUnchanged":true}';
+			await Bun.write(untouchedRecord, untouchedContent);
+			const lock = FileLock.tryAcquire(path.join(olderRuntimeDir, "broker.pid"));
+			if (!lock.acquired) throw new Error("Expected isolated legacy broker lease");
+			try {
+				const broker = startBroker(projectDir, runtimeDir);
+				await expect(broker.finished).rejects.toThrow(/older daemon broker still owns/);
+				expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
+				expect(await Bun.file(untouchedRecord).text()).toBe(untouchedContent);
+			} finally {
+				lock.release();
+			}
+		},
+	);
 
-	it.each(["", "broker-v3"])("waits for an older client in scope '%s' after its broker exits", async olderScope => {
-		using tempDir = TempDir.createSync("@omp-broker-upgrade-client-");
+	it.each(["", "broker-v3", "broker-v4"])(
+		"waits for an older client in scope '%s' after its broker exits",
+		async olderScope => {
+			using tempDir = TempDir.createSync("@omp-broker-upgrade-client-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			await Bun.write(
+				path.join(runtimeDir, olderScope, "clients", `${process.pid}-old.json`),
+				JSON.stringify({ pid: process.pid, id: `${process.pid}-old`, projectDir }),
+			);
+			const broker = startBroker(projectDir, runtimeDir);
+			await expect(broker.finished).rejects.toThrow(/older daemon client still owns/);
+			expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
+		},
+	);
+
+	it("resumes an interrupted v4 migration without replacing records already adopted by v5", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-v4-interrupted-");
 		const projectDir = path.join(tempDir.path(), "project");
 		const runtimeDir = path.join(tempDir.path(), "runtime");
 		await fs.mkdir(projectDir);
-		await Bun.write(
-			path.join(runtimeDir, olderScope, "clients", `${process.pid}-old.json`),
-			JSON.stringify({ pid: process.pid, id: `${process.pid}-old`, projectDir }),
-		);
+		const legacy = path.join(runtimeDir, "broker-v4", "daemons");
+		const current = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons");
+		for (const name of ["adopted", "pending"]) {
+			await Bun.write(
+				path.join(legacy, name, "meta.json"),
+				JSON.stringify({
+					daemon: {
+						name,
+						id: `${name}-generation`,
+						state: "exited",
+						exitCode: 0,
+						createdAt: 1,
+						startedAt: 1,
+						restartCount: 0,
+						outputBytes: 0,
+						persist: true,
+						detached: false,
+					},
+					spec: {
+						name,
+						application: process.execPath,
+						args: ["-e", "process.exit(0)"],
+						env: {},
+						cwd: projectDir,
+						pty: false,
+						restart: "no",
+						persist: true,
+						detached: false,
+					},
+				}),
+			);
+			await Bun.write(path.join(legacy, name, "output.log"), `${name} history\n`);
+		}
+		await fs.mkdir(current, { recursive: true });
+		await fs.rename(path.join(legacy, "adopted"), path.join(current, "adopted"));
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
 		const broker = startBroker(projectDir, runtimeDir);
-		await expect(broker.finished).rejects.toThrow(/older daemon client still owns/);
-		expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
-	});
+		try {
+			await broker.listening;
+			const list = await client.request({ op: "list" });
+			if (list.op !== "list") throw new Error("unexpected list result");
+			expect(list.daemons.map(daemon => daemon.id).sort()).toEqual(["adopted-generation", "pending-generation"]);
+			for (const name of ["adopted", "pending"]) {
+				expect(await Bun.file(path.join(current, name, "output.log")).text()).toBe(`${name} history\n`);
+				expect(await fs.exists(path.join(legacy, name))).toBe(false);
+			}
+		} finally {
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}, 20_000);
 
 	it("refuses a live older broker that predates the native lease", async () => {
 		using tempDir = TempDir.createSync("@omp-broker-upgrade-socket-");
