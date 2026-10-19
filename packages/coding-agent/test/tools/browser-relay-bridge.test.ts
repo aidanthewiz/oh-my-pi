@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
 import type {
 	RelayRpcRequest,
@@ -285,6 +287,64 @@ describe("RelayBridge tab grouping", () => {
 		expect(groups).toHaveLength(1);
 		expect(groups[0]!.tabIds).toEqual([9]);
 	});
+
+	it.each([true, false])(
+		"preserves requested tab selection through the embedded extension (background: %s)",
+		async background => {
+			const bridge = new RelayBridge({});
+			const ext = new FakeExtSocket();
+			const tabs = [tab({ tabId: 1, active: true })];
+			connect(bridge, ext, tabs);
+			const cdp = new FakeCdpSocket();
+			const connId = bridge.cdpConnected(cdp);
+			const event = { addListener() {} };
+			const context = {
+				chrome: {
+					debugger: { onEvent: event, onDetach: event },
+					tabs: {
+						onCreated: event,
+						onUpdated: event,
+						onActivated: event,
+						onRemoved: event,
+						async create({ url, active }: { url: string; active: boolean }) {
+							if (active) for (const existing of tabs) existing.active = false;
+							const created = tab({ tabId: 2, url, active });
+							tabs.push(created);
+							return { ...created, id: created.tabId };
+						},
+					},
+					alarms: { create() {}, onAlarm: event },
+					storage: { local: { get: () => Promise.withResolvers<unknown>().promise }, onChanged: event },
+					action: { onClicked: event },
+					runtime: { onInstalled: event, onStartup: event },
+				},
+			};
+			const source = await readFile(
+				new URL("../../src/tools/browser/relay/extension-assets/background.js.txt", import.meta.url),
+				"utf8",
+			);
+			const runRpc = runInNewContext(`${source}\nrunRpc`, context) as (request: RelayRpcRequest) => Promise<unknown>;
+			const id = ++msgSeq;
+			bridge.cdpMessage(
+				connId,
+				JSON.stringify({
+					id,
+					method: "Target.createTarget",
+					params: { url: "https://example.com/new", background },
+				}),
+			);
+			const [request] = ext.rpcs("createTab");
+			if (!request) throw new Error("Expected a createTab request");
+			const result = await runRpc(request);
+			bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: request.id, ok: true, result }));
+			await flush();
+			expect(tabs.filter(tab => tab.active).map(tab => tab.tabId)).toEqual([background ? 1 : 2]);
+			expect(tabs[1]?.url).toBe("https://example.com/new");
+			expect(cdp.messages.find(message => message.id === id)).toMatchObject({
+				result: { targetId: expect.any(String) },
+			});
+		},
+	);
 
 	it("never re-groups a tab the user pulled out of the omp group", async () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });

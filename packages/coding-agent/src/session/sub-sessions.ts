@@ -10,8 +10,8 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { getAgentTombstonePath } from "../registry/agent-tombstone";
-import type { FileEntry, SessionEntry, SessionHeader } from "./session-entries";
-import { loadEntriesFromFile } from "./session-loader";
+import type { SessionEntry, SessionHeader } from "./session-entries";
+import { loadSessionFile, type SessionLoadResult } from "./session-loader";
 
 /** Persisted subagent session transcript, keyed by slash-joined agent path. */
 export interface SubSession {
@@ -24,21 +24,29 @@ export interface SubSession {
 	leafId: string | null;
 	/** The subagent was explicitly killed (a tombstone sidecar sits next to its transcript). */
 	aborted: boolean;
+	/** JSONL records skipped as malformed while loading this transcript. */
+	malformedRecords: number;
 }
+
+/** Receives the key of a subagent transcript that exists but has no readable session header. */
+export type UnreadableSubSessionHandler = (key: string) => void;
 
 /**
  * Collect subagent session transcripts stored next to a session file.
  *
  * Keys in the returned record are slash-joined ids relative to the main session
- * ("ToolAsk", "ToolAsk/Helper"). Corrupt or empty files are skipped silently.
+ * ("ToolAsk", "ToolAsk/Helper"). Empty files are skipped silently; corrupt ones
+ * are skipped and reported to `onUnreadable`.
+ * Filesystem errors propagate unless `onError` is supplied; a handler preserves readable siblings.
  */
 export async function collectSubSessions(
 	sessionFile: string,
+	onUnreadable?: UnreadableSubSessionHandler,
 	onError?: (error: unknown) => void,
 ): Promise<Record<string, SubSession>> {
 	const result: Record<string, SubSession> = Object.create(null);
 	if (!sessionFile.endsWith(".jsonl")) return result;
-	await collectSubSessionsFromDir(sessionFile.slice(0, -6), null, result, onError);
+	await collectSubSessionsFromDir(sessionFile.slice(0, -6), null, result, onUnreadable, onError);
 	return result;
 }
 
@@ -46,7 +54,8 @@ async function collectSubSessionsFromDir(
 	dir: string,
 	parentKey: string | null,
 	out: Record<string, SubSession>,
-	onError?: (error: unknown) => void,
+	onUnreadable: UnreadableSubSessionHandler | undefined,
+	onError: ((error: unknown) => void) | undefined,
 ): Promise<void> {
 	let dirents: fs.Dirent[];
 	try {
@@ -69,17 +78,17 @@ async function collectSubSessionsFromDir(
 		const agentId = name.slice(0, -6);
 		if (!agentId || agentId === "." || agentId === ".." || agentId.includes("\\")) continue;
 		const key = parentKey ? `${parentKey}/${agentId}` : agentId;
-		let fileEntries: FileEntry[];
+		let loaded: SessionLoadResult;
 		try {
 			const file = path.join(dir, name);
 			if (!(await fs.promises.lstat(file)).isFile()) continue;
-			fileEntries = await loadEntriesFromFile(file);
+			loaded = await loadSessionFile(file);
 		} catch (error) {
 			if (!onError) throw error;
 			onError(error);
 			continue;
 		}
-		// Empty/corrupt files (no valid session header) load as [] — skip silently.
+		const { entries: fileEntries, malformedRecords, invalidHeader } = loaded;
 		if (fileEntries.length > 0) {
 			const header = (fileEntries.find(e => e.type === "session") as SessionHeader | undefined) ?? null;
 			const entries = fileEntries.filter((e): e is SessionEntry => e.type !== "session");
@@ -90,8 +99,13 @@ async function collectSubSessionsFromDir(
 				entries,
 				leafId: entries.length > 0 ? entries[entries.length - 1].id : null,
 				aborted: fileNames.has(getAgentTombstonePath(name)),
+				malformedRecords,
 			};
+		} else if (invalidHeader) {
+			onUnreadable?.(key);
 		}
-		if (childDirectories.has(agentId)) await collectSubSessionsFromDir(path.join(dir, agentId), key, out, onError);
+		if (childDirectories.has(agentId)) {
+			await collectSubSessionsFromDir(path.join(dir, agentId), key, out, onUnreadable, onError);
+		}
 	}
 }

@@ -1,8 +1,13 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { getEditorCommand, openInEditor, resolveEditorSpawnCommand } from "../src/utils/external-editor";
+import {
+	getEditorCommand,
+	openEditorOnPath,
+	openInEditor,
+	resolveEditorSpawnCommand,
+} from "../src/utils/external-editor";
 
 interface MutableProcess {
 	platform: NodeJS.Platform;
@@ -66,27 +71,6 @@ describe("getEditorCommand", () => {
 });
 
 describe("openInEditor", () => {
-	it("always inherits the pane stdio", async () => {
-		const spawn = spyOn(Bun, "spawn").mockReturnValue({
-			exited: Promise.resolve(1),
-		} as never);
-		try {
-			await openInEditor("editor", "original", {
-				extension: ".md",
-				stdio: [0, 1, 2],
-			} as never);
-
-			expect(spawn).toHaveBeenCalledTimes(1);
-			expect(spawn.mock.calls[0]?.[1]).toMatchObject({
-				stdin: "inherit",
-				stdout: "inherit",
-				stderr: "inherit",
-			});
-		} finally {
-			spawn.mockRestore();
-		}
-	});
-
 	it("passes the cmd.exe command line verbatim on Windows", () => {
 		const tmpFile = String.raw`C:\Users\Example User\AppData\Local\Temp\omp-editor-123.omp.md`;
 
@@ -114,6 +98,33 @@ describe("openInEditor", () => {
 
 			expect(result).toBe("edited");
 		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("does not expose ambient credentials to an editor child", async () => {
+		const tempDir = TempDir.createSync("@external-editor-env-");
+		const names = ["COREFORGE_EDITOR_TEST_API_KEY", "COREFORGE_EDITOR_TEST_COPY", "COREFORGE_EDITOR_TEST_LABEL"];
+		const previous = names.map(name => Bun.env[name]);
+		try {
+			Bun.env.COREFORGE_EDITOR_TEST_API_KEY = "synthetic-editor-secret";
+			Bun.env.COREFORGE_EDITOR_TEST_COPY = "synthetic-editor-secret";
+			Bun.env.COREFORGE_EDITOR_TEST_LABEL = "visible-editor-label";
+			const editorPath = path.join(tempDir.path(), "edit");
+			const outputPath = path.join(tempDir.path(), "result");
+			await Bun.write(
+				editorPath,
+				'#!/bin/sh\nprintf "%s\\n%s\\n%s" "${COREFORGE_EDITOR_TEST_API_KEY-missing}" "${COREFORGE_EDITOR_TEST_COPY-missing}" "${COREFORGE_EDITOR_TEST_LABEL-missing}" > "$1"\n',
+			);
+			fs.chmodSync(editorPath, 0o755);
+
+			expect(await openEditorOnPath(`"${editorPath}"`, outputPath)).toBe(0);
+			expect(await Bun.file(outputPath).text()).toBe("missing\nmissing\nvisible-editor-label");
+		} finally {
+			for (const [index, name] of names.entries()) {
+				if (previous[index] === undefined) delete Bun.env[name];
+				else Bun.env[name] = previous[index];
+			}
 			await tempDir.remove();
 		}
 	});

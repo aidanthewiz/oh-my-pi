@@ -17,6 +17,18 @@
 - Resolve both lexical and canonical native archive imports during in-memory embedding without writing generated archives to disk.
 - Build development-profile addons from Cargo's `debug` output directory.
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
+
+## [18.8.8] - 2026-10-10
+
+### Changed
+
+- Reduced macOS accessibility-tree latency for `ax()` without changing its text output: each element's children are read once, and its bounds, which the tree never shows, are no longer read ([#15159](https://github.com/can1357/oh-my-pi/pull/15159) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed macOS computer use reporting `AxFailed` instead of `StaleRef` for a ref whose element the app had removed ([#15156](https://github.com/can1357/oh-my-pi/pull/15156) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS `el.press()` and `el.perform()` reporting `AxFailed` when the app did not answer in time, such as a press that opens a modal dialog; they now report `AxUnconfirmed` ([#15156](https://github.com/can1357/oh-my-pi/pull/15156) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.8.7] - 2026-10-09
 
 ### Added

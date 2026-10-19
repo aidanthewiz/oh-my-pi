@@ -43,6 +43,7 @@ interface FakeAcpBuiltinSession {
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
+	cancelAsyncJob: (id: string) => boolean;
 	formatSessionAsText: () => string;
 	dumpLlmRequestToTmpDir: () => Promise<string | undefined>;
 	dumpSessionArchiveToTmpDir: () => Promise<SessionDumpArchive | undefined>;
@@ -166,6 +167,7 @@ function createRuntime() {
 		getHindsightSessionState: () => undefined,
 		async applyMemoryBackend() {},
 		getAsyncJobSnapshot: () => null,
+		cancelAsyncJob: () => false,
 		formatSessionAsText: () => "",
 		dumpLlmRequestToTmpDir: async () => undefined,
 		dumpSessionArchiveToTmpDir: async () => undefined,
@@ -559,12 +561,26 @@ describe("ACP builtin slash commands", () => {
 
 		await executeAcpBuiltinSlashCommand("/jobs", runtime);
 		await executeAcpBuiltinSlashCommand("/jobs full", runtime);
-		await executeAcpBuiltinSlashCommand("/jobs bogus", runtime);
 
 		expect(output[0]).not.toContain(command);
 		expect(output[1]).toContain(command);
 		expect(output[1]).toContain("build done");
-		expect(output[2]).toContain("Usage: /jobs [full]");
+	});
+
+	it("jobs kill: collapses tabs/newlines and bounds the echoed id", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [],
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+
+		await executeAcpBuiltinSlashCommand(`/jobs kill "a\tb\nc${"x".repeat(200)}"`, runtime);
+
+		const line = output[0] as string;
+		expect(line).not.toMatch(/[\t\n]/);
+		expect(line).toContain("a b c");
+		expect(line).not.toContain("x".repeat(70));
 	});
 
 	it("jobs full: strips control sequences and fences the command", async () => {

@@ -5,6 +5,12 @@
 ### Breaking Changes
 
 - Collaboration protocol version 4 requires loop ownership on lifecycle events and activity snapshots. Version 3 peers are rejected during the handshake.
+## [18.8.8] - 2026-10-10
+
+### Added
+
+- Added `TspToolProps.command` (the command line Copy command copies), `TspToolProps.preview: "children"` (the collapsed body stays whole while its children clamp) and `TspCodeProps.preview`
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

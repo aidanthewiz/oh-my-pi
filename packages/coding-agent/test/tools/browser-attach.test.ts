@@ -34,6 +34,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { acquireTab, getTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
@@ -858,6 +860,127 @@ describe("pickElectronTarget relay path", () => {
 		});
 		expect(picked).toBe(firstPage);
 		expect(second.pageSpy).not.toHaveBeenCalled();
+	});
+
+	it("waits for a just-opened tab to reach /json before failing the matcher", async () => {
+		const opened = {
+			id: "PAGE_NEW",
+			type: "page",
+			title: "",
+			url: "https://example.com/?omp-probe=new",
+			active: "false",
+			discarded: "false",
+		};
+		let served = 0;
+		relay.reload({ fetch: () => Response.json(++served === 1 ? RELAY_ENTRIES : [...RELAY_ENTRIES, opened]) });
+		const openedPage = makePage([() => {}], opened.url).page;
+		const target = makeTarget("PAGE_NEW", openedPage);
+
+		const picked = await pickElectronTarget(makeBrowser([target.target]), { relayJson, matcher: "omp-probe=new" });
+
+		expect(picked).toBe(openedPage);
+		expect(served).toBe(2);
+	});
+
+	it("rejects a missing matcher without adopting another live page", async () => {
+		const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
+		const error = await rejectionOf(
+			pickElectronTarget(makeBrowser([other.target]), {
+				relayJson,
+				matcher: "omp-probe=none",
+			}),
+		);
+
+		expect(error).toBeInstanceOf(ToolError);
+		expect(other.pageSpy).not.toHaveBeenCalled();
+	});
+
+	it("waits for Puppeteer to see a tab that /json already lists", async () => {
+		const cartPage = makePage([() => {}], RELAY_ENTRIES[1]!.url).page;
+		const late = makeTarget("PAGE11", cartPage);
+		const targets: Array<Target & { _targetId: string }> = [];
+		const browser = Object.assign(makeBrowser(targets), {
+			waitForTarget: async (predicate: (target: Target) => boolean) => {
+				targets.push(late.target);
+				return targets.find(predicate);
+			},
+		});
+
+		expect(await pickElectronTarget(browser, { relayJson, matcher: "whole foods" })).toBe(cartPage);
+	});
+
+	it("rejects an unavailable selected target without adopting a different page", async () => {
+		const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
+		const browser = Object.assign(makeBrowser([other.target]), {
+			waitForTarget: async () => {
+				throw Object.assign(new Error("Waiting for target failed"), { name: "TimeoutError" });
+			},
+		});
+
+		const error = await rejectionOf(pickElectronTarget(browser, { relayJson, matcher: "whole foods" }));
+
+		expect(error).toBeInstanceOf(ToolError);
+		expect(other.pageSpy).not.toHaveBeenCalled();
+	});
+
+	it("keeps cancellation during metadata settling distinct from a missing target", async () => {
+		const controller = new AbortController();
+		let served = 0;
+		relay.reload({
+			fetch: () => {
+				if (++served === 2) controller.abort();
+				return Response.json(RELAY_ENTRIES);
+			},
+		});
+		const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
+
+		const error = await rejectionOf(
+			pickElectronTarget(makeBrowser([other.target]), {
+				relayJson,
+				matcher: "omp-probe=none",
+				signal: controller.signal,
+			}),
+		);
+
+		expect(error).toBeInstanceOf(ToolAbortError);
+		expect(other.pageSpy).not.toHaveBeenCalled();
+	});
+
+	it("keeps cancellation while waiting for a selected target distinct from a timeout", async () => {
+		const controller = new AbortController();
+		const entered = Promise.withResolvers<void>();
+		const browser = Object.assign(makeBrowser([]), {
+			waitForTarget: () => {
+				entered.resolve();
+				return Promise.withResolvers<Target>().promise;
+			},
+		});
+		const pending = rejectionOf(
+			pickElectronTarget(browser, {
+				relayJson,
+				matcher: "whole foods",
+				signal: controller.signal,
+			}),
+		);
+		await entered.promise;
+		controller.abort();
+
+		expect(await pending).toBeInstanceOf(ToolAbortError);
+	});
+
+	it("falls back to target enumeration at once when /json lists no pages", async () => {
+		let served = 0;
+		relay.reload({
+			fetch: () => {
+				served++;
+				return Response.json([]);
+			},
+		});
+		const cartPage = fakePage({ url: "https://example.com/cart", title: "Cart" });
+		const cart = makeTarget("PAGE_CART", cartPage);
+
+		expect(await pickElectronTarget(makeBrowser([cart.target]), { relayJson, matcher: "cart" })).toBe(cartPage);
+		expect(served).toBe(1);
 	});
 
 	it("does not adopt another live tab when the selected tab is unreadable", async () => {

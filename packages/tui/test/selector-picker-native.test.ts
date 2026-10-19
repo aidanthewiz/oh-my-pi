@@ -114,6 +114,38 @@ describe("hook selector picker", () => {
 		selector.handleNativeEvent(act("confirm"));
 		expect(picked).toEqual(["two"]);
 	});
+
+	it("inline stays in the dock as a card instead of a hoisted picker sheet", () => {
+		const picked: string[] = [];
+		const selector = new HookSelectorComponent(
+			"Save where?",
+			["project", "global"],
+			o => picked.push(o),
+			() => {},
+			{ inline: true },
+		);
+		const root = selector.describe(pickerCx);
+		expect(JSON.stringify(root)).not.toContain('"k":"picker"');
+		selector.handleNativeEvent({ type: "activate", key: "list", item: "1" });
+		expect(picked).toEqual(["global"]);
+	});
+
+	it("keeps destructive approval details on the card even when native pickers are supported", () => {
+		const picked: string[] = [];
+		const selector = new HookSelectorComponent(
+			"Approval\nWARNING: synthetic destructive action",
+			["Approve", "Deny"],
+			option => picked.push(option),
+			() => {},
+			{ titleStyle: "destructive", disabledIndices: [0] },
+		);
+		const root = selector.describe(pickerCx);
+		expect(root.k).not.toBe("picker");
+		selector.handleNativeEvent({ type: "activate", key: "list", item: "0" });
+		expect(picked).toEqual([]);
+		selector.handleNativeEvent({ type: "activate", key: "list", item: "1" });
+		expect(picked).toEqual(["Deny"]);
+	});
 });
 
 describe("oauth selector picker", () => {

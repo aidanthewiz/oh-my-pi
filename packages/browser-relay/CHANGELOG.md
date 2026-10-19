@@ -6,6 +6,12 @@
 
 - Authenticated the manual relay smoke against the configured authority and removed tokenized endpoint output.
 
+## [18.8.8] - 2026-10-10
+
+### Fixed
+
+- Fixed tabs a relay client asks to open in the background being created as the selected tab ([#15109](https://github.com/can1357/oh-my-pi/pull/15109) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.6.3] - 2026-10-06
 
 ### Fixed

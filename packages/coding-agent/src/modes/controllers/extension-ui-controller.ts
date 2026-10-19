@@ -1027,6 +1027,7 @@ export class ExtensionUiController {
 					checkedIndices: dialogOptions?.checkedIndices,
 					markableCount: dialogOptions?.markableCount,
 					maxVisible,
+					inline: dialogOptions?.inline,
 					slider: extra?.slider,
 				},
 			);
@@ -1052,7 +1053,11 @@ export class ExtensionUiController {
 	/**
 	 * Show a confirmation dialog for hooks.
 	 */
-	async showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
+	async showHookConfirm(
+		title: string,
+		message: string,
+		dialogOptions?: InteractiveSelectorDialogOptions,
+	): Promise<boolean> {
 		const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
 		return result === "Yes";
 	}

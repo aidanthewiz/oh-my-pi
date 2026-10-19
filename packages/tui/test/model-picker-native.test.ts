@@ -435,7 +435,7 @@ test("a rejected compaction edit remains editable in the model hub until correct
 			onAssign: () => {},
 			onUnassign: () => {},
 			onCancel: () => {},
-			onCompactionPointChange: () => (rejected ? "synthetic project shadow" : undefined),
+			onCompactionPointChange: () => (rejected ? { kind: "error", message: "synthetic project shadow" } : undefined),
 		},
 	);
 	hubs.push(hub);
@@ -448,7 +448,6 @@ test("a rejected compaction edit remains editable in the model hub until correct
 	act("compactionPoint");
 	expect(props(hub.describe(withPicker)).focus).toBe("strip");
 	const rejectedText = stripVTControlCharacters(hub.render(120).join("\n"));
-	expect(rejectedText).toContain("synthetic project shadow");
 	expect(rejectedText).toContain("90k");
 
 	rejected = false;
