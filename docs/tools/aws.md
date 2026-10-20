@@ -31,7 +31,7 @@ For example, `{"profile":"employee-gov","service":"sts","operation":"get-caller-
 6. When SSO credentials expire, an interactive session can renew authentication and retry the operation once. Native and managed MCP calls share pending sign-ins for the same SSO group. Each call has one automatic recovery budget across identity checks, operation retries, and managed reconnects.
 7. A declined or failed sign-in pauses automatic recovery for that SSO group. A user-requested `sso login` can retry after a decline, failure, or earlier successful sign-in. A pending sign-in prevents duplicate login processes. Without an interactive surface, the tool returns an explicit login command.
 
-A delayed failure from an older operation does not invalidate a newer sign-in or its pending approval.
+Ordinary authentication failures cannot cancel a pending sign-in. Only that sign-in's owner can approve, decline, or complete it. Delayed failures from older operations cannot invalidate a newer successful sign-in.
 
 The session grant removes ordinary command consent prompts; it does not authenticate to AWS. The user must still complete browser SSO authentication when required. Grants are not saved to configuration or restored in a new process.
 
@@ -41,7 +41,9 @@ The launcher captures its absolute path before adding repository tools.
 Each session call exposes only that helper through a private temporary PATH.
 The native route does not inherit the repository PATH or ambient credentials.
 
-Session commands keep a private input channel open until remote completion, cancellation, or timeout. They do not read from the interactive terminal. Helper startup diagnostics are reported as errors even when the helper exits with code 0.
+Session commands keep a private input channel open until remote completion, cancellation, or timeout. They do not read from the interactive terminal. Their success/error status follows process exit status, not the contents of remote stdout.
+
+The stock Session Manager plugin can print a startup diagnostic and exit with code 0. It does not expose a reliable per-call diagnostic channel on Unix. Such text remains in the returned output but cannot reliably be classified as a tool failure. A nonzero helper exit still reports an error.
 
 ## Results and limits
 

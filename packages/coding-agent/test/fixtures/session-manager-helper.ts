@@ -56,6 +56,9 @@ if (completion === "closed") {
 	process.exit(0);
 }
 console.log("Starting session with SessionId: fixture");
+if (mode === "fixture-remote-diagnostic") {
+	console.log("Cannot perform start session: historical application log entry");
+}
 console.log("REMOTE_COMMAND_OK");
 console.log("SessionToken: fixture-token");
 process.exit(0);

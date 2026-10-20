@@ -975,6 +975,71 @@ for (const deferred of [false, true]) {
 		}
 	}
 }
+for (const approved of [false, true]) {
+	for (const route of [
+		"native",
+		"native-exhausted",
+		"managed-direct-result",
+		"managed-deferred-result",
+		"managed-direct-exception",
+		"managed-deferred-exception",
+	]) {
+		const id = `pending-${approved ? "approved" : "offered"}-${route}`;
+		await explicitRaceLogin(`${id}-initial`);
+		const before = await raceLoginCount();
+		const beforePrompts: number = confirmations;
+		await fs.rm(raceToken);
+		await tool.prepareRuntimeApproval(`${id}-login`, login);
+		if (approved) tool.approveRuntimeApproval(`${id}-login`, login);
+		const definition: MCPToolDefinition = {
+			name: "aws___run_script",
+			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["expired"] } } },
+		};
+		let requests = 0;
+		const pendingConnection = {
+			name: "coreforge-aws-agent-toolkit",
+			config: { command: "unused" },
+			capabilities: { tools: {} },
+			transport: {
+				request: async (method: string) => {
+					if (method === "tools/list") return { tools: [definition] };
+					requests++;
+					if (!(await Bun.file(raceToken).exists())) {
+						if (route.endsWith("exception")) throw new Error("AUTH_REQUIRED: SSO token expired");
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					}
+					return { content: [{ type: "text", text: "managed operation completed after pending sign-in" }] };
+				},
+			},
+		} as unknown as MCPServerConnection;
+		const pendingManaged = route.includes("deferred")
+			? new DeferredMCPTool(pendingConnection.name, definition, async () => pendingConnection)
+			: new MCPTool(pendingConnection, definition);
+		const requestTool = route === "native-exhausted" ? new AwsTool(toolSession, { attempted: true }) : tool;
+		const failure = route.startsWith("native")
+			? await requestTool.execute(id, { ...read, profile: "expired" }, undefined, undefined, context)
+			: await pendingManaged.execute(id, { aws_profile: "expired" }, undefined, context);
+		assert.equal(failure.isError, true, `${id} did not surface its authentication failure`);
+		assert.match(text(failure), /AUTH_REQUIRED/);
+		assert.equal(await raceLoginCount(), before, `${id} ran an unapproved or duplicate login`);
+		assert.equal(confirmations, beforePrompts, `${id} replaced the original approval`);
+		if (!route.startsWith("native")) assert.equal(requests, 1, `${id} did not reach the managed request`);
+		if (!approved) tool.approveRuntimeApproval(`${id}-login`, login);
+		assert.notEqual((await tool.execute(`${id}-login`, login)).isError, true, `${id} revoked its owner's approval`);
+		assert.equal(await raceLoginCount(), before + 1, `${id} did not run exactly one approved login`);
+		await fs.rm(raceToken);
+		const renewed = route.startsWith("native")
+			? await tool.execute(`${id}-real-expiry`, { ...read, profile: "expired" }, undefined, undefined, context)
+			: await pendingManaged.execute(`${id}-real-expiry`, { aws_profile: "expired" }, undefined, context);
+		assert.notEqual(renewed.isError, true, text(renewed));
+		assert.equal(await raceLoginCount(), before + 2, `${id} suppressed or repeated genuine expiry renewal`);
+		assert.equal(confirmations, beforePrompts + 1);
+		if (!route.startsWith("native")) {
+			assert.match(text(renewed), /managed operation completed after pending sign-in/);
+			assert.equal(requests, 3);
+		}
+	}
+}
 
 const sessionLabel = "Allow for the rest of this session";
 const sessionSettings = Settings.isolated({
@@ -1296,18 +1361,36 @@ for (const [service, operation] of [
 	assert.notEqual(call.env.PATH, originalPath);
 	assert.notEqual(call.env.PATH, repository);
 	await assert.rejects(() => fs.stat(call.env.PATH), { code: "ENOENT" });
-	for (const mode of ["fixture-fail", "fixture-zero-error"]) {
-		const failedArgs = { ...args, parameters: { ...parameters, [modeParameter]: mode } };
-		const id = `session-${service}-${mode}`;
-		await tool.prepareRuntimeApproval(id, failedArgs);
-		tool.approveRuntimeApproval(id, failedArgs);
-		const failed = await tool.execute(id, failedArgs);
-		assert.equal(failed.isError, true);
-		assert.equal(failed.details?.code, "AWS_ERROR");
-		assert.equal(failed.details?.exitCode, mode === "fixture-fail" ? 23 : 0);
-		assert.match(text(failed), /fixture helper failure/);
-		assert.ok(!text(failed).includes("REMOTE_COMMAND_OK"));
-	}
+	const failedArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-fail" } };
+	const failedId = `session-${service}-fixture-fail`;
+	await tool.prepareRuntimeApproval(failedId, failedArgs);
+	tool.approveRuntimeApproval(failedId, failedArgs);
+	const failed = await tool.execute(failedId, failedArgs);
+	assert.equal(failed.isError, true);
+	assert.equal(failed.details?.code, "AWS_ERROR");
+	assert.equal(failed.details?.exitCode, 23);
+	assert.match(text(failed), /fixture helper failure/);
+	assert.ok(!text(failed).includes("REMOTE_COMMAND_OK"));
+
+	const logArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-remote-diagnostic" } };
+	const logId = `session-${service}-remote-diagnostic`;
+	await tool.prepareRuntimeApproval(logId, logArgs);
+	tool.approveRuntimeApproval(logId, logArgs);
+	const logResult = await tool.execute(logId, logArgs);
+	assert.notEqual(logResult.isError, true, text(logResult));
+	assert.equal(logResult.details?.exitCode, 0);
+	assert.match(text(logResult), /Cannot perform start session: historical application log entry/);
+	assert.match(text(logResult), /REMOTE_COMMAND_OK/);
+
+	const zeroArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-zero-error" } };
+	const zeroId = `session-${service}-zero-exit-diagnostic`;
+	await tool.prepareRuntimeApproval(zeroId, zeroArgs);
+	tool.approveRuntimeApproval(zeroId, zeroArgs);
+	const zeroResult = await tool.execute(zeroId, zeroArgs);
+	assert.notEqual(zeroResult.isError, true, text(zeroResult));
+	assert.equal(zeroResult.details?.exitCode, 0);
+	assert.match(text(zeroResult), /Cannot perform start session: fixture helper failure/);
+	assert.ok(!text(zeroResult).includes("REMOTE_COMMAND_OK"));
 	const hangingArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-hang" } };
 	const hangingId = `session-${service}-cancel`;
 	await tool.prepareRuntimeApproval(hangingId, hangingArgs);

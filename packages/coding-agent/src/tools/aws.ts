@@ -154,7 +154,7 @@ interface PreparedAwsCall {
 	expectedIdentity?: AwsIdentity;
 	authRecovery: AwsAuthenticationRecoveryBudget;
 	authenticationGeneration: number;
-	loginGeneration?: number;
+	loginReservation?: AwsLoginReservation;
 }
 
 interface AwsToolDetails {
@@ -739,11 +739,16 @@ function serialiseSafeConfig(profiles: readonly string[], config: AwsIni): strin
 	return sections.join("\n");
 }
 
+export interface AwsLoginReservation {
+	readonly group: string;
+}
+
 export class AwsSessionAuthGroups {
 	#states = new Map<string, AwsAuthGroupState>();
 	#inFlight = new Map<string, Promise<AwsApprovedLoginResult>>();
 	#recoveries = new Map<string, Promise<boolean>>();
 	#generations = new Map<string, number>();
+	#reservations = new Map<string, AwsLoginReservation>();
 
 	status(group: string): AwsAuthGroupState {
 		return this.#states.get(group) ?? "unknown";
@@ -753,54 +758,76 @@ export class AwsSessionAuthGroups {
 		return this.#generations.get(group) ?? 0;
 	}
 
-	markAuthenticated(group: string): void {
+	#markAuthenticated(group: string): void {
 		this.#states.set(group, "authenticated");
 		this.#generations.set(group, this.generation(group) + 1);
+		this.#reservations.delete(group);
 	}
 
-	markDeclined(group: string, generation: number): void {
+	recordAuthenticationFailure(group: string, generation: number): void {
+		if (this.#reservations.has(group) || this.#recoveries.has(group)) return;
+		this.#recordFailure(group, generation);
+	}
+
+	#recordFailure(group: string, generation: number): void {
 		if (this.generation(group) !== generation) return;
 		this.#states.set(group, "declined");
 	}
 
-	markApproved(group: string): void {
-		if (this.status(group) === "unknown" || this.status(group) === "offered") this.#states.set(group, "approved");
+	declineLogin(reservation: AwsLoginReservation): void {
+		if (this.#reservations.get(reservation.group) !== reservation) return;
+		this.#reservations.delete(reservation.group);
+		this.#states.set(reservation.group, "declined");
 	}
 
-	reserveLogin(group: string): boolean {
-		return !this.#recoveries.has(group) && this.#reserveLogin(group);
+	markApproved(reservation: AwsLoginReservation): void {
+		if (this.#reservations.get(reservation.group) !== reservation) return;
+		if (this.status(reservation.group) === "offered") this.#states.set(reservation.group, "approved");
 	}
 
-	#reserveLogin(group: string): boolean {
-		const state = this.status(group);
-		if (state === "offered" || state === "approved" || this.#inFlight.has(group)) return false;
+	reserveLogin(group: string): AwsLoginReservation | undefined {
+		return this.#recoveries.has(group) ? undefined : this.#reserveLogin(group);
+	}
+
+	#reserveLogin(group: string): AwsLoginReservation | undefined {
+		if (this.#reservations.has(group) || this.#inFlight.has(group)) return undefined;
+		const reservation: AwsLoginReservation = { group };
+		this.#reservations.set(group, reservation);
 		this.#states.set(group, "offered");
 		this.#generations.set(group, this.generation(group) + 1);
-		return true;
+		return reservation;
 	}
 
-	async recoverOnce(group: string, recover: (reserveLogin: () => boolean) => Promise<boolean>): Promise<boolean> {
+	async recoverOnce(
+		group: string,
+		recover: (reserveLogin: () => AwsLoginReservation | undefined) => Promise<boolean>,
+	): Promise<boolean> {
 		const pending = this.#recoveries.get(group);
 		if (pending) return await pending;
 		const login = this.#inFlight.get(group);
 		if (login) return (await login).authenticated;
 		const state = this.status(group);
 		if (state !== "unknown" && state !== "authenticated") return false;
-		let generation = this.generation(group);
+		const generation = this.generation(group);
+		let reservation: AwsLoginReservation | undefined;
 		const recovery = Promise.resolve().then(() =>
 			recover(() => {
-				if (!this.#reserveLogin(group)) return false;
-				generation = this.generation(group);
-				return true;
+				if (reservation) return undefined;
+				reservation = this.#reserveLogin(group);
+				return reservation;
 			}),
 		);
 		this.#recoveries.set(group, recovery);
 		try {
 			const authenticated = await recovery;
-			if (!authenticated) this.markDeclined(group, generation);
+			if (!authenticated) {
+				if (reservation) this.declineLogin(reservation);
+				else this.#recordFailure(group, generation);
+			}
 			return authenticated;
 		} catch (error) {
-			this.markDeclined(group, generation);
+			if (reservation) this.declineLogin(reservation);
+			else this.#recordFailure(group, generation);
 			throw error;
 		} finally {
 			this.#recoveries.delete(group);
@@ -808,25 +835,29 @@ export class AwsSessionAuthGroups {
 	}
 
 	/** Run an approved login once for all callers sharing the authentication group. */
-	async runApprovedLogin(group: string, login: () => Promise<boolean | void>): Promise<AwsApprovedLoginResult> {
+	async runApprovedLogin(
+		reservation: AwsLoginReservation,
+		login: () => Promise<boolean | void>,
+	): Promise<AwsApprovedLoginResult> {
+		const { group } = reservation;
 		const state = this.status(group);
-		if (state === "declined") return { authenticated: false, declined: true };
-		if (state === "authenticated") return { authenticated: true, declined: false };
+		if (this.#reservations.get(group) !== reservation) {
+			return { authenticated: false, declined: state === "declined" };
+		}
 		const inFlight = this.#inFlight.get(group);
 		if (inFlight) return await inFlight;
 		if (state !== "approved") return { authenticated: false, declined: false };
-		const generation = this.generation(group);
 		const pending = (async () => {
-			const authenticated = (await login()) !== false;
-			if (authenticated) this.markAuthenticated(group);
-			else this.markDeclined(group, generation);
+			const authenticated = (await login()) !== false && this.#reservations.get(group) === reservation;
+			if (authenticated) this.#markAuthenticated(group);
+			else this.declineLogin(reservation);
 			return { authenticated, declined: !authenticated };
 		})();
 		this.#inFlight.set(group, pending);
 		try {
 			return await pending;
 		} catch (error) {
-			this.markDeclined(group, generation);
+			this.declineLogin(reservation);
 			throw error;
 		} finally {
 			this.#inFlight.delete(group);
@@ -1065,8 +1096,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		this.#prepared.delete(callId);
 		this.#approved.delete(callId);
 		if (prepared) {
-			if (prepared.call.profile.ssoGroup && prepared.call.loginGeneration !== undefined)
-				awsSessionAuthGroups.markDeclined(prepared.call.profile.ssoGroup, prepared.call.loginGeneration);
+			if (prepared.call.loginReservation) awsSessionAuthGroups.declineLogin(prepared.call.loginReservation);
 			await fs.rm(prepared.call.tempDir, { force: true, recursive: true });
 		}
 	}
@@ -1341,7 +1371,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		args: unknown,
 		signal?: AbortSignal,
 		context?: AgentToolContext,
-		reserveLogin?: () => boolean,
+		reserveLogin?: () => AwsLoginReservation | undefined,
 	): Promise<RuntimeToolApprovalRequest | undefined> {
 		const params = args as AwsToolParams;
 		const sessionId = this.#getSessionId();
@@ -1375,11 +1405,11 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			if (prepared.login) {
 				const group = prepared.profile.ssoGroup;
 				if (!group) throw new AwsToolError("AUTH_REQUIRED: selected profile does not use AWS IAM Identity Center");
-				if (!(reserveLogin ? reserveLogin() : awsSessionAuthGroups.reserveLogin(group)))
+				prepared.loginReservation = reserveLogin ? reserveLogin() : awsSessionAuthGroups.reserveLogin(group);
+				if (!prepared.loginReservation)
 					throw new AwsToolError(
 						"AUTH_REQUIRED: AWS SSO sign-in is already awaiting approval or running for this authentication group",
 					);
-				prepared.loginGeneration = awsSessionAuthGroups.generation(group);
 				if (this.#hasSessionApproval() && prepared.dcg?.decision !== "ask") {
 					this.approveRuntimeApproval(toolCallId, params);
 					return undefined;
@@ -1403,8 +1433,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			}
 			return undefined;
 		} catch (error) {
-			if (prepared.profile.ssoGroup && prepared.loginGeneration !== undefined)
-				awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup, prepared.loginGeneration);
+			if (prepared.loginReservation) awsSessionAuthGroups.declineLogin(prepared.loginReservation);
 			this.#prepared.delete(toolCallId);
 			this.#approved.delete(toolCallId);
 			await fs.rm(prepared.tempDir, { force: true, recursive: true });
@@ -1418,9 +1447,9 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const prepared = this.#prepared.get(toolCallId);
 		if (prepared?.fingerprint !== fingerprint || prepared.sessionId !== this.#getSessionId()) return;
 		if (params.service === "sso" && params.operation === "login") {
-			const group = prepared.call.profile.ssoGroup;
-			if (!group || prepared.call.loginGeneration !== awsSessionAuthGroups.generation(group)) return;
-			awsSessionAuthGroups.markApproved(group);
+			const reservation = prepared.call.loginReservation;
+			if (!reservation) return;
+			awsSessionAuthGroups.markApproved(reservation);
 		}
 		this.#approved.set(toolCallId, fingerprint);
 	}
@@ -1429,8 +1458,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		const fingerprint = JSON.stringify(args);
 		const prepared = this.#prepared.get(toolCallId);
 		if (prepared?.fingerprint !== fingerprint) return;
-		if (prepared.call.profile.ssoGroup && prepared.call.loginGeneration !== undefined)
-			awsSessionAuthGroups.markDeclined(prepared.call.profile.ssoGroup, prepared.call.loginGeneration);
+		if (prepared.call.loginReservation) awsSessionAuthGroups.declineLogin(prepared.call.loginReservation);
 		this.#approved.delete(toolCallId);
 		this.#prepared.delete(toolCallId);
 		void fs.rm(prepared.call.tempDir, { force: true, recursive: true });
@@ -1467,7 +1495,10 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 	): Promise<boolean> {
 		if (prepared.authRecovery.attempted) {
 			if (prepared.profile.ssoGroup)
-				awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup, prepared.authenticationGeneration);
+				awsSessionAuthGroups.recordAuthenticationFailure(
+					prepared.profile.ssoGroup,
+					prepared.authenticationGeneration,
+				);
 			return false;
 		}
 		prepared.authRecovery.attempted = true;
@@ -1508,7 +1539,10 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					retryError.context?.code === "AUTH_REQUIRED" &&
 					prepared.profile.ssoGroup
 				) {
-					awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup, prepared.authenticationGeneration);
+					awsSessionAuthGroups.recordAuthenticationFailure(
+						prepared.profile.ssoGroup,
+						prepared.authenticationGeneration,
+					);
 				}
 				throw retryError;
 			}
@@ -1607,22 +1641,22 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					prepared.dcg?.decision !== "ask" &&
 					!this.#approved.has(toolCallId)
 				) {
-					if (!awsSessionAuthGroups.reserveLogin(group)) {
+					prepared.loginReservation = awsSessionAuthGroups.reserveLogin(group);
+					if (!prepared.loginReservation) {
 						throw new AwsToolError("AUTH_REQUIRED: AWS SSO sign-in is already awaiting approval or running");
 					}
-					prepared.loginGeneration = awsSessionAuthGroups.generation(group);
-					awsSessionAuthGroups.markApproved(group);
+					awsSessionAuthGroups.markApproved(prepared.loginReservation);
 					this.#approved.set(toolCallId, fingerprint);
 				}
 				if (
 					!group ||
-					prepared.loginGeneration !== awsSessionAuthGroups.generation(group) ||
+					!prepared.loginReservation ||
 					awsSessionAuthGroups.status(group) !== "approved" ||
 					this.#approved.get(toolCallId) !== fingerprint
 				) {
 					throw new AwsToolError("AUTH_REQUIRED: explicit AWS SSO login approval is required");
 				}
-				const loginResult = await awsSessionAuthGroups.runApprovedLogin(group, async () => {
+				const loginResult = await awsSessionAuthGroups.runApprovedLogin(prepared.loginReservation, async () => {
 					let pending = "";
 					const ui = context?.ui;
 					const result = await this.#run(
@@ -1732,7 +1766,10 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					prepared.sessionManagerBin !== undefined,
 				);
 				if (!result.ok && awsFailureCode(result.stderr, false) === "AUTH_REQUIRED" && prepared.profile.ssoGroup) {
-					awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup, prepared.authenticationGeneration);
+					awsSessionAuthGroups.recordAuthenticationFailure(
+						prepared.profile.ssoGroup,
+						prepared.authenticationGeneration,
+					);
 				}
 			}
 			if (result.stdout)
@@ -1750,11 +1787,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 						? `AWS output and artifact capped at ${MAX_AWS_OUTPUT_BYTES} bytes`
 						: undefined,
 			);
-			// Session Manager reports startup errors on stdout even when its process exits zero.
-			const failed =
-				!result.ok ||
-				(prepared.sessionManagerBin !== undefined &&
-					/(?:^|\r?\n)Cannot perform start session:/u.test(result.stdout));
+			const failed = !result.ok;
 			const failure = awsFailureCode(result.stderr, timedOut) ?? (failed ? "AWS_ERROR" : undefined);
 			if (
 				!prepared.profile.ssoGroup ||
@@ -1782,8 +1815,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 				.error(failed)
 				.done();
 		} catch (error) {
-			if (prepared.profile.ssoGroup && prepared.loginGeneration !== undefined)
-				awsSessionAuthGroups.markDeclined(prepared.profile.ssoGroup, prepared.loginGeneration);
+			if (prepared.loginReservation) awsSessionAuthGroups.declineLogin(prepared.loginReservation);
 			throw error;
 		} finally {
 			this.#approved.delete(toolCallId);

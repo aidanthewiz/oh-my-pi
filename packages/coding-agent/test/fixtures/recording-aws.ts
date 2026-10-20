@@ -96,7 +96,7 @@ if (argv.includes("--fixture-child")) {
 		(service === "ecs" && operation === "execute-command") ||
 		(service === "ssm" && operation === "start-session")
 	) {
-		const modes = ["fixture-fail", "fixture-zero-error", "fixture-hang"];
+		const modes = ["fixture-fail", "fixture-zero-error", "fixture-remote-diagnostic", "fixture-hang"];
 		const mode = modes.find(value => argv.some(arg => arg === value || arg.endsWith(`=${value}`)));
 		const helper = Bun.spawn(["session-manager-plugin", mode ?? "fixture-complete"], {
 			env: process.env,
