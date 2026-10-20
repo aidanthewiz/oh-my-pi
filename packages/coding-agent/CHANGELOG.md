@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
+
 ### Fixed
 
 - Source restarts retain trusted runtime preloads and start outside project bunfig/dotenv, preserving the live cwd and resolved configuration after moves.
@@ -15,6 +19,12 @@
 - Session archives retain readable children when another transcript fails. Anonymized archives use private, non-overwriting temporary files and preserve malformed-record accounting after session rollback.
 - Anonymized exports retain IDs, timestamps, models, and usage. Review them before sharing; redaction does not guarantee anonymity or upload any data.
 - Browser metadata-settle and `waitForTarget` cancellation retain `ToolAbortError`. Missing selected targets never adopt another live page.
+- Preserve pending AWS SSO approvals when unrelated native or managed requests report authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
+- Keep successful ECS Exec and SSM output successful when it contains text resembling helper diagnostics ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
+- Preserve newer AWS SSO sign-ins when older operations report delayed authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
+- Wait for delayed ECS Exec and SSM session output, report nonzero helper failures, and stop helper descendants on cancellation ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
+- Renew expired AWS SSO credentials in long-running sessions and allow explicit sign-in retries after earlier completion, decline, or failure without repeated automatic prompts or duplicate logins.
+- Resolve ECS Exec and SSM session helpers from immutable launcher metadata through a private temporary PATH. Preserve redacted terminal output without inheriting repository executables or ambient AWS credentials.
 - Drain extension-generated print/JSON work and detached terminal-message observers before exiting, including non-triggering session-stop outcomes and queued follow-ups.
 - Preserve an enabled saved model when its bare model name also matches an unavailable provider.
 - Await in-memory URL selectors before attaching reader metadata.

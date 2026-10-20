@@ -3,7 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
-import { createLinuxSubreaperScript, exec, NonZeroExitError, spawn, TimeoutError } from "@oh-my-pi/pi-utils/ptree";
+import {
+	AbortError,
+	createLinuxSubreaperScript,
+	exec,
+	NonZeroExitError,
+	spawn,
+	TimeoutError,
+} from "@oh-my-pi/pi-utils/ptree";
 
 async function supportsLinuxMountNamespaces(): Promise<boolean> {
 	if (process.platform !== "linux") return false;
@@ -484,4 +491,79 @@ ${createLinuxSubreaperScript()}
 			expect(threw).toBeInstanceOf(TimeoutError);
 		},
 	);
+});
+
+describe("ptree exec stdin lifetime", () => {
+	const probe = path.join(import.meta.dir, "fixtures/ptree-stdin-probe.ts");
+	const env = { ...Bun.env, BUN_BE_BUN: "1" };
+
+	it("closes stdin by default before a delayed remote completion", async () => {
+		const result = await exec([process.execPath, probe], { env, timeout: 3000, allowNonZero: true });
+
+		expect(result.exitCode).toBe(86);
+		expect(result.stdout).toBe("stdin-eof\n");
+	});
+
+	it("keeps a private stdin pipe open through remote completion", async () => {
+		const result = await exec([process.execPath, probe], { env, timeout: 3000, keepStdinOpen: true });
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toBe("remote-complete\n");
+	});
+
+	it.skipIf(process.platform !== "linux")("retains open stdin through the Linux subreaper", async () => {
+		const result = await exec([process.execPath, probe], {
+			env,
+			timeout: 3000,
+			keepStdinOpen: true,
+			subreaper: true,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toBe("remote-complete\n");
+	});
+
+	it("closes finite input after its payload even when an open pipe was requested", async () => {
+		const result = await exec([process.execPath, probe, "payload"], {
+			env,
+			timeout: 3000,
+			input: "remote input",
+			keepStdinOpen: true,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toBe("REMOTE INPUT");
+	});
+
+	it("cancels an open-input process tree before returning", async () => {
+		const controller = new AbortController();
+		let observed = "";
+		const pids: number[] = [];
+		try {
+			const result = await exec([process.execPath, probe, "hang"], {
+				env,
+				timeout: 3000,
+				keepStdinOpen: true,
+				detached: true,
+				subreaper: true,
+				signal: controller.signal,
+				allowAbort: true,
+				onStdout: chunk => {
+					observed += chunk;
+					if (/child:\d+\n/.test(observed)) controller.abort("session cancelled");
+				},
+			});
+			for (const match of observed.matchAll(/(?:root|child):(\d+)\n/g)) pids.push(Number(match[1]));
+
+			expect(result.exitError).toBeInstanceOf(AbortError);
+			expect(result.exitError).not.toBeInstanceOf(TimeoutError);
+			expect(pids).toHaveLength(2);
+			expect(result.stdout).not.toContain("stdin-eof");
+			for (const pid of pids) expect(Process.fromPid(pid)?.status()).not.toBe(ProcessStatus.Running);
+		} finally {
+			for (const match of observed.matchAll(/(?:root|child):(\d+)\n/g)) {
+				Process.fromPid(Number(match[1]))?.killTree(9);
+			}
+		}
+	});
 });

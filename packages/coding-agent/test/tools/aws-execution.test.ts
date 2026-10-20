@@ -8,18 +8,24 @@ test("native AWS enforces process, account approval, authentication, and output 
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "native-aws-execution-"));
 	try {
 		const executable = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");
-		const fixture = path.resolve(import.meta.dir, "../fixtures/recording-aws.ts");
-		if (process.platform === "win32") {
-			const build = Bun.spawn([process.execPath, "build", "--compile", fixture, "--outfile", executable], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const [buildError, buildExit] = await Promise.all([new Response(build.stderr).text(), build.exited]);
-			expect(buildExit, buildError).toBe(0);
-		} else {
-			await fs.writeFile(executable, `#!${process.execPath}\n${await fs.readFile(fixture, "utf8")}`, {
-				mode: 0o755,
-			});
+		const sessionHelper = path.join(root, process.platform === "win32" ? "session-helper.exe" : "session-helper");
+		for (const [fixtureName, target] of [
+			["recording-aws.ts", executable],
+			["session-manager-helper.ts", sessionHelper],
+		] as const) {
+			const fixture = path.resolve(import.meta.dir, "../fixtures", fixtureName);
+			if (process.platform === "win32") {
+				const build = Bun.spawn([process.execPath, "build", "--compile", fixture, "--outfile", target], {
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [buildError, buildExit] = await Promise.all([new Response(build.stderr).text(), build.exited]);
+				expect(buildExit, buildError).toBe(0);
+			} else {
+				await fs.writeFile(target, `#!${process.execPath}\n${await fs.readFile(fixture, "utf8")}`, {
+					mode: 0o755,
+				});
+			}
 		}
 		const config = path.join(root, "config");
 		await fs.writeFile(
@@ -37,6 +43,15 @@ test("native AWS enforces process, account approval, authentication, and output 
 			["government-expired", "government-expired", "us-gov-west-1"],
 			["mutating-expired", "mutating-expired", "us-east-1"],
 			["mutating-changed", "mutating-changed", "us-east-1"],
+			["mutation-reexpires", "mutation-reexpires", "us-east-1"],
+			["expired-session", "session", "us-east-1"],
+			["expired-session-other", "session-other", "us-east-1"],
+			["expired-session-login", "session-login", "us-east-1"],
+			["expired-session-first", "session-first", "us-east-1"],
+			["expired-managed-direct-preflight", "managed-direct-preflight", "us-east-1"],
+			["expired-managed-deferred-preflight", "managed-deferred-preflight", "us-east-1"],
+			["expired-managed-direct-reconnect", "managed-direct-reconnect", "us-east-1"],
+			["expired-managed-deferred-reconnect", "managed-deferred-reconnect", "us-east-1"],
 		]) {
 			await fs.appendFile(
 				config,
@@ -83,6 +98,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 			OMP_OPERATIONAL_AWS_CONFIG_FILE: config,
 			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "credentials"),
 			OMP_OPERATIONAL_AWS_EXECUTABLE: executable,
+			OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: sessionHelper,
 			OMP_OPERATIONAL_AWS_PROFILE: "commercial",
 			OMP_OPERATIONAL_AWS_REGION: "us-east-1",
 			OMP_DCG_PATH: executable,
@@ -101,7 +117,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 			ANTHROPIC_API_KEY: "unrelated-anthropic",
 			OPENAI_API_KEY: "unrelated-openai",
 		};
-		for (const missingCli of [false, true]) {
+		for (const scenario of ["normal", "missing-cli", "missing-plugin"]) {
 			const probe = Bun.spawn(
 				[
 					process.execPath,
@@ -111,9 +127,16 @@ test("native AWS enforces process, account approval, authentication, and output 
 				{
 					cwd: root,
 					signal: AbortSignal.timeout(60_000),
-					env: missingCli
-						? { ...env, OMP_OPERATIONAL_AWS_EXECUTABLE: undefined, NATIVE_AWS_EXPECT_NO_CLI: "1" }
-						: env,
+					env:
+						scenario === "missing-cli"
+							? { ...env, OMP_OPERATIONAL_AWS_EXECUTABLE: undefined, NATIVE_AWS_EXPECT_NO_CLI: "1" }
+							: scenario === "missing-plugin"
+								? {
+										...env,
+										OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN: undefined,
+										NATIVE_AWS_EXPECT_NO_PLUGIN: "1",
+									}
+								: env,
 					stdout: "pipe",
 					stderr: "pipe",
 				},

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = process.env.HOME ?? process.env.USERPROFILE!;
@@ -48,6 +48,7 @@ if (argv.includes("--fixture-child")) {
 		}
 	} else if (
 		profile === "still-expired" ||
+		(profile === "mutation-reexpires" && service !== "sts") ||
 		(profile === "mutating-changed" && existsSync(join(root, "expire-mutation")) && !existsSync(token)) ||
 		((profile.startsWith("expired") ||
 			[
@@ -58,9 +59,21 @@ if (argv.includes("--fixture-child")) {
 				"firstuse-declined",
 				"government-expired",
 				"mutating-expired",
+				"mutation-reexpires",
 			].includes(profile)) &&
 			!existsSync(token))
 	) {
+		console.error("SSO token expired; login required");
+		process.exitCode = 254;
+	} else if (existsSync(join(root, `auth-race-${profile}-${service}-${operation}.armed`))) {
+		const barrier = join(root, `auth-race-${profile}-${service}-${operation}`);
+		unlinkSync(`${barrier}.armed`);
+		writeFileSync(`${barrier}.started`, "yes");
+		const deadline = Date.now() + 10_000;
+		while (!existsSync(`${barrier}.release`)) {
+			if (Date.now() >= deadline) throw new Error("Authentication race barrier was not released");
+			await Bun.sleep(10);
+		}
 		console.error("SSO token expired; login required");
 		process.exitCode = 254;
 	} else if (service === "configure" && operation === "export-credentials") {
@@ -79,6 +92,19 @@ if (argv.includes("--fixture-child")) {
 		console.log(
 			JSON.stringify({ Account: account, Arn: `arn:${partition}:iam::${account}:user/fixture`, UserId: "fixture" }),
 		);
+	} else if (
+		(service === "ecs" && operation === "execute-command") ||
+		(service === "ssm" && operation === "start-session")
+	) {
+		const modes = ["fixture-fail", "fixture-zero-error", "fixture-remote-diagnostic", "fixture-hang"];
+		const mode = modes.find(value => argv.some(arg => arg === value || arg.endsWith(`=${value}`)));
+		const helper = Bun.spawn(["session-manager-plugin", mode ?? "fixture-complete"], {
+			env: process.env,
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+		process.exitCode = await helper.exited;
 	} else if (argv.includes("--prefix=hang")) {
 		Bun.spawn(
 			process.platform === "win32"

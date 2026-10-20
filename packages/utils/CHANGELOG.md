@@ -9,6 +9,9 @@
 - Added `hueDistance`, the angular distance between two OKLCH hues
 
 ## [18.8.8] - 2026-10-10
+### Added
+
+- `ptree.exec({ keepStdinOpen: true })` keeps a private input channel open until process completion without reading the user's terminal ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 
 ### Fixed
 

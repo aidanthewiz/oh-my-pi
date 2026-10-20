@@ -25,14 +25,31 @@ For example, `{"profile":"employee-gov","service":"sts","operation":"get-caller-
 
 1. The launcher captures a trusted AWS CLI executable and profile file paths. Discovery reads profile metadata, not credentials or remote STS identity.
 2. The tool validates the explicit profile, Region, partition, parameters, and credential-process path. It runs the executable directly with a minimal environment and temporary configuration. Generic Bash does not inherit operational AWS credentials.
-3. Destructive Command Guard applies to every call. Operations outside the explicit read-only allowlist require mutation approval and a verified STS account, ARN, Region, and partition. A changed identity after approval stops execution.
-4. When an SSO session has expired, an interactive session can offer one approved sign-in and retry. A noninteractive session returns an explicit login command. An explicit `sso login` call also requires approval.
+3. Destructive Command Guard applies to every call. Mutations and unclassified operations require verified STS account, ARN, Region, and partition checks. A changed identity after approval stops execution.
+4. Ordinary approvals offer **Deny**, approval for one call, or **Allow for the rest of this session**. The session grant covers later native AWS operations and profiles, including SSO renewal. It remains in memory, survives tool reconstruction within that session, and does not apply to another session or managed MCP commands.
+5. Session approval never overrides explicit tool-policy denies, mandatory per-command Destructive Command Guard asks or denies, identity checks, or provider safety checks. Guard asks still require approval for the exact command and cannot grant session access.
+6. When SSO credentials expire, an interactive session can renew authentication and retry the operation once. Native and managed MCP calls share pending sign-ins for the same SSO group. Each call has one automatic recovery budget across identity checks, operation retries, and managed reconnects.
+7. A declined or failed sign-in pauses automatic recovery for that SSO group. A user-requested `sso login` can retry after a decline, failure, or earlier successful sign-in. A pending sign-in prevents duplicate login processes. Without an interactive surface, the tool returns an explicit login command.
+
+Ordinary authentication failures cannot cancel a pending sign-in. Only that sign-in's owner can approve, decline, or complete it. Delayed failures from older operations cannot invalidate a newer successful sign-in.
+
+The session grant removes ordinary command consent prompts; it does not authenticate to AWS. The user must still complete browser SSO authentication when required. Grants are not saved to configuration or restored in a new process.
+
+ECS `execute-command` and SSM `start-session` require the Session Manager plugin.
+Install `session-manager-plugin` on your employee PATH, then restart Coreforge.
+The launcher captures its absolute path before adding repository tools.
+Each session call exposes only that helper through a private temporary PATH.
+The native route does not inherit the repository PATH or ambient credentials.
+
+Session commands keep a private input channel open until remote completion, cancellation, or timeout. They do not read from the interactive terminal. Their success/error status follows process exit status, not the contents of remote stdout.
+
+The stock Session Manager plugin can print a startup diagnostic and exit with code 0. It does not expose a reliable per-call diagnostic channel on Unix. Such text remains in the returned output but cannot reliably be classified as a tool failure. A nonzero helper exit still reports an error.
 
 ## Results and limits
 
 The result includes redacted AWS output, profile, operation, Region, exit code, and failure code.
-Valid JSON up to 1 MiB may also produce a redacted artifact.
-Invalid, oversized, or truncated JSON is withheld from both the result and artifact.
+Output and artifacts are capped at 1 MiB. Invalid or truncated JSON is withheld.
+Session commands preserve redacted terminal text instead of requiring JSON.
 
 This route uses the employee's IAM permissions and AWS audit logs.
 Direct CLI calls do not carry MCP-specific IAM condition keys.
