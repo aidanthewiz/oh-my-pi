@@ -9,12 +9,16 @@ import { BtwController } from "@oh-my-pi/pi-coding-agent/modes/controllers/btw-c
 import { CleanseCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/cleanse-command-controller";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { OmfgController } from "@oh-my-pi/pi-coding-agent/modes/controllers/omfg-controller";
+import * as ternKind from "@oh-my-pi/pi-coding-agent/tools/browser/tern/kind";
+import { TernSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/wire";
+import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import type { TerminalLaunchRequest } from "../src/subprocess/terminal-launch";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 
 describe("InteractiveMode fork placement bridge", () => {
 	let tempDir: TempDir;
@@ -171,4 +175,82 @@ describe("InteractiveMode fork placement bridge", () => {
 			await pooled.dispose();
 		}
 	});
+
+	it.each(["active", "released", "unpooled"] as const)(
+		"keeps %s account policy across a bare fork inside Tern",
+		async policy => {
+			const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "tern-sessions"));
+			const scope =
+				policy === "unpooled"
+					? undefined
+					: SessionAccountPoolScope.create(session.modelRegistry, { anthropic: [] }, manager.getSessionId());
+			authStorage.keys.setRuntime("anthropic", "owned-runtime-key");
+			const forkSession = new AgentSession({
+				agent: new Agent({
+					initialState: { model: session.model, systemPrompt: ["Test"], tools: [], messages: [] },
+				}),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: scope?.registry(session.modelRegistry) ?? session.modelRegistry,
+				accountPoolScope: scope,
+			});
+			const forkMode = new InteractiveMode(
+				forkSession,
+				"test",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new Composer({ terminal: new VirtualTerminal() }),
+			);
+			const warning = vi.spyOn(forkMode, "showWarning").mockImplementation(() => {});
+			vi.spyOn(forkMode, "showError").mockImplementation(() => {});
+			vi.spyOn(ternKind, "resolveTernPane").mockReturnValue({
+				socketPath: path.join(tempDir.path(), "never-connected.sock"),
+				pane: 7,
+			});
+			const connect = vi.spyOn(TernSocketClient.prototype, "connect").mockResolvedValue();
+			vi.spyOn(TernSocketClient.prototype, "supports").mockReturnValue(true);
+			const transportFork = vi.spyOn(TernSocketClient.prototype, "fork").mockResolvedValue(9);
+			vi.spyOn(TernSocketClient.prototype, "close").mockImplementation(() => {});
+			try {
+				manager.appendMessage({ role: "user", content: "owned Tern transcript", timestamp: 1 });
+				await manager.ensureOnDisk();
+				const sourceFile = manager.getSessionFile();
+				if (!sourceFile) throw new Error("Expected the durable source transcript");
+				const source = await Bun.file(sourceFile).text();
+				const sourceId = forkSession.sessionId;
+				if (policy === "released") scope?.release();
+				let failure: unknown;
+				try {
+					await forkMode.handleForkCommand();
+				} catch (error) {
+					failure = error;
+				}
+				if (policy === "unpooled") {
+					expect(failure).toBeUndefined();
+					expect(transportFork).toHaveBeenCalledTimes(1);
+					expect(forkSession.sessionId).toBe(sourceId);
+					expect(manager.getSessionFile()).toBe(sourceFile);
+				} else {
+					expect(connect).not.toHaveBeenCalled();
+					expect(transportFork).not.toHaveBeenCalled();
+					expect(warning).toHaveBeenCalledTimes(1);
+					if (policy === "active") {
+						expect(failure).toBeUndefined();
+						expect(forkSession.sessionId).not.toBe(sourceId);
+						expect(manager.getSessionFile()).not.toBe(sourceFile);
+					}
+					if (!forkSession.model) throw new Error("Expected the inherited model");
+					const credentials = await forkSession.modelRegistry.getApiKeyAndHeaders(forkSession.model);
+					expect(credentials.ok).toBe(false);
+				}
+				expect(await Bun.file(sourceFile).text()).toBe(source);
+			} finally {
+				forkMode.stop();
+				await forkSession.dispose();
+			}
+		},
+	);
 });

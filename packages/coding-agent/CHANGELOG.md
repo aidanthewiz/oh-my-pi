@@ -7,6 +7,7 @@
 - Terminal forks retain the resolved managed policy, session directory, selected upstream model route, and launcher policy. Flush pending Bash output before launching; scrub credentials from terminal CLI children.
 - Source terminal forks retain trusted runtime preloads and restore the session cwd after neutral-directory startup, without project dotenv loading.
 - Explicit terminal placements refuse process-local OAuth account-pool policies rather than widen their authorization in another process.
+- Bare Tern forks keep OAuth account-pool sessions in process, including retained policies whose leases have been released.
 - Preserve class-backed extension UI receivers and live getters when adding terminal launch support.
 - External editors use the repository-child credential and managed-policy environment boundary, including `/annotate` source editing.
 - Session archives retain readable children when another transcript fails. Anonymized archives use private, non-overwriting temporary files and preserve malformed-record accounting after session rollback.

@@ -1584,6 +1584,12 @@ export class CommandController {
 	async #forkIntoTernPane(): Promise<boolean> {
 		const tern = resolveTernPane();
 		if (!tern || !this.ctx.sessionManager.isSessionOnDisk()) return false;
+		if (this.ctx.session.hasAccountPoolPolicy) {
+			this.ctx.showWarning(
+				"Forking in this process: this session's OAuth account-pool policy cannot be transferred to a Tern pane.",
+			);
+			return false;
+		}
 		const client = new TernSocketClient({ socketPath: tern.socketPath });
 		try {
 			try {
