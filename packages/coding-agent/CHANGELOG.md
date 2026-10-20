@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Source restarts retain trusted runtime preloads and start outside project bunfig/dotenv, preserving the live cwd and resolved configuration after moves.
+- Restarts retain captured launcher policy and refuse process-local OAuth account pools before teardown, including released leases.
 - Terminal forks retain the resolved managed policy, session directory, selected upstream model route, and launcher policy. Flush pending Bash output before launching; scrub credentials from terminal CLI children.
 - Source terminal forks retain trusted runtime preloads and restore the session cwd after neutral-directory startup, without project dotenv loading.
 - Explicit terminal placements refuse process-local OAuth account-pool policies rather than widen their authorization in another process.

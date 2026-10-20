@@ -483,8 +483,24 @@ selectors (`--session`, `--resume`, `--continue`, `--fork`, and foreign imports)
 It adds `--resume <current-id>` only when the session actually exists on disk;
 an in-memory or never-materialized session restarts fresh.
 
+Restart preserves the live cwd, current session directory, and resolved overlay
+and managed configuration paths. Relative startup flags cannot redirect these
+paths after `/move`.
+
+Source restarts share the terminal-fork bootstrap: Bun starts in a neutral
+directory with Bun's project dotenv loading disabled. Trusted runtime flags and
+preloads survive, and the source shim restores the live cwd before CLI imports.
+Compiled restarts retain the launcher-captured env-file policy.
+
+Sessions governed by an SDK OAuth account pool refuse restart before teardown,
+including after their restriction leases have been released. A transcript cannot
+transfer this process-local authorization policy.
+
 POSIX uses process-image replacement when available. Windows or a failed exec
 falls back to spawning the replacement with inherited terminal streams.
+The POSIX exec boundary pins named, non-secret configuration and launcher scope
+through `/usr/bin/env`; it does not serialize provider credentials into argv.
+The spawn fallback receives the same scope through its explicit environment.
 
 ## How session switching actually mutates runtime state
 

@@ -55,6 +55,7 @@ import { isInsideTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-capabilit
 import {
 	$env,
 	adjustHsv,
+	applyLauncherCapturedChildPolicy,
 	formatDuration,
 	formatNumber,
 	getProjectDir,
@@ -155,7 +156,7 @@ import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
-import { resolveCliEntryCmd } from "../subprocess/worker-client";
+import { cliScopeEnvCommand, prepareCliRelaunchCmd, resolveCliEntryCmd } from "../subprocess/worker-client";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { labelEchoesHandle } from "../task/label";
 import { agentTypeBadge, formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
@@ -470,6 +471,11 @@ const cfgLiveUiSettings = combine({
 type LiveUiSettings = SettingValueOf<typeof cfgLiveUiSettings>;
 
 const STILL_CLOSING_DELAY_MS = 3_000;
+const RESTART_SCOPE_OVERRIDES: Readonly<Record<string, true>> = {
+	"--cwd": true,
+	"--config": true,
+	"--session-dir": true,
+};
 const COREFORGE_REPORT_IDLE_DELAY_MS = 1_000;
 const JUDGMENT_BATCH_PROGRESS_RETAIN_MS = 1_000;
 /** Startup emits several status-bar changes within a second; persist only the settled one. */
@@ -6986,26 +6992,63 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	async restart(): Promise<void> {
 		if (this.#isShuttingDown) return;
+		if (this.session.hasAccountPoolPolicy) {
+			this.showError("Cannot restart this session: its OAuth account-pool policy must remain in this process.");
+			return;
+		}
+		let cliCommand = resolveCliEntryCmd();
+		const sourceLaunch = cliCommand.length > 1;
 		this.#beginClose();
 		try {
+			if (sourceLaunch) cliCommand = await prepareCliRelaunchCmd(cliCommand);
 			await this.#teardown();
 		} catch (error) {
 			this.#handleTeardownError("restart", error);
 			return;
 		}
 
-		const cmd = [...resolveCliEntryCmd(), ...restartArgv(process.argv.slice(2), this.#resumableSessionId())];
+		const cwd = this.sessionManager.getCwd();
+		const cmd = [
+			...cliCommand,
+			...restartArgv(process.argv.slice(2), this.#resumableSessionId(), RESTART_SCOPE_OVERRIDES),
+			"--cwd",
+			cwd,
+			"--session-dir",
+			this.sessionManager.getSessionDir(),
+		];
+		const scope: Record<string, string | undefined> = {
+			PI_CODING_AGENT_DIR: this.settings.getAgentDir(),
+			PI_CONFIG_FILES: this.settings.getConfigFiles().join(path.delimiter),
+			OMP_MANAGED_CONFIG_FILE: this.settings.getManagedConfigFile(),
+			OMP_LAUNCH_CWD: sourceLaunch ? cwd : undefined,
+			OMP_DOTENV_OVERRIDE: process.env.OMP_DOTENV_OVERRIDE,
+			OMP_CF_PRODUCT_VERSION: process.env.OMP_CF_PRODUCT_VERSION,
+			BUN_OPTIONS: sourceLaunch ? undefined : process.env.BUN_OPTIONS,
+		};
+		const execCommand = process.platform === "win32" ? undefined : cliScopeEnvCommand(scope, "/usr/bin/env");
 		await postmortem.cleanup();
 		await postmortem.drainStdout();
-		if (process.platform !== "win32") {
+		if (execCommand) {
 			try {
-				execReplace(cmd); // never returns on success
+				execCommand.push(...cmd);
+				execReplace(execCommand); // never returns on success
 			} catch (err) {
 				process.stderr.write(`${chalk.red(`Restart exec failed: ${err instanceof Error ? err.message : err}`)}\n`);
 			}
 		}
 		try {
+			const environment: Record<string, string> = {};
+			for (const [name, value] of Object.entries(process.env)) {
+				if (value !== undefined) environment[name] = value;
+			}
+			for (const [name, value] of Object.entries(scope)) {
+				if (value) environment[name] = value;
+				else delete environment[name];
+			}
+			applyLauncherCapturedChildPolicy(environment);
 			const child = Bun.spawn(cmd, {
+				cwd,
+				env: environment,
 				stdin: "inherit",
 				stdout: "inherit",
 				stderr: "inherit",
