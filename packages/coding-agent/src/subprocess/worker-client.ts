@@ -17,6 +17,7 @@ import {
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
 import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import { getConfigRootDir } from "@oh-my-pi/pi-utils/dirs";
 import type { Subprocess } from "bun";
 
 /**
@@ -154,6 +155,57 @@ export function resolveCliEntryCmd(): string[] {
 	const hostEntry = workerHostEntry();
 	if (hostEntry) return [executable, hostEntry];
 	return [executable, path.resolve(import.meta.dir, "..", "cli.ts")];
+}
+
+/** Start source CLI relaunches before project bunfig or dotenv can execute. */
+export async function prepareCliRelaunchCmd(
+	command: string[],
+	configRootDir = getConfigRootDir(),
+	inheritedRuntimeArgs: readonly string[] = process.execArgv,
+): Promise<string[]> {
+	const neutralCwd = path.join(configRootDir, ".dev-cwd");
+	await fs.promises.mkdir(neutralCwd, { recursive: true, mode: 0o700 });
+	const runtimeArgs: string[] = [];
+	for (let index = 0; index < inheritedRuntimeArgs.length; index++) {
+		const argument = inheritedRuntimeArgs[index]!;
+		if (argument === "--cwd" || argument === "--env-file") {
+			index++;
+			continue;
+		}
+		if (argument === "--no-env-file" || argument.startsWith("--cwd=") || argument.startsWith("--env-file=")) {
+			continue;
+		}
+		runtimeArgs.push(argument);
+	}
+	return [
+		command[0]!,
+		...runtimeArgs,
+		"--cwd",
+		neutralCwd,
+		"--no-env-file",
+		"--preload",
+		path.resolve(import.meta.dir, "../../scripts/omp.ts"),
+		...command.slice(1),
+	];
+}
+
+/**
+ * Apply captured policy to an owned, non-secret scope and encode its `env` prefix.
+ * Absent values must be unset, not inherited from a terminal server or native environ.
+ */
+export function cliScopeEnvCommand(environment: Record<string, string | undefined>, executable = "env"): string[] {
+	const scopeNames = Object.keys(environment);
+	applyLauncherCapturedChildPolicy(environment);
+	for (const name of scopeNames) {
+		if (!Object.hasOwn(environment, name)) environment[name] = undefined;
+	}
+	const unset: string[] = [];
+	const assignments: string[] = [];
+	for (const [name, value] of Object.entries(environment)) {
+		if (value) assignments.push(`${name}=${value}`);
+		else unset.push("-u", name);
+	}
+	return [executable, ...unset, ...assignments];
 }
 
 /**

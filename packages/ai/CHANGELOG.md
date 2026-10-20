@@ -21,6 +21,13 @@
 - Treat unavailable AWS credential/config file paths as absent, and do not stat shared configuration unless loading it is enabled.
 - Preserve retryable OAuth refresh errors when a permitted login, configured fallback, or stored API-key value cannot resolve.
 - Keep glyph-stream previews aligned with decoded deltas when providers reuse mutable message and tool-call objects.
+
+## [18.8.9] - 2026-10-10
+
+### Changed
+
+- Updated state field rendering to trim trailing whitespace and normalize empty collection formatting for consistent prompt output
+
 ## [18.8.8] - 2026-10-10
 
 ### Fixed

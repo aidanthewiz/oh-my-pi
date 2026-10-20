@@ -27,7 +27,9 @@ credentials. Calling the script directly without every credential is an error.
    - requires an `Accepted` result, fetching the submission log when
      available on failure. The temporary keychain and credential files
      are removed on exit.
-3. The `verify_release` job downloads the published arm64 asset, verifies its
+3. Both Darwin matrix legs verify the final strict signature before publishing.
+   When all signing credentials exist, they reject an ad-hoc signature.
+4. The `verify_release` job downloads the published arm64 asset, verifies its
    strict signature, and repeats both launch checks. When signing credentials
    exist, it also rejects an ad-hoc published signature.
 

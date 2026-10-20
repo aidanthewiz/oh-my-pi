@@ -22,6 +22,9 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { CF_COMMAND } from "../../cli/cf-version";
+import { getActiveProfile, getConfigDirName, getConfigRootDir } from "@oh-my-pi/pi-utils/dirs";
+import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
+import { formatModelStringWithRouting } from "../../config/model-resolver";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
@@ -104,6 +107,16 @@ import type { UnavailableUsageAccount } from "@oh-my-pi/pi-tui/overlays/usage-da
 import { cfgTerminalShowImages } from "../settings";
 import { cfgProviderAppendOnlyContext } from "../../session/settings";
 import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "../../commands/settings";
+import { flagConsumesValue, restartArgv } from "../../cli/flag-tables";
+import {
+	createDefaultTerminalLaunchRequest,
+	getTerminalLaunchPlacement,
+	launchTerminal,
+	TerminalLaunchError,
+	type TerminalLaunchRequest,
+	type TerminalLaunchResult,
+} from "../../subprocess/terminal-launch";
+import { cliScopeEnvCommand, prepareCliRelaunchCmd, resolveCliEntryCmd } from "../../subprocess/worker-client";
 
 /** How long `/fork` waits for Tern to open the fork's pane. */
 const TERN_FORK_TIMEOUT_MS = 10_000;
@@ -115,14 +128,67 @@ function formatCreditValue(value: number): string {
 	return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
+interface ForkTerminalDependencies {
+	classifyTerminalMultiplexer: typeof classifyTerminalMultiplexer;
+	environment: () => NodeJS.ProcessEnv;
+	launchTerminal: (request: TerminalLaunchRequest) => Promise<TerminalLaunchResult>;
+	resolveCliEntryCmd: typeof resolveCliEntryCmd;
+	getActiveProfile: typeof getActiveProfile;
+	getConfigRootDir: typeof getConfigRootDir;
+	runtimeArgs: () => readonly string[];
+	argv: () => string[];
+}
+
+/**
+ * Startup flags the fork child re-supplies from the parent's live state
+ * (`--profile`, `--model`, `--thinking`, `--prompt-cache-key`, `--session-dir`) or that would
+ * re-point it at a stale scope (`--config`/`--cwd`/`--provider`; the child
+ * gets the effective overlays via `PI_CONFIG_FILES` and the session cwd).
+ */
+const FORK_LAUNCH_OVERRIDES: Readonly<Record<string, true>> = {
+	"--config": true,
+	"--cwd": true,
+	"--model": true,
+	"--profile": true,
+	"--prompt-cache-key": true,
+	"--provider": true,
+	"--session-dir": true,
+	"--thinking": true,
+};
+
+function hasForkApiKeyOverride(argv: string[]): boolean {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (arg === "--api-key" || arg.startsWith("--api-key=")) return true;
+		if (flagConsumesValue(arg, argv[i + 1])) i++;
+	}
+	return false;
+}
+
 export class CommandController {
 	/** The open native report sheet. */
 	#reportSheet: OverlayHandle | undefined;
 	#reportPaintUnsubscribe: (() => void) | undefined;
 	/** The editor sat on the bottom row when the text-mode report above it opened. */
 	#reportOpenedAtBottom = false;
+	#forkTerminalDependencies: ForkTerminalDependencies;
 
-	constructor(private readonly ctx: InteractiveModeContext) {}
+	constructor(
+		private readonly ctx: InteractiveModeContext,
+		forkTerminalDependencies: Partial<ForkTerminalDependencies> = {},
+	) {
+		this.#forkTerminalDependencies = {
+			classifyTerminalMultiplexer,
+			environment: () => process.env,
+			launchTerminal,
+			resolveCliEntryCmd,
+			getActiveProfile,
+			getConfigRootDir,
+			runtimeArgs: () => process.execArgv,
+			argv: () => process.argv.slice(2),
+			...forkTerminalDependencies,
+		};
+	}
 
 	/**
 	 * Esc: take away the report shown above the editor (text mode); false when
@@ -1319,7 +1385,12 @@ export class CommandController {
 		await this.#runNewSessionFlow({ drop: true }, "Session deleted");
 	}
 
-	async handleForkCommand(): Promise<void> {
+	async handleForkCommand(placement?: "pane" | "window"): Promise<void> {
+		if (placement !== undefined) {
+			await this.#handleForkTerminalCommand(placement);
+			return;
+		}
+
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before forking.");
 			return;
@@ -1360,6 +1431,148 @@ export class CommandController {
 				1,
 			),
 		]);
+	}
+
+	async #handleForkTerminalCommand(placement: "pane" | "window"): Promise<void> {
+		if (this.ctx.session.hasAccountPoolPolicy) {
+			this.ctx.showError(
+				"Cannot open a fork in another terminal: this session has a nonportable OAuth account-pool policy. Its authorization scope must remain in this process.",
+			);
+			return;
+		}
+
+		const dependencies = this.#forkTerminalDependencies;
+		const environment = dependencies.environment();
+		const multiplexer = dependencies.classifyTerminalMultiplexer(environment);
+		const placementInfo = getTerminalLaunchPlacement(multiplexer, placement);
+		if ("error" in placementInfo) {
+			this.ctx.showError(placementInfo.error);
+			return;
+		}
+
+		if (this.ctx.session.isStreaming) {
+			const confirmed = await this.ctx.showHookConfirm(
+				"Fork while a response is running?",
+				"The child may not include the partial response. Continue opening a fork? The current session will keep running here.",
+			);
+			if (!confirmed) return;
+		}
+
+		const initialSessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!initialSessionFile) {
+			this.ctx.showError("Cannot open a fork in another terminal: the current session has not been persisted yet.");
+			return;
+		}
+
+		const childArgs = restartArgv(dependencies.argv(), undefined, FORK_LAUNCH_OVERRIDES);
+		if (hasForkApiKeyOverride(childArgs)) {
+			this.ctx.showError(
+				"Cannot open a fork in another terminal when --api-key was supplied at startup; the key cannot be forwarded without exposing it in the multiplexer command. Configure provider credentials in the auth store and retry.",
+			);
+			return;
+		}
+		const shellGrammar = placementInfo.shellGrammar;
+		if (shellGrammar === "posix") {
+			const confirmed = await this.ctx.showHookConfirm(
+				"Confirm destination shell compatibility",
+				"This fork command uses POSIX shell syntax. Continue only if the destination's configured interactive shell accepts POSIX syntax; this cannot be inferred from the current terminal.",
+			);
+			if (!confirmed) {
+				this.ctx.showWarning("Fork cancelled: POSIX shell compatibility was not confirmed for the destination.");
+				return;
+			}
+		}
+
+		try {
+			await this.ctx.session.flushToDisk();
+		} catch (error) {
+			logger.error("Failed to flush the session before opening a terminal fork", { error });
+			this.ctx.showError("Cannot open a fork in another terminal: failed to save the current session.");
+			return;
+		}
+
+		const sessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!sessionFile) {
+			this.ctx.showError("Cannot open a fork in another terminal: the current session is no longer persisted.");
+			return;
+		}
+		const sourceSessionFile = path.resolve(sessionFile);
+		try {
+			await fs.access(sourceSessionFile);
+		} catch {
+			this.ctx.showError("Cannot open a fork in another terminal: the persisted session transcript is unavailable.");
+			return;
+		}
+
+		try {
+			const cwd = this.ctx.sessionManager.getCwd();
+			const activeProfile = dependencies.getActiveProfile();
+			const activeModel = this.ctx.session.model;
+			if (activeProfile) childArgs.push("--profile", activeProfile);
+			if (activeModel) childArgs.push("--model", formatModelStringWithRouting(activeModel));
+			childArgs.push("--session-dir", this.ctx.sessionManager.getSessionDir());
+			const activeThinkingLevel = this.ctx.session.configuredThinkingLevel();
+			if (activeThinkingLevel !== undefined) childArgs.push("--thinking", activeThinkingLevel);
+			// Forcing --model/--thinking marks the fork's cache shape as changed, which would
+			// drop the inherited key; pin what the parent's requests populated the cache under.
+			childArgs.push("--prompt-cache-key", this.ctx.session.agent.promptCacheKey ?? this.ctx.session.sessionId);
+			childArgs.push("--fork", sourceSessionFile);
+			let cliCommand = dependencies.resolveCliEntryCmd();
+			const sourceLaunch = cliCommand.length > 1;
+			if (sourceLaunch) {
+				cliCommand = await prepareCliRelaunchCmd(
+					cliCommand,
+					dependencies.getConfigRootDir(),
+					dependencies.runtimeArgs(),
+				);
+			}
+			// Pin only non-secret scope variables.
+			const command = [
+				...cliScopeEnvCommand({
+					PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
+					PI_CONFIG_DIR: getConfigDirName(),
+					OMP_PROFILE: activeProfile,
+					PI_PROFILE: activeProfile,
+					PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
+					OMP_MANAGED_CONFIG_FILE: this.ctx.settings.getManagedConfigFile(),
+					OMP_DOTENV_OVERRIDE: undefined,
+					OMP_CF_PRODUCT_VERSION: undefined,
+					BUN_OPTIONS: undefined,
+					OMP_LAUNCH_CWD: sourceLaunch ? cwd : undefined,
+					OMP_CF_VERSION: environment.OMP_CF_VERSION,
+					OMP_CF_UPDATE_CHANNEL: environment.OMP_CF_UPDATE_CHANNEL,
+					PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
+					XDG_DATA_HOME: environment.XDG_DATA_HOME,
+					XDG_STATE_HOME: environment.XDG_STATE_HOME,
+					XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
+				}),
+				...cliCommand,
+				...childArgs,
+			];
+			const launchPlan = createDefaultTerminalLaunchRequest(multiplexer, placement, command, cwd, shellGrammar);
+			if ("error" in launchPlan) {
+				this.ctx.showError(launchPlan.error);
+				return;
+			}
+
+			const result = await dependencies.launchTerminal(launchPlan.request);
+			if (result.warning) {
+				this.ctx.showWarning(
+					`Opened a fork in ${placementInfo.displayName}, but ${result.warning} This session continues here.`,
+				);
+				return;
+			}
+			this.ctx.showStatus(
+				`Opened a fork in ${placementInfo.displayName} (${placementInfo.placementLabel}); this session continues here.`,
+			);
+		} catch (error) {
+			logger.error("Failed to open a terminal fork", { multiplexer, error });
+			this.ctx.showError(
+				error instanceof TerminalLaunchError
+					? `Could not open a fork in ${placementInfo.displayName}: ${error.message}`
+					: `Could not open a fork in ${placementInfo.displayName}. See logs for details.`,
+			);
+		}
 	}
 
 	/**

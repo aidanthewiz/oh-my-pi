@@ -1,10 +1,7 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
 import { type AuthAccountPolicies, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import { fetchCursorAccountEmail } from "@oh-my-pi/pi-ai/registry/oauth/cursor";
-import { removeWithRetries } from "../../utils/src/temp";
 
 const EMAIL = "dev@example.com";
 const POLICIES = [{ provider: "cursor", account: { email: EMAIL }, priority: -1 }] satisfies AuthAccountPolicies;
@@ -41,7 +38,6 @@ function stubCursor(access: string, session?: string): void {
 	}) as typeof fetch);
 }
 
-let dir = "";
 let savedAccessToken: string | undefined;
 
 beforeEach(() => {
@@ -49,12 +45,10 @@ beforeEach(() => {
 	delete process.env.CURSOR_ACCESS_TOKEN;
 });
 
-afterEach(async () => {
+afterEach(() => {
 	vi.restoreAllMocks();
 	if (savedAccessToken === undefined) delete process.env.CURSOR_ACCESS_TOKEN;
 	else process.env.CURSOR_ACCESS_TOKEN = savedAccessToken;
-	if (dir) await removeWithRetries(dir);
-	dir = "";
 });
 
 describe("Cursor account email", () => {
@@ -69,8 +63,7 @@ describe("Cursor account email", () => {
 	});
 
 	test("a Cursor login stores the email an account policy selects", async () => {
-		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cursor-login-"));
-		const store = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		const auth = new AuthStorage(store, { accountPolicies: POLICIES });
 		try {
 			vi.spyOn(Bun, "sleep").mockResolvedValue(undefined);
@@ -86,8 +79,7 @@ describe("Cursor account email", () => {
 	});
 
 	test("a Cursor login stored without an email gains it at the next token refresh", async () => {
-		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cursor-refresh-"));
-		const store = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		const stale = cursorAccessToken("stale");
 		await store.upsertAuthCredential("cursor", {
 			type: "oauth",
@@ -114,8 +106,7 @@ describe("Cursor account email", () => {
 	});
 
 	test("a stalled profile lookup still keeps the tokens a refresh minted", async () => {
-		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cursor-stall-"));
-		const store = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		const stale = cursorAccessToken("stale");
 		await store.upsertAuthCredential("cursor", {
 			type: "oauth",
@@ -153,8 +144,7 @@ describe("Cursor account email", () => {
 
 describe("Cursor session refresh", () => {
 	async function storeExpiredSession(session: string): Promise<SqliteAuthCredentialStore> {
-		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cursor-session-"));
-		const store = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		await store.upsertAuthCredential("cursor", {
 			type: "oauth",
 			access: cursorAccessToken("expired-access"),

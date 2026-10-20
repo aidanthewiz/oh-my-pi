@@ -11,7 +11,7 @@ import {
 import { ProcessTerminal } from "@oh-my-pi/pi-tui/terminal";
 import { setTerminalGlyphProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
-import { withoutTerminalMultiplexer } from "./terminal-multiplexer-environment";
+import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 
 const SUPPORT_QUERY = "\x1b_25a1;s\x1b\\";
 const DA1_REPLY = "\x1b[?1;2c";

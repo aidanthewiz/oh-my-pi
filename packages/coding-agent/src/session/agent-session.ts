@@ -2649,6 +2649,11 @@ export class AgentSession implements SettingsScope {
 		return this.#modelRegistry;
 	}
 
+	/** Configured OAuth account-pool policy, including after its leases are released. */
+	get hasAccountPoolPolicy(): boolean {
+		return this.#accountPoolScope !== undefined;
+	}
+
 	get asyncJobManager(): AsyncJobManager | undefined {
 		return this.#asyncJobManager;
 	}

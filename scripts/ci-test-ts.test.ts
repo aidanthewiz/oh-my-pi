@@ -1,115 +1,155 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { ptree, TempDir } from "@oh-my-pi/pi-utils";
-import { selectShard } from "./ci-test-ts.ts";
 
-describe("CI test child environment", () => {
+const packages = ["natives", "tui", "collab-web", "typescript-edit-benchmark"];
+const inspectedNames = [
+	"ANTHROPIC_API_KEY",
+	"AWS_PROFILE",
+	"PI_PROFILE",
+	"OMP_MODEL_ALLOW",
+	"OMP_CF_VERSION",
+	"DCG_EXPECTED_AT_STARTUP",
+	"GH_TOKEN",
+	"OMP_TEST_CONCURRENCY",
+	"PI_TEST_RUNTIME",
+];
+
+async function prepareFixture(root: string): Promise<void> {
+	await fs.mkdir(path.join(root, "scripts"), { recursive: true });
+	await fs.copyFile(new URL("./ci-test-ts.ts", import.meta.url), path.join(root, "scripts/ci-test-ts.ts"));
+	for (const name of packages) {
+		const directory = path.join(root, "packages", name);
+		await fs.mkdir(directory, { recursive: true });
+		await fs.writeFile(
+			path.join(directory, "consumer.test.ts"),
+			`import { test } from "bun:test";
+import * as path from "node:path";
+test("owned runner consumer", async () => {
+ const output = process.env.RUNNER_TEST_OUTPUT;
+ if (!output) throw new Error("Missing owned output directory");
+ const name = ${JSON.stringify(name)};
+ if (process.env.RUNNER_TEST_STALL === name) {
+  await Bun.write(path.join(output, name + ".started"), "started");
+  await Bun.sleep(60000);
+ }
+ await Bun.write(path.join(output, name + ".json"), JSON.stringify({name, env: Object.fromEntries(${JSON.stringify(inspectedNames)}.map(key => [key, process.env[key] ?? null]))}));
+});
+`,
+		);
+	}
+}
+
+async function runFixture(root: string, output: string, overrides: Record<string, string | undefined> = {}) {
+	root = path.resolve(root);
+	output = path.resolve(output);
+	await fs.mkdir(output, { recursive: true });
+	const env = { ...Bun.env };
+	delete env.OMP_TEST_SHARD;
+	delete env.OMP_TEST_CHUNK_TIMEOUT;
+	for (const [name, value] of Object.entries({
+		CI: "1",
+		NO_COLOR: "1",
+		OMP_TEST_CONCURRENCY: "1",
+		OMP_TEST_TIMEOUT: "60000",
+		RUNNER_TEST_OUTPUT: output,
+		...overrides,
+	})) {
+		if (value === undefined) delete env[name];
+		else env[name] = value;
+	}
+	return ptree.exec([process.execPath, "--no-env-file", path.join(root, "scripts/ci-test-ts.ts"), "native"], {
+		cwd: root,
+		env,
+		timeout: 15_000,
+		detached: true,
+		allowNonZero: true,
+	});
+}
+
+async function completedConsumers(output: string): Promise<string[]> {
+	return (await fs.readdir(output)).filter(name => name.endsWith(".json")).sort();
+}
+
+describe("CI runner process boundaries", () => {
 	test("isolates provider credentials and managed state while retaining runner controls", async () => {
 		using dir = TempDir.createSync("omp-test-runner-env-");
-		const output = dir.join("child-env.json");
-		const names = [
-			"ANTHROPIC_API_KEY",
-			"AWS_PROFILE",
-			"PI_PROFILE",
-			"OMP_MODEL_ALLOW",
-			"OMP_CF_VERSION",
-			"DCG_EXPECTED_AT_STARTUP",
-			"GH_TOKEN",
-			"OMP_TEST_CONCURRENCY",
-			"PI_TEST_RUNTIME",
-		];
-		const childCommand = [
-			process.execPath,
-			"-e",
-			`await Bun.write(${JSON.stringify(output)}, JSON.stringify(Object.fromEntries(${JSON.stringify(names)}.map(k => [k, process.env[k] ?? null]))));`,
-		];
-		const result = await ptree.exec(
-			[
-				process.execPath,
-				"-e",
-				`import { runTestCommandsInParallel } from ${JSON.stringify(import.meta.resolve("./ci-test-ts.ts"))}; await runTestCommandsInParallel([{ label: "inspect env", cwd: ".", command: ${JSON.stringify(childCommand)} }], 1);`,
-			],
-			{
-				env: {
-					...Bun.env,
-					ANTHROPIC_API_KEY: "synthetic-secret",
-					AWS_PROFILE: "synthetic-profile",
-					PI_PROFILE: "synthetic-profile",
-					OMP_MODEL_ALLOW: "synthetic-model",
-					OMP_CF_VERSION: "synthetic-version",
-					DCG_EXPECTED_AT_STARTUP: "synthetic-policy",
-					GH_TOKEN: "synthetic-token",
-					OMP_TEST_CONCURRENCY: "3",
-				},
-				timeout: 10_000,
-				detached: true,
-				allowNonZero: true,
-			},
-		);
-		expect(result.exitCode).toBe(0);
-		const observed = await Bun.file(output).json();
-		for (const name of names.slice(0, 7)) expect(observed[name], name).toBeNull();
-		expect(observed.OMP_TEST_CONCURRENCY).toBe("3");
-		expect(observed.PI_TEST_RUNTIME).toBe("1");
-	}, 15_000);
-});
-
-describe("test runner watchdog", () => {
-	// Parent fake timers cannot drive the real watchdog inside the isolated runner process.
-	test("kills a stalled chunk, reports failure, and continues the queue", async () => {
-		using dir = TempDir.createSync("@omp-test-runner-watchdog-");
-		const started = dir.join("started");
-		const completed = dir.join("completed");
-		const continued = dir.join("continued");
-		const stalledCommand = [
-			process.execPath,
-			"-e",
-			`await Bun.write(${JSON.stringify(started)}, "started"); await Bun.sleep(60_000); await Bun.write(${JSON.stringify(completed)}, "completed");`,
-		];
-		const nextCommand = [process.execPath, "-e", `await Bun.write(${JSON.stringify(continued)}, "continued");`];
-		const commands = [
-			{ label: "stalled chunk", cwd: ".", command: stalledCommand },
-			{ label: "following chunk", cwd: ".", command: nextCommand },
-		];
-		const result = await ptree.exec(
-			[
-				process.execPath,
-				"-e",
-				`import { runTestCommandsInParallel } from ${JSON.stringify(import.meta.resolve("./ci-test-ts.ts"))}; await runTestCommandsInParallel(${JSON.stringify(commands)}, 1);`,
-			],
-			{
-				env: { ...Bun.env, OMP_TEST_CHUNK_TIMEOUT: "1", NO_COLOR: "1" },
-				timeout: 10_000,
-				detached: true,
-				allowNonZero: true,
-			},
-		);
-
-		expect(result.exitCode).toBe(1);
-		expect(await Bun.file(started).exists()).toBe(true);
-		expect(await Bun.file(completed).exists()).toBe(false);
-		expect(await Bun.file(continued).text()).toBe("continued");
-	}, 15_000);
-});
-
-describe("OMP_TEST_SHARD", () => {
-	test("shards partition every chunk exactly once, balanced to within one", () => {
-		const chunks = Array.from({ length: 79 }, (_, i) => i);
-		const shards = [1, 2, 3].map(i => selectShard(chunks, `${i}/3`));
-		expect(shards.flat().sort((a, b) => a - b)).toEqual(chunks);
-		const sizes = shards.map(s => s.length);
-		expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThanOrEqual(1);
-		expect(selectShard(chunks, "1/1")).toEqual(chunks);
-		expect(selectShard(chunks, undefined)).toEqual(chunks);
-	});
-
-	test("rejects malformed specs instead of running an empty or partial shard", () => {
-		for (const spec of ["0/2", "3/2", "1/0", "2", "a/b", "1/2/3"]) {
-			expect(() => selectShard([1, 2, 3], spec)).toThrow(Error);
+		await prepareFixture(dir.path());
+		const output = dir.join("output");
+		const result = await runFixture(dir.path(), output, {
+			ANTHROPIC_API_KEY: "synthetic-secret",
+			AWS_PROFILE: "synthetic-profile",
+			PI_PROFILE: "synthetic-profile",
+			OMP_MODEL_ALLOW: "synthetic-model",
+			OMP_CF_VERSION: "synthetic-version",
+			DCG_EXPECTED_AT_STARTUP: "synthetic-policy",
+			GH_TOKEN: "synthetic-token",
+			OMP_TEST_CONCURRENCY: "3",
+		});
+		expect(result.exitCode, result.stderr || result.stdout).toBe(0);
+		expect(await completedConsumers(output)).toEqual(packages.map(name => `${name}.json`).sort());
+		for (const name of packages) {
+			const observed = await Bun.file(path.join(output, `${name}.json`)).json();
+			for (const key of inspectedNames.slice(0, 7)) expect(observed.env[key], key).toBeNull();
+			expect(observed.env.OMP_TEST_CONCURRENCY).toBe("3");
+			expect(observed.env.PI_TEST_RUNTIME).toBe("1");
 		}
-	});
+	}, 20_000);
 
-	test("rejects a shard that selects no chunks", () => {
-		expect(() => selectShard([1], "2/2")).toThrow(Error);
-		expect(() => selectShard([], "1/1")).toThrow(Error);
-	});
+	test("kills a stalled chunk before completion and runs subsequent chunks", async () => {
+		using dir = TempDir.createSync("omp-test-runner-watchdog-");
+		await prepareFixture(dir.path());
+		const output = dir.join("output");
+		const result = await runFixture(dir.path(), output, {
+			OMP_TEST_CHUNK_TIMEOUT: "1",
+			RUNNER_TEST_STALL: "natives",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(await Bun.file(path.join(output, "natives.started")).text()).toBe("started");
+		expect(await Bun.file(path.join(output, "natives.json")).exists()).toBe(false);
+		expect(await completedConsumers(output)).toEqual(
+			packages
+				.slice(1)
+				.map(name => `${name}.json`)
+				.sort(),
+		);
+	}, 20_000);
+
+	test("shards execute every chunk exactly once and remain balanced", async () => {
+		using dir = TempDir.createSync("omp-test-runner-shards-");
+		await prepareFixture(dir.path());
+		const selected: string[][] = [];
+		for (let index = 1; index <= 3; index++) {
+			const output = dir.join(`shard-${index}`);
+			const result = await runFixture(dir.path(), output, { OMP_TEST_SHARD: `${index}/3` });
+			expect(result.exitCode, result.stderr || result.stdout).toBe(0);
+			selected.push(await completedConsumers(output));
+		}
+		expect(selected.flat().sort()).toEqual(packages.map(name => `${name}.json`).sort());
+		const widths = selected.map(rows => rows.length);
+		expect(Math.max(...widths) - Math.min(...widths)).toBeLessThanOrEqual(1);
+	}, 20_000);
+
+	test("rejects malformed and empty shard requests without running consumers", async () => {
+		using dir = TempDir.createSync("omp-test-runner-invalid-shard-");
+		await prepareFixture(dir.path());
+		for (const [index, spec] of ["0/2", "3/2", "1/0", "2", "a/b", "1/2/3", "5/5"].entries()) {
+			const output = dir.join(`invalid-${index}`);
+			const result = await runFixture(dir.path(), output, { OMP_TEST_SHARD: spec });
+			expect(result.exitCode).not.toBe(0);
+			expect(await fs.readdir(output)).toEqual([]);
+		}
+	}, 20_000);
+
+	test("rejects invalid concurrency before dispatching a consumer", async () => {
+		using dir = TempDir.createSync("omp-test-runner-invalid-concurrency-");
+		await prepareFixture(dir.path());
+		for (const [index, spec] of ["0", "-1", "many"].entries()) {
+			const output = dir.join(`invalid-${index}`);
+			const result = await runFixture(dir.path(), output, { OMP_TEST_CONCURRENCY: spec });
+			expect(result.exitCode).not.toBe(0);
+			expect(await fs.readdir(output)).toEqual([]);
+		}
+	}, 20_000);
 });

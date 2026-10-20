@@ -180,6 +180,8 @@ The eight binary targets are `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-a
 
 `cf-verify.yml` uses the same eight-target matrix. If native inputs changed since the latest ancestor Coreforce release, each target builds the addon from the fork tree. Otherwise it installs and verifies the matching Coreforce release asset. Darwin ARM64 requires Swift 6.4/macOS 27 SDK on the `xcode-27` runner. Its addon must embed the bridge without linking FoundationModels or Swift; Darwin x64 embeds an empty bridge on `macos-15-intel`. Windows ARM64 builds the host Cargo addon on `windows-11-arm`. The release job always builds its native addons from the release commit, not upstream npm packages.
 
+Both Darwin release legs verify the final strict signature before publishing. When all five signing credentials exist, an ad-hoc signature fails that gate. Coreforce retains its separate published-arm64 verification job; upstream npm, Homebrew and cluster publishing jobs remain absent.
+
 ## Debugging playbook
 
 ### Where things land / how to inspect
