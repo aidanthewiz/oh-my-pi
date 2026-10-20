@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `ptree.exec({ keepStdinOpen: true })` keeps a private input channel open until process completion without reading the user's terminal ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
+
 ### Fixed
 ## [18.5.1] - 2026-10-03
 

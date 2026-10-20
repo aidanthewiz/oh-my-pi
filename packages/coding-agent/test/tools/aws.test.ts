@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	AwsSessionAuthGroups,
+	type AwsLoginReservation,
 	catalogAwsProfiles,
 	buildAwsParameterArgv,
 	parseAwsIni,
@@ -155,26 +156,233 @@ describe("native AWS output redaction", () => {
 });
 
 describe("native AWS SSO approvals", () => {
-	it("deduplicates concurrent approved logins and retains a decline for the session", async () => {
+	it("deduplicates an owned approved login and requires explicit approval after an owner decline", async () => {
 		const groups = new AwsSessionAuthGroups();
-		groups.markApproved("https://example.awsapps.com/start|us-west-2");
+		const group = "shared";
+		const reservation = groups.reserveLogin(group)!;
+		groups.markApproved(reservation);
 		let logins = 0;
 		const login = async () => {
 			logins++;
 			return true;
 		};
 		const [first, second] = await Promise.all([
-			groups.runApprovedLogin("https://example.awsapps.com/start|us-west-2", login),
-			groups.runApprovedLogin("https://example.awsapps.com/start|us-west-2", login),
+			groups.runApprovedLogin(reservation, login),
+			groups.runApprovedLogin(reservation, login),
 		]);
 		expect(first.authenticated).toBe(true);
 		expect(second.authenticated).toBe(true);
 		expect(logins).toBe(1);
-		groups.markDeclined("https://example.awsapps.com/declined|us-west-2");
-		expect(await groups.runApprovedLogin("https://example.awsapps.com/declined|us-west-2", login)).toEqual({
-			authenticated: false,
-			declined: true,
+		const declined = groups.reserveLogin(group)!;
+		groups.declineLogin(declined);
+		expect(await groups.runApprovedLogin(declined, login)).toEqual({ authenticated: false, declined: true });
+		let automaticAttempts = 0;
+		expect(
+			await groups.recoverOnce(group, async () => {
+				automaticAttempts++;
+				return true;
+			}),
+		).toBe(false);
+		expect(automaticAttempts).toBe(0);
+		const retry = groups.reserveLogin(group)!;
+		expect(groups.reserveLogin(group)).toBeUndefined();
+		groups.markApproved(retry);
+		expect((await groups.runApprovedLogin(retry, login)).authenticated).toBe(true);
+		expect(logins).toBe(2);
+	});
+
+	it("renews an authenticated group once for concurrent expired operations", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "shared";
+		let logins = 0;
+		const { promise: barrier, resolve: finishLogin } = Promise.withResolvers<void>();
+		const recover = async (reserveLogin: () => AwsLoginReservation | undefined) => {
+			const reservation = reserveLogin()!;
+			groups.markApproved(reservation);
+			return (
+				await groups.runApprovedLogin(reservation, async () => {
+					logins++;
+					if (logins === 2) await barrier;
+					return true;
+				})
+			).authenticated;
+		};
+		expect(await groups.recoverOnce(group, recover)).toBe(true);
+		const firstRenewal = groups.recoverOnce(group, recover);
+		const concurrentRenewal = groups.recoverOnce(group, recover);
+		await Promise.resolve();
+		expect(logins).toBe(2);
+		expect(groups.reserveLogin(group)).toBeUndefined();
+		finishLogin();
+		expect(await firstRenewal).toBe(true);
+		expect(await concurrentRenewal).toBe(true);
+		expect(logins).toBe(2);
+	});
+
+	it("suppresses automatic renewal after an owned failure until an explicit retry", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "failed";
+		let attempts = 0;
+		const failedRenewal = async (reserveLogin: () => AwsLoginReservation | undefined) => {
+			attempts++;
+			const reservation = reserveLogin()!;
+			groups.markApproved(reservation);
+			return (await groups.runApprovedLogin(reservation, async () => false)).authenticated;
+		};
+		expect(await groups.recoverOnce(group, failedRenewal)).toBe(false);
+		expect(await groups.recoverOnce(group, failedRenewal)).toBe(false);
+		expect(attempts).toBe(1);
+		const retry = groups.reserveLogin(group)!;
+		groups.markApproved(retry);
+		expect((await groups.runApprovedLogin(retry, async () => true)).authenticated).toBe(true);
+	});
+
+	it("blocks an explicit reservation during renewal and permits retry after owned probe failure", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const initial = groups.reserveLogin("shared")!;
+		groups.markApproved(initial);
+		await groups.runApprovedLogin(initial, async () => true);
+		const probe = Promise.withResolvers<void>();
+		const releaseProbe = Promise.withResolvers<void>();
+		const recovery = groups.recoverOnce("shared", async () => {
+			probe.resolve();
+			await releaseProbe.promise;
+			return false;
 		});
+		await probe.promise;
+		expect(groups.reserveLogin("shared")).toBeUndefined();
+		groups.recordAuthenticationFailure("shared", groups.generation("shared"));
+		releaseProbe.resolve();
+		expect(await recovery).toBe(false);
+		let attempts = 0;
+		expect(
+			await groups.recoverOnce("shared", async () => {
+				attempts++;
+				return true;
+			}),
+		).toBe(false);
+		expect(attempts).toBe(0);
+		const retry = groups.reserveLogin("shared")!;
+		groups.markApproved(retry);
+		expect((await groups.runApprovedLogin(retry, async () => true)).authenticated).toBe(true);
+	});
+
+	it("allows explicit retry after interruption without running an unapproved handler", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "interrupted";
+		const interrupted = groups.reserveLogin(group)!;
+		groups.markApproved(interrupted);
+		await expect(
+			groups.runApprovedLogin(interrupted, async () => {
+				throw new Error("interrupted");
+			}),
+		).rejects.toThrow("interrupted");
+		let logins = 0;
+		const login = async () => {
+			logins++;
+			return true;
+		};
+		expect(
+			await groups.recoverOnce(
+				group,
+				async reserveLogin => (await groups.runApprovedLogin(reserveLogin()!, login)).authenticated,
+			),
+		).toBe(false);
+		const retry = groups.reserveLogin(group)!;
+		expect((await groups.runApprovedLogin(retry, login)).authenticated).toBe(false);
+		expect(logins).toBe(0);
+		groups.markApproved(retry);
+		expect((await groups.runApprovedLogin(retry, login)).authenticated).toBe(true);
 		expect(logins).toBe(1);
+	});
+
+	it("does not restore authentication when the login owner cancels a running attempt", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "cancelled";
+		const reservation = groups.reserveLogin(group)!;
+		groups.markApproved(reservation);
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const login = groups.runApprovedLogin(reservation, async () => {
+			started.resolve();
+			await finish.promise;
+			return true;
+		});
+		await started.promise;
+		groups.declineLogin(reservation);
+		finish.resolve();
+		expect((await login).authenticated).toBe(false);
+		let automaticAttempts = 0;
+		expect(
+			await groups.recoverOnce(group, async () => {
+				automaticAttempts++;
+				return true;
+			}),
+		).toBe(false);
+		expect(automaticAttempts).toBe(0);
+	});
+
+	for (const approved of [false, true]) {
+		it(`preserves ${approved ? "approved" : "offered"} login authority against same-generation request failures`, async () => {
+			const groups = new AwsSessionAuthGroups();
+			const group = "pending";
+			const reservation = groups.reserveLogin(group)!;
+			if (approved) groups.markApproved(reservation);
+			const observedGeneration = groups.generation(group);
+			let recoveries = 0;
+			expect(
+				await groups.recoverOnce(group, async () => {
+					recoveries++;
+					return false;
+				}),
+			).toBe(false);
+			groups.recordAuthenticationFailure(group, observedGeneration);
+			groups.declineLogin({ group });
+			groups.markApproved(reservation);
+			let logins = 0;
+			const login = async () => {
+				logins++;
+				return true;
+			};
+			expect((await groups.runApprovedLogin(reservation, login)).authenticated).toBe(true);
+			expect(logins).toBe(1);
+			expect(recoveries).toBe(0);
+			expect(
+				await groups.recoverOnce(group, async reserveLogin => {
+					const renewal = reserveLogin()!;
+					groups.markApproved(renewal);
+					return (await groups.runApprovedLogin(renewal, login)).authenticated;
+				}),
+			).toBe(true);
+			expect(logins).toBe(2);
+		});
+	}
+
+	it("ignores completed-generation failures and stale owners during a newer approved login", async () => {
+		const groups = new AwsSessionAuthGroups();
+		const group = "newer-login";
+		const initial = groups.reserveLogin(group)!;
+		groups.markApproved(initial);
+		await groups.runApprovedLogin(initial, async () => true);
+		const failedGeneration = groups.generation(group);
+		const reservation = groups.reserveLogin(group)!;
+		groups.markApproved(reservation);
+		groups.recordAuthenticationFailure(group, failedGeneration);
+		groups.declineLogin(initial);
+		let logins = 0;
+		const login = async () => {
+			logins++;
+			return true;
+		};
+		expect((await groups.runApprovedLogin(reservation, login)).authenticated).toBe(true);
+		groups.recordAuthenticationFailure(group, failedGeneration);
+		expect(
+			await groups.recoverOnce(group, async reserveLogin => {
+				const renewal = reserveLogin()!;
+				groups.markApproved(renewal);
+				return (await groups.runApprovedLogin(renewal, login)).authenticated;
+			}),
+		).toBe(true);
+		expect(logins).toBe(2);
 	});
 });

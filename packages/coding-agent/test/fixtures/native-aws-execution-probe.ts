@@ -5,10 +5,11 @@ import { Settings } from "../../src/config/settings";
 import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
 import { WriteTool } from "../../src/tools/write";
 import type { XdevState } from "../../src/tools/xdev";
-import { MCPTool } from "../../src/mcp/tool-bridge";
-import type { MCPServerConnection } from "../../src/mcp/types";
+import { DeferredMCPTool, MCPTool } from "../../src/mcp/tool-bridge";
+import type { MCPServerConnection, MCPToolDefinition } from "../../src/mcp/types";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import {
 	getOperationalAwsLaunchMetadata,
 	isCoreforgeManagedLaunch,
@@ -182,6 +183,15 @@ globalThis.fetch = Object.assign(
 	},
 	{ preconnect: nativeFetch.preconnect },
 );
+if (process.env.NATIVE_AWS_EXPECT_NO_PLUGIN) {
+	const before = (await calls()).length;
+	await assert.rejects(
+		() => tool.execute("missing-plugin", { profile: "government", service: "ecs", operation: "execute-command" }),
+		error => error instanceof ToolError && error.context?.code === "AWS_SESSION_MANAGER_UNAVAILABLE",
+	);
+	assert.equal((await calls()).length, before);
+	process.exit(0);
+}
 const modelEnvironment: Record<string, string | undefined> = {};
 restoreCoreforgeOperationalAwsEnvironment(modelEnvironment);
 assert.equal(modelEnvironment.OMP_MODEL_AWS_PROFILE, undefined);
@@ -464,9 +474,16 @@ for (const [profile, failure] of [
 		/approval|declined/i,
 		`${profile} reused an interrupted approval`,
 	);
-	await assert.rejects(() => tool.prepareRuntimeApproval(`${profile}-again`, declined), /declined/);
+	await tool.prepareRuntimeApproval(`${profile}-again`, declined);
+	tool.denyRuntimeApproval(`${profile}-again`, declined);
 }
 assert.equal((await calls()).filter(call => call.argv.includes("login")).length, 1);
+await fs.unlink(path.join(root, "authenticated-expired"));
+await tool.prepareRuntimeApproval("explicit-expired-renewal", login);
+tool.approveRuntimeApproval("explicit-expired-renewal", login);
+assert.notEqual((await tool.execute("explicit-expired-renewal", login)).isError, true);
+assert.notEqual((await tool.execute("explicit-expired-read", { ...read, profile: "expired" })).isError, true);
+assert.equal((await calls()).filter(call => call.argv.includes("expired") && call.argv.includes("login")).length, 2);
 let confirmations = 0;
 const context = {
 	hasUI: true,
@@ -477,6 +494,11 @@ const context = {
 			confirmations++;
 			await Bun.sleep(25);
 			return true;
+		},
+		select: async () => {
+			confirmations++;
+			await Bun.sleep(25);
+			return "Approve once";
 		},
 		notify: (message: string) => {
 			if (message.includes("https://fixture.invalid/device") && message.includes("FAKE-CODE")) {
@@ -494,12 +516,23 @@ assert.equal(
 );
 assert.equal((await calls()).filter(call => call.argv.includes("automatic") && call.argv.includes("login")).length, 1);
 const managedRequests: string[] = [];
+let delayedManagedExpiry: { ready(): void; complete: Promise<void> } | undefined;
 const connection = {
 	name: "coreforge-aws-agent-toolkit",
 	config: { command: "unused" },
 	transport: {
 		request: async (_method: string, params: { arguments: { aws_profile: string } }) => {
 			managedRequests.push(params.arguments.aws_profile);
+			if (delayedManagedExpiry) {
+				const delayed = delayedManagedExpiry;
+				delayedManagedExpiry = undefined;
+				delayed.ready();
+				await delayed.complete;
+				return {
+					isError: true,
+					content: [{ type: "text", text: "Tool call failed due to expired or invalid AWS credentials." }],
+				};
+			}
 			return (await Bun.file(path.join(root, "authenticated-parallel")).exists())
 				? { content: [{ type: "text", text: "managed read completed" }] }
 				: {
@@ -569,6 +602,10 @@ const declinedContext = {
 		confirm: async () => {
 			confirmations++;
 			return false;
+		},
+		select: async () => {
+			confirmations++;
+			return "Deny";
 		},
 	},
 } as unknown as AgentToolContext;
@@ -648,6 +685,577 @@ await assert.rejects(() => tool.execute("expired-changed", changedMutation), /id
 await fs.unlink(path.join(root, "changed-identity"));
 assert.equal(confirmations, 8);
 assert.equal((await calls()).filter(call => call.argv.includes("terminate-instances")).length, 2);
+const beforeRenewal = confirmations;
+await fs.unlink(path.join(root, "authenticated-automatic"));
+const renewed = await tool.execute(
+	"automatic-renewal",
+	{ ...read, profile: "automatic" },
+	undefined,
+	undefined,
+	context,
+);
+assert.notEqual(renewed.isError, true);
+assert.equal(confirmations, beforeRenewal + 1);
+assert.equal((await calls()).filter(call => call.argv.includes("automatic") && call.argv.includes("login")).length, 2);
+await fs.unlink(path.join(root, "authenticated-parallel"));
+const beforeSharedRenewal = confirmations;
+const [nativeRenewal, peerRenewal] = await Promise.all([
+	tool.execute("parallel-renewal", { ...read, profile: "parallel" }, undefined, undefined, context),
+	tool.execute("parallel-peer-renewal", { ...read, profile: "parallel-peer" }, undefined, undefined, context),
+]);
+assert.notEqual(nativeRenewal.isError, true);
+assert.notEqual(peerRenewal.isError, true);
+assert.equal(confirmations, beforeSharedRenewal + 1);
+assert.equal(
+	(await calls()).filter(
+		call =>
+			call.argv.includes("login") && call.argv.some((arg: string) => arg === "parallel" || arg === "parallel-peer"),
+	).length,
+	2,
+);
+await fs.unlink(path.join(root, "authenticated-parallel"));
+const beforeMixedRenewal = confirmations;
+const { promise: managedRequestReady, resolve: managedRequestStarted } = Promise.withResolvers<void>();
+const { promise: mixedRenewalComplete, resolve: finishMixedRenewal } = Promise.withResolvers<void>();
+delayedManagedExpiry = {
+	ready: managedRequestStarted,
+	complete: mixedRenewalComplete,
+};
+const managedRenewal = managed.execute("managed-second-expiry", { aws_profile: "parallel-peer" }, undefined, context);
+await managedRequestReady;
+const nativeMixedRenewal = tool
+	.execute("native-second-expiry", { ...read, profile: "parallel" }, undefined, undefined, context)
+	.finally(finishMixedRenewal);
+const [nativeMixedResult, managedRenewalResult] = await Promise.all([nativeMixedRenewal, managedRenewal]);
+assert.notEqual(nativeMixedResult.isError, true);
+assert.notEqual(managedRenewalResult.isError, true);
+assert.equal(confirmations, beforeMixedRenewal + 1);
+assert.equal(
+	(await calls()).filter(
+		call =>
+			call.argv.includes("login") && call.argv.some((arg: string) => arg === "parallel" || arg === "parallel-peer"),
+	).length,
+	3,
+);
+for (const profile of ["firstuse-declined", "declined", "resolution-declined"]) {
+	const explicitRetry = { ...login, profile };
+	await tool.prepareRuntimeApproval(`${profile}-explicit-retry`, explicitRetry);
+	tool.approveRuntimeApproval(`${profile}-explicit-retry`, explicitRetry);
+	assert.notEqual((await tool.execute(`${profile}-explicit-retry`, explicitRetry)).isError, true);
+	assert.equal((await calls()).filter(call => call.argv.includes(profile) && call.argv.includes("login")).length, 1);
+}
+assert.notEqual(
+	(
+		await tool.execute(
+			"after-explicit-retry",
+			{ ...read, profile: "firstuse-declined" },
+			undefined,
+			undefined,
+			context,
+		)
+	).isError,
+	true,
+);
+const beforeBoundedMutation = confirmations;
+const boundedMutation = { ...mutation, profile: "mutation-reexpires" };
+await tool.prepareRuntimeApproval("mutation-reexpires", boundedMutation);
+tool.approveRuntimeApproval("mutation-reexpires", boundedMutation);
+const boundedResult = await tool.execute("mutation-reexpires", boundedMutation);
+assert.equal(boundedResult.isError, true);
+assert.match(text(boundedResult), /AUTH_REQUIRED/);
+assert.equal(confirmations, beforeBoundedMutation + 1);
+await tool.execute(
+	"mutation-reexpires-again",
+	{ ...read, profile: "mutation-reexpires" },
+	undefined,
+	undefined,
+	context,
+);
+assert.equal(confirmations, beforeBoundedMutation + 1);
+assert.equal(
+	(await calls()).filter(call => call.argv.includes("mutation-reexpires") && call.argv.includes("login")).length,
+	1,
+);
+for (const deferred of [false, true]) {
+	for (const phase of ["preflight", "reconnect"]) {
+		const profile = `expired-managed-${deferred ? "deferred" : "direct"}-${phase}`;
+		const token = path.join(root, `authenticated-${profile}`);
+		if (phase === "reconnect") await Bun.write(token, "yes");
+		const definition: MCPToolDefinition = {
+			name: "aws___run_script",
+			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: [profile] } } },
+		};
+		let requests = 0;
+		let reconnects = 0;
+		const managedConnection = {
+			name: "coreforge-aws-agent-toolkit",
+			config: { command: "unused" },
+			capabilities: { tools: {} },
+			awsPreferredProfile: profile,
+			transport: {
+				request: async (method: string) => {
+					if (method === "tools/list") return { tools: [definition] };
+					requests++;
+					if (phase === "reconnect" && requests === 2) throw new Error("Transport closed");
+					await fs.rm(token, { force: true });
+					return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+				},
+			},
+		} as unknown as MCPServerConnection;
+		const reconnect = async () => {
+			reconnects++;
+			return { ...managedConnection };
+		};
+		const bounded = deferred
+			? new DeferredMCPTool(managedConnection.name, definition, async () => managedConnection, undefined, reconnect)
+			: new MCPTool(managedConnection, definition, reconnect);
+		const before: number = confirmations;
+		const result = await bounded.execute(profile, { aws_profile: profile }, undefined, context);
+		assert.equal(result.isError, true);
+		assert.match(text(result), /AUTH_REQUIRED/);
+		assert.equal(confirmations, before + 1);
+		assert.equal(reconnects, phase === "reconnect" ? 1 : 0);
+		assert.equal(
+			(await calls()).filter(call => call.argv.includes(profile) && call.argv.includes("login")).length,
+			1,
+		);
+		await bounded.execute(`${profile}-again`, { aws_profile: profile }, undefined, context);
+		assert.equal(confirmations, before + 1);
+	}
+}
+
+const raceToken = path.join(root, "authenticated-expired");
+const raceLoginCount = async () =>
+	(await calls()).filter(call => call.argv.includes("expired") && call.argv.includes("login")).length;
+const explicitRaceLogin = async (id: string) => {
+	await tool.prepareRuntimeApproval(id, login);
+	tool.approveRuntimeApproval(id, login);
+	assert.notEqual((await tool.execute(id, login)).isError, true);
+};
+const waitForAuthBarrier = async (barrier: string) => {
+	const deadline = Date.now() + 10_000;
+	while (!(await Bun.file(`${barrier}.started`).exists())) {
+		assert.ok(Date.now() < deadline, "Authentication race did not reach its barrier");
+		await Bun.sleep(10);
+	}
+};
+for (const stage of ["operation", "identity", "exhausted-budget"] as const) {
+	const id = `native-generation-${stage}`;
+	await explicitRaceLogin(`${id}-initial`);
+	const before = await raceLoginCount();
+	const beforePrompts: number = confirmations;
+	await fs.rm(raceToken);
+	const raceMutation = { ...mutation, profile: "expired" };
+	const operation =
+		stage === "identity"
+			? "sts-get-caller-identity"
+			: stage === "operation"
+				? "s3api-list-buckets"
+				: "ec2-terminate-instances";
+	const barrier = path.join(root, `auth-race-expired-${operation}`);
+	await fs.rm(`${barrier}.started`, { force: true });
+	await fs.rm(`${barrier}.release`, { force: true });
+	await Bun.write(`${barrier}.armed`, "yes");
+	let failed: Promise<boolean>;
+	if (stage === "identity") {
+		failed = tool.prepareRuntimeApproval(id, raceMutation, undefined, context).then(
+			() => false,
+			error => error instanceof ToolError && error.context?.code === "AUTH_REQUIRED",
+		);
+	} else {
+		if (stage === "exhausted-budget") {
+			await tool.prepareRuntimeApproval(id, raceMutation, undefined, context);
+			tool.approveRuntimeApproval(id, raceMutation);
+		}
+		failed = tool
+			.execute(
+				id,
+				stage === "operation" ? { ...read, profile: "expired" } : raceMutation,
+				undefined,
+				undefined,
+				context,
+			)
+			.then(result => result.isError === true && /AUTH_REQUIRED/.test(text(result)));
+	}
+	await waitForAuthBarrier(barrier);
+	assert.equal(await raceLoginCount(), before + 1, `${stage} did not renew before its retry`);
+	await explicitRaceLogin(`${id}-newer-login`);
+	await Bun.write(`${barrier}.release`, "yes");
+	assert.equal(await failed, true, `${stage} did not surface the old authentication failure`);
+	await fs.rm(raceToken);
+	const afterExpiry = await tool.execute(
+		`${id}-real-expiry`,
+		{ ...read, profile: "expired" },
+		undefined,
+		undefined,
+		context,
+	);
+	assert.notEqual(afterExpiry.isError, true, text(afterExpiry));
+	assert.equal(await raceLoginCount(), before + 3, `${stage} suppressed or repeated the next renewal`);
+	assert.equal(confirmations, beforePrompts + 2);
+	await fs.rm(`${barrier}.started`);
+	await fs.rm(`${barrier}.release`);
+}
+for (const deferred of [false, true]) {
+	for (const failure of ["result", "exception", "probe"] as const) {
+		const id = `managed-generation-${deferred ? "deferred" : "direct"}-${failure}`;
+		await explicitRaceLogin(`${id}-initial`);
+		const before = await raceLoginCount();
+		const beforePrompts: number = confirmations;
+		const retryStarted = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const probeBarrier = path.join(root, "auth-race-expired-sts-get-caller-identity");
+		let requests = 0;
+		const definition: MCPToolDefinition = {
+			name: "aws___run_script",
+			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["expired"] } } },
+		};
+		const raceConnection = {
+			name: "coreforge-aws-agent-toolkit",
+			config: { command: "unused" },
+			capabilities: { tools: {} },
+			awsPreferredProfile: "expired",
+			transport: {
+				request: async (method: string) => {
+					if (method === "tools/list") return { tools: [definition] };
+					requests++;
+					if (requests === 1) {
+						await fs.rm(raceToken);
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					}
+					if (requests === 2) {
+						retryStarted.resolve();
+						if (failure === "probe") {
+							await Bun.write(`${probeBarrier}.armed`, "yes");
+							return {
+								isError: true,
+								content: [
+									{ type: "text", text: "Tool call failed due to expired or invalid AWS credentials." },
+								],
+							};
+						}
+						await releaseRetry.promise;
+						if (failure === "exception") throw new Error("AUTH_REQUIRED: SSO token expired");
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					}
+					if (!(await Bun.file(raceToken).exists()))
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					return { content: [{ type: "text", text: "managed operation completed after real expiry" }] };
+				},
+			},
+		} as unknown as MCPServerConnection;
+		const raceManaged = deferred
+			? new DeferredMCPTool(raceConnection.name, definition, async () => raceConnection)
+			: new MCPTool(raceConnection, definition);
+		const pending = raceManaged.execute(id, { aws_profile: "expired" }, undefined, context);
+		await retryStarted.promise;
+		if (failure === "probe") await waitForAuthBarrier(probeBarrier);
+		assert.equal(await raceLoginCount(), before + 1);
+		await explicitRaceLogin(`${id}-newer-login`);
+		if (failure === "probe") await Bun.write(`${probeBarrier}.release`, "yes");
+		else releaseRetry.resolve();
+		const oldFailure = await pending;
+		assert.equal(oldFailure.isError, true);
+		assert.match(text(oldFailure), /AUTH_REQUIRED/);
+		await fs.rm(raceToken);
+		const afterExpiry = await raceManaged.execute(
+			`${id}-real-expiry`,
+			{ aws_profile: "expired" },
+			undefined,
+			context,
+		);
+		assert.notEqual(afterExpiry.isError, true, text(afterExpiry));
+		assert.match(text(afterExpiry), /managed operation completed after real expiry/);
+		assert.equal(await raceLoginCount(), before + 3);
+		assert.equal(confirmations, beforePrompts + 2);
+		assert.equal(requests, 4);
+		if (failure === "probe") {
+			await fs.rm(`${probeBarrier}.started`);
+			await fs.rm(`${probeBarrier}.release`);
+		}
+	}
+}
+for (const approved of [false, true]) {
+	for (const route of [
+		"native",
+		"native-exhausted",
+		"managed-direct-result",
+		"managed-deferred-result",
+		"managed-direct-exception",
+		"managed-deferred-exception",
+	]) {
+		const id = `pending-${approved ? "approved" : "offered"}-${route}`;
+		await explicitRaceLogin(`${id}-initial`);
+		const before = await raceLoginCount();
+		const beforePrompts: number = confirmations;
+		await fs.rm(raceToken);
+		await tool.prepareRuntimeApproval(`${id}-login`, login);
+		if (approved) tool.approveRuntimeApproval(`${id}-login`, login);
+		const definition: MCPToolDefinition = {
+			name: "aws___run_script",
+			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["expired"] } } },
+		};
+		let requests = 0;
+		const pendingConnection = {
+			name: "coreforge-aws-agent-toolkit",
+			config: { command: "unused" },
+			capabilities: { tools: {} },
+			transport: {
+				request: async (method: string) => {
+					if (method === "tools/list") return { tools: [definition] };
+					requests++;
+					if (!(await Bun.file(raceToken).exists())) {
+						if (route.endsWith("exception")) throw new Error("AUTH_REQUIRED: SSO token expired");
+						return { isError: true, content: [{ type: "text", text: "AUTH_REQUIRED: SSO token expired" }] };
+					}
+					return { content: [{ type: "text", text: "managed operation completed after pending sign-in" }] };
+				},
+			},
+		} as unknown as MCPServerConnection;
+		const pendingManaged = route.includes("deferred")
+			? new DeferredMCPTool(pendingConnection.name, definition, async () => pendingConnection)
+			: new MCPTool(pendingConnection, definition);
+		const requestTool = route === "native-exhausted" ? new AwsTool(toolSession, { attempted: true }) : tool;
+		const failure = route.startsWith("native")
+			? await requestTool.execute(id, { ...read, profile: "expired" }, undefined, undefined, context)
+			: await pendingManaged.execute(id, { aws_profile: "expired" }, undefined, context);
+		assert.equal(failure.isError, true, `${id} did not surface its authentication failure`);
+		assert.match(text(failure), /AUTH_REQUIRED/);
+		assert.equal(await raceLoginCount(), before, `${id} ran an unapproved or duplicate login`);
+		assert.equal(confirmations, beforePrompts, `${id} replaced the original approval`);
+		if (!route.startsWith("native")) assert.equal(requests, 1, `${id} did not reach the managed request`);
+		if (!approved) tool.approveRuntimeApproval(`${id}-login`, login);
+		assert.notEqual((await tool.execute(`${id}-login`, login)).isError, true, `${id} revoked its owner's approval`);
+		assert.equal(await raceLoginCount(), before + 1, `${id} did not run exactly one approved login`);
+		await fs.rm(raceToken);
+		const renewed = route.startsWith("native")
+			? await tool.execute(`${id}-real-expiry`, { ...read, profile: "expired" }, undefined, undefined, context)
+			: await pendingManaged.execute(`${id}-real-expiry`, { aws_profile: "expired" }, undefined, context);
+		assert.notEqual(renewed.isError, true, text(renewed));
+		assert.equal(await raceLoginCount(), before + 2, `${id} suppressed or repeated genuine expiry renewal`);
+		assert.equal(confirmations, beforePrompts + 1);
+		if (!route.startsWith("native")) {
+			assert.match(text(renewed), /managed operation completed after pending sign-in/);
+			assert.equal(requests, 3);
+		}
+	}
+}
+
+const sessionLabel = "Allow for the rest of this session";
+const sessionSettings = Settings.isolated({
+	"tools.approvalMode": "always-ask",
+	"tools.approval": { aws: "prompt" },
+});
+let sessionId = "native-approval-owner";
+const approvalSession = { ...toolSession, settings: sessionSettings, getSessionId: () => sessionId };
+const sessionTool = new AwsTool(approvalSession);
+const sessionContext = {
+	...context,
+	settings: sessionSettings,
+	sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId, getSessionName: () => undefined },
+} as AgentToolContext;
+const selections: string[][] = [];
+let choice: string | undefined = sessionLabel;
+const sessionRunner = {
+	hasHandlers: () => false,
+	hasUI: () => true,
+	consumeToolCallEmitted: () => false,
+	runScoped: <T>(fn: () => T): T => fn(),
+	getUIContext: () => ({
+		select: async (_title: string, options: string[]) => {
+			selections.push(options);
+			return choice;
+		},
+	}),
+} as unknown as ExtensionRunner;
+const sessionWrapper = new ExtensionToolWrapper(sessionTool as unknown as AgentTool, sessionRunner);
+const ordinaryMutation = { ...read, service: "rds", operation: "modify-db-cluster" };
+assert.notEqual(
+	(await sessionWrapper.execute("session-grant", ordinaryMutation, undefined, undefined, sessionContext)).isError,
+	true,
+);
+assert.equal(selections.length, 1);
+choice = "Deny";
+const reconstructed = new AwsTool({ ...approvalSession });
+const reconstructedWrapper = new ExtensionToolWrapper(reconstructed as unknown as AgentTool, sessionRunner);
+assert.notEqual(
+	(
+		await reconstructedWrapper.execute(
+			"different-profile",
+			{ ...queueReceive, profile: "government" },
+			undefined,
+			undefined,
+			sessionContext,
+		)
+	).isError,
+	true,
+);
+const beforeGrantedRead = (await calls()).filter(call => call.argv.includes("get-caller-identity")).length;
+await reconstructedWrapper.execute("granted-read", read, undefined, undefined, sessionContext);
+assert.equal((await calls()).filter(call => call.argv.includes("get-caller-identity")).length, beforeGrantedRead);
+const beforeSessionRenewal = confirmations;
+await Promise.all(
+	["expired-session", "expired-session-other"].map(profile =>
+		sessionWrapper.execute(profile, { ...read, profile }, undefined, undefined, sessionContext),
+	),
+);
+await fs.unlink(path.join(root, "authenticated-expired-session"));
+const sessionRenewal = await sessionWrapper.execute(
+	"granted-renewal",
+	{ ...ordinaryMutation, profile: "expired-session" },
+	undefined,
+	undefined,
+	sessionContext,
+);
+assert.notEqual(sessionRenewal.isError, true);
+assert.equal(confirmations, beforeSessionRenewal);
+assert.equal(selections.length, 1);
+assert.equal(
+	(await calls()).filter(call => call.argv.includes("expired-session") && call.argv.includes("login")).length,
+	2,
+);
+const beforeGuardAsk = (await calls()).filter(call => call.argv.includes("terminate-instances")).length;
+choice = sessionLabel;
+await assert.rejects(
+	() => sessionWrapper.execute("session-guard-forged", mutation, undefined, undefined, sessionContext),
+	/denied by user/,
+);
+assert.ok(!selections.at(-1)!.includes(sessionLabel));
+choice = "Approve once";
+await sessionWrapper.execute("session-guard-once", mutation, undefined, undefined, sessionContext);
+choice = "Deny";
+await assert.rejects(
+	() => sessionWrapper.execute("session-guard-again", mutation, undefined, undefined, sessionContext),
+	/denied by user/,
+);
+assert.equal((await calls()).filter(call => call.argv.includes("terminate-instances")).length, beforeGuardAsk + 1);
+await sessionTool.prepareRuntimeApproval("session-guard-fingerprint", mutation);
+sessionTool.approveRuntimeApproval("session-guard-fingerprint", mutation);
+await assert.rejects(
+	() => sessionTool.execute("session-guard-fingerprint", { ...mutation, parameters: { InstanceIds: ["i-changed"] } }),
+	/approval/,
+);
+await assert.rejects(
+	() =>
+		sessionWrapper.execute(
+			"session-guard-deny",
+			{ ...read, operation: "delete-bucket" },
+			undefined,
+			undefined,
+			sessionContext,
+		),
+	/fixture\.aws/,
+);
+const beforePolicyDeny = (await calls()).length;
+await assert.rejects(
+	() =>
+		sessionWrapper.execute("session-policy-deny", ordinaryMutation, undefined, undefined, {
+			...sessionContext,
+			settings: Settings.isolated({ "tools.approval": { aws: "deny" } }),
+		}),
+	/blocked by user policy/,
+);
+assert.equal((await calls()).length, beforePolicyDeny);
+await sessionTool.prepareRuntimeApproval("session-identity-change", ordinaryMutation);
+await fs.writeFile(path.join(root, "changed-identity"), "yes");
+await assert.rejects(() => sessionTool.execute("session-identity-change", ordinaryMutation), /identity changed/);
+await fs.unlink(path.join(root, "changed-identity"));
+await assert.rejects(
+	() => sessionTool.prepareRuntimeApproval("session-partition-change", { ...ordinaryMutation, profile: "mismatched" }),
+	/WRONG_PARTITION/,
+);
+sessionId = "different-native-session";
+const beforeNewSession = (await calls()).filter(call => call.argv.includes("modify-db-cluster")).length;
+await assert.rejects(
+	() => sessionWrapper.execute("new-session", ordinaryMutation, undefined, undefined, sessionContext),
+	/denied by user/,
+);
+assert.equal((await calls()).filter(call => call.argv.includes("modify-db-cluster")).length, beforeNewSession);
+sessionId = "native-approval-owner-advisor";
+await assert.rejects(
+	() => reconstructedWrapper.execute("advisor-session", ordinaryMutation, undefined, undefined, sessionContext),
+	/denied by user/,
+);
+sessionId = "native-approval-owner";
+const freshSettingsTool = new AwsTool({ ...approvalSession, settings: Settings.isolated() });
+await assert.rejects(() => freshSettingsTool.execute("fresh-settings", ordinaryMutation), /approval/);
+const anonymousTool = new AwsTool({ ...toolSession });
+await assert.rejects(() => anonymousTool.execute("anonymous-session", ordinaryMutation), /approval/);
+const loginSessionTool = new AwsTool({
+	...approvalSession,
+	getSessionId: () => "login-session-owner",
+});
+const loginWrapper = new ExtensionToolWrapper(loginSessionTool as unknown as AgentTool, sessionRunner);
+choice = sessionLabel;
+await loginWrapper.execute(
+	"session-login-grant",
+	{ ...login, profile: "expired-session-login" },
+	undefined,
+	undefined,
+	sessionContext,
+);
+choice = "Deny";
+assert.notEqual(
+	(await loginWrapper.execute("session-login-later", ordinaryMutation, undefined, undefined, sessionContext)).isError,
+	true,
+);
+const automaticSessionTool = new AwsTool({ ...approvalSession, getSessionId: () => "automatic-session-owner" });
+const automaticSessionWrapper = new ExtensionToolWrapper(automaticSessionTool as unknown as AgentTool, sessionRunner);
+let automaticSelections = 0;
+const automaticSessionContext = {
+	...sessionContext,
+	settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+	ui: {
+		...sessionContext.ui,
+		select: async (_title: string, options: string[]) => {
+			automaticSelections++;
+			return options.includes(sessionLabel) ? sessionLabel : "Deny";
+		},
+	},
+} as AgentToolContext;
+assert.notEqual(
+	(
+		await automaticSessionWrapper.execute(
+			"automatic-session-grant",
+			{ ...read, profile: "expired-session-first" },
+			undefined,
+			undefined,
+			automaticSessionContext,
+		)
+	).isError,
+	true,
+);
+await fs.unlink(path.join(root, "authenticated-expired-session-first"));
+assert.notEqual(
+	(
+		await automaticSessionWrapper.execute(
+			"automatic-session-renewal",
+			{ ...ordinaryMutation, profile: "expired-session-first" },
+			undefined,
+			undefined,
+			automaticSessionContext,
+		)
+	).isError,
+	true,
+);
+assert.equal(automaticSelections, 1);
+assert.equal(confirmations, beforeSessionRenewal);
+const beforeManagedGrant = selections.length;
+const managedWrapper = new ExtensionToolWrapper(managed as unknown as AgentTool, sessionRunner);
+await assert.rejects(
+	() =>
+		managedWrapper.execute(
+			"managed-not-granted",
+			{ aws_profile: "parallel-peer" },
+			undefined,
+			undefined,
+			sessionContext,
+		),
+	/denied by user/,
+);
+assert.equal(selections.length, beforeManagedGrant + 1);
+assert.ok(!selections.at(-1)!.includes(sessionLabel));
+
 const beforeReservation = (await listTrustedAwsProfiles()).map(profile => profile.name);
 assert.ok(beforeReservation.includes("adopted-model") && beforeReservation.includes("adopted-alias"));
 void tool.parameters;
@@ -723,6 +1331,97 @@ try {
 	Bun.env.PATH = originalPath;
 	delete Bun.env.OMP_OPERATIONAL_AWS_EXECUTABLE;
 }
+for (const [service, operation] of [
+	["ecs", "execute-command"],
+	["ssm", "start-session"],
+] as const) {
+	const parameters: Record<string, unknown> =
+		service === "ecs"
+			? {
+					Cluster: "synthetic-cluster",
+					Task: "synthetic-task",
+					Container: "synthetic-container",
+					Command: "fixture-complete",
+					Interactive: true,
+				}
+			: { Target: "i-synthetic", DocumentName: "fixture-complete" };
+	const args = { profile: "government", service, operation, parameters };
+	const modeParameter = service === "ecs" ? "Command" : "DocumentName";
+	Bun.env.OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN = path.join(repository, "untrusted-plugin");
+	const approval = await tool.prepareRuntimeApproval(`session-${service}`, args);
+	assert.match(approval!.prompt, /Account: 123456789012/);
+	await assert.rejects(() => tool.execute(`session-denied-${service}`, args), /approval/);
+	tool.approveRuntimeApproval(`session-${service}`, args);
+	const result = await tool.execute(`session-${service}`, args);
+	assert.notEqual(result.isError, true, text(result));
+	assert.match(text(result), /REMOTE_COMMAND_OK/);
+	assert.ok(!text(result).includes("fixture-token"));
+	const call = (await calls()).findLast(call => call.argv.includes(operation));
+	assert.ok(call.env.PATH);
+	assert.notEqual(call.env.PATH, originalPath);
+	assert.notEqual(call.env.PATH, repository);
+	await assert.rejects(() => fs.stat(call.env.PATH), { code: "ENOENT" });
+	const failedArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-fail" } };
+	const failedId = `session-${service}-fixture-fail`;
+	await tool.prepareRuntimeApproval(failedId, failedArgs);
+	tool.approveRuntimeApproval(failedId, failedArgs);
+	const failed = await tool.execute(failedId, failedArgs);
+	assert.equal(failed.isError, true);
+	assert.equal(failed.details?.code, "AWS_ERROR");
+	assert.equal(failed.details?.exitCode, 23);
+	assert.match(text(failed), /fixture helper failure/);
+	assert.ok(!text(failed).includes("REMOTE_COMMAND_OK"));
+
+	const logArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-remote-diagnostic" } };
+	const logId = `session-${service}-remote-diagnostic`;
+	await tool.prepareRuntimeApproval(logId, logArgs);
+	tool.approveRuntimeApproval(logId, logArgs);
+	const logResult = await tool.execute(logId, logArgs);
+	assert.notEqual(logResult.isError, true, text(logResult));
+	assert.equal(logResult.details?.exitCode, 0);
+	assert.match(text(logResult), /Cannot perform start session: historical application log entry/);
+	assert.match(text(logResult), /REMOTE_COMMAND_OK/);
+
+	const zeroArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-zero-error" } };
+	const zeroId = `session-${service}-zero-exit-diagnostic`;
+	await tool.prepareRuntimeApproval(zeroId, zeroArgs);
+	tool.approveRuntimeApproval(zeroId, zeroArgs);
+	const zeroResult = await tool.execute(zeroId, zeroArgs);
+	assert.notEqual(zeroResult.isError, true, text(zeroResult));
+	assert.equal(zeroResult.details?.exitCode, 0);
+	assert.match(text(zeroResult), /Cannot perform start session: fixture helper failure/);
+	assert.ok(!text(zeroResult).includes("REMOTE_COMMAND_OK"));
+	const hangingArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-hang" } };
+	const hangingId = `session-${service}-cancel`;
+	await tool.prepareRuntimeApproval(hangingId, hangingArgs);
+	tool.approveRuntimeApproval(hangingId, hangingArgs);
+	const descendantPath = path.join(root, "session-helper-descendant.pid");
+	await fs.rm(descendantPath, { force: true });
+	const controller = new AbortController();
+	const hangingSession = tool.execute(hangingId, hangingArgs, controller.signal);
+	try {
+		for (let attempt = 0; attempt < 500; attempt++) {
+			if (await Bun.file(descendantPath).exists()) break;
+			await Bun.sleep(10);
+		}
+		const helperPid = Number(await Bun.file(path.join(root, "session-helper.pid")).text());
+		const descendantPid = Number(await Bun.file(descendantPath).text());
+		const helperProcess = Process.fromPid(helperPid);
+		const descendantProcess = Process.fromPid(descendantPid);
+		assert.equal(helperProcess?.status(), ProcessStatus.Running);
+		assert.equal(descendantProcess?.status(), ProcessStatus.Running);
+		controller.abort();
+		const cancelled = await hangingSession;
+		assert.equal(cancelled.isError, true);
+		assert.ok(!text(cancelled).includes("REMOTE_COMMAND_OK"));
+		assert.equal(helperProcess?.status(), ProcessStatus.Exited);
+		assert.equal(descendantProcess?.status(), ProcessStatus.Exited);
+	} finally {
+		controller.abort();
+		await hangingSession.catch(() => {});
+	}
+}
+delete Bun.env.OMP_OPERATIONAL_AWS_SESSION_MANAGER_PLUGIN;
 const cancel = new AbortController();
 const hanging = tool.execute("cancel", { ...read, parameters: { Prefix: "hang" } }, cancel.signal);
 for (let attempt = 0; attempt < 200; attempt++) {

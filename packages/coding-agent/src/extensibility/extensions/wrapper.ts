@@ -438,6 +438,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						actions: "focus",
 					});
 				}
+				const capability = runtimeApprovalTool.sessionApproval;
+				const sessionApproval =
+					pendingSafetyChecks.length === 0 &&
+					(!runtimeApproval || runtimeApproval.allowSessionApproval === true) &&
+					capability?.label &&
+					capability.label !== "Deny" &&
+					capability.label !== "Approve" &&
+					capability.label !== "Approve once"
+						? capability
+						: undefined;
+				let approveSession = false;
 				let approved: boolean;
 				const denialReason = "denied by user";
 				try {
@@ -448,24 +459,31 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								: "";
 						const choice = await uiContext.select(
 							`${runtimeApproval.prompt}${safetySuffix}`,
-							["Deny", "Approve once"],
+							sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
 							{ tuiStyle: runtimeApproval.tuiStyle },
 						);
-						approved = choice === "Approve once";
+						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+						approved = choice === "Approve once" || approveSession;
 					} else {
 						const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
 						const safetyPrompt =
 							pendingSafetyChecks.length > 0
 								? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 								: basePrompt;
-						const choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
-						approved = choice === "Approve";
+						const choice = await uiContext.select(
+							safetyPrompt,
+							sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Approve", "Deny"],
+						);
+						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+						approved = choice === "Approve" || approveSession;
 					}
+					signal?.throwIfAborted();
 				} catch (err) {
 					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 					throw err;
 				}
 				await emitApprovalResolved(approved, approved ? undefined : denialReason);
+				signal?.throwIfAborted();
 				if (!approved) {
 					throw new Error(`Tool call denied by user: ${this.tool.name}`);
 				}
@@ -476,6 +494,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					if (!context) throw new Error("Provider safety approval context is unavailable");
 					context.providerSafetyApproved = true;
 				}
+				if (approveSession) sessionApproval!.approve();
 			} catch (error) {
 				cancelPreflight();
 				runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
