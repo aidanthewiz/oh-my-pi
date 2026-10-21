@@ -1,4 +1,3 @@
-import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -178,43 +177,37 @@ describe("browser open options CDP helpers", () => {
 		expect(await Bun.file(path.join(directory, "report.txt")).exists()).toBe(false);
 	});
 
-	it("keeps a directory named like the download when the rename takes the Windows replacement path", async () => {
+	it("keeps a directory named like the download and reports the retained GUID bytes", async () => {
 		const { directory, elsewhere, complete } = await fakeDownloads();
 		const guid = crypto.randomUUID();
 		const saved = path.join(elsewhere, guid);
 		await Bun.write(saved, "bytes");
 		await Bun.write(path.join(directory, "report.txt", "notes.txt"), "notes");
-		const rename = spyOn(nodeFs.promises, "rename").mockImplementationOnce(async () => {
-			throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
-		});
-		try {
-			expect(await complete(guid, saved)).toBe(saved);
-		} finally {
-			rename.mockRestore();
-		}
+		expect(await complete(guid, saved)).toBe(saved);
 		expect(await Bun.file(path.join(directory, "report.txt", "notes.txt")).text()).toBe("notes");
 		expect(await Bun.file(saved).text()).toBe("bytes");
 	});
 
-	it("keeps the same-named file when a cross-device move fails to copy", async () => {
+	it("keeps the same-named file and GUID bytes when a cross-device move fails to copy", async () => {
 		const { directory, elsewhere, complete } = await fakeDownloads();
 		const guid = crypto.randomUUID();
 		const saved = path.join(elsewhere, guid);
 		await Bun.write(saved, "bytes");
 		await Bun.write(path.join(directory, "report.txt"), "earlier report");
-		const rename = spyOn(nodeFs.promises, "rename").mockImplementationOnce(async () => {
+		const link = spyOn(fs, "link").mockImplementationOnce(async () => {
 			throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
 		});
-		const copyFile = spyOn(nodeFs.promises, "copyFile").mockImplementationOnce(async () => {
+		const copyFile = spyOn(fs, "copyFile").mockImplementationOnce(async () => {
 			throw Object.assign(new Error("i/o error"), { code: "EIO" });
 		});
 		try {
 			expect(await complete(guid, saved)).toBe(saved);
 		} finally {
-			rename.mockRestore();
+			link.mockRestore();
 			copyFile.mockRestore();
 		}
 		expect(await Bun.file(path.join(directory, "report.txt")).text()).toBe("earlier report");
+		expect(await Bun.file(saved).text()).toBe("bytes");
 		expect(await fs.readdir(directory)).toEqual(["report.txt"]);
 	});
 
@@ -224,20 +217,22 @@ describe("browser open options CDP helpers", () => {
 		const saved = path.join(elsewhere, guid);
 		await Bun.write(saved, "bytes");
 		await Bun.write(path.join(directory, "report.txt"), "earlier report");
-		const rename = spyOn(nodeFs.promises, "rename").mockImplementationOnce(async () => {
+		const link = spyOn(fs, "link").mockImplementationOnce(async () => {
 			throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
 		});
-		const unlink = spyOn(nodeFs.promises, "unlink").mockImplementationOnce(async () => {
+		const unlink = spyOn(fs, "unlink").mockImplementationOnce(async () => {
 			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
 		});
 		try {
-			expect(await complete(guid, saved)).toBe(path.join(directory, "report.txt"));
+			expect(await complete(guid, saved)).toBe(path.join(directory, "report (1).txt"));
 		} finally {
-			rename.mockRestore();
+			link.mockRestore();
 			unlink.mockRestore();
 		}
-		expect(await Bun.file(path.join(directory, "report.txt")).text()).toBe("bytes");
-		expect(await fs.readdir(directory)).toEqual(["report.txt"]);
+		expect(await Bun.file(path.join(directory, "report.txt")).text()).toBe("earlier report");
+		expect(await Bun.file(path.join(directory, "report (1).txt")).text()).toBe("bytes");
+		expect(await Bun.file(saved).text()).toBe("bytes");
+		expect((await fs.readdir(directory)).sort()).toEqual(["report (1).txt", "report.txt"]);
 	});
 
 	it("keeps real file names and leaves files in place in a browser the user drives", async () => {
@@ -548,8 +543,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			expect(await Bun.file(path.join(second, "fixture.bin")).text()).toBe("tab second, download 2\n");
 
 			await invoke({ action: "close", name: secondTab });
-			expect((await download(firstTab)).path).toBe(path.join(first, "fixture.bin"));
-			expect(await Bun.file(path.join(first, "fixture.bin")).text()).toBe("tab first, download 3\n");
+			const repeated = await download(firstTab);
+			expect(path.dirname(repeated.path)).toBe(first);
+			expect(repeated.path).not.toBe(path.join(first, "fixture.bin"));
+			expect(await Bun.file(repeated.path).text()).toBe("tab first, download 3\n");
+			expect(await Bun.file(path.join(first, "fixture.bin")).text()).toBe("tab first, download 1\n");
 		} finally {
 			gateOpened.resolve();
 			server.stop(true);

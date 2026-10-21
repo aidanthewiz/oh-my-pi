@@ -1,10 +1,10 @@
+import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { hasFsCode, isEnoent, toError, untilAborted } from "@oh-my-pi/pi-utils";
+import { hasFsCode, isEnoent, logger, toError, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Browser, CDPSession, Page } from "puppeteer-core";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { replaceFileAcrossDevices, replaceFileAtomically } from "../../utils/atomic-file";
 import { devtoolsFrameId } from "./frames";
 
 /** Completed download metadata returned by tab download helpers. */
@@ -193,12 +193,7 @@ export class DownloadManager {
 			name !== "." &&
 			name !== ".." &&
 			(await canMoveDownload(source, pending.guid, target));
-		const downloadPath = movable
-			? await moveDownload(source, target).then(
-					() => target,
-					() => source,
-				)
-			: source;
+		const downloadPath = movable ? await moveDownload(source, target).catch(() => source) : source;
 		const download: BrowserDownload = {
 			path: downloadPath,
 			suggestedFilename: pending.suggestedFilename,
@@ -229,8 +224,8 @@ export class DownloadManager {
 }
 
 /**
- * Whether `source` is a regular file saved under a UUID-shaped download GUID, and `target` is free or a file it may
- * replace. The peer names the GUID, the saved path and the suggested name, so a symlink or directory stays where it is.
+ * Whether `source` is a regular GUID file and the suggested target is a file or absent.
+ * The peer names both paths; a symlink or directory stays where it is.
  */
 async function canMoveDownload(source: string, guid: string, target: string): Promise<boolean> {
 	if (!DOWNLOAD_GUID.test(guid) || path.basename(source) !== guid) return false;
@@ -246,13 +241,45 @@ async function entryKind(file: string): Promise<"file" | "missing" | "other"> {
 	}
 }
 
-/** Move a completed download into a tab's folder, replacing a same-named file as Chromium's own saves do. */
-async function moveDownload(source: string, target: string): Promise<void> {
-	await fs.mkdir(path.dirname(target), { recursive: true });
+/** Publish complete bytes without replacing another file, including another tab's download. */
+async function moveDownload(source: string, target: string): Promise<string> {
+	const directory = path.dirname(target);
+	const name = path.parse(target);
+	let staging: string | undefined;
+	let publicationSource = source;
+	await fs.mkdir(directory, { recursive: true });
 	try {
-		await replaceFileAtomically(source, target);
-	} catch (error) {
-		if (!hasFsCode(error, "EXDEV")) throw error;
-		await replaceFileAcrossDevices(source, target);
+		for (let index = 0; ;) {
+			const candidate = index === 0 ? target : path.join(directory, `${name.name} (${index})${name.ext}`);
+			if (path.resolve(source) === path.resolve(candidate)) return source;
+			try {
+				await fs.link(publicationSource, candidate);
+			} catch (error) {
+				if (hasFsCode(error, "EEXIST")) {
+					index++;
+					continue;
+				}
+				if (!hasFsCode(error, "EXDEV") || staging) throw error;
+				staging = await fs.mkdtemp(path.join(directory, ".omp-download-"));
+				publicationSource = path.join(staging, "payload");
+				await fs.copyFile(source, publicationSource, constants.COPYFILE_EXCL);
+				const handle = await fs.open(publicationSource, "r+");
+				try {
+					await handle.sync();
+				} finally {
+					await handle.close();
+				}
+				continue;
+			}
+			await fs.unlink(source).catch(error => {
+				logger.warn("Failed to remove moved file's source", { source, error: toError(error).message });
+			});
+			return candidate;
+		}
+	} finally {
+		if (staging)
+			await fs.rm(staging, { recursive: true, force: true }).catch(error => {
+				logger.warn("Failed to remove staged download", { staging, error: toError(error).message });
+			});
 	}
 }
