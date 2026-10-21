@@ -861,6 +861,173 @@ public licenses.
 
 Creative Commons may be contacted at creativecommons.org.
 
+-------------------------------------------------------------------------------
+crates/pi-natives/src/hpatch/LICENSE.HDiffPatch
+
+MIT License
+
+HDiffPatch
+Copyright (c) 2012-2025 housisong
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+crates/pi-natives/src/syntaxes/NOTICE
+
+Vendored highlight grammars
+===========================
+
+The source headers identify these pinned origins and licenses. The notices and
+full license terms below apply to the corresponding compiled syntax data as
+well as the source files. INI.sublime-syntax is Stencil's own grammar and remains
+covered by the workspace LICENSE.
+
+MIT-licensed grammars
+--------------------
+
+CMake.sublime-syntax and CMakeCommands.sublime-syntax
+Source: https://github.com/zyxar/Sublime-CMakeLists at 2560a080
+Copyright (c) 2012-2020 The Sublime CMake authors
+CMake.sublime-syntax adapts the regexp context reference for syntect.
+
+Dockerfile.sublime-syntax
+Source: https://github.com/asbjornenge/Docker.tmbundle at 0f6b7bc8, Syntaxes/
+Copyright 2014 Asbjorn Enge
+
+Elixir.sublime-syntax and Regular Expressions (Elixir).sublime-syntax
+Source: https://github.com/princemaple/elixir-sublime-syntax at 4fb01891
+Copyright (c) 2017 Po Chen
+
+PowerShell.sublime-syntax
+Source: https://github.com/sharkdp/bat at 4987f767, assets/syntaxes/02_Extra
+Original project: https://github.com/PowerShell/EditorSyntax
+Copyright (c) Microsoft Corporation
+
+Protobuf.sublime-syntax and ProtobufText.sublime-syntax
+Source: https://github.com/VcamX/protobuf-syntax-highlighting at 13653315
+Copyright (c) 2013-2014 Yuxi Evan You
+
+SCSS.sublime-syntax and Sass.sublime-syntax
+Source: https://github.com/braver/SublimeSass at d3d94046, Syntaxes/
+Copyright (c) 2018 Koen Lageveen
+
+Swift.sublime-syntax
+Source: https://github.com/sharkdp/bat at 4987f767, assets/syntaxes/02_Extra
+Original project: https://github.com/quiqueg/Swift-Sublime-Package
+Copyright (c) 2014 Matthew Alexander
+
+TOML.sublime-syntax
+Source: https://github.com/jasonwilliams/sublime_toml_highlighting at f5a57e8b
+Copyright (c) 2021 Jason Williams
+
+Terraform.sublime-syntax
+Source: https://github.com/alexlouden/Terraform.tmLanguage at 54d8350c
+Copyright (c) 2016 Alex Louden
+
+VimL.sublime-syntax
+Source: https://github.com/SalGnt/Sublime-VimL at fe5bf5ea
+Copyright (c) 2014 Salvatore Gentile
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+GraphQL.sublime-syntax
+---------------------
+
+Source: https://github.com/dncrews/GraphQL-SublimeText3 at 9b6f6d0a
+License: WTFPL. The following copyright identifies the license document's
+original author, not the grammar's author.
+
+DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+Version 2, December 2004
+
+Copyright (C) 2004 Sam Hocevar <sam@hocevar.net>
+
+Everyone is permitted to copy and distribute verbatim or modified copies of
+this license document, and changing it is allowed as long as the name is changed.
+
+DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+
+  0. You just DO WHAT THE FUCK YOU WANT TO.
+
+Kotlin.sublime-syntax
+--------------------
+
+Source: https://github.com/guille/sublime-kotlin at c3536941
+License: Unlicense (public domain).
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+
+Git Ignore.sublime-syntax
+-------------------------
+
+Source: https://github.com/sublimehq/Packages at 759d6eed,
+Git Formats/Git Ignore.sublime-syntax and Git Common.sublime-syntax.
+The required Git Common contexts are inlined for syntect.
+
+The source-supplied Sublime Text Packages permission notice is retained here:
+
+Permission to copy, use, modify, sell and distribute is
+granted provided this notice appears in all copies; provided "as is"
+without express or implied warranty.
+
 BUN / NPM DEPENDENCY INVENTORY
 ==============================
 Locked source/install graph from bun.lock, including nested versions and all platform leaves.
@@ -14213,6 +14380,244 @@ Apache License
 -------------------------------------------------------------------------------
 License: Apache License 2.0 (Apache-2.0)
 Used by:
+- cranelift-bforest 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-codegen 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-codegen-meta 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-codegen-shared 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-control 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-entity 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-frontend 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-native 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- regalloc2 0.11.2 (https://github.com/bytecodealliance/regalloc2)
+- target-lexicon 0.13.5 (https://github.com/bytecodealliance/target-lexicon)
+- wasmtime 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-cranelift 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-environ 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+
+Full license text:
+
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+
+--- LLVM Exceptions to the Apache 2.0 License ----
+
+As an exception, if, as a result of your compiling your source code, portions
+of this Software are embedded into an Object form of such source code, you
+may redistribute such embedded portions in such Object form without complying
+with the conditions of Sections 4(a), 4(b) and 4(d) of the License.
+
+In addition, if you combine or link compiled forms of this Software with
+software that is licensed under the GPLv2 ("Combined Software") and if a
+court of competent jurisdiction determines that the patent provision (Section
+3), the indemnity provision (Section 9) or other Section of the License
+conflicts with the conditions of the GPLv2, you may retroactively and
+prospectively choose to deem waived or otherwise exclude such Section(s) of
+the License, but only in their entirety and only with respect to the Combined
+Software.
+
+-------------------------------------------------------------------------------
+License: Apache License 2.0 (Apache-2.0)
+Used by:
 - calendrical_calculations 0.2.4 (https://github.com/unicode-org/icu4x)
 
 Full license text:
@@ -14844,8 +15249,6 @@ Used by:
 - command-fds 0.3.3 (https://github.com/google/command-fds/)
 - safetensors 0.7.0 (https://github.com/huggingface/safetensors)
 - self_cell 1.3.0 (https://github.com/Voultapher/self_cell)
-- tree-sitter-hcl 1.1.0 (https://github.com/tree-sitter-grammars/tree-sitter-hcl)
-- tree-sitter-ini 1.4.0 (https://github.com/justinmk/tree-sitter-ini)
 - waitgroup 0.1.2 (https://github.com/laizy/waitgroup-rs)
 
 Full license text:
@@ -15482,11 +15885,20 @@ License: Apache License 2.0 (Apache-2.0)
 Used by:
 - blake3 1.8.7 (https://github.com/BLAKE3-team/BLAKE3)
 - constant_time_eq 0.4.2 (https://github.com/cesarb/constant_time_eq)
+- cranelift-bitset 0.116.1 (https://github.com/bytecodealliance/wasmtime)
+- cranelift-isle 0.116.1 (https://github.com/bytecodealliance/wasmtime/tree/main/cranelift/isle)
 - dunce 1.0.5 (https://gitlab.com/kornelski/dunce)
+- ryu 1.0.23 (https://github.com/dtolnay/ryu)
 - serial2 0.2.38 (https://github.com/de-vri-es/serial2-rs)
-- tree-sitter-elixir 0.3.5 (https://github.com/elixir-lang/tree-sitter-elixir)
 - uiautomation 0.25.1 (https://github.com/leexgone/uiautomation-rs)
 - uiautomation_derive 0.7.9 (https://github.com/leexgone/uiautomation-rs)
+- wasmtime-asm-macros 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-c-api-impl 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-c-api-macros 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-jit-icache-coherence 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-math 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-slab 29.0.1 (https://github.com/bytecodealliance/wasmtime)
+- wasmtime-versioned-export-macros 29.0.1 (https://github.com/bytecodealliance/wasmtime)
 
 Full license text:
 
@@ -16653,35 +17065,6 @@ third-party/chromium/LICENSE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-cmake 0.7.5 (https://github.com/uyha/tree-sitter-cmake)
-
-Full license text:
-
-The MIT License (MIT)
-
-Copyright (c) 2025 Uy Ha
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - onig_sys 69.9.3 (https://github.com/rust-onig/rust-onig)
 
 Full license text:
@@ -17215,7 +17598,7 @@ Used by:
 - num-traits 0.2.19 (https://github.com/rust-num/num-traits)
 - regex 1.13.1 (https://github.com/rust-lang/regex)
 - regex-automata 0.4.18 (https://github.com/rust-lang/regex)
-- regex-lite 0.1.9 (https://github.com/rust-lang/regex)
+- regex-bites 0.1.6 (https://github.com/rust-lang/regex/tree/master/regex-bites)
 - regex-syntax 0.8.11 (https://github.com/rust-lang/regex)
 
 Full license text:
@@ -17435,6 +17818,7 @@ THE SOFTWARE.
 License: MIT License (MIT)
 Used by:
 - either 1.18.0 (https://github.com/rayon-rs/either)
+- itertools 0.12.1 (https://github.com/rust-itertools/itertools)
 - itertools 0.14.0 (https://github.com/rust-itertools/itertools)
 - itertools 0.15.0 (https://github.com/rust-itertools/itertools)
 - maplit 1.0.2 (https://github.com/bluss/maplit)
@@ -17633,7 +18017,42 @@ DEALINGS IN THE SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
+- object 0.36.7 (https://github.com/gimli-rs/object)
+
+Full license text:
+
+Copyright (c) 2015 The Gimli Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- gimli 0.31.1 (https://github.com/gimli-rs/gimli)
 - heck 0.5.0 (https://github.com/withoutboats/heck)
+- leb128 0.2.7 (https://github.com/gimli-rs/leb128)
 - linked-hash-map 0.5.6 (https://github.com/contain-rs/linked-hash-map)
 - unicode-bidi 0.3.18 (https://github.com/servo/unicode-bidi)
 - unicode-normalization 0.1.25 (https://github.com/unicode-rs/unicode-normalization)
@@ -17669,6 +18088,33 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- cobs 0.3.0 (https://github.com/jamesmunns/cobs.rs)
+
+Full license text:
+
+Copyright (c) 2015 The cobs.rs Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
@@ -19841,6 +20287,39 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
+- postcard 1.1.3 (https://github.com/jamesmunns/postcard)
+
+Full license text:
+
+Copyright (c) 2019 Anthony James Munns
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
 - slab 0.4.12 (https://github.com/tokio-rs/slab)
 
 Full license text:
@@ -19914,6 +20393,72 @@ Used by:
 Full license text:
 
 Copyright (c) 2019 Ivan Molodetskikh
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- bumpalo 3.20.3 (https://github.com/fitzgen/bumpalo)
+
+Full license text:
+
+Copyright (c) 2019 Nick Fitzgerald
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- mach2 0.4.3 (https://github.com/JohnTitor/mach2)
+
+Full license text:
+
+Copyright (c) 2019 Nick Fitzgerald, 2021 Yuki Okushi
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -20360,21 +20905,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- tree-sitter-solidity 1.2.13 (https://github.com/JoranHonig/tree-sitter-solidity)
-
-Full license text:
-
-Copyright (c) 2020 Joran Honig
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
@@ -21373,33 +21903,6 @@ DEALINGS IN THE SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-vue-next 0.1.0 (https://github.com/jamie8johnson/tree-sitter-vue)
-
-Full license text:
-
-Copyright (c) 2024 Amaan Qureshi <amaanq12@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - deranged 0.5.8 (https://github.com/jhpratt/deranged)
 
 Full license text:
@@ -21522,33 +22025,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- tree-sitter-proto 0.4.0 (https://github.com/coder3101/tree-sitter-proto)
-
-Full license text:
-
-Copyright (c) 2024-2025 Mohammad Ashar Khan
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the " Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice (including the next
-paragraph) shall be included in all copies or substantial portions of the
-Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
@@ -22257,6 +22733,30 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- memfd 0.6.6 (https://github.com/lucab/memfd-rs)
+
+Full license text:
+
+Copyright <YEAR> <COPYRIGHT HOLDER>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
@@ -22991,35 +23491,6 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-nix 0.3.0 (https://github.com/nix-community/tree-sitter-nix)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2019 Charles Strahan
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - bytemuck 1.25.2 (https://github.com/Lokathor/bytemuck)
 - bytemuck_derive 1.12.1 (https://github.com/Lokathor/bytemuck)
 
@@ -23096,6 +23567,7 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
+- arbitrary 1.4.2 (https://github.com/rust-fuzz/arbitrary/)
 - triomphe 0.1.16 (https://github.com/Manishearth/triomphe)
 
 Full license text:
@@ -23296,35 +23768,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-ocaml 0.24.2 (https://github.com/tree-sitter/tree-sitter-ocaml)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2020 Max Brunsfeld and Pieter Goetschalckx
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - z85 3.0.7 (https://github.com/decafbad/z85)
 
 Full license text:
@@ -23512,64 +23955,6 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-elisp 1.7.2 (https://github.com/Wilfred/tree-sitter-elisp)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2021 Wilfred Hughes
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- tree-sitter-swift 0.7.3 (https://github.com/alex-pinkus/tree-sitter-swift)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2021 alex-pinkus
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - gemm 0.19.0 (https://github.com/sarah-ek/gemm/)
 - gemm-c32 0.19.0 (https://github.com/sarah-ek/gemm/)
 - gemm-c64 0.19.0 (https://github.com/sarah-ek/gemm/)
@@ -23672,35 +24057,6 @@ Full license text:
 MIT License
 
 Copyright (c) 2022 sarah
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- tree-sitter-powershell 0.26.4 (https://github.com/airbus-cert/tree-sitter-powershell)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2023 Airbus CERT
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24002,35 +24358,6 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-graphql 0.1.0 (https://github.com/joowani/tree-sitter-graphql)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2025 Joohwan Oh
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - icy_sixel 0.7.0 (https://github.com/mkrueger/icy_sixel)
 
 Full license text:
@@ -24153,30 +24480,13 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-r 1.3.0 (https://github.com/r-lib/tree-sitter-r)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2025 tree-sitter-r authors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- pi-ast 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-builtins 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-iso 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-natives 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-shell 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-voice 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-walker 18.6.1 (https://github.com/can1357/oh-my-pi)
+- pi-ast 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-builtins 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-iso 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-natives 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-shell 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-voice 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-walker 18.9.0 (https://github.com/can1357/oh-my-pi)
 
 Full license text:
 
@@ -24264,35 +24574,6 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-dart 0.2.0 (https://github.com/nielsenko/tree-sitter-dart)
-
-Full license text:
-
-MIT License
-
-Copyright (c) 2026 Kasper Overgård Nielsen (kasper@byolimit.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - asn1-rs-impl 0.2.0 (https://github.com/rusticata/asn1-rs.git)
 - ast-grep-core 0.39.9 (https://github.com/ast-grep/ast-grep)
 - base64-simd 0.8.0 (https://github.com/Nugine/simd)
@@ -24306,14 +24587,15 @@ Used by:
 - chrono 0.4.45 (https://github.com/chronotope/chrono)
 - dispatch2 0.3.1 (https://github.com/madsmtm/objc2)
 - fluent-langneg 0.13.1 (https://github.com/projectfluent/fluent-langneg-rs)
-- hifijson 0.2.3 (https://github.com/01mf02/hifijson)
+- hifijson 0.5.0 (https://github.com/01mf02/hifijson)
 - html-to-markdown-rs 3.14.3 (https://github.com/xberg-io/html-to-markdown)
 - include_dir 0.7.4 (https://github.com/Michael-F-Bryan/include_dir)
 - include_dir_macros 0.7.4 (https://github.com/Michael-F-Bryan/include_dir)
 - intl_pluralrules 7.0.2 (https://github.com/zbraniecki/pluralrules)
-- jaq-core 2.2.1 (https://github.com/01mf02/jaq)
-- jaq-json 1.1.3 (https://github.com/01mf02/jaq)
-- jaq-std 2.1.2 (https://github.com/01mf02/jaq)
+- jaq-core 3.1.1 (https://github.com/01mf02/jaq)
+- jaq-fmts 0.1.1 (https://github.com/01mf02/jaq)
+- jaq-json 2.0.3 (https://github.com/01mf02/jaq)
+- jaq-std 3.0.3 (https://github.com/01mf02/jaq)
 - libm 0.2.16 (https://github.com/rust-lang/compiler-builtins)
 - napi 3.13.0 (https://github.com/napi-rs/napi-rs)
 - napi-build 2.5.0 (https://github.com/napi-rs/napi-rs)
@@ -24343,45 +24625,30 @@ Used by:
 - objc2-metal 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-quartz-core 0.3.2 (https://github.com/madsmtm/objc2)
 - palette_math 0.7.7 (https://github.com/Ogeon/palette)
-- pi-diff 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-edit 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-predict 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-vcs 18.6.1 (https://github.com/can1357/oh-my-pi)
-- pi-vfs 18.6.1 (https://github.com/can1357/oh-my-pi)
+- pi-diff 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-edit 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-predict 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-vcs 18.9.0 (https://github.com/can1357/oh-my-pi)
+- pi-vfs 18.9.0 (https://github.com/can1357/oh-my-pi)
 - pulp-wasm-simd-flag 0.1.1 (https://github.com/sarah-quinones/pulp/)
 - quantette 0.6.0 (https://github.com/IanManske/quantette)
 - rcgen 0.13.2 (https://github.com/rustls/rcgen)
+- sptr 0.3.2 (https://github.com/Gankra/sptr)
 - tree-sitter 0.25.10 (https://github.com/tree-sitter/tree-sitter)
-- tree-sitter-astro-next 0.1.1 (https://github.com/PRRPCHT/tree-sitter-astro-next)
-- tree-sitter-clojure 0.1.0 (https://github.com/jerielverissimo/tree-sitter-clojure)
 - tree-sitter-cpp 0.23.4 (https://github.com/tree-sitter/tree-sitter-cpp)
 - tree-sitter-diff 0.1.0 (https://github.com/tree-sitter/tree-sitter-diff)
-- tree-sitter-dockerfile-updated 0.2.0 (https://github.com/c-gamble/tree-sitter-dockerfile)
-- tree-sitter-erlang 0.16.0 (https://github.com/WhatsApp/tree-sitter-erlang)
-- tree-sitter-fortran 0.6.0 (https://github.com/stadelmanma/tree-sitter-fortran)
-- tree-sitter-haskell 0.23.1 (https://github.com/tree-sitter/tree-sitter-haskell)
 - tree-sitter-html 0.23.2 (https://github.com/tree-sitter/tree-sitter-html)
 - tree-sitter-java 0.23.5 (https://github.com/tree-sitter/tree-sitter-java)
 - tree-sitter-json 0.24.8 (https://github.com/tree-sitter/tree-sitter-json)
-- tree-sitter-julia 0.23.1 (https://github.com/tree-sitter/tree-sitter-julia)
-- tree-sitter-just 0.2.0 (https://github.com/casey/tree-sitter-just)
-- tree-sitter-lua 0.5.0 (https://github.com/tree-sitter-grammars/tree-sitter-lua)
-- tree-sitter-make 1.1.1 (https://github.com/tree-sitter-grammars/tree-sitter-make)
 - tree-sitter-md 0.5.3 (https://github.com/tree-sitter-grammars/tree-sitter-markdown)
-- tree-sitter-objc 3.0.2 (https://github.com/tree-sitter-grammars/tree-sitter-objc)
-- tree-sitter-odin 1.3.0 (https://github.com/tree-sitter-grammars/tree-sitter-odin)
-- tree-sitter-ruby 0.23.1 (https://github.com/tree-sitter/tree-sitter-ruby)
-- tree-sitter-sequel 0.3.11 (https://github.com/derekstride/tree-sitter-sql.git)
-- tree-sitter-starlark 1.3.0 (https://github.com/tree-sitter-grammars/tree-sitter-starlark)
-- tree-sitter-tlaplus 1.5.0 (https://github.com/tlaplus-community/tree-sitter-tlaplus)
 - tree-sitter-toml-ng 0.7.0 (https://github.com/tree-sitter-grammars/tree-sitter-toml)
 - tree-sitter-typescript 0.23.2 (https://github.com/tree-sitter/tree-sitter-typescript)
-- tree-sitter-verilog 1.0.3 (https://github.com/tree-sitter/tree-sitter-verilog)
-- tree-sitter-xml 0.7.0 (https://github.com/tree-sitter-grammars/tree-sitter-xml)
-- tree-sitter-zig 1.1.2 (https://github.com/tree-sitter-grammars/tree-sitter-zig)
 - type-map 0.5.1 (https://github.com/kardeiz/type-map)
 - utf8-chars 3.0.7 (https://github.com/A1-Triard/utf8-chars)
 - vsimd 0.8.0 (https://github.com/Nugine/simd)
+- wasm-encoder 0.221.3 (https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-encoder)
+- wasmparser 0.221.3 (https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser)
+- wasmprinter 0.221.3 (https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmprinter)
 - webrtc 0.17.2 (https://github.com/webrtc-rs/webrtc)
 - whoami 2.1.3 (https://github.com/ardaku/whoami)
 - windows 0.51.1 (https://github.com/microsoft/windows-rs)
@@ -25235,35 +25502,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-c-sharp 0.23.5 (https://github.com/tree-sitter/tree-sitter-c-sharp)
-
-Full license text:
-
-The MIT License (MIT)
-
-Copyright (c) 2014-2023 Max Brunsfeld, Damien Guard, Amaan Qureshi, and contributors.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - base64 0.22.1 (https://github.com/marshallpierce/rust-base64)
 
 Full license text:
@@ -25790,36 +26028,6 @@ THE SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-php 0.24.2 (https://github.com/tree-sitter/tree-sitter-php)
-
-Full license text:
-
-The MIT License (MIT)
-
-Copyright (c) 2017 Josh Vera, GitHub
-Copyright (c) 2019 Max Brunsfeld, Amaan Qureshi, Christian Frøystad, Caleb White
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - tree-sitter-bash 0.25.1 (https://github.com/tree-sitter/tree-sitter-bash)
 
 Full license text:
@@ -26093,23 +26301,6 @@ DEALINGS IN THE SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- tree-sitter-kotlin-sg 0.4.1 (https://github.com/ast-grep/tree-sitter-kotlin)
-
-Full license text:
-
-The MIT License (MIT)
-
-Copyright (c) 2019 fwcd
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
 - fontdb 0.24.0 (https://github.com/RazrFalcon/fontdb)
 
 Full license text:
@@ -26193,35 +26384,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- tree-sitter-svelte-next 0.1.1 (https://github.com/PRRPCHT/tree-sitter-svelte-next)
-
-Full license text:
-
-The MIT License (MIT)
-
-Copyright (c) 2024 Amaan Qureshi <amaanq12@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
@@ -26609,32 +26771,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
--------------------------------------------------------------------------------
-License: MIT License (MIT)
-Used by:
-- tree-sitter-scala 0.26.2 (https://github.com/tree-sitter/tree-sitter-scala)
-
-Full license text:
-
-This software is released under the MIT license:
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)

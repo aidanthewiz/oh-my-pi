@@ -166,6 +166,21 @@ describe("SessionAccountPoolScope lease ownership", () => {
 		tempDir.removeSync();
 	});
 
+	it("admits reset credits only through the current restriction lease", () => {
+		const stale = createScope("a");
+		const accounts = authStorage.oauth.accounts(provider, "shared-session");
+		const a = accounts.find(account => account.accountId === "a")!;
+		const b = accounts.find(account => account.accountId === "b")!;
+		expect(stale.permitsCredential(provider, "shared-session", a.credentialId)).toBe(true);
+		expect(stale.permitsCredential(provider, "shared-session", b.credentialId)).toBe(false);
+		const current = createScope("b");
+		expect(stale.permitsCredential(provider, "shared-session", b.credentialId)).toBe(false);
+		expect(current.permitsCredential(provider, "shared-session", b.credentialId)).toBe(true);
+		current.release();
+		expect(stale.permitsCredential(provider, "shared-session", a.credentialId)).toBe(false);
+		expect(current.permitsCredential(provider, "shared-session", b.credentialId)).toBe(false);
+	});
+
 	it.each([false, true])("rejects stale key routes when the newer owner released first: %s", async releasedFirst => {
 		const stale = createScope("a");
 		const registry = stale.registry(shared);

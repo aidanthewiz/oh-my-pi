@@ -286,11 +286,13 @@ The broker bearer token authorizes the trusted transport and can expose the brok
 
 ### Per-agent and per-session pools
 
-A session pool narrows the process-visible accounts using the same identity keys. Set `task.agentAccountPools` by exact agent name ([Settings](./settings.md#providers-and-services)), pass `oauthAccountPools` to `createAgentSession()`, or call `authStorage.sessions.restrict(provider, sessionId, identityKeys)` directly.
+A process-wide pool controls which accounts a client sees. A session pool narrows those accounts using the same identity keys. `coreforge usage accounts` lists visible OAuth identities and organization names without tokens. Set `task.agentAccountPools` by exact agent name ([Settings](./settings.md#providers-and-services)), pass `oauthAccountPools` to `createAgentSession()`, or call `authStorage.sessions.restrict(provider, sessionId, identityKeys)` directly.
 
-For each listed provider, selection, pins, fallback, and rotation use only listed OAuth accounts. An empty list denies every account. Stored, runtime, config, and environment API keys never supply a fallback. Requests that require environment credentials fail. A `models.yml` `apiKey` also blocks pooled requests, so pooled OAuth tokens cannot reach its configured endpoint.
+For each listed provider, selection, pins, fallback, rotation, saved-reset restores and imminent-expiry salvage use only listed OAuth accounts. An empty list denies every account. Stored, runtime, config and environment API keys never supply a fallback. Requests that require environment credentials fail. A `models.yml` `apiKey` also blocks pooled requests, so pooled OAuth tokens cannot reach its configured endpoint.
 
-SDK session pools cover every model registry key route, including auxiliary session ids and lookups without an id. Nested sessions with their own pools use those pools instead of the parent's. Disposal releases restrictions only after in-flight work settles; startup failure also releases them.
+SDK session pools cover every model registry key route, including auxiliary session ids and lookups without an id. Nested sessions with their own pools use those pools instead of the parent's. Disposal releases restrictions only after physical in-flight work settles, including admitted reset work; startup failure also releases them.
+
+`authStorage.sessions.permits(provider, sessionId, credentialId)` checks whether a durable stored credential is admitted. It does not establish ownership of the session restriction. Leased reset actions also verify the current restriction owner and session generation before spending.
 
 Direct callers must pass the returned lease to `authStorage.sessions.unrestrict(provider, sessionId, lease)`. A stale lease cannot release a newer restriction. Inherited credential affinity does not copy restrictions. Session pools remain trusted-client routing policy, not an authorization boundary.
 

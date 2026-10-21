@@ -1149,7 +1149,7 @@ export function rolePriorityDefaults(role: string): string[] {
 
 /** Resolve aliases inside a configured pattern list without leaking cycles to model matching. */
 function resolveNestedRolePatterns(
-	value: string,
+	value: string | string[],
 	roleDefaults: string[],
 	settings: ModelRoleLookup | undefined,
 	visited: Set<string>,
@@ -1212,7 +1212,11 @@ function resolveConfiguredRolePattern(
 
 	const configured = settings?.getModelRole(role)?.trim();
 	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
-	const roleDefaults = isModelRole(role) ? rolePriorityDefaults(role) : [];
+	// Built-in defaults chain to other roles (judge: `@tiny`, `@smol`, `@default`). Left unexpanded, the
+	// matcher reads them as literal ids and `@default` fuzzy-matches Vertex ids like `claude-opus-4-8@default`.
+	const roleDefaults = isModelRole(role)
+		? resolveNestedRolePatterns(rolePriorityDefaults(role), [], settings, visited)
+		: [];
 	const configuredFallback = isModelRole(role) ? ROLE_CONFIGURED_FALLBACK[role] : undefined;
 	const fallbackPatterns =
 		configured ||
@@ -2093,8 +2097,9 @@ function findExactCliModel(
 export function getAllowedAvailableModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 	settings: Settings | undefined,
+	kind?: Parameters<ModelRegistry["getAvailable"]>[0],
 ): Model<Api>[] {
-	return filterModelsByConfiguredScope(modelRegistry.getAvailable(), settings);
+	return filterModelsByConfiguredScope(modelRegistry.getAvailable(kind), settings);
 }
 
 export interface ResolveCliModelResult {

@@ -64,7 +64,7 @@ function renderCallbackPage(state: object, branding: OAuthCallbackBranding | und
 			? ""
 			: DEFAULT_CALLBACK_BRAND_ICON;
 	const replacements: Record<string, string> = {
-		__OAUTH_STATE__: JSON.stringify(state),
+		__OAUTH_STATE__: serializeCallbackState(state),
 		__OAUTH_BRAND_NAME__: escapeHtml(displayName),
 		__OAUTH_BRAND_ICON__: icon,
 	};
@@ -102,6 +102,11 @@ function isAddressInUse(error: unknown): boolean {
 	const code = (error as { code?: unknown } | null | undefined)?.code;
 	if (typeof code === "string") return code === "EADDRINUSE";
 	return error instanceof Error && /EADDRINUSE|in use/i.test(error.message);
+}
+
+/** Keep JSON data inside the template's script element; JSON.parse restores the original text. */
+function serializeCallbackState(state: unknown): string {
+	return JSON.stringify(state).replaceAll("<", "\\u003c");
 }
 
 /**

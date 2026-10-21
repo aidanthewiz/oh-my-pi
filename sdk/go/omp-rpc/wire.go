@@ -2205,6 +2205,8 @@ func (v *ContextUsage) decodeFrom(raw map[string]json.RawMessage) error {
 type QueuedMessagesState struct {
 	Steering []string `json:"steering"`
 	FollowUp []string `json:"followUp"`
+	// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
+	LiveSteered int64 `json:"liveSteered"`
 }
 
 func (v *QueuedMessagesState) UnmarshalJSON(data []byte) error {
@@ -2216,6 +2218,7 @@ func (v *QueuedMessagesState) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "QueuedMessagesState"}
 	d.required("steering", &out.Steering)
 	d.required("followUp", &out.FollowUp)
+	d.defaulted("liveSteered", &out.LiveSteered, `0`)
 	if d.err != nil {
 		return d.err
 	}
@@ -2561,7 +2564,7 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("queuedMessageCount", &out.QueuedMessageCount, `0`)
 	d.defaulted("hasPendingAsyncWork", &out.HasPendingAsyncWork, `false`)
 	d.defaulted("isSettled", &out.IsSettled, `false`)
-	d.defaulted("queuedMessages", &out.QueuedMessages, `{"steering":[],"followUp":[]}`)
+	d.defaulted("queuedMessages", &out.QueuedMessages, `{"steering":[],"followUp":[],"liveSteered":0}`)
 	d.defaulted("todoPhases", &out.TodoPhases, `[]`)
 	d.scalarOrArray("systemPrompt")
 	d.defaulted("systemPrompt", &out.SystemPrompt, `[]`)
@@ -2597,26 +2600,48 @@ func (v *OutputArtifactError) UnmarshalJSON(data []byte) error {
 	return unknownValue("OutputArtifactError", s)
 }
 
+type ColumnTruncatedRange struct {
+	First int64 `json:"first"`
+	Last  int64 `json:"last"`
+}
+
+func (v *ColumnTruncatedRange) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ColumnTruncatedRange", v.decodeFrom)
+}
+
+func (v *ColumnTruncatedRange) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ColumnTruncatedRange
+	d := fieldDecoder{raw: raw, owner: "ColumnTruncatedRange"}
+	d.required("first", &out.First)
+	d.required("last", &out.Last)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type BashResult struct {
-	Output               string               `json:"output"`
-	Cancelled            bool                 `json:"cancelled"`
-	Truncated            bool                 `json:"truncated"`
-	TotalLines           int64                `json:"totalLines"`
-	TotalBytes           int64                `json:"totalBytes"`
-	OutputLines          int64                `json:"outputLines"`
-	OutputBytes          int64                `json:"outputBytes"`
-	ExitCode             *int64               `json:"exitCode,omitempty"`
-	TimedOut             *bool                `json:"timedOut,omitempty"`
-	ElidedBytes          *int64               `json:"elidedBytes,omitempty"`
-	ElidedLines          *int64               `json:"elidedLines,omitempty"`
-	ColumnDroppedBytes   *int64               `json:"columnDroppedBytes,omitempty"`
-	ColumnTruncatedLines *int64               `json:"columnTruncatedLines,omitempty"`
-	ColumnMax            *int64               `json:"columnMax,omitempty"`
-	ArtifactID           *string              `json:"artifactId,omitempty"`
-	ArtifactElidedBytes  *int64               `json:"artifactElidedBytes,omitempty"`
-	ArtifactError        *OutputArtifactError `json:"artifactError,omitempty"`
-	WorkingDir           *string              `json:"workingDir,omitempty"`
-	Images               []ImageContent       `json:"images,omitempty"`
+	Output               string                `json:"output"`
+	Cancelled            bool                  `json:"cancelled"`
+	Truncated            bool                  `json:"truncated"`
+	TotalLines           int64                 `json:"totalLines"`
+	TotalBytes           int64                 `json:"totalBytes"`
+	OutputLines          int64                 `json:"outputLines"`
+	OutputBytes          int64                 `json:"outputBytes"`
+	ExitCode             *int64                `json:"exitCode,omitempty"`
+	TimedOut             *bool                 `json:"timedOut,omitempty"`
+	ElidedBytes          *int64                `json:"elidedBytes,omitempty"`
+	ElidedLines          *int64                `json:"elidedLines,omitempty"`
+	ColumnDroppedBytes   *int64                `json:"columnDroppedBytes,omitempty"`
+	ColumnTruncatedLines *int64                `json:"columnTruncatedLines,omitempty"`
+	ColumnTruncatedRange *ColumnTruncatedRange `json:"columnTruncatedRange,omitempty"`
+	ColumnMax            *int64                `json:"columnMax,omitempty"`
+	ArtifactID           *string               `json:"artifactId,omitempty"`
+	ArtifactElidedBytes  *int64                `json:"artifactElidedBytes,omitempty"`
+	ArtifactError        *OutputArtifactError  `json:"artifactError,omitempty"`
+	WorkingDir           *string               `json:"workingDir,omitempty"`
+	Images               []ImageContent        `json:"images,omitempty"`
 }
 
 func (v *BashResult) UnmarshalJSON(data []byte) error {
@@ -2639,6 +2664,7 @@ func (v *BashResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("elidedLines", &out.ElidedLines)
 	d.optional("columnDroppedBytes", &out.ColumnDroppedBytes)
 	d.optional("columnTruncatedLines", &out.ColumnTruncatedLines)
+	d.optional("columnTruncatedRange", &out.ColumnTruncatedRange)
 	d.optional("columnMax", &out.ColumnMax)
 	d.optional("artifactId", &out.ArtifactID)
 	d.optional("artifactElidedBytes", &out.ArtifactElidedBytes)
@@ -4427,6 +4453,8 @@ func (v GoalUpdatedEvent) MarshalJSON() ([]byte, error) {
 type QueueUpdateEvent struct {
 	Steering []string `json:"steering"`
 	FollowUp []string `json:"followUp"`
+	// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
+	LiveSteered int64 `json:"liveSteered"`
 }
 
 func (v *QueueUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -4439,6 +4467,7 @@ func (v *QueueUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "queue_update")
 	d.required("steering", &out.Steering)
 	d.required("followUp", &out.FollowUp)
+	d.defaulted("liveSteered", &out.LiveSteered, `0`)
 	if d.err != nil {
 		return d.err
 	}

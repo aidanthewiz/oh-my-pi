@@ -167,6 +167,45 @@ test("picker scope cache invalidates on changed model policy", () => {
 	expect(updated.roles.smol).toBeUndefined();
 });
 
+test("chat picker scope preserves permitted native roles and rejects denied configured runners", () => {
+	const chat = makeModel("provider", "chat");
+	const judge = makeModel("provider", "judge", { kind: "judge" });
+	const blocked = makeModel("provider", "blocked-judge", { kind: "judge" });
+	const settings = Settings.isolated({
+		enabledModels: ["provider/chat", "provider/judge"],
+		modelRoles: { default: "provider/chat", judge: "provider/judge" },
+	});
+	const source = createModelBrowserSource(settings);
+	let unavailable = false;
+	const registry = {
+		getError: () => undefined,
+		getAvailable: () => {
+			if (unavailable) throw new Error("Synthetic runner unavailable");
+			return [chat, judge, blocked];
+		},
+		getAll: () => [chat, judge, blocked],
+	};
+	const cache = new SessionModelScopeCache(source, registry);
+
+	const initial = cache.get([chat]);
+	expect(initial.items.map(item => item.selector)).toEqual(["provider/chat"]);
+	expect(initial.roles.judge?.model).toBe(judge);
+	settings.setModelRole("judge", "provider/blocked-judge");
+	expect(cache.get([chat]).roles.judge).toBeUndefined();
+
+	settings.setModelRole("judge", "provider/judge");
+	unavailable = true;
+	const failed = cache.get([chat]);
+	expect(failed.items.map(item => item.selector)).toEqual(["provider/chat"]);
+	expect(failed.roles.judge).toBeUndefined();
+	expect(failed.error).toBe("Synthetic runner unavailable");
+
+	unavailable = false;
+	const recovered = cache.get([chat]);
+	expect(recovered.roles.judge?.model).toBe(judge);
+	expect(recovered.error).toBeUndefined();
+});
+
 describe("createModelMentionSource", () => {
 	test("refreshes candidates when role settings or availability change between queries", () => {
 		const a = makeModel("a", "example-2");

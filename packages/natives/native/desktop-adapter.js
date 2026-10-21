@@ -21,6 +21,8 @@ const REQUIRED_METHODS = [
 export function adaptDesktopSession(NativeDesktopSession) {
 	const prototype = NativeDesktopSession?.prototype;
 	const missing = REQUIRED_METHODS.filter(method => typeof prototype?.[method] !== "function");
+	const screenState = prototype && Object.getOwnPropertyDescriptor(prototype, "screenState");
+	if (typeof screenState?.get !== "function") missing.push("screenState");
 	if (missing.length === 0) {
 		return NativeDesktopSession;
 	}

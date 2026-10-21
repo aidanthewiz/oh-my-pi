@@ -43,7 +43,7 @@ import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
 import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
-import { upsertStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
+import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
@@ -805,7 +805,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 			const jsonOutputs: unknown[] = [];
 			const images: ImageContent[] = [];
-			const statusEvents: EvalStatusEvent[] = [];
+			const callStatus: StatusEventLog = {};
 			// Oversized displays land in `jsonOutputs` as bounded previews and stream
 			// their full value to the output artifact. Until the artifact write is
 			// confirmed (see `commitDisplaySpills`), the full value is kept here so a
@@ -860,8 +860,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				if (images.length > 0) {
 					details.images = images;
 				}
-				if (statusEvents.length > 0) {
-					details.statusEvents = statusEvents;
+				if (callStatus.statusEvents) {
+					details.statusEvents = callStatus.statusEvents;
+					details.statusEventsElided = callStatus.statusEventsElided;
 				}
 				if (notice) {
 					details.notice = notice;
@@ -935,6 +936,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				cellResult.status = "running";
 				cellResult.output = "";
 				cellResult.statusEvents = undefined;
+				cellResult.statusEventsElided = undefined;
 				cellResult.exitCode = undefined;
 				cellResult.durationMs = undefined;
 				activeLiveCell = { result: cellResult, chars: 0 };
@@ -967,8 +969,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 								idle?.resume();
 								return;
 							}
-							cellResult.statusEvents ??= [];
-							upsertStatusEvent(cellResult.statusEvents, {
+							recordStatusEvent(cellResult, {
 								...event,
 								resolvedThinkingLevel: parseConfiguredThinkingLevel(
 									typeof event.resolvedThinkingLevel === "string" ? event.resolvedThinkingLevel : undefined,
@@ -985,7 +986,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				const durationMs = Date.now() - startTime;
 
-				const cellStatusEvents: EvalStatusEvent[] = [];
+				const cellStatus: StatusEventLog = {};
 				const cellDisplayTexts: string[] = [];
 				const cellImageNotes: string[] = [];
 				let cellHasMarkdown = false;
@@ -1037,8 +1038,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 									: undefined,
 							),
 						};
-						upsertStatusEvent(statusEvents, event);
-						upsertStatusEvent(cellStatusEvents, event);
+						recordStatusEvent(callStatus, event);
+						recordStatusEvent(cellStatus, event);
 					}
 					if (output.type === "markdown") {
 						cellHasMarkdown = true;
@@ -1061,7 +1062,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				cellResult.output = cellOutput;
 				cellResult.exitCode = result.exitCode;
 				cellResult.durationMs = durationMs;
-				cellResult.statusEvents = cellStatusEvents.length > 0 ? cellStatusEvents : undefined;
+				cellResult.statusEvents = cellStatus.statusEvents;
+				cellResult.statusEventsElided = cellStatus.statusEventsElided;
 				cellResult.hasMarkdown = cellHasMarkdown || undefined;
 
 				if (cellOutput) {
@@ -1087,7 +1089,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						languages,
 						cells: cellResults,
 						jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-						statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
+						statusEvents: callStatus.statusEvents,
+						statusEventsElided: callStatus.statusEventsElided,
 						isError: true,
 					};
 					if (notice) details.notice = notice;
@@ -1121,7 +1124,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				languages,
 				cells: cellResults,
 				jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-				statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
+				statusEvents: callStatus.statusEvents,
+				statusEventsElided: callStatus.statusEventsElided,
 			};
 			if (notice) details.notice = notice;
 
@@ -1168,6 +1172,7 @@ async function summarizeFinal(
 		artifactError: rawSummary.artifactError,
 		columnDroppedBytes: rawSummary.columnDroppedBytes,
 		columnTruncatedLines: rawSummary.columnTruncatedLines,
+		columnTruncatedRange: rawSummary.columnTruncatedRange,
 		columnMax: rawSummary.columnMax,
 	};
 }

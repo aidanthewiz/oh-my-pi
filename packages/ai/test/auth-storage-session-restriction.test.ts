@@ -232,6 +232,40 @@ describe("AuthStorage session account restrictions", () => {
 		expect(exchanged).toEqual(["access-b"]);
 	});
 
+	test("permits only allowed accounts for a restricted session", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		const [accountA, accountB] = storage.oauth.accounts(PROVIDER);
+		if (!accountA || !accountB) throw new Error("expected stored accounts");
+		const lease = storage.sessions.restrict(PROVIDER, "session", ["account:acc-a"]);
+
+		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(true);
+		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(false);
+		expect(storage.sessions.permits(PROVIDER, "unrestricted", accountB.credentialId)).toBe(true);
+
+		storage.sessions.unrestrict(PROVIDER, "session", lease);
+		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(true);
+	});
+
+	test("checks durable credential ids after pool reorder and removal", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		const [accountA, accountB] = storage.oauth.accounts(PROVIDER);
+		if (!accountA || !accountB) throw new Error("expected stored accounts");
+		storage.sessions.restrict(PROVIDER, "session", ["account:acc-a"]);
+
+		await storage.credentials.set(PROVIDER, [oauthCredential("b"), oauthCredential("a")]);
+		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(true);
+		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(false);
+		expect(await storage.keys.get(PROVIDER, "session")).toBe("access-a");
+
+		await storage.credentials.set(PROVIDER, [oauthCredential("b"), oauthCredential("c")]);
+		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(false);
+		for (const account of storage.oauth.accounts(PROVIDER)) {
+			expect(storage.sessions.permits(PROVIDER, "session", account.credentialId)).toBe(false);
+		}
+		await expect(storage.keys.get(PROVIDER, "session")).rejects.toThrow("restricted to its OAuth account pool");
+		expect(exchanged).toEqual(["access-a"]);
+	});
+
 	test("keeps restrictions across a credential store replacement", async () => {
 		const lease = storage.sessions.restrict(PROVIDER, "session", ["account:acc-b"]);
 		const replacement = await SqliteAuthCredentialStore.open(path.join(tempDir, "replacement.db"));

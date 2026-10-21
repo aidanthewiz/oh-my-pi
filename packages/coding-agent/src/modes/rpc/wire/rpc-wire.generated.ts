@@ -418,6 +418,8 @@ export interface ContextUsage {
 export interface QueuedMessagesState {
 	steering: string[];
 	followUp: string[];
+	/** Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them. */
+	liveSteered?: number;
 }
 
 export interface ToolDescriptor {
@@ -518,6 +520,11 @@ export interface SessionState {
 
 export type OutputArtifactError = "open" | "write" | "flush" | "end";
 
+export interface ColumnTruncatedRange {
+	first: number;
+	last: number;
+}
+
 export interface BashResult {
 	output: string;
 	cancelled: boolean;
@@ -532,6 +539,7 @@ export interface BashResult {
 	elidedLines?: number;
 	columnDroppedBytes?: number;
 	columnTruncatedLines?: number;
+	columnTruncatedRange?: ColumnTruncatedRange;
 	columnMax?: number;
 	artifactId?: string;
 	artifactElidedBytes?: number;
@@ -996,6 +1004,8 @@ export interface QueueUpdateEvent {
 	type: "queue_update";
 	steering: string[];
 	followUp: string[];
+	/** Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them. */
+	liveSteered?: number;
 }
 
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */

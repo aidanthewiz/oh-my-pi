@@ -240,11 +240,11 @@ describe("Factory Droid completions reasoning matrix", () => {
 		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "answer" }));
 	});
 
-	it.each(["minimax-m3", "mistral-medium-3.5"])(
+	it.each(["minimax-m3", "mistral-medium-3.5", "mistral-large-4"])(
 		"preserves %s reasoning over two tool turns with native implicit effort",
 		async modelId => {
-			const model = modelId === "minimax-m3" ? factoryModel(modelId) : mistralMedium35();
-			if (modelId === "minimax-m3") model.factoryDroidOrgId = "org-1";
+			const model = factoryModel(modelId);
+			model.factoryDroidOrgId = "org-1";
 			const captured: CapturedRequest[] = [];
 			const messages: Message[] = [{ role: "user", content: "inspect twice", timestamp: 1 }];
 			for (let turn = 0; turn < 3; turn++) {
@@ -264,7 +264,7 @@ describe("Factory Droid completions reasoning matrix", () => {
 						tools: [{ name: "Read", description: "read", parameters: type({}) }],
 					},
 					{
-						apiKey: modelId === "minimax-m3" ? WORKOS_TOKEN : "workos-token",
+						apiKey: WORKOS_TOKEN,
 						fetch: captureFetch(captured, [
 							JSON.stringify({
 								id: `turn${turn}`,
@@ -276,7 +276,7 @@ describe("Factory Droid completions reasoning matrix", () => {
 						]),
 					},
 				).result();
-				expect(result.stopReason).toBe("toolUse");
+				expect(result.stopReason, result.errorMessage).toBe("toolUse");
 				const call = result.content.find(block => block.type === "toolCall");
 				if (!call || call.type !== "toolCall") throw new Error("Missing tool call");
 				messages.push(result, {

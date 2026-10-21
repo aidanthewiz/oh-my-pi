@@ -12,6 +12,18 @@
 - Scoped Google OAuth model caches to credentials and discovery endpoints, plus Gemini CLI projects. Startup restores only the current credential's cached catalog.
 - Keep the Anthropic inline-image byte budget off custom endpoints, including legacy models with official-endpoint compatibility rules.
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
+- Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
+- Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+
+## [18.9.0] - 2026-10-11
+
+### Fixed
+
+- Fixed GLM-5.3-FlashX on Zhipu Coding Plan so bundled context, image, and reasoning-level capabilities are reported correctly.
+- Fixed OpenRouter Decisions endpoint derivation when the chat base URL has a trailing slash.
+- Fixed GPT-6.1 Sol Ultrafast usage pricing to apply OpenAI's published premium rates for the OpenAI API and Codex included usage.
+- Fixed GPT-6 Sol, GPT-6.1 Sol, and GPT-6 Luna so changing reasoning effort preserves prompt caching.
+
 ## [18.8.8] - 2026-10-10
 
 ### Added

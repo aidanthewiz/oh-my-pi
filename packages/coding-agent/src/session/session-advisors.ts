@@ -67,6 +67,7 @@ import {
 	formatAdvisorBatchContent,
 	getOrCreateAdvisorProviderSessionId,
 	isAdvisorInterruptImmuneTurnActive,
+	isClassifierRefusal,
 	isInterruptingSeverity,
 	quarantineAdvisorUnsafeOutput,
 	resolveAdvisorDeliveryChannel,
@@ -110,6 +111,7 @@ import {
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
 	type RetryFallbackSelector,
+	retryFallbackAdmits,
 } from "./retry-fallback-chains";
 import { getOpenAiRemoteCompactionPayload } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
@@ -308,6 +310,8 @@ interface AdvisorRetryFallbackState {
 	originalSelector: string;
 	originalThinkingLevel: ThinkingLevel;
 	lastAppliedThinkingLevel: ThinkingLevel;
+	/** Set by a classifier refusal: no cooldown restore until a compaction or new conversation replaces the context. */
+	pinned: boolean;
 }
 
 interface ActiveAdvisor {
@@ -903,9 +907,12 @@ export class SessionAdvisors {
 		for (const advisor of this.#advisors) this.#refreshAdvisorProviderIdentity(advisor);
 	}
 
-	/** Re-primes advisor transcript views after an in-conversation history rewrite. */
-	resetAllRuntimes(reason?: string): void {
-		this.#resetAllAdvisorRuntimes(reason);
+	/**
+	 * Re-primes advisor transcript views after an in-conversation history rewrite.
+	 * `compacted` marks a rewrite that replaced history with a summary, which releases refusal pins.
+	 */
+	resetAllRuntimes(reason?: string, options?: { compacted?: boolean }): void {
+		this.#resetAllAdvisorRuntimes(reason, options?.compacted === true);
 	}
 
 	/** Re-aligns advisor delivered prefixes after an in-place rewrite their contexts already cover. */
@@ -1057,6 +1064,7 @@ export class SessionAdvisors {
 			// A reset aborts any pending usage-limit wait; clear its budget so the new
 			// conversation starts with a fresh retry allowance (issue #11947).
 			a.usageLimitRetries = 0;
+			this.#releaseRefusalPin(a);
 			// Resets the emission guard and every tool-side note state together.
 			a.adviseTool.resetDeliveredNotes();
 			a.eligibleUpdates = 0;
@@ -1885,12 +1893,13 @@ export class SessionAdvisors {
 	}
 
 	/** Re-prime every advisor's transcript view after an in-conversation history rewrite. */
-	#resetAllAdvisorRuntimes(reason?: string): void {
+	#resetAllAdvisorRuntimes(reason: string | undefined, compacted: boolean): void {
 		for (const a of this.#advisors) {
 			a.runtime.reset(reason);
 			// Match the conversation-boundary re-prime: a reset must not carry a
 			// pending wait's usage-limit budget into the reset conversation.
 			a.usageLimitRetries = 0;
+			if (compacted) this.#releaseRefusalPin(a);
 		}
 	}
 
@@ -1994,10 +2003,17 @@ export class SessionAdvisors {
 		);
 	}
 
+	/** Release refusal pins so the next review may retry the configured primary. */
+	#releaseRefusalPin(advisor: ActiveAdvisor): void {
+		if (advisor.retryFallback) advisor.retryFallback.pinned = false;
+	}
+
 	/** Restore an advisor's configured primary once its fallback cooldown expires. */
 	async #maybeRestoreAdvisorRetryFallbackPrimary(advisor: ActiveAdvisor, signal: AbortSignal): Promise<void> {
 		const fallback = advisor.retryFallback;
-		if (!fallback || getRetryFallbackRevertPolicy(this.#host.settings) !== "cooldown-expiry") return;
+		if (!fallback || fallback.pinned || getRetryFallbackRevertPolicy(this.#host.settings) !== "cooldown-expiry") {
+			return;
+		}
 
 		const originalSelector = parseRetryFallbackSelector(fallback.originalSelector, this.#host.modelRegistry);
 		if (!originalSelector) {
@@ -2150,6 +2166,7 @@ export class SessionAdvisors {
 					)
 				: Promise.resolve(false);
 		if (!retrySettings.enabled || !retrySettings.modelFallback) return declineUsageLimit();
+		if (!retryFallbackAdmits(retrySettings.fallbackOn, usageLimit)) return declineUsageLimit();
 		// Same two-key walk the main loop uses: the chain that owns this advisor's
 		// active fallback, then the chain the current model owns. Without the
 		// second key an advisor that lands on the last entry of one chain never
@@ -2164,7 +2181,13 @@ export class SessionAdvisors {
 			return declineUsageLimit();
 		}
 
-		this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		// A refusal by the advisor's primary judges this context, not the model's health:
+		// skip its cooldown and pin the switch. A refusing fallback gets the usual cooldown.
+		const primaryRefused =
+			assistantFailure !== undefined &&
+			isClassifierRefusal(assistantFailure) &&
+			(advisor.retryFallback === undefined || advisor.retryFallback.originalSelector === currentSelector);
+		if (!primaryRefused) this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
 		for (const role of chainKeys) {
 			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
@@ -2187,12 +2210,14 @@ export class SessionAdvisors {
 				const nextThinkingLevel = this.#setAdvisorModel(advisor, candidate, requestedThinkingLevel);
 				if (advisor.retryFallback) {
 					advisor.retryFallback.lastAppliedThinkingLevel = nextThinkingLevel;
+					advisor.retryFallback.pinned ||= primaryRefused;
 				} else {
 					advisor.retryFallback = {
 						role,
 						originalSelector: currentSelector,
 						originalThinkingLevel,
 						lastAppliedThinkingLevel: nextThinkingLevel,
+						pinned: primaryRefused,
 					};
 				}
 				advisor.retryFallbackPendingSuccess = true;
@@ -2594,6 +2619,7 @@ export class SessionAdvisors {
 		} satisfies AdvisorCompactionSummaryMessage;
 
 		agent.replaceMessages([summaryMessage, ...recentMessages]);
+		this.#releaseRefusalPin(advisor);
 		return false;
 	}
 	/**

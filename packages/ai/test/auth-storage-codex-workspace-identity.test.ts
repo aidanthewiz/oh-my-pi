@@ -21,6 +21,8 @@ import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	AuthStorage,
+	isSameOAuthAccount,
+	type OAuthCredential,
 	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
@@ -66,6 +68,43 @@ function readIdentityRows(dbPath: string): Array<{ identity_key: string | null; 
 		db.close();
 	}
 }
+
+describe("OAuth account ownership", () => {
+	const alice: OAuthCredential = {
+		type: "oauth",
+		access: "synthetic-access",
+		refresh: "synthetic-refresh",
+		expires: 0,
+		email: "alice@example.com",
+		accountId: TEAM_WS,
+		orgId: TEAM_WS,
+	};
+
+	it("does not grant ownership through shared workspace or project ids", () => {
+		expect(isSameOAuthAccount(alice, { ...alice, email: "bob@example.com" })).toBe(false);
+		expect(isSameOAuthAccount(alice, { ...alice, email: undefined })).toBe(false);
+		expect(
+			isSameOAuthAccount(
+				{ ...alice, email: undefined, accountId: undefined, projectId: "shared-project" },
+				{ ...alice, email: undefined, accountId: undefined, projectId: "shared-project" },
+			),
+		).toBe(false);
+	});
+
+	it("keeps subscription ownership separate while normalizing the same user", () => {
+		expect(isSameOAuthAccount(alice, { ...alice, orgId: PERSONAL_WS })).toBe(false);
+		expect(isSameOAuthAccount(alice, { ...alice, email: " ALICE@EXAMPLE.COM " })).toBe(true);
+		expect(
+			isSameOAuthAccount({ ...alice, accountId: "user-123" }, { ...alice, email: undefined, accountId: "user-123" }),
+		).toBe(true);
+		expect(
+			isSameOAuthAccount(
+				{ ...alice, accountId: "user-123" },
+				{ ...alice, email: "bob@example.com", accountId: "user-123" },
+			),
+		).toBe(false);
+	});
+});
 
 describe("openai-codex workspace-scoped credential identity", () => {
 	let tempDir = "";

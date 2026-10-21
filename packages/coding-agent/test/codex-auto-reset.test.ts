@@ -18,12 +18,13 @@
  *   consent, live credit eligibility, terminal dedupe, and account cooldown.
  */
 import { describe, expect, it } from "bun:test";
-import type { UsageReport } from "@oh-my-pi/pi-ai";
+import type { ResetCreditTarget, UsageReport } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	ATTEMPT_COOLDOWN_MS,
 	blockedAttemptKey,
 	type CodexResetPlanInput,
+	headlessApprovedResetActions,
 	IMMINENT_RESET_EXPIRY_MS,
 	isTerminalRedeemOutcome,
 	planCodexResetRedemptions,
@@ -151,6 +152,27 @@ function input(reports: UsageReport[] | null, overrides: Partial<CodexResetPlanI
 		...overrides,
 	};
 }
+
+it.each(["blocked", "sweep"] as const)("keeps imminent salvage inside the session pool during %s", trigger => {
+	const plan = planCodexResetRedemptions(
+		input(
+			[
+				report({ accountId: "acct-a", creditExpiries: [4 * 60_000] }),
+				report({ accountId: "acct-b", creditExpiries: [4 * 60_000] }),
+			],
+			{
+				trigger,
+				permitsCredential: id => id === CREDENTIAL_ID_BY_ACCOUNT["acct-b"],
+			},
+		),
+	);
+	expect(plan.actions.map(action => action.target)).toEqual([
+		expect.objectContaining({ provider: "openai-codex", credentialId: CREDENTIAL_ID_BY_ACCOUNT["acct-b"] }),
+	]);
+	expect(plan.skipped).toContainEqual(
+		expect.objectContaining({ rule: "expiring-credit", reason: "outside-account-pool" }),
+	);
+});
 
 describe("planCodexResetRedemptions: blocked-account", () => {
 	it("restores a weekly-only block (5h has headroom) far from the natural reset", () => {
@@ -520,6 +542,20 @@ describe("planCodexResetRedemptions: blocked-account", () => {
 		]);
 	});
 
+	it("never restores a sibling outside the session's account pool when the active account has no credits", () => {
+		const active = report({ credits: 0 });
+		const excluded = report({ accountId: "acct-sib", email: "sib@example.com", credits: 2 });
+		const plan = planCodexResetRedemptions(
+			input([active, excluded], { permitsCredential: credentialId => credentialId === CREDENTIAL_ID }),
+		);
+		expect(plan.actions).toEqual([]);
+		expect(plan.skipped).toContainEqual({
+			accountKey: "openai-codex|-|2",
+			rule: "blocked-account",
+			reason: "outside-account-pool",
+		});
+	});
+
 	it("prefers the active account over an otherwise better sibling", () => {
 		const active = report({ credits: 1 });
 		const sibling = report({ accountId: "acct-sib", email: "sib@example.com", credits: 3 });
@@ -877,6 +913,18 @@ describe("codexResets policy plumbing", () => {
 		expect(isTerminalRedeemOutcome("nothing_to_reset")).toBe(false);
 		expect(isTerminalRedeemOutcome("http_500")).toBe(false);
 		expect(isTerminalRedeemOutcome("credit_list_failed")).toBe(false);
+	});
+
+	it("approves only resets expiring within five minutes for a headless unset host, pinned to that credit", () => {
+		const target: ResetCreditTarget = { provider: "openai-codex", credentialId: CREDENTIAL_ID };
+		const actions = [
+			{ target, creditId: "dying", expiresInMs: IMMINENT_RESET_EXPIRY_MS },
+			{ target, creditId: "later", expiresInMs: IMMINENT_RESET_EXPIRY_MS + 1 },
+			{ target, expiresInMs: undefined },
+		];
+		expect(headlessApprovedResetActions(actions)).toEqual([
+			{ ...actions[0], target: { ...target, creditId: "dying" } },
+		]);
 	});
 
 	it("migrates legacy boolean autoRedeem config to the tri-state policy", () => {

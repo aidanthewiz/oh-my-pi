@@ -3,6 +3,7 @@ import { setInteractiveHost } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import type { AgentSession } from "../../src/session/agent-session";
 import type { EphemeralTurnResult } from "../../src/session/agent-session-types";
+import { SessionManager } from "../../src/session/session-manager";
 import { isCompletionProbeEnabled, startCompletionProbe } from "../../src/task/completion-probe";
 
 async function advance(ms: number): Promise<void> {
@@ -14,6 +15,7 @@ function probeSession(runEphemeralTurn: AgentSession["runEphemeralTurn"]): Agent
 	return {
 		isStreaming: true,
 		agent: { state: {} },
+		sessionManager: SessionManager.inMemory("/test"),
 		runEphemeralTurn,
 	} as unknown as AgentSession;
 }

@@ -71,6 +71,17 @@ export class SessionAccountPoolScope {
 		this.#leases.set(sessionId, leases);
 	}
 
+	/** Admit an exact reset credential only while this scope still owns its authorization. */
+	permitsCredential(provider: string, sessionId: string, credentialId: number): boolean {
+		if (this.#released) return false;
+		try {
+			this.#assertOwnsRestriction(provider, sessionId);
+		} catch {
+			return false;
+		}
+		return this.#authStorage.sessions.permits(provider, sessionId, credentialId);
+	}
+
 	/** Make `sessionId` the session's primary id: restricted, and the id for lookups that carry none. */
 	adopt(sessionId: string): void {
 		this.restrict(sessionId);

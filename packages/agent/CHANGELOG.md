@@ -5,6 +5,12 @@
 ### Fixed
 
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
+## [18.9.0] - 2026-10-11
+
+### Fixed
+
+- Fixed stale queue updates when queued steering is adopted, withdrawn, or added to the transcript, ensuring queue listeners consistently receive the latest state.
+
 ## [18.8.8] - 2026-10-10
 
 ### Added

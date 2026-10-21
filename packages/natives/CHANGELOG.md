@@ -17,6 +17,27 @@
 - Resolve both lexical and canonical native archive imports during in-memory embedding without writing generated archives to disk.
 - Build development-profile addons from Cargo's `debug` output directory.
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
+- Reject desktop addons without live screen-state support before opening a session instead of using an incomplete desktop ABI.
+- Validate desktop screen-state getter descriptors without invoking native state during module import or constructing a desktop session.
+
+## [18.9.0] - 2026-10-11
+
+### Added
+
+- Added `applyBinaryPatch(oldPath, patchPath, outPath)` for applying HDiffPatch single-stream delta patches, including zstd-compressed patches, to files.
+- macOS desktop sessions now keep the display awake while in use and expose screen-lock and display-sleep state through capabilities, `screenState`, and screen captures.
+
+### Changed
+
+- Improved Linux embedded-shell startup performance for external commands.
+- Improved macOS computer-use performance, including faster screenshots and accessibility queries, with better handling of large numbers of off-screen windows.
+- Updated `grep()` and `search()` to truncate matching lines around the first match when they exceed `maxColumns`, mark truncated sides with `...`, and report the match's character column.
+
+### Fixed
+
+- Fixed macOS accessibility and window-management operations requiring Screen Recording permission; only screenshots and display listing now require that permission, and window listing includes windows beyond the frontmost 48. Window titles from other applications remain unavailable without Screen Recording permission.
+- Fixed macOS menu inspection and selection for menus containing items whose titles cannot be read; those items are now skipped safely.
+- Fixed syntax highlighting and language detection for several languages, including TOML, PowerShell, SCSS, Less, Vim script, GraphQL, Protobuf, Terraform/HCL, Dockerfile, CMake, INI, gitignore, Kotlin, Swift, Elixir, Sass, Python f-strings, Julia interpolations, and Elixir interpolations.
 
 ## [18.8.8] - 2026-10-10
 

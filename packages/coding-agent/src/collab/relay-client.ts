@@ -49,6 +49,15 @@ export const HOST_RECLAIM_BACKOFF_MAX_MS = 5_000;
  * a doomed socket.
  */
 export const HOST_RECLAIM_CONFIRM_MS = 1_000;
+/**
+ * How often an open relay socket is pinged. A network that drops without a
+ * reset (Wi-Fi lost, a laptop sleeping) leaves the socket reading as open, and
+ * nothing reveals the loss until the next write: an idle host would stay
+ * unreachable, its room long since retired by the relay, until someone typed.
+ */
+export const RELAY_PING_INTERVAL_MS = 15_000;
+/** A socket that has heard nothing, not even a pong, for this long is dropped and retried. */
+export const RELAY_SILENCE_LIMIT_MS = 40_000;
 const MAX_PENDING_SENDS = 256;
 const MAX_PENDING_SEND_BYTES = 16 * 1024 * 1024;
 /**
@@ -121,6 +130,9 @@ export class CollabSocket {
 	/** A reclaim-time open not yet confirmed by the relay: not writable, not reported open. */
 	#provisional: WebSocket | undefined;
 	#confirmTimer: NodeJS.Timeout | undefined;
+	#heartbeatTimer: NodeJS.Timeout | undefined;
+	/** When the current socket last received anything, pongs included. */
+	#lastHeard = 0;
 	#sending = false;
 	#sendGeneration = 0;
 	#wakeSender: (() => void) | undefined;
@@ -471,6 +483,7 @@ export class CollabSocket {
 		const hadActivity = this.#ws !== null || this.#retryTimer !== undefined || this.#opening;
 		this.#clearRetry();
 		this.#clearProvisional();
+		this.#stopHeartbeat();
 		const wasClosed = this.#closed;
 		this.#closed = true;
 		this.#openingGeneration++;
@@ -532,6 +545,7 @@ export class CollabSocket {
 		this.#ws = ws;
 		ws.onopen = () => {
 			if (this.#ws !== ws) return;
+			this.#startHeartbeat(ws);
 			if (authToken) {
 				ws.send(JSON.stringify({ t: "auth", token: authToken }));
 				return;
@@ -541,11 +555,15 @@ export class CollabSocket {
 		};
 		ws.onmessage = (event: MessageEvent) => {
 			if (this.#ws !== ws) return;
+			this.#lastHeard = Date.now();
 			// The relay only talks to a host it accepted; commit before dispatching so
 			// the room reset still precedes every frame.
 			if (this.#provisional === ws) this.#commitOpen(ws);
 			this.#handleMessage(ws, event.data);
 		};
+		ws.addEventListener("pong", () => {
+			if (this.#ws === ws) this.#lastHeard = Date.now();
+		});
 		ws.onerror = () => {
 			// The paired close event carries the actionable state; nothing to do here.
 		};
@@ -554,6 +572,7 @@ export class CollabSocket {
 			this.#clearBackpressureDrain();
 			this.#authenticated = false;
 			this.#clearProvisional();
+			this.#stopHeartbeat();
 			this.#ws = null;
 			this.#handleClose(event.code, event.reason);
 		};
@@ -567,6 +586,50 @@ export class CollabSocket {
 			return;
 		}
 		this.#commitOpen(ws);
+	}
+
+	/**
+	 * Pings `ws` every {@link RELAY_PING_INTERVAL_MS} and treats it as a transient
+	 * drop once it has heard nothing for {@link RELAY_SILENCE_LIMIT_MS}. No close
+	 * handshake can finish over a dead network, so the socket is terminated and the
+	 * drop handled here rather than waiting for a close event that may never come.
+	 */
+	#startHeartbeat(ws: WebSocket): void {
+		this.#stopHeartbeat();
+		this.#lastHeard = Date.now();
+		this.#heartbeatTimer = setInterval(() => {
+			if (this.#ws !== ws) {
+				this.#stopHeartbeat();
+				return;
+			}
+			if (Date.now() - this.#lastHeard <= RELAY_SILENCE_LIMIT_MS) {
+				try {
+					ws.ping();
+				} catch {
+					// A failed write surfaces as the socket's own close event.
+				}
+				return;
+			}
+			logger.debug("collab: relay connection went silent; reconnecting", { role: this.#opts.role });
+			this.#clearBackpressureDrain();
+			this.#clearProvisional();
+			this.#stopHeartbeat();
+			this.#authenticated = false;
+			this.#ws = null;
+			try {
+				ws.terminate();
+			} catch {
+				// already gone
+			}
+			this.#handleClose(1006, "relay stopped responding");
+		}, RELAY_PING_INTERVAL_MS);
+	}
+
+	#stopHeartbeat(): void {
+		if (this.#heartbeatTimer !== undefined) {
+			clearInterval(this.#heartbeatTimer);
+			this.#heartbeatTimer = undefined;
+		}
 	}
 
 	#commitOpen(ws: WebSocket): void {
@@ -739,6 +802,7 @@ export class CollabSocket {
 		this.#authenticated = false;
 		this.#clearRetry();
 		this.#clearProvisional();
+		this.#stopHeartbeat();
 		this.#discardPendingSends();
 		const ws = this.#ws;
 		this.#ws = null;

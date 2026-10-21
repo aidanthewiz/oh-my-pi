@@ -21,6 +21,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CacheWarmer } from "@oh-my-pi/pi-coding-agent/session/cache-warmer";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createCodexAutoRedeemCoordinator } from "@oh-my-pi/pi-coding-agent/session/codex-auto-reset";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -103,6 +104,8 @@ describe("AgentSession account pools after a dispose deadline", () => {
 			);
 			extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
 		}
+		const codexResetCoordinator = createCodexAutoRedeemCoordinator();
+		codexResetCoordinator.resetLockPath = path.join(tempDir.path(), "reset-fences");
 		const session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [] } }),
 			sessionManager,
@@ -113,6 +116,7 @@ describe("AgentSession account pools after a dispose deadline", () => {
 			providerSessionId: PROVIDER_SESSION_ID,
 			accountPoolScope,
 			cacheWarmer,
+			codexResetCoordinator,
 		});
 		sessions.push(session);
 
@@ -145,6 +149,60 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		}
 		return { session, released: released.promise };
 	}
+
+	it("does not spend a manual reset through a superseded session's restriction", async () => {
+		const { session: stale } = await createPooledSession();
+		await createPooledSession(undefined, undefined, "email:b@example.com|org:org-b");
+		const b = authStorage.oauth
+			.accounts("anthropic", PROVIDER_SESSION_ID)
+			.find(account => account.email === "b@example.com")!;
+		const redeem = vi.spyOn(authStorage.resets, "redeem").mockImplementation(async () => {
+			throw new Error("A denied reset must not reach provider redemption");
+		});
+		const result = await stale.redeemResetCredit({
+			provider: "anthropic",
+			credentialId: b.credentialId,
+			email: b.email,
+			orgId: b.orgId,
+			creditId: "synthetic-credit",
+		});
+		expect(result).toMatchObject({ ok: false, code: "no_account" });
+		expect(redeem).not.toHaveBeenCalled();
+	});
+
+	it("retains reset authorization until an already-started redemption physically settles", async () => {
+		const { session } = await createPooledSession();
+		const accounts = authStorage.oauth.accounts("anthropic", PROVIDER_SESSION_ID);
+		const c = accounts.find(account => account.email === "c@example.com")!;
+		const b = accounts.find(account => account.email === "b@example.com")!;
+		const entered = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<void>();
+		vi.spyOn(authStorage.resets, "redeem").mockImplementation(async () => {
+			entered.resolve();
+			await response.promise;
+			return { ok: true, code: "reset", provider: "anthropic", creditId: "synthetic-credit" };
+		});
+		const redemption = session.redeemResetCredit({
+			provider: "anthropic",
+			credentialId: c.credentialId,
+			email: c.email,
+			orgId: c.orgId,
+			creditId: "synthetic-credit",
+		});
+		await entered.promise;
+		expect(session.hasPostPromptWork).toBe(true);
+		let disposed = false;
+		const disposing = session.dispose().then(() => {
+			disposed = true;
+		});
+		await Promise.resolve();
+		expect(disposed).toBe(false);
+		expect(authStorage.sessions.permits("anthropic", PROVIDER_SESSION_ID, b.credentialId)).toBe(false);
+		response.resolve();
+		await expect(redemption).resolves.toMatchObject({ code: "reset" });
+		await disposing;
+		expect(authStorage.sessions.permits("anthropic", PROVIDER_SESSION_ID, b.credentialId)).toBe(true);
+	});
 
 	async function pastDisposeDeadline<T>(start: () => Promise<T>): Promise<T> {
 		const armed = Promise.withResolvers<void>();

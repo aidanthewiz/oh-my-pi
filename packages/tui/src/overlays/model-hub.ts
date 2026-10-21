@@ -60,6 +60,7 @@ import {
 	thinkingDotToken,
 	type RoleAssignments,
 	resolveRoleAssignments,
+	scopedRolePool,
 	sortModelItems,
 } from "./model-browser";
 import {
@@ -600,22 +601,10 @@ export class ModelHubComponent implements Component {
 		return this.#settings.knownRoleIds.filter(role => !this.#settings.getRoleInfo(role).hidden);
 	}
 
-	/** Resolve fuzzy selectors and role aliases before intersecting a narrowed inventory. */
 	#applyConfiguredPolicy(models: Model[]): Model[] {
 		if (!this.#settings.scopeModels) return models;
 		const allowed = this.#settings.scopeModels(this.#registry.getAll("all"));
 		return models.filter(model => allowed.some(candidate => modelsAreEqual(candidate, model)));
-	}
-
-	/** CLI scope narrows chat cycling; managed policy still applies to every runner. */
-	#scopedPool(): Model[] {
-		const pool = this.#scopedModels.map(scoped => scoped.model);
-		for (const model of this.#registry.getAvailable("all")) {
-			if (modelKind(model) === "chat") continue;
-			if (this.#scopedModels.some(scoped => modelsAreEqual(scoped.model, model))) continue;
-			pool.push(model);
-		}
-		return this.#applyConfiguredPolicy(pool);
 	}
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
@@ -639,7 +628,12 @@ export class ModelHubComponent implements Component {
 		if (this.#scopedModels.length > 0) {
 			this.#configError = undefined;
 			try {
-				allModels = this.#scopedPool();
+				allModels = this.#applyConfiguredPolicy(
+					scopedRolePool(
+						this.#scopedModels.map(scoped => scoped.model),
+						this.#registry,
+					),
+				);
 			} catch (error) {
 				this.#configError = error instanceof Error ? error.message : String(error);
 				const scopedModels = this.#scopedModels.map(scoped => scoped.model);
@@ -1259,7 +1253,12 @@ export class ModelHubComponent implements Component {
 			scope === "project" ? this.#settings.getProjectModelRole(role) : this.#settings.getGlobalModelRole(role);
 		const allModels =
 			this.#scopedModels.length > 0
-				? this.#scopedPool()
+				? this.#applyConfiguredPolicy(
+						scopedRolePool(
+							this.#scopedModels.map(scoped => scoped.model),
+							this.#registry,
+						),
+					)
 				: (this.#settings.scopeModels?.(this.#registry.getAll("all")) ?? this.#registry.getAll("all"));
 		const roleLookup: ModelRoleLookup = {
 			getModelRole: scopedRole =>

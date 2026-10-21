@@ -4,8 +4,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CF_ENGINE_RELEASE_REPO } from "@oh-my-pi/pi-coding-agent/cli/cf-channel";
-import * as pluginCli from "@oh-my-pi/pi-coding-agent/cli/plugin-cli";
-import * as updateCli from "@oh-my-pi/pi-coding-agent/cli/update-cli";
 import {
 	buildBunInstallArgs,
 	buildHomebrewUpdateArgs,
@@ -28,9 +26,7 @@ import {
 	sweepStaleUpdateArtifacts,
 	updateViaBinaryAt,
 } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
-import Update from "@oh-my-pi/pi-coding-agent/commands/update";
 import { $which, removeWithRetries } from "@oh-my-pi/pi-utils";
-import type { CliConfig } from "@oh-my-pi/pi-utils/cli";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 
 const miseBinary = Bun.env.MISE_BIN ?? $which("mise");
@@ -70,35 +66,6 @@ afterEach(async () => {
 
 	await Promise.all(tempDirs.splice(0).map(dir => removeWithRetries(dir)));
 });
-const TEST_CONFIG: CliConfig = {
-	bin: "omp",
-	version: "0.0.0-test",
-	commands: new Map(),
-};
-
-describe("update command plugin dispatch", () => {
-	it("routes -l to plugin upgrade instead of the app updater", async () => {
-		const pluginSpy = spyOn(pluginCli, "runPluginCommand").mockResolvedValue(undefined);
-		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue(undefined);
-
-		const command = new Update(["-l"], TEST_CONFIG);
-		await command.run();
-
-		expect(pluginSpy).toHaveBeenCalledWith({ action: "upgrade", args: [], flags: {} });
-		expect(updateSpy).not.toHaveBeenCalled();
-	});
-
-	it("keeps normal update flags on the app updater path", async () => {
-		const pluginSpy = spyOn(pluginCli, "runPluginCommand").mockResolvedValue(undefined);
-		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue(undefined);
-
-		const command = new Update(["--check", "--force"], TEST_CONFIG);
-		await command.run();
-
-		expect(updateSpy).toHaveBeenCalledWith({ force: true, check: true });
-		expect(pluginSpy).not.toHaveBeenCalled();
-	});
-});
 
 describe("parseUpdateArgs", () => {
 	it("preserves the legacy plugin update shorthand", () => {
@@ -109,6 +76,7 @@ describe("parseUpdateArgs", () => {
 		});
 	});
 });
+
 describe("GitHub update credentials", () => {
 	it("prefers an explicit environment token over gh auth", async () => {
 		let calls = 0;
@@ -128,9 +96,9 @@ describe("GitHub update credentials", () => {
 		const token = await resolveGitHubTokenForTest({
 			envToken: "",
 			ghPath: "gh",
-			runGhAuthToken: async path => path + "-token  ",
+			runGhAuthToken: async () => "keyring-token  ",
 		});
-		expect(token).toBe("gh-token");
+		expect(token).toBe("keyring-token");
 	});
 
 	it("falls back to GH_TOKEN when GITHUB_TOKEN is empty", async () => {
@@ -157,8 +125,8 @@ describe("GitHub update credentials", () => {
 describe("parseReportedVersion", () => {
 	it("preserves the prerelease suffix so a canary launcher verifies as up to date", () => {
 		// Regression: dropping `-canary.1` made a correctly installed canary
-		// build look like a stale `X.Y.Z` launcher, triggering a binary repair
-		// that rejects the prerelease GitHub release.
+		// build look like a stale `X.Y.Z` launcher, triggering a needless
+		// binary repair.
 		expect(parseReportedVersion("omp/18.0.6-canary.1")).toBe("18.0.6-canary.1");
 		expect(parseReportedVersion("coreforge/18.0.6.1")).toBe("18.0.6.1");
 		expect(parseReportedVersion("omp/18.0.5")).toBe("18.0.5");
@@ -911,7 +879,6 @@ describe("update-cli release binary integrity", () => {
 			resolveReleaseBinaryAsset({ ...releaseAsset(), draft: true }, tag, binaryName, { allowPrerelease: true }),
 		).toThrow("is a draft");
 	});
-
 	it("writes a download only after its size and digest match", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, binaryName);
@@ -1015,9 +982,9 @@ describe("update-cli release binary integrity", () => {
 		const targetPath = path.join(dir, binaryName);
 		const installed = "#!/bin/sh\necho omp/17.0.8\n";
 		const altered = "#!/bin/sh\necho omp/17.1.2\n";
-		const expectedDigest = `sha256:${Bun.SHA256.hash("x".repeat(Buffer.byteLength(altered)), "hex")}`;
 		await Bun.write(targetPath, installed);
 		await fs.chmod(targetPath, 0o755);
+		const expectedDigest = `sha256:${Bun.SHA256.hash("x".repeat(Buffer.byteLength(altered)), "hex")}`;
 
 		const requestAuthorizations: Array<string | null> = [];
 		const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {

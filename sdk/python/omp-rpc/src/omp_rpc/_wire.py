@@ -638,6 +638,8 @@ class QueuedMessagesState:
 
     steering: tuple[str, ...]
     follow_up: tuple[str, ...]
+    live_steered: int = 0
+    """Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -733,7 +735,9 @@ class SessionState:
     is_settled: bool = False
     """Idle with nothing queued or pending; same predicate as `session_settled`."""
     queued_messages: QueuedMessagesState = field(
-        default_factory=lambda: parse_queued_messages_state({"steering": [], "followUp": []}, "queuedMessages")
+        default_factory=lambda: parse_queued_messages_state(
+            {"steering": [], "followUp": [], "liveSteered": 0}, "queuedMessages"
+        )
     )
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
@@ -742,6 +746,12 @@ class SessionState:
     context_usage: ContextUsage | None = None
     goal: GoalModeState | None = None
     """Current goal mode; null when the session has no goal."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ColumnTruncatedRange:
+    first: int
+    last: int
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -759,6 +769,7 @@ class BashResult:
     elided_lines: int | None = None
     column_dropped_bytes: int | None = None
     column_truncated_lines: int | None = None
+    column_truncated_range: ColumnTruncatedRange | None = None
     column_max: int | None = None
     artifact_id: str | None = None
     artifact_elided_bytes: int | None = None
@@ -1283,6 +1294,8 @@ class QueueUpdateEvent:
     type: Literal["queue_update"] = "queue_update"
     steering: tuple[str, ...]
     follow_up: tuple[str, ...]
+    live_steered: int = 0
+    """Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2200,6 +2213,7 @@ def parse_queued_messages_state(value: object, path: str = "QueuedMessagesState"
     return QueuedMessagesState(
         steering=required(payload, "steering", array(decode_str), path),
         follow_up=required(payload, "followUp", array(decode_str), path),
+        live_steered=defaulted(payload, "liveSteered", decode_int, path, 0),
     )
 
 
@@ -2300,13 +2314,21 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
             "queuedMessages",
             parse_queued_messages_state,
             path,
-            parse_queued_messages_state({"steering": [], "followUp": []}, path),
+            parse_queued_messages_state({"steering": [], "followUp": [], "liveSteered": 0}, path),
         ),
         todo_phases=defaulted(payload, "todoPhases", array(parse_todo_phase), path, ()),
         system_prompt=defaulted(payload, "systemPrompt", scalar_or_array(decode_str), path, ()),
         dump_tools=defaulted(payload, "dumpTools", array(parse_tool_descriptor), path, ()),
         context_usage=optional(payload, "contextUsage", parse_context_usage, path),
         goal=defaulted(payload, "goal", nullable(parse_goal_mode_state), path, None),
+    )
+
+
+def parse_column_truncated_range(value: object, path: str = "ColumnTruncatedRange") -> ColumnTruncatedRange:
+    payload = expect_object(value, path)
+    return ColumnTruncatedRange(
+        first=required(payload, "first", decode_int, path),
+        last=required(payload, "last", decode_int, path),
     )
 
 
@@ -2326,6 +2348,7 @@ def parse_bash_result(value: object, path: str = "BashResult") -> BashResult:
         elided_lines=optional(payload, "elidedLines", decode_int, path),
         column_dropped_bytes=optional(payload, "columnDroppedBytes", decode_int, path),
         column_truncated_lines=optional(payload, "columnTruncatedLines", decode_int, path),
+        column_truncated_range=optional(payload, "columnTruncatedRange", parse_column_truncated_range, path),
         column_max=optional(payload, "columnMax", decode_int, path),
         artifact_id=optional(payload, "artifactId", decode_str, path),
         artifact_elided_bytes=optional(payload, "artifactElidedBytes", decode_int, path),
@@ -3003,6 +3026,7 @@ def parse_queue_update_event(value: object, path: str = "QueueUpdateEvent") -> Q
     return QueueUpdateEvent(
         steering=required(payload, "steering", array(decode_str), path),
         follow_up=required(payload, "followUp", array(decode_str), path),
+        live_steered=defaulted(payload, "liveSteered", decode_int, path, 0),
     )
 
 
@@ -4566,6 +4590,7 @@ __all__ = [
     "CacheWarmingStartEvent",
     "CancelUiRequest",
     "CancellationResult",
+    "ColumnTruncatedRange",
     "CommandOutputEvent",
     "CompactionResult",
     "CompactionSummaryMessage",
@@ -4761,6 +4786,7 @@ __all__ = [
     "parse_cache_warming_start_event",
     "parse_cancel_ui_request",
     "parse_cancellation_result",
+    "parse_column_truncated_range",
     "parse_command_output_event",
     "parse_compaction_result",
     "parse_compaction_summary_message",

@@ -56,6 +56,7 @@ import {
 	splitAssistantMessageToolTimeline,
 } from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
 import { isWarpCliAgentProtocolActive } from "../warp-events";
+import { ComposerPredictionController } from "./composer-prediction-controller";
 import { StreamingRevealController } from "./streaming-reveal";
 import { streamingStringKeysForTool, ToolArgsRevealController } from "./tool-args-reveal";
 
@@ -246,6 +247,8 @@ export class EventController {
 	// In-flight ephemeral recap turn; aborted by #cancelIdleRecap when any
 	// activity (new turn, compaction, editor draft) supersedes the idle recap.
 	#idleRecapAbort?: AbortController;
+	/** Next-message prediction offered as composer ghost text after a completed turn. */
+	readonly composerPrediction: ComposerPredictionController;
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
 	// Insertion-ordered IRC cards not yet retired; values are the transcript
 	// components each card contributed (see #retireIrcCard for the guard).
@@ -328,6 +331,7 @@ export class EventController {
 			getSmoothStreaming: () => cfgDisplaySmoothStreaming.get(this.ctx.settings),
 			requestRender: component => this.ctx.ui.requestComponentRender(component),
 		});
+		this.composerPrediction = new ComposerPredictionController(ctx);
 		this.#handlers = {
 			agent_start: e => this.#handleAgentStart(e),
 			agent_end: e => this.#handleAgentEnd(e),
@@ -439,6 +443,7 @@ export class EventController {
 		this.#toolArgsReveal.stop();
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
+		this.composerPrediction.cancel();
 		this.#setTerminalProgress(false);
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
@@ -926,6 +931,7 @@ export class EventController {
 		this.#retryPending = this.ctx.viewSession.isRetrying;
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
+		this.composerPrediction.cancel();
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -1082,6 +1088,7 @@ export class EventController {
 		}
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
+		this.composerPrediction.cancel();
 		this.ctx.statusLine.markActivityStart();
 		// The turn owns progress from here; a compaction that started it hands it over.
 		this.#compactionOwnsProgress = false;
@@ -1220,9 +1227,7 @@ export class EventController {
 			// still removable, and finalize it regardless so it can retire.
 			const abandoned = this.ctx.streamingComponent;
 			if (abandoned) {
-				if (this.ctx.chatContainer.canRemoveBlock(abandoned)) {
-					this.ctx.chatContainer.removeChild(abandoned);
-				}
+				this.ctx.chatContainer.removeChild(abandoned);
 				abandoned.markTranscriptBlockFinalized();
 			}
 			this.#finalizeAbandonedPostToolSegments();
@@ -1329,9 +1334,7 @@ export class EventController {
 		}
 		if (previous.canBeDisplacedBy(nextToolName)) {
 			this.#displaceableTodoComponent = undefined;
-			if (this.ctx.chatContainer.canRemoveBlock(previous)) {
-				this.ctx.chatContainer.removeChild(previous);
-			}
+			this.ctx.chatContainer.removeChild(previous);
 			previous.seal();
 			this.ctx.ui.requestRender();
 			return;
@@ -2015,9 +2018,7 @@ export class EventController {
 			const previous = this.#displaceableTodoComponent;
 			if (previous && previous !== component && previous.isDisplaceableBlock()) {
 				this.#displaceableTodoComponent = undefined;
-				if (this.ctx.chatContainer.canRemoveBlock(previous)) {
-					this.ctx.chatContainer.removeChild(previous);
-				}
+				this.ctx.chatContainer.removeChild(previous);
 				previous.seal();
 			}
 			this.#displaceableTodoComponent = component;
@@ -2122,9 +2123,7 @@ export class EventController {
 						const previous = this.#displaceableTodoComponent;
 						if (previous && previous !== component && previous.isDisplaceableBlock()) {
 							this.#displaceableTodoComponent = undefined;
-							if (this.ctx.chatContainer.canRemoveBlock(previous)) {
-								this.ctx.chatContainer.removeChild(previous);
-							}
+							this.ctx.chatContainer.removeChild(previous);
 							previous.seal();
 						}
 						this.#displaceableTodoComponent = component;
@@ -2375,6 +2374,7 @@ export class EventController {
 		this.#scheduleIdleCompaction();
 		this.#idleRecapPending = true;
 		this.#scheduleIdleRecap();
+		if (this.#settledRunStatus(event).state === "done") this.composerPrediction.request();
 		this.sendErrorNotification(event);
 		this.sendCompletionNotification(event);
 	}
@@ -2422,6 +2422,7 @@ export class EventController {
 	): Promise<void> {
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
+		this.composerPrediction.cancel();
 		if (!this.#terminalProgressActive) {
 			this.#setTerminalProgress(true);
 			this.#compactionOwnsProgress = this.#terminalProgressActive;

@@ -114,7 +114,7 @@ describe("openInEditor", () => {
 			const outputPath = path.join(tempDir.path(), "result");
 			await Bun.write(
 				editorPath,
-				'#!/bin/sh\nprintf "%s\\n%s\\n%s" "${COREFORGE_EDITOR_TEST_API_KEY-missing}" "${COREFORGE_EDITOR_TEST_COPY-missing}" "${COREFORGE_EDITOR_TEST_LABEL-missing}" > "$1"\n',
+				`#!/bin/sh\nprintf "%s\\n%s\\n%s" "\${COREFORGE_EDITOR_TEST_API_KEY-missing}" "\${COREFORGE_EDITOR_TEST_COPY-missing}" "\${COREFORGE_EDITOR_TEST_LABEL-missing}" > "$1"\n`,
 			);
 			fs.chmodSync(editorPath, 0o755);
 
