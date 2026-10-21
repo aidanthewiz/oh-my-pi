@@ -334,6 +334,7 @@ jobs:
           fi
           mkdir -p release-assets/package
           cp "${addons[@]}" release-assets/package/
+          cp LICENSE THIRD-PARTY-NOTICES.txt release-assets/package/
           tar -czf "release-assets/coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz" \
             -C release-assets package
       - name: Package source-built native addon (Windows ARM64)
@@ -346,6 +347,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force -Path release-assets/package | Out-Null
           Copy-Item $addons[0].FullName release-assets/package/
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.txt release-assets/package/ -ErrorAction Stop
           $archive = "release-assets/coreforge-pi-natives-${{ matrix.target }}-$env:RELEASE_TAG.tgz"
           tar -czf $archive -C release-assets package
           if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
