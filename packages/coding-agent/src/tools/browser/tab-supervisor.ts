@@ -215,6 +215,7 @@ const workerPageTargets = new WeakMap<WorkerHandle, string>();
 // same tab name so the existence check and `tabs.set` (separated by several
 // awaits) cannot interleave and leak a worker + browser refCount.
 const acquireChains = new Map<string, Promise<void>>();
+const ternReservations = new Map<number, { name: string }>();
 const GRACE_MS = 750;
 // The setup handshake covers Puppeteer import and browser connection, before page acquisition.
 // Its budget is min(10s, remaining/3), with a 2s floor.
@@ -680,13 +681,15 @@ async function acquireCmuxTab(
 }
 
 /**
- * Browser blocks the live Tern tabs of this process (other than `except`)
- * drive, by block id to tab name: never adopted twice.
+ * Browser blocks reserved by pending adoptions or owned by published and closing tabs.
  */
 export function ternBlocksTaken(except?: string): Map<number, string> {
 	const taken = new Map<number, string>();
 	for (const [name, tab] of tabs) {
-		if (name !== except && tab.backend === "tern" && tab.state === "alive") taken.set(tab.ternTab.block, name);
+		if (name !== except && tab.backend === "tern") taken.set(tab.ternTab.block, name);
+	}
+	for (const [block, reservation] of ternReservations) {
+		if (reservation.name !== except) taken.set(block, reservation.name);
 	}
 	return taken;
 }
@@ -723,6 +726,7 @@ async function acquireTernTab(
 		ignoreHttpsErrors: opts.ignoreHttpsErrors,
 	};
 	let ternTab: TernTab;
+	let reservation: { name: string } | undefined;
 	if (opts.target === undefined) {
 		ternTab = await TernTab.open(browser.tern, {
 			...settings,
@@ -734,7 +738,14 @@ async function acquireTernTab(
 		const taken = ternBlocksTaken(name);
 		const block = pickTernBlock(blocks, opts.target, taken);
 		if (!block) throw noTernBlockError(blocks, opts.target, taken);
-		ternTab = await TernTab.adopt(browser.tern, { ...settings, block, viewport: opts.viewport });
+		reservation = { name };
+		ternReservations.set(block.block, reservation);
+		try {
+			ternTab = await TernTab.adopt(browser.tern, { ...settings, block, viewport: opts.viewport });
+		} catch (error) {
+			if (ternReservations.get(block.block) === reservation) ternReservations.delete(block.block);
+			throw error;
+		}
 	}
 	try {
 		const info = await ternTab.readyInfo();
@@ -762,6 +773,10 @@ async function acquireTernTab(
 	} catch (error) {
 		await ternTab.close({ timeoutMs: DEFAULT_TAB_CLOSE_TIMEOUT_MS }).catch(() => undefined);
 		throw error;
+	} finally {
+		if (reservation && ternReservations.get(ternTab.block) === reservation) {
+			ternReservations.delete(ternTab.block);
+		}
 	}
 }
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
-import { acquireBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import { acquireBrowser, holdBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { acquireTab, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { pickTernBlock, type TernBlockEntry } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/blocks";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
@@ -149,6 +149,125 @@ describe("Tern block adoption", () => {
 			'6 "Docs B" https://docs.example/b (picture-in-picture over block 3, on screen',
 		);
 		expect(fake.requests.map(request => String(request.op.op))).toEqual(["blocks"]);
+	});
+
+	it("keeps pending adoptions exclusive without blocking a different block", async () => {
+		const arrived = Promise.withResolvers<number>();
+		let heldId: number | undefined;
+		const agents = new Map<number, string>();
+		daemon = await startFakeDaemon((op, id) => {
+			if (op.op === "blocks") return { ok: { blocks: BLOCKS } };
+			if (op.op === "events" && heldId === undefined) {
+				heldId = id;
+				arrived.resolve(Number(op.block));
+				return null;
+			}
+			if (op.op === "events") return { ok: { events: [], next: 1 } };
+			if (op.op === "state") return { ok: { url: `https://owned.invalid/${op.block}`, loading: false } };
+			if (op.op === "eval") return { ok: { value: { value: [] } } };
+			if (op.op === "agent") agents.set(Number(op.block), String(op.value));
+			if (op.op === "release") agents.delete(Number(op.block));
+			return { ok: {} };
+		});
+		const fake = daemon;
+		const browser = await ternBrowser(fake);
+		holdBrowser(browser);
+		opened.push("pending-owner-a", "pending-owner-b");
+		const first = acquireTab("pending-owner-a", browser, { target: "docs", userAgent: "a", timeoutMs: 5_000 });
+		try {
+			expect(await arrived.promise).toBe(7);
+			const second = await acquireTab("pending-owner-b", browser, {
+				target: "docs",
+				userAgent: "b",
+				timeoutMs: 5_000,
+			});
+			expect(second.tab.targetId).toBe("6");
+			fake.answer(heldId!, { ok: { events: [], next: 1 } });
+			const adopted = await first;
+			expect(adopted.tab.targetId).toBe("7");
+			await releaseTab("pending-owner-a");
+			expect(agents.get(6)).toBe("b");
+		} finally {
+			if (heldId !== undefined) fake.answer(heldId, { ok: { events: [], next: 1 } });
+			await first.catch(() => undefined);
+			await releaseBrowser(browser, { kill: false });
+		}
+	});
+
+	it("recovers a failed adoption and preserves exclusivity across reopen", async () => {
+		let failScripts = true;
+		daemon = await startFakeDaemon(op => {
+			if (op.op === "blocks") return { ok: { blocks: BLOCKS } };
+			if (op.op === "events") return { ok: { events: [], next: 1 } };
+			if (op.op === "state") return { ok: { url: "https://owned.invalid/", loading: false } };
+			if (op.op === "eval") return { ok: { value: { value: [] } } };
+			if (op.op === "scripts" && failScripts) {
+				failScripts = false;
+				return { error: { kind: "failed", message: "synthetic script failure" } };
+			}
+			return { ok: {} };
+		});
+		const browser = await ternBrowser(daemon);
+		holdBrowser(browser);
+		opened.push("failed-adoption", "recovered-adoption", "reopen-conflict");
+		try {
+			await expect(acquireTab("failed-adoption", browser, { target: "7", timeoutMs: 5_000 })).rejects.toBeInstanceOf(
+				Error,
+			);
+			const recovered = await acquireTab("recovered-adoption", browser, { target: "7", timeoutMs: 5_000 });
+			expect(recovered.tab.targetId).toBe("7");
+			const reloaded = await acquireTab("recovered-adoption", browser, {
+				target: "7",
+				dialogs: "dismiss",
+				timeoutMs: 5_000,
+			});
+			expect(reloaded.created).toBe(true);
+			expect(reloaded.tab.targetId).toBe("7");
+			await expect(acquireTab("reopen-conflict", browser, { target: "7", timeoutMs: 5_000 })).rejects.toBeInstanceOf(
+				Error,
+			);
+		} finally {
+			await releaseBrowser(browser, { kill: false });
+		}
+	});
+
+	it("does not reuse an adopted block before its release completes", async () => {
+		const arrived = Promise.withResolvers<void>();
+		let releaseId: number | undefined;
+		daemon = await startFakeDaemon((op, id) => {
+			if (op.op === "blocks") return { ok: { blocks: BLOCKS } };
+			if (op.op === "events") return { ok: { events: [], next: 1 } };
+			if (op.op === "state") return { ok: { url: "https://owned.invalid/", loading: false } };
+			if (op.op === "eval") return { ok: { value: { value: [] } } };
+			if (op.op === "release" && releaseId === undefined) {
+				releaseId = id;
+				arrived.resolve();
+				return null;
+			}
+			return { ok: {} };
+		});
+		const fake = daemon;
+		const browser = await ternBrowser(fake);
+		holdBrowser(browser);
+		opened.push("closing-adoption", "closing-conflict", "after-close");
+		await acquireTab("closing-adoption", browser, { target: "7", timeoutMs: 5_000 });
+		const closing = releaseTab("closing-adoption");
+		try {
+			await arrived.promise;
+			await expect(
+				acquireTab("closing-conflict", browser, { target: "7", timeoutMs: 5_000 }),
+			).rejects.toBeInstanceOf(Error);
+		} finally {
+			if (releaseId !== undefined) fake.answer(releaseId, { ok: {} });
+			await closing;
+			try {
+				await releaseTab("closing-conflict");
+				const after = await acquireTab("after-close", browser, { target: "7", timeoutMs: 5_000 });
+				expect(after.tab.targetId).toBe("7");
+			} finally {
+				await releaseBrowser(browser, { kill: false });
+			}
+		}
 	});
 });
 
