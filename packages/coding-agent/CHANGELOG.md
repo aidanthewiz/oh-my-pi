@@ -78,6 +78,13 @@
 - Resume interrupted daemon upgrades without replacing adopted history. Refuse migration while an older broker or client owns the scope.
 - Keep terminal status consistent with retained host outcomes when collaboration recovery prunes or replaces transcript messages.
 - Verify cached grammar size and SHA-256 before reuse; corrupt files require a verified atomic replacement.
+
+## [18.9.1] - 2026-10-11
+
+### Added
+
+- Added `supportsThinkingBindingControls` to Bedrock `compat` in `models.yml`, so a Bedrock gateway or region that rejects Claude thinking-binding controls can turn them off ([#15316](https://github.com/can1357/oh-my-pi/pull/15316) by [@harshaygadekar](https://github.com/harshaygadekar))
+
 ## [18.9.0] - 2026-10-11
 
 ### Added

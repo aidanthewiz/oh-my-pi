@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -82,7 +84,74 @@ describe("ModelRegistry default custom models config", () => {
 			streamRevision: "possible",
 			// Opus 4.7+ rejects temperature/top_p on every host (class rule).
 			supportsSamplingParams: false,
+			// Bedrock Converse keeps thinking-binding controls on unless an override opts out.
+			supportsThinkingBindingControls: true,
 		});
+	});
+
+	test("applies provider and model binding-control precedence to the serialized Bedrock request", async () => {
+		const id = "us.anthropic.claude-fable-5-1-v1:0";
+		for (const scenario of [
+			{ provider: false, model: undefined, enabled: false },
+			{ provider: false, model: true, enabled: true },
+			{ provider: true, model: false, enabled: false },
+		]) {
+			fs.writeFileSync(
+				path.join(tempDir.path(), "models.yml"),
+				[
+					"providers:",
+					"  bedrock-gateway:",
+					"    baseUrl: https://bedrock.example.invalid",
+					"    api: bedrock-converse-stream",
+					"    apiKey: TEST_KEY",
+					"    compat:",
+					`      supportsThinkingBindingControls: ${scenario.provider}`,
+					"    models:",
+					`      - id: ${id}`,
+					"        reasoning: true",
+					...(scenario.model === undefined
+						? []
+						: ["        compat:", `          supportsThinkingBindingControls: ${scenario.model}`]),
+					"",
+				].join("\n"),
+			);
+			const registry = new ModelRegistry(authStorage);
+			const target = requireRegistryModel(registry, "bedrock-gateway", id);
+			expect(target.api).toBe("bedrock-converse-stream");
+			const requests: Record<string, any>[] = [];
+			const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+				const body = init?.body;
+				requests.push(JSON.parse(body instanceof Uint8Array ? new TextDecoder().decode(body) : String(body)));
+				return new Response("offline payload captured", { status: 400 });
+			}) as unknown as typeof fetch;
+			await streamBedrock(
+				target as Model<"bedrock-converse-stream">,
+				{ messages: [{ role: "user", content: "hi", timestamp: 0 }] },
+				{
+					bearerToken: "test-token",
+					region: "us-east-1",
+					fetch: fetchMock,
+					reasoning: Effort.High,
+					anthropicPrefixMismatchBehavior: "error",
+				},
+			).result();
+
+			expect(requests).toHaveLength(1);
+			const body = requests[0]!;
+			expect(body.additionalModelRequestFields.thinking.type).toBe("adaptive");
+			expect(body.additionalModelRequestFields.output_config).toEqual({ effort: "high" });
+			if (scenario.enabled) {
+				expect(body.additionalModelRequestFields.thinking.block_binding).toEqual({
+					prefix_mismatch_behavior: "error",
+				});
+				expect(body.additionalModelRequestFields.anthropic_beta).toContain("thinking-binding-controls-2026-08-01");
+				expect(body.additionalModelResponseFieldPaths).toEqual(["/input_transformations"]);
+			} else {
+				expect(body.additionalModelRequestFields.thinking.block_binding).toBeUndefined();
+				expect(body.additionalModelRequestFields.anthropic_beta).toBeUndefined();
+				expect(body.additionalModelResponseFieldPaths).toBeUndefined();
+			}
+		}
 	});
 
 	test("prefers default models.yml over models.yaml when both exist", () => {
@@ -434,6 +503,7 @@ interface ModelSnapshot {
 		streamIdleTimeoutMs?: number;
 		streamRevision?: "possible";
 		supportsSamplingParams?: boolean;
+		supportsThinkingBindingControls?: boolean;
 	};
 }
 

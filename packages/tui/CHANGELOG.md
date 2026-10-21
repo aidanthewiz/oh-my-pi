@@ -10,6 +10,12 @@
 - Preserve Coreforge wordmarks and personalized greetings in native welcome cards.
 - Preserve managed model restrictions when chat scopes include non-chat role runners, including catalog failures and recovery.
 
+## [18.9.1] - 2026-10-11
+
+### Fixed
+
+- Fixed inline charts and images leaving overlapping copies over text when moved, resized, replaced, or hidden, while preserving images in scrollback.
+
 ## [18.9.0] - 2026-10-11
 
 ### Added

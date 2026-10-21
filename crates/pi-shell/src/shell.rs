@@ -2256,6 +2256,21 @@ mod tests {
 		let safe = HashMap::from([("SAFE_MARKER".to_owned(), "allowed".to_owned())]);
 		let command =
 			r#"jq -n -c '[env.COREFORGE_TEST_SECRET, env["COREFORGE.TEST.SECRET"], env.SAFE_MARKER]'"#;
+		#[cfg(unix)]
+		let executable_text = {
+			use std::os::unix::fs::PermissionsExt;
+
+			let dir = tempfile::tempdir().expect("temp dir");
+			let script = dir.path().join("plain-script");
+			std::fs::write(
+				&script,
+				"printf '%s|%s\\n' \"${COREFORGE_TEST_SECRET-unset}\" \"$SAFE_MARKER\"\n",
+			)
+			.expect("write executable text");
+			std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+				.expect("make script executable");
+			(dir, quote_arg(script.to_str().expect("utf8 script path")))
+		};
 		for clear_env in [false, true] {
 			let config = ShellConfig {
 				session_env: Some(safe.clone()),
@@ -2310,6 +2325,55 @@ mod tests {
 			.unwrap();
 			assert_eq!(result.exit_code, Some(0));
 			assert_eq!(rx.try_iter().collect::<String>(), expected);
+			#[cfg(unix)]
+			{
+				let (tx, rx) = flume::unbounded();
+				let result = execute_shell(
+					ShellExecuteOptions {
+						command: executable_text.1.clone(),
+						clear_env,
+						session_env: Some(safe.clone()),
+						..Default::default()
+					},
+					Some(tx),
+					CancelToken::default(),
+				)
+				.await
+				.expect("execute text with shell environment");
+				assert_eq!(result.exit_code, Some(0));
+				assert_eq!(
+					rx.try_iter().collect::<String>(),
+					if clear_env {
+						"unset|allowed\n"
+					} else {
+						"ambient|allowed\n"
+					},
+				);
+			}
+		}
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+
+			let mut host_limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			// SAFETY: `host_limit` is valid writable storage for getrlimit.
+			assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut host_limit) }, 0);
+			let lowered = host_limit.rlim_cur.min(4096) - 7;
+			let script = executable_text.0.path().join("limited-script");
+			std::fs::write(&script, "ulimit -S -n\nexit 23\n").expect("write limited script");
+			std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+				.expect("make limited script executable");
+			let (result, output) = execute_captured(format!(
+				"ulimit -S -n {lowered} && {}",
+				quote_arg(script.to_str().expect("utf8 path")),
+			))
+			.await;
+			assert_eq!(result.exit_code, Some(23), "{output}");
+			assert_eq!(output, format!("{lowered}\n"));
+			let mut after = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			// SAFETY: `after` is valid writable storage for getrlimit.
+			assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut after) }, 0);
+			assert_eq!((after.rlim_cur, after.rlim_max), (host_limit.rlim_cur, host_limit.rlim_max));
 		}
 	}
 
@@ -5860,6 +5924,38 @@ mod tests {
 		assert_eq!(mode("loose-builtin"), 0o666);
 		assert_eq!(mode("loose-dir"), 0o777);
 		assert_eq!(host_umask(), before, "the host process umask must not change");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn executable_text_without_shebang_preserves_arguments_and_exit_status() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let script = dir.path().join("plain-script");
+		std::fs::write(&script, "printf '%s|%s|%s\\n' \"$1\" \"$2\" \"$SCRIPT_TOKEN\"\nexit 23\n")
+			.expect("write executable text");
+		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+			.expect("make script executable");
+		for invocation in ["./plain-script", "plain-script"] {
+			let (result, output) = execute_captured(format!(
+				"cd {} && SCRIPT_TOKEN=from-env PATH=\"$PWD:$PATH\" {invocation} 'two words' \
+				 ';literal' > captured; status=$?; cat captured; exit \"$status\"",
+				quote_arg(dir.path().to_str().expect("utf8 path")),
+			))
+			.await;
+			assert_eq!(result.exit_code, Some(23), "{invocation}: {output}");
+			assert_eq!(output, "two words|;literal|from-env\n", "{invocation}");
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn external_command_receives_extra_file_descriptor() {
+		let (result, output) =
+			execute_captured("sh -c 'printf descriptor-output >&3' 3>&1".into()).await;
+		assert_eq!(result.exit_code, Some(0), "{output}");
+		assert_eq!(output, "descriptor-output");
 	}
 
 	/// The `xargs` builtin spawns real child processes, but their stdout must

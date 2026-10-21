@@ -40,6 +40,30 @@ describe("validateProviderConfiguration (models-config auth)", () => {
 	});
 });
 
+describe("ModelsConfigSchema Bedrock compat overrides", () => {
+	test("rejects non-boolean binding-control overrides at every configuration level", () => {
+		const compat = { supportsThinkingBindingControls: "false" };
+		for (const scenario of [
+			{ fields: { compat }, suffix: "compat" },
+			{
+				fields: { models: [{ id: "us.anthropic.claude-fable-5-1", api: "bedrock-converse-stream", compat }] },
+				suffix: "models.0.compat",
+			},
+			{
+				fields: { modelOverrides: { "us.anthropic.claude-fable-5-1": { compat } } },
+				suffix: "modelOverrides.us.anthropic.claude-fable-5-1.compat",
+			},
+		]) {
+			const checked = ModelsConfigSchema({ providers: { "amazon-bedrock": scenario.fields } });
+			if (!(checked instanceof OmpErrors)) throw new Error("expected the schema to reject a string value");
+			expect(checked.map(error => error.path.join("."))).toEqual([
+				`providers.amazon-bedrock.${scenario.suffix}.supportsThinkingBindingControls`,
+			]);
+			expect(checked[0]!.problem).toContain("must be boolean");
+		}
+	});
+});
+
 describe("ModelsConfigSchema Responses compat overrides", () => {
 	/** A custom Responses-compatible proxy serving gpt-6-astra, as a user writes it in models.yml. */
 	function astraProxyConfig(compat: Record<string, unknown>): unknown {
