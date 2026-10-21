@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { Answer } from "@oh-my-pi/pi-ai";
 import { judgeRequest, planFromAnswers } from "@oh-my-pi/pi-coding-agent/auto-graph/planner";
-import { planChart } from "@oh-my-pi/pi-tui/charts/chart-plan";
+import { buildChart, planChart } from "@oh-my-pi/pi-tui/charts/chart-plan";
+import { chartAlt } from "@oh-my-pi/pi-tui/charts/chart-svg";
 import { analyzeTable } from "@oh-my-pi/pi-tui/charts/table-data";
 import type { TableChartRequest } from "@oh-my-pi/pi-tui/chat/table-chart";
 
@@ -60,6 +61,73 @@ describe("judgeRequest", () => {
 });
 
 describe("planFromAnswers", () => {
+	it.each([
+		{ name: "both reordered conditions", columns: [1, 2], headers: ["Patched runtime", "Stock runtime"] },
+		{ name: "only the comparison", columns: [1], headers: ["Patched runtime", "Stock runtime"] },
+		{ name: "bare after-only values", columns: [1], headers: ["After", "Before"] },
+	])("keeps the original denominator when selecting $name", ({ columns, headers }) => {
+		const req = request([
+			["Metric", ...headers],
+			["Time", "5 s", "10 s"],
+			["Memory", "20 MB", "100 MB"],
+			["Errors", "0", "9"],
+			["Total", "8 s", "20 s"],
+		]);
+		const answers: Record<string, Answer> = { kind: choice("change", 0.9) };
+		for (const column of columns) answers[`c${column}`] = { type: "noul", noul: 0.9 };
+		const plan = planFromAnswers(req, answers)!;
+		const spec = buildChart(req.table, plan)!;
+		expect(spec.baseline).toBe(headers[1]);
+		expect(spec.categories).toEqual(["Time", "Memory", "Errors", "Total"]);
+		expect(spec.series.map(series => series.name)).toEqual([headers[0]]);
+		expect(spec.series[0]!.points.map(point => point?.value)).toEqual([0.5, 0.2, 0, 0.4]);
+		expect(chartAlt(spec)).toContain(`vs ${headers[1]}`);
+	});
+
+	it("keeps a selected variant against the same baseline without plotting derived deltas", () => {
+		const req = request([
+			["Metric", "Patched runtime", "Stock runtime", "Warm runtime", "Delta"],
+			["Time", "5 s", "10 s", "7 s", "−50%"],
+			["Memory", "20 MB", "100 MB", "80 MB", "−80%"],
+			["Errors", "0", "9", "3", "−100%"],
+		]);
+		const plan = planFromAnswers(req, {
+			kind: choice("change", 0.9),
+			c3: { type: "noul", noul: 0.9 },
+			c4: { type: "noul", noul: 0.9 },
+		})!;
+		const spec = buildChart(req.table, plan)!;
+		expect(spec.baseline).toBe("Stock runtime");
+		expect(spec.series.map(series => series.name)).toEqual(["Warm runtime"]);
+		expect(spec.series[0]!.points.map(point => point?.value)).toEqual([0.7, 0.8, 1 / 3]);
+	});
+
+	it("uses an explicitly selected arrow's own start instead of another condition", () => {
+		const req = request([
+			["Metric", "Patched runtime", "Stock runtime", "Observed move"],
+			["Time", "5 s", "10 s", "20 s → 4 s"],
+			["Memory", "20 MB", "100 MB", "80 MB → 40 MB"],
+			["Errors", "0", "9", "8 → 2"],
+		]);
+		const plan = planFromAnswers(req, { kind: choice("change", 0.9), c3: { type: "noul", noul: 0.9 } })!;
+		const spec = buildChart(req.table, plan)!;
+		expect(spec.series[0]!.points.map(point => point?.value)).toEqual([0.2, 0.5, 0.25]);
+	});
+
+	it("does not turn unrelated selected measures into baseline factors", () => {
+		const req = request([
+			["Project", "Reads", "Writes"],
+			["alpha", "17", "3"],
+			["beta", "41", "8"],
+			["gamma", "23", "12"],
+		]);
+		const plan = planFromAnswers(req, { kind: choice("grouped", 0.9), c2: { type: "noul", noul: 0.9 } })!;
+		const spec = buildChart(req.table, plan)!;
+		expect(spec.baseline).toBeUndefined();
+		expect(spec.series.map(series => series.name)).toEqual(["Writes"]);
+		expect(spec.series[0]!.points.map(point => point?.value)).toEqual([3, 8, 12]);
+	});
+
 	it("draws no chart when the judge picks none", () => {
 		expect(planFromAnswers(ARMS, { kind: choice("none", 0.9) })).toBeNull();
 	});

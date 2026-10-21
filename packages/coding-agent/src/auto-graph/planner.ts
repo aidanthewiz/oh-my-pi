@@ -651,6 +651,21 @@ export function planFromAnswers(
 		choice = "change";
 		series = guess.series;
 		baselines = guess.baselines;
+	} else if (
+		choice === "change" &&
+		guess.kind === "change" &&
+		guess.series.length >= 2 &&
+		guess.series.every(index => table.columns[index]!.arrowShare < 0.6)
+	) {
+		const [baseline, ...comparisons] = guess.series;
+		const selected = series.filter(index => comparisons.includes(index));
+		const transitions = series.filter(index => table.columns[index]!.arrowShare >= 0.6);
+		if (selected.length || transitions.length === 0) {
+			// Column picks choose comparisons, not the denominator the local plan established.
+			series = [baseline!, ...(selected.length ? selected : comparisons)];
+		} else {
+			series = transitions;
+		}
 	}
 	// A dumbbell only for one quantity under two conditions (the headers say so, or the judge
 	// confirms); otherwise two series stand side by side.

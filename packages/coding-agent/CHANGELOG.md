@@ -14,6 +14,7 @@
 
 - Preserve existing files and each managed-browser download's bytes when suggested names collide, including overlapping tab completions.
 - Reserve Tern browser blocks during adoption and release so different tab names cannot drive the same page.
+- Keep the original comparison baseline when smart chart selection reorders or filters condition columns.
 - Keep saved-reset restores and imminent-expiry salvage inside current account-pool leases and session generations. Drain admitted reset work before releasing authorization.
 - Keep composer predictions opt-in, deny local inference for collaboration guests and disposed sessions, and retain delayed costs on the original journal.
 - Authenticate browser target discovery and redact failed endpoint credentials. Cancel deferred MCP resource reads without cancelling shared startup.
