@@ -1,9 +1,9 @@
 """Repository rules fetching pruned LLVM release binaries for the cross toolchains.
 
 Each rule downloads the official LLVM release archive for the host that
-fetches the repo and prunes it to the `bin/` entries its toolchain wraps plus
-the clang builtin headers (lib/clang/<major>/include — immintrin.h & co). The
-pruned trees are a few hundred MiB instead of ~10 GiB.
+fetches the repo and extracts only its required tools, complete link targets,
+clang builtin headers and shared libraries. Unused payloads are never written
+to disk.
 
     llvm_msvc_tools_repository    LLVM 20.1.7, clang-cl / lld-link / llvm-lib /
                                   llvm-rc for //bazel/toolchains/msvc (linux
@@ -16,10 +16,10 @@ pruned trees are a few hundred MiB instead of ~10 GiB.
                                   SDK's .tbd stubs (llvm/llvm-project#222721);
                                   older ones reject libSystem.tbd outright.
 
-Archive downloads (~1.5-2 GiB) go through repository_ctx.download_and_extract
-with a pinned sha256, so they land in Bazel's content-addressed repository
-cache: re-fetches after `bazel clean --expunge` or a .bzl edit only pay
-extraction. Checksums are the official llvm-project release assets.
+Archive downloads (~1.5-2 GiB) go through repository_ctx.download with a pinned
+sha256, preserving Bazel's content-addressed repository cache. A Python 3
+standard-library extractor streams the archive twice without staging the
+complete ~10 GiB tree. Checksums are the official llvm-project release assets.
 """
 
 def _host_key(rctx):
@@ -59,10 +59,7 @@ filegroup(
 
 filegroup(
     name = "all",
-    srcs = [
-        ":bin",
-        ":builtin_headers",
-    ],
+    srcs = glob(["**"], exclude = ["BUILD.bazel"]),
 )
 """
 
@@ -78,44 +75,30 @@ def _llvm_tools_impl(rctx):
         ))
     suffix, sha256 = dist
     prefix = "LLVM-{}-{}".format(rctx.attr.version, suffix)
+    python = rctx.which("python3")
+    if not python:
+        fail("bazel/toolchains/llvm.bzl: python3 is required on the exec host to unpack LLVM")
+    extractor = rctx.path(Label("//bazel/toolchains:extract_llvm.py"))
+    rctx.watch(extractor)
     rctx.report_progress("Downloading LLVM {} ({}, ~2 GiB, repository-cache backed)".format(rctx.attr.version, suffix))
-    rctx.download_and_extract(
+    rctx.download(
         url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-{}/{}.tar.xz".format(rctx.attr.version, prefix),
+        output = "llvm.tar.xz",
         sha256 = sha256,
-        stripPrefix = prefix,
     )
-
-    # Close the keep-set over symlink targets (clang-cl -> clang -> clang-20,
-    # ld64.lld -> lld, llvm-lib -> llvm-ar), then prune bin/.
-    keep = {name: None for name in rctx.attr.bins}
-    bin_dir = rctx.path("bin")
-    for name in rctx.attr.bins:
-        tool = bin_dir.get_child(name)
-        if tool.exists:
-            keep[tool.realpath.basename] = None
-    for entry in bin_dir.readdir():
-        if entry.basename not in keep:
-            rctx.delete(entry)
-
-    # Prune everything outside bin/ and lib/clang/<ver>/include.
-    for entry in rctx.path(".").readdir():
-        if entry.basename not in ("bin", "lib"):
-            rctx.delete(entry)
-    lib_dir = rctx.path("lib")
-    for entry in lib_dir.readdir():
-        if entry.basename != "clang":
-            rctx.delete(entry)
-    for verdir in lib_dir.get_child("clang").readdir():
-        for entry in verdir.readdir():
-            if entry.basename != "include":
-                rctx.delete(entry)
+    rctx.report_progress("Extracting required LLVM tools, headers and shared libraries")
+    result = rctx.execute(
+        [python, extractor, "llvm.tar.xz", prefix] + rctx.attr.bins,
+        timeout = 1200,
+        quiet = False,
+    )
+    rctx.delete("llvm.tar.xz")
+    if result.return_code != 0:
+        fail("bazel/toolchains/llvm.bzl: unpacking {} failed:\n{}{}".format(prefix, result.stdout, result.stderr))
 
     rctx.file("BUILD.bazel", _BUILD.format(version = rctx.attr.version, host = key, consumer = rctx.attr.consumer), executable = False)
 
-    # Opt into the repo contents cache: the fetch is a pure function of the
-    # pinned URL+sha256 and the deterministic prune above, and the ~172 s
-    # extraction of the 2 GiB archive was the single largest cost of every
-    # fresh output base on ephemeral CI pods (profiled: run 30510579596).
+    # The pinned archive and deterministic selection are repository-cache safe.
     return rctx.repo_metadata(reproducible = True)
 
 def _llvm_tools_repository(consumer, version, dists, bins):

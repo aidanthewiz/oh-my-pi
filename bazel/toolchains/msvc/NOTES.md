@@ -8,7 +8,7 @@ exec hosts. Replaces cargo-xwin.
 
 | Piece | Where | Why separate |
 | --- | --- | --- |
-| `@llvm_msvc_tools` | `//bazel/toolchains:llvm.bzl` (shared with the darwin toolchain) | LLVM 20.1.7 release archive for the fetching host, pruned to clang-cl/lld-link/llvm-lib/llvm-rc/llvm-mt + `lib/clang/*/include`. Downloads (~2 GiB) are sha256-pinned → Bazel repository cache. |
+| `@llvm_msvc_tools` | `//bazel/toolchains:llvm.bzl` (shared with the darwin toolchain) | LLVM 20.1.7 release archive for the fetching host. The Python 3 standard-library extractor retains configured tools, complete symlink/hardlink targets, `lib/clang/*/include`, and shared libraries without extracting unused payloads. Downloads (~2 GiB) remain sha256-pinned in Bazel's repository cache. |
 | `@xwin_sysroot` | `sysroot.bzl` | xwin 0.6.5 (pinned per-host sha256) runs `splat` in the repo rule. The ~1 GiB CRT/SDK payload comes from the Microsoft CDN via xwin itself and is **not** in Bazel's repo cache — a cold output base re-downloads it. Keep `sysroot.bzl` stable. |
 | `@msvc_cc` | `cc.bzl` | Wrapper scripts + `cc_toolchain` + MSVC feature config (copied from the resolved rules_cc, like `@local_config_cc`). Cheap to regenerate — iterate flags here. |
 | `toolchain()`s | `//bazel/toolchains` (`msvc-cc-from-*`) | One per exec host (linux-x64/arm64, darwin-arm64/x64), all pointing at `@msvc_cc//:cc_toolchain`; only the local host's variant can resolve. `target_compatible_with = [windows, x86_64]` ⇒ can never shadow zig on linux. |
@@ -57,6 +57,13 @@ exec hosts. Replaces cargo-xwin.
 
 - First fetch per host: ~2 GiB LLVM (repo-cache backed) + ~15 MiB xwin +
   ~1 GiB MS CDN splat (not repo-cache backed). Splat repo ends up ~800 MiB.
+- LLVM extraction reads archive metadata, then streams only selected payloads.
+  Peak repository storage is one compressed archive plus the selected files,
+  in addition to the retained download cache. It never stages the full LLVM
+  tree. The extractor reports selected and total archive payload byte counts.
+  Generated `:all` includes retained shared libraries for sandboxed execution.
+- Run `python3 -m unittest discover -s bazel/toolchains -p test_extract_llvm.py`
+  to check selected payloads, linked builtin headers, unsafe archives and failed-extraction cleanup.
 - `--manifest-version 17` pins the VS2022 channel, but Microsoft advances the
   channel payload over time → splat is stable day-to-day, not bit-reproducible
   forever (same property cargo-xwin had). Action keys only depend on the files

@@ -19,7 +19,7 @@ applefm_toolchain(
     ld = "@llvm_darwin_tools//:bin/ld64.lld",
     sdk_settings = "@macos_sdk//:settings",
     srcs = [
-        "@llvm_darwin_tools//:bin",
+        "@llvm_darwin_tools//:all",
         "@macos_sdk//:cc",
         "@macos_sdk//:swift",
         "@swift_linux//:all",

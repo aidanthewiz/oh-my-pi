@@ -18,6 +18,8 @@
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["extract_llvm.py"])
+
 _MUSL_RUST_TOOLCHAINS = {
     "linux-x64-to-musl-x64": (
         ["@platforms//os:linux", "@platforms//cpu:x86_64"],
