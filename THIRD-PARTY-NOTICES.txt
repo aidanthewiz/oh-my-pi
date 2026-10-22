@@ -1028,6 +1028,21 @@ Permission to copy, use, modify, sell and distribute is
 granted provided this notice appears in all copies; provided "as is"
 without express or implied warranty.
 
+Markdown.sublime-syntax
+-----------------------
+
+Source: https://github.com/sublimehq/Packages at
+fa6b8629c95041bf262d4c1dab95c456a0530122,
+Markdown/Markdown.sublime-syntax, as pinned by syntect 5.3.0.
+Original source SHA-256:
+fe045101a3be4d2ce2773095a323da4296950826e6fa4129ca34f4c7e5c58967.
+The local grammar contains modified escape and repetition expressions.
+
+Permission to copy, use, modify, sell and distribute this
+software is granted. This software is provided "as is" without
+express or implied warranty, and with no claim as to its
+suitability for any purpose.
+
 BUN / NPM DEPENDENCY INVENTORY
 ==============================
 Locked source/install graph from bun.lock, including nested versions and all platform leaves.
@@ -24480,13 +24495,13 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- pi-ast 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-builtins 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-iso 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-natives 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-shell 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-voice 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-walker 18.9.1 (https://github.com/can1357/oh-my-pi)
+- pi-ast 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-builtins 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-iso 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-natives 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-shell 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-voice 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-walker 18.9.2 (https://github.com/can1357/oh-my-pi)
 
 Full license text:
 
@@ -24625,11 +24640,11 @@ Used by:
 - objc2-metal 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-quartz-core 0.3.2 (https://github.com/madsmtm/objc2)
 - palette_math 0.7.7 (https://github.com/Ogeon/palette)
-- pi-diff 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-edit 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-predict 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-vcs 18.9.1 (https://github.com/can1357/oh-my-pi)
-- pi-vfs 18.9.1 (https://github.com/can1357/oh-my-pi)
+- pi-diff 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-edit 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-predict 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-vcs 18.9.2 (https://github.com/can1357/oh-my-pi)
+- pi-vfs 18.9.2 (https://github.com/can1357/oh-my-pi)
 - pulp-wasm-simd-flag 0.1.1 (https://github.com/sarah-quinones/pulp/)
 - quantette 0.6.0 (https://github.com/IanManske/quantette)
 - rcgen 0.13.2 (https://github.com/rustls/rcgen)

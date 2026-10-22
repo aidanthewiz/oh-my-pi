@@ -82,6 +82,24 @@
 - Keep terminal status consistent with retained host outcomes when collaboration recovery prunes or replaces transcript messages.
 - Verify cached grammar size and SHA-256 before reuse; corrupt files require a verified atomic replacement.
 
+## [18.9.2] - 2026-10-11
+
+### Fixed
+
+- Improved responsiveness when adding assistant text after tool calls in long transcripts.
+- Fixed `apply_patch` handling of context-free hunks when the target text appears multiple times.
+- Fixed `find` filename ranking and sketch scoring with judge endpoints that limit the number of questions per request.
+- Fixed `omp gc --apply` leaving temporary session files after an interrupted save.
+- Fixed `omp auth-gateway serve` handling of OpenRouter routing variants such as `:floor` and `:nitro`.
+- Improved validation errors for `computer` helpers with missing or non-string text arguments by identifying the helper and argument involved.
+- Fixed `/tan` forks incorrectly inheriting the parent task's subagent spending while preserving token counts.
+- Fixed `omp://` documentation links so they open the corresponding files in source checkouts.
+- Fixed bare model IDs in `models.yml` incorrectly resolving to auto-discovered Ollama, llama.cpp, or LM Studio providers.
+- Added warnings when configured Ollama, llama.cpp, or LM Studio endpoints cannot be reached, identifying the relevant environment variable.
+- Keep explicit model exclusions authoritative for synthesized OpenRouter routing variants without disabling other admitted routes.
+- Preserve separate lazy chunks when different source directories contain matching names and compiled content.
+- Reclaim only authenticated, idle session rewrite temps. Preserve active or replaced files and avoid recreating vanished paths during preview or apply.
+
 ## [18.9.1] - 2026-10-11
 
 ### Added

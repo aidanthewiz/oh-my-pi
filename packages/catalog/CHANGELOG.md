@@ -15,6 +15,12 @@
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
 
+## [18.9.2] - 2026-10-11
+
+### Removed
+
+- Removed `parseCloudflareAiGatewayCredential`, `serializeCloudflareAiGatewayCredential`, and `CloudflareAiGatewayCredential` from `@oh-my-pi/pi-catalog/wire/cloudflare-ai-gateway`. Use the equivalents from `@oh-my-pi/pi-catalog/wire/cloudflare` instead.
+
 ## [18.9.1] - 2026-10-11
 
 ### Added

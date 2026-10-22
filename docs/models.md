@@ -143,8 +143,17 @@ override matching model tags. These fields do not configure the Anthropic Messag
 - `google-vertex`
 - `typesafe`
 - `openrouter-decisions`
+- `openai-decisions`
+- `workers-ai-systemone`
 
-`typesafe` and `openrouter-decisions` are judgment APIs, not chat transports: a model declared with one answers System One judgment requests (`{baseUrl}/v1/systemone` and `{baseUrl}/decisions` respectively) and is selected by the `judge` model role. Its `headers` carry gateway routing or custom authentication headers for that traffic.
+`typesafe`, `openrouter-decisions`, `openai-decisions`, and `workers-ai-systemone` are judgment APIs, not chat transports. Select these models through the `judge` role:
+
+- `typesafe` posts the System One body to `{baseUrl}/v1/systemone`.
+- `openrouter-decisions` posts the same body to `{baseUrl}/decisions`.
+- `openai-decisions` translates questions and answers for `{baseUrl}/decisions`. The authored `openai/gpt-6-luna-decisions` model requests wire ID `gpt-6-luna`. The current frozen bundle does not contain this row; successful OpenAI discovery adds it when absent.
+- `workers-ai-systemone` posts the System One body to `{baseUrl}/{model id}`. The stored account ID or `CLOUDFLARE_ACCOUNT_ID` replaces `<account>` in the base URL. Its runtime factory supplies the authored Clef models.
+
+Model `headers` carry routing or custom authentication headers. Model metadata does not grant account access or bypass configured model scope.
 
 A model or `modelOverrides` entry may also use a runner API, which serves one model `kind`; `RUNNER_API_KINDS` in `packages/catalog/src/types.ts` lists them (for example `openai-images` serves `image`, `openai-embeddings` serves `embedding`, `openai-speech` serves `tts`). `web-search` is built in and cannot be named here, so neither can `kind: search`. `kind` defaults to the api's kind (`chat` for chat transports), and an explicit `kind` must be one its api serves. Chat transports serve `chat` and `tiny` (small models for the `tiny`, `memory`, and `judge` roles); those that `generate_image` runs (`openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`) also serve `image`: on `openai-responses`, the image is generated through the Responses `image_generation` tool, carried by a GPT-5+ chat model on the same provider, instead of `/images/generations`. This moves discovered gateway models to the image role:
 
@@ -703,6 +712,11 @@ surface; the denylist then removes matching models. The policy applies to
 initial selection, role and temporary switches, retry fallbacks, secondary
 agents, compaction, memory processing, and restored sessions. CLI `--models`
 can narrow the allowed set but cannot override either configured list.
+
+Gateway routing variants inherit admission from their catalog base, but explicit
+deny selectors still apply to the synthesized ID before provider dispatch.
+For nested OpenRouter IDs, `openrouter/**/*:nitro` excludes all `:nitro` routes
+while retaining other admitted suffixes.
 
 Policy selectors resolve against the full catalog before provider, kind, or
 preferred-model filtering. Narrowed candidate lists intersect that allowed set;

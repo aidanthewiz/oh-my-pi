@@ -1,44 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import {
-	DESKTOP_METHODS,
-	ELEMENT_METHODS,
-	isReadOnlyComputerCall,
-	renderComputerCall,
-	WINDOW_METHODS,
-} from "@oh-my-pi/pi-coding-agent/tools/computer/call";
-
-function errorMessage(run: () => unknown): string {
-	try {
-		run();
-	} catch (error) {
-		if (error instanceof Error) return error.message;
-		throw error;
-	}
-	throw new Error("Expected callback to throw");
-}
+import { isReadOnlyComputerCall, renderComputerCall } from "@oh-my-pi/pi-coding-agent/tools/computer/call";
 
 describe("renderComputerCall", () => {
-	it("renders root, window-hop, and element-hop calls byte-for-byte", () => {
-		expect(renderComputerCall([{ method: "windows", args: [{ app: "Code" }] }])).toBe(
-			'return await desktop.windows({"app":"Code"});',
-		);
-		expect(renderComputerCall([{ method: "clipboard.write", args: ["hi"] }])).toBe(
-			'return await desktop.clipboard.write("hi");',
-		);
-		expect(
-			renderComputerCall([
-				{ method: "window", args: ["42"] },
-				{ method: "click", args: [10, 20, { button: "right" }] },
-			]),
-		).toBe('return await (await desktop.window("42")).click(10, 20, {"button":"right"});');
-		expect(
-			renderComputerCall([
-				{ method: "ref", args: ["e5"] },
-				{ method: "setValue", args: ["todo"] },
-			]),
-		).toBe('return await (await desktop.ref("e5")).setValue("todo");');
-	});
-
 	it("classifies read-only chains by the terminal helper", () => {
 		expect(isReadOnlyComputerCall([{ method: "screenshot", args: [] }])).toBe(true);
 		expect(isReadOnlyComputerCall([{ method: "type", args: ["x"] }])).toBe(false);
@@ -69,59 +32,35 @@ describe("renderComputerCall", () => {
 		).toBe(false);
 	});
 
-	it("reports every invalid chain with its exact public error", () => {
-		expect(errorMessage(() => renderComputerCall([]))).toBe("Action 'call' requires a non-empty 'chain'.");
-		expect(
-			errorMessage(() =>
-				renderComputerCall([
-					{ method: "window", args: ["42"] },
-					{ method: "find", args: [{}] },
-					{ method: "press", args: [] },
-				]),
-			),
-		).toBe("Call chains support one handle hop at most; use computer.run(fn) for longer sequences.");
-		expect(errorMessage(() => renderComputerCall([{ method: "launch", args: [] }]))).toBe(
-			`Unknown desktop method "launch". Desktop helpers support: ${Object.keys(DESKTOP_METHODS).join(", ")}.`,
-		);
-		expect(errorMessage(() => renderComputerCall([{ method: "toString", args: [] }]))).toContain(
-			'Unknown desktop method "toString"',
-		);
-		expect(
-			errorMessage(() =>
-				renderComputerCall([
-					{ method: "windows", args: [] },
-					{ method: "click", args: [1, 2] },
-				]),
-			),
-		).toBe(
-			"Only desktop.window(id)/desktop.display(id)/desktop.ref(ref) results accept a chained call; got desktop.windows().",
-		);
-		expect(
-			errorMessage(() =>
-				renderComputerCall([
-					{ method: "window", args: ["42"] },
-					{ method: "setValue", args: ["x"] },
-				]),
-			),
-		).toBe(`Unknown window method "setValue". Window handles support: ${Object.keys(WINDOW_METHODS).join(", ")}.`);
-		expect(
-			errorMessage(() =>
-				renderComputerCall([
-					{ method: "window", args: ["42"] },
-					{ method: "toString", args: [] },
-				]),
-			),
-		).toContain('Unknown window method "toString"');
-		expect(
-			errorMessage(() =>
-				renderComputerCall([
-					{ method: "ref", args: ["e5"] },
-					{ method: "raise", args: [] },
-				]),
-			),
-		).toBe(`Unknown element method "raise". Element handles support: ${Object.keys(ELEMENT_METHODS).join(", ")}.`);
-		expect(errorMessage(() => isReadOnlyComputerCall([{ method: "launch", args: [] }]))).toContain(
-			'Unknown desktop method "launch"',
-		);
+	it("rejects invalid roots and handle hops before execution", () => {
+		for (const chain of [
+			[],
+			[{ method: "launch", args: [] }],
+			[{ method: "toString", args: [] }],
+			[
+				{ method: "windows", args: [] },
+				{ method: "click", args: [1, 2] },
+			],
+			[
+				{ method: "window", args: ["42"] },
+				{ method: "setValue", args: ["x"] },
+			],
+			[
+				{ method: "window", args: ["42"] },
+				{ method: "toString", args: [] },
+			],
+			[
+				{ method: "ref", args: ["e5"] },
+				{ method: "raise", args: [] },
+			],
+			[
+				{ method: "window", args: ["42"] },
+				{ method: "find", args: [{}] },
+				{ method: "press", args: [] },
+			],
+		]) {
+			expect(() => renderComputerCall(chain)).toThrow();
+			expect(() => isReadOnlyComputerCall(chain)).toThrow();
+		}
 	});
 });

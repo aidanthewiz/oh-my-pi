@@ -209,8 +209,14 @@ export declare class EditStore {
  * process exit; `release()` is idempotent.
  */
 export declare class FileLock {
-  /** Try to acquire `path` without blocking. */
-  static tryAcquire(path: string): FileLock
+  /**
+   * Try to acquire `path` without blocking.
+   *
+   * File-backed Unix locks create their file by default. `create = false`
+   * refuses symlinks and leaves missing files unacquired.
+   * Name-only locks never create files.
+   */
+  static tryAcquire(path: string, create?: boolean | undefined | null): FileLock
   /** Whether this handle owns the requested lock. */
   get acquired(): boolean
   /** Release this handle's ownership without affecting a successor. */

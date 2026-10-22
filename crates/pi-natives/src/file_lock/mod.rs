@@ -63,10 +63,21 @@ impl FileLock {
 	}
 
 	/// Try to acquire `path` without blocking.
+	///
+	/// File-backed Unix locks create their file by default. `create = false`
+	/// refuses symlinks and leaves missing files unacquired.
+	/// Name-only locks never create files.
 	#[napi(factory)]
-	pub fn try_acquire(path: JsString) -> napi::Result<Self> {
+	pub fn try_acquire(path: JsString, create: Option<bool>) -> napi::Result<Self> {
 		let path = js::utf8(path)?;
-		Self::try_acquire_path(Path::new(&*path)).map_err(|error| {
+		#[cfg(all(unix, not(target_os = "linux")))]
+		let lock = platform::try_acquire_with_create(&path, create.unwrap_or(true));
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
+		let lock = {
+			let _ = create;
+			platform::try_acquire(&path)
+		};
+		lock.map(|inner| Self { inner }).map_err(|error| {
 			napi::Error::from_reason(format!(
 				"Failed to acquire native file lock for {}: {error}",
 				&*path

@@ -10,6 +10,16 @@
 - Preserve Coreforge wordmarks and personalized greetings in native welcome cards.
 - Preserve managed model restrictions when chat scopes include non-chat role runners, including catalog failures and recovery.
 
+## [18.9.2] - 2026-10-11
+
+### Added
+
+- Added native TSP rendering support for Tern terminal sessions running inside tmux, with automatic session detection and safe title-setting behavior.
+
+### Fixed
+
+- Improved responsiveness when inserting assistant messages after tool calls in long transcripts.
+
 ## [18.9.1] - 2026-10-11
 
 ### Fixed

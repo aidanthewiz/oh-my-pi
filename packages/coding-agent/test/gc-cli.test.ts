@@ -1,16 +1,22 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { promises as storageFs } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import { withStatsSyncLock } from "@oh-my-pi/omp-stats/aggregator";
 import { type GcResult, runGcCommand } from "@oh-my-pi/pi-coding-agent/cli/gc-cli";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { BlobStore, blobStagingPath } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	sessionStagingPath,
+	tryAcquireSessionLease,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	getAgentDir,
 	getBlobsDir,
@@ -774,6 +780,190 @@ describe("runGcCommand history checkpoint", () => {
 			writer.close();
 		}
 	}, 10_000);
+});
+
+describe("runGcCommand session staging sweep", () => {
+	test("removes rewrite temps abandoned by killed writers, keeping in-flight and unrelated ones", async () => {
+		const live = await writeSession(root, "project", "live", "pending");
+		const abandoned = sessionStagingPath(live);
+		const inFlight = sessionStagingPath(live);
+		// Subagent transcripts nest inside the parent's artifacts directory.
+		const nestedAbandoned = sessionStagingPath(path.join(live.slice(0, -".jsonl".length), "0-sub.jsonl"));
+		// An extensionless `--session` transcript outside the sessions tree, known only to the registry.
+		const externalDir = path.join(root, "external-sessions");
+		const externalFile = path.join(externalDir, "work");
+		const header = `${JSON.stringify({ type: "session", version: 3, id: "live", cwd: root })}\n`;
+		await Bun.write(externalFile, header);
+		await Bun.write(path.join(getCustomSessionFilesDir(root), "session-1"), externalFile);
+		const externalAbandoned = sessionStagingPath(externalFile);
+		const unrelated = path.join(externalDir, ".notes.0123456789abcdef.tmp");
+		for (const file of [abandoned, nestedAbandoned, externalAbandoned, unrelated]) {
+			await Bun.write(file, header);
+			await agePath(file);
+		}
+		await Bun.write(inFlight, "partial");
+		const flags = { agentDir: root, archive: true };
+
+		const dryRun = await runGcCommand({ flags });
+		expect(dryRun.archive).toMatchObject({
+			wouldDeleteTemps: 3,
+			deletedTemps: 0,
+			tempBytes: Buffer.byteLength(header) * 3,
+		});
+		expect(await Bun.file(abandoned).exists()).toBe(true);
+
+		const applied = await runGcCommand({ flags: { ...flags, apply: true } });
+		expect(applied.archive).toMatchObject({ wouldDeleteTemps: 3, deletedTemps: 3, errors: [] });
+		for (const removed of [abandoned, nestedAbandoned, externalAbandoned]) {
+			expect(await Bun.file(removed).exists()).toBe(false);
+		}
+		for (const kept of [live, inFlight, externalFile, unrelated]) {
+			expect(await Bun.file(kept).exists()).toBe(true);
+		}
+	});
+	test("sweeps the first-save temp of a missing registered session before its stale marker is pruned", async () => {
+		const target = path.join(root, "external-sessions", "first-save");
+		const marker = path.join(getCustomSessionFilesDir(root), "first-save");
+		await Bun.write(marker, target);
+		await agePath(marker, 2);
+		const abandoned = sessionStagingPath(target);
+		await Bun.write(abandoned, `${JSON.stringify({ type: "session", version: 3, id: "first-save", cwd: root })}\n`);
+		await agePath(abandoned);
+
+		const result = await runGcCommand({
+			flags: { agentDir: root, archive: true, stale: true, apply: true },
+		});
+
+		expect(result.archive).toMatchObject({ wouldDeleteTemps: 1, deletedTemps: 1, errors: [] });
+		expect(result.stale?.danglingMarkers).toBe(1);
+		expect(await Bun.file(marker).exists()).toBe(false);
+		expect(await Bun.file(abandoned).exists()).toBe(false);
+		expect(await Bun.file(target).exists()).toBe(false);
+	});
+
+	test("keeps stale active, foreign, headerless and leased staging files", async () => {
+		const target = await writeSession(root, "project", "owned", "pending");
+		const body = await Bun.file(target).text();
+		const held = sessionStagingPath(target);
+		const foreign = sessionStagingPath(target);
+		const malformed = sessionStagingPath(target);
+		const active = sessionStagingPath(path.join(path.dirname(target), "active.jsonl"));
+		for (const [file, content] of [
+			[held, body],
+			[foreign, body.replace('"owned"', '"foreign"')],
+			[malformed, "partial"],
+			[active, body.replace('"owned"', '"active"')],
+		]) {
+			await Bun.write(file!, content!);
+			await agePath(file!);
+		}
+		const stagingLease = FileLock.tryAcquire(path.join(await fs.realpath(path.dirname(held)), path.basename(held)));
+		const sessionLease = tryAcquireSessionLease("active");
+		if (!stagingLease.acquired || !sessionLease) throw new Error("expected fixture leases");
+		try {
+			const result = await runGcCommand({ flags: { agentDir: root, archive: true, apply: true } });
+			expect(result.archive?.deletedTemps).toBe(0);
+			for (const file of [held, foreign, malformed, active]) expect(await Bun.file(file).exists()).toBe(true);
+		} finally {
+			sessionLease.release();
+			stagingLease.release();
+		}
+	});
+
+	test.each([false, true])("does not recreate a vanished staging file when apply=%s", async apply => {
+		const target = await writeSession(root, "project", "published-race", "pending");
+		const body = await Bun.file(target).text();
+		const staging = sessionStagingPath(target);
+		await Bun.write(staging, body);
+		await agePath(staging);
+		const lstat = fs.lstat;
+		let vanished = false;
+		const statSpy = spyOn(fs, "lstat").mockImplementation((async (file: Parameters<typeof fs.lstat>[0]) => {
+			const stat = await lstat(file);
+			if (String(file) === staging && !vanished) {
+				vanished = true;
+				await fs.unlink(staging);
+			}
+			return stat;
+		}) as typeof fs.lstat);
+		try {
+			const result = await runGcCommand({ flags: { agentDir: root, archive: true, apply } });
+			expect(vanished).toBe(true);
+			expect(await Bun.file(staging).exists()).toBe(false);
+			expect(await Bun.file(target).text()).toBe(body);
+			expect(result.archive).toMatchObject({ deletedTemps: 0, errors: [] });
+		} finally {
+			statSpy.mockRestore();
+		}
+	});
+
+	test("does not unlink a staging path replaced during header inspection", async () => {
+		const target = await writeSession(root, "project", "reused", "pending");
+		const staging = sessionStagingPath(target);
+		await Bun.write(staging, await Bun.file(target).text());
+		await agePath(staging);
+		const replacement = `${staging}.replacement`;
+		await Bun.write(replacement, "replacement owner");
+		const lstat = fs.lstat;
+		let replaced = false;
+		const statSpy = spyOn(fs, "lstat").mockImplementation((async (file: Parameters<typeof fs.lstat>[0]) => {
+			const stat = await lstat(file);
+			if (String(file) === target && !replaced) {
+				replaced = true;
+				await fs.rename(replacement, staging);
+			}
+			return stat;
+		}) as typeof fs.lstat);
+		try {
+			const result = await runGcCommand({ flags: { agentDir: root, archive: true, apply: true } });
+			expect(replaced).toBe(true);
+			expect(result.archive?.deletedTemps).toBe(0);
+			expect(await Bun.file(staging).text()).toBe("replacement owner");
+		} finally {
+			statSpy.mockRestore();
+		}
+	});
+
+	test("keeps an aged rewrite while FileSessionStorage is still staging it", async () => {
+		const target = await writeSession(root, "project", "delayed-write", "pending");
+		const before = await Bun.file(target).text();
+		const after = `${before}${JSON.stringify({ type: "custom", id: "new", parentId: null, customType: "proof", data: {} })}\n`;
+		const entered = Promise.withResolvers<string>();
+		const resume = Promise.withResolvers<void>();
+		const writeFile = storageFs.writeFile;
+		const writeSpy = spyOn(storageFs, "writeFile").mockImplementation((async (
+			...args: Parameters<typeof storageFs.writeFile>
+		) => {
+			await writeFile(...args);
+			const file = String(args[0]);
+			if (path.basename(file).startsWith(".delayed-write.jsonl.") && file.endsWith(".tmp")) {
+				await agePath(file);
+				entered.resolve(file);
+				await resume.promise;
+			}
+		}) as typeof storageFs.writeFile);
+		const operation = new FileSessionStorage().writeTextAtomic(target, after);
+		try {
+			const staging = await Promise.race([
+				entered.promise,
+				operation.then(() => {
+					throw new Error("Storage published without entering the staging gate");
+				}),
+			]);
+			const result = await runGcCommand({ flags: { agentDir: root, archive: true, apply: true } });
+			expect(result.archive?.deletedTemps).toBe(0);
+			expect(await Bun.file(staging).text()).toBe(after);
+			expect(await Bun.file(target).text()).toBe(before);
+		} finally {
+			resume.resolve();
+			try {
+				await operation;
+			} finally {
+				writeSpy.mockRestore();
+			}
+		}
+		expect(await Bun.file(target).text()).toBe(after);
+	});
 });
 
 describe("runGcCommand cold-session archive", () => {

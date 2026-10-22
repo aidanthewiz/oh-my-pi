@@ -5,6 +5,13 @@
 ### Fixed
 
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
+
+## [18.9.2] - 2026-10-11
+
+### Changed
+
+- Improved context caching for repeat turns, reducing redundant prompt processing and making subsequent turns faster when the system prompt is unchanged.
+
 ## [18.9.0] - 2026-10-11
 
 ### Fixed

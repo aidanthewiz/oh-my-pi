@@ -1997,7 +1997,7 @@ export function filterAvailableModelsByEnabledPatterns(
 	return includeSyntheticAllowedModels(available, allowedModels);
 }
 
-function excludeModelsByDisabledPatterns(models: Model<Api>[], patterns: readonly string[]): Model<Api>[] {
+export function excludeModelsByDisabledPatterns(models: Model<Api>[], patterns: readonly string[]): Model<Api>[] {
 	if (patterns.length === 0 || models.length === 0) return models;
 	const excludedKeys = new Set<string>();
 	for (const pattern of patterns) {

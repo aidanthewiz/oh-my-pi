@@ -28,6 +28,18 @@ export function sessionContentFingerprint(content: string): string {
 	return createHash("sha1").update(content).digest("hex");
 }
 
+/**
+ * Basename of a rewrite staged by {@link sessionStagingPath}; group 1 is the
+ * target's basename. Writers hold a staging-path lease until publication or
+ * cleanup; `omp gc` reclaims authenticated leftovers only after that lease ends.
+ */
+export const SESSION_STAGING_RE = /^\.(.+)\.[0-9a-f]{16}\.tmp$/;
+
+/** Fresh staging path beside `target`, matching {@link SESSION_STAGING_RE}. */
+export function sessionStagingPath(target: string): string {
+	return path.join(path.dirname(target), `.${path.basename(target)}.${Snowflake.next()}.tmp`);
+}
+
 export interface SessionStorageStat {
 	size: number;
 	mtimeMs: number;
@@ -810,6 +822,18 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	#acquireStagingLease(fpath: string, tempPath: string): NativeFileLock {
+		try {
+			const parent = fs.realpathSync(path.dirname(tempPath));
+			const lease = NativeFileLock.tryAcquire(path.join(parent, path.basename(tempPath)));
+			if (lease.acquired) return lease;
+			lease.release();
+		} catch (error) {
+			throw new SessionLockError(fpath, `OS staging lease failed: ${toError(error).message}`);
+		}
+		throw new SessionLockError(fpath, "Session staging path is owned by another writer");
+	}
+
 	/**
 	 * Sidecar carrying the OS gate. It lives beside the lockfile (same trust
 	 * domain). Platforms backed by `flock(2)` require this path to remain
@@ -985,17 +1009,11 @@ export class FileSessionStorage implements SessionStorage {
 	): void {
 		const dir = path.dirname(fpath);
 		this.ensureDirSync(dir);
-		const tempPath = path.join(dir, `.${path.basename(fpath)}.${Snowflake.next()}.tmp`);
+		const tempPath = sessionStagingPath(fpath);
+		const stagingLease = this.#acquireStagingLease(fpath, tempPath);
 		try {
 			stage(tempPath);
-		} catch (err) {
-			this.#discardTemp(tempPath, fpath);
-			throw toError(err);
-		}
-		// The freshness check through the final rename runs under the
-		// cross-process publish lock: no cooperating writer can slip an
-		// append between the size check and the rename.
-		try {
+			// Publish freshness checks and rename share one cross-process gate.
 			this.#withPublishLock(fpath, () => {
 				this.#assertExpectedState(fpath, options);
 				try {
@@ -1008,6 +1026,8 @@ export class FileSessionStorage implements SessionStorage {
 		} catch (err) {
 			this.#discardTemp(tempPath, fpath);
 			throw toError(err);
+		} finally {
+			stagingLease.release();
 		}
 	}
 
@@ -1115,23 +1135,15 @@ export class FileSessionStorage implements SessionStorage {
 		options: WriteTextAtomicOptions | undefined,
 	): Promise<void> {
 		const dir = path.resolve(fpath, "..");
-		const tempPath = path.join(dir, `.${path.basename(fpath)}.${Snowflake.next()}.tmp`);
+		const tempPath = sessionStagingPath(fpath);
 		await fs.promises.mkdir(dir, { recursive: true });
+		const stagingLease = this.#acquireStagingLease(fpath, tempPath);
 		try {
 			await stage(tempPath);
-		} catch (err) {
-			this.#discardTemp(tempPath, fpath);
-			throw toError(err);
-		}
-		// Guard-check + rename MUST NOT be separated by an await. A concurrent
-		// synchronous rewrite (flushSync -> #rewriteSynchronously) can otherwise
-		// publish a fresh body between the check and the rename, and this stale
-		// staged body would overwrite it. Sync rename closes that window.
-		if (options?.commitGuard && !options.commitGuard()) {
-			this.#discardTemp(tempPath, fpath);
-			return;
-		}
-		try {
+			if (options?.commitGuard && !options.commitGuard()) {
+				this.#discardTemp(tempPath, fpath);
+				return;
+			}
 			// The publish lock spans the freshness check through the rename (and
 			// its EPERM fallback): a cooperating appender or rewrite cannot
 			// interleave, and appenders re-open a replaced path before writing.
@@ -1148,6 +1160,8 @@ export class FileSessionStorage implements SessionStorage {
 		} catch (err) {
 			this.#discardTemp(tempPath, fpath);
 			throw toError(err);
+		} finally {
+			stagingLease.release();
 		}
 	}
 

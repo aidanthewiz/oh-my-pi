@@ -10,6 +10,8 @@ Use a Coreforce-approved installer or an authenticated release from [Coreforce-C
 
 To develop from this fork, follow [Getting started from source](#getting-started-from-source). The source-based Nix flake is available from `github:Coreforce-CAD/oh-my-pi/coreforge`; it does not download an upstream binary.
 
+For Nix 2.30 or later, use `nix profile add github:Coreforce-CAD/oh-my-pi/coreforge`. Older Nix uses `nix profile install` with the same Coreforce source.
+
 ### Shell completions
 
 `omp` generates its own completion scripts for **bash**, **zsh**, and **fish** from the live command/flag metadata, so they never drift from the actual CLI. Subcommands, flags, and enum values complete statically; model names (`--model`, `--smol`, `--slow`, `--plan`) resolve against the bundled model catalog and `--resume` against your on-disk sessions.
@@ -299,7 +301,7 @@ modelRoles:
 
 ### Four knobs that make routing useful
 
-- **Custom providers** — Declare anything that speaks `openai-completions`, `openai-responses`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-gemini-cli`, `google-vertex`, `typesafe`, or `openrouter-decisions` (the two judge APIs) in `~/.omp/agent/models.yml`.
+- **Custom providers** — Declare anything that speaks `openai-completions`, `openai-responses`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-gemini-cli`, `google-vertex`, `typesafe`, `openrouter-decisions`, `openai-decisions`, or `workers-ai-systemone` (the judge APIs) in `~/.omp/agent/models.yml`.
 - **Fallback chains** — Per-role or per-model chains under `retry.fallbackChains`. When the primary throws 429s or hits a quota wall, the next entry takes the rest of the turn — restored on cooldown.
 - **Path-scoped models** — Scope `enabledModels`, `disabledModels`, and `disabledProviders` entries to a `path:` prefix to vary model policy by repository without changing global config. Scoped entries cover the path and everything under it.
 - **Round-robin credentials** — Stack API keys per provider and the runtime rotates with session affinity and per-credential backoff. Useful when one key would burn its quota by lunch.

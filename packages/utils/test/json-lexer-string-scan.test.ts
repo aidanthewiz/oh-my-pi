@@ -1,48 +1,78 @@
 import { describe, expect, it } from "bun:test";
-import { JsonLexer } from "@oh-my-pi/pi-utils/json-lexer";
+import { JsonLexer, QUOTE } from "@oh-my-pi/pi-utils/json-lexer";
+import { parseStreamingJson } from "@oh-my-pi/pi-utils/json-parse";
 
-const QUOTE = 0x22;
-
-/** Best-of-5 wall time to lex `units` copies of `unit` as one string, `runs` times. */
-function lexCost(unit: string, units: number, runs: number): number {
-	const src = `"${unit.repeat(units)}"`;
-	let best = Number.POSITIVE_INFINITY;
-	for (let trial = 0; trial < 5; trial++) {
-		const start = performance.now();
-		for (let run = 0; run < runs; run++) new JsonLexer(src, "strict").string(QUOTE);
-		best = Math.min(best, performance.now() - start);
-	}
-	return best;
-}
-
-/**
- * Contract: `JsonLexer.string()` scans a string in linear time whatever its
- * escape density, and decodes it exactly. Streaming tool-call arguments are
- * re-lexed on every growth step, so a superlinear scan on escape-heavy
- * payloads (Windows paths, escaped code) turns each partial parse into a
- * stall.
- */
 describe("JsonLexer string scan", () => {
-	it("keeps escape-dense strings linear", () => {
-		// Equal total work at two sizes: 64 lexes of 2K units vs 8 lexes of 16K.
-		// A linear scan costs about the same (ratio ~1); one that re-searches the
-		// rest of the input per escape pays ~8x more on the long string (~5.5x
-		// measured on the quadratic revision of this scan).
-		const unit = "a\\\\";
-		const ratio = lexCost(unit, 16_384, 8) / lexCost(unit, 2_048, 64);
-		expect(ratio).toBeLessThan(3);
+	it.each([
+		["`", 0x60],
+		["「", 0x300c],
+	] as const)("honors a nonstandard %s delimiter after a long run", (delimiter, quote) => {
+		const prefix = "prefix: ";
+		const value = "abc".repeat(32);
+		const lexer = new JsonLexer(`${prefix}${delimiter}${value}${delimiter},next`, "strict", prefix.length);
 
-		const progress = new JsonLexer(`"${unit.repeat(4)}"`, "strict").string(QUOTE);
-		expect(progress.complete).toBe(true);
-		expect(progress.value).toBe("a\\".repeat(4));
+		expect(lexer.string(quote)).toEqual({ value, complete: true, stableLen: value.length });
+		expect(lexer.src.slice(lexer.pos)).toBe(",next");
 	});
 
-	it("decodes long mixed runs of text and escapes like the per-character scan", () => {
+	it("does not reinterpret a wrapped delimiter as an escape while streaming", () => {
+		const value = `${"abc".repeat(32)}\`,next`;
+		const lexer = new JsonLexer(`\`${value}`, "incoming");
+		expect(lexer.string(0x10060)).toEqual({ value, complete: false, stableLen: value.length });
+	});
+
+	it("decodes adjacent escaped backslashes before a long plain suffix", () => {
+		const escapes = 4096;
+		const src = `"${"\\\\".repeat(escapes)}${"x".repeat(64)}"`;
+		expect(new JsonLexer(src, "strict").string(QUOTE)).toEqual({
+			value: `${"\\".repeat(escapes)}${"x".repeat(64)}`,
+			complete: true,
+			stableLen: escapes + 64,
+		});
+	});
+
+	it("retains sibling string values before a streamed object closes", () => {
+		const entries = Array.from({ length: 512 }, (_, k) => [`key${k}`, `value number ${k}`] as const);
+		const json = JSON.stringify(Object.fromEntries(entries));
+		expect(parseStreamingJson<Record<string, string>>(json.slice(0, -1))).toEqual(Object.fromEntries(entries));
+	});
+
+	it("re-searches backslashes when the cursor moves before the cached range", () => {
+		const first = '"a\\nb"';
+		const src = `${first} "${"x".repeat(64)}"`;
+		const lexer = new JsonLexer(src, "strict", first.length + 1);
+		expect(lexer.string(QUOTE).value).toBe("x".repeat(64));
+
+		lexer.pos = 0;
+		expect(lexer.string(QUOTE)).toEqual({ value: "a\nb", complete: true, stableLen: 3 });
+	});
+
+	it("decodes long mixed runs of text and escapes", () => {
 		const body = 'C:\\\\Users\\\\me\\\\file \\"quoted\\" \\n line \\u00e9 '.repeat(400);
 		const src = `"${body}"`;
+		expect(new JsonLexer(src, "strict").string(QUOTE).value).toBe(JSON.parse(src));
+	});
 
-		const progress = new JsonLexer(src, "strict").string(QUOTE);
+	it("keeps a trailing split escape unstable after skipping a long run", () => {
+		const prefix = "x".repeat(128);
+		expect(new JsonLexer(`"${prefix}\\uD83D`, "incoming").string(QUOTE)).toEqual({
+			value: `${prefix}\ud83d`,
+			stableLen: prefix.length,
+			complete: false,
+		});
+		// No closing `"}`: complete JSON would take the JSON.parse fast path.
+		expect(parseStreamingJson<{ text: string }>(`{"text":"${prefix}\\uD83D\\uDE00`)).toEqual({
+			text: `${prefix}😀`,
+		});
+	});
 
-		expect(progress.value).toBe(JSON.parse(src));
+	it("preserves inner quote recovery and following fields after a long run", () => {
+		const prefix = "x".repeat(128);
+		expect(
+			parseStreamingJson<{ text: string; next: number }>(`{"text":"${prefix}say "hello" again", "next": 1}`),
+		).toEqual({
+			text: `${prefix}say "hello" again`,
+			next: 1,
+		});
 	});
 });

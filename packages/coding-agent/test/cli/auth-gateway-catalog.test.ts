@@ -9,6 +9,7 @@ import {
 	gatewayRoutableModels,
 	gatewayRoutableProviders,
 	indexModelsByRequestId,
+	resolveGatewayModel,
 } from "../../src/cli/auth-gateway-cli";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -231,6 +232,54 @@ describe("auth-gateway strict account routing", () => {
 			fetchMock.mockRestore();
 		}
 	});
+});
+
+describe("resolveGatewayModel", () => {
+	test("routes an OpenRouter variant selector the catalog does not list to its base model", async () => {
+		const storage = await createAuthStorage();
+		await storage.credentials.set("openrouter", { type: "api_key", key: "sk-test-openrouter" });
+		await storage.credentials.set("anthropic", { type: "api_key", key: "sk-test-anthropic" });
+		const settings = Settings.isolated({});
+		const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
+		const providers = gatewayRoutableProviders(storage, settings);
+		const routable = gatewayRoutableModels(registry).filter(model => providers.has(model.provider));
+		const index = indexModelsByRequestId(routable, providers);
+		const base = routable.find(model => model.provider === "openrouter" && !model.id.includes(":"));
+		const anthropic = routable.find(model => model.provider === "anthropic");
+		if (!base || !anthropic) throw new Error("expected bundled openrouter and anthropic models");
+
+		const floor = resolveGatewayModel(`openrouter/${base.id}:floor`, index, routable, settings);
+		expect(floor?.provider).toBe("openrouter");
+		expect(floor?.id).toBe(`${base.id}:floor`);
+		expect(floor?.api).toBe(base.api);
+		// Route suffixes are an OpenRouter concept; other providers stay exact-match.
+		expect(resolveGatewayModel(`anthropic/${anthropic.id}:floor`, index, routable, settings)).toBeUndefined();
+		expect(
+			resolveGatewayModel("openrouter/no-such-vendor/no-such-model:floor", index, routable, settings),
+		).toBeUndefined();
+	});
+
+	test.each(["glob", "exact"] as const)(
+		"rejects a synthesized variant excluded by a %s deny selector",
+		async selector => {
+			const storage = await createAuthStorage();
+			await storage.credentials.set("openrouter", { type: "api_key", key: "synthetic-openrouter-key" });
+			const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true });
+			const routable = gatewayRoutableModels(registry).filter(model => model.provider === "openrouter");
+			const base = routable.find(model => !model.id.includes(":"));
+			if (!base) throw new Error("expected a bundled OpenRouter base model");
+			const settings = Settings.isolated({
+				enabledModels: [`openrouter/${base.id}`],
+				disabledModels: [selector === "glob" ? "openrouter/**/*:nitro" : `openrouter/${base.id}:nitro`],
+			});
+			const index = indexModelsByRequestId(routable, new Set(["openrouter"]), settings);
+			expect(index.get(`openrouter/${base.id}`)).toBe(base);
+			expect(resolveGatewayModel(`openrouter/${base.id}:nitro`, index, routable, settings)).toBeUndefined();
+			expect(resolveGatewayModel(`openrouter/${base.id}:floor`, index, routable, settings)?.id).toBe(
+				`${base.id}:floor`,
+			);
+		},
+	);
 });
 
 describe("createSerializedRebuilder", () => {

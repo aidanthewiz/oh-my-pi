@@ -10,13 +10,25 @@ pub struct PlatformFileLock {
 }
 
 pub fn try_acquire(path: &str) -> io::Result<Option<PlatformFileLock>> {
-	let file = OpenOptions::new()
+	try_acquire_with_create(path, true)
+}
+
+pub fn try_acquire_with_create(path: &str, create: bool) -> io::Result<Option<PlatformFileLock>> {
+	let mut options = OpenOptions::new();
+	options
 		.read(true)
 		.write(true)
-		.create(true)
+		.create(create)
 		.truncate(false)
-		.mode(0o600)
-		.open(path)?;
+		.mode(0o600);
+	if !create {
+		options.custom_flags(libc::O_NOFOLLOW);
+	}
+	let file = match options.open(path) {
+		Ok(file) => file,
+		Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error),
+	};
 	// SAFETY: `file` owns a live descriptor for the duration of this call. The
 	// non-blocking operation only changes the advisory lock attached to that
 	// open file description.

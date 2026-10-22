@@ -135,3 +135,18 @@ The source-supplied Sublime Text Packages permission notice is retained here:
 Permission to copy, use, modify, sell and distribute is
 granted provided this notice appears in all copies; provided "as is"
 without express or implied warranty.
+
+Markdown.sublime-syntax
+-----------------------
+
+Source: https://github.com/sublimehq/Packages at
+fa6b8629c95041bf262d4c1dab95c456a0530122,
+Markdown/Markdown.sublime-syntax, as pinned by syntect 5.3.0.
+Original source SHA-256:
+fe045101a3be4d2ce2773095a323da4296950826e6fa4129ca34f4c7e5c58967.
+The local grammar contains modified escape and repetition expressions.
+
+Permission to copy, use, modify, sell and distribute this
+software is granted. This software is provided "as is" without
+express or implied warranty, and with no claim as to its
+suitability for any purpose.

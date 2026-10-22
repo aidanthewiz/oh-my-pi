@@ -55,6 +55,16 @@ The addon loads only when a helper is called on Windows; other platforms preserv
 the input path without loading it. These helpers change long/8.3 spellings without
 resolving symlinks or junctions.
 
+### File locks
+
+`FileLock.tryAcquire(path, create = true)` returns a non-blocking ownership handle.
+Check `acquired` and release the handle after the protected operation.
+Release is idempotent and cannot release another handle's ownership.
+
+On file-backed Unix platforms, `create = false` opens only an existing non-symlink.
+A missing path returns an unacquired handle without creating a file.
+Linux and Windows use kernel names and never create filesystem lock files.
+
 ## Building
 
 ```bash

@@ -20,6 +20,13 @@
 - Reject desktop addons without live screen-state support before opening a session instead of using an incomplete desktop ABI.
 - Validate desktop screen-state getter descriptors without invoking native state during module import or constructing a desktop session.
 
+## [18.9.2] - 2026-10-11
+
+### Fixed
+
+- Fixed stalls when highlighting Markdown tool previews containing many inline spans or backslash escapes.
+- Add non-creating file-backed lock acquisition for staging inspection. Missing files remain unacquired, symlinks are refused, and existing one-argument callers retain their behavior.
+
 ## [18.9.1] - 2026-10-11
 
 ### Fixed
