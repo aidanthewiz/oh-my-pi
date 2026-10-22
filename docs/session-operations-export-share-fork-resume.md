@@ -141,7 +141,9 @@ Discovery skips linked transcript files, linked directories, and unsafe archive-
    ```
 
 Unpack restores the transcript, artifacts, and referenced blobs. It does not grant launcher or account-pool authority on the destination.
-An unchanged local prefix can be replaced. Edited or diverged local content creates a fork instead of overwriting local work.
+Unpack holds session and subagent ownership leases while comparing and replacing local data.
+It replaces a local prefix only when all local artifact bytes also occur unchanged in the archive.
+Local journal or artifact changes create an incoming fork. Live owners prevent unpacking until they close.
 Resuming a copy marked moved away forks it; later resumes use that fork normally.
 
 Packing refuses source/artifact output aliases and linked or nonregular artifact roots. Invalid journals and corrupt blobs fail before local replacement.

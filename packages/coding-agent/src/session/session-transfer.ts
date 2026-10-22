@@ -104,8 +104,8 @@ export interface UnpackSessionOptions {
 /**
  * How {@link unpackSession} placed the session:
  * - `created` — no local copy existed;
- * - `replaced` — local copies were prefixes of the incoming transcript and were replaced;
- * - `forked` — a local copy diverged, so the incoming transcript became a fork with a new id.
+ * - `replaced` — local journals were prefixes and every local artifact had identical incoming bytes;
+ * - `forked` — local journal or artifact state differed, so the incoming transcript became a new session.
  */
 export type UnpackMode = "created" | "replaced" | "forked";
 
@@ -597,10 +597,10 @@ async function placeSession(
  * and moved with {@link SessionManager.openRelocated}, which rewrites the
  * header `cwd`. An `arrived` marker is appended.
  *
- * One live copy: local copies of the same session whose entries are a prefix
- * of the incoming ones are replaced (restored if placing fails); if any local
- * copy diverged, the incoming transcript lands as a fork with a new id whose
- * `parentSession` is the original id, and local copies stay untouched.
+ * One live copy: local copies whose entries are a prefix of the incoming
+ * transcript and whose artifact bytes are all present unchanged are replaced
+ * (restored if placing fails). Otherwise the incoming transcript lands as a
+ * fork with a new id whose `parentSession` is the original id, leaving locals untouched.
  */
 export async function unpackSession(archivePath: string, options: UnpackSessionOptions): Promise<UnpackSessionResult> {
 	const archive = path.resolve(archivePath);
@@ -629,22 +629,49 @@ export async function unpackSession(archivePath: string, options: UnpackSessionO
 			await Bun.write(path.join(stagedArtifacts, ...relative.split("/")), bytes);
 		}
 
-		const localCopies = await findLocalCopies(id, sessionDir);
-		let diverged = false;
-		for (const file of localCopies) {
-			const entries = (await loadEntriesFromFile(file)).filter(isBodyEntry);
-			if (!isTranscriptPrefix(entries, contents.entries)) diverged = true;
-		}
-
-		if (diverged) {
-			const placed = await placeSession(() => SessionManager.forkFrom(stagedFile, cwd, sessionDir), arrival);
-			logger.info("Unpacked session as a fork of a diverged local copy", { parent: id, ...placed });
-			return { ...placed, mode: "forked" };
-		}
-
 		const releases: (() => void)[] = [];
 		try {
-			for (const file of localCopies) releases.push(claimSessionOrRefuse(id, file, "replace"));
+			releases.push(claimSessionOrRefuse(id, stagedFile, "unpack"));
+			const localCopies = await findLocalCopies(id, sessionDir);
+			const localArtifacts = new Map<string, string[]>();
+			let diverged = false;
+			for (const file of localCopies) {
+				const stat = await fs.promises.lstat(file);
+				if (!stat.isFile() || stat.nlink > 1) {
+					diverged = true;
+					continue;
+				}
+				const artifacts = file.slice(0, -".jsonl".length);
+				const relatives = await listFilesRecursive(artifacts);
+				localArtifacts.set(file, relatives);
+				for (const relative of relatives) {
+					if (!relative.endsWith(".jsonl")) continue;
+					const transcript = path.join(artifacts, ...relative.split("/"));
+					const childId = await readSessionHeaderId(transcript);
+					if (childId !== undefined) releases.push(claimSessionOrRefuse(childId, transcript, "replace"));
+				}
+			}
+			const incomingArtifacts = new Map(contents.artifacts);
+			for (const file of localCopies) {
+				const entries = (await loadEntriesFromFile(file)).filter(isBodyEntry);
+				if (!isTranscriptPrefix(entries, contents.entries)) diverged = true;
+				const artifacts = file.slice(0, -".jsonl".length);
+				for (const relative of localArtifacts.get(file) ?? []) {
+					const incoming = incomingArtifacts.get(relative);
+					if (incoming === undefined) {
+						diverged = true;
+						continue;
+					}
+					const local = await fs.promises.readFile(path.join(artifacts, ...relative.split("/")));
+					if (!local.equals(incoming)) diverged = true;
+				}
+			}
+
+			if (diverged) {
+				const placed = await placeSession(() => SessionManager.forkFrom(stagedFile, cwd, sessionDir), arrival);
+				logger.info("Unpacked session as a fork of a diverged local copy", { parent: id, ...placed });
+				return { ...placed, mode: "forked" };
+			}
 			const aside = await setAside(localCopies);
 			let placed: { sessionFile: string; id: string };
 			try {

@@ -14,6 +14,7 @@
 
 - Refuse session archive outputs that alias the source or its artifacts; publish owner-only archives atomically.
 - Reject malformed transferred journals and fork edited same-ID local copies instead of replacing local work.
+- Hold session and subagent ownership while importing continuations. Preserve completed local turns and independently changed artifacts instead of replacing them.
 - Keep managed MCP credential transfers inside the active profile and validate imported identities before any provider write.
 - Pin shared embedding servers to their admitted model and canonical cache directory, with one runtime namespace across profiles.
 - Reset local-worker idle windows on valid requests, including keepalives, without interrupting busy work.
