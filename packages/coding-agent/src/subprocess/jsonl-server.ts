@@ -90,6 +90,7 @@ export class JsonLineServer<Req, Res> {
 					logger.warn(`${this.#options.name}: malformed request line`, { error: String(error) });
 					return;
 				}
+				this.#armIdle();
 				this.#options.onRequest(request, reply);
 			},
 			() => this.#connections.delete(connection),
