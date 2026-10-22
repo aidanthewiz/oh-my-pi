@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Retain known billed usage from decoded unusable judgment responses and positive-cost gateway responses with zero tokens.
 - Preserve OAuth account identity when preflight reloads reorder credential rows.
 - Keep OAuth account pools closed when credential rows disappear or change identity during request preparation and refresh.
 - Fixed expired AWS IAM Identity Center sessions being retried as generic Anthropic connection failures; credential resolution can now invoke a bounded, single-flight re-authentication callback and preserve actionable AWS errors when recovery fails.

@@ -518,6 +518,36 @@ describe("NativeJudge", () => {
 		expect(peak).toBe(4);
 	});
 
+	it("reports billed answers discarded by a failed split exactly once after draining", async () => {
+		const partial: Array<{ input: number; output: number; cost: { total: number } }> = [];
+		const judge = new NativeJudge({
+			apiKey: "synthetic",
+			maxQuestions: 1,
+			fetch: async (_url, init) => {
+				const questions = JSON.parse(String(init?.body)).questions;
+				return Response.json({
+					answers: "good" in questions ? { good: { type: "noul", noul: 0.7 } } : {},
+					usage: { input_tokens: "good" in questions ? 11 : 7, output_tokens: 2, cost: 0.03 },
+				});
+			},
+		});
+		await expect(
+			judge.judge(
+				{
+					state: "synthetic",
+					questions: {
+						good: { type: "noul", instructions: "Good?" },
+						missing: { type: "noul", instructions: "Missing?" },
+					},
+				},
+				{ onPartialUsage: usage => partial.push(usage) },
+			),
+		).rejects.toThrow('missing a "noul" answer');
+		expect(partial).toEqual([
+			expect.objectContaining({ input: 18, output: 4, cost: expect.objectContaining({ total: 0.06 }) }),
+		]);
+	});
+
 	it("rejects a non-positive or fractional maxQuestions", () => {
 		// One row per guard: integer but not positive, then not an integer.
 		for (const maxQuestions of [0, 1.5]) {
@@ -637,9 +667,14 @@ describe("NativeJudge OpenAI Decisions dialect", () => {
 				}),
 		});
 
+		const partial: number[] = [];
 		await expect(
-			judge.judge({ state: "s", questions: { urgent: { type: "noul", instructions: "Urgent?" } } }),
+			judge.judge(
+				{ state: "s", questions: { urgent: { type: "noul", instructions: "Urgent?" } } },
+				{ onPartialUsage: usage => partial.push(usage.input) },
+			),
 		).rejects.toThrow(/refused to answer question "urgent"/);
+		expect(partial).toEqual([3]);
 	});
 });
 

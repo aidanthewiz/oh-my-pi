@@ -97,9 +97,8 @@ export interface NativeJudgeOptions extends NativeJudgeConnection {
 /** Per-call options for {@link NativeJudge.judge}. */
 export interface NativeJudgeCallOptions extends JudgeOptions {
 	/**
-	 * Called before a split judgment rejects, with the summed usage of the chunks that had already
-	 * succeeded: billed upstream, but their answers are discarded with the failure. Not called when
-	 * no chunk succeeded or the request was not split.
+	 * Called before a judgment rejects with known billed usage whose answers were discarded.
+	 * Split judgments report once after every worker settles, including decoded refusals.
 	 */
 	onPartialUsage?: (usage: Usage) => void;
 }
@@ -172,8 +171,8 @@ export class NativeJudge implements Judge {
 	/**
 	 * Answer `request` in requests of at most `cap` questions each, {@link CHUNK_PARALLEL} at a time;
 	 * answers merge and usage sums. The first failing chunk aborts its in-flight siblings and stops
-	 * dispatch, so a doomed judgment stops spending; once every chunk settles, the usage of those that
-	 * succeeded goes to `onPartialUsage` before the judgment rejects.
+	 * dispatch, so a doomed judgment stops spending; once every chunk settles, known billed usage
+	 * goes to `onPartialUsage` before the judgment rejects.
 	 */
 	async #judgeChunked<Q extends Questions>(
 		request: JudgmentRequest<Q>,
@@ -189,7 +188,19 @@ export class NativeJudge implements Judge {
 		}
 		const failed = new AbortController();
 		const signal = options?.signal ? AbortSignal.any([options.signal, failed.signal]) : failed.signal;
-		const chunkOptions = { signal };
+		let discarded = 0;
+		let input = 0;
+		let output = 0;
+		let cost = 0;
+		const chunkOptions = {
+			signal,
+			onPartialUsage: (usage: Usage) => {
+				discarded++;
+				input += usage.input;
+				output += usage.output;
+				cost += usage.cost.total;
+			},
+		};
 		const results: JudgmentResult[] = [];
 		let next = 0;
 		const drain = async (): Promise<void> => {
@@ -207,9 +218,6 @@ export class NativeJudge implements Judge {
 		await Promise.allSettled(Array.from({ length: Math.min(CHUNK_PARALLEL, chunks.length) }, drain));
 		const answers = Object.create(null) as Record<string, Answer>;
 		let settled = 0;
-		let input = 0;
-		let output = 0;
-		let cost = 0;
 		for (const result of results) {
 			if (result === undefined) continue;
 			settled++;
@@ -220,7 +228,7 @@ export class NativeJudge implements Judge {
 		}
 		// Every chunk failure aborts `failed`, so `signal` carries the first failure or the caller's abort.
 		if (signal.aborted) {
-			if (settled > 0) options?.onPartialUsage?.(tokenUsage(input, output, cost));
+			if (settled > 0 || discarded > 0) options?.onPartialUsage?.(tokenUsage(input, output, cost));
 			throw signal.reason;
 		}
 		return {
@@ -234,7 +242,7 @@ export class NativeJudge implements Judge {
 
 	async #judgeOnce<Q extends Questions>(
 		request: JudgmentRequest<Q>,
-		options: JudgeOptions | undefined,
+		options: NativeJudgeCallOptions | undefined,
 	): Promise<JudgmentResult<Q>> {
 		const body = JSON.stringify(this.#wire.encode(request, this.model));
 		const signal = options?.signal;
@@ -251,6 +259,7 @@ export class NativeJudge implements Judge {
 			if (!Object.hasOwn(request.questions, id)) continue;
 			const type = request.questions[id].type;
 			if (decoded.refused.includes(id)) {
+				options?.onPartialUsage?.(decoded.usage);
 				throw new AIError.ProviderResponseError(`${this.label} refused to answer question "${id}"`, {
 					provider: this.provider,
 					kind: "content-blocked",
@@ -258,6 +267,7 @@ export class NativeJudge implements Judge {
 			}
 			const answer = Object.hasOwn(decoded.answers, id) ? decoded.answers[id] : undefined;
 			if (!isAnswerOf(answer, type)) {
+				options?.onPartialUsage?.(decoded.usage);
 				throw new AIError.ProviderResponseError(
 					`${this.label} response is missing a "${type}" answer for question "${id}"`,
 					{ provider: this.provider, kind: "envelope" },

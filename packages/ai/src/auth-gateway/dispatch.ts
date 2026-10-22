@@ -271,7 +271,7 @@ export function recordGatewayUsage(
 	usage: Usage,
 	at?: number,
 ): void {
-	if (usage.input + usage.output + usage.cacheRead + usage.cacheWrite === 0) return;
+	if (usage.input + usage.output + usage.cacheRead + usage.cacheWrite === 0 && usage.cost.total === 0) return;
 	storage.usage.observe({
 		provider: model.provider,
 		model: model.id,
