@@ -75,6 +75,7 @@ export class BtwController {
 	#store: BtwHistoryStore | undefined;
 	#storePromise: Promise<BtwHistoryStore> | undefined;
 	#storeSessionId: string | undefined;
+	#storeOwnerSessionId: string | undefined;
 	#storeArtifactsDir: string | undefined;
 	#storeScope: string | undefined;
 	#historyPanel: BtwHistoryPanel | undefined;
@@ -243,6 +244,10 @@ export class BtwController {
 		return true;
 	}
 
+	async disposeSession(sessionId: string): Promise<void> {
+		if (this.#storeOwnerSessionId === sessionId) await this.dispose();
+	}
+
 	async dispose(): Promise<void> {
 		this.#generation++;
 		this.#transitionCount++;
@@ -259,6 +264,7 @@ export class BtwController {
 			this.#store = undefined;
 			this.#storePromise = undefined;
 			this.#storeSessionId = undefined;
+			this.#storeOwnerSessionId = undefined;
 			this.#storeArtifactsDir = undefined;
 			this.#storeScope = undefined;
 		} finally {
@@ -279,6 +285,10 @@ export class BtwController {
 		// rebasing their disk revisions. Newly failing writes still reject below.
 		const failuresAtStart = [...this.#failedWrites.keys()];
 		for (const request of failuresAtStart) await this.#persist(request, true);
+		const request = this.#activeRequest;
+		if (request && getBtwLatestTurn(request.record).status === "running" && !failuresAtStart.includes(request)) {
+			await this.#persist(request);
+		}
 		while (this.#writes.size > 0) await Promise.all(this.#writes);
 		const failure = this.#failedWrites.values().next().value;
 		if (failure) {
@@ -318,22 +328,26 @@ export class BtwController {
 
 	async #loadHistory(): Promise<BtwHistoryStore> {
 		const sessionId = this.#sessionManager.getSessionId();
+		const ownerSessionId = this.ctx.sessionManager.getSessionId();
 		const artifactsDir = this.#sessionManager.getArtifactsDir() ?? undefined;
 		const scope = this.#historyScope;
 		if (
 			this.#storeSessionId !== sessionId ||
+			this.#storeOwnerSessionId !== ownerSessionId ||
 			this.#storeArtifactsDir !== artifactsDir ||
 			this.#storeScope !== scope
 		) {
 			await this.dispose();
 			if (
 				this.#sessionManager.getSessionId() !== sessionId ||
+				this.ctx.sessionManager.getSessionId() !== ownerSessionId ||
 				(this.#sessionManager.getArtifactsDir() ?? undefined) !== artifactsDir ||
 				this.#historyScope !== scope
 			) {
 				throw new Error("The session changed while opening BTW history.");
 			}
 			this.#storeSessionId = sessionId;
+			this.#storeOwnerSessionId = ownerSessionId;
 			this.#storeArtifactsDir = artifactsDir;
 			this.#storeScope = scope;
 		}
@@ -341,6 +355,9 @@ export class BtwController {
 		const pending = this.#storePromise;
 		try {
 			const store = await pending;
+			if (this.ctx.sessionManager.getSessionId() !== ownerSessionId) {
+				throw new Error("The session changed while opening BTW history.");
+			}
 			if (this.#storePromise === pending) this.#store = store;
 			return store;
 		} catch (error) {

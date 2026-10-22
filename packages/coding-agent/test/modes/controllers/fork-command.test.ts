@@ -106,6 +106,7 @@ function createContext(
 		showStatus: vi.fn(),
 		showWarning: vi.fn(),
 		showError,
+		retireOutgoingSessionUi: async () => {},
 		showHookConfirm,
 	} as unknown as InteractiveModeContext;
 	const controller = new CommandController(ctx, {

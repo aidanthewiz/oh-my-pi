@@ -1391,15 +1391,15 @@ export class CommandController {
 
 		// After a `/fork`, the current session ID is changed to the forked one,
 		// so the session ID before the fork is the one we want to show in the hint.
-		const previousSessionId = this.ctx.sessionManager.isSessionOnDisk()
-			? this.ctx.sessionManager.getSessionId()
-			: undefined;
+		const outgoingSessionId = this.ctx.sessionManager.getSessionId();
+		const previousSessionId = this.ctx.sessionManager.isSessionOnDisk() ? outgoingSessionId : undefined;
 
 		const success = await this.ctx.session.fork();
 		if (!success) {
 			this.ctx.showError("Fork failed (session not persisted or cancelled)");
 			return;
 		}
+		await this.ctx.retireOutgoingSessionUi(outgoingSessionId);
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();

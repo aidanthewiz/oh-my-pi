@@ -7847,6 +7847,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#hidePlanReview();
 	}
 
+	async retireOutgoingSessionUi(sessionId: string): Promise<void> {
+		await this.#btwController.disposeSession(sessionId);
+		this.#omfgController.disposeSession(sessionId);
+		this.#cleanseController.disposeSession(sessionId);
+		this.#extensionUiController.clearSessionTerminalInputListeners(sessionId);
+	}
+
 	async handleClearCommand(): Promise<void> {
 		if (this.#vibeSessionTransitionBlocked()) return;
 		await this.prepareSessionSwitch();
@@ -7869,11 +7876,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async handleForkCommand(placement?: "pane" | "window"): Promise<void> {
 		if (this.#vibeSessionTransitionBlocked()) return;
-		if (!placement) {
-			await this.#btwController.dispose();
-			this.#omfgController.dispose();
-			this.#cleanseController.dispose();
-		}
+		if (!placement) await this.#btwController.flush();
 		await this.#commandController.handleForkCommand(placement);
 	}
 

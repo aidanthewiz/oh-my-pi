@@ -21,6 +21,7 @@ interface OmfgRequest {
 	component: OmfgPanelComponent;
 	abortController: AbortController;
 	complaint: string;
+	sessionId: string;
 }
 
 interface OmfgCandidate extends ParsedGeneratedRule {
@@ -66,6 +67,10 @@ export class OmfgController {
 		this.#closeActiveRequest({ abort: true });
 	}
 
+	disposeSession(sessionId: string): void {
+		if (this.#activeRequest?.sessionId === sessionId) this.dispose();
+	}
+
 	async start(complaint: string): Promise<void> {
 		const trimmedComplaint = complaint.trim();
 		if (!trimmedComplaint) {
@@ -85,6 +90,7 @@ export class OmfgController {
 			component: new OmfgPanelComponent({ complaint: trimmedComplaint, tui: this.ctx.ui }),
 			abortController: new AbortController(),
 			complaint: trimmedComplaint,
+			sessionId: this.ctx.sessionManager.getSessionId(),
 		};
 		this.ctx.omfgContainer.clear();
 		this.ctx.omfgContainer.addChild(request.component);

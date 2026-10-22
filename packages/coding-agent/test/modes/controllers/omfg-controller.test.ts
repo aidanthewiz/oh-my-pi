@@ -116,7 +116,10 @@ async function createHarness(options: HarnessOptions): Promise<Harness> {
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		omfgContainer: container,
 		session,
-		sessionManager: { getCwd: () => projectDir } as unknown as InteractiveModeContext["sessionManager"],
+		sessionManager: {
+			getCwd: () => projectDir,
+			getSessionId: () => "omfg-controller-session",
+		} as unknown as InteractiveModeContext["sessionManager"],
 		settings: { getAgentDir: () => agentDir } as unknown as InteractiveModeContext["settings"],
 		showStatus: vi.fn(),
 		showError: vi.fn(),

@@ -507,8 +507,10 @@ export interface InteractiveModeContext {
 	/** Open the `/effort` picker over the levels the current model accepts. */
 	showThinkingSelector(): void;
 	showSessionSelector(source?: ForeignSessionSource): void;
-	/** Settle side requests before replacing the session or deleting its artifacts. */
+	/** Settle side requests and clear transient session UI for session transitions. */
 	prepareSessionSwitch(): Promise<void>;
+	/** Retire side UI owned by the outgoing session after a successful switch. */
+	retireOutgoingSessionUi(sessionId: string): Promise<void>;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;

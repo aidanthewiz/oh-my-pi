@@ -109,7 +109,7 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 }
 
 export class ExtensionUiController {
-	#extensionTerminalInputUnsubscribers = new Set<() => void>();
+	#extensionTerminalInputUnsubscribers = new Map<() => void, string>();
 	#composerShapeDisposers: Array<() => void> = [];
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
@@ -1267,7 +1267,7 @@ export class ExtensionUiController {
 	 */
 	addExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
 		const unsubscribe = this.ctx.ui.addInputListener(handler);
-		this.#extensionTerminalInputUnsubscribers.add(unsubscribe);
+		this.#extensionTerminalInputUnsubscribers.set(unsubscribe, this.ctx.sessionManager.getSessionId());
 		return () => {
 			unsubscribe();
 			this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
@@ -1286,8 +1286,16 @@ export class ExtensionUiController {
 		this.#rebuildHookWidgets();
 	}
 
+	clearSessionTerminalInputListeners(sessionId: string): void {
+		for (const [unsubscribe, owner] of this.#extensionTerminalInputUnsubscribers) {
+			if (owner !== sessionId) continue;
+			unsubscribe();
+			this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
+		}
+	}
+
 	clearExtensionTerminalInputListeners(): void {
-		for (const unsubscribe of this.#extensionTerminalInputUnsubscribers) {
+		for (const unsubscribe of this.#extensionTerminalInputUnsubscribers.keys()) {
 			unsubscribe();
 		}
 		this.#extensionTerminalInputUnsubscribers.clear();
