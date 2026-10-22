@@ -26,7 +26,7 @@ import {
 	resolveOAuthDiscoveryAccounts,
 } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resolveCliModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { resolveCliModel, resolveProviderModelReference } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -41,6 +41,39 @@ const ANTHROPIC_AUTH_ENV_NAMES = [
 	"ANTHROPIC_WORKSPACE_ID",
 	"ANTHROPIC_BASE_URL",
 ] as const;
+
+test("OpenRouter fallback variants keep the requested route in their wire identity", () => {
+	const base = {
+		...buildModel({
+			id: "vendor/aliased",
+			name: "Aliased Model",
+			provider: "openrouter",
+			api: "openai-completions",
+			baseUrl: "https://openrouter.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 2, output: 3, cacheRead: 1, cacheWrite: 4 },
+			contextWindow: 8192,
+			maxTokens: 1024,
+		}),
+		requestModelId: "vendor/base-wire-id",
+	};
+	expect(resolveProviderModelReference("openrouter", base.id, [base])).toBe(base);
+	expect(resolveProviderModelReference("openrouter", "vendor/not-admitted:floor", [base])).toBeUndefined();
+	expect(resolveProviderModelReference("openrouter", `${base.id}:floor`, [])).toBeUndefined();
+	for (const suffix of [":floor", ":nitro"]) {
+		const requestedId = `${base.id}${suffix}`;
+		const resolved = resolveProviderModelReference("openrouter", requestedId, [base]);
+		expect(resolved?.id).toBe(requestedId);
+		expect(resolved?.requestModelId).toBe(`${base.requestModelId}${suffix}`);
+		expect(resolved?.api).toBe("openai-completions");
+		expect(resolved?.provider).toBe(base.provider);
+		expect(resolved?.baseUrl).toBe(base.baseUrl);
+		expect(resolved?.cost).toEqual(base.cost);
+		expect(resolved?.contextWindow).toBe(base.contextWindow);
+	}
+	expect(base.requestModelId).toBe("vendor/base-wire-id");
+});
 
 describe("ModelRegistry runtime discovery", () => {
 	let tempDir: string;

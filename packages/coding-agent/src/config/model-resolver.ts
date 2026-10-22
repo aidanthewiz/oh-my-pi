@@ -263,9 +263,14 @@ function getOpenRouterFallbackModelIds(modelId: string): string[] {
 }
 
 function cloneModelWithRequestedId(model: Model<Api>, requestedId: string): Model<Api> {
+	const route = getOpenRouterRouteSuffix(requestedId);
+	const wireBase = model.requestModelId;
 	return {
 		...model,
 		id: requestedId,
+		...(wireBase && route
+			? { requestModelId: `${getOpenRouterRouteSuffix(wireBase)?.baseId ?? wireBase}:${route.suffix}` }
+			: {}),
 		...(model.name === model.id ? { name: requestedId } : {}),
 	};
 }

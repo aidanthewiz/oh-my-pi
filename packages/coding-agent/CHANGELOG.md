@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Preserve requested OpenRouter routing suffixes when a logical model maps to a different wire ID.
 - Preserve existing files and each managed-browser download's bytes when suggested names collide, including overlapping tab completions.
 - Reserve Tern browser blocks during adoption and release so different tab names cannot drive the same page.
 - Keep the original comparison baseline when smart chart selection reorders or filters condition columns.
