@@ -1290,7 +1290,11 @@ fn compute_replacements(
 		let matched = &lines[found..(found + pattern.len()).min(lines.len())];
 		if matches!(
 			result.strategy,
-			Some(SequenceMatchStrategy::Prefix | SequenceMatchStrategy::Substring)
+			Some(
+				SequenceMatchStrategy::Prefix
+					| SequenceMatchStrategy::Substring
+					| SequenceMatchStrategy::Character
+			)
 		) {
 			assert_partial_match(path, &pattern, matched, &new_lines, found)?;
 		}

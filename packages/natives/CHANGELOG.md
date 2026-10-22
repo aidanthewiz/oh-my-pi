@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Reject multi-hunk character matches that would discard unmatched surrounding text.
 - Native patch application and checks now convert only affected source and destination paths, ignoring unrelated required filter failures.
 - Keep create-new cloning compatible with descriptor-returning Linux and Windows backends.
 - Return closed-reader errors from `tail -f` without polling invalid descriptors indefinitely.
