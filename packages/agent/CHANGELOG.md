@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
+- Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 
 ## [18.9.2] - 2026-10-11
 

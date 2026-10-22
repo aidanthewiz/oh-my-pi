@@ -42,7 +42,7 @@ function toolKeyForPrefix(tool: AgentTool): string {
 	const examples = (tool as { examples?: unknown }).examples;
 	// Identity strings for objects (Map-assigned ids, no string-build cost
 	// on the hot path beyond the first sighting per object).
-	return [
+	return JSON.stringify([
 		tool.name ?? "",
 		tool.description ?? "",
 		String(tool.strict ?? ""),
@@ -51,7 +51,7 @@ function toolKeyForPrefix(tool: AgentTool): string {
 		objectId(params),
 		objectId(customFormat),
 		objectId(examples),
-	].join("\u0000");
+	]);
 }
 
 const objectIds = new WeakMap<object, number>();
