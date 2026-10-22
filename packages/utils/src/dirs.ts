@@ -1099,6 +1099,11 @@ export function getTinyWorkerRuntimeDir(): string {
 	return dirs.rootSubdir(path.join("run", "tiny"), "state");
 }
 
+/** Profile-independent directory for shared mnemopi embedding endpoints and logs (~/.omp/run/mnemopi; XDG default: $XDG_STATE_HOME/omp/run/mnemopi). */
+export function getMnemopiEmbedRuntimeDir(): string {
+	return dirs.baseRootSubdir(path.join("run", "mnemopi"), "state");
+}
+
 /** Root directory containing every per-project daemon runtime scope (~/.omp/run/daemons; XDG default: $XDG_STATE_HOME/omp/run/daemons). */
 export function getDaemonRuntimeRoot(): string {
 	return dirs.rootSubdir(path.join("run", "daemons"), "state");

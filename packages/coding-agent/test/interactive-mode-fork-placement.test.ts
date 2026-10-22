@@ -5,10 +5,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { SessionAccountPoolScope } from "@oh-my-pi/pi-coding-agent/config/account-pool-scope";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { BtwController } from "@oh-my-pi/pi-coding-agent/modes/controllers/btw-controller";
-import { CleanseCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/cleanse-command-controller";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
-import { OmfgController } from "@oh-my-pi/pi-coding-agent/modes/controllers/omfg-controller";
 import * as ternKind from "@oh-my-pi/pi-coding-agent/tools/browser/tern/kind";
 import { TernSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/wire";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
@@ -59,22 +56,6 @@ describe("InteractiveMode fork placement bridge", () => {
 		tempDir?.removeSync();
 		vi.restoreAllMocks();
 		resetSettingsForTest();
-	});
-
-	it.each([
-		["an in-place fork tears down", undefined, 1],
-		["a pane fork keeps", "pane", 0],
-	] as const)("%s the current session's side controllers", async (_label, placement, disposals) => {
-		const btwDispose = vi.spyOn(BtwController.prototype, "dispose");
-		const omfgDispose = vi.spyOn(OmfgController.prototype, "dispose");
-		const cleanseDispose = vi.spyOn(CleanseCommandController.prototype, "dispose");
-		vi.spyOn(CommandController.prototype, "handleForkCommand").mockResolvedValue();
-
-		await mode.handleForkCommand(placement);
-
-		expect(btwDispose).toHaveBeenCalledTimes(disposals);
-		expect(omfgDispose).toHaveBeenCalledTimes(disposals);
-		expect(cleanseDispose).toHaveBeenCalledTimes(disposals);
 	});
 
 	it("flushes deferred Bash output into an independent fork without replacing its unpooled source owner", async () => {

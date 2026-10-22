@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { STREAM_HISTORY_LIMIT, STREAM_PROTO, type StreamHostFrame, type StreamServerToHost } from "@oh-my-pi/pi-wire";
 import { STREAM_LOCAL_PROTO, type StreamStreamerFrame } from "../../src/stream/protocol";
 import { StreamRedactor } from "../../src/stream/redactor";
@@ -24,7 +24,7 @@ interface FakeStreamServer {
 }
 
 interface FakeSession {
-	socket: net.Socket;
+	conn: IpcConnection;
 	frames: StreamStreamerFrame[];
 	send(...frames: object[]): void;
 	waitForFrame(predicate: (frame: StreamStreamerFrame) => boolean): Promise<StreamStreamerFrame>;
@@ -32,7 +32,7 @@ interface FakeSession {
 
 const hosts: StreamMuxHost[] = [];
 const servers: FakeStreamServer[] = [];
-const sessions: net.Socket[] = [];
+const sessions: IpcConnection[] = [];
 const projectDirs: string[] = [];
 
 afterEach(async () => {
@@ -120,31 +120,19 @@ function startFakeStreamServer(port = 0): FakeStreamServer {
 }
 
 async function connectSession(endpoint: string): Promise<FakeSession> {
-	const socket = net.createConnection({ path: endpoint });
-	sessions.push(socket);
-	const connected = Promise.withResolvers<void>();
-	socket.once("connect", () => connected.resolve());
-	socket.once("error", error => connected.reject(error));
-	await connected.promise;
+	const conn = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: 3000 });
+	sessions.push(conn);
 	const frames: StreamStreamerFrame[] = [];
 	const waiters: FrameWaiter<StreamStreamerFrame>[] = [];
-	let buffer = "";
-	socket.setEncoding("utf8");
-	socket.on("data", chunk => {
-		buffer += chunk;
-		for (;;) {
-			const newline = buffer.indexOf("\n");
-			if (newline < 0) return;
-			const line = buffer.slice(0, newline);
-			buffer = buffer.slice(newline + 1);
-			recordFrame(frames, waiters, JSON.parse(line) as StreamStreamerFrame);
-		}
-	});
+	conn.start(
+		line => recordFrame(frames, waiters, JSON.parse(line) as StreamStreamerFrame),
+		() => {},
+	);
 	return {
-		socket,
+		conn,
 		frames,
 		send(...outgoing): void {
-			socket.write(`${outgoing.map(frame => JSON.stringify(frame)).join("\n")}\n`);
+			for (const frame of outgoing) conn.send(JSON.stringify(frame));
 		},
 		waitForFrame: predicate => waitForFrame(frames, waiters, predicate),
 	};

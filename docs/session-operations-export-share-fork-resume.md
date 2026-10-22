@@ -1,4 +1,4 @@
-# Session Operations: export, dump, share, fresh, clear, fork, resume/continue
+# Session operations: export, transfer, share, fresh, clear, fork, and resume
 
 This document describes operator-visible behavior for session export, sharing, conversation reset, lifecycle, fork, and resume operations as currently implemented.
 
@@ -118,6 +118,34 @@ No session persistence entries are appended by dumping.
 Subagent system prompts and tool inventories are not persisted, so subagent files omit them. Subagents with no messages are skipped. If subagent discovery fails, the archive still holds the main dump and the report says why subagents are missing. The TUI copies the archive path to the clipboard and lists its members; headless/ACP returns the same report as command output. Like the sidecar, the archive persists and can contain raw context or secrets.
 
 Discovery skips linked transcript files, linked directories, and unsafe archive-member stems. A failed child read or render does not discard readable siblings. Dumping never publishes data or contacts a share server. Archives use exclusive file creation and owner-only permissions on Unix; they remain unencrypted local artifacts.
+
+## Move a session between machines
+
+1. Pack the source transcript and its artifacts:
+
+   ```sh
+   coreforge session pack /path/to/session.jsonl /private/path/session.tar
+   ```
+
+2. Copy the archive through an encrypted transport.
+3. Unpack it on the destination:
+
+   ```sh
+   coreforge session unpack /private/path/session.tar --cwd /path/to/project
+   ```
+
+4. Mark the source copy moved away:
+
+   ```sh
+   coreforge session moved /path/to/session.jsonl --to target-machine
+   ```
+
+Unpack restores the transcript, artifacts, and referenced blobs. It does not grant launcher or account-pool authority on the destination.
+An unchanged local prefix can be replaced. Edited or diverged local content creates a fork instead of overwriting local work.
+Resuming a copy marked moved away forks it; later resumes use that fork normally.
+
+Packing refuses source/artifact output aliases and linked or nonregular artifact roots. Invalid journals and corrupt blobs fail before local replacement.
+Archives use owner-only permissions on Unix and remain unencrypted. Review their contents before transfer.
 
 ## Share
 
@@ -302,7 +330,7 @@ an explicit error; use bare `/fork` there instead.
 
 ### Preconditions and immediate guards
 
-- Bare `/fork` is rejected with a warning while the agent is streaming.
+- Bare `/fork` first tries the current Tern pane, including during streaming. If that launch is declined or unconfirmed, in-place fallback stays blocked while streaming.
 - A placement fork during streaming asks before launching. The child can omit
   the partial response, and confirming does not stop the parent response.
 - Forking is rejected while vibe mode is active.
@@ -315,6 +343,10 @@ an explicit error; use bare `/fork` there instead.
   parked or released leases. The child cannot inherit that authorization scope.
 - UI status/loading indicators are cleared only for the original bare `/fork`
   flow.
+- Bare forks checkpoint active BTW answers and flush pending history writes before copying artifacts.
+  External, declined, rejected, and no-op forks retain the original side sheet and focus.
+- A successful in-place fork retires only outgoing session owners after `session_switch`.
+  Extension handlers and side views created by the incoming hook remain active.
 
 ### Terminal placement flow
 
@@ -558,7 +590,7 @@ These callbacks are observational; they do not cancel switch/fork.
 
 ### Other cancellation surfaces relevant to this doc
 
-- `/fork` is blocked while streaming (user must wait/abort current response first).
+- In-place `/fork` fallback is blocked while streaming; a successful Tern pane fork leaves the original response running.
 - `/resume` selector can be cancelled by user closing selector.
 - Cross-project `--resume <id>` can be cancelled by declining the missing-directory move/re-root prompt.
 - `/share` has a UI abort path (`Share cancelled`); the upload itself is not killed mid-flight.

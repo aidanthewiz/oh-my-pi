@@ -1,8 +1,13 @@
 # napi (vendored)
 
 Vendored copy of [napi-rs](https://github.com/napi-rs/napi-rs)' `napi` crate
-3.13.0, the crates.io release. The workspace `Cargo.toml` routes the registry
+3.14.2, the crates.io release. The workspace `Cargo.toml` routes the registry
 dependency here through `[patch.crates-io]`. MIT licensed; see `LICENSE`.
+
+Pristine archive: <https://static.crates.io/crates/napi/napi-3.14.2.crate>.
+SHA-256: `a4e2cf85c02d9b057898c485b824c3c416b65193689e2b7f517efc94b86ed24c`.
+The archive records upstream commit `8bab46ee5dfd48a7b51e8bad3d09aed315ada4df`,
+path `crates/napi`, in `.cargo_vcs_info.json`.
 
 ## Local changes
 
@@ -19,7 +24,8 @@ dependency here through `[patch.crates-io]`. MIT licensed; see `LICENSE`.
   previous entry on the premise that its env is already gone. `bun test
   --isolate` (implied by `--parallel`) breaks that premise: every test file
   gets a fresh global object and `napi_env` on the same worker thread, and the
-  previous env is never torn down. The overwritten strong references then pin
+  previous env is never torn down (still so in Bun 1.4.3, which also skips the
+  teardown at the end of a run). The overwritten strong references then pin
   every earlier file's realm, global object and entire module graph, for the
   life of the worker. In `packages/coding-agent` that is ~15 MB of JS heap per
   test file, so a `bun test --parallel=8` worker grows to ~6 GB.
@@ -31,11 +37,15 @@ dependency here through `[patch.crates-io]`. MIT licensed; see `LICENSE`.
   threadsafe function, and deletes its cached `Reflect` holder, all through
   that still-valid env. Under Node an env on a thread is always torn down
   (clearing the slot) before another registers, so the new path never runs.
-- `Cargo.toml`: `publish = false`. The crates.io `Cargo.lock`,
+- `Cargo.toml`: `publish = false` and a `[lints.clippy]` block that keeps the
+  workspace's lint config off upstream code. `CHANGELOG.md`: the vendor
+  import entries under `[Unreleased]`. The crates.io `Cargo.lock`,
   `Cargo.toml.orig`, `README.md` and VCS metadata are dropped; `BUILD.bazel`
   and `rustfmt.toml` are workspace wiring.
+- `LICENSE`: retain the complete MIT notices for LongYinan and GitHub.
+  The registry archive does not include this file.
 
-Everything else is byte-identical to the 3.13.0 release.
+Everything else is byte-identical to the 3.14.2 release.
 
 ## Updating
 
@@ -43,5 +53,8 @@ Copy the new release's `src/`, `build.rs`, `Cargo.toml` and `CHANGELOG.md`
 over this directory, then from here run
 `patch -p1 < patches/0001-release-superseded-env-handles.patch` (drop the patch
 if upstream fixed the per-env leak) and regenerate it against the new release.
-Restore `publish = false` and sync `crate_features` in `BUILD.bazel` with
-`cargo tree -p pi-natives -i napi -e normal -f '{p} [{f}]'`.
+Preserve `LICENSE` and record the new archive checksum and VCS commit.
+Restore the `Cargo.toml` and `CHANGELOG.md` edits above, bump `version` in
+`BUILD.bazel` and sync its `crate_features` with
+`cargo tree -p pi-natives -i napi -e normal -f '{p} [{f}]'`, then run
+`cargo update -p napi -p napi-derive` and `bun scripts/gen-bazel-lock.ts`.

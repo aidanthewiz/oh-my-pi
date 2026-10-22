@@ -157,17 +157,14 @@ async function resolveScopeProjectDir(runtimeDir: string): Promise<string | unde
 // ---------------------------------------------------------------------------
 
 /**
- * Connect to a scope's broker. Undefined when the scope cannot be addressed
- * (Windows pipe names derive from the project dir, which may be unknown for
- * discovered scopes). The caller owns the returned client and must close it.
+ * Connect to a scope's broker; the endpoint derives from the runtime dir alone.
+ * Legacy scopes without current broker provenance remain offline-only.
+ * The caller owns the returned client and must close it.
  */
 export async function scopeClient(scope: PsScope): Promise<DaemonBrokerClient | undefined> {
 	const runtimeRoot = path.dirname(scope.runtimeDir);
 	if (daemonBrokerRuntimeDir(runtimeRoot) !== scope.runtimeDir) return undefined;
-	const connectDir =
-		scope.projectDir ?? (process.platform === "win32" && scope.kind !== "global" ? undefined : runtimeRoot);
-	if (connectDir === undefined) return undefined;
-	return createDaemonBrokerClient(connectDir, { runtimeDir: runtimeRoot });
+	return createDaemonBrokerClient(scope.projectDir ?? runtimeRoot, { runtimeDir: runtimeRoot });
 }
 
 /**

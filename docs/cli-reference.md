@@ -250,6 +250,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 | --- | --- | --- |
 | `launch` | Start a coding session (the default command). | [Launch flags](#launch-flags) |
 | `acp` | Run Coreforge as an ACP (Agent Client Protocol) server over stdio. | [approval mode](./approval-mode.md#acp-sessions) |
+| `auth` | Export or import stored provider credentials as JSON. | [Credential transfer](#credential-transfer) |
 | `auth-broker` | Manage the Coreforge auth broker (credential vault). | [auth broker / gateway](./auth-broker-gateway.md) |
 | `auth-gateway` | Run an auth-gateway: an HTTP forward proxy backed by the configured broker (`serve`), or JSON lines on stdin/stdout for a parent process with your own credentials (`stdio`). | [auth broker / gateway](./auth-broker-gateway.md) |
 | `agents` | Manage bundled task agents. | [task agent discovery](./task-agent-discovery.md) |
@@ -282,6 +283,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 | `predict` | Compare word-completion engines' live ghost text for a prompt. | |
 | `ps` | List and control daemon-supervised background processes (logs, stop, kill, restart). | |
 | `say` | Synthesize text with the local TTS engine and play it through the speakers. | [tts tool](./tools/tts.md) |
+| `session` | Pack, unpack, or mark a session moved between machines. | [Session transfer](./session-operations-export-share-fork-resume.md#move-a-session-between-machines) |
 | `share` | Share a saved session via an encrypted link (same as the `/share` slash command). | [session operations](./session-operations-export-share-fork-resume.md) |
 | `setup` | Run onboarding setup or install dependencies for optional features. | |
 | `shell` | Interactive shell console. | |
@@ -309,3 +311,19 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 `usage accounts` refreshes credential metadata before listing identity keys. If refresh fails, it retains cached identities and warns on stderr that they may be stale. JSON stdout remains parseable and contains no tokens. `--redact` is rejected because account pools require exact identity keys.
 
 `__complete` is an internal, hidden subcommand used by shell completion scripts.
+
+## Credential transfer
+
+```sh
+umask 077
+coreforge auth export > credentials.json
+coreforge auth import credentials.json
+```
+
+Credential files contain plaintext API keys and OAuth refresh tokens. Use an encrypted transport. Never commit or publish them.
+
+Export includes only the active profile's managed MCP credentials. Import rejects another profile's managed MCP credentials before writing any provider.
+Own-profile and legacy MCP metadata remain transferable. Explicit pipes and `coreforge auth import -` are supported.
+
+The command does not transfer Coreforge's MSAL identity cache or destination account-pool policy. Broker-managed credentials remain with their broker.
+

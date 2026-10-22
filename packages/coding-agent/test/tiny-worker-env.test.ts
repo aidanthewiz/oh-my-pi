@@ -3,11 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
+import { ipcEndpoint } from "@oh-my-pi/pi-natives";
+import { sharedWorkerLogPath } from "@oh-my-pi/pi-coding-agent/subprocess/shared-worker";
 import { nativeLibraryPathOverlay, workerEnvFromParent } from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgProvidersTinyModelDevice } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { tinyWorkerEnvOverlay } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
-import { tinyWorkerEndpoint, tinyWorkerLogPath } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
+import { tinyWorkerName } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
 
 describe("workerEnvFromParent", () => {
 	it("drops inherited git repo-location overrides but keeps an explicit overlay", () => {
@@ -203,13 +205,14 @@ describe("nativeLibraryPathOverlay", () => {
 	});
 });
 
-describe("tinyWorkerLogPath", () => {
+describe("sharedWorkerLogPath", () => {
 	// Regression: the log used to be `${endpoint}.log`, which on Windows turns
 	// the named-pipe endpoint (`\\.\pipe\omp-tiny-…`) into an unopenable file
 	// path and crashed `--smoke-test` with ENOENT.
 	it("stays under the runtime directory instead of deriving from the endpoint", () => {
 		const runtimeDir = "/runtime";
-		const logPath = tinyWorkerLogPath(runtimeDir, "lfm2.5-230m", "onnx");
+		const name = tinyWorkerName("lfm2.5-230m", "onnx");
+		const logPath = sharedWorkerLogPath(runtimeDir, name);
 		// `path.join` is platform-native, so assert containment through
 		// `path.relative` rather than assuming the host's separator: on Windows
 		// the same call yields `\runtime\<name>.log`.
@@ -219,7 +222,7 @@ describe("tinyWorkerLogPath", () => {
 		expect(logPath.endsWith(".log")).toBe(true);
 		expect(logPath.includes(".sock")).toBe(false);
 		if (process.platform === "win32") {
-			expect(tinyWorkerEndpoint("/runtime", "lfm2.5-230m", "onnx").startsWith("\\\\.\\pipe\\")).toBe(true);
+			expect(ipcEndpoint(runtimeDir, name).startsWith("\\\\.\\pipe\\")).toBe(true);
 			expect(logPath.startsWith("\\\\.\\pipe\\")).toBe(false);
 		}
 	});

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
-import { FileLock } from "@oh-my-pi/pi-natives";
+import { FileLock, IpcServer } from "@oh-my-pi/pi-natives";
 import * as path from "node:path";
 import type { PsScope } from "@oh-my-pi/pi-tui/apps/ps-data";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -472,17 +471,15 @@ describe("daemon metadata writes", () => {
 			stderr: "ignore",
 		});
 		await Bun.write(path.join(runtimeDir, "broker.pid"), JSON.stringify({ pid: child.pid }));
-		const server = net.createServer(socket => socket.destroy());
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(daemonBrokerEndpoint(projectDir, runtimeDir), resolve);
-		});
+		const server = await IpcServer.listen(daemonBrokerEndpoint(runtimeDir), { framing: "lines" }, socket =>
+			socket.destroy(),
+		);
 		try {
 			const broker = startBroker(projectDir, runtimeDir);
 			await expect(broker.finished).rejects.toThrow(/older daemon broker still owns/);
 			expect(await fs.exists(path.join(daemonBrokerRuntimeDir(runtimeDir), "broker.pid"))).toBe(false);
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await server.close();
 			child.kill();
 			await child.exited;
 		}

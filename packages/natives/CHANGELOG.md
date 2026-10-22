@@ -20,6 +20,15 @@
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
 - Reject desktop addons without live screen-state support before opening a session instead of using an incomplete desktop ABI.
 - Validate desktop screen-state getter descriptors without invoking native state during module import or constructing a desktop session.
+## [18.10.0] - 2026-10-12
+
+### Added
+
+- Added `IpcServer`, `IpcConnection`, and `ipcEndpoint`: a local IPC transport over Unix sockets and Windows named pipes with owner-only access, single-instance binding, stale-endpoint takeover, and newline framing.
+
+### Changed
+
+- Optimized transport performance with task-local write coalescing and batch-based newline processing
 
 ## [18.9.2] - 2026-10-11
 

@@ -1,5 +1,4 @@
-import { chmodSync, lstatSync, type Stats, unlinkSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { type IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
 import { type Component, isFocusable, type OverlayOptions, type TUI } from "./tui";
 import { plainText } from "./native/spans";
 
@@ -68,27 +67,6 @@ function errorMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
 	} catch {
 		return "debug operation failed";
-	}
-}
-
-function isEnoent(error: unknown): boolean {
-	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function removeOwnedSocket(path: string): boolean {
-	let stats: Stats;
-	try {
-		stats = lstatSync(path);
-	} catch (error) {
-		return isEnoent(error);
-	}
-	if (!stats.isSocket()) return false;
-	if (typeof process.getuid === "function" && stats.uid !== process.getuid()) return false;
-	try {
-		unlinkSync(path);
-		return true;
-	} catch {
-		return false;
 	}
 }
 
@@ -229,76 +207,71 @@ function mouseSequence(x: number, y: number, action: string): string {
 /** NDJSON debug and input server enabled by the `OMP_TUI_DEBUG` socket path. */
 export class TuiDebugServer {
 	readonly #tui: TUI;
-	readonly #path: string;
-	#server: Server | undefined;
-	#sockets = new Set<Socket>();
+	#path: string;
+	#server: IpcServer | undefined;
+	#listening: Promise<boolean> | undefined;
+	#closing: Promise<unknown> | undefined;
+	#generation = 0;
+	#connections = new Set<IpcConnection>();
 
 	constructor(tui: TUI, path: string) {
 		this.#tui = tui;
 		this.#path = path;
 	}
 
-	start(): void {
-		if (this.#server !== undefined || !removeOwnedSocket(this.#path)) return;
-		const server = createServer(socket => this.#accept(socket));
-		this.#server = server;
-		server.on("error", () => {
-			if (this.#server === server) this.#server = undefined;
+	/** Resolves true once the socket accepts connections, false if listen failed or the server stopped first. */
+	get ready(): Promise<boolean> {
+		return this.#listening ?? Promise.resolve(false);
+	}
+
+	start(path = this.#path): void {
+		if (this.#listening !== undefined) return;
+		this.#path = path;
+		const generation = ++this.#generation;
+		const closing = this.#closing;
+		this.#listening = (async () => {
+			if (closing) await closing;
+			if (generation !== this.#generation) return false;
 			try {
-				server.close();
+				const server = await IpcServer.listen(path, { framing: "lines" }, connection =>
+					this.#accept(connection, generation),
+				);
+				if (generation !== this.#generation) {
+					await server.close();
+					return false;
+				}
+				this.#server = server;
+				return true;
 			} catch {
-				// The listener may have failed before it reached the listening state.
+				// A live peer or unusable path disables debugging without affecting the host.
+				return false;
 			}
-			removeOwnedSocket(this.#path);
-		});
-		try {
-			server.listen(this.#path);
-			if (process.platform !== "win32") chmodSync(this.#path, 0o600);
-		} catch {
-			this.#server = undefined;
-			try {
-				server.close();
-			} catch {
-				// The listener never reached the listening state.
-			}
-			removeOwnedSocket(this.#path);
-		}
+		})();
 	}
 
 	stop(): void {
+		this.#generation++;
 		const server = this.#server;
 		this.#server = undefined;
-		for (const socket of this.#sockets) socket.destroy();
-		this.#sockets.clear();
-		try {
-			server?.close();
-		} catch {
-			// A failed or already-closed listener still needs its stale path removed.
+		this.#closing = server ? server.close().catch(() => {}) : (this.#listening ?? this.#closing);
+		this.#listening = undefined;
+		for (const connection of this.#connections) connection.destroy();
+		this.#connections.clear();
+	}
+
+	#accept(connection: IpcConnection, generation: number): void {
+		if (generation !== this.#generation) {
+			connection.destroy();
+			return;
 		}
-		removeOwnedSocket(this.#path);
+		this.#connections.add(connection);
+		connection.start(
+			line => void this.#handleLine(connection, line),
+			() => this.#connections.delete(connection),
+		);
 	}
 
-	#accept(socket: Socket): void {
-		this.#sockets.add(socket);
-		let buffer = "";
-		socket.setEncoding("utf8");
-		socket.on("data", chunk => {
-			buffer += chunk;
-			let newline = buffer.indexOf("\n");
-			while (newline !== -1) {
-				const line = buffer.slice(0, newline).replace(/\r$/, "");
-				buffer = buffer.slice(newline + 1);
-				if (line.length > 0) this.#handleLine(socket, line);
-				newline = buffer.indexOf("\n");
-			}
-		});
-		socket.on("error", error => {
-			void error;
-		});
-		socket.on("close", () => this.#sockets.delete(socket));
-	}
-
-	#handleLine(socket: Socket, line: string): void {
+	async #handleLine(connection: IpcConnection, line: string): Promise<void> {
 		let request: DebugRequest;
 		try {
 			const parsed: unknown = JSON.parse(line);
@@ -306,36 +279,31 @@ export class TuiDebugServer {
 				throw new Error("request must be an object");
 			request = parsed as DebugRequest;
 		} catch (error) {
-			this.#write(socket, { ok: false, error: `malformed JSON: ${errorMessage(error)}` });
+			this.#write(connection, { ok: false, error: `malformed JSON: ${errorMessage(error)}` });
 			return;
 		}
+		let response: DebugResponse;
 		try {
-			const response = this.#dispatch(request);
-			if (request.op === "quit" && response.ok) {
-				this.#write(socket, response, () => {
-					this.#tui.stop();
-					process.exit(0);
-				});
-				return;
-			}
-			this.#write(socket, response);
+			response = this.#dispatch(request);
 		} catch (error) {
-			this.#write(socket, { ok: false, error: errorMessage(error) });
+			response = { ok: false, error: errorMessage(error) };
+		}
+		this.#write(connection, response);
+		if (request.op === "quit" && response.ok) {
+			await connection.drained();
+			this.#tui.stop();
+			process.exit(0);
 		}
 	}
 
-	#write(socket: Socket, response: DebugResponse, flushed?: () => void): void {
+	#write(connection: IpcConnection, response: DebugResponse): void {
 		let line: string;
 		try {
 			line = JSON.stringify(response);
 		} catch (error) {
 			line = JSON.stringify({ ok: false, error: errorMessage(error) });
 		}
-		try {
-			socket.write(`${line}\n`, flushed);
-		} catch {
-			// Broken clients cannot affect the TUI.
-		}
+		connection.send(line);
 	}
 
 	#dispatch(request: DebugRequest): DebugResponse {
