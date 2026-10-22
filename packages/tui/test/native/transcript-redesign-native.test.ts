@@ -170,20 +170,69 @@ describe("native transcript redesign", () => {
 		expect(harness.errors).toEqual([]);
 	});
 
-	it("gives a user message no head row, and routes its toolbar to omp's copy and rewind", async () => {
+	it("routes the user footer to copy and rewind without changing the prompt", async () => {
 		const actions: TranscriptAction[] = [];
 		setTranscriptActionHandler(action => actions.push(action));
 		const user = new UserMessageComponent("Fix the build", { timestamp: Date.UTC(2026, 0, 1, 12, 30) });
 		harness = await TspHarness.start();
 		harness.tui.addChild(user);
 		await harness.render();
-		const frame = harness.find(node => node.k === "card" && node.p?.role === "omp.user");
-		expect(prop(frame, "head")).toBeUndefined();
-		const tool = (label: string) =>
-			harness!.find(node => node.p?.role === "omp.user.tool" && prop(node, "text") === label)!;
-		harness.event({ ev: "action", sf: harness.terminal.surface!, id: tool("Copy").id, act: "copy-message" });
-		harness.event({ ev: "action", sf: harness.terminal.surface!, id: tool("Rewind").id, act: "rewind" });
+		const tool = (icon: string) =>
+			harness!.find(node => node.p?.role === "omp.user.tool" && prop(node, "name") === icon)!;
+		harness.event({ ev: "action", sf: harness.terminal.surface!, id: tool("copy").id, act: "copy-message" });
+		harness.event({ ev: "action", sf: harness.terminal.surface!, id: tool("rewind").id, act: "rewind" });
 		expect(actions).toEqual([{ act: "copy", text: "Fix the build" }, { act: "rewind" }]);
+	});
+
+	it("copies a turn's answer from its footer: the text blocks a blank line apart, no thinking", async () => {
+		const actions: TranscriptAction[] = [];
+		setTranscriptActionHandler(action => actions.push(action));
+		const answer = (...content: AssistantMessage["content"]): AssistantMessage => ({
+			...failed(""),
+			stopReason: "stop",
+			errorMessage: undefined,
+			content,
+		});
+		const component = new AssistantMessageComponent();
+		component.updateContent(
+			answer(
+				{ type: "text", text: "First part.\n" },
+				{ type: "thinking", thinking: "Checking the rest" },
+				{ type: "text", text: "  Second part." },
+			),
+		);
+		component.setTurnUsage({ elapsedMs: 133_000, input: 70_000, output: 1_000, cost: 0.85 });
+		harness = await TspHarness.start();
+		harness.tui.addChild(component);
+		await harness.render();
+		const copy = harness.find(node => node.p?.role === "omp.turn.copy");
+		harness.event({ ev: "action", sf: harness.terminal.surface!, id: copy!.id, act: "copy-answer" });
+		expect(actions).toEqual([{ act: "copy", text: "First part.\n\nSecond part." }]);
+
+		component.updateContent(answer({ type: "text", text: "Streaming replacement" }), { transient: true });
+		await harness.render();
+		expect(
+			harness.find(node => node.k === "md" && node.p?.stream === true && node.p?.text === "Streaming replacement"),
+		).toBeDefined();
+		const liveCopy = harness.find(node => node.p?.role === "omp.turn.copy")!;
+		harness.event({ ev: "action", sf: harness.terminal.surface!, id: liveCopy.id, act: "copy-answer" });
+		expect(actions.at(-1)).toEqual({ act: "copy", text: "Streaming replacement" });
+
+		component.updateContent(answer({ type: "thinking", thinking: "Nothing to say" }));
+		await harness.render();
+		expect(harness.find(node => node.p?.role === "omp.turn.usage")).toBeDefined();
+		expect(harness.find(node => node.p?.role === "omp.turn.copy")).toBeUndefined();
+		const actionCount = actions.length;
+		harness.event({ ev: "action", sf: harness.terminal.surface!, id: copy!.id, act: "copy-answer" });
+		expect(actions).toHaveLength(actionCount);
+		component.updateContent(answer({ type: "text", text: "Removed answer must not copy" }));
+		await harness.render();
+		const removedCopy = harness.find(node => node.p?.role === "omp.turn.copy")!;
+		harness.tui.removeChild(component);
+		await harness.render();
+		harness.event({ ev: "action", sf: harness.terminal.surface!, id: removedCopy.id, act: "copy-answer" });
+		expect(actions).toHaveLength(actionCount);
+		expect(harness.errors).toEqual([]);
 	});
 
 	it("shows a user message's time on the terminal's clock", async () => {

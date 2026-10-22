@@ -41,7 +41,7 @@ function plain(text: TspText | undefined): string {
 	return typeof text === "string" ? text : (text ?? []).map(s => s.t).join("");
 }
 
-function codeProps(children: readonly NativeChild[] | undefined): { start?: number; text?: string }[] {
+function codeProps(children: readonly NativeChild[] | undefined): { start?: number; text?: string; lang?: string }[] {
 	return collect(children, n => n.k === "code").flatMap(n => (n.k === "code" && n.p ? [n.p] : []));
 }
 
@@ -82,8 +82,40 @@ describe("grep native view", () => {
 		const view = grepToolRenderer.describeResult(result, expanded, { pattern: "hit" });
 		const first = collect(view.body, n => role(n) === "omp.tool.search.file")[0]!;
 		expect(codeStarts(first.c)).toEqual([9, 40]);
-		const kinds = (first.c ?? []).filter(isNode).map(n => n.k);
-		expect(kinds).toEqual(["row", "code", "text", "code"]);
+	});
+
+	it("puts a single-file search, which prints no header, under that file's row", () => {
+		const single = [" 9│ctx", "*10│hit", "   │...", "*40│far"].join("\n");
+		const view = grepToolRenderer.describeResult(
+			{
+				content: [{ type: "text", text: single }],
+				details: { matchCount: 2, fileCount: 1, files: ["src/a.ts"], displayContent: single },
+			},
+			expanded,
+			{ pattern: "hit" },
+		);
+		const body = (view.body ?? []).filter(isNode);
+		expect(body.map(role)).toEqual(["omp.tool.search.file"]);
+		expect(codeProps(body[0]!.c).map(p => ({ start: p.start, text: p.text, lang: p.lang }))).toEqual([
+			{ start: 9, text: "ctx\nhit", lang: "typescript" },
+			{ start: 40, text: "far", lang: "typescript" },
+		]);
+		expect(codeStarts(body[0]!.c)).toEqual([9, 40]);
+	});
+
+	it("does not duplicate an explicit file header when single-file metadata is also present", () => {
+		const text = "# src/\n## a.ts\n*7│match";
+		const view = grepToolRenderer.describeResult(
+			{
+				content: [{ type: "text", text }],
+				details: { matchCount: 1, fileCount: 1, files: ["src/a.ts"], displayContent: text },
+			},
+			expanded,
+			{ pattern: "match" },
+		);
+		const files = collect(view.body, n => role(n) === "omp.tool.search.file");
+		expect(files.map(n => n.key)).toEqual(["f:src/a.ts"]);
+		expect(codeProps(files[0]!.c).map(p => [p.start, p.text, p.lang])).toEqual([[7, "match", "typescript"]]);
 	});
 });
 

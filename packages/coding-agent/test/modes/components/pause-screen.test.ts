@@ -100,6 +100,20 @@ describe("pause screen", () => {
 		});
 	});
 
+	describe("native sheet", () => {
+		it("resumes from the Resume button", async () => {
+			const { host, shown } = makeHost();
+			const run = runPauseScreen(host); // shows the sheet synchronously, before its first await
+			const component = shown[0];
+			expect(component).toBeInstanceOf(PauseScreenComponent);
+			if (component instanceof PauseScreenComponent) {
+				component.handleNativeEvent({ type: "action", key: "actions/resume", act: "resume", mods: [] });
+			}
+			await run;
+			expect(agentPauseGate.paused).toBe(false);
+		});
+	});
+
 	describe("runPauseScreen", () => {
 		it("engages the gate for the screen's lifetime and releases it on escape", async () => {
 			const { host, shown, statuses, hiddenCount } = makeHost();

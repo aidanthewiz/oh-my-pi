@@ -249,6 +249,60 @@ describe("BtwHistoryPanel native events", () => {
 		history.update([{ ...records[0]!, answer: "answer to first question, longer now" }]);
 		expect(details()?.scroll).toEqual({ by: "end", n: 1 });
 	});
+
+	it("routes the footer buttons to the same paths as their keys", async () => {
+		const onCopy = vi.fn();
+		const onFollowUp = vi.fn(async () => true);
+		// The accepted follow-up closes the composer and renders once more.
+		const sent = Promise.withResolvers<void>();
+		const history: BtwHistoryPanel = new BtwHistoryPanel({
+			records: [record("a", "first question"), record("b", "second question")],
+			onClose: () => {},
+			onCopy,
+			onCancel: () => {},
+			canFollowUp: () => true,
+			onFollowUp,
+			requestRender: () => {
+				if (onFollowUp.mock.calls.length > 0 && !findNode(history.describe(), node => node.key === "composer")) {
+					sent.resolve();
+				}
+			},
+			getHeight: () => 30,
+		});
+		const click = (act: string): void =>
+			history.handleNativeEvent({ type: "action", key: `actions/${act}`, act, mods: [] });
+		click("copy");
+		expect(onCopy).toHaveBeenCalledWith(expect.objectContaining({ id: "a" }));
+		click("follow-up");
+		expect(findNode(history.describe(), node => node.key === "composer")).toBeDefined();
+		click("discard");
+		expect(findNode(history.describe(), node => node.key === "composer")).toBeUndefined();
+		click("follow-up");
+		history.handleInput("w");
+		history.handleInput("hy?");
+		click("send");
+		await sent.promise;
+		expect(onFollowUp).toHaveBeenCalledWith(expect.objectContaining({ id: "a" }), "why?", expect.any(AbortSignal));
+	});
+
+	it("stops a running answer from its footer button without cancelling a removed record", () => {
+		const onCancel = vi.fn();
+		const running: BtwHistoryRecord = { ...record("a", "still going"), status: "running" };
+		const history = new BtwHistoryPanel({
+			records: [running],
+			onClose: () => {},
+			onCopy: () => {},
+			onCancel,
+			requestRender: () => {},
+			getHeight: () => 30,
+			escapeHides: true,
+		});
+		history.handleNativeEvent({ type: "action", key: "actions/stop", act: "stop", mods: [] });
+		expect(onCancel).toHaveBeenCalledWith(running);
+		history.update([]);
+		history.handleNativeEvent({ type: "action", key: "actions/stop", act: "stop", mods: [] });
+		expect(onCancel).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("CodexResetFireworks under a native surface", () => {
