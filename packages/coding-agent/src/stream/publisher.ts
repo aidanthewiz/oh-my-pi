@@ -81,6 +81,7 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 	}
 
 	let settled = false;
+	let rejected = false;
 	let frameHandler: ((frame: StreamStreamerFrame) => void) | undefined;
 	let closeHandler: ((reason: string | null) => void) | undefined;
 	let closeReason: string | null | undefined;
@@ -89,6 +90,7 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 	const timer = setTimeout(() => {
 		if (settled) return;
 		settled = true;
+		rejected = true;
 		logger.debug("stream: local publisher connection timed out");
 		conn.destroy();
 		resolve(null);
@@ -98,6 +100,7 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 	const finishNull = (error?: unknown): void => {
 		if (settled) return;
 		settled = true;
+		rejected = true;
 		clearTimeout(timer);
 		if (error !== undefined) logConnectFailure(error);
 		conn.destroy();
@@ -136,7 +139,7 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 	};
 	conn.start(
 		frame => {
-			if (!conn.closed) handleLine(frame);
+			if (!rejected) handleLine(frame);
 		},
 		reason => {
 			closeReason = reason;
@@ -195,13 +198,8 @@ export class StreamPublisher {
 		options: Omit<StreamPublisherOptions, "redactor">,
 		redactor: StreamRedactor,
 	): StreamPublisher | null {
-		if (opened.conn.closed) return null;
 		const publisher = new StreamPublisher(opened.conn, options, redactor);
 		opened.setFrameHandler(frame => publisher.#handleFrame(frame));
-		opened.setCloseHandler(reason => {
-			if (reason !== null) logger.debug("stream: local publisher connection failed", { reason });
-			publisher.#detach();
-		});
 		publisher.#onStatus({ viewers: 0 });
 		publisher.#unsubscribePaint = publisher.#tui.addPaintListener(paint => {
 			if (publisher.#disposed) return;
@@ -209,7 +207,11 @@ export class StreamPublisher {
 			publisher.#scheduleFlush();
 		});
 		for (const frame of opened.takeQueuedFrames()) publisher.#handleFrame(frame);
-		return publisher;
+		opened.setCloseHandler(reason => {
+			if (reason !== null) logger.debug("stream: local publisher connection failed", { reason });
+			publisher.#detach();
+		});
+		return publisher.#disposed ? null : publisher;
 	}
 
 	constructor(conn: IpcConnection, options: Omit<StreamPublisherOptions, "redactor">, redactor: StreamRedactor) {

@@ -209,10 +209,14 @@ export class StreamMuxHost {
 		}
 		const connection: LocalConnection = { conn };
 		this.#connections.add(connection);
+		let rejected = false;
 		conn.start(
 			frame => {
-				if (conn.closed) return;
-				if (!this.#handleLocalLine(connection, frame)) conn.destroy();
+				if (this.#closing || rejected) return;
+				if (!this.#handleLocalLine(connection, frame)) {
+					rejected = true;
+					conn.destroy();
+				}
 			},
 			() => this.#detach(connection),
 		);
