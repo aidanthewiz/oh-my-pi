@@ -154,6 +154,9 @@ Typed transport failures retain uncertain outcomes even when their text resemble
 Use `retry: "never"` for mutations. Use `retry: "read"` only for known reads.
 Without an explicit override, replay requires `readOnlyHint: true` or
 `idempotentHint: true`. A connection failure alone never proves write safety.
+Authentication challenges do not override this replay contract.
+Unsafe calls preserve original errors without credential probes or recovery after dispatch.
+Authentication setup remains available before the first dispatch.
 Cancellation stops connection waits and checks again before dispatch.
 An aborted in-flight call can still have changed remote state; reconcile its
 outcome instead of resubmitting it.

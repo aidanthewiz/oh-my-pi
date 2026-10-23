@@ -410,13 +410,15 @@ async function callProfileAwareTool(
 	toolName: string,
 	args: MCPToolArgs,
 	authenticationRecovery: AwsAuthenticationRecoveryBudget,
+	replaySafe: boolean,
 	signal?: AbortSignal,
 	context?: AgentToolContext,
 ): Promise<MCPToolCallResult> {
 	const profile = String(args.aws_profile);
-	const group = isAuthenticatedAwsTool(connection.name, toolName)
-		? (await resolveTrustedAwsProfile(profile))?.ssoGroup
-		: undefined;
+	const group =
+		replaySafe && isAuthenticatedAwsTool(connection.name, toolName)
+			? (await resolveTrustedAwsProfile(profile))?.ssoGroup
+			: undefined;
 	let retried = false;
 	while (true) {
 		const authenticationGeneration = group ? awsSessionAuthGroups.generation(group) : 0;
@@ -424,6 +426,7 @@ async function callProfileAwareTool(
 			throwIfAborted(signal);
 			const result = await callTool(connection, toolName, args, { signal });
 			if (
+				!replaySafe ||
 				!result.isError ||
 				!isAuthenticatedAwsTool(connection.name, toolName) ||
 				!(await isAwsAuthenticationFailure(
@@ -440,6 +443,7 @@ async function callProfileAwareTool(
 				return result;
 		} catch (error) {
 			rethrowIfAborted(error, signal);
+			if (!replaySafe) throw error;
 			if (error instanceof MCPTransportError && error.stage !== "protocol") throw error;
 			if (
 				!isAuthenticatedAwsTool(connection.name, toolName) ||
@@ -473,12 +477,22 @@ async function callToolWithAuthRetry(
 	toolName: string,
 	args: MCPToolArgs,
 	authenticationRecovery: AwsAuthenticationRecoveryBudget,
+	replaySafe: boolean,
 	reconnect: MCPReconnect | undefined,
 	signal?: AbortSignal,
 	context?: AgentToolContext,
 	prepareConnection?: (connection: MCPServerConnection) => Promise<MCPServerConnection>,
 ): Promise<MCPToolCallAttempt> {
-	const result = await callProfileAwareTool(connection, toolName, args, authenticationRecovery, signal, context);
+	const result = await callProfileAwareTool(
+		connection,
+		toolName,
+		args,
+		authenticationRecovery,
+		replaySafe,
+		signal,
+		context,
+	);
+	if (!replaySafe) return { connection, result };
 	const authChallenge = getMcpAuthChallenge(result);
 	if (!authChallenge || !reconnect) return { connection, result };
 
@@ -498,7 +512,15 @@ async function callToolWithAuthRetry(
 		const readyConnection = prepareConnection ? await prepareConnection(newConnection) : newConnection;
 		return {
 			connection: readyConnection,
-			result: await callProfileAwareTool(readyConnection, toolName, args, authenticationRecovery, signal, context),
+			result: await callProfileAwareTool(
+				readyConnection,
+				toolName,
+				args,
+				authenticationRecovery,
+				replaySafe,
+				signal,
+				context,
+			),
 		};
 	} catch (error) {
 		rethrowIfAborted(error, signal);
@@ -985,6 +1007,7 @@ export async function dispatchMCPTool(
 			tool.name,
 			args,
 			authenticationRecovery,
+			replaySafe,
 			reconnect,
 			signal,
 			context,
@@ -1001,7 +1024,15 @@ export async function dispatchMCPTool(
 		const ready = await prepareConnection(reconnected);
 		return {
 			connection: ready,
-			result: await callProfileAwareTool(ready, tool.name, args, authenticationRecovery, signal, context),
+			result: await callProfileAwareTool(
+				ready,
+				tool.name,
+				args,
+				authenticationRecovery,
+				replaySafe,
+				signal,
+				context,
+			),
 		};
 	}
 }
@@ -1197,6 +1228,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.#fallbackProviderName;
 
 		const managedAws = isAuthenticatedAwsTool(this.serverName, this.tool.name);
+		const replaySafe = canReplayMCPTool(this.tool);
 		const authenticationRecovery: AwsAuthenticationRecoveryBudget = { attempted: false };
 		if (managedAws) {
 			try {
@@ -1231,6 +1263,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 					this.tool.name,
 					args,
 					authenticationRecovery,
+					replaySafe,
 					this.reconnect,
 					signal,
 					_ctx,
@@ -1263,7 +1296,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				);
 			} catch (callError) {
 				rethrowIfAborted(callError, signal);
-				if (this.reconnect && canReplayMCPTool(this.tool) && isRetriableConnectionError(callError)) {
+				if (this.reconnect && replaySafe && isRetriableConnectionError(callError)) {
 					const newConn = await reconnectWithAbort(
 						this.reconnect,
 						signal,
@@ -1279,6 +1312,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 								this.tool.name,
 								args,
 								authenticationRecovery,
+								replaySafe,
 								signal,
 								_ctx,
 							);
@@ -1316,6 +1350,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 							this.tool.name,
 							args,
 							authenticationRecovery,
+							replaySafe,
 							signal,
 							_ctx,
 						);

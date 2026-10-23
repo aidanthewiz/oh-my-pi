@@ -3,7 +3,9 @@ import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { connectToServer, disconnectServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import { dispatchMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -473,4 +475,96 @@ describe("session-owned extension MCP", () => {
 		expect(f.calls).toHaveLength(1);
 		expect(s.extensionRunner!.createContext().ui.supportsCustomUI).not.toBe(true);
 	});
+});
+
+describe("MCP authentication replay contracts", () => {
+	for (const scenario of [
+		{ label: "explicit never mutation", retry: "never", hint: false, read: false },
+		{ label: "explicit never overrides readonly metadata", retry: "never", hint: true, read: false },
+		{ label: "default unknown mutation", retry: undefined, hint: false, read: false },
+		{ label: "annotated safe read", retry: undefined, hint: true, read: true },
+		{ label: "explicit safe read", retry: "read", hint: false, read: true },
+	] as const) {
+		it(`honors the authentication replay contract for ${scenario.label}`, async () => {
+			const effects: string[] = [];
+			let attempts = 0;
+			let reconnects = 0;
+			const definition = {
+				name: scenario.read ? "get_state" : "create_record",
+				inputSchema: { type: "object" as const },
+				annotations: scenario.hint ? { readOnlyHint: true } : undefined,
+			};
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				async fetch(request) {
+					if (request.method !== "POST") return new Response(null, { status: 405 });
+					const rpc = (await request.json()) as { id?: number; method: string };
+					if (rpc.id === undefined) return new Response(null, { status: 202 });
+					let result: unknown = {};
+					if (rpc.method === "initialize") {
+						result = {
+							protocolVersion: "2025-11-25",
+							capabilities: { tools: {} },
+							serverInfo: { name: "synthetic-auth", version: "1" },
+						};
+					} else if (rpc.method === "tools/list") {
+						result = { tools: [definition] };
+					} else if (rpc.method === "tools/call") {
+						attempts++;
+						if (!scenario.read) effects.push("synthetic-record");
+						result =
+							attempts === 1
+								? {
+										isError: true,
+										content: [{ type: "text", text: "Authentication challenge after partial processing" }],
+										structuredContent: { recordId: "synthetic-record", applied: !scenario.read },
+										_meta: {
+											"mcp/www_authenticate": ['Bearer realm="synthetic"'],
+											receipt: "partial-receipt",
+										},
+									}
+								: {
+										content: [{ type: "text", text: "Recovered synthetic state" }],
+										structuredContent: { state: "synthetic-state" },
+									};
+					}
+					return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+				},
+			});
+			cleanup.push(() => server.stop(true));
+			const config = { type: "http" as const, url: server.url.href };
+			let connection = await connectToServer("synthetic-auth", config);
+			cleanup.push(() => disconnectServer(connection));
+			const [tool] = await listTools(connection);
+			if (!tool) throw new Error("Synthetic authentication server exposed no tool");
+			const attempt = await dispatchMCPTool(
+				connection,
+				tool,
+				{},
+				async () => {
+					reconnects++;
+					await disconnectServer(connection);
+					connection = await connectToServer("synthetic-auth", config);
+					return connection;
+				},
+				{ retry: scenario.retry },
+			);
+			if (scenario.read) {
+				expect(attempt.result.isError).not.toBe(true);
+				expect(attempt.result.structuredContent?.state).toBe("synthetic-state");
+				expect(attempts).toBe(2);
+				expect(reconnects).toBe(1);
+				expect(effects).toEqual([]);
+			} else {
+				expect(effects).toEqual(["synthetic-record"]);
+				expect(attempts).toBe(1);
+				expect(reconnects).toBe(0);
+				expect(attempt.result.isError).toBe(true);
+				expect(attempt.result.structuredContent?.recordId).toBe("synthetic-record");
+				expect(attempt.result._meta?.receipt).toBe("partial-receipt");
+				expect(attempt.result._meta?.["mcp/www_authenticate"]).toEqual(['Bearer realm="synthetic"']);
+			}
+		});
+	}
 });

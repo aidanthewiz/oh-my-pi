@@ -15,6 +15,7 @@
 ### Fixed
 
 - Honor effective MCP enable overrides for extension calls and prepare managed AWS profiles before their first signed dispatch without replaying unsafe transport failures.
+- Apply MCP replay contracts to authentication challenges and AWS errors. Unsafe calls retain raw results and diagnostics without authentication retries after dispatch.
 - Preserve portable title candidates across persistence, cold resume, copies, forks, moves, and backend reconstruction. Apply live icon preferences at display sinks and reject stale metadata and asynchronous updates.
 - Keep winning title cards and searchable displayed codes in clipped-header and cached-picker paths. Use registered presentation defaults when no settings scope exists.
 - Clear OSC 7501 status synchronously before signal teardown awaits persistence or disposal.
