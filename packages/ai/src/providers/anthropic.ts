@@ -4263,7 +4263,17 @@ function withholdKillSwitchFields(params: MessageCreateParamsStreaming): void {
 	delete params.context_management;
 	delete params.compaction;
 	// Server-side fallback entries carry their own per-attempt controls.
-	for (const entry of params.fallbacks ?? []) withholdKillSwitchControls(entry);
+	if (params.fallbacks) {
+		params.fallbacks = params.fallbacks.map(entry => {
+			const sanitized = {
+				...entry,
+				...(entry.thinking && { thinking: { ...entry.thinking } }),
+				...(entry.output_config && { output_config: { ...entry.output_config } }),
+			};
+			withholdKillSwitchControls(sanitized);
+			return sanitized;
+		});
+	}
 	for (const tool of params.tools ?? []) {
 		if ("strict" in tool) delete tool.strict;
 		if ("defer_loading" in tool) delete tool.defer_loading;
@@ -4497,12 +4507,12 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			dynamicHeaders,
 			headers,
 		);
-		// Unlike the generic builder below, this branch has no enforced-key
-		// filter: a caller-supplied `anthropic-beta` lands in the default
-		// headers verbatim, cache betas included.
-		const defaultHeaders = dropPromptCacheBetas
+		const cacheStrippedHeaders = dropPromptCacheBetas
 			? stripHeaderBetas(mergedCopilotHeaders, promptCacheBetas)
 			: mergedCopilotHeaders;
+		const defaultHeaders = experimentalBetasDisabled(model)
+			? stripHeaderBetas(cacheStrippedHeaders, killSwitchBetas)
+			: cacheStrippedHeaders;
 		applyInferenceHeaders(defaultHeaders, {
 			provider: model.provider,
 			protocol: "anthropic",

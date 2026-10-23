@@ -233,11 +233,13 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 					output_config: { effort: "high", task_budget: { type: "tokens", total: 50_000 } },
 				},
 			];
+			const before = structuredClone(fallbacks);
 			const request = await captureRequest(anthropicModel(), { fallbacks });
 			expect(request.body.fallbacks).toEqual([
 				{ model: "claude-opus-5", thinking: { type: "adaptive" }, output_config: { effort: "high" } },
 			]);
 			expect(request.beta).not.toContain("task-budgets-2026-03-13");
+			expect(fallbacks).toEqual(before);
 		});
 	});
 
@@ -417,6 +419,28 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 			expect(requests).toBe(0);
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("ran server tools");
+		});
+	});
+
+	it("strips caller headers on explicitly opted-in Copilot routes without opting in ordinary Copilot models", async () => {
+		await withEnv({ ...OFFICIAL_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
+			for (const admitted of [false, true]) {
+				const model = buildModel({
+					...anthropicModel(),
+					provider: "github-copilot",
+					baseUrl: "https://copilot-gateway.example.com",
+					compat: { honorsClaudeCodeBetaKillSwitch: admitted },
+				});
+				const apiKey = "synthetic-copilot-key";
+				const request = await captureRequest(model, {
+					apiKey,
+					headers: { "AnThRoPiC-BeTa": `${BINDING_BETA},${CONTEXT_MANAGEMENT_BETA},custom-beta-2026-01-01` },
+				});
+				expect(request.beta.includes(BINDING_BETA)).toBe(!admitted);
+				expect(request.beta.includes(CONTEXT_MANAGEMENT_BETA)).toBe(!admitted);
+				expect(request.beta).toContain("custom-beta-2026-01-01");
+				expect(request.authorization).toBe(`Bearer ${apiKey}`);
+			}
 		});
 	});
 });
