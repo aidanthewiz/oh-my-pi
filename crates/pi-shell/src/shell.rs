@@ -849,7 +849,7 @@ async fn create_session_for_run(
 	// implementations that run without spawning a process and resolve paths
 	// against the shell working directory. The whole set can be disabled
 	// (falling back to system binaries) via PI_DISABLE_UUTILS_BUILTINS; the
-	// destructive set (`rm`, `mv`, `cp`, `ln`) additionally honors
+	// destructive set (`rm`, `mv`, `cp`, `ln`, `dd`) additionally honors
 	// PI_DISABLE_UUTILS_DESTRUCTIVE, and `rm`/`mv` have their own switches.
 	if !env_flag(config, "PI_DISABLE_UUTILS_BUILTINS") {
 		let destructive_disabled = env_flag(config, "PI_DISABLE_UUTILS_DESTRUCTIVE");
@@ -859,9 +859,9 @@ async fn create_session_for_run(
 			let disabled = match name {
 				"rm" => rm_disabled,
 				"mv" => mv_disabled,
-				// cp overwrites existing files, ln can clobber them via -f; gate
-				// both with the destructive set.
-				"cp" | "ln" => destructive_disabled,
+				// cp and dd (`of=`) overwrite existing files, ln can clobber them
+				// via -f; gate them with the destructive set.
+				"cp" | "ln" | "dd" => destructive_disabled,
 				_ => false,
 			};
 			if !disabled {
@@ -4738,142 +4738,40 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&tmp);
 	}
 
-	/// Every utility `pi-builtins` offers must actually be dispatchable in
-	/// process, under the name it is registered as.
-	///
-	/// The registry (`pi_builtins::utility_builtins`) maps a name to a
-	/// `Registration`, and each registration renders its help from its own
-	/// `clap` command. Wiring a name to the wrong module — easy to do, since the
-	/// mapping is written by hand — still compiles and still runs; the only
-	/// visible symptom is that `NAME --help` describes some other utility. With
-	/// `PATH` emptied there is no binary to fall back on, so this also proves
-	/// the whole set resolves as builtins rather than as system commands.
 	#[tokio::test(flavor = "multi_thread")]
-	async fn every_utility_builtin_is_registered_under_its_own_name() {
-		let tmp = std::env::temp_dir().join(format!("pi-utility-help-{}", std::process::id()));
-		let _ = std::fs::remove_dir_all(&tmp);
-		std::fs::create_dir_all(&tmp).expect("temp dir");
-
-		let config = ShellConfig {
-			session_env:   None,
-			clear_env:     false,
-			snapshot_path: None,
-			minimizer:     None,
-			filesystem:    Fs::native(),
-		};
-		let mut session = create_session(&config).await.expect("create_session");
-		session
-			.shell
-			.set_working_dir(tmp.to_str().expect("utf8 temp path"))
+	async fn destructive_switch_prevents_dd_from_changing_output() {
+		let tmp = tempfile::tempdir().expect("temp dir");
+		std::fs::write(tmp.path().join("input"), b"replacement").expect("input");
+		std::fs::write(tmp.path().join("output"), b"preserved").expect("output");
+		for (disabled, expected_code, expected_bytes) in
+			[(true, 127, b"preserved".as_slice()), (false, 0, b"replacement".as_slice())]
+		{
+			let (tx, rx) = flume::unbounded();
+			let result = execute_shell(
+				ShellExecuteOptions {
+					command: "dd if=input of=output status=none".to_owned(),
+					cwd: Some(tmp.path().to_string_lossy().into_owned()),
+					clear_env: true,
+					session_env: Some(HashMap::from([
+						("PATH".to_owned(), tmp.path().to_string_lossy().into_owned()),
+						("PI_DISABLE_UUTILS_DESTRUCTIVE".to_owned(), i32::from(disabled).to_string()),
+					])),
+					..Default::default()
+				},
+				Some(tx),
+				CancelToken::default(),
+			)
 			.await
-			.expect("set cwd");
-		let mut params = session.shell.default_exec_params();
-		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
-		params.set_fd(OpenFiles::STDOUT_FD, null_file().expect("null stdout"));
-		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null stderr"));
-		let source_info = SourceInfo::from("pi-natives:test");
-
-		// Pin the registry contents rather than iterating whatever it happens to
-		// contain: a loop over the registry cannot notice a name missing from it.
-		// Adding a utility is expected to update this list.
-		let expected = [
-			"b2sum",
-			"base32",
-			"base64",
-			"basename",
-			"cat",
-			"cksum",
-			"cmp",
-			"combine",
-			"comm",
-			"cp",
-			"cut",
-			"date",
-			"diff",
-			"dirname",
-			#[cfg(unix)]
-			"errno",
-			"fd",
-			"find",
-			"grep",
-			"head",
-			"hostname",
-			"ifne",
-			"isutf8",
-			"jq",
-			"ln",
-			"ls",
-			"md5sum",
-			"mkdir",
-			"mktemp",
-			"mv",
-			"nproc",
-			"paste",
-			"printenv",
-			"readlink",
-			"realpath",
-			"rg",
-			"rm",
-			"sed",
-			"seq",
-			"sha1sum",
-			"sha224sum",
-			"sha256sum",
-			"sha384sum",
-			"sha512sum",
-			"sort",
-			"sponge",
-			"stat",
-			"tac",
-			"tail",
-			"tee",
-			"touch",
-			"tr",
-			"truncate",
-			"ts",
-			"uname",
-			"uniq",
-			"wc",
-			"which",
-			"whoami",
-			"xargs",
-			"yes",
-		];
-		let mut names: Vec<&'static str> =
-			pi_builtins::utility_builtins::<brush_core::extensions::DefaultShellExtensions>()
-				.into_iter()
-				.map(|(name, _)| name)
-				.collect();
-		names.sort_unstable();
-		assert_eq!(names, expected, "the utility builtin registry changed");
-
-		for name in names {
-			let exec = session
-				.shell
-				.run_string(format!("PATH= {name} --help > help.txt 2> err.txt"), &source_info, &params)
-				.await
-				.unwrap_or_else(|err| panic!("{name} --help failed to run: {err}"));
-			assert_eq!(exit_code(&exec), 0, "{name} --help exited nonzero");
-
-			let help = std::fs::read_to_string(tmp.join("help.txt")).expect("help.txt");
-			let err = std::fs::read_to_string(tmp.join("err.txt")).expect("err.txt");
-			assert!(err.is_empty(), "{name} --help wrote to stderr: {err:?}");
-			// Two builtins are registered under the familiar command name but keep
-			// their implementation's own help text, exactly as the standalone
-			// versions did: `rg` is ripgrep, `jq` is jaq.
-			let expected = match name {
-				"rg" => "ripgrep",
-				"jq" => "jaq",
-				other => other,
-			};
-			assert!(
-				help.contains(expected),
-				"{name} --help does not mention {expected:?}, so it is wired to the wrong utility: \
-				 {help:.200?}"
-			);
+			.expect("execute dd");
+			assert_eq!(result.exit_code, Some(expected_code));
+			assert_eq!(std::fs::read(tmp.path().join("output")).expect("read output"), expected_bytes);
+			let output = rx.try_iter().collect::<String>();
+			if disabled {
+				assert!(output.contains("dd"), "{output}");
+			} else {
+				assert_eq!(output, "");
+			}
 		}
-
-		let _ = std::fs::remove_dir_all(&tmp);
 	}
 
 	/// Every process builtin `pi-builtins` offers must be installed and

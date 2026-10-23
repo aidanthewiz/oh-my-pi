@@ -570,11 +570,14 @@ interface ManagedBashJobHandle {
 	jobId: string;
 	completion: Promise<ManagedBashJobCompletion>;
 	getLatestText: () => string;
-	stopUpdates: () => void;
+	/** Hand the call's card to the job: later frames carry `details.async` and the last one settles it. */
+	background: () => void;
 }
 
 interface BashProgressDetails extends BashToolDetails {
 	images?: ImageContent[];
+	/** A running job's output so far (`proc://` shows it). */
+	output?: string;
 }
 
 /** Pid probe of a background job with no command in flight. */
@@ -1183,13 +1186,28 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let pids: () => readonly number[] = NO_PIDS;
 		let latestText = "";
 		let latestProgressDetails: BashProgressDetails | undefined;
-		let forwardUpdates = options.foreground;
+		let backgrounded = !options.foreground;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
 		const jobId = manager.register(
 			"bash",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
+				// Records the job's progress and shows it on the call's card: plain output
+				// while the call still waits on it, the job frame (`details.async`) once
+				// backgrounded, so the card keeps filling and settles with the job.
+				const report = async (text: string, details: BashProgressDetails): Promise<void> => {
+					latestText = text;
+					const reported = reportProgress(text, { ...details });
+					// `output` feeds job listings; the card already shows `text`.
+					const { output: _output, images, ...frame } = details;
+					const { async: _async, ...foregroundFrame } = frame;
+					options.onUpdate?.({
+						content: [{ type: "text", text }, ...(images ?? [])],
+						details: backgrounded ? frame : foregroundFrame,
+					});
+					await reported;
+				};
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const wallTimeStart = performance.now();
 				try {
@@ -1206,11 +1224,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						artifactPath,
 						artifactId,
 						onPreview: text => {
-							latestText = text;
-							void reportProgress(text, {
-								output: text,
-								async: { state: "running", jobId, type: "bash" },
-							});
+							void report(text, { output: text, async: { state: "running", jobId, type: "bash" } });
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 						onStart: probe => {
@@ -1243,18 +1257,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						// delivers the error text, matching prior throw-based behavior.
 						throw new ToolError(finalText);
 					}
-					await reportProgress(finalText, {
+					await report(finalText, {
 						...latestProgressDetails,
 						async: { state: "completed", jobId, type: "bash" },
 					});
 					return finalText;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
-					latestText = message;
+					const output = latestText && !message.includes(latestText) ? `${latestText}\n\n${message}` : message;
 					completion.resolve({ kind: "failed", error });
-					await reportProgress(message, {
+					// Only a cancel aborts the job's own signal (deadlines end in a timed-out result).
+					await report(output, {
 						...latestProgressDetails,
-						async: { state: "failed", jobId, type: "bash" },
+						async: { state: runSignal.aborted ? "cancelled" : "failed", jobId, type: "bash" },
 					});
 					throw error;
 				}
@@ -1263,14 +1278,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				ownerId: this.session.getAgentId?.() ?? undefined,
 				foreground: options.foreground,
 				process: { command: options.command, cwd: options.commandCwd, pids: () => pids() },
-				onProgress: async text => {
-					latestText = text;
-					if (!forwardUpdates) return;
-					await options.onUpdate?.({
-						content: [{ type: "text", text }],
-						details: latestProgressDetails ?? {},
-					});
-				},
 			},
 		);
 
@@ -1278,8 +1285,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			jobId,
 			completion: completion.promise,
 			getLatestText: () => latestText,
-			stopUpdates: () => {
-				forwardUpdates = false;
+			background: () => {
+				backgrounded = true;
 			},
 		};
 	}
@@ -1484,7 +1491,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				autoBgManager.releaseForegroundJob(job.jobId);
 				throw new ToolAbortError(job.getLatestText() || "Command aborted");
 			}
-			job.stopUpdates();
+			job.background();
 			autoBgManager.backgroundJob(job.jobId);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.

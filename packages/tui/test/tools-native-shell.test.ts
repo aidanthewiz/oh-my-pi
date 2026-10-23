@@ -128,6 +128,25 @@ describe("bash native run box", () => {
 		expect(foot(nodes(view.body)[0])).toMatchObject({ state: "Running", time: { age: 2500, stopped: undefined } });
 	});
 
+	it("keeps a parked background job's card in background with a live clock while its output streams", () => {
+		const view = bashToolRenderer.describeResult(
+			{
+				content: [{ type: "text", text: "Benchmark 1\nBenchmark 2" }],
+				details: { async: { state: "running", jobId: "bg_2", type: "bash" } },
+			},
+			{ expanded: false, isPartial: true, executionStarted: true, elapsedMs: 61_000 },
+			{ command: "hyperfine bench" },
+		);
+		const box = nodes(view.body)[0];
+		expect(String(props(collect(box?.c, "ansi")[0]).text)).toBe("Benchmark 1\nBenchmark 2");
+		expect(foot(box)).toMatchObject({ state: "In background", time: { age: 61_000, stopped: undefined } });
+		expect(
+			foot(box)
+				?.facts?.map(s => s.t)
+				.join(""),
+		).toBe("Job bg_2");
+	});
+
 	it("maps exit, timeout, spawn failure and background jobs to the foot state and box tone", () => {
 		const settle = (text: string, details: Record<string, unknown>, isError: boolean) => {
 			const view = bashToolRenderer.describeResult(
@@ -207,6 +226,82 @@ describe("bash native run box", () => {
 			expect(props(described).preview).toBe("children");
 			expect(props(described).command).toBe("plot");
 			expect(nodes(described.c).map(child => role(child) ?? child.k)).toEqual(["omp.run", "image"]);
+		} finally {
+			tool.dispose();
+		}
+	});
+});
+
+describe("read image results", () => {
+	const ui = { requestRender: () => {}, requestComponentRender: () => {}, resetDisplay: () => {} };
+	const readImage = () => {
+		const tool = new ToolExecutionComponent("read", { path: "logo.png" }, { showImages: true }, undefined, ui);
+		tool.updateResult(
+			{
+				content: [
+					{ type: "text", text: "Read image" },
+					{ type: "image", data: PNG, mimeType: "image/png" } as { type: string; text?: string },
+				],
+				details: { resolvedPath: "/repo/logo.png", mediaPath: "/repo/logo.png", mediaMimeType: "image/png" },
+			},
+			false,
+		);
+		return tool;
+	};
+
+	it("keeps captured image bytes when the host supports reopening mutable files", () => {
+		const tool = readImage();
+		try {
+			const described = tool.describe(cx(["tool", "ansi", "code", "image", "media"]));
+			const media = collect(described.c, "media");
+			expect(media).toHaveLength(0);
+			expect(collect(described.c, "image")).toHaveLength(1);
+		} finally {
+			tool.dispose();
+		}
+	});
+
+	it("upload the image blob without media support", () => {
+		const tool = readImage();
+		try {
+			const described = tool.describe(cx(["tool", "ansi", "code", "image"]));
+			expect(collect(described.c, "media")).toHaveLength(0);
+			expect(collect(described.c, "image")).toHaveLength(1);
+		} finally {
+			tool.dispose();
+		}
+	});
+
+	it("does not turn arbitrary display metadata into a platform-reader host path", () => {
+		const tool = new ToolExecutionComponent("read", { path: "spec.pdf" }, { showImages: true }, undefined, ui);
+		tool.updateResult(
+			{
+				content: [{ type: "text", text: "# Spec\n\nConverted text" }],
+				details: { mediaPath: "/repo/spec.pdf", contentType: "text/markdown" },
+			},
+			false,
+		);
+		try {
+			const media = collect(tool.describe(cx(["tool", "ansi", "code", "image", "media"])).c, "media");
+			expect(media).toHaveLength(0);
+			const plain = tool.describe(cx(["tool", "ansi", "code", "image"]));
+			expect(collect(plain.c, "media")).toHaveLength(0);
+			expect(collect(plain.c, "image")).toHaveLength(0);
+		} finally {
+			tool.dispose();
+		}
+	});
+
+	it("hides captured raster images when images are disabled", () => {
+		const tool = new ToolExecutionComponent("read", { path: "logo.png" }, { showImages: false }, undefined, ui);
+		try {
+			tool.updateResult({
+				content: [{ type: "image", data: PNG, mimeType: "image/png" }],
+				details: { mediaPath: "/repo/logo.png", mediaMimeType: "image/png" },
+			});
+			const described = tool.describe(cx(["tool", "ansi", "code", "image", "media"]));
+			expect(collect(described.c, "media")).toHaveLength(0);
+			expect(collect(described.c, "image")).toHaveLength(0);
 		} finally {
 			tool.dispose();
 		}

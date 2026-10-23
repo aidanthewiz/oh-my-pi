@@ -660,7 +660,7 @@ export const readToolRenderer = {
 	 */
 	describeResult(
 		result: { content: Array<{ type: string; text?: string }>; details?: ReadToolDetails; isError?: boolean },
-		_options: RenderResultOptions,
+		options: RenderResultOptions,
 		args?: ReadRenderArgs,
 	): NativeToolView {
 		const details = result.details;
@@ -696,7 +696,7 @@ export const readToolRenderer = {
 		);
 
 		const contentText = details?.displayContent?.text ?? stripOutputNotice(resultText(result), details?.meta);
-		const imageBlock = result.content?.find(isImageBlock);
+		const imageBlock = options.showImages === false ? undefined : result.content?.find(isImageBlock);
 		if (imageBlock) {
 			const detailText = contentText.trim();
 			return {

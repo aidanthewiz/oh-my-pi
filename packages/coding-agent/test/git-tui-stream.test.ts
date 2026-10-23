@@ -12,15 +12,22 @@ import {
 	type DiffBuildOptions,
 	DiffPane,
 } from "@oh-my-pi/pi-tui/apps/git/diff-pane";
+import type { ChangedFile } from "@oh-my-pi/pi-tui/apps/git/state";
 import { GitModel } from "../src/cli/git-tui/state";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { showGitOverlay } from "@oh-my-pi/pi-tui/apps/git/git-tui";
 import { selectionBgAnsi } from "@oh-my-pi/pi-tui/apps/git/colors";
 import { TspHarness } from "../../tui/test/native/tsp-harness";
+import { TSP_KINDS } from "@oh-my-pi/pi-wire";
+import { getNativeBlob } from "@oh-my-pi/pi-tui/native/blobs";
 
 const RED_PNG = Buffer.from(
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+	"base64",
+);
+const GRAY_PNG = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
 	"base64",
 );
 const LFS_POINTER_VERSION = "version https://git-lfs.github.com/spec/v1";
@@ -191,6 +198,49 @@ describe("git TUI asset previews", () => {
 			const rendered = sanitizeText(pane.render(80, 12).join("\n"));
 			expect(rendered).toContain("After · PNG");
 			expect(rendered).not.toContain("Binary object");
+		});
+	});
+
+	test("records the path and revision each media side was read from", async () => {
+		await withReviewRepo(async repo => {
+			const logo = path.join(repo, "logo.png");
+			const gone = path.join(repo, "gone.png");
+			await Bun.write(logo, RED_PNG);
+			await Bun.write(gone, RED_PNG);
+			await $`git add logo.png gone.png`.cwd(repo).quiet();
+			await $`git commit -m add`.cwd(repo).quiet();
+			const added = (await $`git rev-parse HEAD`.cwd(repo).quiet().text()).trim();
+			await Bun.write(logo, GRAY_PNG);
+			await $`git commit -am gray`.cwd(repo).quiet();
+			const gray = (await $`git rev-parse HEAD`.cwd(repo).quiet().text()).trim();
+			// logo.png: staged (gray → red) and unstaged (red → raw bytes); gone.png deleted; fresh.png untracked.
+			await Bun.write(logo, RED_PNG);
+			await $`git add logo.png`.cwd(repo).quiet();
+			await Bun.write(logo, new Uint8Array([0xff, 0xfe, 0xfd, 0xfc]));
+			await fs.rm(gone);
+			await Bun.write(path.join(repo, "fresh.png"), RED_PNG);
+
+			const model = new GitModel(repo);
+			await model.refresh();
+			const refs = async (file: ChangedFile | undefined) => {
+				if (!file) throw new Error("changed file was not discovered");
+				const contents = await model.streamContents(file, () => {});
+				if (contents.kind !== "asset") throw new Error(`${file.path} was not loaded as an asset`);
+				return [contents.oldRef, contents.newRef];
+			};
+			const unstaged = (filePath: string) => model.unstaged.find(file => file.path === filePath);
+
+			expect(await refs(model.staged.find(file => file.path === "logo.png"))).toEqual([
+				{ path: logo, rev: "HEAD" },
+				{ path: logo, rev: ":0" },
+			]);
+			expect(await refs(unstaged("logo.png"))).toEqual([{ path: logo, rev: ":0" }, { path: logo }]);
+			expect(await refs(unstaged("gone.png"))).toEqual([{ path: gone, rev: ":0" }, undefined]);
+			expect(await refs(unstaged("fresh.png"))).toEqual([undefined, { path: path.join(repo, "fresh.png") }]);
+			expect(await refs({ path: "logo.png", kind: "modified", area: "commit" })).toEqual([
+				{ path: logo, rev: added },
+				{ path: logo, rev: gray },
+			]);
 		});
 	});
 
@@ -473,6 +523,87 @@ describe("native Git selection and index", () => {
 			h.stop();
 		}
 	}
+
+	test("delivers owned decoded Git image blobs instead of reopening mutable source paths", async () => {
+		await withReviewRepo(async repo => {
+			await Bun.write(path.join(repo, "logo.png"), RED_PNG);
+			await Bun.write(path.join(repo, "fake.png"), new Uint8Array([0, 1, 2, 3]));
+			await Bun.write(
+				path.join(repo, "diagram.svg"),
+				'<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>',
+			);
+			await $`git add logo.png fake.png diagram.svg`.cwd(repo).quiet();
+			for (const images of [true, false]) {
+				const h = await TspHarness.start(undefined, {
+					cols: 150,
+					rows: 40,
+					kinds: TSP_KINDS.filter(kind => images || kind !== "image"),
+				});
+				const closed = showGitOverlay(h.tui, {
+					model: new GitModel(repo),
+					createAvatarSource: () => ({ get: () => null }),
+					aiStage: async () => {
+						throw new Error("paid operation forbidden");
+					},
+					generateCommitMessage: async () => {
+						throw new Error("paid operation forbidden");
+					},
+				});
+				try {
+					for (const name of ["logo.png", "fake.png", "diagram.svg"]) {
+						await waitFor(h, () =>
+							Boolean(
+								h.find(
+									node =>
+										node.k === "list" &&
+										node.id.endsWith("/staged") &&
+										node.c?.some(child => child.p?.title?.endsWith(`: ${name}`)) === true,
+								),
+							),
+						);
+						const list = h.find(node => node.k === "list" && node.id.endsWith("/staged"))!;
+						const item = list.c!.find(child => child.p?.title?.endsWith(`: ${name}`))!;
+						h.event({ ev: "select", sf: h.terminal.surface!, id: list.id, item: item.id });
+						if (images && name !== "fake.png") {
+							await waitFor(h, () => h.findAll(node => node.k === "image").length === 1);
+							const image = h.find(node => node.k === "image")!;
+							const props = image.p;
+							if (!props || !("blob" in props) || typeof props.blob !== "string")
+								throw new Error("Git preview lacks a blob id");
+							const blob = getNativeBlob(props.blob);
+							if (!blob) throw new Error("Git preview does not own its decoded blob");
+							expect(blob.mime).toBe("image/png");
+							const before = Buffer.from(blob.bytes);
+							if (name === "logo.png") expect(before).toEqual(RED_PNG);
+							else expect(before.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+							await Bun.write(path.join(repo, name), new Uint8Array([0, 9, 8, 7]));
+							expect(Buffer.from(blob.bytes)).toEqual(before);
+						} else {
+							await waitFor(
+								h,
+								() =>
+									h.findAll(node => node.k === "image").length === 0 &&
+									Boolean(
+										h.find(
+											node =>
+												node.k === "kv" &&
+												JSON.stringify(node.p).includes(name === "fake.png" ? "binary" : "image"),
+										),
+									),
+							);
+						}
+						expect(h.findAll(node => node.k === "media")).toEqual([]);
+					}
+					expect(h.errors).toEqual([]);
+				} finally {
+					h.terminal.send("\x03");
+					h.flush();
+					await closed;
+					h.stop();
+				}
+			}
+		});
+	});
 
 	test("reveals the selected hunk and stages and unstages only that target after refresh", async () => {
 		await withReviewRepo(async repo => {

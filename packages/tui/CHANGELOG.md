@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Deliver Git raster and SVG previews through captured image blobs. Unsupported binary and media previews retain their existing fact and ANSI fallbacks.
 - Preserve quoted code and authored whitespace when resolving native Markdown links across quote and list containers.
 - Preserve session-relative native table links across escaped pipes and normalized cells.
 - Show per-model compaction triggers and their policy basis in classic model previews after edits and resets.
@@ -12,6 +13,23 @@
 - Retain native debug listener ownership across TUI restarts, disabled intervals, and socket-path changes; close old listeners before binding replacements.
 - Preserve prompt custody, host-controlled approvals, and explicit credit confirmations across the native modal redesign.
 - Keep standalone MCP and queue-mode picker wording product-neutral.
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added opt-in `/tree` branch navigation across visible branches and nested fork depths; bind `app.tree.previousBranch` / `app.tree.nextBranch` (e.g. to `Shift+Left` / `Shift+Right`) in `keybindings.yml` ([#12623](https://github.com/can1357/oh-my-pi/pull/12623) by [@azain47](https://github.com/azain47)).
+
+### Changed
+
+- The `wait` tool's native job rows (`omp.wait.job`) are a single `row`: badge, id and label, progress and clock, without the output preview or capture notice beneath
+- The native bash run foot reads In background with a live clock (`omp.run.time` without `stopped`) while a parked job's frames stream (`details.async.state === "running"`, partial), instead of Running
+- Native model pickers (/model, the quick switch and the advisor's) mark providers with their logo (`mark.icon: "provider:<id>"`, initials where the terminal has none), and every model row leads with its provider's mark
+
+### Removed
+
+- Removed the unused `app.tree.foldOrUp` / `app.tree.unfoldOrDown` keybinding ids, which no longer did anything.
+- Added `parksAsBackground(toolName, details)`, `asyncJobState(details)`, `isSettledJobFrame(details)` and `settleWithJobFrame(component, frame, toolCallId)` (`chat/tool-execution`): whether a returned call's card stays live for its background job's frames (`task` always; `bash` and `eval` under native rendering), the job state a frame reports, and settling the card with the job's last frame (a cancelled job keeps its output and seals as cancelled)
+- `BashToolDetails.async.state` and `EvalToolDetails.async.state` gain `cancelled` for a job killed before it finished
 
 ## [18.10.1] - 2026-10-12
 
@@ -2771,53 +2789,4 @@
 
 - Optimized padding operations across all components to use pre-allocated space buffer for better performance
 
-## [9.2.2] - 2026-01-31
-
-### Added
-
-- Added setAutocompleteMaxVisible() configuration (3-20 items)
-- Added image detection to terminal capabilities (containsImage method)
-- Added stdin monitoring to detect stalled input events and log warnings
-
-### Changed
-
-- Improved blockquote rendering with text wrapping in Markdown component
-- Restructured terminal capabilities from interface-based to class-based model
-- Improved table column width calculation with word-aware wrapping
-- Refactored text utilities to use native WASM implementations for strings >256 chars with JS fast path
-
-### Fixed
-
-- Simplified terminal write error handling to mark terminal as dead on any write failure
-- Fixed multi-line strings in renderOutputBlock causing width overflow
-- Fixed slash command autocomplete applying stale completion when typing quickly
-
-### Removed
-
-- Removed TUI layout engine exports from public API (BoxNode, ColumnNode, LayoutNode, etc.)
-
-## [8.12.7] - 2026-01-29
-
-### Fixed
-
-- Fixed slash command autocomplete applying stale completion when typing quickly
-
-## [8.4.1] - 2026-01-25
-
-### Added
-
-- Added fuzzy match function for autocomplete suggestions
-
-## [8.4.0] - 2026-01-25
-
-### Changed
-
-- Added Ctrl+Backspace as a delete-word-backward keybinding and improved modified backspace matching
-
-### Fixed
-
-- Terminal gracefully handles write failures by marking dead instead of exiting the process
-- Reserved cursor space for zero padding and corrected end-of-line cursor rendering to prevent wrap glitches
-- Corrected editor end-of-line cursor rendering assertion to use includes() instead of endsWith()
-
-Older entries are archived in [packages/tui/CHANGELOG.md@89ad0a77d575](https://github.com/can1357/oh-my-pi/blob/89ad0a77d575f01398d3c0a57bc3a22111bef36a/packages/tui/CHANGELOG.md).
+Older entries are archived in [packages/tui/CHANGELOG.md@e19bb3cb2344](https://github.com/can1357/oh-my-pi/blob/e19bb3cb2344a8953dc04aa398b810230f0e24c3/packages/tui/CHANGELOG.md).

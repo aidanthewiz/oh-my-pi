@@ -20,6 +20,13 @@
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
 - Reject desktop addons without live screen-state support before opening a session instead of using an incomplete desktop ABI.
 - Validate desktop screen-state getter descriptors without invoking native state during module import or constructing a desktop session.
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added in-process `env`, `du`, `chmod`, `fold`, `rmdir`, `od`, `df`, `uptime`, `id`, and `dd` shell builtins matching GNU coreutils 9.x options, output, and exit codes (`chmod` and `id` on Unix only; `dd` is disabled with the destructive set by `PI_DISABLE_UUTILS_DESTRUCTIVE`).
+- Added an in-process `nl` shell builtin (ported from uutils coreutils 0.8.0, matching GNU `nl`), with header/body/footer numbering styles including `pBRE` regex styles, logical-page section delimiters, `-l` blank-line grouping, and `ln`/`rn`/`rz` number formats.
+
 ## [18.10.0] - 2026-10-12
 
 ### Added

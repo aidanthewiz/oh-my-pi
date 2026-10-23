@@ -1,9 +1,3 @@
-/**
- * A user prompt typed into a focused, kept-alive subagent (HITL steering from
- * the TUI) runs a turn no task executor drives. Its accepted `yield` must still
- * reach the parent like an IRC wake turn's: the `<id>.md` artifact is rewritten
- * and the parent's delivery sink receives the completion (#14428).
- */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -95,7 +89,7 @@ function resultForLatestPrompt(messages: ReadonlyArray<{ role: string; content: 
 }
 
 /** Runs `AGENT_ID` to a kept-alive idle state that yielded `initial result`, with the parent's delivery sink recording completions. */
-async function spawnKeptAliveChild() {
+async function spawnKeptAliveChild(structured = true) {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
 	// ~/.omp and load the developer's installed plugins as project plugins.
@@ -109,7 +103,27 @@ async function spawnKeptAliveChild() {
 	const modelRegistry = new ModelRegistry(authStorage);
 	const mock = createMockModel({
 		handler: context => {
-			if (!(context.tools ?? []).some(tool => tool.name === "yield")) return { content: ["label"] };
+			if (!(context.tools ?? []).some(tool => tool.name === "yield")) {
+				const emptyReport = context.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes("empty report"),
+				);
+				if (!structured && emptyReport) {
+					return { content: [] };
+				}
+				if (
+					!structured &&
+					context.messages.some(
+						message => message.role === "user" && JSON.stringify(message.content).includes("failed report"),
+					)
+				) {
+					return {
+						content: ["partial failed report"],
+						stopReason: "error",
+						errorMessage: "report provider failed",
+					};
+				}
+				return { content: [structured ? "label" : resultForLatestPrompt(context.messages)] };
+			}
 			// A turn that already yielded ends on the tool result; answer it with prose.
 			if (context.messages.at(-1)?.role === "toolResult") return { content: ["ok"] };
 			const data = resultForLatestPrompt(context.messages);
@@ -137,6 +151,7 @@ async function spawnKeptAliveChild() {
 			task: "report",
 			index: 0,
 			id: AGENT_ID,
+			structured,
 			parentAgentId: PARENT_ID,
 			asyncJobManager: manager,
 			modelOverride: "mock/mock-model",
@@ -184,37 +199,74 @@ it("a focused manual prompt's yield rewrites the artifact and notifies the paren
 	}
 }, 15_000);
 
-it("a prompt typed while the previous turn awaits owned background work reports each turn's own result", async () => {
-	const child = await spawnKeptAliveChild();
-	try {
-		// Owned background work keeps the first manual turn's observation open
-		// after the turn itself returns, leaving the child idle for another prompt.
-		const gate = Promise.withResolvers<void>();
-		manager.register(
-			"bash",
-			"background build",
-			async () => {
-				await gate.promise;
-				return "build done";
-			},
-			{ ownerId: AGENT_ID, agentId: AGENT_ID },
-		);
-		await child.session.prompt("go on");
-		await child.session.prompt("finish up");
-		gate.resolve();
+it.each([true, false])(
+	"overlapping focused turns retain their own result (structured=%s)",
+	async structured => {
+		const child = await spawnKeptAliveChild(structured);
+		try {
+			// Owned background work keeps the first manual turn's observation open
+			// after the turn itself returns, leaving the child idle for another prompt.
+			const gate = Promise.withResolvers<void>();
+			manager.register(
+				"bash",
+				"background build",
+				async () => {
+					await gate.promise;
+					return "build done";
+				},
+				{ ownerId: AGENT_ID, agentId: AGENT_ID },
+			);
+			await child.session.prompt("go on");
+			await child.session.prompt("finish up");
+			gate.resolve();
 
-		await child.firstDelivery;
+			await child.firstDelivery;
+			await manager.waitForOwnerJobs(PARENT_ID);
+			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+			// One completion per turn, each carrying only that turn's yield.
+			const manual = child.deliveries.filter(text => text.includes("manual result"));
+			const final = child.deliveries.filter(text => text.includes("final result"));
+			expect(child.deliveries).toHaveLength(2);
+			expect(manual).toHaveLength(1);
+			expect(final).toHaveLength(1);
+			expect(manual[0]).not.toContain("final result");
+			expect(await Bun.file(child.artifact).text()).toContain("final result");
+		} finally {
+			child.close();
+		}
+	},
+	15_000,
+);
+
+it("a focused plain result rewrites its artifact and notifies the parent", async () => {
+	const child = await spawnKeptAliveChild(false);
+	try {
+		await child.session.prompt("go on");
 		await manager.waitForOwnerJobs(PARENT_ID);
 		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
-		// One completion per turn, each carrying only that turn's yield.
-		const manual = child.deliveries.filter(text => text.includes("manual result"));
-		const final = child.deliveries.filter(text => text.includes("final result"));
-		expect(child.deliveries).toHaveLength(2);
-		expect(manual).toHaveLength(1);
-		expect(final).toHaveLength(1);
-		expect(manual[0]).not.toContain("final result");
-		expect(await Bun.file(child.artifact).text()).toContain("final result");
+		expect({
+			artifact: (await Bun.file(child.artifact).text()).includes("manual result"),
+			delivered: child.deliveries.filter(text => text.includes("manual result")).length,
+		}).toEqual({ artifact: true, delivered: 1 });
 	} finally {
 		child.close();
 	}
 }, 15_000);
+
+it.each(["empty report", "failed report"])(
+	"a focused %s preserves its prior authoritative artifact",
+	async prompt => {
+		const child = await spawnKeptAliveChild(false);
+		try {
+			const accepted = await Bun.file(child.artifact).text();
+			await child.session.prompt(prompt);
+			await manager.waitForOwnerJobs(PARENT_ID);
+			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+			expect(await Bun.file(child.artifact).text()).toBe(accepted);
+			expect(child.deliveries).toEqual([]);
+		} finally {
+			child.close();
+		}
+	},
+	15_000,
+);

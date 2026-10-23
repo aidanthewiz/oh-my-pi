@@ -129,9 +129,13 @@ function createTaskSchema(options: {
 	defaultAgent: string;
 	effortEnabled: boolean;
 	evalToolsEnabled: boolean;
+	structured: boolean;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
+	const schemaFields = options.structured
+		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
+		: {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
@@ -141,8 +145,7 @@ function createTaskSchema(options: {
 				task: "string",
 				solutionSpace: "string",
 				...effortField,
-				"outputSchema?": outputSchemaInputSchema,
-				"schemaMode?": '"permissive" | "strict"',
+				...schemaFields,
 				"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 				...toolsField,
 				"isolated?": "boolean",
@@ -160,8 +163,7 @@ function createTaskSchema(options: {
 			task: "string",
 			solutionSpace: "string",
 			...effortField,
-			"outputSchema?": outputSchemaInputSchema,
-			"schemaMode?": '"permissive" | "strict"',
+			...schemaFields,
 			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 			...toolsField,
 			"+": "delete",
@@ -179,8 +181,7 @@ function createTaskSchema(options: {
 			task: "string",
 			solutionSpace: "string",
 			...effortField,
-			"outputSchema?": outputSchemaInputSchema,
-			"schemaMode?": '"permissive" | "strict"',
+			...schemaFields,
 			"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 			...toolsField,
 			"isolated?": "boolean",
@@ -193,8 +194,7 @@ function createTaskSchema(options: {
 		task: "string",
 		solutionSpace: "string",
 		...effortField,
-		"outputSchema?": outputSchemaInputSchema,
-		"schemaMode?": '"permissive" | "strict"',
+		...schemaFields,
 		"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 		...toolsField,
 		"+": "delete",
@@ -208,19 +208,22 @@ export function getTaskSchema(options: {
 	effortEnabled?: boolean;
 	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
 	evalToolsEnabled?: boolean;
+	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
+	structured?: boolean;
 	defaultAgent?: string;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
-	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled) {
+	const structured = options.structured ?? true;
+	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && structured) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
-	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, defaultAgent });
+	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, structured, defaultAgent });
 	taskSchemaCache.set(key, schema);
 	return schema;
 }

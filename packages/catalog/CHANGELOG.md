@@ -14,6 +14,12 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added the `honors-claude-code-beta-kill-switch` axis (`compat.honorsClaudeCodeBetaKillSwitch`), on for the `anthropic` provider, so a rule or `models.yml` override decides which providers honor `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` ([#15458](https://github.com/can1357/oh-my-pi/pull/15458) by [@H4vC](https://github.com/H4vC))
+
 ## [18.10.0] - 2026-10-12
 
 ### Changed

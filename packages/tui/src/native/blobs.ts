@@ -10,7 +10,7 @@
 import type { TspProps } from "@oh-my-pi/pi-wire";
 import { getImageDimensions } from "../terminal-capabilities";
 import { node } from "./describe";
-import type { NativeNode } from "./node";
+import type { NativeChild, NativeNode } from "./node";
 
 export interface NativeBlob {
 	readonly id: string;
@@ -102,4 +102,19 @@ export class NativeImageCache {
 		this.#entries.set(key, { data, node: image });
 		return image;
 	}
+}
+
+/** Blob ids already shown by the renderer's described image nodes. */
+export function shownImageBlobs(children: readonly NativeChild[] | undefined): Set<string> {
+	const shown = new Set<string>();
+	const visit = (list: readonly NativeChild[] | undefined): void => {
+		for (const child of list ?? []) {
+			if (!("k" in child)) continue;
+			const props = child.p;
+			if (child.k === "image" && props && "blob" in props && typeof props.blob === "string") shown.add(props.blob);
+			visit(child.c);
+		}
+	};
+	visit(children);
+	return shown;
 }

@@ -443,6 +443,7 @@ export class Agent {
 	/** Messages {@link withdrawUndeliveredQueuedMessages} took back, keyed to the run that must not record them. */
 	#withdrawnMessages = new WeakMap<AgentMessage, AbortController>();
 	#steeringWaiters = new Set<() => void>();
+	#detachedToolUpdateEpoch = 0;
 	#queuedMessageGrouping?: (previous: AgentMessage, next: AgentMessage) => boolean;
 
 	#steeringMode: "all" | "one-at-a-time";
@@ -1527,6 +1528,7 @@ export class Agent {
 	}
 
 	abort(reason?: unknown) {
+		this.#detachedToolUpdateEpoch++;
 		this.#abortController?.abort(reason);
 	}
 
@@ -1558,6 +1560,7 @@ export class Agent {
 	}
 
 	reset() {
+		this.#detachedToolUpdateEpoch++;
 		if (this.#queuedMessageClaims.steering || this.#queuedMessageClaims.followUp) {
 			this.#abortController?.abort();
 			this.#abortController = undefined;
@@ -1754,6 +1757,7 @@ export class Agent {
 		const loopSignal = continuationSignal
 			? AbortSignal.any([loopAbortController.signal, continuationSignal])
 			: loopAbortController.signal;
+		const detachedToolUpdateEpoch = this.#detachedToolUpdateEpoch;
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
@@ -1951,6 +1955,11 @@ export class Agent {
 			getFollowUpMessages: signal => this.#dequeueFollowUpMessagesAfterHooks(signal ?? loopSignal),
 			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
 			onBeforeYield: () => this.#onBeforeYield?.(),
+			onDetachedToolUpdate: event => {
+				if (!loopSignal.aborted && detachedToolUpdateEpoch === this.#detachedToolUpdateEpoch) {
+					this.emitExternalEvent(event);
+				}
+			},
 			telemetry: this.#telemetry,
 		};
 

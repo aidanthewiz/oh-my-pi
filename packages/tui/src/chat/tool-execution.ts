@@ -32,7 +32,7 @@ import {
 import { plainText } from "../native/spans";
 import { diagnosticsSection, displayPath, toolHead } from "../tools/native-view";
 import type { FileDiagnosticsResult } from "../tools/lsp";
-import { NativeImageCache } from "../native/blobs";
+import { NativeImageCache, shownImageBlobs } from "../native/blobs";
 import { Memo } from "../native/memo";
 import { type EditMode, type PerFileDiffPreview, renderStreamingFallback } from "../tools/edit";
 import { taskCardAgentIds } from "../tools/task";
@@ -220,18 +220,17 @@ export interface ToolExecutionOptions {
 	useBuiltInRenderer?: boolean;
 }
 
+/** A tool result or progress frame as a card shows it. */
+export interface ToolResultFrame {
+	content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+	details?: unknown;
+	isError?: boolean;
+}
+
 export interface ToolExecutionHandle extends Component {
 	updateArgs(args: unknown, toolCallId?: string): void;
 	updateStreamPreview?(update: unknown): void;
-	updateResult(
-		result: {
-			content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-			details?: unknown;
-			isError?: boolean;
-		},
-		isPartial?: boolean,
-		toolCallId?: string,
-	): void;
+	updateResult(result: ToolResultFrame, isPartial?: boolean, toolCallId?: string): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExecutionStarted(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
@@ -240,6 +239,50 @@ export interface ToolExecutionHandle extends Component {
 	parkAsBackground(): void;
 	/** Seal the block as final history and stop its animations. */
 	seal(): void;
+}
+
+/** Tools whose returned call hands its card to the background job it started (see {@link parksAsBackground}). */
+const JOB_CARD_TOOLS: Record<string, "always" | "native"> = { task: "always", bash: "native", eval: "native" };
+
+/**
+ * Whether a call that returned with `details.async.state === "running"` stays
+ * parked ({@link ToolExecutionHandle.parkAsBackground}) so its job's later
+ * frames keep filling the card until a `completed`/`failed` frame settles it.
+ * Detached `task` spawns always do; backgrounded `bash`/`eval` jobs only under
+ * native rendering, where the terminal transcript keeps them frozen instead.
+ * Shared by the live event controller and the transcript rebuild.
+ */
+export function parksAsBackground(toolName: string, details: unknown): boolean {
+	const mode = JOB_CARD_TOOLS[toolName];
+	if (mode === undefined || (mode === "native" && !isNativeRendering())) return false;
+	return asyncJobState(details) === "running";
+}
+
+/** The background job state a tool result reports (`details.async.state`: running, completed, failed, cancelled). */
+export function asyncJobState(details: unknown): string | undefined {
+	if (!isRecord(details) || !isRecord(details.async)) return undefined;
+	return typeof details.async.state === "string" ? details.async.state : undefined;
+}
+
+/** Whether a frame is a background job's last one: it completed, failed or was cancelled. */
+export function isSettledJobFrame(details: unknown): boolean {
+	const state = asyncJobState(details);
+	return state === "completed" || state === "failed" || state === "cancelled";
+}
+
+/**
+ * Settle a parked card ({@link parksAsBackground}) with its job's last frame
+ * ({@link isSettledJobFrame}): a completed or failed job is the call's result;
+ * a cancelled one keeps the output it got to and seals the card as cancelled.
+ */
+export function settleWithJobFrame(component: ToolExecutionHandle, frame: ToolResultFrame, toolCallId: string): void {
+	const state = asyncJobState(frame.details);
+	if (state === "cancelled") {
+		component.updateResult(frame, true, toolCallId);
+		component.seal();
+		return;
+	}
+	component.updateResult({ ...frame, isError: state === "failed" }, false, toolCallId);
 }
 
 /** Card tone per status when the renderer doesn't choose one; settled cards stay neutral. */
@@ -585,15 +628,7 @@ export class ToolExecutionComponent extends Container {
 		return result !== undefined && !this.#isPartial && (result.isError === true || result.details != null);
 	}
 
-	updateResult(
-		result: {
-			content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-			details?: unknown;
-			isError?: boolean;
-		},
-		isPartial = false,
-		_toolCallId?: string,
-	): void {
+	updateResult(result: ToolResultFrame, isPartial = false, _toolCallId?: string): void {
 		const hadNoResult = this.#result === undefined;
 		const wasPartialResult = this.#result !== undefined && this.#isPartial;
 		const firstResultRepaintShapePainted = this.#firstResultViewportRepaintShapePainted;
@@ -1011,7 +1046,7 @@ export class ToolExecutionComponent extends Container {
 		const status = this.#nativeStatus();
 		const head = view.tool;
 		const late = this.#lateDiagnosticsParts();
-		const body: NativeChild[] = [...(view.body ?? []), ...this.#nativeResultImages()];
+		const body: NativeChild[] = [...(view.body ?? []), ...this.#nativeResultImages(view.body)];
 		if (late.section) body.push(late.section);
 		const inline = view.inline === true;
 		const hasBody = body.length > 0;
@@ -1099,7 +1134,7 @@ export class ToolExecutionComponent extends Container {
 		const children: NativeChild[] = [
 			node("row", { gap: "sm", align: "baseline" }, headChildren, "head"),
 			...(view.body ?? []),
-			...this.#nativeResultImages(),
+			...this.#nativeResultImages(view.body),
 			...(late.section ? [late.section] : []),
 		];
 		const role = `omp.tool.${this.#toolName}`;
@@ -1134,6 +1169,7 @@ export class ToolExecutionComponent extends Container {
 	#nativeView(): NativeToolView {
 		const status = this.#nativeStatus();
 		const options: RenderResultContextOptions = {
+			showImages: this.#showImages,
 			expanded: this.#expanded,
 			isPartial: this.#isPartial,
 			showFigures: this.#renderState.showFigures,
@@ -1213,12 +1249,17 @@ export class ToolExecutionComponent extends Container {
 		return indicators ? (output ? `${output}\n${indicators}` : indicators) : output;
 	}
 
-	#nativeResultImages(): NativeNode[] {
+	/** Result images not already shown by the renderer's body. */
+	#nativeResultImages(body: readonly NativeChild[] | undefined): NativeNode[] {
 		if (!this.#result || !this.#showImages) return [];
+		const shown = shownImageBlobs(body);
 		const images: NativeNode[] = [];
 		this.#getAllImageBlocks().forEach((image, index) => {
-			if (image.data && image.mimeType)
-				images.push(this.#nativeImages.get(`img${index}`, image.data, image.mimeType));
+			if (!image.data || !image.mimeType) return;
+			const described = this.#nativeImages.get(`img${index}`, image.data, image.mimeType);
+			const props = described.p;
+			if (!props || !("blob" in props) || typeof props.blob !== "string" || !shown.has(props.blob))
+				images.push(described);
 		});
 		return images;
 	}

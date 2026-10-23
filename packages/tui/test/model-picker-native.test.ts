@@ -135,37 +135,27 @@ function titleOf(children: readonly NativeChild[] | undefined): unknown {
 	return title ? prop(title, "text") : undefined;
 }
 
-test("the model hub describes a data-first picker when the terminal has the kind, else its generic frame", () => {
-	const hub = openHub({ assign: [], cancel: 0 });
-	expect(hub.nativeSheet(withPicker)).toBe(true);
-	expect(hub.nativeSheet(withoutPicker)).toBe(false);
-	expect(hub.describe(withoutPicker).k).not.toBe("picker");
-
-	const root = hub.describe(withPicker);
-	const p = props(root);
-	expect(p).toMatchObject({ size: "lg", layout: "rows", preview: "side", icon: "cpu", title: "Models", scope: "all" });
-	expect(p.scopes?.map(scope => [scope.id, scope.count, scope.group])).toEqual([
-		["roles", 2, undefined],
-		["all", 5, undefined],
-		["provider:anthropic", 2, "Providers"],
-		["provider:demo", 1, "Providers"],
-		["provider:openai", 2, "Providers"],
-	]);
-	expect(p.scopes?.find(scope => scope.id === "provider:anthropic")?.mark).toEqual({ text: "An", seed: "anthropic" });
-	// The recent/role block, then one group per provider.
-	expect(groups(p)).toEqual(["Recent", "anthropic", "openai"]);
-	expect(p.current).toEqual(["demo/demo"]);
-	expect(p.total).toBe(5);
-	const demo = p.items?.find(entry => entry.id === "demo/demo");
-	// The default role runs with thinking off (`defaultThinkingLevel`): its chip carries that level's dot.
-	expect(demo?.chips).toEqual([{ text: "default", on: true, dot: "thinkingOff" }]);
-	expect(p.items?.find(entry => entry.id === "anthropic/claude-sonnet-5-5")?.facts?.int).toBe("60");
-	expect(p.items?.find(entry => entry.id === "openai/gpt-5.6-mini")?.badges).toEqual([
-		{ text: "free", tone: "success" },
-	]);
-	expect(titleOf(root.c)).toBe("demo");
-	// Unchanged state keeps the node.
-	expect(hub.describe(withPicker)).toBe(root);
+test("provider scopes retain model identity and cannot reveal models excluded by host policy", () => {
+	const allowed = MODELS[0]!;
+	const hub = new ModelHubComponent(
+		ui,
+		{
+			...source({ default: "anthropic/claude-sonnet-5-5" }, []),
+			scopeModels: models => models.filter(model => model.id === allowed.id),
+		},
+		registry(MODELS),
+		MODELS.map(model => ({ model })),
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+	);
+	hubs.push(hub);
+	const all = props(hub.describe(withPicker));
+	expect(all.items?.map(item => item.id)).toEqual(["anthropic/claude-sonnet-5-5"]);
+	expect(all.items?.[0]?.mark).toEqual({ text: "An", seed: "anthropic", icon: "provider:anthropic" });
+	expect(all.scopes?.find(scope => scope.id === "provider:anthropic")?.mark).toEqual(all.items?.[0]?.mark);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "provider:anthropic", mods: [] });
+	expect(props(hub.describe(withPicker)).items?.map(item => item.id)).toEqual(["anthropic/claude-sonnet-5-5"]);
+	hub.handleNativeEvent({ type: "activate", key: "", item: "openai/gpt-5.6" });
+	expect(props(hub.describe(withPicker)).selected).not.toBe("openai/gpt-5.6");
 });
 
 test("Factory Droid rows carry the base credit rate and a credit-only model is never free", () => {

@@ -16,6 +16,8 @@ export interface RenderResultOptions {
 	isPartial: boolean;
 	/** Whether this transcript can draw tool figures; false outside the root session. */
 	showFigures?: boolean;
+	/** Whether result images are visible. Native describe hooks only. */
+	showImages?: boolean;
 	/** Current spinner frame index for animated elements (0-9, only provided during partial results) */
 	spinnerFrame?: number;
 	/**

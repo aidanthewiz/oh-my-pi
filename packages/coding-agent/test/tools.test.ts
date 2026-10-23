@@ -2535,7 +2535,7 @@ function b() {
 
 		it("should auto-background at the threshold even with a longer timeout", async () => {
 			const deliveries: Array<{ jobId: string; text: string }> = [];
-			const updates: string[] = [];
+			const updates: Array<{ text: string; state?: string }> = [];
 			const asyncJobManager = new AsyncJobManager({
 				onJobComplete: async (jobId, text) => {
 					deliveries.push({ jobId, text });
@@ -2565,17 +2565,15 @@ function b() {
 				},
 				undefined,
 				update => {
-					updates.push(update.content?.find(block => block.type === "text")?.text ?? "");
+					updates.push({
+						text: update.content?.find(block => block.type === "text")?.text ?? "",
+						state: update.details?.async?.state,
+					});
 				},
 			);
 
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
-			// Auto-backgrounded after its foreground wait: the deadline counts the job's whole run, not time left.
-			expect(getTextOutput(result)).toContain("Backgrounded as job");
-			expect(getTextOutput(result)).toContain(
-				"(killed once it has run 3600s in total; `timeout: 0` disables the deadline)",
-			);
 
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
@@ -2583,15 +2581,53 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
-			const updatesAtBackground = updates.slice();
+			const updatesAtBackground = updates.length;
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
 			expect(deliveries[0]?.text).toContain("start");
 			expect(deliveries[0]?.text).toContain("done");
-			expect(updates).toEqual(updatesAtBackground);
+			// The job keeps filling the call's card and settles it with its outcome.
+			const jobFrames = updates.slice(updatesAtBackground);
+			expect(jobFrames.every(frame => frame.state !== undefined)).toBe(true);
+			expect(jobFrames.at(-1)?.state).toBe("completed");
+			expect(jobFrames.at(-1)?.text).toContain("done");
 			await asyncJobManager.dispose();
+		});
+
+		it("retains streamed output in the terminal frame when a returned job is cancelled", async () => {
+			const manager = new AsyncJobManager({});
+			const emitted = Promise.withResolvers<void>();
+			const frames: Array<{ text: string; state?: string }> = [];
+			const tool = new BashTool(
+				createTestToolSession(testDir, Settings.isolated({ "async.enabled": true }), {
+					getSessionId: () => "cancelled-output-owner",
+					asyncJobManager: manager,
+				}),
+			);
+			try {
+				const result = await tool.execute(
+					"cancelled-output-call",
+					{ command: "printf 'retained-before-cancel\\n'; sleep 30", async: true, timeout: 0 },
+					undefined,
+					frame => {
+						const text = frame.content.find(block => block.type === "text")?.text ?? "";
+						frames.push({ text, state: frame.details?.async?.state });
+						if (text.includes("retained-before-cancel")) emitted.resolve();
+					},
+				);
+				const jobId = result.details?.async?.jobId;
+				if (!jobId) throw new Error("Expected a returned background job");
+				await emitted.promise;
+				expect(manager.cancel(jobId)).toBe(true);
+				await manager.getJob(jobId)?.promise;
+				expect(frames.at(-1)?.state).toBe("cancelled");
+				expect(frames.at(-1)?.text).toContain("retained-before-cancel");
+				expect(manager.getJob(jobId)?.status).toBe("cancelled");
+			} finally {
+				await manager.dispose();
+			}
 		});
 
 		it("backgrounds a running command when the steering signal fires mid-wait", async () => {

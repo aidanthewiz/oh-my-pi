@@ -120,6 +120,11 @@ export interface StructuredSubagentRequest {
 	schemaMode?: StructuredSubagentSchemaMode;
 	/** Parent context inheritance. Default `inherit`; `none` starts without parent context files. */
 	contextFilePolicy?: ContextFilePolicy;
+	/**
+	 * `false` = no output schema (caller, agent, or session) and no `yield` tool:
+	 * the child's final assistant message is its result. Default `true`.
+	 */
+	structured?: boolean;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
@@ -233,6 +238,9 @@ function sanitizeAgentId(value: string | undefined): string | undefined {
 
 function resolveSchema(request: StructuredSubagentRequest, agent: AgentDefinition): StructuredSubagentSchemaResolution {
 	const mode = request.schemaMode ?? request.session.outputSchemaMode ?? "permissive";
+	if (request.structured === false) {
+		return { schema: undefined, source: "none", mode, outputSchemaOverridesAgent: false };
+	}
 	if (Object.hasOwn(request, "outputSchema")) {
 		return { schema: request.outputSchema, source: "caller", mode, outputSchemaOverridesAgent: true };
 	}
@@ -569,6 +577,7 @@ function buildExecutorOptions(
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
 		solutionSpace: request.solutionSpace?.trim() || undefined,
+		structured: request.structured !== false,
 		...(policy.schema.source === "none"
 			? {}
 			: {

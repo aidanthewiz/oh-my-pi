@@ -565,7 +565,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const sessionAbortController = new AbortController();
 		const emitToolUpdate = onUpdate
 			? (text: string, details: EvalToolDetails): void => {
-					onUpdate({ content: [{ type: "text", text }], details });
+					const { images, ...frame } = details;
+					onUpdate({ content: [{ type: "text", text }, ...(images ?? [])], details: frame });
 				}
 			: undefined;
 		const run = async (
@@ -632,25 +633,36 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 		let latestText = "";
 		let latestDetails: EvalToolDetails | undefined;
-		let forwardUpdates = !startBackgrounded;
+		let backgrounded = startBackgrounded;
 		const completion = Promise.withResolvers<ManagedEvalJobCompletion>();
 
 		const jobId = autoBgManager.register(
 			"eval",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
+				// Once backgrounded, the job's frames carry `details.async` so the call's
+				// card keeps filling and settles with the job.
+				const showJobFrame = (
+					text: string,
+					details: EvalToolDetails | undefined,
+					state: "running" | "completed" | "failed" | "cancelled",
+				): void => {
+					if (backgrounded) emitToolUpdate?.(text, { ...details, async: { state, jobId, type: "eval" } });
+				};
 				try {
 					const result = await run(runSignal, (text, details) => {
 						latestText = text;
 						latestDetails = details;
 						void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
-						if (forwardUpdates) emitToolUpdate?.(text, details);
+						if (backgrounded) showJobFrame(text, details, "running");
+						else emitToolUpdate?.(text, details);
 					});
 					const finalText =
 						(result.content.find(block => block.type === "text")?.text ?? "") +
 						formatOutputNotice(result.details?.meta);
 					latestText = finalText;
-					latestDetails = result.details;
+					const images = result.content.filter((block): block is ImageContent => block.type === "image");
+					latestDetails = { ...result.details, ...(images.length > 0 ? { images } : {}) };
 					// Hand the full result (images included) to the foreground waiter
 					// before deciding the job's terminal state.
 					completion.resolve({ kind: "completed", result });
@@ -660,6 +672,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						// records it as failed and delivers the error text.
 						throw new ToolError(finalText || "Eval cell failed");
 					}
+					showJobFrame(finalText, latestDetails, "completed");
 					await reportProgress(finalText, {
 						...result.details,
 						async: { state: "completed", jobId, type: "eval" },
@@ -667,11 +680,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					return finalText;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
-					latestText = message;
+					const output = latestText && !message.includes(latestText) ? `${latestText}\n\n${message}` : message;
+					latestText = output;
 					completion.resolve({ kind: "failed", error });
-					await reportProgress(message, {
+					const state = runSignal.aborted ? "cancelled" : "failed";
+					showJobFrame(output, latestDetails, state);
+					await reportProgress(output, {
 						...latestDetails,
-						async: { state: "failed", jobId, type: "eval" },
+						async: { state, jobId, type: "eval" },
 					});
 					throw error;
 				}
@@ -715,7 +731,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoBgManager.releaseForegroundJob(jobId);
 			throw new ToolAbortError(latestText || "Eval cell aborted");
 		}
-		forwardUpdates = false;
+		backgrounded = true;
 		autoBgManager.backgroundJob(jobId);
 		// "steer": a queued user/peer message arrived mid-wait — background the
 		// cell (it keeps running) so the message injects promptly.

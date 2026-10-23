@@ -18,7 +18,15 @@ import { RecapNotice } from "@oh-my-pi/pi-tui/chat/recap-notice";
 import { TodoReminderComponent } from "@oh-my-pi/pi-tui/chat/todo-reminder";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
-import { ToolExecutionComponent, type ToolExecutionHandle, toolRenderName } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import {
+	asyncJobState,
+	isSettledJobFrame,
+	parksAsBackground,
+	settleWithJobFrame,
+	ToolExecutionComponent,
+	type ToolExecutionHandle,
+	toolRenderName,
+} from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TtsrNotificationComponent } from "@oh-my-pi/pi-tui/chat/ttsr-notification";
 import { createUsageRowBlock, TurnUsageTally, turnElapsedMs } from "@oh-my-pi/pi-tui/overlays/usage-row";
 import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
@@ -175,7 +183,15 @@ export class EventController {
 	#lastVisibleBlockCount = 0;
 	#renderedCustomMessages = new Set<string>();
 	#lastIntent: string | undefined = undefined;
-	#backgroundTaskCallIds = new Set<string>();
+	#disposed = false;
+	/** Returned calls parked for their background job's frames ({@link parksAsBackground}). */
+	#backgroundCallIds = new Set<string>();
+	/**
+	 * A job's settled frame ({@link isSettledJobFrame}) that landed while its
+	 * call was still executing, keyed by call id: a fast job can settle before
+	 * the call's `tool_execution_end` carries its `running` start result.
+	 */
+	#settledBeforeReturn = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_update" }>>();
 	/** Tool calls waiting on the user (an approval prompt or `ask`), with the
 	 *  `blocked` status each reports; cleared at their tool_execution_end so the
 	 *  run returns to `working` once none is left. */
@@ -431,6 +447,10 @@ export class EventController {
 	}
 
 	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#backgroundCallIds.clear();
+		this.#settledBeforeReturn.clear();
 		this.#detachToolApprovalPreviewWaiter?.();
 		this.#detachToolApprovalPreviewWaiter = undefined;
 		this.#clearApprovalPreviewGates();
@@ -459,7 +479,7 @@ export class EventController {
 	/** Freeze foreground tool cards once no live agent turn can complete them. */
 	#sealAbandonedForegroundTools(): void {
 		const background = new Set<ToolExecutionHandle>();
-		for (const toolCallId of this.#backgroundTaskCallIds) {
+		for (const toolCallId of this.#backgroundCallIds) {
 			const component = this.ctx.pendingTools.get(toolCallId);
 			if (component) background.add(component);
 		}
@@ -472,12 +492,12 @@ export class EventController {
 			}
 		}
 		for (const [toolCallId, component] of this.ctx.pendingTools) {
-			if (this.#backgroundTaskCallIds.has(toolCallId)) continue;
+			if (this.#backgroundCallIds.has(toolCallId)) continue;
 			component.seal();
 			this.ctx.pendingTools.delete(toolCallId);
 		}
-		this.#backgroundTaskCallIds = new Set(
-			Array.from(this.#backgroundTaskCallIds).filter(toolCallId => this.ctx.pendingTools.has(toolCallId)),
+		this.#backgroundCallIds = new Set(
+			Array.from(this.#backgroundCallIds).filter(toolCallId => this.ctx.pendingTools.has(toolCallId)),
 		);
 		this.#finalizeAbandonedPostToolSegments();
 	}
@@ -773,6 +793,7 @@ export class EventController {
 	 * snapshot first so ordering is preserved.
 	 */
 	async dispatchSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (this.#disposed) return;
 		if (event.type === "message_update") {
 			this.#enqueueMessageUpdate(event);
 			return;
@@ -915,7 +936,8 @@ export class EventController {
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
-		this.#backgroundTaskCallIds.clear();
+		this.#backgroundCallIds.clear();
+		this.#settledBeforeReturn.clear();
 		this.#blockingPrompts.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -967,9 +989,11 @@ export class EventController {
 	}
 
 	async handleEvent(event: AgentSessionEvent): Promise<void> {
+		if (this.#disposed) return;
 		if (!this.ctx.isInitialized) {
 			await this.ctx.init();
 		}
+		if (this.#disposed) return;
 
 		// Each handler explicitly requests a render (or leaves it out, when it
 		// changed nothing visible). A blanket pre-render fired on every event —
@@ -1388,15 +1412,15 @@ export class EventController {
 	}
 
 	/**
-	 * Re-register parked background task cards after a transcript rebuild so a
-	 * detached task's replayed and live progress frames keep routing to the
-	 * preserved component. Focus attach clears {@link #backgroundTaskCallIds}
+	 * Re-register parked background cards after a transcript rebuild so a
+	 * background job's replayed and live progress frames keep routing to the
+	 * preserved component. Focus attach clears {@link #backgroundCallIds}
 	 * via {@link resetTranscriptAnchors} before the rebuild repopulates it.
 	 * Ids whose component did not survive into `pendingTools` are skipped.
 	 */
-	markBackgroundTaskCalls(toolCallIds: Iterable<string>): void {
+	markBackgroundCalls(toolCallIds: Iterable<string>): void {
 		for (const toolCallId of toolCallIds) {
-			if (this.ctx.pendingTools.has(toolCallId)) this.#backgroundTaskCallIds.add(toolCallId);
+			if (this.ctx.pendingTools.has(toolCallId)) this.#backgroundCallIds.add(toolCallId);
 		}
 	}
 
@@ -1739,7 +1763,7 @@ export class EventController {
 				if (supersededByRewind) {
 					this.ctx.streamingComponent.markRewound();
 					for (const [toolCallId, component] of Array.from(this.ctx.pendingTools.entries())) {
-						if (this.#backgroundTaskCallIds.has(toolCallId)) continue;
+						if (this.#backgroundCallIds.has(toolCallId)) continue;
 						if (
 							!(component instanceof ToolExecutionComponent) &&
 							!(component instanceof ReadToolGroupComponent)
@@ -1959,22 +1983,21 @@ export class EventController {
 		this.#ensureWorkingLoaderWhileStreaming();
 		const component = this.ctx.pendingTools.get(event.toolCallId);
 		if (component) {
-			const asyncState = (event.partialResult.details as { async?: { state?: string } } | undefined)?.async?.state;
-			const isFinalAsyncState = asyncState === "completed" || asyncState === "failed";
+			const isFinalAsyncState = isSettledJobFrame(event.partialResult.details);
 			// A final async snapshot is terminal only for a parked background
 			// block (the call already returned and was kept alive for its jobs).
 			// While the call is still executing — a mixed blocking+async task
 			// call whose jobs settle before its blocking subset — treat it as a
 			// partial frame: `tool_execution_end` still owns the terminal result.
-			const isTerminal = isFinalAsyncState && this.#backgroundTaskCallIds.has(event.toolCallId);
-			component.updateResult(
-				{ ...event.partialResult, isError: asyncState === "failed" },
-				!isTerminal,
-				event.toolCallId,
-			);
+			const isTerminal = isFinalAsyncState && this.#backgroundCallIds.has(event.toolCallId);
 			if (isTerminal) {
+				settleWithJobFrame(component, event.partialResult, event.toolCallId);
 				this.ctx.pendingTools.delete(event.toolCallId);
-				this.#backgroundTaskCallIds.delete(event.toolCallId);
+				this.#backgroundCallIds.delete(event.toolCallId);
+			} else {
+				if (isFinalAsyncState) this.#settledBeforeReturn.set(event.toolCallId, event);
+				const isError = asyncJobState(event.partialResult.details) === "failed";
+				component.updateResult({ ...event.partialResult, isError }, true, event.toolCallId);
 			}
 			this.ctx.ui.requestRender();
 		}
@@ -2028,15 +2051,23 @@ export class EventController {
 		component: ToolExecutionHandle,
 		event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
 	): void {
-		const asyncState = (event.result.details as { async?: { state?: string } } | undefined)?.async?.state;
-		const isBackgroundTask = event.toolName === "task" && asyncState === "running";
-		component.updateResult({ ...event.result, isError: event.isError }, isBackgroundTask, event.toolCallId);
-		if (isBackgroundTask) {
+		const settled = this.#settledBeforeReturn.get(event.toolCallId)?.partialResult;
+		this.#settledBeforeReturn.delete(event.toolCallId);
+		const parks = parksAsBackground(event.toolName, event.result.details);
+		if (parks && settled) {
+			// The job finished before the call returned: its settled frame, not the
+			// `running` start result, is the card's final state.
+			settleWithJobFrame(component, settled, event.toolCallId);
+			this.ctx.pendingTools.delete(event.toolCallId);
+			return;
+		}
+		component.updateResult({ ...event.result, isError: event.isError }, parks, event.toolCallId);
+		if (parks) {
 			component.parkAsBackground();
-			this.#backgroundTaskCallIds.add(event.toolCallId);
+			this.#backgroundCallIds.add(event.toolCallId);
 		} else {
 			this.ctx.pendingTools.delete(event.toolCallId);
-			this.#backgroundTaskCallIds.delete(event.toolCallId);
+			this.#backgroundCallIds.delete(event.toolCallId);
 		}
 	}
 

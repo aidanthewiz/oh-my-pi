@@ -3357,7 +3357,12 @@ export class AgentSession implements SettingsScope {
 			// logical session transitions clear the cache.
 			this.#activeToolExecutionUpdates.set(event.toolCallId, event);
 		} else if (event.type === "tool_execution_end") {
-			this.#activeToolExecutionUpdates.delete(event.toolCallId);
+			const details = event.result.details;
+			// A returned running result cannot supersede a job frame that arrived
+			// before it. Blocking results remain authoritative.
+			if (!isRecord(details) || !isRecord(details.async) || details.async.state !== "running") {
+				this.#activeToolExecutionUpdates.delete(event.toolCallId);
+			}
 		}
 		if (event.type === "message_update") {
 			this.#emit(event);
@@ -3438,6 +3443,7 @@ export class AgentSession implements SettingsScope {
 	 * event/persistence pipeline during teardown.
 	 */
 	#handleAgentEvent = (event: AgentEvent): Promise<void> => {
+		if (this.#isDisposed && event.type === "tool_execution_update") return Promise.resolve();
 		if (event.type === "agent_start") {
 			this.#agentRunId = Bun.randomUUIDv7();
 			this.#lifecycleState = { runId: this.#agentRunId, phase: "running" };

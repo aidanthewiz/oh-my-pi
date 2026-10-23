@@ -771,6 +771,19 @@ interface LocatedRead {
 	spec: SchemeSpec;
 }
 
+interface FilesystemReadOptions {
+	dispatch: ReadDispatchState;
+	literalQueryPath?: boolean;
+	located?: LocatedRead;
+	question?: string;
+	/** Model-facing path for `?q=` hints; defaults to the displayed file path. */
+	questionPath?: string;
+	signal?: AbortSignal;
+	onBufferedFile?: (bytes: Buffer) => void;
+	onConflictMarkers?: () => void;
+	lexicalAbsolutePath?: string;
+}
+
 /**
  * Workflow hint for a large located file: page it through its URL, search/copy its backing
  * file. `rawBlocked` explains a refused whole-file `:raw` read.
@@ -1821,21 +1834,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	 * The filesystem read pipeline: directories, archives, sqlite, PDFs, video,
 	 * images, documents, notebooks, and streamed/paged text. `located` carries
 	 * the URL a routed read resolved to `readPath`; its hints name that URL.
+	 * Image results retain admitted bytes; host paths would reopen a mutable or translated source.
 	 */
 	async #readFilesystemPath(
 		readPath: string,
-		options: {
-			dispatch: ReadDispatchState;
-			located?: LocatedRead;
-			question?: string;
-			literalQueryPath?: boolean;
-			/** Model-facing path for `?q=` hints; defaults to the displayed file path. */
-			questionPath?: string;
-			signal?: AbortSignal;
-			onBufferedFile?: (bytes: Buffer) => void;
-			onConflictMarkers?: () => void;
-			lexicalAbsolutePath?: string;
-		},
+		options: FilesystemReadOptions,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const {
 			located,
