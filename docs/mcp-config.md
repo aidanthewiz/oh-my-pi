@@ -146,6 +146,11 @@ Native confirmation never overrides a deny or prompt policy.
 After redaction, each structured data or metadata channel requires its own changed replacement.
 Changing unrelated details never authorizes unchanged original channels or restores original raw content.
 
+Calls honor effective enable and disable overrides.
+Managed AWS calls validate the explicit operational profile before opening its signed connection.
+They share normal MCP authentication limits.
+Typed transport failures retain uncertain outcomes even when their text resembles an authentication error.
+
 Use `retry: "never"` for mutations. Use `retry: "read"` only for known reads.
 Without an explicit override, replay requires `readOnlyHint: true` or
 `idempotentHint: true`. A connection failure alone never proves write safety.

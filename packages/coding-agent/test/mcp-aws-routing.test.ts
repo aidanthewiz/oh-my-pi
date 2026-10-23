@@ -142,7 +142,7 @@ test("managed AWS discovers anonymously and signs with the selected profile on f
 		const config = path.join(root, "config");
 		await fs.writeFile(
 			config,
-			"[profile expired]\nregion = us-east-1\nsso_session = first\n[sso-session first]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n[profile healthy]\nregion = us-east-1\n[profile still-expired]\nregion = us-east-1\n",
+			"[profile expired]\nregion = us-east-1\nsso_session = first\n[sso-session first]\nsso_start_url = https://fixture.invalid/start\nsso_region = us-east-1\n[profile healthy]\nregion = us-east-1\n[profile still-expired]\nregion = us-east-1\n[profile coreforge]\nregion = us-east-1\n",
 		);
 		const aws = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");
 		const fixture = path.resolve(import.meta.dir, "fixtures/recording-aws.ts");
@@ -312,6 +312,28 @@ try {
    path: join(getAgentDir(), "mcp.managed.json"), level: "user" },
  });
  await manager.waitForPendingConnections();
+ const beforeNative = proxyCalls().length;
+ const beforeNativeIdentity = awsCalls().length;
+ for (const selected of [undefined, "missing", "coreforge"]) {
+  await assert.rejects(
+   manager.callTool(serverName, "aws___run_script", { code: "never dispatch", ...(selected ? { aws_profile: selected } : {}) }, { retry: "never" }),
+   /PROFILE_NOT_FOUND/,
+  );
+ }
+ assert.equal(proxyCalls().length, beforeNative);
+ assert.equal(awsCalls().length, beforeNativeIdentity);
+ const native = await manager.callTool(serverName, "aws___run_script", { aws_profile: "healthy", code: "native first use" }, { retry: "never" });
+ assert.notEqual(native.isError, true);
+ assert.deepEqual(JSON.parse(native.content[0].text).profiles, ["healthy", "expired", "still-expired"]);
+ assert.equal(JSON.parse(native.content[0].text).args.aws_profile, "healthy");
+ const beforeInvalid = proxyCalls().length;
+ await assert.rejects(manager.callTool(serverName, "aws___run_script", { aws_profile: "still-expired", code: "no fallback" }, { retry: "never" }), /AUTH_REQUIRED/);
+ assert.equal(proxyCalls().length, beforeInvalid);
+ assert.equal(awsCalls().at(-1).argv.includes("still-expired"), true);
+ const nativeController = new AbortController();
+ nativeController.abort();
+ await assert.rejects(manager.callTool(serverName, "aws___run_script", { aws_profile: "healthy", code: "cancelled" }, { retry: "never", signal: nativeController.signal }));
+ assert.equal(proxyCalls().length, beforeInvalid);
  const managerConnection = manager.getConnection(serverName);
  const { promise: refreshed, resolve: resolveRefreshed } = Promise.withResolvers();
  assert.ok(managerConnection?.transport.onNotification);
@@ -335,6 +357,40 @@ try {
  await manager.disconnectAll();
  delete Bun.env.OMP_MANAGED_AWS_MCP_COMMAND;
  delete Bun.env.OMP_MANAGED_MCP_CWD;
+}
+const beforeTransportIdentity = awsCalls().length;
+let uncertainDispatches = 0;
+const transportFixture = Bun.serve({
+ port: 0, hostname: "127.0.0.1",
+ async fetch(request) {
+  if (request.method !== "POST") return new Response(null, { status: 405 });
+  const rpc = await request.json();
+  if (rpc.id === undefined) return new Response(null, { status: 202 });
+  if (rpc.method === "tools/call") {
+   uncertainDispatches++;
+   return new Response("SSO token expired; login required", { status: 503 });
+  }
+  const result = rpc.method === "initialize"
+   ? { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } }
+   : rpc.method === "tools/list"
+    ? { tools: [{ name: "aws___run_script", inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["healthy"] } } } }] }
+    : {};
+  return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+ },
+});
+const transportManager = new MCPManager(process.env.HOME);
+try {
+ await transportManager.connectServers({ "coreforge-aws-agent-toolkit": { type: "http", url: transportFixture.url.href } }, {}, undefined, 0);
+ await transportManager.waitForStartup(0);
+ await assert.rejects(
+  transportManager.callTool("coreforge-aws-agent-toolkit", "aws___run_script", { aws_profile: "healthy", code: "uncertain write" }, { retry: "never" }),
+  error => error.name === "MCPTransportError" && error.failure === "http_status",
+ );
+ assert.equal(uncertainDispatches, 1);
+ assert.equal(awsCalls().length, beforeTransportIdentity);
+} finally {
+ await transportManager.disconnectAll();
+ transportFixture.stop(true);
 }
 console.log("first-use routing passed");
 `;

@@ -219,6 +219,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let sources: Record<string, SourceMeta> = {};
 	for (const server of result.items) {
 		configs[server.name] = convertToLegacyConfig(server);
+		if (forcedEnabled.has(server.name)) configs[server.name].enabled = true;
 		sources[server.name] = server._source;
 	}
 

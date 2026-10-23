@@ -18,6 +18,7 @@ afterEach(async () => {
 async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 	let failCalls = 0;
 	let protocolError = false;
+	let connectionCount = 0;
 	const calls: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
 	const initialized = Promise.withResolvers<void>();
 	const server = Bun.serve({
@@ -33,6 +34,7 @@ async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 			if (rpc.id === undefined) return new Response(null, { status: 202 });
 			let result: unknown;
 			if (rpc.method === "initialize") {
+				connectionCount++;
 				initialized.resolve();
 				result = {
 					protocolVersion: "2025-11-25",
@@ -41,7 +43,13 @@ async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 				};
 			} else if (rpc.method === "tools/list") {
 				if (toolsGate) await toolsGate;
-				result = { tools: ["get_task", "create_task"].map(name => ({ name, inputSchema: { type: "object" } })) };
+				result = {
+					tools: [
+						{ name: "get_task", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } },
+						{ name: "create_task", inputSchema: { type: "object" } },
+						{ name: "idempotent_task", inputSchema: { type: "object" }, annotations: { idempotentHint: true } },
+					],
+				};
 			} else if (rpc.method === "tools/call") {
 				calls.push(rpc.params);
 				if (failCalls-- > 0) return new Response("upstream unavailable", { status: 503 });
@@ -82,6 +90,7 @@ async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 		manager,
 		calls,
 		loading,
+		connectionCount: () => connectionCount,
 		failNext: () => {
 			failCalls = 1;
 		},
@@ -161,6 +170,41 @@ describe("session-owned extension MCP", () => {
 		expect(f.calls.map(call => call.name)).toEqual(["create_task", "create_task", "get_task", "get_task"]);
 	});
 
+	it("recovers annotated safe calls by default but obeys an explicit never-replay contract", async () => {
+		const f = await fixture();
+		for (const name of ["get_task", "idempotent_task"]) {
+			f.failNext();
+			const result = await f.manager.callTool("minions", name);
+			expect(result.structuredContent?.tenant).toBe("tenant-a");
+			f.failNext();
+			await expect(f.manager.callTool("minions", name, {}, { retry: "never" })).rejects.toThrow();
+		}
+		expect(f.calls.map(call => call.name)).toEqual([
+			"get_task",
+			"get_task",
+			"get_task",
+			"idempotent_task",
+			"idempotent_task",
+			"idempotent_task",
+		]);
+	});
+
+	it("does not reconnect or dispatch when a user disables a pending server", async () => {
+		const gate = Promise.withResolvers<void>();
+		const f = await fixture("tenant-a", gate.promise);
+		const pending = f.manager.callTool("minions", "create_task", {}, { retry: "never" });
+		const rejected = pending.catch(error => error);
+		const initializationsBeforeDisable = f.connectionCount();
+		const disconnecting = f.manager.disconnectServer("minions");
+		gate.resolve();
+		const [failure] = await Promise.all([rejected, disconnecting, f.loading]);
+		expect(failure).toBeInstanceOf(Error);
+		expect(f.calls).toEqual([]);
+		expect(f.connectionCount()).toBe(initializationsBeforeDisable);
+		expect(f.manager.getConnectedServers()).toEqual([]);
+		await expect(f.manager.callTool("minions", "create_task", {}, { retry: "never" })).rejects.toThrow("not enabled");
+	});
+
 	it("cannot dispatch a mutation after cancellation while waiting for discovery", async () => {
 		const gate = Promise.withResolvers<void>();
 		const f = await fixture("tenant-a", gate.promise);
@@ -215,8 +259,14 @@ describe("session-owned extension MCP", () => {
 				},
 				Settings.isolated({ "tools.approval": { mcp__minions_create_task: policy } }),
 			);
+			const untrustedOptions = {
+				retry: "never" as const,
+				context: { autoApprove: true, xdevApproved: true, hasUI: true, ui: { confirm: async () => true } },
+			};
 			await expect(
-				s.extensionRunner!.createContext().mcp!.callTool("minions", "create_task", { title: "synthetic" }),
+				s
+					.extensionRunner!.createContext()
+					.mcp!.callTool("minions", "create_task", { title: "synthetic" }, untrustedOptions),
 			).rejects.toThrow();
 			expect(f.calls).toEqual([]);
 			expect(callHooks).toBe(policy === "deny" ? 0 : 1);

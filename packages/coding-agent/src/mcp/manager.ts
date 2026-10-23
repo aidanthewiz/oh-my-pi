@@ -6,6 +6,7 @@
  */
 import * as path from "node:path";
 import * as url from "node:url";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
@@ -14,7 +15,6 @@ import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
 import { throwIfAborted } from "../tools/tool-errors";
 import {
-	callTool,
 	MCPConnectionTimeoutError,
 	connectToServer,
 	disconnectServer,
@@ -49,7 +49,7 @@ import type { McpConnectionStatusEvent } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
 
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
-import { canReplayMCPTool, DeferredMCPTool, isRetriableConnectionError, MCPTool } from "./tool-bridge";
+import { DeferredMCPTool, dispatchMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
 import { setGeneratedHeader } from "./transports/header-policy";
 import type {
@@ -1089,18 +1089,16 @@ export class MCPManager {
 				}
 			})().then(
 				connection => {
-					// Store config without resolved tokens to keep cache keys stable and
-					// avoid leaking rotating credentials.
-					connection.config = connectionConfig;
-					this.#serverConfigs.set(name, connectionConfig);
-					if (sources[name]) {
-						connection._source = sources[name];
-					}
-
 					if (this.#epoch !== connectionEpoch || this.#pendingConnections.get(name) !== connectionPromise) {
 						this.#detachConnection(name, connection);
 						void disconnectServer(connection).catch(() => {});
 						throw new Error(`Server "${name}" was disconnected during initial connection`);
+					}
+					// Store config without resolved tokens to keep cache keys stable and
+					// avoid leaking rotating credentials.
+					connection.config = connectionConfig;
+					if (sources[name]) {
+						connection._source = sources[name];
 					}
 
 					this.#pendingConnections.delete(name);
@@ -1164,18 +1162,6 @@ export class MCPManager {
 				}
 			});
 			this.#pendingToolLoads.set(name, toolsPromise);
-			void toolsPromise.then(
-				() => {
-					if (this.#connectionAbortControllers.get(name) === connectionAbortController) {
-						this.#connectionAbortControllers.delete(name);
-					}
-				},
-				() => {
-					if (this.#connectionAbortControllers.get(name) === connectionAbortController) {
-						this.#connectionAbortControllers.delete(name);
-					}
-				},
-			);
 
 			const tracked = trackPromise(toolsPromise);
 			connectionTasks.push({ name, cached: cached ?? undefined, tracked, connectSignal });
@@ -1419,13 +1405,16 @@ export class MCPManager {
 		toolName: string,
 		args: Record<string, unknown> = {},
 		options: MCPCallToolOptions = {},
+		context?: AgentToolContext,
 	): Promise<MCPToolCallResult> {
-		const { signal } = options;
+		const ownerSignal = this.#connectionAbortControllers.get(serverName)?.signal ?? this.#connectAbort.signal;
+		const signal = options.signal ? AbortSignal.any([options.signal, ownerSignal]) : ownerSignal;
 		throwIfAborted(signal);
-		if (!this.getServerConfig(serverName) || this.getServerConfig(serverName)?.enabled === false) {
+		const config = this.#serverConfigs.get(serverName);
+		if (!config || config.enabled === false) {
 			throw new Error(`MCP server is not enabled in this session: ${serverName}`);
 		}
-		let connection = await untilAborted(signal, () => this.waitForConnection(serverName));
+		let connection = await untilAborted(signal, () => this.waitForConnection(serverName, signal));
 		if (!connection.transport.connected) {
 			const reconnected = await untilAborted(signal, () => this.#reconnectServerForTool(serverName));
 			if (!reconnected) throw new Error(`MCP server not connected: ${serverName}`);
@@ -1435,18 +1424,15 @@ export class MCPManager {
 		const tools = connection.tools ?? (await untilAborted(signal, () => listTools(connection, { signal })));
 		const tool = tools.find(candidate => candidate.name === toolName);
 		if (!tool) throw new Error(`MCP tool not found: ${serverName}/${toolName}`);
-		const replaySafe = options.retry === "read" || (options.retry !== "never" && canReplayMCPTool(tool));
-		try {
-			return await callTool(connection, toolName, args, { signal });
-		} catch (error) {
-			throwIfAborted(signal);
-			if (!replaySafe || !isRetriableConnectionError(error)) throw error;
-			const reconnected = await untilAborted(signal, () => this.#reconnectServerForTool(serverName));
-			throwIfAborted(signal);
-			if (!reconnected) throw error;
-			connection = reconnected;
-			return await callTool(connection, toolName, args, { signal });
-		}
+		const attempt = await dispatchMCPTool(
+			connection,
+			tool,
+			args,
+			reconnectOptions => this.#reconnectServerForTool(serverName, reconnectOptions),
+			{ retry: options.retry, signal },
+			context,
+		);
+		return attempt.result;
 	}
 
 	/**
@@ -1575,7 +1561,8 @@ export class MCPManager {
 	/**
 	 * Wait for a connection to complete (or fail).
 	 */
-	async waitForConnection(name: string): Promise<MCPServerConnection> {
+	async waitForConnection(name: string, signal?: AbortSignal): Promise<MCPServerConnection> {
+		throwIfAborted(signal);
 		const connection = this.#connections.get(name);
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
@@ -1586,6 +1573,7 @@ export class MCPManager {
 				// A deferred tool may recover interactively after non-interactive discovery fails.
 			}
 		}
+		throwIfAborted(signal);
 		const recovered = this.#connections.get(name);
 		if (recovered) return recovered;
 		const reconnecting = this.#pendingReconnections.get(name);
@@ -1593,6 +1581,7 @@ export class MCPManager {
 			const result = await reconnecting;
 			if (result) return result;
 		}
+		throwIfAborted(signal);
 		const reconnected = await this.#reconnectServerForTool(name);
 		if (reconnected) return reconnected;
 		throw new Error(`MCP server not connected: ${name}`);

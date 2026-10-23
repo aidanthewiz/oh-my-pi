@@ -35,12 +35,17 @@ export function createExtensionMCPContext(
 				approval: "write",
 				mcpServerName: serverName,
 				mcpToolName: toolName,
-				async execute(_toolCallId, input) {
+				async execute(_toolCallId, input, _signal, _onUpdate, context) {
 					throwIfAborted(signal);
 					if (!isRecord(input)) throw new Error("MCP tool arguments must be an object");
+					if (!context) throw new Error("MCP tool execution context is unavailable");
 					try {
 						original = buildResult(
-							await manager.callTool(serverName, toolName, input, options),
+							await manager.callTool(serverName, toolName, input, options, {
+								...context,
+								hasUI: runner.hasUI(),
+								ui: runner.getUIContext(),
+							}),
 							serverName,
 							toolName,
 						);

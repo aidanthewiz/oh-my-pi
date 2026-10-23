@@ -145,6 +145,67 @@ describe("mcp-managed provider", () => {
 		expect(configs["managed-y"]).toBeDefined();
 	});
 
+	for (const disabled of [false, true]) {
+		test(`host calls honor force-enable overrides with explicit disable ${disabled}`, async () => {
+			const calls: string[] = [];
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				async fetch(request) {
+					if (request.method !== "POST") return new Response(null, { status: 405 });
+					const rpc = (await request.json()) as { id?: number; method: string; params?: { name: string } };
+					if (rpc.id === undefined) return new Response(null, { status: 202 });
+					let result: unknown = {};
+					if (rpc.method === "initialize")
+						result = {
+							protocolVersion: "2025-11-25",
+							capabilities: { tools: {} },
+							serverInfo: { name: "fixture", version: "1" },
+						};
+					if (rpc.method === "tools/list")
+						result = { tools: [{ name: "catalog_ping", inputSchema: { type: "object" } }] };
+					if (rpc.method === "tools/call") {
+						calls.push(rpc.params!.name);
+						result = { content: [{ type: "text", text: "synthetic enabled result" }] };
+					}
+					return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+				},
+			});
+			const manager = new MCPManager(projectDir);
+			try {
+				await writeManagedFile(
+					agentDir,
+					JSON.stringify({
+						mcpServers: { minions: { type: "http", url: server.url.href, enabled: false, exposeTools: false } },
+					}),
+				);
+				await writeUserMcpJson(agentDir, {
+					mcpServers: {},
+					enabledServers: ["minions"],
+					disabledServers: disabled ? ["minions"] : [],
+				});
+				clearFsCache();
+				await manager.discoverAndConnect({ discoveryProviders: ["mcp-managed", "native"], startupTimeoutMs: 0 });
+				await manager.waitForStartup(0);
+				if (disabled) {
+					await expect(manager.callTool("minions", "catalog_ping")).rejects.toThrow("not enabled");
+					expect(calls).toEqual([]);
+					expect(manager.getConnectedServers()).toEqual([]);
+				} else {
+					const result = await manager.callTool("minions", "catalog_ping", {}, { retry: "never" });
+					expect(result.content).toEqual([{ type: "text", text: "synthetic enabled result" }]);
+					expect(manager.getTools()).toEqual([]);
+					await manager.disconnectServer("minions");
+					await expect(manager.callTool("minions", "catalog_ping")).rejects.toThrow("not enabled");
+					expect(calls).toEqual(["catalog_ping"]);
+				}
+			} finally {
+				await manager.disconnectAll();
+				server.stop(true);
+			}
+		});
+	}
+
 	test("managed enabled:false without user allowlist stays excluded from runtime configs", async () => {
 		await writeManagedFile(
 			agentDir,
