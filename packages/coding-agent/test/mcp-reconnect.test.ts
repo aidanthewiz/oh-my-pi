@@ -28,7 +28,7 @@ function mockTransport(requestFn: (...args: Parameters<MCPTransport["request"]>)
 	};
 }
 
-const TOOL_DEF = { name: "do_stuff", inputSchema: { type: "object" as const } };
+const TOOL_DEF = { name: "do_stuff", inputSchema: { type: "object" as const }, annotations: { readOnlyHint: true } };
 
 function toolCallResult(text: string, isError = false): MCPToolCallResult {
 	return { content: [{ type: "text", text }], isError };
@@ -224,6 +224,57 @@ describe("MCPTool.execute retry on connection error", () => {
 		expect(result.content).toEqual([{ type: "text", text: "Screenshot captured" }, image]);
 	});
 
+	for (const deferred of [false, true]) {
+		it(`does not replay an unannotated write after an ambiguous reset (${deferred ? "deferred" : "live"})`, async () => {
+			let writes = 0;
+			let reconnects = 0;
+			const connection = makeConnection(
+				mockTransport(async () => {
+					writes++;
+					throw new Error("ECONNRESET");
+				}),
+			);
+			const definition = { name: "create_task", inputSchema: { type: "object" as const } };
+			const reconnect: MCPReconnect = async () => {
+				reconnects++;
+				return connection;
+			};
+			const tool = deferred
+				? new DeferredMCPTool("test-server", definition, async () => connection, undefined, reconnect)
+				: new MCPTool(connection, definition, reconnect);
+			const result = await tool.execute("ambiguous", {}, noop, noCtx);
+			expect(writes).toBe(1);
+			expect(reconnects).toBe(0);
+			expect(result.isError).toBe(true);
+		});
+	}
+
+	it("retries an explicitly readonly deferred tool once", async () => {
+		let calls = 0;
+		const initial = makeConnection(
+			mockTransport(async () => {
+				calls++;
+				throw new Error("ECONNRESET");
+			}),
+		);
+		const recovered = makeConnection(
+			mockTransport(async () => {
+				calls++;
+				return toolCallResult("recovered task");
+			}),
+		);
+		const tool = new DeferredMCPTool(
+			"test-server",
+			TOOL_DEF,
+			async () => initial,
+			undefined,
+			async () => recovered,
+		);
+		const result = await tool.execute("read", {}, noop, noCtx);
+		expect(calls).toBe(2);
+		expect(result.content).toEqual([{ type: "text", text: "recovered task" }]);
+	});
+
 	it("reuses refreshed connection on later call", async () => {
 		let oldCalls = 0;
 		let newCalls = 0;
@@ -345,6 +396,13 @@ describe("MCPTool.execute retry on connection error", () => {
 		expect(content.text).toContain('"token":"[redacted]"');
 		expect(content.text).not.toContain("server-secret");
 		expect(content.text.match(/^next: /gm)).toHaveLength(1);
+		expect(result.details?.protocolError).toMatchObject({
+			code: -32042,
+			failure: "json_rpc",
+			traceId: "trace-abc123",
+			data: expect.stringContaining('"token":"[redacted]"'),
+		});
+		expect(JSON.stringify(result.details)).not.toContain("server-secret");
 	});
 
 	it("redacts compound credential keys in JSON-RPC error data", () => {

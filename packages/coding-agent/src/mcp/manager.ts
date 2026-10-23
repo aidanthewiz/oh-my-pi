@@ -12,7 +12,9 @@ import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
+import { throwIfAborted } from "../tools/tool-errors";
 import {
+	callTool,
 	MCPConnectionTimeoutError,
 	connectToServer,
 	disconnectServer,
@@ -47,12 +49,14 @@ import type { McpConnectionStatusEvent } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
 
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
-import { DeferredMCPTool, MCPTool } from "./tool-bridge";
+import { canReplayMCPTool, DeferredMCPTool, isRetriableConnectionError, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
 import { setGeneratedHeader } from "./transports/header-policy";
 import type {
 	MCPAuthChallenge,
 	MCPAuthHandlerContext,
+	MCPCallToolOptions,
+	MCPToolCallResult,
 	MCPGetPromptResult,
 	MCPPrompt,
 	MCPRequestOptions,
@@ -1291,7 +1295,7 @@ export class MCPManager {
 	 */
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
-		this.#tools.push(...tools);
+		if (this.#serverConfigs.get(name)?.exposeTools !== false) this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(this.#tools);
@@ -1407,6 +1411,42 @@ export class MCPManager {
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
 		return this.#tools;
+	}
+
+	/** Invoke only this manager's configured server; never use the process singleton. */
+	async callTool(
+		serverName: string,
+		toolName: string,
+		args: Record<string, unknown> = {},
+		options: MCPCallToolOptions = {},
+	): Promise<MCPToolCallResult> {
+		const { signal } = options;
+		throwIfAborted(signal);
+		if (!this.getServerConfig(serverName) || this.getServerConfig(serverName)?.enabled === false) {
+			throw new Error(`MCP server is not enabled in this session: ${serverName}`);
+		}
+		let connection = await untilAborted(signal, () => this.waitForConnection(serverName));
+		if (!connection.transport.connected) {
+			const reconnected = await untilAborted(signal, () => this.#reconnectServerForTool(serverName));
+			if (!reconnected) throw new Error(`MCP server not connected: ${serverName}`);
+			connection = reconnected;
+		}
+		throwIfAborted(signal);
+		const tools = connection.tools ?? (await untilAborted(signal, () => listTools(connection, { signal })));
+		const tool = tools.find(candidate => candidate.name === toolName);
+		if (!tool) throw new Error(`MCP tool not found: ${serverName}/${toolName}`);
+		const replaySafe = options.retry === "read" || (options.retry !== "never" && canReplayMCPTool(tool));
+		try {
+			return await callTool(connection, toolName, args, { signal });
+		} catch (error) {
+			throwIfAborted(signal);
+			if (!replaySafe || !isRetriableConnectionError(error)) throw error;
+			const reconnected = await untilAborted(signal, () => this.#reconnectServerForTool(serverName));
+			throwIfAborted(signal);
+			if (!reconnected) throw error;
+			connection = reconnected;
+			return await callTool(connection, toolName, args, { signal });
+		}
 	}
 
 	/**

@@ -9,6 +9,8 @@
 ### Added
 
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
+- Extensions can call session-owned MCP servers with cancellation, policy hooks, and explicit replay contracts. Host-only MCP servers stay connected without exposing raw tools.
+- Custom extension surfaces advertise `ui.supportsCustomUI`.
 
 ### Fixed
 
@@ -51,6 +53,7 @@
 - Session archives retain readable children when another transcript fails. Anonymized archives use private, non-overwriting temporary files and preserve malformed-record accounting after session rollback.
 - Anonymized exports retain IDs, timestamps, models, and usage. Review them before sharing; redaction does not guarantee anonymity or upload any data.
 - Browser metadata-settle and `waitForTarget` cancellation retain `ToolAbortError`. Missing selected targets never adopt another live page.
+- Never replay unknown MCP writes after connection failures. Preserve bounded, redacted protocol diagnostics in typed tool details.
 - Preserve pending AWS SSO approvals when unrelated native or managed requests report authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 - Keep successful ECS Exec and SSM output successful when it contains text resembling helper diagnostics ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 - Preserve newer AWS SSO sign-ins when older operations report delayed authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).

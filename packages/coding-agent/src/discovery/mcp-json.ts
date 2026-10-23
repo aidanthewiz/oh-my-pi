@@ -26,6 +26,7 @@ interface MCPConfigFile {
 		string,
 		{
 			enabled?: boolean;
+			exposeTools?: boolean;
 			timeout?: number;
 			requestIdFormat?: "string" | "number";
 			instructions?: boolean;
@@ -105,6 +106,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta & { level:
 			const server: MCPServer = {
 				name,
 				enabled,
+				exposeTools: typeof serverConfig.exposeTools === "boolean" ? serverConfig.exposeTools : undefined,
 				timeout,
 				requestIdFormat,
 				instructions,

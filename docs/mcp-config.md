@@ -114,9 +114,10 @@ The config writer accepts names up to 100 characters containing letters, numbers
 Shared fields for every transport:
 
 - `enabled?: boolean` — skip this server when `false`, unless the active-profile user `enabledServers` allowlist names it
+- `exposeTools?: boolean` — default `true`; `false` keeps connection, discovery, cache, and startup events, but hides raw tools from model catalogs, including after refresh/reconnect. OMP-native, root, managed, and OMP plugin configurations support it.
 - `timeout?: number` — MCP request timeout in milliseconds; `0` disables client-side MCP timeouts
 - `requestIdFormat?: "number" | "string"` — outgoing JSON-RPC request-id encoding; defaults to per-transport integers. `"string"` uses collision-resistant snowflake IDs. This OMP-specific field is read only from OMP-native files, root `mcp.json` / `.mcp.json`, and OMP extension packages; configs translated from other tools ignore it.
-- `instructions?: boolean` — include server-provided instructions in the system prompt (default: `true`). Set `false` to omit that server's instructions without disabling its tools. Like `requestIdFormat`, this is OMP-specific and is ignored in configs translated from other tools.
+- `instructions?: boolean` — include server-provided instructions in the system prompt (default: `true`). Set `false` to omit that server's instructions without disabling its tools. Native, standalone, managed, and OMP plugin configurations support it; imported tool configs ignore it.
 - `auth?: { ... }` — stored-credential metadata; managed credential injection is implemented for OAuth
 - `oauth?: { ... }` — explicit OAuth client and callback settings used during auth/reauth
 
@@ -131,6 +132,30 @@ Initial MCP discovery returns after a 250 ms window while slower connections con
 Client-generated remote protocol headers take precedence over configured headers case-insensitively. Streamable HTTP owns `MCP-Protocol-Version`: it ignores configured copies and sends the negotiated version after initialization. Portable Agent Plugins' configured headers are origin-locked and are not forwarded to another origin on redirects.
 
 Remote HTTP and SSE transports do not impose an additional socket-idle timeout. Without an applicable MCP deadline, a silent connection can wait indefinitely; cancel the call or close the transport to stop it. A quiet stream alone does not prove that its peer is still reachable.
+
+### Extension calls
+
+Normal SDK sessions provide `ctx.mcp`; hand-built contexts without a runner may omit it.
+`ctx.mcp.callTool(serverName, toolName, args, { retry, signal })` uses only the
+owning session's manager and existing OAuth identity.
+Calls use the standard session approval pipeline, including `tools.approval.mcp__<server>_<tool>` policies.
+Initial denies prevent hooks and dispatch.
+`tool_call` input replacements pass through approval again before dispatch.
+Native confirmation never overrides a deny or prompt policy.
+`tool_result` handlers can replace results.
+After redaction, each structured data or metadata channel requires its own changed replacement.
+Changing unrelated details never authorizes unchanged original channels or restores original raw content.
+
+Use `retry: "never"` for mutations. Use `retry: "read"` only for known reads.
+Without an explicit override, replay requires `readOnlyHint: true` or
+`idempotentHint: true`. A connection failure alone never proves write safety.
+Cancellation stops connection waits and checks again before dispatch.
+An aborted in-flight call can still have changed remote state; reconcile its
+outcome instead of resubmitting it.
+
+Check `ctx.ui.supportsCustomUI === true` before opening custom components.
+Only the interactive custom-rendering surface advertises this capability.
+
 
 ### `stdio` transport
 

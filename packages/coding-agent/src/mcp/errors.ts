@@ -1,5 +1,6 @@
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { JsonRpcError } from "./types";
+import type { MCPProtocolDiagnostic } from "@oh-my-pi/pi-tui/tools/mcp";
 
 /** MCP transport used by a failed operation. */
 export type MCPTransportKind = "http" | "stdio" | "unknown";
@@ -55,7 +56,7 @@ export class MCPTransportError extends Error {
 	readonly stage: MCPFailureStage;
 	/** Stable machine-readable failure classification. */
 	readonly failure: MCPFailureClass;
-	/** Whether reconnecting and replaying follows the existing safe-retry policy. */
+	/** Whether reconnect may help; replay additionally requires a safe operation contract. */
 	readonly retryable: boolean;
 	/** Transport, HTTP, subprocess, or JSON-RPC error code when available. */
 	readonly code: string | number | undefined;
@@ -74,9 +75,16 @@ export class MCPTransportError extends Error {
 		this.stage = options.stage;
 		this.failure = options.failure;
 		this.retryable = options.retryable;
-		this.code = options.code;
-		this.data = options.data;
-		this.traceId = options.traceId;
+		this.code =
+			typeof options.code === "string" ? sanitizeDiagnosticText(options.code, MAX_TRACE_ID_CHARS) : options.code;
+		if (options.data !== undefined) {
+			try {
+				this.data = serializeData(JSON.parse(options.data));
+			} catch {
+				this.data = sanitizeDiagnosticText(options.data, MAX_DATA_CHARS);
+			}
+		}
+		this.traceId = safeTraceId(options.traceId);
 	}
 }
 
@@ -94,6 +102,11 @@ function sanitizeDiagnosticText(value: string, maxChars: number): string {
 	return value
 		.replace(FETCH_VERBOSE_ADVICE, "")
 		.replace(AUTH_SCHEME_VALUE, redactAuthCredential)
+		.replace(
+			/("(?:[^"]*(?:secret|token|credential|password|api[-_]?key|authorization)[^"]*)"\s*:\s*")[^"]*"/gi,
+			'$1[redacted]"',
+		)
+		.replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[redacted]@")
 		.replace(/([?&](?:access[-_]?token|api[-_]?key|key|token|secret|password)=)[^&#\s]+/gi, "$1[redacted]")
 		.replace(
 			/((?:authorization|api[-_]?key|private[-_]?key|access[-_]?key|token|secret|passw(?:or)?d|pwd|credential)\s*[:=]\s*)[^\s,;}]+/gi,
@@ -249,27 +262,42 @@ export function normalizeMCPTransportError(
 function nextStep(error: MCPTransportError): string {
 	switch (error.failure) {
 		case "connect":
-			return "Check that the MCP server is running and reachable, then retry.";
+			return "Check server availability and reconcile mutation outcomes before retrying.";
 		case "timeout":
 			return "Check server health or increase the MCP timeout; the request outcome is unknown.";
 		case "eof":
 		case "reset":
 			return error.transport === "stdio"
-				? "Inspect the MCP subprocess logs, restart the server, then retry."
-				: "Check the MCP server logs and availability, then retry.";
+				? "Inspect subprocess logs and reconcile mutation outcomes before retrying."
+				: "Check server logs and reconcile mutation outcomes before retrying.";
 		case "malformed_response":
 			return "Inspect the MCP server logs for an invalid JSON-RPC response.";
 		case "json_rpc":
 			return "Address the server-reported MCP error before retrying.";
 		case "http_status":
 			return error.retryable
-				? "Check the MCP server status, then retry."
+				? "Check server status and reconcile mutation outcomes before retrying."
 				: "Check the MCP endpoint and authentication configuration.";
 		case "closed":
-			return "Reconnect the MCP server, then retry.";
+			return "Reconnect the server and reconcile mutation outcomes before retrying.";
 		case "unknown":
 			return "Inspect the MCP server logs and transport configuration.";
 	}
+}
+
+/** Return only bounded diagnostic fields, excluding causes and transport state. */
+export function getMCPToolDiagnostic(error: unknown): MCPProtocolDiagnostic {
+	const diagnostic = normalizeMCPTransportError(error, { transport: "unknown", stage: "protocol" });
+	return {
+		transport: diagnostic.transport,
+		stage: diagnostic.stage,
+		failure: diagnostic.failure,
+		message: diagnostic.message,
+		retryable: diagnostic.retryable,
+		code: diagnostic.code,
+		data: diagnostic.data,
+		traceId: diagnostic.traceId,
+	};
 }
 
 /** Render an MCP tool failure as stable, actionable diagnostic fields. */

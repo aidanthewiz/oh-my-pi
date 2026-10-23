@@ -67,6 +67,8 @@ export type MCPRequestIdFormat = "string" | "number";
 interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Keep connected and cached, but hide raw tools from the model catalog. */
+	exposeTools?: boolean;
 	/** MCP request timeout in milliseconds (default: 30000, 0 to disable) */
 	timeout?: number;
 	/**
@@ -302,6 +304,21 @@ export interface MCPToolCallResult {
 	 */
 	structuredContent?: Record<string, unknown>;
 	_meta?: Record<string, unknown>;
+}
+
+/** Explicit replay contract for trusted extension callers. */
+export interface MCPCallToolOptions {
+	retry?: "never" | "read";
+	signal?: AbortSignal;
+}
+
+export interface ExtensionMCPContext {
+	callTool(
+		serverName: string,
+		toolName: string,
+		args?: Record<string, unknown>,
+		options?: MCPCallToolOptions,
+	): Promise<MCPToolCallResult>;
 }
 
 // =============================================================================

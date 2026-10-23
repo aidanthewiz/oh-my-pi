@@ -33,7 +33,7 @@ import {
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool, isAuthenticatedAwsTool, listTools } from "./client";
-import { formatMCPToolFailure, MCPTransportError } from "./errors";
+import { formatMCPToolFailure, getMCPToolDiagnostic, MCPTransportError } from "./errors";
 import { describeMCPCall, describeMCPResult, renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
 import type {
 	MCPAuthChallenge,
@@ -86,6 +86,11 @@ export function isRetriableConnectionError(error: unknown): boolean {
 }
 
 type MCPToolArgs = NonNullable<MCPToolCallParams["arguments"]>;
+
+/** An unknown tool is not replay-safe, regardless of the transport failure. */
+export function canReplayMCPTool(tool: MCPToolDefinition): boolean {
+	return tool.annotations?.readOnlyHint === true || tool.annotations?.idempotentHint === true;
+}
 
 function normalizeToolArgs(value: unknown): MCPToolArgs {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -282,7 +287,7 @@ function structuredContentAlreadyInText(structured: Record<string, unknown>, con
 }
 
 /** Build a CustomToolResult from a callTool response. */
-function buildResult(
+export function buildResult(
 	result: MCPToolCallResult,
 	serverName: string,
 	mcpToolName: string,
@@ -322,7 +327,7 @@ function buildResult(
 }
 
 /** Build an error CustomToolResult from a caught exception. */
-function buildErrorResult(
+export function buildErrorResult(
 	error: unknown,
 	serverName: string,
 	mcpToolName: string,
@@ -332,7 +337,14 @@ function buildErrorResult(
 	const message = formatMCPToolFailure(error, serverName, mcpToolName);
 	return {
 		content: [{ type: "text", text: message }],
-		details: { serverName, mcpToolName, isError: true, provider, providerName },
+		details: {
+			serverName,
+			mcpToolName,
+			isError: true,
+			protocolError: getMCPToolDiagnostic(error),
+			provider,
+			providerName,
+		},
 		isError: true,
 	};
 }
@@ -408,6 +420,7 @@ async function callProfileAwareTool(
 	while (true) {
 		const authenticationGeneration = group ? awsSessionAuthGroups.generation(group) : 0;
 		try {
+			throwIfAborted(signal);
 			const result = await callTool(connection, toolName, args, { signal });
 			if (
 				!result.isError ||
@@ -1026,7 +1039,16 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			return ready;
 		};
 		try {
-			const connection = await prepareConnection(this.connection);
+			let candidate = this.connection;
+			if (!candidate.transport.connected && this.reconnect) {
+				candidate =
+					(await reconnectWithAbort(
+						this.reconnect,
+						signal,
+						managedAws ? { awsProfile: String(args.aws_profile) } : undefined,
+					)) ?? candidate;
+			}
+			const connection = await prepareConnection(candidate);
 			this.connection = connection;
 			const attempt = await callToolWithAuthRetry(
 				connection,
@@ -1060,7 +1082,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			);
 		} catch (error) {
 			rethrowIfAborted(error, signal);
-			if (this.reconnect && isRetriableConnectionError(error)) {
+			if (this.reconnect && canReplayMCPTool(this.tool) && isRetriableConnectionError(error)) {
 				const newConn = await reconnectWithAbort(
 					this.reconnect,
 					signal,
@@ -1264,7 +1286,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				);
 			} catch (callError) {
 				rethrowIfAborted(callError, signal);
-				if (this.reconnect && isRetriableConnectionError(callError)) {
+				if (this.reconnect && canReplayMCPTool(this.tool) && isRetriableConnectionError(callError)) {
 					const newConn = await reconnectWithAbort(
 						this.reconnect,
 						signal,

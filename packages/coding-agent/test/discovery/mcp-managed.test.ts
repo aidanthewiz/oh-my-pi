@@ -14,6 +14,7 @@ import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability
 import { type MCPServer, mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
 import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
@@ -80,6 +81,33 @@ describe("mcp-managed provider", () => {
 		expect(server?.command).toBe("managed-cmd");
 		expect(server?._source.providerName).toBe("Coreforge Managed");
 		expect(server?._source.path).toBe(path.join(agentDir, "mcp.managed.json"));
+	});
+
+	test("a managed host-only definition stays callable without exposing raw tools", async () => {
+		await writeManagedFile(
+			agentDir,
+			JSON.stringify({
+				mcpServers: {
+					minions: {
+						command: process.execPath,
+						args: [path.join(import.meta.dir, "..", "fixtures", "delayed-catalog-mcp.ts")],
+						exposeTools: false,
+					},
+				},
+			}),
+		);
+		const { configs, sources } = await loadAllMCPConfigs(projectDir, { discoveryProviders: ["mcp-managed"] });
+		const manager = new MCPManager(projectDir);
+		try {
+			await manager.connectServers(configs, sources, undefined, 0);
+			await manager.waitForStartup(0);
+			expect(manager.getConnectedServers()).toEqual(["minions"]);
+			expect(manager.getTools()).toEqual([]);
+			const result = await manager.callTool("minions", "catalog_ping", {}, { retry: "read" });
+			expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+		} finally {
+			await manager.disconnectAll();
+		}
 	});
 
 	test("managed definition wins a same-name collision against the user mcp.json", async () => {
