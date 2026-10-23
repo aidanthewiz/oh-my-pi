@@ -8,6 +8,7 @@ import {
 	serviceTierFamily,
 	shouldSendServiceTier,
 } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 
 const m = (provider: string, api: Api, id: string) => ({
@@ -80,6 +81,72 @@ describe("resolveModelServiceTier", () => {
 });
 
 describe("shouldSendServiceTier", () => {
+	it("admits unadvertised Ultrafast only for the exact official Codex Sol route", () => {
+		const spec = {
+			id: "gpt-6.1-sol",
+			name: "Sol",
+			api: "openai-codex-responses" as const,
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"] as "text"[],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		for (const serviceTiers of [undefined, [], ["priority"]]) {
+			const model = buildModel({ ...spec, serviceTiers });
+			expect(shouldSendServiceTier("ultrafast", model)).toBe(true);
+			expect(getPremiumServiceTierRequests("ultrafast", model)).toBe(1);
+			expect(shouldSendServiceTier(undefined, model)).toBe(false);
+			expect(shouldSendServiceTier("auto", model)).toBe(false);
+			expect(shouldSendServiceTier("default", model)).toBe(true);
+			expect(shouldSendServiceTier("flex", model)).toBe(true);
+			expect(shouldSendServiceTier("priority", model)).toBe(true);
+		}
+		for (const route of [
+			{ id: "gpt-6-sol" },
+			{ id: "gpt-unknown" },
+			{ provider: "custom-relay" },
+			{ baseUrl: "https://relay.invalid/backend-api" },
+			{ baseUrl: "https://chatgpt.com.evil.invalid/backend-api" },
+			{ baseUrl: "http://chatgpt.com/backend-api" },
+			{ baseUrl: "https://chatgpt.com/backend-apix" },
+			{ baseUrl: "https://chatgpt.com:444/backend-api" },
+			{ baseUrl: "not a URL" },
+			{ requestModelId: "gpt-6-sol" },
+			{ requestModelId: "" },
+			{ id: "sol-alias", requestModelId: spec.id },
+		]) {
+			const model = buildModel({ ...spec, ...route, serviceTiers: ["priority"] });
+			expect(shouldSendServiceTier("ultrafast", model)).toBe(false);
+			expect(getPremiumServiceTierRequests("ultrafast", model)).toBe(0);
+			expect(
+				shouldSendServiceTier("ultrafast", buildModel({ ...spec, ...route, serviceTiers: ["ultrafast"] })),
+			).toBe(true);
+		}
+		for (const api of ["openai-responses", "openai-completions"] as const) {
+			expect(shouldSendServiceTier("ultrafast", buildModel({ ...spec, api }))).toBe(false);
+		}
+		for (const baseUrl of [
+			undefined,
+			"",
+			"https://chatgpt.com/backend-api/",
+			"https://chatgpt.com/backend-api/codex/responses",
+		]) {
+			expect(shouldSendServiceTier("ultrafast", { ...buildModel(spec), baseUrl })).toBe(true);
+		}
+		expect(shouldSendServiceTier("ultrafast", buildModel({ ...spec, requestModelId: spec.id }))).toBe(true);
+		const model = buildModel(spec);
+		const historical = { provider: model.provider, api: model.api, identity: model.identity };
+		expect(shouldSendServiceTier("ultrafast", historical)).toBe(false);
+		expect(getPremiumServiceTierRequests("ultrafast", historical, { served: true })).toBe(1);
+		expect(serviceTierFamily(historical)).toBe("openai");
+		expect(resolveModelServiceTier({ openai: "priority" }, historical)).toBe("priority");
+		expect(shouldSendServiceTier("priority", buildModel({ ...spec, serviceTiers: ["ultrafast"] }))).toBe(false);
+		expect(shouldSendServiceTier("scale", buildModel({ ...spec, serviceTiers: ["priority"] }))).toBe(false);
+	});
+
 	it("sends every explicit tier on the OpenAI family, omits auto, supported tiers elsewhere", () => {
 		for (const p of ["openai", "openai-codex"] as const) {
 			expect(shouldSendServiceTier("flex", p)).toBe(true);

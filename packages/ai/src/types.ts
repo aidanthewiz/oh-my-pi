@@ -2,6 +2,7 @@ export * from "@oh-my-pi/pi-catalog/effort";
 export * from "@oh-my-pi/pi-catalog/types";
 
 import type { Type } from "@oh-my-pi/omptype";
+import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
 import type { AnthropicSlowModeHooks } from "./providers/anthropic-slow-mode";
 import type {
 	DeleteArgs,
@@ -132,7 +133,8 @@ export type CacheRetention = "none" | "short" | "long";
  * - OpenAI / OpenAI-Codex: sent verbatim as the `service_tier` field
  *   (`flex`/`scale`/`priority`/`ultrafast`). `ultrafast` is a separate
  *   low-latency serving path: sent to the OpenAI API as-is (preview access is
- *   per project), and to Codex only for models whose discovery advertises it.
+ *   per project), and to Codex for advertised models or explicitly selected
+ *   first-party GPT-6.1 Sol.
  * - Google (Gemini API + Vertex AI): sent as the top-level `serviceTier`
  *   field (`flex`/`priority`).
  * - OpenRouter: passed through as `service_tier`; OpenRouter realizes it for
@@ -157,7 +159,8 @@ export type ServiceTierFamily = "openai" | "anthropic" | "google";
  */
 export type ServiceTierByFamily = Partial<Record<ServiceTierFamily, ServiceTier>>;
 
-type ServiceTierModel = Pick<Model, "provider" | "api" | "identity"> & Partial<Pick<Model, "serviceTiers">>;
+export type ServiceTierModel = Pick<Model, "provider" | "api" | "identity"> &
+	Partial<Pick<Model, "id" | "requestModelId" | "baseUrl" | "serviceTiers">>;
 // The service-tier matrix below intentionally stays in TypeScript rather than
 // the KDL compat tree: `shouldSendServiceTier` accepts bare provider strings
 // (agent telemetry, google-shared header placement) and the stats parser
@@ -234,9 +237,10 @@ export function resolveModelServiceTier(
  * realizes only its Priority serving path. Anthropic is absent because it
  * realizes `priority` via `speed: "fast"`.
  *
- * Codex-backend models (`openai-codex-responses`): `ultrafast` is sent only
- * when the model's discovered `service_tiers` lists it. `priority`/`scale`
- * are dropped only when that list is non-empty and omits them (codex-rs
+ * Codex-backend models (`openai-codex-responses`): `ultrafast` requires an
+ * advertised tier, except exact GPT-6.1 Sol on the official openai-codex route.
+ * This compatibility rule does not establish account access. `priority`/`scale`
+ * are dropped only when the list is non-empty and omits them (codex-rs
  * `service_tier_for_request`); an empty or missing list counts as "not
  * reported" — accounts whose `/models` lists no tiers keep `/fast` — so the
  * provider-level answer stands. `flex` and `default` are never gated.
@@ -256,7 +260,15 @@ export function shouldSendServiceTier(
 		serviceTier !== "default"
 	) {
 		const advertised = target.serviceTiers;
-		if (serviceTier === "ultrafast") return advertised?.includes(serviceTier) === true;
+		if (serviceTier === "ultrafast") {
+			return (
+				advertised?.includes(serviceTier) === true ||
+				(provider === "openai-codex" &&
+					target.id === "gpt-6.1-sol" &&
+					(target.requestModelId ?? target.id) === "gpt-6.1-sol" &&
+					isOfficialCodexApiUrl(target.baseUrl))
+			);
+		}
 		if (advertised !== undefined && advertised.length > 0) return advertised.includes(serviceTier);
 	}
 	if (serviceTier === "ultrafast") {

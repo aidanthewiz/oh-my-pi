@@ -51,6 +51,7 @@ import {
 	getPremiumServiceTierRequests,
 	parseServiceTier,
 	type ServiceTier,
+	type ServiceTierModel,
 	type StopReason,
 	type StreamOptions,
 	shouldSendServiceTier,
@@ -354,7 +355,7 @@ export function resolveOpenAIRequestSetup(
 export function applyOpenAIServiceTier(
 	params: { service_tier?: ServiceTier | null | undefined },
 	serviceTier: ServiceTier | null | undefined,
-	model: Pick<Model, "provider" | "api" | "identity">,
+	model: ServiceTierModel,
 ): void {
 	if (!shouldSendServiceTier(serviceTier, model)) return;
 	params.service_tier = serviceTier;

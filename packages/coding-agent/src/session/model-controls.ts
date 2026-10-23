@@ -820,9 +820,9 @@ export class ModelControls {
 
 	/**
 	 * `/fast ultra` sets the OpenAI family to `ultrafast`. Enabling requires the
-	 * active model to realize it (first-party OpenAI, or a Codex model whose
-	 * discovery advertises the tier); otherwise the tier is left unchanged and
-	 * `false` is returned. Disabling clears only an `ultrafast` selection.
+	 * active model to pass the canonical service-tier gate, including the
+	 * first-party Sol compatibility rule. Otherwise the tier stays unchanged.
+	 * Disabling clears only an `ultrafast` selection.
 	 */
 	setUltrafastMode(enabled: boolean): boolean {
 		const model = this.#model;

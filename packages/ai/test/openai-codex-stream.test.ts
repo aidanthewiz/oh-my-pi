@@ -19,6 +19,7 @@ import type {
 	Model,
 	ModelSpec,
 	ProviderSessionState,
+	ServiceTier,
 } from "@oh-my-pi/pi-ai/types";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
@@ -2326,6 +2327,80 @@ describe("openai-codex streaming", () => {
 		expect(result.usage.cost.output).toBeCloseTo(0.0012, 12);
 	});
 
+	it.each([undefined, [], ["priority"]].map(serviceTiers => ({ serviceTiers })))(
+		"serializes explicit Sol Ultrafast and records the sent or served tier (%j)",
+		async ({ serviceTiers }) => {
+			const tempDir = TempDir.createSync("@pi-sol-tier-");
+			setAgentDir(tempDir.path());
+			try {
+				const model = buildModel({
+					id: "gpt-6.1-sol",
+					name: "Sol",
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					baseUrl: "https://chatgpt.com/backend-api",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 272_000,
+					maxTokens: 128_000,
+					serviceTiers,
+				});
+				for (const echo of [undefined, "default", "auto", "ultrafast", "priority", "flex", "scale"] as const) {
+					let captured: Record<string, unknown> | undefined;
+					const fetchMock: FetchImpl = async (_input, init) => {
+						captured = JSON.parse(decodeCodexRequestBody(init?.body));
+						const item = {
+							type: "message",
+							id: "sol_message",
+							role: "assistant",
+							status: "completed",
+							content: [{ type: "output_text", text: "synthetic Sol" }],
+						};
+						const events = [
+							{
+								type: "response.output_item.added",
+								item: { ...item, status: "in_progress", content: [] },
+							},
+							{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+							{ type: "response.output_text.delta", delta: "synthetic Sol" },
+							{ type: "response.output_item.done", item },
+							{
+								type: "response.completed",
+								response: {
+									status: "completed",
+									service_tier: echo,
+									usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+								},
+							},
+						];
+						return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+							headers: { "content-type": "text/event-stream" },
+						});
+					};
+					const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+						fetch: fetchMock,
+						apiKey: createCodexTestToken(),
+						serviceTier: "ultrafast",
+						preferWebsockets: false,
+					}).result();
+					const served = !echo || echo === "default" || echo === "auto" ? "ultrafast" : echo;
+					const multiplier = served === "scale" ? 1 : (model.serviceTierCost?.[served] ?? 1);
+					expect(result.stopReason).toBe("stop");
+					expect(captured?.service_tier).toBe("ultrafast");
+					expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "synthetic Sol" }));
+					expect(result.serviceTier).toBe(served);
+					expect(result.usage.premiumRequests).toBe(served === "ultrafast" || served === "priority" ? 1 : 0);
+					expect(result.usage.cost.input).toBeCloseTo(((5 * model.cost.input) / 1e6) * multiplier, 12);
+					expect(result.usage.cost.output).toBeCloseTo(((3 * model.cost.output) / 1e6) * multiplier, 12);
+				}
+			} finally {
+				setAgentDir(originalAgentDir);
+				tempDir.removeSync();
+			}
+		},
+	);
+
 	it.each(["default", "auto"] as const)(
 		"bills a requested priority turn at the priority rate when the response echoes %s",
 		async echo => {
@@ -4004,7 +4079,49 @@ describe("openai-codex streaming", () => {
 		}
 	});
 
-	it("includes service_tier in websocket payloads when requested", async () => {
+	it.each([
+		{ id: "gpt-5.3-codex-spark", tier: "priority" as ServiceTier, wire: "priority", serviceTiers: undefined },
+		{ id: "gpt-6.1-sol", tier: "ultrafast" as ServiceTier, wire: "ultrafast", serviceTiers: undefined },
+		{ id: "gpt-6.1-sol", tier: "ultrafast" as ServiceTier, wire: "ultrafast", serviceTiers: [] },
+		{ id: "gpt-6.1-sol", tier: "ultrafast" as ServiceTier, wire: "ultrafast", serviceTiers: ["priority"] },
+		{ id: "gpt-6.1-sol", tier: "ultrafast" as ServiceTier, wire: "ultrafast", serviceTiers: ["ultrafast"] },
+		{ id: "gpt-6-sol", tier: "ultrafast" as ServiceTier, wire: undefined, serviceTiers: ["priority"] },
+		{
+			id: "sol-alias",
+			requestModelId: "gpt-6.1-sol",
+			tier: "ultrafast" as ServiceTier,
+			wire: undefined,
+			serviceTiers: ["priority"],
+		},
+		{
+			id: "gpt-6.1-sol",
+			requestModelId: "gpt-6-sol",
+			tier: "ultrafast" as ServiceTier,
+			wire: undefined,
+			serviceTiers: ["priority"],
+		},
+		{
+			id: "gpt-6.1-sol",
+			provider: "custom-relay",
+			tier: "ultrafast" as ServiceTier,
+			wire: undefined,
+			serviceTiers: ["priority"],
+		},
+		{
+			id: "gpt-6.1-sol",
+			baseUrl: "https://relay.invalid/backend-api",
+			tier: "ultrafast" as ServiceTier,
+			wire: undefined,
+			serviceTiers: ["priority"],
+		},
+		{
+			id: "gpt-6.1-sol",
+			provider: "custom-relay",
+			tier: "ultrafast" as ServiceTier,
+			wire: "ultrafast",
+			serviceTiers: ["ultrafast"],
+		},
+	])("gates prewarm and websocket tiers and resets chains on effective tier changes (%j)", async route => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -4014,6 +4131,7 @@ describe("openai-codex streaming", () => {
 		).toBase64();
 		const token = `aaa.${payload}.bbb`;
 		const sentRequests: Array<Record<string, unknown>> = [];
+		const handshakeHeaders: Array<WsHeaders | undefined> = [];
 
 		const fetchMock = vi.fn(async () => {
 			throw new Error("SSE fallback should not be called");
@@ -4022,14 +4140,17 @@ describe("openai-codex streaming", () => {
 		class ServiceTierWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
+				handshakeHeaders.push(options?.headers);
 				this.scheduleOpen();
 			}
 
 			override send(data: string): void {
 				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				const responseId = `resp_ws_${sentRequests.length}`;
+				const messageId = `msg_ws_${sentRequests.length}`;
 				this.sendJson({
 					type: "response.output_item.added",
-					item: { type: "message", id: "msg_ws", role: "assistant", status: "in_progress", content: [] },
+					item: { type: "message", id: messageId, role: "assistant", status: "in_progress", content: [] },
 				});
 				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
 				this.sendJson({ type: "response.output_text.delta", delta: "Hello WS" });
@@ -4037,16 +4158,16 @@ describe("openai-codex streaming", () => {
 					type: "response.output_item.done",
 					item: {
 						type: "message",
-						id: "msg_ws",
+						id: messageId,
 						role: "assistant",
 						status: "completed",
 						content: [{ type: "output_text", text: "Hello WS" }],
 					},
 				});
-				this.sendJson({ type: "response.created", response: { id: "resp_ws" } });
+				this.sendJson({ type: "response.created", response: { id: responseId } });
 				this.sendJson({
 					type: "response.done",
-					response: { id: "resp_ws", status: "completed", usage: DEFAULT_USAGE },
+					response: { id: responseId, status: "completed", usage: DEFAULT_USAGE },
 				});
 			}
 		}
@@ -4054,38 +4175,61 @@ describe("openai-codex streaming", () => {
 		global.WebSocket = ServiceTierWebSocket as unknown as typeof WebSocket;
 
 		const model: Model<"openai-codex-responses"> = buildModel({
-			id: "gpt-5.3-codex-spark",
-			name: "GPT-5.3 Codex Spark",
+			id: route.id,
+			requestModelId: route.requestModelId,
+			name: "Synthetic Codex",
 			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "https://chatgpt.com/backend-api",
+			provider: route.provider ?? "openai-codex",
+			baseUrl: route.baseUrl ?? "https://chatgpt.com/backend-api",
 			reasoning: true,
 			preferWebsockets: true,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000,
 			maxTokens: 128000,
+			serviceTiers: route.serviceTiers,
 		});
 		const context: Context = {
 			systemPrompt: ["You are a helpful assistant."],
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
 
-		const result = await streamOpenAICodexResponses(model, context, {
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
 			fetch: fetchMock as FetchImpl,
 			apiKey: token,
-			serviceTier: "priority",
 			sessionId: "ws-service-tier-session",
-			providerSessionState: new Map<string, ProviderSessionState>(),
-		}).result();
-		expect(result.stopReason).toBe("stop");
-		expect(fetchMock).not.toHaveBeenCalled();
-		expect(sentRequests[0]?.type).toBe("response.create");
-		expect(sentRequests[0]?.service_tier).toBe("priority");
-		// The served tier is recorded on the message and counted as a premium
-		// request, so live sessions and the stats backfill agree.
-		expect(result.serviceTier).toBe("priority");
-		expect(result.usage.premiumRequests).toBe(1);
+			providerSessionState,
+		};
+		try {
+			await prewarmOpenAICodexResponses(model, { ...options, serviceTier: route.tier });
+			expect(handshakeHeaders[0]?.["x-codex-routing-hint"]).toBe(
+				`model=${model.requestModelId ?? model.id}${route.wire ? `;tier=${route.wire}` : ""}`,
+			);
+			for (const tier of [route.tier, route.tier, undefined, route.tier]) {
+				const result = await streamOpenAICodexResponses(model, context, { ...options, serviceTier: tier }).result();
+				expect(result.stopReason).toBe("stop");
+				expect(result.serviceTier).toBe(tier ? (route.wire ?? "default") : "default");
+				expect(result.usage.premiumRequests).toBe(tier && route.wire && model.provider === "openai-codex" ? 1 : 0);
+				context.messages.push(result, { role: "user", content: "Continue", timestamp: Date.now() });
+			}
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(sentRequests.map(request => [request.type, request.model, request.service_tier])).toEqual([
+				["response.create", model.requestModelId ?? model.id, route.wire],
+				["response.create", model.requestModelId ?? model.id, route.wire],
+				["response.create", model.requestModelId ?? model.id, undefined],
+				["response.create", model.requestModelId ?? model.id, route.wire],
+			]);
+			expect(sentRequests.map(request => request.previous_response_id)).toEqual(
+				route.wire === "ultrafast"
+					? [undefined, "resp_ws_1", undefined, undefined]
+					: [undefined, "resp_ws_1", "resp_ws_2", "resp_ws_3"],
+			);
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+			providerSessionState.clear();
+			tempDir.removeSync();
+		}
 	});
 
 	it("records the websocket tier onPayload sent when the response echoes default", async () => {
@@ -4353,9 +4497,8 @@ describe("openai-codex streaming", () => {
 		expect(JSON.stringify(sentRequests[2]?.input)).not.toContain("Question 2");
 		expect(JSON.stringify(sentRequests[3]?.input)).toContain("Question 1");
 
-		// A Codex model that does not advertise the tier never receives it.
 		sentRequests.length = 0;
-		await streamOpenAICodexResponses(buildModel({ ...spec, serviceTiers: ["priority"] }), context, {
+		await streamOpenAICodexResponses(buildModel({ ...createCodexTestModel(), serviceTiers: ["priority"] }), context, {
 			...baseOptions,
 			sessionId: "ws-ultrafast-unadvertised",
 			serviceTier: "ultrafast",
