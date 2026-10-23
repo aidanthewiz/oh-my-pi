@@ -2139,6 +2139,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.#inputController.getDraftText(),
 			beginDispose: () => {
+				disposeProgramStatus();
 				this.mcpManager?.cancelAuthQueue();
 				this.session.beginDispose();
 			},
