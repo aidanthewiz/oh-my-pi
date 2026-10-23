@@ -526,11 +526,18 @@ export function createWorkerHandle<Inbound, Outbound>(
 		},
 		async terminate() {
 			intentionalExit.value = true;
+			// An awaited unref'd child does not keep its owner alive.
+			try {
+				proc.ref();
+			} catch {
+				// Already gone.
+			}
 			try {
 				proc.kill("SIGKILL");
 			} catch {
 				// Already gone.
 			}
+			await proc.exited;
 		},
 	};
 }
