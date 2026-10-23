@@ -62,7 +62,15 @@ Breadcrumb content begins with cwd and session file path. Optional extra lines a
 
 ## File Format
 
-Session files are JSONL: one JSON object per line. Current files physically begin with a fixed-width, 256-byte `type: "title"` slot (including its newline), followed by the session header and then `SessionEntry` values. Legacy files may begin directly with the header. Loaders strip the physical slot and fold its current title/source into the logical header.
+Session files are JSONL: one JSON object per line. Current files begin with a fixed-width title slot of exactly 256 UTF-8 bytes, including its newline. The session header and `SessionEntry` values follow it. Legacy files may begin directly with the header.
+
+Loaders select the title, source, update identity, and optional `titleCard` from the winning container. A plain title slot never borrows stale header metadata. A validated short-title slot retains its own card even when an older, longer header exceeds the listing prefix.
+
+`titleCard` contains a validated `code`, optional portable `emoji`, optional canonical `nf`, and `key`. The key is the first 16 lowercase hexadecimal characters of `SHA256(JSON.stringify([title, source-or-null, updatedAt]))`. It binds metadata to its title tuple; it is not authorization.
+
+The serializer omits a card rather than shortening the title. Overlong titles remain complete in the header; their physical slot carries a tuple-bound `ref`. Existing fenced rewrites publish overflow updates. Backend title metadata retains the full semantic title, not the physical placeholder.
+
+Public title and name values remain strings. Legacy and manual names remain opaque; already-truncated historical text cannot be reconstructed. A plain same-text update clears metadata. Every applied update receives a monotonically fresh identity, including repeated text within one millisecond.
 
 - The logical first entry is always the session header (`type: "session"`).
 - Remaining logical entries are `SessionEntry` values.
@@ -95,6 +103,7 @@ Notes:
 - `parentSession` is an opaque lineage string. Current code writes either a session id or a session path depending on flow (`fork`, `forkFrom`, `createBranchedSession`, or explicit `newSession({ parentSession })`). Treat it as metadata, not a typed foreign key.
 
 - `titleSource` is `auto` or `user`; automatic renames cannot overwrite a user title.
+- `titleUpdatedAt` identifies the current title transaction. Optional `titleCard` candidates belong to the same title/source/update tuple.
 
 ### Entry Base (`SessionEntryBase`)
 
@@ -371,7 +380,13 @@ Extension-provided message that does participate in LLM context. `content` can b
 
 Append-only audit entry for a session rename. It records `title`, `source` (`auto` or `user`), and optionally `previousTitle` and `trigger`. The current title is also updated in the fixed-width title slot so listing does not require a full-file rewrite.
 
-`/rename <title>` sets an explicit title. `/rename` without a title generates one from recent conversation using the title-generation candidates (`tiny`, `commit`, `smol`, then eligible current-model fallbacks), keeping the current title's card (`<icon> <CODE>: `) if it has one. A title still without a card, typed or generated, gets one from the same candidates (`src/prompts/system/title-card.md`) unless `title.icons` is `boring`; a failed card leaves the title plain, and an interrupt drops only the card from a typed title. Both are user-requested renames (`source: "user"`), so later automatic titling cannot replace them. Empty conversation or failed generation leaves the current title unchanged. A session switch or newer rename while generation runs discards the stale result. Local tiny-model failures never fall back to an online provider.
+`/rename <title>` requests an explicit name. `/rename` without a title generates one from recent conversation through the existing title-generation candidates. Generated retitles retain the current validated card without nesting incoming headings. New card inference preserves portable emoji and canonical Nerd Font candidates independently of `title.icons`.
+
+A failed card leaves the title plain. An interrupt drops only the pending card from a typed name. Plain same-text renames clear metadata without inference. Legacy headings remain opaque. Both command forms use `source: "user"`, so later automatic titling cannot replace them.
+
+Empty context or failed generation leaves the current name unchanged. A switch, newer rename, cancellation, or newer title transaction rejects stale inference. Local tiny-model failures never fall back to an online provider.
+
+Presentation reads current preferences at its sinks. `boring` shows the authoritative title only. `emoji` uses the portable candidate. `nf+emoji` uses Nerd Fonts only with the active Nerd symbol preset; otherwise it uses emoji. Native and OS titles never select a private-use candidate. Extension terminal overrides retain their existing sanitization and survive preference-only refreshes.
 
 ### `ttsr_injection`
 
@@ -578,6 +593,8 @@ Implementations and adapters:
 
 `SessionStorageWriter` exposes `append`, optional `appendSync`, `flush`, optional `flushSync`, `isOpen`, `close`, and `getError`.
 
+SQL backends add nullable `title_card TEXT` to the existing session row through their existing schema migration path. Deployments using `createTable: false` must provision this column before using the new schema. Redis retains the tuple in its existing title hash. No additional title table, service, or cache is introduced.
+
 ### Manual storage maintenance
 
 `omp gc` previews maintenance by default; `--apply` is required to sweep unreferenced blobs, archive eligible cold sessions, checkpoint database WALs, or prune stale state. Storage maintenance is separate from model-context compaction.
@@ -603,7 +620,9 @@ Discovery helpers live in `session-listing.ts`; `SessionManager` exposes project
 - `SessionManager.listForPicker(...)` / `listAllForPicker()` -> pinned-first lists with untitled, prompt-less zero-turn stubs removed; pinned stubs remain selectable
 - `resolveResumableSession(...)` -> local lookup then optional global fallback
 
-`getRecentSessions()` sorts file stats and first looks up titles in `history.db`'s `session_titles` index; unindexed files fall back to content scanning and backfill their title. `findMostRecentSession()` reads a 4 KiB prefix. Status-enabled full/non-empty scans read that prefix plus a bounded 32 KiB tail. Scans are stat-keyed and cached; large full lists use bounded parallel workers. Normal per-directory scans also recover the newest orphaned EPERM backup when its primary JSONL is missing.
+`getRecentSessions()` sorts file stats and reads the winning title container before applying current display preferences. A stale `history.db` title cannot replace the file winner. Discovered authoritative strings still update the existing title index.
+
+Normal scans read a 4 KiB prefix. A clipped overflow header requires a full read to recover its complete name. Status-enabled scans also read a bounded 32 KiB tail. Scans remain stat-keyed and cached, with bounded parallel workers. Normal directory scans retain orphaned EPERM backup recovery.
 
 `SessionManager.list()`/`listAll()` sort pinned sessions first; raw listing helpers sort newest first. Empty filtering is picker/continue-specific, not applied to id lookup or maintenance. Resume matching is case-insensitive and accepts session id prefixes, full filename prefixes, or the id suffix after the timestamp. Explicit `sessionDir` disables global fallback unless `allowGlobalFallback: true` is requested.
 

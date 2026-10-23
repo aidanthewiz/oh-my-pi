@@ -12,6 +12,10 @@
 
 ### Fixed
 
+- Preserve portable title candidates across persistence, cold resume, copies, forks, moves, and backend reconstruction. Apply live icon preferences at display sinks and reject stale metadata and asynchronous updates.
+- Keep winning title cards and searchable displayed codes in clipped-header and cached-picker paths. Use registered presentation defaults when no settings scope exists.
+- Clear OSC 7501 status synchronously before signal teardown awaits persistence or disposal.
+- Allow `/fast ultra` for exact official Codex GPT-6.1 Sol when discovery omits Ultrafast, while preserving refused selections and existing priority behavior.
 - Retain background tool updates after their originating turn ends, and reject late updates once session disposal begins.
 - Keep Read image previews bound to captured bytes. Native terminals do not reopen source paths or load viewer sidecars automatically.
 - Preserve early terminal Bash and Eval output and status across initial running results and transcript rebuilds.

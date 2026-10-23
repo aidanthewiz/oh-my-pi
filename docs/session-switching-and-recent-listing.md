@@ -34,8 +34,10 @@ There are two different listing pipelines:
 
 1. `getRecentSessions(sessionDir, limit = 4)` (welcome/summary view)
    - Lists files and sorts by `mtime` descending.
-   - Uses the `history.db` session-title index to avoid reading indexed files.
-   - For files without an indexed title, uses the same prefix/tail scan and assistant-detection fallback as full listings, skips untitled empty stubs, and backfills discovered titles into the index.
+   - Reads the winning title-slot/header tuple; a stale indexed title cannot override it.
+   - Retains authoritative title strings in the existing `history.db` index.
+   - Applies optional `titleCard` candidates at display sinks with current preferences.
+   - Reads a complete overflow header when the normal prefix clips it.
    - Understands current fixed-width title-slot files and legacy header-first files.
    - Returns lightweight `RecentSessionInfo` (`path`, `name`, `timeAgo`).
 
@@ -57,12 +59,14 @@ For recent summaries (`RecentSessionInfo`):
 - display name preference (`sessionDisplayName`): `title` -> first user message -> an `Untitled · <time>` label (the raw `id` is intentionally never used)
 - the welcome screen truncates the rendered name to the available column width (no fixed length)
 - only the first line is kept and control characters are stripped from title/message-derived names (`sanitizeSessionName`)
+- title presentation uses the current scoped or global settings, or the registered default when no live settings scope exists
 
 For `SessionInfo` list entries:
 
-- `title` is the fixed title-slot value when present, otherwise `header.title`, otherwise the last compaction `shortSummary` seen in the prefix
+- `title` is the winning title-slot/header string, including the complete header title selected by a valid overflow `ref`, or the last compaction `shortSummary` seen in the prefix
 - `firstMessage` is first user message text discoverable from the prefix or `"(no messages)"`
 - the picker also shows modified time, file size, a `current` marker on the live session, lifecycle status (except `unknown`), fork marker, and cwd in all-projects scope
+- optional `titleCard` metadata is separate from the authoritative string; `titlePresentation()` applies current icon preferences without changing identity
 
 ## `--continue` resolution and terminal breadcrumb preference
 
@@ -154,7 +158,8 @@ Flow:
 - Esc to cancel; Ctrl+C to exit
 - Tab to toggle current-folder / all-projects scope
 - mouse wheel/click in the fullscreen picker
-- multi-token search across id/title/cwd/first message/prefix message text/path: literal matches lead by recency, then sufficiently strong fuzzy matches; prompt-history matches from `history.db` may be promoted after typing pauses
+- multi-token search across id/title/displayed card code/cwd/first message/prefix message text/path: literal title matches lead, then other literal matches by recency and sufficiently strong fuzzy matches; prompt-history matches from `history.db` may be promoted after typing pauses
+- displayed-title changes invalidate the cached search text; plain title strings remain searchable independently of their presentation
 - the live session (when `currentSessionPath` is supplied) is labeled `current` on its metadata line and focused on open and after a Tab scope toggle
 
 Empty-list render behavior:

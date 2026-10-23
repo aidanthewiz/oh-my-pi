@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Allow explicitly selected Ultrafast for exact official Codex GPT-6.1 Sol when discovery omits it. Preserve advertised custom routes, accounting, defaults, and WebSocket chain boundaries without granting account access.
+- Preserve caller-owned Anthropic fallback controls during beta sanitization. Apply beta-header filtering to explicitly opted-in Copilot routes without admitting ordinary Copilot routes.
 - Retain known billed usage from decoded unusable judgment responses and positive-cost gateway responses with zero tokens.
 - Preserve OAuth account identity when preflight reloads reorder credential rows.
 - Keep OAuth account pools closed when credential rows disappear or change identity during request preparation and refresh.

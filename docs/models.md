@@ -623,6 +623,17 @@ When a bare id matches models from multiple providers, preference order is:
 3. recently used providers
 4. registry order
 
+### Explicit service tiers
+
+`/fast ultra` can explicitly select Ultrafast for exact first-party `openai-codex/gpt-6.1-sol` when discovery omits that tier.
+The exception requires the official Codex endpoint and an absent or identical `requestModelId`.
+Local aliases, wire remaps, and unadvertised custom routes do not inherit it.
+Explicitly advertised Codex tiers retain their existing behavior, including custom routes.
+
+Selection does not establish account entitlement, pricing, or actual serving latency.
+Provider-reported served tiers and existing model prices remain authoritative.
+This exception does not change the default tier or add an authentication, retry, or fallback path.
+
 ### Initial model selection priority
 
 `findInitialModel(...)` uses this order:
