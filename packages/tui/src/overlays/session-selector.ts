@@ -41,6 +41,8 @@ export interface SessionSelectorEntry {
 	id: string;
 	cwd: string;
 	title?: string;
+	/** Host-owned formatting evaluated when this entry is displayed. */
+	titlePresentation?(): string;
 	modified: Date;
 	created?: Date;
 	size: number;
@@ -117,8 +119,12 @@ function sessionStatusTone(status: SessionSelectorStatus | undefined): TspTone |
 
 /** The name a session goes by: its title, else its first message on one line, else its id. */
 function sessionLabel(session: SessionSelectorEntry): string {
-	const title = session.title ? plainText(session.title).trim() : "";
+	const title = plainText(session.titlePresentation?.() ?? session.title ?? "").trim();
 	return title || plainText(session.firstMessage).replace(/\s+/g, " ").trim() || session.id;
+}
+
+function sessionTitleForSearch(session: SessionSelectorEntry): string {
+	return session.title?.trim() ? sessionLabel(session) : "";
 }
 
 /** Longest prompt or answer excerpt the native preview shows. */
@@ -205,6 +211,7 @@ function formatSessionDate(date: Date): string {
 
 /** A cached native session item and the inputs it was built from. */
 interface SessionItemMemo {
+	label: string;
 	node: NativeNode;
 	date: string;
 	pinned: boolean;
@@ -221,6 +228,7 @@ interface NativeSessionInfo extends SessionSelectorEntry {
 
 /** The session picker's catalogue: one item per session in scope, and the inputs it was built from. */
 interface SessionCatalogue {
+	labels: readonly string[];
 	version: number;
 	showCwd: boolean;
 	currentPath: string | undefined;
@@ -266,10 +274,11 @@ const SCOPE_TABS: readonly { id: "folder" | "all"; label: string }[] = [
 /** Returns the IDs of sessions whose recorded prompts match a query, best first. */
 export type SessionHistoryMatcher = (query: string) => string[];
 
-function sessionSearchText(session: SessionSelectorEntry): string {
+function sessionSearchText(session: SessionSelectorEntry, displayTitle: string): string {
 	const parts = [
 		session.id,
 		session.title ?? "",
+		displayTitle === session.title ? "" : displayTitle,
 		session.cwd ?? "",
 		session.firstMessage ?? "",
 		session.allMessagesText,
@@ -279,28 +288,32 @@ function sessionSearchText(session: SessionSelectorEntry): string {
 }
 
 /**
- * Lowercased per-session search haystack, built once and cached on the
- * {@link SessionSelectorEntry} itself (so it dies with the listing that produced it).
+ * Lowercased per-session search haystack, cached while its displayed title is unchanged
+ * on the {@link SessionSelectorEntry} itself, so it dies with its listing.
  * Rebuilding it per keystroke — a ~4KB string join plus `toLowerCase` per
  * session — was one of the costs that made resume search visibly lag.
  *
- * Only the string is cached. A prebuilt fuzzy index (~60KB per 4KB session)
+ * Only the haystack and displayed title are cached. A prebuilt fuzzy index (~60KB per 4KB session)
  * would cost hundreds of MB on multi-thousand-session listings, so fuzzy
  * indexes are built transiently per scan visit instead (see
  * {@link scoreFuzzySession} callers).
  */
 const kSearchTextLower = Symbol("session.searchTextLower");
+const kSearchPresentation = Symbol("session.searchPresentation");
 
 interface SearchableSessionInfo extends SessionSelectorEntry {
 	[kSearchTextLower]?: string;
+	[kSearchPresentation]?: string;
 }
 
 function sessionTextLower(session: SessionSelectorEntry): string {
 	const tagged = session as SearchableSessionInfo;
+	const displayTitle = sessionTitleForSearch(session);
 	let textLower = tagged[kSearchTextLower];
-	if (textLower === undefined) {
-		textLower = sessionSearchText(session).toLowerCase();
+	if (textLower === undefined || tagged[kSearchPresentation] !== displayTitle) {
+		textLower = sessionSearchText(session, displayTitle).toLowerCase();
 		tagged[kSearchTextLower] = textLower;
+		tagged[kSearchPresentation] = displayTitle;
 	}
 	return textLower;
 }
@@ -382,8 +395,9 @@ function prioritizeTitleMatches<T extends SessionSelectorEntry>(
 	// Title hits are literal matches, already ranked by recency and source index.
 	for (const { session } of literal) {
 		const title = session.title?.trim().toLowerCase().replace(/\s+/g, " ");
-		if (title === query) exact.push(session);
-		else if (title && isLiteralMatch(title, tokens)) partial.push(session);
+		const displayTitle = sessionTitleForSearch(session).toLowerCase().replace(/\s+/g, " ");
+		if (title === query || displayTitle === query) exact.push(session);
+		else if ((title && isLiteralMatch(title, tokens)) || isLiteralMatch(displayTitle, tokens)) partial.push(session);
 		else continue;
 		titleMatches.add(session);
 	}
@@ -556,7 +570,13 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	/** Per-row line heights of the visible list for the ANSI window, reused until the set changes. */
 	#rowHeights: { items: readonly T[]; length: number; version: number; heights: readonly number[] } | undefined;
 	#itemsNative:
-		| { version: number; showCwd: boolean; currentPath: string | undefined; items: NativeNode[] }
+		| {
+				version: number;
+				labels: readonly string[];
+				showCwd: boolean;
+				currentPath: string | undefined;
+				items: NativeNode[];
+		  }
 		| undefined;
 	#listNative:
 		| { items: readonly NativeNode[]; selected: string | undefined; query: string; node: NativeNode }
@@ -587,7 +607,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		this.#historyMatcher = historyMatcher;
 		this.#menu = new MenuSelection<T>(sessions, {
 			getKey: session => session.path,
-			getSearchText: sessionSearchText,
+			getSearchText: session => sessionSearchText(session, sessionTitleForSearch(session)),
 		});
 		this.#selectCurrentSession();
 		this.#searchInput = new Input();
@@ -943,13 +963,16 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	#catalogue(): SessionCatalogue {
 		const currentPath = this.#getCurrentSessionPath();
 		const minute = Math.floor(Date.now() / 60_000);
+		const labels = this.#allSessions.map(sessionLabel);
 		const cached = this.#pickerCatalogue;
 		if (
 			cached?.version === this.#datasetVersion &&
 			cached.showCwd === this.#showCwd &&
 			cached.currentPath === currentPath &&
 			cached.pinnedIds === this.#pinnedIds &&
-			cached.minute === minute
+			cached.minute === minute &&
+			cached.labels.length === labels.length &&
+			cached.labels.every((label, index) => label === labels[index])
 		) {
 			return cached;
 		}
@@ -962,6 +985,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		});
 		this.#pickerPatched.clear();
 		const catalogue: SessionCatalogue = {
+			labels,
 			version: this.#datasetVersion,
 			showCwd: this.#showCwd,
 			currentPath,
@@ -976,7 +1000,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 
 	#pickerItem(session: T, currentPath: string | undefined, now: number): TspPickerItem {
 		const message = plainText(session.firstMessage).replace(/\s+/g, " ").trim();
-		const title = session.title ? plainText(session.title).trim() : "";
+		const title = plainText(session.titlePresentation?.() ?? session.title ?? "").trim();
 		const badges: { text: string; tone?: TspTone; title?: string }[] = [];
 		if (session.parentSessionPath) {
 			badges.push({ text: "fork", title: `Forked from “${this.parentLabel(session.parentSessionPath)}”` });
@@ -1045,14 +1069,18 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	 */
 	describeList(): NativeNode {
 		const currentPath = this.#getCurrentSessionPath();
+		const labels = this.#menu.visibleItems.map(sessionLabel);
 		let items = this.#itemsNative;
 		if (
 			items?.version !== this.#itemsVersion ||
 			items.showCwd !== this.#showCwd ||
-			items.currentPath !== currentPath
+			items.currentPath !== currentPath ||
+			items.labels.length !== labels.length ||
+			items.labels.some((label, index) => label !== labels[index])
 		) {
 			items = {
 				version: this.#itemsVersion,
+				labels,
 				showCwd: this.#showCwd,
 				currentPath,
 				items: this.#menu.visibleItems.map(session => this.#describeSession(session, currentPath)),
@@ -1081,9 +1109,11 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		const pinned = this.#pinnedIds.has(session.id);
 		const current = currentPath !== undefined && session.path === currentPath;
 		const tagged = session as NativeSessionInfo;
+		const label = sessionLabel(session);
 		const cached = tagged[kNativeItem];
 		if (
 			cached?.date === date &&
+			cached.label === label &&
 			cached.pinned === pinned &&
 			cached.current === current &&
 			cached.showCwd === this.#showCwd
@@ -1105,7 +1135,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		const item = node(
 			"item",
 			{
-				label: (session.title && plainText(session.title)) || message || session.id,
+				label,
 				detail: detail.length > 0 ? detail : undefined,
 				value: [span(`${date} ${theme.sep.dot} ${formatBytes(session.size)}`, "dim")],
 				icon: pinned ? "pin" : undefined,
@@ -1113,7 +1143,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 			undefined,
 			session.path,
 		);
-		tagged[kNativeItem] = { node: item, date, pinned, current, showCwd: this.#showCwd };
+		tagged[kNativeItem] = { node: item, date, pinned, current, showCwd: this.#showCwd, label };
 		return item;
 	}
 
@@ -1186,7 +1216,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 
 			if (session.title) {
 				// Has title: show title on first line, dimmed first message on second line
-				const truncatedTitle = truncateToWidth(session.title, maxTextWidth);
+				const truncatedTitle = truncateToWidth(sessionLabel(session), maxTextWidth);
 				const titleLine = `${cursor}${pinPrefix}${isSelected ? theme.bold(truncatedTitle) : truncatedTitle}`;
 				sessionLines.push(titleLine);
 
@@ -1416,7 +1446,14 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	/** The open delete confirmation's two answers, for the picker's confirm strip. */
 	#deleteChoice: DeleteChoice<T> | null = null;
 	/** The preview pane's content and the session it shows; follows the selection once it settles. */
-	#preview: { session: T | undefined; nodes: readonly NativeChild[] } | undefined;
+	#preview:
+		| {
+				session: T | undefined;
+				label: string | undefined;
+				parentLabel: string | undefined;
+				nodes: readonly NativeChild[];
+		  }
+		| undefined;
 	#previewPending: T | undefined;
 	#previewSettled: T | undefined;
 	#previewTimer: NodeJS.Timeout | undefined;
@@ -1591,7 +1628,8 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	}
 
 	#showDeleteConfirmation(session: T): void {
-		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
+		const displayName =
+			session.titlePresentation?.() || session.title || session.firstMessage.slice(0, 40) || session.id;
 		const closeDialog = () => {
 			this.#confirmationDialog = null;
 			this.#deleteChoice = null;
@@ -1837,8 +1875,13 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	 */
 	#previewFor(target: T | undefined): readonly NativeChild[] {
 		const shown = this.#preview;
-		if (shown && shown.session === target) return shown.nodes;
-		if (shown && target !== this.#previewSettled) {
+		const label = target ? sessionLabel(target) : undefined;
+		const parentLabel = target?.parentSessionPath
+			? this.#sessionList.parentLabel(target.parentSessionPath)
+			: undefined;
+		if (shown && shown.session === target && shown.label === label && shown.parentLabel === parentLabel)
+			return shown.nodes;
+		if (shown && shown.session !== target && target !== this.#previewSettled) {
 			if (this.#previewPending !== target || this.#previewTimer === undefined) {
 				clearTimeout(this.#previewTimer);
 				this.#previewPending = target;
@@ -1850,13 +1893,8 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 			}
 			return shown.nodes;
 		}
-		const nodes = target
-			? sessionPreview(
-					target,
-					target.parentSessionPath ? this.#sessionList.parentLabel(target.parentSessionPath) : undefined,
-				)
-			: [];
-		this.#preview = { session: target, nodes };
+		const nodes = target ? sessionPreview(target, parentLabel) : [];
+		this.#preview = { session: target, label, parentLabel, nodes };
 		return nodes;
 	}
 

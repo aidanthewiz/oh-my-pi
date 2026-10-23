@@ -18,6 +18,7 @@ import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
 import {
+	applySessionTitleSlot,
 	parseTitleSlotFromContent,
 	parseTitleSlotLine,
 	type SessionTitleUpdate,
@@ -142,17 +143,7 @@ function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHea
 }
 
 function applyTitleSlot(entry: FileEntry | undefined, slot: SessionTitleUpdate | undefined): void {
-	if (!slot || !isValidSessionHeader(entry)) return;
-	if (slot.title && slot.title.length > 0) {
-		entry.title = slot.title;
-	} else {
-		delete entry.title;
-	}
-	if (slot.source) {
-		entry.titleSource = slot.source;
-	} else {
-		delete entry.titleSource;
-	}
+	if (isValidSessionHeader(entry)) applySessionTitleSlot(entry, slot);
 }
 
 /** Parse session JSONL while stripping and folding the optional fixed title slot. */

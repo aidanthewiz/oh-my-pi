@@ -2578,8 +2578,8 @@ describe("ACP agent", () => {
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 		const inferences = [
-			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<string | null>() },
-			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<string | null>() },
+			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<{ title: string } | null>() },
+			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<{ title: string } | null>() },
 		];
 		const titleSignals: Array<AbortSignal | undefined> = [];
 		let inferenceIndex = 0;
@@ -2621,7 +2621,7 @@ describe("ACP agent", () => {
 			expect(titleSignals[1]?.aborted).toBe(false);
 			const beforeLateResult = harness.updates.length;
 
-			inferences[0].title.resolve("Cancelled title");
+			inferences[0].title.resolve({ title: "Cancelled title" });
 			const settledByOldRename = await Promise.race([secondPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
 			expect(settledByOldRename).toBe(false);
 			expect(session.sessionManager.getSessionName()).toBe("Original title");
@@ -2636,7 +2636,7 @@ describe("ACP agent", () => {
 					),
 			).toEqual([]);
 
-			inferences[1].title.resolve("Rename cancellation isolation");
+			inferences[1].title.resolve({ title: "Rename cancellation isolation" });
 			expect((await secondPrompt).stopReason).toBe("end_turn");
 			expect(session.sessionManager.getSessionName()).toBe("Rename cancellation isolation");
 			expect(harness.updates.slice(beforeLateResult)).toContainEqual({

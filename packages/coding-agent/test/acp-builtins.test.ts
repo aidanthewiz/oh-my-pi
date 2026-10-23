@@ -32,7 +32,7 @@ interface FakeAcpBuiltinSession {
 	sessionId: string;
 	sessionName: string;
 	titleGenerationSignal: AbortSignal;
-	renameTitle(title?: string): Promise<string | null | undefined>;
+	renameTitle(title?: string): Promise<{ title: string } | null | undefined>;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	_switchedTo: string | undefined;
 	_movedFromEmptySessionFile: string | undefined;
@@ -96,7 +96,7 @@ function createRuntime() {
 		titleGenerationSignal: new AbortController().signal,
 		// A typed title passes through uncarded; a bare /rename has nothing to generate from.
 		async renameTitle(title?: string) {
-			return title || null;
+			return title ? { title } : null;
 		},
 		_todoPhases: [],
 		_switchedTo: undefined,

@@ -32,6 +32,8 @@ import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
 
 import { cfgRetryModelFallback } from "../session/settings";
+import { renderSessionTitle, type TitleCard } from "./title-card";
+import type { TitleIcons } from "./title-settings";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 const TITLE_MARKER_INSTRUCTION = prompt.render(titleMarkerInstruction);
@@ -615,7 +617,7 @@ function writeTerminalTitle(title: string, recomposeStaticOnFailure = false): vo
 				const latched =
 					terminalTitleRuntime.extensionOverride ??
 					buildTerminalTitleWithState(
-						terminalTitleRuntime.label,
+						terminalTitleRuntime.sessionName ? portableSessionName() : terminalTitleRuntime.label,
 						terminalTitleRuntime.state,
 						terminalTitleRuntime.frame,
 						terminalTitleRuntime.enabled,
@@ -636,9 +638,8 @@ function writeTerminalTitle(title: string, recomposeStaticOnFailure = false): vo
 }
 
 /**
- * Set the session's base terminal title: the session name, which a generated
- * title carries in the card form `<icon> <CODE>: <name>` that Tern indexes
- * parked panes by, else the cwd.
+ * Set the authoritative plain session name, else cwd.
+ * The sink uses matching live metadata for portable title presentation.
  */
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
 	// An authoritative session title (rename, new session, focus swap) supersedes
@@ -654,13 +655,12 @@ export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: s
 	terminalTitleRuntime.extensionOverride = undefined;
 	terminalTitleRuntime.sessionName = sanitizeTerminalTitlePart(sessionName);
 	terminalTitleRuntime.label = terminalTitleRuntime.sessionName ?? getFallbackTerminalTitle(cwd);
-	emitTerminalTitle();
+	refreshSessionTerminalTitle();
 	reportTernSession();
 }
 
 /**
- * Whether the effective symbol preset is `nerd`: under `nf+emoji` title icons,
- * the title fork then asks the model for a Nerd Fonts glyph to head the title.
+ * Whether the active terminal grid can render a validated Nerd Font candidate.
  */
 export function nerdGlyphsActive(): boolean {
 	return typeof theme !== "undefined" && theme.getSymbolPreset() === "nerd";
@@ -675,6 +675,8 @@ export interface TerminalSessionSource {
 	file(): string | undefined;
 	/** The session's working directory. */
 	cwd(): string;
+	/** Presentation belongs to this live session, not a glyph lookup cache. */
+	title?(): { name: string | undefined; card?: TitleCard; icons: TitleIcons };
 }
 
 /** Where the current session's file and directory are read from. */
@@ -726,7 +728,7 @@ export function reportTernSession(): void {
  */
 export function setTerminalTitlePullRequest(pr: number | undefined): void {
 	terminalTitleRuntime.pullRequest = pr;
-	emitTerminalTitle();
+	refreshSessionTerminalTitle();
 }
 
 /**
@@ -738,13 +740,13 @@ export function setTerminalTitlePullRequest(pr: number | undefined): void {
  */
 export function setExtensionTerminalTitle(title: string): void {
 	// A title that renders to nothing RELEASES the override rather than owning the
-	// terminal with it: `emitTerminalTitle` falls through on nullish only, so a
+	// terminal with it: the composed sink falls through on nullish only, so a
 	// latched blank would strand the title at the bare brand and silence every
 	// subsequent run-state change. Reuse the sink's own emptiness predicate so
 	// "releases its claim" means the same thing here as it does at the sink, and
 	// so the stored override is the value that will actually render.
 	terminalTitleRuntime.extensionOverride = sanitizeTerminalTitlePart(title);
-	emitTerminalTitle();
+	refreshSessionTerminalTitle();
 }
 
 export type TerminalTitleState = "idle" | "working" | "attention";
@@ -868,7 +870,16 @@ export function buildNativeTerminalTitle(sessionName: string | undefined, pullRe
 	return pullRequest === undefined ? name : `${name} · #${pullRequest}`;
 }
 
-function emitTerminalTitle(): void {
+function portableSessionName(): string | undefined {
+	const name = terminalTitleRuntime.sessionName;
+	if (!name) return name;
+	const presentation = sessionSource?.title?.();
+	return presentation?.name === name
+		? renderSessionTitle(name, presentation.card, presentation.icons, false, true)
+		: renderSessionTitle(name, undefined, "emoji", false, true);
+}
+
+export function refreshSessionTerminalTitle(): void {
 	// The teardown latch lives at the sink (`writeTerminalTitle`), so every path
 	// here is covered without a second check.
 	// An extension override owns the terminal verbatim; the terminal sink
@@ -877,9 +888,9 @@ function emitTerminalTitle(): void {
 	const next =
 		terminalTitleRuntime.extensionOverride ??
 		(native
-			? buildNativeTerminalTitle(terminalTitleRuntime.sessionName, terminalTitleRuntime.pullRequest)
+			? buildNativeTerminalTitle(portableSessionName(), terminalTitleRuntime.pullRequest)
 			: buildTerminalTitleWithState(
-					terminalTitleRuntime.label,
+					terminalTitleRuntime.sessionName ? portableSessionName() : terminalTitleRuntime.label,
 					terminalTitleRuntime.state,
 					terminalTitleRuntime.frame,
 					terminalTitleRuntime.enabled,
@@ -920,7 +931,7 @@ function startTerminalTitleSpinner(): void {
 		terminalTitleRuntime.frame =
 			(terminalTitleRuntime.frame + 1) % TERMINAL_TITLE_SPINNER_STYLES[terminalTitleRuntime.style].length;
 		// An extension override is frame-independent; the sink would dedupe it anyway.
-		if (terminalTitleRuntime.extensionOverride === undefined) emitTerminalTitle();
+		if (terminalTitleRuntime.extensionOverride === undefined) refreshSessionTerminalTitle();
 	}, TITLE_SPINNER_INTERVAL_MS);
 	// Never keep the event loop alive for a cosmetic animation.
 	terminalTitleRuntime.timer.unref?.();
@@ -935,7 +946,7 @@ export function setTerminalTitleState(state: TerminalTitleState): void {
 	terminalTitleRuntime.state = state;
 	if (state === "working" && terminalTitleRuntime.enabled) startTerminalTitleSpinner();
 	else stopTerminalTitleSpinner();
-	emitTerminalTitle();
+	refreshSessionTerminalTitle();
 }
 
 /** Enable/disable the run-state separator (driven by the `tui.titleState` setting). */
@@ -943,7 +954,7 @@ export function setTerminalTitleStateEnabled(enabled: boolean): void {
 	terminalTitleRuntime.enabled = enabled;
 	if (enabled && terminalTitleRuntime.state === "working") startTerminalTitleSpinner();
 	else stopTerminalTitleSpinner();
-	emitTerminalTitle();
+	refreshSessionTerminalTitle();
 }
 
 /**
@@ -962,7 +973,7 @@ export function setTerminalTitleSpinnerStyle(style: string | undefined): void {
 		stopTerminalTitleSpinner();
 		startTerminalTitleSpinner();
 	}
-	emitTerminalTitle();
+	refreshSessionTerminalTitle();
 }
 
 /**
@@ -993,7 +1004,7 @@ export function initTerminalTitleState(): void {
 	terminalTitleRuntime.unwatchNative ??= onNativeRenderingChange(native => {
 		if (native) stopTerminalTitleSpinner();
 		else if (terminalTitleRuntime.state === "working" && terminalTitleRuntime.enabled) startTerminalTitleSpinner();
-		emitTerminalTitle();
+		refreshSessionTerminalTitle();
 	});
 }
 

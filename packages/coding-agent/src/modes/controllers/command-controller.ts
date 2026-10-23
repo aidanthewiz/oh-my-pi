@@ -95,6 +95,7 @@ import { copyToClipboard } from "../../utils/clipboard";
 import { formatDumpArchiveReport, type SessionDumpArchive } from "../../session/session-dump-format";
 import { openPath } from "../../utils/open";
 import { resumeCommand } from "../../utils/resume-command";
+import type { TitleCard } from "../../utils/title-card";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import {
 	collapseSharedUsageReports,
@@ -1802,7 +1803,7 @@ export class CommandController {
 		return true;
 	}
 
-	async handleRenameCommand(title: string): Promise<void> {
+	async handleRenameCommand(title: string, card?: TitleCard): Promise<void> {
 		const session = this.ctx.session;
 		const sessionManager = this.ctx.sessionManager;
 		const sessionId = sessionManager.getSessionId();
@@ -1815,7 +1816,7 @@ export class CommandController {
 			sessionManager.getSessionId() === sessionId &&
 			sessionManager.titleRevision === titleRevision;
 		try {
-			const persistence = sessionManager.setSessionName(title, "user");
+			const persistence = sessionManager.setSessionName(title, "user", undefined, card);
 			titleRevision = sessionManager.titleRevision;
 			const stored = await persistence;
 			if (!isCurrent()) return;

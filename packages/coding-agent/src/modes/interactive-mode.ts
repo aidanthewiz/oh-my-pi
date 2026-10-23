@@ -212,12 +212,16 @@ import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-tui/them
 import { messageHasDisplayableThinking } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import type { TokenRateMeter } from "../utils/token-rate";
 import { disposeProgramStatus, initProgramStatus, setProgramStatusEnabled } from "../utils/run-status";
+import { renderSessionTitle, type TitleCard } from "../utils/title-card";
+import { cfgTitleIcons } from "../utils/title-settings";
 import {
 	disposeTerminalTitleState,
 	initTerminalTitleState,
+	nerdGlyphsActive,
 	popTerminalTitle,
 	pushTerminalTitle,
 	reportTernSession,
+	refreshSessionTerminalTitle,
 	setSessionTerminalTitle,
 	setTerminalSessionSource,
 	setTerminalTitlePullRequest,
@@ -454,6 +458,7 @@ const cfgLiveUiSettings = combine({
 	"tui.textSizing": cfgTuiTextSizing,
 	"tui.tight": cfgTuiTight,
 	"tui.hyperlinks": cfgTuiHyperlinks,
+	"title.icons": cfgTitleIcons,
 	"tui.titleState": cfgTuiTitleState,
 	"tui.titleSpinner": cfgTuiTitleSpinner,
 	"statusLine.preset": cfgStatusLinePreset,
@@ -1322,8 +1327,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * onto the working row instead — right-aligned, dim, italic. */
 	#workingTitleTrailer(): string | undefined {
 		if (cfgComposerShape.get(settings) !== "band") return undefined;
-		const name = this.sessionManager.getSessionName();
-		if (!name) return undefined;
+		const title = this.sessionManager.getSessionName();
+		if (!title) return undefined;
+		const name = renderSessionTitle(
+			title,
+			this.sessionManager.getSessionTitleCard(),
+			cfgTitleIcons.get(this.settings),
+			nerdGlyphsActive(),
+		);
 		return `\x1b[2;3m${sanitizeStatusText(name)}\x1b[23;22m`;
 	}
 	/** Live gen tok/s for the working row: the viewed session's own meter, so a
@@ -2337,6 +2348,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalSessionSource({
 			file: () => this.sessionManager.getSessionFile(),
 			cwd: () => this.sessionManager.getCwd(),
+			title: () => ({
+				name: this.sessionManager.getSessionName(),
+				card: this.sessionManager.getSessionTitleCard(),
+				icons: cfgTitleIcons.get(this.settings),
+			}),
 		});
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		// Seeds the border, the status-line `vim` segment, and the cursor shape in one call.
@@ -3678,6 +3694,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.invalidate();
 			this.ui.requestRender();
 		}
+		if (any("title.icons")) {
+			refreshSessionTerminalTitle();
+			this.ui.invalidate();
+			this.ui.requestRender();
+		}
 		if (any("tui.titleState")) setTerminalTitleStateEnabled(cfgTuiTitleState.get(this.settings));
 		if (any("tui.titleSpinner")) setTerminalTitleSpinnerStyle(cfgTuiTitleSpinner.get(this.settings));
 		if (any("terminal.programStatus")) setProgramStatusEnabled(cfgTerminalProgramStatus.get(this.settings));
@@ -3883,6 +3904,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	#composerNativeState(): ComposerNativeState {
 		const draft = this.editor.getText().trimStart();
+		const title = this.sessionManager.getSessionName();
 		return {
 			shell: this.isBashMode
 				? { kind: "bash", excluded: draft.startsWith("!!") }
@@ -3894,7 +3916,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			rate: this.#nativeTokenRate(),
 			running: this.loadingAnimation !== undefined || this.session.isStreaming,
 			viewing: this.#viewingLineage(),
-			title: this.sessionManager.getSessionName(),
+			title: title
+				? renderSessionTitle(
+						title,
+						this.sessionManager.getSessionTitleCard(),
+						cfgTitleIcons.get(this.settings),
+						nerdGlyphsActive(),
+					)
+				: undefined,
 		};
 	}
 
@@ -7931,8 +7960,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#btwController.withSessionMove(operation);
 	}
 
-	handleRenameCommand(title: string): Promise<void> {
-		return this.#commandController.handleRenameCommand(title);
+	handleRenameCommand(title: string, card?: TitleCard): Promise<void> {
+		return this.#commandController.handleRenameCommand(title, card);
 	}
 
 	handleMemoryCommand(text: string): Promise<void> {

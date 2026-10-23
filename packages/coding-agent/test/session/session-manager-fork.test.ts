@@ -67,6 +67,57 @@ async function loadHistory(file: string): Promise<SessionEntry[]> {
 }
 
 describe("SessionManager.forkFrom", () => {
+	it("retains the bound tuple through clone, persisted copy, full fork, branch, import and cold reopen", async () => {
+		using root = TempDir.createSync("@omp-portable-fork-");
+		const storage = new MemorySessionStorage();
+		const dir = path.join(root.path(), "sessions");
+		const cwd = root.path();
+		const card = { code: "FORK", emoji: "🧪", nf: "nf-md-flask" };
+		const manager = SessionManager.create(cwd, dir, storage);
+		manager.appendMessage({ role: "user", content: "synthetic branch", timestamp: 1 });
+		await manager.ensureOnDisk();
+		await manager.setSessionName("Portable fork", "user", undefined, card);
+		const updatedAt = manager.titleUpdatedAt;
+		const sourceFile = manager.getSessionFile()!;
+		const clone = manager.cloneCurrentSession({ persist: false });
+		try {
+			expect(clone.getSessionName()).toBe("Portable fork");
+			expect(clone.getSessionTitleCard()).toEqual(card);
+			expect(clone.titleUpdatedAt).toBe(updatedAt);
+		} finally {
+			await clone.close();
+		}
+		const copy = await manager.persistCopy({ sessionDir: path.join(root.path(), "copies") }, storage);
+		const copiedFile = copy.getSessionFile()!;
+		await copy.close();
+		await manager.fork();
+		const fullFile = manager.getSessionFile()!;
+		expect(fullFile).not.toBe(sourceFile);
+		manager.createBranchedSession(manager.getLeafId()!, { copyArtifacts: false });
+		await manager.flush();
+		const branchFile = manager.getSessionFile()!;
+		await manager.close();
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, dir, storage, {
+			copyArtifacts: false,
+			suppressBreadcrumb: true,
+		});
+		const foreignFile = forked.getSessionFile()!;
+		await forked.close();
+		for (const file of [sourceFile, copiedFile, fullFile, branchFile, foreignFile]) {
+			for (let pass = 0; pass < 2; pass++) {
+				const cold = await SessionManager.open(file, dir, storage);
+				try {
+					expect(cold.getSessionName()).toBe("Portable fork");
+					expect(cold.getSessionTitleCard()).toEqual(card);
+					expect(cold.titleSource).toBe("user");
+					expect(cold.titleUpdatedAt).toBe(updatedAt);
+				} finally {
+					await cold.close();
+				}
+			}
+		}
+	});
+
 	it("suppresses terminal breadcrumbs while preserving source history under a new parented session", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-");
 		const previousAgentDir = getAgentDir();

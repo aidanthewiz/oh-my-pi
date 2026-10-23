@@ -654,7 +654,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 						await runtime.output("Could not generate a session title. Use /rename <title> to set one.");
 						return;
 					}
-					const persistence = sessionManager.setSessionName(title, "user");
+					const persistence = sessionManager.setSessionName(title.title, "user", undefined, title.card);
 					titleRevision = sessionManager.titleRevision;
 					const ok = await persistence;
 					if (!isCurrent()) return;
@@ -664,7 +664,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					}
 					await runtime.notifyTitleChanged?.();
 					if (!isCurrent()) return;
-					await runtime.output(`Session renamed to ${title}.`);
+					await runtime.output(`Session renamed to ${title.title}.`);
 				} catch (err) {
 					if (!isCurrent()) return;
 					if (command.args || !runtime.runCommandInBackground) throw err;
@@ -699,7 +699,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				runtime.ctx.showStatus("Could not generate a session title. Use /rename <title> to set one.");
 				return;
 			}
-			await runtime.ctx.handleRenameCommand(title);
+			await runtime.ctx.handleRenameCommand(title.title, title.card);
 		},
 	},
 	{

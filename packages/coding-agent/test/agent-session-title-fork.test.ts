@@ -78,28 +78,34 @@ function nextTitle(target: AgentSession): Promise<void> {
 }
 
 describe("AgentSession title fork", () => {
-	it("titles the session from a fork of the first reply, sharing the main request's prefix and cache key", async () => {
-		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
-		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
-		const target = await createSession(main, side);
-		const titleModel = vi.spyOn(ai, "completeSimple");
-		const titled = nextTitle(target);
+	it.each(["nf+emoji", "emoji", "boring"] as const)(
+		"retains both candidates from a cache-sharing reply fork under %s",
+		async icons => {
+			const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+			const side = createMockModel({ handler: { content: [CARD_REPLY] } });
+			const target = await createSession(main, side, { "title.icons": icons });
+			const titleModel = vi.spyOn(ai, "completeSimple");
+			const titled = nextTitle(target);
 
-		await target.prompt(FIRST_MESSAGE);
-		await titled;
+			await target.prompt(FIRST_MESSAGE);
+			await titled;
 
-		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
-		expect(titleModel).not.toHaveBeenCalled();
-		const mainCall = main.calls[0]!;
-		const sideCall = side.calls[0]!;
-		expect(sideCall.context.systemPrompt).toEqual(mainCall.context.systemPrompt);
-		expect(sideCall.context.tools).toEqual(mainCall.context.tools);
-		expect(sideCall.context.messages.slice(0, mainCall.context.messages.length)).toEqual(mainCall.context.messages);
-		// Providers key the prompt cache on `promptCacheKey`, else the session id.
-		expect(sideCall.options?.promptCacheKey).toBe(mainCall.options?.promptCacheKey ?? mainCall.options?.sessionId);
-		// The fork runs beside the main turn, which finishes on its own.
-		expect(target.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
-	});
+			expect(target.sessionName).toBe("Fix flaky park tests");
+			expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" });
+			expect(titleModel).not.toHaveBeenCalled();
+			const mainCall = main.calls[0]!;
+			const sideCall = side.calls[0]!;
+			expect(sideCall.context.systemPrompt).toEqual(mainCall.context.systemPrompt);
+			expect(sideCall.context.tools).toEqual(mainCall.context.tools);
+			expect(sideCall.context.messages.slice(0, mainCall.context.messages.length)).toEqual(
+				mainCall.context.messages,
+			);
+			// Providers key the prompt cache on `promptCacheKey`, else the session id.
+			expect(sideCall.options?.promptCacheKey).toBe(mainCall.options?.promptCacheKey ?? mainCall.options?.sessionId);
+			// The fork runs beside the main turn, which finishes on its own.
+			expect(target.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		},
+	);
 
 	it.each<[string, MockResponse, MockResponse]>([
 		["the fork declines", { content: ["Reading the park tests first."] }, { content: ["<title/>"] }],
@@ -144,7 +150,8 @@ describe("AgentSession title fork", () => {
 		titleModelReply.resolve(createAssistantMessage("<title/>"));
 		await titled;
 
-		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
+		expect(target.sessionName).toBe("Fix flaky park tests");
+		expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" });
 		expect(side.calls).toHaveLength(2);
 		expect(titleModel).toHaveBeenCalledTimes(1);
 	});
@@ -199,9 +206,28 @@ describe("AgentSession title fork", () => {
 		await titled;
 		await run;
 
-		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
+		expect(target.sessionName).toBe("Fix flaky park tests");
+		expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" });
 		expect(side.calls).toHaveLength(2);
 		expect(titleModel).not.toHaveBeenCalled();
+	});
+
+	it("carries metadata when branching before the root user message creates an empty session", async () => {
+		const main = createMockModel({ handler: { content: ["Unused"] } });
+		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
+		const target = await createSession(main, side, {}, false);
+		const user = { role: "user" as const, content: FIRST_MESSAGE, timestamp: 1 };
+		const entryId = target.sessionManager.appendMessage(user);
+		target.agent.appendMessage(user);
+		const card = { code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" };
+		await target.sessionManager.setSessionName("Fix flaky park tests", "user", undefined, card);
+		const before = target.sessionId;
+		const result = await target.branch(entryId);
+		expect(result).toEqual({ selectedText: FIRST_MESSAGE, selectedImages: [], cancelled: false });
+		expect(target.sessionId).not.toBe(before);
+		expect(target.sessionName).toBe("Fix flaky park tests");
+		expect(target.sessionManager.titleSource).toBe("user");
+		expect(target.sessionManager.getSessionTitleCard()).toEqual(card);
 	});
 
 	it("leaves sessions without autoTitle unnamed", async () => {

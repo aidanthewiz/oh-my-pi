@@ -28,7 +28,6 @@ function createRuntime(
 ) {
 	authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("anthropic", "test-key");
-	// Plain titles keep the rename lifecycle tests to one title request; the card tests opt in.
 	const settings = Settings.isolated({
 		"compaction.enabled": false,
 		"title.icons": "boring",
@@ -71,7 +70,7 @@ function createRuntime(
 		showError: () => {},
 	});
 	const controller = new CommandController(ctx);
-	ctx.handleRenameCommand = title => controller.handleRenameCommand(title);
+	ctx.handleRenameCommand = (title, card) => controller.handleRenameCommand(title, card);
 	return {
 		session,
 		sessionManager,
@@ -85,10 +84,13 @@ function createRuntime(
 function deferTitle() {
 	const started = Promise.withResolvers<void>();
 	const response = Promise.withResolvers<string | null>();
-	const generate = vi.spyOn(tinyTitleClient, "generate").mockImplementation(() => {
-		started.resolve();
-		return response.promise;
-	});
+	const generate = vi
+		.spyOn(tinyTitleClient, "generate")
+		.mockResolvedValue(null)
+		.mockImplementationOnce(() => {
+			started.resolve();
+			return response.promise;
+		});
 	return { started, response, generate };
 }
 
@@ -135,44 +137,77 @@ for (const mode of ["TUI", "headless"] as const) {
 			await execute("/rename   ");
 
 			expect(session.sessionName).toBe("Cache invalidation repair");
-			expect(generate).toHaveBeenCalledTimes(1);
 			const context = generate.mock.calls[0]?.[1];
 			expect(context).toContain("Repair cache invalidation after writes");
 			await sessionManager.setSessionName("Later automatic title", "auto");
 			expect(session.sessionName).toBe("Cache invalidation repair");
 		});
 
-		it("keeps the current title's card on a generated title without asking for a new one", async () => {
-			const { session, sessionManager, runtime, execute } = createRuntime(mode);
-			cfgTitleIcons.override(runtime.settings, "emoji");
-			await sessionManager.setSessionName("🧪 CACHE: Fix cache writes", "auto");
-			const generate = vi.spyOn(tinyTitleClient, "generate").mockResolvedValue("Cache invalidation repair");
-
+		it("retains validated current candidates without nesting an incoming generated heading", async () => {
+			const { session, sessionManager, execute } = createRuntime(mode);
+			const card = { code: "CACHE", emoji: "🧪", nf: "nf-md-flask" };
+			await sessionManager.setSessionName("Fix cache writes", "auto", undefined, card);
+			vi.spyOn(tinyTitleClient, "generate").mockResolvedValue("🔥 NEW: Cache invalidation repair");
 			await execute("/rename");
-
-			expect(session.sessionName).toBe("🧪 CACHE: Cache invalidation repair");
-			expect(generate).toHaveBeenCalledTimes(1);
+			expect(session.sessionName).toBe("Cache invalidation repair");
+			expect(sessionManager.getSessionTitleCard()).toEqual(card);
 		});
 
-		it("heads a typed or generated title without a card with one the title model names", async () => {
-			const { session, runtime, execute } = createRuntime(mode);
-			cfgTitleIcons.override(runtime.settings, "emoji");
-			const generate = vi
-				.spyOn(tinyTitleClient, "generate")
-				.mockImplementation(async (_model, _message, options) =>
-					options && "systemPrompt" in options ? "🗄 CACHE" : "Cache invalidation repair",
+		it.each(["nf+emoji", "emoji", "boring"] as const)(
+			"persists both new candidates independently of %s presentation",
+			async icons => {
+				const { session, sessionManager, runtime, execute } = createRuntime(mode);
+				cfgTitleIcons.override(runtime.settings, icons);
+				vi.spyOn(tinyTitleClient, "generate").mockImplementation(async (_model, _message, options) =>
+					options && "systemPrompt" in options ? "nf-md-flask 🧪 CACHE" : "Cache invalidation repair",
 				);
+				await execute("/rename");
+				expect(session.sessionName).toBe("Cache invalidation repair");
+				expect(sessionManager.getSessionTitleCard()).toEqual({ code: "CACHE", emoji: "🧪", nf: "nf-md-flask" });
+				await execute("/rename Cache ownership");
+				expect(session.sessionName).toBe("Cache ownership");
+				expect(sessionManager.getSessionTitleCard()).toEqual({ code: "CACHE", emoji: "🧪", nf: "nf-md-flask" });
+				await execute("/rename 🐳 DOCKER: Docker builds");
+				expect(session.sessionName).toBe("🐳 DOCKER: Docker builds");
+				expect(sessionManager.getSessionTitleCard()).toBeUndefined();
+			},
+		);
 
-			await execute("/rename");
-			expect(session.sessionName).toBe("🗄️ CACHE: Cache invalidation repair");
+		it.each(["nf+emoji", "emoji", "boring"] as const)(
+			"clears metadata on a plain same-text rename under %s",
+			async icons => {
+				const { sessionManager, runtime, execute } = createRuntime(mode);
+				cfgTitleIcons.override(runtime.settings, icons);
+				await sessionManager.setSessionName("Fix cache writes", "auto", undefined, {
+					code: "CACHE",
+					emoji: "🧪",
+					nf: "nf-md-flask",
+				});
+				const generate = vi.spyOn(tinyTitleClient, "generate").mockResolvedValue("Unrequested card");
+				await execute("/rename Fix cache writes");
+				expect(sessionManager.getSessionName()).toBe("Fix cache writes");
+				expect(sessionManager.titleSource).toBe("user");
+				expect(sessionManager.getSessionTitleCard()).toBeUndefined();
+				expect(generate).not.toHaveBeenCalled();
+			},
+		);
 
-			await execute("/rename Cache ownership");
-			expect(session.sessionName).toBe("🗄️ CACHE: Cache ownership");
-			expect(generate.mock.calls.at(-1)?.[1]).toBe("Cache ownership");
-
-			await execute("/rename 🐳 DOCKER: Docker builds");
-			expect(session.sessionName).toBe("🐳 DOCKER: Docker builds");
-			expect(generate).toHaveBeenCalledTimes(3);
+		it.each(["rename", "switch"] as const)("rejects a late card after a newer %s", async interruption => {
+			const { session, sessionManager, execute } = createRuntime(mode);
+			const { started, response } = deferTitle();
+			const pending = execute("/rename Cache ownership");
+			try {
+				await Promise.race([started.promise, pending]);
+				if (interruption === "switch") await session.newSession();
+				else await sessionManager.setSessionName("Newer manual title", "user");
+				response.resolve("nf-md-flask 🧪 CACHE");
+				await pending;
+				expect(sessionManager.getSessionName()).toBe(interruption === "switch" ? undefined : "Newer manual title");
+				expect(sessionManager.getSessionTitleCard()).toBeUndefined();
+			} finally {
+				response.resolve(null);
+				await pending;
+			}
 		});
 
 		it("applies a typed title without its card when an interrupt cancels the card", async () => {
@@ -190,16 +225,6 @@ for (const mode of ["TUI", "headless"] as const) {
 				response.resolve(null);
 				await pending;
 			}
-		});
-
-		it("persists an explicit title without asking the model", async () => {
-			const { session, execute } = createRuntime(mode);
-			const generate = vi.spyOn(tinyTitleClient, "generate").mockResolvedValue("Unrequested generated title");
-
-			await execute("/rename   Cache ownership   ");
-
-			expect(session.sessionName).toBe("Cache ownership");
-			expect(generate).not.toHaveBeenCalled();
 		});
 
 		it("keeps the previous title without inference when there is no conversation", async () => {
@@ -229,7 +254,6 @@ for (const mode of ["TUI", "headless"] as const) {
 					);
 					generate.mockResolvedValueOnce(null);
 					await execute("/rename");
-					expect(generate).toHaveBeenCalledTimes(1);
 
 					session.agent.replaceMessages(messages);
 					response.resolve("Cache invalidation repair");
@@ -254,7 +278,6 @@ for (const mode of ["TUI", "headless"] as const) {
 
 				await execute("/rename");
 
-				expect(generate).toHaveBeenCalledTimes(1);
 				expect(session.sessionName).toBe("Keep this title");
 				expect(sessionManager.getEntries()).toEqual(entries);
 			});
@@ -299,12 +322,11 @@ for (const mode of ["TUI", "headless"] as const) {
 		it("does not rename a replacement session when an earlier generation completes", async () => {
 			const { session, sessionManager, execute, ctx, runtime } = createRuntime(mode);
 			const output = mode === "TUI" ? vi.spyOn(ctx, "showStatus") : vi.spyOn(runtime, "output");
-			const { started, response, generate } = deferTitle();
+			const { started, response } = deferTitle();
 			const pending = execute("/rename");
 			try {
 				// Also settles on the old usage-only path, so a regression fails instead of hanging.
 				await Promise.race([started.promise, pending]);
-				expect(generate).toHaveBeenCalledTimes(1);
 				const previousSessionId = sessionManager.getSessionId();
 				expect(await session.newSession()).toBe(true);
 				expect(sessionManager.getSessionId()).not.toBe(previousSessionId);
@@ -355,11 +377,10 @@ for (const mode of ["TUI", "headless"] as const) {
 		it("preserves a newer explicit rename even when it repeats the same title", async () => {
 			const { session, sessionManager, execute } = createRuntime(mode);
 			await sessionManager.setSessionName("My chosen title", "user");
-			const { started, response, generate } = deferTitle();
+			const { started, response } = deferTitle();
 			const pending = execute("/rename");
 			try {
 				await Promise.race([started.promise, pending]);
-				expect(generate).toHaveBeenCalledTimes(1);
 				await execute("/rename My chosen title");
 				const entries = sessionManager.getEntries();
 
@@ -461,8 +482,8 @@ it.each([true, false])("keeps the latest RPC rename request when older finishes 
 	const { session, sessionManager, runtime } = createRuntime("headless");
 	await sessionManager.setSessionName("Original title", "user");
 	const responses = [Promise.withResolvers<string | null>(), Promise.withResolvers<string | null>()];
-	const generate = vi
-		.spyOn(tinyTitleClient, "generate")
+	vi.spyOn(tinyTitleClient, "generate")
+		.mockResolvedValue(null)
 		.mockImplementationOnce(() => responses[0].promise)
 		.mockImplementationOnce(() => responses[1].promise);
 	const pending: Promise<void>[] = [];
@@ -472,7 +493,6 @@ it.each([true, false])("keeps the latest RPC rename request when older finishes 
 	try {
 		await executeAcpBuiltinSlashCommand("/rename", runtime);
 		await executeAcpBuiltinSlashCommand("/rename", runtime);
-		expect(generate).toHaveBeenCalledTimes(2);
 		const first = olderFirst ? 0 : 1;
 		const titles = ["Stale generated title", "Latest generated title"];
 		responses[first].resolve(titles[first]);
@@ -497,8 +517,8 @@ it.each(["TUI", "headless"] as const)(
 		const manual = Promise.withResolvers<string | null>();
 		const applied = Promise.withResolvers<void>();
 		const unsubscribe = sessionManager.onSessionNameChanged(() => applied.resolve());
-		const generate = vi
-			.spyOn(tinyTitleClient, "generate")
+		vi.spyOn(tinyTitleClient, "generate")
+			.mockResolvedValue(null)
 			.mockImplementationOnce(() => automatic.promise)
 			.mockImplementationOnce(() => manual.promise);
 		let pending: Promise<unknown> | undefined;
@@ -508,7 +528,6 @@ it.each(["TUI", "headless"] as const)(
 			session.setTitleSystemPrompt("Name the session in 3-6 words.");
 			await session.prompt("Repair cache invalidation after writes");
 			pending = execute("/rename");
-			expect(generate).toHaveBeenCalledTimes(2);
 			automatic.resolve("Initial automatic title");
 			await applied.promise;
 			manual.resolve("Requested manual title");

@@ -19,6 +19,7 @@ import {
 	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
 	serializeTitleSlot,
+	titleFitsSlot,
 } from "./session-title-slot";
 
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
@@ -1036,6 +1037,17 @@ export class FileSessionStorage implements SessionStorage {
 		update: SessionTitleUpdate,
 		options?: SessionStorageWriteOptions,
 	): Promise<Hash> {
+		if (!titleFitsSlot(update)) {
+			const content = await this.readText(fpath);
+			const body = overlayTitleSlotContent(content, update);
+			await this.writeTextAtomic(fpath, body, {
+				...options,
+				expectedSize:
+					options?.expectedSize === undefined ? Buffer.byteLength(content, "utf8") : options.expectedSize,
+				expectedFingerprint: options?.expectedFingerprint ?? sessionContentFingerprint(content),
+			});
+			return createHash("sha1").update(body);
+		}
 		let fingerprint!: Hash;
 		this.#withPublishLock(fpath, () => {
 			this.#assertExpectedState(fpath, options);

@@ -1,80 +1,80 @@
 import { describe, expect, it } from "bun:test";
 import {
-	keepTitleCard,
+	renderSessionTitle,
 	parseCardReply,
 	parseCardTitleReply,
 	splitCardTitle,
 } from "@oh-my-pi/pi-coding-agent/utils/title-card";
 
-describe("parseCardTitleReply", () => {
+describe("portable session cards", () => {
 	const reply = '<title nf="nf-md-flask" emoji="🧪" code="FLAKY">Fix flaky park tests</title>';
+	const card = { code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" };
 
-	it("heads the title with the icon the style allows", () => {
-		expect(parseCardTitleReply(reply, "nf+emoji")).toBe("\u{f0093} FLAKY: Fix flaky park tests");
-		expect(parseCardTitleReply(reply, "emoji")).toBe("🧪 FLAKY: Fix flaky park tests");
-		expect(parseCardTitleReply(reply, "boring")).toBe("Fix flaky park tests");
+	it("retains both candidates while presentation follows the current sink", () => {
+		const parsed = parseCardTitleReply(reply)!;
+		expect(parsed).toEqual({ title: "Fix flaky park tests", card });
+		for (const nerd of [false, true]) {
+			expect(renderSessionTitle(parsed.title, parsed.card, "boring", nerd)).toBe(parsed.title);
+			expect(renderSessionTitle(parsed.title, parsed.card, "emoji", nerd)).toBe("🧪 FLAKY: Fix flaky park tests");
+			expect(renderSessionTitle(parsed.title, parsed.card, "nf+emoji", nerd)).toBe(
+				`${nerd ? "\u{f0093}" : "🧪"} FLAKY: Fix flaky park tests`,
+			);
+			expect(renderSessionTitle(parsed.title, parsed.card, "nf+emoji", nerd, true)).toBe(
+				"🧪 FLAKY: Fix flaky park tests",
+			);
+		}
+		expect(parsed.card).toEqual(card);
 	});
 
-	it("falls back to the emoji for a Nerd Fonts name the catalog does not know", () => {
-		// A real hallucination from the prompt workshop.
+	it("degrades malformed candidates independently without inferring private-use glyphs", () => {
+		expect(parseCardTitleReply('<title nf="nf-md-not_a_glyph" emoji="🧪" code="FLAKY">Fix tests</title>')).toEqual({
+			title: "Fix tests",
+			card: { code: "FLAKY", emoji: "🧪" },
+		});
+		expect(parseCardTitleReply('<title nf="nf-md-flask" emoji="flask" code="FLAKY">Fix tests</title>')).toEqual({
+			title: "Fix tests",
+			card: { code: "FLAKY", nf: "nf-md-flask" },
+		});
+		expect(parseCardTitleReply('<title nf="nf-md-flask" emoji="🧪" code="TOOLONG">Fix tests</title>')).toEqual({
+			title: "Fix tests",
+		});
+		expect(parseCardReply("\u{f0093} FLAKY")).toBeUndefined();
+		expect(renderSessionTitle("Fix tests", { code: "FLAKY", nf: "nf-md-flask" }, "nf+emoji", true, true)).toBe(
+			"Fix tests",
+		);
+	});
+
+	it("normalizes candidates and generated line headings without nesting them", () => {
+		expect(parseCardReply("nf-md-text-box 📝 blur: Rewrite text")).toEqual({
+			code: "BLUR",
+			emoji: "📝",
+			nf: "nf-md-text_box",
+		});
+		expect(parseCardTitleReply('<title emoji="🗄" code="seed">Create seed data</title>')).toEqual({
+			title: "Create seed data",
+			card: { code: "SEED", emoji: "🗄️" },
+		});
+		expect(parseCardTitleReply("<title>🧪 FLAKY: Fix tests</title>")).toEqual({
+			title: "Fix tests",
+			card: { code: "FLAKY", emoji: "🧪" },
+		});
+		expect(parseCardTitleReply('<title nf="nf-md-flask" emoji="🧪" code="FLAKY">🔥 NEW: Fix tests</title>')).toEqual({
+			title: "Fix tests",
+			card,
+		});
+		expect(parseCardTitleReply("<title>Fix: the parser</title>")).toEqual({ title: "Fix: the parser" });
+	});
+
+	it("reconciles generated casing and rejects declined or invalid titles", () => {
 		expect(
-			parseCardTitleReply(
-				'<title nf="nf-dev-git_cherry_pick" emoji="🍒" code="CHERRY">Review and cherry-pick commit a6a017e</title>',
-				"nf+emoji",
-			),
-		).toBe("🍒 CHERRY: Review and cherry-pick commit a6a017e");
-	});
-
-	it("keeps the plain title when the card has no icon the style shows", () => {
-		expect(parseCardTitleReply('<title nf="nf-md-flask" code="FLAKY">Fix flaky park tests</title>', "emoji")).toBe(
-			"Fix flaky park tests",
-		);
-	});
-
-	it.each([
-		["a decline", "<title/>"],
-		["a decline with attributes", '<title emoji="🧪" code="X" />'],
-		["a reply without a tag", "I'll start by reading the park tests."],
-		["an unclosed tag", '<title emoji="🧪" code="FLAKY">Fix flaky park tests'],
-		["a title the normalizer rejects", '<title emoji="🧪" code="DOTS">..</title>'],
-	])("names no title for %s", (_case, reply) => {
-		expect(parseCardTitleReply(reply, "emoji")).toBeNull();
-	});
-
-	it.each([
-		["a code longer than 6", '<title nf="nf-md-flask" emoji="🧪" code="FLAKIEST">Fix flaky tests</title>'],
-		["a code with punctuation", '<title emoji="🧪" code="FL-KY">Fix flaky tests</title>'],
-		[
-			"no icon the card form can show",
-			'<title nf="nf-md-not_a_glyph" emoji="flask" code="FLAKY">Fix flaky tests</title>',
-		],
-		["a keycap emoji, which starts with ASCII", '<title emoji="#️⃣" code="HASH">Fix flaky tests</title>'],
-		["two emoji", '<title emoji="🧪🧪" code="FLAKY">Fix flaky tests</title>'],
-	])("keeps a plain title for %s", (_case, reply) => {
-		expect(parseCardTitleReply(reply, "nf+emoji")).toBe("Fix flaky tests");
-	});
-
-	it("repairs a lowercase code and an emoji missing its variation selector", () => {
-		expect(parseCardTitleReply('<title emoji="🗄" code="seed">Create seed data</title>', "emoji")).toBe(
-			"🗄️ SEED: Create seed data",
-		);
-	});
-
-	it("reads the line card form inside a plain tag, but not an ordinary title with a colon", () => {
-		expect(parseCardTitleReply("<title>🗄️ Z3: Exclude z3 from bun test</title>", "emoji")).toBe(
-			"🗄️ Z3: Exclude z3 from bun test",
-		);
-		expect(parseCardTitleReply("<title>Fix: the parser</title>", "emoji")).toBe("Fix: the parser");
-	});
-
-	it("reconciles the title's casing against the user's message", () => {
-		expect(
-			parseCardTitleReply(
-				'<title emoji="🦀" code="VMM">Port tinyvmm to arm64</title>',
-				"emoji",
-				"port TinyVMM to arm64",
-			),
-		).toBe("🦀 VMM: Port TinyVMM to arm64");
+			parseCardTitleReply('<title emoji="🦀" code="VMM">Port tinyvmm to arm64</title>', "port TinyVMM to arm64"),
+		).toEqual({ title: "Port TinyVMM to arm64", card: { code: "VMM", emoji: "🦀" } });
+		for (const text of ["<title/>", '<title emoji="🧪" code="X" />', "No task", "<title>..</title>"]) {
+			expect(parseCardTitleReply(text)).toBeNull();
+		}
+		for (const text of ["FLAKY", "🧪", "🧪 FLAKIEST", "Card 🧪 FLAKY", "#️⃣ HASH", "🧪🧪 FLAKY"]) {
+			expect(parseCardReply(text)).toBeUndefined();
+		}
 	});
 });
 
@@ -98,43 +98,10 @@ describe("splitCardTitle", () => {
 	});
 });
 
-describe("parseCardReply", () => {
-	it("picks the icon the style allows", () => {
-		expect(parseCardReply("nf-md-flask 🧪 FLAKY", "nf+emoji")).toEqual({ icon: "\u{f0093}", code: "FLAKY" });
-		expect(parseCardReply("nf-md-flask 🧪 FLAKY", "emoji")).toEqual({ icon: "🧪", code: "FLAKY" });
-		expect(parseCardReply("nf-md-not-a-glyph 🧪 FLAKY", "nf+emoji")).toEqual({ icon: "🧪", code: "FLAKY" });
-	});
-
-	it("finds a Nerd Fonts name written with dashes for underscores", () => {
-		expect(parseCardReply("nf-md-text-box 📝 BLUR", "nf+emoji")).toEqual({ icon: "\u{f021a}", code: "BLUR" });
-	});
-
-	it("repairs a lowercase code and ignores the title echoed after it", () => {
-		expect(parseCardReply("🗄 seed: Create seed data", "emoji")).toEqual({ icon: "🗄️", code: "SEED" });
-	});
-
-	it.each([
-		["no icon", "FLAKY"],
-		["no code", "🧪"],
-		["a code longer than 6", "🧪 FLAKIEST"],
-		["a word before the icon", "Card 🧪 FLAKY"],
-	])("names no card for %s", (_case, reply) => {
-		expect(parseCardReply(reply, "emoji")).toBeUndefined();
-	});
-
-	it("names no card when the style is boring", () => {
-		expect(parseCardReply("🧪 FLAKY", "boring")).toBeUndefined();
-	});
-});
-
-describe("keepTitleCard", () => {
-	it("heads the new title with the current card, replacing one the new title brings", () => {
-		expect(keepTitleCard("🧪 CACHE: Fix cache writes", "Repair cache")).toBe("🧪 CACHE: Repair cache");
-		expect(keepTitleCard("🧪 CACHE: Fix cache writes", "🔥 NEW: Repair cache")).toBe("🧪 CACHE: Repair cache");
-	});
-
-	it("leaves the new title alone when the current title has no card", () => {
-		expect(keepTitleCard("Fix cache writes", "🔥 NEW: Repair cache")).toBe("🔥 NEW: Repair cache");
-		expect(keepTitleCard(undefined, "Repair cache")).toBe("Repair cache");
+describe("portable legacy title presentation", () => {
+	it("strips only an unusable private-use heading at the OS sink", () => {
+		expect(renderSessionTitle("\u{f0093} FLAKY: Fix tests", undefined, "nf+emoji", true, true)).toBe("Fix tests");
+		expect(renderSessionTitle("🧪 FLAKY: Fix tests", undefined, "boring", false, true)).toBe("🧪 FLAKY: Fix tests");
+		expect(renderSessionTitle("Manual title", undefined, "emoji", true, true)).toBe("Manual title");
 	});
 });

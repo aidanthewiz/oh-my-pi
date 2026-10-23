@@ -263,13 +263,13 @@ import { normalizeModelContextImages } from "../utils/image-loading";
 import { TokenRateMeter } from "../utils/token-rate";
 import { resumeCommand } from "../utils/resume-command";
 import {
-	formatCardTitle,
-	keepTitleCard,
+	type GeneratedSessionTitle,
+	validateTitleCard,
 	parseCardReply,
 	parseCardTitleReply,
 	splitCardTitle,
 } from "../utils/title-card";
-import { generateSessionTitle, nerdGlyphsActive } from "../utils/title-generator";
+import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
 import type { VibeModeState } from "../vibe/state";
 import type {
@@ -528,7 +528,7 @@ import {
 	cfgExtendedContext,
 	cfgWorkspaceAdditionalDirectories,
 } from "./context-settings";
-import { cfgTitleGenerator, cfgTitleIcons, cfgTitleRefreshOnReplan, type TitleIcons } from "../utils/title-settings";
+import { cfgTitleGenerator, cfgTitleRefreshOnReplan } from "../utils/title-settings";
 import {
 	cfgArchiveEnabled,
 	cfgComputerEnabled,
@@ -9637,9 +9637,8 @@ export class AgentSession implements SettingsScope {
 	 * Under `title.generator: fork` the request is an ephemeral side turn forked
 	 * from the streaming reply on the same model, system prompt, tools and
 	 * prompt-cache key, so it reads the whole prefix from cache, sees the model's
-	 * own reading of the task, and asks for a card (icon and code, unless
-	 * `title.icons` is `boring`) to head the title. The title model
-	 * ({@link generateTitle}) takes over when the fork fails, times out or
+	 * own reading of the task, and asks for both validated card candidates.
+	 * The title model ({@link generateTitle}) takes over when the fork fails, times out or
 	 * declines, and is the only path under `tiny` or a TITLE_SYSTEM.md override.
 	 *
 	 * Returns whether a request started.
@@ -9679,17 +9678,17 @@ export class AgentSession implements SettingsScope {
 		this.#titleGenerationInFlightFor = sessionId;
 		const signal = this.#titleGenerationAbortController.signal;
 		const started = performance.now();
-		const icons = this.#cardIcons();
+		const titleRevision = this.sessionManager.titleRevision;
 		this.runEphemeralTurn({
 			promptText: prompt.render(titleForkPrompt, {
-				card: icons !== "boring",
-				nerdFonts: icons === "nf+emoji",
+				card: true,
+				nerdFonts: true,
 			}),
 			signal: AbortSignal.any([signal, AbortSignal.timeout(TITLE_FORK_TIMEOUT_MS)]),
 		})
 			.then(
 				async ({ replyText, assistantMessage }) => {
-					const title = parseCardTitleReply(replyText, icons, input.text);
+					const title = parseCardTitleReply(replyText, input.text);
 					logger.debug("title-generator: fork reply", {
 						sessionId,
 						ms: Math.round(performance.now() - started),
@@ -9702,8 +9701,13 @@ export class AgentSession implements SettingsScope {
 						this.#fallBackFromTitleFork(input, signal);
 						return;
 					}
-					if (this.sessionManager.getSessionId() !== sessionId || this.sessionName) return;
-					await this.sessionManager.setSessionName(title, "auto");
+					if (
+						this.sessionManager.getSessionId() !== sessionId ||
+						this.sessionName ||
+						this.sessionManager.titleRevision !== titleRevision
+					)
+						return;
+					await this.sessionManager.setSessionName(title.title, "auto", undefined, title.card);
 					this.#deferredTitle = undefined;
 				},
 				(err: unknown) => {
@@ -9722,12 +9726,6 @@ export class AgentSession implements SettingsScope {
 					error: err instanceof Error ? err.message : String(err),
 				});
 			});
-	}
-
-	/** The icons a new card may show: `title.icons`, an emoji where Nerd Fonts glyphs do not render, no card when boring. */
-	#cardIcons(): TitleIcons {
-		const icons = cfgTitleIcons.get(this.settings);
-		return icons === "nf+emoji" && !nerdGlyphsActive() ? "emoji" : icons;
 	}
 
 	#fallBackFromTitleFork(input: TitleInput, signal: AbortSignal): void {
@@ -9751,7 +9749,7 @@ export class AgentSession implements SettingsScope {
 				// Re-check after generation so a later completion cannot replace
 				// the first title, and a request from a replaced session cannot
 				// name the current one.
-				if (this.sessionManager.getSessionId() !== sessionId) return;
+				if (signal.aborted || this.sessionManager.getSessionId() !== sessionId) return;
 				if (title && !this.sessionName) {
 					await this.sessionManager.setSessionName(title, "auto");
 				}
@@ -9875,8 +9873,8 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * The title `/rename` gives the session: `title` as typed, else a fresh
 	 * title-model title for the recent conversation that keeps the current
-	 * title's card. A result without a card is headed by one the title model
-	 * names for it, unless `title.icons` is `boring`; a failed card leaves it plain.
+	 * title's validated candidates. Presentation selects the icon later.
+	 * Plain same-title renames clear metadata.
 	 *
 	 * A request that asks a model reserves a title revision first, which
 	 * discards an older rename still generating; one with nothing to generate
@@ -9887,43 +9885,58 @@ export class AgentSession implements SettingsScope {
 	 * the request, or an interrupt cancelled a generated title (a typed title
 	 * still applies, without the card it was waiting for).
 	 */
-	async renameTitle(title?: string, signal?: AbortSignal): Promise<string | null | undefined> {
-		const icons = this.#cardIcons();
-		const needsCard = (name: string) => icons !== "boring" && !splitCardTitle(name);
-		if (title && !needsCard(title)) return title;
+	async renameTitle(title?: string, signal?: AbortSignal): Promise<GeneratedSessionTitle | null | undefined> {
+		const { sessionManager } = this;
+		if (title && (title === this.sessionName || splitCardTitle(title))) return { title };
 		const context = title ? undefined : this.#buildReplanTitleContext();
 		if (context !== undefined && (!context || isLowSignalTitleInput(context))) return null;
-		const { sessionManager } = this;
 		const revision = sessionManager.reserveTitleRevision();
 		const sessionId = sessionManager.getSessionId();
 		const titleSignal = this.titleGenerationSignal;
 		const stale = () =>
-			(!title && titleSignal.aborted) ||
+			(!title && (titleSignal.aborted || signal?.aborted)) ||
 			sessionManager.getSessionId() !== sessionId ||
 			sessionManager.titleRevision !== revision;
-		const named = context === undefined ? title : await this.#retitle(context, signal);
+		const named: GeneratedSessionTitle | null =
+			context === undefined ? { title: title! } : await this.#retitle(context, signal);
 		if (stale()) return undefined;
-		if (!named || !needsCard(named)) return named ?? null;
-		const cardPrompt = prompt.render(titleCardPrompt, { nerdFonts: icons === "nf+emoji" });
-		const reply = await this.generateTitle(named, cardPrompt, signal);
+		if (!named || named.card || splitCardTitle(named.title)) return named;
+		const reply = await this.generateTitle(named.title, prompt.render(titleCardPrompt, { nerdFonts: true }), signal);
 		if (stale()) return undefined;
-		const card = reply ? parseCardReply(reply, icons) : undefined;
-		return card ? formatCardTitle(card, named) : named;
+		return {
+			title: named.title,
+			card: reply && !titleSignal.aborted && !signal?.aborted ? parseCardReply(reply) : undefined,
+		};
 	}
 
-	/** A fresh title-model title for `context` that keeps the current title's card; null when generation fails. */
-	async #retitle(context: string, signal?: AbortSignal): Promise<string | null> {
+	/** Retitle with the current validated candidates; legacy headings remain opaque. */
+	async #retitle(context: string, signal?: AbortSignal): Promise<GeneratedSessionTitle | null> {
+		const current = this.sessionName;
+		const card = this.sessionManager.getSessionTitleCard();
 		const title = await this.generateTitle(context, undefined, signal);
-		return title && keepTitleCard(this.sessionName, title);
+		if (!title) return null;
+		const incoming = splitCardTitle(title);
+		if (card) return { title: incoming?.title ?? title, card };
+		const legacy = current ? splitCardTitle(current) : undefined;
+		if (legacy) return { title: `${legacy.icon} ${legacy.code}: ${incoming?.title ?? title}` };
+		const incomingCard = incoming ? validateTitleCard({ code: incoming.code, emoji: incoming.icon }) : undefined;
+		return incomingCard ? { title: incoming!.title, card: incomingCard } : { title };
 	}
 
 	async #refreshTitleAfterReplan(context: string, sessionId: string): Promise<void> {
+		const updatedAt = this.sessionManager.titleUpdatedAt;
+		const revision = this.sessionManager.titleRevision;
+		const signal = this.titleGenerationSignal;
 		const title = await this.#retitle(context);
-		if (!title) return;
-		if (this.sessionManager.getSessionId() !== sessionId) return;
-		if (!cfgTitleRefreshOnReplan.get(this.settings)) return;
-		if (this.sessionManager.titleSource === "user") return;
-		await this.sessionManager.setSessionName(title, "auto", "replan");
+		if (!title || signal.aborted) return;
+		if (
+			this.sessionManager.getSessionId() !== sessionId ||
+			this.sessionManager.titleRevision !== revision ||
+			this.sessionManager.titleUpdatedAt !== updatedAt
+		)
+			return;
+		if (!cfgTitleRefreshOnReplan.get(this.settings) || this.sessionManager.titleSource === "user") return;
+		await this.sessionManager.setSessionName(title.title, "auto", "replan", title.card);
 	}
 
 	/** Currently-applied {@link TITLE_SYSTEM.md} override, or undefined when the
@@ -12168,8 +12181,9 @@ export class AgentSession implements SettingsScope {
 				if (!leafId) {
 					const title = this.sessionManager.getSessionName();
 					const titleSource = this.sessionManager.titleSource;
+					const titleCard = this.sessionManager.getSessionTitleCard();
 					await this.sessionManager.newSession({ parentSession: previousSessionFile });
-					if (title) await this.sessionManager.setSessionName(title, titleSource);
+					if (title) await this.sessionManager.setSessionName(title, titleSource, undefined, titleCard);
 				} else {
 					this.sessionManager.createBranchedSession(leafId, { copyArtifacts: options?.copyArtifacts });
 				}

@@ -8,6 +8,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import type { TitleCard } from "../utils/title-card";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
@@ -22,6 +23,11 @@ export const TITLE_CHANGE_ENTRY_TYPE = "title_change";
 
 export type SessionTitleSource = "auto" | "user";
 
+/** Binds candidates to one title/source/update tuple. */
+export interface SessionTitleCard extends TitleCard {
+	key: string;
+}
+
 /** Fixed-width first-line slot carrying the mutable current session title. */
 export interface SessionTitleSlotEntry {
 	type: typeof SESSION_TITLE_SLOT_ENTRY_TYPE;
@@ -29,6 +35,9 @@ export interface SessionTitleSlotEntry {
 	title: string;
 	source?: SessionTitleSource;
 	updatedAt: string;
+	card?: SessionTitleCard;
+	/** Full overflow title remains in the matching header. */
+	ref?: string;
 	pad: string;
 }
 
@@ -40,6 +49,8 @@ export interface SessionHeader {
 	id: string;
 	title?: string; // Auto-generated title from first message
 	titleSource?: SessionTitleSource;
+	titleCard?: SessionTitleCard;
+	titleUpdatedAt?: string;
 	timestamp: string;
 	cwd: string;
 	/**

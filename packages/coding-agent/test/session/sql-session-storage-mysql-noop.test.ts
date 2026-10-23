@@ -1,21 +1,3 @@
-/**
- * MySQL no-op-update repro: `replaceIfSize` with a byte-identical body matches
- * the row but changes nothing, so MySQL reports `affectedRows: 0`. That must
- * not surface as a `SessionWriteConflictError`.
- *
- * There is no live MySQL in this environment (and none in CI), so the fake
- * below drives the REAL `mysql` adapter branch of `SqlSessionStorageBackend`
- * with documented MySQL `affectedRows` semantics: 0 when a matched row is
- * unchanged, 1 when it changes, 0 when nothing matches. Repo convention for
- * dialect coverage without a server: see sql-session-storage.test.ts ("We
- * can't run a real Postgres/MySQL instance from the test process").
- *
- * Boundary: actual MySQL driver/flag behavior (e.g. CLIENT_FOUND_ROWS) is
- * unverified here; the guard under test is dialect-neutral (a size match
- * means no size-precondition conflict by definition) and mirrors the
- * verify-on-failure pattern in IndexedSessionStorage.writeTextAtomic.
- */
-
 import { describe, expect, it } from "bun:test";
 import {
 	SqlSessionStorage,
@@ -34,6 +16,7 @@ interface FakeRow {
 	title: string | null;
 	title_source: string | null;
 	title_updated_at: string | null;
+	title_card: string | null;
 }
 
 function mysqlResult(affectedRows: number, rows: unknown[] = []): SqlSessionStorageResult {
@@ -58,6 +41,7 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 						title: row.title,
 						title_source: row.title_source,
 						title_updated_at: row.title_updated_at,
+						title_card: row.title_card,
 					})),
 				);
 			}
@@ -72,6 +56,7 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 									title: row.title,
 									title_source: row.title_source,
 									title_updated_at: row.title_updated_at,
+									title_card: row.title_card,
 								},
 							]
 						: [],
@@ -87,6 +72,7 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 						title: values[3] as string | null,
 						title_source: values[4] as string | null,
 						title_updated_at: values[5] as string | null,
+						title_card: values[6] as string | null,
 					});
 					return mysqlResult(1, [{ path }]);
 				}
@@ -98,20 +84,23 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 						title: existing?.title ?? null,
 						title_source: existing?.title_source ?? null,
 						title_updated_at: existing?.title_updated_at ?? null,
+						title_card: existing?.title_card ?? null,
 					});
 					return mysqlResult(existing ? 2 : 1);
 				}
 				rows.set(path, {
-					content: values[6] as string,
-					mtimeMs: values[7] as number,
-					title: values[8] as string | null,
-					title_source: values[9] as string | null,
-					title_updated_at: values[10] as string | null,
+					content: values[7] as string,
+					mtimeMs: values[8] as number,
+					title: values[9] as string | null,
+					title_source: values[10] as string | null,
+					title_updated_at: values[11] as string | null,
+					title_card: values[12] as string | null,
 				});
 				return mysqlResult(1);
 			}
 			if (sql.startsWith("UPDATE") && sql.includes("SET title = ?")) {
-				const [title, title_source, title_updated_at, mtimeMs, path] = values as [
+				const [title, title_source, title_updated_at, title_card, mtimeMs, path] = values as [
+					string | null,
 					string | null,
 					string | null,
 					string | null,
@@ -120,19 +109,12 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 				];
 				const row = rows.get(path);
 				if (!row) return mysqlResult(0);
-				rows.set(path, { ...row, title, title_source, title_updated_at, mtimeMs });
+				rows.set(path, { ...row, title, title_source, title_updated_at, title_card, mtimeMs });
 				return mysqlResult(1);
 			}
 			if (sql.startsWith("UPDATE")) {
-				const [content, mtimeMs, title, title_source, title_updated_at, path, expectedSize] = values as [
-					string,
-					number,
-					string | null,
-					string | null,
-					string | null,
-					string,
-					number,
-				];
+				const [content, mtimeMs, title, title_source, title_updated_at, title_card, path, expectedSize] =
+					values as [string, number, string | null, string | null, string | null, string | null, string, number];
 				if (skipNextUpdate) {
 					skipNextUpdate = false;
 					return mysqlResult(0);
@@ -145,13 +127,14 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 					row.content === content &&
 					row.title === title &&
 					row.title_source === title_source &&
-					row.title_updated_at === title_updated_at
+					row.title_updated_at === title_updated_at &&
+					row.title_card === title_card
 				) {
 					// Matched but unchanged: a real MySQL UPDATE reports
 					// affectedRows 0 here (unless CLIENT_FOUND_ROWS is set).
 					return mysqlResult(0);
 				}
-				rows.set(path, { content, mtimeMs, title, title_source, title_updated_at });
+				rows.set(path, { content, mtimeMs, title, title_source, title_updated_at, title_card });
 				return mysqlResult(1);
 			}
 			throw new Error(`mysqlFake: unhandled statement: ${sql.slice(0, 60)}`);

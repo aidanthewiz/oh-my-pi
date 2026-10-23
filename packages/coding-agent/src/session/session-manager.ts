@@ -1,3 +1,5 @@
+import { type TitleCard, validateTitleCard } from "../utils/title-card";
+import type { SessionTitleCard } from "./session-entries";
 import * as buffer from "node:buffer";
 import { createHash, type Hash } from "node:crypto";
 import * as fs from "node:fs";
@@ -110,9 +112,10 @@ import {
 	SessionWriteConflictError,
 } from "./session-storage";
 import {
-	parseTitleSlotFromContent,
+	admitTitleCard,
+	boundTitleCard,
 	serializeTitleSlot,
-	titleUpdateFromSlot,
+	titleFitsSlot,
 	type SessionTitleUpdate,
 } from "./session-title-slot";
 import {
@@ -785,6 +788,7 @@ interface SessionManagerStateSnapshot {
 	sessionId: string;
 	sessionName: string | undefined;
 	titleSource: SessionTitleSource | undefined;
+	titleCard: SessionTitleCard | undefined;
 	sessionFile: string | undefined;
 	expectedDiskSize: number | null;
 	expectedDiskFingerprint: Hash | undefined;
@@ -943,6 +947,7 @@ export class SessionManager {
 	#sessionId = "";
 	#sessionName: string | undefined;
 	#titleSource: SessionTitleSource | undefined;
+	#titleCard: SessionTitleCard | undefined;
 	#titleRevision = 0;
 	/** Bumped by in-place entry updates, which a {@link SessionBodyStamp} cannot otherwise see. */
 	#bodyRevision = 0;
@@ -1671,6 +1676,7 @@ export class SessionManager {
 		return serializeTitleSlot({
 			title: this.#sessionName,
 			source: this.#titleSource,
+			card: this.#titleCard,
 			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
 		});
 	}
@@ -1678,6 +1684,8 @@ export class SessionManager {
 	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
 	#serializeBody(): SessionFileBody {
 		const titleLine = this.#titleSlotLine();
+		this.#header.titleUpdatedAt = this.#titleUpdatedAt || this.#header.timestamp;
+		this.#header.titleCard = this.#titleCard;
 		const headerLine = this.#lineFor(this.#header);
 		const entries = this.#entries;
 		const lines = [titleLine, headerLine];
@@ -1696,7 +1704,12 @@ export class SessionManager {
 			revision: this.#bodyRevision,
 			prefix: titleLine + headerLine,
 		};
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(titleLine));
+		const title: SessionTitleUpdate = {
+			title: this.#sessionName ?? "",
+			source: this.#titleSource,
+			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
+			...(this.#titleCard ? { card: this.#titleCard } : {}),
+		};
 		return { lines, bytes, fingerprint, titleMeta: title ? JSON.stringify(title) : null, stamp };
 	}
 
@@ -2056,6 +2069,7 @@ export class SessionManager {
 			!this.#fileIsCurrent ||
 			this.#rewriteRequired ||
 			!this.#hasTitleSlot ||
+			!titleFitsSlot(update) ||
 			!this.#storage.existsSync(this.#sessionFile) ||
 			this.#sessionOwnedElsewhere()
 		) {
@@ -2140,6 +2154,7 @@ export class SessionManager {
 		this.#sessionId = mintSessionId();
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
+		this.#titleCard = undefined;
 		this.#titleUpdatedAt = "";
 		this.#hasTitleSlot = true;
 
@@ -2198,7 +2213,9 @@ export class SessionManager {
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
-		this.#titleUpdatedAt = header.timestamp;
+		this.#titleUpdatedAt = header.titleUpdatedAt ?? header.timestamp;
+		const update = { title: header.title, source: header.titleSource, updatedAt: this.#titleUpdatedAt };
+		this.#titleCard = admitTitleCard(update, boundTitleCard(update, header.titleCard));
 		const repairedUsage = normalizeLoadedUsage(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
 		this.#index.rebuild(entries);
@@ -2345,6 +2362,7 @@ export class SessionManager {
 			sessionId: this.#sessionId,
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
+			titleCard: this.#titleCard,
 			titleUpdatedAt: this.#titleUpdatedAt,
 			hasTitleSlot: this.#hasTitleSlot,
 			sessionFile: this.#sessionFile,
@@ -2414,6 +2432,7 @@ export class SessionManager {
 		this.#sessionName = snapshot.sessionName;
 
 		this.#titleSource = snapshot.titleSource;
+		this.#titleCard = snapshot.titleCard;
 		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
 		this.#hasTitleSlot = snapshot.hasTitleSlot;
 		this.#artifactManager = null;
@@ -2551,7 +2570,7 @@ export class SessionManager {
 		this.#expectedDiskFingerprint = loaded.sourceFingerprint?.copy();
 		this.#expectedDiskTitleMeta = loaded.sourceTitleMeta;
 		this.#additionalDirectories = header.additionalDirectories ?? [];
-		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
+		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.titleUpdatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
 		this.#fileIsCurrent = true;
 		this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
@@ -2609,8 +2628,10 @@ export class SessionManager {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
 			id: this.#sessionId,
-			title: this.#header.title ?? this.#sessionName,
-			titleSource: this.#header.titleSource ?? this.#titleSource,
+			title: this.#sessionName,
+			titleSource: this.#titleSource,
+			titleCard: this.#titleCard,
+			titleUpdatedAt: this.#titleUpdatedAt,
 			timestamp,
 			cwd: this.#cwd,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
@@ -2619,7 +2640,7 @@ export class SessionManager {
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
-		this.#titleUpdatedAt = timestamp;
+		this.#titleUpdatedAt = this.#header.titleUpdatedAt ?? timestamp;
 		this.#hasTitleSlot = true;
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
@@ -2871,9 +2892,12 @@ export class SessionManager {
 		manager.#resetToNewSession();
 		manager.#sessionName = this.#sessionName;
 		manager.#titleSource = this.#titleSource;
+		manager.#titleCard = this.#titleCard;
 		manager.#titleUpdatedAt = this.#titleUpdatedAt;
 		manager.#header.title = this.#sessionName;
 		manager.#header.titleSource = this.#titleSource;
+		manager.#header.titleCard = this.#titleCard;
+		manager.#header.titleUpdatedAt = this.#titleUpdatedAt;
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
@@ -3504,6 +3528,14 @@ export class SessionManager {
 		return ++this.#titleRevision;
 	}
 
+	get titleUpdatedAt(): string {
+		return this.#titleUpdatedAt;
+	}
+
+	getSessionTitleCard(): TitleCard | undefined {
+		return validateTitleCard(this.#titleCard);
+	}
+
 	getSessionName(): string | undefined {
 		return this.#sessionName;
 	}
@@ -3552,7 +3584,12 @@ export class SessionManager {
 	 * @param source "user" for explicit renames; "auto" for generated titles.
 	 *   Auto titles are ignored once the user has set a name.
 	 */
-	async setSessionName(name: string, source: SessionTitleSource = "auto", trigger?: string): Promise<boolean> {
+	async setSessionName(
+		name: string,
+		source: SessionTitleSource = "auto",
+		trigger?: string,
+		card?: TitleCard,
+	): Promise<boolean> {
 		if (this.#released) return false;
 		if (this.#titleSource === "user" && source === "auto") return false;
 
@@ -3560,13 +3597,18 @@ export class SessionManager {
 		if (!title) return false;
 
 		const previousTitle = this.#sessionName;
-		const timestamp = nowIso();
+		const timestamp = new Date(Math.max(Date.now(), (Date.parse(this.#titleUpdatedAt) || 0) + 1)).toISOString();
+		const update: SessionTitleUpdate = { title, source, updatedAt: timestamp };
+		update.card = admitTitleCard(update, card);
 		this.#sessionName = title;
 		this.#titleSource = source;
+		this.#titleCard = update.card;
 		if (source === "user") this.#titleRevision++;
 		this.#titleUpdatedAt = timestamp;
 		this.#header.title = title;
 		this.#header.titleSource = source;
+		this.#header.titleCard = update.card;
+		this.#header.titleUpdatedAt = timestamp;
 
 		const entry: TitleChangeEntry = {
 			type: TITLE_CHANGE_ENTRY_TYPE,
@@ -3580,7 +3622,7 @@ export class SessionManager {
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		this.#notifyEntryAppended(entry);
-		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
+		await this.#persistTitleChangeEntry(entry, update);
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
@@ -4115,6 +4157,8 @@ export class SessionManager {
 			cwd: this.#cwd,
 			title: this.#sessionName,
 			titleSource: this.#titleSource,
+			titleCard: this.#titleCard,
+			titleUpdatedAt: this.#titleUpdatedAt,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
 		};
@@ -4139,7 +4183,9 @@ export class SessionManager {
 		this.#sessionId = newSessionId;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
-		this.#titleUpdatedAt = timestamp;
+		this.#titleUpdatedAt = header.titleUpdatedAt ?? timestamp;
+		const update = { title: header.title, source: header.titleSource, updatedAt: this.#titleUpdatedAt };
+		this.#titleCard = admitTitleCard(update, boundTitleCard(update, header.titleCard));
 		this.#hasTitleSlot = true;
 		this.#index.rebuild(this.#entries);
 		this.#artifactManager = null;
@@ -4262,12 +4308,16 @@ export class SessionManager {
 		);
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
+		manager.#header.titleUpdatedAt = sourceHeader?.titleUpdatedAt;
+		manager.#header.titleCard = sourceHeader?.titleCard;
 		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
 		manager.#sessionName = manager.#header.title;
 		manager.#titleSource = manager.#header.titleSource;
-		manager.#titleUpdatedAt = nowIso();
+		manager.#titleUpdatedAt = sourceHeader?.titleUpdatedAt ?? nowIso();
+		const update = { title: manager.#sessionName, source: manager.#titleSource, updatedAt: manager.#titleUpdatedAt };
+		manager.#titleCard = admitTitleCard(update, boundTitleCard(update, sourceHeader?.titleCard));
 		manager.#hasTitleSlot = true;
 		manager.#entries = history;
 		manager.#index.rebuild(history);

@@ -1,3 +1,4 @@
+import { isNativeRendering, setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as os from "node:os";
 import {
@@ -6,6 +7,9 @@ import {
 	setTerminalTitle,
 	initTerminalTitleState,
 	setSessionTerminalTitle,
+	refreshSessionTerminalTitle,
+	setExtensionTerminalTitle,
+	setTerminalTitleStateEnabled,
 	setTerminalSessionSource,
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleState,
@@ -177,6 +181,55 @@ describe("disposeTerminalTitleState", () => {
 			const value = savedWslEnv[key];
 			if (value === undefined) delete Bun.env[key];
 			else Bun.env[key] = value;
+		}
+	});
+
+	it("selects portable live metadata at the OSC and native title sinks", () => {
+		const previousNative = isNativeRendering();
+		let icons: "nf+emoji" | "emoji" | "boring" = "nf+emoji";
+		let name = "Portable";
+		const card = { code: "TITLE", emoji: "🧪", nf: "nf-md-flask" };
+		setTerminalSessionSource({
+			file: () => undefined,
+			cwd: () => "/synthetic",
+			title: () => ({ name, card, icons }),
+		});
+		setTerminalTitleStateEnabled(true);
+		try {
+			for (const native of [false, true]) {
+				setNativeRendering(native);
+				for (const preference of ["nf+emoji", "emoji", "boring"] as const) {
+					icons = preference;
+					name = `Portable ${native} ${preference}`;
+					resetObserved(writes, windowsTitleMock);
+					setSessionTerminalTitle(name);
+					const display = preference === "boring" ? name : `🧪 TITLE: ${name}`;
+					expect(observedTitles(writes, windowsTitleMock)).toEqual([native ? display : `${BRAND} > ${display}`]);
+				}
+			}
+			icons = "emoji";
+			refreshSessionTerminalTitle();
+			resetObserved(writes, windowsTitleMock);
+			icons = "boring";
+			refreshSessionTerminalTitle();
+			expect(observedTitles(writes, windowsTitleMock)).toEqual([name]);
+			setExtensionTerminalTitle("Extension owns title");
+			resetObserved(writes, windowsTitleMock);
+			icons = "emoji";
+			refreshSessionTerminalTitle();
+			expect(observedTitles(writes, windowsTitleMock)).toEqual([]);
+			setExtensionTerminalTitle("");
+			expect(observedTitles(writes, windowsTitleMock)).toEqual([`🧪 TITLE: ${name}`]);
+
+			resetObserved(writes, windowsTitleMock);
+			setSessionTerminalTitle("Different session");
+			expect(observedTitles(writes, windowsTitleMock)).toEqual(["Different session"]);
+			resetObserved(writes, windowsTitleMock);
+			setSessionTerminalTitle("\uf0c3 LEGACY: Original name");
+			expect(observedTitles(writes, windowsTitleMock)).toEqual(["Original name"]);
+		} finally {
+			setTerminalSessionSource(undefined);
+			setNativeRendering(previousNative);
 		}
 	});
 
