@@ -6,6 +6,11 @@
 
 - Fixed dashboard controls remaining busy after a cached query's refresh is abandoned by hiding the page or switching keys.
 - Preserve the Coreforce hammer favicon in the branded stats dashboard.
+## [18.10.4] - 2026-10-13
+
+### Fixed
+
+- Usage recorded at $0 for a model whose catalog price changes on a date (Gemini 4 Argon, Devin SWE-2) is now priced at the rate in force on the request's date, instead of staying $0 like peak/off-peak tariff usage ([#15620](https://github.com/can1357/oh-my-pi/pull/15620) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.9.0] - 2026-10-11
 

@@ -20,6 +20,12 @@
 - Keep `tail -c` within its exact byte limit when pipe reads have uneven sizes, including JSON query diagnostics.
 - Reject desktop addons without live screen-state support before opening a session instead of using an incomplete desktop ABI.
 - Validate desktop screen-state getter descriptors without invoking native state during module import or constructing a desktop session.
+## [18.10.4] - 2026-10-13
+
+### Fixed
+
+- Fixed `pwsh` code blocks rendering without PowerShell syntax colors ([#15008](https://github.com/can1357/oh-my-pi/issues/15008)).
+
 ## [18.10.2] - 2026-10-12
 
 ### Added

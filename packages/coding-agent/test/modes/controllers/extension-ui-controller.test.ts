@@ -3,6 +3,7 @@ import { type Component, Container, isFocusable, type OverlayOptions, setKeybind
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import { ApprovalDialogComponent } from "@oh-my-pi/pi-tui/overlays/approval-dialog";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
@@ -20,7 +21,7 @@ beforeAll(async () => {
 	setThemeInstance(dark);
 });
 
-function makeHarness() {
+function makeHarness(hideToolActivity = false) {
 	const editor = new CustomEditor(getEditorTheme());
 	const editorContainer = new Container();
 	editorContainer.addChild(editor);
@@ -43,6 +44,7 @@ function makeHarness() {
 	let uiContext: ExtensionUIContext | undefined;
 	const ctx = {
 		editor,
+		hideToolActivity,
 		ui: {
 			requestRender,
 			getFocused,
@@ -243,6 +245,78 @@ describe("ExtensionUiController Ask dialog input", () => {
 			results: [{ id: "answer", selectedOptions: [], customInput: "typed after failure" }],
 		});
 		expect(harness.editor.getText()).toBe("");
+	});
+});
+
+describe("ExtensionUiController docked approval", () => {
+	it.each([false, true])(
+		"keeps the draft and shows full details only when tool activity is hidden (%s)",
+		async hidden => {
+			const harness = makeHarness(hidden);
+			harness.editor.setText("retain this unfinished draft");
+			const ui = await harness.init();
+			const pending = ui.approve!({
+				full: "Allow tool: write\nContent:\nfull-body-marker",
+				compact: "Allow tool: write\nContent: 1 line in the tool call",
+			});
+			const dialog = harness.getFocused();
+			if (!(dialog instanceof ApprovalDialogComponent)) throw new Error("Expected approval dialog");
+			const rendered = Bun.stripANSI(dialog.render(120).join("\n"));
+			expect(rendered.includes("full-body-marker")).toBe(hidden);
+			harness.handleInput("\r");
+			expect(harness.getFocused()).toBe(dialog);
+			dialog.handleNativeEvent({ type: "action", key: "approve", act: "approve", mods: [] });
+			expect(await pending).toBe(true);
+			expect(harness.getFocused()).toBe(harness.editor);
+			expect(harness.editor.getText()).toBe("retain this unfinished draft");
+		},
+	);
+
+	it("starts a queued approval timeout on presentation, resets it on input, and ignores a retired dialog", async () => {
+		vi.useFakeTimers();
+		const harness = makeHarness();
+		const firstAbort = new AbortController();
+		const secondAbort = new AbortController();
+		const start = vi.fn();
+		const reset = vi.fn();
+		const timedOut = vi.fn();
+		const prompt = { full: "Allow tool: bash\nCommand: pwd", compact: "Allow tool: bash\nCommand: pwd" };
+		try {
+			const ui = await harness.init();
+			const first = ui.approve!(prompt, { signal: firstAbort.signal });
+			const retired = harness.getFocused();
+			if (!(retired instanceof ApprovalDialogComponent)) throw new Error("Expected first approval dialog");
+			const second = ui.approve!(prompt, {
+				signal: secondAbort.signal,
+				timeout: 1_000,
+				onTimeoutStart: start,
+				onTimeoutReset: reset,
+				onTimeout: timedOut,
+			});
+			vi.advanceTimersByTime(1_100);
+			expect(start).not.toHaveBeenCalled();
+			expect(timedOut).not.toHaveBeenCalled();
+			firstAbort.abort();
+			expect(await first).toBe(false);
+			const active = harness.getFocused();
+			expect(active).toBeInstanceOf(ApprovalDialogComponent);
+			expect(start).toHaveBeenCalledTimes(1);
+			retired.handleNativeEvent({ type: "action", key: "approve", act: "approve", mods: [] });
+			expect(harness.getFocused()).toBe(active);
+			vi.advanceTimersByTime(900);
+			harness.handleInput("\x1b[B");
+			expect(reset).toHaveBeenCalledTimes(1);
+			vi.advanceTimersByTime(200);
+			expect(timedOut).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(800);
+			expect(await second).toBe(false);
+			expect(timedOut).toHaveBeenCalledTimes(1);
+			expect(harness.getFocused()).toBe(harness.editor);
+		} finally {
+			firstAbort.abort();
+			secondAbort.abort();
+			vi.useRealTimers();
+		}
 	});
 });
 

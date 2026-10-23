@@ -12,6 +12,7 @@ import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
+import { isSharedBrowserDaemonName } from "../tools/browser/shared-daemon";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -323,6 +324,10 @@ export async function modeService(
 	mode: "persist" | "session" | "detached",
 	signal?: AbortSignal,
 ): Promise<DaemonSnapshot> {
+	// The broker detaches a service by relaunching it, which would start the
+	// shared Chrome on an unprepared profile and reopen its previous pages.
+	if (mode === "detached" && isSharedBrowserDaemonName(name))
+		throw new Error(`${name} is omp's project-shared browser and cannot be detached`);
 	const result = await request(session, { op: "mode", name, mode }, signal);
 	if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
 	return result.daemon;

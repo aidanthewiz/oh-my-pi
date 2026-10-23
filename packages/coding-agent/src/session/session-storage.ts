@@ -1300,6 +1300,22 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	/**
+	 * Rename `replacement` over the session file `fpath` under the
+	 * cross-process publish lock that serializes appends and rewrites, when
+	 * `unchanged` still accepts the file there. Returns whether it renamed.
+	 * Throws {@link SessionLockError} while another writer holds the lock.
+	 */
+	replaceSessionFileSync(fpath: string, replacement: string, unchanged: () => boolean): boolean {
+		let replaced = false;
+		this.#withPublishLock(fpath, () => {
+			if (!unchanged()) return;
+			this.renameSync(replacement, fpath);
+			replaced = true;
+		});
+		return replaced;
+	}
+
+	/**
 	 * The kernel releases the ID-keyed ownership lease when its process exits.
 	 * A failed OS acquisition must not be treated as ownership.
 	 */

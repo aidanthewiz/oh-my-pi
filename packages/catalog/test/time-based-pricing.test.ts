@@ -189,6 +189,51 @@ describe("time-based token pricing", () => {
 	});
 });
 
+describe("successive partial dated cards", () => {
+	for (const axis of ["costPatch", "costFallback"] as const) {
+		it(`retains earlier ${axis} rates through build and rebuild`, () => {
+			const first = Date.parse("2020-01-01T00:00:00Z");
+			const second = Date.parse("2021-01-01T00:00:00Z");
+			const clock = spyOn(Date, "now").mockReturnValue(second);
+			try {
+				const base = { input: 1, output: 10, cacheRead: 0.1, cacheWrite: 0 };
+				const patch = {
+					...base,
+					effectiveRates: {
+						first: { effectiveFrom: "2020-01-01T00:00:00Z", input: 2 },
+						second: { effectiveFrom: "2021-01-01T00:00:00Z", output: 20 },
+					},
+				};
+				const model = spec("custom-model", "custom");
+				model.cost = axis === "costPatch" ? { ...base } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+				applyCatalogCorrections(model, { [axis]: patch });
+				const rebuilt = { ...model, cost: { ...model.cost } };
+				applyCatalogCorrections(rebuilt, { [axis]: patch });
+				for (const candidate of [model, rebuilt]) {
+					expect(candidate.cost.input).toBe(2);
+					expect(candidate.cost.output).toBe(20);
+					expect(calculateUsageCost(candidate.cost, usage(1_000_000, 0, 0, 0), first - 1).input).toBe(1);
+					expect(calculateUsageCost(candidate.cost, usage(1_000_000, 0, 0, 0), first).input).toBe(2);
+					const before = calculateUsageCost(candidate.cost, usage(1_000_000, 1_000_000, 0, 0), second - 1);
+					const after = calculateUsageCost(candidate.cost, usage(1_000_000, 1_000_000, 0, 0), second);
+					expect({ input: before.input, output: before.output, total: before.total }).toEqual({
+						input: 2,
+						output: 10,
+						total: 12,
+					});
+					expect({ input: after.input, output: after.output, total: after.total }).toEqual({
+						input: 2,
+						output: 20,
+						total: 22,
+					});
+				}
+			} finally {
+				clock.mockRestore();
+			}
+		});
+	}
+});
+
 describe("recurring tariff period and transitions", () => {
 	const weekdayCost: ModelCost = {
 		...spec().cost,
@@ -349,6 +394,25 @@ describe("financial schedule validation", () => {
 				effectiveRates: [{ ...serialized.effectiveRates?.[0], effectiveFrom: Infinity }],
 			}),
 		).toBe(false);
+	});
+
+	it("rejects malformed cost-patch and cost-fallback dated cards instead of keeping the old price", () => {
+		const card = { effectiveFrom: "2026-12-01T08:00:00Z", input: 4, output: 20 };
+		const invalid = [
+			{ ...card, effectiveFrom: "2026-12-01" },
+			{ ...card, effectiveFrom: "2026-02-30T08:00:00Z" },
+			{ ...card, input: -1 },
+			{ ...card, cache_read: 0.2 },
+		];
+		for (const axis of ["costPatch", "costFallback"] as const) {
+			const name = axis === "costPatch" ? "cost-patch" : "cost-fallback";
+			for (const effectiveRate of invalid) {
+				const catalog = { [axis]: { input: 2, output: 10, effectiveRates: { listPrice: effectiveRate } } };
+				expect(() => applyCatalogCorrections(spec("custom-model", "custom"), catalog)).toThrow(`Invalid ${name}`);
+			}
+			const duplicate = { [axis]: { input: 2, output: 10, effectiveRates: { first: card, second: card } } };
+			expect(() => applyCatalogCorrections(spec("custom-model", "custom"), duplicate)).toThrow(`Invalid ${name}`);
+		}
 	});
 });
 
