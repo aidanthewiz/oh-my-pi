@@ -240,6 +240,11 @@ export class HookSelectorComponent extends OverlayPanel {
 	#detailScroll: NativeScroll | undefined;
 	#listView: ScrollView | undefined;
 	#listSelectionRow = 0;
+	#listSelectionRows = 1;
+	readonly #reviewContent = new Container();
+	#reviewKey: string | undefined;
+	#availableRows = 0;
+	#nativeRendering = false;
 	readonly #layoutSpacers: Spacer[] = [];
 	readonly #hint = new Text("", 0, 0);
 	readonly #controlsHint: string;
@@ -358,7 +363,7 @@ export class HookSelectorComponent extends OverlayPanel {
 					opts?.onTimeout?.();
 					// Auto-select current option on timeout (typically the first/recommended option)
 					const selected = this.#menu.selectedItem;
-					if (selected && !this.#menu.isDisabled(selected)) {
+					if (selected && !this.#menu.isDisabled(selected) && this.#canConfirm()) {
 						this.#onSelectCallback(selected.option.label);
 					} else {
 						this.#onCancelCallback();
@@ -396,15 +401,21 @@ export class HookSelectorComponent extends OverlayPanel {
 		this.addChild(spacer);
 	}
 
-	#layout(renderWidth: number): void {
+	#layout(renderWidth: number, native = false): void {
+		this.#nativeRendering = native;
 		if (this.#lastRenderWidth !== renderWidth) {
 			this.#lastRenderWidth = renderWidth;
 			this.#updateList(renderWidth);
 		}
 		if (this.#detailLines.length === 0) return;
 
-		const terminalRows = Math.max(4, this.#getHeight?.() ?? this.#tui?.terminal.rows ?? process.stdout.rows ?? 24);
+		const terminalRows = Math.max(
+			native ? 4 : 0,
+			this.#getHeight?.() ?? this.#tui?.terminal.rows ?? process.stdout.rows ?? 24,
+		);
+		this.#availableRows = terminalRows;
 		const list = this.#outlinedList ?? this.#listContainer!;
+		this.#sliderComponent?.setText(this.#renderSliderLine());
 		for (const spacer of this.#layoutSpacers) spacer.setLines(1);
 		this.#hint.setText(theme.fg("dim", `${this.#controlsHint}  PgUp/PgDn details`));
 		const fixedRows = () => {
@@ -418,25 +429,82 @@ export class HookSelectorComponent extends OverlayPanel {
 		if (fixed + list.render(renderWidth).length + 1 > terminalRows) {
 			for (const spacer of this.#layoutSpacers) spacer.setLines(0);
 			this.#hint.setText(theme.fg("dim", truncateToWidth(`PgUp/PgDn details  ${this.#controlsHint}`, renderWidth)));
-			if (terminalRows <= 4) this.#hint.setText("");
+			if (native && terminalRows <= 4) this.#hint.setText("");
 			fixed = fixedRows();
 		}
-		const menuBudget = Math.max(1, terminalRows - fixed - 1);
-		const maxVisible = Math.min(
-			this.#configuredMaxVisible,
-			Math.max(1, menuBudget - (this.#outlinedList ? 2 : 0) - 1),
-		);
-		if (maxVisible !== this.#maxVisible) {
-			this.#maxVisible = maxVisible;
-			this.#updateList(renderWidth);
+		if (!native && fixed + this.#listSelectionRows + 1 > terminalRows) {
+			this.#hint.setText("");
+			fixed = fixedRows();
 		}
-		const menuHeight = Math.min(menuBudget, list.render(renderWidth).length);
-		this.#listView?.setHeight(menuHeight);
-		this.#listView?.setActiveRow(this.#listSelectionRow, "start");
-		const detailRows = this.#detailContent.render(renderWidth).length;
-		this.#detailHeight = Math.max(1, Math.min(detailRows, terminalRows - fixed - menuHeight));
+		// Oversized choices share the detail viewport so paging can expose their full scope.
+		if (!native && fixed + this.#listSelectionRows + 1 > terminalRows) {
+			this.#sliderComponent?.setText("");
+			this.#hint.setText("");
+			const key = `${this.#menu.selectedKey}:${renderWidth}:${this.#sliderIndex}`;
+			if (this.#reviewKey !== key) {
+				this.#reviewKey = key;
+				this.#reviewContent.clear();
+				const selected = this.#menu.selectedItem;
+				if (selected) {
+					for (const line of this.#renderOptionLines(
+						selected.option,
+						true,
+						this.#menu.isDisabled(selected),
+						getMarkdownTheme(),
+						"full",
+						renderWidth,
+						selected.index,
+					)) {
+						this.#reviewContent.addChild(new Text(line, 1, 0, paintSelectedRow));
+					}
+				} else {
+					this.#reviewContent.addChild(list);
+				}
+				if (this.#slider) this.#reviewContent.addChild(new Text(this.#renderSliderLine(), 0, 0));
+				this.#reviewContent.addChild(this.#detailContent);
+				this.#detailView.scrollToTop();
+			}
+			this.#detailView.setChild(this.#reviewContent);
+			this.#detailView.setScrollbar("always");
+			this.#listView?.setHeight(0);
+			this.#detailHeight = Math.max(0, terminalRows - 2);
+		} else {
+			this.#detailView.setChild(this.#detailContent);
+			this.#detailView.setScrollbar("auto");
+			this.#reviewKey = undefined;
+			const menuBudget = Math.max(native ? 1 : 0, terminalRows - fixed - 1);
+			const maxVisible = Math.min(
+				this.#configuredMaxVisible,
+				Math.max(1, menuBudget - (this.#outlinedList ? 2 : 0) - 1),
+			);
+			if (maxVisible !== this.#maxVisible) {
+				this.#maxVisible = maxVisible;
+				this.#updateList(renderWidth);
+			}
+			const menuHeight = Math.min(menuBudget, list.render(renderWidth).length);
+			this.#listView?.setHeight(menuHeight);
+			this.#listView?.render(renderWidth);
+			this.#listView?.revealRange(
+				{
+					id: this.#menu.selectedKey ?? "",
+					start: this.#listSelectionRow,
+					end: this.#listSelectionRow + this.#listSelectionRows,
+					margin: 0,
+					oversized: "start",
+				},
+				renderWidth,
+			);
+			const detailRows = this.#detailContent.render(renderWidth).length;
+			this.#detailHeight = Math.max(native ? 1 : 0, Math.min(detailRows, terminalRows - fixed - menuHeight));
+		}
 		this.#detailView.setHeight(this.#detailHeight);
 		this.#detailView.render(renderWidth);
+	}
+
+	#canConfirm(): boolean {
+		if (this.#detailLines.length === 0 || this.#nativeRendering) return true;
+		this.#layout(this.#lastRenderWidth ?? Math.max(1, (this.#tui?.terminal.columns ?? 80) - 4));
+		return this.#availableRows > 2;
 	}
 
 	#isDisabled(index: number): boolean {
@@ -624,6 +692,7 @@ export class HookSelectorComponent extends OverlayPanel {
 				this.#listSelectionRow =
 					(this.#outlinedList ? 1 : 0) +
 					rows.reduce((count, row) => count + this.#renderedLineRowCount(row.text, renderWidth ?? 80), 0);
+				this.#listSelectionRows = this.#optionRowCount(filtered.option, renderWidth, true, mdTheme, 0);
 			}
 			for (const text of this.#renderOptionLines(
 				filtered.option,
@@ -745,7 +814,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		if (!target || this.#isDisabled(target.index)) return true;
 		this.#menu.setSelectedIndex(targetIndex);
 		this.#updateList();
-		if (this.#selectionMarker !== "checkbox") this.#onSelectCallback(target.option.label);
+		if (this.#selectionMarker !== "checkbox" && this.#canConfirm()) this.#onSelectCallback(target.option.label);
 		return true;
 	}
 
@@ -760,7 +829,10 @@ export class HookSelectorComponent extends OverlayPanel {
 			return;
 		}
 		if (this.#detailLines.length > 0 && (matchesKey(keyData, "pageUp") || matchesKey(keyData, "pageDown"))) {
-			this.#layout(this.#lastRenderWidth ?? Math.max(1, (this.#tui?.terminal.columns ?? 80) - 4));
+			this.#layout(
+				this.#lastRenderWidth ?? Math.max(1, (this.#tui?.terminal.columns ?? 80) - 4),
+				this.#nativeRendering,
+			);
 			const down = matchesKey(keyData, "pageDown");
 			this.#detailView.page(down ? 1 : -1);
 			this.#detailScroll = { by: down ? "page-down" : "page-up", n: (this.#detailScroll?.n ?? 0) + 1 };
@@ -777,7 +849,8 @@ export class HookSelectorComponent extends OverlayPanel {
 			this.#moveSelection(1);
 		} else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selected = this.#menu.selectedItem;
-			if (selected && !this.#menu.isDisabled(selected)) this.#onSelectCallback(selected.option.label);
+			if (selected && !this.#menu.isDisabled(selected) && this.#canConfirm())
+				this.#onSelectCallback(selected.option.label);
 		} else if (
 			matchesKey(keyData, "left") ||
 			(this.#slider && !this.#isSearchEnabled() && matchesKey(keyData, "h"))
@@ -799,7 +872,10 @@ export class HookSelectorComponent extends OverlayPanel {
 
 	override render(width: number): readonly string[] {
 		this.#layout(Math.max(1, width - 4));
-		return super.render(width);
+		const rows = super.render(width);
+		return this.#detailLines.length > 0 && rows.length > this.#availableRows
+			? rows.slice(0, this.#availableRows)
+			: rows;
 	}
 
 	override renderContent(width: number): string[] {
@@ -864,7 +940,7 @@ export class HookSelectorComponent extends OverlayPanel {
 	 * and the key hints.
 	 */
 	override describe(cx: DescribeContext): NativeNode {
-		this.#layout(Math.max(1, cx.cols - 4));
+		this.#layout(Math.max(1, cx.cols - 4), true);
 		const nativeScroll = cx.feature("scroll");
 		if (
 			cx.supports("picker") &&

@@ -14,7 +14,11 @@ const PAGE_UP = "\x1b[5~";
 const DOWN = "\x1b[B";
 const PERMISSIONS = ["Deny", "Approve once", "Allow for the rest of this session"];
 const COMMAND_TAIL = "COMMAND_TAIL_79";
-const TITLE = `AWS approval\nCommand: aws s3api get-object --key ${"x".repeat(2400)}${COMMAND_TAIL}\nProfile: audit\nAccount: 123456789012\nPartition: aws-us-gov`;
+const COMMAND_ARGUMENT = Array.from(
+	{ length: 200 },
+	(_, index) => `segment_${index.toString().padStart(3, "0")}_`,
+).join("");
+const TITLE = `AWS approval\nCommand: aws s3api get-object --key ${COMMAND_ARGUMENT}${COMMAND_TAIL}\nProfile: audit\nAccount: 123456789012\nPartition: aws-us-gov`;
 const SAFETY_DETAILS = `Safety checks: ${"Reject any unverified account or partition. ".repeat(30)}SAFETY_TAIL`;
 
 beforeAll(async () => {
@@ -33,6 +37,14 @@ function nativeText(root: NativeNode): string {
 	if (root.k !== "text") throw new Error("Expected native text");
 	const text = root.p?.text ?? root.p?.spans;
 	return typeof text === "string" ? text : (text?.map(part => part.t).join("") ?? "");
+}
+
+function appendPage(seen: string[], rows: string[]): void {
+	let overlap = Math.min(seen.length, rows.length);
+	while (overlap > 0 && !rows.slice(0, overlap).every((row, index) => row === seen[seen.length - overlap + index])) {
+		overlap--;
+	}
+	seen.push(...rows.slice(overlap));
 }
 
 function fixture(columns: number, rows: number, title = TITLE) {
@@ -133,7 +145,7 @@ describe("selector detail viewport", () => {
 				h.selector.handleInput(PAGE_DOWN);
 			}
 			const read = seen.join("").replace(/\s+/g, "");
-			expect(read).toContain(`Command:awss3apiget-object--key${"x".repeat(2400)}${COMMAND_TAIL}`);
+			expect(read).toContain(`Command:awss3apiget-object--key${COMMAND_ARGUMENT}${COMMAND_TAIL}`);
 			expect(read).toContain("Profile:audit");
 			expect(read).toContain("Account:123456789012");
 			expect(read).toContain("Partition:aws-us-gov");
@@ -170,13 +182,151 @@ describe("selector detail viewport", () => {
 			h.selector.handleInput(DOWN);
 			expect(h.frame().join("\n")).toContain("Approve once");
 			h.selector.handleInput(DOWN);
-			expect(h.frame().join("\n")).toContain("Allow for");
-			h.selector.handleInput(PAGE_UP);
+			const seen: string[] = [];
+			for (let page = 0; page < 300; page++) {
+				const selected = h.frame();
+				expect(selected).toHaveLength(10);
+				expect(selected.slice(-5).map(row => row.trim())).toEqual([
+					"HOOK BELOW ONE",
+					"HOOK BELOW TWO",
+					"HOOK BELOW THREE",
+					"STATUS FOOTER",
+					"STATUS SECOND",
+				]);
+				for (const row of selected) expect(visibleWidth(row)).toBeLessThanOrEqual(24);
+				const body = selected.slice(1, 4).map(row =>
+					row
+						.slice(2, -2)
+						.replace(/[│█]\s*$/, "")
+						.trim(),
+				);
+				if (page === 0) expect(body.join("").replace(/\s+/g, "")).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
+				appendPage(seen, body);
+				h.selector.handleInput(PAGE_DOWN);
+			}
+			const read = seen.join("").replace(/\s+/g, "");
+			expect(read).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
+			expect(read).toContain(`Command:awss3apiget-object--key${COMMAND_ARGUMENT}${COMMAND_TAIL}`);
+			expect(read).toContain("Profile:audit");
+			expect(read).toContain("Account:123456789012");
+			expect(read).toContain("Partition:aws-us-gov");
+			expect(read).toContain(SAFETY_DETAILS.replace(/\s+/g, ""));
 			expect(h.picked).toEqual([]);
+			h.selector.handleInput("\x1b[A");
+			expect(h.frame().join("\n")).toContain("Approve once");
+			h.selector.handleInput(DOWN);
+			expect(
+				h
+					.frame()
+					.slice(1, 4)
+					.map(row => row.slice(2, -2).replace(/[│█]\s*$/, ""))
+					.join("")
+					.replace(/\s+/g, ""),
+			).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
 			h.selector.handleInput("\n");
 			expect(h.picked).toEqual([PERMISSIONS[2]!]);
 			h.selector.handleInput("\x1b");
 			expect(h.cancellations()).toBe(1);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	it("keeps empty search feedback readable and restores consent after clearing the query", () => {
+		const h = composedFixture(52, 18);
+		try {
+			h.frame();
+			h.lower.setText("HOOK BELOW ONE\nHOOK BELOW TWO\nHOOK BELOW THREE");
+			h.status.setHookStatus("second", "STATUS SECOND");
+			h.terminal.resize(24, 10);
+			h.frame();
+			h.selector.handleInput(DOWN);
+			h.selector.handleInput(DOWN);
+			h.frame();
+			const query = "unmatched";
+			h.selector.handleInput(query);
+			const filtered = h.frame();
+			expect(
+				filtered
+					.slice(1, 4)
+					.join("")
+					.replace(/[│█\s]/g, ""),
+			).toContain("Nomatchingoptions");
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual([]);
+			for (const _character of query) h.selector.handleInput("\x7f");
+			h.frame();
+			h.selector.handleInput(DOWN);
+			h.selector.handleInput(DOWN);
+			expect(
+				h
+					.frame()
+					.slice(1, 4)
+					.join("")
+					.replace(/[│█\s]/g, ""),
+			).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual([PERMISSIONS[2]!]);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	it("pages an oversized selected scope with its details and rejects consent when no body row fits", () => {
+		const h = composedFixture(52, 18);
+		try {
+			h.frame();
+			h.lower.setText("HOOK BELOW ONE\nHOOK BELOW TWO\nHOOK BELOW THREE");
+			h.status.setHookStatus("second", "STATUS SECOND");
+			h.terminal.resize(24, 9);
+			h.selector.handleInput(DOWN);
+			h.selector.handleInput(DOWN);
+			const seen: string[] = [];
+			for (let page = 0; page < 300; page++) {
+				const frame = h.frame();
+				expect(frame).toHaveLength(9);
+				expect(frame.slice(-5).map(row => row.trim())).toEqual([
+					"HOOK BELOW ONE",
+					"HOOK BELOW TWO",
+					"HOOK BELOW THREE",
+					"STATUS FOOTER",
+					"STATUS SECOND",
+				]);
+				for (const row of frame) expect(visibleWidth(row)).toBeLessThanOrEqual(24);
+				const body = frame.slice(1, 3).map(row =>
+					row
+						.slice(2, -2)
+						.replace(/[│█]\s*$/, "")
+						.trim(),
+				);
+				appendPage(seen, body);
+				h.selector.handleInput(PAGE_DOWN);
+			}
+			const read = seen.join("").replace(/\s+/g, "");
+			expect(read).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
+			expect(read).toContain(COMMAND_TAIL);
+			expect(read).toContain("Profile:audit");
+			expect(read).toContain("Account:123456789012");
+			expect(read).toContain("Partition:aws-us-gov");
+			expect(read).toContain(SAFETY_DETAILS.replace(/\s+/g, ""));
+			h.terminal.resize(24, 7);
+			expect(h.frame()).toHaveLength(7);
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual([]);
+			h.terminal.resize(52, 18);
+			expect(h.frame().join("\n")).toContain(PERMISSIONS[2]!);
+			h.selector.handleInput(PAGE_DOWN);
+			const roomy = h.frame();
+			expect(roomy.join("\n")).toContain(PERMISSIONS[2]!);
+			expect(roomy.slice(-5).map(row => row.trim())).toEqual([
+				"HOOK BELOW ONE",
+				"HOOK BELOW TWO",
+				"HOOK BELOW THREE",
+				"STATUS FOOTER",
+				"STATUS SECOND",
+			]);
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual([PERMISSIONS[2]!]);
 		} finally {
 			h.dispose();
 		}
