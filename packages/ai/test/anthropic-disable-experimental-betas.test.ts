@@ -224,6 +224,50 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 		});
 	});
 
+	it.each(["before", "during"] as const)(
+		"retains fresh beta headers when a fallback credit expires %s preparation",
+		async timing => {
+			await withEnv({ ...OFFICIAL_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: undefined }, async () => {
+				const model = anthropicModel();
+				const options: AnthropicOptions = {
+					effort: Effort.High,
+					taskBudget: { type: "tokens", total: 50_000 },
+				};
+				const baseline = await captureRequest(model, options);
+				let expiryReads = 0;
+				const request = await captureRequest(model, {
+					...options,
+					fallbackCreditRedemption: {
+						token: "fct_expired",
+						prefillClaim: false,
+						params: {
+							model: model.id,
+							messages: [{ role: "user", content: "saved" }],
+							max_tokens: 1024,
+							stream: true,
+						},
+						betas: ["fallback-credit-2026-06-01"],
+						betaHeader: "fallback-credit-2026-06-01",
+						get expiresAt() {
+							return timing === "during" && expiryReads++ === 0 ? Date.now() + 60_000 : Date.now() - 1;
+						},
+					},
+				});
+				expect(baseline.body.context_management).toBeDefined();
+				expect(baseline.body.output_config?.task_budget).toEqual(options.taskBudget);
+				expect(baseline.body.output_config?.effort).toBe("high");
+				expect(request.body.fallback_credit_token).toBeUndefined();
+				expect(request.body.messages).toEqual(baseline.body.messages);
+				expect(request.body.output_config).toEqual(baseline.body.output_config);
+				expect(request.body.context_management).toEqual(baseline.body.context_management);
+				expect(request.body.thinking).toEqual(baseline.body.thinking);
+				expect(new Set(request.beta.split(",").map(beta => beta.trim()))).toEqual(
+					new Set(baseline.beta.split(",").map(beta => beta.trim())),
+				);
+			});
+		},
+	);
+
 	it("withholds the switch's controls inside server-side fallback entries", async () => {
 		await withEnv({ ...OFFICIAL_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
 			const fallbacks: NonNullable<AnthropicOptions["fallbacks"]> = [

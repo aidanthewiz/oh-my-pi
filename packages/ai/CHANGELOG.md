@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Preserve fresh Anthropic beta headers when fallback credits expire before or during request preparation. Keep frozen headers only with frozen-body replay.
 - Allow explicitly selected Ultrafast for exact official Codex GPT-6.1 Sol when discovery omits it. Preserve advertised custom routes, accounting, defaults, and WebSocket chain boundaries without granting account access.
 - Preserve caller-owned Anthropic fallback controls during beta sanitization. Apply beta-header filtering to explicitly opted-in Copilot routes without admitting ordinary Copilot routes.
 - Retain known billed usage from decoded unusable judgment responses and positive-cost gateway responses with zero tokens.

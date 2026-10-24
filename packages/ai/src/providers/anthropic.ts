@@ -2379,6 +2379,7 @@ const streamAnthropicOnce = (
 					"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS was set after a refused turn that ran server tools; its fallback credit cannot be redeemed without the experimental fields the switch withholds.",
 				);
 			}
+			let frozenHeaderRedemption = forfeitFrozenForKillSwitch ? undefined : frozenRedemption;
 			// Collected at most once, on first params build; a frozen redemption
 			// body never builds params.
 			let controlRecords: AnthropicControlRecord[] | undefined;
@@ -2539,9 +2540,9 @@ const streamAnthropicOnce = (
 				if (officialCreditRoute && !extraBetas.includes(fallbackCreditBeta)) {
 					extraBetas.push(fallbackCreditBeta);
 				}
-				// A forfeited frozen body keeps the fresh request's betas.
-				if (fallbackCreditRedemption && !forfeitFrozenForKillSwitch) {
-					const frozenBetas = (fallbackCreditRedemption.betas ?? []).filter(
+				// Frozen betas apply only while replaying the frozen body.
+				if (frozenHeaderRedemption) {
+					const frozenBetas = (frozenHeaderRedemption.betas ?? []).filter(
 						b => !b.startsWith("server-side-fallback-"),
 					);
 					extraBetas.length = 0;
@@ -2607,6 +2608,10 @@ const streamAnthropicOnce = (
 			let { client, isOAuthToken } = resolveClient();
 			const preparedContext = await prepareAnthropicImageContext(context, model);
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
+				if (frozenHeaderRedemption) {
+					frozenHeaderRedemption = undefined;
+					({ client, isOAuthToken } = resolveClient());
+				}
 				const built = buildParams(model, preparedContext, isOAuthToken, options, {
 					compactionSupported,
 					disableStrictTools,
