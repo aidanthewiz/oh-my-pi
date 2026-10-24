@@ -77,6 +77,7 @@ function createContext(
 		flushToDisk: flush,
 	};
 	const sessionManager = {
+		getHeader: vi.fn(() => undefined),
 		getCwd: vi.fn(() => options.cwd ?? "/workspace/project"),
 		getSessionFile: vi.fn(() => sessionFile),
 		getSessionDir: () => options.sessionDir ?? tempDirectory,

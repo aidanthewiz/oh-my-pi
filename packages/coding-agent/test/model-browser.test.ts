@@ -1,7 +1,7 @@
 import { createModelBrowserSource } from "../src/modes/model-browser-source";
 import { createAgentsHubDeps } from "../src/modes/agents-hub-deps";
 import { cfgEnabledModels } from "../src/config/model-settings";
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -555,6 +555,36 @@ describe("ModelBrowser native model metadata", () => {
 		// A router priced per request is not free, so the `free` filter skips it.
 		browser.setQuery("free");
 		expect(browser.visibleCount).toBe(0);
+	});
+
+	test("shows a held model's effective price at the dated boundary without rewriting its original card", () => {
+		const switchAt = Date.parse("2026-12-01T08:00:00Z");
+		const clock = spyOn(Date, "now").mockReturnValue(switchAt - 1);
+		try {
+			const repriced = makeModel("google", "dated-list-price", {
+				cost: {
+					input: 2,
+					output: 10,
+					cacheRead: 0.1,
+					cacheWrite: 0,
+					timeBased: {
+						offPeakMultiplier: 1,
+						peakWindows: [],
+						effectiveRates: [
+							{ effectiveFrom: -8_640_000_000_000_000, input: 2, output: 10, cacheRead: 0.1, cacheWrite: 0 },
+							{ effectiveFrom: switchAt, input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 },
+						],
+					},
+				},
+			});
+			expect(renderDetail(repriced)).toContain("$2/10 per M");
+			clock.mockReturnValue(switchAt);
+			expect(renderDetail(repriced)).toContain("$4/20 per M");
+			expect(repriced.cost.input).toBe(2);
+			expect(repriced.cost.output).toBe(10);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("price rows preserve free labels and identify invalid rates", () => {

@@ -11,6 +11,7 @@ import {
 	requireSupportedEffort,
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Api, Model, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
+import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { buildGeneratedModel } from "../scripts/generate-models";
 
 function createModel<TApi extends Api>(overrides: {
@@ -40,6 +41,39 @@ function createModel<TApi extends Api>(overrides: {
 }
 
 describe("model thinking derivation", () => {
+	it("offers unknown Meta models an opt-in ladder without exporting a capability to another host", () => {
+		const model = createModel({
+			id: "unclassified-preview",
+			api: "openai-responses",
+			provider: "meta",
+			baseUrl: "https://api.meta.ai/v1",
+			reasoning: false,
+		});
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+			unverified: true,
+		});
+		const rerouted = buildModel({
+			...toModelSpec(model),
+			provider: "private-gateway",
+			baseUrl: "https://private.example/v1",
+		});
+		expect(rerouted.reasoning).toBe(false);
+		expect(rerouted.thinking).toBeUndefined();
+	});
+
+	it("does not infer an unverified ladder for a known neutral model or an unadmitted host", () => {
+		for (const [provider, id] of [
+			["meta", "gpt-4o"],
+			["private-gateway", "unclassified-preview"],
+		]) {
+			const model = createModel({ id, provider, api: "openai-responses", reasoning: false });
+			expect(model.reasoning).toBe(false);
+			expect(model.thinking).toBeUndefined();
+		}
+	});
+
 	it("stores supported efforts for Codex mini in model metadata", () => {
 		const model = createModel({
 			id: "gpt-5.1-codex-mini",

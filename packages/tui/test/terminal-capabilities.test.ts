@@ -1,6 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	detectStyledUnderlineSupport,
@@ -20,6 +18,8 @@ import {
 	isInsideTerminalMultiplexer,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
+import { tmuxClientRendersSixel } from "@oh-my-pi/pi-tui/tmux";
+import { withFakeTmux } from "./helpers/fake-tmux";
 
 describe("hasTerminalMultiplexerSession", () => {
 	it("recognizes Herdr session identity while ignoring client-only settings", () => {
@@ -162,17 +162,9 @@ describe("detectTerminalId", () => {
 
 describe("tmux client terminal resolution", () => {
 	it.skipIf(process.platform === "win32")("uses the attached client's terminal profile", async () => {
-		const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-tmux-client-"));
-		try {
+		const replies = { "display-message -p #{client_termtype}": "WezTerm 20260905-175422-0f4b5596" };
+		const stdout = await withFakeTmux(replies, async binDir => {
 			const tmux = path.join(binDir, "tmux");
-			await Bun.write(
-				tmux,
-				`#!/bin/sh
-[ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = '#{client_termtype}' ] || exit 64
-printf "%s\\n" "WezTerm 20260905-175422-0f4b5596"
-`,
-			);
-			await fs.chmod(tmux, 0o755);
 			const env = subprocessEnv({
 				PI_TEST_RUNTIME: undefined,
 				BUN_ENV: undefined,
@@ -211,11 +203,47 @@ console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyPro
 			]);
 
 			expect(exitCode, stderr).toBe(0);
-			expect(JSON.parse(stdout)).toEqual({ id: "wezterm", notifyProtocol: NotifyProtocol.Osc9 });
-		} finally {
-			await fs.rm(binDir, { force: true, recursive: true });
-		}
+			return stdout;
+		});
+
+		expect(JSON.parse(stdout)).toEqual({ id: "wezterm", notifyProtocol: NotifyProtocol.Osc9 });
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"queries Sxl without leaking credentials or losing tmux identity",
+		async () => {
+			await withFakeTmux({}, async binDir => {
+				await Bun.write(
+					path.join(binDir, "tmux"),
+					`#!/bin/sh
+[ -z "$OPENAI_API_KEY$AWS_ACCESS_KEY_ID$AWS_SESSION_TOKEN$OMP_OPERATIONAL_AWS_PROFILE$BORROWED_VALUE" ] || exit 70
+[ "$TMUX" = "$TMUX_EXPECTED" ] && [ "$TMUX_PANE" = "%19" ] || exit 71
+case "$*" in
+'display-message -p #{client_name}') printf '%s\\n' '/dev/pts/19' ;;
+'show-messages -T -t /dev/pts/19') printf '%s\\n' ' 216: Sxl: (flag) true' ;;
+*) exit 64 ;;
+esac
+`,
+				);
+				const tmux = `/tmp/coreforge-sxl-${crypto.randomUUID()},4244,0`;
+				const secret = `synthetic-secret-${crypto.randomUUID()}`;
+				expect(
+					tmuxClientRendersSixel({
+						...subprocessEnv({}),
+						PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
+						TMUX: tmux,
+						TMUX_EXPECTED: tmux,
+						TMUX_PANE: "%19",
+						OPENAI_API_KEY: secret,
+						BORROWED_VALUE: secret,
+						AWS_ACCESS_KEY_ID: "synthetic-access-key",
+						AWS_SESSION_TOKEN: "synthetic-session-token",
+						OMP_OPERATIONAL_AWS_PROFILE: "synthetic-operational",
+					}),
+				).toBe(true);
+			});
+		},
+	);
 });
 
 describe("synchronizedOutputUserOverride", () => {

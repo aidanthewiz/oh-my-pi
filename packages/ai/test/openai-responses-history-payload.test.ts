@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import { type OpenAIResponsesOptions, streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import {
+	type OpenAIResponsesOptions,
+	openAIResponsesReplaysNativeHistory,
+	streamOpenAIResponses,
+} from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessage, Context, Model, ModelSpec, ProviderSessionState, Tool } from "@oh-my-pi/pi-ai/types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -11,6 +16,52 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import * as piUtils from "@oh-my-pi/pi-utils";
+
+describe("unverified Responses thinking", () => {
+	it("requires opt-in for unverified effort and preserves explicit force-off", async () => {
+		const model = buildModel({
+			id: "unclassified-preview",
+			name: "Unclassified preview",
+			api: "openai-responses",
+			provider: "meta",
+			baseUrl: "https://api.meta.ai/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		});
+		for (const [options, expectedEffort] of [
+			[{}, undefined],
+			[{ reasoning: Effort.High }, "high"],
+			[{ reasoning: Effort.High, disableReasoning: true }, undefined],
+			[{ reasoning: Effort.High, forceReasoningOff: true }, "none"],
+		] as const) {
+			const controller = new AbortController();
+			let body: { reasoning?: { effort?: string } } | undefined;
+			await streamSimple(
+				model,
+				{ messages: [{ role: "user", content: "Test", timestamp: 1 }] },
+				{
+					...options,
+					apiKey: "test-key",
+					signal: controller.signal,
+					onPayload: payload => {
+						body = payload as typeof body;
+						controller.abort();
+					},
+					fetch: async () => {
+						throw new Error("Unexpected fetch after payload abort");
+					},
+				},
+			).result();
+			expect(body).toBeDefined();
+			if (expectedEffort === undefined) expect(body?.reasoning).toBeUndefined();
+			else expect(body?.reasoning?.effort).toBe(expectedEffort);
+		}
+		expect(model.thinking?.unverified).toBe(true);
+	});
+});
 
 const TEST_INSTALLATION_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -759,6 +810,41 @@ describe("OpenAI responses history payload", () => {
 		expect(containsEncryptedReasoning(warm.input)).toBe(true);
 		expect(containsEncryptedReasoning(closed.input)).toBe(false);
 		expect(containsAssistantOutputText(closed.input, "generic assistant that should be rebuilt")).toBe(true);
+	});
+
+	it("reports the replay decision each request makes through openAIResponsesReplaysNativeHistory", async () => {
+		const observed: Array<{ step: string; reported: boolean; replayed: boolean }> = [];
+		for (const model of [
+			getOpenAIReasoningModel("github-copilot", "gpt-5.4"),
+			getOpenAIReasoningModel("xai-oauth", "grok-4.7"),
+		]) {
+			const context = resumedEncryptedReasoningContext(model);
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const observe = async (step: string, state: Map<string, ProviderSessionState> | undefined) => {
+				const reported = openAIResponsesReplaysNativeHistory(model, state);
+				const payload = (await captureResponsesPayload(model, context, state)) as { input?: unknown[] };
+				observed.push({
+					step: `${model.provider} ${step}`,
+					reported,
+					replayed: containsEncryptedReasoning(payload.input),
+				});
+			};
+			await observe("without session state", undefined);
+			await observe("first request", providerSessionState);
+			markResponsesProviderSessionStateWarmed(providerSessionState);
+			await observe("warmed", providerSessionState);
+			for (const state of providerSessionState.values()) state.close();
+			await observe("closed", providerSessionState);
+		}
+
+		for (const { step, reported, replayed } of observed)
+			expect({ step, reported }).toEqual({ step, reported: replayed });
+		// Only the connection-bound host starts cold; every host is cold after a close.
+		expect(observed.filter(o => !o.replayed).map(o => o.step)).toEqual([
+			"github-copilot first request",
+			"github-copilot closed",
+			"xai-oauth closed",
+		]);
 	});
 
 	it("keeps a closed provider session state cold when a request started before the close succeeds", async () => {

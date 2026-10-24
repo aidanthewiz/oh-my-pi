@@ -493,6 +493,49 @@ The same enterability policy applies to picker selections. A missing direct path
 fails with `Session "<path>" not found.`; an existing empty file or malformed
 non-empty headers fail closed without modifying the file.
 
+## CLI `--restore`
+
+`--restore [value]` selects and opens its session exactly as `--resume [value]`
+does, then, once the interactive TUI is up, goes on with what the session's last
+process left unfinished when it died (`task/restore.ts`, `restoreSession`). Tern's
+session daemon relaunches omp panes with it after a crash: omp reports
+`omp_restore=1` (OSC 1337 user variable) beside its session file to say it
+understands the flag.
+
+1. **Subagents first.** Every persisted subagent transcript under the session
+   (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
+   mid-turn, that was not killed (no tombstone) and that a cold revive can rebuild
+   (a `session_init` contract, not isolated) runs one more monitored turn as a
+   background job of its parent, under the subagent's id. The lifecycle reviver
+   rebuilds it from its transcript, the turn goes on as below, and the parent
+   receives the result as the job's ordinary `async-result`, so a parent waiting on
+   that job finds it again.
+2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A turn
+   cut off without a `session_exit` record (a crash, SIGKILL or power loss records
+   none) is first closed the way exit recovery closes one whose exit was recorded:
+   unfinished tool calls get "outcome unknown" results and an interrupted-turn
+   abort ends it. That turn is then retried as `/retry` does: a batch whose every
+   call was cut off runs again; otherwise the model answers from where the
+   transcript stops.
+
+Repeated or concurrent restoration in one live session does not start another copy
+of the same interrupted turn or child job. Existing running, completed, and failed
+jobs retain their identities and outcomes. Rejected job admission remains retryable
+when capacity becomes available.
+
+A changed or disposed root or branch stops pending discovery from restoring old
+work. `/new` also cancels registered child jobs before they can dispatch pending
+tools or model requests after cold revival.
+
+Restoration cannot determine whether an unrecorded tool effect occurred before
+the crash. Review uncertain effects before replaying interrupted work.
+
+Nothing is continued when the last turn finished, failed, or the user interrupted
+it, or when a normal exit was recorded after it (the user quit with it
+interrupted). `--restore` is interactive only, takes no prompt, and cannot be
+combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
+`/restart` drops it like the other one-shot selectors.
+
 ## CLI `--continue`
 
 `SessionManager.continueRecent(cwd, sessionDir)`:
