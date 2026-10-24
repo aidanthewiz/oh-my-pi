@@ -183,7 +183,7 @@ function normalizeDecision(value: unknown): Omit<ResolvedApproval, "policy"> & {
 	return { tier: "exec", override: false };
 }
 
-function getToolDecision(
+export function resolveToolDecision(
 	tool: ApprovalSubject,
 	args: unknown,
 ): Omit<ResolvedApproval, "policy"> & { policy?: ApprovalPolicy } {
@@ -200,7 +200,7 @@ function getToolDecision(
  * argument-dependent tier instead of falling back to `exec`.
  */
 export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
-	return getToolDecision(tool, args).tier;
+	return resolveToolDecision(tool, args).tier;
 }
 
 function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
@@ -229,7 +229,7 @@ export function resolveApproval(
 	mode: ApprovalMode,
 	userConfig: Record<string, unknown> = {},
 ): ResolvedApproval {
-	const decision = getToolDecision(tool, args);
+	const decision = resolveToolDecision(tool, args);
 	const policyKey = decision.policyKey ?? tool.name;
 	const userPolicy = Object.hasOwn(userConfig, policyKey) ? normalizePolicy(userConfig[policyKey]) : undefined;
 	const fallbackPolicy =

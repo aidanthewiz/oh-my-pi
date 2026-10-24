@@ -989,7 +989,7 @@ export async function recoverTrustedAwsAuthentication(
 					let approved: boolean;
 					if (existingTool) {
 						const choice = await ui.select(
-							message,
+							`AWS sign-in approval\nReason: ${request.reason}\n${message}`,
 							capability ? ["Deny", "Approve once", capability.label] : ["Deny", "Approve once"],
 							{ signal, timeout: 120_000, tuiStyle: request.tuiStyle },
 						);

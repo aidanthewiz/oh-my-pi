@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep long selector details scrollable while permission choices remain reachable on narrow terminals and after resizing.
+
 ## [18.6.1] - 2026-10-04
 
 ### Fixed

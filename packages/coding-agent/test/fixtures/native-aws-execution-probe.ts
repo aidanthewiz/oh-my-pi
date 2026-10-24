@@ -13,6 +13,7 @@ import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import {
 	getOperationalAwsLaunchMetadata,
 	isCoreforgeManagedLaunch,
+	isRecord,
 	reserveManagedAwsProfile,
 } from "@oh-my-pi/pi-utils";
 import { ensureCoreforgeAwsSso } from "../../src/identity/aws-sso";
@@ -20,6 +21,11 @@ import { restoreCoreforgeOperationalAwsEnvironment } from "../../src/identity/ru
 import { resolveAwsCredentials } from "@oh-my-pi/pi-ai/providers/aws-credentials";
 import { ExtensionToolWrapper } from "../../src/extensibility/extensions/wrapper";
 import type { ExtensionRunner } from "../../src/extensibility/extensions";
+import { disposeVmContextsByOwner } from "../../src/eval/js/context-manager";
+import { executeJs } from "../../src/eval/js/executor";
+import { callSessionTool } from "../../src/eval/js/tool-bridge";
+import { SessionTools, type SessionToolsHost } from "../../src/session/session-tools";
+import type { ToolSession } from "../../src/tools";
 
 const root = process.env.HOME!;
 const repository = path.join(root, "repository");
@@ -78,7 +84,7 @@ const references: Record<string, unknown> = {
 			Python: {
 				Boto3: {
 					...Object.fromEntries(
-						["s3", "ce", "logs", "ec2", "rds", "sqs", "sagemaker", "bedrock", "signin"].map(service => [
+						["s3", "ecr", "ce", "logs", "ec2", "rds", "sqs", "sagemaker", "bedrock", "signin"].map(service => [
 							service,
 							{ service },
 						]),
@@ -96,6 +102,11 @@ const references: Record<string, unknown> = {
 			operation("ListBuckets", "s3", "list_buckets", ["s3", "ListAllMyBuckets"]),
 			operation("DeleteBucket", "s3", "delete_bucket", ["s3", "DeleteBucket"]),
 		],
+	},
+	"ecr/ecr.json": {
+		Name: "ecr",
+		Actions: [action("DescribeRepositories")],
+		Operations: [operation("DescribeRepositories", "ecr", "describe_repositories", ["ecr", "DescribeRepositories"])],
 	},
 	"sqs/sqs.json": {
 		Name: "sqs",
@@ -1055,25 +1066,111 @@ const sessionContext = {
 	sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId, getSessionName: () => undefined },
 } as AgentToolContext;
 const selections: string[][] = [];
+const selectionTitles: string[] = [];
 let choice: string | undefined = sessionLabel;
+let selectionFailure: Error | undefined;
+let selectionAbort: AbortController | undefined;
 const sessionRunner = {
 	hasHandlers: () => false,
 	hasUI: () => true,
 	consumeToolCallEmitted: () => false,
 	runScoped: <T>(fn: () => T): T => fn(),
 	getUIContext: () => ({
-		select: async (_title: string, options: string[]) => {
+		select: async (title: string, options: string[]) => {
+			selectionTitles.push(title);
 			selections.push(options);
+			if (selectionFailure) throw selectionFailure;
+			selectionAbort?.abort(new Error("fixture approval cancelled"));
 			return choice;
 		},
 	}),
 } as unknown as ExtensionRunner;
 const sessionWrapper = new ExtensionToolWrapper(sessionTool as unknown as AgentTool, sessionRunner);
 const ordinaryMutation = { ...read, service: "rds", operation: "modify-db-cluster" };
-assert.notEqual(
-	(await sessionWrapper.execute("session-grant", ordinaryMutation, undefined, undefined, sessionContext)).isError,
-	true,
+const batchRegistry = new Map<string, AgentTool>([["aws", sessionWrapper]]);
+const batchXdev: XdevState = {
+	tools: batchRegistry,
+	mountedNames: new Set(["aws"]),
+	builtInNames: new Set(["aws", "write"]),
+	isActive: () => false,
+};
+let batchContext = sessionContext;
+const batchSession: ToolSession = {
+	...approvalSession,
+	xdev: batchXdev,
+	getToolContext: () => batchContext,
+	getToolForEvalBridge: name => batchTools.getToolForEvalBridge(name),
+	getEvalBridgeToolNames: () => batchTools.getEvalBridgeToolNames(),
+};
+const batchWrite = new ExtensionToolWrapper(new WriteTool(batchSession) as unknown as AgentTool, sessionRunner);
+batchRegistry.set("write", batchWrite);
+const batchTools = new SessionTools(
+	{
+		agent: { state: { tools: [...batchRegistry.values()] } },
+		settings: sessionSettings,
+		clientBridge: () => undefined,
+		model: () => undefined,
+		evalPreludes: () => [],
+		sessionAgents: () => [],
+	} as unknown as SessionToolsHost,
+	{ toolRegistry: batchRegistry, xdev: batchXdev, baseSystemPrompt: [] },
 );
+const batchBefore = (await calls()).filter(call => call.argv.includes("ecr")).length;
+const batchOwner = "native-aws-batch";
+async function runBatch(start: number): Promise<void> {
+	const result = await executeJs(
+		`
+		let completed = 0;
+		for (let index = ${start}; index < ${start + 120}; index++) {
+			const params = {
+				profile: (index >> 1) % 2 ? "government" : "commercial",
+				service: "ecr",
+				operation: index % 2 ? "describe-repositories" : "batch-get-image",
+				parameters: index % 2
+					? { RepositoryNames: ["fixture-" + index] }
+					: { RepositoryName: "fixture-" + index, ImageIds: Array.from({ length: 60 }, (_, tag) => ({ imageTag: "fixture-image-" + tag })) },
+			};
+			const value = (index >> 2) % 2
+				? await tool.write({ path: "xd://aws", content: JSON.stringify(params) })
+				: await tool.aws(params);
+			if (typeof value === "object" && value?.hasError) throw new Error(JSON.stringify(value));
+			completed++;
+		}
+		return String(completed);
+		`,
+		{ sessionId: batchOwner, kernelOwnerId: batchOwner, session: batchSession, cwd, timeoutMs: 90_000 },
+	);
+	assert.equal(result.exitCode, 0, result.output);
+	assert.equal(result.output.trim(), "120");
+}
+try {
+	await runBatch(0);
+	assert.equal(selections.length, 1);
+	choice = "Deny";
+	const replacement = new AwsTool({ ...approvalSession });
+	batchRegistry.set("aws", new ExtensionToolWrapper(replacement as unknown as AgentTool, sessionRunner));
+	await runBatch(120);
+} finally {
+	await disposeVmContextsByOwner(batchOwner);
+}
+assert.equal((await calls()).filter(call => call.argv.includes("ecr")).length, batchBefore + 240);
+const batchPrompt = selectionTitles[0];
+const [batchHeading, ...batchDetailLines] = batchPrompt.split("\n");
+const batchDetails = batchDetailLines.join("\n");
+assert.ok(!batchHeading.includes("--image-ids"));
+assert.ok(batchDetails.includes("fixture-image-59"), "approval omitted the final image in the exact command");
+const firstBatchArgv: string[] = (await calls()).find(call => call.argv.includes("ecr")).argv;
+const shownCommand = batchDetailLines.find(line => line.startsWith("AWS command: "))?.slice("AWS command: ".length);
+assert.equal(
+	shownCommand,
+	[getOperationalAwsLaunchMetadata()!.executable!, ...firstBatchArgv]
+		.map(value => `'${value.replace(/'/gu, "'\\''")}'`)
+		.join(" "),
+);
+assert.match(batchDetails, /Account: 123456789012/);
+assert.match(batchDetails, /ARN: arn:aws:iam::123456789012:user\/fixture/);
+assert.match(batchDetails, /Region: us-east-1/);
+assert.match(batchDetails, /Partition: aws/);
 assert.equal(selections.length, 1);
 choice = "Deny";
 const reconstructed = new AwsTool({ ...approvalSession });
@@ -1207,7 +1304,12 @@ const automaticSessionContext = {
 	settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 	ui: {
 		...sessionContext.ui,
-		select: async (_title: string, options: string[]) => {
+		select: async (title: string, options: string[]) => {
+			const [heading, ...details] = title.split("\n");
+			assert.ok(!heading.includes("expired-session-first"));
+			assert.ok(details.join("\n").includes("'sso' 'login'"));
+			assert.ok(details.join("\n").includes("expired-session-first"));
+			assert.ok(details.join("\n").includes("Source:"));
 			automaticSelections++;
 			return options.includes(sessionLabel) ? sessionLabel : "Deny";
 		},
@@ -1255,6 +1357,123 @@ await assert.rejects(
 );
 assert.equal(selections.length, beforeManagedGrant + 1);
 assert.ok(!selections.at(-1)!.includes(sessionLabel));
+
+const nestedOrdinary = { path: "xd://aws", content: JSON.stringify(ordinaryMutation) };
+for (const deniedTool of ["write", "aws"]) {
+	batchContext = {
+		...sessionContext,
+		settings: Settings.isolated({ "tools.approval": { [deniedTool]: "deny" } }),
+	};
+	const before = (await calls()).length;
+	await assert.rejects(
+		() => callSessionTool("write", nestedOrdinary, { session: batchSession }),
+		/blocked by user policy/,
+		`native session grant must not bypass explicit ${deniedTool} deny through xd://aws`,
+	);
+	assert.equal((await calls()).length, before);
+}
+batchContext = sessionContext;
+const unrelatedPath = path.join(cwd, "unrelated-write.txt");
+const beforeUnrelated = selections.length;
+await assert.rejects(
+	() =>
+		callSessionTool("write", { path: unrelatedPath, content: "must remain unapproved" }, { session: batchSession }),
+	/denied by user/,
+	"native AWS session grant must not approve an unrelated filesystem write",
+);
+assert.equal(await Bun.file(unrelatedPath).exists(), false);
+assert.equal(selections.length, beforeUnrelated + 1);
+assert.ok(!selections.at(-1)!.includes(sessionLabel));
+const beforeNestedGuard = (await calls()).filter(call => call.argv.includes("terminate-instances")).length;
+choice = sessionLabel;
+function assertNestedFailure(value: unknown, reason: RegExp, contract: string): void {
+	assert.ok(isRecord(value), contract);
+	assert.equal(value.hasError, true, contract);
+	assert.equal(typeof value.text, "string", contract);
+	assert.match(String(value.text), reason, contract);
+}
+assertNestedFailure(
+	await callSessionTool("write", { path: "xd://aws", content: JSON.stringify(mutation) }, { session: batchSession }),
+	/denied by user/,
+	"mandatory DCG ask must reject an ineligible session-grant selection through xd://aws",
+);
+assert.ok(!selections.at(-1)!.includes(sessionLabel));
+assert.ok(selectionTitles.at(-1)!.includes("fixture guard policy"));
+choice = "Approve once";
+await callSessionTool("write", { path: "xd://aws", content: JSON.stringify(mutation) }, { session: batchSession });
+choice = "Deny";
+assertNestedFailure(
+	await callSessionTool("write", { path: "xd://aws", content: JSON.stringify(mutation) }, { session: batchSession }),
+	/denied by user/,
+	"mandatory DCG ask must prompt again after one-call approval through xd://aws",
+);
+assert.equal((await calls()).filter(call => call.argv.includes("terminate-instances")).length, beforeNestedGuard + 1);
+assertNestedFailure(
+	await callSessionTool(
+		"write",
+		{ path: "xd://aws", content: JSON.stringify({ ...read, operation: "delete-bucket" }) },
+		{ session: batchSession },
+	),
+	/fixture\.aws/,
+	"mandatory DCG deny must surface an error through xd://aws despite the native session grant",
+);
+const safetyMessage = "fixture provider safety ".repeat(40) + "final safety condition";
+batchContext = {
+	...sessionContext,
+	toolCall: {
+		batchId: "fixture-provider-safety",
+		total: 1,
+		index: 0,
+		toolCalls: [],
+		providerMetadata: {
+			type: "computer",
+			providerItemId: "fixture-computer-call",
+			actions: [],
+			pendingSafetyChecks: [{ id: "fixture-provider-check", message: safetyMessage }],
+		},
+	},
+} as AgentToolContext;
+const beforeSafety = (await calls()).filter(call => call.argv.includes("modify-db-cluster")).length;
+await assert.rejects(
+	() => callSessionTool("aws", ordinaryMutation, { session: batchSession }),
+	/denied by user/,
+	"native session grant must not bypass provider safety approval",
+);
+assert.ok(!selections.at(-1)!.includes(sessionLabel));
+assert.ok(selectionTitles.at(-1)!.includes(safetyMessage));
+assert.equal((await calls()).filter(call => call.argv.includes("modify-db-cluster")).length, beforeSafety);
+batchContext = sessionContext;
+for (const outcome of ["once", "deny", "failed", "cancelled"] as const) {
+	sessionId = `ungranted-${outcome}`;
+	const beforePrompts: number = selections.length;
+	const before = (await calls()).filter(call => call.argv.includes("modify-db-cluster")).length;
+	choice = outcome === "once" ? "Approve once" : outcome === "deny" ? undefined : sessionLabel;
+	selectionFailure = outcome === "failed" ? new Error("fixture selection failed") : undefined;
+	selectionAbort = outcome === "cancelled" ? new AbortController() : undefined;
+	if (outcome === "once") {
+		await callSessionTool("aws", ordinaryMutation, { session: batchSession });
+	} else {
+		await assert.rejects(
+			() => callSessionTool("aws", ordinaryMutation, { session: batchSession, signal: selectionAbort?.signal }),
+			outcome === "failed" ? /fixture selection failed/ : outcome === "cancelled" ? /cancelled/ : /denied by user/,
+			`${outcome} ordinary AWS selection must reject without executing`,
+		);
+	}
+	selectionFailure = undefined;
+	selectionAbort = undefined;
+	choice = "Deny";
+	await assert.rejects(
+		() => callSessionTool("aws", ordinaryMutation, { session: batchSession }),
+		/denied by user/,
+		`${outcome} ordinary AWS selection must not grant later session access`,
+	);
+	assert.equal(selections.length, beforePrompts + 2);
+	assert.equal(
+		(await calls()).filter(call => call.argv.includes("modify-db-cluster")).length,
+		before + (outcome === "once" ? 1 : 0),
+	);
+}
+sessionId = "native-approval-owner";
 
 const beforeReservation = (await listTrustedAwsProfiles()).map(profile => profile.name);
 assert.ok(beforeReservation.includes("adopted-model") && beforeReservation.includes("adopted-alias"));

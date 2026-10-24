@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Show full AWS approval commands and identity details in a wrapped, scrollable body below a short heading.
+- Avoid repeat AWS permission prompts in eval and nested device batches after granting session access.
 - Preserve pending AWS SSO approvals when unrelated native or managed requests report authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 - Keep successful ECS Exec and SSM output successful when it contains text resembling helper diagnostics ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 - Preserve newer AWS SSO sign-ins when older operations report delayed authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).

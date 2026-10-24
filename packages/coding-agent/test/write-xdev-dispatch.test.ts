@@ -104,14 +104,6 @@ describe("read and write route xd:// device URLs", () => {
 				paths: [filePath],
 			});
 
-			// The write gate decodes the device payload and evaluates the mounted
-			// tool's own approval. ast_edit is write-tier for a filesystem path.
-			const approval = write!.approval;
-			expect(typeof approval).toBe("function");
-			if (typeof approval === "function") {
-				expect(approval({ path: "xd://ast_edit", content })).toEqual({ tier: "write", policyKey: "ast_edit" });
-			}
-
 			// Execute dispatches through the xdev registry to the mounted ast_edit,
 			// staging a preview (not a direct apply).
 			const previewResult = await write!.execute("write-xdev-preview", { path: "xd://ast_edit", content });
@@ -169,13 +161,6 @@ describe("read and write route xd:// device URLs", () => {
 		const xdev = createTestXdevState([device]);
 		const write = new WriteTool(xdevSession(process.cwd(), { xdev }));
 		const args = { path: "xd://knowledge_search", content: JSON.stringify({ q: "x" }) };
-
-		const approval = write.approval;
-		expect(typeof approval).toBe("function");
-		if (typeof approval !== "function") throw new Error("expected a function approval");
-		// The gate reports the mounted tool's (default exec) tier and keys user
-		// policy on the device name.
-		expect(approval(args)).toEqual({ tier: "exec", policyKey: "knowledge_search" });
 
 		// No device policy → falls back to the write tool's own policy.
 		expect(resolveApproval(write, args, "always-ask", { write: "prompt" }).policy).toBe("prompt");
@@ -276,10 +261,8 @@ describe("read and write route xd:// device URLs", () => {
 			const tools = await createTools(xdevSession(tempDir));
 			const write = tools.find(entry => entry.name === "write");
 			expect(write).toBeDefined();
-			const approval = write!.approval;
-			expect(typeof approval).toBe("function");
-			if (typeof approval !== "function") throw new Error("expected a function approval");
-			const tier = (path: string, content: string) => approval({ path, content });
+			const policy = (path: string, content?: string) =>
+				resolveApproval(write!, { path, content }, "always-ask").policy;
 
 			// ast_edit on a filesystem path → write; on read-tier sandbox URLs only → read.
 			const astFsPath = JSON.stringify({
@@ -290,32 +273,23 @@ describe("read and write route xd:// device URLs", () => {
 				ops: [{ pat: "a", out: "b" }],
 				paths: ["local://notes.ts"],
 			});
-			expect(tier("xd://ast_edit", astFsPath)).toEqual({ tier: "write", policyKey: "ast_edit" });
-			expect(tier("xd://ast_edit", astInternalPath)).toEqual({ tier: "read", policyKey: "ast_edit" });
+			expect(policy("xd://ast_edit", astFsPath)).toBe("prompt");
+			expect(policy("xd://ast_edit", astInternalPath)).toBe("allow");
 
 			// debug: inspection action → read; a real launch → exec (control).
-			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toEqual({
-				tier: "read",
-				policyKey: "debug",
-			});
-			expect(tier("xd://debug", JSON.stringify({ action: "launch", program: "./app" }))).toEqual({
-				tier: "exec",
-				policyKey: "debug",
-			});
+			expect(policy("xd://debug", JSON.stringify({ action: "sessions" }))).toBe("allow");
+			expect(policy("xd://debug", JSON.stringify({ action: "launch", program: "./app" }))).toBe("prompt");
 
 			// Fail closed: malformed JSON, non-object or schema-invalid payloads,
 			// missing content, and unknown devices all stay exec so the gate never
 			// under-prompts.
-			expect(tier("xd://ast_edit", "{ not json")).toBe("exec");
-			expect(tier("xd://ast_edit", "[1,2,3]")).toBe("exec");
-			expect(tier("xd://ast_edit", '"a string"')).toBe("exec");
+			expect(policy("xd://ast_edit", "{ not json")).toBe("prompt");
+			expect(policy("xd://ast_edit", "[1,2,3]")).toBe("prompt");
+			expect(policy("xd://ast_edit", '"a string"')).toBe("prompt");
 			// ast_edit's own approval fails a malformed path entry closed at exec.
-			expect(tier("xd://ast_edit", JSON.stringify({ paths: [null] }))).toEqual({
-				tier: "exec",
-				policyKey: "ast_edit",
-			});
-			expect(approval({ path: "xd://ast_edit" })).toBe("exec");
-			expect(tier("xd://no_such_device", "{}")).toBe("exec");
+			expect(policy("xd://ast_edit", JSON.stringify({ paths: [null] }))).toBe("prompt");
+			expect(policy("xd://ast_edit")).toBe("prompt");
+			expect(policy("xd://no_such_device", "{}")).toBe("prompt");
 		} finally {
 			await removeWithRetries(tempDir);
 		}

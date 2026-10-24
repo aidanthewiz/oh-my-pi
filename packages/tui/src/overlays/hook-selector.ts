@@ -33,11 +33,12 @@ import { OverlayPanel } from "../chrome/overlay-box";
 import { renderSegmentTrack } from "../chrome/segment-track";
 import { Input } from "../components/input";
 import { MenuSelection, getMenuWindow } from "../components/menu-selection";
+import { ScrollView } from "../components/scroll-view";
 import type { KeyName } from "../key-hint-format";
 import { node, span } from "../native/describe";
-import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
+import type { DescribeContext, NativeChild, NativeNode, NativeScroll, NativeUiEvent } from "../native/node";
 import { actionHint, hintsRow, overlayCard } from "../native/overlay";
-import { plainText } from "../native/spans";
+import { plainText, rowsText } from "../native/spans";
 import { CLOSE_ACTION, dockedPicker, PICKER_KEY, pickerAction, pickerEvent, pickerQuery } from "../native/picker";
 import type { TspPickerItem } from "@oh-my-pi/pi-wire";
 
@@ -201,6 +202,12 @@ interface HookSelectorNativeMemo {
 	query: string;
 	slider: number;
 	countdown: NativeNode | undefined;
+	detailHeight: number;
+	menuRows: number;
+	detailScroll: NativeScroll | undefined;
+	detailOffset: number;
+	width: number;
+	nativeScroll: boolean;
 	node: NativeNode;
 }
 
@@ -214,6 +221,21 @@ export class HookSelectorComponent extends OverlayPanel {
 	#checkedIndices: Set<number>;
 	#markableCount: number;
 	#maxVisible: number;
+	readonly #configuredMaxVisible: number;
+	readonly #tui: TUI | undefined;
+	readonly #detailContent = new Container();
+	readonly #detailView = new ScrollView(this.#detailContent, {
+		height: 0,
+		ellipsis: Ellipsis.Omit,
+		theme: { track: text => theme.fg("dim", text), thumb: text => theme.fg("accent", text) },
+	});
+	#detailHeight = 0;
+	#detailScroll: NativeScroll | undefined;
+	#listView: ScrollView | undefined;
+	#listSelectionRow = 0;
+	readonly #layoutSpacers: Spacer[] = [];
+	readonly #hint = new Text("", 0, 0);
+	readonly #controlsHint: string;
 	#listContainer: Container | undefined;
 	#outlinedList: OutlinedList | undefined;
 	#onSelectCallback: (option: string) => void;
@@ -282,10 +304,12 @@ export class HookSelectorComponent extends OverlayPanel {
 		);
 		this.#markableCount = Math.max(0, Math.min(opts?.markableCount ?? this.#options.length, this.#options.length));
 		this.#maxVisible = Math.max(3, opts?.maxVisible ?? 12);
+		this.#configuredMaxVisible = this.#maxVisible;
+		this.#tui = opts?.tui;
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#baseTitle = this.title;
-		this.#detailLines = title.split(/\r?\n/).slice(1);
+		this.#detailLines = titleLines.slice(1).map(line => replaceTabs(line));
 		this.#helpText = opts?.helpText;
 		this.#onLeftCallback = opts?.onLeft;
 		this.#onRightCallback = opts?.onRight;
@@ -298,19 +322,20 @@ export class HookSelectorComponent extends OverlayPanel {
 
 		for (const line of titleLines.slice(1)) {
 			if (line.length === 0) {
-				this.addChild(new Spacer(1));
+				this.#detailContent.addChild(new Spacer(1));
 			} else {
-				this.addChild(
+				this.#detailContent.addChild(
 					new Text(destructiveTitle ? renderDestructiveTitleLine(line) : theme.fg("accent", line), 0, 0),
 				);
 			}
 		}
-		this.addChild(new Spacer(1));
+		if (this.#detailLines.length > 0) this.addChild(this.#detailView);
+		this.#addLayoutSpacer();
 
 		if (this.#slider) {
 			this.#sliderComponent = new Text(this.#renderSliderLine(), 0, 0);
 			this.addChild(this.#sliderComponent);
-			this.addChild(new Spacer(1));
+			this.#addLayoutSpacer();
 		}
 
 		if (opts?.timeout && opts.timeout > 0 && opts.tui) {
@@ -334,19 +359,74 @@ export class HookSelectorComponent extends OverlayPanel {
 
 		if (opts?.outline) {
 			this.#outlinedList = new OutlinedList();
-			this.addChild(this.#outlinedList);
+			if (this.#detailLines.length === 0) this.addChild(this.#outlinedList);
 		} else {
 			this.#listContainer = new Container();
-			this.addChild(this.#listContainer);
+			if (this.#detailLines.length === 0) this.addChild(this.#listContainer);
 		}
-		this.addChild(new Spacer(1));
-		const controlsHint =
+		const list = this.#outlinedList ?? this.#listContainer!;
+		if (this.#detailLines.length > 0) {
+			this.#listView = new ScrollView(list, { height: this.#maxVisible, scrollbar: "never" });
+			this.addChild(this.#listView);
+		}
+		this.#addLayoutSpacer();
+		this.#controlsHint =
 			opts?.helpText ??
 			`${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${editorKey("tui.select.cancel")} cancel`;
-		this.addChild(new Text(theme.fg("dim", controlsHint), 0, 0));
-		this.addChild(new Spacer(1));
+		this.#hint.setText(theme.fg("dim", this.#controlsHint));
+		this.addChild(this.#hint);
+		this.#addLayoutSpacer();
 
 		this.#updateList();
+	}
+
+	#addLayoutSpacer(): void {
+		const spacer = new Spacer(1);
+		this.#layoutSpacers.push(spacer);
+		this.addChild(spacer);
+	}
+
+	#layout(renderWidth: number): void {
+		if (this.#lastRenderWidth !== renderWidth) {
+			this.#lastRenderWidth = renderWidth;
+			this.#updateList(renderWidth);
+		}
+		if (this.#detailLines.length === 0) return;
+
+		const terminalRows = Math.max(4, this.#tui?.terminal.rows ?? process.stdout.rows ?? 24);
+		const list = this.#outlinedList ?? this.#listContainer!;
+		for (const spacer of this.#layoutSpacers) spacer.setLines(1);
+		this.#hint.setText(theme.fg("dim", `${this.#controlsHint}  PgUp/PgDn details`));
+		const fixedRows = () => {
+			let rows = 2;
+			for (const child of this.children) {
+				if (child !== this.#detailView && child !== this.#listView) rows += child.render(renderWidth).length;
+			}
+			return rows;
+		};
+		let fixed = fixedRows();
+		if (fixed + list.render(renderWidth).length + 1 > terminalRows) {
+			for (const spacer of this.#layoutSpacers) spacer.setLines(0);
+			this.#hint.setText(theme.fg("dim", truncateToWidth(`PgUp/PgDn details  ${this.#controlsHint}`, renderWidth)));
+			if (terminalRows <= 4) this.#hint.setText("");
+			fixed = fixedRows();
+		}
+		const menuBudget = Math.max(1, terminalRows - fixed - 1);
+		const maxVisible = Math.min(
+			this.#configuredMaxVisible,
+			Math.max(1, menuBudget - (this.#outlinedList ? 2 : 0) - 1),
+		);
+		if (maxVisible !== this.#maxVisible) {
+			this.#maxVisible = maxVisible;
+			this.#updateList(renderWidth);
+		}
+		const menuHeight = Math.min(menuBudget, list.render(renderWidth).length);
+		this.#listView?.setHeight(menuHeight);
+		this.#listView?.setActiveRow(this.#listSelectionRow, "start");
+		const detailRows = this.#detailContent.render(renderWidth).length;
+		this.#detailHeight = Math.max(1, Math.min(detailRows, terminalRows - fixed - menuHeight));
+		this.#detailView.setHeight(this.#detailHeight);
+		this.#detailView.render(renderWidth);
 	}
 
 	#isDisabled(index: number): boolean {
@@ -530,6 +610,11 @@ export class HookSelectorComponent extends OverlayPanel {
 			// under the label alone. Disabled rows never claim focus even if the
 			// index momentarily lands on one during initial coercion.
 			const highlight = isSelected && !isDisabled;
+			if (isSelected) {
+				this.#listSelectionRow =
+					(this.#outlinedList ? 1 : 0) +
+					rows.reduce((count, row) => count + this.#renderedLineRowCount(row.text, renderWidth ?? 80), 0);
+			}
 			for (const text of this.#renderOptionLines(
 				filtered.option,
 				isSelected,
@@ -664,6 +749,13 @@ export class HookSelectorComponent extends OverlayPanel {
 			this.#onCancelCallback();
 			return;
 		}
+		if (this.#detailLines.length > 0 && (matchesKey(keyData, "pageUp") || matchesKey(keyData, "pageDown"))) {
+			this.#layout(this.#lastRenderWidth ?? Math.max(1, (this.#tui?.terminal.columns ?? 80) - 4));
+			const down = matchesKey(keyData, "pageDown");
+			this.#detailView.page(down ? 1 : -1);
+			this.#detailScroll = { by: down ? "page-down" : "page-up", n: (this.#detailScroll?.n ?? 0) + 1 };
+			return;
+		}
 
 		if (this.#handleQuickSelect(keyData)) {
 			return;
@@ -696,16 +788,18 @@ export class HookSelectorComponent extends OverlayPanel {
 	}
 
 	override render(width: number): readonly string[] {
-		const renderWidth = Math.max(1, width - 4);
-		if (this.#lastRenderWidth !== renderWidth) {
-			this.#lastRenderWidth = renderWidth;
-			this.#updateList(renderWidth);
-		}
+		this.#layout(Math.max(1, width - 4));
 		return super.render(width);
+	}
+
+	override renderContent(width: number): string[] {
+		this.#layout(Math.max(1, width));
+		return super.renderContent(width);
 	}
 
 	override dispose(): void {
 		this.#countdown?.dispose();
+		super.dispose();
 	}
 
 	/** The options as a `picker md` sheet: every option by original index, filtering sends only `order`. */
@@ -735,7 +829,6 @@ export class HookSelectorComponent extends OverlayPanel {
 		const checkbox = this.#selectionMarker === "checkbox";
 		const result = dockedPicker({
 			title: fixed.title,
-			...(this.#detailLines.length > 0 ? { subtitle: plainText(this.#detailLines.join("\n")) } : {}),
 			noun: "options",
 			size: "md",
 			layout: "rows",
@@ -760,7 +853,15 @@ export class HookSelectorComponent extends OverlayPanel {
 	 * option index, the search query while typing, and the key hints.
 	 */
 	override describe(cx: DescribeContext): NativeNode {
-		if (cx.supports("picker") && !this.#destructiveTitle && !this.#slider && !this.#countdown)
+		this.#layout(Math.max(1, cx.cols - 4));
+		const nativeScroll = cx.feature("scroll");
+		if (
+			cx.supports("picker") &&
+			this.#detailLines.length === 0 &&
+			!this.#destructiveTitle &&
+			!this.#slider &&
+			!this.#countdown
+		)
 			return this.#describePicker();
 		const items = this.#menu.visibleItems;
 		const selected = this.#menu.selectedKey;
@@ -773,7 +874,13 @@ export class HookSelectorComponent extends OverlayPanel {
 			memo.selected === selected &&
 			memo.query === query &&
 			memo.slider === this.#sliderIndex &&
-			memo.countdown === countdown
+			memo.countdown === countdown &&
+			memo.detailHeight === this.#detailHeight &&
+			memo.menuRows === this.#maxVisible &&
+			memo.detailScroll === this.#detailScroll &&
+			memo.detailOffset === this.#detailView.getScrollOffset() &&
+			memo.width === cx.cols &&
+			memo.nativeScroll === nativeScroll
 		) {
 			return memo.node;
 		}
@@ -786,7 +893,19 @@ export class HookSelectorComponent extends OverlayPanel {
 				node("row", { gap: "sm", align: "baseline" }, [node("text", { text: fixed.title }), countdown], "head"),
 			);
 		}
-		if (fixed.detail) children.push(fixed.detail);
+		if (fixed.detail) {
+			const detail = nativeScroll
+				? { ...fixed.detail, scroll: this.#detailScroll }
+				: rowsText(this.#detailView.render(Math.max(1, cx.cols - 4)));
+			children.push(
+				node(
+					"col",
+					{ max: { h: `${this.#detailHeight}lines` }, min: { w: 0, h: "1lines" }, shrink: 1 },
+					[detail],
+					"details",
+				),
+			);
+		}
 		if (this.#slider) children.push(...this.#describeSlider(this.#slider));
 
 		const selectedItem = this.#menu.selectedItem;
@@ -802,6 +921,7 @@ export class HookSelectorComponent extends OverlayPanel {
 					filter: query.trim() || undefined,
 					empty: "No matching options",
 					max: { lines: this.#maxVisible },
+					shrink: 0,
 				},
 				rows,
 				"list",
@@ -812,10 +932,27 @@ export class HookSelectorComponent extends OverlayPanel {
 				node("text", { spans: [span("Search: ", "dim"), span(query)], wrap: "none" }, undefined, "search"),
 			);
 		}
-		children.push(fixed.hints);
+		children.push(
+			this.#detailLines.length > 0
+				? node("col", { shrink: 0 }, [rowsText(this.#hint.render(Math.max(1, cx.cols - 4)))], "hints")
+				: fixed.hints,
+		);
 
 		const root = overlayCard(this.nativeRole, countdown ? undefined : fixed.title, children);
-		this.#nativeMemo = { items, selected, query, slider: this.#sliderIndex, countdown, node: root };
+		this.#nativeMemo = {
+			items,
+			selected,
+			query,
+			slider: this.#sliderIndex,
+			countdown,
+			detailHeight: this.#detailHeight,
+			menuRows: this.#maxVisible,
+			detailScroll: this.#detailScroll,
+			detailOffset: this.#detailView.getScrollOffset(),
+			width: cx.cols,
+			nativeScroll,
+			node: root,
+		};
 		return root;
 	}
 
@@ -878,7 +1015,7 @@ export class HookSelectorComponent extends OverlayPanel {
 								...(index > 0 ? [span("\n")] : []),
 								span(plainText(line), this.#destructiveTitle ? "warning strong" : "accent"),
 							]),
-							wrap: "word",
+							wrap: "char",
 						},
 						undefined,
 						"detail",

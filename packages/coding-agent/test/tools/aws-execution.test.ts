@@ -126,7 +126,7 @@ test("native AWS enforces process, account approval, authentication, and output 
 				],
 				{
 					cwd: root,
-					signal: AbortSignal.timeout(60_000),
+					signal: AbortSignal.timeout(150_000),
 					env:
 						scenario === "missing-cli"
 							? { ...env, OMP_OPERATIONAL_AWS_EXECUTABLE: undefined, NATIVE_AWS_EXPECT_NO_CLI: "1" }
@@ -151,4 +151,4 @@ test("native AWS enforces process, account approval, authentication, and output 
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 90_000);
+}, 180_000);

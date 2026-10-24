@@ -20,7 +20,6 @@ import {
 	type RuntimeApprovalCapableTool,
 	resolveApproval,
 	resolveApprovalFromContext,
-	truncateForPrompt,
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
@@ -177,8 +176,7 @@ function approvalData(value: string): string {
 	const sanitized = sanitizeText(value)
 		.replace(/[\r\n\t]+/g, " ")
 		.trim();
-	const truncated = truncateForPrompt(sanitized, 500);
-	return truncated.replace(/([\\`*_{}[\]()<>#+\-.!|])/g, "\\$1");
+	return sanitized.replace(/([\\`*_{}[\]()<>#+\-.!|])/g, "\\$1");
 }
 
 function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
@@ -458,7 +456,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 								: "";
 						const choice = await uiContext.select(
-							`${runtimeApproval.prompt}${safetySuffix}`,
+							`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
 							sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
 							{ tuiStyle: runtimeApproval.tuiStyle },
 						);
