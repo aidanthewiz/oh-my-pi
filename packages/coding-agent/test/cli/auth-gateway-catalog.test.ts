@@ -1,12 +1,15 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
+	createStrictCompletionProbe,
 	createSerializedRebuilder,
 	gatewayRoutableModels,
+	gatewayRoutableProviders,
 	indexModelsByRequestId,
+	resolveGatewayModel,
 } from "../../src/cli/auth-gateway-cli";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -135,6 +138,21 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 		expect(index.get(blocked.id)).toBeUndefined();
 	});
 
+	test("drops providers disabled in settings from the served catalog", async () => {
+		const storage = await createAuthStorage();
+		await storage.credentials.set("anthropic", { type: "api_key", key: "sk-test-anthropic" });
+		await storage.credentials.set("openrouter", { type: "api_key", key: "sk-test-openrouter" });
+		const settings = Settings.isolated({ disabledProviders: ["openrouter"] });
+		const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
+
+		const routable = gatewayRoutableProviders(storage, settings);
+		const index = indexModelsByRequestId(gatewayRoutableModels(registry), routable);
+
+		expect([...routable].sort()).toEqual(["anthropic"]);
+		expect([...index.values()].some(model => model.provider === "openrouter")).toBe(false);
+		expect([...index.values()].some(model => model.provider === "anthropic")).toBe(true);
+	});
+
 	test("serves judge-kind models alongside chat and keeps unrouted kinds out", async () => {
 		using tempDir = TempDir.createSync("@omp-auth-gateway-catalog-");
 		const registry = new ModelRegistry(await createAuthStorage(), tempDir.join("models.yml"));
@@ -150,6 +168,118 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 		// Tiny on-device models have no gateway route and are not advertised.
 		expect([...index.values()].some(model => modelKind(model) === "tiny")).toBe(false);
 	});
+});
+
+describe("auth-gateway strict account routing", () => {
+	test("probes Snowflake with its stored OAuth account instead of PAT account routing", async () => {
+		const accessToken = "stored-account-token";
+		const requests: Array<{ url: string; authorization: string | null }> = [];
+		const fetchMock = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+					requests.push({
+						url: typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+						authorization: new Headers(init?.headers).get("authorization"),
+					});
+					return Response.json({ error: { message: "Invalid token" } }, { status: 401 });
+				},
+				{ preconnect: fetch.preconnect },
+			),
+		);
+		try {
+			const probe = createStrictCompletionProbe(Settings.isolated({ enabledModels: ["snowflake/openai-gpt-5.1"] }));
+			const result = await probe({
+				provider: "snowflake",
+				credentialId: 1,
+				credential: {
+					type: "oauth",
+					accessToken,
+					enterpriseUrl: "https://stored-account.snowflakecomputing.com",
+				},
+				signal: new AbortController().signal,
+			});
+
+			expect(result.ok).toBe(false);
+			expect(requests).toEqual([
+				{
+					url: "https://stored-account.snowflakecomputing.com/api/v2/cortex/v1/chat/completions",
+					authorization: `Bearer ${accessToken}`,
+				},
+			]);
+		} finally {
+			fetchMock.mockRestore();
+		}
+	});
+
+	test("refuses Snowflake OAuth without a bound account before any credential leaves the gateway", async () => {
+		const fetchMock = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => Response.json({ error: { message: "Unexpected request" } }, { status: 401 }), {
+				preconnect: fetch.preconnect,
+			}),
+		);
+		try {
+			const probe = createStrictCompletionProbe(Settings.isolated({ enabledModels: ["snowflake/openai-gpt-5.1"] }));
+			await expect(
+				probe({
+					provider: "snowflake",
+					credentialId: 1,
+					credential: { type: "oauth", accessToken: "unbound-token" },
+					signal: new AbortController().signal,
+				}),
+			).rejects.toThrow("Invalid Snowflake credential");
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			fetchMock.mockRestore();
+		}
+	});
+});
+
+describe("resolveGatewayModel", () => {
+	test("routes an OpenRouter variant selector the catalog does not list to its base model", async () => {
+		const storage = await createAuthStorage();
+		await storage.credentials.set("openrouter", { type: "api_key", key: "sk-test-openrouter" });
+		await storage.credentials.set("anthropic", { type: "api_key", key: "sk-test-anthropic" });
+		const settings = Settings.isolated({});
+		const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
+		const providers = gatewayRoutableProviders(storage, settings);
+		const routable = gatewayRoutableModels(registry).filter(model => providers.has(model.provider));
+		const index = indexModelsByRequestId(routable, providers);
+		const base = routable.find(model => model.provider === "openrouter" && !model.id.includes(":"));
+		const anthropic = routable.find(model => model.provider === "anthropic");
+		if (!base || !anthropic) throw new Error("expected bundled openrouter and anthropic models");
+
+		const floor = resolveGatewayModel(`openrouter/${base.id}:floor`, index, routable, settings);
+		expect(floor?.provider).toBe("openrouter");
+		expect(floor?.id).toBe(`${base.id}:floor`);
+		expect(floor?.api).toBe(base.api);
+		// Route suffixes are an OpenRouter concept; other providers stay exact-match.
+		expect(resolveGatewayModel(`anthropic/${anthropic.id}:floor`, index, routable, settings)).toBeUndefined();
+		expect(
+			resolveGatewayModel("openrouter/no-such-vendor/no-such-model:floor", index, routable, settings),
+		).toBeUndefined();
+	});
+
+	test.each(["glob", "exact"] as const)(
+		"rejects a synthesized variant excluded by a %s deny selector",
+		async selector => {
+			const storage = await createAuthStorage();
+			await storage.credentials.set("openrouter", { type: "api_key", key: "synthetic-openrouter-key" });
+			const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true });
+			const routable = gatewayRoutableModels(registry).filter(model => model.provider === "openrouter");
+			const base = routable.find(model => !model.id.includes(":"));
+			if (!base) throw new Error("expected a bundled OpenRouter base model");
+			const settings = Settings.isolated({
+				enabledModels: [`openrouter/${base.id}`],
+				disabledModels: [selector === "glob" ? "openrouter/**/*:nitro" : `openrouter/${base.id}:nitro`],
+			});
+			const index = indexModelsByRequestId(routable, new Set(["openrouter"]), settings);
+			expect(index.get(`openrouter/${base.id}`)).toBe(base);
+			expect(resolveGatewayModel(`openrouter/${base.id}:nitro`, index, routable, settings)).toBeUndefined();
+			expect(resolveGatewayModel(`openrouter/${base.id}:floor`, index, routable, settings)?.id).toBe(
+				`${base.id}:floor`,
+			);
+		},
+	);
 });
 
 describe("createSerializedRebuilder", () => {

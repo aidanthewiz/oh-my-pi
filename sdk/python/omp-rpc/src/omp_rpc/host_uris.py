@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Generic, Literal, TypeAlias, TypeVar, TypedDict
+from typing import Generic, Literal, TypeAlias, TypedDict, TypeVar
 
 from ._wire_runtime import JsonObject
 
 TPayload = TypeVar("TPayload")
 
 
-HostUriContentType: TypeAlias = Literal[
-    "text/markdown", "application/json", "text/plain"
-]
+HostUriContentType: TypeAlias = Literal["text/markdown", "application/json", "text/plain"]
 
 
 class HostUriReadResult(TypedDict, total=False):
@@ -101,9 +100,7 @@ def normalize_read_result(value: HostUriReadValue) -> JsonObject:
     if isinstance(value, str):
         return {"content": value}
     if not isinstance(value, dict):
-        raise TypeError(
-            "Host URI read handlers must return a string or a HostUriReadResult mapping"
-        )
+        raise TypeError("Host URI read handlers must return a string or a HostUriReadResult mapping")
 
     payload: JsonObject = {}
     if "content" not in value:

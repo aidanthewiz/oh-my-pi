@@ -6,7 +6,10 @@
  * //:natives-* targets. Host target only — no cross-compilation.
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
- * incremental, unstripped). Image builds set `ci` for a stripped addon.
+ * incremental, unstripped). The `ci` profile strips only on non-Darwin hosts.
+ *
+ * `OMP_NATIVE_FEATURES` passes extra cargo features to `napi build --features`
+ * (e.g. `wayland-pipewire`). Cargo path only; Bazel builds ignore it.
  */
 
 import * as fsSync from "node:fs";
@@ -213,8 +216,12 @@ if (!napiBinEntry) {
 const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
-// speed, `ci` strips and drops incremental state.
+// speed, `ci` drops incremental state and strips on non-Darwin hosts.
 const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
+if (process.platform === "darwin") {
+	// rust-objcopy stripping corrupts Mach-O dylibs built with Xcode 27.
+	Bun.env[`CARGO_PROFILE_${cargoProfile.toUpperCase().replaceAll("-", "_")}_STRIP`] = "false";
+}
 
 const napiArgs = [
 	"build",
@@ -228,11 +235,18 @@ const napiArgs = [
 	"index.d.ts",
 	"-o",
 	buildOutputDir,
-	"--profile",
-	cargoProfile,
 ];
+// napi-rs treats profile names as directory names; Cargo writes `dev` to `debug`.
+if (cargoProfile !== "dev") napiArgs.push("--profile", cargoProfile);
 if (process.platform === "win32" && hostArch === "arm64") {
 	napiArgs.push("--target", "aarch64-pc-windows-msvc");
+}
+
+// Local-only opt-in: pass extra cargo features through to napi build, e.g.
+// OMP_NATIVE_FEATURES=wayland-pipewire bun --cwd=packages/natives run build
+const extraFeatures = Bun.env.OMP_NATIVE_FEATURES?.trim();
+if (extraFeatures) {
+	napiArgs.push("--features", extraFeatures);
 }
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`

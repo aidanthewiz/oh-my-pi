@@ -18,8 +18,9 @@
  *   siblings are endpoint-scoped and stay: `strictToolsDisabled`
  *   (grammar-too-large 400 for the model's tool schema),
  *   `replayUnsignedThinkingDisabled` / `thinkingReplayDisabled` (the endpoint
- *   is a signing proxy), `prefixDroppedThinkingBlocks` (blocks the API itself
- *   dropped).
+ *   is a signing proxy), `prefixDroppedThinkingBlocks` (blocks a prefix-binding
+ *   400 made the client strip), `reportedPrefixDroppedThinking` (server drops
+ *   already warned about, keyed by replay identity).
  * - **OpenAI Responses** — the `previous_response_id` chain baselines are
  *   account-scoped: a stored response belongs to the account that created it.
  *   Strict-tools / reasoning-effort fallbacks, replay warmup and the chaining

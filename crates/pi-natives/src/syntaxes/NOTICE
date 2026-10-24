@@ -1,0 +1,152 @@
+Vendored highlight grammars
+===========================
+
+The source headers identify these pinned origins and licenses. The notices and
+full license terms below apply to the corresponding compiled syntax data as
+well as the source files. INI.sublime-syntax is Stencil's own grammar and remains
+covered by the workspace LICENSE.
+
+MIT-licensed grammars
+--------------------
+
+CMake.sublime-syntax and CMakeCommands.sublime-syntax
+Source: https://github.com/zyxar/Sublime-CMakeLists at 2560a080
+Copyright (c) 2012-2020 The Sublime CMake authors
+CMake.sublime-syntax adapts the regexp context reference for syntect.
+
+Dockerfile.sublime-syntax
+Source: https://github.com/asbjornenge/Docker.tmbundle at 0f6b7bc8, Syntaxes/
+Copyright 2014 Asbjorn Enge
+
+Elixir.sublime-syntax and Regular Expressions (Elixir).sublime-syntax
+Source: https://github.com/princemaple/elixir-sublime-syntax at 4fb01891
+Copyright (c) 2017 Po Chen
+
+PowerShell.sublime-syntax
+Source: https://github.com/sharkdp/bat at 4987f767, assets/syntaxes/02_Extra
+Original project: https://github.com/PowerShell/EditorSyntax
+Copyright (c) Microsoft Corporation
+
+Protobuf.sublime-syntax and ProtobufText.sublime-syntax
+Source: https://github.com/VcamX/protobuf-syntax-highlighting at 13653315
+Copyright (c) 2013-2014 Yuxi Evan You
+
+SCSS.sublime-syntax and Sass.sublime-syntax
+Source: https://github.com/braver/SublimeSass at d3d94046, Syntaxes/
+Copyright (c) 2018 Koen Lageveen
+
+Swift.sublime-syntax
+Source: https://github.com/sharkdp/bat at 4987f767, assets/syntaxes/02_Extra
+Original project: https://github.com/quiqueg/Swift-Sublime-Package
+Copyright (c) 2014 Matthew Alexander
+
+TOML.sublime-syntax
+Source: https://github.com/jasonwilliams/sublime_toml_highlighting at f5a57e8b
+Copyright (c) 2021 Jason Williams
+
+Terraform.sublime-syntax
+Source: https://github.com/alexlouden/Terraform.tmLanguage at 54d8350c
+Copyright (c) 2016 Alex Louden
+
+VimL.sublime-syntax
+Source: https://github.com/SalGnt/Sublime-VimL at fe5bf5ea
+Copyright (c) 2014 Salvatore Gentile
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+GraphQL.sublime-syntax
+---------------------
+
+Source: https://github.com/dncrews/GraphQL-SublimeText3 at 9b6f6d0a
+License: WTFPL. The following copyright identifies the license document's
+original author, not the grammar's author.
+
+DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+Version 2, December 2004
+
+Copyright (C) 2004 Sam Hocevar <sam@hocevar.net>
+
+Everyone is permitted to copy and distribute verbatim or modified copies of
+this license document, and changing it is allowed as long as the name is changed.
+
+DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+
+  0. You just DO WHAT THE FUCK YOU WANT TO.
+
+Kotlin.sublime-syntax
+--------------------
+
+Source: https://github.com/guille/sublime-kotlin at c3536941
+License: Unlicense (public domain).
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+
+Git Ignore.sublime-syntax
+-------------------------
+
+Source: https://github.com/sublimehq/Packages at 759d6eed,
+Git Formats/Git Ignore.sublime-syntax and Git Common.sublime-syntax.
+The required Git Common contexts are inlined for syntect.
+
+The source-supplied Sublime Text Packages permission notice is retained here:
+
+Permission to copy, use, modify, sell and distribute is
+granted provided this notice appears in all copies; provided "as is"
+without express or implied warranty.
+
+Markdown.sublime-syntax
+-----------------------
+
+Source: https://github.com/sublimehq/Packages at
+fa6b8629c95041bf262d4c1dab95c456a0530122,
+Markdown/Markdown.sublime-syntax, as pinned by syntect 5.3.0.
+Original source SHA-256:
+fe045101a3be4d2ce2773095a323da4296950826e6fa4129ca34f4c7e5c58967.
+The local grammar contains modified escape and repetition expressions.
+
+Permission to copy, use, modify, sell and distribute this
+software is granted. This software is provided "as is" without
+express or implied warranty, and with no claim as to its
+suitability for any purpose.

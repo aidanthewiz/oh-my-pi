@@ -6,6 +6,7 @@ import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-
 import type {
 	CompactOptions,
 	ExtensionActions,
+	ExtensionApprovalPrompt,
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResult,
 	ExtensionAskDialogResultItem,
@@ -24,6 +25,7 @@ import type {
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { ApprovalDialogComponent } from "@oh-my-pi/pi-tui/overlays/approval-dialog";
 import {
 	type AskDialogPrompt,
 	type AskDialogPromptValue,
@@ -41,8 +43,12 @@ import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../sessi
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
+import { launchTerminal } from "../../subprocess/terminal-launch";
 
 const MAX_WIDGET_LINES = 10;
+/** Approval answers, as a collab guest's select shows them. */
+const APPROVE_OPTION = "Approve";
+const DENY_OPTION = "Deny";
 
 /**
  * Footer hint for a guest-rendered ask selector. The guest's selector handles
@@ -55,6 +61,26 @@ function guestAskHelpText(enterAction: string, extra = ""): string {
 const ASK_OTHER_OPTION = "Other (type your own)";
 const ASK_CHAT_OPTION = "Chat about this";
 const ASK_NEXT_OPTION = "Next →";
+
+function withTerminalLauncher(uiContext: ExtensionUIContext, hasUI: boolean): ExtensionUIContext {
+	if (!hasUI || uiContext.openTerminal) return uiContext;
+	const delegatedMethods = new Map<PropertyKey, unknown>();
+	return new Proxy(uiContext, {
+		get(target, property) {
+			if (property === "openTerminal") return launchTerminal;
+			const cached = delegatedMethods.get(property);
+			if (cached) return cached;
+			const value: unknown = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			const delegated: unknown = value.bind(target);
+			delegatedMethods.set(property, delegated);
+			return delegated;
+		},
+		has(target, property) {
+			return property === "openTerminal" || Reflect.has(target, property);
+		},
+	});
+}
 
 async function editDialogExternally(text: string): Promise<string | null> {
 	const command = getEditorCommand();
@@ -88,7 +114,7 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 }
 
 export class ExtensionUiController {
-	#extensionTerminalInputUnsubscribers = new Set<() => void>();
+	#extensionTerminalInputUnsubscribers = new Map<() => void, string>();
 	#composerShapeDisposers: Array<() => void> = [];
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
@@ -125,10 +151,12 @@ export class ExtensionUiController {
 		// Create and set hook & tool UI context
 		const uiContext: ExtensionUIContext = {
 			timeoutStartsOnPresentation: true,
+			supportsEditor: true,
 			select: (title, options, dialogOptions) => this.showCollabAwareSelector(title, options, dialogOptions),
 			confirm: (title, message, dialogOptions) => this.showHookConfirm(title, message, dialogOptions),
 			input: (title, placeholder, dialogOptions) => this.showHookInput(title, placeholder, dialogOptions),
 			askDialog: (questions, dialogOptions) => this.showAskDialog(questions, dialogOptions),
+			approve: (prompt, dialogOptions) => this.showCollabAwareApproval(prompt, dialogOptions),
 			notify: (message, type) => this.showHookNotify(message, type),
 			onTerminalInput: handler => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setHookStatus(key, text),
@@ -166,8 +194,9 @@ export class ExtensionUiController {
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
 		};
-		this.ctx.setToolUIContext(uiContext, true);
-		this.#toolUIContext = uiContext;
+		const enrichedUiContext = withTerminalLauncher(uiContext, true);
+		this.ctx.setToolUIContext(enrichedUiContext, true);
+		this.#toolUIContext = enrichedUiContext;
 		this.ctx.session.setUsageFallbackConfirmer?.((confirmation, signal) => {
 			const reserve =
 				confirmation.remainingPercent === undefined
@@ -199,7 +228,10 @@ export class ExtensionUiController {
 			getAllTools: () => this.ctx.session.getAllToolInfos(),
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
-				const key = await this.ctx.session.modelRegistry.getApiKey(model);
+				const key = await this.ctx.session.modelRegistry.getApiKeyForProvider(model.provider, undefined, {
+					baseUrl: model.baseUrl,
+					modelId: model.id,
+				});
 				if (!key) return false;
 				await this.ctx.session.setModel(model);
 				return true;
@@ -219,6 +251,13 @@ export class ExtensionUiController {
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			shutdown: () => this.ctx.requestShutdown(),
+			resolvePlanReview: (reviewId, choice, input) =>
+				!this.#rejectGuestExtensionTurn() && this.ctx.resolvePlanReview(reviewId, choice, input),
+			getPendingPlanReview: () => (this.ctx.collabGuest ? undefined : this.ctx.getPendingPlanReview()),
+			openPlanReview: async () => {
+				if (this.#rejectGuestExtensionTurn()) return false;
+				return this.ctx.openPlanReview({ fromExtension: true });
+			},
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
@@ -304,18 +343,24 @@ export class ExtensionUiController {
 			switchSession: async sessionPath => {
 				await this.ctx.prepareSessionSwitch();
 				this.clearHookWidgets();
-				const result = await this.ctx.session.switchSession(sessionPath);
+				let modelFallbackWarning: string | undefined;
+				const result = await this.ctx.session.switchSession(sessionPath, {
+					onModelFallback: warning => {
+						modelFallbackWarning = warning;
+					},
+				});
 				if (!result) {
 					return { cancelled: true };
 				}
 				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 				await this.ctx.reloadTodos();
+				if (modelFallbackWarning) this.ctx.showWarning(modelFallbackWarning);
 				return { cancelled: false };
 			},
 		};
 
-		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		extensionRunner.initialize(actions, contextActions, commandActions, enrichedUiContext, "tui");
 
 		// Subscribe to extension errors
 		extensionRunner.onError((error: ExtensionError) => {
@@ -425,7 +470,10 @@ export class ExtensionUiController {
 			getAllTools: () => this.ctx.session.getAllToolInfos(),
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
-				const key = await this.ctx.session.modelRegistry.getApiKey(model);
+				const key = await this.ctx.session.modelRegistry.getApiKeyForProvider(model.provider, undefined, {
+					baseUrl: model.baseUrl,
+					modelId: model.id,
+				});
 				if (!key) return false;
 				await this.ctx.session.setModel(model);
 				return true;
@@ -445,6 +493,13 @@ export class ExtensionUiController {
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			shutdown: () => this.ctx.requestShutdown(),
+			resolvePlanReview: (reviewId, choice, input) =>
+				!this.#rejectGuestExtensionTurn() && this.ctx.resolvePlanReview(reviewId, choice, input),
+			getPendingPlanReview: () => (this.ctx.collabGuest ? undefined : this.ctx.getPendingPlanReview()),
+			openPlanReview: async () => {
+				if (this.#rejectGuestExtensionTurn()) return false;
+				return this.ctx.openPlanReview({ fromExtension: true });
+			},
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
@@ -527,17 +582,24 @@ export class ExtensionUiController {
 			switchSession: async sessionPath => {
 				await this.ctx.prepareSessionSwitch();
 				this.clearHookWidgets();
-				const result = await this.ctx.session.switchSession(sessionPath);
+				let modelFallbackWarning: string | undefined;
+				const result = await this.ctx.session.switchSession(sessionPath, {
+					onModelFallback: warning => {
+						modelFallbackWarning = warning;
+					},
+				});
 				if (!result) {
 					return { cancelled: true };
 				}
 				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 				await this.ctx.reloadTodos();
+				if (modelFallbackWarning) this.ctx.showWarning(modelFallbackWarning);
 				return { cancelled: false };
 			},
 		};
 
-		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		const runnerUiContext = withTerminalLauncher(uiContext, _hasUI);
+		extensionRunner.initialize(actions, contextActions, commandActions, runnerUiContext, "tui");
 		this.#syncExtensionComposerShapes();
 	}
 
@@ -618,6 +680,51 @@ export class ExtensionUiController {
 		return this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
 			this.showHookEditor(title, prefill, { ...dialogOptions, signal }, editorOptions),
 		);
+	}
+
+	/**
+	 * The tool-approval prompt in the composer's place; a collab guest answers it as an Approve/Deny
+	 * select over the full prompt. Locally the compact prompt stands in for multi-line details only
+	 * while tool activity shows the call in the transcript; hidden, the dialog wraps the full one.
+	 */
+	async showCollabAwareApproval(
+		prompt: ExtensionApprovalPrompt,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<boolean> {
+		const request: CollabUiRequestDraft = {
+			kind: "select",
+			title: prompt.full,
+			options: [APPROVE_OPTION, DENY_OPTION],
+		};
+		const choice = await this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
+			this.#presentDialog(signal, settle => {
+				const callHidden = this.ctx.hideToolActivity;
+				const dialog = new ApprovalDialogComponent(
+					callHidden ? prompt.full : prompt.compact,
+					{ onApprove: () => settle(APPROVE_OPTION), onDeny: () => settle(DENY_OPTION) },
+					{
+						tui: this.ctx.ui,
+						wrapDetails: callHidden,
+						timeout: dialogOptions?.timeout,
+						onTimeout: dialogOptions?.onTimeout,
+						onTimeoutStart: dialogOptions?.onTimeoutStart,
+						onTimeoutReset: dialogOptions?.onTimeoutReset,
+					},
+				);
+				this.ctx.editorContainer.clear();
+				this.ctx.editorContainer.addChild(dialog);
+				this.ctx.ui.setFocus(dialog);
+				this.ctx.ui.requestRender();
+				return () => {
+					dialog.dispose();
+					this.ctx.editorContainer.clear();
+					this.ctx.editorContainer.addChild(this.ctx.editor);
+					this.ctx.ui.setFocus(this.ctx.editor);
+					this.ctx.ui.requestRender();
+				};
+			}),
+		);
+		return choice === APPROVE_OPTION;
 	}
 
 	async showAskDialog(
@@ -1009,6 +1116,7 @@ export class ExtensionUiController {
 					checkedIndices: dialogOptions?.checkedIndices,
 					markableCount: dialogOptions?.markableCount,
 					maxVisible,
+					inline: dialogOptions?.inline,
 					slider: extra?.slider,
 				},
 			);
@@ -1034,7 +1142,11 @@ export class ExtensionUiController {
 	/**
 	 * Show a confirmation dialog for hooks.
 	 */
-	async showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
+	async showHookConfirm(
+		title: string,
+		message: string,
+		dialogOptions?: InteractiveSelectorDialogOptions,
+	): Promise<boolean> {
 		const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
 		return result === "Yes";
 	}
@@ -1220,7 +1332,7 @@ export class ExtensionUiController {
 	 */
 	addExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
 		const unsubscribe = this.ctx.ui.addInputListener(handler);
-		this.#extensionTerminalInputUnsubscribers.add(unsubscribe);
+		this.#extensionTerminalInputUnsubscribers.set(unsubscribe, this.ctx.sessionManager.getSessionId());
 		return () => {
 			unsubscribe();
 			this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
@@ -1239,8 +1351,16 @@ export class ExtensionUiController {
 		this.#rebuildHookWidgets();
 	}
 
+	clearSessionTerminalInputListeners(sessionId: string): void {
+		for (const [unsubscribe, owner] of this.#extensionTerminalInputUnsubscribers) {
+			if (owner !== sessionId) continue;
+			unsubscribe();
+			this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
+		}
+	}
+
 	clearExtensionTerminalInputListeners(): void {
-		for (const unsubscribe of this.#extensionTerminalInputUnsubscribers) {
+		for (const unsubscribe of this.#extensionTerminalInputUnsubscribers.keys()) {
 			unsubscribe();
 		}
 		this.#extensionTerminalInputUnsubscribers.clear();

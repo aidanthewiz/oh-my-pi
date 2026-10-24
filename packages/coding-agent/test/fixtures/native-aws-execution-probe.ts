@@ -1106,7 +1106,7 @@ const batchWrite = new ExtensionToolWrapper(new WriteTool(batchSession) as unkno
 batchRegistry.set("write", batchWrite);
 const batchTools = new SessionTools(
 	{
-		agent: { state: { tools: [...batchRegistry.values()] } },
+		agent: { state: { tools: [...batchRegistry.values()], messages: [] } },
 		settings: sessionSettings,
 		clientBridge: () => undefined,
 		model: () => undefined,

@@ -203,7 +203,6 @@ export function resolveReleaseBinaryAsset(
 		digest: `sha256:${digest.toLowerCase()}`,
 	};
 }
-
 export interface VerifiedBinaryDownloadOptions {
 	url: string;
 	targetPath: string;
@@ -214,6 +213,7 @@ export interface VerifiedBinaryDownloadOptions {
 
 /**
  * Download a binary and verify its GitHub-reported size and SHA-256 digest.
+ * Remove the destination when download or verification fails.
  */
 export async function downloadVerifiedBinary(options: VerifiedBinaryDownloadOptions): Promise<void> {
 	const fetchImpl = options.fetchImpl ?? fetch;
@@ -384,6 +384,28 @@ function tryRealpath(p: string): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Name of the app that manages the omp at `binaryPath`, or undefined when none does.
+ *
+ * A manager (Tern) keeps `manager.json` (`{"manager": "tern", "name": "Tern"}`) two
+ * directories above every binary it installs (`<root>/versions/<version>`,
+ * `<root>/bin/omp.exe`) and updates them itself, so `omp update` must leave them alone.
+ * A missing or unreadable manifest means unmanaged.
+ */
+export async function managedInstallName(binaryPath: string): Promise<string | undefined> {
+	const resolved = tryRealpath(binaryPath);
+	if (!resolved) return undefined;
+	let manifest: unknown;
+	try {
+		manifest = await Bun.file(path.join(path.dirname(path.dirname(resolved)), "manager.json")).json();
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(manifest)) return undefined;
+	const name = typeof manifest.name === "string" && manifest.name ? manifest.name : manifest.manager;
+	return typeof name === "string" && name ? name : undefined;
 }
 
 function isSymlinkPath(p: string): boolean {
@@ -643,8 +665,8 @@ export function resolveUpdateTargetFromPath(
  * valid. The `bun pm bin -g` / `npm prefix -g` probes are then skipped unless
  * the launcher is a symlink, whose bin dirs distinguish a manager launcher
  * (taken over in place) from a foreign symlink (resolved to its real binary).
- * Homebrew/mise detection always runs: both managers install GitHub release
- * binaries and stay valid regardless of how the release is distributed.
+ * Homebrew/mise detection always runs: both managers install the standalone
+ * release binaries and stay valid regardless of how the release is distributed.
  */
 async function resolveUpdateTarget(options: { allowPackageManagers: boolean }): Promise<UpdateTarget> {
 	const homebrewPrefix = await getHomebrewFormulaPrefix();
@@ -1109,9 +1131,8 @@ async function removeBackupBestEffort(filePath: string): Promise<boolean> {
  * unlinking it would break the live process's TCC permission attribution — so
  * a live image survives until its process exits. A `.new` temp file only
  * survives a hard kill mid-download; it is reaped once older than the download
- * window,
- * which a live download cannot exceed without timing out and cleaning up after
- * itself — so a concurrent run's in-progress temp is never deleted. Legacy
+ * window, which a live download cannot exceed without timing out and cleaning
+ * up after itself — so a concurrent run's in-progress temp is never deleted. Legacy
  * fixed `<binary>.bak` / `<binary>.new` names (from before suffixes were made
  * unique) are matched too, so users upgrading from a buggy release get the
  * orphaned files cleaned up.
@@ -1435,13 +1456,17 @@ export async function updateViaBinaryAt(
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
-/**
- * Run the update command.
- */
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
+	const ompPath = resolveOmpPath();
+	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
+	if (manager) {
+		console.log(
+			chalk.yellow(`${ompPath} is installed and kept up to date by ${manager}; update it from ${manager}.`),
+		);
+		return;
+	}
 	console.log(chalk.dim(`Current version: ${CF_VERSION}`));
 
-	// Check for updates
 	let release: ReleaseInfo;
 	try {
 		release = await getLatestRelease();

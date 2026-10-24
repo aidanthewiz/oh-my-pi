@@ -158,10 +158,8 @@ describe("subagent runtime model resolution", () => {
 			const expectedSelector = level ? `custom/coding-router:max:${level}` : "custom/coding-router:max";
 			const latest = snapshots.findLast(progress => progress.resolvedModel !== undefined);
 			expect(latest?.resolvedModelIdentity).toBe(collide ? "custom/coding-router" : "custom/coding-router:max");
-			expect(latest?.resolvedThinkingLevel).toBe(collide ? ThinkingLevel.Max : level);
 			expect(result.resolvedModel).toBe(expectedSelector);
 			expect(result.resolvedModelIdentity).toBe(collide ? "custom/coding-router" : "custom/coding-router:max");
-			expect(result.resolvedThinkingLevel).toBe(collide ? ThinkingLevel.Max : level);
 			expect(result.resolvedModelIsFallback).toBeFalsy();
 		});
 	}

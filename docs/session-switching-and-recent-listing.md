@@ -34,8 +34,10 @@ There are two different listing pipelines:
 
 1. `getRecentSessions(sessionDir, limit = 4)` (welcome/summary view)
    - Lists files and sorts by `mtime` descending.
-   - Uses the `history.db` session-title index to avoid reading indexed files.
-   - For files without an indexed title, uses the same prefix/tail scan and assistant-detection fallback as full listings, skips untitled empty stubs, and backfills discovered titles into the index.
+   - Reads the winning title-slot/header tuple; a stale indexed title cannot override it.
+   - Retains authoritative title strings in the existing `history.db` index.
+   - Applies optional `titleCard` candidates at display sinks with current preferences.
+   - Reads a complete overflow header when the normal prefix clips it.
    - Understands current fixed-width title-slot files and legacy header-first files.
    - Returns lightweight `RecentSessionInfo` (`path`, `name`, `timeAgo`).
 
@@ -57,12 +59,14 @@ For recent summaries (`RecentSessionInfo`):
 - display name preference (`sessionDisplayName`): `title` -> first user message -> an `Untitled · <time>` label (the raw `id` is intentionally never used)
 - the welcome screen truncates the rendered name to the available column width (no fixed length)
 - only the first line is kept and control characters are stripped from title/message-derived names (`sanitizeSessionName`)
+- title presentation uses the current scoped or global settings, or the registered default when no live settings scope exists
 
 For `SessionInfo` list entries:
 
-- `title` is the fixed title-slot value when present, otherwise `header.title`, otherwise the last compaction `shortSummary` seen in the prefix
+- `title` is the winning title-slot/header string, including the complete header title selected by a valid overflow `ref`, or the last compaction `shortSummary` seen in the prefix
 - `firstMessage` is first user message text discoverable from the prefix or `"(no messages)"`
 - the picker also shows modified time, file size, a `current` marker on the live session, lifecycle status (except `unknown`), fork marker, and cwd in all-projects scope
+- optional `titleCard` metadata is separate from the authoritative string; `titlePresentation()` applies current icon preferences without changing identity
 
 ## `--continue` resolution and terminal breadcrumb preference
 
@@ -89,7 +93,7 @@ Breadcrumb writes are best-effort and non-fatal.
 `createSessionManager(...)` handles string-valued `--resume` in two modes:
 
 1. Path-like value (contains `/`, `\\`, or ends with `.jsonl`)
-   - direct `SessionManager.open(sessionArg, parsed.sessionDir)`
+   - direct `SessionManager.open(sessionArg, parsed.sessionDir, undefined, { throwIfMissing: true })`; a missing path fails with `Session "<path>" not found.` instead of creating a session there
 
 2. Resume key value
    - `resolveResumableSession(...)` searches local sessions first, then all sessions unless a custom `sessionDir` disables global fallback
@@ -154,7 +158,8 @@ Flow:
 - Esc to cancel; Ctrl+C to exit
 - Tab to toggle current-folder / all-projects scope
 - mouse wheel/click in the fullscreen picker
-- multi-token search across id/title/cwd/first message/prefix message text/path: literal matches lead by recency, then sufficiently strong fuzzy matches; prompt-history matches from `history.db` may be promoted after typing pauses
+- multi-token search across id/title/displayed card code/cwd/first message/prefix message text/path: literal title matches lead, then other literal matches by recency and sufficiently strong fuzzy matches; prompt-history matches from `history.db` may be promoted after typing pauses
+- displayed-title changes invalidate the cached search text; plain title strings remain searchable independently of their presentation
 - the live session (when `currentSessionPath` is supplied) is labeled `current` on its metadata line and focused on open and after a Tab scope toggle
 
 Empty-list render behavior:
@@ -174,10 +179,10 @@ Lifecycle/state transition:
 3. snapshot rollback state (manager, queues, messages, model/thinking/tier, tools/prompts, provider-cache identity, and checkpoint/rewind state), then clear message queues
 4. for a different session, drain/detach advisor recorders
 5. `sessionManager.setSessionFile(sessionPath)`: update breadcrumb, load/migrate/blob-resolve/index entries, and adopt an existing recorded cwd when permitted by cwd policy
-6. sync session id, memory key, inherited provider-cache key, display context, and checkpoint/rewind state
+6. sync session id, memory key, inherited provider-cache key, and display context; resolve the recorded model (see below); rehydrate checkpoint/rewind state
 7. emit `session_switch`, replace messages, reset advisor session state, and sync todos
 8. close provider sessions for a different session, or for a same-session reload whose replay changed
-9. restore the first available recorded model in role/default fallback order
+9. apply the resolved model, or the caller's explicit `model`
 10. if the loaded branch ended with an interrupted tool flow, append a synthetic abort message and rebuild display context
 11. restore configured thinking (`auto` survives as auto) and per-family service tiers, falling back to current settings when no corresponding entry exists
 12. reset memory/tool session state as required, reconnect listeners, run mode reconciliation, and refresh the workspace-aware base system prompt
@@ -185,6 +190,8 @@ Lifecycle/state transition:
 `switchSession()` returns `false` when a before-switch hook cancels or cwd policy rejects the transition. A cross-project switch without a cwd-change callback is rejected rather than silently adopting the target cwd; callback rejection is also cancellation.
 
 Failures after the snapshot restore the previous manager and runtime state, reconnect/reconcile it, and mark the bash transition failed. Cwd-policy rejection returns `false`; other failures rethrow. Mode-reconciliation and base-prompt-refresh failures on the success path are logged without rolling back the switch.
+
+The recorded model resolves as in startup resume: the first role/default candidate that is registered, enabled, and has credentials configured, retried once after a provider-scoped discovery refresh. When none resolves for a different session, the switch throws `Could not restore model <provider/id>` before `session_switch` and rolls back. A session created with `hasUI` and `allowSessionModelFallback` (the TUI) instead keeps its current model when `retry.modelFallback` is on, and reports `Could not restore model <provider/id>. Using <provider/id>` through `onModelFallback` or a `notice` event. A same-file reload keeps the current model. Callers that choose the model pass `model` (RPC `open_session`/`switch_session` with `provider`/`modelId`); collab replicas pass `keepModel`, since the host's state supplies theirs.
 
 ## UI state rebuild after interactive switch
 
@@ -197,7 +204,7 @@ Failures after the snapshot restore the previous manager and runtime state, reco
 - if the resumed session's cwd differs from the previous one, re-point the process and cwd-derived caches at it (`applyCwdChange`)
 - clear chat container and rerender from session context (`renderInitialMessages`)
 - reload todos from new session artifacts
-- show `Resumed session` (or `Resumed session in <dir>` for a cross-project resume)
+- show `Resumed session` (or `Resumed session in <dir>` for a cross-project resume), then the model fallback warning, if any
 
 So visible conversation/todo state is rebuilt from the new session file.
 
@@ -226,6 +233,7 @@ So visible conversation/todo state is rebuilt from the new session file.
 - CLI picker cancel -> returns `null`, caller prints `No session selected`, process exits.
 - Interactive picker cancel -> closes the overlay with no session change.
 - Core hook or cwd-policy cancellation -> `switchSession()` returns `false`; the interactive selector stops before its UI refresh/status path, preserving the old session and UI. Callback-free cross-project switches are rejected rather than silently adopting the target cwd.
+- Unrestorable saved model without fallback permission -> `switchSession()` throws `Could not restore model <provider/id>`; the picker and `/resume <id>` show the error and keep the old session.
 
 ### Empty list paths
 

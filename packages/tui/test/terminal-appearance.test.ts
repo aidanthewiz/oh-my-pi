@@ -8,6 +8,9 @@ import {
 	setCellDimensions,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
+
+withoutTerminalMultiplexer();
 
 const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -18,8 +21,6 @@ const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin,
 const originalWslDistroName = Bun.env.WSL_DISTRO_NAME;
 const originalWslInterop = Bun.env.WSL_INTEROP;
 const originalWtSession = Bun.env.WT_SESSION;
-const originalTermProgram = Bun.env.TERM_PROGRAM;
-const originalTmux = Bun.env.TMUX;
 
 // These suites drive the real ProcessTerminal start()/probe pipeline, so they
 // opt out of the test-default headless suppression and restore it per case.
@@ -47,7 +48,6 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 		Object.defineProperty(process.stdin, "setRawMode", { value: vi.fn(), configurable: true });
 		previousHeadless = setTerminalHeadless(false);
-		delete Bun.env.TMUX;
 	});
 
 	afterEach(() => {
@@ -61,8 +61,6 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		restoreEnv("WSL_INTEROP", originalWslInterop);
 		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
 		restoreEnv("WT_SESSION", originalWtSession);
-		restoreEnv("TERM_PROGRAM", originalTermProgram);
-		restoreEnv("TMUX", originalTmux);
 	});
 
 	// conpty defaults false so kitty-flag assertions stay hermetic under WSL,
@@ -378,6 +376,32 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		expect(writes).toContain("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\");
 
 		terminal.stop();
+	});
+
+	// Herdr classifies before tmux, but the refresh follows whichever session
+	// caches OSC 11; a multiplexer without a cache keeps the refresh direct.
+	it.each([
+		["tmux nested inside a Herdr pane", "/tmp/tmux-1000/default,1234,0", true],
+		["a Herdr pane without tmux", undefined, false],
+	] as const)("routes an explicit refresh inside %s by the caching session", (_label, tmux, passthrough) => {
+		const originalHerdrPane = Bun.env.HERDR_PANE_ID;
+		Bun.env.HERDR_PANE_ID = "w1:p1";
+		if (tmux !== undefined) Bun.env.TMUX = tmux;
+		try {
+			const { terminal, writes, queryCount } = setupTerminal();
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			for (let i = 0; i < 8; i++) process.stdin.emit("data", "\x1b[?1;2c");
+			const before = queryCount();
+			terminal.refreshAppearance?.();
+			terminal.stop();
+
+			expect(writes.includes("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\")).toBe(passthrough);
+			// A cache refresh defers its direct read; a direct refresh queries now.
+			expect(queryCount()).toBe(passthrough ? before : before + 1);
+		} finally {
+			if (originalHerdrPane === undefined) delete Bun.env.HERDR_PANE_ID;
+			else Bun.env.HERDR_PANE_ID = originalHerdrPane;
+		}
 	});
 
 	it("reads tmux's refreshed cache without passing a DA1 reply through tmux", () => {

@@ -16,9 +16,9 @@ import { cfgDisabledModels, cfgDisabledProviders } from "@oh-my-pi/pi-coding-age
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { isRecord } from "@oh-my-pi/pi-utils";
 
-const fast = getBundledModel("google", "gemini-2.5-flash")!;
+const fast = getBundledModel("google", "gemini-3.5-flash")!;
 const mini = getBundledModel("openai", "gpt-4o-mini")!;
-const vertex = getBundledModel("google-vertex", "gemini-2.5-flash")!;
+const vertex = getBundledModel("google-vertex", "gemini-3.5-flash")!;
 const models = [fast, mini, vertex];
 const registry = { getAll: () => models, getAvailable: () => models };
 const key = (model: typeof fast) => `${model.provider}/${model.id}`;

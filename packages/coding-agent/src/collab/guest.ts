@@ -29,7 +29,7 @@ import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentLifecycleState, AgentSessionLifecycleEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
-import { mintSessionId } from "../session/session-manager";
+import { mintSessionId, SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
@@ -474,13 +474,16 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
+		this.#clearUiRequests();
+		await this.#ctx.eventController.drainSessionEvents();
+		if (this.#left) return;
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}-${this.#replicaId}.jsonl`);
 		// A child of the host's session, as a sibling move is.
 		const header = {
 			...pending.header,
 			id: this.#replicaId,
 			parentSession: pending.header.id,
-			providerPromptCacheKey: pending.header.providerPromptCacheKey ?? pending.header.id,
+			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
 		const lines = [header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		const storage = new FileSessionStorage();
@@ -497,8 +500,9 @@ export class CollabGuestLink {
 		}
 		if (this.#left) return;
 
-		// Resume through AgentSession without adopting the host's cwd.
-		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true });
+		// Resume through AgentSession without adopting the host's cwd. The replica
+		// keeps its model: #applyHostState mirrors the host's, which runs inference.
+		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true, keepModel: true });
 		if (switched === false) {
 			throw new Error("Collab replica activation was cancelled");
 		}
@@ -508,6 +512,10 @@ export class CollabGuestLink {
 			...this.#ctx.pendingTools.values(),
 			...this.#ctx.eventController.takeDisplaceableComponents(),
 		];
+		// Drop turn-scoped controller state (coalesced message_update timer,
+		// in-flight anchors) so a pending pre-boundary snapshot cannot flush
+		// into the replacement transcript.
+		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
 		this.state = pending.state;
@@ -519,6 +527,8 @@ export class CollabGuestLink {
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
 		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
+		await this.#ctx.eventController.drainSessionEvents();
+		if (this.#left) return;
 		// No eager teardown here: renderInitialMessages() stages the replacement
 		// transcript and disposes the visible children only when the staged tree
 		// commits (ui-helpers), which both preserves its atomicity/rollback
@@ -694,9 +704,15 @@ export class CollabGuestLink {
 			!this.#assistantStreamSynced
 		) {
 			this.#assistantStreamSynced = true;
-			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+			this.#dispatchEvent({ type: "message_start", message: event.message });
 		}
-		void this.#ctx.eventController.handleEvent(event);
+		this.#dispatchEvent(event);
+	}
+
+	#dispatchEvent(event: AgentSessionLifecycleEvent): void {
+		this.#ctx.eventController.dispatchSessionEvent(event).catch(err => {
+			logger.warn("collab guest event dispatch failed", { type: event.type, error: String(err) });
+		});
 	}
 
 	/** Reconcile missed physical boundaries using authoritative host ownership. */
@@ -875,6 +891,7 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#socket?.close();
 		this.#socket = null;
+		this.#clearUiRequests();
 		this.#restoration = this.#runRestoreLocalSession();
 		this.#ctx.collabController?.resumeAfterGuest(this.#restoration);
 		return this.#restoration;
@@ -887,6 +904,7 @@ export class CollabGuestLink {
 		this.#reconcileLifecycle(null);
 		// Keep the guest turn guard and replica lease active until host handlers finish.
 		await this.#lifecycleEmitter.drain();
+		await this.#ctx.eventController.drainSessionEvents();
 		try {
 			if (this.#replicaActivated) await this.#resumeLocalSession();
 		} finally {
@@ -902,6 +920,8 @@ export class CollabGuestLink {
 	async #resumeLocalSession(): Promise<void> {
 		this.#ctx.statusLine.setCollabStatus(null);
 		this.#flushPendingTranscripts();
+		// A pending coalesced mirror message_update must not flush after leave.
+		this.#ctx.eventController.resetTranscriptAnchors();
 		this.#clearAgentMirror();
 		this.#ctx.syncRunningSubagentBadge();
 		this.#ctx.resetObserverRegistry();

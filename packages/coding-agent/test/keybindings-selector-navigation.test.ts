@@ -22,10 +22,17 @@ const TEST_KEYBINDINGS = KeybindingsManager.inMemory({
 	"tui.select.down": "ctrl+n",
 });
 
+// Branch navigation ships unbound; traversal tests opt into the documented Shift+arrow bindings.
+const BRANCH_KEYBINDINGS = KeybindingsManager.inMemory({
+	"app.tree.previousBranch": "shift+left",
+	"app.tree.nextBranch": "shift+right",
+});
+
 const tempDirs: TempDir[] = [];
 
-beforeAll(() => {
-	initTheme();
+beforeAll(async () => {
+	await initTheme();
+	setKeybindings(KeybindingsManager.inMemory());
 });
 
 afterEach(async () => {
@@ -71,6 +78,19 @@ function createAgentMessageNode(id: string, parentId: string | null, message: Ag
 			parentId,
 			timestamp: "2024-01-01T00:00:00Z",
 			message,
+		},
+		children: [],
+	};
+}
+
+function createModelNode(id: string, parentId: string | null): SessionTreeNode {
+	return {
+		entry: {
+			type: "model_change",
+			id,
+			parentId,
+			timestamp: "2024-01-01T00:00:00Z",
+			model: "test/model",
 		},
 		children: [],
 	};
@@ -278,6 +298,146 @@ describe("selector navigation keybindings", () => {
 		selector.handleInput("\n");
 
 		expect(selected).toEqual(["inactive-branch", "root"]);
+	});
+
+	it("uses Shift+Left and Shift+Right to cycle visible branches through filtered heads", () => {
+		setKeybindings(BRANCH_KEYBINDINGS);
+		const root = createMessageNode("root", null, "Root");
+		const activeBranch = createMessageNode("active-branch", "root", "Active branch");
+		const filteredBranch = createModelNode("filtered-branch", "root");
+		const promotedHead = createModelNode("promoted-head", "root");
+		const promotedMessage = createMessageNode("promoted-message", "promoted-head", "Promoted branch");
+		promotedHead.children.push(promotedMessage);
+		root.children.push(activeBranch, filteredBranch, promotedHead);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"active-branch",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;2D");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["promoted-message", "active-branch"]);
+	});
+
+	it("wraps Shift+Left past a branch head that is itself a fork", () => {
+		setKeybindings(BRANCH_KEYBINDINGS);
+		const root = createMessageNode("root", null, "Root");
+		const forkA = createMessageNode("a", "root", "Branch A");
+		const a1 = createMessageNode("a1", "a", "Branch A1");
+		const a2 = createMessageNode("a2", "a", "Branch A2");
+		const branchB = createMessageNode("b", "root", "Branch B");
+		forkA.children.push(a1, a2);
+		root.children.push(forkA, branchB);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"a1",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+		for (let press = 0; press < 5; press++) {
+			selector.handleInput("\x1b[1;2D");
+			selector.handleInput("\n");
+		}
+
+		expect(selected).toEqual(["a", "b", "a2", "a1", "a"]);
+	});
+
+	it("follows rebinding and explicit unbinding without retaining the previous branch key", () => {
+		const root = createMessageNode("root", null, "Root");
+		const activeBranch = createMessageNode("active-branch", "root", "Active branch");
+		const siblingBranch = createMessageNode("sibling-branch", "root", "Sibling branch");
+		root.children.push(activeBranch, siblingBranch);
+		const navigate = (keys: string[]) => {
+			const selected: string[] = [];
+			const selector = new TreeSelectorComponent(
+				[root],
+				"active-branch",
+				40,
+				id => selected.push(id),
+				() => {},
+			);
+			for (const key of keys) {
+				selector.handleInput(key);
+				selector.handleInput("\n");
+			}
+			return selected;
+		};
+
+		setKeybindings(BRANCH_KEYBINDINGS);
+		expect(navigate(["\x1b[1;2C"])).toEqual(["sibling-branch"]);
+
+		setKeybindings(KeybindingsManager.inMemory({ "app.tree.nextBranch": "ctrl+n" }));
+		expect(navigate(["\x1b[1;2C", CTRL_N])).toEqual(["active-branch", "sibling-branch"]);
+		setKeybindings(KeybindingsManager.inMemory({ "app.tree.nextBranch": [] }));
+		expect(navigate([CTRL_N])).toEqual(["active-branch"]);
+	});
+
+	it("recomputes branch targets after the filter changes", () => {
+		setKeybindings(BRANCH_KEYBINDINGS);
+		const root = createMessageNode("root", null, "Root");
+		const activeBranch = createMessageNode("active-branch", "root", "Active branch");
+		const modelBranch = createModelNode("model-branch", "root");
+		root.children.push(activeBranch, modelBranch);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"active-branch",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+		// Alt+A reveals the model-change branch hidden by the default filter.
+		selector.handleInput("\x1ba");
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["active-branch", "model-branch"]);
+	});
+
+	it("continues branch navigation across nested fork depths", () => {
+		setKeybindings(BRANCH_KEYBINDINGS);
+		const root = createMessageNode("root", null, "Root");
+		const outerActive = createMessageNode("outer-active", "root", "Outer active branch");
+		const outerSibling = createMessageNode("outer-sibling", "root", "Outer sibling branch");
+		const innerActive = createMessageNode("inner-active", "outer-active", "Inner active branch");
+		const innerLeaf = createMessageNode("inner-leaf", "inner-active", "Inner active leaf");
+		const innerSibling = createMessageNode("inner-sibling", "outer-active", "Inner sibling branch");
+		innerActive.children.push(innerLeaf);
+		outerActive.children.push(innerActive, innerSibling);
+		root.children.push(outerActive, outerSibling);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"inner-leaf",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;2D");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["inner-sibling", "outer-sibling", "inner-sibling"]);
 	});
 
 	it("uses PageUp and PageDown to move by a visible page in the session tree", () => {

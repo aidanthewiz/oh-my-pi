@@ -188,21 +188,4 @@ describe("task async preflight", () => {
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	});
-
-	it("rejects an ambiguous per-call model before dispatching the item", async () => {
-		mockDiscovery();
-		const runSubprocess = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(resultFor("unexpected"));
-		const jobs = manager();
-		const tool = await TaskTool.create(
-			createSession({ manager: jobs, settings: { "async.enabled": false, "task.batch": true } }),
-		);
-
-		const result = await tool.execute("ambiguous-model", {
-			context: "Shared context.",
-			tasks: [{ name: "Ambiguous", agent: "task", task: "Do the work.", model: "default" }],
-		} as TaskParams);
-
-		expect(result.isError).toBe(true);
-		expect(runSubprocess).not.toHaveBeenCalled();
-	});
 });

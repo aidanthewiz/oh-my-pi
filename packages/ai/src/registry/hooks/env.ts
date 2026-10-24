@@ -3,9 +3,8 @@
  * than a fixed variable list (Foundry mode, AWS credential chains, Vertex ADC).
  */
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { $env } from "@oh-my-pi/pi-utils";
+import { userAdcPath } from "../../providers/google-auth";
 import { resolveAnthropicAwsProviderCredential } from "../anthropic-aws-env";
 import { resolveAnthropicEnvironmentCredential } from "../anthropic";
 import { resolveAwsRegistryApiKey } from "../aws";
@@ -17,9 +16,7 @@ let cachedVertexAdcCredentialsExists: boolean | null = null;
 function hasVertexAdcCredentials(): boolean {
 	if (cachedVertexAdcCredentialsExists === null) {
 		const gacPath = $env.GOOGLE_APPLICATION_CREDENTIALS;
-		cachedVertexAdcCredentialsExists = fs.existsSync(
-			gacPath ?? path.join(os.homedir(), ".config", "gcloud", "application_default_credentials.json"),
-		);
+		cachedVertexAdcCredentialsExists = fs.existsSync(gacPath ?? userAdcPath());
 	}
 	return cachedVertexAdcCredentialsExists;
 }

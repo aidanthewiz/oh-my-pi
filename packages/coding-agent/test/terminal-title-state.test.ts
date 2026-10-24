@@ -1,10 +1,16 @@
+import { isNativeRendering, setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as os from "node:os";
 import {
 	buildTerminalTitleWithState,
 	disposeTerminalTitleState,
 	setTerminalTitle,
 	initTerminalTitleState,
 	setSessionTerminalTitle,
+	refreshSessionTerminalTitle,
+	setExtensionTerminalTitle,
+	setTerminalTitleStateEnabled,
+	setTerminalSessionSource,
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
@@ -175,6 +181,55 @@ describe("disposeTerminalTitleState", () => {
 			const value = savedWslEnv[key];
 			if (value === undefined) delete Bun.env[key];
 			else Bun.env[key] = value;
+		}
+	});
+
+	it("selects portable live metadata at the OSC and native title sinks", () => {
+		const previousNative = isNativeRendering();
+		let icons: "nf+emoji" | "emoji" | "boring" = "nf+emoji";
+		let name = "Portable";
+		const card = { code: "TITLE", emoji: "🧪", nf: "nf-md-flask" };
+		setTerminalSessionSource({
+			file: () => undefined,
+			cwd: () => "/synthetic",
+			title: () => ({ name, card, icons }),
+		});
+		setTerminalTitleStateEnabled(true);
+		try {
+			for (const native of [false, true]) {
+				setNativeRendering(native);
+				for (const preference of ["nf+emoji", "emoji", "boring"] as const) {
+					icons = preference;
+					name = `Portable ${native} ${preference}`;
+					resetObserved(writes, windowsTitleMock);
+					setSessionTerminalTitle(name);
+					const display = preference === "boring" ? name : `🧪 TITLE: ${name}`;
+					expect(observedTitles(writes, windowsTitleMock)).toEqual([native ? display : `${BRAND} > ${display}`]);
+				}
+			}
+			icons = "emoji";
+			refreshSessionTerminalTitle();
+			resetObserved(writes, windowsTitleMock);
+			icons = "boring";
+			refreshSessionTerminalTitle();
+			expect(observedTitles(writes, windowsTitleMock)).toEqual([name]);
+			setExtensionTerminalTitle("Extension owns title");
+			resetObserved(writes, windowsTitleMock);
+			icons = "emoji";
+			refreshSessionTerminalTitle();
+			expect(observedTitles(writes, windowsTitleMock)).toEqual([]);
+			setExtensionTerminalTitle("");
+			expect(observedTitles(writes, windowsTitleMock)).toEqual([`🧪 TITLE: ${name}`]);
+
+			resetObserved(writes, windowsTitleMock);
+			setSessionTerminalTitle("Different session");
+			expect(observedTitles(writes, windowsTitleMock)).toEqual(["Different session"]);
+			resetObserved(writes, windowsTitleMock);
+			setSessionTerminalTitle("\uf0c3 LEGACY: Original name");
+			expect(observedTitles(writes, windowsTitleMock)).toEqual(["Original name"]);
+		} finally {
+			setTerminalSessionSource(undefined);
+			setNativeRendering(previousNative);
 		}
 	});
 
@@ -354,5 +409,60 @@ describe("disposeTerminalTitleState", () => {
 		resetObserved(writes, windowsTitleMock);
 		vi.advanceTimersByTime(400);
 		expect(observedTitles(writes, windowsTitleMock).length).toBeGreaterThan(0);
+	});
+});
+
+// Tern names omp's directory in its composer bar from the OSC 7 omp writes, as
+// it does for a shell's prompt; other terminals must not hear it.
+describe("reporting the session to Tern", () => {
+	const OSC7 = /\x1b\]7;([^\x07]*)\x07/g;
+	let writes = "";
+	let stdoutSpy: { mockRestore(): void } | undefined;
+	let prevHeadless = false;
+	let ttyDescriptor: PropertyDescriptor | undefined;
+	let prevTermProgram: string | undefined;
+
+	beforeEach(() => {
+		prevHeadless = setTerminalHeadless(false);
+		ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		prevTermProgram = Bun.env.TERM_PROGRAM;
+		Bun.env.TERM_PROGRAM = "tern";
+		writes = "";
+		stdoutSpy = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			writes += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array);
+			return true;
+		});
+		initTerminalTitleState();
+	});
+
+	afterEach(() => {
+		disposeTerminalTitleState();
+		stdoutSpy?.mockRestore();
+		if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+		else Reflect.deleteProperty(process.stdout, "isTTY");
+		if (prevTermProgram === undefined) delete Bun.env.TERM_PROGRAM;
+		else Bun.env.TERM_PROGRAM = prevTermProgram;
+		setTerminalHeadless(prevHeadless);
+	});
+
+	it.skipIf(process.platform === "win32")("reports the directory with OSC 7 when it changes", () => {
+		let cwd = "/work/my project";
+		setTerminalSessionSource({ file: () => undefined, cwd: () => cwd });
+		// Retitling in the same directory says nothing new.
+		setSessionTerminalTitle("my-project");
+		cwd = "/work/other";
+		setSessionTerminalTitle("my-project");
+		expect([...writes.matchAll(OSC7)].map(match => match[1])).toEqual([
+			`file://${os.hostname()}/work/my%20project`,
+			`file://${os.hostname()}/work/other`,
+		]);
+	});
+
+	it("reports nothing to other terminals", () => {
+		Bun.env.TERM_PROGRAM = "ghostty";
+		setTerminalSessionSource({ file: () => undefined, cwd: () => "/work/other" });
+		setSessionTerminalTitle("my-project");
+		expect(writes).not.toContain("\x1b]7;");
 	});
 });

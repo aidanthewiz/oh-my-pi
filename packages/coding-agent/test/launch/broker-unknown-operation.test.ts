@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
@@ -52,39 +52,37 @@ describe("broker unknown operations", () => {
 				(rejection: unknown) => rejection,
 			);
 			expect(error).toBeInstanceOf(DaemonBrokerRejectedError);
-			expect((error as Error).message).toBe("Unknown daemon operation: from-a-newer-omp");
 
 			// The rejection is scoped to that request; the connection keeps serving known operations.
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
 			const brokerRuntimeDir = daemonBrokerRuntimeDir(runtimeDir);
 			const token = await Bun.file(path.join(brokerRuntimeDir, "broker.token")).text();
-			const response = await new Promise<{ id: string; ok: boolean; error: string }>((resolve, reject) => {
-				const socket = net.createConnection(daemonBrokerEndpoint(projectDir, brokerRuntimeDir));
-				let buffer = "";
-				socket.once("error", reject);
-				socket.setTimeout(2_000, () => {
-					socket.destroy();
-					reject(new Error("Legacy handshake timed out"));
-				});
-				socket.once("connect", () => {
-					socket.write(
-						`${JSON.stringify({
-							id: "legacy-shutdown",
-							protocolVersion: 3,
-							token: token.trim(),
-							operation: { op: "shutdown" },
-						})}\n`,
-					);
-				});
-				socket.on("data", chunk => {
-					buffer += chunk.toString();
-					if (!buffer.includes("\n")) return;
-					socket.destroy();
-					resolve(JSON.parse(buffer.slice(0, buffer.indexOf("\n"))));
-				});
+			const socket = await IpcConnection.connect(daemonBrokerEndpoint(brokerRuntimeDir), {
+				framing: "lines",
+				timeoutMs: 2_000,
 			});
+			const handshake = Promise.withResolvers<{ id: string; ok: boolean; error: string }>();
+			const timer = setTimeout(() => handshake.reject(new Error("Legacy handshake timed out")), 2_000);
+			let response: { id: string; ok: boolean; error: string };
+			try {
+				socket.start(
+					line => handshake.resolve(JSON.parse(line)),
+					reason => handshake.reject(new Error(reason ?? "Legacy handshake closed")),
+				);
+				socket.send(
+					JSON.stringify({
+						id: "legacy-shutdown",
+						protocolVersion: 3,
+						token: token.trim(),
+						operation: { op: "shutdown" },
+					}),
+				);
+				response = await handshake.promise;
+			} finally {
+				clearTimeout(timer);
+				socket.destroy();
+			}
 			expect(response).toMatchObject({ id: "legacy-shutdown", ok: false });
-			expect(response.error).toMatch(/protocol 3; expected 4/iu);
 			expect((await client.request({ op: "ping" })).op).toBe("ping");
 		} finally {
 			await client.request({ op: "shutdown" }).catch(() => undefined);

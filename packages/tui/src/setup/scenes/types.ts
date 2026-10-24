@@ -30,6 +30,7 @@ export interface SetupHost extends SetupUiHost {
 	readonly oauthProviders: readonly OAuthProviderInfo[];
 	readonly authStorage: AuthStorage;
 	readonly modelSource: ModelBrowserSource;
+	/** Available and catalog models of every kind; role chips resolve over all of them, rows list chat models. */
 	getModels(): { available: Model[]; all: Model[]; current: Model | undefined };
 	refreshModels(): Promise<void>;
 	selectModel(model: Model, selector: string): Promise<void>;

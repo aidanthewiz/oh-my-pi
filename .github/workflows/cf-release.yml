@@ -334,6 +334,7 @@ jobs:
           fi
           mkdir -p release-assets/package
           cp "${addons[@]}" release-assets/package/
+          cp LICENSE THIRD-PARTY-NOTICES.txt release-assets/package/
           tar -czf "release-assets/coreforge-pi-natives-${{ matrix.target }}-${RELEASE_TAG}.tgz" \
             -C release-assets package
       - name: Package source-built native addon (Windows ARM64)
@@ -346,6 +347,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force -Path release-assets/package | Out-Null
           Copy-Item $addons[0].FullName release-assets/package/
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.txt release-assets/package/ -ErrorAction Stop
           $archive = "release-assets/coreforge-pi-natives-${{ matrix.target }}-$env:RELEASE_TAG.tgz"
           tar -czf $archive -C release-assets package
           if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
@@ -374,6 +376,19 @@ jobs:
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: bash scripts/ci-macos-sign.sh "packages/coding-agent/binaries/${{ matrix.binary }}"
+      - name: Verify macOS release signature
+        if: startsWith(matrix.target, 'darwin-')
+        run: |
+          binary="packages/coding-agent/binaries/${{ matrix.binary }}"
+          codesign --verify --strict --verbose=4 "$binary"
+          if [[ "$MACOS_SIGNING" == 'true' ]]; then
+            info="$(codesign -dvvv "$binary" 2>&1)"
+            printf '%s\n' "$info"
+            if grep -qE 'flags=.*adhoc|Signature=adhoc' <<< "$info"; then
+              echo "::error::$binary is ad-hoc signed despite configured Developer ID credentials"
+              exit 1
+            fi
+          fi
       - name: Smoke binary
         # Cross-built win32 has no runner to execute on (matches upstream);
         # native builds must report the injected channel version. The `--version`

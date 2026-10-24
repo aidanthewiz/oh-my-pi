@@ -8,7 +8,9 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import type { TitleCard } from "../utils/title-card";
 import type { CompactionMethod } from "./compaction-methods";
+import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -21,6 +23,11 @@ export const TITLE_CHANGE_ENTRY_TYPE = "title_change";
 
 export type SessionTitleSource = "auto" | "user";
 
+/** Binds candidates to one title/source/update tuple. */
+export interface SessionTitleCard extends TitleCard {
+	key: string;
+}
+
 /** Fixed-width first-line slot carrying the mutable current session title. */
 export interface SessionTitleSlotEntry {
 	type: typeof SESSION_TITLE_SLOT_ENTRY_TYPE;
@@ -28,6 +35,9 @@ export interface SessionTitleSlotEntry {
 	title: string;
 	source?: SessionTitleSource;
 	updatedAt: string;
+	card?: SessionTitleCard;
+	/** Full overflow title remains in the matching header. */
+	ref?: string;
 	pad: string;
 }
 
@@ -39,6 +49,8 @@ export interface SessionHeader {
 	id: string;
 	title?: string; // Auto-generated title from first message
 	titleSource?: SessionTitleSource;
+	titleCard?: SessionTitleCard;
+	titleUpdatedAt?: string;
 	timestamp: string;
 	cwd: string;
 	/**
@@ -50,14 +62,17 @@ export interface SessionHeader {
 	parentSession?: string;
 	/** Prior absolute JSONL locations recorded by successful session moves. */
 	previousSessionFiles?: string[];
-	/** Provider prompt-cache identity inherited by exact-route full forks. */
+	/** Local-only provider prompt-cache identity inherited by exact-route full forks; omitted from shares and HTML. */
 	providerPromptCacheKey?: string;
+	/** Local-only Task candidate, gated by the actual request model's cache policy; omitted from shares and HTML. */
+	taskPromptCacheKey?: string;
 }
 
 export interface NewSessionOptions {
 	parentSession?: string;
 	/** Provider prompt-cache identity to seed on the new session header. */
 	providerPromptCacheKey?: string;
+	taskPromptCacheKey?: string;
 	/** Skip flushing the current session and delete it instead of saving. */
 	drop?: boolean;
 	/** Additional workspace directories to seed on the new session. */
@@ -90,6 +105,8 @@ export interface ModelUsageEntry extends SessionEntryBase {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	/** Active leaf at append time for late usage; absence keeps ordinary last-entry semantics. */
+	activeLeafId?: string | null;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -234,8 +251,8 @@ export interface CredentialPinEntry extends SessionEntryBase {
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
-	/** Full system prompt sent to the model */
-	systemPrompt: string;
+	/** System prompt blocks exactly as sent to the model; files written before blocks were kept store one joined string. */
+	systemPrompt: string[] | string;
 	/** Initial task/user message */
 	task: string;
 	/** Tools available to the agent */
@@ -266,6 +283,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	/** True when the subagent ran inside an isolation worktree: never revivable, transcript-only after park. Absent on older files. */
 	isolated?: boolean;
+	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
+	workPoolYieldItems?: WorkPoolYieldItem[];
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */
@@ -319,6 +338,32 @@ export type SessionEntry =
 	| ModeChangeEntry
 	| CredentialPinEntry
 	| ResetBoundaryEntry;
+
+/** Leaf selected when replaying one entry; late usage restores its captured active leaf. */
+export function sessionEntryLeafId(entry: SessionEntry): string | null {
+	return entry.type === "model_usage" && entry.activeLeafId !== undefined ? entry.activeLeafId : entry.id;
+}
+
+/** Newest entry that selects itself on replay; skips late-usage markers. */
+export function lastSelfSelectedLeafId(entries: readonly SessionEntry[]): string | null {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (sessionEntryLeafId(entry) === entry.id) return entry.id;
+	}
+	return null;
+}
+
+/**
+ * Active leaf after replaying entries in file order; an empty or cleared session has no leaf.
+ * A captured leaf that no longer exists (rollback, rewrite) falls back to the newest self-selecting entry.
+ */
+export function resolveSessionLeafId(entries: readonly SessionEntry[]): string | null {
+	const last = entries.at(-1);
+	if (!last) return null;
+	const leafId = sessionEntryLeafId(last);
+	if (leafId === null || leafId === last.id || entries.some(entry => entry.id === leafId)) return leafId;
+	return lastSelfSelectedLeafId(entries);
+}
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;

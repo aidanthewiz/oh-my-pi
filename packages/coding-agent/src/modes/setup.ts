@@ -33,7 +33,7 @@ export { runStartupSplash } from "@oh-my-pi/pi-tui/setup/startup-splash";
 
 /** Bind application preferences and runtime effects to the setup presentation. */
 export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
-	const modelSource = createModelBrowserSource(ctx.settings);
+	const modelSource = createModelBrowserSource(ctx.settings, model => ctx.session.effectiveServiceTier(model));
 	return {
 		ui: ctx.ui,
 		get statusLine() {
@@ -59,8 +59,8 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 		},
 		modelSource,
 		getModels: () => ({
-			available: getAllowedAvailableModels(ctx.session.modelRegistry, ctx.settings),
-			all: ctx.session.modelRegistry.getAll(),
+			available: getAllowedAvailableModels(ctx.session.modelRegistry, ctx.settings, "all"),
+			all: ctx.session.modelRegistry.getAll("all"),
 			current: ctx.session.model,
 		}),
 		refreshModels: () => ctx.session.modelRegistry.refresh("online-if-uncached"),

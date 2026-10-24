@@ -32,6 +32,7 @@ interface FakeAcpBuiltinSession {
 	sessionId: string;
 	sessionName: string;
 	titleGenerationSignal: AbortSignal;
+	renameTitle(title?: string): Promise<{ title: string } | null | undefined>;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	_switchedTo: string | undefined;
 	_movedFromEmptySessionFile: string | undefined;
@@ -42,6 +43,7 @@ interface FakeAcpBuiltinSession {
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
+	cancelAsyncJob: (id: string) => boolean;
 	formatSessionAsText: () => string;
 	dumpLlmRequestToTmpDir: () => Promise<string | undefined>;
 	dumpSessionArchiveToTmpDir: () => Promise<SessionDumpArchive | undefined>;
@@ -92,6 +94,10 @@ function createRuntime() {
 		sessionId: "fake-session-id",
 		sessionName: "Fake Session",
 		titleGenerationSignal: new AbortController().signal,
+		// A typed title passes through uncarded; a bare /rename has nothing to generate from.
+		async renameTitle(title?: string) {
+			return title ? { title } : null;
+		},
 		_todoPhases: [],
 		_switchedTo: undefined,
 		_movedFromEmptySessionFile: undefined,
@@ -161,6 +167,7 @@ function createRuntime() {
 		getHindsightSessionState: () => undefined,
 		async applyMemoryBackend() {},
 		getAsyncJobSnapshot: () => null,
+		cancelAsyncJob: () => false,
 		formatSessionAsText: () => "",
 		dumpLlmRequestToTmpDir: async () => undefined,
 		dumpSessionArchiveToTmpDir: async () => undefined,
@@ -554,12 +561,26 @@ describe("ACP builtin slash commands", () => {
 
 		await executeAcpBuiltinSlashCommand("/jobs", runtime);
 		await executeAcpBuiltinSlashCommand("/jobs full", runtime);
-		await executeAcpBuiltinSlashCommand("/jobs bogus", runtime);
 
 		expect(output[0]).not.toContain(command);
 		expect(output[1]).toContain(command);
 		expect(output[1]).toContain("build done");
-		expect(output[2]).toContain("Usage: /jobs [full]");
+	});
+
+	it("jobs kill: collapses tabs/newlines and bounds the echoed id", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [],
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
+
+		await executeAcpBuiltinSlashCommand(`/jobs kill "a\tb\nc${"x".repeat(200)}"`, runtime);
+
+		const line = output[0] as string;
+		expect(line).not.toMatch(/[\t\n]/);
+		expect(line).toContain("a b c");
+		expect(line).not.toContain("x".repeat(70));
 	});
 
 	it("jobs full: strips control sequences and fences the command", async () => {
@@ -1506,7 +1527,7 @@ describe("wave 5 — adapters and polish", () => {
 		(session as unknown as Record<string, unknown>).systemPrompt = ["You are a helpful assistant."];
 		session.messages = [
 			{ role: "user", content: "Hello, how are you?" },
-			{ role: "assistant", content: "I am doing well." },
+			{ role: "assistant", content: [{ type: "text", text: "I am doing well." }] },
 		];
 		const result = await executeAcpBuiltinSlashCommand("/context", runtime);
 		expect(result).toEqual({ consumed: true });

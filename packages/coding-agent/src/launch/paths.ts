@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { getDaemonRuntimeDir, hasFsCode, isEacces, isEisdir, isEnoent } from "@oh-my-pi/pi-utils";
 import { DAEMON_BROKER_PROTOCOL_VERSION } from "./protocol";
 
@@ -88,14 +89,6 @@ export async function readStoredDaemonRecord(dir: string): Promise<StoredDaemonR
 }
 
 /** Resolve the Unix socket or Windows named pipe used by one daemon broker scope. */
-export function daemonBrokerEndpoint(projectDir: string, runtimeDir: string): string {
-	if (process.platform === "win32") {
-		const key = Bun.hash
-			.wyhash(`${path.resolve(projectDir)}\0${path.resolve(runtimeDir)}`)
-			.toString(16)
-			.padStart(16, "0");
-		const version = /^broker-v(\d+)$/.exec(path.basename(runtimeDir))?.[1] ?? DAEMON_BROKER_PROTOCOL_VERSION;
-		return `\\\\.\\pipe\\omp-daemon-v${version}-${key}`;
-	}
-	return path.join(runtimeDir, "broker.sock");
+export function daemonBrokerEndpoint(runtimeDir: string): string {
+	return ipcEndpoint(runtimeDir, "broker");
 }

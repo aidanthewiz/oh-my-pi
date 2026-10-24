@@ -91,6 +91,7 @@ With the default batched task schema, supply shared `context` and per-item `task
 
 `/model`'s Roles view can assign and persist custom role mappings such as `review`, `fast`, and `good`. Changing only the active or default session selection does not remap those roles.
 
+
 ## User-tagged model agents
 
 Type `^` in the composer to choose a model from the same scope and ranking as the `Alt+P` session picker. Accepting a completion inserts an atomic chip showing its display name. For example, type `Have ^`, pick a model, then finish with `review this change`.
@@ -124,6 +125,8 @@ modelRoles:
 ```
 
 The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model.
+
+Without an agent model override or configured role, workers inherit the active model identity and its single upstream route (`@upstream`). They do not inherit live thinking-level metadata.
 
 ## Bundled agents
 
@@ -222,18 +225,11 @@ A missing name fails preflight with `Unknown agent "...". Available: ...`; no su
 
 For task dispatch, model precedence is:
 
-1. the call's own `model` selector (task item / flat call, or eval `agent(model=…)`)
-2. `task.agentModelOverrides[agentName]`
-3. the agent frontmatter's prioritized `model` list
-4. the parent's active model, then its configured/default model fallback
+1. `task.agentModelOverrides[agentName]`
+2. the agent frontmatter's prioritized `model` list
+3. the parent's active model, then its configured/default model fallback
 
-Role aliases in any of the first three sources are expanded through `modelRoles`, except `@default`
-(equivalently `*`), which names step 4 itself: it resolves to the parent's active model rather than
-to `modelRoles.default`, so a child asked for `@default` runs whatever its parent switched to. A
-per-call `model` is validated before dispatch: the ambiguous literals `default`/`inherit` are
-rejected in favor of an explicit `@default`, and a selector that expands to nothing or matches no
-available model fails the spawn naming the selector rather than silently falling through to a
-lower-precedence source.
+Role aliases in either of the first two sources are expanded through `modelRoles`. Eval `agent()` and `workpool()` use this same settings and agent-definition precedence; callers cannot override the worker model per invocation.
 
 After policy resolution, the `before_subagent_spawn` extension hook runs once for the actual dispatch. It can block the spawn or replace the resolved model patterns; a routing note is carried into progress metadata.
 
@@ -243,6 +239,12 @@ Compaction triggers are separate from model and service-tier selection: an exact
 `task.agentCompactionThresholdOverrides[agentName]` entry (`90000` or `"80%"`) replaces the
 `compaction.threshold*` settings for that agent only; agents without an entry, including agents it
 spawns, use the main session's thresholds. See [Settings](./settings.md#context-compaction-and-memory).
+
+Request budgets follow the same exact-name pattern: a `task.agentSoftRequestBudget[agentName]` entry
+(a non-negative integer) is that agent's soft request budget, replacing both `task.softRequestBudget`
+and the bundled scout/sonic ceiling, so it can raise a budget the global setting can only lower; `0`
+disables that agent's guard, and `null` clears an entry from a lower settings layer. Agents without an
+entry keep the global setting capped by their bundled ceiling. See [task](./tools/task.md#limits--caps).
 
 Service-tier precedence is independent of model selection: an exact, case-sensitive
 `task.agentServiceTierOverrides[agentName]` entry overrides `tier.subagent`; an absent entry preserves
@@ -256,6 +258,26 @@ parked agent revived after a restart keeps its per-agent tier instead of re-deri
 `tier.subagent`. The entry is looked up by task/eval dispatch only; Vibe workers launched through
 the same executor keep `tier.subagent`. Service tiers are configuration-only; agent frontmatter and
 the task/eval wire formats do not expose a tier field or automatic Fast policy.
+
+Account selection is independent of model and service-tier selection: an exact, case-sensitive
+`task.agentAccountPools[agentName]` entry maps provider ids to OAuth identity keys (the `identityKey`
+values broker [client account pools](./auth-broker-gateway.md#client-account-pools-routing-not-authorization)
+use, such as `email:<address>|org:<id>` for Anthropic; [`omp usage accounts`](./cli-reference.md)
+lists them). For each listed provider the child authenticates
+only with those accounts: ranking, the parent's copied account affinity, restored pins, fallback
+passes, credential rotation, and saved-reset restores stay inside the pool, and runtime,
+environment, and stored API keys
+are not used; a `models.yml` `apiKey` for the provider fails the request instead of sending a pooled
+token to that endpoint. Environment-owned transports and keyless authentication cannot bypass a pool.
+When no pooled account can serve, the request fails instead of borrowing another account; an empty
+list allows no account. Saved-reset restores and imminent-expiry salvage stay inside the pool.
+Released or superseded session leases cannot spend saved credits.
+Pools do not pick models, so model and retry-fallback policy still decide
+which provider the child calls. The pool covers every key lookup the agent makes, whatever provider
+session id it carries: fresh or reset sessions, advisors, title generation, skill compression, and
+subagents it spawns without their own entry (an entry of their own replaces it). Vibe workers take
+the pool from their first turn, and a parked agent revived in the same process or after a restart
+takes the live entry for its agent name. A custom SDK `getApiKey` resolver bypasses pools.
 
 Runtime output schema precedence is:
 

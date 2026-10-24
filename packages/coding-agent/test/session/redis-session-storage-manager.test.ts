@@ -90,6 +90,21 @@ function createFakeRedis(): FakeRedis {
 				getHash(titleKey).set(filePath, title);
 				return 1;
 			}
+			if (script.includes("OMP_MOVE")) {
+				const [sourceKey, destinationKey, metaKey, titleKey] = keys;
+				const [src, dst, mtimeMs] = argv;
+				const content = strings.get(sourceKey);
+				if (content === undefined) throw new Error("ERR no such key");
+				const title = getHash(titleKey).get(src);
+				strings.set(destinationKey, content);
+				strings.delete(sourceKey);
+				getHash(metaKey).delete(src);
+				getHash(metaKey).set(dst, mtimeMs);
+				getHash(titleKey).delete(src);
+				getHash(titleKey).delete(dst);
+				if (title !== undefined) getHash(titleKey).set(dst, title);
+				return 1;
+			}
 			throw new Error("Unsupported Redis script");
 		},
 		async get(key) {
@@ -123,12 +138,6 @@ function createFakeRedis(): FakeRedis {
 			}
 			return n;
 		},
-		async rename(src, dst) {
-			if (!strings.has(src)) throw new Error("ERR no such key");
-			strings.set(dst, strings.get(src) as string);
-			strings.delete(src);
-			return "OK";
-		},
 		async scan(_cursor, ...rest) {
 			let pattern = "*";
 			for (let i = 0; i < rest.length; i++) {
@@ -139,10 +148,6 @@ function createFakeRedis(): FakeRedis {
 			const regex = new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
 			const matches = Array.from(strings.keys()).filter(k => regex.test(k));
 			return ["0", matches];
-		},
-		async hset(key, field, value) {
-			getHash(key).set(field, value);
-			return 1;
 		},
 		async hgetall(key) {
 			const h = hashes.get(key);
@@ -179,6 +184,45 @@ function fakeUsage(input: number, output: number): Usage {
 const sessionRoot = path.resolve("/sessions");
 
 describe("SessionManager + RedisSessionStorage", () => {
+	it("reopens portable metadata, clears it on a plain rename, and preserves overflow titles", async () => {
+		const redis = createFakeRedis();
+		const dir = path.join(sessionRoot, "portable-card");
+		let storage = await RedisSessionStorage.create({ client: redis });
+		let manager = SessionManager.create("/cwd", dir, storage);
+		try {
+			await manager.ensureOnDisk();
+			await manager.setSessionName("Portable", "auto", undefined, {
+				code: "DB",
+				emoji: "🧪",
+				nf: "nf-md-flask",
+			});
+			const file = manager.getSessionFile()!;
+			await manager.close();
+			storage = await RedisSessionStorage.create({ client: redis });
+			manager = await SessionManager.open(file, dir, storage);
+			expect(manager.getSessionName()).toBe("Portable");
+			expect(manager.getSessionTitleCard()).toEqual({ code: "DB", emoji: "🧪", nf: "nf-md-flask" });
+			await manager.setSessionName("Portable", "user");
+			await manager.close();
+			storage = await RedisSessionStorage.create({ client: redis });
+			manager = await SessionManager.open(file, dir, storage);
+			expect(manager.getSessionName()).toBe("Portable");
+			expect(manager.getSessionTitleCard()).toBeUndefined();
+			await manager.setSessionName("界".repeat(150), "user", undefined, { code: "LONG", emoji: "🧪" });
+			await manager.close();
+			storage = await RedisSessionStorage.create({ client: redis });
+			manager = await SessionManager.open(file, dir, storage);
+			expect(manager.getSessionName()).toBe("界".repeat(150));
+			expect(manager.getSessionTitleCard()).toBeUndefined();
+			const snapshot = await storage.readTextSnapshot(file);
+			expect(JSON.parse(snapshot.titleMeta!).title).toBe("界".repeat(150));
+			expect(Buffer.byteLength(snapshot.rawContent.split("\n")[0] + "\n", "utf8")).toBe(256);
+		} finally {
+			await manager.close();
+			await storage.drain();
+		}
+	});
+
 	it("persists appended assistant messages into Redis and reloads them via open()", async () => {
 		const redis = createFakeRedis();
 		const storage = await RedisSessionStorage.create({ client: redis });

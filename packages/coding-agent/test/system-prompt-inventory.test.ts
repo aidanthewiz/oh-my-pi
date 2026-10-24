@@ -86,11 +86,7 @@ describe("system prompt tool inventory", () => {
 
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
-	async function render(opts: {
-		nativeTools: boolean;
-		inlineToolDescriptors: boolean;
-		coreforgeReportEnabled?: boolean;
-	}): Promise<string> {
+	async function render(opts: { nativeTools: boolean; inlineToolDescriptors: boolean }): Promise<string> {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
 			contextFiles: [],
@@ -101,27 +97,10 @@ describe("system prompt tool inventory", () => {
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
 			nativeTools: opts.nativeTools,
 			inlineToolDescriptors: opts.inlineToolDescriptors,
-			coreforgeReportEnabled: opts.coreforgeReportEnabled,
 		});
 		return systemPrompt.join("\n\n");
 	}
 
-	it("routes tool problems through the Coreforge issue workflow", async () => {
-		const prompt = await render({
-			nativeTools: true,
-			inlineToolDescriptors: false,
-			coreforgeReportEnabled: true,
-		});
-
-		expect(prompt).toContain("Coreforge does not send automated QA telemetry");
-		expect(prompt).toContain("write `<tool>: <concise description>` as plain text to `xd://report_issue`");
-		expect(prompt).toContain("per-occurrence consent");
-		expect(prompt).toContain("automatically starts the Coreforge `/report` workflow");
-		expect(prompt).toContain("requires explicit confirmation");
-
-		const headlessPrompt = await render({ nativeTools: true, inlineToolDescriptors: false });
-		expect(headlessPrompt).not.toContain("xd://report_issue");
-	});
 	async function renderPrompt(opts: {
 		toolNames: string[];
 		tools: Map<string, SystemPromptToolMetadata>;
@@ -633,8 +612,7 @@ describe("system prompt tool inventory", () => {
 			contextFiles: [],
 			skills: [],
 			rules: [],
-			toolNames: ["eval", "read"],
-			directToolNames: ["eval"],
+			toolNames: ["eval"],
 			tools,
 			evalPreludes: [{ name: "computer", guidance: "COMPUTER-GUIDANCE" }],
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
@@ -642,9 +620,8 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: true,
 		});
 		const text = systemPrompt.join("\n\n");
-		// Only the direct keep-set renders as provider-callable functions.
-		expect(text).toContain("Runs code cells.");
-		expect(text).not.toContain("Reads files from disk.");
+		expect(text).toContain("type eval = (");
+		expect(text).not.toContain("type computer = (");
 		// Guidance still ships for enabled Eval preludes.
 		expect(text).toContain("COMPUTER-GUIDANCE");
 	});

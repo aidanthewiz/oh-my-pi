@@ -112,7 +112,12 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		streamingMessage: undefined,
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: {
+			handleEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			drainSessionEvents: () => Promise.resolve(),
+			resetTranscriptAnchors: () => {},
+		},
 		loadingAnimation: undefined,
 		statusLine: {
 			setCollabStatus: () => {},
@@ -165,7 +170,12 @@ function makeCancelledSwitchGuestContext(
 		streamingMessage: undefined,
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: {
+			handleEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			drainSessionEvents: () => Promise.resolve(),
+			resetTranscriptAnchors: () => {},
+		},
 		loadingAnimation: undefined,
 		statusLine: {
 			setCollabStatus: () => {},

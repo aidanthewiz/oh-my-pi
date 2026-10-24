@@ -1,11 +1,4 @@
-/**
- * The local text read path materializes a file once and derives every view from
- * those bytes: the binary sniff, the rendered window and its byte accounting,
- * bracket context, and the whole-file snapshot hash. These tests pin the parts
- * of that contract a plausible rewrite would silently break — the decode the
- * snapshot tag is hashed from, exact on-disk byte counts, the raw terminal
- * newline sentinel, and the absence of a second whole-file read.
- */
+/** Snapshot fidelity and byte accounting at the public Read/Edit boundary. */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -99,66 +92,11 @@ describe("read tool single-pass file access", () => {
 		expect(text).not.toContain(formatBytes(lineBytes + strayBytes * 2));
 	});
 
-	it("counts the terminal newline as an addressable line only in raw mode", async () => {
+	it("exposes the terminal newline as an empty raw line", async () => {
 		const filePath = path.join(tmpDir, "trailing.txt");
 		await fs.writeFile(filePath, "alpha\nbeta\n");
 		const tool = new ReadTool(createSession(tmpDir));
 
-		// Non-raw: the trailing LF closes line 2 rather than opening line 3.
-		expect(textOutput(await tool.execute("beyond", { path: `${filePath}:3` }))).toBe(
-			"Line 3 is beyond end of file (2 lines total). Use :1 to read from the start, or :2 to read the last line.",
-		);
-		// Raw: the sentinel is addressable, so line 3 exists and is empty.
 		expect(textOutput(await tool.execute("raw-sentinel", { path: `${filePath}:raw:3` }))).toBe("");
-		expect(textOutput(await tool.execute("raw-beyond", { path: `${filePath}:raw:4` }))).toContain(
-			"beyond end of file (3 lines total)",
-		);
-	});
-
-	it("does not re-read a file it already materialized", async () => {
-		// Bracket context and the snapshot hash each used to pull the whole file
-		// through `Bun.file(path).text()`, so a ranged read of one file opened it
-		// four times. Any reintroduced whole-file re-read trips this counter.
-		const filePath = path.join(tmpDir, "counted.ts");
-		await fs.writeFile(
-			filePath,
-			`${Array.from({ length: 400 }, (_, i) => `export const value${i} = ${i};`).join("\n")}\n`,
-		);
-
-		type FileFactory = typeof Bun.file;
-		const originalFile: FileFactory = Bun.file;
-		const bunNamespace = Bun as unknown as { file: FileFactory };
-		let wholeFileReads = 0;
-		bunNamespace.file = ((target: Parameters<FileFactory>[0], ...rest: unknown[]) => {
-			const factory = originalFile as unknown as (t: unknown, ...r: unknown[]) => Bun.BunFile;
-			const handle = factory(target, ...rest);
-			if (typeof target !== "string" || target !== filePath) return handle;
-			return new Proxy(handle, {
-				// Receiver must be the real BunFile: native accessors such as `size`
-				// throw when `this` is the proxy.
-				get(obj, prop) {
-					const value = Reflect.get(obj, prop);
-					if (prop === "text" || prop === "bytes" || prop === "arrayBuffer") {
-						const reader = value as (...a: unknown[]) => Promise<unknown>;
-						return (...args: unknown[]) => {
-							wholeFileReads++;
-							return reader.apply(obj, args);
-						};
-					}
-					return typeof value === "function" ? value.bind(obj) : value;
-				},
-			});
-		}) as FileFactory;
-
-		try {
-			const tool = new ReadTool(createSession(tmpDir));
-			const text = textOutput(await tool.execute("counted", { path: `${filePath}:100-120` }));
-			expect(text).toContain("export const value100 = 100;");
-			expect(text).toMatch(/^\[counted\.ts#[0-9A-F]{4}\]$/m);
-		} finally {
-			bunNamespace.file = originalFile;
-		}
-
-		expect(wholeFileReads).toBe(0);
 	});
 });

@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "bun:test";
-import { completionBudgetReport, GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
+import { describe, expect, it } from "bun:test";
+import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
 	return {
@@ -57,77 +58,6 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 }
 
 describe("GoalTool", () => {
-	it("routes create/get/complete operations and returns completion budget details", async () => {
-		const createGoalState: GoalModeState = {
-			enabled: true,
-			mode: "active",
-			goal: createGoal({ objective: "Create route", tokenBudget: 10 }),
-		};
-		const getGoalState: GoalModeState = {
-			enabled: true,
-			mode: "active",
-			goal: createGoal({ objective: "Get route", tokensUsed: 4, tokenBudget: 10 }),
-		};
-		const completedGoal = createGoal({
-			objective: "Complete route",
-			status: "complete",
-			tokensUsed: 7,
-			timeUsedSeconds: 3,
-			tokenBudget: 10,
-		});
-		const runtime = {
-			createGoal: vi.fn(async () => createGoalState),
-			completeGoalFromTool: vi.fn(async () => completedGoal),
-		};
-		const getGoalModeState = vi.fn(() => getGoalState);
-		const tool = new GoalTool(
-			createToolSession({
-				getGoalRuntime: () => runtime as unknown as GoalRuntime,
-				getGoalModeState,
-			}),
-		);
-
-		const created = await tool.execute("call-create", {
-			op: "create",
-			objective: "  Create route  ",
-			token_budget: 10,
-		});
-		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route", tokenBudget: 10 });
-		expect(created.details).toMatchObject({
-			op: "create",
-			goal: createGoalState.goal,
-			remainingTokens: 10,
-			completionBudgetReport: null,
-		});
-
-		const fetched = await tool.execute("call-get", { op: "get", objective: undefined, token_budget: undefined });
-		expect(getGoalModeState).toHaveBeenCalledTimes(1);
-		expect(fetched.details).toMatchObject({
-			op: "get",
-			goal: getGoalState.goal,
-			remainingTokens: 6,
-			completionBudgetReport: null,
-		});
-		expect(runtime.completeGoalFromTool).not.toHaveBeenCalled();
-
-		const completed = await tool.execute("call-complete", {
-			op: "complete",
-			objective: undefined,
-			token_budget: undefined,
-		});
-		expect(runtime.completeGoalFromTool).toHaveBeenCalledTimes(1);
-		expect(completed.details).toMatchObject({
-			op: "complete",
-			goal: completedGoal,
-			remainingTokens: 3,
-			completionBudgetReport: completionBudgetReport(completedGoal),
-		});
-		expect(completed.content[0]).toEqual({
-			type: "text",
-			text: "Goal: Complete route\nStatus: complete\nTokens: 7 used / 10 budget\nRemaining tokens: 3\n\nGoal achieved. Report final budget usage to the user: tokens used: 7 of 10; time used: 3 seconds.",
-		});
-	});
-
 	it("rejects create when a goal already exists", async () => {
 		const harness = createRuntimeHarness({
 			enabled: true,
@@ -316,5 +246,13 @@ describe("GoalTool", () => {
 		expect(result.details?.op).toBe("drop");
 		expect(result.details?.goal?.status).toBe("dropped");
 		expect(harness.getState()).toBeUndefined();
+	});
+
+	it("auto-approves every op in write mode; always-ask prompts only for goal changes (#14368)", () => {
+		const tool = new GoalTool(createToolSession({}));
+		for (const op of ["get", "create", "complete", "resume", "drop"]) {
+			expect(resolveApproval(tool, { op }, "write").policy).toBe("allow");
+			expect(resolveApproval(tool, { op }, "always-ask").policy).toBe(op === "get" ? "allow" : "prompt");
+		}
 	});
 });

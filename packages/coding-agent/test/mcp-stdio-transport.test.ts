@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
-import { resolveStdioSpawnCommand, StdioTransport, writeFrame } from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
+import {
+	resolveStdioSpawnCommand,
+	StdioTransport,
+	terminateStdioProcess,
+	writeFrame,
+} from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("resolveStdioSpawnCommand", () => {
@@ -896,4 +901,577 @@ describe("StdioTransport.close", () => {
 		},
 		5000,
 	);
+});
+describe("resolveStdioSpawnCommand", () => {
+	it("hides Windows executable MCP servers when the host has no console", async () => {
+		// Hidden so a console-app child does not allocate a visible window when
+		// OMP is launched without a terminal console (#3536).
+		await expect(
+			resolveStdioSpawnCommand(
+				{ command: "server.exe", args: ["--stdio"] },
+				{ cwd: process.cwd(), env: {}, platform: "win32", hostHasInheritableConsole: false },
+			),
+		).resolves.toEqual({
+			cmd: ["server.exe", "--stdio"],
+			windowsHide: true,
+			detached: false,
+		});
+	});
+
+	it("inherits an attached Windows console instead of forcing CREATE_NO_WINDOW", async () => {
+		await expect(
+			resolveStdioSpawnCommand(
+				{ command: "server.exe", args: ["--stdio"] },
+				{ cwd: process.cwd(), env: {}, platform: "win32", hostHasInheritableConsole: true },
+			),
+		).resolves.toEqual({
+			cmd: ["server.exe", "--stdio"],
+			windowsHide: false,
+			detached: false,
+		});
+	});
+
+	it("keeps Darwin stdio MCP servers attached so TCC Apple Events prompts can resolve", async () => {
+		await expect(
+			resolveStdioSpawnCommand(
+				{ command: "xcrun", args: ["mcpbridge"] },
+				{ cwd: process.cwd(), env: {}, platform: "darwin" },
+			),
+		).resolves.toEqual({
+			cmd: ["xcrun", "mcpbridge"],
+			detached: false,
+		});
+	});
+
+	it("detaches off-Windows MCP servers so terminal job-control signals cannot stop them", async () => {
+		await expect(
+			resolveStdioSpawnCommand(
+				{ command: "server.exe", args: ["--stdio"] },
+				{ cwd: process.cwd(), env: {}, platform: "linux" },
+			),
+		).resolves.toEqual({
+			cmd: ["server.exe", "--stdio"],
+			detached: true,
+		});
+	});
+});
+
+it("removes project dotenv values while preserving explicit server env", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-env-boundary-"));
+	const projectKey = `OMP_MCP_PROJECT_SECRET_${Date.now()}`;
+	const projectSecret = "project-controlled-mcp-secret";
+	const explicitKey = `OMP_MCP_EXPLICIT_VALUE_${Date.now()}`;
+	const explicitSecret = "explicit-server-secret";
+	const outputPath = path.join(cwd, "child-env.json");
+	const previous = Bun.env[projectKey];
+	await Bun.write(path.join(cwd, ".env"), `${projectKey}=${projectSecret}\n`);
+	Bun.env[projectKey] = projectSecret;
+	const transport = new StdioTransport({
+		command: process.execPath,
+		args: [
+			"-e",
+			`await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify(process.env)); await Bun.sleep(60_000);`,
+		],
+		cwd,
+		env: { [explicitKey]: explicitSecret },
+	});
+
+	try {
+		await transport.connect();
+		// The external child exposes readiness only through its output file; fake timers cannot drive its process.
+		for (let attempt = 0; attempt < 100 && !(await Bun.file(outputPath).exists()); attempt++) {
+			await Bun.sleep(20);
+		}
+		const childEnv = JSON.parse(await Bun.file(outputPath).text()) as Record<string, string | undefined>;
+		expect(childEnv[projectKey]).toBeUndefined();
+		expect(childEnv[explicitKey]).toBe(explicitSecret);
+	} finally {
+		await transport.close();
+		if (previous === undefined) delete Bun.env[projectKey];
+		else Bun.env[projectKey] = previous;
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
+it("does not let explicit server env reopen managed dotenv loading", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-managed-env-boundary-"));
+	const agentDir = path.join(cwd, "agent");
+	const outputPath = path.join(cwd, "child-env.json");
+	const secretKey = `OMP_MCP_MANAGED_SECRET_${Date.now()}`;
+	const projectKey = `OMP_MCP_PROJECT_ONLY_${Date.now()}`;
+	await fs.mkdir(agentDir, { recursive: true });
+	await Bun.write(path.join(agentDir, ".env"), `${secretKey}=managed-profile-secret\n`);
+	await Bun.write(path.join(cwd, ".env"), `${projectKey}=project-dotenv\n`);
+	const envModuleUrl = new URL("../../utils/src/env.ts", import.meta.url).href;
+	const script = [
+		`const { $env } = await import(${JSON.stringify(envModuleUrl)});`,
+		`await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify({ secret: $env[${JSON.stringify(secretKey)}], projectValue: process.env[${JSON.stringify(projectKey)}], sentinel: process.env.OMP_NO_ENV_FILE, noEnvFile: process.execArgv.includes("--no-env-file") }));`,
+		"await Bun.sleep(60_000);",
+	].join("\n");
+	const transport = new StdioTransport({
+		command: process.execPath,
+		args: ["-e", script],
+		cwd,
+		env: {
+			BUN_OPTIONS: "",
+			OMP_NO_ENV_FILE: "0",
+			OMP_PROFILE: "",
+			PI_CODING_AGENT_DIR: agentDir,
+			PI_PROFILE: "",
+		},
+	});
+
+	try {
+		await transport.connect();
+		for (let attempt = 0; attempt < 100 && !(await Bun.file(outputPath).exists()); attempt++) {
+			await Bun.sleep(20);
+		}
+		expect(await Bun.file(outputPath).exists()).toBeTrue();
+		const childEnv = JSON.parse(await Bun.file(outputPath).text()) as {
+			secret?: string;
+			projectValue?: string;
+			sentinel?: string;
+			noEnvFile?: boolean;
+		};
+		expect(childEnv.secret).toBeUndefined();
+		expect(childEnv.sentinel).toBe("1");
+		expect(childEnv.projectValue).toBeUndefined();
+		expect(childEnv.noEnvFile).toBe(true);
+	} finally {
+		await transport.close();
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
+it("passes immutable AWS metadata only to the managed proxy after runtime cleanup", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-managed-aws-stdio-"));
+	const managedOutput = path.join(root, "managed.json");
+	const genericOutput = path.join(root, "generic.json");
+	const transportUrl = new URL("../src/mcp/transports/stdio.ts", import.meta.url).href;
+	const captureChildEnvironment = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify(process.env));";
+	const trusted = {
+		configFile: path.join(root, "trusted-config"),
+		sharedCredentialsFile: path.join(root, "trusted-credentials"),
+		profile: "trusted-profile",
+		region: "us-gov-west-1",
+		executable: path.join(root, "trusted-aws"),
+	};
+	const untrusted = {
+		OMP_OPERATIONAL_AWS_CONFIG_FILE: path.join(root, "project-config"),
+		OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "project-credentials"),
+		OMP_OPERATIONAL_AWS_PROFILE: "project-profile",
+		OMP_OPERATIONAL_AWS_REGION: "eu-west-1",
+		OMP_OPERATIONAL_AWS_EXECUTABLE: path.join(root, "project-aws"),
+		OMP_OPERATIONAL_AWS_HOME_DIRECTORY: path.join(root, "project-home"),
+		AWS_ACCESS_KEY_ID: "config-access-key",
+		AWS_SECRET_ACCESS_KEY: "config-secret-key",
+	};
+	await Bun.write(
+		path.join(root, ".env"),
+		`${Object.entries(untrusted)
+			.map(([key, value]) => `${key}=${value}`)
+			.join("\n")}\n`,
+	);
+	// The spawned transport has no readiness protocol. This integration probe waits for its actual output file.
+	const script = [
+		`const { StdioTransport } = await import(${JSON.stringify(transportUrl)});`,
+		`const capture = ${JSON.stringify(captureChildEnvironment)};`,
+		`const managedOutput = ${JSON.stringify(managedOutput)};`,
+		`const genericOutput = ${JSON.stringify(genericOutput)};`,
+		`const untrusted = ${JSON.stringify(untrusted)};`,
+		"for (const key of Object.keys(process.env)) { if (key.startsWith('OMP_OPERATIONAL_AWS_')) delete process.env[key]; }",
+		"const waitFor = async output => { for (let attempt = 0; attempt < 100 && !(await Bun.file(output).exists()); attempt++) await Bun.sleep(10); if (!(await Bun.file(output).exists())) throw new Error('child did not capture its environment'); };",
+		"const managed = new StdioTransport({ command: process.execPath, args: ['-e', capture, managedOutput], cwd: process.cwd(), env: untrusted }, { preserveOperationalAws: true });",
+		"await managed.connect(); await waitFor(managedOutput); await managed.close();",
+		"const generic = new StdioTransport({ command: process.execPath, args: ['-e', capture, genericOutput], cwd: process.cwd(), env: untrusted });",
+		"await generic.connect(); await waitFor(genericOutput); await generic.close();",
+		"process.stdout.write(JSON.stringify({ managed: JSON.parse(await Bun.file(managedOutput).text()), generic: JSON.parse(await Bun.file(genericOutput).text()) }));",
+	].join("\n");
+	const proc = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+		cwd: root,
+		env: {
+			...process.env,
+			HOME: root,
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: trusted.configFile,
+			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: trusted.sharedCredentialsFile,
+			OMP_OPERATIONAL_AWS_PROFILE: trusted.profile,
+			OMP_OPERATIONAL_AWS_REGION: trusted.region,
+			OMP_OPERATIONAL_AWS_EXECUTABLE: trusted.executable,
+			AWS_ACCESS_KEY_ID: "ambient-access-key",
+			AWS_SECRET_ACCESS_KEY: "ambient-secret-key",
+			AWS_SESSION_TOKEN: "ambient-session-token",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	try {
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		const result = JSON.parse(stdout) as {
+			managed: Record<string, string | undefined>;
+			generic: Record<string, string | undefined>;
+		};
+		expect(result.managed).toMatchObject({
+			OMP_OPERATIONAL_AWS_CONFIG_FILE: trusted.configFile,
+			OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: trusted.sharedCredentialsFile,
+			OMP_OPERATIONAL_AWS_PROFILE: trusted.profile,
+			OMP_OPERATIONAL_AWS_REGION: trusted.region,
+			OMP_OPERATIONAL_AWS_EXECUTABLE: trusted.executable,
+			OMP_OPERATIONAL_AWS_HOME_DIRECTORY: root,
+		});
+		for (const key of [
+			"AWS_ACCESS_KEY_ID",
+			"AWS_SECRET_ACCESS_KEY",
+			"AWS_SESSION_TOKEN",
+			"AWS_PROFILE",
+			"AWS_REGION",
+		]) {
+			expect(result.managed[key]).toBeUndefined();
+		}
+		for (const key of [
+			"OMP_OPERATIONAL_AWS_CONFIG_FILE",
+			"OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE",
+			"OMP_OPERATIONAL_AWS_PROFILE",
+			"OMP_OPERATIONAL_AWS_REGION",
+			"OMP_OPERATIONAL_AWS_EXECUTABLE",
+			"OMP_OPERATIONAL_AWS_HOME_DIRECTORY",
+			"AWS_ACCESS_KEY_ID",
+			"AWS_SECRET_ACCESS_KEY",
+			"AWS_SESSION_TOKEN",
+			"AWS_PROFILE",
+			"AWS_REGION",
+		]) {
+			expect(result.generic[key]).toBeUndefined();
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+// Regression for #3945: request() awaited stdin.write/flush, so a child that
+// stops draining stdin would park the async fn past the timeout timer and past
+// `return promise`, orphaning the deferred rejection and hanging the caller
+// forever. `sleep` is POSIX-only, so the check is scoped to non-Windows hosts.
+describe.skipIf(process.platform === "win32")("StdioTransport request write stall", () => {
+	it("rejects with the timeout error when the child never drains stdin", async () => {
+		const timeoutMs = 100;
+		const orphaned: Error[] = [];
+		const captureOrphan = (reason: unknown) => {
+			if (reason instanceof Error) orphaned.push(reason);
+		};
+		process.on("unhandledRejection", captureOrphan);
+
+		// `sleep 60` accepts a stdin pipe but never reads it; a 1 MB payload
+		// overruns the OS pipe buffer plus any FileSink JS-side buffering, so
+		// Bun's write() returns a Promise that only settles if the child reads.
+		const transport = new StdioTransport({
+			command: "sleep",
+			args: ["60"],
+			timeout: timeoutMs,
+		});
+
+		try {
+			await transport.connect();
+
+			const bigParam = "x".repeat(1024 * 1024);
+			const started = performance.now();
+			const outcome = await transport.request("tools/call", { name: "noop", arguments: { blob: bigParam } }).then(
+				() => ({ kind: "resolved" as const }),
+				(error: unknown) => ({ kind: "rejected" as const, error }),
+			);
+			const elapsedMs = performance.now() - started;
+
+			expect(outcome.kind).toBe("rejected");
+			if (outcome.kind !== "rejected") return;
+			if (!(outcome.error instanceof Error)) {
+				throw new Error(`expected Error rejection, got ${String(outcome.error)}`);
+			}
+			expect(outcome.error.message).toContain(`Request timeout after ${timeoutMs}ms`);
+			// Generous ceiling: bare rejection latency plus room for slow CI. The
+			// pre-fix behavior was an unbounded hang, not a slightly-late reject.
+			expect(elapsedMs).toBeLessThan(timeoutMs + 1500);
+			expect(orphaned).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", captureOrphan);
+			await transport.close();
+		}
+	}, 8000);
+});
+
+// `kill(pid, 0)` succeeds for a zombie too: a grandchild whose parent (the
+// killed leader) is gone sits as <defunct> until whatever reaps orphans
+// (init/subreaper) gets around to it — which can lag on some hosts. A
+// zombie already received and honored the group SIGKILL; it is just not
+// harvested yet, so treating it as "still alive" would make the group-kill
+// assertions below flaky rather than testing what they claim to test.
+function processExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+	} catch {
+		return false;
+	}
+	const result = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)]);
+	const state = result.stdout.toString().trim();
+	return result.exitCode === 0 && state.length > 0 && !state.startsWith("Z");
+}
+
+// Regression for #5578: `close()` used a bare `this.#process.kill()` (direct
+// SIGTERM, no wait, no escalate, no process-group signal), so a detached
+// session-leader child (or a grandchild it spawned) that ignores/traps
+// SIGTERM survived host exit and became an orphan pinned to PID 1 on Linux.
+// `sleep`/`bun`/POSIX signal semantics are exercised directly here rather
+// than through `StdioTransport.connect()`, because `connect()` derives
+// `detached` from `resolveStdioSpawnCommand()`, which is tied to the host's
+// real `process.platform` — a POSIX detached session cannot be reproduced
+// end-to-end through `connect()` on a non-Linux dev/CI host, but a real
+// detached process group can still be spawned directly on any POSIX host.
+describe.skipIf(process.platform === "win32")("terminateStdioProcess", () => {
+	const TEST_TERM_GRACE_MS = 50;
+	it("escalates a detached child that traps SIGTERM to SIGKILL", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stdio-kill-solo-"));
+		const scriptPath = path.join(tempDir, "child.mjs");
+		const readyPath = path.join(tempDir, "ready");
+		await fs.writeFile(
+			scriptPath,
+			[
+				"import { writeFileSync } from 'node:fs';",
+				"process.on('SIGTERM', () => {});",
+				`writeFileSync(${JSON.stringify(readyPath)}, '1');`,
+				"setInterval(() => {}, 60_000);",
+			].join("\n"),
+		);
+		const proc = Bun.spawn([process.execPath, scriptPath], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			detached: true,
+		});
+		try {
+			// Wait for the child to actually register its SIGTERM handler before
+			// signaling it: signaling too early races the child's startup and
+			// hits the default (terminate) action instead of exercising the trap.
+			for (let i = 0; i < 100; i++) {
+				try {
+					await fs.access(readyPath);
+					break;
+				} catch {
+					await Bun.sleep(20);
+				}
+			}
+
+			const started = performance.now();
+			await terminateStdioProcess(proc, true, process.platform, TEST_TERM_GRACE_MS);
+			await proc.exited;
+			const elapsedMs = performance.now() - started;
+
+			expect(proc.signalCode).toBe("SIGKILL");
+			// The injected test grace preserves the production transition without
+			// making this subprocess boundary test sleep for the full 1s window.
+			expect(elapsedMs).toBeGreaterThanOrEqual(TEST_TERM_GRACE_MS - 15);
+		} finally {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	}, 5000);
+
+	it("reaches a SIGTERM-trapping grandchild through the group SIGKILL, not just the direct child", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stdio-group-kill-"));
+		const grandchildScriptPath = path.join(tempDir, "grandchild.mjs");
+		const parentScriptPath = path.join(tempDir, "parent.mjs");
+		const grandchildPidPath = path.join(tempDir, "grandchild.pid");
+
+		// Grandchild also traps SIGTERM, so only an unrestricted SIGKILL to the
+		// whole group — not a signal to the direct (parent) child alone — can
+		// reach and stop it.
+		await fs.writeFile(
+			grandchildScriptPath,
+			[
+				"import { writeFileSync } from 'node:fs';",
+				"process.on('SIGTERM', () => {});",
+				`writeFileSync(${JSON.stringify(grandchildPidPath)}, String(process.pid));`,
+				"setInterval(() => {}, 60_000);",
+			].join("\n"),
+		);
+		await fs.writeFile(
+			parentScriptPath,
+			[
+				"process.on('SIGTERM', () => {});",
+				`Bun.spawn([process.execPath, ${JSON.stringify(grandchildScriptPath)}], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });`,
+				"setInterval(() => {}, 60_000);",
+			].join("\n"),
+		);
+
+		const proc = Bun.spawn([process.execPath, parentScriptPath], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			detached: true,
+		});
+
+		try {
+			// Polls real wall-clock time rather than an event/promise: the
+			// grandchild process is a real external OS process writing to a real
+			// file, with no in-process signal this test can `await` directly.
+			let grandchildPid: number | undefined;
+			for (let i = 0; i < 100 && grandchildPid === undefined; i++) {
+				try {
+					grandchildPid = Number.parseInt(await fs.readFile(grandchildPidPath, "utf8"), 10);
+				} catch {
+					await Bun.sleep(20);
+				}
+			}
+			if (grandchildPid === undefined) throw new Error("grandchild never reported its pid");
+			expect(processExists(grandchildPid)).toBe(true);
+
+			await terminateStdioProcess(proc, true, process.platform, TEST_TERM_GRACE_MS);
+			await proc.exited;
+			expect(proc.signalCode).toBe("SIGKILL");
+
+			// The group SIGKILL is delivered to every member simultaneously, but
+			// give the kernel a brief window to finish reaping before asserting.
+			let grandchildAlive = processExists(grandchildPid);
+			for (let i = 0; i < 25 && grandchildAlive; i++) {
+				await Bun.sleep(20);
+				grandchildAlive = processExists(grandchildPid);
+			}
+			expect(grandchildAlive).toBe(false);
+		} finally {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	}, 8000);
+
+	it("still reaps a SIGTERM-trapping grandchild after the detached leader exits cooperatively", async () => {
+		// Regression: the leader exiting within the SIGTERM grace window used to
+		// be treated as proof the whole process group was gone, so `close()`
+		// returned early and never delivered a group SIGKILL — leaving exactly
+		// the orphaned grandchild this change is meant to reap. Unlike the
+		// group-SIGKILL test above, the leader here does NOT trap SIGTERM, so
+		// it exits promptly on its own; only the grandchild ignores signals.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stdio-leader-exit-group-kill-"));
+		const grandchildScriptPath = path.join(tempDir, "grandchild.mjs");
+		const parentScriptPath = path.join(tempDir, "parent.mjs");
+		const grandchildPidPath = path.join(tempDir, "grandchild.pid");
+
+		await fs.writeFile(
+			grandchildScriptPath,
+			[
+				"import { writeFileSync } from 'node:fs';",
+				"process.on('SIGTERM', () => {});",
+				`writeFileSync(${JSON.stringify(grandchildPidPath)}, String(process.pid));`,
+				"setInterval(() => {}, 60_000);",
+			].join("\n"),
+		);
+		// No SIGTERM handler here: the default action (terminate) fires as soon
+		// as the group SIGTERM lands, well inside TERM_GRACE_MS.
+		await fs.writeFile(
+			parentScriptPath,
+			[
+				`Bun.spawn([process.execPath, ${JSON.stringify(grandchildScriptPath)}], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });`,
+				"setInterval(() => {}, 60_000);",
+			].join("\n"),
+		);
+
+		const proc = Bun.spawn([process.execPath, parentScriptPath], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			detached: true,
+		});
+
+		try {
+			let grandchildPid: number | undefined;
+			for (let i = 0; i < 100 && grandchildPid === undefined; i++) {
+				try {
+					grandchildPid = Number.parseInt(await fs.readFile(grandchildPidPath, "utf8"), 10);
+				} catch {
+					await Bun.sleep(20);
+				}
+			}
+			if (grandchildPid === undefined) throw new Error("grandchild never reported its pid");
+			expect(processExists(grandchildPid)).toBe(true);
+
+			const started = performance.now();
+			await terminateStdioProcess(proc, true, process.platform, TEST_TERM_GRACE_MS);
+			await proc.exited;
+			const elapsedMs = performance.now() - started;
+
+			// The leader exits on the initial SIGTERM (no trap), so this must not
+			// block for the ~1s TERM grace window before sweeping the group.
+			expect(elapsedMs).toBeLessThan(700);
+
+			let grandchildAlive = processExists(grandchildPid);
+			for (let i = 0; i < 25 && grandchildAlive; i++) {
+				await Bun.sleep(20);
+				grandchildAlive = processExists(grandchildPid);
+			}
+			expect(grandchildAlive).toBe(false);
+		} finally {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	}, 8000);
+
+	it("never attempts a process-group signal when the transport did not spawn detached", async () => {
+		const proc = Bun.spawn(["bun", "-e", "await Bun.sleep(60_000)"], {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			detached: false,
+		});
+		const killSpy = spyOn(process, "kill");
+		try {
+			await terminateStdioProcess(proc, false);
+			await proc.exited;
+
+			// Only the direct-child `Subprocess.kill()` path may run; the global
+			// `process.kill()` (used exclusively for the negative-pid group
+			// signal) must never be reached.
+			expect(killSpy).not.toHaveBeenCalled();
+		} finally {
+			killSpy.mockRestore();
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+	}, 5000);
+});
+
+describe.skipIf(process.platform === "win32")("StdioTransport.close teardown", () => {
+	it("closes a well-behaved child promptly without escalating to SIGKILL", async () => {
+		const transport = new StdioTransport({
+			command: "bun",
+			args: ["-e", "await Bun.sleep(60_000)"],
+		});
+		try {
+			await transport.connect();
+			const started = performance.now();
+			await transport.close();
+			const elapsedMs = performance.now() - started;
+
+			// No SIGTERM trap => the child dies almost immediately; close() must
+			// not block for the full ~1s TERM grace window before returning.
+			expect(elapsedMs).toBeLessThan(700);
+		} finally {
+			await transport.close();
+		}
+	}, 5000);
 });

@@ -2,9 +2,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentOptions, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -52,16 +52,25 @@ describe("AgentSession manual retry", () => {
 		tempDir.removeSync();
 	});
 
-	async function createWithStopDiagnostic(responses: MockResponseSource, tools: AgentTool[] = []) {
+	async function createWithStopDiagnostic(
+		responses: MockResponseSource,
+		tools: AgentTool[] = [],
+		transformContext?: AgentOptions["transformContext"],
+		existing?: { manager: SessionManager; provider: MockModel },
+	) {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model");
-		const manager = SessionManager.inMemory(tempDir.path());
+		const manager = existing?.manager ?? SessionManager.inMemory(tempDir.path());
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
 			pi => {
 				pi.on("session_stop", event => {
 					const assistant = event.last_assistant_message;
-					if (assistant?.role !== "assistant" || assistant.stopReason !== "error") return;
+					if (
+						assistant?.role !== "assistant" ||
+						(assistant.stopReason !== "error" && assistant.stopReason !== "aborted")
+					)
+						return;
 					pi.sendMessage(
 						{
 							customType: "retry-diagnostic",
@@ -78,12 +87,13 @@ describe("AgentSession manual retry", () => {
 			runtime,
 			"manual-retry-stop",
 		);
-		const provider = createMockModel({ responses });
+		const provider = existing?.provider ?? createMockModel({ responses });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools },
+			initialState: { model, systemPrompt: ["Test"], tools, messages: manager.buildSessionContext().messages },
 			streamFn: provider.stream,
 			convertToLlm,
+			transformContext,
 		});
 		session = new AgentSession({
 			agent,
@@ -180,6 +190,98 @@ describe("AgentSession manual retry", () => {
 			expect(provider.calls).toHaveLength(2);
 		},
 	);
+
+	it("retries a reopened context cancellation and then a reopened passive error diagnostic", async () => {
+		const entered = Promise.withResolvers<void>();
+		const { active, manager, provider } = await createWithStopDiagnostic(
+			[
+				context => {
+					expect(context.messages.some(message => message.role === "assistant")).toBe(false);
+					return { throw: "Retry failed after context cancellation" };
+				},
+				context => {
+					expect(context.messages.some(message => message.role === "assistant")).toBe(false);
+					return { content: ["Recovered after context cancellation"] };
+				},
+			],
+			[],
+			async (messages, signal) => {
+				if (!signal) throw new Error("Expected context cancellation signal");
+				const cancelled = Promise.withResolvers<void>();
+				if (signal.aborted) cancelled.resolve();
+				else signal.addEventListener("abort", () => cancelled.resolve(), { once: true });
+				entered.resolve();
+				await cancelled.promise;
+				signal.throwIfAborted();
+				return messages;
+			},
+		);
+		const terminalTranscripts: AgentMessage[][] = [];
+		active.subscribe(event => {
+			if (event.type === "agent_end") {
+				terminalTranscripts.push(manager.buildSessionContext({ transcript: true }).messages);
+			}
+		});
+		const running = active.prompt("cancel during context preparation");
+		await entered.promise;
+		active.agent.abort("Interrupted by user");
+		await running;
+		await active.waitForIdle();
+		const transcript = manager.buildSessionContext({ transcript: true }).messages;
+		expect(transcript.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({ stopReason: "aborted", errorMessage: "Interrupted by user" }),
+		]);
+		expect(transcript.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(terminalTranscripts).toEqual([transcript]);
+		expect(provider.calls).toHaveLength(0);
+		const sessionFile = path.join(tempDir.path(), "reopened-context-cancellation.jsonl");
+		fs.writeFileSync(
+			sessionFile,
+			[manager.getHeader(), ...manager.getEntries()].map(entry => JSON.stringify(entry)).join("\n") + "\n",
+		);
+		await active.dispose();
+		const reopened = await SessionManager.open(sessionFile, tempDir.path());
+		const failedRetry = await createWithStopDiagnostic([], [], undefined, { manager: reopened, provider });
+		const failedRetryTranscripts: AgentMessage[][] = [];
+		failedRetry.active.subscribe(event => {
+			if (event.type === "agent_end") {
+				failedRetryTranscripts.push(reopened.buildSessionContext({ transcript: true }).messages);
+			}
+		});
+		await expect(failedRetry.active.retry()).resolves.toBe(true);
+		await failedRetry.active.waitForIdle();
+		const failedTranscript = reopened.buildSessionContext({ transcript: true }).messages;
+		expect(failedTranscript.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({ stopReason: "aborted", errorMessage: "Interrupted by user" }),
+			expect.objectContaining({ stopReason: "error", errorMessage: "Retry failed after context cancellation" }),
+		]);
+		expect(failedTranscript.filter(message => message.role === "custom")).toEqual([
+			expect.objectContaining({ customType: "retry-diagnostic", details: { failedAttempt: true } }),
+		]);
+		expect(failedTranscript.at(-1)).toMatchObject({ role: "custom", customType: "retry-diagnostic" });
+		expect(failedRetryTranscripts).toEqual([failedTranscript]);
+		expect(provider.calls).toHaveLength(1);
+		const diagnosticFile = path.join(tempDir.path(), "reopened-context-retry-diagnostic.jsonl");
+		fs.writeFileSync(
+			diagnosticFile,
+			[reopened.getHeader(), ...reopened.getEntries()].map(entry => JSON.stringify(entry)).join("\n") + "\n",
+		);
+		await failedRetry.active.dispose();
+		const diagnosticManager = await SessionManager.open(diagnosticFile, tempDir.path());
+		const recovered = await createWithStopDiagnostic([], [], undefined, { manager: diagnosticManager, provider });
+		await expect(recovered.active.retry()).resolves.toBe(true);
+		await recovered.active.waitForIdle();
+		expect(lastAgentMessage(recovered.active).content).toContainEqual({
+			type: "text",
+			text: "Recovered after context cancellation",
+		});
+		expect(provider.calls).toHaveLength(2);
+		expect(diagnosticManager.buildSessionContext({ transcript: true }).messages).toContainEqual(
+			expect.objectContaining({ customType: "retry-diagnostic" }),
+		);
+		await expect(recovered.active.retry()).resolves.toBe(false);
+		expect(provider.calls).toHaveLength(2);
+	});
 
 	it("does not retry an older failure through an unrelated custom message", async () => {
 		const { active, provider } = await createWithStopDiagnostic([{ throw: "original failure" }]);

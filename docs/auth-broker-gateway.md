@@ -47,7 +47,7 @@ The broker is the only writer of OAuth refresh tokens. Clients (including the ga
 ### CLI
 
 ```
-omp auth-broker serve     [--bind=host:port]                    # boot the broker
+omp auth-broker serve     [--bind=host:port] [--trust-proxy-headers]  # boot the broker
 omp auth-broker token     [--regenerate] [--json]               # print or rotate the bearer token
 omp auth-broker login     [<provider>] [--via=user@host] [--dry-run]
 omp auth-broker logout    [<provider>]
@@ -58,6 +58,7 @@ omp auth-broker status    [--json]
 ```
 
 - `serve` opens the local SQLite store at `getAgentDbPath()` and binds an HTTP listener (default `127.0.0.1:8765`). On startup a token is ensured at `<config-dir>/auth-broker.token` (mode `0600`, newly created parent directory `0700`). The background refresher runs immediately and then every `refreshIntervalMs` (default 60 s), targeting OAuth credentials whose expiry is within `refreshSkewMs` (default 5 min).
+- Logs attribute requests to the socket peer address. Behind a trusted reverse proxy, pass `--trust-proxy-headers` to use `X-Forwarded-For` / `X-Real-IP` for authenticated requests; unauthorized requests are always logged with the socket peer, and paths outside the broker's routes are logged as `<unrouted>`.
 - `token` prints the stored bearer or generates a new one. `--regenerate` replaces the token file; restart a running broker to load the replacement into its in-memory allow-list.
 - `login [<provider>]` runs the registered sign-in flow locally (OAuth or a provider's API-key login). With no provider it shows an interactive numbered picker. With `--via=user@host` it runs `ssh -L <callback-port>:127.0.0.1:<callback-port> -o ExitOnForwardFailure=yes user@host omp auth-broker login <provider>`; the credential is written on the remote host (`--via` requires `<provider>`, and `--dry-run` applies only to this remote path). Ports are derived from the auth registry: `anthropic:54545`, `openai-codex:1455`, `google-gemini-cli:8085`, `google-antigravity:51121`, `gitlab-duo:8080`, `devin:59653`, `openrouter:54549`, `stencil:54547`. `gitlab-duo-agent` and `zai-coding-plan` use non-loopback/manual callbacks rather than the old `8080`/`9999` listeners; run those flows on the host directly. Login is driven in-process through `AuthStorage.oauth.login()`.
 - `logout [<provider>]` disables the provider's active rows with cause `logged out by user`; disabled tombstones remain available through the broker API. With no argument it shows an interactive numbered picker of stored providers.
@@ -84,7 +85,7 @@ omp auth-broker status    [--json]
 | `GET`    | `/v1/usage/history`          | bearer | Persisted usage history; optional `sinceMs` and `provider` filters |
 | `POST`   | `/v1/usage/observed`         | bearer | Record usage observed by a broker client                           |
 | `GET`    | `/v1/usage/clients`          | bearer | Summarize client-observed usage since optional `sinceMs`           |
-| `POST`   | `/v1/usage/stale`            | bearer | Invalidate the broker's current usage cache                        |
+| `POST`   | `/v1/usage/stale`            | bearer | Invalidate the broker's usage cache; optional `provider` scope     |
 
 Requests use `Authorization: Bearer <token>`. The server compares against an in-memory token allow-list; the gateway’s implementation uses a timing-safe comparison.
 
@@ -212,11 +213,11 @@ omp auth-gateway check   [--strict] [--json]
 | `GET`  | `/v1/videos/:id`        | bearer | Poll a video job. `:id` is gateway-issued and stateless: it encodes provider, model, and upstream job id |
 | `GET`  | `/v1/videos/:id/content` | bearer | Stream the finished video bytes with the upstream content type |
 
-The model id is read from the top-level `model` field for foreign wire formats and from the pi-native request body for `/v1/pi/stream`. It may be provider-qualified (`typesafe/jev-latest`) or bare (`jev-latest`). The gateway resolves it against the served catalog — every registry model of a kind the gateway has a route for (`chat`, `judge`, `image`, `tts`, `stt`, `embedding`, `rerank`, `video`), scoped to providers the broker holds credentials for — parses the inbound wire format, resolves the provider credential from broker-backed `AuthStorage`, dispatches through the matching `pi-ai` client (`streamSimple()` for chat, `TypeSafeJudge` for judgments, `generateImage` / `synthesizeSpeech` / `transcribeAudio` / `embed` / `rerank` / `submitVideo` for the modality routes), and re-encodes the result to the inbound format (SSE for streamed chat responses).
+The model id is read from the top-level `model` field for foreign wire formats and from the pi-native request body for `/v1/pi/stream`. It may be provider-qualified (`typesafe/jev-latest`) or bare (`jev-latest`). The gateway resolves it against the served catalog — every registry model of a kind the gateway has a route for (`chat`, `judge`, `image`, `tts`, `stt`, `embedding`, `rerank`, `video`), scoped to providers the broker holds credentials for — parses the inbound wire format, resolves the provider credential from broker-backed `AuthStorage`, dispatches through the matching `pi-ai` client (`streamSimple()` for chat, `NativeJudge` for judgments (translated to the resolved model's own judgment API, e.g. OpenAI Decisions), `generateImage` / `synthesizeSpeech` / `transcribeAudio` / `embed` / `rerank` / `submitVideo` for the modality routes), and re-encodes the result to the inbound format (SSE for streamed chat responses).
 
 Chat routes reject non-chat models with a `400` that names the route to use instead (`Model typesafe/jev-latest is a judge model; use POST /v1/systemone`). `GET /v1/models` marks such rows with `kind` (`judge` | `image` | `tts` | `stt` | `embedding` | `rerank` | `video`); absent means chat.
 
-The served catalog includes bundled, cached, and broker-discovered models. The gateway ignores the host's `models.yml` overrides/custom models so local base URLs, headers, and keys cannot redirect broker-backed traffic. It rebuilds the catalog every 15 minutes and checks credential changes every 10 seconds; credential changes force online discovery. Provider-qualified IDs are unambiguous; bare IDs use the first matching registry entry. Model-list rows also include `api`, `display_name`, `input_modalities`, available `context_length`/`max_output_tokens`, and `supports_tools: false` when explicitly unsupported.
+The served catalog includes bundled, cached, and broker-discovered models. The gateway ignores the host's `models.yml` overrides/custom models so local base URLs, headers, and keys cannot redirect broker-backed traffic. Providers listed in `disabledProviders` of the gateway's effective settings (the same `config.yml` that supplies `auth.accountPolicies`) are neither discovered, advertised, nor routable; `serve` leaves their accounts out of `/v1/usage` and `/v1/credentials/check`, and `check` skips their credentials. The gateway rebuilds the catalog every 15 minutes and checks credential changes every 10 seconds; credential changes force online discovery. Provider-qualified IDs are unambiguous; bare IDs use the first matching registry entry. Model-list rows also include `api`, `display_name`, `input_modalities`, available `context_length`/`max_output_tokens`, and `supports_tools: false` only when the catalog explicitly says tools are unsupported.
 
 Live OpenRouter discovery covers image and Decisions rosters, `/embeddings/models`, `/videos/models`, and rerank-flagged `/models` rows. Speech/transcription models use catalog kinds and seeds. Bundled fallbacks and `kind-apis` runner mappings are authored in `packages/catalog/src/compat/rules/providers/openrouter.kdl`. Per-search, per-second, and per-character billing have no catalog cost axis, so those rows carry zero token cost and the provider-reported `cost` in the response is authoritative.
 
@@ -268,7 +269,7 @@ Broker clients can restrict their visible OAuth accounts by setting `OMP_AUTH_BR
 }
 ```
 
-`identityKey` is the token-free identity field already carried by each authenticated `/v1/snapshot` credential entry. Operator tooling should project only `provider` and `identityKey`; it must not retain or print the accompanying credential payload. A dedicated account-listing CLI is intentionally outside this routing feature's scope.
+`identityKey` is the token-free identity field already carried by each authenticated `/v1/snapshot` credential entry. `omp usage accounts` lists visible OAuth identity keys and organization names without tokens. Operator tooling must not retain or print the accompanying credential payload.
 
 SDK hosts can supply the same provider-to-identity mapping as `accountPool` in `discoverAuthStorage()` or `RemoteAuthCredentialStore`. An explicit programmatic pool takes precedence over the environment file.
 
@@ -282,6 +283,18 @@ The file is parsed once when broker-backed auth storage starts. An unreadable fi
 This is a **trusted-client routing policy, not an authorization boundary**. The client still holds a broker bearer token, receives raw broker responses before applying its local view, and can call broker endpoints directly. Use server-side authorization—not account pools—when clients must be prevented from retrieving other credentials.
 
 The broker bearer token authorizes the trusted transport and can expose the broker's full credential snapshot to its holder. The client-side pool filters which OAuth identities that client selects for requests; it does not constrain what the bearer holder can retrieve from the broker.
+
+### Per-agent and per-session pools
+
+A process-wide pool controls which accounts a client sees. A session pool narrows those accounts using the same identity keys. `coreforge usage accounts` lists visible OAuth identities and organization names without tokens. Set `task.agentAccountPools` by exact agent name ([Settings](./settings.md#providers-and-services)), pass `oauthAccountPools` to `createAgentSession()`, or call `authStorage.sessions.restrict(provider, sessionId, identityKeys)` directly.
+
+For each listed provider, selection, pins, fallback, rotation, saved-reset restores and imminent-expiry salvage use only listed OAuth accounts. An empty list denies every account. Stored, runtime, config and environment API keys never supply a fallback. Requests that require environment credentials fail. A `models.yml` `apiKey` also blocks pooled requests, so pooled OAuth tokens cannot reach its configured endpoint.
+
+SDK session pools cover every model registry key route, including auxiliary session ids and lookups without an id. Nested sessions with their own pools use those pools instead of the parent's. Disposal releases restrictions only after physical in-flight work settles, including admitted reset work; startup failure also releases them.
+
+`authStorage.sessions.permits(provider, sessionId, credentialId)` checks whether a durable stored credential is admitted. It does not establish ownership of the session restriction. Leased reset actions also verify the current restriction owner and session generation before spending.
+
+Direct callers must pass the returned lease to `authStorage.sessions.unrestrict(provider, sessionId, lease)`. A stale lease cannot release a newer restriction. Inherited credential affinity does not copy restrictions. Session pools remain trusted-client routing policy, not an authorization boundary.
 
 ## Operator opt-in
 
@@ -315,6 +328,18 @@ The gateway uses the same broker URL/token resolution and account-pool environme
 | `retry.usageReservePct` | `10` | Default protected remaining-quota percentage when an account has no `reservePct` override. |
 
 Broker connection values come from the agent's main config file, not project settings. Account policies/reserve use effective settings (including project/explicit config layers). Long-lived SDK sessions follow policy changes and can replace the credential store in place when effective broker settings change; failed changes leave the current store active.
+
+#### How sessions choose and keep an account
+
+When a provider has account policies, OMP ranks its accounts whenever it selects or reconsiders one (not on every request: a warm explicit pin, or a sole account, skips ranking). In order, an account loses when it is blocked (hit a limit), outside a required plan, past its renewable allowance, or inside its reserve; then Codex accounts with an untouched 5-hour window are preferred, accounts whose 5-hour window is at least 85% used fall back, accounts with a usage report beat accounts whose report could not be fetched, and only then does higher `priority` win. Ties go to the account whose quota would otherwise expire unused soonest. So `priority` orders healthy, measured accounts; it does not override reserve or the safety checks before it.
+
+That ranking picks the account for a **new** session. A running session remembers the account it used last (its pin) and keeps it while the pin is warm, so the provider's prompt cache and signed reasoning stay valid:
+
+- Anthropic pins go cold after an hour without a request; other providers' pins stay warm indefinitely. A cold or blocked pin re-ranks.
+- A warm pin moves only away from a bad account: when the pinned account enters its reserve and another account is measured outside its own reserve, or when its allowance is spent and an unblocked sibling still has allowance.
+- A warm pin does not move back when a higher-priority account recovers. New sessions use the recovered account; running ones stay where they are until one of the cases above applies.
+- An account the user chose explicitly for a session is never moved by ranking or reserve. It is still skipped while blocked, after a failed token refresh, or when it fails a required plan check; the session then falls through to a sibling.
+- Pins are saved with the session. A resumed session restores its pin with its original last-use time, and subagents start on their parent's pins. When a parked subagent is revived in the same session, its saved pin wins over the parent's automatic affinity; an explicit parent pin still wins, subject to the child's account pool.
 
 ### Token files
 

@@ -7,7 +7,10 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
@@ -123,7 +126,7 @@ class FakeAgentSession {
 	model: Model | undefined;
 	thinkingLevel: string | undefined;
 	customCommands: [] = [];
-	extensionRunner = undefined;
+	extensionRunner: ExtensionRunner | undefined = undefined;
 	isStreaming = false;
 	queuedMessageCount = 0;
 	systemPrompt = "system";
@@ -493,6 +496,8 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
+		/** Gives each session the factory creates a real extension runner with no extensions. */
+		extensionRunners?: boolean;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -529,6 +534,15 @@ async function createHarness(
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
 		const session = new FakeAgentSession(cwd);
+		if (options.extensionRunners) {
+			session.extensionRunner = new ExtensionRunner(
+				[],
+				new ExtensionRuntime(),
+				cwd,
+				session.sessionManager,
+				{} as ModelRegistry,
+			);
+		}
 		const setToolUIContext = vi.fn();
 		sessions.push(session);
 		setToolUIContextSpies.push(setToolUIContext);
@@ -1218,7 +1232,11 @@ describe("ACP agent", () => {
 
 		const result = (await harness.agent.extMethod("speech.models.list", {})) as Record<string, unknown> & {
 			speechToText: { models: Array<{ value: string }> };
-			textToSpeech: { models: Array<{ value: string; voices: unknown[] }>; voices: unknown[] };
+			textToSpeech: {
+				models: Array<{ value: string; voices: unknown[] }>;
+				voices: unknown[];
+				speeds: Array<{ value: unknown }>;
+			};
 		};
 
 		expect(result).toMatchObject({
@@ -1227,11 +1245,14 @@ describe("ACP agent", () => {
 				textToSpeechModel: "modelRoles.speech",
 				textToSpeechVoice: "tts.localVoice",
 				speechVoice: "speech.voice",
+				textToSpeechSpeed: "tts.localSpeed",
+				speechSpeed: "speech.speed",
 			},
 			defaults: {
 				speechToTextModel: "local/parakeet-tdt-0.6b-v3",
 				textToSpeechModel: "local/kokoro",
 				voice: "af_heart",
+				speed: 1,
 			},
 			speechToText: {
 				setting: "modelRoles.dictation",
@@ -1241,8 +1262,12 @@ describe("ACP agent", () => {
 				modelSetting: "modelRoles.speech",
 				voiceSetting: "tts.localVoice",
 				speechVoiceSetting: "speech.voice",
+				speedSetting: "tts.localSpeed",
+				speechSpeedSetting: "speech.speed",
 				defaultModel: "local/kokoro",
 				defaultVoice: "af_heart",
+				defaultSpeed: 1,
+				speedRange: { min: 0.5, max: 2.5 },
 			},
 		});
 		expect(result.speechToText.models.map(model => model.value)).toEqual([
@@ -1253,6 +1278,8 @@ describe("ACP agent", () => {
 		]);
 		expect(result.textToSpeech.models.map(model => model.value)).toEqual(["local/kokoro"]);
 		expect(result.textToSpeech.models[0]?.voices).toEqual(result.textToSpeech.voices);
+		// Speed presets are numbers so clients can write them straight into the numeric settings.
+		expect(result.textToSpeech.speeds.map(speed => speed.value)).toEqual([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -2551,8 +2578,8 @@ describe("ACP agent", () => {
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 		const inferences = [
-			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<string | null>() },
-			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<string | null>() },
+			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<{ title: string } | null>() },
+			{ started: Promise.withResolvers<void>(), title: Promise.withResolvers<{ title: string } | null>() },
 		];
 		const titleSignals: Array<AbortSignal | undefined> = [];
 		let inferenceIndex = 0;
@@ -2566,7 +2593,9 @@ describe("ACP agent", () => {
 			Object.assign(session, {
 				messages: session.sessionManager.buildSessionContext().messages,
 				titleGenerationSignal: new AbortController().signal,
-				generateTitle: (_context: string, _systemPrompt?: string, signal?: AbortSignal) => {
+				renameTitle: (_title?: string, signal?: AbortSignal) => {
+					// A generating rename reserves a title revision, as `AgentSession.renameTitle` does.
+					session.sessionManager.reserveTitleRevision();
 					const inference = inferences[inferenceIndex++];
 					titleSignals.push(signal);
 					inference.started.resolve();
@@ -2592,7 +2621,7 @@ describe("ACP agent", () => {
 			expect(titleSignals[1]?.aborted).toBe(false);
 			const beforeLateResult = harness.updates.length;
 
-			inferences[0].title.resolve("Cancelled title");
+			inferences[0].title.resolve({ title: "Cancelled title" });
 			const settledByOldRename = await Promise.race([secondPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
 			expect(settledByOldRename).toBe(false);
 			expect(session.sessionManager.getSessionName()).toBe("Original title");
@@ -2607,7 +2636,7 @@ describe("ACP agent", () => {
 					),
 			).toEqual([]);
 
-			inferences[1].title.resolve("Rename cancellation isolation");
+			inferences[1].title.resolve({ title: "Rename cancellation isolation" });
 			expect((await secondPrompt).stopReason).toBe("end_turn");
 			expect(session.sessionManager.getSessionName()).toBe("Rename cancellation isolation");
 			expect(harness.updates.slice(beforeLateResult)).toContainEqual({
@@ -2964,6 +2993,48 @@ describe("ACP agent", () => {
 		expect(harness.sessionFactoryOptions).toEqual([{ interactivePrompts: false }]);
 		expect(harness.setToolUIContextSpies).toHaveLength(1);
 		expect(harness.setToolUIContextSpies[0]).not.toHaveBeenCalled();
+
+		await harness.agent.dispose();
+	});
+
+	it("keeps the extension UI context without form elicitation, with prompts that answer nothing", async () => {
+		const messages: string[] = [];
+		const harness = await createHarness({
+			clientCapabilities: {},
+			extensionRunners: true,
+			elicitationHandler: async request => {
+				messages.push(request.message);
+				return { action: "accept", content: { value: "Yes" } };
+			},
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const runner = harness.findSession(created.sessionId)?.extensionRunner;
+
+		// Commands such as /review branch on hasUI and cancel when the selector answers nothing.
+		// Saved-reset consent reads the session's `interactivePrompts: false` instead.
+		expect(runner?.hasUI()).toBe(true);
+		expect(await runner?.getUIContext().select("Spend a saved reset?", ["Yes", "No"])).toBeUndefined();
+		expect(messages).toEqual([]);
+		expect(harness.sessionFactoryOptions).toEqual([{ interactivePrompts: false }]);
+
+		await harness.agent.dispose();
+	});
+
+	it("routes extension prompts to form elicitation when the client supports it", async () => {
+		const messages: string[] = [];
+		const harness = await createHarness({
+			extensionRunners: true,
+			elicitationHandler: async request => {
+				messages.push(request.message);
+				return { action: "accept", content: { value: "Yes" } };
+			},
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const runner = harness.findSession(created.sessionId)?.extensionRunner;
+
+		expect(runner?.hasUI()).toBe(true);
+		expect(await runner?.getUIContext().select("Spend a saved reset?", ["Yes", "No"])).toBe("Yes");
+		expect(messages).toEqual(["Spend a saved reset?"]);
 
 		await harness.agent.dispose();
 	});

@@ -1,8 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
-import { createConnection, type Socket } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
 import { type Component, Input, Text, TUI, TuiDebugServer, type TuiDebugTreeNode } from "../src";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -16,35 +16,35 @@ interface DebugReply {
 }
 
 class DebugClient {
-	readonly #socket: Socket;
-	#buffer = "";
+	readonly #connection: IpcConnection;
 	#pending: PromiseWithResolvers<DebugReply> | undefined;
 
-	constructor(socket: Socket) {
-		this.#socket = socket;
-		socket.setEncoding("utf8");
-		socket.on("data", chunk => {
-			this.#buffer += chunk;
-			const newline = this.#buffer.indexOf("\n");
-			if (newline === -1) return;
-			const line = this.#buffer.slice(0, newline);
-			this.#buffer = this.#buffer.slice(newline + 1);
-			const pending = this.#pending;
-			this.#pending = undefined;
-			pending?.resolve(JSON.parse(line) as DebugReply);
-		});
+	constructor(connection: IpcConnection) {
+		this.#connection = connection;
+		connection.start(
+			frame => {
+				const pending = this.#pending;
+				this.#pending = undefined;
+				pending?.resolve(JSON.parse(frame) as DebugReply);
+			},
+			reason => {
+				const pending = this.#pending;
+				this.#pending = undefined;
+				pending?.reject(new Error(`debug socket closed: ${reason ?? "eof"}`));
+			},
+		);
 	}
 
 	async request(request: Record<string, unknown>): Promise<DebugReply> {
 		if (this.#pending !== undefined) throw new Error("debug client request already pending");
 		const pending = Promise.withResolvers<DebugReply>();
 		this.#pending = pending;
-		this.#socket.write(`${JSON.stringify(request)}\n`);
+		this.#connection.send(JSON.stringify(request));
 		return pending.promise;
 	}
 
 	close(): void {
-		this.#socket.destroy();
+		this.#connection.destroy();
 	}
 }
 
@@ -54,17 +54,13 @@ async function nextEventLoopTurn(): Promise<void> {
 	await turn.promise;
 }
 
+/** The TUI starts its debug listener asynchronously; dial until it binds. */
 async function connectDebugSocket(path: string): Promise<DebugClient> {
 	for (let attempt = 0; attempt < 100; attempt++) {
-		const connected = Promise.withResolvers<Socket>();
-		const socket = createConnection(path);
-		socket.once("connect", () => connected.resolve(socket));
-		socket.once("error", error => connected.reject(error));
 		try {
-			return new DebugClient(await connected.promise);
+			return new DebugClient(await IpcConnection.connect(path, { framing: "lines", timeoutMs: 1000 }));
 		} catch {
-			socket.destroy();
-			await nextEventLoopTurn();
+			await Bun.sleep(10);
 		}
 	}
 	throw new Error(`debug socket did not become available: ${path}`);
@@ -91,7 +87,8 @@ async function paintedText(client: DebugClient): Promise<DebugReply> {
 
 test("OMP_TUI_DEBUG drives and inspects a live TUI", async () => {
 	const previousDebugPath = process.env.OMP_TUI_DEBUG;
-	const socketPath = `/tmp/pi-tui-${process.pid}-${Bun.randomUUIDv7().slice(0, 8)}.sock`;
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tui-debug-"));
+	const socketPath = path.join(root, "debug.sock");
 	process.env.OMP_TUI_DEBUG = socketPath;
 	const terminal = new VirtualTerminal(50, 12);
 	const tui = new TUI(terminal);
@@ -145,6 +142,7 @@ test("OMP_TUI_DEBUG drives and inspects a live TUI", async () => {
 	} finally {
 		client?.close();
 		tui.stop();
+		await fs.rm(root, { recursive: true, force: true });
 		if (previousDebugPath === undefined) delete process.env.OMP_TUI_DEBUG;
 		else process.env.OMP_TUI_DEBUG = previousDebugPath;
 	}
@@ -157,10 +155,200 @@ test("TUI debug server preserves an occupied non-socket path", async () => {
 	const server = new TuiDebugServer(new TUI(new VirtualTerminal(20, 4)), occupiedPath);
 	try {
 		server.start();
-		await nextEventLoopTurn();
+		expect(await server.ready).toBe(false);
 		expect(await fs.readFile(occupiedPath, "utf8")).toBe("keep");
 	} finally {
 		server.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("a second debug server cannot replace or remove the live endpoint", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tui-debug-"));
+	const endpoint = path.join(root, "debug.sock");
+	const tui = new TUI(new VirtualTerminal(20, 4));
+	const owner = new TuiDebugServer(tui, endpoint);
+	const contender = new TuiDebugServer(tui, endpoint);
+	let client: DebugClient | undefined;
+	try {
+		owner.start();
+		expect(await owner.ready).toBe(true);
+		contender.start();
+		expect(await contender.ready).toBe(false);
+		contender.stop();
+		client = await connectDebugSocket(endpoint);
+		expect((await client.request({ op: "info" })).ok).toBe(true);
+	} finally {
+		client?.close();
+		contender.stop();
+		owner.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("stopped pending debug listeners cannot publish into a restarted lifetime", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tui-debug-"));
+	const endpoint = path.join(root, "debug.sock");
+	const tui = new TUI(new VirtualTerminal(20, 4));
+	const input = new Input();
+	tui.addChild(input);
+	tui.setFocus(input);
+	const server = new TuiDebugServer(tui, endpoint);
+	let client: DebugClient | undefined;
+	try {
+		server.start();
+		const stoppedReady = server.ready;
+		server.stop();
+		server.start();
+		const restartedReady = server.ready;
+		expect(await stoppedReady).toBe(false);
+		expect(await restartedReady).toBe(true);
+		if (process.platform !== "win32") {
+			expect((await fs.lstat(endpoint)).mode & 0o777).toBe(0o600);
+		}
+		client = await connectDebugSocket(endpoint);
+		await client.request({ op: "keys", keys: "'first'" });
+		expect(JSON.stringify((await client.request({ op: "values" })).values)).toContain("first");
+		client.close();
+		client = undefined;
+
+		server.stop();
+		server.start();
+		expect(await server.ready).toBe(true);
+		client = await connectDebugSocket(endpoint);
+		await client.request({ op: "keys", keys: "'-second'" });
+		expect(JSON.stringify((await client.request({ op: "values" })).values)).toContain("first-second");
+	} finally {
+		client?.close();
+		server.stop();
+		for (let attempt = 0; attempt < 100; attempt++) {
+			if (
+				!(await fs.lstat(endpoint).then(
+					() => true,
+					() => false,
+				))
+			)
+				break;
+			await nextEventLoopTurn();
+		}
+		const endpointRemains = await fs.lstat(endpoint).then(
+			() => true,
+			() => false,
+		);
+		await fs.rm(root, { recursive: true, force: true });
+		expect(endpointRemains).toBe(false);
+	}
+});
+
+test.each(["same-path", "disabled-reenabled", "changed-path", "changed-back"] as const)(
+	"actual TUI retains pending native debug ownership across %s",
+	async scenario => {
+		const previousDebugPath = process.env.OMP_TUI_DEBUG;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tui-debug-"));
+		const endpoint = path.join(root, "debug.sock");
+		const changedEndpoint = path.join(root, "changed.sock");
+		process.env.OMP_TUI_DEBUG = endpoint;
+		const tui = new TUI(new VirtualTerminal(40, 8));
+		const input = new Input();
+		(input as Component).debugId = "owner-input";
+		input.setValue("retained");
+		tui.addChild(input);
+		tui.setFocus(input);
+
+		const originalListen = IpcServer.listen;
+		const bound = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const servers = new Set<IpcServer>();
+		const connections = new Set<IpcConnection>();
+		const nativeAttempts: Promise<IpcServer>[] = [];
+		const deliveries = new Set<Promise<IpcServer>>();
+		let firstAttempt = true;
+		const listen = spyOn(IpcServer, "listen");
+		listen.mockImplementation((...args) => {
+			const held = firstAttempt;
+			firstAttempt = false;
+			const nativeAttempt = originalListen.call(IpcServer, args[0], args[1], connection => {
+				connections.add(connection);
+				args[2](connection);
+			});
+			nativeAttempts.push(nativeAttempt);
+			const delivery = (async () => {
+				const server = await nativeAttempt;
+				servers.add(server);
+				if (held) {
+					bound.resolve();
+					await release.promise;
+				}
+				return server;
+			})();
+			deliveries.add(delivery);
+			void delivery.finally(() => deliveries.delete(delivery)).catch(() => {});
+			return delivery;
+		});
+
+		let client: DebugClient | undefined;
+		try {
+			tui.start();
+			await bound.promise;
+			const transitions =
+				scenario === "disabled-reenabled"
+					? [undefined, endpoint]
+					: scenario === "changed-path"
+						? [changedEndpoint]
+						: scenario === "changed-back"
+							? [changedEndpoint, endpoint]
+							: [endpoint];
+			for (const nextPath of transitions) {
+				tui.stop();
+				if (nextPath === undefined) delete process.env.OMP_TUI_DEBUG;
+				else process.env.OMP_TUI_DEBUG = nextPath;
+				tui.start();
+			}
+			await nextEventLoopTurn();
+			await Promise.allSettled(nativeAttempts);
+			release.resolve();
+			await Promise.allSettled(deliveries);
+			await nextEventLoopTurn();
+			const activePath = transitions.at(-1);
+			if (activePath === undefined) throw new Error("fixture must end with debugging enabled");
+			client = await connectDebugSocket(activePath);
+			expect(await client.request({ op: "info" })).toMatchObject({
+				ok: true,
+				columns: 40,
+				rows: 8,
+			});
+			await client.request({ op: "keys", keys: "'-live'" });
+			expect(input.getValue()).toBe("retained-live");
+			expect((await client.request({ op: "values" })).values?.["Input#owner-input"]).toMatchObject({
+				textPreview: "retained-live",
+				textLength: 13,
+			});
+			if (process.platform !== "win32") {
+				expect((await fs.lstat(activePath)).mode & 0o777).toBe(0o600);
+			}
+			for (const inactivePath of [endpoint, changedEndpoint].filter(value => value !== activePath)) {
+				expect(
+					await fs.lstat(inactivePath).then(
+						() => true,
+						() => false,
+					),
+				).toBe(false);
+			}
+		} finally {
+			release.resolve();
+			client?.close();
+			tui.stop();
+			try {
+				await Promise.allSettled(deliveries);
+			} finally {
+				listen.mockRestore();
+				for (const connection of connections) connection.destroy();
+				await Promise.all([...servers].map(server => server.close()));
+				await fs.rm(root, { recursive: true, force: true });
+				if (previousDebugPath === undefined) delete process.env.OMP_TUI_DEBUG;
+				else process.env.OMP_TUI_DEBUG = previousDebugPath;
+			}
+		}
+	},
+	10_000,
+);

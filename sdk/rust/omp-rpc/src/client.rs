@@ -458,7 +458,7 @@ impl Shared {
 			}
 		}
 		if !response.success {
-			// An uncorrelated failure belongs to the only pending call of that command.
+			// An uncorrelated failure belongs to the sole matching call.
 			let mut matching = state
 				.pending
 				.iter()
@@ -836,7 +836,7 @@ impl Client {
 			default_timeout: options.default_timeout,
 			registration: Mutex::new(()),
 		};
-		// From here on an early return drops `client`, which tears everything down.
+		// Early return drops the client and tears down its transport.
 		client.ready = match ready_rx.recv_timeout(options.ready_timeout) {
 			Ok(ready) => ready,
 			Err(RecvTimeoutError::Timeout) => {
@@ -998,7 +998,7 @@ impl Client {
 		let id = self.next_id();
 		let frame = encode_command(&id, prompt)?;
 		let (tx, rx) = mpsc::channel();
-		// Registered before writing: the result may arrive before the acknowledgement.
+		// Register before writing; the result can precede acknowledgement.
 		self.shared.state().prompts.insert(id.clone(), tx);
 		let _collector = Collector { shared: &self.shared, id: &id };
 		let response = self.request(&id, PromptCommand::NAME, &frame, timeout)?;

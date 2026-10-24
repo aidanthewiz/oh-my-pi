@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
-import { OAuthCallbackFlow } from "@oh-my-pi/pi-ai/registry/oauth/callback-server";
+import { OAuthCallbackFlow, type OAuthCallbackBranding } from "@oh-my-pi/pi-ai/registry/oauth/callback-server";
 import type { OAuthAuthInfo, OAuthCredentials } from "@oh-my-pi/pi-ai/registry/oauth/types";
+import { parseHTML } from "@oh-my-pi/pi-utils/dom";
 
 class CallbackProbeFlow extends OAuthCallbackFlow {
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string }> {
@@ -31,7 +32,7 @@ const ipv6Loopback = (() => {
 	}
 })();
 
-async function startFlow(): Promise<{
+async function startFlow(branding?: OAuthCallbackBranding): Promise<{
 	info: OAuthAuthInfo;
 	abort: AbortController;
 	login: Promise<OAuthCredentials>;
@@ -43,7 +44,7 @@ async function startFlow(): Promise<{
 			onAuth: info => authFired.resolve(info),
 			signal: abort.signal,
 		},
-		{ preferredPort: 0 },
+		{ preferredPort: 0, branding },
 	);
 	const login = flow.login();
 	void login.catch(() => undefined);
@@ -67,6 +68,66 @@ afterEach(() => {
 });
 
 describe("OAuthCallbackFlow callback security", () => {
+	it.each([
+		["markup", "</ScRiPt><script id=injected>globalThis.callbackInjected=1</script><b>denied & retry</b>", undefined],
+		["replacement patterns", "$& $' $" + "` $$", undefined],
+		["branded markup", "</ScRiPt><script id=injected>bad()</script>", { displayName: "Coreforge <review> &" }],
+		["branded replacement patterns", "$& $' $" + "` $$", { displayName: "Coreforge <review> &" }],
+	] as const)(
+		"preserves %s in provider errors as inert page data without a valid state",
+		async (_label, errorText, branding) => {
+			const { info, abort, login } = await startFlow(branding);
+			const redirectUri = new URL(info.url).searchParams.get("redirect_uri");
+			if (!redirectUri) throw new Error("OAuth test flow did not advertise its callback URI");
+
+			try {
+				const callback = new URL(redirectUri);
+				callback.searchParams.set("error", "access_denied");
+				callback.searchParams.set("error_description", errorText);
+				const response = await fetch(callback);
+				expect(response.status).toBe(500);
+				const { document } = parseHTML(await response.text());
+				expect(document.getElementById("injected")).toBeNull();
+				if (branding) expect(document.title).toBe("Coreforge <review> & · authentication");
+				const stateElement = document.getElementById("server-state");
+				if (!stateElement) throw new Error("OAuth callback page is missing its state");
+				expect(JSON.parse(stateElement.textContent ?? "")).toEqual({
+					ok: false,
+					error: "Authorization failed: " + errorText,
+				});
+			} finally {
+				abort.abort("test cleanup");
+				await login.catch(() => undefined);
+			}
+		},
+	);
+
+	it("preserves callback codes containing markup and replacement patterns", async () => {
+		const { info, abort, login } = await startFlow();
+		const authUrl = new URL(info.url);
+		const redirectUri = authUrl.searchParams.get("redirect_uri");
+		const state = authUrl.searchParams.get("state");
+		if (!redirectUri || !state) throw new Error("OAuth test flow did not advertise its callback parameters");
+		const code = "</script><script id=injected>globalThis.callbackInjected=1</script> $& $'";
+
+		try {
+			const callback = new URL(redirectUri);
+			callback.searchParams.set("code", code);
+			callback.searchParams.set("state", state);
+			const response = await fetch(callback);
+			expect(response.status).toBe(200);
+			expect((await login).access).toBe(code);
+			const { document } = parseHTML(await response.text());
+			expect(document.getElementById("injected")).toBeNull();
+			const stateElement = document.getElementById("server-state");
+			if (!stateElement) throw new Error("OAuth callback page is missing its state");
+			expect(JSON.parse(stateElement.textContent ?? "")).toEqual({ ok: true, code, state });
+		} finally {
+			abort.abort("test cleanup");
+			await login.catch(() => undefined);
+		}
+	});
+
 	it("keeps waiting after invalid callback requests and accepts the legitimate callback", async () => {
 		const { info, abort, login } = await startFlow();
 		const authUrl = new URL(info.url);

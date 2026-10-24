@@ -13,7 +13,6 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -331,7 +330,6 @@ describe("task spawn routing", () => {
 					durationMs: 1,
 					resolvedModel: "custom/coding-router:max:high",
 					resolvedModelIdentity: "custom/coding-router:max",
-					resolvedThinkingLevel: ThinkingLevel.High,
 				};
 				options.onProgress?.(progress);
 				publishAdvisor = () => options.onProgress?.({ ...progress, tokens: 2, advisor: liveAdvisor });
@@ -339,7 +337,6 @@ describe("task spawn routing", () => {
 				return makeResult(options.id ?? "?", {
 					resolvedModel: progress.resolvedModel,
 					resolvedModelIdentity: progress.resolvedModelIdentity,
-					resolvedThinkingLevel: progress.resolvedThinkingLevel,
 					advisor: settledAdvisor,
 				});
 			});
@@ -361,7 +358,6 @@ describe("task spawn routing", () => {
 					status: "running",
 					resolvedModel: "custom/coding-router:max:high",
 					resolvedModelIdentity: "custom/coding-router:max",
-					resolvedThinkingLevel: ThinkingLevel.High,
 				});
 				expect(snapshotJobs(session, [job])[0]?.advisor).toBeUndefined();
 
@@ -380,7 +376,6 @@ describe("task spawn routing", () => {
 			expect(snapshotJobs(session, [job])[0]?.status).toBe("completed");
 			expect(snapshotJobs(session, [job])[0]).toMatchObject({
 				resolvedModelIdentity: "custom/coding-router:max",
-				resolvedThinkingLevel: ThinkingLevel.High,
 			});
 			expect(snapshotJobs(session, [job])[0]?.advisor).toBe(expectedAdvisor);
 		});
@@ -463,7 +458,6 @@ describe("task spawn routing", () => {
 				cost: 0,
 				resolvedModel: "custom/coding-router:max:high",
 				resolvedModelIdentity: "custom/coding-router:max",
-				resolvedThinkingLevel: ThinkingLevel.High,
 				resolvedModelIsFallback: true,
 			};
 			options.onProgress?.(progress);
@@ -480,13 +474,12 @@ describe("task spawn routing", () => {
 			await pollUntil(
 				() =>
 					publishProgress !== undefined &&
-					snapshotJobs(session, [job])[0]?.resolvedThinkingLevel === ThinkingLevel.High,
+					snapshotJobs(session, [job])[0]?.resolvedModel === "custom/coding-router:max:high",
 			);
 			expect(getJobProgress(job)?.resolvedModelIsFallback).toBe(true);
 			publishProgress!({
 				resolvedModel: undefined,
 				resolvedModelIdentity: undefined,
-				resolvedThinkingLevel: undefined,
 				resolvedModelIsFallback: true,
 			});
 			await pollUntil(() => snapshotJobs(session, [job])[0]?.resolvedModel === undefined);
@@ -497,13 +490,11 @@ describe("task spawn routing", () => {
 			publishProgress!({
 				resolvedModel: "custom/legacy:low",
 				resolvedModelIdentity: undefined,
-				resolvedThinkingLevel: undefined,
 				resolvedModelIsFallback: undefined,
 			});
 			await pollUntil(() => snapshotJobs(session, [job])[0]?.resolvedModel === "custom/legacy:low");
 			const legacy = snapshotJobs(session, [job])[0];
 			expect(legacy?.resolvedModelIdentity).toBeUndefined();
-			expect(legacy?.resolvedThinkingLevel).toBeUndefined();
 			expect(getJobProgress(job)?.resolvedModelIsFallback).toBeUndefined();
 
 			publishProgress!({ resolvedModelIsFallback: false });
@@ -518,7 +509,6 @@ describe("task spawn routing", () => {
 		expect(settled?.status).toBe("completed");
 		expect(settled?.resolvedModel).toBeUndefined();
 		expect(settled?.resolvedModelIdentity).toBeUndefined();
-		expect(settled?.resolvedThinkingLevel).toBeUndefined();
 		expect(getJobProgress(job)?.resolvedModelIsFallback).toBeUndefined();
 	});
 

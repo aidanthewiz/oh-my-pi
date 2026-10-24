@@ -11,7 +11,10 @@ import {
 	TERMINAL,
 	wrapTmuxPassthrough,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { type HistoryBatch, TUI } from "@oh-my-pi/pi-tui/tui";
 import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
+import { VirtualRenderScheduler } from "./virtual-render-scheduler";
+import { VirtualTerminal } from "./virtual-terminal";
 
 withoutTerminalMultiplexer();
 
@@ -85,11 +88,14 @@ describe("kitty direct-placement wire format", () => {
 	it("rejects non-placement image lines", () => {
 		// Placeholder virtual placement (a=p,U=1 lead) is not a direct placement.
 		expect(parseKittyDirectPlacementLine("\x1b_Ga=p,U=1,q=2,i=5,p=5,c=4,r=4\x1b\\")).toBeNull();
-		// tmux-wrapped placements stay untouched.
-		expect(parseKittyDirectPlacementLine(wrapTmuxPassthrough("\x1b_Ga=p,q=2,C=1,i=5,p=5,c=4,r=4\x1b\\"))).toBeNull();
 		// Transmit-and-display and plain text never match.
 		expect(parseKittyDirectPlacementLine("\x1b_Ga=T,f=100,q=2,C=1,c=4,r=4;AAAA\x1b\\")).toBeNull();
 		expect(parseKittyDirectPlacementLine("plain text")).toBeNull();
+	});
+
+	it("recognizes passthrough placements so tmux redraws can delete the old image", () => {
+		const line = `\x1b7\x1b[3A${wrapTmuxPassthrough("\x1b_Ga=p,q=2,C=1,i=5,p=5,c=4,r=4\x1b\\")}\x1b8`;
+		expect(parseKittyDirectPlacementLine(line)).toEqual({ imageId: 5, placementId: 5, columns: 4, rows: 4 });
 	});
 
 	it("encodes the anchored, clipped, and last-row-only placement forms", () => {
@@ -110,66 +116,184 @@ describe("kitty direct-placement wire format", () => {
 	});
 });
 
-// Unit tests cover only the epoch transitions the TUI integration below cannot
-// reach deterministically (ledger rewinds, position-less emits, purge
-// lifecycle, reset reporting). The ordinary advance/stability arithmetic is
-// proven end-to-end by the integration tests' exact placement-id assertions.
-describe("ImageBudget placement epochs", () => {
-	it("skips epoch bookkeeping for emits without a frame position", () => {
-		const budget = new ImageBudget(8, () => {});
-		budget.registerPlacementGeometry(5, 40, 60);
-		expect(budget.resolvePlacementEmit(5, 10, 4)?.placementId).toBe(1);
-		// Alt-screen/resize emit: unknown position, unknown commits.
-		expect(budget.resolvePlacementEmit(5, -1, -1)?.placementId).toBe(1);
-		// The unknown emit must not have overwritten the tracked attach top.
-		expect(budget.resolvePlacementEmit(5, 10, 12)?.placementId).toBe(2);
+/** A multi-row graphic for exercising viewport ownership against the terminal engine. */
+function image(budget: ImageBudget): Image {
+	return new Image(
+		BASE64_ONE_PIXEL_PNG,
+		"image/png",
+		{ fallbackColor: text => text },
+		{ maxWidthCells: 4, maxHeightCells: 4, budget, imageKey: "placement" },
+		{ widthPx: 40, heightPx: 40 },
+	);
+}
+
+class CapturingVirtualTerminal extends VirtualTerminal {
+	#writes = "";
+
+	override write(data: string): void {
+		this.#writes += data;
+		super.write(data);
+	}
+
+	takeWrites(): string {
+		const writes = this.#writes;
+		this.#writes = "";
+		return writes;
+	}
+}
+
+describe("direct placement lifecycle", () => {
+	it("retires one of two live copies without deleting the other copy of the same image", async () => {
+		const term = new VirtualTerminal(40, 12);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
+		const graphic = image(tui.imageBudget);
+		let firstVisible = true;
+		tui.setFrameProvider({
+			renderFrame: size => ({
+				viewport: [
+					...(firstVisible ? graphic.render(size.columns) : ["replacement prose", "", "", ""]),
+					"between copies",
+					...graphic.render(size.columns),
+				],
+			}),
+			acknowledgeHistory() {},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(term);
+			const copies = term.graphicsPlacements().sort((a, b) => a.row - b.row);
+			expect(copies.map(copy => copy.row)).toEqual([0, 5]);
+			expect(copies[0]!.imageId).toBe(copies[1]!.imageId);
+			expect(copies[0]!.placementId).not.toBe(copies[1]!.placementId);
+
+			firstVisible = false;
+			tui.requestRender();
+			await scheduler.settle(term);
+			expect(term.graphicsPlacements()).toEqual([copies[1]!]);
+			expect(term.getViewport()[0]?.trimEnd()).toBe("replacement prose");
+		} finally {
+			tui.stop();
+		}
 	});
 
-	it("returns null for unregistered ids and after a full purge", () => {
-		const budget = new ImageBudget(8, () => {});
-		expect(budget.resolvePlacementEmit(9, 0, 0)).toBeNull();
-		budget.registerPlacementGeometry(9, 40, 60);
-		budget.enqueueTransmit(9, "seq");
-		expect(budget.resolvePlacementEmit(9, 0, -1)).not.toBeNull();
-		budget.takeAllTransmittedIds();
-		expect(budget.resolvePlacementEmit(9, 0, -1)).toBeNull();
+	for (const fullscreen of [false, true]) {
+		it(`removes moved and hidden images from the ${fullscreen ? "alternate" : "normal"} viewport`, async () => {
+			const term = new CapturingVirtualTerminal(40, 12);
+			const scheduler = new VirtualRenderScheduler();
+			const tui = new TUI(term, undefined, { renderScheduler: scheduler });
+			const graphic = image(tui.imageBudget);
+			let top = 1;
+			let visible = true;
+			const render = (width: number) => [
+				...Array.from({ length: top }, (_, index) => `prose ${index}`),
+				...(visible ? graphic.render(width) : ["replacement prose"]),
+			];
+			tui.setFrameProvider({ renderFrame: size => ({ viewport: render(size.columns) }), acknowledgeHistory() {} });
+			if (fullscreen) tui.showOverlay({ render, invalidate() {} }, { fullscreen: true, anchor: "top-left" });
+			try {
+				tui.start();
+				await scheduler.settle(term);
+				expect(term.graphicsPlacements().map(placement => placement.row)).toEqual([1]);
+				const first = term.graphicsPlacements()[0]!;
+				term.takeWrites();
+
+				top = 2;
+				tui.requestRender();
+				await scheduler.settle(term);
+				expect(term.graphicsPlacements().map(placement => placement.row)).toEqual([2]);
+				expect(term.takeWrites()).toContain(`\x1b_Ga=d,d=i,i=${first.imageId},p=${first.placementId},q=2\x1b\\`);
+				const moved = term.graphicsPlacements()[0]!;
+				expect(moved.imageId).toBe(first.imageId);
+
+				visible = false;
+				tui.requestRender();
+				await scheduler.settle(term);
+				expect(term.graphicsPlacements()).toEqual([]);
+				expect(term.getViewport()[2]?.trimEnd()).toBe("replacement prose");
+				const hiddenWrites = term.takeWrites();
+				expect(hiddenWrites).toContain(`\x1b_Ga=d,d=i,i=${moved.imageId},p=${moved.placementId},q=2\x1b\\`);
+				expect(hiddenWrites).not.toContain("\x1b_Ga=d,d=I,");
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	it("deletes a live copy without deleting the same image already committed to scrollback", async () => {
+		const term = new VirtualTerminal(40, 12);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
+		const graphic = image(tui.imageBudget);
+		let append = false;
+		let acknowledged = false;
+		let visible = true;
+		tui.setFrameProvider({
+			renderFrame: size => {
+				const rows = graphic.render(size.columns);
+				const history: HistoryBatch | undefined =
+					append && !acknowledged
+						? { id: 1, rows: [...rows, ...Array.from({ length: 16 }, (_, index) => `history ${index}`)] }
+						: undefined;
+				return { history, viewport: visible ? rows : ["replacement prose"] };
+			},
+			acknowledgeHistory() {
+				acknowledged = true;
+			},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(term);
+			append = true;
+			visible = false;
+			tui.requestRender();
+			await scheduler.settle(term);
+			const archived = term.graphicsPlacements();
+			expect(archived).toHaveLength(1);
+
+			visible = true;
+			tui.requestRender();
+			await scheduler.settle(term);
+			expect(term.graphicsPlacements()).toHaveLength(2);
+			const copies = term.graphicsPlacements();
+			expect(copies.map(copy => copy.imageId)).toEqual([archived[0]!.imageId, archived[0]!.imageId]);
+			expect(copies[0]!.placementId).not.toBe(copies[1]!.placementId);
+
+			visible = false;
+			tui.requestRender();
+			await scheduler.settle(term);
+			expect(term.graphicsPlacements()).toEqual(archived);
+		} finally {
+			tui.stop();
+		}
 	});
 
-	it("detects archived cells across commit-ledger rewinds without churning afterwards", () => {
-		const budget = new ImageBudget(8, () => {});
-		budget.registerPlacementGeometry(5, 40, 60);
-		// Placement 1 attaches from row 100 while commits sit at 90.
-		expect(budget.resolvePlacementEmit(5, 100, 90)?.placementId).toBe(1);
-		// Later frames (no re-emission) commit past the attach top...
-		budget.observeCommitWatermark(120);
-		// ...then a divergence recommit rewinds the ledger to 50. The archived
-		// cells are physically in scrollback, so the re-emit must not re-use
-		// placement 1 (Kitty replace would strip the archive).
-		expect(budget.resolvePlacementEmit(5, 60, 50)?.placementId).toBe(2);
-		// The stale pre-rewind peak must NOT keep advancing the epoch: rewrites
-		// with no commit progression replace placement 2 in place.
-		expect(budget.resolvePlacementEmit(5, 60, 50)?.placementId).toBe(2);
-		budget.observeCommitWatermark(55);
-		expect(budget.resolvePlacementEmit(5, 60, 50)?.placementId).toBe(2);
-		// The recommit re-crossing the new attach top advances exactly once.
-		budget.observeCommitWatermark(61);
-		expect(budget.resolvePlacementEmit(5, 60, 50)?.placementId).toBe(3);
-	});
+	it("preserves replay history split into the viewport after the next live repaint", async () => {
+		const term = new VirtualTerminal(40, 12);
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
+		const graphic = image(tui.imageBudget);
+		let acknowledged = false;
+		tui.setFrameProvider({
+			renderFrame: size => ({
+				history: acknowledged ? undefined : { id: 1, kind: "replay", rows: graphic.render(size.columns) },
+				viewport: ["live prose"],
+			}),
+			acknowledgeHistory() {
+				acknowledged = true;
+			},
+		});
+		try {
+			tui.start();
+			await scheduler.settle(term);
+			const archived = term.graphicsPlacements();
+			expect(archived).toHaveLength(1);
 
-	it("reports every image with its highest epoch when resetting", () => {
-		const budget = new ImageBudget(8, () => {});
-		budget.registerPlacementGeometry(5, 40, 60);
-		budget.registerPlacementGeometry(7, 40, 60);
-		expect(budget.resolvePlacementEmit(5, 10, 4)?.placementId).toBe(1);
-		expect(budget.resolvePlacementEmit(5, 12, 12)?.placementId).toBe(2);
-		expect(budget.resolvePlacementEmit(7, 30, 12)?.placementId).toBe(1);
-		// Every image is reported — an image absent from the replay never
-		// re-places, so even its epoch-1 registry entry must be deleted.
-		expect(budget.resetPlacementEpochs()).toEqual([
-			{ imageId: 5, lastEpoch: 2 },
-			{ imageId: 7, lastEpoch: 1 },
-		]);
-		// After the reset both images are back at epoch 1.
-		expect(budget.resolvePlacementEmit(5, 10, -1)?.placementId).toBe(1);
+			tui.requestRender();
+			await scheduler.settle(term);
+			expect(term.graphicsPlacements()).toEqual(archived);
+		} finally {
+			tui.stop();
+		}
 	});
 });

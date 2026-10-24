@@ -214,9 +214,11 @@ describe("HookEditorComponent prompt-style mode", () => {
 			supports: () => true,
 			feature: () => true,
 		};
-		const card = component.describe(cx);
-		expect(card.p).toMatchObject({ head: "Custom answer" });
-		expect(card.c?.[0]).toMatchObject({ k: "md", p: { text: question, role: "omp.ask.question" } });
+		const root = component.describe(cx);
+		const head = root.c?.[0];
+		const parts = typeof head === "object" && head !== null && "k" in head ? head.c : undefined;
+		expect(parts?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "Custom answer" }] } });
+		expect(parts?.[1]).toMatchObject({ k: "md", p: { text: question, role: "omp.ask.question" } });
 	});
 
 	it("refuses image attachments unless the prompt opted in and is still open", () => {

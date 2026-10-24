@@ -6,7 +6,6 @@ import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
 import {
 	buildStructuredSubagentRecoveryHint,
-	invalidModelSelectorReason,
 	reserveStructuredSubagentId,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
@@ -31,7 +30,6 @@ export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
 const agentArgsSchema = type({
 	prompt: "string>0",
 	"agent?": "string>0",
-	"model?": "string | string[]",
 	"label?": "string",
 	"schema?": "unknown",
 	"schemaMode?": "'permissive' | 'strict'",
@@ -46,7 +44,6 @@ const agentArgsSchema = type({
 interface EvalAgentArgs {
 	prompt: string;
 	agent?: string;
-	model?: string | string[];
 	label?: string;
 	schema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
@@ -100,8 +97,7 @@ function parseAgentArgs(args: unknown): EvalAgentArgs {
 	if (result instanceof type.errors) {
 		throw new ToolError(`agent() received invalid arguments: ${result.summary}`);
 	}
-	const selectorProblem = invalidModelSelectorReason(result.model, "agent()");
-	if (selectorProblem) throw new ToolError(selectorProblem);
+
 	return result;
 }
 
@@ -209,7 +205,6 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			invocationKind: "eval",
 			assignment: parsed.prompt,
 			...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
-			...(parsed.model !== undefined ? { model: parsed.model } : {}),
 			...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 			...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 			...(parsed.contextFilePolicy !== undefined ? { contextFilePolicy: parsed.contextFilePolicy } : {}),
@@ -234,7 +229,6 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						invocationKind: "eval",
 						assignment: parsed.prompt,
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
-						...(parsed.model !== undefined ? { model: parsed.model } : {}),
 						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 						...(parsed.contextFilePolicy !== undefined ? { contextFilePolicy: parsed.contextFilePolicy } : {}),

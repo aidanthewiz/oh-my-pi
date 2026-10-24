@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import type { Api, Model, ModelSpec, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -153,7 +153,10 @@ describe("/fast targets the current model's service-tier family", () => {
 		expect(session.serviceTierByFamily.anthropic).toBeUndefined();
 	});
 
-	const codexModel = (serviceTiers: string[]) =>
+	const codexModel = (
+		serviceTiers: string[] | undefined,
+		overrides: Partial<ModelSpec<"openai-codex-responses">> = {},
+	) =>
 		buildModel({
 			id: "gpt-6.1-sol",
 			name: "GPT-6.1 Sol",
@@ -166,13 +169,51 @@ describe("/fast targets the current model's service-tier family", () => {
 			contextWindow: 272_000,
 			maxTokens: 128_000,
 			serviceTiers,
+			...overrides,
 		});
 
-	it("refuses Ultrafast on a Codex model that does not advertise it", async () => {
-		const session = await createSessionForModel(codexModel(["priority"]));
+	it.each([undefined, [], ["priority"]].map(serviceTiers => ({ serviceTiers })))(
+		"selects first-party Sol Ultrafast without advertisement (%j)",
+		async ({ serviceTiers }) => {
+			const session = await createSessionForModel(codexModel(serviceTiers));
+			expect(session.isFastModeActive()).toBe(false);
+			expect(session.setUltrafastMode(true)).toBe(true);
+			expect(session.serviceTierByFamily).toEqual({ openai: "ultrafast" });
+			expect(session.effectiveServiceTier(session.model!)).toBe("ultrafast");
+			expect(session.isFastModeActive()).toBe(true);
+			expect(session.setUltrafastMode(false)).toBe(true);
+			expect(session.serviceTierByFamily).toEqual({});
+			expect(session.isFastModeActive()).toBe(false);
+			session.setFastMode(true);
+			session.setUltrafastMode(false);
+			expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
+		},
+	);
+
+	it.each([
+		{ id: "gpt-6-sol" },
+		{ provider: "custom-relay" },
+		{ baseUrl: "https://relay.invalid/backend-api" },
+		{ requestModelId: "gpt-6-sol" },
+		{ id: "sol-alias", requestModelId: "gpt-6.1-sol" },
+	])("preserves priority when an unadvertised route refuses Ultrafast (%j)", async route => {
+		const session = await createSessionForModel(codexModel(["priority"], route));
+		expect(session.setFastMode(true)).toBe(true);
 		expect(session.setUltrafastMode(true)).toBe(false);
-		expect(session.serviceTierByFamily).toEqual({});
+		expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
 		expect(session.isUltrafastModeEnabled()).toBe(false);
+		expect(session.isFastModeActive()).toBe(true);
+	});
+
+	it("retains advertised Ultrafast for a custom Codex route", async () => {
+		const model = codexModel(["ultrafast"], {
+			provider: "custom-relay",
+			baseUrl: "https://relay.invalid/backend-api",
+		});
+		const session = await createSessionForModel(model);
+		expect(session.setUltrafastMode(true)).toBe(true);
+		expect(session.effectiveServiceTier(model)).toBe("ultrafast");
+		expect(session.isFastModeActive()).toBe(true);
 	});
 
 	it("refuses /fast on a Codex model whose discovered tiers omit priority", async () => {
@@ -187,7 +228,6 @@ describe("/fast targets the current model's service-tier family", () => {
 		expect(session.setFastMode(true)).toBe(true);
 		expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
 		expect(session.isFastModeActive()).toBe(true);
-		expect(session.setUltrafastMode(true)).toBe(false);
 	});
 
 	it("selects Ultrafast on an advertising Codex model and clears it with /fast off", async () => {

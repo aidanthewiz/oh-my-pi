@@ -34,6 +34,45 @@ function fakeUsage(input: number, output: number): Usage {
 }
 
 describe("SessionManager + SqlSessionStorage (SQLite)", () => {
+	it("reopens portable metadata, clears it on a plain rename, and preserves overflow titles", async () => {
+		const client = new SQL("sqlite::memory:");
+		const dir = virtualDir("/sessions/portable-card");
+		let storage = await SqlSessionStorage.create({ client });
+		let manager = SessionManager.create("/cwd", dir, storage);
+		try {
+			await manager.ensureOnDisk();
+			await manager.setSessionName("Portable", "auto", undefined, {
+				code: "DB",
+				emoji: "🧪",
+				nf: "nf-md-flask",
+			});
+			const file = manager.getSessionFile()!;
+			await manager.close();
+			storage = await SqlSessionStorage.create({ client });
+			manager = await SessionManager.open(file, dir, storage);
+			expect(manager.getSessionName()).toBe("Portable");
+			expect(manager.getSessionTitleCard()).toEqual({ code: "DB", emoji: "🧪", nf: "nf-md-flask" });
+			await manager.setSessionName("Portable", "user");
+			await manager.close();
+			storage = await SqlSessionStorage.create({ client });
+			manager = await SessionManager.open(file, dir, storage);
+			expect(manager.getSessionName()).toBe("Portable");
+			expect(manager.getSessionTitleCard()).toBeUndefined();
+			await manager.setSessionName("界".repeat(150), "user", undefined, { code: "LONG", emoji: "🧪" });
+			await manager.close();
+			storage = await SqlSessionStorage.create({ client });
+			manager = await SessionManager.open(file, dir, storage);
+			expect(manager.getSessionName()).toBe("界".repeat(150));
+			expect(manager.getSessionTitleCard()).toBeUndefined();
+			const snapshot = await storage.readTextSnapshot(file);
+			expect(JSON.parse(snapshot.titleMeta!).title).toBe("界".repeat(150));
+			expect(Buffer.byteLength(snapshot.rawContent.split("\n")[0] + "\n", "utf8")).toBe(256);
+		} finally {
+			await manager.close();
+			await client.end();
+		}
+	});
+
 	it("persists appended assistant messages into SQL and reloads via open()", async () => {
 		const client = new SQL("sqlite::memory:");
 		const storage = await SqlSessionStorage.create({ client });

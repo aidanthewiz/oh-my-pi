@@ -98,6 +98,10 @@ export interface HookSelectorOptions {
 	/** Number of leading options (original order) that receive a selection
 	 *  marker. Defaults to every option when {@link selectionMarker} is set. */
 	markableCount?: number;
+	/** Describe as a card in the dock (the composer slot) instead of a picker
+	 *  sheet, so dock content above it (e.g. a `/omfg` candidate rule) stays
+	 *  visible and the transcript stays scrollable on native surfaces. */
+	inline?: boolean;
 }
 
 export interface HookSelectorOption {
@@ -251,6 +255,7 @@ export class HookSelectorComponent extends OverlayPanel {
 	#sliderComponent: Text | undefined;
 	#lastRenderWidth: number | undefined;
 	readonly #detailLines: readonly string[];
+	readonly #inline: boolean;
 	readonly #helpText: string | undefined;
 	readonly #destructiveTitle: boolean;
 	/** Described option rows by original index; `marker` is the radio state baked into the label. */
@@ -311,6 +316,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		this.#baseTitle = this.title;
 		this.#detailLines = titleLines.slice(1).map(line => replaceTabs(line));
 		this.#helpText = opts?.helpText;
+		this.#inline = opts?.inline ?? false;
 		this.#onLeftCallback = opts?.onLeft;
 		this.#onRightCallback = opts?.onRight;
 		this.#onExternalEditorCallback = opts?.onExternalEditor;
@@ -847,16 +853,18 @@ export class HookSelectorComponent extends OverlayPanel {
 	}
 
 	/**
-	 * A plain option list is a picker sheet. Otherwise a card headed by the
-	 * title (plus the countdown `elapsed` when a timeout runs), the extra title
-	 * lines, the slider as `tabs`, the options as a `list` keyed by original
-	 * option index, the search query while typing, and the key hints.
+	 * A plain option list is a picker sheet. Otherwise (inline, slider, or
+	 * countdown) a card headed by the title (plus the countdown `elapsed` when a
+	 * timeout runs), the extra title lines, the slider as `tabs`, the options as
+	 * a `list` keyed by original option index, the search query while typing,
+	 * and the key hints.
 	 */
 	override describe(cx: DescribeContext): NativeNode {
 		this.#layout(Math.max(1, cx.cols - 4));
 		const nativeScroll = cx.feature("scroll");
 		if (
 			cx.supports("picker") &&
+			!this.#inline &&
 			this.#detailLines.length === 0 &&
 			!this.#destructiveTitle &&
 			!this.#slider &&

@@ -6,7 +6,7 @@ import {
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
 import { enoent } from "./session-storage-errors";
-import type { SessionTitleUpdate } from "./session-title-slot";
+import { boundTitleCard, type SessionTitleUpdate } from "./session-title-slot";
 
 /**
  * Supported `bun:sql` adapter dialects. `Bun.SQL` reports this string on
@@ -104,6 +104,7 @@ interface IndexRow {
 	title?: string | null;
 	title_source?: string | null;
 	title_updated_at?: string | null;
+	title_card?: string | null;
 }
 
 interface ContentRow {
@@ -111,14 +112,33 @@ interface ContentRow {
 	title?: string | null;
 	title_source?: string | null;
 	title_updated_at?: string | null;
+	title_card?: string | null;
+}
+
+function rowTitleCard(row: IndexRow | ContentRow): SessionTitleUpdate["card"] {
+	if (!row.title_updated_at || !row.title_card) return undefined;
+	try {
+		return boundTitleCard(
+			{
+				title: row.title ?? undefined,
+				source: rowTitleSource(row.title_source),
+				updatedAt: row.title_updated_at,
+			},
+			JSON.parse(row.title_card),
+		);
+	} catch {
+		return undefined;
+	}
 }
 
 function titleMetaFromRow(row: ContentRow | undefined): string | null {
+	const card = row ? rowTitleCard(row) : undefined;
 	return row?.title_updated_at
 		? JSON.stringify({
 				title: row.title ?? undefined,
 				source: rowTitleSource(row.title_source),
 				updatedAt: row.title_updated_at,
+				...(card ? { card } : {}),
 			})
 		: null;
 }
@@ -155,30 +175,32 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 				`mtime_ms BIGINT NOT NULL, ` +
 				`title TEXT NULL, ` +
 				`title_source VARCHAR(16) NULL, ` +
-				`title_updated_at VARCHAR(64) NULL` +
+				`title_updated_at VARCHAR(64) NULL, ` +
+				`title_card TEXT NULL` +
 				`) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			addTitleColumns: [
 				`ALTER TABLE ${table} ADD COLUMN title TEXT NULL`,
 				`ALTER TABLE ${table} ADD COLUMN title_source VARCHAR(16) NULL`,
 				`ALTER TABLE ${table} ADD COLUMN title_updated_at VARCHAR(64) NULL`,
+				`ALTER TABLE ${table} ADD COLUMN title_card TEXT NULL`,
 			],
 			upsertReplace:
-				`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) VALUES (?, ?, ?, ?, ?, ?) ` +
-				`ON DUPLICATE KEY UPDATE content = ?, mtime_ms = ?, title = ?, title_source = ?, title_updated_at = ?`,
-			insertIfMissing: `INSERT IGNORE INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+				`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at, title_card) VALUES (?, ?, ?, ?, ?, ?, ?) ` +
+				`ON DUPLICATE KEY UPDATE content = ?, mtime_ms = ?, title = ?, title_source = ?, title_updated_at = ?, title_card = ?`,
+			insertIfMissing: `INSERT IGNORE INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at, title_card) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			replaceIfSize:
-				`UPDATE ${table} SET content = ?, mtime_ms = ?, title = ?, title_source = ?, title_updated_at = ? ` +
+				`UPDATE ${table} SET content = ?, mtime_ms = ?, title = ?, title_source = ?, title_updated_at = ?, title_card = ? ` +
 				`WHERE path = ? AND length(content) = ?`,
 			upsertAppend:
 				`INSERT INTO ${table} (path, content, mtime_ms) VALUES (?, ?, ?) ` +
 				`ON DUPLICATE KEY UPDATE content = CONCAT(content, ?), mtime_ms = ?`,
-			updateTitle: `UPDATE ${table} SET title = ?, title_source = ?, title_updated_at = ?, mtime_ms = ? WHERE path = ?`,
+			updateTitle: `UPDATE ${table} SET title = ?, title_source = ?, title_updated_at = ?, title_card = ?, mtime_ms = ? WHERE path = ?`,
 			delete: `DELETE FROM ${table} WHERE path = ?`,
 			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
-			loadIndex: `SELECT path, mtime_ms, length(content) AS byte_len, title, title_source, title_updated_at FROM ${table}`,
+			loadIndex: `SELECT path, mtime_ms, length(content) AS byte_len, title, title_source, title_updated_at, title_card FROM ${table}`,
 			readFull: `SELECT content AS content FROM ${table} WHERE path = ?`,
-			readFullWithTitleMeta: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ?`,
-			readFullLocked: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ? FOR UPDATE`,
+			readFullWithTitleMeta: `SELECT content, title, title_source, title_updated_at, title_card FROM ${table} WHERE path = ?`,
+			readFullLocked: `SELECT content, title, title_source, title_updated_at, title_card FROM ${table} WHERE path = ? FOR UPDATE`,
 			readSlices:
 				`SELECT substring(cast(content AS binary), 1, ?) AS head, ` +
 				`CASE WHEN ? <= 0 THEN cast('' AS binary) ` +
@@ -208,39 +230,41 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			`mtime_ms ${mtimeType} NOT NULL, ` +
 			`title TEXT, ` +
 			`title_source TEXT, ` +
-			`title_updated_at TEXT` +
+			`title_updated_at TEXT, ` +
+			`title_card TEXT` +
 			`)`,
 		addTitleColumns: [
 			`ALTER TABLE ${table} ADD COLUMN title TEXT`,
 			`ALTER TABLE ${table} ADD COLUMN title_source TEXT`,
 			`ALTER TABLE ${table} ADD COLUMN title_updated_at TEXT`,
+			`ALTER TABLE ${table} ADD COLUMN title_card TEXT`,
 		],
 		upsertReplace:
-			`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)}, ${placeholder(5)}, ${placeholder(6)}) ` +
-			`ON CONFLICT (path) DO UPDATE SET content = excluded.content, mtime_ms = excluded.mtime_ms, title = excluded.title, title_source = excluded.title_source, title_updated_at = excluded.title_updated_at`,
+			`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at, title_card) ` +
+			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)}, ${placeholder(5)}, ${placeholder(6)}, ${placeholder(7)}) ` +
+			`ON CONFLICT (path) DO UPDATE SET content = excluded.content, mtime_ms = excluded.mtime_ms, title = excluded.title, title_source = excluded.title_source, title_updated_at = excluded.title_updated_at, title_card = excluded.title_card`,
 		insertIfMissing:
-			`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)}, ${placeholder(5)}, ${placeholder(6)}) ` +
+			`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at, title_card) ` +
+			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)}, ${placeholder(5)}, ${placeholder(6)}, ${placeholder(7)}) ` +
 			`ON CONFLICT (path) DO NOTHING RETURNING path`,
 		replaceIfSize:
 			`UPDATE ${table} SET content = ${placeholder(1)}, mtime_ms = ${placeholder(2)}, title = ${placeholder(3)}, ` +
-			`title_source = ${placeholder(4)}, title_updated_at = ${placeholder(5)} ` +
-			`WHERE path = ${placeholder(6)} AND ${byteLengthExpr} = ${placeholder(7)} RETURNING path`,
+			`title_source = ${placeholder(4)}, title_updated_at = ${placeholder(5)}, title_card = ${placeholder(6)} ` +
+			`WHERE path = ${placeholder(7)} AND ${byteLengthExpr} = ${placeholder(8)} RETURNING path`,
 		upsertAppend:
 			`INSERT INTO ${table} (path, content, mtime_ms) ` +
 			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}) ` +
 			`ON CONFLICT (path) DO UPDATE SET content = ${tableQualifier} || excluded.content, mtime_ms = excluded.mtime_ms`,
-		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, mtime_ms = ${placeholder(4)} WHERE path = ${placeholder(5)}`,
+		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, title_card = ${placeholder(4)}, mtime_ms = ${placeholder(5)} WHERE path = ${placeholder(6)}`,
 		delete: `DELETE FROM ${table} WHERE path = ${placeholder(1)}`,
 		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)} RETURNING path`,
-		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len, title, title_source, title_updated_at FROM ${table}`,
+		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len, title, title_source, title_updated_at, title_card FROM ${table}`,
 		readFull: `SELECT content AS content FROM ${table} WHERE path = ${placeholder(1)}`,
-		readFullWithTitleMeta: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ${placeholder(1)}`,
+		readFullWithTitleMeta: `SELECT content, title, title_source, title_updated_at, title_card FROM ${table} WHERE path = ${placeholder(1)}`,
 		readFullLocked:
 			adapter === "sqlite"
-				? `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ?`
-				: `SELECT content, title, title_source, title_updated_at FROM ${table} WHERE path = ${placeholder(1)} FOR UPDATE`,
+				? `SELECT content, title, title_source, title_updated_at, title_card FROM ${table} WHERE path = ?`
+				: `SELECT content, title, title_source, title_updated_at, title_card FROM ${table} WHERE path = ${placeholder(1)} FOR UPDATE`,
 		readSlices,
 	};
 }
@@ -356,6 +380,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			title: row.title ?? undefined,
 			titleSource: rowTitleSource(row.title_source),
 			titleUpdatedAt: row.title_updated_at ?? undefined,
+			titleCard: rowTitleCard(row),
 		}));
 	}
 
@@ -390,7 +415,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		expectedFingerprint?: string,
 		expectedTitleMeta?: string | null,
 	): Promise<void> {
-		const titleValues = [title?.title ?? null, title?.source ?? null, title?.updatedAt ?? null];
+		const titleValues = [
+			title?.title ?? null,
+			title?.source ?? null,
+			title?.updatedAt ?? null,
+			title?.card ? JSON.stringify(title.card) : null,
+		];
 		if (expectedFingerprint !== undefined || expectedTitleMeta !== undefined) {
 			if (expectedSize === undefined || expectedSize === null) {
 				throw new Error("A session content fingerprint requires an existing size precondition.");
@@ -453,6 +483,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			title.title ?? null,
 			title.source ?? null,
 			title.updatedAt,
+			title.card ? JSON.stringify(title.card) : null,
 			mtimeMs,
 			path,
 		]);

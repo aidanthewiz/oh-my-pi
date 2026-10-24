@@ -41,6 +41,8 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.2"
+      - name: Verify selective LLVM extraction
+        run: python3 -m unittest discover -s bazel/toolchains -p test_extract_llvm.py
       - name: Select native verification source
         id: native
         env:
@@ -236,6 +238,7 @@ jobs:
           fi
           mkdir -p release-assets/package
           cp "${addons[@]}" release-assets/package/
+          cp LICENSE THIRD-PARTY-NOTICES.txt release-assets/package/
           archive="release-assets/coreforge-pi-natives-${{ matrix.target }}-verify.tgz"
           tar -czf "$archive" -C release-assets package
           test -s "$archive"
@@ -249,6 +252,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force release-assets/package | Out-Null
           Copy-Item $addons[0].FullName release-assets/package/
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.txt release-assets/package/ -ErrorAction Stop
           $archive = "release-assets/coreforge-pi-natives-win32-arm64-verify.tgz"
           tar -czf $archive -C release-assets package
           if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {

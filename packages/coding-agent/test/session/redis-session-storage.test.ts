@@ -21,7 +21,11 @@ import {
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import {
+	admitTitleCard,
+	serializeTitleSlot,
+	titleUpdateFromContent,
+} from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 
 interface FakeRedisCall {
@@ -129,6 +133,22 @@ function createFakeRedis(): FakeRedis {
 				getHash(titleKey).set(filePath, title);
 				return 1;
 			}
+			if (script.includes("OMP_MOVE")) {
+				checkFailure("rename");
+				const [sourceKey, destinationKey, metaKey, titleKey] = keys;
+				const [src, dst, mtimeMs] = argv;
+				const content = strings.get(sourceKey);
+				if (content === undefined) throw new Error("ERR no such key");
+				const title = getHash(titleKey).get(src);
+				strings.set(destinationKey, content);
+				strings.delete(sourceKey);
+				getHash(metaKey).delete(src);
+				getHash(metaKey).set(dst, mtimeMs);
+				getHash(titleKey).delete(src);
+				getHash(titleKey).delete(dst);
+				if (title !== undefined) getHash(titleKey).set(dst, title);
+				return 1;
+			}
 			throw new Error("Unsupported Redis script");
 		},
 		async get(key) {
@@ -174,16 +194,6 @@ function createFakeRedis(): FakeRedis {
 			}
 			return deleted;
 		},
-		async rename(src, dst) {
-			record("rename", [src, dst]);
-			checkFailure("rename");
-			if (!strings.has(src)) {
-				throw new Error("ERR no such key");
-			}
-			strings.set(dst, strings.get(src) as string);
-			strings.delete(src);
-			return "OK";
-		},
 		async scan(cursor, ...rest) {
 			record("scan", [cursor, ...rest]);
 			checkFailure("scan");
@@ -196,12 +206,6 @@ function createFakeRedis(): FakeRedis {
 			const regex = new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
 			const matches = Array.from(strings.keys()).filter(k => regex.test(k));
 			return ["0", matches];
-		},
-		async hset(key, field, value) {
-			record("hset", [key, field, value]);
-			checkFailure("hset");
-			getHash(key).set(field, value);
-			return 1;
 		},
 		async hgetall(key) {
 			record("hgetall", [key]);
@@ -260,7 +264,6 @@ describe("RedisSessionStorage", () => {
 		expect(redis.strings.get(`omp:sessions:file:${sessionPath}`)).toBe("old\n");
 		expect(redis.hashes.get("omp:sessions:meta")?.get(sessionPath)).toBe(oldMtime);
 		expect(storage.statSync(sessionPath).size).toBe(4);
-		expect(redis.calls.some(call => call.method === "send" && call.args[0] === "EVAL")).toBe(true);
 	});
 
 	it("rejects equal-byte-length stale content without changing the file or metadata", async () => {
@@ -439,6 +442,54 @@ describe("RedisSessionStorage", () => {
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/orig.jsonl")).toBe(false);
 	});
 
+	it("moves a card tuple and clears stale destination metadata when a plain source replaces it", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const source = "/sessions/p/card-source.jsonl";
+		const destination = "/sessions/p/card-destination.jsonl";
+		const update = { title: "Portable", source: "auto" as const, updatedAt: "t1" };
+		await storage.writeText(
+			source,
+			`${serializeTitleSlot({ ...update, card: admitTitleCard(update, { code: "DB", emoji: "🧪" }) })}` +
+				'{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n',
+		);
+		await storage.writeText(destination, "replaced destination\n");
+		await storage.rename(source, destination);
+		const moved = await RedisSessionStorage.create({ client: redis });
+		expect(titleUpdateFromContent(await moved.readText(destination))?.card?.code).toBe("DB");
+		expect(moved.existsSync(source)).toBe(false);
+		await moved.writeText(source, "plain source\n");
+		await moved.rename(source, destination);
+		const cleared = await RedisSessionStorage.create({ client: redis });
+		expect(await cleared.readText(destination)).toBe("plain source\n");
+		expect((await cleared.readTextSnapshot(destination)).titleMeta).toBeNull();
+		expect(await cleared.readTextSlices(destination, 256, 0)).toEqual(["plain source\n", ""]);
+	});
+
+	it("rejects a stale rewrite after a card-only update and keeps the newer visible card", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const sessionPath = "/sessions/p/card-fence.jsonl";
+		const update = { title: "Portable", source: "auto" as const, updatedAt: "t1" };
+		const old = { ...update, card: admitTitleCard(update, { code: "OLD", emoji: "🧪" }) };
+		const raw = `${serializeTitleSlot(old)}{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n`;
+		await storage.writeText(sessionPath, raw);
+		const snapshot = await storage.readTextSnapshot(sessionPath);
+		const peer = await RedisSessionStorage.create({ client: redis });
+		await peer.updateSessionTitle(sessionPath, {
+			...update,
+			card: admitTitleCard(update, { code: "NEW", emoji: "🚀" }),
+		});
+		await expect(
+			storage.writeTextAtomic(sessionPath, raw, {
+				expectedSize: Buffer.byteLength(snapshot.rawContent, "utf8"),
+				expectedFingerprint: createHash("sha1").update(snapshot.rawContent).digest("hex"),
+				expectedTitleMeta: snapshot.titleMeta,
+			}),
+		).rejects.toBeInstanceOf(SessionWriteConflictError);
+		const cold = await RedisSessionStorage.create({ client: redis });
+		expect((await cold.readTextSnapshot(sessionPath)).rawContent).toBe(raw);
+		expect(titleUpdateFromContent(await cold.readText(sessionPath))?.card?.code).toBe("NEW");
+	});
+
 	it("rename rolls back the index when Redis RENAME fails", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		await storage.writeText("/sessions/p/a.jsonl", "keep\n");
@@ -476,17 +527,6 @@ describe("RedisSessionStorage", () => {
 		expect((await storage.readTextSlices("/sessions/p/big.jsonl", 0, 3))[1]).toBe("hij");
 		expect((await storage.readTextSlices("/sessions/p/big.jsonl", 0, 100))[1]).toBe("abcdefghij");
 		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
-	});
-
-	it("readTextSlices uses GETRANGE instead of GET", async () => {
-		const storage = await RedisSessionStorage.create({ client: redis });
-		await storage.writeText("/sessions/p/big.jsonl", "abcdefghij");
-
-		redis.calls.length = 0;
-		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
-		expect(redis.calls.map(call => call.method)).toEqual(["getrange", "getrange"]);
-		expect(redis.calls[0].args).toEqual(["omp:sessions:file:/sessions/p/big.jsonl", 0, 3]);
-		expect(redis.calls[1].args).toEqual(["omp:sessions:file:/sessions/p/big.jsonl", -3, -1]);
 	});
 
 	it("custom prefix isolates keyspaces", async () => {

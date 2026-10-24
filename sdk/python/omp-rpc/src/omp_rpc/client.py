@@ -9,9 +9,10 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generic, Mapping, Sequence, TypeVar, cast
+from typing import Any, Generic, TypeVar, cast
 
 from ._wire import (
     _TODO_STATUS_VALUES,
@@ -97,9 +98,7 @@ class _RpcFrameDecoder:
         count = value.get("count")
         byte_length = value.get("byteLength")
         data = value.get("data")
-        max_chunk_count = (
-            _MAX_RPC_REASSEMBLED_BYTES + _RPC_CHUNK_PAYLOAD_BYTES - 1
-        ) // _RPC_CHUNK_PAYLOAD_BYTES
+        max_chunk_count = (_MAX_RPC_REASSEMBLED_BYTES + _RPC_CHUNK_PAYLOAD_BYTES - 1) // _RPC_CHUNK_PAYLOAD_BYTES
         if (
             not isinstance(chunk_id, str)
             or not chunk_id
@@ -360,7 +359,6 @@ class HostToolCompletedEvent:
     tool_call_id: str
 
 
-
 @dataclass(slots=True, frozen=True)
 class PromptTurn:
     events: tuple[RpcAgentEvent, ...]
@@ -507,12 +505,8 @@ class RpcClient(WireClient):
         self._extra_args = tuple(extra_args)
         self._startup_timeout = startup_timeout
         self._request_timeout = request_timeout
-        self._max_event_history = self._validate_history_limit(
-            "max_event_history", max_event_history
-        )
-        self._max_stderr_chunks = self._validate_history_limit(
-            "max_stderr_chunks", max_stderr_chunks
-        )
+        self._max_event_history = self._validate_history_limit("max_event_history", max_event_history)
+        self._max_stderr_chunks = self._validate_history_limit("max_stderr_chunks", max_stderr_chunks)
 
         self._process: subprocess.Popen[str] | None = None
         self._pgid: int | None = None
@@ -534,9 +528,7 @@ class RpcClient(WireClient):
         self._pending_host_uri_requests: dict[str, _PendingHostUriRequest] = {}
         self._request_id = 0
         self._events = _BoundedHistory[JsonObject](self._max_event_history)
-        self._async_errors = _BoundedHistory[BaseException](
-            _DEFAULT_ERROR_HISTORY_LIMIT
-        )
+        self._async_errors = _BoundedHistory[BaseException](_DEFAULT_ERROR_HISTORY_LIMIT)
         # Accepted prompt request ids still awaiting their `prompt_result`.
         self._pending_prompt_ids: set[str] = set()
         # `prompt_and_wait` slots keyed by request id: the prompt's result and
@@ -554,12 +546,8 @@ class RpcClient(WireClient):
         self._protocol_version = 1
         self._protocol_v2_enabled = False
         self._frame_decoder = _RpcFrameDecoder()
-        self._protocol_errors = _BoundedHistory[RpcProtocolError](
-            _DEFAULT_ERROR_HISTORY_LIMIT
-        )
-        self._listener_errors = _BoundedHistory[ListenerErrorEvent](
-            _DEFAULT_ERROR_HISTORY_LIMIT
-        )
+        self._protocol_errors = _BoundedHistory[RpcProtocolError](_DEFAULT_ERROR_HISTORY_LIMIT)
+        self._listener_errors = _BoundedHistory[ListenerErrorEvent](_DEFAULT_ERROR_HISTORY_LIMIT)
         self._prompt_lifecycle = _PromptLifecycleCoordinator()
 
         self._notification_listeners: list[NotificationListener] = []
@@ -638,21 +626,15 @@ class RpcClient(WireClient):
         self._process = process
         self._pgid = _process_group_id(process)
 
-        self._stdout_thread = threading.Thread(
-            target=self._read_stdout_loop, name="omp-rpc-stdout", daemon=True
-        )
-        self._stderr_thread = threading.Thread(
-            target=self._read_stderr_loop, name="omp-rpc-stderr", daemon=True
-        )
+        self._stdout_thread = threading.Thread(target=self._read_stdout_loop, name="omp-rpc-stdout", daemon=True)
+        self._stderr_thread = threading.Thread(target=self._read_stderr_loop, name="omp-rpc-stderr", daemon=True)
         self._stdout_thread.start()
         self._stderr_thread.start()
 
         if not self._ready.wait(self._startup_timeout):
             stderr = self.stderr
             self.stop()
-            raise RpcTimeoutError(
-                f"Timed out waiting for RPC ready signal. Stderr: {stderr}"
-            )
+            raise RpcTimeoutError(f"Timed out waiting for RPC ready signal. Stderr: {stderr}")
 
         if not self._ready_received:
             error = self._closed_error
@@ -661,12 +643,8 @@ class RpcClient(WireClient):
             if isinstance(error, RpcError):
                 raise error
             if error is not None:
-                raise RpcProcessExitError(
-                    f"RPC process stopped before ready: {error}. Stderr: {stderr}"
-                ) from error
-            raise RpcTimeoutError(
-                f"Timed out waiting for RPC ready signal. Stderr: {stderr}"
-            )
+                raise RpcProcessExitError(f"RPC process stopped before ready: {error}. Stderr: {stderr}") from error
+            raise RpcTimeoutError(f"Timed out waiting for RPC ready signal. Stderr: {stderr}")
 
         ready_event = self._ready_event
         if (
@@ -824,15 +802,11 @@ class RpcClient(WireClient):
         self._listener_error_listeners.append(listener)
         return lambda: self._remove_listener(self._listener_error_listeners, listener)
 
-    def on_unknown_notification(
-        self, listener: Callable[[UnknownNotification], None]
-    ) -> Callable[[], None]:
+    def on_unknown_notification(self, listener: Callable[[UnknownNotification], None]) -> Callable[[], None]:
         """Subscribe to frames this client does not model or could not parse."""
         return self._listen("unknown", listener)
 
-    def _listen(
-        self, frame_type: str, listener: Callable[..., None]
-    ) -> Callable[[], None]:
+    def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
         listeners = self._typed_listeners.setdefault(frame_type, [])
         listeners.append(listener)
         return lambda: self._remove_listener(listeners, listener)
@@ -917,19 +891,13 @@ class RpcClient(WireClient):
         try:
             return self._ui_requests.get(timeout=timeout)
         except queue.Empty as exc:
-            raise RpcTimeoutError(
-                "Timed out waiting for an extension UI request"
-            ) from exc
+            raise RpcTimeoutError("Timed out waiting for an extension UI request") from exc
 
     def send_ui_value(self, request_id: str, value: str) -> None:
-        self._send_notification(
-            {"type": "extension_ui_response", "id": request_id, "value": value}
-        )
+        self._send_notification({"type": "extension_ui_response", "id": request_id, "value": value})
 
     def send_ui_confirmation(self, request_id: str, confirmed: bool) -> None:
-        self._send_notification(
-            {"type": "extension_ui_response", "id": request_id, "confirmed": confirmed}
-        )
+        self._send_notification({"type": "extension_ui_response", "id": request_id, "confirmed": confirmed})
 
     def send_ui_answers(self, request_id: str, answers: Sequence[AskAnswer]) -> None:
         """Answer an `ask` request with one `AskAnswer` per question, in question order."""
@@ -942,9 +910,7 @@ class RpcClient(WireClient):
             if answer.custom_input is not None:
                 entry["customInput"] = answer.custom_input
             wire_answers.append(entry)
-        self._send_notification(
-            {"type": "extension_ui_response", "id": request_id, "answers": wire_answers}
-        )
+        self._send_notification({"type": "extension_ui_response", "id": request_id, "answers": wire_answers})
 
     def cancel_ui_request(self, request_id: str, *, timed_out: bool = False) -> None:
         payload: JsonObject = {
@@ -959,14 +925,10 @@ class RpcClient(WireClient):
     def get_todos(self) -> tuple[TodoPhase, ...]:
         return self.get_state().todo_phases
 
-    def set_todos(
-        self, todos: Sequence[TodoSeed | TodoPhaseSeed]
-    ) -> tuple[TodoPhase, ...]:
+    def set_todos(self, todos: Sequence[TodoSeed | TodoPhaseSeed]) -> tuple[TodoPhase, ...]:
         phases = self._normalize_todo_phases(todos)
         data = self._command("set_todos", {"phases": phases})
-        return required(
-            expect_object(data, "set_todos"), "todoPhases", array(parse_todo_phase), "set_todos"
-        )
+        return required(expect_object(data, "set_todos"), "todoPhases", array(parse_todo_phase), "set_todos")
 
     def clear_todos(self) -> tuple[TodoPhase, ...]:
         return self.set_todos(())
@@ -980,13 +942,8 @@ class RpcClient(WireClient):
                 cursor: str | None = None
                 while True:
                     page = self.get_messages_page(cursor=cursor, limit=256)
-                    if (
-                        total_messages is not None
-                        and page.total_messages != total_messages
-                    ):
-                        raise RpcError(
-                            "RPC message pagination returned an inconsistent total"
-                        )
+                    if total_messages is not None and page.total_messages != total_messages:
+                        raise RpcError("RPC message pagination returned an inconsistent total")
                     total_messages = page.total_messages
                     messages.extend(page.messages)
                     cursor = page.next_cursor
@@ -996,9 +953,7 @@ class RpcClient(WireClient):
                         raise RpcError("RPC message pagination repeated a cursor")
                     seen_cursors.add(cursor)
                 if len(messages) != total_messages:
-                    raise RpcError(
-                        "RPC message pagination ended before the advertised total"
-                    )
+                    raise RpcError("RPC message pagination ended before the advertised total")
                 return tuple(messages)
             except RpcCommandError as error:
                 if error.command != "get_messages_page" or not (
@@ -1038,9 +993,7 @@ class RpcClient(WireClient):
                 definition["loadMode"] = tool.load_mode
             definitions.append(definition)
         data = self._command("set_host_tools", {"tools": definitions})
-        return required(
-            expect_object(data, "set_host_tools"), "toolNames", array(decode_str), "set_host_tools"
-        )
+        return required(expect_object(data, "set_host_tools"), "toolNames", array(decode_str), "set_host_tools")
 
     def set_host_uris(self, host_uris: Sequence[HostUri[Any]]) -> tuple[str, ...]:
         self._host_uris = tuple(host_uris)
@@ -1087,9 +1040,7 @@ class RpcClient(WireClient):
         )
         return request_id
 
-    def abort_and_prompt(
-        self, message: str, *, images: Sequence[ImageContent] | None = None
-    ) -> str:
+    def abort_and_prompt(self, message: str, *, images: Sequence[ImageContent] | None = None) -> str:
         """Abort the current run and submit a prompt; returns its request id."""
         request_id = self._next_request_id()
         self._submit_prompt(
@@ -1133,9 +1084,7 @@ class RpcClient(WireClient):
             )
             if not agent_invoked:
                 with self._event_condition:
-                    events = self._event_slice(
-                        start_index, self._events.current_index()
-                    )
+                    events = self._event_slice(start_index, self._events.current_index())
                 return self._build_prompt_turn(events, None)
             result, events = self._wait_for_prompt_result(
                 request_id, start_index, start_async_error_index, timeout=timeout
@@ -1159,15 +1108,11 @@ class RpcClient(WireClient):
                         raise RpcProcessExitError(str(self._closed_error))
                     self._raise_async_errors_since(start_async_error_index)
                     if not self._pending_prompt_ids:
-                        self._raise_async_errors_since(
-                            self._last_schedule_async_error_index
-                        )
+                        self._raise_async_errors_since(self._last_schedule_async_error_index)
                         return
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise RpcTimeoutError(
-                            f"Timed out waiting for prompt_result. Stderr: {self.stderr}"
-                        )
+                        raise RpcTimeoutError(f"Timed out waiting for prompt_result. Stderr: {self.stderr}")
                     self._event_condition.wait(remaining)
         finally:
             self._prompt_lifecycle.release(operation)
@@ -1192,9 +1137,7 @@ class RpcClient(WireClient):
                     raise RpcProcessExitError(str(self._closed_error))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RpcTimeoutError(
-                        f"Timed out waiting for session_settled. Stderr: {self.stderr}"
-                    )
+                    raise RpcTimeoutError(f"Timed out waiting for session_settled. Stderr: {self.stderr}")
                 self._event_condition.wait(remaining)
 
     def collect_events(self, timeout: float | None = None) -> tuple[RpcAgentEvent, ...]:
@@ -1203,9 +1146,7 @@ class RpcClient(WireClient):
         try:
             start_index = self._current_event_index()
             start_async_error_index = self._current_async_error_index()
-            return self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
-            )
+            return self._wait_for_agent_end(start_index, start_async_error_index, timeout=timeout)
         finally:
             self._prompt_lifecycle.release(operation)
 
@@ -1220,9 +1161,7 @@ class RpcClient(WireClient):
         with self._event_condition:
             return self._async_errors.current_index()
 
-    def _submit_prompt(
-        self, command_type: str, request_id: str, **payload: JsonValue
-    ) -> bool:
+    def _submit_prompt(self, command_type: str, request_id: str, **payload: JsonValue) -> bool:
         """Send a prompt command, tracking it until its `prompt_result`.
 
         Returns False when the server handled it locally (`agentInvoked: false`),
@@ -1267,9 +1206,7 @@ class RpcClient(WireClient):
                 "Increase max_event_history to retain more streamed events."
             )
 
-    def _event_slice(
-        self, start_index: int, end_index: int
-    ) -> tuple[RpcAgentEvent, ...]:
+    def _event_slice(self, start_index: int, end_index: int) -> tuple[RpcAgentEvent, ...]:
         """Parse retained events in `[start_index, end_index)`; caller holds `_event_condition`."""
         self._check_event_history(start_index)
         payloads = self._events.snapshot_from(start_index)[: end_index - start_index]
@@ -1295,9 +1232,7 @@ class RpcClient(WireClient):
                     return result, self._event_slice(start_index, end_index)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RpcTimeoutError(
-                        f"Timed out waiting for prompt_result. Stderr: {self.stderr}"
-                    )
+                    raise RpcTimeoutError(f"Timed out waiting for prompt_result. Stderr: {self.stderr}")
                 self._event_condition.wait(remaining)
 
     def _record_prompt_result(self, result: PromptResultEvent) -> None:
@@ -1320,9 +1255,7 @@ class RpcClient(WireClient):
         for event_index in range(len(events) - 1, -1, -1):
             event = events[event_index]
             if isinstance(event, AgentEndEvent):
-                final_messages = self._complete_agent_end_messages(
-                    events[:event_index], event
-                )
+                final_messages = self._complete_agent_end_messages(events[:event_index], event)
                 break
 
         assistant_message: AssistantMessage | None = None
@@ -1343,9 +1276,7 @@ class RpcClient(WireClient):
             events=events,
             messages=final_messages,
             assistant_message=assistant_message,
-            assistant_text=assistant_text(assistant_message)
-            if assistant_message is not None
-            else None,
+            assistant_text=assistant_text(assistant_message) if assistant_message is not None else None,
             result=result,
         )
 
@@ -1353,9 +1284,7 @@ class RpcClient(WireClient):
     def _complete_agent_end_messages(
         events: tuple[RpcAgentEvent, ...], terminal: AgentEndEvent
     ) -> tuple[AgentMessage, ...]:
-        if terminal.message_count is None or terminal.message_count <= len(
-            terminal.messages
-        ):
+        if terminal.message_count is None or terminal.message_count <= len(terminal.messages):
             return terminal.messages
 
         run_start = 0
@@ -1364,11 +1293,7 @@ class RpcClient(WireClient):
                 run_start = event_index + 1
                 break
 
-        streamed_messages = tuple(
-            event.message
-            for event in events[run_start:]
-            if isinstance(event, MessageEndEvent)
-        )
+        streamed_messages = tuple(event.message for event in events[run_start:] if isinstance(event, MessageEndEvent))
         streamed_prefix_count = terminal.message_count - len(terminal.messages)
         if streamed_prefix_count > len(streamed_messages):
             raise RpcError(
@@ -1394,17 +1319,14 @@ class RpcClient(WireClient):
 
                 end_index = self._events.current_index()
                 if any(
-                    payload.get("type") == "agent_end"
-                    and payload.get("isTerminal") is not False
+                    payload.get("type") == "agent_end" and payload.get("isTerminal") is not False
                     for payload in self._events.snapshot_from(start_index)
                 ):
                     return self._event_slice(start_index, end_index)
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RpcTimeoutError(
-                        f"Timed out waiting for agent_end. Stderr: {self.stderr}"
-                    )
+                    raise RpcTimeoutError(f"Timed out waiting for agent_end. Stderr: {self.stderr}")
                 self._event_condition.wait(remaining)
 
     def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
@@ -1420,9 +1342,7 @@ class RpcClient(WireClient):
         timeout: float | None = None,
     ) -> JsonObject:
         """Send one command and return its `data` (`{}` when absent or null)."""
-        data = self._request_data(
-            command_type, request_id, payload, drop_none=drop_none, timeout=timeout
-        )
+        data = self._request_data(command_type, request_id, payload, drop_none=drop_none, timeout=timeout)
         return data if data is not None else {}
 
     def _request_data(
@@ -1446,9 +1366,7 @@ class RpcClient(WireClient):
 
         response_queue: queue.Queue[JsonObject | BaseException] = queue.Queue(maxsize=1)
         with self._state_lock:
-            self._pending[request_id] = _PendingRequest(
-                command=command_type, response_queue=response_queue
-            )
+            self._pending[request_id] = _PendingRequest(command=command_type, response_queue=response_queue)
 
         try:
             self._write_json(process, envelope)
@@ -1458,15 +1376,11 @@ class RpcClient(WireClient):
             raise
 
         try:
-            response = response_queue.get(
-                timeout=self._request_timeout if timeout is None else timeout
-            )
+            response = response_queue.get(timeout=self._request_timeout if timeout is None else timeout)
         except queue.Empty as exc:
             with self._state_lock:
                 self._pending.pop(request_id, None)
-            raise RpcTimeoutError(
-                f"Timed out waiting for response to {command_type}. Stderr: {self.stderr}"
-            ) from exc
+            raise RpcTimeoutError(f"Timed out waiting for response to {command_type}. Stderr: {self.stderr}") from exc
 
         if isinstance(response, BaseException):
             raise response
@@ -1524,11 +1438,7 @@ class RpcClient(WireClient):
         tool_name = payload.get("toolName")
         tool_call_id = payload.get("toolCallId")
         raw_arguments = payload.get("arguments")
-        if (
-            not isinstance(request_id, str)
-            or not isinstance(tool_name, str)
-            or not isinstance(tool_call_id, str)
-        ):
+        if not isinstance(request_id, str) or not isinstance(tool_name, str) or not isinstance(tool_call_id, str):
             return
         # Remember the dispatch so tool_execution_* events for this call id can
         # be renamed from the transport tool to the host tool that ran; see
@@ -1554,11 +1464,7 @@ class RpcClient(WireClient):
             return
 
         tool = next(
-            (
-                candidate
-                for candidate in self._custom_tools
-                if candidate.name == tool_name
-            ),
+            (candidate for candidate in self._custom_tools if candidate.name == tool_name),
             None,
         )
         if tool is None:
@@ -1630,9 +1536,7 @@ class RpcClient(WireClient):
             finally:
                 self._pending_host_tool_calls.pop(request_id, None)
 
-        threading.Thread(
-            target=run_tool, name=f"omp-rpc-host-tool:{tool_name}", daemon=True
-        ).start()
+        threading.Thread(target=run_tool, name=f"omp-rpc-host-tool:{tool_name}", daemon=True).start()
 
     def _handle_host_tool_cancel(self, payload: JsonObject) -> None:
         target_id = payload.get("targetId")
@@ -1656,16 +1560,10 @@ class RpcClient(WireClient):
         request_id = payload.get("id")
         operation = payload.get("operation")
         url = payload.get("url")
-        if (
-            not isinstance(request_id, str)
-            or not isinstance(operation, str)
-            or not isinstance(url, str)
-        ):
+        if not isinstance(request_id, str) or not isinstance(operation, str) or not isinstance(url, str):
             return
         if operation not in ("read", "write"):
-            self._send_host_uri_error(
-                request_id, f"Unsupported host URI operation: {operation}"
-            )
+            self._send_host_uri_error(request_id, f"Unsupported host URI operation: {operation}")
             return
 
         try:
@@ -1681,9 +1579,7 @@ class RpcClient(WireClient):
             None,
         )
         if uri is None:
-            self._send_host_uri_error(
-                request_id, f'Host URI scheme "{scheme}://" is not registered'
-            )
+            self._send_host_uri_error(request_id, f'Host URI scheme "{scheme}://" is not registered')
             return
 
         if operation == "write" and uri.write is None:
@@ -1722,9 +1618,7 @@ class RpcClient(WireClient):
                     uri.write(url, content, context)
                     if pending.cancel_event.is_set():
                         return
-                    self._send_notification(
-                        {"type": "host_uri_result", "id": request_id}
-                    )
+                    self._send_notification({"type": "host_uri_result", "id": request_id})
             except Exception as exc:
                 if pending.cancel_event.is_set():
                     return
@@ -1732,9 +1626,7 @@ class RpcClient(WireClient):
             finally:
                 self._pending_host_uri_requests.pop(request_id, None)
 
-        threading.Thread(
-            target=run, name=f"omp-rpc-host-uri:{scheme}:{operation}", daemon=True
-        ).start()
+        threading.Thread(target=run, name=f"omp-rpc-host-uri:{scheme}:{operation}", daemon=True).start()
 
     def _handle_host_uri_cancel(self, payload: JsonObject) -> None:
         target_id = payload.get("targetId")
@@ -1789,9 +1681,7 @@ class RpcClient(WireClient):
                 status: TodoStatus = cast(TodoStatus, raw_status)
             else:
                 status = "pending"
-            return wire_item(
-                content, status, seed.get("blocker"), seed.get("details"), seed.get("notes")
-            )
+            return wire_item(content, status, seed.get("blocker"), seed.get("details"), seed.get("notes"))
 
         def is_phase_seed(seed: TodoSeed | TodoPhaseSeed) -> bool:
             if isinstance(seed, TodoPhase):
@@ -1809,14 +1699,10 @@ class RpcClient(WireClient):
                 if not isinstance(raw_name, str) or not raw_name.strip():
                     raise RpcError("Todo phases must provide a non-empty 'name' value")
                 raw_tasks = seed.get("tasks") or ()
-                if not isinstance(raw_tasks, Sequence) or isinstance(
-                    raw_tasks, (str, bytes)
-                ):
+                if not isinstance(raw_tasks, Sequence) or isinstance(raw_tasks, (str, bytes)):
                     raise RpcError("Todo phase 'tasks' must be a sequence")
                 name = raw_name
-                tasks = [
-                    normalize_todo_item(cast(TodoSeed, task)) for task in raw_tasks
-                ]
+                tasks = [normalize_todo_item(cast(TodoSeed, task)) for task in raw_tasks]
 
             return {"name": name, "tasks": cast(JsonValue, tasks)}
 
@@ -1824,9 +1710,7 @@ class RpcClient(WireClient):
             phases: list[JsonObject] = []
             for seed in todos:
                 if not is_phase_seed(seed):
-                    raise RpcError(
-                        "Cannot mix flat todo items with todo phases in one set_todos() call"
-                    )
+                    raise RpcError("Cannot mix flat todo items with todo phases in one set_todos() call")
                 phases.append(normalize_phase(cast(TodoPhaseSeed, seed)))
             return phases
 
@@ -1865,9 +1749,7 @@ class RpcClient(WireClient):
             command.append("--no-skills")
         if self._no_rules:
             command.append("--no-rules")
-        emit_no_title = (
-            self._no_title if self._no_title is not None else self._rpc_defaults
-        )
+        emit_no_title = self._no_title if self._no_title is not None else self._rpc_defaults
         if emit_no_title:
             command.append("--no-title")
         if self._no_ui:
@@ -1894,9 +1776,7 @@ class RpcClient(WireClient):
                 process.stdin.write("\n")
                 process.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
-                raise RpcProcessExitError(
-                    f"Failed to write RPC command: {exc}"
-                ) from exc
+                raise RpcProcessExitError(f"Failed to write RPC command: {exc}") from exc
 
     def _read_stdout_loop(self) -> None:
         process = self._process
@@ -1954,20 +1834,11 @@ class RpcClient(WireClient):
                     # Protocol drift must not terminate the reader. This also
                     # demotes parser defects to UnknownNotification; consumers
                     # that need visibility should register an unknown listener.
-                    notification = UnknownNotification(
-                        _clone_json_object(payload), parse_error=str(exc)
-                    )
-                    if (
-                        payload_type == "agent_end"
-                        and payload.get("isTerminal") is not False
-                    ):
-                        self._append_async_error(
-                            RpcError(f"Failed to parse terminal agent_end: {exc}")
-                        )
+                    notification = UnknownNotification(_clone_json_object(payload), parse_error=str(exc))
+                    if payload_type == "agent_end" and payload.get("isTerminal") is not False:
+                        self._append_async_error(RpcError(f"Failed to parse terminal agent_end: {exc}"))
                     elif payload_type == "prompt_result":
-                        self._append_async_error(
-                            RpcError(f"Failed to parse prompt_result: {exc}")
-                        )
+                        self._append_async_error(RpcError(f"Failed to parse prompt_result: {exc}"))
                         prompt_id = payload.get("id")
                         if isinstance(prompt_id, str):
                             self._settle_prompt(prompt_id)
@@ -1993,9 +1864,7 @@ class RpcClient(WireClient):
                         self._event_condition.notify_all()
                 elif isinstance(notification, RpcAgentEvent):
                     self._append_event(payload)
-                    self._dispatch_listeners(
-                        "event", notification.type, self._event_listeners, notification
-                    )
+                    self._dispatch_listeners("event", notification.type, self._event_listeners, notification)
 
                 self._dispatch_listeners(
                     "typed",
@@ -2012,16 +1881,10 @@ class RpcClient(WireClient):
                     try:
                         exit_code = process.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
-                        self._mark_closed(
-                            RpcProcessExitError(
-                                "RPC process stdout closed before the process exited"
-                            )
-                        )
+                        self._mark_closed(RpcProcessExitError("RPC process stdout closed before the process exited"))
                         return
                 self._mark_closed(
-                    RpcProcessExitError(
-                        f"RPC process exited with code {exit_code}. Stderr: {self.stderr}"
-                    )
+                    RpcProcessExitError(f"RPC process exited with code {exit_code}. Stderr: {self.stderr}")
                 )
 
     def _read_stderr_loop(self) -> None:
@@ -2068,13 +1931,8 @@ class RpcClient(WireClient):
         if protocol_error is None:
             return
 
-        if (
-            protocol_error.command in _ASYNC_COMMANDS
-            and protocol_error.remote_error is not None
-        ):
-            self._append_async_error(
-                RpcCommandError(protocol_error.command, protocol_error.remote_error)
-            )
+        if protocol_error.command in _ASYNC_COMMANDS and protocol_error.remote_error is not None:
+            self._append_async_error(RpcCommandError(protocol_error.command, protocol_error.remote_error))
 
         self._record_protocol_error(protocol_error)
 
@@ -2087,11 +1945,7 @@ class RpcClient(WireClient):
             return False
 
         with self._state_lock:
-            matching_ids = [
-                request_id
-                for request_id, pending in self._pending.items()
-                if pending.command == command
-            ]
+            matching_ids = [request_id for request_id, pending in self._pending.items() if pending.command == command]
             target_id: str | None = None
             if len(matching_ids) == 1:
                 target_id = matching_ids[0]
@@ -2126,9 +1980,7 @@ class RpcClient(WireClient):
     def _record_protocol_error(self, error: RpcProtocolError) -> None:
         with self._state_lock:
             self._protocol_errors.append(error)
-        self._dispatch_listeners(
-            "protocol_error", error.command, self._protocol_error_listeners, error
-        )
+        self._dispatch_listeners("protocol_error", error.command, self._protocol_error_listeners, error)
 
     def _record_listener_error(self, event: ListenerErrorEvent) -> None:
         with self._state_lock:

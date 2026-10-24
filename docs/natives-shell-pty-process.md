@@ -49,7 +49,9 @@ Rust creates `brush_core::Shell` with:
 - bash-mode builtins, with `exec` and `suspend` disabled,
 - process builtins registered unconditionally from `pi_builtins::process_builtins()` — `nohup`, `pgrep`, `pkill`, `pidwait`, `ps`, `sleep`, `timeout`, and `top` (`nohup` is withheld when `PI_DISABLE_NOHUP_BUILTIN` is set; `kill` comes from the default bash-mode set, where `pi-builtins`' richer implementation replaces brush's original),
 - in-process utility builtins registered from `pi_builtins::utility_builtins()` (see the next section),
-- an opt-in `git` builtin (`crates/pi-shell/src/git.rs`, gated by `PI_SMART_GIT`) that serves supported `git worktree add` invocations through `pi-vcs`: copy-on-write clone, worktree registration, and reconciliation to the target commit, with an in-process checkout fallback when cloning is unavailable. Unsupported commands/options/repository configurations run the git binary with the original arguments,
+- an opt-in `git` builtin (`crates/pi-shell/src/git.rs`), registered when either layer below is on; anything a layer does not take runs the git binary with the original arguments:
+  - `PI_SMART_GIT` serves supported `git worktree add` invocations through `pi-vcs`: copy-on-write clone, worktree registration, and reconciliation to the target commit, with an in-process checkout fallback when cloning is unavailable;
+  - `PI_GIT_GUARD` (set by the coding agent from `bash.gitGuard`; `crates/pi-shell/src/git/guard.rs`) refuses, with exit status 1, git commands that discard or move work in a shared checkout: `stash` other than `list`/`show`, `reset --hard`, `reset` to a commit other than HEAD's, and `checkout`/`switch`/working-tree `restore` unless the repository is mid-merge/rebase/cherry-pick/revert (unmerged index entries or the operation's state files), and even then not forced or whole-tree forms. It judges the expanded argv in the directory git actually runs in (`cd` and `-C` applied); `--git-dir`/`--work-tree`/`GIT_DIR`-style redirection forfeits the conflict exemption,
 - skip-list for shell-sensitive vars (`PS1`, `PWD`, `SHLVL`, bash function exports, etc.),
 - a non-exported `env="$env"` fallback so PowerShell-style `$env:NAME` survives brush parameter expansion unless the user shadows `env`.
 
@@ -100,6 +102,15 @@ Persistent shell (`Shell.run`) uses this state machine:
 - **Error**: session is dropped.
 
 One-shot shell (`executeShell`) always creates and drops a fresh session per call.
+
+Brush job handles own shell-internal tasks through `AbortOnDropHandle`, including asynchronous lists and coprocesses.
+Dropping a subshell or its job table aborts those tasks; `ShellSessionCore` has no separate task-cleanup destructor.
+Cancellation aborts internal jobs before process-group cleanup, while existing descendant cleanup and bounded reader shutdown remain active.
+
+For internal jobs, `kill -0 %N` probes without stopping work; terminating signals abort the task.
+Unix stop, continue, and default-ignored signals fail instead of reporting delivery or terminating internal work.
+These include `CHLD`, `CONT`, `STOP`, `TSTP`, `TTIN`, `TTOU`, `URG`, and `WINCH`, plus `INFO` and `IO` on macOS.
+External jobs retain platform process-signal behavior and host-process protection.
 
 ### Streaming/output and minimizer behavior
 

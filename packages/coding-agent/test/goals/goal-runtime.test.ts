@@ -115,6 +115,43 @@ describe("goal runtime", () => {
 		).toBe(0);
 	});
 
+	it("captures completion usage before accounting awaits rather than charging a later turn", async () => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		harness.runtime.onTurnStart("turn-1", createUsage({ input: 10 }));
+		let input = 17;
+		const completion = harness.runtime.onAgentEnd({ currentUsage: () => createUsage({ input }) });
+		input = 100;
+		await completion;
+		expect(harness.getState()?.goal.tokensUsed).toBe(7);
+		expect(harness.persists.at(-1)?.state?.goal.tokensUsed).toBe(7);
+	});
+
+	it("accounts wall-clock completion without evaluating a token thunk when no turn is active", async () => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		await harness.runtime.onThreadResumed({ preserveActiveGoal: true });
+		harness.advance(2_500);
+		await harness.runtime.onAgentEnd({
+			currentUsage: () => {
+				throw new Error("No token snapshot exists");
+			},
+		});
+		expect(harness.getState()?.goal.tokensUsed).toBe(0);
+		expect(harness.getState()?.goal.timeUsedSeconds).toBe(2);
+	});
+
+	it("skips token collection after the goal is disabled", async () => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		harness.setState({ enabled: false, mode: "active", goal: createGoal({ status: "paused" }) });
+		await harness.runtime.onAgentEnd({
+			currentUsage: () => {
+				throw new Error("Goal accounting is disabled");
+			},
+		});
+		expect(harness.getState()?.goal.tokensUsed).toBe(0);
+		expect(harness.runtime.snapshot.turnSnapshot).toBeUndefined();
+	});
+
 	it("advances wall-clock accounting only by persisted whole seconds", async () => {
 		const harness = createHarness({
 			state: { enabled: true, mode: "active", goal: createGoal() },

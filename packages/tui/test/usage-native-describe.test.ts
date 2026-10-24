@@ -52,6 +52,10 @@ beforeAll(async () => {
 });
 
 describe("UsageDashboardComponent.describe", () => {
+	function plain(n: NativeNode): string {
+		const p = n.p as { text?: string; spans?: readonly { t: string }[] } | undefined;
+		return p?.text ?? p?.spans?.map(s => s.t).join("") ?? "";
+	}
 	function dashboard(
 		reports: UsageReport[],
 		refresh?: () => Promise<UsageReport[] | null>,
@@ -78,14 +82,14 @@ describe("UsageDashboardComponent.describe", () => {
 		];
 		const meters = findAll(dashboard(reports).describe(cx), n => n.k === "meter").map(n => n.p);
 		expect(meters).toEqual([
-			expect.objectContaining({ value: 1, style: "bar", tone: "error" }),
 			expect.objectContaining({ value: 0.9, style: "bar", tone: "warning" }),
+			expect.objectContaining({ value: 1, style: "bar", tone: "error" }),
 		]);
 		const fallback = dashboard(reports).describe(plainCx);
 		expect(findAll(fallback, n => n.k === "meter" || n.k === "chart")).toEqual([]);
 		expect(findAll(fallback, n => n.k === "progress").map(n => n.p)).toEqual([
-			expect.objectContaining({ value: 1, tone: "error" }),
 			expect.objectContaining({ value: 0.9, tone: "warning" }),
+			expect.objectContaining({ value: 1, tone: "error" }),
 		]);
 	});
 
@@ -102,8 +106,53 @@ describe("UsageDashboardComponent.describe", () => {
 		expect(tabs?.p).toEqual(expect.objectContaining({ active: "detail" }));
 		// One row per account in the detail table, not the bucket mean.
 		const table = findAll(detail, n => n.k === "table")[0];
-		const left = table?.k === "table" ? table.p?.rows.map(row => row.cells.left) : undefined;
-		expect(left).toEqual([[{ t: "75% left" }], [{ t: "25% left", s: "warning" }]]);
+		const left =
+			table?.k === "table"
+				? table.p?.rows.map(row => {
+						const value = row.cells.left;
+						return Number.parseFloat(typeof value === "string" ? value : (value ?? []).map(s => s.t).join(""));
+					})
+				: undefined;
+		expect(left).toEqual([75, 25]);
+	});
+
+	it("leads with the tightest quota and the activity's headline figures", () => {
+		const now = new Date();
+		const iso = (back: number): string => {
+			const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - back);
+			return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+		};
+		const component = dashboard(
+			[
+				report("anthropic", "a@test", [
+					limit("anthropic", "5h", "Claude 5h", 0.2, "ok"),
+					limit("anthropic", "7d", "Claude Weekly", 0.9, "warning"),
+				]),
+			],
+			undefined,
+			[
+				{ day: iso(0), cost: 12.5, requests: 40 },
+				{ day: iso(1), cost: 30, requests: 90 },
+				{ day: iso(2), cost: 4, requests: 10 },
+				{ day: iso(100), cost: 200, requests: 600 },
+			],
+		);
+		const root = component.describe(cx);
+		const tiles = findAll(root, n => n.p?.role === "omp.usage.stat").map(tile =>
+			findAll(tile, n => n.k === "text").map(plain),
+		);
+		expect(tiles.map(tile => tile[1])).toEqual(["10% left", "$247", "$46.50", "$200"]);
+		expect(tiles[0]?.[2]).toContain("Claude Weekly");
+		expect(tiles.slice(1).map(tile => Number.parseInt(/(\d+) requests/.exec(tile[2] ?? "")?.[1] ?? "", 10))).toEqual([
+			740, 140, 600,
+		]);
+	});
+
+	it("shows one empty state when nothing is used anywhere", () => {
+		const root = dashboard([report("zai", "z@test", [limit("zai", "5h", "Usage", 0, "ok")])]).describe(cx);
+		const empty = findAll(root, n => n.p?.role === "omp.usage.empty")[0];
+		expect(empty).toBeDefined();
+		expect(findAll(root, n => n.p?.role === "omp.usage.stats" || n.k === "chart")).toEqual([]);
 	});
 
 	it("re-fetches reports from the Refresh button like the r key", async () => {
@@ -123,7 +172,7 @@ describe("UsageDashboardComponent.describe", () => {
 		component.handleNativeEvent({ type: "action", key: "head/refresh", act: "refresh", mods: [] });
 		expect(calls).toBe(1);
 		const providers = (): (string | undefined)[] =>
-			findAll(component.describe(cx), n => n.k === "card").map(n => n.key);
+			findAll(component.describe(cx), n => n.p?.role === "omp.usage.provider").map(n => n.key);
 		const refreshed = Promise.withResolvers<void>();
 		onRender = () => {
 			if (providers()[0] === "openai") refreshed.resolve();
@@ -140,7 +189,7 @@ describe("UsageDashboardComponent.describe", () => {
 		const now = new Date();
 		const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 		const component = dashboard([], undefined, [{ day: today, cost: 0.13, requests: 2 }]);
-		const chart = findAll(component.describe(cx), n => n.k === "chart")[0];
+		const chart = findAll(component.describe(cx), n => n.k === "chart" && n.p?.kind === "heatmap")[0];
 		if (chart?.k !== "chart") throw new Error("no chart");
 		const weekday = (now.getDay() + 6) % 7;
 		const last = chart.p?.cells?.[weekday]?.length ?? 0;
@@ -153,30 +202,74 @@ describe("UsageDashboardComponent.describe", () => {
 });
 
 describe("SessionInfoOverlay.describe", () => {
-	it("turns the themed session report into a copyable file row and headed key/value sections", () => {
-		const info =
-			`${theme.fg("dim", "File:")} /tmp/s.jsonl\n` +
-			`\n${theme.bold("MCP Servers")}\n` +
-			`${theme.fg("dim", "github:")} ${theme.fg("success", "connected")} ${theme.fg("dim", "(4 tools)")}\n`;
-		const overlay = new SessionInfoOverlay({ terminal: { rows: 20 } }, info, () => {});
+	const dim = (key: string): string => theme.fg("dim", `${key}:`);
+	// Built per test: the theme initializes in `beforeAll`, after this block is collected.
+	const fullReport = (): string =>
+		`${dim("File")} /tmp/s.jsonl\n${dim("ID")} abc-123\n` +
+		`\n${theme.bold("Provider")}\n${dim("Model")} claude-sonnet-4-5\n` +
+		`\n${theme.bold("Messages")}\n${dim("User")} 6\n${dim("Tool Calls")} 23\n${dim("Total")} 29\n\n` +
+		`${dim("Append-Only")} ${theme.fg("success", "active")} (setting: auto)\n` +
+		`${theme.bold("Tokens")}\n${dim("Input")} 182,440\n${dim("Total")} 182,440\n` +
+		`\n${theme.bold("Cost")}\n${dim("Total")} 0.4127\n` +
+		`\n${theme.bold("MCP Servers")}\n` +
+		`${dim("github")} ${theme.fg("success", "connected")} ${theme.fg("dim", "(4 tools)")}\n`;
+	const kvItems = (root: NativeNode, role: string) =>
+		findAll(root, n => n.p?.role === role)
+			.flatMap(n => (n.k === "kv" ? (n.p?.items ?? []) : []))
+			.map(item => ({
+				k: typeof item.k === "string" ? item.k : item.k.map(s => s.t).join(""),
+				v: typeof item.v === "string" ? item.v : item.v.map(s => s.t).join(""),
+			}));
+
+	it("leads with the session id, then the file, each copying its own value", () => {
+		const overlay = new SessionInfoOverlay({ terminal: { rows: 20 } }, fullReport(), () => {});
 		const root = overlay.describe(cx);
-		const kvs = findAll(root, n => n.k === "kv").map(n => n.p);
 		const copies = findAll(root, n => n.p?.role === "omp.info.copy");
-		expect(copies.map(n => n.p?.title)).toEqual(["Copy file path"]);
-		expect(JSON.stringify(copies[0])).toContain("/tmp/s.jsonl");
-		expect(kvs).toEqual([
-			expect.objectContaining({
-				items: [
-					{
-						k: "github",
-						v: [{ t: "connected", s: "success" }, { t: " " }, { t: "(4 tools)", s: "dim" }],
-					},
-				],
-			}),
+		expect(
+			copies.map(n =>
+				findAll(n, child => child.k === "text")
+					.map(child =>
+						child.k === "text" ? (child.p?.text ?? child.p?.spans?.map(s => s.t).join("") ?? "") : "",
+					)
+					.join(""),
+			),
+		).toEqual(["abc-123", "/tmp/s.jsonl"]);
+	});
+
+	it("does not offer to copy an in-memory session's file", () => {
+		const overlay = new SessionInfoOverlay({ terminal: { rows: 20 } }, `${dim("File")} In-memory\n`, () => {});
+		const root = overlay.describe(cx);
+		expect(findAll(root, n => n.p?.role === "omp.info.copy")).toEqual([]);
+	});
+
+	it("keeps message, token, cost, model and MCP facts assigned to their own sections", () => {
+		const overlay = new SessionInfoOverlay({ terminal: { rows: 20 } }, fullReport(), () => {});
+		const root = overlay.describe(cx);
+		expect(kvItems(root, "omp.info.nums")).toEqual([
+			{ k: "User", v: "6" },
+			{ k: "Tool calls", v: "23" },
+			{ k: "Input", v: "182,440" },
+			{ k: "Total", v: "$0.4127" },
 		]);
-		const sections = findAll(root, n => n.k === "section").map(n => (n.k === "section" ? n.p?.head : undefined));
-		expect(sections).toEqual(["MCP Servers"]);
-		expect(JSON.stringify(root)).not.toContain("\x1b");
+		expect(kvItems(root, "omp.info.total").map(item => item.v)).toEqual(["29", "182,440"]);
+		const provider = kvItems(root, "omp.info.kv");
+		expect(provider.find(item => item.k === "Model")?.v).toBe("claude-sonnet-4-5");
+		expect(provider.find(item => item.k === "Append-only")?.v).toContain("active");
+		expect(kvItems(root, "omp.info.names").map(item => item.k)).toEqual(["github"]);
+	});
+
+	it("shows the context window as a figure over a meter, or a progress bar without meters", () => {
+		const context = { tokens: 41_200, contextWindow: 200_000, percent: 20.6 };
+		const overlay = new SessionInfoOverlay({ terminal: { rows: 20 } }, fullReport(), () => {}, context);
+		const root = overlay.describe(cx);
+		const [meter] = findAll(root, n => n.k === "meter");
+		if (meter?.k !== "meter") throw new Error("no context meter");
+		expect(meter?.p?.value).toBeCloseTo(0.206);
+		const plain = new SessionInfoOverlay({ terminal: { rows: 20 } }, fullReport(), () => {}, context).describe(
+			plainCx,
+		);
+		expect(findAll(plain, n => n.k === "meter")).toEqual([]);
+		expect(findAll(plain, n => n.k === "progress")).toHaveLength(1);
 	});
 
 	it("closes from the Close button like Esc", () => {
@@ -209,18 +302,45 @@ describe("ContextUsageView.describe", () => {
 		const bar = findAll(view.describe(cx), n => n.k === "meter" && n.p?.style === "bar")[0];
 		if (bar?.k !== "meter") throw new Error("no bar meter");
 		const parts = bar.p?.parts ?? [];
-		expect(parts.map(part => part.token)).toEqual([
-			"accent",
-			"warning",
-			"customMessageLabel",
-			"userMessageText",
-			"track",
-			"warning",
-		]);
+		expect(parts.filter(part => part.token === "track").map(part => part.value)).toEqual([151_388 / 200_000]);
+		expect(parts.at(-1)?.value).toBeCloseTo(30_000 / 200_000);
 		expect(parts.at(-1)?.hatch).toBe(true);
 		expect(parts.reduce((sum, part) => sum + part.value, 0)).toBeCloseTo(1);
 		const threshold = bar.p?.marks?.[0]?.at ?? 0;
+		expect(threshold).toBeCloseTo(0.85);
 		expect(threshold).toBeCloseTo(1 - (parts.at(-1)?.value ?? 0));
+	});
+
+	/** The text of every `text` node with `role` under `root`, spans joined. */
+	const texts = (root: NativeNode, role: string): string[] =>
+		findAll(root, n => n.k === "text" && n.p?.role === role).map(n =>
+			n.k === "text" ? (n.p?.text ?? (n.p?.spans ?? []).map(s => s.t).join("")) : "",
+		);
+
+	it("titles snapcompact's savings, or says why it is inactive", () => {
+		const withSnap = (snapcompact: NonNullable<typeof breakdown.snapcompact>) =>
+			new ContextUsageView({ ...breakdown, snapcompact }, theme).describe(cx);
+		const applied = withSnap({
+			visionCapable: true,
+			systemPrompt: {
+				applied: true,
+				scope: "agents-md",
+				textTokens: 7_284,
+				frames: 2,
+				imageTokens: 3_120,
+				savedTokens: 4_164,
+			},
+			toolResults: { total: 41, swapped: 0, textTokens: 0, frames: 0, imageTokens: 0, savedTokens: 0 },
+			savedTokens: 4_164,
+		});
+		expect(
+			texts(applied, "omp.context.tokens")
+				.slice(-2)
+				.map(value => Number.parseFloat(value.replace(/[−~]/g, ""))),
+		).toEqual([4.2, 14]);
+		const inactive = withSnap({ visionCapable: false, savedTokens: 0 });
+		expect(findAll(inactive, n => n.p?.role === "omp.context.snap.row")).toEqual([]);
+		expect(findAll(inactive, n => n.p?.role === "omp.context.snap.note")).toHaveLength(1);
 	});
 
 	it("keeps the glyph grid on terminals without `meter`", () => {
@@ -245,5 +365,33 @@ describe("createUsageRowBlock describe", () => {
 		if (!fast || !slow) throw new Error("usage row did not describe");
 		expect(findAll(fast, n => n.k === "rate")).toEqual([]);
 		expect(findAll(slow, n => n.k === "rate").map(n => n.p)).toEqual([{ value: 250, unit: "tok/s" }]);
+	});
+
+	it("shows the turn's time on the terminal's clock, re-describing when it changes", () => {
+		const usage = {
+			input: 100,
+			output: 500,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 600,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const block = createUsageRowBlock(usage, 2000, undefined, new Date(2026, 0, 1, 18, 5, 9).getTime());
+		const shown = (hour12: boolean | undefined) => {
+			const described = block.describe?.({ ...cx, hour12 });
+			if (!described) throw new Error("usage row did not describe");
+			const [line] = findAll(described, n => n.k === "text");
+			return { line: JSON.stringify(line), title: String(described.p?.title) };
+		};
+		// No clock from the terminal keeps the log-style stamp.
+		expect(shown(undefined).line).toContain('"18:05 · ');
+		expect(shown(undefined).title).toBe("2026-01-01 18:05:09");
+		const twelve = shown(true);
+		expect(twelve.line).toMatch(/"0?6:05\s?pm · /i);
+		expect(twelve.title).toMatch(/^2026-01-01 0?6:05:09\s?pm$/i);
+		const twentyFour = shown(false);
+		expect(twentyFour.line).toContain('"18:05 · ');
+		expect(twentyFour.title).toBe("2026-01-01 18:05:09");
+		expect(shown(undefined).title).toBe("2026-01-01 18:05:09");
 	});
 });

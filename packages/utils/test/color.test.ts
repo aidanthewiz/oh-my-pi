@@ -1,5 +1,18 @@
 import { describe, expect, it } from "bun:test";
-import { colorLuma, hexToOklch, hslToHex, oklchToHex, relativeLuminance } from "@oh-my-pi/pi-utils/color";
+import { colorLuma, hexToOklch, hslToHex, hueDistance, oklchToHex, relativeLuminance } from "@oh-my-pi/pi-utils/color";
+
+describe("hueDistance", () => {
+	it.each([
+		[350, 10, 20],
+		[-10, 730, 20],
+		[0, 1080, 0],
+		[90, 630, 180],
+		[-720.25, 0.25, 0.5],
+	])("measures the shortest wrapped arc from %s to %s", (a, b, distance) => {
+		expect(hueDistance(a, b)).toBeCloseTo(distance, 10);
+		expect(hueDistance(b, a)).toBeCloseTo(distance, 10);
+	});
+});
 
 describe("relativeLuminance (WCAG, linearized sRGB)", () => {
 	it("hits the extremes", () => {

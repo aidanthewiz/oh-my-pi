@@ -10,6 +10,7 @@ import {
 	getAgentDir,
 	getConfigAgentDirName,
 	getConfigRootDir,
+	getMnemopiEmbedRuntimeDir,
 	getPythonGatewayDir,
 	getSessionsDir,
 	getStatsDbPath,
@@ -129,6 +130,51 @@ describe("profile directories", () => {
 		expect(getAgentDbPath()).toBe(path.join(agent, "agent.db"));
 		expect(getSessionsDir()).toBe(path.join(agent, "sessions"));
 		expect(getStatsDbPath()).toBe(path.join(root, "stats.db"));
+	});
+
+	it("routes different profiles to one shared embedding owner", async () => {
+		const { IpcConnection, IpcServer, ipcEndpoint } = await import("@oh-my-pi/pi-natives");
+		const connections: { destroy(): void }[] = [];
+		const closed: Promise<void>[] = [];
+		let server: Awaited<ReturnType<typeof IpcServer.listen>> | undefined;
+		const owner = Snowflake.next();
+		let served = 0;
+		const request = async (endpoint: string): Promise<string> => {
+			const connection = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: 1000 });
+			connections.push(connection);
+			const response = Promise.withResolvers<string>();
+			const done = Promise.withResolvers<void>();
+			closed.push(done.promise);
+			connection.start(response.resolve, reason => {
+				done.resolve();
+				response.reject(new Error(`Shared embedding connection closed: ${String(reason)}`));
+			});
+			connection.send("same-model-cache");
+			return response.promise;
+		};
+		try {
+			setProfile("work");
+			const endpoint = ipcEndpoint(getMnemopiEmbedRuntimeDir(), "shared-profile-test");
+			server = await IpcServer.listen(endpoint, { framing: "lines" }, connection => {
+				connections.push(connection);
+				const done = Promise.withResolvers<void>();
+				closed.push(done.promise);
+				connection.start(
+					() => {
+						connection.send(`${owner}:${++served}`);
+					},
+					() => done.resolve(),
+				);
+			});
+			expect(await request(endpoint)).toBe(`${owner}:1`);
+
+			setProfile("personal");
+			expect(await request(ipcEndpoint(getMnemopiEmbedRuntimeDir(), "shared-profile-test"))).toBe(`${owner}:2`);
+		} finally {
+			for (const connection of connections) connection.destroy();
+			await server?.close();
+			await Promise.all(closed);
+		}
 	});
 
 	it("treats the default profile as regular mode", () => {

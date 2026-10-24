@@ -11,6 +11,8 @@ import {
 	requireSupportedEffort,
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Api, Model, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
+import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
+import { buildGeneratedModel } from "../scripts/generate-models";
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -39,6 +41,39 @@ function createModel<TApi extends Api>(overrides: {
 }
 
 describe("model thinking derivation", () => {
+	it("offers unknown Meta models an opt-in ladder without exporting a capability to another host", () => {
+		const model = createModel({
+			id: "unclassified-preview",
+			api: "openai-responses",
+			provider: "meta",
+			baseUrl: "https://api.meta.ai/v1",
+			reasoning: false,
+		});
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+			unverified: true,
+		});
+		const rerouted = buildModel({
+			...toModelSpec(model),
+			provider: "private-gateway",
+			baseUrl: "https://private.example/v1",
+		});
+		expect(rerouted.reasoning).toBe(false);
+		expect(rerouted.thinking).toBeUndefined();
+	});
+
+	it("does not infer an unverified ladder for a known neutral model or an unadmitted host", () => {
+		for (const [provider, id] of [
+			["meta", "gpt-4o"],
+			["private-gateway", "unclassified-preview"],
+		]) {
+			const model = createModel({ id, provider, api: "openai-responses", reasoning: false });
+			expect(model.reasoning).toBe(false);
+			expect(model.thinking).toBeUndefined();
+		}
+	});
+
 	it("stores supported efforts for Codex mini in model metadata", () => {
 		const model = createModel({
 			id: "gpt-5.1-codex-mini",
@@ -852,6 +887,118 @@ describe("model thinking derivation", () => {
 		expect(direct.compat.supportsPerMessageEffort).toBe(true);
 		expect(vertex.compat.supportsThinkingBindingControls).toBe(false);
 		expect(vertex.compat.supportsPerMessageEffort).toBe(false);
+	});
+
+	it("materializes a bare /v1/models Haiku 5.5 row as adaptive and priced, unlike Haiku 4.5", () => {
+		// Anthropic's /v1/models carries no capability metadata for a new id.
+		const discovered = (id: string) =>
+			buildModel({
+				id,
+				name: id,
+				api: "anthropic-messages",
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: null,
+				maxTokens: null,
+			});
+		const haiku55 = discovered("claude-haiku-5-5");
+
+		expect(haiku55.reasoning).toBe(true);
+		expect(haiku55.thinking?.mode).toBe("anthropic-adaptive");
+		expect(getSupportedEfforts(haiku55)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
+		expect(haiku55.thinking?.prefixBinding).toBe(true);
+		expect(haiku55.compat.supportsSamplingParams).toBe(false);
+		expect(haiku55.compat.supportsForcedToolChoice).toBe(true);
+		expect(haiku55.compat.supportsBetweenToolsThinking).toBe(false);
+		expect(haiku55.input).toEqual(["text", "image"]);
+		expect(haiku55.contextWindow).toBe(1_000_000);
+		expect(haiku55.maxTokens).toBe(128_000);
+		expect(haiku55.tokenizer).toBe("claude-v5-sonnet");
+		expect(haiku55.cost).toEqual({
+			input: 0.1,
+			output: 0.5,
+			cacheRead: 0.01,
+			cacheWrite: 0.125,
+			longContext: {
+				inputThreshold: 100_000,
+				input: 0.5,
+				output: 2.5,
+				cacheRead: 0.05,
+				cacheWrite: 0.625,
+			},
+		});
+
+		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
+		expect(haiku45.thinking?.mode).toBe("budget");
+		expect(haiku45.compat.supportsSamplingParams).toBe(true);
+		expect(haiku45.tokenizer).toBe("claude-v3");
+	});
+
+	it("reclassifies stale snapshot tokenizers without losing authored compatibility", () => {
+		const snapshot = createModel({
+			id: "claude-haiku-5-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			compat: { supportsForcedToolChoice: false },
+		});
+		const rebuilt = buildGeneratedModel({ ...snapshot, tokenizer: "claude-v3" });
+
+		expect(rebuilt.tokenizer).toBe("claude-v5-sonnet");
+		expect(rebuilt.compat).toMatchObject({ supportsForcedToolChoice: false });
+	});
+
+	it("keeps Haiku 5.5 first-party controls off Vertex while preserving adaptive Bedrock thinking", () => {
+		const direct = createModel({ id: "claude-haiku-5-5", api: "anthropic-messages", provider: "anthropic" });
+		const vertex = createModel({
+			id: "claude-haiku-5-5@default",
+			api: "anthropic-messages",
+			provider: "google-vertex",
+		});
+		const bedrock = createModel({
+			id: "us.anthropic.claude-haiku-5-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
+
+		expect(direct.compat.supportsThinkingBindingControls).toBe(true);
+		expect(direct.compat.supportsPerMessageEffort).toBe(true);
+		expect(vertex.compat.supportsThinkingBindingControls).toBe(false);
+		expect(vertex.compat.supportsPerMessageEffort).toBe(false);
+		expect(vertex.compat.supportsMidConversationToolChanges).toBe(true);
+		expect(bedrock.thinking?.mode).toBe("anthropic-adaptive");
+		expect(bedrock.thinking?.prefixBinding).toBe(true);
+		expect(bedrock.compat.supportsForcedToolChoice).toBe(true);
+	});
+
+	it("keeps copied alias tokenizers unless the wire model has a current policy", () => {
+		const alias = createModel({ id: "private-alias", api: "anthropic-messages", provider: "gitlab-duo" });
+		const copied = buildGeneratedModel({ ...alias, tokenizer: "claude-v3" });
+		const routed = buildGeneratedModel({
+			...alias,
+			requestModelId: "claude-haiku-5-5",
+			tokenizer: "claude-v3",
+		});
+
+		expect(copied.tokenizer).toBe("claude-v3");
+		expect(routed.tokenizer).toBe("claude-v5-sonnet");
+		expect(routed.id).toBe("private-alias");
+		expect(routed.requestModelId).toBe("claude-haiku-5-5");
+	});
+
+	it("corrects Moonshot K3 cache writes without changing another serving host", () => {
+		const discovered = {
+			...createModel({ id: "kimi-k3", api: "openai-completions", provider: "moonshot" }),
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 },
+		};
+		const moonshot = buildGeneratedModel(discovered);
+		const gateway = buildGeneratedModel({ ...discovered, provider: "private-gateway" });
+
+		expect(moonshot.cost).toEqual({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 });
+		expect(gateway.cost.cacheWrite).toBe(3);
 	});
 
 	it("keeps per-message effort off every Vertex Claude line that takes it on the Claude API", () => {

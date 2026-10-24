@@ -95,12 +95,19 @@ Tool approval does not authorize the underlying real-world action. On-screen tex
 
 ## Per-tool prompt details
 
-Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The standard prompt includes:
+Tools can add approval-prompt body lines with `formatApprovalDetails(args, options?)`. The standard prompt includes:
 
 - `Allow tool: <name>`
 - `Origin: MCP server tool` for unannotated `mcp__...` tools
 - `Reason: <reason>` when the tool decision supplies one
 - tool-specific details such as command, path, code, browser action, or subagent assignment
+
+When `options.compact` is true, return complete multiline values so the shared formatter can count every line.
+Full prompts may retain normal detail truncation.
+
+In the interactive UI the prompt replaces the composer until answered: `Ctrl+Enter` (or `Ctrl+Q`; rebind `app.approval.approve`) approves, `Esc` denies, and plain `Enter` does nothing, so typing into the composer as the prompt appears cannot approve a call. The approve key is ignored for the first half second, since it is also the follow-up key. The prompt shows one row per detail, with multi-line values (file content, code) reduced to a line count, since the tool call in the transcript shows them in full; with `display.hideToolActivity` on, it shows the full details instead. RPC, ACP, and other hosts without an approval dialog get an Approve/Deny select with the full details.
+
+Runtime safety prompts and eligible session-access choices retain their explicit selectors. Docked approval does not grant broader access.
 
 ## Defining approval on tools
 
@@ -120,7 +127,10 @@ export type ToolApprovalDecision =
 export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprovalDecision);
 
 approval?: ToolApproval;
-formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
+export interface ApprovalDetailsOptions {
+  compact?: boolean;
+}
+formatApprovalDetails?: (args: unknown, options?: ApprovalDetailsOptions) => string | string[] | undefined;
 ```
 
 Examples:

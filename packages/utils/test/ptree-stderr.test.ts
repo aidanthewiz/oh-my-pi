@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { heapStats } from "bun:jsc";
 import { exec, NonZeroExitError, spawn } from "@oh-my-pi/pi-utils/ptree";
 
 const STDERR_LIMIT = NonZeroExitError.MAX_TRACE;
@@ -66,6 +67,25 @@ describe("ptree stderr capture", () => {
 		expect(streamed).toBe(result.stderr);
 	});
 
+	it("drains both pipes after the stdout retention cap without losing full stderr", async () => {
+		const observed: string[] = [];
+		const command = stderrFixture(LARGE_STDERR_SIZE);
+		command[2] = 'await Bun.stdout.write("stdout-ok\\n" + "x".repeat(4 * 1024 * 1024));\n' + command[2];
+		const result = await exec(command, {
+			stderr: "full",
+			maxOutputBytes: 10,
+			onStdout: chunk => observed.push(chunk),
+		});
+
+		expect(result.stdout).toBe("stdout-ok\n");
+		expect(observed.join("")).toBe("stdout-ok\n");
+		expect(result.stdoutTruncated).toBe(true);
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.length).toBe(LARGE_STDERR_SIZE);
+		expect(result.stderr).toStartWith(STDERR_HEAD);
+		expect(result.stderr).toEndWith(STDERR_TAIL);
+	});
+
 	it("keeps peek and nonzero errors on the bounded stderr tail", async () => {
 		using child = spawn(stderrFixture(STDERR_LIMIT * 4, 7));
 		let error: unknown;
@@ -82,5 +102,18 @@ describe("ptree stderr capture", () => {
 		expect(error.stderr).toEndWith(STDERR_TAIL);
 		expect(error.message).toContain(STDERR_TAIL);
 		expect(child.peekStderr()).toBe(error.stderr);
+	});
+
+	it("does not retain drained stderr chunks while the process handle is alive", async () => {
+		const size = 32 * 1024 * 1024;
+		Bun.gc(true);
+		const before = heapStats().heapSize;
+		using child = spawn(stderrFixture(size));
+		const result = await child.wait();
+		Bun.gc(true);
+		const growth = heapStats().heapSize - before;
+
+		expect(result.stderr).toEndWith(STDERR_TAIL);
+		expect(growth).toBeLessThan(8 * 1024 * 1024);
 	});
 });

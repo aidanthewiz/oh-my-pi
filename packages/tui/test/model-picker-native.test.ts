@@ -135,37 +135,27 @@ function titleOf(children: readonly NativeChild[] | undefined): unknown {
 	return title ? prop(title, "text") : undefined;
 }
 
-test("the model hub describes a data-first picker when the terminal has the kind, else its generic frame", () => {
-	const hub = openHub({ assign: [], cancel: 0 });
-	expect(hub.nativeSheet(withPicker)).toBe(true);
-	expect(hub.nativeSheet(withoutPicker)).toBe(false);
-	expect(hub.describe(withoutPicker).k).not.toBe("picker");
-
-	const root = hub.describe(withPicker);
-	const p = props(root);
-	expect(p).toMatchObject({ size: "lg", layout: "rows", preview: "side", icon: "cpu", title: "Models", scope: "all" });
-	expect(p.scopes?.map(scope => [scope.id, scope.count, scope.group])).toEqual([
-		["roles", 2, undefined],
-		["all", 5, undefined],
-		["provider:anthropic", 2, "Providers"],
-		["provider:demo", 1, "Providers"],
-		["provider:openai", 2, "Providers"],
-	]);
-	expect(p.scopes?.find(scope => scope.id === "provider:anthropic")?.mark).toEqual({ text: "An", seed: "anthropic" });
-	// The recent/role block, then one group per provider.
-	expect(groups(p)).toEqual(["Recent", "anthropic", "openai"]);
-	expect(p.current).toEqual(["demo/demo"]);
-	expect(p.total).toBe(5);
-	const demo = p.items?.find(entry => entry.id === "demo/demo");
-	// The default role runs with thinking off (`defaultThinkingLevel`): its chip carries that level's dot.
-	expect(demo?.chips).toEqual([{ text: "default", on: true, dot: "thinkingOff" }]);
-	expect(p.items?.find(entry => entry.id === "anthropic/claude-sonnet-5-5")?.facts?.int).toBe("60");
-	expect(p.items?.find(entry => entry.id === "openai/gpt-5.6-mini")?.badges).toEqual([
-		{ text: "free", tone: "success" },
-	]);
-	expect(titleOf(root.c)).toBe("demo");
-	// Unchanged state keeps the node.
-	expect(hub.describe(withPicker)).toBe(root);
+test("provider scopes retain model identity and cannot reveal models excluded by host policy", () => {
+	const allowed = MODELS[0]!;
+	const hub = new ModelHubComponent(
+		ui,
+		{
+			...source({ default: "anthropic/claude-sonnet-5-5" }, []),
+			scopeModels: models => models.filter(model => model.id === allowed.id),
+		},
+		registry(MODELS),
+		MODELS.map(model => ({ model })),
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+	);
+	hubs.push(hub);
+	const all = props(hub.describe(withPicker));
+	expect(all.items?.map(item => item.id)).toEqual(["anthropic/claude-sonnet-5-5"]);
+	expect(all.items?.[0]?.mark).toEqual({ text: "An", seed: "anthropic", icon: "provider:anthropic" });
+	expect(all.scopes?.find(scope => scope.id === "provider:anthropic")?.mark).toEqual(all.items?.[0]?.mark);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "provider:anthropic", mods: [] });
+	expect(props(hub.describe(withPicker)).items?.map(item => item.id)).toEqual(["anthropic/claude-sonnet-5-5"]);
+	hub.handleNativeEvent({ type: "activate", key: "", item: "openai/gpt-5.6" });
+	expect(props(hub.describe(withPicker)).selected).not.toBe("openai/gpt-5.6");
 });
 
 test("Factory Droid rows carry the base credit rate and a credit-only model is never free", () => {
@@ -392,4 +382,101 @@ test("the quick picker is an md sheet with the summary below and a task-model to
 	expect(p.actions?.find(action => action.id === "task")?.on).toBe(true);
 	picker.handleNativeEvent({ type: "activate", key: "", item: "openai/gpt-5.6" });
 	expect(picked).toEqual(["task:openai/gpt-5.6"]);
+});
+
+test("shows a non-default service tier's own speed aggregate", () => {
+	const perf = new Map([
+		["openai/gpt-5.6", { samples: 4, tps: 25, ttftMs: 500 }],
+		["openai/gpt-5.6@ultrafast", { samples: 2, tps: 300, ttftMs: 120 }],
+		["anthropic/claude-opus-5", { samples: 3, tps: 40, ttftMs: 300 }],
+		["openai/gpt-5.6-mini@priority", { samples: 1, tps: 90, ttftMs: 200 }],
+	]);
+	const hub = new ModelHubComponent(
+		ui,
+		{
+			...source({ default: "demo/demo" }, ["demo/demo"]),
+			modelPerf: perf,
+			serviceTierFor: model => (model.provider === "openai" ? "ultrafast" : undefined),
+		},
+		registry(MODELS),
+		MODELS.map(entry => ({ model: entry })),
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+		{ currentSelector: "demo/demo" },
+	);
+	hubs.push(hub);
+	const items = props(hub.describe(withPicker)).items ?? [];
+	const speed = (id: string) => items.find(entry => entry.id === id)?.facts?.speed;
+	// The tier the host would send wins over the standard aggregate.
+	expect(speed("openai/gpt-5.6")).toBe("300 ultrafast");
+	// No tier configured for the family: the standard aggregate, unlabeled.
+	expect(speed("anthropic/claude-opus-5")).toBe("40");
+	// Only a tier aggregate exists: show it rather than nothing.
+	expect(speed("openai/gpt-5.6-mini")).toBe("90 priority");
+});
+
+test("a rejected compaction edit remains editable in the model hub until corrected or cancelled", () => {
+	let rejected = true;
+	const hub = new ModelHubComponent(
+		ui,
+		source({ default: "demo/demo" }, []),
+		registry(MODELS),
+		MODELS.map(entry => ({ model: entry })),
+		{
+			onAssign: () => {},
+			onUnassign: () => {},
+			onCancel: () => {},
+			onCompactionPointChange: () => (rejected ? { kind: "error", message: "synthetic project shadow" } : undefined),
+		},
+	);
+	hubs.push(hub);
+	const act = (act: string, value?: string) =>
+		hub.handleNativeEvent({ type: "action", key: "", act, value, mods: [] });
+	act("scope", "roles");
+	hub.handleNativeEvent({ type: "select", key: "", item: "role:default" });
+	act("roles:compaction");
+	hub.handleInput("90k");
+	act("compactionPoint");
+	expect(props(hub.describe(withPicker)).focus).toBe("strip");
+	const rejectedText = stripVTControlCharacters(hub.render(120).join("\n"));
+	expect(rejectedText).toContain("90k");
+
+	rejected = false;
+	hub.handleInput("\r");
+	expect(props(hub.describe(withPicker)).focus).toBe("list");
+	expect(props(hub.describe(withPicker)).selected).toBe("role:default");
+	act("roles:compaction");
+	act("cancel");
+	expect(props(hub.describe(withPicker)).focus).toBe("list");
+	expect(props(hub.describe(withPicker)).selected).toBe("role:default");
+});
+
+test("classic model previews track compaction trigger changes", () => {
+	let tokens = 90_000;
+	let revision = 0;
+	const settings = {
+		...source({ default: "demo/demo" }, []),
+		get revision() {
+			return revision;
+		},
+		compactionPointFor: () => ({ tokens, source: "global", draft: String(tokens) }),
+	};
+	const selected = MODELS[2]!;
+	const hub = new ModelHubComponent(
+		ui,
+		settings,
+		registry([selected]),
+		[{ model: selected }],
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+		{ currentSelector: "demo/demo" },
+	);
+	hubs.push(hub);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "all", mods: [] });
+	hub.handleNativeEvent({ type: "select", key: "", item: "demo/demo" });
+	const rendered = () => stripVTControlCharacters(hub.render(240).join("\n"));
+	expect(rendered()).toMatch(/\b(?:90,?000|90(?:\.0)?k)\b/i);
+
+	tokens = 160_000;
+	revision++;
+	expect(rendered()).toMatch(/\b(?:160,?000|160(?:\.0)?k)\b/i);
+	expect(rendered()).not.toMatch(/\b(?:90,?000|90(?:\.0)?k)\b/i);
 });

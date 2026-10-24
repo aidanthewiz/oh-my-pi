@@ -22,6 +22,9 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { CF_COMMAND } from "../../cli/cf-version";
+import { getActiveProfile, getConfigDirName, getConfigRootDir } from "@oh-my-pi/pi-utils/dirs";
+import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
+import { formatModelStringWithRouting } from "../../config/model-resolver";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
@@ -76,6 +79,8 @@ import {
 } from "../../slash-commands/helpers/active-oauth-account";
 import { formatProviderName } from "@oh-my-pi/pi-tui/chrome/format";
 import { formatCompactQuota } from "@oh-my-pi/pi-tui/overlays/advisor-config";
+import { resolveTernPane } from "../../tools/browser/tern/kind";
+import { TernError, type TernErrorKind, TernSocketClient } from "../../tools/browser/tern/wire";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -87,9 +92,10 @@ import {
 	selectChangelogEntries,
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
-import { formatDumpArchiveReport } from "../../session/session-dump-format";
+import { formatDumpArchiveReport, type SessionDumpArchive } from "../../session/session-dump-format";
 import { openPath } from "../../utils/open";
 import { resumeCommand } from "../../utils/resume-command";
+import type { TitleCard } from "../../utils/title-card";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import {
 	collapseSharedUsageReports,
@@ -102,42 +108,100 @@ import type { UnavailableUsageAccount } from "@oh-my-pi/pi-tui/overlays/usage-da
 import { cfgTerminalShowImages } from "../settings";
 import { cfgProviderAppendOnlyContext } from "../../session/settings";
 import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "../../commands/settings";
+import { flagConsumesValue, restartArgv } from "../../cli/flag-tables";
+import {
+	createDefaultTerminalLaunchRequest,
+	getTerminalLaunchPlacement,
+	launchTerminal,
+	TerminalLaunchError,
+	type TerminalLaunchRequest,
+	type TerminalLaunchResult,
+} from "../../subprocess/terminal-launch";
+import { cliScopeEnvCommand, prepareCliRelaunchCmd, resolveCliEntryCmd } from "../../subprocess/worker-client";
+
+/** How long `/fork` waits for Tern to open the fork's pane. */
+const TERN_FORK_TIMEOUT_MS = 10_000;
+
+/** Fork failures after which Tern may still open the pane, so `/fork` must not also fork in place. */
+const TERN_FORK_UNCONFIRMED: Partial<Record<TernErrorKind, true>> = { closed: true, timeout: true, protocol: true };
 
 function formatCreditValue(value: number): string {
 	return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+
+interface ForkTerminalDependencies {
+	classifyTerminalMultiplexer: typeof classifyTerminalMultiplexer;
+	environment: () => NodeJS.ProcessEnv;
+	launchTerminal: (request: TerminalLaunchRequest) => Promise<TerminalLaunchResult>;
+	resolveCliEntryCmd: typeof resolveCliEntryCmd;
+	getActiveProfile: typeof getActiveProfile;
+	getConfigRootDir: typeof getConfigRootDir;
+	runtimeArgs: () => readonly string[];
+	argv: () => string[];
+}
+
+/**
+ * Startup flags the fork child re-supplies from the parent's live state
+ * (`--profile`, `--model`, `--thinking`, `--prompt-cache-key`, `--session-dir`) or that would
+ * re-point it at a stale scope (`--config`/`--cwd`/`--provider`; the child
+ * gets the effective overlays via `PI_CONFIG_FILES` and the session cwd).
+ */
+const FORK_LAUNCH_OVERRIDES: Readonly<Record<string, true>> = {
+	"--config": true,
+	"--cwd": true,
+	"--model": true,
+	"--profile": true,
+	"--prompt-cache-key": true,
+	"--provider": true,
+	"--session-dir": true,
+	"--thinking": true,
+};
+
+function hasForkApiKeyOverride(argv: string[]): boolean {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (arg === "--api-key" || arg.startsWith("--api-key=")) return true;
+		if (flagConsumesValue(arg, argv[i + 1])) i++;
+	}
+	return false;
 }
 
 export class CommandController {
 	/** The open native report sheet. */
 	#reportSheet: OverlayHandle | undefined;
 	#reportPaintUnsubscribe: (() => void) | undefined;
-	/** The editor sat on the bottom row when the text-mode report above it opened. */
-	#reportOpenedAtBottom = false;
+	#forkTerminalDependencies: ForkTerminalDependencies;
 
-	constructor(private readonly ctx: InteractiveModeContext) {}
+	constructor(
+		private readonly ctx: InteractiveModeContext,
+		forkTerminalDependencies: Partial<ForkTerminalDependencies> = {},
+	) {
+		this.#forkTerminalDependencies = {
+			classifyTerminalMultiplexer,
+			environment: () => process.env,
+			launchTerminal,
+			resolveCliEntryCmd,
+			getActiveProfile,
+			getConfigRootDir,
+			runtimeArgs: () => process.execArgv,
+			argv: () => process.argv.slice(2),
+			...forkTerminalDependencies,
+		};
+	}
 
-	/**
-	 * Esc: take away the report shown above the editor (text mode); false when
-	 * none is shown. While open it may have pushed rows into the terminal's
-	 * scrollback that cannot come back, so an editor that sat on the bottom
-	 * row before is pinned there again instead of jumping up the screen.
-	 */
+	/** Esc: take away the report shown above the editor (text mode); false when none is shown. */
 	dismissCommandReport(): boolean {
-		if (!this.#clearReport()) return false;
-		if (this.#reportOpenedAtBottom) this.ctx.pinComposerToBottom();
-		this.#reportOpenedAtBottom = false;
-		return true;
+		return this.#clearReport();
 	}
 
 	/**
 	 * Drop any report — the one above the editor, or a focused sheet/page —
-	 * without pinning anything: the transcript or session under it was reset,
-	 * and its contents describe what is gone.
+	 * because the transcript or session under it was reset, and its contents
+	 * describe what is gone.
 	 */
 	clearCommandReport(): void {
 		this.#clearReport();
 		this.#closeReportSheet();
-		this.#reportOpenedAtBottom = false;
 	}
 
 	#clearReport(): boolean {
@@ -172,9 +236,6 @@ export class CommandController {
 	 * Esc or Close.
 	 */
 	showCommandReport(options: { title: string; head?: TspText; body: Component }): void {
-		// A replacement keeps where the editor sat before the first report.
-		const openedAtBottom =
-			this.ctx.reportContainer.children.length > 0 ? this.#reportOpenedAtBottom : this.ctx.composerInputAtBottom();
 		this.#clearReport();
 		this.#closeReportSheet();
 		const terminal = this.ctx.ui.terminal;
@@ -206,7 +267,6 @@ export class CommandController {
 			showFullscreen();
 		} else {
 			this.ctx.reportContainer.addChild(report);
-			this.#reportOpenedAtBottom = openedAtBottom;
 			let columns = terminal.columns;
 			let rows = inline;
 			this.#reportPaintUnsubscribe = this.ctx.ui.addPaintListener(() => {
@@ -219,8 +279,6 @@ export class CommandController {
 				this.#reportPaintUnsubscribe?.();
 				this.#reportPaintUnsubscribe = undefined;
 				this.ctx.reportContainer.clear();
-				if (this.#reportOpenedAtBottom) this.ctx.pinComposerToBottom();
-				this.#reportOpenedAtBottom = false;
 				showFullscreen();
 			});
 		}
@@ -351,9 +409,17 @@ export class CommandController {
 		}
 	}
 
-	async handleDumpAllCommand(): Promise<void> {
+	handleDumpAllCommand(): Promise<void> {
+		return this.#writeDumpArchive(() => this.ctx.session.dumpSessionArchiveToTmpDir());
+	}
+
+	handleDumpAnonCommand(): Promise<void> {
+		return this.#writeDumpArchive(() => this.ctx.session.dumpAnonymizedArchiveToTmpDir());
+	}
+
+	async #writeDumpArchive(write: () => Promise<SessionDumpArchive | undefined>): Promise<void> {
 		try {
-			const archive = await this.ctx.session.dumpSessionArchiveToTmpDir();
+			const archive = await write();
 			if (!archive) {
 				this.ctx.showError("No messages to dump yet.");
 				return;
@@ -1303,7 +1369,17 @@ export class CommandController {
 		await this.#runNewSessionFlow({ drop: true }, "Session deleted");
 	}
 
-	async handleForkCommand(): Promise<void> {
+	async handleForkCommand(placement?: "pane" | "window"): Promise<void> {
+		if (placement !== undefined) {
+			await this.#handleForkTerminalCommand(placement);
+			return;
+		}
+
+		// A Tern pane fork leaves this session untouched, so it may run mid-turn.
+		if (await this.#forkIntoTernPane()) return;
+
+		// An in-place fork moves this process onto the new file; a running turn
+		// would finish there and leave the original transcript cut mid-turn.
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before forking.");
 			return;
@@ -1316,15 +1392,15 @@ export class CommandController {
 
 		// After a `/fork`, the current session ID is changed to the forked one,
 		// so the session ID before the fork is the one we want to show in the hint.
-		const previousSessionId = this.ctx.sessionManager.isSessionOnDisk()
-			? this.ctx.sessionManager.getSessionId()
-			: undefined;
+		const outgoingSessionId = this.ctx.sessionManager.getSessionId();
+		const previousSessionId = this.ctx.sessionManager.isSessionOnDisk() ? outgoingSessionId : undefined;
 
 		const success = await this.ctx.session.fork();
 		if (!success) {
 			this.ctx.showError("Fork failed (session not persisted or cancelled)");
 			return;
 		}
+		await this.ctx.retireOutgoingSessionUi(outgoingSessionId);
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();
@@ -1342,6 +1418,207 @@ export class CommandController {
 				1,
 			),
 		]);
+	}
+
+	async #handleForkTerminalCommand(placement: "pane" | "window"): Promise<void> {
+		if (this.ctx.session.hasAccountPoolPolicy) {
+			this.ctx.showError(
+				"Cannot open a fork in another terminal: this session has a nonportable OAuth account-pool policy. Its authorization scope must remain in this process.",
+			);
+			return;
+		}
+
+		const dependencies = this.#forkTerminalDependencies;
+		const environment = dependencies.environment();
+		const multiplexer = dependencies.classifyTerminalMultiplexer(environment);
+		const placementInfo = getTerminalLaunchPlacement(multiplexer, placement);
+		if ("error" in placementInfo) {
+			this.ctx.showError(placementInfo.error);
+			return;
+		}
+
+		if (this.ctx.session.isStreaming) {
+			const confirmed = await this.ctx.showHookConfirm(
+				"Fork while a response is running?",
+				"The child may not include the partial response. Continue opening a fork? The current session will keep running here.",
+			);
+			if (!confirmed) return;
+		}
+
+		const initialSessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!initialSessionFile) {
+			this.ctx.showError("Cannot open a fork in another terminal: the current session has not been persisted yet.");
+			return;
+		}
+
+		const childArgs = restartArgv(dependencies.argv(), undefined, FORK_LAUNCH_OVERRIDES);
+		if (hasForkApiKeyOverride(childArgs)) {
+			this.ctx.showError(
+				"Cannot open a fork in another terminal when --api-key was supplied at startup; the key cannot be forwarded without exposing it in the multiplexer command. Configure provider credentials in the auth store and retry.",
+			);
+			return;
+		}
+		const shellGrammar = placementInfo.shellGrammar;
+		if (shellGrammar === "posix") {
+			const confirmed = await this.ctx.showHookConfirm(
+				"Confirm destination shell compatibility",
+				"This fork command uses POSIX shell syntax. Continue only if the destination's configured interactive shell accepts POSIX syntax; this cannot be inferred from the current terminal.",
+			);
+			if (!confirmed) {
+				this.ctx.showWarning("Fork cancelled: POSIX shell compatibility was not confirmed for the destination.");
+				return;
+			}
+		}
+
+		try {
+			await this.ctx.session.flushToDisk();
+		} catch (error) {
+			logger.error("Failed to flush the session before opening a terminal fork", { error });
+			this.ctx.showError("Cannot open a fork in another terminal: failed to save the current session.");
+			return;
+		}
+
+		const sessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!sessionFile) {
+			this.ctx.showError("Cannot open a fork in another terminal: the current session is no longer persisted.");
+			return;
+		}
+		const sourceSessionFile = path.resolve(sessionFile);
+		try {
+			await fs.access(sourceSessionFile);
+		} catch {
+			this.ctx.showError("Cannot open a fork in another terminal: the persisted session transcript is unavailable.");
+			return;
+		}
+
+		try {
+			const cwd = this.ctx.sessionManager.getCwd();
+			const activeProfile = dependencies.getActiveProfile();
+			const activeModel = this.ctx.session.model;
+			if (activeProfile) childArgs.push("--profile", activeProfile);
+			if (activeModel) childArgs.push("--model", formatModelStringWithRouting(activeModel));
+			childArgs.push("--session-dir", this.ctx.sessionManager.getSessionDir());
+			const activeThinkingLevel = this.ctx.session.configuredThinkingLevel();
+			if (activeThinkingLevel !== undefined) childArgs.push("--thinking", activeThinkingLevel);
+			// Forcing --model/--thinking marks the fork's cache shape as changed, which would
+			// drop the inherited key. Automatic candidates travel in the source header;
+			// forwarding them as --prompt-cache-key would bypass their model gate.
+			if (
+				this.ctx.session.agent.promptCacheKey !== undefined ||
+				this.ctx.sessionManager.getHeader()?.taskPromptCacheKey === undefined
+			) {
+				childArgs.push("--prompt-cache-key", this.ctx.session.agent.promptCacheKey ?? this.ctx.session.sessionId);
+			}
+			childArgs.push("--fork", sourceSessionFile);
+			let cliCommand = dependencies.resolveCliEntryCmd();
+			const sourceLaunch = cliCommand.length > 1;
+			if (sourceLaunch) {
+				cliCommand = await prepareCliRelaunchCmd(
+					cliCommand,
+					dependencies.getConfigRootDir(),
+					dependencies.runtimeArgs(),
+				);
+			}
+			// Pin only non-secret scope variables.
+			const command = [
+				...cliScopeEnvCommand({
+					PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
+					PI_CONFIG_DIR: getConfigDirName(),
+					OMP_PROFILE: activeProfile,
+					PI_PROFILE: activeProfile,
+					PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
+					OMP_MANAGED_CONFIG_FILE: this.ctx.settings.getManagedConfigFile(),
+					OMP_DOTENV_OVERRIDE: undefined,
+					OMP_CF_PRODUCT_VERSION: undefined,
+					BUN_OPTIONS: undefined,
+					OMP_LAUNCH_CWD: sourceLaunch ? cwd : undefined,
+					OMP_CF_VERSION: environment.OMP_CF_VERSION,
+					OMP_CF_UPDATE_CHANNEL: environment.OMP_CF_UPDATE_CHANNEL,
+					PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
+					XDG_DATA_HOME: environment.XDG_DATA_HOME,
+					XDG_STATE_HOME: environment.XDG_STATE_HOME,
+					XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
+				}),
+				...cliCommand,
+				...childArgs,
+			];
+			const launchPlan = createDefaultTerminalLaunchRequest(multiplexer, placement, command, cwd, shellGrammar);
+			if ("error" in launchPlan) {
+				this.ctx.showError(launchPlan.error);
+				return;
+			}
+
+			const result = await dependencies.launchTerminal(launchPlan.request);
+			if (result.warning) {
+				this.ctx.showWarning(
+					`Opened a fork in ${placementInfo.displayName}, but ${result.warning} This session continues here.`,
+				);
+				return;
+			}
+			this.ctx.showStatus(
+				`Opened a fork in ${placementInfo.displayName} (${placementInfo.placementLabel}); this session continues here.`,
+			);
+		} catch (error) {
+			logger.error("Failed to open a terminal fork", { multiplexer, error });
+			this.ctx.showError(
+				error instanceof TerminalLaunchError
+					? `Could not open a fork in ${placementInfo.displayName}: ${error.message}`
+					: `Could not open a fork in ${placementInfo.displayName}. See logs for details.`,
+			);
+		}
+	}
+
+	/**
+	 * `/fork` inside a Tern pane: ask Tern to run `omp --fork` of this session in a new pane beside
+	 * this one, which keeps the original session. False means fork in place instead: outside Tern,
+	 * an unsaved session, a Tern without `fork`, or Tern refusing it. Once the request is out, an
+	 * unconfirmed one is reported rather than retried in place, since Tern may still open the pane.
+	 */
+	async #forkIntoTernPane(): Promise<boolean> {
+		const tern = resolveTernPane();
+		if (!tern || !this.ctx.sessionManager.isSessionOnDisk()) return false;
+		if (this.ctx.session.hasAccountPoolPolicy) {
+			this.ctx.showWarning(
+				"Forking in this process: this session's OAuth account-pool policy cannot be transferred to a Tern pane.",
+			);
+			return false;
+		}
+		const client = new TernSocketClient({ socketPath: tern.socketPath });
+		try {
+			try {
+				await client.connect();
+			} catch (error) {
+				logger.debug("Tern unreachable for /fork; forking in place", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
+			}
+			if (!client.supports("fork")) return false;
+			// The new pane's omp reads the session file as it starts.
+			await this.ctx.session.flushToDisk();
+			try {
+				await client.fork({ block: tern.pane }, { timeoutMs: TERN_FORK_TIMEOUT_MS });
+			} catch (error) {
+				if (error instanceof TernError && !TERN_FORK_UNCONFIRMED[error.kind]) {
+					const details = { kind: error.kind, error: error.message };
+					if (error.kind === "failed") logger.warn("Tern could not open the fork pane; forking in place", details);
+					else logger.debug("Tern refused the fork; forking in place", details);
+					return false;
+				}
+				this.ctx.showError(
+					`Tern did not confirm the fork: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return true;
+			}
+		} finally {
+			client.close();
+		}
+		const note = this.ctx.session.isStreaming ? " · the running response continues here, not in the fork" : "";
+		this.ctx.present([
+			new Spacer(1),
+			new Text(theme.fg("accent", `${theme.status.success} Session forked into a new pane${note}`), 1, 1),
+		]);
+		return true;
 	}
 
 	/**
@@ -1428,14 +1705,19 @@ export class CommandController {
 
 	/**
 	 * `/wt [<branch>]` — fork the checkout into a new linked git worktree on
-	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along,
-	 * then relocate the session there like `/move`.
+	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along
+	 * unless `keepChanges` is false, then relocate the session there like `/move`.
+	 * Returns the worktree only when the session now lives in it.
 	 */
-	async handleWorktreeCommand(branch?: string): Promise<void> {
+	async handleWorktreeCommand(
+		branch?: string,
+		options: { keepChanges?: boolean } = {},
+	): Promise<SessionWorktree | undefined> {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before creating a worktree.");
-			return;
+			return undefined;
 		}
+		let created: SessionWorktree | undefined;
 		await this.#withSessionMove(async () => {
 			const branchName = branch?.trim() || defaultSessionWorktreeBranch();
 			const cwd = this.ctx.sessionManager.getCwd();
@@ -1451,7 +1733,7 @@ export class CommandController {
 			this.ctx.ui.requestRender();
 			let worktree: SessionWorktree;
 			try {
-				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName);
+				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName, options);
 			} catch (err) {
 				this.ctx.showError(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
 				return false;
@@ -1466,7 +1748,10 @@ export class CommandController {
 				});
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
-			const cleanup = await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings);
+			created = worktree;
+			const cleanup = worktree.keptChanges
+				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+				: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
@@ -1480,6 +1765,7 @@ export class CommandController {
 			]);
 			return true;
 		});
+		return created;
 	}
 
 	/** Save source settings before acquiring the gate for a complete relocation operation. */
@@ -1523,7 +1809,7 @@ export class CommandController {
 		return true;
 	}
 
-	async handleRenameCommand(title: string): Promise<void> {
+	async handleRenameCommand(title: string, card?: TitleCard): Promise<void> {
 		const session = this.ctx.session;
 		const sessionManager = this.ctx.sessionManager;
 		const sessionId = sessionManager.getSessionId();
@@ -1536,7 +1822,7 @@ export class CommandController {
 			sessionManager.getSessionId() === sessionId &&
 			sessionManager.titleRevision === titleRevision;
 		try {
-			const persistence = sessionManager.setSessionName(title, "user");
+			const persistence = sessionManager.setSessionName(title, "user", undefined, card);
 			titleRevision = sessionManager.titleRevision;
 			const stored = await persistence;
 			if (!isCurrent()) return;

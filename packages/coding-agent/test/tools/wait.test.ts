@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import * as net from "node:net";
+import { type IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { TOOL_INTERRUPT_ABORT_REASON } from "@oh-my-pi/pi-agent-core";
@@ -40,51 +40,45 @@ async function withDiscoveryClient(
 	const runtimeDir = path.join(tempDir.path(), "run");
 	const client = await brokerClients.createDaemonBrokerClient(tempDir.path(), { runtimeDir });
 	const requested = Promise.withResolvers<void>();
-	const sockets = new Set<net.Socket>();
-	const lists: Array<{ id: string; socket: net.Socket }> = [];
+	const sockets = new Set<IpcConnection>();
+	const lists: Array<{ id: string; socket: IpcConnection }> = [];
 	let released = false;
-	const reply = ({ id, socket }: { id: string; socket: net.Socket }, error?: string) =>
-		socket.write(
-			`${JSON.stringify(
-				error ? { id, ok: false, error } : { id, ok: true, result: { op: "list", daemons: [] } },
-			)}\n`,
+	const reply = ({ id, socket }: { id: string; socket: IpcConnection }, error?: string) =>
+		socket.send(
+			JSON.stringify(error ? { id, ok: false, error } : { id, ok: true, result: { op: "list", daemons: [] } }),
 		);
-	const server = net.createServer(socket => {
-		sockets.add(socket);
-		socket.on("close", () => sockets.delete(socket));
-		socket.setEncoding("utf8");
-		let buffer = "";
-		socket.on("data", chunk => {
-			buffer += chunk;
-			for (;;) {
-				const newline = buffer.indexOf("\n");
-				if (newline < 0) break;
-				const request = JSON.parse(buffer.slice(0, newline)) as DaemonWireRequest;
-				buffer = buffer.slice(newline + 1);
-				if (request.operation.op === "list") {
-					if (released) reply({ id: request.id, socket });
-					else lists.push({ id: request.id, socket });
-					requested.resolve();
-				} else {
-					socket.write(
-						`${JSON.stringify({
-							id: request.id,
-							ok: true,
-							result: {
-								op: "ping",
-								projectDir: client.projectDir,
-								protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
-							},
-						})}\n`,
-					);
-				}
-			}
-		});
-	});
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(daemonBrokerEndpoint(client.projectDir, daemonBrokerRuntimeDir(runtimeDir)), resolve);
-	});
+	const server = await IpcServer.listen(
+		daemonBrokerEndpoint(daemonBrokerRuntimeDir(runtimeDir)),
+		{ framing: "lines" },
+		socket => {
+			sockets.add(socket);
+			socket.start(
+				line => {
+					const request = JSON.parse(line) as DaemonWireRequest;
+					if (request.operation.op === "list") {
+						if (released) reply({ id: request.id, socket });
+						else lists.push({ id: request.id, socket });
+						requested.resolve();
+					} else {
+						socket.send(
+							JSON.stringify({
+								id: request.id,
+								ok: true,
+								result: {
+									op: "ping",
+									projectDir: client.projectDir,
+									protocolVersion: DAEMON_BROKER_PROTOCOL_VERSION,
+								},
+							}),
+						);
+					}
+				},
+				() => {
+					sockets.delete(socket);
+				},
+			);
+		},
+	);
 	let acquisitions = 0;
 	const acquisition = vi.spyOn(brokerClients, "daemonClientForProject").mockImplementation(async () => {
 		acquisitions++;
@@ -108,7 +102,7 @@ async function withDiscoveryClient(
 		acquisition.mockRestore();
 		client.close();
 		for (const socket of sockets) socket.destroy();
-		await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+		await server.close();
 	}
 }
 

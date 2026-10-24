@@ -74,6 +74,23 @@ describe("preprocessTinyMessage", () => {
 		expect(prepared).toMatch(/\[… \d+ chars omitted …\]/);
 		expect(prepared.length).toBeLessThanOrEqual(MAX_TINY_MESSAGE_CHARS);
 	});
+
+	it("preserves the ends of huge pastes full of unclosed tags", () => {
+		const unit = "const p: Promise<void> = run(); ";
+		const message = `HEAD ${unit.repeat(Math.ceil((800 * 1024) / unit.length))} TAIL`;
+		const prepared = preprocessTinyMessage(message);
+		expect(prepared.startsWith("HEAD ")).toBe(true);
+		expect(prepared.endsWith(" TAIL")).toBe(true);
+		expect(prepared.length).toBeLessThanOrEqual(MAX_TINY_MESSAGE_CHARS);
+	});
+
+	it("keeps prose between two large fenced blocks", () => {
+		const message = `\`\`\`\n${"SOURCE_NOISE ".repeat(2000)}\n\`\`\`\nPlease fix login redirect\n\`\`\`\n${"TRACE_NOISE ".repeat(2000)}\n\`\`\``;
+		const prepared = preprocessTinyMessage(message);
+		expect(prepared).toContain("Please fix login redirect");
+		expect(prepared).not.toContain("SOURCE_NOISE");
+		expect(prepared).not.toContain("TRACE_NOISE");
+	});
 });
 
 describe("formatTitleUserMessage", () => {

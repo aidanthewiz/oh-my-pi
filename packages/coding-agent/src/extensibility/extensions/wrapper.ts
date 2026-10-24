@@ -18,6 +18,7 @@ import {
 	denyError,
 	formatApprovalPrompt,
 	type RuntimeApprovalCapableTool,
+	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
 } from "../../tools/approval";
@@ -462,7 +463,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						);
 						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 						approved = choice === "Approve once" || approveSession;
-					} else {
+					} else if (sessionApproval || pendingSafetyChecks.length > 0) {
+						// Provider safety details have no transcript preview and must remain fully readable.
 						const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
 						const safetyPrompt =
 							pendingSafetyChecks.length > 0
@@ -470,10 +472,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								: basePrompt;
 						const choice = await uiContext.select(
 							safetyPrompt,
-							sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Approve", "Deny"],
+							sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
 						);
 						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 						approved = choice === "Approve" || approveSession;
+					} else {
+						approved = await requestApproval(uiContext, this.tool, resolvedArgs, approvalCheck.reason);
 					}
 					signal?.throwIfAborted();
 				} catch (err) {
