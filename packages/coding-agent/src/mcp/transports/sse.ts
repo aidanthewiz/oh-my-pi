@@ -272,7 +272,7 @@ export class LegacySseTransport implements MCPTransport {
 		this.#pending.set(id, pending);
 
 		try {
-			const response = await this.#postJson(body, operation.signal);
+			const response = await this.#postJson(body, operation.signal, options?.allowAuthRetry);
 			if (!response.ok) {
 				const text = await response.text();
 				throw new Error(`HTTP ${response.status}: ${text}`);
@@ -324,6 +324,7 @@ export class LegacySseTransport implements MCPTransport {
 	async #postJson(
 		body: JsonRpcRequest | JsonRpcResponse | { jsonrpc: "2.0"; method: string; params: Record<string, unknown> },
 		signal?: AbortSignal,
+		allowAuthRetry?: boolean,
 	): Promise<Response> {
 		const endpointUrl = this.#endpointUrl;
 		if (!endpointUrl) throw new Error("Transport not connected");
@@ -334,7 +335,7 @@ export class LegacySseTransport implements MCPTransport {
 		const payload = JSON.stringify(body);
 		let response = await this.#fetch(endpointUrl, { method: "POST", body: payload, signal }, generated);
 		const status = AIError.status(response);
-		if (!this.onAuthError || (status !== 401 && status !== 403)) return response;
+		if (allowAuthRetry === false || !this.onAuthError || (status !== 401 && status !== 403)) return response;
 
 		const refreshedHeaders = await this.onAuthError();
 		if (!refreshedHeaders) return response;

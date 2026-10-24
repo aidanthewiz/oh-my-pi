@@ -419,7 +419,12 @@ export class HttpTransport implements MCPTransport {
 			// original POST and may have executed it — replaying could run a
 			// state-changing tool twice.
 			const status = error instanceof Error ? AIError.status(error) : undefined;
-			if (!(error instanceof SSEResumeError) && this.onAuthError && (status === 401 || status === 403)) {
+			if (
+				options?.allowAuthRetry !== false &&
+				!(error instanceof SSEResumeError) &&
+				this.onAuthError &&
+				(status === 401 || status === 403)
+			) {
 				const newHeaders = await this.onAuthError();
 				if (newHeaders) {
 					// Persist refreshed headers so subsequent requests use them directly

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
+import { connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
+import { dispatchMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
 import { postmortem } from "@oh-my-pi/pi-utils";
 
@@ -278,6 +279,170 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		expect(error.data?.length).toBeLessThanOrEqual(2_000);
 		expect(error.data).toContain("[redacted]");
 		expect(error.data).not.toContain("server-secret");
+	});
+});
+
+describe("MCP Streamable HTTP authentication replay policy", () => {
+	for (const scenario of [
+		{ label: "explicit never mutation", retry: "never", hint: false, safe: false, status: 401 },
+		{ label: "explicit never overrides readonly metadata", retry: "never", hint: true, safe: false, status: 403 },
+		{ label: "default unannotated mutation", retry: undefined, hint: false, safe: false, status: 403 },
+		{ label: "default annotated read", retry: undefined, hint: true, safe: true, status: 401 },
+		{ label: "explicit safe read", retry: "read", hint: false, safe: true, status: 403 },
+	] as const) {
+		it(`honors transport authentication replay policy for ${scenario.label}`, async () => {
+			const effects: string[] = [];
+			let calls = 0;
+			let refreshes = 0;
+			const definition = {
+				name: scenario.safe ? "get_state" : "create_record",
+				inputSchema: { type: "object" },
+				annotations: scenario.hint ? { readOnlyHint: true } : undefined,
+			};
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(req) {
+					if (req.method !== "POST") return new Response(null, { status: 405 });
+					const rpc = (await req.json()) as { id?: string | number; method: string };
+					if (rpc.id === undefined) return new Response(null, { status: 202 });
+					let result: unknown = {};
+					if (rpc.method === "initialize") {
+						result = {
+							protocolVersion: "2025-11-25",
+							capabilities: { tools: {} },
+							serverInfo: { name: "synthetic-http-auth", version: "1" },
+						};
+					} else if (rpc.method === "tools/list") {
+						result = { tools: [definition] };
+					} else if (rpc.method === "tools/call") {
+						calls++;
+						if (!scenario.safe) effects.push("synthetic-record");
+						if (req.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+							return new Response("synthetic auth rejection after processing", {
+								status: scenario.status,
+								headers: {
+									"WWW-Authenticate": 'Bearer realm="synthetic"',
+									"X-Request-Id": "synthetic-original-response",
+								},
+							});
+						}
+						result = {
+							content: [{ type: "text", text: "Recovered synthetic state" }],
+							structuredContent: { state: "synthetic-state" },
+						};
+					}
+					return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+				},
+			});
+			const connection = await connectToServer("synthetic-http-auth", {
+				type: "http",
+				url: server.url.href,
+				timeout: REQUEST_TIMEOUT_MS,
+			});
+			try {
+				const [tool] = await listTools(connection);
+				if (!tool) throw new Error("Synthetic server exposed no tool");
+				if (!(connection.transport instanceof HttpTransport)) throw new Error("Expected HTTP transport");
+				connection.transport.onAuthError = async () => {
+					refreshes++;
+					return { Authorization: "Bearer synthetic-refreshed" };
+				};
+				const outcome = await dispatchMCPTool(connection, tool, {}, undefined, { retry: scenario.retry }).then(
+					attempt => ({ result: attempt.result, error: undefined }),
+					(error: unknown) => ({ result: undefined, error }),
+				);
+				if (scenario.safe) {
+					expect(outcome.error).toBeUndefined();
+					expect(outcome.result?.structuredContent).toEqual({ state: "synthetic-state" });
+					expect(calls).toBe(2);
+					expect(refreshes).toBe(1);
+					expect(effects).toEqual([]);
+				} else {
+					expect(effects).toEqual(["synthetic-record"]);
+					expect(calls).toBe(1);
+					expect(refreshes).toBe(0);
+					expect(outcome.error).toBeInstanceOf(MCPTransportError);
+					expect(outcome.error).toMatchObject({
+						transport: "http",
+						stage: "receive",
+						failure: "http_status",
+						code: scenario.status,
+						traceId: "synthetic-original-response",
+						message: `HTTP ${scenario.status}: synthetic auth rejection after processing [WWW-Authenticate: Bearer realm="synthetic"]`,
+					});
+				}
+			} finally {
+				await connection.transport.close();
+			}
+		});
+	}
+
+	it("enforces allowAuthRetry false at the direct request boundary", async () => {
+		const effects: string[] = [];
+		let refreshes = 0;
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const rpc = (await req.json()) as { id: number };
+				effects.push("synthetic-record");
+				if (req.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+					return new Response("synthetic mutation recorded", { status: 401 });
+				}
+				return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { applied: true } });
+			},
+		});
+		const transport = await connectedTransport();
+		transport.onAuthError = async () => {
+			refreshes++;
+			return { Authorization: "Bearer synthetic-refreshed" };
+		};
+		try {
+			const error = await transport.request("tools/call", { name: "create_record" }, { allowAuthRetry: false }).then(
+				() => undefined,
+				reason => reason,
+			);
+			expect(effects).toEqual(["synthetic-record"]);
+			expect(refreshes).toBe(0);
+			expect(error).toMatchObject({ code: 401, message: "HTTP 401: synthetic mutation recorded" });
+		} finally {
+			await transport.close();
+		}
+	});
+
+	it("retains auth recovery for discovery requests without a replay override", async () => {
+		let refreshes = 0;
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const rpc = (await req.json()) as { id: number };
+				if (req.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+					return new Response("synthetic discovery auth rejection", { status: 403 });
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: rpc.id,
+					result: { tools: [{ name: "discovered", inputSchema: { type: "object" } }] },
+				});
+			},
+		});
+		const transport = await connectedTransport();
+		transport.onAuthError = async () => {
+			refreshes++;
+			return { Authorization: "Bearer synthetic-refreshed" };
+		};
+		try {
+			await expect(transport.request<ToolList>("tools/list")).resolves.toEqual({
+				tools: [{ name: "discovered", inputSchema: { type: "object" } }],
+			});
+			expect(refreshes).toBe(1);
+		} finally {
+			await transport.close();
+		}
 	});
 });
 

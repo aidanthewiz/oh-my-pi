@@ -155,7 +155,8 @@ Use `retry: "never"` for mutations. Use `retry: "read"` only for known reads.
 Without an explicit override, replay requires `readOnlyHint: true` or
 `idempotentHint: true`. A connection failure alone never proves write safety.
 Authentication challenges do not override this replay contract.
-Unsafe calls preserve original errors without credential probes or recovery after dispatch.
+HTTP and legacy SSE transports enforce this decision for OAuth retries of the original tool request.
+Unsafe requests preserve their original authentication failure without refreshing credentials to resend them.
 Authentication setup remains available before the first dispatch.
 Cancellation stops connection waits and checks again before dispatch.
 An aborted in-flight call can still have changed remote state; reconcile its

@@ -424,7 +424,7 @@ async function callProfileAwareTool(
 		const authenticationGeneration = group ? awsSessionAuthGroups.generation(group) : 0;
 		try {
 			throwIfAborted(signal);
-			const result = await callTool(connection, toolName, args, { signal });
+			const result = await callTool(connection, toolName, args, { signal, allowAuthRetry: replaySafe });
 			if (
 				!replaySafe ||
 				!result.isError ||

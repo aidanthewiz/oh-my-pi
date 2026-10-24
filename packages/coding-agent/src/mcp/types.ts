@@ -328,6 +328,8 @@ export interface ExtensionMCPContext {
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
+	/** False forbids refreshing credentials to resend this request after an authentication failure. */
+	allowAuthRetry?: boolean;
 }
 
 /** Transport interface - abstracts stdio/http */
