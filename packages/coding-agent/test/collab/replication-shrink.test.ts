@@ -54,6 +54,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { runtimeIdentityHistory } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
 
 interface RelayData {
 	role: "host" | "guest";
@@ -532,6 +533,63 @@ describe("serializeReplicatedEntry (#11433)", () => {
 		expect(entry.id).toBe(id);
 		expect(entry.parentId).toBe(id);
 		expect(entry.timestamp).toBe(id);
+	});
+
+	it("preserves an omitted entry's writer through serialized guest ingestion", () => {
+		const runtime = {
+			version: "18.11.0",
+			commit: "0123456789abcdef",
+			branch: "feature/writer",
+			diff: "dirty-fixture",
+			label: "synthetic source build",
+		};
+		const entry = userMessage("writer-entry", null, "2026-10-23T00:00:00Z", "content");
+		entry.runtime = runtime;
+		Object.assign(entry.message, { blob: { ["k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES)]: true } });
+		const { value, json } = serializeReplicatedEntry(entry);
+		expect(value.type).toBe("custom_message");
+		expect(Buffer.byteLength(json, "utf8")).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		const guest = SessionManager.inMemory();
+		guest.ingestReplicatedEntry(JSON.parse(json));
+		expect(runtimeIdentityHistory(guest.getEntries())).toEqual([runtime]);
+		expect(entry.runtime).toEqual(runtime);
+	});
+
+	it.each([String.fromCharCode(0), "中"])("bounds escaped identity and writer metadata containing %j", character => {
+		const identity = character.repeat(128 * 1024);
+		const entry = userMessage(identity, identity, identity, "content");
+		entry.runtime = {
+			version: identity,
+			commit: identity,
+			branch: identity,
+			diff: identity,
+			label: identity,
+		};
+		Object.assign(entry.message, { blob: { ["k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES)]: true } });
+		const { value, json } = serializeReplicatedEntry(entry);
+		expect(value.type).toBe("custom_message");
+		expect(Buffer.byteLength(json, "utf8")).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		const replicated = JSON.parse(json) as ReplicatedEntry;
+		for (const field of [replicated.id, replicated.parentId, replicated.timestamp]) {
+			expect(field?.startsWith(character.repeat(128))).toBe(true);
+		}
+		for (const field of ["version", "commit", "branch", "diff", "label"] as const) {
+			expect(replicated.runtime?.[field]?.startsWith(character.repeat(128))).toBe(true);
+		}
+		expect(entry.runtime.branch).toBe(identity);
+	});
+
+	it("omits malformed writer fields without losing an oversized entry's branch identity", () => {
+		const entry = userMessage("malformed-writer", "prior-entry", "2026-10-23T00:00:00Z", "content");
+		Object.assign(entry, { runtime: { version: "18.11.0", commit: 42, label: "retained label" } });
+		Object.assign(entry.message, { blob: { ["k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES)]: true } });
+		const { value, json } = serializeReplicatedEntry(entry);
+		expect(value.type).toBe("custom_message");
+		expect(Buffer.byteLength(json, "utf8")).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		const replicated = JSON.parse(json) as ReplicatedEntry;
+		expect(replicated.id).toBe("malformed-writer");
+		expect(replicated.parentId).toBe("prior-entry");
+		expect(runtimeIdentityHistory([replicated])).toEqual([{ version: "18.11.0", label: "retained label" }]);
 	});
 
 	for (const [name, metadata] of [

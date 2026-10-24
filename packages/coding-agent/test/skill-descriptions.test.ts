@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { SkillDescriptionCatalog, SkillDescriptionStore } from "../src/extensibility/skill-descriptions";
+import {
+	type SkillDescriptionCompressor,
+	SkillDescriptionCatalog,
+	SkillDescriptionStore,
+} from "../src/extensibility/skill-descriptions";
 import type { Skill } from "../src/extensibility/skills";
 import { buildSystemPrompt } from "../src/system-prompt";
 
@@ -21,11 +25,13 @@ describe("system prompt skill descriptions", () => {
 		const { promise, resolve } = Promise.withResolvers<string>();
 		const started = Promise.withResolvers<void>();
 		let calls = 0;
-		const compress = (_name: string, _description: string, request: string) => {
-			calls++;
-			started.resolve();
-			expect(request).toContain(original.description);
-			return promise;
+		const compress: SkillDescriptionCompressor = {
+			modelKey: () => "test/smol-a",
+			compress: () => {
+				calls++;
+				started.resolve();
+				return promise;
+			},
 		};
 		const session = new SkillDescriptionCatalog({ store, compress });
 		const preview = session.render([original, original])[0]?.description;
@@ -70,9 +76,12 @@ describe("system prompt skill descriptions", () => {
 		let calls = 0;
 		const first = new SkillDescriptionCatalog({
 			store,
-			compress: async () => {
-				calls++;
-				return "Use for interactive browser tasks.";
+			compress: {
+				modelKey: () => "test/smol-a",
+				compress: async () => {
+					calls++;
+					return "Use for interactive browser tasks.";
+				},
 			},
 		});
 		first.render([original]);
@@ -80,9 +89,12 @@ describe("system prompt skill descriptions", () => {
 		const changed = { ...original, description: `${original.description} Also inspect accessibility trees.` };
 		const next = new SkillDescriptionCatalog({
 			store,
-			compress: async () => {
-				calls++;
-				return "Use for interactive browser and accessibility tasks.";
+			compress: {
+				modelKey: () => "test/smol-a",
+				compress: async () => {
+					calls++;
+					return "Use for interactive browser and accessibility tasks.";
+				},
 			},
 		});
 		expect(next.render([changed])[0]?.description).not.toBe("Use for interactive browser tasks.");
@@ -90,16 +102,74 @@ describe("system prompt skill descriptions", () => {
 		expect(calls).toBe(2);
 	});
 
-	it("does not cache malformed output and retries in a later session", async () => {
+	it("avoids repeating an unusable compression until the model changes", async () => {
 		using temp = TempDir.createSync("omp-skill-description-invalid-");
 		using store = SkillDescriptionStore.open(temp.join("skills.db"));
-		const failed = new SkillDescriptionCatalog({ store, compress: async () => "line one\nline two" });
+		let modelACalls = 0;
+		const failed = new SkillDescriptionCatalog({
+			store,
+			compress: {
+				modelKey: () => "test/smol-a",
+				compress: async () => {
+					modelACalls++;
+					return "line one\nline two";
+				},
+			},
+		});
 		const preview = failed.render([original])[0]?.description;
 		await failed.waitForPending();
+		const sameModel = new SkillDescriptionCatalog({
+			store,
+			compress: {
+				modelKey: () => "test/smol-a",
+				compress: async () => {
+					modelACalls++;
+					return "Use for interactive sites; not static pages.";
+				},
+			},
+		});
+		expect(sameModel.render([original])[0]?.description).toBe(preview);
+		await sameModel.waitForPending();
+		expect(modelACalls).toBe(1);
+		let modelBCalls = 0;
+		const nextModel = new SkillDescriptionCatalog({
+			store,
+			compress: {
+				modelKey: () => "test/smol-b",
+				compress: async () => {
+					modelBCalls++;
+					return "Use for interactive sites; not static pages.";
+				},
+			},
+		});
+		nextModel.render([original]);
+		await nextModel.waitForPending();
+		expect(modelBCalls).toBe(1);
+		expect(new SkillDescriptionCatalog({ store }).render([original])[0]?.description).toBe(
+			"Use for interactive sites; not static pages.",
+		);
+	});
 
+	it("retries a transport failure for the same model in a later session", async () => {
+		using temp = TempDir.createSync("omp-skill-description-transport-");
+		using store = SkillDescriptionStore.open(temp.join("skills.db"));
+		const failed = new SkillDescriptionCatalog({
+			store,
+			compress: {
+				modelKey: () => "test/smol-a",
+				compress: async () => {
+					throw new Error("synthetic transport failure");
+				},
+			},
+		});
+		const preview = failed.render([original])[0]?.description;
+		await failed.waitForPending();
 		const retry = new SkillDescriptionCatalog({
 			store,
-			compress: async () => "Use for interactive sites; not static pages.",
+			compress: {
+				modelKey: () => "test/smol-a",
+				compress: async () => "Use for interactive sites; not static pages.",
+			},
 		});
 		expect(retry.render([original])[0]?.description).toBe(preview);
 		await retry.waitForPending();
@@ -113,14 +183,20 @@ describe("system prompt skill descriptions", () => {
 		const dbPath = temp.join("skills.db");
 		const store = SkillDescriptionStore.open(dbPath);
 		try {
-			const first = new SkillDescriptionCatalog({ store, compress: async () => "Use for interactive sites." });
+			const first = new SkillDescriptionCatalog({
+				store,
+				compress: {
+					modelKey: () => "test/smol-a",
+					compress: async () => "Use for interactive sites.",
+				},
+			});
 			first.render([original]);
 			await first.waitForPending();
 			expect(new SkillDescriptionCatalog({ store }).render([original])[0]?.description).toBe(
 				"Use for interactive sites.",
 			);
 		} finally {
-			store.close();
+			await store.close();
 		}
 		using reopened = SkillDescriptionStore.open(dbPath);
 		expect(new SkillDescriptionCatalog({ store: reopened }).render([original])[0]?.description).toBe(

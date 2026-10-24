@@ -38,7 +38,14 @@ export type DaemonInputDelivery = "broker_write_only";
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
-	| { op: "start"; spec: DaemonSpec; owner?: string; replace?: boolean }
+	| {
+			op: "start";
+			spec: DaemonSpec;
+			owner?: string;
+			replace?: boolean;
+			/** `false` answers once the process launches; follow with a `wait` for readiness. Legacy brokers ignore it and wait. */
+			awaitReady?: boolean;
+	  }
 	| { op: "list" }
 	| {
 			op: "logs";
@@ -340,6 +347,8 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				spec: parseDaemonSpec(source.spec),
 				owner: optionalString(source.owner, "operation.owner"),
 				replace: source.replace === undefined ? undefined : booleanValue(source.replace, "operation.replace"),
+				awaitReady:
+					source.awaitReady === undefined ? undefined : booleanValue(source.awaitReady, "operation.awaitReady"),
 			};
 		case "logs":
 			return {

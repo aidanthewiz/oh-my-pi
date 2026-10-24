@@ -215,6 +215,101 @@ describe("session-owned supervised services", () => {
 		}, 15_000);
 	}
 
+	for (const invalidation of ["steer", "dispose", "switch"] as const) {
+		it(`readiness steering preserves ${invalidation === "steer" ? "the live service" : `${invalidation} cancellation`}`, async () => {
+			using tempDir = TempDir.createSync("@omp-service-ready-interrupt-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			const client = await brokerClients.createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+			const previousTitle = process.title;
+			const broker = await startBroker(projectDir, runtimeDir);
+			let sessionId = "original-session";
+			let disposed = false;
+			const disposeCallbacks = new Set<() => void>();
+			const changeCallbacks = new Set<() => void>();
+			const session: ToolSession = {
+				cwd: projectDir,
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				getSessionId: () => sessionId,
+				isDisposed: () => disposed,
+				registerDisposeCallback: callback => {
+					disposeCallbacks.add(callback);
+					return () => disposeCallbacks.delete(callback);
+				},
+				registerSessionChangeCallback: callback => {
+					changeCallbacks.add(callback);
+					return () => changeCallbacks.delete(callback);
+				},
+			};
+			const waiting = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const steering = new AbortController();
+			try {
+				vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+				const request = client.request.bind(client);
+				vi.spyOn(client, "request").mockImplementation(async (operation, signal) => {
+					if (operation.op === "wait" && operation.for === "ready") {
+						waiting.resolve();
+						await release.promise;
+					}
+					return request(operation, signal);
+				});
+				const outcome = startService(
+					session,
+					{
+						name: "pending-ready",
+						command: "read answer",
+						shell: { shell: "/bin/sh", args: ["-c"], env: {} },
+						pty: false,
+						ready: { log: "never-ready", timeout: 5 },
+					},
+					undefined,
+					steering.signal,
+				).then(
+					result => ({ ok: true as const, result }),
+					(error: unknown) => ({ ok: false as const, error }),
+				);
+				await waiting.promise;
+				steering.abort();
+				if (invalidation === "dispose") {
+					disposed = true;
+					for (const callback of disposeCallbacks) callback();
+				} else if (invalidation === "switch") {
+					sessionId = "other-session";
+					for (const callback of changeCallbacks) callback();
+					sessionId = "original-session";
+					for (const callback of changeCallbacks) callback();
+				}
+				release.resolve();
+				const settled = await outcome;
+				if (invalidation === "steer") {
+					if (!settled.ok) throw settled.error;
+					expect(settled.result.readyInterrupted).toBe(true);
+					expect(settled.result.readyTimedOut).toBe(false);
+					expect(hasLiveOwnedService(session)).toBe(true);
+					const services = await request({ op: "list" });
+					if (services.op !== "list") throw new Error("Expected daemon list");
+					expect(services.daemons.find(daemon => daemon.name === "pending-ready")?.state).toBe("starting");
+				} else {
+					if (settled.ok) throw new Error("Invalidated service start returned success");
+					expect(settled.error).toBeInstanceOf(ToolAbortError);
+					expect(hasLiveOwnedService(session)).toBe(false);
+				}
+			} finally {
+				release.resolve();
+				vi.restoreAllMocks();
+				await client.request({ op: "shutdown" }).catch(() => undefined);
+				client.close();
+				await broker.finished;
+				process.title = previousTitle;
+			}
+		}, 15_000);
+	}
+
 	it("does not restore old ownership from a response that finishes after switching sessions", async () => {
 		using tempDir = TempDir.createSync("@omp-service-stale-list-");
 		const projectDir = path.join(tempDir.path(), "project");

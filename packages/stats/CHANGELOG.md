@@ -6,6 +6,12 @@
 
 - Fixed dashboard controls remaining busy after a cached query's refresh is abandoned by hiding the page or switching keys.
 - Preserve the Coreforce hammer favicon in the branded stats dashboard.
+## [18.11.0] - 2026-10-14
+
+### Fixed
+
+- Providers → Subscription windows no longer mixes Codex 5-hour and 7-day quotas across plans: Team and weekly-only (ProLite) accounts now share the 7-day row, the 5-hour row counts only accounts that have one, and labels no longer flip with whichever account reported last ([#15664](https://github.com/can1357/oh-my-pi/issues/15664))
+
 ## [18.10.4] - 2026-10-13
 
 ### Fixed

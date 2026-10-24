@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
 import { type Component, Container, isFocusable, type OverlayOptions, setKeybindings } from "@oh-my-pi/pi-tui";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
@@ -21,7 +22,7 @@ beforeAll(async () => {
 	setThemeInstance(dark);
 });
 
-function makeHarness(hideToolActivity = false) {
+function makeHarness() {
 	const editor = new CustomEditor(getEditorTheme());
 	const editorContainer = new Container();
 	editorContainer.addChild(editor);
@@ -42,9 +43,10 @@ function makeHarness(hideToolActivity = false) {
 	};
 	const showOverlay = vi.fn(() => fakeHandle);
 	let uiContext: ExtensionUIContext | undefined;
+	const steering: string[] = [];
+	const sessionListeners = new Set<(event: { type: string; steering?: string[] }) => void>();
 	const ctx = {
 		editor,
-		hideToolActivity,
 		ui: {
 			requestRender,
 			getFocused,
@@ -56,6 +58,11 @@ function makeHarness(hideToolActivity = false) {
 		session: {
 			extensionRunner: undefined,
 			setUsageFallbackConfirmer: vi.fn(),
+			getQueuedMessages: () => ({ steering: [...steering], followUp: [], liveSteered: 0 }),
+			subscribe(listener: (event: { type: string; steering?: string[] }) => void) {
+				sessionListeners.add(listener);
+				return () => sessionListeners.delete(listener);
+			},
 		},
 		setToolUIContext(context: ExtensionUIContext, hasUI: boolean): void {
 			expect(hasUI).toBe(true);
@@ -80,6 +87,16 @@ function makeHarness(hideToolActivity = false) {
 		controller,
 		inputController: (readText: () => Promise<string>) =>
 			new InputController(ctx, { readImage: async () => null, readText }),
+		/** Queue a user steer the way the session does: append, then emit `queue_update`. */
+		queueSteer(text: string): void {
+			steering.push(text);
+			for (const listener of sessionListeners) listener({ type: "queue_update", steering: [...steering] });
+		},
+		/** Deliver the queued steering at the batch boundary: the queue empties. */
+		deliverSteering(): void {
+			steering.length = 0;
+			for (const listener of sessionListeners) listener({ type: "queue_update", steering: [] });
+		},
 		handleInput(data: string): void {
 			if (!focused?.handleInput) throw new Error("Expected a focused input component");
 			focused.handleInput(data);
@@ -249,29 +266,6 @@ describe("ExtensionUiController Ask dialog input", () => {
 });
 
 describe("ExtensionUiController docked approval", () => {
-	it.each([false, true])(
-		"keeps the draft and shows full details only when tool activity is hidden (%s)",
-		async hidden => {
-			const harness = makeHarness(hidden);
-			harness.editor.setText("retain this unfinished draft");
-			const ui = await harness.init();
-			const pending = ui.approve!({
-				full: "Allow tool: write\nContent:\nfull-body-marker",
-				compact: "Allow tool: write\nContent: 1 line in the tool call",
-			});
-			const dialog = harness.getFocused();
-			if (!(dialog instanceof ApprovalDialogComponent)) throw new Error("Expected approval dialog");
-			const rendered = Bun.stripANSI(dialog.render(120).join("\n"));
-			expect(rendered.includes("full-body-marker")).toBe(hidden);
-			harness.handleInput("\r");
-			expect(harness.getFocused()).toBe(dialog);
-			dialog.handleNativeEvent({ type: "action", key: "approve", act: "approve", mods: [] });
-			expect(await pending).toBe(true);
-			expect(harness.getFocused()).toBe(harness.editor);
-			expect(harness.editor.getText()).toBe("retain this unfinished draft");
-		},
-	);
-
 	it("starts a queued approval timeout on presentation, resets it on input, and ignores a retired dialog", async () => {
 		vi.useFakeTimers();
 		const harness = makeHarness();
@@ -579,5 +573,113 @@ describe("ExtensionUiController custom overlay", () => {
 		expect(component.dispose).toHaveBeenCalledTimes(1);
 		expect(harness.editorContainer.children).toEqual([harness.editor]);
 		expect(harness.editor.getText()).toBe("draft typed while factory is pending");
+	});
+});
+
+describe("ExtensionUiController tool approval", () => {
+	const prompt = {
+		full: "Allow tool: bash\nCommand: rm -rf build",
+		compact: "Allow tool: bash\nCommand: rm -rf build",
+	};
+
+	it("lets the composer steer while a call waits: the queued message denies the call", async () => {
+		const harness = makeHarness();
+		// A steer queued before the prompt appeared does not answer it.
+		harness.queueSteer("earlier message");
+		harness.editor.onSubmit = text => harness.queueSteer(text);
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		const [dialog] = harness.editorContainer.children;
+		expect(harness.editorContainer.children).toEqual([dialog, harness.editor]);
+		// Enter on an empty composer is swallowed: the dialog stays up (settling unmounts it synchronously).
+		harness.handleInput("\r");
+		expect(harness.editorContainer.children).toEqual([dialog, harness.editor]);
+		for (const key of "keep the build dir") harness.handleInput(key);
+		expect(harness.editor.getText()).toBe("keep the build dir");
+		harness.handleInput("\r");
+		expect(await pending).toBe(false);
+		expect(harness.editorContainer.children).toEqual([harness.editor]);
+		expect(harness.getFocused()).toBe(harness.editor);
+	});
+
+	it("one steer denies every approval of the batch, including those queued behind the shown one", async () => {
+		const harness = makeHarness();
+		harness.editor.onSubmit = text => harness.queueSteer(text);
+		const first = harness.controller.showCollabAwareApproval(prompt);
+		const second = harness.controller.showCollabAwareApproval({ ...prompt, full: "Allow tool: write" });
+		for (const key of "stop") harness.handleInput(key);
+		harness.handleInput("\r");
+		expect(await first).toBe(false);
+		expect(await second).toBe(false);
+		expect(harness.editorContainer.children).toEqual([harness.editor]);
+	});
+
+	it("a steer also denies approvals its batch requests later, until it is delivered", async () => {
+		const harness = makeHarness();
+		harness.editor.onSubmit = text => harness.queueSteer(text);
+		const first = harness.controller.showCollabAwareApproval(prompt);
+		for (const key of "stop") harness.handleInput(key);
+		harness.handleInput("\r");
+		expect(await first).toBe(false);
+		// An exclusive call asks only after the denied one settled; the steer is still queued.
+		expect(await harness.controller.showCollabAwareApproval(prompt)).toBe(false);
+		// Delivered at the batch boundary: the next turn's approvals ask again.
+		harness.deliverSteering();
+		void harness.controller.showCollabAwareApproval(prompt);
+		expect(harness.editorContainer.children).toHaveLength(2);
+	});
+
+	it("attaches pasted images to the steer: clipboard and image-path pastes reach the composer, later keys wait", async () => {
+		const harness = makeHarness();
+		const clipboard = Promise.withResolvers<boolean>();
+		const onPasteImage = vi.fn(() => clipboard.promise);
+		const onPasteImagePath = vi.fn();
+		harness.editor.onPasteImage = onPasteImage;
+		harness.editor.onPasteImagePath = onPasteImagePath;
+		void harness.controller.showCollabAwareApproval(prompt);
+		// Image-only clipboard paste: the terminal sends an empty bracketed paste.
+		harness.handleInput("\x1b[200~\x1b[201~");
+		expect(onPasteImage).toHaveBeenCalledTimes(1);
+		// Typed while the clipboard read is pending: held until the image lands.
+		harness.handleInput("x");
+		expect(harness.editor.getText()).toBe("");
+		clipboard.resolve(true);
+		await clipboard.promise;
+		await Promise.resolve();
+		expect(harness.editor.getText()).toBe("x");
+		harness.handleInput("\x1b[200~/tmp/shot.png\x1b[201~");
+		await Promise.resolve();
+		expect(onPasteImagePath).toHaveBeenCalledWith("/tmp/shot.png");
+	});
+
+	it("sends a steer whose Enter arrived in a separate read while its image was still landing", async () => {
+		const harness = makeHarness();
+		const clipboard = Promise.withResolvers<void>();
+		harness.editor.onPasteImage = async () => {
+			await clipboard.promise;
+			harness.editor.setText("[Image #1]");
+			return true;
+		};
+		const onSubmit = vi.fn();
+		harness.editor.onSubmit = onSubmit;
+		void harness.controller.showCollabAwareApproval(prompt);
+		harness.handleInput("\x1b[200~\x1b[201~");
+		// The composer is still empty, yet this Enter belongs to the paste, not to the empty-composer guard.
+		harness.handleInput("\r");
+		clipboard.resolve();
+		await clipboard.promise;
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(onSubmit).toHaveBeenCalledWith("[Image #1]");
+	});
+
+	it("lets ctrl+o reveal a single-line detail the row clips, even when compact and full match", () => {
+		const harness = makeHarness();
+		const command = `Allow tool: bash\nCommand: echo ok && ${"x".repeat(120)} && rm -rf ~`;
+		void harness.controller.showCollabAwareApproval({ full: command, compact: command });
+		const body = () =>
+			stripVTControlCharacters(harness.editorContainer.children[0]!.render(60).join("\n")).replace(/[│\s]+/g, "");
+		expect(body()).not.toContain("rm-rf~");
+		harness.handleInput("\x0f");
+		expect(body()).toContain("rm-rf~");
 	});
 });

@@ -2230,10 +2230,13 @@ async function streamAssistantResponse(
 							}
 						}
 						finalMessage = snapshotAssistantMessage(finalMessage);
-						// Sanitize every committed DSML-model turn, including mixed tool
-						// turns and truncations. Only a stopped turn without calls needs a nudge.
-						if (dsmlLeakRecoveryEnabled && removeDsmlToolMarkupLeak(finalMessage)) {
-							dsmlLeakMessages.add(finalMessage);
+						// Only failed text-only calls need a nudge; sanitize every DSML turn.
+						if (dsmlLeakRecoveryEnabled) {
+							const hasToolCall = finalMessage.content.some(block => block.type === "toolCall");
+							const removed = removeDsmlToolMarkupLeak(finalMessage);
+							if (removed && finalMessage.stopReason === "stop" && !hasToolCall) {
+								dsmlLeakMessages.add(finalMessage);
+							}
 						}
 						// Expand inline macros (and any other registered rewrite) on the
 						// finalized message before it reaches the context, the UI, or tool

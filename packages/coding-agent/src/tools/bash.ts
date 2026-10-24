@@ -36,7 +36,7 @@ import { DEFAULT_MAX_BYTES, enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import type { ToolSession } from ".";
-import { type ApprovalDetailsOptions, type RuntimeToolApprovalRequest, truncateApprovalDetail } from "./approval";
+import { type RuntimeToolApprovalRequest, truncateForPrompt } from "./approval";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
 import { rewriteGitWorktreeAdd } from "./bash-worktree-rewrite";
@@ -50,7 +50,7 @@ import {
 } from "./destructive-command-guard";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
-import { startService, type ServiceReady } from "../launch/services";
+import { serviceLogs, startService, type ServiceReady } from "../launch/services";
 import { isFindEnabled } from "./jfind";
 import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -729,10 +729,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		return "exec";
 	};
-	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
+	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "(missing)";
-		return [`Command: ${truncateApprovalDetail(command, options)}`];
+		return [`Command: ${truncateForPrompt(command)}`];
 	};
 	readonly label = "Bash";
 	readonly loadMode = "essential";
@@ -1376,8 +1376,30 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					shell: { ...backend.shellConfig, prefix: undefined },
 				},
 				signal,
+				normalizedInput.ready === undefined ? undefined : ctx?.toolCall?.steeringSignal,
 			);
 			const daemon = service.daemon;
+			if (service.readyInterrupted) {
+				// A queued message arrived mid-wait: return so it injects promptly.
+				// The broker keeps starting the service, inspectable via proc://.
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${normalizedInput.name}: starting${daemon.pid === undefined ? "" : ` pid=${daemon.pid}`}\nReadiness wait interrupted early to handle an incoming message; the service is still starting and keeps running. Read proc://${normalizedInput.name} for status.`,
+						},
+					],
+					details: {
+						service: {
+							name: normalizedInput.name,
+							state: daemon.state,
+							ready: false,
+							timedOut: false,
+							pid: daemon.pid,
+						},
+					},
+				};
+			}
 			const lines = [
 				`${daemon.name}: ${daemon.state}${daemon.pid === undefined ? "" : ` pid=${daemon.pid}`}${daemon.readyAt === undefined ? "" : " ready"}`,
 			];
@@ -1386,7 +1408,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					`NOT ready — readiness timed out after ${normalizedInput.ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
 				);
 			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
-			if (service.log) lines.push(service.log);
+			const log = await serviceLogs(this.session, normalizedInput.name, signal);
+			if (log) lines.push(log);
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: {

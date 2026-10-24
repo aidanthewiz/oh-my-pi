@@ -11,10 +11,27 @@
 - Preserve earlier token rates when successive partial dated price cards take effect, including rebuilt models and historical request billing.
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
 - Scoped Google OAuth model caches to credentials and discovery endpoints, plus Gemini CLI projects. Startup restores only the current credential's cached catalog.
+- Scoped SambaNova model caches to credentials and discovery endpoints so keyless resolution retains the bundled seed instead of a previous authenticated roster.
 - Keep the Anthropic inline-image byte budget off custom endpoints, including legacy models with official-endpoint compatibility rules.
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.11.0] - 2026-10-14
+
+### Added
+
+- Added `local/nemotron-streaming-en-0.6b` for local streaming English dictation ([#15759](https://github.com/can1357/oh-my-pi/pull/15759) by [@daaximus](https://github.com/daaximus)).
+- Added SambaNova Cloud (`sambanova`) as a provider: `/login sambanova` with an API key, and the live `/v1/models` roster with its prices, reasoning models, and Gemma 4 image input ([#14986](https://github.com/can1357/oh-my-pi/pull/14986) by [@rjuez00](https://github.com/rjuez00))
+
+### Changed
+
+- OpenCode Go requests now go to the current `https://opencode.ai/inference/go/v1` endpoint instead of the legacy `/zen/go` one ([#15722](https://github.com/can1357/oh-my-pi/issues/15722))
+
+### Fixed
+
+- Fixed OpenCode Go's `deepseek-flash` alias showing $0, unknown limits, and no reasoning instead of the V4.1 Flash rate card and capabilities ([#15357](https://github.com/can1357/oh-my-pi/issues/15357))
+- Fixed OpenCode Go's Gemini 4 Argon Contributor failing with an unsupported protocol and thinking level; it now uses the native Gemini endpoint ([#15722](https://github.com/can1357/oh-my-pi/issues/15722))
+
 ## [18.10.4] - 2026-10-13
 
 ### Added

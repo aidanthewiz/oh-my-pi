@@ -1710,7 +1710,12 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#evalToolSession = config.evalToolSession;
 		const initialEvalStateContext = this.#buildEvalStateContextMessage();
-		if (initialEvalStateContext) this.agent.appendMessage(initialEvalStateContext);
+		if (
+			initialEvalStateContext &&
+			this.#needsEvalStateContext(this.agent.state.messages, initialEvalStateContext.content)
+		) {
+			this.agent.appendMessage(initialEvalStateContext);
+		}
 		const ircHost: IrcBridgeHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -2370,6 +2375,10 @@ export class AgentSession implements SettingsScope {
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			persistEvalStateContext: () => {
+				const message = this.#buildEvalStateContextMessage();
+				if (message) this.sessionManager.appendMessage(message);
+			},
 			convertToLlmForSideRequest: messages => this.#convertToLlmForSideRequest(messages),
 			buildLiveProviderContext: async (summarized, retained, signal, model) => {
 				// compact() rebuilds the previous summary message; send the live
@@ -5184,7 +5193,7 @@ export class AgentSession implements SettingsScope {
 	async #emitAgentEndNotification(
 		runId: string,
 		messages: AgentMessage[],
-		options?: { willContinue?: boolean },
+		options?: AgentEndSettleOptions,
 	): Promise<void> {
 		if (this.#extensionEventsDrained) await this.#extensionEventsDrained.promise;
 		await this.#extensionRunner?.emit({
@@ -5192,6 +5201,7 @@ export class AgentSession implements SettingsScope {
 			runId,
 			messages,
 			willContinue: options?.willContinue,
+			...(options?.willContinue === true && options.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
 		});
 	}
 
@@ -6808,7 +6818,15 @@ export class AgentSession implements SettingsScope {
 	#withEvalStateContext(context: SessionContext): SessionContext {
 		const evalStateContext = this.#buildEvalStateContextMessage();
 		if (!evalStateContext) return context;
+		if (!this.#needsEvalStateContext(context.messages, evalStateContext.content)) return context;
 		return { ...context, messages: [...context.messages, evalStateContext] };
+	}
+
+	#needsEvalStateContext(messages: AgentMessage[], content: CustomMessage["content"]): boolean {
+		const latest = messages.findLast(
+			message => message.role === "custom" && message.customType === "eval-state-context",
+		);
+		return latest?.role !== "custom" || latest.content !== content;
 	}
 
 	#buildEvalStateContextMessage(): CustomMessage | undefined {

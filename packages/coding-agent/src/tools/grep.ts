@@ -19,7 +19,7 @@ import {
 	openArchive,
 	parseArchivePathCandidates,
 } from "@oh-my-pi/pi-utils/ar";
-import { getEditStore } from "../edit/store";
+import { getEditStore, recordFullySeenRows } from "../edit/store";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
@@ -965,6 +965,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const renderMatchesForFile = (relativePath: string): FileMatchSection => {
 					const modelOut: string[] = [];
 					const displayOut: string[] = [];
+					let cutLines: Set<number> | undefined;
 					const fileMatches = matchesByFile.get(relativePath) ?? [];
 					const hashContext = hashContexts.get(relativePath);
 					const useHashLines = hashContext !== undefined;
@@ -987,6 +988,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								displayOut.push(`${gutterPad}│...`);
 							}
 							modelOut.push(formatMatchLine(lineNumber, line, isMatch, { useHashLines }));
+							if (!isMatch && line.endsWith("...") && Buffer.byteLength(line) >= DEFAULT_MAX_COLUMN - 6) {
+								(cutLines ??= new Set()).add(lineNumber);
+							}
 							displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
 							lastEmittedLine = lineNumber;
 						};
@@ -997,6 +1001,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						}
 						// A cut line shows a window around its first match; name where that match sits.
 						const matchLine = match.column === undefined ? match.line : `${match.line} [col ${match.column}]`;
+						if (match.truncated) (cutLines ??= new Set()).add(match.lineNumber);
 						pushLine(match.lineNumber, matchLine, true);
 						if (match.truncated) linesTruncated = true;
 						if (match.contextAfter) {
@@ -1007,10 +1012,12 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
 					}
 					if (hashContext?.tag) {
-						getEditStore(this.session).recordSeenLinesFromBody(
+						recordFullySeenRows(
+							getEditStore(this.session),
 							hashContext.path,
 							hashContext.tag,
 							modelOut.join("\n"),
+							cutLines,
 						);
 					}
 					return { model: modelOut, display: displayOut, tag: hashContext?.tag };

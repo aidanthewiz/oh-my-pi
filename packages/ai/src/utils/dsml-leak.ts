@@ -13,9 +13,9 @@
 import type { AssistantMessage, Model } from "../types";
 
 // Structural DSML tags in either pipe spelling (fullwidth `｜` U+FF5C or ASCII),
-// tolerating stray whitespace inside the delimiter run.
+// including doubled delimiters and the observed malformed ` calls` wrapper.
 const DSML_TAG_PATTERN =
-	/<\s*(\/?)\s*[｜|]\s*DSML\s*[｜|]\s*(tool_calls|invoke|parameter)\b(?:[ \t]*(?:\r?\n[ \t]*)?(?:name|string)[ \t]*=[ \t]*(?:"[^"<>\r\n]*"?|'[^'<>\r\n]*'?|[^\s<>]+))*(?:\s*>|[ \t]*)/gu;
+	/<\s*(\/?)\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(tool_calls|invoke|parameter|calls)\b(?:[ \t]*(?:\r?\n[ \t]*)?(?:name|string)[ \t]*=[ \t]*(?:"[^"<>\r\n]*"?|'[^'<>\r\n]*'?|[^\s<>]+))*(?:\s*>|[ \t]*)/gu;
 // Code the model deliberately quoted (fences, inline spans) is not a leak.
 const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|(?<!`)(`+)(?!`)[^\n]*?\2(?!`)/g;
 // The identifier-only line a degraded model writes in place of
@@ -54,7 +54,7 @@ function stripUnquoted(text: string): string {
 	let parameterizedInvoke: number | undefined;
 	for (let index = 0; index < tags.length; index++) {
 		const tag = tags[index]!;
-		const kind = tag[2]!;
+		const kind = tag[2] === "calls" ? "tool_calls" : tag[2]!;
 		if (kind === "parameter") parameterizedInvoke = open.get("invoke");
 		for (const [name, opener] of open) {
 			if (name !== kind && kind !== "tool_calls" && !(kind === "invoke" && name === "parameter")) continue;
@@ -114,21 +114,37 @@ export function stripDsmlToolMarkup(text: string): string | undefined {
 }
 
 /**
- * Remove leaked DSML tool-call markup from `message`'s text blocks in place,
- * dropping blocks left empty. Returns true when anything was removed.
+ * Remove leaked DSML tool-call markup from an assistant message before commit,
+ * including reasoning blocks and turns with valid structured calls. Rewritten
+ * thinking with an opaque signature is discarded; OpenAI-compatible reasoning
+ * field names are replay markers, not signatures, and survive cleanup.
  */
 export function removeDsmlToolMarkupLeak(message: AssistantMessage): boolean {
-	let removed = false;
-	const content: AssistantMessage["content"] = [];
-	for (const block of message.content) {
-		const stripped = block.type === "text" ? stripDsmlToolMarkup(block.text) : undefined;
-		if (block.type !== "text" || stripped === undefined) {
-			content.push(block);
+	let content: AssistantMessage["content"] | undefined;
+	for (let index = 0; index < message.content.length; index++) {
+		const block = message.content[index]!;
+		if (block.type !== "text" && block.type !== "thinking") {
+			content?.push(block);
 			continue;
 		}
-		removed = true;
-		if (stripped.trim().length > 0) content.push({ ...block, text: stripped });
+		const stripped = stripDsmlToolMarkup(block.type === "text" ? block.text : block.thinking);
+		if (stripped === undefined) {
+			content?.push(block);
+			continue;
+		}
+		content ??= message.content.slice(0, index);
+		if (block.type === "text") {
+			if (stripped.trim().length > 0) content.push({ ...block, text: stripped });
+		} else {
+			const signature = block.thinkingSignature;
+			const reasoningField =
+				(message.api === "openai-completions" || message.api === "openrouter") &&
+				(signature === "reasoning_content" || signature === "reasoning" || signature === "reasoning_text");
+			if ((!signature || reasoningField) && stripped.trim().length > 0) {
+				content.push({ ...block, thinking: stripped });
+			}
+		}
 	}
-	if (removed) message.content = content;
-	return removed;
+	if (content) message.content = content;
+	return content !== undefined;
 }

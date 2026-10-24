@@ -377,11 +377,25 @@ export function serializeReplicatedEntry(entry: ReplicatedEntry): SerializedRepl
 	const shrunk = shrinkPayloadShape(entry);
 	if (shrunk.json !== null) return { value: shrunk.value, json: shrunk.json };
 	const detail = omittedDetail(entry.type, replicationByteLength(entry));
+	// Eight bounded identity fields fit the ceiling even with six-byte JSON escapes.
 	const placeholder: ReplicatedEntry = {
 		type: "custom_message",
-		id: clipString(entry.id, 64 * 1024),
-		parentId: entry.parentId === null ? null : clipString(entry.parentId, 64 * 1024),
-		timestamp: clipString(entry.timestamp, 64 * 1024),
+		id: clipString(entry.id, 16 * 1024),
+		parentId: entry.parentId === null ? null : clipString(entry.parentId, 16 * 1024),
+		timestamp: clipString(entry.timestamp, 16 * 1024),
+		runtime:
+			entry.runtime && typeof entry.runtime.version === "string"
+				? {
+						version: clipString(entry.runtime.version, 16 * 1024),
+						commit:
+							typeof entry.runtime.commit === "string" ? clipString(entry.runtime.commit, 16 * 1024) : undefined,
+						branch:
+							typeof entry.runtime.branch === "string" ? clipString(entry.runtime.branch, 16 * 1024) : undefined,
+						diff: typeof entry.runtime.diff === "string" ? clipString(entry.runtime.diff, 16 * 1024) : undefined,
+						label:
+							typeof entry.runtime.label === "string" ? clipString(entry.runtime.label, 16 * 1024) : undefined,
+					}
+				: undefined,
 		customType: COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
 		display: true,
 		content: `…[${detail} omitted for collab session: too large to replicate]`,

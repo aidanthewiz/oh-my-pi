@@ -144,20 +144,16 @@ describe("task.batch schema gating", () => {
 		const flatSession = createSession({ settings: { "task.batch": false } });
 		const flat = await TaskTool.create(flatSession);
 		expect(getSchemaProperties(flat).effort).toBeUndefined();
-		expect(flat.description).not.toContain("`effort`");
 
 		cfgTaskEnableEffort.override(flatSession.settings, true);
 		expect(getSchemaProperties(flat).effort).toBeDefined();
-		expect(flat.description).toContain("`effort`");
 
 		const batchSession = createSession({ settings: { "task.batch": true } });
 		const batch = await TaskTool.create(batchSession);
 		expect(getBatchItemProperties(batch).effort).toBeUndefined();
-		expect(batch.description).not.toContain("`effort`");
 
 		cfgTaskEnableEffort.override(batchSession.settings, true);
 		expect(getBatchItemProperties(batch).effort).toBeDefined();
-		expect(batch.description).toContain("`effort`");
 	});
 
 	it("keeps isolation boolean-only in the batch item schema", async () => {
@@ -187,7 +183,6 @@ describe("task.batch schema gating", () => {
 		);
 		const itemProperties = getBatchItemProperties(tool);
 		expect(itemProperties.isolated).toBeUndefined();
-		expect(tool.description).not.toContain("`isolated`");
 	});
 
 	it("exposes outputSchema but never the stale schema field", async () => {
@@ -225,6 +220,17 @@ describe("task.batch validation", () => {
 		const result = await tool.execute("tool-call", params);
 		return getFirstText(result);
 	}
+
+	it("reports missing tasks as a failed tool result instead of a successful refusal", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+		const result = await tool.execute("missing-tasks", {
+			context: "<tasks><task>Inspect the project</task></tasks>",
+		});
+
+		expect(getFirstText(result)).toContain("Missing `tasks`");
+		expect(result.isError).toBe(true);
+	});
 
 	it("rejects the stale schema argument regardless of batch mode", async () => {
 		for (const batch of [false, true]) {

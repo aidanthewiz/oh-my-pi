@@ -271,6 +271,41 @@ afterEach(() => {
 });
 
 describe("collab guest extension lifecycle mirror", () => {
+	it("distinguishes scheduled continuations from background waits in mirrored agent_end events", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const harness = await makeHarness("lifecycle-mirror-async-wait");
+		try {
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "scheduled" } });
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", runId: "scheduled", messages: [], isTerminal: false },
+			});
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start", runId: "background" } });
+			harness.hostSocket.send({
+				t: "event",
+				event: {
+					type: "agent_end",
+					runId: "background",
+					messages: [],
+					isTerminal: false,
+					awaitingAsyncWork: true,
+				},
+			});
+			await harness.barrier();
+			const ends = harness.emitted.filter(event => event.type === "agent_end");
+			expect(ends).toEqual([
+				expect.objectContaining({ runId: "scheduled", willContinue: true }),
+				expect.objectContaining({ runId: "background", willContinue: true, awaitingAsyncWork: true }),
+			]);
+			expect(ends[0]).not.toHaveProperty("awaitingAsyncWork");
+		} finally {
+			await harness.cleanup();
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
 	it("mirrors a real session_stop continuation through host and guest links", async () => {
 		const home = TempDir.createSync("@pi-guest-loop-transport-");
 		const homedirSpy = spyOn(os, "homedir").mockReturnValue(home.path());

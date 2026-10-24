@@ -333,6 +333,9 @@ impl GitRepo {
 		let mut prepared = BTreeMap::new();
 		for path in &changed {
 			if let Some(entry) = worktree.get(path) {
+				if entry.mode == Mode::COMMIT {
+					continue;
+				}
 				validate_repo_path(path).map_err(ApplyFailure::into_error)?;
 				let bytes = blob_bytes(&repo, entry.id)?;
 				let bytes = if entry.mode == Mode::SYMLINK {
@@ -831,6 +834,30 @@ fn apply_patches_to_map(
 				message: format!("mode does not match for {}", source_path.unwrap_or_default()),
 			});
 		}
+		if source
+			.as_ref()
+			.is_some_and(|entry| entry.mode == Mode::COMMIT)
+			|| target_mode == Some(Mode::COMMIT)
+		{
+			if let Some(entry) = &source
+				&& entry.id != gitlink_id(patch, if options.reverse { b'+' } else { b'-' })?
+			{
+				return Err(Error::PatchFailed {
+					message: format!("gitlink does not match for {}", source_path.unwrap_or_default()),
+				});
+			}
+			if let Some(path) = source_path
+				&& target_path != Some(path)
+			{
+				state.remove(path);
+			}
+			if let Some(path) = target_path {
+				validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+				let id = gitlink_id(patch, if options.reverse { b'-' } else { b'+' })?;
+				state.insert(path.to_owned(), FileEntry::new(id, Mode::COMMIT));
+			}
+			continue;
+		}
 		let source_bytes = match source.as_ref() {
 			Some(entry) => blob_bytes(repo, entry.id)?,
 			None => Vec::new(),
@@ -862,6 +889,18 @@ fn apply_patches_to_map(
 		}
 	}
 	Ok(())
+}
+
+fn gitlink_id(patch: &FilePatch, kind: u8) -> Result<gix::ObjectId> {
+	let id = patch
+		.hunks
+		.iter()
+		.flat_map(|hunk| &hunk.lines)
+		.find(|line| line.kind == kind)
+		.and_then(|line| line.data.strip_prefix(b"Subproject commit "))
+		.ok_or_else(|| Error::PatchFailed { message: "gitlink patch lacks a commit id".into() })?;
+	gix::ObjectId::from_hex(id)
+		.map_err(|_| Error::PatchFailed { message: "gitlink patch has an invalid commit id".into() })
 }
 
 fn patch_sides(
@@ -1829,6 +1868,9 @@ fn checkout_changed_paths(
 	}
 	for path in changed {
 		if let Some(entry) = worktree.get(path) {
+			if entry.mode == Mode::COMMIT {
+				continue;
+			}
 			if fs::symlink_metadata(repo.root().join(path)).is_ok_and(|metadata| metadata.is_dir()) {
 				remove_worktree_path(repo, path)?;
 			}
@@ -1841,7 +1883,7 @@ fn checkout_changed_paths(
 		let Some(entry) = merged.get(path) else {
 			continue;
 		};
-		let stat = if unstaged.contains(path) {
+		let stat = if entry.mode == Mode::COMMIT || unstaged.contains(path) {
 			Stat::default()
 		} else {
 			let metadata = gix::index::fs::Metadata::from_path_no_follow(&repo.root().join(path))?;
@@ -2024,6 +2066,34 @@ mod tests {
 	fn reset(path: &Path) {
 		git(path, &["reset", "--hard", "-q", "HEAD"]);
 		git(path, &["clean", "-fdq"]);
+	}
+
+	#[test]
+	fn cherry_pick_gitlink_updates_preserve_the_submodule_directory() {
+		let temp = init(&[("a", b"base\n")]);
+		let root = temp.path();
+		let old = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(root, &["update-index", "--add", "--cacheinfo", &format!("160000,{old},module")]);
+		git(root, &["commit", "-qm", "add gitlink"]);
+		let base = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+		let new = "b".repeat(40);
+		git(root, &["update-index", "--cacheinfo", &format!("160000,{new},module")]);
+		git(root, &["commit", "-qm", "update gitlink"]);
+		let picked = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(root, &["checkout", "-q", "--detach", &base]);
+		fs::create_dir_all(root.join("module")).unwrap();
+		fs::write(root.join("module/local"), b"preserved\n").unwrap();
+
+		repo(root).cherry_pick(&picked).unwrap();
+
+		assert_eq!(git(root, &["rev-parse", "HEAD^"]).trim(), base);
+		assert_eq!(
+			git(root, &["ls-tree", "HEAD", "--", "module"]),
+			format!("160000 commit {new}\tmodule\n")
+		);
+		assert!(git(root, &["ls-files", "--stage", "--", "module"]).contains(&new));
+		assert_eq!(fs::read(root.join("module/local")).unwrap(), b"preserved\n");
+		assert_eq!(fs::read(root.join("a")).unwrap(), b"base\n");
 	}
 
 	#[test]

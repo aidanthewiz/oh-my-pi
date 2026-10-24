@@ -18,8 +18,9 @@
  * simply never sees those events (see `WIRE_AGENT_EVENT_TYPES` in
  * `collab/host.ts`).
  *
- * Physical loop completions carry the host's ownership and continuation
- * decision independently of the public session completion stream.
+ * Physical loop completions preserve host ownership independently of public
+ * session completion. Non-terminal settles map to `willContinue`; only
+ * background waits also map to `awaitingAsyncWork`.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -123,6 +124,7 @@ export function extensionEventFromSessionEvent(
 				runId,
 				messages: event.messages,
 				willContinue: event.isTerminal === false ? true : undefined,
+				...(event.isTerminal === false && event.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
 			};
 		case "turn_start":
 			return { type: "turn_start", turnIndex, timestamp: Date.now() };

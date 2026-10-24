@@ -2020,6 +2020,107 @@ mod tests {
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "?? new");
 	}
 
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn commit_respects_configured_signing_and_refuses_failed_signatures() {
+		let (temp, _) = fixture();
+		// A pre-1973 author date: git rejects a bare `<seconds> <offset>` under
+		// nine digits, so the amend below proves the raw date reaches the
+		// signed commit intact.
+		git(temp.path(), &["commit", "-q", "--amend", "--no-edit", "--date=@86400 +0130"]);
+		let key = temp.path().join("signing-key");
+		let output = Command::new("ssh-keygen")
+			.args(["-q", "-t", "ed25519", "-N", "", "-f"])
+			.arg(&key)
+			.output()
+			.unwrap();
+		assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+		let signers = temp.path().join("allowed-signers");
+		fs::write(
+			&signers,
+			format!("test@example.com {}\n", fs::read_to_string(key.with_extension("pub")).unwrap()),
+		)
+		.unwrap();
+		git(temp.path(), &["config", "gpg.format", "ssh"]);
+		git(temp.path(), &["config", "user.signingkey", key.to_str().unwrap()]);
+		git(temp.path(), &["config", "gpg.ssh.allowedSignersFile", signers.to_str().unwrap()]);
+		git(temp.path(), &["config", "commit.gpgsign", "true"]);
+		let repo = GitRepo::require(temp.path()).unwrap();
+		let identity = |rev: &str| {
+			git(temp.path(), &["log", "-1", "--date=raw", "--format=%an|%ae|%ad|%cn|%ce", rev])
+		};
+
+		fs::write(temp.path().join("a"), "amended\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		let amended = repo
+			.commit_create("signed amend", &CommitOptions { amend: true, ..Default::default() }, None)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), amended);
+		git(temp.path(), &["verify-commit", "HEAD"]);
+		assert_eq!(identity("HEAD"), "Test|test@example.com|86400 +0130|Test|test@example.com");
+		assert_eq!(git(temp.path(), &["rev-list", "--count", "HEAD"]), "1");
+
+		let message = "subject ünïcode\n\nbody line\n";
+		fs::write(temp.path().join("b"), "signed\n").unwrap();
+		repo.stage_files(&["b".into()]).unwrap();
+		let signed = repo
+			.commit_create(
+				message,
+				&CommitOptions {
+					author: Some(CommitAuthor {
+						name:  "Other".into(),
+						email: "other@example.com".into(),
+						date:  Some("@172800 -0230".into()),
+					}),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), signed);
+		git(temp.path(), &["verify-commit", "HEAD"]);
+		assert_eq!(identity("HEAD"), "Other|other@example.com|172800 -0230|Test|test@example.com");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD^"]), amended);
+		let raw = git(temp.path(), &["cat-file", "commit", "HEAD"]);
+		assert!(raw.ends_with(&format!("\n\n{}", message.trim_end())), "{raw}");
+
+		git(temp.path(), &["config", "user.signingkey", "/no-such-signing-key"]);
+		fs::write(temp.path().join("a"), "must not commit\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+		let staged = git(temp.path(), &["write-tree"]);
+		let error = repo
+			.commit_create("failed signer", &CommitOptions::default(), None)
+			.await
+			.unwrap_err();
+		assert!(matches!(error, Error::Cli { .. }), "{error:?}");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), signed);
+		assert_eq!(git(temp.path(), &["write-tree"]), staged);
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"must not commit\n");
+
+		// Git refuses a malformed boolean; committing unsigned instead would
+		// silently drop the signature the user asked for.
+		git(temp.path(), &["config", "commit.gpgsign", "sometimes"]);
+		let repo = GitRepo::require(temp.path()).unwrap();
+		assert!(
+			repo
+				.commit_create("malformed config", &CommitOptions::default(), None)
+				.await
+				.is_err()
+		);
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), signed);
+		assert_eq!(git(temp.path(), &["write-tree"]), staged);
+
+		git(temp.path(), &["config", "commit.gpgsign", "false"]);
+		let repo = GitRepo::require(temp.path()).unwrap();
+		repo
+			.commit_create("unsigned by choice", &CommitOptions::default(), None)
+			.await
+			.unwrap();
+		assert!(!git(temp.path(), &["cat-file", "-p", "HEAD"]).contains("\ngpgsig "));
+	}
+
 	/// Staged entries record the file's stat so later status calls can skip
 	/// re-hashing them; a zeroed stat would force a content check every time.
 	/// A file changed in the second staging began could change again within
