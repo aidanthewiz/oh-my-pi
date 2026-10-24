@@ -313,46 +313,59 @@ export async function clickElement(
 	options: ClickAtOptions = {},
 ): Promise<void> {
 	const point = await actionableClickPoint(handle, label, signal, options);
-	const watch = await untilAborted(signal, () =>
-		handle.evaluateHandle(el => {
-			interface InputEvent {
-				type: string;
-				defaultPrevented: boolean;
-				composedPath(): unknown[];
-			}
-			type Listen = (type: string, listener: (event: InputEvent) => void, capture: boolean) => void;
-			const target = el as unknown as { addEventListener: Listen; removeEventListener: Listen };
-			const page = globalThis as unknown as { addEventListener: Listen; removeEventListener: Listen };
-			const pointerDowns: InputEvent[] = [];
-			const state = {
-				reached: false,
-				// Read after the click: the page's handlers have run by then.
-				delivered: () => state.reached || pointerDowns.some(event => event.defaultPrevented),
-				stop: () => {},
-			};
-			const record = (event: InputEvent) => {
-				if (event.type === "pointerdown") pointerDowns.push(event);
-				else state.reached = true;
-			};
-			// The target's own listener sees events inside a closed shadow root, which the window's path hides;
-			// the window's sees an event a page handler stops before it reaches the target.
-			const onPage = (event: InputEvent) => {
-				if (event.composedPath().includes(el)) record(event);
-			};
-			const types = ["pointerdown", "mousedown", "click"];
+	throwIfAborted(signal);
+	const pendingWatch = handle.evaluateHandle(el => {
+		interface InputEvent {
+			type: string;
+			defaultPrevented: boolean;
+			composedPath(): unknown[];
+		}
+		type Listen = (type: string, listener: (event: InputEvent) => void, capture: boolean) => void;
+		const target = el as unknown as { addEventListener: Listen; removeEventListener: Listen };
+		const page = globalThis as unknown as { addEventListener: Listen; removeEventListener: Listen };
+		const pointerDowns: InputEvent[] = [];
+		const state = {
+			reached: false,
+			// Read after the click: the page's handlers have run by then.
+			delivered: () => state.reached || pointerDowns.some(event => event.defaultPrevented),
+			stop: () => {},
+		};
+		const record = (event: InputEvent) => {
+			if (event.type === "pointerdown") pointerDowns.push(event);
+			else state.reached = true;
+		};
+		// The target's own listener sees events inside a closed shadow root, which the window's path hides;
+		// the window's sees an event a page handler stops before it reaches the target.
+		const onPage = (event: InputEvent) => {
+			if (event.composedPath().includes(el)) record(event);
+		};
+		const types = ["pointerdown", "mousedown", "click"];
+		for (const type of types) {
+			target.addEventListener(type, record, true);
+			page.addEventListener(type, onPage, true);
+		}
+		state.stop = () => {
 			for (const type of types) {
-				target.addEventListener(type, record, true);
-				page.addEventListener(type, onPage, true);
+				target.removeEventListener(type, record, true);
+				page.removeEventListener(type, onPage, true);
 			}
-			state.stop = () => {
-				for (const type of types) {
-					target.removeEventListener(type, record, true);
-					page.removeEventListener(type, onPage, true);
-				}
-			};
-			return state;
-		}),
-	);
+		};
+		return state;
+	});
+	let watch: Awaited<typeof pendingWatch>;
+	try {
+		watch = await untilAborted(signal, pendingWatch);
+	} catch (error) {
+		void pendingWatch.then(
+			lateWatch =>
+				lateWatch
+					.evaluate(state => state.stop())
+					.catch(() => undefined)
+					.finally(() => lateWatch.dispose().catch(() => undefined)),
+			() => undefined,
+		);
+		throw error;
+	}
 	const frame = handle.frame;
 	const page = frame.page();
 	let navigated = false;

@@ -12,7 +12,7 @@
 
 ### Fixed
 
-- Reject unconfirmed browser click delivery after transport failure or page closure. Retire delivery listeners and handles when verification is cancelled.
+- Reject unconfirmed browser click delivery after transport failure or page closure. Retire delivery listeners and handles when acquisition or verification is cancelled, including watches returned after cancellation.
 - Force physical APFS copies during session compression; cloned files otherwise retain uncompressed storage.
 - Discard delayed archive renders after a model or session change, or once disposal begins; preserve the current reader's live history.
 - Restrict extension plan-review actions to the collaboration host and refuse plans that become blank before presentation.

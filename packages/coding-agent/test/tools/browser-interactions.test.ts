@@ -949,11 +949,11 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 		}
 	}, 30_000);
 
-	test("rejects unverified delivery and releases a watch cancelled during verification", async () => {
+	test("rejects unverified clicks and retires watches across acquisition and verification cancellation", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		try {
-			for (const fault of ["transport", "cancel"] as const) {
+			for (const fault of ["transport", "cancel", "acquire"] as const) {
 				const page = await browserHandle.browser.newPage();
 				const controller = new AbortController();
 				const held = Promise.withResolvers<void>();
@@ -989,8 +989,10 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 							if (first) {
 								first = false;
 								if (fault === "transport") throw new Error("Synthetic watch transport failure");
-								controller.abort(new Error("Synthetic verification cancellation"));
-								await held.promise;
+								if (fault === "cancel") {
+									controller.abort(new Error("Synthetic verification cancellation"));
+									await held.promise;
+								}
 							}
 							return await evaluate(...evaluationArgs);
 						}) as typeof watch.evaluate;
@@ -998,11 +1000,21 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 							await dispose();
 							released.resolve();
 						};
+						if (fault === "acquire") {
+							queueMicrotask(() => controller.abort(new Error("Synthetic acquisition cancellation")));
+							await held.promise;
+						}
 						return watch;
 					}) as typeof handle.evaluateHandle;
 					await expect(clickElement(handle, "fixture click", controller.signal)).rejects.toBeInstanceOf(Error);
+					if (fault === "acquire") {
+						expect(await page.evaluate("activeClickWatches()")).toBe(6);
+						held.resolve();
+					}
 					await released.promise;
-					expect(await handle.evaluate(element => element.getAttribute("data-clicks"))).toBe("1");
+					expect(await handle.evaluate(element => element.getAttribute("data-clicks"))).toBe(
+						fault === "acquire" ? "0" : "1",
+					);
 					expect(await page.evaluate("activeClickWatches()")).toBe(0);
 					await handle.dispose();
 				} finally {
