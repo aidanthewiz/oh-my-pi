@@ -21,6 +21,7 @@ interface OmfgRequest {
 	component: OmfgPanelComponent;
 	abortController: AbortController;
 	complaint: string;
+	sessionId: string;
 }
 
 interface OmfgCandidate extends ParsedGeneratedRule {
@@ -38,6 +39,8 @@ const MAX_ATTEMPTS = 3;
 const PROJECT_OPTION = "This project (.omp/rules)";
 const GLOBAL_OPTION = "Global — all projects (~/.omp/agent/rules)";
 const AMEND_OPTION = "Amend with feedback…";
+/** Keep /omfg prompts in the composer slot: a picker sheet would cover the candidate rule above it. */
+const OMFG_DIALOG = { inline: true } as const;
 
 export class OmfgController {
 	#activeRequest: OmfgRequest | undefined;
@@ -64,6 +67,10 @@ export class OmfgController {
 		this.#closeActiveRequest({ abort: true });
 	}
 
+	disposeSession(sessionId: string): void {
+		if (this.#activeRequest?.sessionId === sessionId) this.dispose();
+	}
+
 	async start(complaint: string): Promise<void> {
 		const trimmedComplaint = complaint.trim();
 		if (!trimmedComplaint) {
@@ -83,6 +90,7 @@ export class OmfgController {
 			component: new OmfgPanelComponent({ complaint: trimmedComplaint, tui: this.ctx.ui }),
 			abortController: new AbortController(),
 			complaint: trimmedComplaint,
+			sessionId: this.ctx.sessionManager.getSessionId(),
 		};
 		this.ctx.omfgContainer.clear();
 		this.ctx.omfgContainer.addChild(request.component);
@@ -106,6 +114,7 @@ export class OmfgController {
 					const shouldSave = await this.ctx.showHookConfirm(
 						"Validation",
 						"Couldn't confirm this rule matches the conversation. Save anyway?",
+						OMFG_DIALOG,
 					);
 					if (!this.#isActiveRequest(request)) return;
 					if (!shouldSave) {
@@ -213,11 +222,11 @@ export class OmfgController {
 
 		for (;;) {
 			request.component.setStatus("saving", "Choose where to save or amend the TTSR rule…");
-			const location = await this.ctx.showHookSelector("Save TTSR rule where?", [
-				PROJECT_OPTION,
-				GLOBAL_OPTION,
-				AMEND_OPTION,
-			]);
+			const location = await this.ctx.showHookSelector(
+				"Save TTSR rule where?",
+				[PROJECT_OPTION, GLOBAL_OPTION, AMEND_OPTION],
+				OMFG_DIALOG,
+			);
 			if (!this.#isActiveRequest(request)) return { kind: "aborted" };
 			if (!location) {
 				request.component.markAborted();
@@ -242,6 +251,7 @@ export class OmfgController {
 				const shouldOverwrite = await this.ctx.showHookConfirm(
 					"Overwrite TTSR rule?",
 					`${shortenPath(target.filePath)} already exists. Overwrite it?`,
+					OMFG_DIALOG,
 				);
 				if (!this.#isActiveRequest(request)) return { kind: "aborted" };
 				if (!shouldOverwrite) {

@@ -203,25 +203,35 @@ describe("AgentSession concurrent disposal", () => {
 		expect(closeAt).toBeGreaterThan(order.indexOf("mnemopi:end"));
 	});
 
-	it("bounds post-prompt work that ignores abort", async () => {
-		vi.useFakeTimers();
-		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	it("finishes logical disposal before an aborted post-prompt task physically settles", async () => {
 		const current = createSession();
 		const hangingTask = Promise.withResolvers<void>();
-		current.trackPostPromptTaskForTests(hangingTask.promise);
-
-		const dispose = current.dispose();
-		await flushMicrotasks();
-		vi.advanceTimersByTime(5_000);
-		await flushMicrotasks();
-		await dispose;
-		session = undefined;
-
-		expect(warn).toHaveBeenCalledWith(
-			"Post-prompt tasks still draining at dispose deadline",
-			expect.objectContaining({ error: "Error: Timed out draining post-prompt tasks during dispose" }),
-		);
-	});
+		let physicallySettled = false;
+		const task = hangingTask.promise.then(() => {
+			physicallySettled = true;
+		});
+		current.trackPostPromptTaskForTests(task);
+		const dispose = current.dispose({ drainTimeoutMs: 1 });
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error("Logical disposal did not finish with stalled post-prompt work")),
+				9_000,
+			);
+		});
+		try {
+			await Promise.race([dispose, deadline]);
+			expect(current.isDisposed).toBe(true);
+			expect(physicallySettled).toBe(false);
+		} finally {
+			clearTimeout(timer);
+			hangingTask.resolve();
+			await task;
+			await dispose;
+			await flushMicrotasks();
+			session = undefined;
+		}
+	}, 12_000);
 
 	it("clears the owned async manager when its dispose rejects", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});

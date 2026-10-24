@@ -81,6 +81,53 @@ describe("Factory Droid anthropic wire (Claude)", () => {
 		const tools = captured[0].body.tools as Array<{ name: string }>;
 		expect(captured[0].body.tool_choice).toEqual(expected(tools[0].name));
 	});
+
+	it.each([
+		["claude-opus-5-5", "azure_anthropic", true],
+		["claude-sonnet-5-5", "azure_anthropic", true],
+		// Haiku 5.5 is the third prefix-bound model droid serves on Azure.
+		["claude-haiku-5-5", "azure_anthropic", true],
+		["claude-opus-5-5", "anthropic", false],
+		["claude-sonnet-5-5", "vertex_anthropic", false],
+		["claude-opus-4-8", "azure_anthropic", false],
+	] as const)("%s via %s binds thinking to drop stale blocks: %p", async (id, upstream, bound) => {
+		const captured: CapturedRequest[] = [];
+		const model = factoryModel(id, [upstream]);
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamFactoryDroid(
+			model,
+			{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+			{ apiKey: WORKOS_TOKEN, reasoning: Effort.High, fetch: captureFetch(captured, anthropicChunks("OK")) },
+		).result();
+		expect(result.stopReason).toBe("stop");
+		const thinking = captured[0].body.thinking as { type: string; block_binding?: unknown };
+		expect(thinking.type).toBe("adaptive");
+		expect(thinking.block_binding).toEqual(bound ? { prefix_mismatch_behavior: "drop_block" } : undefined);
+		expect((captured[0].headers["anthropic-beta"] ?? "").includes("thinking-binding-controls-2026-08-01")).toBe(
+			bound,
+		);
+	});
+
+	it.each([
+		["claude-sonnet-5-5", "between_tools", false],
+		["claude-opus-5-5", "adaptive", true],
+	] as const)("%s via azure_anthropic at Off sends %s with binding and beta together: %p", async (id, type, bound) => {
+		const captured: CapturedRequest[] = [];
+		const model = factoryModel(id, ["azure_anthropic"]);
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamFactoryDroid(
+			model,
+			{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+			{ apiKey: WORKOS_TOKEN, disableReasoning: true, fetch: captureFetch(captured, anthropicChunks("OK")) },
+		).result();
+		expect(result.stopReason).toBe("stop");
+		const thinking = captured[0].body.thinking as { type: string; block_binding?: unknown };
+		expect(thinking.type).toBe(type);
+		expect(thinking.block_binding !== undefined).toBe(bound);
+		expect((captured[0].headers["anthropic-beta"] ?? "").includes("thinking-binding-controls-2026-08-01")).toBe(
+			bound,
+		);
+	});
 });
 
 const usage = {
@@ -209,5 +256,89 @@ describe("Factory Droid native thinking-history boundary", () => {
 		expect(payload.thinking).toMatchObject({ type: "enabled" });
 		expect(replayedBlockTypes(payload)).toContain("thinking");
 		expect(replayedBlockTypes(payload)).toContain("redacted_thinking");
+	});
+
+	it.each([
+		["claude-opus-4-8", "anthropic"],
+		["claude-sonnet-4-6", "vertex_anthropic"],
+		["claude-opus-5", "snowflake"],
+		["claude-haiku-5-5", "bedrock_anthropic"],
+	] as const)("%s via %s at Off sends disabled thinking and replays no thinking", async (id, upstream) => {
+		const captured: CapturedRequest[] = [];
+		const model = factoryModel(id, [upstream]);
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamFactoryDroid(
+			model,
+			{ messages: history("thinking-led", { provider: "factory-droid", model: id }), tools: readTool },
+			{ apiKey: WORKOS_TOKEN, disableReasoning: true, fetch: captureFetch(captured, anthropicChunks("OK")) },
+		).result();
+		expect(result.stopReason).toBe("stop");
+		const body = captured[0].body;
+		expect(body.thinking).toEqual({ type: "disabled" });
+		expect(body.output_config).toBeUndefined();
+		expect(replayedBlockTypes(body)).not.toContain("thinking");
+		expect(replayedBlockTypes(body)).not.toContain("redacted_thinking");
+	});
+
+	// Bedrock and Vertex reject `output_config` without the effort beta.
+	it.each([
+		["anthropic", false],
+		["bedrock_anthropic", true],
+		["vertex_anthropic", true],
+	] as const)(
+		"sends Sonnet 5.5 Off via %s as between_tools pinned to high effort, effort beta %p",
+		async (upstream, beta) => {
+			const captured: CapturedRequest[] = [];
+			const model = factoryModel("claude-sonnet-5-5", [upstream]);
+			model.factoryDroidOrgId = "org-1";
+			const result = await streamFactoryDroid(
+				model,
+				{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+				{ apiKey: WORKOS_TOKEN, disableReasoning: true, fetch: captureFetch(captured, anthropicChunks("OK")) },
+			).result();
+			expect(result.stopReason).toBe("stop");
+			expect(captured[0].body.thinking).toEqual({ type: "between_tools" });
+			expect(captured[0].body.output_config).toEqual({ effort: "high" });
+			expect((captured[0].headers["anthropic-beta"] ?? "").includes("effort-2025-11-24")).toBe(beta);
+		},
+	);
+
+	it("does not send an official fallback credit or frozen body to Factory Bedrock", async () => {
+		const captured: CapturedRequest[] = [];
+		const respond = captureFetch(captured, anthropicChunks("OK"));
+		const model = factoryModel("claude-sonnet-5-5", ["bedrock_anthropic"]);
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamFactoryDroid(
+			model,
+			{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+			{
+				apiKey: WORKOS_TOKEN,
+				disableReasoning: true,
+				fallbackCreditRedemption: {
+					token: "fct_review",
+					prefillClaim: false,
+					params: {
+						model: "claude-sonnet-5-5",
+						messages: [{ role: "user", content: "saved-secret" }],
+						max_tokens: 1024,
+						thinking: { type: "between_tools" },
+						output_config: { effort: "high" },
+						stream: true,
+					},
+					betas: ["fallback-credit-2026-06-01"],
+					betaHeader: "fallback-credit-2026-06-01",
+					expiresAt: Date.now() + 60_000,
+				},
+				fetch: respond,
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(captured).toHaveLength(1);
+		const rebuilt = captured[0];
+		expect(JSON.stringify(rebuilt.body)).not.toContain("saved-secret");
+		expect(rebuilt.headers["anthropic-beta"] ?? "").not.toContain("fallback-credit-");
+		expect(rebuilt.body.fallback_credit_token).toBeUndefined();
+		expect(rebuilt.body.output_config).toEqual({ effort: "high" });
+		expect(rebuilt.headers["anthropic-beta"] ?? "").toContain("effort-2025-11-24");
 	});
 });

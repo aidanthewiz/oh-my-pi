@@ -4,7 +4,7 @@ from __future__ import annotations
 if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
-    import asyncio, collections.abc, contextvars, inspect, os, json, math, re, time, types, typing
+    import asyncio, collections.abc, contextvars, inspect, os, json, math, re, sys, time, types, typing
     from urllib.parse import unquote
 
 
@@ -25,6 +25,9 @@ if "__omp_prelude_loaded__" not in globals():
 
     def display(value):
         """Render a value. Falls back to a JSON+text/plain bundle for plain dict/list/tuple."""
+        if isinstance(value, dict) and value.get("type") == "image":
+            _omp_display(value)
+            return
         if any(hasattr(value, attr) for attr in _PRESENTABLE_REPRS):
             _omp_display(value)
             return
@@ -56,6 +59,8 @@ if "__omp_prelude_loaded__" not in globals():
         return val
 
     _OMP_INTERNAL_URL_RE = re.compile(r"^([a-z][a-z0-9+.-]*)://(.*)$", re.IGNORECASE)
+    _OMP_ARTIFACT_ID_RE = re.compile(r"^\d+$")
+    _OMP_BARE_ARTIFACT_RE = re.compile(r"^artifact://\d+$", re.IGNORECASE)
 
     def _omp_url_roots() -> dict:
         """On-disk roots for internal-URL schemes, keyed by scheme (PI_EVAL_LOCAL_ROOTS)."""
@@ -66,11 +71,19 @@ if "__omp_prelude_loaded__" not in globals():
         return roots if isinstance(roots, dict) else {}
 
     def _should_delegate_read(path: str | Path) -> bool:
-        """Delegate `scheme://` reads to the read tool unless the scheme has an injected root."""
+        """Delegate `scheme://` reads to the read tool unless the scheme has an injected root.
+
+        `artifact://<id>` reads its file directly; selector forms
+        (`artifact://3:raw:5-9`) stay with the read tool, which parses them."""
         if not isinstance(path, str):
             return False
         match = _OMP_INTERNAL_URL_RE.match(path)
-        return match is not None and match.group(1).lower() not in _omp_url_roots()
+        if match is None:
+            return False
+        scheme = match.group(1).lower()
+        if scheme not in _omp_url_roots():
+            return True
+        return scheme == "artifact" and not _OMP_ARTIFACT_ID_RE.match(match.group(2))
 
     def _read_line_selector(offset: int, limit: int | None) -> str | None:
         if offset <= 1 and limit is None:
@@ -86,6 +99,28 @@ if "__omp_prelude_loaded__" not in globals():
             return result["text"]
         return result
 
+    def _artifact_file(path: str) -> Path | None:
+        """This session's file for `artifact://<id>` (`<id>.<tool>.log` in its
+        artifacts dir), or None when the id is not there or no dir is known."""
+        root = _omp_url_roots().get("artifact")
+        if not root:
+            return None
+        artifact_id = path[11:]
+        try:
+            names = os.listdir(root)
+        except FileNotFoundError:
+            return None
+        for name in names:
+            if name.startswith(f"{artifact_id}."):
+                return Path(os.path.join(os.path.abspath(root), name))
+        return None
+
+    def _read_through_tool(path: str, offset: int, limit: int | None) -> str:
+        if limit is not None and limit <= 0:
+            return ""
+        selector = _read_line_selector(offset, limit)
+        return _read_tool_text(path if selector is None else f"{path}:{selector}")
+
     def _resolve_omp_path(path: str | Path) -> Path:
         """Map a helper path to a real filesystem Path.
 
@@ -93,7 +128,8 @@ if "__omp_prelude_loaded__" not in globals():
         PI_EVAL_LOCAL_ROOTS) is rewritten under that root so it lands where
         `read scheme://…` resolves — not a literal `scheme:/` directory under
         the cwd (which `Path("scheme://x")` collapses to). Plain paths pass
-        through unchanged; any other `scheme://` is rejected."""
+        through unchanged; any other `scheme://` is rejected, as is
+        `artifact://`, whose root is a lookup dir for reads, not a path prefix."""
         if not isinstance(path, str):
             return Path(path)
         match = _OMP_INTERNAL_URL_RE.match(path)
@@ -101,7 +137,7 @@ if "__omp_prelude_loaded__" not in globals():
             return Path(path)
         scheme = match.group(1).lower()
         root = _omp_url_roots().get(scheme)
-        if not root:
+        if not root or scheme == "artifact":
             raise ValueError(f"Protocol paths are not supported by this helper: {path}")
         relative = unquote(match.group(2).replace("\\", "/"))
         # Mirror the host `path.resolve`/`resolveLocalUrlToPath`: normalize and
@@ -120,13 +156,17 @@ if "__omp_prelude_loaded__" not in globals():
 
     def read(path: str | Path, offset: int = 1, limit: int | None = None) -> str:
         """Read file or read-tool URI contents. offset/limit are 1-indexed lines."""
-        if _should_delegate_read(path):
+        if isinstance(path, str) and _OMP_BARE_ARTIFACT_RE.match(path):
             if limit is not None and limit <= 0:
                 return ""
-            selector = _read_line_selector(offset, limit)
-            tool_path = path if selector is None else f"{path}:{selector}"
-            return _read_tool_text(tool_path)
-        p = _resolve_omp_path(path)
+            p = _artifact_file(path)
+            if p is None:
+                # Another session's, or no artifacts dir was injected: the read tool searches every registered one.
+                return _read_through_tool(f"{path}:raw", offset, limit)
+        elif _should_delegate_read(path):
+            return _read_through_tool(path, offset, limit)
+        else:
+            p = _resolve_omp_path(path)
         data = p.read_text(encoding="utf-8")
         lines = data.splitlines(keepends=True)
         if offset > 1 or limit is not None:
@@ -471,7 +511,7 @@ if "__omp_prelude_loaded__" not in globals():
             mime_type = image.get("mimeType")
             if not isinstance(data, str) or not isinstance(mime_type, str):
                 continue
-            _omp_display({mime_type: data}, raw=True)
+            _omp_display({"application/x-omp-image": image}, raw=True)
             displayed += 1
         if displayed == 0:
             return value
@@ -520,7 +560,7 @@ if "__omp_prelude_loaded__" not in globals():
 
         origin = typing.get_origin(annotation)
         args = typing.get_args(annotation)
-        if origin is typing.Annotated:
+        if origin is not None and origin is getattr(typing, "Annotated", None):
             schema = _annotation_schema(args[0])
             description = next((item for item in args[1:] if isinstance(item, str)), None)
             if description is not None:
@@ -528,7 +568,9 @@ if "__omp_prelude_loaded__" not in globals():
             return schema
         if origin is typing.Literal:
             return {"enum": list(args)}
-        if origin in (typing.Union, types.UnionType):
+        if origin is typing.Union or (
+            origin is not None and origin is getattr(types, "UnionType", None)
+        ):
             non_null = [item for item in args if item is not type(None)]
             if len(non_null) == 1 and len(non_null) != len(args):
                 return {
@@ -575,7 +617,11 @@ if "__omp_prelude_loaded__" not in globals():
         """Infer one eval-defined tool's object schema from its signature."""
         signature = inspect.signature(fn)
         try:
-            hints = typing.get_type_hints(fn, include_extras=True)
+            hints = (
+                typing.get_type_hints(fn, include_extras=True)
+                if sys.version_info >= (3, 9)
+                else typing.get_type_hints(fn)
+            )
         except Exception:
             hints = getattr(fn, "__annotations__", {})
         properties = {}
@@ -1001,7 +1047,6 @@ if "__omp_prelude_loaded__" not in globals():
         merge=None,
         context_file_policy=None,
         tools=None,
-        model=None,
     ):
         """Start a background subagent and return its handle.
 
@@ -1027,8 +1072,6 @@ if "__omp_prelude_loaded__" not in globals():
             args["merge"] = bool(merge)
         if tools is not None:
             args["tools"] = list(tools)
-        if model is not None:
-            args["model"] = model
         result = _bridge_call("__agent__", args)
         if not isinstance(result, dict) or not isinstance(result.get("id"), str):
             raise RuntimeError("agent() did not return a handle")
@@ -1074,7 +1117,7 @@ if "__omp_prelude_loaded__" not in globals():
         def __repr__(self):
             return f"<workpool {self.name} ({self.agent}) {self.limit} agents>"
 
-    def workpool(agent=None, *, name=None, context=None, tools=None, model=None):
+    def workpool(agent=None, *, name=None, context=None, tools=None):
         """Create a pool of keep-alive subagents."""
         args = {"op": "create"}
         if agent is not None:
@@ -1085,8 +1128,6 @@ if "__omp_prelude_loaded__" not in globals():
             args["context"] = context
         if tools is not None:
             args["tools"] = list(tools)
-        if model is not None:
-            args["model"] = model
         result = _bridge_call("__workpool__", args)
         if not isinstance(result, dict) or not isinstance(result.get("name"), str):
             raise RuntimeError("workpool() did not return a pool")

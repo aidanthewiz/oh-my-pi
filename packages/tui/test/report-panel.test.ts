@@ -4,7 +4,7 @@ import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-containe
 import { ReportPanel } from "@oh-my-pi/pi-tui/overlays/report-panel";
 import { COMPOSER_DEFAULTS, Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { withoutTerminalMultiplexer } from "./terminal-multiplexer-environment";
+import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -17,7 +17,7 @@ beforeAll(async () => {
 });
 
 /**
- * A long transcript, a report above a one-row editor, both transient chrome as
+ * A long transcript, a report above a one-row editor, both below-transcript chrome as
  * the interactive mode mounts them, the report capped to the rows the editor
  * leaves free.
  */
@@ -37,7 +37,7 @@ async function mountReport(bodyRows: number) {
 	const dock = new Container();
 	const editor = new Container();
 	editor.addChild(new Text("EDITOR", 0, 0));
-	composer.setRuntimeChildren([transcript, dock, editor], { transient: [editor, dock] });
+	composer.setRuntimeChildren([transcript, dock, editor]);
 	composer.start({ playWelcomeIntro: false });
 	await scheduler.settle(terminal);
 	const panel = new ReportPanel({
@@ -125,7 +125,7 @@ describe("ReportPanel in text mode", () => {
 		const dock = new Container();
 		const editor = new Container();
 		editor.addChild(new Text("EDITOR", 0, 0));
-		composer.setRuntimeChildren([transcript, dock, editor], { transient: [editor, dock] });
+		composer.setRuntimeChildren([transcript, dock, editor]);
 		composer.start({ playWelcomeIntro: false });
 		await scheduler.settle(terminal);
 		const editorRow = () => terminal.getViewport().findIndex(row => row.includes("EDITOR"));
@@ -157,7 +157,6 @@ describe("ReportPanel in text mode", () => {
 		composer.ui.requestRender();
 		await scheduler.settle(terminal);
 		dock.clear();
-		composer.pinInputToBottom();
 		composer.ui.requestRender();
 		await scheduler.settle(terminal);
 
@@ -175,5 +174,26 @@ describe("ReportPanel in text mode", () => {
 		const shrunk = panel.render(60);
 		expect(shrunk).toHaveLength(4);
 		expect(Bun.stripANSI(shrunk[0]!)).toContain("Report");
+	});
+});
+
+describe("ReportPanel natively", () => {
+	it("describes the report as the scrolled reading body, then Close, which closes it like Esc", () => {
+		let closed = 0;
+		const panel = new ReportPanel({
+			title: "Report",
+			body: new Text("body", 0, 0),
+			closeKey: "Esc",
+			onClose: () => closed++,
+		});
+		expect(panel.nativeOverlay).toMatchObject({ role: "omp.overlay.report", size: "lg", head: "Report" });
+		type Described = { key?: string; p?: { role?: string }; c?: Described[]; scroll?: unknown };
+		const root = panel.describe() as Described;
+		expect(root.c?.[0]).toMatchObject({ key: "body", p: { role: "omp.report.body" } });
+		expect(root.c?.at(-1)?.p?.role).toBe("omp.actions");
+		panel.handleInput("\x1b[6~");
+		expect((panel.describe() as Described).c?.[0]?.scroll).toEqual({ by: "page-down", n: 1 });
+		panel.handleNativeEvent({ type: "action", key: "actions/close", act: "close", mods: [] });
+		expect(closed).toBe(1);
 	});
 });

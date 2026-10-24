@@ -89,7 +89,7 @@ async function persistWorkerSession(cwd: string, artifactsDir: string, id: strin
 	const childManager = SessionManager.create(cwd, artifactsDir);
 	await childManager.setSessionFile(childSessionFile);
 	childManager.appendSessionInit({
-		systemPrompt: "Persisted Vibe worker",
+		systemPrompt: ["Persisted Vibe worker"],
 		task: "Keep working.",
 		tools: ["read", "yield"],
 		spawns: "",

@@ -48,6 +48,22 @@ async fn core_fixture_cases() {
 }
 
 #[tokio::test]
+async fn multi_hunk_partial_line_match_keeps_surrounding_text() {
+	let workspace = common::Workspace::new(EditMode::ApplyPatch);
+	workspace.write("a.txt", "prefix token suffix\nanchor\n");
+	let before = files_under(workspace.cwd());
+	let result = workspace
+		.apply_raw(
+			"*** Begin Patch\n*** Update File: \
+			 a.txt\n@@\n-token\n+replacement\n@@\n-anchor\n+ANCHOR\n*** End Patch",
+			&common::DiskWriter::default(),
+		)
+		.await;
+	assert!(result.is_err());
+	assert_eq!(files_under(workspace.cwd()), before);
+}
+
+#[tokio::test]
 async fn applies_all_21_portable_scenarios() {
 	let scenarios =
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apply_patch/scenarios");

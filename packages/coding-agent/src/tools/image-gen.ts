@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
@@ -12,6 +13,7 @@ import {
 	parseAntigravityCredentials,
 } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { isEnoent, logger, parseImageMetadata, prompt, ptree, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import {
 	type RoleChainCandidate,
@@ -24,7 +26,7 @@ import { settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { resolveConfiguredModelTarget } from "../session/role-models";
-import { resolveReadPath } from "./path-utils";
+import { resolveReadPath, specialFileKind } from "./path-utils";
 
 const IMAGE_TIMEOUT = 3 * 60 * 1000;
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
@@ -93,6 +95,10 @@ function normalizeDataUrl(data: string): { data: string; mimeType?: string } {
 async function loadImageFromPath(imagePath: string, cwd: string): Promise<{ data: string; mimeType: string }> {
 	const resolved = resolveReadPath(imagePath, cwd);
 	try {
+		const stat = await fs.stat(resolved);
+		const kind = specialFileKind(stat);
+		if (kind) throw new Error(`Cannot load '${imagePath}': it is a ${kind}, not a regular file or directory.`);
+		if (stat.size > MAX_IMAGE_SIZE) throw new Error(`Image file too large: ${imagePath}`);
 		const buffer = await Bun.file(resolved).bytes();
 		if (buffer.length > MAX_IMAGE_SIZE) throw new Error(`Image file too large: ${imagePath}`);
 		const mimeType = parseImageMetadata(buffer)?.mimeType;
@@ -148,9 +154,14 @@ function resolveHostedImageCarrier(
 ): Model | undefined {
 	if (activeModel?.provider === selectedModel.provider && activeModel.hostedImage) return activeModel;
 	let carrier: Model | undefined;
+	let carrierInput = Infinity;
 	for (const model of modelRegistry.getAvailable()) {
 		if (model.provider !== selectedModel.provider || !model.hostedImage) continue;
-		if (!carrier || model.cost.input < carrier.cost.input) carrier = model;
+		const input = getEffectiveTokenCost(model.cost).input;
+		if (!carrier || input < carrierInput) {
+			carrier = model;
+			carrierInput = input;
+		}
 	}
 	return carrier;
 }

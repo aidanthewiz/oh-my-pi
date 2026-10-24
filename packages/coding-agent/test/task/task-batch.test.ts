@@ -108,7 +108,7 @@ describe("task.batch schema gating", () => {
 	it("swaps between the flat and batch wire shapes", async () => {
 		mockDiscovery();
 
-		const off = await TaskTool.create(createSession({ settings: { "task.batch": false } }));
+		const off = await TaskTool.create(createSession({ settings: { "task.batch": false, "task.structured": true } }));
 		const offProperties = getSchemaProperties(off);
 		expect(offProperties.tasks).toBeUndefined();
 		expect(offProperties.context).toBeUndefined();
@@ -118,7 +118,7 @@ describe("task.batch schema gating", () => {
 		expect(typeof offProperties.outputSchema).toBe("object");
 		expect(offProperties.schemaMode).toBeDefined();
 
-		const on = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+		const on = await TaskTool.create(createSession({ settings: { "task.batch": true, "task.structured": true } }));
 		const onProperties = getSchemaProperties(on);
 		expect(onProperties.tasks).toBeDefined();
 		expect(onProperties.context).toBeDefined();
@@ -193,12 +193,24 @@ describe("task.batch schema gating", () => {
 	it("exposes outputSchema but never the stale schema field", async () => {
 		mockDiscovery();
 
-		const flat = await TaskTool.create(createSession({ settings: { "task.batch": false } }));
+		const flat = await TaskTool.create(createSession({ settings: { "task.batch": false, "task.structured": true } }));
 		expect(getSchemaProperties(flat).outputSchema).toBeDefined();
 		expect(getSchemaProperties(flat).schema).toBeUndefined();
 
-		const batch = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+		const batch = await TaskTool.create(createSession({ settings: { "task.batch": true, "task.structured": true } }));
 		expect(getSchemaProperties(batch).schema).toBeUndefined();
+	});
+
+	it("omits structured output controls from the default wire contract", async () => {
+		mockDiscovery();
+
+		const flat = await TaskTool.create(createSession({ settings: { "task.batch": false } }));
+		expect(getSchemaProperties(flat).outputSchema).toBeUndefined();
+		expect(getSchemaProperties(flat).schemaMode).toBeUndefined();
+
+		const batch = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": true } }));
+		expect(getBatchItemProperties(batch).outputSchema).toBeUndefined();
+		expect(getBatchItemProperties(batch).schemaMode).toBeUndefined();
 	});
 });
 
@@ -383,7 +395,11 @@ describe("task.batch spawning", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, agentId: "ParentA", settings: { "async.enabled": true, "task.batch": true } }),
+			createSession({
+				manager,
+				agentId: "ParentA",
+				settings: { "async.enabled": true, "task.batch": true, "task.structured": true },
+			}),
 		);
 		const alphaSchema = { type: "object", properties: { alpha: { type: "string" } } };
 		const betaSchema = { type: "object", properties: { beta: { type: "number" } } };
@@ -480,7 +496,7 @@ describe("task.batch spawning", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
+			createSession({ manager, settings: { "async.enabled": true, "task.batch": true, "task.structured": true } }),
 		);
 		const result = await tool.execute("tc-mixed-agents", {
 			context: "Shared routing context.",
@@ -575,6 +591,7 @@ describe("task.batch spawning", () => {
 				settings: {
 					"async.enabled": true,
 					"task.batch": true,
+					"task.structured": true,
 					"task.agentModelOverrides": { task: "openai/gpt-4.1-mini" },
 				},
 			}),
@@ -721,22 +738,5 @@ describe("task.batch spawning", () => {
 		expect(last?.async?.state).toBe("failed");
 		expect(last?.progress?.find(p => p.id === "Second")?.status).toBe("aborted");
 		expect(last?.progress?.find(p => p.id === "First")?.status).toBe("completed");
-	});
-});
-
-describe("batch model placement", () => {
-	afterEach(() => vi.restoreAllMocks());
-	it("rejects a top-level model before dispatch even when wire validation is bypassed", async () => {
-		mockDiscovery();
-		const run = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Unexpected"));
-		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": false } }));
-		const result = await tool.execute("batch-model", {
-			context: "Shared context",
-			model: "p/requested",
-			tasks: [{ task: "Do work" }],
-		});
-		expect(getFirstText(result)).toMatch(/model.*tasks|model.*item/i);
-		expect(result.isError).toBe(true);
-		expect(run).not.toHaveBeenCalled();
 	});
 });

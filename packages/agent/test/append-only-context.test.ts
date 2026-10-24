@@ -84,6 +84,18 @@ describe("StablePrefix", () => {
 		expect(changed).toBe(true);
 	});
 
+	it("keeps NUL-bearing tool names and descriptions distinct", () => {
+		const p = new StablePrefix();
+		const tool = makeTool("read\u0000private", "policy");
+		const ctx = makeContext({ tools: [tool] });
+		p.build(ctx, BUILD_OPTS);
+		tool.name = "read";
+		tool.description = "private\u0000policy";
+		expect(p.build(ctx, BUILD_OPTS)).toBe(true);
+		expect(p.toContext().tools[0]!.name).toBe("read");
+		expect(p.toContext().tools[0]!.description).toBe("private\u0000policy");
+	});
+
 	it("invalidate forces rebuild", () => {
 		const p = new StablePrefix();
 		const ctx = makeContext({ systemPrompt: ["Stable"] });
@@ -160,7 +172,7 @@ describe("StablePrefix", () => {
 
 	it("detects in-place system-prompt mutation without invalidate", () => {
 		// Same array object, pushed in place (Agent.setSystemPrompt stores
-		// the caller's array). Reference equality holds; joined bytes don't.
+		// the caller's array). Reference equality holds; the segments don't.
 		const p = new StablePrefix();
 		const prompt = ["Stable"];
 		const ctx = makeContext({ systemPrompt: prompt });
@@ -169,6 +181,16 @@ describe("StablePrefix", () => {
 		prompt.push(" appended in place");
 		expect(p.build(ctx, BUILD_OPTS)).toBe(true);
 		expect(p.toContext().systemPrompt).toEqual(["Stable", " appended in place"]);
+	});
+
+	it("rebuilds when in-place segments change but their NUL-joined text does not", () => {
+		const p = new StablePrefix();
+		const prompt = ["A", "C"];
+		const ctx = makeContext({ systemPrompt: prompt });
+		expect(p.build(ctx, BUILD_OPTS)).toBe(true);
+		prompt.splice(0, 2, "A\u0000C");
+		expect(p.build(ctx, BUILD_OPTS)).toBe(true);
+		expect(p.toContext().systemPrompt).toEqual(["A\u0000C"]);
 	});
 
 	it("toContext() throws when not built", () => {

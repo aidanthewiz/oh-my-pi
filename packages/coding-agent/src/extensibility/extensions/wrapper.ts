@@ -18,6 +18,7 @@ import {
 	denyError,
 	formatApprovalPrompt,
 	type RuntimeApprovalCapableTool,
+	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
 	truncateForPrompt,
@@ -464,18 +465,25 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						);
 						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 						approved = choice === "Approve once" || approveSession;
-					} else {
-						const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-						const safetyPrompt =
-							pendingSafetyChecks.length > 0
-								? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-								: basePrompt;
+					} else if (sessionApproval) {
 						const choice = await uiContext.select(
-							safetyPrompt,
-							sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Approve", "Deny"],
+							formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason),
+							["Approve", "Deny", sessionApproval.label],
 						);
-						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+						approveSession = choice === sessionApproval.label;
 						approved = choice === "Approve" || approveSession;
+					} else {
+						const safetyAppendix =
+							pendingSafetyChecks.length > 0
+								? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)]
+								: [];
+						approved = await requestApproval(
+							uiContext,
+							this.tool,
+							resolvedArgs,
+							approvalCheck.reason,
+							safetyAppendix,
+						);
 					}
 					signal?.throwIfAborted();
 				} catch (err) {

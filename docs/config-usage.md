@@ -320,7 +320,9 @@ Create `TITLE_SYSTEM.md` in any generic config base:
 Generate a session name using lowercase `<type>:<primary-objective>`.
 ```
 
-- Missing `TITLE_SYSTEM.md` keeps the bundled title prompts.
+- Missing `TITLE_SYSTEM.md` keeps the bundled title prompts. `title.generator: tiny` is the default: only the title model role generates titles, without a card index.
+- Set `title.generator: fork` to opt into a side turn on the session's model. When its first reply starts a text or tool-call block, that model reads the cached prefix and `src/prompts/system/title-fork.md`. It returns a title and a card index: Nerd Fonts icon, emoji, and 1–6 character code. The window title shows `<icon> <CODE>: <title>`. The title model role handles unavailable, failed, timed-out, or declined forks.
+- With `TITLE_SYSTEM.md` present, initial titles and replan refreshes use the title model role with the override, even when `title.generator: fork` is selected.
 - Discovery checks the current project directory bases first (`<cwd>/.omp`, `.claude`, `.codex`, `.gemini`), then the user bases in the generic helper order. Unlike native `SYSTEM.md`, project title discovery does **not** walk ancestor directories.
 - The override replaces only the automatic session-title generation system prompt; normal `SYSTEM.md` / `APPEND_SYSTEM.md` prompt customization is unaffected.
 - The online path asks the title model to wrap the title in `<title>...</title>` and parses it leniently from text (a plain sentence, a truncated/unclosed tag, or a stray `{"title": "..."}` JSON echo all still work). A `TITLE_SYSTEM.md` override gets the wrap-in-`<title>` instruction appended after it. The local tiny-title path keeps the `<title>...</title>` prefill/stop wrapper and uses this file as its system turn.

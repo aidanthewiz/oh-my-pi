@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type InternalUrl, VaultProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 
@@ -36,5 +37,34 @@ describe("read keeps the query of schemes that own it", () => {
 		expect(result.content.map(part => (part.type === "text" ? part.text : "")).join("\n")).toContain(
 			"hit: Plans/roadmap.md",
 		);
+	});
+});
+
+describe("read routed documents", () => {
+	it("preserves notes while returning only the selected document lines", async () => {
+		const router = InternalUrlRouter.instance();
+		router.register({
+			scheme: "cf-noted-document",
+			spec: { backing: "virtual", selectors: "lines", immutable: true },
+			resolve: async url => ({
+				url: url.href,
+				content: "unselected-before\nselected-document-line\nunselected-after",
+				contentType: "text/plain",
+				notes: ["synthetic resource note"],
+			}),
+		});
+		try {
+			const result = await new ReadTool(createSession()).execute("noted-document", {
+				path: "cf-noted-document://page:raw:2-2",
+			});
+			const text = result.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
+			expect(result.isError).not.toBe(true);
+			expect(text).toContain("selected-document-line");
+			expect(text).toContain("synthetic resource note");
+			expect(text).not.toContain("unselected-before");
+			expect(text).not.toContain("unselected-after");
+		} finally {
+			router.unregister("cf-noted-document");
+		}
 	});
 });

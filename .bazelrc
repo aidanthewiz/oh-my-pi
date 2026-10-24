@@ -32,11 +32,9 @@ build --@rules_rust//rust/settings:error_format=human
 # Generated toolchains carry target_settings requiring the nightly channel.
 build --@rules_rust//rust/toolchain/channel=nightly
 
-# Pin target and exec links to macOS 12.0. The default follows the selected
-# SDK (27.0 on xcode-27 runners) and would prevent the addon from loading on
-# older systems. The embedded Foundation Models bridge targets macOS 27 but
-# loads only when the host supports it.
-build:macos --macos_minimum_os=12.0
+# The addon targets macOS 12 on every build host. The optional Foundation
+# Models bridge targets macOS 27 and loads only on supported hosts.
+build --macos_minimum_os=12.0
 build:macos --host_macos_minimum_os=12.0
 # rustc strips Apple binaries with its bundled rust-objcopy, which leaves
 # minos >= 12.0 dylibs with a LINKEDIT string pool dyld rejects ("mis-aligned

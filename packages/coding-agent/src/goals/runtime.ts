@@ -224,12 +224,26 @@ export class GoalRuntime {
 		await this.flushUsage("suppressed");
 	}
 
-	async onAgentEnd(options?: { turnCompleted?: boolean; currentUsage?: GoalTokenUsage }): Promise<void> {
+	/**
+	 * `currentUsage` may be a thunk: it is read synchronously (before any await)
+	 * only when goal accounting is active, so idle sessions skip the usage walk.
+	 */
+	async onAgentEnd(options?: {
+		turnCompleted?: boolean;
+		currentUsage?: GoalTokenUsage | (() => GoalTokenUsage);
+	}): Promise<void> {
 		if (!this.#hasAccountingState()) {
 			this.#turnSnapshot = undefined;
 			return;
 		}
-		await this.flushUsage("suppressed", options?.currentUsage);
+		const currentUsage = options?.currentUsage;
+		const usage =
+			typeof currentUsage === "function"
+				? this.#turnSnapshot?.activeGoalId === this.#host.getState()?.goal.id
+					? currentUsage()
+					: undefined
+				: currentUsage;
+		await this.flushUsage("suppressed", usage);
 		this.#turnSnapshot = undefined;
 	}
 
@@ -310,19 +324,22 @@ export class GoalRuntime {
 		});
 	}
 
+	/** `currentUsage` defaults to the host's live totals, read only once a token delta is needed. */
 	async #flushUsageLocked(
 		steering: GoalBudgetSteering,
-		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
+		currentUsage?: GoalTokenUsage,
 		persistWallClock = false,
 	): Promise<void> {
 		const state = this.#getStateClone();
 		if (!state?.enabled || !isAccountingStatus(state.goal)) return;
 		if (this.#turnSnapshot?.activeGoalId !== state.goal.id && this.#wallClock.activeGoalId !== state.goal.id) return;
 
-		const tokenDelta =
-			this.#turnSnapshot?.activeGoalId === state.goal.id
-				? goalTokenDelta(currentUsage, this.#turnSnapshot.baselineUsage)
-				: 0;
+		let usage: GoalTokenUsage | undefined;
+		let tokenDelta = 0;
+		if (this.#turnSnapshot?.activeGoalId === state.goal.id) {
+			usage = currentUsage ?? this.#host.getCurrentUsage();
+			tokenDelta = goalTokenDelta(usage, this.#turnSnapshot.baselineUsage);
+		}
 		const wallSeconds =
 			this.#wallClock.activeGoalId === state.goal.id
 				? Math.max(0, Math.floor((this.#now() - this.#wallClock.lastAccountedAt) / 1000))
@@ -340,8 +357,8 @@ export class GoalRuntime {
 			state.goal.status = "budget-limited";
 		}
 
-		if (this.#turnSnapshot?.activeGoalId === state.goal.id) {
-			this.#turnSnapshot.baselineUsage = { ...currentUsage };
+		if (usage && this.#turnSnapshot?.activeGoalId === state.goal.id) {
+			this.#turnSnapshot.baselineUsage = { ...usage };
 		}
 		if (this.#wallClock.activeGoalId === state.goal.id && wallSeconds > 0) {
 			this.#wallClock.lastAccountedAt += wallSeconds * 1000;
@@ -360,10 +377,7 @@ export class GoalRuntime {
 		}
 	}
 
-	async flushUsage(
-		steering: GoalBudgetSteering,
-		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
-	): Promise<void> {
+	async flushUsage(steering: GoalBudgetSteering, currentUsage?: GoalTokenUsage): Promise<void> {
 		await this.#withAccounting(() => this.#flushUsageLocked(steering, currentUsage));
 	}
 

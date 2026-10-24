@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import * as vm from "node:vm";
+import { TempDir } from "@oh-my-pi/pi-utils/temp";
+import { createHelpers } from "../../src/eval/js/shared/helpers";
 import { JAVASCRIPT_PRELUDE_SOURCE } from "../../src/eval/js/shared/prelude";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import { runEvalWait } from "../../src/eval/handle-bridge";
@@ -145,18 +148,91 @@ describe("eval js wait options", () => {
 		}
 	});
 
-	it("rejects mixed option forms on global, resolved, and pending handles", async () => {
+	it("rejects mixing an options object with positional args", async () => {
 		const { sandbox, manager, gate } = fixture();
 		try {
 			const agent = sandbox.agent as (prompt: string) => Waitable;
 			const resolved = (await agent("resolved")) as Waitable;
 			const mixed = /do not mix both forms/;
-			await expect((sandbox.wait as WaitHelper)([resolved], { timeout: 1 }, true)).rejects.toThrow(mixed);
-			await expect(resolved.wait({ timeout: 1 }, false)).rejects.toThrow(mixed);
-			await expect(agent("pending").wait({ timeout: 1 }, false)).rejects.toThrow(mixed);
+			await expect((sandbox.wait as WaitHelper)([resolved], { timeout: 10 }, true)).rejects.toThrow(mixed);
+			await expect(resolved.wait({ timeout: 1 }, 2)).rejects.toThrow(mixed);
+			await expect(agent("pending").wait({ timeout: 1 }, 2)).rejects.toThrow(mixed);
 		} finally {
 			gate.resolve("released");
 			await manager.dispose();
 		}
+	});
+});
+
+describe("eval js read() URI delegation", () => {
+	it("appends line selectors to delegated URI paths", async () => {
+		const calls: Array<{ name: string; args: unknown }> = [];
+		const sandbox = loadPrelude(async (name, args) => {
+			calls.push({ name, args });
+			return { text: "resource contents" };
+		});
+		sandbox.__omp_helpers__ = { hasRoot: () => false };
+
+		const result = await vm.runInContext(`read("mcp://server/resource", { offset: 10, limit: 5 })`, sandbox);
+
+		expect(result).toBe("resource contents");
+		expect(calls).toEqual([
+			{
+				name: "read",
+				args: { path: "mcp://server/resource:10-14" },
+			},
+		]);
+	});
+
+	function loadArtifactPrelude(artifacts: string | undefined) {
+		const roots: Record<string, string> = artifacts === undefined ? {} : { artifact: artifacts };
+		const calls: Array<{ name: string; args: unknown }> = [];
+		const sandbox = loadPrelude(async (name, args) => {
+			calls.push({ name, args });
+			return { text: "from the read tool" };
+		});
+		sandbox.__omp_helpers__ = createHelpers({
+			cwd: () => process.cwd(),
+			env: new Map(),
+			localRoots: () => roots,
+			emitStatus: () => {},
+		});
+		return { calls, sandbox };
+	}
+
+	it("returns an empty string for artifact:// reads with a non-positive limit", async () => {
+		using tmp = TempDir.createSync("@eval-prelude-artifact-limit-");
+		await Bun.write(path.join(tmp.path(), "12.eval.log"), "first\nsecond\nthird\n");
+		const { calls, sandbox } = loadArtifactPrelude(tmp.path());
+
+		expect(await vm.runInContext(`read("artifact://12", { limit: 0 })`, sandbox)).toBe("");
+		expect(await vm.runInContext(`read("artifact://12", { limit: -1 })`, sandbox)).toBe("");
+		expect(await vm.runInContext(`read("artifact://7", { limit: 0 })`, sandbox)).toBe("");
+		expect(calls).toEqual([]);
+	});
+
+	it("asks the read tool for an artifact another session holds", async () => {
+		using tmp = TempDir.createSync("@eval-prelude-artifact-fallback-");
+		const { calls, sandbox } = loadArtifactPrelude(tmp.path());
+
+		expect(await vm.runInContext(`read("artifact://7")`, sandbox)).toBe("from the read tool");
+		expect(await vm.runInContext(`read("artifact://7", { offset: 2, limit: 2 })`, sandbox)).toBe(
+			"from the read tool",
+		);
+		expect(calls).toEqual([
+			{ name: "read", args: { path: "artifact://7:raw" } },
+			{ name: "read", args: { path: "artifact://7:raw:2-3" } },
+		]);
+	});
+
+	it("asks the read tool for the raw view when no artifacts dir was injected", async () => {
+		const { calls, sandbox } = loadArtifactPrelude(undefined);
+
+		expect(await vm.runInContext(`read("artifact://12")`, sandbox)).toBe("from the read tool");
+		expect(await vm.runInContext(`read("artifact://12:raw:1-1")`, sandbox)).toBe("from the read tool");
+		expect(calls).toEqual([
+			{ name: "read", args: { path: "artifact://12:raw" } },
+			{ name: "read", args: { path: "artifact://12:raw:1-1" } },
+		]);
 	});
 });

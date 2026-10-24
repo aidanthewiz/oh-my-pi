@@ -1,13 +1,21 @@
 /**
  * Functional tests for {@link SqlSessionStorage}. Driven by a real
  * `Bun.SQL` SQLite instance (in-memory) so the storage exercises actual
- * SQL execution, not a hand-rolled mock. PostgreSQL/MySQL behaviour is
- * covered by the dialect-specific query suite below, which inspects the
- * statements built at construction.
+ * SQL execution, not a hand-rolled mock. PostgreSQL/MySQL need actual-engine
+ * qualification; captured query strings do not establish database behavior.
  */
 
 import { describe, expect, it } from "bun:test";
-import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import {
+	admitTitleCard,
+	overlayTitleSlotContent,
+	serializeTitleSlot,
+	titleUpdateFromContent,
+} from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import {
+	SessionWriteConflictError,
+	sessionContentFingerprint,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 
@@ -18,6 +26,196 @@ async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; stora
 }
 
 describe("SqlSessionStorage (SQLite backend)", () => {
+	it("migrates existing title rows, reconstructs cards, and clears an identical title's card", async () => {
+		const client = new SQL("sqlite::memory:");
+		try {
+			await client.unsafe(
+				`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT)`,
+			);
+			const sessionPath = "/sessions/p/card.jsonl";
+			const old = { title: "Portable", source: "auto" as const, updatedAt: "t1" };
+			const raw = `${serializeTitleSlot(old)}{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n`;
+			await client.unsafe(
+				`INSERT INTO omp_session_files (path, content, mtime_ms, title, title_source, title_updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+				[sessionPath, raw, 1, old.title, old.source, old.updatedAt],
+			);
+			const storage = await SqlSessionStorage.create({ client });
+			const update = { title: "Portable", source: "auto" as const, updatedAt: "t2" };
+			const card = admitTitleCard(update, { code: "DB", emoji: "🧪", nf: "nf-md-flask" });
+			await storage.updateSessionTitle(sessionPath, { ...update, card });
+			const rebuilt = await SqlSessionStorage.create({ client });
+			const [prefix] = await rebuilt.readTextSlices(sessionPath, 256, 0);
+			expect(JSON.parse(prefix).card).toMatchObject({ code: "DB", emoji: "🧪", nf: "nf-md-flask" });
+			expect(titleUpdateFromContent(await rebuilt.readText(sessionPath))?.card?.code).toBe("DB");
+			const clear = { title: "Portable", source: "user" as const, updatedAt: "t3" };
+			await rebuilt.updateSessionTitle(sessionPath, clear);
+			const cold = await SqlSessionStorage.create({ client });
+			expect(titleUpdateFromContent(await cold.readText(sessionPath))).toEqual(clear);
+			const rows = await client.unsafe(
+				`SELECT title, title_source, title_updated_at, title_card FROM omp_session_files WHERE path = ?`,
+				[sessionPath],
+			);
+			expect(rows).toEqual([{ title: "Portable", title_source: "user", title_updated_at: "t3", title_card: null }]);
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("rejects a stale rewrite after a card-only peer update without changing raw bytes", async () => {
+		const { client, storage } = await createSqlite();
+		try {
+			const sessionPath = "/sessions/p/card-fence.jsonl";
+			const update = { title: "Portable", source: "auto" as const, updatedAt: "t1" };
+			const first = { ...update, card: admitTitleCard(update, { code: "OLD", emoji: "🧪" }) };
+			const raw = `${serializeTitleSlot(first)}{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n`;
+			await storage.writeText(sessionPath, raw);
+			const snapshot = await storage.readTextSnapshot(sessionPath);
+			const peer = await SqlSessionStorage.create({ client });
+			await peer.updateSessionTitle(sessionPath, {
+				...update,
+				card: admitTitleCard(update, { code: "NEW", emoji: "🚀" }),
+			});
+			await expect(
+				storage.writeTextAtomic(sessionPath, raw, {
+					expectedSize: Buffer.byteLength(snapshot.rawContent, "utf8"),
+					expectedFingerprint: sessionContentFingerprint(snapshot.rawContent),
+					expectedTitleMeta: snapshot.titleMeta,
+				}),
+			).rejects.toBeInstanceOf(SessionWriteConflictError);
+			expect((await peer.readTextSnapshot(sessionPath)).rawContent).toBe(snapshot.rawContent);
+			expect(titleUpdateFromContent(await peer.readText(sessionPath))?.card?.code).toBe("NEW");
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("rolls back a rejected title/card publish and permits a later title transaction", async () => {
+		const { client, storage } = await createSqlite();
+		try {
+			const sessionPath = "/sessions/p/rejected-card.jsonl";
+			const old = { title: "Old", source: "auto" as const, updatedAt: "t1" };
+			const first = { ...old, card: admitTitleCard(old, { code: "OLD", emoji: "🧪" }) };
+			await storage.writeText(
+				sessionPath,
+				`${serializeTitleSlot(first)}{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n`,
+			);
+			await client.unsafe(
+				`CREATE TRIGGER reject_title_card BEFORE UPDATE OF title_card ON omp_session_files ` +
+					`BEGIN SELECT RAISE(ABORT, 'card rejected'); END`,
+			);
+			const next = { title: "New", source: "user" as const, updatedAt: "t2" };
+			await expect(
+				storage.updateSessionTitle(sessionPath, {
+					...next,
+					card: admitTitleCard(next, { code: "NEW", emoji: "🚀" }),
+				}),
+			).rejects.toThrow("card rejected");
+			const [prefix] = await storage.readTextSlices(sessionPath, 256, 0);
+			expect(JSON.parse(prefix)).toMatchObject({
+				title: "Old",
+				source: "auto",
+				updatedAt: "t1",
+				card: { code: "OLD" },
+			});
+			expect(titleUpdateFromContent(await storage.readText(sessionPath))).toEqual(first);
+			await client.unsafe(`DROP TRIGGER reject_title_card`);
+			await storage.updateSessionTitle(sessionPath, next);
+			expect(titleUpdateFromContent(await storage.readText(sessionPath))).toEqual(next);
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("does not attach a stored card to a different winning title tuple", async () => {
+		const { client, storage } = await createSqlite();
+		try {
+			const sessionPath = "/sessions/p/stale-card.jsonl";
+			const old = { title: "Generated", source: "auto" as const, updatedAt: "t1" };
+			const update = { ...old, card: admitTitleCard(old, { code: "GEN", emoji: "🧪" }) };
+			await storage.writeText(
+				sessionPath,
+				`${serializeTitleSlot(update)}{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n`,
+			);
+			await client.unsafe(
+				`UPDATE omp_session_files SET title = ?, title_source = ?, title_updated_at = ? WHERE path = ?`,
+				["Manual", "user", "t2", sessionPath],
+			);
+			const cold = await SqlSessionStorage.create({ client });
+			expect(titleUpdateFromContent(await cold.readText(sessionPath))).toEqual({
+				title: "Manual",
+				source: "user",
+				updatedAt: "t2",
+			});
+			const [prefix] = await cold.readTextSlices(sessionPath, 256, 0);
+			expect(JSON.parse(prefix).title).toBe("Manual");
+			expect(JSON.parse(prefix).card).toBeUndefined();
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("preserves a card across append and move, then clears it on truncation", async () => {
+		const { client, storage } = await createSqlite();
+		try {
+			const source = "/sessions/p/moving-card.jsonl";
+			const destination = "/sessions/p/moved-card.jsonl";
+			const update = { title: "Portable", source: "auto" as const, updatedAt: "t1" };
+			await storage.writeText(
+				source,
+				`${serializeTitleSlot({ ...update, card: admitTitleCard(update, { code: "DB", emoji: "🧪" }) })}` +
+					'{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n',
+			);
+			await storage.writeText(destination, "old destination\n");
+			const writer = storage.openWriter(source);
+			await writer.append('{"type":"custom","data":"appended"}\n');
+			await writer.close();
+			await storage.rename(source, destination);
+			const cold = await SqlSessionStorage.create({ client });
+			const content = await cold.readText(destination);
+			expect(titleUpdateFromContent(content)?.card?.code).toBe("DB");
+			expect(content).toEndWith('{"type":"custom","data":"appended"}\n');
+			expect(cold.existsSync(source)).toBe(false);
+			const replacement = cold.openWriter(destination, { flags: "w" });
+			await replacement.append("replacement\n");
+			await replacement.close();
+			const cleared = await SqlSessionStorage.create({ client });
+			expect(await cleared.readText(destination)).toBe("replacement\n");
+			expect((await cleared.readTextSnapshot(destination)).titleMeta).toBeNull();
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("keeps complete overflow titles through direct updates, sync writes, and fenced rewrites", async () => {
+		const { client, storage } = await createSqlite();
+		try {
+			const sessionPath = "/sessions/p/overflow.jsonl";
+			const short = { title: "Short", source: "auto" as const, updatedAt: "t1" };
+			const raw = `${serializeTitleSlot(short)}{"type":"session","id":"s","timestamp":"t1","cwd":"/repo"}\n{"type":"custom","data":"tail"}\n`;
+			await storage.writeText(sessionPath, raw);
+			const long = { title: "界".repeat(150), source: "user" as const, updatedAt: "t2" };
+			await storage.updateSessionTitle(sessionPath, long);
+			const snapshot = await storage.readTextSnapshot(sessionPath);
+			expect(JSON.parse(snapshot.titleMeta!)).toEqual(long);
+			expect(titleUpdateFromContent(snapshot.content)).toEqual(long);
+			expect(Buffer.byteLength(snapshot.rawContent.split("\n")[0] + "\n", "utf8")).toBe(256);
+			expect(snapshot.rawContent).toEndWith('{"type":"custom","data":"tail"}\n');
+			storage.writeTextSync("/sessions/p/overflow-copy.jsonl", snapshot.content);
+			await storage.drain();
+			const newer = { ...long, title: "🙂".repeat(130), updatedAt: "t3" };
+			await storage.writeTextAtomic(sessionPath, overlayTitleSlotContent(snapshot.content, newer), {
+				expectedSize: Buffer.byteLength(snapshot.rawContent, "utf8"),
+				expectedFingerprint: sessionContentFingerprint(snapshot.rawContent),
+				expectedTitleMeta: snapshot.titleMeta,
+			});
+			const cold = await SqlSessionStorage.create({ client });
+			expect(titleUpdateFromContent(await cold.readText(sessionPath))).toEqual(newer);
+			expect(JSON.parse((await cold.readTextSnapshot("/sessions/p/overflow-copy.jsonl")).titleMeta!)).toEqual(long);
+		} finally {
+			await client.end();
+		}
+	});
+
 	it("indexes writeText metadata and reads content asynchronously", async () => {
 		const { client, storage } = await createSqlite();
 		await storage.writeText("/sessions/p/a.jsonl", "line1\nline2\n");
@@ -36,37 +234,23 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
-	it("create() warms the metadata index without selecting full content", async () => {
+	it("reconstructs existing rows with UTF-8 byte sizes", async () => {
 		const client = new SQL("sqlite::memory:");
-		await client.unsafe(
-			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT)`,
-		);
-		await client.unsafe(`INSERT INTO omp_session_files (path, content, mtime_ms) VALUES (?, ?, ?)`, [
-			"/sessions/p/huge.jsonl",
-			"0123456789",
-			Date.now(),
-		]);
-
-		const queries: string[] = [];
-		const wrapped: SqlSessionStorageClient = {
-			options: { adapter: "sqlite" },
-			unsafe(query, values) {
-				queries.push(query);
-				return client.unsafe(query, values);
-			},
-			transaction(callback) {
-				return client.transaction(async transaction => callback(transaction));
-			},
-		};
-
-		const storage = await SqlSessionStorage.create({ client: wrapped, createTable: false });
-		expect(storage.statSync("/sessions/p/huge.jsonl").size).toBe(10);
-
-		const warmup = queries.find(query => query.startsWith("SELECT path"));
-		expect(warmup).toContain("length(cast(content AS blob))");
-		expect(warmup).not.toMatch(/SELECT\s+path,\s*content\b/i);
-		expect(queries.some(query => /SELECT\s+content\s+AS\s+content/i.test(query))).toBe(false);
-		await client.end();
+		try {
+			await client.unsafe(
+				`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, title_card TEXT)`,
+			);
+			await client.unsafe(`INSERT INTO omp_session_files (path, content, mtime_ms) VALUES (?, ?, ?)`, [
+				"/sessions/p/existing.jsonl",
+				"界🙂\n",
+				1,
+			]);
+			const storage = await SqlSessionStorage.create({ client, createTable: false });
+			expect(storage.statSync("/sessions/p/existing.jsonl").size).toBe(8);
+			expect(await storage.readText("/sessions/p/existing.jsonl")).toBe("界🙂\n");
+		} finally {
+			await client.end();
+		}
 	});
 
 	it("listFilesSync returns only direct children matching the glob", async () => {
@@ -332,28 +516,15 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
-	it("readTextSlices uses bounded SQL byte substrings instead of a full content select", async () => {
-		const client = new SQL("sqlite::memory:");
-		const queries: string[] = [];
-		const wrapped: SqlSessionStorageClient = {
-			options: { adapter: "sqlite" },
-			unsafe(query, values) {
-				queries.push(query);
-				return client.unsafe(query, values);
-			},
-			transaction(callback) {
-				return client.transaction(async transaction => callback(transaction));
-			},
-		};
-		const storage = await SqlSessionStorage.create({ client: wrapped });
-		await storage.writeText("/sessions/p/big.jsonl", "abcdefghij");
-
-		queries.length = 0;
-		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
-		expect(queries).toHaveLength(1);
-		expect(queries[0]).toContain("substr(cast(content AS blob)");
-		expect(queries[0]).not.toMatch(/SELECT\s+content\s+AS\s+content/i);
-		await client.end();
+	it("reads multibyte head and tail windows by bytes", async () => {
+		const { client, storage } = await createSqlite();
+		try {
+			await storage.writeText("/sessions/p/unicode.jsonl", "界🙂middle🚀終");
+			expect(await storage.readTextSlices("/sessions/p/unicode.jsonl", 7, 7)).toEqual(["界🙂", "🚀終"]);
+			expect(await storage.readTextSlices("/sessions/p/unicode.jsonl", 0, 3)).toEqual(["", "終"]);
+		} finally {
+			await client.end();
+		}
 	});
 
 	it("custom table name is honored", async () => {
@@ -403,7 +574,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		const client = new SQL("sqlite::memory:");
 		// Pre-create the table with the expected schema.
 		await client.unsafe(
-			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT)`,
+			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, title_card TEXT)`,
 		);
 		const storage = await SqlSessionStorage.create({ client, createTable: false });
 		await storage.writeText("/s/x.jsonl", "ok");
@@ -412,104 +583,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// Dialect-specific statement coverage. We can't run a real Postgres/MySQL
-// instance from the test process, so we instantiate a `Bun.SQL` client (which
-// parses the URL but doesn't connect until the first query) and stub
-// `client.unsafe` to capture the rendered SQL. This catches dialect-specific
-// regressions in the query builder.
-// ---------------------------------------------------------------------------
-
-interface CapturedQuery {
-	sql: string;
-	values: unknown[] | undefined;
-}
-
-function capturingClient(adapter: "postgres" | "mysql"): {
-	client: SqlSessionStorageClient;
-	queries: CapturedQuery[];
-} {
-	const queries: CapturedQuery[] = [];
-	const client: SqlSessionStorageClient = {
-		options: { adapter },
-		async unsafe(sql, values) {
-			queries.push({ sql, values });
-			return [];
-		},
-		async transaction(callback) {
-			return callback(client);
-		},
-	};
-	return { client, queries };
-}
-
-describe("SqlSessionStorage (dialect-specific SQL)", () => {
-	it("PostgreSQL uses numbered placeholders and `||` concat", async () => {
-		const { client, queries } = capturingClient("postgres");
-		const storage = await SqlSessionStorage.create({ client });
-		const writer = storage.openWriter("/s/p.jsonl");
-		await writer.append("chunk\n");
-		await writer.close();
-
-		const ddl = queries.find(q => q.sql.startsWith("CREATE TABLE"));
-		expect(ddl?.sql).toContain("path TEXT PRIMARY KEY");
-		expect(ddl?.sql).toContain("mtime_ms BIGINT");
-
-		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
-		expect(loadIndex?.sql).toContain("octet_length(content)");
-		expect(loadIndex?.sql).not.toMatch(/SELECT\s+path,\s*content\b/i);
-
-		const append = queries.find(q => q.sql.includes("ON CONFLICT") && q.sql.includes("||"));
-		expect(append?.sql).toContain("$1");
-		expect(append?.sql).toContain("$2");
-		expect(append?.sql).toContain("$3");
-		expect(append?.sql).toMatch(/content = \w+\.content \|\| excluded\.content/);
-
-		expect(storage.adapter).toBe("postgres");
-	});
-
-	it("MySQL uses bound update values with `ON DUPLICATE KEY UPDATE` and `CONCAT()`", async () => {
-		const { client, queries } = capturingClient("mysql");
-		const storage = await SqlSessionStorage.create({ client });
-		await storage.writeText("/s/replace.jsonl", "body\n");
-		const writer = storage.openWriter("/s/m.jsonl");
-		await writer.append("chunk\n");
-		await writer.close();
-
-		const ddl = queries.find(q => q.sql.startsWith("CREATE TABLE"));
-		expect(ddl?.sql).toContain("VARCHAR(512)");
-		expect(ddl?.sql).toContain("LONGTEXT");
-		expect(ddl?.sql).toContain("ENGINE=InnoDB");
-		expect(ddl?.sql).toContain("utf8mb4");
-
-		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
-		expect(loadIndex?.sql).toContain("length(content)");
-		expect(loadIndex?.sql).not.toMatch(/SELECT\s+path,\s*content\b/i);
-
-		const upserts = queries.filter(q => q.sql.includes("ON DUPLICATE KEY UPDATE"));
-		expect(upserts).toHaveLength(2);
-		expect(upserts.every(query => !/VALUES\(\w+\)/i.test(query.sql))).toBe(true);
-
-		const replace = upserts.find(q => q.sql.includes("title_updated_at"));
-		expect(replace?.values?.slice(0, 6)).toEqual([
-			"/s/replace.jsonl",
-			"body\n",
-			expect.any(Number),
-			null,
-			null,
-			null,
-		]);
-		expect(replace?.values?.slice(6)).toEqual(["body\n", expect.any(Number), null, null, null]);
-
-		const append = upserts.find(q => q.sql.includes("CONCAT"));
-		expect(append?.sql).toContain("CONCAT(content, ?)");
-		expect(append?.values?.slice(0, 3)).toEqual(["/s/m.jsonl", "chunk\n", expect.any(Number)]);
-		expect(append?.values?.slice(3)).toEqual(["chunk\n", expect.any(Number)]);
-		expect(append?.sql).not.toContain("$1");
-
-		expect(storage.adapter).toBe("mysql");
-	});
-
+describe("SqlSessionStorage adapter admission", () => {
 	it("rejects clients reporting an unknown adapter without an override", async () => {
 		const client: SqlSessionStorageClient = {
 			options: { adapter: "weirdb" },
@@ -523,17 +597,19 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await expect(SqlSessionStorage.create({ client })).rejects.toThrow(/unable to infer adapter/);
 	});
 
-	it("explicit `adapter` option overrides the reported adapter", async () => {
-		const client: SqlSessionStorageClient = {
-			options: { adapter: "" }, // empty / missing
-			async unsafe() {
-				return [];
-			},
-			async transaction(callback) {
-				return callback(client);
-			},
-		};
-		const storage = await SqlSessionStorage.create({ client, adapter: "postgres" });
-		expect(storage.adapter).toBe("postgres");
+	it("executes against an explicitly selected SQLite adapter", async () => {
+		const client = new SQL("sqlite::memory:");
+		try {
+			const wrapped: SqlSessionStorageClient = {
+				options: { adapter: "" },
+				unsafe: (query, values) => client.unsafe(query, values),
+				transaction: callback => client.transaction(async transaction => callback(transaction)),
+			};
+			const storage = await SqlSessionStorage.create({ client: wrapped, adapter: "sqlite" });
+			await storage.writeText("/sessions/override.jsonl", "selected adapter\n");
+			expect(await storage.readText("/sessions/override.jsonl")).toBe("selected adapter\n");
+		} finally {
+			await client.end();
+		}
 	});
 });

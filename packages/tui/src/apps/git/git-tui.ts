@@ -26,12 +26,13 @@
  */
 
 import type { TspSpan } from "@oh-my-pi/pi-wire";
-import { formatKeyHint, formatKeyHints } from "../../app-keybindings";
+import { formatKeyHint, formatKeyHints, formatTooltipKey } from "../../app-keybindings";
 import { SplitPane } from "../../components/layout/split-pane";
 import { Stack } from "../../components/layout/stack";
 import { matchesKey } from "../../keys";
 import { ProcessTerminal } from "../../terminal";
 import { routeSgrMouseInput } from "../../mouse";
+import { NativeImageCache } from "../../native/blobs";
 import { col, compact, keyed, node, row, span, text } from "../../native/describe";
 import { Memo } from "../../native/memo";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../../native/node";
@@ -42,6 +43,7 @@ import { theme, warmHighlighter } from "../../theme/theme";
 import type { AvatarSource } from "./avatar";
 import { pill, softPill, tintChip } from "./colors";
 import {
+	assetTitle,
 	buildDiffDocument,
 	buildLineSelectionPatch,
 	DiffPane,
@@ -52,7 +54,7 @@ import {
 } from "./diff-pane";
 import { GitHelpSheet } from "./help";
 import { Sidebar, type SidebarAction, type GitCommitMessage } from "./sidebar";
-import type { AssetFileContents, ChangedFile, FileContents, GitTuiModel } from "./state";
+import type { AssetFileContents, ChangedFile, FileAssetSide, FileContents, GitTuiModel } from "./state";
 
 /** AI staging counts displayed after filtering the working tree. */
 export interface AiStageOutcome {
@@ -187,6 +189,7 @@ class GitTuiComponent implements Component {
 	#help: OverlayHandle | null = null;
 	readonly #nativeBar = new Memo();
 	readonly #nativeRoot = new Memo();
+	readonly #nativeImages = new NativeImageCache();
 
 	constructor(ui: TUI, host: GitTuiHost) {
 		this.#ui = ui;
@@ -1018,8 +1021,8 @@ class GitTuiComponent implements Component {
 		const right: NativeNode[] = [
 			row(
 				[
-					iconButton("chev-up", "prev-hunk", `Previous change (${formatKeyHint("alt+up")})`),
-					iconButton("chev", "next-hunk", `Next change (${formatKeyHint("alt+down")})`),
+					iconButton("chev-up", "prev-hunk", `Previous change (${formatTooltipKey("alt+up")})`),
+					iconButton("chev", "next-hunk", `Next change (${formatTooltipKey("alt+down")})`),
 				],
 				{ gap: "none", align: "center" },
 			),
@@ -1040,13 +1043,13 @@ class GitTuiComponent implements Component {
 					"type",
 					"whitespace",
 					this.#whitespace === "off"
-						? `Ignore whitespace (${formatKeyHint("b")})`
+						? `Ignore whitespace (${formatTooltipKey("b")})`
 						: this.#whitespace === "whitespace"
-							? `Ignoring whitespace; also ignore formatting (${formatKeyHint("b")})`
-							: `Ignoring formatting and imports; show all (${formatKeyHint("b")})`,
+							? `Ignoring whitespace; also ignore formatting (${formatTooltipKey("b")})`
+							: `Ignoring formatting and imports; show all (${formatTooltipKey("b")})`,
 					this.#whitespace !== "off",
 				),
-				iconButton("corner-down-right", "wrap", `Wrap lines (${formatKeyHint("w")})`, this.#pane.wrap),
+				iconButton("corner-down-right", "wrap", `Wrap lines (${formatTooltipKey("w")})`, this.#pane.wrap),
 			);
 		}
 		if (file?.area === "unstaged" || file?.area === "staged") {
@@ -1058,8 +1061,8 @@ class GitTuiComponent implements Component {
 			);
 		}
 		right.push(
-			iconButton("keyboard", "help", `Keyboard shortcuts (${formatKeyHint("?")})`),
-			iconButton("x", "close", `Close (${formatKeyHint("q")})`),
+			iconButton("keyboard", "help", `Keyboard shortcuts (${formatTooltipKey("?")})`),
+			iconButton("x", "close", `Close (${formatTooltipKey("q")})`),
 		);
 		return keyed(
 			row(
@@ -1103,6 +1106,25 @@ class GitTuiComponent implements Component {
 		}
 		const contents = this.#contents;
 		if (this.#pane.state === "asset" && file && contents?.kind === "asset") {
+			if (cx.supports("image") && (contents.old.kind === "image" || contents.new.kind === "image")) {
+				const oldImage =
+					contents.old.kind === "image"
+						? this.#nativeImages.get("before", contents.old.image.data, contents.old.image.mimeType)
+						: undefined;
+				const newImage =
+					contents.new.kind === "image"
+						? this.#nativeImages.get("after", contents.new.image.data, contents.new.image.mimeType)
+						: undefined;
+				return keyed(
+					row([assetColumn("before", contents.old, oldImage), assetColumn("after", contents.new, newImage)], {
+						gap: "sm",
+						align: "stretch",
+						grow: 1,
+						role: "omp.app.git.compare",
+					}),
+					"compare",
+				);
+			}
 			return keyed(
 				col(
 					[
@@ -1146,6 +1168,29 @@ class GitTuiComponent implements Component {
 			"empty",
 		);
 	}
+}
+
+/** Owned decoded blobs prevent a later host reopen of mutable worktree/index/HEAD paths. */
+function assetColumn(side: "before" | "after", asset: FileAssetSide, image: NativeNode | undefined): NativeNode {
+	const head = keyed(
+		text([span(assetTitle(side === "before" ? "Before" : "After", asset), "strong")], {
+			truncate: "end",
+			role: "omp.app.git.media-head",
+		}),
+		"head",
+	);
+	const body =
+		image ??
+		keyed(
+			text(
+				asset.kind === "empty"
+					? [span(side === "before" ? "Did not exist" : "Deleted", "muted")]
+					: assetText(asset).map(fact => span(fact.t, "muted")),
+				{ role: "omp.app.git.media-none" },
+			),
+			"none",
+		);
+	return keyed(col([head, body], { gap: "xs", grow: 1, basis: 0, role: "omp.app.git.media-side" }), side);
 }
 
 /** One side of a media/binary change as a short fact line. */

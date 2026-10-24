@@ -4,25 +4,33 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import { oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId, resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import { googleAntigravityModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/google";
 import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import {
+	discoverLiteLLMModels,
 	discoverOllamaModels,
 	discoverOpenAIModelsList,
 	discoveryProbeTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
-import { RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
+import {
+	RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS,
+	resolveOAuthDiscoveryAccounts,
+} from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resolveCliModel, resolveProviderModelReference } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 const ANTHROPIC_AUTH_ENV_NAMES = [
 	"ANTHROPIC_API_KEY",
@@ -33,6 +41,39 @@ const ANTHROPIC_AUTH_ENV_NAMES = [
 	"ANTHROPIC_WORKSPACE_ID",
 	"ANTHROPIC_BASE_URL",
 ] as const;
+
+test("OpenRouter fallback variants keep the requested route in their wire identity", () => {
+	const base = {
+		...buildModel({
+			id: "vendor/aliased",
+			name: "Aliased Model",
+			provider: "openrouter",
+			api: "openai-completions",
+			baseUrl: "https://openrouter.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 2, output: 3, cacheRead: 1, cacheWrite: 4 },
+			contextWindow: 8192,
+			maxTokens: 1024,
+		}),
+		requestModelId: "vendor/base-wire-id",
+	};
+	expect(resolveProviderModelReference("openrouter", base.id, [base])).toBe(base);
+	expect(resolveProviderModelReference("openrouter", "vendor/not-admitted:floor", [base])).toBeUndefined();
+	expect(resolveProviderModelReference("openrouter", `${base.id}:floor`, [])).toBeUndefined();
+	for (const suffix of [":floor", ":nitro"]) {
+		const requestedId = `${base.id}${suffix}`;
+		const resolved = resolveProviderModelReference("openrouter", requestedId, [base]);
+		expect(resolved?.id).toBe(requestedId);
+		expect(resolved?.requestModelId).toBe(`${base.requestModelId}${suffix}`);
+		expect(resolved?.api).toBe("openai-completions");
+		expect(resolved?.provider).toBe(base.provider);
+		expect(resolved?.baseUrl).toBe(base.baseUrl);
+		expect(resolved?.cost).toEqual(base.cost);
+		expect(resolved?.contextWindow).toBe(base.contextWindow);
+	}
+	expect(base.requestModelId).toBe("vendor/base-wire-id");
+});
 
 describe("ModelRegistry runtime discovery", () => {
 	let tempDir: string;
@@ -445,6 +486,85 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(refreshCalls).toEqual([]);
 		expect(authStorage.credentials.getOAuth("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
 	});
+	test("Antigravity startup hydrates only the current credential's model cache", async () => {
+		const modelA = "gemini-2.5-account-a";
+		const modelB = "gemini-2.5-account-b";
+		const useAccount = (access: string) =>
+			authStorage.credentials.set("google-antigravity", {
+				type: "oauth",
+				access,
+				refresh: `refresh-${access}`,
+				expires: Date.now() + 3_600_000,
+			});
+		const fetcher: FetchImpl = async (input, init) => {
+			if (!String(input).includes(":fetchAvailableModels")) return new Response("version: 2.19.1\n");
+			const modelId = new Headers(init?.headers).get("Authorization") === "Bearer account-a" ? modelA : modelB;
+			return Response.json({
+				models: { [modelId]: { displayName: modelId, supportsThinking: true } },
+			});
+		};
+		const registry = () => new ModelRegistry(authStorage, modelsJsonPath, { cacheDbPath, fetch: fetcher });
+
+		await useAccount("account-a");
+		await registry().refreshProvider("google-antigravity", "online");
+		const restartedA = registry();
+		await restartedA.hydrateCredentialScopedModelCaches();
+		expect(restartedA.find("google-antigravity", modelA)?.id).toBe(modelA);
+
+		await useAccount("account-b");
+		const restartedB = registry();
+		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
+		await restartedB.hydrateCredentialScopedModelCaches();
+		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
+		await restartedB.refreshProvider("google-antigravity", "online-if-uncached");
+		expect(restartedB.find("google-antigravity", modelB)?.id).toBe(modelB);
+		expect(restartedB.find("google-antigravity", modelA)).toBeUndefined();
+	});
+
+	test("Antigravity cache follows the account union and explicit credential authority", async () => {
+		const credential = (account: string, access = account): OAuthCredentials & { type: "oauth" } => ({
+			type: "oauth",
+			access,
+			refresh: `refresh-${account}`,
+			expires: Date.now() + 3_600_000,
+			email: `${account}@example.com`,
+		});
+		let rosterCalls = 0;
+		const fetcher: FetchImpl = async (input, init) => {
+			if (!String(input).includes(":fetchAvailableModels")) return new Response("version: 2.19.1\n");
+			rosterCalls++;
+			const token = new Headers(init?.headers).get("Authorization")?.replace("Bearer ", "");
+			const id = `gemini-2.5-${token}`;
+			return Response.json({ models: { [id]: { displayName: id, supportsThinking: true } } });
+		};
+		const registry = () => new ModelRegistry(authStorage, modelsJsonPath, { cacheDbPath, fetch: fetcher });
+		await authStorage.credentials.set("google-antigravity", credential("a"));
+		await registry().refreshProvider("google-antigravity", "online");
+
+		await authStorage.credentials.set("google-antigravity", [credential("a"), credential("b")]);
+		const expanded = registry();
+		await expanded.refreshProvider("google-antigravity", "online-if-uncached");
+		expect(expanded.find("google-antigravity", "gemini-2.5-a")?.accountAccess).toEqual({ "a@example.com": {} });
+		expect(expanded.find("google-antigravity", "gemini-2.5-b")?.accountAccess).toEqual({ "b@example.com": {} });
+
+		await authStorage.credentials.set("google-antigravity", [
+			credential("b", "b-refreshed"),
+			credential("a", "a-refreshed"),
+		]);
+		const callsBeforeHydration = rosterCalls;
+		const restarted = registry();
+		await restarted.hydrateCredentialScopedModelCaches();
+		expect(restarted.find("google-antigravity", "gemini-2.5-b")?.accountAccess).toEqual({ "b@example.com": {} });
+		expect(rosterCalls).toBe(callsBeforeHydration);
+
+		authStorage.keys.setRuntime("google-antigravity", "external");
+		const external = registry();
+		await external.refreshProvider("google-antigravity", "online-if-uncached");
+		expect(external.find("google-antigravity", "gemini-2.5-external")?.id).toBe("gemini-2.5-external");
+		expect(external.find("google-antigravity", "gemini-2.5-a")).toBeUndefined();
+		expect(external.find("google-antigravity", "gemini-2.5-b")).toBeUndefined();
+	});
+
 	test("online-if-uncached refreshes expired OAuth when the discovery cache is stale for the model manager", async () => {
 		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
 		await authStorage.credentials.set("anthropic", {
@@ -785,6 +905,185 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(getModelsForProvider(registry, "openai-codex").length).toBeGreaterThan(0);
 	});
 
+	test("Antigravity discovery unions every account's roster and routes each model to an account serving it", async () => {
+		// Account A's plan omits Claude 5.5; account B's serves it. Discovery is
+		// authoritative, so reading only one account's roster would prune Claude
+		// 5.5 for both whenever A is the account discovery happens to pick.
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				email: "b@example.com",
+				projectId: "project-b",
+			},
+		]);
+		const gemini = { "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", supportsThinking: true } };
+		const claude = Object.fromEntries(
+			["low", "medium", "high"].map(tier => [`claude-opus-5-5-${tier}`, { supportsThinking: true }]),
+		);
+		const rosters: Record<string, object> = {
+			"Bearer token-a": { models: gemini },
+			"Bearer token-b": { models: { ...gemini, ...claude } },
+		};
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.includes(":fetchAvailableModels")) {
+				const roster = rosters[new Headers(init?.headers).get("authorization") ?? ""];
+				return roster ? Response.json(roster) : new Response("Unauthorized", { status: 401 });
+			}
+			return new Response("version: 2.19.1\n");
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-antigravity", "online");
+
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		expect(opus?.accountAccess).toEqual({ "b@example.com": {} });
+		expect(registry.find("google-antigravity", "gemini-3.1-pro")?.accountAccess).toEqual({
+			"a@example.com": {},
+			"b@example.com": {},
+		});
+		// Bundled rows that no account serves stay pruned.
+		expect(registry.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
+
+		// A session pinned to account A moves to B for a model only B serves.
+		const sessionId = "antigravity-claude-session";
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
+		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity routing still works for an account whose login stored no email", async () => {
+		// Google's userinfo lookup is optional at login; such a credential keeps
+		// only its project id, which must still tag and select the account.
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				projectId: "project-b",
+			},
+		]);
+		const gemini = { "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", supportsThinking: true } };
+		const claude = Object.fromEntries(
+			["low", "medium", "high"].map(tier => [`claude-opus-5-5-${tier}`, { supportsThinking: true }]),
+		);
+		const rosters: Record<string, object> = {
+			"Bearer token-a": { models: gemini },
+			"Bearer token-b": { models: { ...gemini, ...claude } },
+		};
+		const fetchMock: FetchImpl = async (input, init) => {
+			if (String(input).includes(":fetchAvailableModels")) {
+				const roster = rosters[new Headers(init?.headers).get("authorization") ?? ""];
+				return roster ? Response.json(roster) : new Response("Unauthorized", { status: 401 });
+			}
+			return new Response("version: 2.19.1\n");
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-antigravity", "online");
+
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		expect(opus?.accountAccess).toEqual({ "project-b": {} });
+		const sessionId = "antigravity-emailless-session";
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
+		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity discovery retains the project identity of a token override matching a stored account", async () => {
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				projectId: "project-b",
+			},
+		]);
+		authStorage.keys.setRuntime("google-antigravity", "token-b");
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async input =>
+				String(input).includes(":fetchAvailableModels")
+					? Response.json({ models: { "claude-opus-5-5-low": { supportsThinking: true } } })
+					: new Response("version: 2.19.1\n"),
+		});
+		await registry.refreshProvider("google-antigravity", "online");
+		authStorage.keys.removeRuntime("google-antigravity");
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and discovered Claude Opus 5.5");
+		expect(
+			authStorage.sessions.pin("google-antigravity", "antigravity-override-session", accountA.credentialId),
+		).toBe(true);
+		expect(opus.accountAccess).toEqual({ "project-b": {} });
+		expect(await registry.getApiKey(opus, "antigravity-override-session")).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity discovery does not append a stale preflight token after its stored account refreshes", async () => {
+		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
+		await authStorage.credentials.set("google-antigravity", {
+			type: "oauth",
+			access: "expired-antigravity",
+			refresh: "refresh-antigravity",
+			expires: Date.now() - 60_000,
+			projectId: "project-only",
+		});
+		const options = googleAntigravityModelManagerOptions({
+			resolveAccounts: async () => {
+				const accounts = await resolveOAuthDiscoveryAccounts(
+					authStorage,
+					"google-antigravity",
+					"expired-antigravity",
+				);
+				return (
+					accounts?.map(account => ({ accessToken: account.accessToken, accountKey: oauthAccountKey(account) })) ??
+					null
+				);
+			},
+			endpoint: "https://antigravity.test",
+			fetch: async (input, init) => {
+				if (!String(input).includes(":fetchAvailableModels")) return new Response("version: 2.19.1\n");
+				if (new Headers(init?.headers).get("Authorization") !== ["Bearer", "fresh-google-antigravity"].join(" ")) {
+					return new Response("Unavailable", { status: 503 });
+				}
+				return Response.json({ models: { "claude-opus-5-5-low": { supportsThinking: true } } });
+			},
+		});
+		const models = await options.fetchDynamicModels?.();
+		expect(models?.find(model => model.id === "claude-opus-5-5")?.accountAccess).toEqual({ "project-only": {} });
+		expect(refreshCalls).toEqual(["google-antigravity"]);
+	});
+
 	test("Gemini CLI discovery forwards a stored OAuth project id to the quota fallback", async () => {
 		await authStorage.credentials.set("google-gemini-cli", {
 			type: "oauth",
@@ -1000,6 +1299,70 @@ describe("ModelRegistry runtime discovery", () => {
 		const model = registry.find("ollama", "phi4-mini");
 		expect(model?.baseUrl).toBe("http://omp-ollama.example:2222/v1");
 		expect(registry.getProviderDiscoveryState("ollama")?.optional).toBe(false);
+	});
+
+	test("resolves a bare id shared with implicit ollama to the models.yml provider", async () => {
+		using _baseUrl = withEnv("OLLAMA_BASE_URL", "http://ollama.lan:11434");
+		writeRawModelsJson({
+			omlx: {
+				baseUrl: "http://omlx.lan:11434/v1",
+				api: "openai-completions",
+				apiKey: "sk-omlx-test",
+				models: [{ id: "phi-4-4bit", name: "Phi-4 4-bit", contextWindow: 128000, maxTokens: 8192 }],
+			},
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: mockOllamaDiscovery(["phi-4-4bit"], "http://ollama.lan:11434"),
+		});
+		await registry.refresh();
+		expect(registry.find("ollama", "phi-4-4bit")).toBeDefined();
+
+		const resolved = resolveCliModel({ cliModel: "phi-4-4bit", modelRegistry: registry });
+		expect(resolved.model?.provider).toBe("omlx");
+		expect(resolved.model?.baseUrl).toBe("http://omlx.lan:11434/v1");
+	});
+
+	test("warns with the env var only when an env-redirected implicit endpoint fails discovery", async () => {
+		// Echo the request URL like real fetch errors do, so credential leaks through the error are caught too.
+		const unreachable: FetchImpl = async input => {
+			throw new Error(`EHOSTUNREACH: connect failed ${String(input)}?api_key=query-secret#fragment-secret`);
+		};
+		{
+			using _baseUrl = withEnv(
+				"OLLAMA_BASE_URL",
+				"http://reviewer:topsecret@ollama.typo:11434?access_token=endpoint-secret#endpoint-fragment",
+			);
+			const logged = vi.spyOn(logger, "warn");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: unreachable });
+				await registry.refreshProvider("ollama");
+				const warnings = registry.drainConfigWarnings().filter(warning => warning.includes("ollama"));
+				expect(warnings).toHaveLength(1);
+				expect(warnings[0]).toContain("OLLAMA_BASE_URL");
+				expect(warnings[0]).toContain("http://ollama.typo:11434");
+				expect(warnings[0]).toContain("EHOSTUNREACH");
+				const diagnostics = JSON.stringify([warnings, logged.mock.calls]);
+				for (const secret of [
+					"reviewer",
+					"topsecret",
+					"query-secret",
+					"fragment-secret",
+					"endpoint-secret",
+					"endpoint-fragment",
+				]) {
+					expect(diagnostics).not.toContain(secret);
+				}
+			} finally {
+				logged.mockRestore();
+			}
+		}
+		{
+			// The default loopback probe is optional: a missing local Ollama stays silent.
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", undefined);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: unreachable });
+			await registry.refresh();
+			expect(registry.drainConfigWarnings()).toEqual([]);
+		}
 	});
 
 	test("refreshes implicit Ollama discovery when the configured endpoint changes", async () => {
@@ -3099,14 +3462,6 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("litellm discovery maps rich model metadata and keeps runtime /v1 baseUrl", async () => {
-		writeRawModelsJson({
-			"litellm-test": {
-				baseUrl: "http://127.0.0.1:4000",
-				api: "openai-completions",
-				auth: "none",
-				discovery: { type: "litellm" },
-			},
-		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:4000/model_group/info") {
@@ -3126,9 +3481,17 @@ describe("ModelRegistry runtime discovery", () => {
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
-		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
-		await registry.refresh();
-		const model = registry.find("litellm-test", "gpt-big");
+		const models = await discoverLiteLLMModels(
+			{
+				provider: "litellm-test",
+				baseUrl: "http://127.0.0.1:4000",
+				api: "openai-completions",
+				discovery: { type: "litellm" },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		const model = models.find(model => model.id === "gpt-big");
+		if (!model) throw new Error("Missing discovered LiteLLM model");
 
 		expect(model?.baseUrl).toBe("http://127.0.0.1:4000/v1");
 		expect(model?.contextWindow).toBe(262_144);
@@ -3136,17 +3499,19 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(model?.input).toEqual(["text", "image"]);
 		expect(model?.reasoning).toBe(true);
 		expect(model?.api).toBe("openai-responses");
+		expect(model.provider).toBe("litellm-test");
+		expect(model.providerType).toBe("litellm");
+		if (model.api !== "openai-responses") throw new Error("Expected discovered Responses API");
+		expect(
+			resolveOpenAIRequestSetup(model as Model<"openai-responses">, {
+				apiKey: "test",
+				messages: [],
+				sessionId: "rich-alias-session",
+			}).requestHeaders["x-litellm-session-id"],
+		).toBe("rich-alias-session");
 	});
 
 	test("litellm discovery falls back to /v1/models when the rich phase times out (#10964)", async () => {
-		writeRawModelsJson({
-			"litellm-test": {
-				baseUrl: "http://127.0.0.1:4013/v1",
-				api: "openai-completions",
-				auth: "none",
-				discovery: { type: "litellm", timeoutMs: 50 },
-			},
-		});
 		const { promise: richHang } = Promise.withResolvers<Response>(); // never resolves
 		const richEndpoints = ["/model_group/info", "/v2/model/info", "/model/info", "/v1/model/info"];
 		let v1ModelsHits = 0;
@@ -3166,11 +3531,31 @@ describe("ModelRegistry runtime discovery", () => {
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
-		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
-		await registry.refresh();
+		const models = await discoverLiteLLMModels(
+			{
+				provider: "litellm-test",
+				baseUrl: "http://127.0.0.1:4013/v1",
+				api: "openai-responses",
+				discovery: { type: "litellm", timeoutMs: 50 },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		const model = models.find(model => model.id === "vendor-7/model-7");
+		if (!model) throw new Error("Missing fallback LiteLLM model");
 
 		expect(v1ModelsHits).toBeGreaterThan(0);
-		expect(registry.find("litellm-test", "vendor-7/model-7")?.baseUrl).toBe("http://127.0.0.1:4013/v1");
+		expect(model.baseUrl).toBe("http://127.0.0.1:4013/v1");
+		expect(model.provider).toBe("litellm-test");
+		expect(model.providerType).toBe("litellm");
+		expect(model.api).toBe("openai-responses");
+		if (model.api !== "openai-responses") throw new Error("Expected fallback Responses API");
+		expect(
+			resolveOpenAIRequestSetup(model as Model<"openai-responses">, {
+				apiKey: "test",
+				messages: [],
+				sessionId: "fallback-alias-session",
+			}).requestHeaders["x-litellm-session-id"],
+		).toBe("fallback-alias-session");
 	});
 
 	test("configured litellm discovery omits non-conversational rich modes", async () => {

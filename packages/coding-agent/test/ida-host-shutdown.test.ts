@@ -1,6 +1,6 @@
 import { expect, mock, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
+import { IpcConnection, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { IdaHost } from "../src/ida/host";
@@ -9,7 +9,7 @@ import type { IdaHostResponse } from "../src/ida/protocol";
 type Gate<T> = PromiseWithResolvers<T>;
 
 interface SocketClient {
-	socket: net.Socket;
+	socket: IpcConnection;
 	send(frame: { id: number; op: string; [key: string]: unknown }, timeoutMs?: number): Promise<IdaHostResponse>;
 	cancel(id: number, target: number): void;
 }
@@ -26,59 +26,37 @@ function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Prom
 }
 
 async function connect(endpoint: string): Promise<SocketClient> {
-	const socket = net.createConnection(endpoint);
+	const socket = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: 5_000 });
 	const pending = new Map<number, Gate<IdaHostResponse>>();
-	let buffer = "";
-	socket.setEncoding("utf8");
-	socket.on("data", (chunk: string) => {
-		buffer += chunk;
-		for (let end = buffer.indexOf("\n"); end !== -1; end = buffer.indexOf("\n")) {
-			const frame = JSON.parse(buffer.slice(0, end)) as IdaHostResponse;
-			buffer = buffer.slice(end + 1);
+	socket.start(
+		line => {
+			const frame = JSON.parse(line) as IdaHostResponse;
 			pending.get(frame.id)?.resolve(frame);
 			pending.delete(frame.id);
-		}
-	});
-	socket.on("close", () => {
-		for (const response of pending.values()) response.reject(new Error("IDA socket closed before response"));
-		pending.clear();
-	});
-	socket.on("error", error => {
-		for (const response of pending.values()) response.reject(error);
-		pending.clear();
-	});
-	try {
-		await bounded(
-			new Promise<void>((resolve, reject) => {
-				socket.once("connect", resolve);
-				socket.once("error", reject);
-			}),
-			"connection",
-		);
-	} catch (error) {
-		socket.destroy();
-		throw error;
-	}
+		},
+		reason => {
+			for (const response of pending.values())
+				response.reject(new Error(reason ?? "IDA connection closed before response"));
+			pending.clear();
+		},
+	);
 	return {
 		socket,
 		send(frame: { id: number; op: string; [key: string]: unknown }, timeoutMs?: number): Promise<IdaHostResponse> {
 			const response = Promise.withResolvers<IdaHostResponse>();
 			pending.set(frame.id, response);
-			socket.write(`${JSON.stringify(frame)}\n`);
+			socket.send(JSON.stringify(frame));
 			return bounded(response.promise, `response ${frame.id}`, timeoutMs);
 		},
 		cancel(id: number, target: number): void {
-			socket.write(`${JSON.stringify({ id, op: "cancel", target })}\n`);
+			socket.send(JSON.stringify({ id, op: "cancel", target }));
 		},
 	};
 }
 
 test("pre-open cancellation stays socket-local and shutdown saves accepted mutation", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-ida-host-"));
-	const endpoint =
-		process.platform === "win32"
-			? `\\\\.\\pipe\\omp-ida-host-${process.pid}-${path.basename(root)}`
-			: path.join(root, "host.sock");
+	const endpoint = ipcEndpoint(root, "host");
 	const openEntered = Promise.withResolvers<void>();
 	const openGate = Promise.withResolvers<FakeWorker>();
 	const execEntered = Promise.withResolvers<AbortSignal | undefined>();
@@ -180,10 +158,7 @@ test("pre-open cancellation stays socket-local and shutdown saves accepted mutat
 
 test("shutdown interrupts a stuck accepted call and closes the worker", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-ida-host-"));
-	const endpoint =
-		process.platform === "win32"
-			? `\\\\.\\pipe\\omp-ida-host-${process.pid}-${path.basename(root)}`
-			: path.join(root, "host.sock");
+	const endpoint = ipcEndpoint(root, "host");
 	const entered = Promise.withResolvers<AbortSignal>();
 	const closeCalls: boolean[] = [];
 	class StuckWorker {

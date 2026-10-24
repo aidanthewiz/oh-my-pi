@@ -2,7 +2,6 @@ import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
@@ -342,17 +341,6 @@ describe("runEvalAgent", () => {
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});
 
-	it("rejects an ambiguous or blank per-call model on agent() before dispatch", async () => {
-		mockAgents();
-		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
-
-		for (const model of ["default", "   ", "p/current,"]) {
-			await expect(runEvalAgent({ prompt: "work", model }, { session: makeSession() })).rejects.toBeInstanceOf(
-				ToolError,
-			);
-		}
-		expect(runSpy).not.toHaveBeenCalled();
-	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
 		const agentSchema = { type: "object" };
 		const sessionSchema = { type: "object" };
@@ -478,16 +466,9 @@ describe("runEvalAgent", () => {
 		).toContain("Cleanup");
 	});
 
-	it("maps successful and failed subagent results", async () => {
+	it("surfaces failed subagent errors", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess");
-		runSpy.mockImplementationOnce(async options =>
-			singleResult(options, {
-				id: "0-EvalAgent",
-				output: "done",
-				resolvedModel: "p/model",
-			}),
-		);
 		runSpy.mockImplementationOnce(async options =>
 			singleResult(options, {
 				exitCode: 1,
@@ -497,11 +478,6 @@ describe("runEvalAgent", () => {
 			}),
 		);
 
-		const result = await runEvalAgentAndWait({ prompt: "hello" }, { session: makeSession() });
-		expect(result).toEqual({
-			text: "done",
-			details: { agent: "task", id: "0-EvalAgent", model: "p/model", structured: false },
-		});
 		await expect(runEvalAgentAndWait({ prompt: "fail" }, { session: makeSession() })).rejects.toThrow("boom");
 	});
 

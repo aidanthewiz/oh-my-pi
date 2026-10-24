@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
@@ -14,9 +15,9 @@ import { enoent } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
-	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
-	titleUpdateFromSlot,
+	titleFitsSlot,
+	titleUpdateFromContent,
 } from "./session-title-slot";
 
 export interface SessionStorageIndexEntry {
@@ -26,6 +27,7 @@ export interface SessionStorageIndexEntry {
 	title?: string;
 	titleSource?: SessionTitleUpdate["source"];
 	titleUpdatedAt?: string;
+	titleCard?: SessionTitleUpdate["card"];
 }
 
 export interface SessionStorageBackend {
@@ -61,6 +63,7 @@ interface IndexEntry {
 	title?: string;
 	titleSource?: SessionTitleUpdate["source"];
 	titleUpdatedAt?: string;
+	titleCard?: SessionTitleUpdate["card"];
 }
 
 interface EnqueueOptions {
@@ -110,7 +113,12 @@ function uniquePaths(paths: readonly string[]): string[] {
 }
 function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined {
 	if (!entry.titleUpdatedAt) return undefined;
-	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
+	return {
+		title: entry.title,
+		source: entry.titleSource,
+		updatedAt: entry.titleUpdatedAt,
+		...(entry.titleCard ? { card: entry.titleCard } : {}),
+	};
 }
 
 export class IndexedSessionStorage implements SessionStorage {
@@ -160,7 +168,12 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#index.clear();
 		for (const row of rows) {
 			const title = row.titleUpdatedAt
-				? { title: row.title, source: row.titleSource, updatedAt: row.titleUpdatedAt }
+				? {
+						title: row.title,
+						source: row.titleSource,
+						updatedAt: row.titleUpdatedAt,
+						...(row.titleCard ? { card: row.titleCard } : {}),
+					}
 				: null;
 			this.#setIndex(row.path, row.size, row.mtimeMs, title);
 		}
@@ -202,7 +215,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#assertExpectedSize(path, options?.expectedSize);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
+		const title = titleUpdateFromContent(content);
 		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const write = this.#enqueuePath(
@@ -215,6 +228,15 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
 		await this.#awaitPath(path);
+		if (!titleFitsSlot(title)) {
+			const snapshot = await this.readTextSnapshot(path);
+			await this.writeTextAtomic(path, overlayTitleSlotContent(snapshot.content, title), {
+				expectedSize: byteLength(snapshot.rawContent),
+				expectedFingerprint: createHash("sha1").update(snapshot.rawContent).digest("hex"),
+				expectedTitleMeta: snapshot.titleMeta,
+			});
+			return;
+		}
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
 		const mtimeMs = this.#allocMtimeMs();
@@ -223,6 +245,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			title: title.title,
 			titleSource: title.source,
 			titleUpdatedAt: title.updatedAt,
+			titleCard: title.card,
 			mtimeMs,
 		};
 		this.#index.set(path, next);
@@ -313,7 +336,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
+		const title = titleUpdateFromContent(content);
 		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
@@ -334,7 +357,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#assertExpectedSize(path, options?.expectedSize);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
+		const title = titleUpdateFromContent(content);
 		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
 		this.#pushFrame(path, { mtimeMs, previous });
 		try {
@@ -533,6 +556,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			title: title === undefined ? current?.title : (title?.title ?? undefined),
 			titleSource: title === undefined ? current?.titleSource : (title?.source ?? undefined),
 			titleUpdatedAt: title === undefined ? current?.titleUpdatedAt : (title?.updatedAt ?? undefined),
+			titleCard: title === undefined ? current?.titleCard : title?.card,
 		});
 		if (mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = mtimeMs;
 	}

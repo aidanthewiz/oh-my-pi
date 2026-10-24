@@ -103,12 +103,15 @@ The CLI applies the same ownership rules to every list entry. `omp read 'cat.png
 6. It tries SQLite resolution with `resolveSqliteReadPath()` in `read-sqlite.ts`.
    - `parseSqlitePathCandidates()` scans for `.sqlite`, `.sqlite3`, `.db`, `.db3` before any `:table`, `:key`, or `?query` suffix.
    - `readSqlite()` dispatches on `parseSqliteSelector()`. Executable/IDA database view targets are then handled by `resolveBinaryViewPath()` and `readBinary()`.
-7. Otherwise it treats the input as a local filesystem path.
+7. It resolves JSON query suffixes with `resolveJsonReadPath()` in `read-json.ts` before ordinary filesystem reads.
+   - `.json`, `.jsonl`, and `.ndjson` files accept `?q=<jq-filter>` or `?query=<jq-filter>`.
+   - Existing literal query-looking filenames retain precedence. Query punctuation remains data during path-list parsing.
+8. Otherwise it treats the input as a local filesystem path.
    - `resolveReadPath()` expands `~`, resolves relative to session cwd, treats bare `/` as session cwd, and retries macOS screenshot/NFD/curly-quote variants.
    - If the path does not exist, `findUniqueWorkspaceSuffix()` attempts a workspace-wide unique suffix match (skipped for remote mounts). A cwd-root filename matching the active `local://` plan basename may recover that plan. As a final guarded recovery, a mistakenly delimited list of existing paths is read part by part; callers should still issue one `read` per path.
    - A resolved target that is neither a regular file nor a directory (character or block device, FIFO, socket) is rejected with a `ToolError` naming its kind. Reads run in-process, so reading `/dev/stdin` or a FIFO would block, and `/dev/zero` would never finish, on a native thread that no timeout or abort can cancel.
-8. Directories go through `#readDirectory()`.
-9. Non-directories branch by content type:
+9. Directories go through `#readDirectory()`.
+10. Non-directories branch by content type:
    - image metadata / inline image
    - summarized macOS `sample` or V8 `.cpuprofile` report
    - editable notebook text
@@ -224,6 +227,18 @@ The CLI applies the same ownership rules to every list entry. `omp read 'cat.png
    - per-column width `40` (`MAX_COLUMN_WIDTH`)
 - `openSqliteReadConnection()` in `sqlite-reader.ts` uses strict Bun SQLite with `PRAGMA query_only = ON` and `busy_timeout = 3000`. It normally opens read-only; missing WAL sidecars or `SQLITE_CANTOPEN` trigger a read-write connection (`create: false`) solely to initialize sidecars.
 
+### JSON queries
+
+- Use `file.json?q=.items[]` or `events.jsonl?q=select(.status=="ok")`.
+- Queries run through bundled jaq and tail, even when Bash builtin execution is disabled. Filters are quoted positional arguments, not shell code.
+- The query shell replaces its inherited environment using the existing child policy. `env` and `$ENV` exclude managed credentials and value aliases.
+- `raw=true` returns unquoted strings. `compact=true` renders each result on one line.
+- `offset` and `limit` select whole results. A single array result pages its elements; other results form a stream.
+- The page limit defaults to `100` and is capped at `1000`. Continuation hints preserve the filter and formatting flags.
+- A trailing line selector selects lines from query output.
+- Queries have a 30-second deadline and a 5,242,880-character stdout capture cap. Caller cancellation stops the query.
+- A bounded stderr pipe retains the final 8 KiB of diagnostics. Its private temporary file is removed after each run.
+
 ### Documents
 
 - `CONVERTIBLE_EXTENSIONS` in `packages/coding-agent/src/utils/markit.ts` covers `.pdf`, `.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.rtf`, `.epub`.
@@ -267,9 +282,9 @@ The CLI applies the same ownership rules to every list entry. `omp read 'cat.png
    - parses the URL with `parseInternalUrl()` so colons inside the host segment are legal
    - handles URLs with no local file (virtual, remote, and device schemes, plus located schemes whose target is a directory or missing)
    - returns discrete values (`shape: "value"`, e.g. `agent://` path extraction) without pagination; otherwise paginates the resolved text in memory
-   - `:img` is rejected here; it requires a file-backed URL
+   - `:img` is rejected here; it requires a file-backed URL. A file-backed URL that only reached this path because locate deferred to a remote resolve (an unknown `skill://` while MCP is available) reports its local miss (`Unknown skill`) instead
    - passes `immutable` (defaulted from the scheme spec) through to `resolveFileDisplayMode()` so anchors are suppressed for immutable resources such as artifacts, skills, memory, and agent outputs
-   - sets `ignoreResultLimits: true` for schemes whose spec is `unbounded` (`skill://`) so the full text is paginated only by explicit selectors, not by the normal default line limit
+   - sets `ignoreResultLimits: true` for schemes whose spec is `unbounded` (`skill://`) so the full text is paginated only by explicit selectors, not by the normal default line limit; a resource can override that (`InternalResource.unbounded`), which `skill://` does for MCP-served skill text
 - `conflict://` blocks are registered by the `<path>:conflicts` selector; `conflict://<N>` reads one registered marker block, and `/ours`, `/theirs`, `/base`, or `/both` selects a side. `conflict://*` is write-only.
 - `issue://<N>` / `pr://<N>` (and the long form `issue://<owner>/<repo>/<N>` / `pr://<owner>/<repo>/<N>`) route through the same SQLite cache the `github` tool writes to; `?comments=0` selects the no-comments rendering. Bare `issue://` / `pr://` (and repository-qualified variants) browse live lists with `?state=`, `?limit=`, `?author=`, and `?label=`. PR diffs use `pr://<N>/diff`, `/diff/<i>`, and `/diff/all`. Every repository-qualified form also accepts a GitHub Enterprise host prefix (`pr://ghe.example.com/<owner>/<repo>/<N>`), and a host with no dot (`pr://ghe/<owner>/<repo>/<N>`) is recognized in the numbered form. Short forms resolve the host from the session checkout, so an enterprise repo needs no prefix.
 - `memory://` accepts two grammars. `memory://root[/path]` reads file-backed memory artifacts under the project memory root (`memory://root` resolves to the compact startup summary `memory_summary.md`; deeper paths address files such as `MEMORY.md` and `skills/<name>/SKILL.md`, and `memory://root/...` supports glob patterns for `glob`). `memory://<memory-id>` looks up a live Mnemopi memory row by id — working or episodic — and returns the full stored content (not the clipped recall preview) behind a YAML frontmatter header carrying `id`, `bank`, `store`, `memory_type`, `source`, `timestamp`/`created_at`, `importance`, `veracity`, `session_id`, and `metadata`. The id grammar resolves against the calling session: it needs that session on `memory.backend = mnemopi` and searches only its own scoped banks, so a row held by another live session is not reachable; with `hindsight` it returns a corrective pointer (hindsight memories are not addressable), and unknown ids error with a pointer to `recall` for the available ids. This is the read counterpart to `memory_edit update`: read the full row before overwriting a truncated preview.
@@ -300,6 +315,11 @@ Notes: ...
 ---
 ```
 
+- X URLs (`x.com`, `twitter.com`, and their `www.`/`mobile.` hosts) never reach `loadPage()`; X blocks scraping. `handleTwitter()` (`packages/coding-agent/src/web/scrapers/twitter.ts`) classifies the page with `parseXUrl()` (`packages/coding-agent/src/web/x.ts`) and has Grok's `x_search` tool read it with a fixed call plan and output format (`packages/coding-agent/src/prompts/system/x-read.md`):
+   - post (`/<handle>/status/<id>`, `/i/web/status/<id>`, trailing `/photo/N` etc.) → `x_thread_fetch`: the post, parent thread, quoted post, replies, metrics, and media URLs;
+   - profile (`/<handle>`, `/with_replies`, `/media`) → `x_user_search` plus a `from:<handle>` `x_keyword_search` (Latest, 10 posts), with `allowed_x_handles` pinned to the handle;
+   - search (`/search?q=`; `f=live` → Latest, `f=media` → `filter:media`, `f=user` → `x_user_search`) and hashtag (`/hashtag/<tag>`) → `x_keyword_search`.
+   - Models are tried in `xaiModelChain()` order (`web` role xAI candidates plus the provider default's `webSearchModel`, ranked by provider priority so `xai-oauth` runs before `xai` unless `modelProviderOrder` says otherwise) with `max_turns: 2` and low reasoning effort; the call bills the xAI account per post and profile fetched. The answer is the model's rendering of the tool output, which the API does not expose raw; the `Notes:` header names the model and fetch counts. Without xAI credentials, for other X pages (home, explore, followers, lists), or when every model fails, the result is a `text/plain` explanation with method `x-unavailable`.
 - `method` records the winning path (`json`, `feed`, `text`, `alternate-markdown`, `md-suffix`, `content-negotiation`, `image`, `markit`, `llms.txt`, `raw`, `raw-html`, etc.).
 - URL reads may return an inline image block when the fetched resource is a supported image and survives resizing.
 

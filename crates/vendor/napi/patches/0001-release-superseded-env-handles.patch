@@ -1,6 +1,11 @@
 --- a/src/bindgen_runtime/module_register.rs
 +++ b/src/bindgen_runtime/module_register.rs
-@@ -200,3 +200,67 @@
+@@ -194,6 +194,70 @@
+       .as_ref()
+       .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, handle))
+   })
++}
++
 +// The env that last registered on this OS thread and has not been torn down since:
 +// `live_env_cleanup`, an env-cleanup hook, clears it at teardown. The per-thread slots
 +// below (`REGISTERED_CLASSES`, `CURRENT_CUSTOM_GC_HANDLE`, the `Reflect` cache in
@@ -63,12 +68,10 @@
 +    crate::error::release_reflect_intrinsics(previous);
 +  }
 +  unsafe { sys::napi_add_env_cleanup_hook(env, Some(live_env_cleanup), env.cast()) };
-+}
-+
+ }
+ 
  type RegisteredClasses = PersistedPerInstanceHashMap<
-   /* export name */ String,
-   /* constructor */ sys::napi_ref,
-@@ -857,5 +921,8 @@
+@@ -897,6 +961,9 @@
    // use-after-free this change exists to prevent. `create_custom_gc` only needs a
    // valid `env` (it creates a dummy function + the per-env TSFN and never reads
    // `exports`), so running it this early is safe.
@@ -77,9 +80,13 @@
 +
    #[cfg(feature = "napi4")]
    create_custom_gc(env);
+ 
 --- a/src/error.rs
 +++ b/src/error.rs
-@@ -1021,3 +1021,11 @@
+@@ -1018,6 +1018,14 @@
+   });
+ }
+ 
 +/// Drops the cached `Reflect` pair if it belongs to `env`, a superseded env that was never
 +/// torn down (see `release_superseded_env` in `module_register.rs`); napi calls through it
 +/// are still legal.

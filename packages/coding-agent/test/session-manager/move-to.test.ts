@@ -86,6 +86,44 @@ describe("SessionManager.moveTo", () => {
 		await fsp.rm(testAgentDir, { recursive: true, force: true });
 	});
 
+	it("retains the title tuple through move, rollback and repeated cold reopen", async () => {
+		const manager = SessionManager.create(cwdA);
+		const card = { code: "MOVE", emoji: "🧪", nf: "nf-md-flask" };
+		await manager.ensureOnDisk();
+		await manager.setSessionName("Portable move", "user", undefined, card);
+		const before = manager.captureState();
+		await manager.moveTo(cwdB);
+		const moved = manager.getSessionFile()!;
+		await manager.close();
+		for (let pass = 0; pass < 2; pass++) {
+			const cold = await SessionManager.open(moved);
+			try {
+				expect(cold.getSessionName()).toBe("Portable move");
+				expect(cold.getSessionTitleCard()).toEqual(card);
+				expect(cold.titleUpdatedAt).toBe(before.titleUpdatedAt);
+				expect(cold.getCwd()).toBe(cwdB);
+			} finally {
+				await cold.close();
+			}
+		}
+		const rollback = await SessionManager.open(moved);
+		try {
+			await rollback.rollbackMove(before);
+			expect(rollback.getSessionTitleCard()).toEqual(card);
+			expect(rollback.getCwd()).toBe(cwdA);
+		} finally {
+			await rollback.close();
+		}
+		const cold = await SessionManager.open(before.sessionFile!);
+		try {
+			expect(cold.getSessionName()).toBe("Portable move");
+			expect(cold.getSessionTitleCard()).toEqual(card);
+			expect(cold.titleUpdatedAt).toBe(before.titleUpdatedAt);
+		} finally {
+			await cold.close();
+		}
+	});
+
 	function pauseAfterSessionFileMove(oldFile: string) {
 		const landed = Promise.withResolvers<string>();
 		const release = Promise.withResolvers<void>();

@@ -125,7 +125,9 @@ The result carries `details.service` (`name`, `state`, `ready`, `timedOut`, opti
 
 Restricted plan-mode and device-only cancellation captures the calling session's owner before asynchronous lookup. The broker checks the persisted service owner immediately before stopping it. Missing or foreign owners fail without stopping the service. Approved unrestricted cancellation keeps its existing behavior.
 
-Broker protocol 4 stores runtime state under `broker-v4`. Close older clients and stop older brokers before upgrading. Stale detached services retain their PID and logs during migration; live non-detached services must stop first. Migration validates all records and refuses active leases or colliding live records before moving service metadata.
+Broker protocol 5 stores runtime state under `broker-v5`. Close older clients and stop older brokers before upgrading. Stale detached services retain their PID and logs during migration; live non-detached services must stop first. Migration validates all records and refuses active leases or colliding live records before moving service metadata. Interrupted migration resumes without replacing already adopted records.
+
+Relay replacement stops only the daemon generation that was inspected. A stale generation ID cannot stop its successor. Restricted cancellation also requires the captured session owner; a matching generation never bypasses that check.
 
 ## Non-interactive execution engine (`executeBash`)
 
@@ -147,27 +149,25 @@ Concurrent calls never share one `Shell`: the native session runs one command at
 
 ## Bundled `jq` compatibility
 
-Unless `PI_DISABLE_UUTILS_BUILTINS` is truthy, the non-PTY native shell registers a bundled `jq` command backed by vendored [jaq](https://github.com/01mf02/jaq), not the system `jq`. Setting that flag disables the in-process uutils command set and falls back to system binaries. The bundled jaq errors when chained access indexes through a null or missing intermediate: `.a.b` over `{}` exits 5, whereas jq returns `null`.
+Unless `PI_DISABLE_UUTILS_BUILTINS` is truthy, the non-PTY native shell registers a bundled `jq` command backed by [jaq](https://github.com/01mf02/jaq) 3.1.1, not the system `jq`; `jq --version` prints `jaq 3.1.1`. Setting that flag disables the in-process uutils command set and falls back to system binaries. `env jq …` runs the system `jq` for one command.
 
-Guard the access with `[.a.b?][0]` when the parent may be null or absent. The `?` suppresses jaq's traversal error (jq never raises it), and `[…][0]` maps the suppressed empty output to `null` while preserving a legitimate `false` or `null` value:
+The bundled jaq follows jq where scripts commonly rely on it: indexing `null` or a missing key yields `null` (`.a.b` over `{}`), `IN`, `input_filename`, `input_line_number` and `--unbuffered` are defined, `tonumber` reads one number literal (`"021"`, `"+1"`), file operands form one input stream (`-s` slurps all of them into one array, and `input` reads on into the next file), an error in one input does not stop the next, and output is always JSON (`nan` prints `null`).
 
-```jq
-{"c": [.a.b?][0]}
-```
-
-Avoid the naive `.a.b? // null`: `//` treats a legitimate `false` (and `null`) as absent, so it silently rewrites boolean data to the fallback. It also diverges on parse — `{"c": .a.b? // null}` is accepted by jaq but is a syntax error in jq (the value needs parentheses: `{"c": (.a.b? // null)}`).
+Known differences from jq 1.8: slicing `null` errors (`.a[1:]` over `{}`), indexing an object with a number yields `null` instead of an error (`.[0]` over `{"a":1}`), assignment does not create missing parents (`{} | .a.b = 1`), `del` moves the last key into the deleted key's place, `scan` yields only its first match and no capture arrays, `join` renders `null` as `"null"`, array indices must be integers (`.[1.5]` errors), floats print in jaq's notation (`3/1` prints `3.0`), `todate` keeps fractional seconds, `from_entries` reads only `key`/`value`, and `tostream`, `$__loc__`, `trimstr`, `INDEX`, `JOIN`, `--seq` and `--stream` are missing.
 
 ## Shell config, direnv, and snapshot behavior
 
-At each call, the executor loads settings shell config (`shell`, `env`, optional `prefix`) and runs `applyDirenvPreflight()`.
+`BashTool` prepares the selected shell, command, working directory, and direnv environment before DCG review. Approved calls revalidate that preparation before execution.
 
-Unless `bash.direnv` is `"off"`, preflight attempts to load the cwd's direnv/devenv changes within `bash.direnvLoadTimeoutMs`, additionally bounded by a positive command timeout. Direnv-provided variables are merged below explicit caller `env`; safe variables removed by direnv are prepended as `unset -v ...`. ACP-terminal and PTY routes run the same preflight before their backend; the non-PTY executor runs it internally.
+Unless `bash.direnv` is `"off"`, preflight loads the cwd's direnv/devenv changes within `bash.direnvLoadTimeoutMs`, bounded by a positive command timeout. Safe variables removed by direnv become an `unset -v ...` prefix. ACP-terminal, PTY, and non-PTY execution consume the approved preparation without applying its transformation twice. The bash tool does not accept caller `env`.
+
+Successful exports retain their loaded environment and `DIRENV_*` state per `.envrc` directory. Each call still runs `direnv export json` to check direnv's watched inputs and authorization state, but an unchanged environment avoids re-running `.envrc` and devenv setup. OMP returns the complete diff relative to its process environment. A change to that process environment, or to the nanosecond timestamp, size, or existence of the `.envrc` or any direnv-watched path (including direnv's allow/deny files), restarts the load from a clean baseline; so does a warm export that reports any change. This cache does not modify OMP's process environment.
 
 If the selected shell includes `bash`, it attempts `getOrCreateSnapshot()`:
 
 - snapshot captures aliases/functions/options from user rc,
 - snapshot creation is best-effort,
-- failure falls back to no snapshot.
+- failure falls back to no snapshot; a failed snapshot is retried after 60 s, or sooner when the rc file's mtime or size or the shell environment changes.
 
 If `prefix` is configured, it wraps the command after any direnv unset prefix.
 
@@ -247,7 +247,7 @@ Non-PTY execution also passes shell-minimizer settings into the native `Shell` s
 
 ## Live tool updates and async jobs
 
-For non-PTY foreground execution, `BashTool` uses a separate `TailBuffer` for partial updates and emits `onUpdate` snapshots while command is running.
+For non-PTY foreground execution, `BashTool` passes an `onPreview` callback to `executeBash()`, which streams the `OutputSink`'s own inline view (`OutputSink.preview()`) as `onUpdate` snapshots while the command is running; there is no separate partial-update buffer.
 
 For PTY execution, live rendering is handled by custom UI overlay, not by `onUpdate` text chunks.
 
@@ -257,12 +257,8 @@ When `async.enabled` is true and the call passes `async: true`, `BashTool` start
 
 After execution:
 
-1. A cancellation or missing exit status throws a tool error. The client-bridge
-   terminal route also throws `ToolError` for timeout before structured result
-   shaping.
-2. Local non-PTY and interactive-PTY timeouts return an error result with
-   `details.timedOut = true` so the renderer can distinguish them from an
-   ordinary failure.
+1. Caller cancellation throws `ToolAbortError`; other non-timeout cancellation throws `ToolError`.
+2. Local non-PTY, interactive-PTY, and client-bridge timeouts return error results with `details.timedOut = true`. The client bridge kills before its bounded final output read. Exit, timeout, abort, and bridge failure share one latched outcome.
 3. Empty output becomes `(no output)`.
 4. A final inline byte cap protects routes that bypass `OutputSink`; it reuses the sink artifact when available or saves a `bash-original` artifact.
 5. Truncation metadata is attached from the sink summary.

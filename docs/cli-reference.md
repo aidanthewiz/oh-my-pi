@@ -91,13 +91,14 @@ Argument handling:
 | --- | --- |
 | `--continue`, `-c` | Continue the previous session. |
 | `--resume [id]`, `-r`, `--session [id]` | Resume a session by ID prefix or path, or open the picker when no value is given. |
+| `--restore [id]` | Resume a session as `--resume` does, then go on with what its last process left unfinished when it crashed or was killed: the interrupted turn and the subagents it was running. Interactive only; takes no prompt. See [session operations](./session-operations-export-share-fork-resume.md#cli---restore). |
 | `--fork <session>` | Fork a saved session (by ID prefix or path) into a new session. See [session operations](./session-operations-export-share-fork-resume.md). |
 | `--from-claude` | Import a Claude Code session into Coreforge. |
 | `--from-codex` | Import a Codex session into Coreforge. |
 | `--export <session>` | Export a session file to HTML and exit. |
 | `--no-title` | Disable title auto-generation (equivalent to the `PI_NO_TITLE` [environment variable](./environment-variables.md)). |
 
-`--continue`, `--resume`, `--fork`, and foreign-session imports require
+`--continue`, `--resume`, `--restore`, `--fork`, and foreign-session imports require
 persistence and cannot use `--no-session`. `--from-claude` and `--from-codex`
 are mutually exclusive and cannot be combined with `--continue`, `--resume`,
 or `--fork`.
@@ -250,6 +251,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 | --- | --- | --- |
 | `launch` | Start a coding session (the default command). | [Launch flags](#launch-flags) |
 | `acp` | Run Coreforge as an ACP (Agent Client Protocol) server over stdio. | [approval mode](./approval-mode.md#acp-sessions) |
+| `auth` | Export or import stored provider credentials as JSON. | [Credential transfer](#credential-transfer) |
 | `auth-broker` | Manage the Coreforge auth broker (credential vault). | [auth broker / gateway](./auth-broker-gateway.md) |
 | `auth-gateway` | Run an auth-gateway: an HTTP forward proxy backed by the configured broker (`serve`), or JSON lines on stdin/stdout for a parent process with your own credentials (`stdio`). | [auth broker / gateway](./auth-broker-gateway.md) |
 | `agents` | Manage bundled task agents. | [task agent discovery](./task-agent-discovery.md) |
@@ -282,6 +284,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 | `predict` | Compare word-completion engines' live ghost text for a prompt. | |
 | `ps` | List and control daemon-supervised background processes (logs, stop, kill, restart). | |
 | `say` | Synthesize text with the local TTS engine and play it through the speakers. | [tts tool](./tools/tts.md) |
+| `session` | Pack, unpack, or mark a session moved between machines. | [Session transfer](./session-operations-export-share-fork-resume.md#move-a-session-between-machines) |
 | `share` | Share a saved session via an encrypted link (same as the `/share` slash command). | [session operations](./session-operations-export-share-fork-resume.md) |
 | `setup` | Run onboarding setup or install dependencies for optional features. | |
 | `shell` | Interactive shell console. | |
@@ -293,7 +296,7 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 | `stats` | View usage statistics. | |
 | `stream` | Broadcast local OMP session screens and chat to a public live channel. | |
 | `update` | Check for and install updates; `--canary`/`--stable` switch release channels. | |
-| `usage` | Show provider usage limits for every authenticated account; `usage clients` breaks token burn down per client (with `--days`), `usage invalidate` drops cached reports. | |
+| `usage` | Show provider usage limits for every authenticated account, flagging saved resets close to expiry; `usage clients` breaks token burn down per client (with `--days`), `usage invalidate` drops cached reports, `usage accounts` lists each OAuth account's provider and identity key (the key `task.agentAccountPools` and broker account pools take; no tokens, `--json` supported), and `usage reset` lists each Codex and Claude account's saved rate-limit resets by `<provider>/<credential id>` (`--json`, `--redact`) and `usage reset <provider>/<credential id>` spends one, also from an auth-broker client. | [Task agent discovery](./task-agent-discovery.md#model-and-structured-output-precedence), [saved resets](./settings.md#saved-reset-auto-consumption) |
 | `tiny-models` | Download tiny local models for session titles, memory, and word completion. | [local models](./local-models.md) |
 | `token` | Get the API key or OAuth token for a provider. | [secrets](./secrets.md) |
 | `toks` | Count file or text tokens with the embedded offline tokenizers. | |
@@ -306,4 +309,22 @@ Run `coreforge <command> --help` for each command's own flags and examples.
 > command, and so on). The table lists each as it is registered in
 > `packages/coding-agent/src/cli-commands.ts`.
 
+`usage accounts` refreshes credential metadata before listing identity keys. If refresh fails, it retains cached identities and warns on stderr that they may be stale. JSON stdout remains parseable and contains no tokens. `--redact` is rejected because account pools require exact identity keys.
+
 `__complete` is an internal, hidden subcommand used by shell completion scripts.
+
+## Credential transfer
+
+```sh
+umask 077
+coreforge auth export > credentials.json
+coreforge auth import credentials.json
+```
+
+Credential files contain plaintext API keys and OAuth refresh tokens. Use an encrypted transport. Never commit or publish them.
+
+Export includes only the active profile's managed MCP credentials. Import rejects another profile's managed MCP credentials before writing any provider.
+Own-profile and legacy MCP metadata remain transferable. Explicit pipes and `coreforge auth import -` are supported.
+
+The command does not transfer Coreforge's MSAL identity cache or destination account-pool policy. Broker-managed credentials remain with their broker.
+

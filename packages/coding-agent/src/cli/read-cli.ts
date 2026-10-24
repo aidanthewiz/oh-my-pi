@@ -12,18 +12,18 @@ import { Settings } from "../config/settings";
 import { initializeWithSettings } from "../discovery";
 import { releaseIdaDatabases } from "../ida";
 import { loadSkills } from "../extensibility/skills";
-import { extractUriScheme } from "../internal-urls/parse";
-import { InternalUrlRouter } from "../internal-urls/router";
 import { closeDaemonClients } from "../launch/client";
 import { discoverAndLoadMCPTools } from "../mcp/loader";
 import { MCPManager } from "../mcp/manager";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import type { AuthStorage } from "../session/auth-storage";
 import type { ToolSession } from "../tools";
+import { parseReadUrlTarget } from "../tools/fetch";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { splitDelimitedPathEntry } from "../tools/path-utils";
 import { ownsReadQuery, ReadTool, splitImageQuestionTarget } from "../tools/read";
 import { renderError } from "../tools/tool-errors";
+import { parseXUrl } from "../web/x";
 
 import { cfgDisabledExtensions, cfgExtensions, cfgSkills } from "../extensibility/settings";
 import { cfgMcpEnableProjectConfig } from "../mcp/settings";
@@ -33,17 +33,10 @@ export interface ReadCommandArgs {
 }
 
 /**
- * Session state `omp read <path>` must load before resolving: the caller's
- * skills for skill:// and MCP servers for MCP resources — `mcp://` or any
- * scheme with no registered handler that the router's MCP fallback accepts.
- * Filesystem paths, web URLs, and other registered schemes need neither.
+ * `read` may split the input into list entries (`;`, `,`, whitespace) and read each one, so the
+ * caller's skills load whenever any entry could be a skill:// URL. Loading them is local and cheap.
  */
-function readPrerequisites(input: string): { skills: boolean; mcp: boolean } {
-	const router = InternalUrlRouter.instance();
-	const scheme = extractUriScheme(input);
-	if (!scheme || !router.canResolve(input)) return { skills: false, mcp: false };
-	return { skills: scheme === "skill", mcp: scheme === "mcp" || router.getHandler(scheme) === undefined };
-}
+const SKILL_URL_RE = /skill:\/\//i;
 
 export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 	if (!cmd.path) {
@@ -69,8 +62,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 	let failed = false;
 
 	try {
-		const needs = readPrerequisites(cmd.path);
-		if (needs.skills) {
+		if (SKILL_URL_RE.test(cmd.path)) {
 			const discovered = await loadSkills({
 				...cfgSkills.get(settings),
 				cwd,
@@ -85,8 +77,10 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			session.skills = discovered.skills;
 		}
 
-		if (needs.mcp) {
-			authStorage = await discoverAuthStorage(undefined, { settings });
+		// MCP servers start only when a read reaches an MCP resource — `mcp://`, a scheme with no
+		// registered handler, or a skill:// URL no loaded skill owns — in any list entry.
+		MCPManager.setDeferredInstance(async () => {
+			authStorage ??= await discoverAuthStorage(undefined, { settings });
 			const result = await discoverAndLoadMCPTools(cwd, {
 				enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
 				filterExa: true,
@@ -97,22 +91,24 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			});
 			mcpManager = result.manager;
 			session.mcpManager = mcpManager;
-			MCPManager.setInstance(mcpManager);
-		}
+			return mcpManager;
+		});
 
-		let needsVisionModel = false;
-		if (cmd.path.includes("?")) {
-			const readPaths = (await splitDelimitedPathEntry(cmd.path, cwd, {
-				queryOwner: entry => ownsReadQuery(entry, cwd),
-			})) ?? [cmd.path];
-			for (const entry of readPaths) {
-				if (splitImageQuestionTarget(entry).question !== undefined && (await ownsReadQuery(entry, cwd))) {
-					needsVisionModel = true;
-					break;
-				}
+		let needsModelRegistry = false;
+		const readPaths = (await splitDelimitedPathEntry(cmd.path, cwd, {
+			queryOwner: entry => ownsReadQuery(entry, cwd),
+		})) ?? [cmd.path];
+		for (const entry of readPaths) {
+			const urlTarget = parseReadUrlTarget(entry);
+			if (
+				(urlTarget && parseXUrl(urlTarget.path)) ||
+				(splitImageQuestionTarget(entry).question !== undefined && (await ownsReadQuery(entry, cwd)))
+			) {
+				needsModelRegistry = true;
+				break;
 			}
 		}
-		if (needsVisionModel) {
+		if (needsModelRegistry) {
 			authStorage ??= await discoverAuthStorage(undefined, { settings });
 			const modelRegistry = new ModelRegistry(authStorage);
 			await modelRegistry.hydrateCredentialScopedModelCaches();
@@ -138,6 +134,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 		process.stderr.write(`${chalk.red(renderError(err))}\n`);
 		failed = true;
 	} finally {
+		MCPManager.setDeferredInstance(undefined);
 		if (mcpManager) {
 			await mcpManager.disconnectAll();
 			if (MCPManager.instance() === mcpManager) MCPManager.setInstance(undefined);

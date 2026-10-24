@@ -1,6 +1,6 @@
 # Shipping pi_natives addons, one per (platform, arch, ISA-variant).
 # `bazel build //:natives-<target>` yields the canonically named .node file;
-# packages/natives/scripts/build-native.ts copies it into packages/natives/native/.
+# scripts/bazel-natives.ts installs it into packages/natives/native/.
 # Note: musl addons intentionally reuse the plain linux-<arch> filenames — the
 # loader never sees gnu and musl side by side; release jobs keep them apart.
 
@@ -35,11 +35,12 @@ _ADDONS = {
     for target, (platform, out) in _ADDONS.items()
 ]
 
-# Every addon buildable from a linux-x64 host (the omp-kata pods): all linux
-# targets plus the msvc cross build. darwin addons build on mac hosts.
+# Every shipped addon, available through Linux-hosted cross toolchains.
 filegroup(
-    name = "natives-linux-all",
+    name = "natives-all",
     srcs = [
+        ":natives-darwin-arm64",
+        ":natives-darwin-x64-baseline",
         ":natives-linux-arm64",
         ":natives-linux-musl-arm64",
         ":natives-linux-musl-x64-baseline",

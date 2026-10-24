@@ -7,6 +7,11 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
+import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import {
+	googleAntigravityModelManagerOptions,
+	googleGeminiCliModelManagerOptions,
+} from "@oh-my-pi/pi-catalog/provider-models/google";
 import { modelsDevCatalogFallback } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { removeWithRetries } from "../../utils/src/temp";
@@ -200,6 +205,61 @@ describe("model cache write churn", () => {
 		expect(entry?.authoritative).toBe(false);
 	});
 
+	/** Serialized `models` payload for `ids`, as this binary writes it. */
+	function payloadFor(ids: string[]): string {
+		const otherPath = path.join(tempDir, "payload-source.db");
+		writeModelCache(
+			"rewrite-test",
+			1_000,
+			ids.map(id => model(id)),
+			true,
+			"fp",
+			otherPath,
+		);
+		const row = payloadRow(otherPath, "rewrite-test");
+		if (!row) throw new Error("expected payload row");
+		return row.models;
+	}
+
+	it("re-reads a row an older binary replaced without recording its payload hash", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+		const replacement = payloadFor(["a", "legacy"]);
+		const db = new Database(dbPath);
+		db.run(
+			`INSERT OR REPLACE INTO model_cache (
+				provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
+				header_omitted_model_ids, unrestorable_header_model_ids, header_restore_version, models
+			)
+			SELECT provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
+				header_omitted_model_ids, unrestorable_header_model_ids, header_restore_version, ?
+			FROM model_cache WHERE provider_id = 'rewrite-test'`,
+			[replacement],
+		);
+		db.close();
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual([
+			"a",
+			"legacy",
+		]);
+	});
+
+	it("re-reads and rewrites a payload edited in place", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+		const edited = payloadFor(["a", "edited"]);
+		const db = new Database(dbPath);
+		db.run("UPDATE model_cache SET models = ? WHERE provider_id = 'rewrite-test'", [edited]);
+		db.close();
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual([
+			"a",
+			"edited",
+		]);
+
+		// Writing the original snapshot again must replace the edited row, not skip it as unchanged.
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+	});
+
 	it("does not re-persist an unchanged snapshot while discovery keeps failing", async () => {
 		let online = true;
 		let clock = 10_000;
@@ -230,6 +290,87 @@ describe("model cache write churn", () => {
 		expect(entry?.updatedAt).toBe(clock);
 		expect(entry?.authoritative).toBe(false);
 		expect(entry?.models.map(m => m.id).sort()).toEqual(["dynamic-a", "static-a"]);
+	});
+
+	it.each(["google-antigravity", "google-gemini-cli"] as const)(
+		"isolates %s cached model rosters across credentials and endpoints",
+		async providerId => {
+			const options = (oauthToken: string, roster: string, endpoint?: string) => {
+				const modelId = `gemini-2.5-${roster}`;
+				const fetcher: FetchImpl = async input =>
+					String(input).includes(":fetchAvailableModels")
+						? Response.json({ models: { [modelId]: { displayName: modelId, supportsThinking: true } } })
+						: new Response("version: 2.19.1\n");
+				const managerOptions =
+					providerId === "google-antigravity"
+						? {
+								...googleAntigravityModelManagerOptions({
+									resolveAccounts: async () => [{ accessToken: oauthToken }],
+									endpoint,
+									fetch: fetcher,
+								}),
+								cacheProviderId: `${resolveModelCacheProviderId(providerId, {
+									apiKey: JSON.stringify([`token:${oauthToken}`]),
+									baseUrl: endpoint,
+								})}:union-v2`,
+							}
+						: googleGeminiCliModelManagerOptions({ oauthToken, endpoint, fetch: fetcher });
+				return {
+					...managerOptions,
+					cacheDbPath: dbPath,
+				};
+			};
+			const resolvedIds = (result: Awaited<ReturnType<typeof resolveProviderModels>>) =>
+				result.models.map(row => row.id);
+
+			expect(resolvedIds(await resolveProviderModels(options("account-a", "account-a"), "online"))).toContain(
+				"gemini-2.5-account-a",
+			);
+			const accountB = resolvedIds(
+				await resolveProviderModels(options("account-b", "account-b"), "online-if-uncached"),
+			);
+			expect(accountB).toContain("gemini-2.5-account-b");
+			expect(accountB).not.toContain("gemini-2.5-account-a");
+			const endpointB = resolvedIds(
+				await resolveProviderModels(
+					options("account-b", "endpoint-b", "https://google-roster-proxy.example"),
+					"online-if-uncached",
+				),
+			);
+			expect(endpointB).toContain("gemini-2.5-endpoint-b");
+			expect(endpointB).not.toContain("gemini-2.5-account-b");
+			expect(
+				resolvedIds(await resolveProviderModels(options("account-b", "unexpected-online-b"), "offline")),
+			).toContain("gemini-2.5-account-b");
+			expect(
+				resolvedIds(await resolveProviderModels(options("account-a", "unexpected-online-a"), "offline")),
+			).toContain("gemini-2.5-account-a");
+		},
+	);
+
+	it("isolates Gemini CLI quota caches across projects on one credential", async () => {
+		const options = (projectId: string) => ({
+			...googleGeminiCliModelManagerOptions({
+				oauthToken: "workspace-account",
+				projectId,
+				fetch: async (input, init) => {
+					const url = String(input);
+					if (url.includes(":fetchAvailableModels")) return new Response("Forbidden", { status: 403 });
+					if (url.includes(":retrieveUserQuota")) {
+						const body = JSON.parse(String(init?.body)) as { project: string };
+						return Response.json({ buckets: [{ modelId: `gemini-2.5-${body.project}` }] });
+					}
+					return new Response("version: 2.19.1\n");
+				},
+			}),
+			cacheDbPath: dbPath,
+		});
+		await resolveProviderModels(options("project-a"), "online");
+		const projectB = await resolveProviderModels(options("project-b"), "online-if-uncached");
+		expect(projectB.models.map(row => row.id)).toContain("gemini-2.5-project-b");
+		expect(projectB.models.map(row => row.id)).not.toContain("gemini-2.5-project-a");
+		const projectA = await resolveProviderModels(options("project-a"), "offline");
+		expect(projectA.models.map(row => row.id)).toContain("gemini-2.5-project-a");
 	});
 
 	it("reads back every bundled provider snapshot it writes", () => {

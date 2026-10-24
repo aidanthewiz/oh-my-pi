@@ -2,12 +2,13 @@ import { describe, expect, it } from "bun:test";
 import type { Api } from "@oh-my-pi/pi-ai/types";
 import {
 	coerceServiceTierByFamily,
-	getPriorityPremiumRequests,
+	getPremiumServiceTierRequests,
 	realizesPriorityServiceTier,
 	resolveModelServiceTier,
 	serviceTierFamily,
 	shouldSendServiceTier,
 } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 
 const m = (provider: string, api: Api, id: string) => ({
@@ -80,6 +81,72 @@ describe("resolveModelServiceTier", () => {
 });
 
 describe("shouldSendServiceTier", () => {
+	it("admits unadvertised Ultrafast only for the exact official Codex Sol route", () => {
+		const spec = {
+			id: "gpt-6.1-sol",
+			name: "Sol",
+			api: "openai-codex-responses" as const,
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"] as "text"[],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		for (const serviceTiers of [undefined, [], ["priority"]]) {
+			const model = buildModel({ ...spec, serviceTiers });
+			expect(shouldSendServiceTier("ultrafast", model)).toBe(true);
+			expect(getPremiumServiceTierRequests("ultrafast", model)).toBe(1);
+			expect(shouldSendServiceTier(undefined, model)).toBe(false);
+			expect(shouldSendServiceTier("auto", model)).toBe(false);
+			expect(shouldSendServiceTier("default", model)).toBe(true);
+			expect(shouldSendServiceTier("flex", model)).toBe(true);
+			expect(shouldSendServiceTier("priority", model)).toBe(true);
+		}
+		for (const route of [
+			{ id: "gpt-6-sol" },
+			{ id: "gpt-unknown" },
+			{ provider: "custom-relay" },
+			{ baseUrl: "https://relay.invalid/backend-api" },
+			{ baseUrl: "https://chatgpt.com.evil.invalid/backend-api" },
+			{ baseUrl: "http://chatgpt.com/backend-api" },
+			{ baseUrl: "https://chatgpt.com/backend-apix" },
+			{ baseUrl: "https://chatgpt.com:444/backend-api" },
+			{ baseUrl: "not a URL" },
+			{ requestModelId: "gpt-6-sol" },
+			{ requestModelId: "" },
+			{ id: "sol-alias", requestModelId: spec.id },
+		]) {
+			const model = buildModel({ ...spec, ...route, serviceTiers: ["priority"] });
+			expect(shouldSendServiceTier("ultrafast", model)).toBe(false);
+			expect(getPremiumServiceTierRequests("ultrafast", model)).toBe(0);
+			expect(
+				shouldSendServiceTier("ultrafast", buildModel({ ...spec, ...route, serviceTiers: ["ultrafast"] })),
+			).toBe(true);
+		}
+		for (const api of ["openai-responses", "openai-completions"] as const) {
+			expect(shouldSendServiceTier("ultrafast", buildModel({ ...spec, api }))).toBe(false);
+		}
+		for (const baseUrl of [
+			undefined,
+			"",
+			"https://chatgpt.com/backend-api/",
+			"https://chatgpt.com/backend-api/codex/responses",
+		]) {
+			expect(shouldSendServiceTier("ultrafast", { ...buildModel(spec), baseUrl })).toBe(true);
+		}
+		expect(shouldSendServiceTier("ultrafast", buildModel({ ...spec, requestModelId: spec.id }))).toBe(true);
+		const model = buildModel(spec);
+		const historical = { provider: model.provider, api: model.api, identity: model.identity };
+		expect(shouldSendServiceTier("ultrafast", historical)).toBe(false);
+		expect(getPremiumServiceTierRequests("ultrafast", historical, { served: true })).toBe(1);
+		expect(serviceTierFamily(historical)).toBe("openai");
+		expect(resolveModelServiceTier({ openai: "priority" }, historical)).toBe("priority");
+		expect(shouldSendServiceTier("priority", buildModel({ ...spec, serviceTiers: ["ultrafast"] }))).toBe(false);
+		expect(shouldSendServiceTier("scale", buildModel({ ...spec, serviceTiers: ["priority"] }))).toBe(false);
+	});
+
 	it("sends every explicit tier on the OpenAI family, omits auto, supported tiers elsewhere", () => {
 		for (const p of ["openai", "openai-codex"] as const) {
 			expect(shouldSendServiceTier("flex", p)).toBe(true);
@@ -133,7 +200,7 @@ describe("shouldSendServiceTier", () => {
 		const unlisted = { ...codex, serviceTiers: ["ultrafast"] };
 		expect(shouldSendServiceTier("priority", unlisted)).toBe(false);
 		expect(realizesPriorityServiceTier("priority", unlisted)).toBe(false);
-		expect(getPriorityPremiumRequests("priority", unlisted)).toBe(0);
+		expect(getPremiumServiceTierRequests("priority", unlisted)).toBe(0);
 		expect(shouldSendServiceTier("scale", unlisted)).toBe(false);
 		expect(shouldSendServiceTier("priority", { ...codex, serviceTiers: ["priority"] })).toBe(true);
 		// An empty list means "not reported" (free-plan accounts list [] for every model): Fast stays available.
@@ -178,22 +245,51 @@ describe("realizesPriorityServiceTier", () => {
 	});
 });
 
-describe("getPriorityPremiumRequests", () => {
+describe("getPremiumServiceTierRequests", () => {
 	it("counts one premium request per realized priority on billing providers", () => {
-		expect(getPriorityPremiumRequests("priority", openai)).toBe(1);
-		expect(getPriorityPremiumRequests("priority", codex)).toBe(1);
-		expect(getPriorityPremiumRequests("priority", anthropic)).toBe(1);
-		expect(getPriorityPremiumRequests("priority", gemini)).toBe(1);
-		expect(getPriorityPremiumRequests("priority", vertexGemini)).toBe(1);
+		expect(getPremiumServiceTierRequests("priority", openai)).toBe(1);
+		expect(getPremiumServiceTierRequests("priority", codex)).toBe(1);
+		expect(getPremiumServiceTierRequests("priority", anthropic)).toBe(1);
+		expect(getPremiumServiceTierRequests("priority", gemini)).toBe(1);
+		expect(getPremiumServiceTierRequests("priority", vertexGemini)).toBe(1);
+	});
+
+	it("counts ultrafast on the OpenAI family only where the wire sends it", () => {
+		expect(getPremiumServiceTierRequests("ultrafast", openai)).toBe(1);
+		// Codex-backend models realize ultrafast only when discovery advertises it.
+		expect(getPremiumServiceTierRequests("ultrafast", codex)).toBe(0);
+		expect(getPremiumServiceTierRequests("ultrafast", { ...codex, serviceTiers: ["ultrafast"] })).toBe(1);
+		// Relays, OpenRouter, and other families never bill it as a premium request.
+		expect(getPremiumServiceTierRequests("ultrafast", customOpenAI)).toBe(0);
+		expect(getPremiumServiceTierRequests("ultrafast", orOpenAI)).toBe(0);
+		expect(getPremiumServiceTierRequests("ultrafast", gemini)).toBe(0);
+	});
+
+	it("trusts a served tier over the discovery gate", () => {
+		// A recorded served tier is proof the tier reached the wire, so a
+		// stats-backfill row without discovery metadata still counts.
+		expect(getPremiumServiceTierRequests("ultrafast", codex, { served: true })).toBe(1);
+		expect(getPremiumServiceTierRequests("ultrafast", customOpenAI, { served: true })).toBe(0);
+		// The family gate still applies: a non-OpenAI provider never bills it.
+		expect(getPremiumServiceTierRequests("ultrafast", gemini, { served: true })).toBe(0);
+		// `served` does not invent premium weight for a standard tier.
+		expect(getPremiumServiceTierRequests("default", openai, { served: true })).toBe(0);
+		// Priority follows the same rule: a Codex model whose discovered list omits
+		// it still counts when the response reported serving it.
+		const unlisted = { ...codex, serviceTiers: ["ultrafast"] };
+		expect(getPremiumServiceTierRequests("priority", unlisted)).toBe(0);
+		expect(getPremiumServiceTierRequests("priority", unlisted, { served: true })).toBe(1);
+		// The provider allowlist is not bypassed.
+		expect(getPremiumServiceTierRequests("priority", { ...orOpenAI, serviceTiers: [] }, { served: true })).toBe(0);
 	});
 
 	it("does not bill OpenRouter, unrealized, or non-priority traffic", () => {
-		expect(getPriorityPremiumRequests("priority", orOpenAI)).toBe(0); // OpenRouter bills its own way
-		expect(getPriorityPremiumRequests("priority", vertexClaude)).toBe(0); // not realized
-		expect(getPriorityPremiumRequests("priority", fireworks)).toBe(0); // realized but not Copilot-premium
-		expect(getPriorityPremiumRequests("priority", fireworksOpenAI)).toBe(0); // dedicated provider tier
-		expect(getPriorityPremiumRequests("flex", openai)).toBe(0);
-		expect(getPriorityPremiumRequests(undefined, openai)).toBe(0);
+		expect(getPremiumServiceTierRequests("priority", orOpenAI)).toBe(0); // OpenRouter bills its own way
+		expect(getPremiumServiceTierRequests("priority", vertexClaude)).toBe(0); // not realized
+		expect(getPremiumServiceTierRequests("priority", fireworks)).toBe(0); // realized but not Copilot-premium
+		expect(getPremiumServiceTierRequests("priority", fireworksOpenAI)).toBe(0); // dedicated provider tier
+		expect(getPremiumServiceTierRequests("flex", openai)).toBe(0);
+		expect(getPremiumServiceTierRequests(undefined, openai)).toBe(0);
 	});
 });
 

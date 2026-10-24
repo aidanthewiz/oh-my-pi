@@ -181,6 +181,42 @@ describe("ModelRegistry managed models overlay", () => {
 		expect(registry().getError()).toBeDefined();
 	});
 
+	test("diagnostics retain both source paths before managed compatibility overrides replace user values", async () => {
+		const userConfig = JSON.stringify({
+			providers: {
+				custom: {
+					baseUrl: "https://example.test/v1",
+					auth: "none",
+					api: "openai-completions",
+					compat: { supportsStroe: false, supportsStore: false },
+					models: [{ id: "custom-model" }],
+				},
+			},
+		});
+		const managedConfig = JSON.stringify({
+			providers: { custom: { compat: { supportsStroe: true, supportsStore: true } } },
+		});
+		fs.writeFileSync(modelsPath, userConfig);
+		fs.writeFileSync(managedPath, managedConfig);
+		const reg = registry();
+		expect(reg.getError()).toBeUndefined();
+		expect(reg.find("custom", "custom-model")?.compatConfig).toMatchObject({
+			supportsStroe: true,
+			supportsStore: true,
+		});
+		const warnings = reg.drainConfigWarnings();
+		expect(warnings).toHaveLength(2);
+		for (const sourcePath of [modelsPath, managedPath]) {
+			expect(warnings.filter(warning => warning.includes(`${sourcePath}:`))).toEqual([
+				expect.stringContaining("providers.custom.compat.supportsStroe"),
+			]);
+		}
+		await reg.refresh("offline", { refreshCommandCredentials: true });
+		expect(reg.drainConfigWarnings()).toEqual([]);
+		expect(fs.readFileSync(modelsPath, "utf8")).toBe(userConfig);
+		expect(fs.readFileSync(managedPath, "utf8")).toBe(managedConfig);
+	});
+
 	test("managed-only edit invalidates the stale-refresh fast-path", async () => {
 		fs.writeFileSync(
 			managedPath,

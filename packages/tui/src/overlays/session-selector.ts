@@ -41,6 +41,8 @@ export interface SessionSelectorEntry {
 	id: string;
 	cwd: string;
 	title?: string;
+	/** Host-owned formatting evaluated when this entry is displayed. */
+	titlePresentation?(): string;
 	modified: Date;
 	created?: Date;
 	size: number;
@@ -117,8 +119,12 @@ function sessionStatusTone(status: SessionSelectorStatus | undefined): TspTone |
 
 /** The name a session goes by: its title, else its first message on one line, else its id. */
 function sessionLabel(session: SessionSelectorEntry): string {
-	const title = session.title ? plainText(session.title).trim() : "";
+	const title = plainText(session.titlePresentation?.() ?? session.title ?? "").trim();
 	return title || plainText(session.firstMessage).replace(/\s+/g, " ").trim() || session.id;
+}
+
+function sessionTitleForSearch(session: SessionSelectorEntry): string {
+	return session.title?.trim() ? sessionLabel(session) : "";
 }
 
 /** Longest prompt or answer excerpt the native preview shows. */
@@ -179,9 +185,13 @@ function sessionPreview(session: SessionSelectorEntry, forkedFrom: string | unde
 	]);
 }
 
+/** Absolute dates of week-old sessions; `toLocaleDateString` goes through Intl on every call. */
+const localeDateCache = new WeakMap<Date, { time: number; text: string }>();
+
 /** Relative age of a session's last modification (`"3 hours ago"`), falling back to the date after a week. */
 function formatSessionDate(date: Date): string {
-	const diffMs = Date.now() - date.getTime();
+	const time = date.getTime();
+	const diffMs = Date.now() - time;
 	const diffMins = Math.floor(diffMs / 60000);
 	const diffHours = Math.floor(diffMs / 3600000);
 	const diffDays = Math.floor(diffMs / 86400000);
@@ -192,11 +202,16 @@ function formatSessionDate(date: Date): string {
 	if (diffDays === 1) return "1 day ago";
 	if (diffDays < 7) return `${diffDays} days ago`;
 
-	return date.toLocaleDateString();
+	const cached = localeDateCache.get(date);
+	if (cached?.time === time) return cached.text;
+	const text = date.toLocaleDateString();
+	localeDateCache.set(date, { time, text });
+	return text;
 }
 
 /** A cached native session item and the inputs it was built from. */
 interface SessionItemMemo {
+	label: string;
 	node: NativeNode;
 	date: string;
 	pinned: boolean;
@@ -213,6 +228,7 @@ interface NativeSessionInfo extends SessionSelectorEntry {
 
 /** The session picker's catalogue: one item per session in scope, and the inputs it was built from. */
 interface SessionCatalogue {
+	labels: readonly string[];
 	version: number;
 	showCwd: boolean;
 	currentPath: string | undefined;
@@ -258,10 +274,11 @@ const SCOPE_TABS: readonly { id: "folder" | "all"; label: string }[] = [
 /** Returns the IDs of sessions whose recorded prompts match a query, best first. */
 export type SessionHistoryMatcher = (query: string) => string[];
 
-function sessionSearchText(session: SessionSelectorEntry): string {
+function sessionSearchText(session: SessionSelectorEntry, displayTitle: string): string {
 	const parts = [
 		session.id,
 		session.title ?? "",
+		displayTitle === session.title ? "" : displayTitle,
 		session.cwd ?? "",
 		session.firstMessage ?? "",
 		session.allMessagesText,
@@ -271,28 +288,32 @@ function sessionSearchText(session: SessionSelectorEntry): string {
 }
 
 /**
- * Lowercased per-session search haystack, built once and cached on the
- * {@link SessionSelectorEntry} itself (so it dies with the listing that produced it).
+ * Lowercased per-session search haystack, cached while its displayed title is unchanged
+ * on the {@link SessionSelectorEntry} itself, so it dies with its listing.
  * Rebuilding it per keystroke — a ~4KB string join plus `toLowerCase` per
  * session — was one of the costs that made resume search visibly lag.
  *
- * Only the string is cached. A prebuilt fuzzy index (~60KB per 4KB session)
+ * Only the haystack and displayed title are cached. A prebuilt fuzzy index (~60KB per 4KB session)
  * would cost hundreds of MB on multi-thousand-session listings, so fuzzy
  * indexes are built transiently per scan visit instead (see
  * {@link scoreFuzzySession} callers).
  */
 const kSearchTextLower = Symbol("session.searchTextLower");
+const kSearchPresentation = Symbol("session.searchPresentation");
 
 interface SearchableSessionInfo extends SessionSelectorEntry {
 	[kSearchTextLower]?: string;
+	[kSearchPresentation]?: string;
 }
 
 function sessionTextLower(session: SessionSelectorEntry): string {
 	const tagged = session as SearchableSessionInfo;
+	const displayTitle = sessionTitleForSearch(session);
 	let textLower = tagged[kSearchTextLower];
-	if (textLower === undefined) {
-		textLower = sessionSearchText(session).toLowerCase();
+	if (textLower === undefined || tagged[kSearchPresentation] !== displayTitle) {
+		textLower = sessionSearchText(session, displayTitle).toLowerCase();
 		tagged[kSearchTextLower] = textLower;
+		tagged[kSearchPresentation] = displayTitle;
 	}
 	return textLower;
 }
@@ -374,8 +395,9 @@ function prioritizeTitleMatches<T extends SessionSelectorEntry>(
 	// Title hits are literal matches, already ranked by recency and source index.
 	for (const { session } of literal) {
 		const title = session.title?.trim().toLowerCase().replace(/\s+/g, " ");
-		if (title === query) exact.push(session);
-		else if (title && isLiteralMatch(title, tokens)) partial.push(session);
+		const displayTitle = sessionTitleForSearch(session).toLowerCase().replace(/\s+/g, " ");
+		if (title === query || displayTitle === query) exact.push(session);
+		else if ((title && isLiteralMatch(title, tokens)) || isLiteralMatch(displayTitle, tokens)) partial.push(session);
 		else continue;
 		titleMatches.add(session);
 	}
@@ -517,12 +539,12 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	readonly #getCurrentSessionPath: () => string | undefined;
 	readonly #historyMatcher?: SessionHistoryMatcher;
 	#historyMergeTimer: NodeJS.Timeout | undefined;
-	/** Re-render hook for async list updates (fuzzy scan chunks, history merge). */
+	/** Re-render hook for async list updates (fuzzy scan completion, history merge). */
 	onRequestRender?: () => void;
 
 	// ── Incremental search state ──────────────────────────────────────────
 	// The menu's visible list is always composed from these three inputs (see
-	// #composeFiltered), so late-arriving fuzzy chunks and the debounced
+	// #composeFiltered), so a late-finishing fuzzy scan and the debounced
 	// history merge can land in any order without clobbering each other.
 	/** Recency-ranked sessions whose text contains every query token verbatim. */
 	#literalRanked: RankedSessionMatch<T>[] = [];
@@ -535,8 +557,8 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	#scanTimer: NodeJS.Timeout | undefined;
 	/**
 	 * True once the user moved the selection for the current query; blocks the
-	 * history merge from reordering the list under their cursor. (Fuzzy chunks
-	 * only append below the literal group, which never shifts existing rows.)
+	 * history merge from reordering the list under their cursor. (The fuzzy scan
+	 * only appends below the literal group, which never shifts existing rows.)
 	 */
 	#selectionMoved = false;
 	/** True after a nonempty query; empty refilter restores current only then. */
@@ -545,8 +567,16 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	#lastFilterQuery = "";
 	/** Bumped whenever the visible session set may have changed (native memo key). */
 	#itemsVersion = 0;
+	/** Per-row line heights of the visible list for the ANSI window, reused until the set changes. */
+	#rowHeights: { items: readonly T[]; length: number; version: number; heights: readonly number[] } | undefined;
 	#itemsNative:
-		| { version: number; showCwd: boolean; currentPath: string | undefined; items: NativeNode[] }
+		| {
+				version: number;
+				labels: readonly string[];
+				showCwd: boolean;
+				currentPath: string | undefined;
+				items: NativeNode[];
+		  }
 		| undefined;
 	#listNative:
 		| { items: readonly NativeNode[]; selected: string | undefined; query: string; node: NativeNode }
@@ -577,7 +607,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		this.#historyMatcher = historyMatcher;
 		this.#menu = new MenuSelection<T>(sessions, {
 			getKey: session => session.path,
-			getSearchText: sessionSearchText,
+			getSearchText: session => sessionSearchText(session, sessionTitleForSearch(session)),
 		});
 		this.#selectCurrentSession();
 		this.#searchInput = new Input();
@@ -677,38 +707,48 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		// Fuzzy pass: building a fuzzy index per session is too expensive to run
 		// across a huge listing inside one keystroke, so scan a bounded slice now
 		// and spill the remainder into async chunks.
-		this.#scanFuzzySlice(this.#scanGeneration, tokens, rest, 0, FUZZY_SCAN_INLINE_COUNT);
+		const inlineEnd = Math.min(rest.length, FUZZY_SCAN_INLINE_COUNT);
+		this.#scoreFuzzy(tokens, rest, 0, inlineEnd);
 		this.#composeFiltered();
+		if (inlineEnd < rest.length) {
+			this.#scheduleFuzzyScan(this.#scanGeneration, tokens, rest, inlineEnd, this.#fuzzyRanked.length);
+		}
 		// New query rebuilds ranking from scratch. Same-query refilter (delete)
-		// and async compose (fuzzy chunks / history merge) only clamp so an
+		// and async compose (fuzzy scan / history merge) only clamp so an
 		// arrow selection survives. A live-session index > 0 would otherwise
 		// land on a lower-ranked match after the first keystroke.
 		if (queryChanged) this.#menu.setSelectedIndex(0);
 		this.#scheduleHistoryMerge(query);
 	}
 
-	/**
-	 * Score up to `budget` sessions from `rest[start..]` (indexes into the
-	 * unfiltered list), then schedule the remainder on a macrotask so pending
-	 * input events run first. Chunks that added matches recompose the visible
-	 * list and request a render; a stale generation aborts silently.
-	 */
-	#scanFuzzySlice(generation: number, tokens: string[], rest: number[], start: number, budget: number): void {
+	/** Fuzzy-score `rest[start..end)` (indexes into the unfiltered list) into {@link #fuzzyRanked}. */
+	#scoreFuzzy(tokens: string[], rest: number[], start: number, end: number): void {
 		const all = this.#allSessions;
-		const end = Math.min(rest.length, start + budget);
 		for (let i = start; i < end; i++) {
 			const index = rest[i]!;
 			const session = all[index]!;
 			const match = scoreFuzzySession(session, index, tokens, new FuzzyText(sessionTextLower(session)));
 			if (match) this.#fuzzyRanked.push(match);
 		}
-		if (end >= rest.length) return;
+	}
+
+	/**
+	 * Score `rest[start..]` in {@link FUZZY_SCAN_CHUNK_COUNT}-session macrotask
+	 * chunks so pending input runs between them, then recompose the visible
+	 * list once if the scan matched more than the `shown` fuzzy hits already
+	 * composed. Publishing per chunk reorders the list dozens of times per
+	 * keystroke on a large listing, and the native picker replays its
+	 * row-arrival animation on every reorder. A stale generation aborts silently.
+	 */
+	#scheduleFuzzyScan(generation: number, tokens: string[], rest: number[], start: number, shown: number): void {
 		this.#scanTimer = setTimeout(() => {
 			this.#scanTimer = undefined;
 			if (generation !== this.#scanGeneration) return;
-			const before = this.#fuzzyRanked.length;
-			this.#scanFuzzySlice(generation, tokens, rest, end, FUZZY_SCAN_CHUNK_COUNT);
-			if (this.#fuzzyRanked.length > before) {
+			const end = Math.min(rest.length, start + FUZZY_SCAN_CHUNK_COUNT);
+			this.#scoreFuzzy(tokens, rest, start, end);
+			if (end < rest.length) {
+				this.#scheduleFuzzyScan(generation, tokens, rest, end, shown);
+			} else if (this.#fuzzyRanked.length > shown) {
 				this.#composeFiltered();
 				this.onRequestRender?.();
 			}
@@ -730,7 +770,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 			tokenizeSessionQuery(this.#searchInput.getValue()),
 			this.#literalRanked,
 		);
-		// Async chunks and the history merge only clamp the cursor so an arrow
+		// The fuzzy scan and the history merge only clamp the cursor so an arrow
 		// selection survives recomposition; the query path resets explicitly.
 		const keepIndex = Math.min(this.#menu.selectedIndex, Math.max(0, composed.length - 1));
 		this.#menu.setItems(composed, keepIndex >= 0 ? composed[keepIndex]?.path : undefined);
@@ -923,13 +963,16 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	#catalogue(): SessionCatalogue {
 		const currentPath = this.#getCurrentSessionPath();
 		const minute = Math.floor(Date.now() / 60_000);
+		const labels = this.#allSessions.map(sessionLabel);
 		const cached = this.#pickerCatalogue;
 		if (
 			cached?.version === this.#datasetVersion &&
 			cached.showCwd === this.#showCwd &&
 			cached.currentPath === currentPath &&
 			cached.pinnedIds === this.#pinnedIds &&
-			cached.minute === minute
+			cached.minute === minute &&
+			cached.labels.length === labels.length &&
+			cached.labels.every((label, index) => label === labels[index])
 		) {
 			return cached;
 		}
@@ -942,6 +985,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		});
 		this.#pickerPatched.clear();
 		const catalogue: SessionCatalogue = {
+			labels,
 			version: this.#datasetVersion,
 			showCwd: this.#showCwd,
 			currentPath,
@@ -956,7 +1000,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 
 	#pickerItem(session: T, currentPath: string | undefined, now: number): TspPickerItem {
 		const message = plainText(session.firstMessage).replace(/\s+/g, " ").trim();
-		const title = session.title ? plainText(session.title).trim() : "";
+		const title = plainText(session.titlePresentation?.() ?? session.title ?? "").trim();
 		const badges: { text: string; tone?: TspTone; title?: string }[] = [];
 		if (session.parentSessionPath) {
 			badges.push({ text: "fork", title: `Forked from “${this.parentLabel(session.parentSessionPath)}”` });
@@ -1025,14 +1069,18 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 	 */
 	describeList(): NativeNode {
 		const currentPath = this.#getCurrentSessionPath();
+		const labels = this.#menu.visibleItems.map(sessionLabel);
 		let items = this.#itemsNative;
 		if (
 			items?.version !== this.#itemsVersion ||
 			items.showCwd !== this.#showCwd ||
-			items.currentPath !== currentPath
+			items.currentPath !== currentPath ||
+			items.labels.length !== labels.length ||
+			items.labels.some((label, index) => label !== labels[index])
 		) {
 			items = {
 				version: this.#itemsVersion,
+				labels,
 				showCwd: this.#showCwd,
 				currentPath,
 				items: this.#menu.visibleItems.map(session => this.#describeSession(session, currentPath)),
@@ -1061,9 +1109,11 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		const pinned = this.#pinnedIds.has(session.id);
 		const current = currentPath !== undefined && session.path === currentPath;
 		const tagged = session as NativeSessionInfo;
+		const label = sessionLabel(session);
 		const cached = tagged[kNativeItem];
 		if (
 			cached?.date === date &&
+			cached.label === label &&
 			cached.pinned === pinned &&
 			cached.current === current &&
 			cached.showCwd === this.#showCwd
@@ -1085,7 +1135,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		const item = node(
 			"item",
 			{
-				label: (session.title && plainText(session.title)) || message || session.id,
+				label,
 				detail: detail.length > 0 ? detail : undefined,
 				value: [span(`${date} ${theme.sep.dot} ${formatBytes(session.size)}`, "dim")],
 				icon: pinned ? "pin" : undefined,
@@ -1093,7 +1143,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 			undefined,
 			session.path,
 		);
-		tagged[kNativeItem] = { node: item, date, pinned, current, showCwd: this.#showCwd };
+		tagged[kNativeItem] = { node: item, date, pinned, current, showCwd: this.#showCwd, label };
 		return item;
 	}
 
@@ -1130,14 +1180,13 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		// worst-case count-based window would leave (then padded by
 		// fill-height).
 		const filtered = this.#menu.visibleItems;
-		const itemHeight = (session: T): number => (session.title ? 4 : 3);
 		const budget = this.#lineBudget();
 		const {
 			startIndex,
 			endIndex,
 			rowOffset: offsetRows,
 			totalRows: rawTotalRows,
-		} = getMenuWindow(filtered.map(itemHeight), this.#menu.selectedIndex, budget);
+		} = getMenuWindow(this.#visibleRowHeights(filtered), this.#menu.selectedIndex, budget);
 
 		// Each session block is built into sessionLines, then wrapped by ScrollView
 		// so the right-edge scrollbar is proportional at the physical-line level.
@@ -1167,7 +1216,7 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 
 			if (session.title) {
 				// Has title: show title on first line, dimmed first message on second line
-				const truncatedTitle = truncateToWidth(session.title, maxTextWidth);
+				const truncatedTitle = truncateToWidth(sessionLabel(session), maxTextWidth);
 				const titleLine = `${cursor}${pinPrefix}${isSelected ? theme.bold(truncatedTitle) : truncatedTitle}`;
 				sessionLines.push(titleLine);
 
@@ -1230,6 +1279,17 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		lines.push(...svLines);
 
 		return lines;
+	}
+
+	/** Line height per visible session (3, or 4 when a title adds a preview line), memoized per visible set. */
+	#visibleRowHeights(items: readonly T[]): readonly number[] {
+		const cached = this.#rowHeights;
+		if (cached?.items === items && cached.length === items.length && cached.version === this.#itemsVersion) {
+			return cached.heights;
+		}
+		const heights = items.map(session => (session.title ? 4 : 3));
+		this.#rowHeights = { items, length: items.length, version: this.#itemsVersion, heights };
+		return heights;
 	}
 
 	handleInput(keyData: string): void {
@@ -1310,7 +1370,11 @@ export interface SessionSelectorOptions<T extends SessionSelectorEntry = Session
 	title?: string;
 	/** Fixed scope label, or false to omit the scope suffix. */
 	scopeLabel?: string | false;
-	/** Show each session's working directory in the list. */
+	/**
+	 * Show each session's working directory in the list. Defaults to on when
+	 * the session files live in more than one directory (e.g. the folder scope
+	 * merging a repository's worktrees).
+	 */
 	showCwd?: boolean;
 	/**
 	 * Reads the live terminal height so the visible window fits the viewport.
@@ -1354,6 +1418,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	#onRequestRender?: () => void;
 	readonly #loadAllSessions?: () => Promise<T[]>;
 	#folderSessions: T[];
+	readonly #folderShowCwd: boolean;
 	#globalSessions: T[] | null = null;
 	#scope: "folder" | "all" = "folder";
 	#toggling = false;
@@ -1381,7 +1446,14 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	/** The open delete confirmation's two answers, for the picker's confirm strip. */
 	#deleteChoice: DeleteChoice<T> | null = null;
 	/** The preview pane's content and the session it shows; follows the selection once it settles. */
-	#preview: { session: T | undefined; nodes: readonly NativeChild[] } | undefined;
+	#preview:
+		| {
+				session: T | undefined;
+				label: string | undefined;
+				parentLabel: string | undefined;
+				nodes: readonly NativeChild[];
+		  }
+		| undefined;
 	#previewPending: T | undefined;
 	#previewSettled: T | undefined;
 	#previewTimer: NodeJS.Timeout | undefined;
@@ -1420,6 +1492,9 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 		this.#onDelete = options.onDelete;
 		this.#loadAllSessions = options.loadAllSessions;
 		this.#folderSessions = sessions;
+		// Storage directory, not recorded cwd: one folder's sessions may record
+		// symlink aliases of the same path, which must not turn the column on.
+		this.#folderShowCwd = options.showCwd ?? new Set(sessions.map(session => path.dirname(session.path))).size > 1;
 		this.#globalSessions = options.allSessions ?? null;
 		this.#getTerminalRows = options.getTerminalRows ?? (() => 24);
 		this.#fillHeight = options.fillHeight ?? false;
@@ -1437,7 +1512,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 		// projects' history (issue #3099).
 		this.#sessionList = new SessionList(
 			sessions,
-			options.showCwd ?? false,
+			this.#folderShowCwd,
 			options.historyMatcher,
 			options.getTerminalRows,
 			options.pinnedIds,
@@ -1510,7 +1585,7 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 			this.#sessionList.setSessions(global, true);
 		} else {
 			this.#scope = "folder";
-			this.#sessionList.setSessions(this.#folderSessions, false);
+			this.#sessionList.setSessions(this.#folderSessions, this.#folderShowCwd);
 		}
 		this.title = this.#headerLabel();
 		this.#onRequestRender?.();
@@ -1553,7 +1628,8 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	}
 
 	#showDeleteConfirmation(session: T): void {
-		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
+		const displayName =
+			session.titlePresentation?.() || session.title || session.firstMessage.slice(0, 40) || session.id;
 		const closeDialog = () => {
 			this.#confirmationDialog = null;
 			this.#deleteChoice = null;
@@ -1799,8 +1875,13 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 	 */
 	#previewFor(target: T | undefined): readonly NativeChild[] {
 		const shown = this.#preview;
-		if (shown && shown.session === target) return shown.nodes;
-		if (shown && target !== this.#previewSettled) {
+		const label = target ? sessionLabel(target) : undefined;
+		const parentLabel = target?.parentSessionPath
+			? this.#sessionList.parentLabel(target.parentSessionPath)
+			: undefined;
+		if (shown && shown.session === target && shown.label === label && shown.parentLabel === parentLabel)
+			return shown.nodes;
+		if (shown && shown.session !== target && target !== this.#previewSettled) {
 			if (this.#previewPending !== target || this.#previewTimer === undefined) {
 				clearTimeout(this.#previewTimer);
 				this.#previewPending = target;
@@ -1812,13 +1893,8 @@ export class SessionSelectorComponent<T extends SessionSelectorEntry = SessionSe
 			}
 			return shown.nodes;
 		}
-		const nodes = target
-			? sessionPreview(
-					target,
-					target.parentSessionPath ? this.#sessionList.parentLabel(target.parentSessionPath) : undefined,
-				)
-			: [];
-		this.#preview = { session: target, nodes };
+		const nodes = target ? sessionPreview(target, parentLabel) : [];
+		this.#preview = { session: target, label, parentLabel, nodes };
 		return nodes;
 	}
 

@@ -15,6 +15,7 @@ interface CleanseRun {
 	panel: CleansePanelComponent;
 	abortController: AbortController;
 	settled: boolean;
+	sessionId: string;
 }
 
 interface ParsedCleanseArgs {
@@ -57,6 +58,10 @@ export class CleanseCommandController {
 		this.#close(run);
 	}
 
+	disposeSession(sessionId: string): void {
+		if (this.#active?.sessionId === sessionId) this.dispose();
+	}
+
 	async start(args: string): Promise<void> {
 		if (this.#active) {
 			this.ctx.showStatus(
@@ -77,6 +82,7 @@ export class CleanseCommandController {
 			}),
 			abortController: new AbortController(),
 			settled: false,
+			sessionId: this.ctx.sessionManager.getSessionId(),
 		};
 		this.#active = run;
 		this.ctx.cleanseContainer.clear();

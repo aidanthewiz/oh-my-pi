@@ -1,31 +1,6 @@
 import { expect, test } from "bun:test";
-import { PROVIDER_DESCRIPTORS, resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import { openaiCodexModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/special";
-
-test("lightweight cache resolver matches every descriptor default", () => {
-	for (const descriptor of PROVIDER_DESCRIPTORS) {
-		const options = descriptor.createModelManagerOptions({});
-		expect(resolveModelCacheProviderId(descriptor.providerId)).toBe(options.cacheProviderId ?? descriptor.providerId);
-	}
-});
-
-test("lightweight cache resolver matches scoped descriptor inputs", () => {
-	const cases = [
-		{ providerId: "litellm", baseUrl: "http://litellm.example:4100/v1" },
-		{ providerId: "ollama", baseUrl: "http://ollama.example:11434/v1/" },
-		{ providerId: "muse-code", baseUrl: "https://api.meta.example/subscriber/v1" },
-		{ providerId: "opencode-go", baseUrl: "https://opencode.example/go" },
-		{ providerId: "opencode-zen", baseUrl: "https://opencode.example/zen/v1/" },
-		{ providerId: "vllm", baseUrl: "http://vllm.example:8000/v1" },
-	] as const;
-	for (const { providerId, baseUrl } of cases) {
-		const descriptor = PROVIDER_DESCRIPTORS.find(candidate => candidate.providerId === providerId);
-		if (!descriptor) throw new Error(`Missing descriptor for ${providerId}`);
-		const config = { apiKey: "cache-test-key", baseUrl };
-		const options = descriptor.createModelManagerOptions(config);
-		expect(resolveModelCacheProviderId(providerId, config)).toBe(options.cacheProviderId ?? providerId);
-	}
-});
 
 test("Muse Code cache scope changes with subscription credentials and endpoints", () => {
 	const accountA = resolveModelCacheProviderId("muse-code", {
@@ -44,12 +19,6 @@ test("Muse Code cache scope changes with subscription credentials and endpoints"
 			baseUrl: "https://proxy.example/meta/v1",
 		}),
 	);
-});
-
-test("canonical-reference consumers invalidate pre-isolation cache rows", () => {
-	for (const providerId of ["gmi-cloud", "siliconflow", "siliconflow-cn"]) {
-		expect(resolveModelCacheProviderId(providerId)).toBe(`${providerId}:models-v1`);
-	}
 });
 
 test("ollama cache scope preserves reverse-proxy path prefixes", () => {

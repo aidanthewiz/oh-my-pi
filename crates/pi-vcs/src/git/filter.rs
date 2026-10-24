@@ -69,7 +69,8 @@ impl<'repo> WorktreeFilter<'repo> {
 			if !optional_drivers.contains_key(driver.name.as_bstr()) {
 				optional_drivers.insert(driver.name.clone(), !driver.required);
 			}
-			// gix-filter 0.32 checks a single-file child's exit only when required.
+			// gix-filter 0.32 checks a single-file child's exit only when
+			// required.
 			driver.required = true;
 		}
 		let mut encoding_attrs = gix::attrs::search::Outcome::default();

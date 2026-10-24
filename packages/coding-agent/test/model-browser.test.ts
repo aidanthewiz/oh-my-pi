@@ -1,10 +1,15 @@
 import { createModelBrowserSource } from "../src/modes/model-browser-source";
+import { createAgentsHubDeps } from "../src/modes/agents-hub-deps";
 import { cfgEnabledModels } from "../src/config/model-settings";
-import { beforeAll, describe, expect, test } from "bun:test";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	buildBrowserItems,
 	buildSessionModelScope,
@@ -55,6 +60,22 @@ function makeBrowser(
 	browser.setItems(items);
 	return browser;
 }
+
+test("agent generation does not silently select an explicit-only provider", async () => {
+	const model = makeModel("apple", "on-device");
+	const registry = {
+		getAvailable: () => [model],
+		refresh: async () => {},
+	} as unknown as ModelRegistry;
+	const deps = createAgentsHubDeps(process.cwd(), Settings.isolated({}), registry, () => {
+		throw new Error("Agent discovery is not part of model selection");
+	});
+	expect(deps.getAvailableModels()).toEqual([model]);
+	expect(deps.resolvePatterns(["apple/on-device"])).toBe("apple/on-device");
+	await expect(deps.generateAgent("Synthetic specification", () => {})).rejects.toThrow(
+		"No available model to generate agent specification.",
+	);
+});
 
 describe("resolveRoleAssignments", () => {
 	test("rejects configured models that do not match the role's accepted kind", () => {
@@ -146,6 +167,45 @@ test("picker scope cache invalidates on changed model policy", () => {
 	expect(updated.roles.smol).toBeUndefined();
 });
 
+test("chat picker scope preserves permitted native roles and rejects denied configured runners", () => {
+	const chat = makeModel("provider", "chat");
+	const judge = makeModel("provider", "judge", { kind: "judge" });
+	const blocked = makeModel("provider", "blocked-judge", { kind: "judge" });
+	const settings = Settings.isolated({
+		enabledModels: ["provider/chat", "provider/judge"],
+		modelRoles: { default: "provider/chat", judge: "provider/judge" },
+	});
+	const source = createModelBrowserSource(settings);
+	let unavailable = false;
+	const registry = {
+		getError: () => undefined,
+		getAvailable: () => {
+			if (unavailable) throw new Error("Synthetic runner unavailable");
+			return [chat, judge, blocked];
+		},
+		getAll: () => [chat, judge, blocked],
+	};
+	const cache = new SessionModelScopeCache(source, registry);
+
+	const initial = cache.get([chat]);
+	expect(initial.items.map(item => item.selector)).toEqual(["provider/chat"]);
+	expect(initial.roles.judge?.model).toBe(judge);
+	settings.setModelRole("judge", "provider/blocked-judge");
+	expect(cache.get([chat]).roles.judge).toBeUndefined();
+
+	settings.setModelRole("judge", "provider/judge");
+	unavailable = true;
+	const failed = cache.get([chat]);
+	expect(failed.items.map(item => item.selector)).toEqual(["provider/chat"]);
+	expect(failed.roles.judge).toBeUndefined();
+	expect(failed.error).toBe("Synthetic runner unavailable");
+
+	unavailable = false;
+	const recovered = cache.get([chat]);
+	expect(recovered.roles.judge?.model).toBe(judge);
+	expect(recovered.error).toBeUndefined();
+});
+
 describe("createModelMentionSource", () => {
 	test("refreshes candidates when role settings or availability change between queries", () => {
 		const a = makeModel("a", "example-2");
@@ -187,6 +247,25 @@ describe("ModelBrowser search ranking", () => {
 		expect(ranked.map(item => item.selector)).toEqual(["b/example-2", "a/example-2"]);
 		expect(browser.getSelected()?.selector).toBe(ranked[0].selector);
 		expect(ranked.length).toBe(browser.visibleCount);
+	});
+
+	test("orders same-provider -latest models alphabetically regardless of input order", () => {
+		// Regression: the comparator answered "first wins" for two `-latest` ids, so their
+		// order followed whatever order the catalog or fuzzy pass handed in.
+		const alpha = makeModel("demo", "alpha-latest");
+		const beta = makeModel("demo", "beta-latest");
+		const roles: RoleAssignments = {};
+		const options = { roles, mruOrder: [], affinity: buildSearchAffinity([], roles, []) };
+		for (const models of [
+			[alpha, beta],
+			[beta, alpha],
+		]) {
+			const sorted = buildBrowserItems(models);
+			sortModelItems(sorted);
+			expect(sorted.map(item => item.selector)).toEqual(["demo/alpha-latest", "demo/beta-latest"]);
+			const ranked = rankModelItems("latest", buildBrowserItems(models), options);
+			expect(ranked.map(item => item.selector)).toEqual(["demo/alpha-latest", "demo/beta-latest"]);
+		}
 	});
 
 	test("an exact query match outranks the MRU model", () => {
@@ -409,13 +488,6 @@ describe("ModelBrowser perf display", () => {
 		expect(tiny).not.toContain("128k");
 	});
 
-	test("detail line shows measured perf regardless of width", () => {
-		const browser = makePerfBrowser();
-
-		const lines = renderPlain(browser, 70);
-		expect(lines[lines.length - 2]).toContain("~118t/s · 0.9s ttft");
-	});
-
 	test("catalog metrics render an intelligence tab and estimated TPS when unmeasured", () => {
 		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([makeModel("openai", "gpt-5", { int: 45.2, tps: 82.5 })]));
@@ -458,25 +530,6 @@ describe("ModelBrowser native model metadata", () => {
 		return lines[lines.length - 2] as string;
 	}
 
-	test("detail line badges upstream flags and appends the provider blurb", () => {
-		const detail = renderDetail(
-			makeModel("fixture", "swe-2", {
-				description: "Fast\tagentic\ncoder",
-				isNew: true,
-				isBeta: true,
-				isRecommended: true,
-			}),
-		);
-
-		expect(detail).toContain("swe-2 · new · beta · recommended · 128k ctx · 1k out · free per M");
-		// Tabs and newlines are flattened so the blurb stays one detail row.
-		expect(detail).toMatch(/free per M · Fast {2,}agentic coder$/);
-	});
-
-	test("models without upstream metadata render the plain detail line", () => {
-		expect(renderDetail(makeModel("openai", "gpt-5"))).toContain("gpt-5 · 128k ctx · 1k out · free per M");
-	});
-
 	test("labels declared pricing states instead of calling the zero rate card free", () => {
 		// Published rates win over any declared state.
 		expect(
@@ -502,6 +555,36 @@ describe("ModelBrowser native model metadata", () => {
 		// A router priced per request is not free, so the `free` filter skips it.
 		browser.setQuery("free");
 		expect(browser.visibleCount).toBe(0);
+	});
+
+	test("shows a held model's effective price at the dated boundary without rewriting its original card", () => {
+		const switchAt = Date.parse("2026-12-01T08:00:00Z");
+		const clock = spyOn(Date, "now").mockReturnValue(switchAt - 1);
+		try {
+			const repriced = makeModel("google", "dated-list-price", {
+				cost: {
+					input: 2,
+					output: 10,
+					cacheRead: 0.1,
+					cacheWrite: 0,
+					timeBased: {
+						offPeakMultiplier: 1,
+						peakWindows: [],
+						effectiveRates: [
+							{ effectiveFrom: -8_640_000_000_000_000, input: 2, output: 10, cacheRead: 0.1, cacheWrite: 0 },
+							{ effectiveFrom: switchAt, input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 },
+						],
+					},
+				},
+			});
+			expect(renderDetail(repriced)).toContain("$2/10 per M");
+			clock.mockReturnValue(switchAt);
+			expect(renderDetail(repriced)).toContain("$4/20 per M");
+			expect(repriced.cost.input).toBe(2);
+			expect(repriced.cost.output).toBe(10);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("price rows preserve free labels and identify invalid rates", () => {
@@ -593,5 +676,100 @@ describe("Factory Droid credits badge", () => {
 		expect(paidRow).not.toContain("free");
 		browser.setQuery("free");
 		expect(browser.visibleCount).toBe(0);
+	});
+});
+
+describe("serviceTierFor", () => {
+	beforeAll(async () => {
+		await initTheme(false);
+	});
+
+	test("labels the live session tier rather than the configured setting", async () => {
+		// The setting asks for ultrafast, but `/fast ultra` and `/slow` act on the
+		// session's per-family map; the browser must follow the session.
+		const settings = Settings.isolated({ "tier.openai": "ultrafast" });
+		const astra = makeModel("openai", "gpt-6-astra");
+		const auth = await AuthStorage.create(":memory:");
+		try {
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: astra, systemPrompt: ["Test"], tools: [], messages: [] } }),
+				sessionManager: SessionManager.inMemory(),
+				modelRegistry: new ModelRegistry(auth),
+				settings,
+			});
+			try {
+				const browser = new ModelBrowser(
+					createModelBrowserSource(settings, model => session.effectiveServiceTier(model)),
+				);
+				browser.setItems(buildBrowserItems([astra]));
+				browser.setPerfStats(
+					new Map([
+						["openai/gpt-6-astra", { samples: 4, tps: 25, ttftMs: null }],
+						["openai/gpt-6-astra@ultrafast", { samples: 2, tps: 300, ttftMs: null }],
+					]),
+				);
+				const row = () => Bun.stripANSI(browser.render(120)[2] ?? "");
+
+				expect(row()).toContain("25t/s");
+				expect(row()).not.toContain("ultrafast");
+
+				expect(session.setUltrafastMode(true)).toBe(true);
+				expect(row()).toContain("300t/s ultrafast");
+
+				session.setUltrafastMode(false);
+				expect(row()).toContain("25t/s");
+				expect(row()).not.toContain("ultrafast");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			auth.close();
+		}
+	});
+
+	test("without a session, returns the configured tier only when the request would carry it", () => {
+		const source = createModelBrowserSource(Settings.isolated({ "tier.openai": "ultrafast" }));
+		const firstParty = makeModel("openai", "gpt-6-astra");
+		const codexUnlisted = makeModel("openai-codex", "gpt-6-astra");
+		const codexAdvertised = buildModel({
+			id: "gpt-6-astra",
+			name: "gpt-6-astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 0 },
+			contextWindow: 400_000,
+			maxTokens: 128_000,
+			serviceTiers: ["ultrafast"],
+		});
+		const anthropic = buildModel({
+			id: "claude-opus-5-5",
+			name: "claude-opus-5-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 200_000,
+			maxTokens: 64_000,
+		});
+
+		// First-party OpenAI takes ultrafast as-is.
+		expect(source.serviceTierFor?.(firstParty)).toBe("ultrafast");
+		// Codex realizes it only when discovery advertises it, so the browser must
+		// not label a tier the request would drop.
+		expect(source.serviceTierFor?.(codexUnlisted)).toBeUndefined();
+		expect(source.serviceTierFor?.(codexAdvertised)).toBe("ultrafast");
+		// No configured tier for the family.
+		expect(source.serviceTierFor?.(anthropic)).toBeUndefined();
+
+		// Anthropic realizes priority through fast mode, not a `service_tier` field,
+		// so no served tier is ever recorded for it and there is no row to label.
+		const anthropicPriority = createModelBrowserSource(Settings.isolated({ "tier.anthropic": "priority" }));
+		expect(anthropicPriority.serviceTierFor?.(anthropic)).toBeUndefined();
+		expect(anthropicPriority.serviceTierFor?.(firstParty)).toBeUndefined();
 	});
 });

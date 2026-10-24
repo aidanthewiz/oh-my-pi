@@ -3,14 +3,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
+import { findScopedSettings } from "../config/settings";
+import { renderSessionTitle, type TitleCard } from "../utils/title-card";
+import { cfgTitleIcons } from "../utils/title-settings";
+import type { SessionHeader } from "./session-entries";
+import { applySessionTitleSlot, parseTitleSlotLine, titleUpdateFromSlot } from "./session-title-slot";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
-import { lookupSessionTitle, recordSessionTitle } from "./session-index";
+import { recordSessionTitle } from "./session-index";
 
 /**
  * Coarse lifecycle status of a session, derived from its last persisted message.
@@ -34,6 +40,9 @@ export interface SessionInfo {
 	/** Working directory where the session was started. Empty string for old sessions. */
 	cwd: string;
 	title?: string;
+	titleCard?: TitleCard;
+	/** Evaluated at the display sink, not stored in the title index. */
+	titlePresentation?(): string;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
 	created: Date;
@@ -142,7 +151,15 @@ function formatTimeAgo(date: Date): string {
  */
 export function sessionDisplayName(info: SessionInfo): string {
 	const title = sanitizeSessionName(info.title);
-	if (title) return title;
+	if (title) {
+		const settings = findScopedSettings(info.cwd) ?? findScopedSettings();
+		return renderSessionTitle(
+			title,
+			info.titleCard,
+			settings ? cfgTitleIcons.get(settings) : cfgTitleIcons.default,
+			typeof theme !== "undefined" && theme.getSymbolPreset() === "nerd",
+		);
+	}
 	const first =
 		info.firstMessage && info.firstMessage !== "(no messages)" ? sanitizeSessionName(info.firstMessage) : undefined;
 	if (first) return first;
@@ -316,6 +333,7 @@ interface SessionListHeader {
 	id: string;
 	cwd?: string;
 	title?: string;
+	titleCard?: TitleCard;
 	parentSession?: string;
 	timestamp?: string;
 }
@@ -323,24 +341,6 @@ interface SessionListHeader {
 function normalizeTitleOverride(title: string | undefined): string | null | undefined {
 	if (title === undefined) return undefined;
 	return title.trim() ? title : null;
-}
-
-function sessionListHeaderFromRecord(
-	record: Record<string, unknown> | undefined,
-	titleOverride?: string | null,
-): SessionListHeader | undefined {
-	if (record?.type !== "session" || typeof record.id !== "string") return undefined;
-	return {
-		type: "session",
-		id: record.id,
-		cwd: typeof record.cwd === "string" ? record.cwd : undefined,
-		title:
-			titleOverride === null
-				? undefined
-				: (titleOverride ?? (typeof record.title === "string" ? record.title : undefined)),
-		parentSession: typeof record.parentSession === "string" ? record.parentSession : undefined,
-		timestamp: typeof record.timestamp === "string" ? record.timestamp : undefined,
-	};
 }
 
 function parseSessionListHeaderLine(line: string, titleOverride?: string | null): SessionListHeader | undefined {
@@ -361,26 +361,30 @@ function parseSessionListHeader(
 	content: string,
 	entries: Array<Record<string, unknown>>,
 ): SessionListHeader | undefined {
-	const firstEntry = entries[0];
-	const parsedSlotTitle = normalizeTitleOverride(
-		firstEntry?.type === "title" && typeof firstEntry.title === "string" ? firstEntry.title : undefined,
-	);
-	const parsedHeader = sessionListHeaderFromRecord(entries[firstEntry?.type === "title" ? 1 : 0], parsedSlotTitle);
-	if (parsedHeader) return parsedHeader;
-
-	let slotTitle: string | null | undefined;
-	let firstNonEmpty = true;
-	for (const rawLine of content.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line) continue;
-		if (firstNonEmpty && extractStringProperty(line, "type") === "title") {
-			slotTitle = normalizeTitleOverride(extractStringProperty(line, "title"));
-			firstNonEmpty = false;
-			continue;
-		}
-		return parseSessionListHeaderLine(line, slotTitle);
+	const lines = content.split(/\r?\n/).filter(line => line.trim());
+	const slot = titleUpdateFromSlot(parseTitleSlotLine(lines[0] ?? ""));
+	const record = entries[slot ? 1 : 0];
+	if (record?.type === "session" && typeof record.id === "string") {
+		const header = { ...record } as unknown as SessionHeader;
+		applySessionTitleSlot(header, slot);
+		return {
+			type: "session",
+			id: header.id,
+			cwd: header.cwd,
+			title: header.title,
+			titleCard: header.titleCard,
+			parentSession: header.parentSession,
+			timestamp: header.timestamp,
+		};
 	}
-	return undefined;
+	// A clipped legacy header never supplies card metadata.
+	if (slot?.ref) return undefined;
+	const header = parseSessionListHeaderLine(
+		lines[slot ? 1 : 0] ?? "",
+		slot ? normalizeTitleOverride(slot.title) : undefined,
+	);
+	if (header && slot?.card && header.title === slot.title) header.titleCard = slot.card;
+	return header;
 }
 
 function getSessionListWorkerCount(fileCount: number): number {
@@ -417,7 +421,13 @@ async function scanSessionFile(
 	const cacheKey = withStatus ? `s\0${file}` : `h\0${file}`;
 	const cached = cache.get(cacheKey);
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-		return cached.info ? { ...cached.info } : undefined;
+		if (!cached.info) return undefined;
+		const info = {
+			...cached.info,
+			titleCard: cached.info.titleCard ? { ...cached.info.titleCard } : undefined,
+		};
+		info.titlePresentation = () => sessionDisplayName(info);
+		return info;
 	}
 	try {
 		const [content, suffix] = await storage.readTextSlices(
@@ -427,7 +437,15 @@ async function scanSessionFile(
 		);
 		const { size, mtime } = stat;
 		const entries = parseJsonlLenient<Record<string, unknown>>(content);
-		const header = parseSessionListHeader(content, entries);
+		let header = parseSessionListHeader(content, entries);
+		if (!header && parseTitleSlotLine(content.slice(0, content.indexOf("\n")))?.ref) {
+			const fullContent = await storage.readText(file);
+			const currentStat = storage.statSync(file);
+			if (currentStat.size !== stat.size || currentStat.mtimeMs !== stat.mtimeMs) return undefined;
+			const headerEnd = fullContent.indexOf("\n", fullContent.indexOf("\n") + 1);
+			const headerContent = headerEnd < 0 ? fullContent : fullContent.slice(0, headerEnd);
+			header = parseSessionListHeader(headerContent, parseJsonlLenient<Record<string, unknown>>(headerContent));
+		}
 		if (!header) {
 			// Cache the negative result too: an unparseable file stays unparseable
 			// until its stat identity changes.
@@ -485,6 +503,7 @@ async function scanSessionFile(
 			id: header.id,
 			cwd: header.cwd ?? "",
 			title: header.title ?? shortSummary,
+			titleCard: header.title ? header.titleCard : undefined,
 			parentSessionPath: header.parentSession,
 			created: new Date(header.timestamp ?? ""),
 			modified: mtime,
@@ -495,9 +514,13 @@ async function scanSessionFile(
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 			status: withStatus ? deriveSessionStatus(suffix) : undefined,
 		};
-		// The cache keeps its own shallow copy; hits also hand out copies, so
-		// callers can never mutate the shared cached object.
-		cache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info } });
+		info.titlePresentation = () => sessionDisplayName(info);
+		// Cached candidates and returned candidates have separate ownership.
+		cache.set(cacheKey, {
+			mtimeMs: stat.mtimeMs,
+			size: stat.size,
+			info: { ...info, titleCard: info.titleCard ? { ...info.titleCard } : undefined },
+		});
 		return info;
 	} catch {
 		return undefined;
@@ -611,10 +634,11 @@ async function scanSessionDir(
 	sessionDir: string,
 	storage: SessionStorage,
 	withStatus: boolean,
+	siblingDirs: readonly string[] = [],
 ): Promise<SessionInfo[]> {
 	try {
 		await recoverOrphanedBackups(sessionDir, storage);
-		const files = storage.listFilesSync(sessionDir, "*.jsonl");
+		const files = [sessionDir, ...siblingDirs].flatMap(dir => storage.listFilesSync(dir, "*.jsonl"));
 		return await collectSessionsFromFiles(files, storage, withStatus);
 	} catch {
 		return [];
@@ -636,10 +660,16 @@ async function scanSessionDirReadOnly(
 
 /**
  * List sessions in a resolved session directory (newest first), reading each
- * file's lifecycle {@link SessionStatus}.
+ * file's lifecycle {@link SessionStatus}. `siblingDirs` merge into the same
+ * list; they belong to other working directories (see `worktreeSessionDirs`),
+ * so orphaned-backup recovery runs on `sessionDir` only.
  */
-export function listSessions(sessionDir: string, storage: SessionStorage): Promise<SessionInfo[]> {
-	return scanSessionDir(sessionDir, storage, true);
+export function listSessions(
+	sessionDir: string,
+	storage: SessionStorage,
+	siblingDirs: readonly string[] = [],
+): Promise<SessionInfo[]> {
+	return scanSessionDir(sessionDir, storage, true, siblingDirs);
 }
 
 /**
@@ -868,16 +898,7 @@ export async function findSessionFiles(idPrefix: string, sessionsRoot: string = 
 	}
 }
 
-/**
- * Get recent sessions for display in the welcome screen.
- *
- * Deliberately avoids {@link scanSessionDir}'s full-directory content scan
- * (multi-hundred-ms with thousands of sessions): lists files, sorts by mtime,
- * and resolves names for the newest `limit` files from the history.db title
- * index. Files without an indexed title (legacy sessions, branch/fork copies)
- * fall back to a per-file header scan whose title — when present — is
- * backfilled into the index so the next launch skips the read.
- */
+/** Recent names use the winning persisted title and current presentation settings. */
 export async function getRecentSessions(
 	sessionDir: string,
 	limit = 4,
@@ -889,12 +910,6 @@ export async function getRecentSessions(
 	const recent: RecentSessionInfo[] = [];
 	for (const { file, stat } of await newestSessionFiles(sessionDir, "*.jsonl", storage)) {
 		if (recent.length >= limit) break;
-		const id = useIndex ? sessionIdFromSessionPath(file) : undefined;
-		const indexed = id ? lookupSessionTitle(id) : undefined;
-		if (indexed) {
-			recent.push({ path: file, name: indexed, timeAgo: formatTimeAgo(stat.mtime) });
-			continue;
-		}
 		const info = await scanSessionFile(file, storage, true, stat);
 		if (!info || isEmptySession(info)) continue;
 		const title = sanitizeSessionName(info.title);

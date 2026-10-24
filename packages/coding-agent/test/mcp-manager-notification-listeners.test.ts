@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import type { MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { MCPServerConfig, MCPToolDefinition } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { CUSTOM_NOTIFICATION_METHOD, CUSTOM_NOTIFICATION_PAYLOAD } from "./fixtures/notifications-mcp";
 
@@ -177,6 +178,112 @@ describe("MCPManager notification listeners", () => {
 			await manager.disconnectAll();
 		}
 	});
+
+	it("runs a refresh queued during a failed tools refresh instead of dropping it", async () => {
+		const manager = new MCPManager(workDir);
+		const collector = makeFrameCollector();
+		manager.addNotificationListener(collector.listener);
+
+		try {
+			await manager.connectServers({ alpha: serverConfig() }, {});
+			// The handshake's list_changed refresh fans out only after it settles.
+			await collector.awaitFrame("alpha", "notifications/tools/list_changed");
+
+			let calls = 0;
+			manager.setOnToolsChanged(async () => {
+				calls++;
+				if (calls === 1) {
+					// A tools/list_changed arriving mid-flight marks the refresh dirty…
+					void manager.refreshServerTools("alpha");
+					// …and then the in-flight pass fails.
+					throw new Error("in-flight refresh failed");
+				}
+			});
+
+			await manager.refreshServerTools("alpha");
+			expect(calls).toBe(2);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
+
+	it("coalesces a burst of tool refreshes into one trailing pass that every caller waits for", async () => {
+		const manager = new MCPManager(workDir);
+		const collector = makeFrameCollector();
+		manager.addNotificationListener(collector.listener);
+
+		try {
+			await manager.connectServers({ alpha: serverConfig() }, {});
+			await collector.awaitFrame("alpha", "notifications/tools/list_changed");
+
+			const firstEntered = Promise.withResolvers<void>();
+			const releaseFirst = Promise.withResolvers<void>();
+			let calls = 0;
+			manager.setOnToolsChanged(async () => {
+				calls++;
+				if (calls === 1) {
+					firstEntered.resolve();
+					await releaseFirst.promise;
+				}
+			});
+
+			const first = manager.refreshServerTools("alpha");
+			await firstEntered.promise;
+			const burst = [1, 2, 3, 4].map(() => manager.refreshServerTools("alpha"));
+			let burstSettled = false;
+			void Promise.all(burst).then(() => {
+				burstSettled = true;
+			});
+			releaseFirst.resolve();
+			await Promise.all([first, ...burst]);
+
+			expect(burstSettled).toBe(true);
+			// The held pass plus exactly one trailing pass for the whole burst.
+			expect(calls).toBe(2);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
+
+	for (const reconnect of [false, true]) {
+		it(`does not restore stale tools after a server is ${reconnect ? "replaced" : "disconnected"}`, async () => {
+			const manager = new MCPManager(workDir);
+			const collector = makeFrameCollector();
+			manager.addNotificationListener(collector.listener);
+			const entered = Promise.withResolvers<void>();
+			const held = Promise.withResolvers<MCPToolDefinition[]>();
+			const staleTools: MCPToolDefinition[] = [
+				{ name: "stale", description: "Old connection tool", inputSchema: { type: "object", properties: {} } },
+			];
+			let restore: (() => void) | undefined;
+			try {
+				await manager.connectServers({ alpha: serverConfig() }, {});
+				await collector.awaitFrame("alpha", "notifications/tools/list_changed");
+				const connection = manager.getConnection("alpha");
+				if (!connection) throw new Error("Expected connected server");
+				const listTools = mcpClient.listTools;
+				const listing = spyOn(mcpClient, "listTools").mockImplementation(async (candidate, options) => {
+					if (candidate !== connection) return listTools(candidate, options);
+					entered.resolve();
+					return held.promise;
+				});
+				restore = () => listing.mockRestore();
+				const refresh = manager.refreshServerTools("alpha");
+				await entered.promise;
+				const trailing = manager.refreshServerTools("alpha");
+				await manager.disconnectServer("alpha");
+				if (reconnect) await manager.connectServers({ alpha: serverConfig() }, {});
+				held.resolve(staleTools);
+				await Promise.all([refresh, trailing]);
+				expect(manager.getTools()).toEqual([]);
+				expect(manager.getConnectedServers()).toEqual(reconnect ? ["alpha"] : []);
+			} finally {
+				held.resolve(staleTools);
+				restore?.();
+				await manager.disconnectAll();
+			}
+		});
+	}
 
 	it("refreshServerTools awaits an async setOnToolsChanged handler before resolving", async () => {
 		// Verifies the second-layer guarantee (issue raised in review):

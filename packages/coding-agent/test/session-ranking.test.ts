@@ -7,6 +7,7 @@ import { mergeSessionRanking, rankSessionSearchMatches } from "@oh-my-pi/pi-tui/
 import { listSessions, type SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getHistoryDbPath, getSessionsDir, TempDir } from "@oh-my-pi/pi-utils";
+import { serializeTitleSlot } from "../src/session/session-title-slot";
 
 function makeSession(id: string, overrides: Partial<SessionInfo> = {}): SessionInfo {
 	return {
@@ -33,7 +34,7 @@ describe("slotted session headers", () => {
 		storage.writeTextSync(
 			file,
 			[
-				JSON.stringify({ type: "title", v: 1, title: "Slot Title", updatedAt: "2026-06-27T00:00:00.000Z" }),
+				serializeTitleSlot({ title: "Slot Title", updatedAt: "2026-06-27T00:00:00.000Z" }).trimEnd(),
 				JSON.stringify({
 					type: "session",
 					id: "header-id",

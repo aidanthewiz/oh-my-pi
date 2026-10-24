@@ -196,11 +196,15 @@ const { session } = await createAgentSession({
 
 When no explicit `model`/`modelPattern` is provided:
 
-1. restore model from existing session (if restorable + key available)
+1. restore a saved session model that has configured credentials and passes the model policy
 2. settings default model role (`default`)
 3. an authenticated provider-default model in availability order (falling back to the first authenticated available model when no provider default is present)
 
-If restore fails, `modelFallbackMessage` explains fallback.
+Saved selectors retain their thinking suffix. Restoration respects `enabledModels`, `disabledModels`, and `disabledProviders`, including after extension discovery.
+
+If no saved model can be restored, startup rejects by default. A UI-enabled session with `allowSessionModelFallback` and `retry.modelFallback` may use the settings fallback; `modelFallbackMessage` explains it.
+
+`session.switchSession(path)` applies the same restoration policy and restores the previous session if restoration fails. An explicit `model` option must also pass the model policy.
 
 ### Auth priority
 
@@ -304,7 +308,7 @@ Related APIs:
 - `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`
 - `abort()`
 
-`deliverAs: "aside"` (both APIs) delivers at the next agent step boundary without interrupting the current tool batch, instead of steering (which skips remaining tools) or waiting for the run to finish. When the session is idle both start a turn instead (in plan mode the custom message is folded into context without a turn).
+`deliverAs: "aside"` (both APIs) delivers at the next agent step boundary without interrupting the current tool batch, instead of steering (which skips remaining tools) or waiting for the run to finish. The one exception is a running interruptible `wait` or `vibe_wait`, which an aside ends so the message is not delayed behind it. When the session is idle both start a turn instead (in plan mode the custom message is folded into context without a turn).
 
 During `session_stop`, `triggerTurn: false` without an explicit delivery mode appends an outcome without starting another turn. Passive diagnostics do not prevent manual retry, including after reopening the session. The failed attempt's transcript retains its diagnostics. Explicit delivery modes retain their queue semantics.
 

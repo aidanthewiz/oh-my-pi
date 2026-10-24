@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { STREAM_HISTORY_LIMIT, STREAM_PROTO, type StreamHostFrame, type StreamServerToHost } from "@oh-my-pi/pi-wire";
 import { STREAM_LOCAL_PROTO, type StreamStreamerFrame } from "../../src/stream/protocol";
 import { StreamRedactor } from "../../src/stream/redactor";
 import { resolveStreamUrls, StreamMuxHost, type StreamConsoleEvent } from "../../src/stream/streamer";
+import { gateNativeDeliveryUntilEof } from "./ipc-delivery";
 
 type HostSocketData = Record<string, never>;
 
@@ -24,7 +25,7 @@ interface FakeStreamServer {
 }
 
 interface FakeSession {
-	socket: net.Socket;
+	conn: IpcConnection;
 	frames: StreamStreamerFrame[];
 	send(...frames: object[]): void;
 	waitForFrame(predicate: (frame: StreamStreamerFrame) => boolean): Promise<StreamStreamerFrame>;
@@ -32,7 +33,7 @@ interface FakeSession {
 
 const hosts: StreamMuxHost[] = [];
 const servers: FakeStreamServer[] = [];
-const sessions: net.Socket[] = [];
+const sessions: IpcConnection[] = [];
 const projectDirs: string[] = [];
 
 afterEach(async () => {
@@ -120,31 +121,19 @@ function startFakeStreamServer(port = 0): FakeStreamServer {
 }
 
 async function connectSession(endpoint: string): Promise<FakeSession> {
-	const socket = net.createConnection({ path: endpoint });
-	sessions.push(socket);
-	const connected = Promise.withResolvers<void>();
-	socket.once("connect", () => connected.resolve());
-	socket.once("error", error => connected.reject(error));
-	await connected.promise;
+	const conn = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: 3000 });
+	sessions.push(conn);
 	const frames: StreamStreamerFrame[] = [];
 	const waiters: FrameWaiter<StreamStreamerFrame>[] = [];
-	let buffer = "";
-	socket.setEncoding("utf8");
-	socket.on("data", chunk => {
-		buffer += chunk;
-		for (;;) {
-			const newline = buffer.indexOf("\n");
-			if (newline < 0) return;
-			const line = buffer.slice(0, newline);
-			buffer = buffer.slice(newline + 1);
-			recordFrame(frames, waiters, JSON.parse(line) as StreamStreamerFrame);
-		}
-	});
+	conn.start(
+		line => recordFrame(frames, waiters, JSON.parse(line) as StreamStreamerFrame),
+		() => {},
+	);
 	return {
-		socket,
+		conn,
 		frames,
 		send(...outgoing): void {
-			socket.write(`${outgoing.map(frame => JSON.stringify(frame)).join("\n")}\n`);
+			for (const frame of outgoing) conn.send(JSON.stringify(frame));
 		},
 		waitForFrame: predicate => waitForFrame(frames, waiters, predicate),
 	};
@@ -157,6 +146,123 @@ describe("resolveStreamUrls", () => {
 });
 
 describe("StreamMuxHost", () => {
+	it("forwards final screen payloads before pane-close when native EOF precedes JS delivery", async () => {
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stream-eof-"));
+		projectDirs.push(projectDir);
+		const server = startFakeStreamServer();
+		const host = new StreamMuxHost({
+			projectDir,
+			title: "EOF contract",
+			hostUrl: `ws://127.0.0.1:${server.port}/ws/host`,
+			token: () => Promise.resolve("contract-token"),
+			redactor: new StreamRedactor([], []),
+			onEvent: () => {},
+		});
+		hosts.push(host);
+		const endpoint = await host.start();
+		await server.waitForFrame(frame => frame.t === "hello");
+		const gate = gateNativeDeliveryUntilEof();
+		try {
+			const session = await connectSession(endpoint);
+			session.send({ t: "hello", proto: STREAM_LOCAL_PROTO, sessionId: "eof", title: "Final", cols: 80, rows: 2 });
+			await session.waitForFrame(frame => frame.t === "welcome");
+			gate.arm();
+			session.send(
+				{ t: "history", rows: ["committed final history"] },
+				{ t: "viewport", rows: ["final screen", "last row"] },
+				{ t: "patch", rows: 2, ops: [[1, "last update"]] },
+			);
+			session.conn.end();
+			await server.waitForFrame(frame => frame.t === "pane-close");
+			expect(server.frames.filter(frame => frame.t !== "hello")).toEqual([
+				{ t: "pane-open", pane: 1, title: "Final", cols: 80, rows: 2 },
+				{ t: "history", pane: 1, rows: ["committed final history"] },
+				{ t: "viewport", pane: 1, rows: ["final screen", "last row"] },
+				{ t: "patch", pane: 1, rows: 2, ops: [[1, "last update"]] },
+				{ t: "pane-close", pane: 1 },
+			]);
+		} finally {
+			gate.restore();
+		}
+	});
+
+	it.each(["invalid-json", "invalid-screen", "duplicate-hello"])(
+		"rejects %s without forwarding later queued screen payloads",
+		async invalid => {
+			const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stream-reject-"));
+			projectDirs.push(projectDir);
+			const server = startFakeStreamServer();
+			const host = new StreamMuxHost({
+				projectDir,
+				title: "Reject contract",
+				hostUrl: `ws://127.0.0.1:${server.port}/ws/host`,
+				token: () => Promise.resolve("contract-token"),
+				redactor: new StreamRedactor([], []),
+				onEvent: () => {},
+			});
+			hosts.push(host);
+			const endpoint = await host.start();
+			await server.waitForFrame(frame => frame.t === "hello");
+			const session = await connectSession(endpoint);
+			const hello = {
+				t: "hello",
+				proto: STREAM_LOCAL_PROTO,
+				sessionId: "reject",
+				title: "Reject",
+				cols: 80,
+				rows: 2,
+			};
+			session.send(hello);
+			await session.waitForFrame(frame => frame.t === "welcome");
+			const rejected =
+				invalid === "invalid-json"
+					? "{"
+					: JSON.stringify(invalid === "invalid-screen" ? { t: "viewport", rows: [42] } : hello);
+			session.conn.send(rejected);
+			session.send({ t: "viewport", rows: ["must not reach viewers"] });
+			await server.waitForFrame(frame => frame.t === "pane-close");
+			expect(server.frames.filter(frame => frame.t !== "hello")).toEqual([
+				{ t: "pane-open", pane: 1, title: "Reject", cols: 80, rows: 2 },
+				{ t: "pane-close", pane: 1 },
+			]);
+		},
+	);
+
+	it("does not attach a queued pane after local host cancellation", async () => {
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stream-cancel-"));
+		projectDirs.push(projectDir);
+		const server = startFakeStreamServer();
+		const events: StreamConsoleEvent[] = [];
+		const host = new StreamMuxHost({
+			projectDir,
+			title: "Cancel contract",
+			hostUrl: `ws://127.0.0.1:${server.port}/ws/host`,
+			token: () => Promise.resolve("contract-token"),
+			redactor: new StreamRedactor([], []),
+			onEvent: event => events.push(event),
+		});
+		hosts.push(host);
+		const endpoint = await host.start();
+		await server.waitForFrame(frame => frame.t === "hello");
+		const gate = gateNativeDeliveryUntilEof();
+		try {
+			const session = await connectSession(endpoint);
+			gate.arm(() => {
+				void host.close("local cancellation");
+			});
+			session.send(
+				{ t: "hello", proto: STREAM_LOCAL_PROTO, sessionId: "cancel", title: "Stale", cols: 80, rows: 2 },
+				{ t: "viewport", rows: ["must not reanimate"] },
+			);
+			session.conn.end();
+			await host.wait();
+			expect(events.filter(event => event.t === "pane")).toEqual([]);
+			expect(events).toContainEqual({ t: "link", state: "stopped", detail: "local cancellation" });
+		} finally {
+			gate.restore();
+		}
+	});
+
 	it("materializes patch, reset, and bounded history state across reconnect replays", async () => {
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stream-test-"));
 		projectDirs.push(projectDir);

@@ -8,24 +8,16 @@
  *     session start, before any prompt rendered.
  *   - NPM install: NAPI finalizer segfault at process teardown.
  *
- * The fix relocates the embeddings stack into a Bun.spawn child process. The
- * agent's main process hands `mnemopi.setLocalModelInitializer` a wrapper that
- * round-trips through `__omp_worker_mnemopi_embed`, and `SIGKILL`s the child
- * on dispose so the destructor never runs in either address space. These tests
- * pin the three pieces of that contract so a future refactor cannot quietly
- * re-introduce the crash.
+ * The fix relocates the embeddings stack into a Bun.spawn child process
+ * (`__omp_worker_mnemopi_embed`) owned by the machine-shared embedding server;
+ * the agent hands `mnemopi.setLocalModelInitializer` a wrapper that round-trips
+ * through that server, and the server `SIGKILL`s the child so the destructor
+ * never runs in any address space. These tests pin the child's contract so a
+ * future refactor cannot quietly re-introduce the crash.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import {
-	createMnemopiEmbedSubprocess,
-	MnemopiEmbedClient,
-	type MnemopiEmbedWorkerHandle,
-} from "@oh-my-pi/pi-coding-agent/mnemopi/embed-client";
-import type {
-	MnemopiEmbedWorkerInbound,
-	MnemopiEmbedWorkerOutbound,
-} from "@oh-my-pi/pi-coding-agent/mnemopi/embed-protocol";
+import { createMnemopiEmbedSubprocess, spawnMnemopiEmbedWorker } from "@oh-my-pi/pi-coding-agent/mnemopi/embed-client";
 
 describe("issue #3031 — mnemopi embeddings live in an isolated subprocess", () => {
 	it("ping/pongs through the spawned worker subprocess and tears it down cleanly", async () => {
@@ -73,97 +65,12 @@ describe("issue #3031 — mnemopi embeddings live in an isolated subprocess", ()
 	}, 15_000);
 
 	it("does not surface intentional terminate() SIGKILLs as worker errors", async () => {
-		// Inverse of the previous test: a SIGKILL issued by the wrapper's
-		// own `terminate()` MUST NOT fault callers — terminate is the
-		// shutdown path and the worker handle is already torn down by then.
-		// Regression guard against an over-eager fix that surfaces every
-		// signal exit indiscriminately.
-		const sub = createMnemopiEmbedSubprocess();
+		const worker = spawnMnemopiEmbedWorker();
 		let errored = false;
-		sub.errors.add(() => {
+		worker.onError(() => {
 			errored = true;
 		});
-		// Simulate what `wrapSubprocess.terminate()` does: flip the flag,
-		// then SIGKILL. We test the primitive directly rather than going
-		// through the wrapper to avoid coupling to `WorkerHandle` internals.
-		// `proc.exited` resolves only after the `onExit` handler runs, so by
-		// the time the await returns the error channel reflects the truth —
-		// no real-clock sleep needed.
-		sub.intentionalExit.value = true;
-		sub.proc.kill("SIGKILL");
-		await sub.proc.exited;
+		await worker.terminate();
 		expect(errored).toBe(false);
 	}, 10_000);
-
-	it("carries (model, cacheDir) on every embed so a respawned worker can self-init", async () => {
-		// Without this contract: after `shutdownMnemopiEmbedClient()` runs on
-		// session dispose, mnemopi still holds the cached `LocalEmbeddingModel`
-		// wrapper. The next embed re-spawns a fresh subprocess that has never
-		// seen `init`, and a bare `embed` request would trip the "embed before
-		// init" guard and break local embeddings for the rest of the process.
-		// Drive the protocol with a fake worker so the assertion runs without
-		// fastembed/onnxruntime; we only care about the IPC the client emits.
-		const sentMessages: MnemopiEmbedWorkerInbound[] = [];
-		let messageHandler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
-		const spawnCount = { value: 0 };
-		const spawn = (): MnemopiEmbedWorkerHandle => {
-			spawnCount.value += 1;
-			return {
-				send(message) {
-					sentMessages.push(message);
-					// Synthesize the worker's reply on the next tick so the
-					// client's awaited promise resolves before the test asserts.
-					queueMicrotask(() => {
-						if (message.type === "ping") messageHandler?.({ type: "pong", id: message.id });
-						else if (message.type === "init") messageHandler?.({ type: "ready", id: message.id });
-						else if (message.type === "embed") {
-							messageHandler?.({ type: "vectors", id: message.id, vectors: [[0, 0, 0]] });
-						}
-					});
-				},
-				onMessage(handler) {
-					messageHandler = handler;
-					return () => {
-						if (messageHandler === handler) messageHandler = undefined;
-					};
-				},
-				onError() {
-					return () => {};
-				},
-				ref() {},
-				unref() {},
-				async terminate() {
-					messageHandler = undefined;
-				},
-			};
-		};
-
-		const client = new MnemopiEmbedClient(spawn);
-		const wrapper = await client.initialize("fast-bge-base-en-v1.5", "/tmp/cache");
-		expect(wrapper).not.toBeNull();
-
-		// Drain the wrapper once normally and snapshot the embed message.
-		for await (const _ of wrapper!.embed(["hello"])) {
-			/* drain */
-		}
-		// Tear down the worker as the session-dispose path does, then drive
-		// the SAME cached wrapper again — the client must re-spawn and the
-		// embed message must still carry (model, cacheDir).
-		await client.terminate();
-		for await (const _ of wrapper!.embed(["world"])) {
-			/* drain */
-		}
-
-		expect(spawnCount.value).toBe(2);
-		const embeds = sentMessages.filter(
-			(m): m is Extract<MnemopiEmbedWorkerInbound, { type: "embed" }> => m.type === "embed",
-		);
-		expect(embeds.length).toBe(2);
-		for (const embed of embeds) {
-			expect(embed.model).toBe("fast-bge-base-en-v1.5");
-			expect(embed.cacheDir).toBe("/tmp/cache");
-		}
-
-		await client.terminate();
-	});
 });
