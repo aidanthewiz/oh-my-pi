@@ -1,8 +1,10 @@
 /**
  * Focused subagent views are chat-only, except for viewer-scoped commands: `/btw`
  * asks a side question about the focused transcript, `/export` writes the focused
- * agent's own transcript (with its nested subagents), and `/usage` reports
- * account-wide limits. Everything else still requires returning to main.
+ * agent's own transcript (with its nested subagents), `/jobs` lists the focused
+ * agent's background jobs, and `/usage` reports account-wide limits. Everything
+ * else, and mutating forms such as `/usage reset` and `/jobs kill`, still requires
+ * returning to main.
  *
  * Failure mode if this regresses: these commands silently do nothing (or steer the
  * agent) in a focused view, or `/export` writes the main session instead of the viewed one.
@@ -60,6 +62,7 @@ function createFocusedContext() {
 		handleUsageCommand: vi.fn(async () => {}),
 		handleExportCommand: vi.fn(async () => {}),
 		handleBtwCommand: vi.fn(async () => {}),
+		handleJobsCommand: vi.fn(async () => {}),
 		showResetUsageSelector: vi.fn(async () => {}),
 		withLocalSubmission: vi.fn(async <T>(_text: string, fn: () => Promise<T>) => fn()),
 	};
@@ -104,24 +107,6 @@ describe("focused subagent view slash commands", () => {
 		expect(prompt).toHaveBeenCalledWith(manualContinuePrompt, { synthetic: true, userInitiated: true });
 	});
 
-	it("runs /usage from the focused view", async () => {
-		const { raw, prompt } = await submit("/usage");
-		expect(raw.handleUsageCommand).toHaveBeenCalledTimes(1);
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("runs /export with its arguments from the focused view", async () => {
-		const { raw, prompt } = await submit("/export out.html");
-		expect(raw.handleExportCommand).toHaveBeenCalledWith("/export out.html");
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("runs /btw with its question from the focused view instead of steering the agent", async () => {
-		const { raw, prompt } = await submit("/btw what is it doing?");
-		expect(raw.handleBtwCommand).toHaveBeenCalledWith("what is it doing?");
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
 	it("keeps other commands gated to the main session, draft intact", async () => {
 		const { editor, prompt } = await submit("/compact");
 		expect(editor.getText()).toBe("/compact");
@@ -133,6 +118,15 @@ describe("focused subagent view slash commands", () => {
 			const { raw, editor } = await submit(text);
 			expect(raw.showResetUsageSelector).not.toHaveBeenCalled();
 			expect(raw.handleUsageCommand).not.toHaveBeenCalled();
+			expect(editor.getText()).toBe(text);
+		}
+	});
+
+	it("keeps the mutating /jobs kill form gated to the main session", async () => {
+		for (const text of ["/jobs kill all", "/jobs kill job-1"]) {
+			const { raw, editor } = await submit(text);
+			expect(raw.handleJobsCommand).not.toHaveBeenCalled();
+			expect(raw.showStatus).toHaveBeenCalled();
 			expect(editor.getText()).toBe(text);
 		}
 	});

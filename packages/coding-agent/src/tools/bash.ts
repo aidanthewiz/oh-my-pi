@@ -1347,7 +1347,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const { command, commandCwd, backend } = prepared;
 		const pendingNotices: string[] = [];
-		if (normalizedInput.name === undefined && normalizeReady(input.ready)) {
+		const ignoredReady = normalizeReady(input.ready);
+		if (
+			normalizedInput.name === undefined &&
+			ignoredReady !== undefined &&
+			(ignoredReady.log !== undefined || (ignoredReady.port !== undefined && ignoredReady.port !== 0))
+		) {
 			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
 		}
 		const approval = this.approval(input);

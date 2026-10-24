@@ -637,6 +637,59 @@ describe("Agent", () => {
 		expect(dequeueSignals.every(signal => signal?.aborted === true)).toBe(true);
 	});
 
+	it("prioritizes only pending steering identities and preserves each group's delivery order", async () => {
+		const mock = createMockModel({ responses: Array.from({ length: 4 }, () => ({ content: ["Processed"] })) });
+		const agent = new Agent({ streamFn: mock.stream, steeringMode: "one-at-a-time" });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "Ready" }])]);
+		const older = createUserMessage("same content");
+		const first = createUserMessage("first selected");
+		const other = createUserMessage("other pending");
+		const second = createUserMessage("second selected");
+		for (const message of [older, first, other, second]) agent.steer(message);
+
+		agent.prioritizeSteering([second, { ...older }, first]);
+		await agent.continue();
+
+		const delivered = agent.state.messages.filter(message => message.role === "user");
+		expect(delivered).toHaveLength(4);
+		for (const [index, message] of [first, second, older, other].entries()) {
+			expect(delivered[index]).toBe(message);
+		}
+		expect(mock.calls).toHaveLength(4);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("leaves a claimed steering delivery ahead of newly prioritized pending messages", async () => {
+		const mock = createMockModel({ responses: Array.from({ length: 3 }, () => ({ content: ["Processed"] })) });
+		const agent = new Agent({ streamFn: mock.stream, steeringMode: "one-at-a-time" });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "Ready" }])]);
+		const claimed = createUserMessage("claimed");
+		const older = createUserMessage("older pending");
+		const selected = createUserMessage("selected");
+		const preparing = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		agent.prepareQueuedMessages = async messages => {
+			if (messages[0] !== claimed) return;
+			preparing.resolve();
+			await release.promise;
+		};
+		for (const message of [claimed, older, selected]) agent.steer(message);
+		const running = agent.continue();
+		await preparing.promise;
+
+		agent.prioritizeSteering([selected, claimed]);
+		release.resolve();
+		await running;
+
+		const delivered = agent.state.messages.filter(message => message.role === "user");
+		expect(delivered).toHaveLength(3);
+		for (const [index, message] of [claimed, selected, older].entries()) {
+			expect(delivered[index]).toBe(message);
+		}
+		expect(mock.calls).toHaveLength(3);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("delivers a steer that lands at the yield boundary instead of stranding it", async () => {
 		// Regression: a steering message queued after the stop-boundary dequeue
 		// (e.g. while onBeforeYield runs) was silently stranded in the queue until
@@ -992,6 +1045,48 @@ describe("Agent", () => {
 		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
 		expect(toolResults).toHaveLength(1);
 		expect(toolResults[0]).toMatchObject({ toolCallId: toolCall.id, toolName: toolCall.name });
+	});
+
+	it("keeps only the re-run result when Cursor re-dispatches a buffered call", async () => {
+		// Issue #15749: Cursor re-sent an exec frame for a call it had already
+		// run. The provider keeps one block for the call; persisting both results
+		// paired two answers with one id, which Cursor rejects on every rebuild.
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-read-race",
+			name: "read",
+			arguments: { path: "/tmp/race.txt" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const readResult = (text: string, isError: boolean): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text }],
+			isError,
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					await options?.cursorOnToolResult?.(readResult("not found", true));
+					await options?.cursorOnToolResult?.(readResult("hello", false));
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "done", reason: "stop", message: started });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("trigger");
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "hello" }] });
 	});
 
 	it("injects Cursor-carried passive context after the buffered results on success and provider error", async () => {

@@ -660,6 +660,9 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 		}
 		index += 1;
 	}
+	for path in patch.old_path.iter().chain(&patch.new_path) {
+		validate_repo_path(path)?;
+	}
 	if patch.hunks.is_empty()
 		&& patch.binary.is_empty()
 		&& patch.old_path == patch.new_path
@@ -839,8 +842,19 @@ fn apply_patches_to_map(
 			.is_some_and(|entry| entry.mode == Mode::COMMIT)
 			|| target_mode == Some(Mode::COMMIT)
 		{
-			if let Some(entry) = &source
-				&& entry.id != gitlink_id(patch, if options.reverse { b'+' } else { b'-' })?
+			let (preimage, postimage) = if options.reverse {
+				(b'+', b'-')
+			} else {
+				(b'-', b'+')
+			};
+			// `git apply` reads a gitlink preimage only from the index; worktree
+			// application drops gitlink hunks, so any directory stands for the old
+			// commit. A pure rename has no hunk and keeps the source commit.
+			let changed = !patch.hunks.is_empty();
+			if options.cached
+				&& changed
+				&& let Some(entry) = &source
+				&& entry.id != gitlink_id(patch, preimage)?
 			{
 				return Err(Error::PatchFailed {
 					message: format!("gitlink does not match for {}", source_path.unwrap_or_default()),
@@ -853,7 +867,10 @@ fn apply_patches_to_map(
 			}
 			if let Some(path) = target_path {
 				validate_repo_path(path).map_err(ApplyFailure::into_error)?;
-				let id = gitlink_id(patch, if options.reverse { b'-' } else { b'+' })?;
+				let id = match &source {
+					Some(entry) if !changed => entry.id,
+					_ => gitlink_id(patch, postimage)?,
+				};
 				state.insert(path.to_owned(), FileEntry::new(id, Mode::COMMIT));
 			}
 			continue;
@@ -1405,6 +1422,7 @@ fn tree_map(repo: &gix::Repository, tree: gix::ObjectId) -> Result<BTreeMap<Stri
 
 /// Read only patch sources and targets. Targets are needed for collision
 /// checks. Tracked paths retain index modes and intent-to-add state.
+/// A directory at a source path represents an initialized or empty gitlink.
 fn patch_worktree_map(
 	repo: &GitRepo,
 	gix_repo: &gix::Repository,
@@ -1422,6 +1440,14 @@ fn patch_worktree_map(
 				.map(|path| (path, target_mode)),
 		) {
 			if state.contains_key(path) {
+				continue;
+			}
+			validate_worktree_path(repo, path)?;
+			if source == Some(path)
+				&& fs::symlink_metadata(repo.root().join(path)).is_ok_and(|metadata| metadata.is_dir())
+			{
+				let id = gix::ObjectId::null(gix_repo.object_hash());
+				state.insert(path.to_owned(), FileEntry::new(id, Mode::COMMIT));
 				continue;
 			}
 			let indexed = index.get(path);
@@ -1693,7 +1719,15 @@ fn write_patch_worktree(
 			let entry = state.get(target).ok_or_else(|| Error::PatchFailed {
 				message: format!("missing applied path {target}"),
 			})?;
-			write_worktree_entry(repo, gix_repo, filter, target, entry)?;
+			if entry.mode == Mode::COMMIT {
+				// Like `git apply`, a gitlink only ensures its directory: an added
+				// one is created empty, a checked-out submodule is left
+				// untouched.
+				validate_worktree_path(repo, target)?;
+				fs::create_dir_all(repo.root().join(target))?;
+			} else {
+				write_worktree_entry(repo, gix_repo, filter, target, entry)?;
+			}
 		}
 	}
 	Ok(())
@@ -1861,6 +1895,16 @@ fn checkout_changed_paths(
 	changed: &BTreeSet<String>,
 	unstaged: &BTreeSet<String>,
 ) -> Result<()> {
+	fn remove_empty_directories(path: &Path) -> std::io::Result<()> {
+		for entry in fs::read_dir(path)? {
+			let entry = entry?;
+			if entry.file_type()?.is_dir() {
+				remove_empty_directories(&entry.path())?;
+			}
+		}
+		fs::remove_dir(path)
+	}
+
 	for path in changed {
 		if !worktree.contains_key(path) {
 			remove_worktree_path(repo, path)?;
@@ -1872,7 +1916,7 @@ fn checkout_changed_paths(
 				continue;
 			}
 			if fs::symlink_metadata(repo.root().join(path)).is_ok_and(|metadata| metadata.is_dir()) {
-				remove_worktree_path(repo, path)?;
+				remove_empty_directories(&repo.root().join(path))?;
 			}
 			write_worktree_bytes(repo, path, entry, &prepared[path])?;
 		}
@@ -1924,7 +1968,7 @@ fn write_worktree_entry(
 }
 
 fn write_worktree_bytes(repo: &GitRepo, path: &str, entry: &FileEntry, bytes: &[u8]) -> Result<()> {
-	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	validate_worktree_path(repo, path)?;
 	let absolute = repo.root().join(path);
 	if let Some(parent) = absolute.parent() {
 		fs::create_dir_all(parent)?;
@@ -1940,6 +1984,9 @@ fn write_worktree_bytes(repo: &GitRepo, path: &str, entry: &FileEntry, bytes: &[
 		fs::write(&absolute, bytes)?;
 		return Ok(());
 	}
+	if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+		fs::remove_file(&absolute)?;
+	}
 	fs::write(&absolute, bytes)?;
 	#[cfg(unix)]
 	{
@@ -1954,24 +2001,22 @@ fn write_worktree_bytes(repo: &GitRepo, path: &str, entry: &FileEntry, bytes: &[
 	Ok(())
 }
 
+/// Remove `path` and the parent directories it leaves empty. A directory at
+/// `path` is a gitlink: like git, only an empty (uninitialized) one is
+/// removed, a checked-out submodule stays.
 fn remove_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
-	fn remove_empty_directories(path: &Path) -> std::io::Result<()> {
-		for entry in fs::read_dir(path)? {
-			let entry = entry?;
-			if entry.file_type()?.is_dir() {
-				remove_empty_directories(&entry.path())?;
-			}
-		}
-		fs::remove_dir(path)
-	}
-
-	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	validate_worktree_path(repo, path)?;
 	let absolute = repo.root().join(path);
-	match fs::remove_file(&absolute) {
-		Ok(()) => {},
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-		Err(_) if fs::symlink_metadata(&absolute)?.is_dir() => remove_empty_directories(&absolute)?,
-		Err(err) => return Err(err.into()),
+	if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_dir()) {
+		if fs::remove_dir(&absolute).is_err() {
+			return Ok(());
+		}
+	} else {
+		match fs::remove_file(&absolute) {
+			Ok(()) => {},
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(err) => return Err(err.into()),
+		}
 	}
 	let mut directory = absolute.parent();
 	while let Some(current) = directory {
@@ -1986,11 +2031,30 @@ fn remove_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
 	Ok(())
 }
 
+fn validate_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
+	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	for parent in Path::new(path).ancestors().skip(1) {
+		if parent.as_os_str().is_empty() {
+			break;
+		}
+		if fs::symlink_metadata(repo.root().join(parent))
+			.is_ok_and(|metadata| metadata.file_type().is_symlink())
+		{
+			return Err(Error::PatchFailed { message: format!("unsafe patch path: {path}") });
+		}
+	}
+	Ok(())
+}
+
 fn validate_repo_path(path: &str) -> std::result::Result<(), ApplyFailure> {
 	let candidate = PathBuf::from(path);
 	if candidate.is_absolute()
 		|| candidate.components().any(|component| {
 			matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+				|| component
+					.as_os_str()
+					.to_str()
+					.is_some_and(|name| name.eq_ignore_ascii_case(".git"))
 		})
 		|| path.is_empty()
 	{
@@ -2066,6 +2130,93 @@ mod tests {
 	fn reset(path: &Path) {
 		git(path, &["reset", "--hard", "-q", "HEAD"]);
 		git(path, &["clean", "-fdq"]);
+	}
+
+	#[test]
+	fn patch_rejects_escaping_source_and_destination_paths_without_changes() {
+		let temp = init(&[("inside", b"preserved\n")]);
+		let repository = repo(temp.path());
+		let before_index = fs::read(temp.path().join(".git/index")).unwrap();
+		for (source, target) in [
+			("../victim", "renamed"),
+			("inside", "../victim"),
+			(".git/config", "renamed"),
+			("inside", ".git/config"),
+		] {
+			let patch = format!(
+				"diff --git a/{source} b/{target}\nsimilarity index 100%\nrename from \
+				 {source}\nrename to {target}\n"
+			);
+			for cached in [false, true] {
+				let options = ApplyOptions { cached, ..Default::default() };
+				assert!(!repository.can_apply_patch(&patch, &options).unwrap());
+				assert!(repository.apply_patch(&patch, &options).is_err());
+				assert_eq!(fs::read(temp.path().join("inside")).unwrap(), b"preserved\n");
+				assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), before_index);
+			}
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn patch_rejects_symlink_ancestors_on_sources_and_destinations() {
+		use std::os::unix::fs::symlink;
+
+		let temp = init(&[("inside", b"preserved\n")]);
+		let outside = tempfile::tempdir().unwrap();
+		fs::write(outside.path().join("victim"), b"external\n").unwrap();
+		symlink(outside.path(), temp.path().join("escape")).unwrap();
+		let repository = repo(temp.path());
+		for (source, target) in [("escape/victim", "renamed"), ("inside", "escape/new")] {
+			let patch = format!(
+				"diff --git a/{source} b/{target}\nsimilarity index 100%\nrename from \
+				 {source}\nrename to {target}\n"
+			);
+			assert!(
+				repository
+					.can_apply_patch(&patch, &ApplyOptions::default())
+					.is_err()
+			);
+			assert!(
+				repository
+					.apply_patch(&patch, &ApplyOptions::default())
+					.is_err()
+			);
+			assert_eq!(fs::read(temp.path().join("inside")).unwrap(), b"preserved\n");
+			assert_eq!(fs::read(outside.path().join("victim")).unwrap(), b"external\n");
+			assert!(!outside.path().join("new").exists());
+			assert!(!temp.path().join("renamed").exists());
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn patch_replaces_a_symlink_with_a_file_without_writing_its_target() {
+		use std::os::unix::fs::symlink;
+
+		let temp = init(&[("inside", b"preserved\n")]);
+		let outside = tempfile::tempdir().unwrap();
+		let victim = outside.path().join("victim");
+		let link = temp.path().join("link");
+		fs::write(&victim, b"external\n").unwrap();
+		symlink(&victim, &link).unwrap();
+		let patch = format!(
+			"diff --git a/link b/link\nold mode 120000\nnew mode 100644\n--- a/link\n+++ b/link\n@@ \
+			 -1 +1 @@\n-{}\n\\ No newline at end of file\n+replacement\n",
+			victim.display()
+		);
+		let repository = repo(temp.path());
+		assert!(
+			repository
+				.can_apply_patch(&patch, &ApplyOptions::default())
+				.unwrap()
+		);
+		repository
+			.apply_patch(&patch, &ApplyOptions::default())
+			.unwrap();
+		assert!(fs::symlink_metadata(&link).unwrap().is_file());
+		assert_eq!(fs::read(&link).unwrap(), b"replacement\n");
+		assert_eq!(fs::read(&victim).unwrap(), b"external\n");
 	}
 
 	#[test]
@@ -3338,5 +3489,197 @@ mod tests {
 		assert!(repository.stash_try_pop(false).expect("pop second"));
 		assert_eq!(git(temp.path(), &["rev-parse", "refs/stash"]), first);
 		assert_eq!(fs::read(temp.path().join("file.txt")).expect("second restored"), b"second\n");
+	}
+
+	/// Superproject tracking gitlink `module` at the first of two module
+	/// commits: checked out there when `initialized`, an empty directory
+	/// otherwise. Module commits carry fixed dates, so every fixture shares the
+	/// same `(old, new)` commit ids.
+	fn gitlink_fixture(initialized: bool) -> (TempDir, String, String) {
+		let temp = init(&[("file.txt", b"base\n")]);
+		let module = temp.path().join("module");
+		fs::create_dir(&module).expect("create module");
+		git(&module, &["init", "-q"]);
+		let commit = |content: &[u8]| {
+			fs::write(module.join("f.txt"), content).expect("write module file");
+			git(&module, &["add", "f.txt"]);
+			let status = Command::new("git")
+				.current_dir(&module)
+				.env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+				.env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+				.args([
+					"-c",
+					"user.name=Patch Test",
+					"-c",
+					"user.email=patch@example.com",
+					"commit",
+					"-qm",
+					"module",
+				])
+				.status()
+				.expect("run git commit");
+			assert!(status.success(), "module commit failed");
+			git(&module, &["rev-parse", "HEAD"]).trim().to_owned()
+		};
+		let old = commit(b"one\n");
+		let new = commit(b"two\n");
+		git(&module, &["checkout", "-q", &old]);
+		git(temp.path(), &["update-index", "--add", "--cacheinfo", &format!("160000,{old},module")]);
+		git(temp.path(), &["commit", "-qm", "add gitlink"]);
+		if !initialized {
+			fs::remove_dir_all(&module).expect("remove module checkout");
+			fs::create_dir(&module).expect("create empty module");
+		}
+		(temp, old, new)
+	}
+
+	/// Index, status, and the `module` and `moved` directory listings (`None`
+	/// when absent).
+	fn gitlink_snapshot(path: &Path) -> (String, String, Vec<Option<Vec<String>>>) {
+		let listings = ["module", "moved"]
+			.iter()
+			.map(|dir| {
+				fs::read_dir(path.join(dir)).ok().map(|entries| {
+					let mut names: Vec<String> = entries
+						.map(|entry| {
+							entry
+								.expect("gitlink dir entry")
+								.file_name()
+								.to_string_lossy()
+								.into_owned()
+						})
+						.collect();
+					names.sort();
+					names
+				})
+			})
+			.collect();
+		(git(path, &["ls-files", "--stage"]), git(path, &["status", "--porcelain"]), listings)
+	}
+
+	/// Apply `patch` to `ours` and `git apply` it to `oracle`, then assert both
+	/// agree on success, `can_apply_patch`, and the resulting gitlink state.
+	fn assert_gitlink_apply_matches_git(
+		ours: &Path,
+		oracle: &Path,
+		patch: &str,
+		options: &ApplyOptions,
+		case: &str,
+	) {
+		let repository = repo(ours);
+		let checked = repository
+			.can_apply_patch(patch, options)
+			.expect("check patch");
+		let applied = repository.apply_patch(patch, options);
+		fs::write(oracle.join(".git/change.patch"), patch).expect("write patch");
+		let mut args = vec!["apply"];
+		if options.cached {
+			args.push("--cached");
+		}
+		if options.reverse {
+			args.push("--reverse");
+		}
+		args.push(".git/change.patch");
+		let expected = Command::new("git")
+			.current_dir(oracle)
+			.args(args)
+			.output()
+			.expect("run git apply");
+		assert_eq!(
+			applied.is_ok(),
+			expected.status.success(),
+			"{case}: ours {applied:?}, git {}",
+			String::from_utf8_lossy(&expected.stderr)
+		);
+		assert_eq!(checked, expected.status.success(), "{case}");
+		assert_eq!(gitlink_snapshot(ours), gitlink_snapshot(oracle), "{case}");
+	}
+
+	#[test]
+	fn worktree_apply_of_gitlink_patches_matches_git() {
+		// Regression: worktree application found no source for a submodule
+		// directory ("does not exist") and materialized added gitlinks as blobs.
+		for initialized in [true, false] {
+			for (kind, reverse) in [("update", false), ("delete", false), ("delete", true)] {
+				let (ours, old, new) = gitlink_fixture(initialized);
+				let (oracle, ..) = gitlink_fixture(initialized);
+				if kind == "update" {
+					git(ours.path(), &["update-index", "--cacheinfo", &format!("160000,{new},module")]);
+				} else {
+					git(ours.path(), &["update-index", "--force-remove", "module"]);
+				}
+				let patch = repo(ours.path())
+					.diff_text(&DiffOptions { cached: true, ..DiffOptions::default() })
+					.expect("gitlink patch");
+				git(ours.path(), &[
+					"update-index",
+					"--add",
+					"--cacheinfo",
+					&format!("160000,{old},module"),
+				]);
+				assert_gitlink_apply_matches_git(
+					ours.path(),
+					oracle.path(),
+					&patch,
+					&ApplyOptions { reverse, ..ApplyOptions::default() },
+					&format!("{kind} reverse={reverse} initialized={initialized}"),
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn deleting_gitlinks_does_not_remove_empty_descendant_directories() {
+		let (ours, old, _) = gitlink_fixture(false);
+		let (oracle, ..) = gitlink_fixture(false);
+		for fixture in [&ours, &oracle] {
+			fs::create_dir_all(fixture.path().join("module/nested/empty")).unwrap();
+		}
+		git(ours.path(), &["update-index", "--force-remove", "module"]);
+		let patch = repo(ours.path())
+			.diff_text(&DiffOptions { cached: true, ..Default::default() })
+			.unwrap();
+		git(ours.path(), &["update-index", "--add", "--cacheinfo", &format!("160000,{old},module")]);
+		assert_gitlink_apply_matches_git(
+			ours.path(),
+			oracle.path(),
+			&patch,
+			&ApplyOptions::default(),
+			"nonempty gitlink directory",
+		);
+		assert!(ours.path().join("module/nested/empty").is_dir());
+	}
+
+	#[test]
+	fn gitlink_pure_rename_applies_like_git() {
+		// Regression: a header-only gitlink rename has no `Subproject commit`
+		// line, so apply failed instead of keeping the source commit.
+		for initialized in [true, false] {
+			for cached in [true, false] {
+				let (ours, old, _) = gitlink_fixture(initialized);
+				let (oracle, ..) = gitlink_fixture(initialized);
+				git(ours.path(), &["update-index", "--force-remove", "module"]);
+				git(ours.path(), &[
+					"update-index",
+					"--add",
+					"--cacheinfo",
+					&format!("160000,{old},moved"),
+				]);
+				let patch = repo(ours.path())
+					.diff_text(&DiffOptions { cached: true, ..DiffOptions::default() })
+					.expect("gitlink rename patch");
+				assert!(patch.contains("rename to moved") && !patch.contains("@@"), "{patch}");
+				git(ours.path(), &["reset", "-q"]);
+				for reverse in [false, true] {
+					assert_gitlink_apply_matches_git(
+						ours.path(),
+						oracle.path(),
+						&patch,
+						&ApplyOptions { cached, reverse, ..ApplyOptions::default() },
+						&format!("cached={cached} reverse={reverse} initialized={initialized}"),
+					);
+				}
+			}
+		}
 	}
 }

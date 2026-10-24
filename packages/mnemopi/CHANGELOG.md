@@ -6,6 +6,12 @@
 
 - Rebuild stored local E5-large and all-MiniLM vectors after fastembed's CLS-to-mean pooling change, without deleting memories or changing configured model names.
 - Keep cached query vectors isolated between local mean-pooling models and API or custom providers.
+## [18.11.1] - 2026-10-15
+
+### Fixed
+
+- Fixed a failing `mnemopi` CLI command or MCP memory call dropping the embeddings of memories it had just stored ([#15804](https://github.com/can1357/oh-my-pi/pull/15804) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
 ## [18.11.0] - 2026-10-14
 
 ### Fixed

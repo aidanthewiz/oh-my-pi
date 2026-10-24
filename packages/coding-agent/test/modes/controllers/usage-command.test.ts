@@ -4,7 +4,7 @@ import { AuthStorage, type UsageReport } from "@oh-my-pi/pi-ai";
 import { CommandController, renderUsageReports } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import * as activityClient from "@oh-my-pi/pi-coding-agent/stats/activity-client";
-import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { Container, visibleWidth } from "@oh-my-pi/pi-tui";
 import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -395,6 +395,45 @@ describe("interactive /usage account visibility", () => {
 	function display(): string {
 		return stripVTControlCharacters(mounted?.render(120).join("\n") ?? "");
 	}
+
+	it("renders advisor status before usage refresh returns", async () => {
+		const refresh = Promise.withResolvers<UsageReport[] | null>();
+		const advisorName = "pending-refresh-advisor";
+		const advisorStats = {
+			contextWindow: 0,
+			contextTokens: 0,
+			tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: 0,
+			messages: { user: 0, assistant: 0, total: 0 },
+		};
+		const ctx = createInteractiveModeContext({
+			reportContainer: new Container(),
+			commandReportRows: () => 20,
+			ui: { terminal: { columns: 120, rows: 30 } },
+			session: {
+				getAdvisorStats: () => ({
+					configured: true,
+					active: false,
+					...advisorStats,
+					advisors: [{ ...advisorStats, name: advisorName, status: "paused" }],
+				}),
+				fetchUsageReports: () => refresh.promise,
+				modelRegistry: { authStorage },
+			},
+		});
+		let settled = false;
+		const result = new CommandController(ctx).handleAdvisorStatusCommand().then(() => {
+			settled = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(settled).toBe(true);
+			expect(stripVTControlCharacters(ctx.reportContainer.render(120).join("\n"))).toContain(advisorName);
+		} finally {
+			refresh.resolve([]);
+			await result;
+		}
+	});
 
 	it("warns without opening the dashboard when usage reporting is not configured", async () => {
 		const warnings: string[] = [];
