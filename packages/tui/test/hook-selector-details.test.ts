@@ -1,17 +1,21 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { TUI, visibleWidth } from "@oh-my-pi/pi-tui";
+import { Container, Text, TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { HookSelectorComponent } from "@oh-my-pi/pi-tui/overlays/hook-selector";
+import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
+import { createStartupStatusLine } from "@oh-my-pi/pi-tui/status-line/startup";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import { VirtualTerminal } from "./virtual-terminal";
+import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 
 const PAGE_DOWN = "\x1b[6~";
 const PAGE_UP = "\x1b[5~";
 const DOWN = "\x1b[B";
-const UP = "\x1b[A";
 const PERMISSIONS = ["Deny", "Approve once", "Allow for the rest of this session"];
 const COMMAND_TAIL = "COMMAND_TAIL_79";
 const TITLE = `AWS approval\nCommand: aws s3api get-object --key ${"x".repeat(2400)}${COMMAND_TAIL}\nProfile: audit\nAccount: 123456789012\nPartition: aws-us-gov`;
+const SAFETY_DETAILS = `Safety checks: ${"Reject any unverified account or partition. ".repeat(30)}SAFETY_TAIL`;
 
 beforeAll(async () => {
 	const dark = await getThemeByName("dark");
@@ -45,41 +49,140 @@ function fixture(columns: number, rows: number, title = TITLE) {
 	return { terminal, selector, picked, cancellations: () => cancelled };
 }
 
+function composedFixture(columns: number, rows: number) {
+	const terminal = new VirtualTerminal(columns, rows);
+	const composer = new Composer({
+		terminal,
+		preferences: { quiet: true },
+		tuiOptions: { renderScheduler: new VirtualRenderScheduler() },
+	});
+	const status = createStartupStatusLine({
+		settings: { preset: "custom", leftSegments: [], rightSegments: [], showHookStatus: true },
+		gitEnabled: false,
+		autoThinking: false,
+		fastMode: false,
+		usingSubscription: false,
+		autoCompactEnabled: false,
+		compactionBoundaries: null,
+	});
+	status.setHookStatus("fixture", "STATUS FOOTER");
+	composer.setStatusComponent(status);
+	const transcript = new TranscriptContainer();
+	transcript.addChild(new Text("Earlier transcript", 0, 0));
+	const editor = new Container();
+	const lower = new Text("HOOK BELOW ONE\nHOOK BELOW TWO", 0, 0);
+	const picked: string[] = [];
+	let cancelled = 0;
+	const selector = new HookSelectorComponent(
+		`${TITLE}\n${SAFETY_DETAILS}`,
+		PERMISSIONS,
+		value => picked.push(value),
+		() => cancelled++,
+		{
+			tui: composer.ui,
+			titleStyle: "destructive",
+			getHeight: () => {
+				const below = composer.rowsBelow(editor);
+				return below === undefined ? undefined : terminal.rows - below;
+			},
+		},
+	);
+	editor.addChild(selector);
+	composer.setRuntimeChildren([transcript, editor, lower]);
+	composer.ui.setFocus(selector);
+	composer.start({ playWelcomeIntro: false });
+	const frame = () =>
+		composer.renderFrame({ columns: terminal.columns, rows: terminal.rows }).viewport.map(row => Bun.stripANSI(row));
+	return {
+		terminal,
+		composer,
+		status,
+		lower,
+		selector,
+		picked,
+		frame,
+		cancellations: () => cancelled,
+		dispose: () => {
+			selector.dispose();
+			composer.stop();
+			status.dispose();
+		},
+	};
+}
+
 function context(cols: number, scroll = true): DescribeContext {
 	return { cols, reduceMotion: false, dark: true, supports: () => true, feature: name => name === "scroll" && scroll };
 }
 
 describe("selector detail viewport", () => {
-	it("pages through an unbroken command and identity on a short narrow terminal without selecting permission", () => {
-		const { selector, picked, cancellations } = fixture(28, 8);
-		const seen: string[] = [];
-		for (let page = 0; page < 300; page++) {
-			const rendered = selector.render(28);
-			expect(rendered.length).toBeLessThanOrEqual(8);
-			for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(28);
-			const content = selector.renderContent(24).map(row => Bun.stripANSI(row));
-			const frame = content.join("\n");
-			expect(frame).toContain("Deny");
-			expect(frame).toContain("Approve once");
-			seen.push(content[0]!);
-			selector.handleInput(PAGE_DOWN);
+	it("pages every approval detail in the real composer above lower widgets and the status footer without consent", () => {
+		const h = composedFixture(28, 8);
+		try {
+			const seen: string[] = [];
+			for (let page = 0; page < 300; page++) {
+				const frame = h.frame();
+				expect(frame[0]).toContain("AWS approval");
+				expect(frame.slice(-3).map(row => row.trim())).toEqual([
+					"HOOK BELOW ONE",
+					"HOOK BELOW TWO",
+					"STATUS FOOTER",
+				]);
+				expect(frame.join("\n")).toContain("Deny");
+				for (const row of frame) expect(visibleWidth(row)).toBeLessThanOrEqual(28);
+				seen.push(frame[1]!.slice(2, -2).replace(/[│█]\s*$/, ""));
+				h.selector.handleInput(PAGE_DOWN);
+			}
+			const read = seen.join("").replace(/\s+/g, "");
+			expect(read).toContain(`Command:awss3apiget-object--key${"x".repeat(2400)}${COMMAND_TAIL}`);
+			expect(read).toContain("Profile:audit");
+			expect(read).toContain("Account:123456789012");
+			expect(read).toContain("Partition:aws-us-gov");
+			expect(read).toContain(SAFETY_DETAILS.replace(/\s+/g, ""));
+			expect(h.picked).toEqual([]);
+			expect(h.cancellations()).toBe(0);
+			h.selector.handleInput(PAGE_UP);
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual(["Deny"]);
+		} finally {
+			h.dispose();
 		}
-		const read = seen
-			.join("")
-			.replace(/\s+/g, "")
-			.replace(/[│█]/g, "");
-		expect(read).toContain(`Command:awss3apiget-object--key${"x".repeat(2400)}${COMMAND_TAIL}`);
-		expect(read).toContain("Profile:audit");
-		expect(read).toContain("Account:123456789012");
-		expect(read).toContain("Partition:aws-us-gov");
-		expect(picked).toEqual([]);
-		expect(cancellations()).toBe(0);
-		selector.handleInput(PAGE_UP);
-		selector.handleInput("\n");
-		expect(picked).toEqual(["Deny"]);
 	});
 
-	it("keeps the session permission reachable after paging and resizing, and preserves cancel", () => {
+	it("remeasures changing lower chrome on the first resize frame and keeps every permission reachable", () => {
+		const h = composedFixture(52, 18);
+		try {
+			expect(h.frame().join("\n")).toContain("AWS approval");
+			h.selector.handleInput(PAGE_DOWN);
+			h.lower.setText("HOOK BELOW ONE\nHOOK BELOW TWO\nHOOK BELOW THREE");
+			h.status.setHookStatus("second", "STATUS SECOND");
+			h.terminal.resize(24, 10);
+			const resize = h.composer.renderResizeFrame({ columns: 24, rows: 10 }).map(row => Bun.stripANSI(row));
+			expect(resize.join("\n")).toContain("AWS approval");
+			const frame = h.frame();
+			expect(frame.join("\n")).toContain("AWS approval");
+			expect(frame.slice(-5).map(row => row.trim())).toEqual([
+				"HOOK BELOW ONE",
+				"HOOK BELOW TWO",
+				"HOOK BELOW THREE",
+				"STATUS FOOTER",
+				"STATUS SECOND",
+			]);
+			h.selector.handleInput(DOWN);
+			expect(h.frame().join("\n")).toContain("Approve once");
+			h.selector.handleInput(DOWN);
+			expect(h.frame().join("\n")).toContain("Allow for");
+			h.selector.handleInput(PAGE_UP);
+			expect(h.picked).toEqual([]);
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual([PERMISSIONS[2]!]);
+			h.selector.handleInput("\x1b");
+			expect(h.cancellations()).toBe(1);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	it("keeps the complete session consent readable in a standalone selector after resizing", () => {
 		const { selector, terminal, picked, cancellations } = fixture(52, 18);
 		selector.render(52);
 		for (let page = 0; page < 30; page++) selector.handleInput(PAGE_DOWN);
@@ -92,22 +195,12 @@ describe("selector detail viewport", () => {
 			.map(row => Bun.stripANSI(row))
 			.join("")
 			.replace(/\s+/g, "");
-		expect(content).toContain("Allowfortherestofthissession");
+		expect(content).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
 		expect(picked).toEqual([]);
-		selector.handleInput(PAGE_UP);
 		selector.handleInput("\n");
 		expect(picked).toEqual([PERMISSIONS[2]!]);
-		selector.handleInput(UP);
-		terminal.resize(70, 20);
-		const frames: string[] = [];
-		for (let page = 0; page < 60; page++) {
-			selector.handleInput(PAGE_DOWN);
-			frames.push(Bun.stripANSI(selector.render(70).join("\n")));
-		}
-		expect(frames.join("\n")).toContain("Partition: aws-us-gov");
 		selector.handleInput("\x1b");
 		expect(cancellations()).toBe(1);
-		expect(picked).toEqual([PERMISSIONS[2]!]);
 	});
 
 	it("describes a full sanitized native scroller beside permission controls and forwards repeated page requests", () => {

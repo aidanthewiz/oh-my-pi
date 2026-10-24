@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Keep long selector details scrollable while permission choices remain reachable on narrow terminals and after resizing.
+- Keep long selector details scrollable above status lines and lower hook widgets, including the first composed frame and terminal resizes.
 - Deliver Git raster and SVG previews through captured image blobs. Unsupported binary and media previews retain their existing fact and ANSI fallbacks.
 - Preserve quoted code and authored whitespace when resolving native Markdown links across quote and list containers.
 - Preserve session-relative native table links across escaped pipes and normalized cells.

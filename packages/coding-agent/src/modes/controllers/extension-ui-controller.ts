@@ -37,6 +37,7 @@ import { EditorTopGap } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
 import { boundPromptTitle, HookEditorComponent, type HookEditorOptions } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { HookInputComponent } from "@oh-my-pi/pi-tui/overlays/hook-input";
 import { HookSelectorComponent, type HookSelectorSlider } from "@oh-my-pi/pi-tui/overlays/hook-selector";
+import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
@@ -1109,6 +1110,11 @@ export class ExtensionUiController {
 					onTimeoutStart: dialogOptions?.onTimeoutStart,
 					onTimeoutReset: dialogOptions?.onTimeoutReset,
 					tui: this.ctx.ui,
+					getHeight: () => {
+						if (isNativeRendering()) return undefined;
+						const below = this.ctx.composer.rowsBelow(this.ctx.editorContainer);
+						return below === undefined ? undefined : this.ctx.ui.terminal.rows - below;
+					},
 					titleStyle: dialogOptions?.tuiStyle,
 					outline: dialogOptions?.outline,
 					disabledIndices: dialogOptions?.disabledIndices,

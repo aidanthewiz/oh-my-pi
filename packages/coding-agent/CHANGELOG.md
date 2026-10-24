@@ -12,7 +12,7 @@
 
 ### Fixed
 
-- Show full AWS approval commands and identity details in a wrapped, scrollable body below a short heading.
+- Keep full AWS approval commands, identity, and safety details scrollable above status lines and lower hook widgets after resizing.
 - Keep complete provider safety checks readable in approval dialogs even when tool activity is visible.
 - Avoid repeat AWS permission prompts in eval and nested device batches after granting session access.
 - Force physical APFS copies during session compression; cloned files otherwise retain uncompressed storage.

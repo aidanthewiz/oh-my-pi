@@ -70,6 +70,8 @@ export interface HookSelectorSlider {
 
 export interface HookSelectorOptions {
 	tui?: TUI;
+	/** Total panel rows available above the host's lower chrome, at the current width. */
+	getHeight?: () => number | undefined;
 	timeout?: number;
 	onTimeout?: () => void;
 	onTimeoutStart?: () => void;
@@ -227,6 +229,7 @@ export class HookSelectorComponent extends OverlayPanel {
 	#maxVisible: number;
 	readonly #configuredMaxVisible: number;
 	readonly #tui: TUI | undefined;
+	readonly #getHeight: (() => number | undefined) | undefined;
 	readonly #detailContent = new Container();
 	readonly #detailView = new ScrollView(this.#detailContent, {
 		height: 0,
@@ -311,6 +314,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		this.#maxVisible = Math.max(3, opts?.maxVisible ?? 12);
 		this.#configuredMaxVisible = this.#maxVisible;
 		this.#tui = opts?.tui;
+		this.#getHeight = opts?.getHeight;
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#baseTitle = this.title;
@@ -399,7 +403,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		}
 		if (this.#detailLines.length === 0) return;
 
-		const terminalRows = Math.max(4, this.#tui?.terminal.rows ?? process.stdout.rows ?? 24);
+		const terminalRows = Math.max(4, this.#getHeight?.() ?? this.#tui?.terminal.rows ?? process.stdout.rows ?? 24);
 		const list = this.#outlinedList ?? this.#listContainer!;
 		for (const spacer of this.#layoutSpacers) spacer.setLines(1);
 		this.#hint.setText(theme.fg("dim", `${this.#controlsHint}  PgUp/PgDn details`));
