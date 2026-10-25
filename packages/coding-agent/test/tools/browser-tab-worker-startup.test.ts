@@ -71,6 +71,7 @@ const initPayload = {
 	mode: "headless" as const,
 	browserWSEndpoint: "ws://127.0.0.1/devtools/browser/test",
 	safeDir: "/tmp/omp-puppeteer",
+	uploadDir: "/tmp/omp-uploads-test",
 };
 const SECRET_KEY = "BROWSER_WORKER_PARENT_SECRET";
 const MANAGED_SECRET_KEY = "OMP_MANAGED_BROWSER_WORKER_SECRET";

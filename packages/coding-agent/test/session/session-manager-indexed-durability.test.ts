@@ -18,14 +18,19 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { createHash } from "node:crypto";
+import type { SessionTitleUpdate } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 class FakeBackend implements SessionStorageBackend {
 	readonly files = new Map<string, string>();
 	readonly mtimes = new Map<string, number>();
+	readonly titles = new Map<string, string>();
 	/** Reject the next N append calls with a transient failure. */
 	failAppends = 0;
 	/** Reject the next N whole-file publishes with a transient failure. */
 	failWrites = 0;
+	holdNextWrite: PromiseWithResolvers<void> | undefined;
+	readonly writeHeld = Promise.withResolvers<void>();
 	#mtime = 1;
 
 	async init(): Promise<void> {}
@@ -43,7 +48,7 @@ class FakeBackend implements SessionStorageBackend {
 	}
 	async readFullWithTitleMeta(path: string): Promise<{ rawContent: string; titleMeta: string | null } | null> {
 		const rawContent = this.files.get(path);
-		return rawContent === undefined ? null : { rawContent, titleMeta: null };
+		return rawContent === undefined ? null : { rawContent, titleMeta: this.titles.get(path) ?? null };
 	}
 
 	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
@@ -66,35 +71,55 @@ class FakeBackend implements SessionStorageBackend {
 		path: string,
 		content: string,
 		mtimeMs: number,
-		_title?: unknown,
+		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
+		expectedFingerprint?: string,
+		expectedTitleMeta?: string | null,
 	): Promise<void> {
 		if (this.failWrites > 0) {
 			this.failWrites -= 1;
 			throw new Error("transient backend write failure");
+		}
+		const hold = this.holdNextWrite;
+		if (hold) {
+			this.holdNextWrite = undefined;
+			this.writeHeld.resolve();
+			await hold.promise;
 		}
 		const current = this.files.get(path) ?? null;
 		const actualSize = current === null ? null : Buffer.byteLength(current, "utf8");
 		if (expectedSize !== undefined && actualSize !== expectedSize) {
 			throw new SessionWriteConflictError(path, expectedSize, actualSize);
 		}
+		if (
+			(expectedFingerprint !== undefined &&
+				(current === null || createHash("sha1").update(current).digest("hex") !== expectedFingerprint)) ||
+			(expectedTitleMeta !== undefined && (this.titles.get(path) ?? null) !== expectedTitleMeta)
+		) {
+			throw new SessionWriteConflictError(path, expectedSize ?? null, actualSize, actualSize === expectedSize);
+		}
 		this.files.set(path, content);
 		this.mtimes.set(path, mtimeMs);
+		if (title) this.titles.set(path, JSON.stringify(title));
+		else this.titles.delete(path);
 	}
 
-	async updateSessionTitle(path: string, _title: unknown, mtimeMs: number): Promise<void> {
+	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
 		this.mtimes.set(path, mtimeMs);
+		this.titles.set(path, JSON.stringify(title));
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
 		this.files.set(path, "");
 		this.mtimes.set(path, mtimeMs);
+		this.titles.delete(path);
 	}
 
 	async remove(paths: string[]): Promise<void> {
 		for (const path of paths) {
 			this.files.delete(path);
 			this.mtimes.delete(path);
+			this.titles.delete(path);
 		}
 	}
 
@@ -104,6 +129,9 @@ class FakeBackend implements SessionStorageBackend {
 		this.files.delete(src);
 		this.files.set(dst, content);
 		this.mtimes.set(dst, mtimeMs);
+		const title = this.titles.get(src);
+		this.titles.delete(src);
+		if (title !== undefined) this.titles.set(dst, title);
 	}
 }
 
@@ -332,5 +360,47 @@ describe("SessionManager + indexed backend durability", () => {
 		const body = backend.files.get(sessionFile) ?? "";
 		expect(body).toContain("first turn");
 		expect(body).toContain("second turn");
+	});
+
+	// The size-check conflict after pruning is covered against the real backend in
+	// sql-session-storage-manager.test.ts.
+	it("recovers IndexedSessionStorage after a rejected deferred publish", async () => {
+		const { backend, storage, manager } = await makeManager();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("expected a session file");
+
+		manager.appendMessage(assistantMessage("seed reply"));
+		manager.appendMessage({ role: "user", content: "before rewrite", timestamp: Date.now() });
+		await manager.flush();
+		await storage.drain();
+
+		const hold = Promise.withResolvers<void>();
+		backend.holdNextWrite = hold;
+		const rewritePublished = manager.rewriteEntries();
+		await backend.writeHeld.promise;
+		backend.failWrites = 1;
+		manager.appendMessage({ role: "user", content: "fenced append", timestamp: Date.now() });
+		manager.appendMessage({ role: "user", content: "after fenced append", timestamp: Date.now() });
+		hold.resolve();
+		await rewritePublished.catch(() => {});
+		await manager.flush().catch(() => {});
+		await storage.drain().catch(() => {});
+
+		manager.appendMessage({ role: "user", content: "later turn 1", timestamp: Date.now() });
+		manager.appendMessage({ role: "user", content: "later turn 2", timestamp: Date.now() });
+		await manager.flush().catch(() => {});
+		await storage.drain().catch(() => {});
+
+		const body = backend.files.get(sessionFile) ?? "";
+		for (const turn of ["fenced append", "after fenced append", "later turn 1", "later turn 2"]) {
+			expect(body).toContain(turn);
+		}
+		expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(body, "utf8"));
+		const confirmed = manager.captureState();
+		expect(confirmed.expectedDiskFingerprint?.copy().digest("hex")).toBe(
+			createHash("sha1").update(body).digest("hex"),
+		);
+		expect(confirmed.expectedDiskTitleMeta).toBe(backend.titles.get(sessionFile));
+		await manager.close();
 	});
 });

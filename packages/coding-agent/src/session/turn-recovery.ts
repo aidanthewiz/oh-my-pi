@@ -55,6 +55,7 @@ import {
 	getStopHookAssistantEntryId,
 	isEmptyAssistantStop,
 	isEmptyErrorTurn,
+	operatorTitleText,
 } from "./messages";
 import {
 	type ActiveRetryFallbackState,
@@ -1136,6 +1137,13 @@ export class TurnRecovery {
 				this.#unexpectedStopRetryCount = 0;
 				return false;
 			}
+			// This turn answers a stop nudge, which demands the next tool call or
+			// the final answer. Visible text without a tool call is that final
+			// answer; judging it again only chains no-op "nothing more to add" turns.
+			if (this.#unexpectedStopRetryCount > 0) {
+				this.#unexpectedStopRetryCount = 0;
+				return false;
+			}
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), this.#unexpectedStopJudgeTimeoutMs);
 			// Esc/session teardown must interrupt the extended judge wait: link the
@@ -1144,9 +1152,10 @@ export class TurnRecovery {
 			const sessionSignal = this.#host.unexpectedStopAbortSignal?.();
 			const onSessionAbort = (): void => controller.abort();
 			sessionSignal?.addEventListener("abort", onSessionAbort, { once: true });
+			const stop = { message: text, request: this.#latestOperatorRequest() };
 			let classification: boolean | undefined;
 			try {
-				classification = await classifyUnexpectedStop(text, {
+				classification = await classifyUnexpectedStop(stop, {
 					settings: this.#host.settings,
 					registry: this.#host.modelRegistry,
 					sessionId: this.#host.sessionId(),
@@ -1191,6 +1200,16 @@ export class TurnRecovery {
 			generation: this.#host.promptGeneration(),
 		});
 		return true;
+	}
+
+	/** The operator's latest typed request, which a text-only stop is judged against. */
+	#latestOperatorRequest(): string | undefined {
+		const messages = this.#host.agent.state.messages;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const request = operatorTitleText(messages[i]!);
+			if (request !== undefined) return request;
+		}
+		return undefined;
 	}
 
 	#unexpectedStopRetryReminder(): string {

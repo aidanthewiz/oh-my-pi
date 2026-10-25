@@ -41,11 +41,13 @@ import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOpti
 import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
 import { resolvePeer } from "../utils/resolve-peer";
+import { type AuthGatewayClientScope, AuthGatewayClientTable } from "./clients";
 import {
 	type AuthGatewayBootOptions,
 	type AuthGatewayRouteOptions,
 	type ModelResolver,
 	buildGatewayApiKeyResolver,
+	gatewayRequestLogFields,
 	mirrorRequestAbort,
 	normalizeClientSessionKey,
 	recordGatewayUsage,
@@ -59,6 +61,7 @@ import {
 	hasMisplacedBearer,
 	isAuthorized,
 	json,
+	readBearerToken,
 	resolveClientIdentity,
 	withCors,
 } from "./http";
@@ -359,7 +362,7 @@ async function handleFormatEndpoint(
 	// expected to resolve the credential and pass it as `options.apiKey`.
 	// For OAuth providers this returns the access token (refreshed via the
 	// broker override on AuthStorage when needed).
-	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
+	const apiKey = await resolveGatewayApiKey(bootOpts, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return clientClosedResponse(route);
 	if ("status" in apiKey) return route.module.formatError(apiKey.status, apiKey.type, apiKey.message);
 
@@ -376,19 +379,19 @@ async function handleFormatEndpoint(
 		model,
 		context: parsed.context,
 		toolsJson,
-		account: resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, apiKey.apiKey),
+		account: resolveGatewayAccount(apiKey),
+		client: bootOpts.client?.name,
 	});
 	streamOpts.providerSessionState = lease.states;
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
-		bootOpts.storage,
+		bootOpts,
 		model,
 		sessionId,
 		apiKey,
 		controller.signal,
 		route.label,
 		peer,
-		resolvedKey =>
-			lease.updateAccount(resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, resolvedKey)),
+		resolved => lease.updateAccount(resolveGatewayAccount(resolved)),
 	);
 
 	logger.info("auth-gateway request", {
@@ -399,6 +402,7 @@ async function handleFormatEndpoint(
 		resolvedModel: model.id,
 		stream: parsed.stream,
 		peer,
+		...gatewayRequestLogFields(bootOpts, apiKey),
 	});
 
 	if (!parsed.stream) {
@@ -443,9 +447,15 @@ async function handleFormatEndpoint(
 		}
 	}
 
-	// A streamed turn outlives this function, so the lease travels with the
-	// event stream and is released when the turn settles. Until that handoff
-	// happens, the `finally` below owns it.
+	// A streamed turn outlives this function, so the lease, and a scoped
+	// client's hold on its account restriction, travel with the event stream and
+	// are released when the turn settles. Until that handoff happens, the
+	// `finally` below owns them.
+	const clientHold = bootOpts.client?.retain();
+	const settle = (): void => {
+		lease.release();
+		clientHold?.();
+	};
 	let streamOwnsLease = false;
 	try {
 		let events: AssistantMessageEventStream;
@@ -464,7 +474,7 @@ async function handleFormatEndpoint(
 				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
 			)
 			.catch(() => {})
-			.finally(() => lease.release());
+			.finally(settle);
 		streamOwnsLease = true;
 
 		const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
@@ -489,7 +499,7 @@ async function handleFormatEndpoint(
 			},
 		});
 	} finally {
-		if (!streamOwnsLease) lease.release();
+		if (!streamOwnsLease) settle();
 	}
 }
 
@@ -554,7 +564,7 @@ async function handlePiNative(
 	const sessionId = clientKey ?? deriveSessionId(parsed.modelId, parsed.context, toolsJson);
 	parsed.options.sessionId = sessionId;
 
-	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
+	const apiKey = await resolveGatewayApiKey(bootOpts, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return piNative.formatError(apiKey.status, apiKey.type, apiKey.message);
 
@@ -568,7 +578,8 @@ async function handlePiNative(
 		model,
 		context: parsed.context,
 		toolsJson,
-		account: resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, apiKey.apiKey),
+		account: resolveGatewayAccount(apiKey),
+		client: bootOpts.client?.name,
 	});
 	// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 	// trust the client's options (already allow-listed by `parseRequest`) and
@@ -582,15 +593,14 @@ async function handlePiNative(
 	};
 	if (bootOpts.fetch) streamOpts.fetch = bootOpts.fetch;
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
-		bootOpts.storage,
+		bootOpts,
 		model,
 		sessionId,
 		apiKey,
 		controller.signal,
 		"pi-native",
 		peer,
-		resolvedKey =>
-			lease.updateAccount(resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, resolvedKey)),
+		resolved => lease.updateAccount(resolveGatewayAccount(resolved)),
 	);
 	if (model.api === "openai-codex-responses") {
 		delete streamOpts.temperature;
@@ -616,6 +626,7 @@ async function handlePiNative(
 		resolvedModel: model.id,
 		stream: parsed.stream,
 		peer,
+		...gatewayRequestLogFields(bootOpts, apiKey),
 	});
 
 	if (!parsed.stream) {
@@ -656,9 +667,15 @@ async function handlePiNative(
 		}
 	}
 
-	// A streamed turn outlives this function, so the lease travels with the
-	// event stream and is released when the turn settles. Until that handoff
-	// happens, the `finally` below owns it.
+	// A streamed turn outlives this function, so the lease, and a scoped
+	// client's hold on its account restriction, travel with the event stream and
+	// are released when the turn settles. Until that handoff happens, the
+	// `finally` below owns them.
+	const clientHold = bootOpts.client?.retain();
+	const settle = (): void => {
+		lease.release();
+		clientHold?.();
+	};
 	let streamOwnsLease = false;
 	try {
 		let events: AssistantMessageEventStream;
@@ -677,7 +694,7 @@ async function handlePiNative(
 				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
 			)
 			.catch(() => {})
-			.finally(() => lease.release());
+			.finally(settle);
 		streamOwnsLease = true;
 
 		const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
@@ -699,7 +716,7 @@ async function handlePiNative(
 			},
 		});
 	} finally {
-		if (!streamOwnsLease) lease.release();
+		if (!streamOwnsLease) settle();
 	}
 }
 
@@ -825,8 +842,8 @@ const MODEL_ROUTES: Record<string, (opts: AuthGatewayRouteOptions, req: Request,
 
 /** The gateway's `/v1/*` routes, for a transport that has already admitted the caller. */
 export interface AuthGatewayRouter {
-	/** Answers one request; `peer` names the caller in logs. Never rejects: a crashed route answers 500. */
-	route(req: Request, peer: string, resolveModel?: ModelResolver): Promise<Response>;
+	/** `resolveModel` is a trusted transport override, narrowed by `client` when supplied. */
+	route(req: Request, peer: string, client?: AuthGatewayClientScope, resolveModel?: ModelResolver): Promise<Response>;
 	/** Whether this route accepts a top-level model selector. */
 	isModelRequest(req: Request): boolean;
 	/**
@@ -836,20 +853,59 @@ export interface AuthGatewayRouter {
 	close(): void;
 }
 
+/** Why a scoped client cannot read `/v1/usage` or `/v1/credentials/check`: both cover every account the gateway holds. */
+const GATEWAY_WIDE_ROUTE = "client tokens cannot read gateway-wide usage or credential health";
+
 /**
- * The gateway's routes over `opts`, owning their per-session provider state:
+ * Route options for a request from scoped `client`. Its models narrow
+ * `resolveModel` and `listModels`, so every route refuses a model outside them
+ * as unknown before any credential lookup; `client` itself binds the
+ * request's credential lookups (see `dispatch.ts`).
+ */
+function scopeRouteOptions(opts: AuthGatewayRouteOptions, client: AuthGatewayClientScope): AuthGatewayRouteOptions {
+	if (!client.limitsModels) return { ...opts, client };
+	const { resolveModel, listModels } = opts;
+	return {
+		...opts,
+		client,
+		resolveModel: id => {
+			const model = resolveModel(id);
+			if (model) {
+				if (client.allows(model)) return model;
+				// A provider-qualified id names one model: a refused one is never reread as another provider's bare id.
+				if (`${model.provider}/${model.id}` === id) return undefined;
+			}
+			// A bare id whose first match is refused resolves to the first served model of that id the client may call.
+			for (const candidate of listModels?.() ?? []) {
+				if (candidate.id === id && client.allows(candidate)) return candidate;
+			}
+			return undefined;
+		},
+		listModels: listModels && (() => [...listModels()].filter(model => client.allows(model))),
+	};
+}
+
+/**
+ * The gateway's routes over `hostOpts`, owning their per-session provider state:
  * two routers in one process never share (or tear down) each other's.
  */
-export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGatewayRouter {
+export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): AuthGatewayRouter {
 	const sessionStates = new AuthGatewaySessionStateStore();
-	const route = async (req: Request, peer: string, resolveModel?: ModelResolver): Promise<Response> => {
-		const routeOpts = resolveModel ? { ...opts, resolveModel } : opts;
+	const route = async (
+		req: Request,
+		peer: string,
+		client?: AuthGatewayClientScope,
+		resolveModel?: ModelResolver,
+	): Promise<Response> => {
 		const pathname = new URL(req.url).pathname;
+		const requestOpts = resolveModel ? { ...hostOpts, resolveModel } : hostOpts;
+		const opts = client ? scopeRouteOptions(requestOpts, client) : requestOpts;
 		try {
 			// Aggregated usage — backed by AuthStorage's 5-min per-credential cache.
 			// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 			// same client struct.
 			if (req.method === "GET" && pathname === "/v1/usage") {
+				if (client) return json(403, { error: GATEWAY_WIDE_ROUTE });
 				return await handleUsage(opts, req.signal);
 			}
 
@@ -857,30 +913,31 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 			// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 			// credentials, so we need a separate endpoint that captures errors.
 			if (req.method === "GET" && pathname === "/v1/credentials/check") {
+				if (client) return json(403, { error: GATEWAY_WIDE_ROUTE });
 				return await handleCredentialsCheck(opts, req.signal);
 			}
 
 			// Provider-format dispatch.
 			const formatRoute = FORMAT_ROUTES[pathname];
 			if (formatRoute && req.method === "POST") {
-				return await handleFormatEndpoint(formatRoute, routeOpts, req, peer, sessionStates);
+				return await handleFormatEndpoint(formatRoute, opts, req, peer, sessionStates);
 			}
 
 			// Pi-native fast path. Same auth + provider plumbing as the
 			// foreign-wire routes, just without the wire-format translation.
 			if (req.method === "POST" && pathname === "/v1/pi/stream") {
-				return await handlePiNative(routeOpts, req, peer, sessionStates);
+				return await handlePiNative(opts, req, peer, sessionStates);
 			}
 
 			const modelRoute = MODEL_ROUTES[pathname];
 			if (modelRoute && req.method === "POST") {
-				return await modelRoute(routeOpts, req, peer);
+				return await modelRoute(opts, req, peer);
 			}
 			const videoJob = req.method === "GET" ? VIDEO_JOB_PATH.exec(pathname) : null;
 			if (videoJob) {
 				const gatewayId = decodeURIComponent(videoJob[1]);
 				const handler = videoJob[2] ? handleVideoContent : handleVideoPoll;
-				return await handler(routeOpts, req, peer, gatewayId);
+				return await handler(opts, req, peer, gatewayId);
 			}
 
 			// Model catalog.
@@ -919,6 +976,10 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
+	const clients = new AuthGatewayClientTable(opts.storage.sessions, tokens);
+	if (opts.clients) clients.set(opts.clients);
+	// A client table, even an empty one, keeps bearer auth on without a gateway token.
+	let requireBearer = tokens.size > 0 || opts.clients !== undefined;
 	const version = opts.version;
 	const router = createAuthGatewayRouter(opts);
 
@@ -938,19 +999,34 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 			if (req.method === "GET" && pathname === "/healthz") {
 				return withCors(json(200, { ok: true, version }), req);
 			}
-			if (!isAuthorized(req, tokens)) {
-				logger.info("auth-gateway request unauthorized", {
-					method: req.method,
-					path: loggablePath(pathname),
-					peer: socketPeer,
-				});
-				return withCors(json(401, { error: "unauthorized" }), req);
+			let client: AuthGatewayClientScope | undefined;
+			let misplaceable: ReadonlySet<string> = tokens;
+			if (requireBearer && !(tokens.size > 0 && isAuthorized(req, tokens))) {
+				const bearer = readBearerToken(req);
+				client = bearer === undefined ? undefined : clients.authenticate(bearer);
+				if (bearer === undefined || client === undefined) {
+					logger.info("auth-gateway request unauthorized", {
+						method: req.method,
+						path: loggablePath(pathname),
+						peer: socketPeer,
+					});
+					return withCors(json(401, { error: "unauthorized" }), req);
+				}
+				// Client tokens are configured as digests; the presented one is the only one held in full.
+				misplaceable = new Set([...tokens, bearer]);
 			}
-			if (hasMisplacedBearer(req, url, tokens)) {
+			if (hasMisplacedBearer(req, url, misplaceable)) {
 				return withCors(json(400, { error: "gateway bearer token outside Authorization" }), req);
 			}
 			const peer = resolvePeer(req, socketPeer, opts.trustProxyHeaders);
-			return withCors(await router.route(req, peer), req);
+			if (!client) return withCors(await router.route(req, peer), req);
+			// Taken in the tick `authenticate` ran, so a reload cannot lift the restriction first.
+			const release = client.retain();
+			try {
+				return withCors(await router.route(req, peer, client), req);
+			} finally {
+				release();
+			}
 		},
 		// Max-out Bun's idle timeout. Long thinking-budget calls can sit idle
 		// for minutes before the first token arrives; the default kills them.
@@ -969,6 +1045,11 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 			// sockets and timers (Codex WebSockets, GitLab Duo workflows), so the
 			// process can't settle until each one is closed.
 			router.close();
+			clients.close();
+		},
+		setClients: list => {
+			clients.set(list);
+			requireBearer = true;
 		},
 	};
 }

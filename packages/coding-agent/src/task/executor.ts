@@ -2739,10 +2739,11 @@ interface FinalizeRunArgs {
 	detached?: boolean;
 	/**
 	 * This finalize is a revival/wake or explicit follow-up turn, not the initial
-	 * run. Such turns only (re)write `<id>.md` for a yield or a successful plain
-	 * report, never a structured peer conversation or an empty/failed plain turn.
+	 * run. Structured turns only republish a real `yield`; message-result turns
+	 * republish successful, non-empty reports requested by the parent or operator.
 	 */
 	followUpTurn?: boolean;
+	publishMessageResult?: boolean;
 	sessionFile?: string;
 	startTime: number;
 }
@@ -2811,18 +2812,19 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// Write output artifact (input and jsonl already written in real-time).
 	// Compute output metadata for agent:// URL integration.
 	//
-	// Structured peer chatter must not replace an accepted result with a
-	// missing-yield warning. Plain turns publish only successful, non-empty reports.
+	// Structured follow-ups need a real yield; plain peer replies cannot replace
+	// the parent's accepted artifact.
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
-	const publishFollowUp = structured
-		? hasYield
-		: exitCode === 0 &&
-			!done.aborted &&
-			!signal?.aborted &&
-			!monitor.runtimeLimitExceeded() &&
-			(monitor.lastReportTurnText()?.trim().length ?? 0) > 0;
-	if (args.artifactsDir && (!args.followUpTurn || publishFollowUp)) {
+	const hasMessageResult =
+		args.publishMessageResult &&
+		!structured &&
+		exitCode === 0 &&
+		!done.aborted &&
+		!signal?.aborted &&
+		!monitor.runtimeLimitExceeded() &&
+		rawOutput.trim().length > 0;
+	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		try {
 			await writeArtifact(candidatePath, rawOutput);
@@ -3141,6 +3143,8 @@ function extractIrcRecordText(content: string | ReadonlyArray<{ type: string; te
 		.join("\n");
 }
 
+const observedTurnFinalizations = new Map<string, Promise<void>>();
+
 /**
  * Bracket a kept-alive subagent's undriven turns — autonomous IRC wakes and
  * user prompts from focused-session steering — with a task run monitor so
@@ -3186,13 +3190,15 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const turnStartTime = Date.now();
 		const relay = Promise.withResolvers<void>();
 		session.trackIrcReply(relay.promise);
-		const sessionFile = AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined;
+		const turnRef = AgentRegistry.global().get(id);
+		const sessionFile = turnRef?.sessionFile ?? options.sessionFile ?? undefined;
+		const finalizationKey = options.artifactsDir ? path.join(options.artifactsDir, `${id}.md`) : undefined;
 		// The parent receives this turn's outcome through an owner-routed job: the
 		// ordinary async-result delivery, and what its `wait` blocks on. A turn
 		// woken by the parent's own message is work the parent started, so the job
 		// spans the whole turn. Otherwise a yield or clean plain report registers
 		// the job before the ref goes idle; finalization settles its outcome.
-		const ownerId = AgentRegistry.global().get(id)?.parentId;
+		const ownerId = turnRef?.parentId;
 		// Cancelling the job cancels the turn it stands for.
 		const jobCancel = new AbortController();
 		let wakeJob: { ownerId: string; outcome: PromiseWithResolvers<AsyncJobRunResult> } | undefined;
@@ -3263,7 +3269,13 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 
 		turnMonitor.setActiveSession(session);
 		const unsubscribeTurn = turnMonitor.attach(session);
-		if (wakeSources(records, id).some(source => source.from === ownerId)) registerWakeJob();
+		const ownerWoken = wakeSources(records, id).some(source => source.from === ownerId);
+		const focusedPrompt = records.some(
+			record =>
+				(record.role === "user" && record.attribution === "user") ||
+				(record.role === "developer" && record.userInitiated === true),
+		);
+		if (ownerWoken) registerWakeJob();
 		return async turnError => {
 			unsubscribeTurn();
 			const activeSession = turnMonitor.takeActiveSession();
@@ -3307,7 +3319,14 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			const abortReason = aborted ? turnMonitor.resolveAbortReasonText() : undefined;
 			let result: SingleResult | undefined;
 			let finalizeError: unknown;
+			// Detach and snapshot before waiting: a successor turn owns subsequent
+			// session events, while artifact and sidecar writes retain close order.
+			const previousFinalization = finalizationKey ? observedTurnFinalizations.get(finalizationKey) : undefined;
+			const finalized = Promise.withResolvers<void>();
+			if (finalizationKey) observedTurnFinalizations.set(finalizationKey, finalized.promise);
 			try {
+				await previousFinalization;
+				const currentRef = AgentRegistry.global().get(id);
 				result = await finalizeRunResult({
 					monitor: turnMonitor,
 					done: {
@@ -3327,12 +3346,18 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					outputSchema: options.outputSchema,
 					outputSchemaMode: options.outputSchemaMode,
 					outputSchemaSource: options.outputSchemaSource,
-					artifactsDir: options.artifactsDir,
+					artifactsDir:
+						currentRef === turnRef && currentRef?.session === session && currentRef.status !== "aborted"
+							? options.artifactsDir
+							: undefined,
 					eventBus: options.eventBus,
 					subagentEventBus: options.subagentEventBus,
 					parentToolCallId: options.parentToolCallId,
 					detached: true,
 					followUpTurn: true,
+					publishMessageResult: ownerWoken || focusedPrompt,
+					// A cancelled wake job must not replace the accepted result.
+					signal: jobCancel.signal,
 					sessionFile,
 					startTime: turnStartTime,
 				});
@@ -3343,6 +3368,10 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					error: caught instanceof Error ? caught.message : String(caught),
 				});
 			} finally {
+				finalized.resolve();
+				if (finalizationKey && observedTurnFinalizations.get(finalizationKey) === finalized.promise) {
+					observedTurnFinalizations.delete(finalizationKey);
+				}
 				// Once registered, the wake job carries this turn's outcome to the
 				// parent whatever it is: the yield result, the failure that
 				// superseded it, or, for a turn that never yielded, the answer a
@@ -3552,9 +3581,9 @@ export interface FollowUpTurnOptions {
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	/**
-	 * When set, a turn that produces a `yield` result (re)writes `<artifactsDir>/<id>.md`
-	 * so `agent://<id>` tracks the latest completion. A yield-less turn (e.g. a peer-message
-	 * wake answering a message) leaves the existing artifact intact (issue #9518).
+	 * When set, a turn that yields or completes a successful, non-empty message
+	 * result (re)writes `<artifactsDir>/<id>.md` so `agent://<id>` tracks the latest
+	 * completion. Structured turns without a yield leave the existing artifact intact.
 	 */
 	artifactsDir?: string;
 	/** Wall-clock cap in ms for this turn; 0 disables. */
@@ -3731,6 +3760,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		parentToolCallId: options.parentToolCallId,
 		detached: true,
 		followUpTurn: true,
+		publishMessageResult: true,
 		sessionFile,
 		startTime,
 	});

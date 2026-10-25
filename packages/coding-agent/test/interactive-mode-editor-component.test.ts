@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -106,31 +107,36 @@ describe("InteractiveMode editor and report handoff", () => {
 		});
 	});
 
-	it("continues draining queued consents while the agent remains idle", async () => {
-		vi.useFakeTimers();
-		await mode.init({ suppressWelcomeIntro: true });
-		const prompt = vi
-			.spyOn(ExtensionUiController.prototype, "showCollabAwareSelector")
-			.mockResolvedValueOnce("Dismiss")
-			.mockResolvedValueOnce("Prepare /report");
+	for (const firstChoice of ["Dismiss", undefined] as const) {
+		it(`continues draining queued consents after ${firstChoice ?? "cancellation"} while the agent remains idle`, async () => {
+			vi.useFakeTimers();
+			await mode.init({ suppressWelcomeIntro: true });
+			const firstAnswer = Promise.withResolvers<string | undefined>();
+			const prompt = vi
+				.spyOn(ExtensionUiController.prototype, "showCollabAwareSelector")
+				.mockImplementationOnce(() => firstAnswer.promise)
+				.mockResolvedValueOnce("Prepare /report");
 
-		await dispatchReportIssueDevice({} as ToolSession, "read: first failure");
-		await dispatchReportIssueDevice({} as ToolSession, "bash: second failure");
+			await dispatchReportIssueDevice({} as ToolSession, "read: first failure");
+			await dispatchReportIssueDevice({} as ToolSession, "bash: second failure");
 
-		const submittedPromise = mode.getUserInput();
-		vi.advanceTimersByTime(1_000);
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(prompt).toHaveBeenCalledTimes(1);
+			const submittedPromise = mode.getUserInput();
+			vi.advanceTimersByTime(1_000);
+			expect(prompt).toHaveBeenCalledTimes(1);
+			vi.advanceTimersByTime(1_000);
+			expect(prompt).toHaveBeenCalledTimes(1);
 
-		vi.advanceTimersByTime(999);
-		expect(prompt).toHaveBeenCalledTimes(1);
-		vi.advanceTimersByTime(1);
+			firstAnswer.resolve(firstChoice);
+			await nextTurn();
+			vi.advanceTimersByTime(999);
+			expect(prompt).toHaveBeenCalledTimes(1);
+			vi.advanceTimersByTime(1);
 
-		const submitted = await submittedPromise;
-		expect(prompt).toHaveBeenCalledTimes(2);
-		expect(submitted.text).toBe("/report bash: second failure");
-	});
+			const submitted = await submittedPromise;
+			expect(prompt).toHaveBeenCalledTimes(2);
+			expect(submitted.text).toBe("/report bash: second failure");
+		});
+	}
 
 	it("exposes the active editor factory while replacing the editor", () => {
 		const firstFactory = (_tui: unknown, editorTheme: ConstructorParameters<typeof TestModalEditor>[0]) =>

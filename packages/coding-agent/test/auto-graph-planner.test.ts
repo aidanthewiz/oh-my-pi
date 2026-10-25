@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { Answer } from "@oh-my-pi/pi-ai";
 import { judgeRequest, planFromAnswers } from "@oh-my-pi/pi-coding-agent/auto-graph/planner";
 import { buildChart, planChart } from "@oh-my-pi/pi-tui/charts/chart-plan";
-import { chartAlt } from "@oh-my-pi/pi-tui/charts/chart-svg";
+import { renderChartSvg } from "@oh-my-pi/pi-tui/charts/chart-svg";
 import { analyzeTable } from "@oh-my-pi/pi-tui/charts/table-data";
 import type { TableChartRequest } from "@oh-my-pi/pi-tui/chat/table-chart";
 
@@ -81,7 +81,7 @@ describe("planFromAnswers", () => {
 		expect(spec.categories).toEqual(["Time", "Memory", "Errors", "Total"]);
 		expect(spec.series.map(series => series.name)).toEqual([headers[0]]);
 		expect(spec.series[0]!.points.map(point => point?.value)).toEqual([0.5, 0.2, 0, 0.4]);
-		expect(chartAlt(spec)).toContain(`vs ${headers[1]}`);
+		expect(renderChartSvg(spec).match(/\baria-label="([^"]*)"/)?.[1]).toContain(headers[1]!);
 	});
 
 	it("keeps a selected variant against the same baseline without plotting derived deltas", () => {

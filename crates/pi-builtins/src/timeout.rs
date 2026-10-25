@@ -86,10 +86,9 @@ impl clap::Parser for TimeoutCommand {}
 
 /// Records the external children spawned while running the timed command.
 ///
-/// brush's cancellation token can only SIGKILL a child (see
-/// `brush_core::processes::Process::wait`), so delivering the *configured*
-/// signal requires knowing the child's pid/pgid; the shell reports those
-/// through its [`SpawnObserver`] hook.
+/// The embedding host owns cancellation's TERM/KILL wave; brush waits for
+/// that grace before a final kill. Delivering this builtin's configured
+/// signal requires the child's original pid/pgid, reported by [`SpawnObserver`].
 #[derive(Default)]
 struct SpawnRecorder(Mutex<Vec<(i32, Option<i32>)>>);
 
@@ -272,7 +271,7 @@ impl builtins::Command for TimeoutCommand {
 		if !signalled {
 			// The operand ran in-process (a builtin, say) or the child is
 			// already gone; cancellation is the only remaining lever. For
-			// external children it degrades to SIGKILL — see `Process::wait`.
+			// external children brush waits for host cleanup, then hard-kills.
 			child_cancel.cancel();
 		}
 		let mut killed = signal.as_str() == "SIGKILL";

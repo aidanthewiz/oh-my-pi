@@ -1594,23 +1594,12 @@ export class SessionManager {
 			} catch (drainFailure) {
 				recoveryErrors.push(toError(drainFailure));
 			}
-			let actual: string;
 			try {
-				const observed = this.#storage.readCommittedState
-					? await this.#storage.readCommittedState(target)
-					: { content: await this.#storage.readText(target), titleMeta: undefined };
-				actual = observed.content;
-				if (this.#storage.readCommittedState) {
-					if (observed.titleMeta !== body.titleMeta) {
-						throw new Error("Authoritative session title metadata did not match durable storage.");
-					}
+				if (!(await this.#fullRewriteIsDurable(target, body))) {
+					throw new Error("Authoritative session repair did not match durable storage.");
 				}
 			} catch (readFailure) {
 				recoveryErrors.push(toError(readFailure));
-				throw this.#latchIndeterminate(operationError, recoveryErrors);
-			}
-			if (!textMatchesLines(actual, body.lines)) {
-				recoveryErrors.push(new Error("Authoritative session repair did not match durable storage."));
 				throw this.#latchIndeterminate(operationError, recoveryErrors);
 			}
 		}
@@ -1648,13 +1637,21 @@ export class SessionManager {
 		if (this.#storage.readTextSnapshot) this.#expectedDiskTitleMeta = body.titleMeta;
 	}
 
+	async #fullRewriteIsDurable(sessionFile: string, body: SessionFileBody): Promise<boolean> {
+		if (this.#storage.readCommittedState) {
+			const observed = await this.#storage.readCommittedState(sessionFile);
+			return observed.titleMeta === body.titleMeta && textMatchesLines(observed.rawContent, body.lines);
+		}
+		return textMatchesLines(await this.#storage.readText(sessionFile), body.lines);
+	}
+
 	/**
 	 * Confirm a publish the backend only queued. The manager's durability state
 	 * (durable size, current-marking) advances only here, never at queue time:
 	 * until the store confirms, the record still describes the last confirmed
-	 * publish. A rejected publish is realigned with the size the store actually
-	 * holds and latched, so the next append retries the transcript instead of
-	 * reusing an `expectedSize` the backend never reached.
+	 * publish. Rejection retains that complete confirmed snapshot; optimistic
+	 * index metadata cannot establish a new content fingerprint or title fence.
+	 * Later repairs compare against the same confirmed tuple.
 	 *
 	 * `onConfirm` runs only once the backend confirms the queued publish. A
 	 * deferred rewrite must neither record the replacement nor mark the manager
@@ -1675,13 +1672,7 @@ export class SessionManager {
 			.catch(err => {
 				this.#fileIsCurrent = false;
 				this.#rewriteRequired = true;
-				try {
-					this.#expectedDiskSize = this.#storage.existsSync(sessionFile)
-						? this.#storage.statSync(sessionFile).size
-						: null;
-				} catch {
-					// Backend unreadable: leave the record for the next write to re-establish.
-				}
+				// Keep the size, fingerprint and title fence from one confirmed body.
 				this.#noteDiskFailure(err);
 			});
 	}
@@ -1787,6 +1778,8 @@ export class SessionManager {
 			}
 			this.#clearDiskError();
 			if (this.#storage.defersSyncPublish) {
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = true;
 				// The publish is only queued: record nothing and stay non-current
 				// until the backend confirms (hV-oB). A racing rewrite still
 				// carries the last confirmed token, so the store's queue-time
@@ -1886,8 +1879,8 @@ export class SessionManager {
 	 * the writer close and the full-file replace, and loops on
 	 * `#atomicRewriteDirty` so any fenced append that lands during the rewrite
 	 * is captured before the task resolves. Returns `false` when the disk epoch
-	 * moved (a superseding synchronous rewrite has taken over) so callers skip
-	 * their post-publish state updates.
+	 * moved so callers skip current-marking updates; a body that landed before
+	 * that change still advances the durable byte record after readback.
 	 */
 	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
 		if (this.#released) return false;
@@ -1923,7 +1916,7 @@ export class SessionManager {
 						continue;
 					}
 					try {
-						if (textMatchesLines(await this.#storage.readText(sessionFile), body.lines)) {
+						if (await this.#fullRewriteIsDurable(sessionFile, body)) {
 							this.#recordFullRewrite(body);
 						}
 					} catch {
@@ -1931,7 +1924,16 @@ export class SessionManager {
 					}
 					throw error;
 				}
-				if (this.#diskEpoch !== epoch) return false;
+				if (this.#diskEpoch !== epoch) {
+					try {
+						if (await this.#fullRewriteIsDurable(sessionFile, body)) {
+							this.#recordFullRewrite(body);
+						}
+					} catch {
+						// A successor owns durability when this body cannot be confirmed.
+					}
+					return false;
+				}
 				this.#recordFullRewrite(body);
 			} while (this.#atomicRewriteDirty);
 			return true;

@@ -226,6 +226,33 @@ crate.annotation(
     version = "0.28.0",
 )
 
+# crate_universe omits workspace-local dependencies from registry targets.
+crate.annotation(
+    crate = "cranelift-frontend",
+    deps = ["@@//crates/vendor/cranelift-codegen:cranelift-codegen"],
+    version = "0.116.1",
+)
+crate.annotation(
+    crate = "cranelift-native",
+    deps = ["@@//crates/vendor/cranelift-codegen:cranelift-codegen"],
+    version = "0.116.1",
+)
+crate.annotation(
+    crate = "wasmtime-cranelift",
+    deps = ["@@//crates/vendor/cranelift-codegen:cranelift-codegen"],
+    version = "29.0.1",
+)
+crate.annotation(
+    crate = "wasmtime-winch",
+    deps = ["@@//crates/vendor/cranelift-codegen:cranelift-codegen"],
+    version = "29.0.1",
+)
+crate.annotation(
+    crate = "winch-codegen",
+    deps = ["@@//crates/vendor/cranelift-codegen:cranelift-codegen"],
+    version = "29.0.1",
+)
+
 # Release addons must never pick up a host libpcre2 (Homebrew paths leaked into
 # shipped dylibs before); always build the vendored static copy.
 crate.annotation(

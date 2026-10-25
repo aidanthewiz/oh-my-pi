@@ -1663,4 +1663,66 @@ describe("AgentSession aside delivery", () => {
 		expect(events.indexOf("observer-finish")).toBeGreaterThan(events.indexOf("continuation-ran"));
 		expect(JSON.stringify(mock.calls[1]!.context.messages)).toContain("build ok");
 	});
+
+	it("a mid-stream steer mention rides the hidden session-agent notice like an idle prompt (#14093)", async () => {
+		const modelRegistry = new ModelRegistry(authStorage);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			provider: "openai",
+			id: "gpt-test",
+			responses: [
+				async () => {
+					started.resolve();
+					await release.promise;
+					return { content: ["done"] };
+				},
+				{ content: ["steer handled"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+		settings.setModelRole("default", `${mock.model.provider}/${mock.model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings,
+			modelRegistry,
+			toolRegistry: new Map(),
+		});
+
+		const run = session.prompt("go");
+		await started.promise;
+
+		spyOn(modelRegistry, "getAvailable").mockReturnValue([mock.model]);
+		await session.prompt("delegate to ^openai/gpt-test", { streamingBehavior: "steer" });
+
+		release.resolve();
+		await run;
+		await session.waitForIdle();
+
+		const request = mock.calls.find(call =>
+			call.context.messages.some(
+				message => message.role === "user" && JSON.stringify(message.content).includes("delegate to"),
+			),
+		);
+		if (!request) throw new Error("The queued delegation never reached the provider");
+		const messages = request.context.messages;
+		const userIndex = messages.findIndex(
+			message => message.role === "user" && JSON.stringify(message.content).includes("delegate to"),
+		);
+		const noticeIndex = messages.findIndex(
+			message =>
+				message.role !== "user" &&
+				JSON.stringify(message.content).includes("m1") &&
+				JSON.stringify(message.content).includes("openai/gpt-test"),
+		);
+		expect(noticeIndex).toBeGreaterThanOrEqual(0);
+		expect(noticeIndex).toBeLessThan(userIndex);
+	});
 });

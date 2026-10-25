@@ -5,12 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CF_ENGINE_RELEASE_REPO } from "@oh-my-pi/pi-coding-agent/cli/cf-channel";
 import {
-	buildBunInstallArgs,
-	buildHomebrewUpdateArgs,
-	buildMiseForceInstallArgs,
-	buildMiseUpdateEnv,
-	buildMiseUpgradeArgs,
-	buildNpmInstallArgs,
 	downloadVerifiedBinary,
 	isMuslLinuxForTest,
 	managedInstallName,
@@ -26,10 +20,8 @@ import {
 	sweepStaleUpdateArtifacts,
 	updateViaBinaryAt,
 } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
-import { $which, removeWithRetries } from "@oh-my-pi/pi-utils";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
-
-const miseBinary = Bun.env.MISE_BIN ?? $which("mise");
 
 const tempDirs: string[] = [];
 
@@ -515,160 +507,7 @@ describe("update-cli install target detection", () => {
 	});
 });
 
-describe("update-cli package manager commands", () => {
-	it("targets the Homebrew tap formula and switches to reinstall for forced updates", () => {
-		expect(buildHomebrewUpdateArgs(false)).toEqual(["upgrade", "can1357/tap/omp"]);
-		expect(buildHomebrewUpdateArgs(true)).toEqual(["reinstall", "can1357/tap/omp"]);
-	});
-
-	it("targets the mise GitHub backend and overrides release-age settings for attended updates", () => {
-		expect(buildMiseUpgradeArgs()).toEqual(["upgrade", "github:can1357/oh-my-pi", "--bump", "--before", "0s"]);
-		expect(buildMiseUpgradeArgs(false)).toEqual(["upgrade", "github:can1357/oh-my-pi", "--bump"]);
-		expect(buildMiseUpdateEnv({ PATH: "/bin", MISE_MINIMUM_RELEASE_AGE: "24h" })).toEqual({
-			PATH: "/bin",
-			MISE_MINIMUM_RELEASE_AGE: "0s",
-		});
-		expect(buildMiseForceInstallArgs("15.10.5")).toEqual(["install", "--force", "github:can1357/oh-my-pi@15.10.5"]);
-	});
-
-	it.skipIf(!miseBinary)("overrides per-tool release age during actual mise upgrade resolution", async () => {
-		if (!miseBinary) throw new Error("mise binary unavailable");
-		const root = await makeTempDir();
-		const releases = [
-			{ tag_name: "v2.0.0", draft: false, prerelease: false, created_at: "2026-09-09T00:00:00Z", assets: [] },
-			{ tag_name: "v1.0.0", draft: false, prerelease: false, created_at: "2020-01-01T00:00:00Z", assets: [] },
-		];
-		const server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch(request) {
-				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/releases/latest")) return Response.json(releases[0]);
-				if (pathname.endsWith("/releases")) return Response.json(releases);
-				return new Response("not found", { status: 404 });
-			},
-		});
-		try {
-			await Bun.write(
-				path.join(root, "mise.toml"),
-				`[tools]
-"github:can1357/oh-my-pi" = { version = "1", minimum_release_age = "999y", api_url = "${server.url}" }
-`,
-			);
-			const env = {
-				...process.env,
-				HOME: path.join(root, "home"),
-				MISE_CACHE_DIR: path.join(root, "cache"),
-				MISE_CONFIG_DIR: path.join(root, "config"),
-				MISE_DATA_DIR: path.join(root, "data"),
-				MISE_STATE_DIR: path.join(root, "state"),
-				HTTP_PROXY: "http://127.0.0.1:9",
-				HTTPS_PROXY: "http://127.0.0.1:9",
-				ALL_PROXY: "http://127.0.0.1:9",
-				NO_PROXY: "127.0.0.1,localhost",
-			};
-			const run = async (args: string[]): Promise<string> => {
-				const process = Bun.spawn([miseBinary, "-C", root, ...args], {
-					env,
-					stdin: "ignore",
-					stdout: "pipe",
-					stderr: "pipe",
-				});
-				const [stdout, stderr, exitCode] = await Promise.all([
-					new Response(process.stdout).text(),
-					new Response(process.stderr).text(),
-					process.exited,
-				]);
-				if (exitCode !== 0) throw new Error(`mise upgrade failed: ${stdout}${stderr}`);
-				return stdout + stderr;
-			};
-
-			const blocked = await run(["upgrade", "github:can1357/oh-my-pi", "--bump", "--dry-run"]);
-			expect(blocked).not.toContain("Would install github:can1357/oh-my-pi@2.0.0");
-
-			const allowed = await run([...buildMiseUpgradeArgs(), "--dry-run"]);
-			expect(allowed).toContain("Would install github:can1357/oh-my-pi@2.0.0");
-		} finally {
-			server.stop(true);
-		}
-	});
-
-	it("pins npm package installs to the official registry and the checked native package versions", () => {
-		const args = buildNpmInstallArgs("16.3.15", "win32-x64");
-
-		expect(args.slice(0, 2)).toEqual(["install", "-g"]);
-		expect(args).toContain("--registry=https://registry.npmjs.org/");
-		expect(args).toContain("@oh-my-pi/pi-coding-agent@16.3.15");
-		expect(args).toContain("@oh-my-pi/pi-natives@16.3.15");
-		expect(args).toContain("@oh-my-pi/pi-natives-win32-x64@16.3.15");
-	});
-});
-
-describe("update-cli package argument compatibility", () => {
-	it("installs custom package names in lock-step, with no default-name leftovers in the argv", () => {
-		const packages = { pkg: "@new/omp", natives: "@new/natives" };
-
-		const bunArgs = buildBunInstallArgs("17.0.0", "linux-x64", packages);
-		expect(bunArgs).toContain("@new/omp@17.0.0");
-		expect(bunArgs).toContain("@new/natives@17.0.0");
-		expect(bunArgs).toContain("@new/natives-linux-x64@17.0.0");
-		expect(bunArgs.some(arg => arg.startsWith("@oh-my-pi/"))).toBe(false);
-
-		expect(buildNpmInstallArgs("17.0.0", "linux-x64", packages)).toContain("@new/omp@17.0.0");
-	});
-
-	it("adds --force to npm argv only for rename migrations so the old package's bin can be clobbered", () => {
-		const packages = { pkg: "@new/omp", natives: "@new/natives" };
-		expect(buildNpmInstallArgs("17.0.0", "linux-x64", packages, { force: true })).toContain("--force");
-		expect(buildNpmInstallArgs("16.3.15", "win32-x64")).not.toContain("--force");
-	});
-});
-
-describe("update-cli bun install command", () => {
-	it("pins the official npm registry and bypasses the manifest cache so a stale mirror or snapshot cannot mask a freshly published version", () => {
-		// Regression: omp queries https://registry.npmjs.org/<pkg>/latest directly.
-		// The install MUST hit the same registry, otherwise:
-		//   - a lagging mirror (corp proxy, Taobao, …) rejects the version with
-		//     `No version matching "X" (but package exists)`,
-		//   - or bun's local manifest snapshot does the same when the user's bun
-		//     is already pointed at the official registry but its cache predates
-		//     the release.
-		// See https://github.com/can1357/oh-my-pi/issues/1686.
-		const args = buildBunInstallArgs("15.7.6", "linux-x64");
-		expect(args.slice(0, 5)).toEqual([
-			"install",
-			"-g",
-			"--no-cache",
-			"--registry=https://registry.npmjs.org/",
-			"@oh-my-pi/pi-coding-agent@15.7.6",
-		]);
-	});
-
-	it("pins the native addon core and the platform-specific leaf to the same version so the loader sentinel cannot drift on supported tags", () => {
-		// Regression: bun install -g <pkg>@<v> would update only the top-level
-		// package, leaving @oh-my-pi/pi-natives and @oh-my-pi/pi-natives-<tag>
-		// at their previous version. The next launch then loaded a stale .node
-		// file and aborted at validateLoadedBindings with `The .node file on
-		// disk is from a different release than this loader`. See
-		// https://github.com/can1357/oh-my-pi/issues/1824.
-		for (const tag of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"]) {
-			const args = buildBunInstallArgs("15.9.0", tag);
-			expect(args).toContain("@oh-my-pi/pi-natives@15.9.0");
-			expect(args).toContain(`@oh-my-pi/pi-natives-${tag}@15.9.0`);
-		}
-	});
-
-	it("omits the leaf on unsupported platform tags so an EBADPLATFORM swap does not mask the underlying `no matching version` error", () => {
-		// Defensive: an unsupported tag (e.g. linux-arm32) still installs the
-		// core natives package — which will fail at module load if the platform
-		// truly is unsupported — but we never request a leaf the release
-		// pipeline doesn't publish, otherwise bun aborts with EBADPLATFORM
-		// and hides the real diagnostic from `loadNative`'s aggregated error.
-		const args = buildBunInstallArgs("15.9.0", "linux-arm");
-		expect(args).toContain("@oh-my-pi/pi-natives@15.9.0");
-		expect(args.some(arg => arg.startsWith("@oh-my-pi/pi-natives-"))).toBe(false);
-	});
-
+describe("update-cli bun paths", () => {
 	it("derives global node_modules from supported Bun locations with the explicit global directory taking precedence", () => {
 		expect(
 			resolveBunGlobalNodeModulesDirFromLocations({

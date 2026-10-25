@@ -2456,6 +2456,28 @@ describe("Tool argument coercion", () => {
 				}),
 			).toThrow();
 		});
+
+		it("rejects an ambiguous two-string payload identically in either key order", () => {
+			const tool: Tool = {
+				name: "delete_this_file",
+				description: "",
+				parameters: type({ path: type("string") }),
+			};
+			const orders: Record<string, unknown>[] = [
+				{ alpha: "A.txt", beta: "B.txt" },
+				{ beta: "B.txt", alpha: "A.txt" },
+			];
+			for (const args of orders) {
+				expect(() =>
+					validateToolArguments(tool, {
+						type: "toolCall",
+						id: "c-amb",
+						name: "delete_this_file",
+						arguments: args,
+					}),
+				).toThrow();
+			}
+		});
 	});
 });
 

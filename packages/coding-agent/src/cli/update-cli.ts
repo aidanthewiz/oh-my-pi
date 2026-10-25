@@ -24,64 +24,13 @@ import type { CfFetchOptions, CfRelease } from "./cf-channel";
 import { CF_ENGINE_RELEASE_REPO, fetchCfAsset, fetchCfLatestRelease } from "./cf-channel";
 import { CF_COMMAND, CF_VERSION, compareCfVersions } from "./cf-version";
 
-// [coreforge patch] REPO removed - release lookups/downloads go through
-// cf-channel.ts (Coreforce-CAD/oh-my-pi releases) instead of upstream GitHub.
-const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const COREFORGE_VERSION_PRODUCT = "coreforge";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
 const NIX_STORE_DIR = "/nix/store";
-/**
- * Official npm registry origin.
- *
- * Pinned across both the version check and the bun install step so the two
- * agree on which catalog they are talking to. A user's bun may be pointed at
- * an unofficial mirror (corporate proxy, Taobao, etc.) that lags the upstream
- * registry by minutes-to-hours, in which case `getLatestRelease` would resolve
- * a version the mirror has not yet replicated and the install would fail with
- * `No version matching "X" found for specifier "<pkg>" (but package exists)`.
- * See #1686.
- */
-const NPM_REGISTRY = "https://registry.npmjs.org/";
 const REPO = CF_ENGINE_RELEASE_REPO;
 const RELEASE_METADATA_TIMEOUT_MS = 30_000;
 const BINARY_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
-
-/**
- * Core native addon package. Bumped in lock-step with {@link PACKAGE} so the
- * version sentinel the loader looks up at runtime matches the `.node` on
- * disk; see {@link buildBunInstallArgs} for why this must be installed
- * explicitly rather than inherited as a transitive dependency.
- */
-const NATIVES_PACKAGE = "@oh-my-pi/pi-natives";
-
-/**
- * Platform tags the release pipeline publishes as
- * `@oh-my-pi/pi-natives-<tag>` leaves. Mirrors `SUPPORTED_PLATFORMS` in
- * `packages/natives/native/loader-state.js` and `LEAF_TARGETS` in
- * `packages/natives/scripts/gen-npm-packages.ts`; kept here as the local
- * source of truth so the update path stays free of cross-package imports.
- */
-const SUPPORTED_NATIVE_TAGS: ReadonlySet<string> = new Set([
-	"linux-x64",
-	"linux-arm64",
-	"darwin-x64",
-	"darwin-arm64",
-	"win32-x64",
-	"win32-arm64",
-]);
-
-function currentNativeTag(): string {
-	return `${process.platform}-${process.arch}`;
-}
-
-/** npm package names retained for update argument compatibility tests. */
-export interface ReleasePackages {
-	pkg: string;
-	natives: string;
-}
-
-const CURRENT_PACKAGES: ReleasePackages = { pkg: PACKAGE, natives: NATIVES_PACKAGE };
 
 interface ReleaseInfo {
 	tag: string;
@@ -1044,16 +993,6 @@ async function validateExistingUpdateTarget(targetPath: string): Promise<void> {
 	);
 }
 
-/**
- * Run the PATH-resolved omp binary and check if it reports the expected version.
- */
-async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
-	const ompPath = resolveOmpPath();
-	if (!ompPath) return { ok: false };
-	const binaryPath = tryRealpath(ompPath) ?? ompPath;
-	return await verifyBinaryAtPath(binaryPath, expectedVersion);
-}
-
 function printVerifiedVersion(expectedVersion: string, binaryPath?: string): void {
 	const icon = theme?.status?.success ?? "✔";
 	const location = binaryPath ? ` at ${binaryPath}` : "";
@@ -1066,10 +1005,6 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 	}
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
 }
-
-// [coreforge patch] printVerification removed with the bun/brew/mise update
-// channels - the binary path verifies through replaceBinaryForUpdate, which
-// rolls back on mismatch instead of printing a reinstall hint.
 
 async function unlinkIfExists(filePath: string): Promise<void> {
 	try {
@@ -1219,113 +1154,6 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
-function buildVersionedPackageInstallArgs(
-	expectedVersion: string,
-	nativeTag: string,
-	packages: ReleasePackages,
-): string[] {
-	const args = [`${packages.pkg}@${expectedVersion}`, `${packages.natives}@${expectedVersion}`];
-	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
-		args.push(`${packages.natives}-${nativeTag}@${expectedVersion}`);
-	}
-	return args;
-}
-
-/**
- * Build the bun argv used to globally install a specific omp version.
- *
- * This compatibility helper retains the official npm origin for callers
- * that build package-manager arguments. Coreforge updates install verified
- * GitHub release binaries, never npm packages.
- *
- * Also pins {@link NATIVES_PACKAGE} and the platform-specific
- * `@oh-my-pi/pi-natives-<tag>` leaf to `expectedVersion`. `bun install -g`
- * does not reliably refresh transitive `optionalDependencies` when the
- * top-level package is the only one bumped, so the native addon and its
- * version sentinel can drift out of sync with the freshly installed
- * `@oh-my-pi/pi-coding-agent` and the loader aborts at
- * `validateLoadedBindings` on the next launch
- * (`The .node file on disk is from a different release than this loader`).
- * Listing the natives explicitly forces bun to replace them in lock-step.
- * The leaf is added only on tags the release pipeline actually publishes
- * ({@link SUPPORTED_NATIVE_TAGS}) so unsupported platforms still fail with
- * the original "no matching version" message instead of `EBADPLATFORM`.
- * See #1824.
- */
-export function buildBunInstallArgs(
-	expectedVersion: string,
-	nativeTag: string = currentNativeTag(),
-	packages: ReleasePackages = CURRENT_PACKAGES,
-	options: { registry?: string } = {},
-): string[] {
-	return [
-		"install",
-		"-g",
-		"--no-cache",
-		`--registry=${options.registry ?? NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
-	];
-}
-
-/**
- * Build the npm argv used to update npm-managed global installs.
- * Pins `--registry` to the checked registry for the same reason as
- * {@link buildBunInstallArgs}.
- *
- * `force` is set only for rename migrations: npm refuses to write the `omp`
- * bin while the old package still owns it (`EEXIST`), and the migration
- * installs the new package BEFORE removing the old one so a failed install
- * never leaves the user without a working `omp`.
- */
-export function buildNpmInstallArgs(
-	expectedVersion: string,
-	nativeTag: string = currentNativeTag(),
-	packages: ReleasePackages = CURRENT_PACKAGES,
-	flags: { force?: boolean; registry?: string } = {},
-): string[] {
-	return [
-		"install",
-		"-g",
-		...(flags.force ? ["--force"] : []),
-		`--registry=${flags.registry ?? NPM_REGISTRY}`,
-		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag, packages),
-	];
-}
-
-export function buildHomebrewUpdateArgs(force: boolean): string[] {
-	return [force ? "reinstall" : "upgrade", HOMEBREW_FORMULA];
-}
-
-/**
- * Build the attended mise update command.
- *
- * `--before 0s` overrides global and per-tool release-age settings for this
- * invocation. Unlike `MISE_MINIMUM_RELEASE_AGE`, the command option has the
- * precedence required when the tool entry itself sets `minimum_release_age`.
- * `--before` is accepted by mise releases with release-age filtering and is
- * the hidden compatibility name for `--minimum-release-age` in current mise.
- * Older mise releases predate the option and reject unknown flags, so callers
- * omit it when the installed command help does not advertise either name.
- */
-export function buildMiseUpgradeArgs(supportsReleaseAgeOverride = true): string[] {
-	return ["upgrade", MISE_TOOL, "--bump", ...(supportsReleaseAgeOverride ? ["--before", "0s"] : [])];
-}
-
-export function buildMiseUpdateEnv(
-	base: Record<string, string | undefined> = process.env,
-): Record<string, string | undefined> {
-	return { ...base, MISE_MINIMUM_RELEASE_AGE: "0s" };
-}
-
-export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
-	return ["install", "--force", `${MISE_TOOL}@${expectedVersion}`];
-}
-
-// [coreforge patch] updateViaBun/updateViaHomebrew/updateViaMise removed -
-// those channels would install UPSTREAM omp over the patched build. The
-// exported build*Args helpers above are retained: their unit tests pin the
-// argv contracts, which keeps rebases onto upstream conflict-free.
-
 async function downloadCoreforgeBinary(
 	targetPath: string,
 	expectedVersion: string,
@@ -1397,7 +1225,7 @@ export async function updateViaBinaryAt(
 		allowPrerelease?: boolean;
 		/** Refuse replacement unless the existing path passes Coreforge ownership validation. */
 		validateExistingTarget?: boolean | ((targetPath: string) => Promise<void>);
-		verifyInstalledVersion?: typeof verifyInstalledVersion;
+		verifyInstalledVersion?: (expectedVersion: string) => Promise<InstalledVersionVerification>;
 	} = {},
 ): Promise<void> {
 	const requestedValidator = options.validateExistingTarget;

@@ -721,6 +721,7 @@ it("reads transcript and title metadata from one committed indexed snapshot afte
 	});
 	expect(await storage.readCommittedState(sessionPath)).toEqual({
 		content: newRaw,
+		rawContent: newRaw,
 		titleMeta: JSON.stringify(newTitle),
 	});
 });

@@ -223,11 +223,11 @@ describe("AuthStorage config-override apiKey", () => {
 				if (!model) throw new Error("missing bundled AWS Claude model");
 				await seedOAuth("anthropic-aws", "broker-oauth");
 				const signal = new AbortController().signal;
-				const apiKey = await resolveGatewayApiKey(authStorage, model, "aws-session", signal, "local");
+				const apiKey = await resolveGatewayApiKey({ storage: authStorage }, model, "aws-session", signal, "local");
 				expect(apiKey).toEqual({ apiKey: "aws-workspace-key" });
 				if (!("apiKey" in apiKey)) throw new Error("missing AWS bearer");
 				const resolver = buildGatewayApiKeyResolver(
-					authStorage,
+					{ storage: authStorage },
 					model,
 					"aws-session",
 					apiKey,

@@ -19,13 +19,14 @@ members = [
    "crates/vendor/brush-core",
    "crates/vendor/brush-parser",
    "crates/vendor/cfg_aliases",
+   "crates/vendor/cranelift-codegen",
    "crates/vendor/napi",
    "crates/vendor/tree-sitter-go",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "18.11.1"
+version = "18.11.2"
 edition = "2024"
 license = "MIT"
 authors = ["Stencil Labs, Inc."]
@@ -40,6 +41,7 @@ brush-parser = { path = "crates/vendor/brush-parser" }
 # portable-pty 0.9.0 pins nix 0.28, whose cfg_aliases 0.1.1 expansion emits
 # future-incompatible trailing semicolons.
 cfg_aliases = { path = "crates/vendor/cfg_aliases" }
+cranelift-codegen = { path = "crates/vendor/cranelift-codegen" }
 # napi 3.13.0 pins every `bun test --isolate` realm through per-thread handles
 # of never-torn-down envs; the vendored copy releases them (see its README.md).
 napi = { path = "crates/vendor/napi" }

@@ -5,10 +5,13 @@
  * and on an autonomous IRC wake turn.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { AsyncJob } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { resetRegisteredArtifactDirsForTests } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -28,7 +31,9 @@ import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import * as completionProbeModule from "@oh-my-pi/pi-coding-agent/task/completion-probe";
 import type { CompletionProbeOptions } from "@oh-my-pi/pi-coding-agent/task/completion-probe";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 const AGENT_ID = "accepted-result";
 
@@ -410,6 +415,257 @@ describe("runSubprocess result acceptance", () => {
 			expect(delivered[1]).toContain("broadcast-ok");
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it("reads the latest message-result completion after an IRC wake instead of the first result", async () => {
+		const tempDir = TempDir.createSync("@omp-latest-agent-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const delivered: string[] = [];
+		manager.registerDeliverySink("Parent", (_id, text) => {
+			delivered.push(text);
+		});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+		});
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const reader = new ReadTool({
+			cwd: artifactsDir,
+			hasUI: false,
+			getArtifactsDir: () => artifactsDir,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+		});
+
+		try {
+			// A completed first run left a structured payload on disk.
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), '{"reports":[{"verdict":"round-1"}]}');
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), '{"reports":[{"verdict":"round-1"}]}');
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "review the revised patch",
+					display: false,
+					details: { id: "msg-revised", from: "Parent", message: "review the revised patch" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			harness.emitAssistantText('{"reports":[{"verdict":"round-2"}]}');
+			await finish?.(undefined);
+			await manager.waitForAll();
+			await manager.drainDeliveries({ timeoutMs: 1000 });
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]).toContain("round-2");
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).exists()).toBe(false);
+			AgentRegistry.global().setStatus(AGENT_ID, "idle");
+
+			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
+			expect(resolved.content).toBe('{"reports":[{"verdict":"round-2"}]}');
+			const read = await reader.execute("latest-result", { path: `agent://${AGENT_ID}` });
+			expect(read.content).toEqual(
+				expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("round-2") })]),
+			);
+			expect(JSON.stringify(read.content)).not.toContain("round-1");
+			// The previous structured sidecar must not shadow the new message result.
+			const extracted = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}/reports/0/verdict`);
+			expect(extracted.content).toBe("round-2");
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			InternalUrlRouter.resetForTests();
+			resetRegisteredArtifactDirsForTests();
+			tempDir.removeSync();
+		}
+	});
+
+	it("delivers a peer-only plain report once without replacing the parent's accepted artifact", async () => {
+		const tempDir = TempDir.createSync("@omp-peer-agent-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const delivered: string[] = [];
+		const relayed: Record<string, string[]> = { Parent: [], OtherAgent: [] };
+		manager.registerDeliverySink("Parent", (_id, text) => {
+			delivered.push(text);
+		});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		for (const id of ["Parent", "OtherAgent"]) {
+			AgentRegistry.global().register({
+				id,
+				displayName: id,
+				kind: "main",
+				status: "running",
+				session: {
+					deliverIrcMessage: async (message: { body: string }) => {
+						relayed[id].push(message.body);
+						return "injected";
+					},
+				} as unknown as AgentSession,
+			});
+		}
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const accepted = '{"report":"accepted verdict"}';
+		try {
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "is line 42 fine?",
+					display: false,
+					details: { id: "msg-peer", from: "OtherAgent", message: "is line 42 fine?" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			expect(manager.getAllJobs()).toEqual([]);
+			harness.emitAssistantText("line 42 is fine");
+			await finish?.(undefined);
+			await manager.waitForAll();
+			await manager.drainDeliveries({ timeoutMs: 1000 });
+			await manager.drainDeliveries({ timeoutMs: 1000 });
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]).toContain("line 42 is fine");
+			expect(relayed.Parent).toEqual([]);
+			expect(relayed.OtherAgent).toHaveLength(1);
+			expect(relayed.OtherAgent[0]).toContain("line 42 is fine");
+			expect(manager.getJob(AGENT_ID)?.ownerId).toBe("Parent");
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
+	it("publishes an explicit plain follow-up and removes its previous structured sidecar", async () => {
+		const tempDir = TempDir.createSync("@omp-explicit-plain-result-");
+		const artifactsDir = tempDir.path();
+		const harness = createHarness();
+		registerRunning(harness.session);
+		const report = '{"report":"explicit revised verdict"}';
+		vi.spyOn(harness.session, "prompt").mockImplementation(async () => {
+			harness.emitAssistantText(report);
+			return true;
+		});
+		try {
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), '{"report":"old"}');
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), '{"report":"old"}');
+			const result = await runSubagentFollowUpTurn({
+				id: AGENT_ID,
+				agent: baseAgent,
+				message: "review the revision",
+				structured: false,
+				artifactsDir,
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toBe(report);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(report);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).exists()).toBe(false);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("keeps the accepted artifact and sidecar when the parent cancels its wake job before finalization", async () => {
+		const tempDir = TempDir.createSync("@omp-cancelled-wake-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const accepted = '{"report":"accepted verdict"}';
+
+		try {
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "recheck",
+					display: false,
+					details: { id: "msg-owner", from: "Parent", message: "recheck" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			harness.emitAssistantText("cancelled answer");
+			expect(manager.cancel(AGENT_ID)).toBe(true);
+			await finish?.(undefined);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
+	it("keeps the accepted artifact and sidecar when an unstructured follow-up starts aborted", async () => {
+		const tempDir = TempDir.createSync("@omp-aborted-agent-result-");
+		const artifactsDir = tempDir.path();
+		const harness = createHarness();
+		registerRunning(harness.session);
+		vi.spyOn(harness.session, "prompt").mockImplementation(async () => {
+			harness.emitAssistantText("cancelled replacement");
+			return true;
+		});
+		const accepted = '{"report":"accepted verdict"}';
+
+		try {
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const result = await runSubagentFollowUpTurn({
+				id: AGENT_ID,
+				agent: baseAgent,
+				message: "continue",
+				structured: false,
+				artifactsDir,
+				signal: AbortSignal.abort("cancelled"),
+			});
+			expect(result.aborted).toBe(true);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+		} finally {
+			tempDir.removeSync();
 		}
 	});
 

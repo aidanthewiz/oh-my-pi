@@ -16,7 +16,13 @@ export const eventDefs = {
 	NotifyType: "'info' | 'warning' | 'error'",
 	AgentLifecycleOutcome: "'success' | 'error' | 'aborted' | 'unknown'",
 
-	AgentStartEvent: { type: "'agent_start'" },
+	AgentStartEvent: {
+		type: "'agent_start'",
+		"resumedToolCallIds?": doc(
+			"string[]",
+			"Calls of an unpaired assistant tail a continued run executes before its first model request.",
+		),
+	},
 	AgentEndEvent: {
 		type: "'agent_end'",
 		messages: doc(

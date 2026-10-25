@@ -43,6 +43,7 @@ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../s
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
+import { trackUserWaits, type UserWaitTracker } from "./user-wait";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type {
 	AfterProviderResponseEvent,
@@ -512,6 +513,7 @@ export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
+	#trackUserWait?: UserWaitTracker;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -853,7 +855,10 @@ export class ExtensionRunner {
 			this.#compactFn = commandContextActions.compact;
 		}
 
-		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#uiContext =
+			uiContext && this.#trackUserWait
+				? trackUserWaits(uiContext, this.#trackUserWait)
+				: (uiContext ?? noOpUIContext);
 		this.#mode = mode;
 		this.#initialized = true;
 
@@ -1050,6 +1055,14 @@ export class ExtensionRunner {
 		return () => {
 			if (this.#toolApprovalPreviewWaiter === waiter) this.#toolApprovalPreviewWaiter = undefined;
 		};
+	}
+
+	/**
+	 * Runs each dialog of the UI context the next {@link initialize} receives (tool approvals, extension prompts) as a
+	 * wait for the user.
+	 */
+	setUserWaitTracker(track: UserWaitTracker): void {
+		this.#trackUserWait = track;
 	}
 
 	/** Waits until the interactive transcript can show the tool call being approved. */

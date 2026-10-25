@@ -6,6 +6,7 @@ import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CfgProtocolHandler, setCfgApprovalHost } from "@oh-my-pi/pi-coding-agent/internal-urls/cfg-protocol";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
+import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import {
@@ -64,7 +65,10 @@ describe("cfg:// approval prompt wiring", () => {
 		await fs.rm(tmp, { recursive: true, force: true });
 	});
 
-	async function startMode(askTimeout: number | undefined): Promise<Array<number | undefined>> {
+	async function startMode(
+		askTimeout: number | undefined,
+		mcpManager?: MCPManager,
+	): Promise<Array<number | undefined>> {
 		testSession = await createTestSession(
 			askTimeout === undefined ? {} : { settingsOverrides: { "ask.timeout": askTimeout } },
 		);
@@ -79,7 +83,7 @@ describe("cfg:// approval prompt wiring", () => {
 			undefined,
 			undefined,
 			undefined,
-			undefined,
+			mcpManager,
 			undefined,
 			new Composer({ terminal: new VirtualTerminal(200, 60) }),
 		);

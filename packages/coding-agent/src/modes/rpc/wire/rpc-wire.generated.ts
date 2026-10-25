@@ -786,6 +786,8 @@ export type AgentLifecycleOutcome = "success" | "error" | "aborted" | "unknown";
 
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** Calls of an unpaired assistant tail a continued run executes before its first model request. */
+	resumedToolCallIds?: string[];
 }
 
 export interface AgentEndEvent {

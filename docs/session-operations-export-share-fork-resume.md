@@ -364,7 +364,7 @@ Absent scope variables are unset, not exported empty. Captured launcher policy
 wins over stale multiplexer-server environment. The command starts with `--fork`
 and the absolute path of the current transcript. The
 generic terminal launcher handles provider-specific execution and reports
-capability or launch failures in the TUI. Herdr, CMUX, and Orca launches require
+capability or launch failures in the TUI. CMUX and Orca launches require
 explicit confirmation that the destination's configured interactive shell
 accepts POSIX syntax; this is never inferred from the local OS or `SHELL`.
 Declining confirmation stops before the session is flushed or a terminal is

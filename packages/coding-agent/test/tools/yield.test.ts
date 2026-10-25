@@ -794,25 +794,58 @@ describe("YieldTool", () => {
 		);
 	});
 
-	it("accepts data alongside an empty-string error (non-strict OpenAI-compatible backends)", async () => {
-		const tool = new YieldTool(createSession());
-		const result = await tool.execute("call-empty-error", { type: "result", data: { ok: true }, error: "" } as never);
-		expect(result.details?.status).toBe("success");
-		expect(result.details?.data).toEqual({ ok: true });
-		expect(result.details?.error).toBeUndefined();
+	it("accepts data alongside empty or placeholder errors (non-strict OpenAI-compatible backends)", async () => {
+		for (const error of ["", "   ", "unused", "n/a", "None", "  placeholder\n"]) {
+			const tool = new YieldTool(createSession());
+			const result = await tool.execute("call-placeholder-error", {
+				type: "result",
+				data: { ok: true },
+				error,
+			} as never);
+			expect(result.details?.status).toBe("success");
+			expect(result.details?.data).toEqual({ ok: true });
+			expect(result.details?.error).toBeUndefined();
+		}
+	});
 
-		const failure = await tool.execute("call-only-empty-error", { error: "" } as never).catch(err => err);
-		expect(failure).toBeInstanceOf(Error);
-		expect(String(failure.message)).toContain("yield must contain either `data` or `error`");
+	it("treats a blank error without data as an empty result, but keeps filler text as an error-only failure reason", async () => {
+		for (const error of ["", "   "]) {
+			const tool = new YieldTool(createSession());
+			await expect(tool.execute("call-blank-error-only", { error } as never)).rejects.toBeInstanceOf(Error);
+		}
+		const tool = new YieldTool(createSession());
+		const unused = await tool.execute("call-unused-error-only", { error: "unused" } as never);
+		expect(unused.details?.status).toBe("aborted");
+		expect(unused.details?.error).toBe("unused");
+		const padded = await tool.execute("call-padded-error-only", { error: "  boom\n" } as never);
+		expect(padded.details?.error).toBe("boom");
+	});
+
+	it.each(["result", ["findings"]])("rejects conflicting data without consuming the yield: %j", async type => {
+		const tool = new YieldTool(createSession());
+		await expect(
+			tool.execute("conflict", { type, data: { ok: true }, error: "invalid output shape" } as never),
+		).rejects.toBeInstanceOf(Error);
+		const accepted = await tool.execute("corrected", { type, data: { ok: true } } as never);
+		expect(accepted.details?.status).toBe("success");
+		expect(accepted.details?.data).toEqual({ ok: true });
+		expect(accepted.details?.error).toBeUndefined();
+	});
+
+	it("does not consume a workpool item when data conflicts with a real error", async () => {
+		const tool = new YieldTool(createSession({ getWorkPoolYieldItems: () => [{ id: "review#2", index: 2 }] }));
+		await expect(tool.execute("pool-conflict", { key: 2, data: { ok: true }, error: "boom" })).rejects.toBeInstanceOf(
+			Error,
+		);
+		const accepted = await tool.execute("pool-corrected", { key: 2, data: { ok: true } });
+		expect(accepted.details).toMatchObject({ status: "success", type: ["review#2"], complete: true });
 	});
 
 	it("aborts instead of throwing forever after repeated untyped empty results", async () => {
 		const tool = new YieldTool(createSession());
-		const expectedGuidance =
-			'yield must contain either `data` or `error`. Submit success as {"data":<your output>} or failure as {"error":"message"}.';
 
 		for (let attempt = 1; attempt <= 3; attempt++) {
-			await expect(tool.execute(`call-empty-retry-${attempt}`, {} as never)).rejects.toThrow(expectedGuidance);
+			await expect(tool.execute(`call-empty-retry-${attempt}`, {} as never)).rejects.toBeInstanceOf(Error);
 		}
 
 		const abortResult = await tool.execute("call-empty-abort", {} as never);
@@ -826,20 +859,16 @@ describe("YieldTool", () => {
 
 	it("resets the untyped empty-result retry budget after a valid yield", async () => {
 		const tool = new YieldTool(createSession());
-		const expectedGuidance =
-			'yield must contain either `data` or `error`. Submit success as {"data":<your output>} or failure as {"error":"message"}.';
 
 		for (let attempt = 1; attempt <= 2; attempt++) {
-			await expect(tool.execute(`call-empty-before-valid-${attempt}`, {} as never)).rejects.toThrow(
-				expectedGuidance,
-			);
+			await expect(tool.execute(`call-empty-before-valid-${attempt}`, {} as never)).rejects.toBeInstanceOf(Error);
 		}
 
 		const validResult = await tool.execute("call-valid-reset", { data: { ok: true } } as never);
 		expect(validResult.details).toEqual({ data: { ok: true }, status: "success", error: undefined });
 
 		for (let attempt = 1; attempt <= 3; attempt++) {
-			await expect(tool.execute(`call-empty-after-valid-${attempt}`, {} as never)).rejects.toThrow(expectedGuidance);
+			await expect(tool.execute(`call-empty-after-valid-${attempt}`, {} as never)).rejects.toBeInstanceOf(Error);
 		}
 
 		const abortResult = await tool.execute("call-empty-after-reset-abort", {} as never);

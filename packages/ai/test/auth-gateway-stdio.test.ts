@@ -441,8 +441,8 @@ describe("auth-gateway stdio transport", () => {
 			});
 		try {
 			const [chatResponse, videoResponse] = await Promise.all([
-				router.route(request(), "test", () => chat),
-				router.route(request(), "test", () => video),
+				router.route(request(), "test", undefined, () => chat),
+				router.route(request(), "test", undefined, () => video),
 			]);
 			expect(chatResponse.status).toBe(401);
 			expect(videoResponse.status).toBe(400);

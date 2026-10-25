@@ -4,7 +4,6 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult, RenderResultOptions } from "@oh-my-pi/pi-agent-core";
-import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { restoreEnvValue } from "../helpers/settings-test-state";
@@ -32,7 +31,6 @@ import {
 	type DeleteFile,
 	type Diagnostic,
 	type LspClient,
-	lspSchema,
 	type RenameFile,
 	type ServerConfig,
 	type SymbolInformation,
@@ -56,7 +54,6 @@ import {
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
-import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { sanitizeText, TempDir } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
@@ -409,22 +406,6 @@ describe("lsp regressions", () => {
 		expect(hasGlobPattern("src/[ab].ts")).toBe(true);
 		expect(hasGlobPattern("src/**/*.ts")).toBe(true);
 		expect(hasGlobPattern("src/main.ts")).toBe(false);
-	});
-
-	it("supports long LSP timeouts up to the advertised ceiling", () => {
-		expect(clampTimeout("lsp")).toBe(20);
-		expect(clampTimeout("lsp", 1)).toBe(5);
-		expect(clampTimeout("lsp", 120)).toBe(120);
-		expect(clampTimeout("lsp", 1000)).toBe(300);
-		expect(arkToWireSchema(lspSchema)).toMatchObject({
-			properties: {
-				timeout: {
-					description: "Timeout in seconds (default 20; range 5–300).",
-					maximum: 300,
-					minimum: 5,
-				},
-			},
-		});
 	});
 
 	it("lazily activates TypeScript LSP from a nested project root", async () => {

@@ -35,6 +35,8 @@ export interface RuntimeHooks {
 	onDisplay(output: JsDisplayOutput): void;
 	callTool(name: string, args: unknown, identity?: RuntimeCallIdentity): Promise<unknown>;
 	onPendingHelper?(): () => void;
+	/** Called after compilation, immediately before evaluating the cell. A throw prevents evaluation. */
+	onEvaluate?(): void;
 }
 
 /**
@@ -606,6 +608,7 @@ export class JsRuntime {
 			return await this.#als.run(context, async () => {
 				const wrapped = await wrapCode(code);
 				let value: unknown;
+				hooks.onEvaluate?.();
 				try {
 					value = indirectEval(wrapped.source, filename);
 				} catch (error) {

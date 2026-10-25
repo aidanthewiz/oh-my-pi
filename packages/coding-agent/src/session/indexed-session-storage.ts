@@ -220,7 +220,16 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#pushFrame(path, { mtimeMs, previous });
 		const write = this.#enqueuePath(
 			path,
-			() => this.#backend.writeFull(path, content, mtimeMs, title, options?.expectedSize),
+			() =>
+				this.#backend.writeFull(
+					path,
+					content,
+					mtimeMs,
+					title,
+					options?.expectedSize,
+					options?.expectedFingerprint,
+					options?.expectedTitleMeta,
+				),
 			{ trackDrain: true },
 		);
 		this.#trackFrame(path, mtimeMs, write);
@@ -303,12 +312,13 @@ export class IndexedSessionStorage implements SessionStorage {
 		};
 	}
 
-	async readCommittedState(path: string): Promise<{ content: string; titleMeta: string | null }> {
+	async readCommittedState(path: string): Promise<{ content: string; rawContent: string; titleMeta: string | null }> {
 		const snapshot = await this.#backend.readFullWithTitleMeta(path);
 		if (!snapshot) throw enoent(path);
 		const title = snapshot.titleMeta ? (JSON.parse(snapshot.titleMeta) as SessionTitleUpdate) : undefined;
 		return {
 			content: title ? overlayTitleSlotContent(snapshot.rawContent, title) : snapshot.rawContent,
+			rawContent: snapshot.rawContent,
 			titleMeta: snapshot.titleMeta,
 		};
 	}
@@ -393,7 +403,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			try {
 				if (options?.expectedTitleMeta !== undefined) {
 					const observed = await this.readCommittedState(path);
-					if (observed.content === content && observed.titleMeta === (title ? JSON.stringify(title) : null)) {
+					if (observed.rawContent === content && observed.titleMeta === (title ? JSON.stringify(title) : null)) {
 						this.#dropFrame(path, mtimeMs);
 						return;
 					}

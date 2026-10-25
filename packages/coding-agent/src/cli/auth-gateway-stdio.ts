@@ -180,7 +180,7 @@ export function createAuthGatewayStdioRouter(
 				body: JSON.stringify(native ? { ...body, modelId: key } : { ...body, model: key }),
 				signal: req.signal,
 			});
-			response = await router.route(attempt, STDIO_PEER, id => (id === key ? model : undefined));
+			response = await router.route(attempt, STDIO_PEER, undefined, id => (id === key ? model : undefined));
 			let failureStatus = response.status >= 400 ? response.status : undefined;
 			let invalidStreamRequest = false;
 			if (response.ok && response.headers.get("content-type")?.split(";", 1)[0]?.trim() === "text/event-stream") {

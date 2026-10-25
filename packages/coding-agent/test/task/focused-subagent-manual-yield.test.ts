@@ -152,6 +152,7 @@ async function spawnKeptAliveChild(structured = true) {
 			index: 0,
 			id: AGENT_ID,
 			structured,
+			outputSchema: structured ? { type: "string" } : undefined,
 			parentAgentId: PARENT_ID,
 			asyncJobManager: manager,
 			modelOverride: "mock/mock-model",
@@ -203,6 +204,24 @@ it.each([true, false])(
 	"overlapping focused turns retain their own result (structured=%s)",
 	async structured => {
 		const child = await spawnKeptAliveChild(structured);
+		const publicationStarted = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const newerWrites: Promise<number>[] = [];
+		const realWrite = Bun.write.bind(Bun);
+		const writeSpy = vi.spyOn(Bun, "write").mockImplementation(async (target, content, options) => {
+			if (String(target).startsWith(`${child.artifact}.tmp-`) && typeof content === "string") {
+				if (content.includes("manual result")) {
+					publicationStarted.resolve();
+					await releasePublication.promise;
+					await Promise.all(newerWrites);
+				} else if (content.includes("final result")) {
+					const write = realWrite(target as string, content, options);
+					newerWrites.push(write);
+					return write;
+				}
+			}
+			return (realWrite as (...args: unknown[]) => Promise<number>)(target, content, options);
+		});
 		try {
 			// Owned background work keeps the first manual turn's observation open
 			// after the turn itself returns, leaving the child idle for another prompt.
@@ -218,7 +237,10 @@ it.each([true, false])(
 			);
 			await child.session.prompt("go on");
 			await child.session.prompt("finish up");
+			await publicationStarted.promise;
 			gate.resolve();
+			await child.session.settleAsyncWork();
+			releasePublication.resolve();
 
 			await child.firstDelivery;
 			await manager.waitForOwnerJobs(PARENT_ID);
@@ -231,7 +253,12 @@ it.each([true, false])(
 			expect(final).toHaveLength(1);
 			expect(manual[0]).not.toContain("final result");
 			expect(await Bun.file(child.artifact).text()).toContain("final result");
+			if (structured) {
+				expect(await Bun.file(child.artifact.replace(/\.md$/, ".json")).json()).toBe("final result");
+			}
 		} finally {
+			releasePublication.resolve();
+			writeSpy.mockRestore();
 			child.close();
 		}
 	},
@@ -258,12 +285,18 @@ it.each(["empty report", "failed report"])(
 	async prompt => {
 		const child = await spawnKeptAliveChild(false);
 		try {
+			await child.session.prompt("go on");
+			await child.firstDelivery;
+			await manager.waitForOwnerJobs(PARENT_ID);
+			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+			expect(await Bun.file(child.artifact).text()).toContain("manual result");
 			const accepted = await Bun.file(child.artifact).text();
+			const acceptedDeliveries = [...child.deliveries];
 			await child.session.prompt(prompt);
 			await manager.waitForOwnerJobs(PARENT_ID);
 			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
 			expect(await Bun.file(child.artifact).text()).toBe(accepted);
-			expect(child.deliveries).toEqual([]);
+			expect(child.deliveries).toEqual(acceptedDeliveries);
 		} finally {
 			child.close();
 		}

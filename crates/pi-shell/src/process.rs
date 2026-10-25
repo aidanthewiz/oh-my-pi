@@ -51,6 +51,13 @@ mod platform {
 			self.pid
 		}
 
+		#[cfg(test)]
+		pub(super) fn with_reused_pid(mut self, pid: i32) -> Self {
+			self.pid = pid;
+			self.start_time = 0;
+			self
+		}
+
 		pub fn children(&self) -> Vec<Self> {
 			if !self.live_identity() {
 				return Vec::new();
@@ -277,6 +284,14 @@ mod platform {
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		#[cfg(test)]
+		pub(super) fn with_reused_pid(mut self, pid: i32) -> Self {
+			self.pid = pid;
+			self.start_tvsec = 0;
+			self.start_tvusec = 0;
+			self
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -1149,14 +1164,10 @@ struct SpawnedProcess {
 	pgid:    Option<i32>,
 }
 
-/// Per-run record of the OS processes a single shell command launched,
-/// captured at spawn time via brush's `SpawnObserver` hook.
+/// Original process identities in one shell cancellation scope.
 ///
-/// Replaces the old process-global "new descendants since a baseline" diff,
-/// which could not distinguish the children of concurrent runs sharing one
-/// host process: a run that cancelled would signal *any* descendant spawned
-/// after its baseline, including another run's children. Ownership is now
-/// explicit — only processes this run actually spawned are ever signalled.
+/// A persistent session may inherit its previous scope. Independent shells
+/// never share a scope; current-run PID attribution uses a separate registry.
 #[derive(Default)]
 struct RegistryState {
 	spawned:       Vec<SpawnedProcess>,
@@ -1198,6 +1209,35 @@ impl SpawnRegistry {
 	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Carry original process identities into the next run's cancellation scope.
+	pub(crate) fn inherit_from(&self, previous: &Self) {
+		if std::ptr::eq(self, previous) {
+			return;
+		}
+		let inherited = {
+			let mut state = previous.state.lock();
+			prune_exited(&mut state.spawned);
+			state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
+			state.spawned.clone()
+		};
+		let mut state = self.state.lock();
+		prune_exited(&mut state.spawned);
+		state.spawned.extend(inherited);
+		state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
+	}
+
+	/// Release completed identities even when no later command will run.
+	pub(crate) fn prune(&self) {
+		let mut state = self.state.lock();
+		prune_exited(&mut state.spawned);
+		state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
+	}
+
+	#[cfg(test)]
+	pub(crate) fn retained_count(&self) -> usize {
+		self.state.lock().spawned.len()
 	}
 
 	/// Record a freshly spawned child. Called from the spawn-observer hook.
@@ -1356,6 +1396,93 @@ const fn platform_process_group_alive(_pgid: i32) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(unix)]
+	struct OwnedChild(std::process::Child);
+
+	#[cfg(unix)]
+	impl Drop for OwnedChild {
+		fn drop(&mut self) {
+			let _ = self.0.kill();
+			let _ = self.0.wait();
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn inherited_scope_keeps_original_child_after_the_previous_registry_drops() {
+		let mut child = OwnedChild(
+			std::process::Command::new("sleep")
+				.arg("30")
+				.spawn()
+				.expect("child"),
+		);
+		let pid = i32::try_from(child.0.id()).expect("child pid");
+		let previous = SpawnRegistry::new();
+		previous.record(None, Some(Process::from_pid(pid).expect("original identity")));
+		let next = SpawnRegistry::new();
+		next.inherit_from(&previous);
+		drop(previous);
+
+		assert!(child.0.try_wait().expect("child status").is_none());
+		next.build_targets().signal(TERM_SIGNAL);
+		assert!(
+			!child
+				.0
+				.wait()
+				.expect("inherited child terminated")
+				.success()
+		);
+		next.prune();
+		assert!(next.state.lock().spawned.is_empty(), "completed identities must not pin handles");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn inheriting_a_stale_identity_never_adopts_the_process_reusing_its_numeric_pid() {
+		use std::{
+			io::{Read, Write},
+			process::{Command, Stdio},
+		};
+
+		let mut original = OwnedChild(Command::new("sleep").arg("30").spawn().expect("original"));
+		let original_pid = i32::try_from(original.0.id()).expect("original pid");
+		let pinned = Process::from_pid(original_pid).expect("pin original");
+		original.0.kill().expect("end original");
+		original.0.wait().expect("reap original");
+
+		let mut sentinel = OwnedChild(
+			Command::new("sh")
+				.args(["-c", "IFS= read -r marker; printf '%s\\n' \"$marker\""])
+				.stdin(Stdio::piped())
+				.stdout(Stdio::piped())
+				.spawn()
+				.expect("sentinel"),
+		);
+		let sentinel_pid = i32::try_from(sentinel.0.id()).expect("sentinel pid");
+		let stale = Process { inner: pinned.inner.with_reused_pid(sentinel_pid) };
+		let previous = SpawnRegistry::new();
+		previous.record(None, Some(stale));
+		let next = SpawnRegistry::new();
+		next.inherit_from(&previous);
+		next.build_targets().signal(KILL_SIGNAL);
+		drop(previous);
+		drop(next);
+
+		let mut input = sentinel.0.stdin.take().expect("sentinel input");
+		writeln!(input, "preserved").expect("unrelated process still accepts input");
+		drop(input);
+		let mut output = String::new();
+		sentinel
+			.0
+			.stdout
+			.take()
+			.expect("sentinel output")
+			.read_to_string(&mut output)
+			.expect("sentinel reply");
+		assert!(sentinel.0.wait().expect("sentinel completed").success());
+		assert_eq!(output, "preserved\n");
+	}
 
 	/// The harness pid must be the only protected pid. Including its recorded
 	/// parent would be unsafe on Windows: that stale numeric pid can have been

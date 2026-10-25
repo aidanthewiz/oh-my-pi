@@ -187,7 +187,7 @@ export interface SessionStorage {
 	/** Read visible content, raw backing bytes, and title metadata in one indexed snapshot. */
 	readTextSnapshot?(path: string): Promise<{ content: string; rawContent: string; titleMeta: string | null }>;
 	/** Read authoritative bytes and title metadata after an uncertain indexed publish. */
-	readCommittedState?(path: string): Promise<{ content: string; titleMeta: string | null }>;
+	readCommittedState?(path: string): Promise<{ content: string; rawContent: string; titleMeta: string | null }>;
 	/**
 	 * Synchronous {@link readText}. Optional: `SessionManager` reads the file
 	 * back to keep another writer's entries when a synchronous rewrite meets

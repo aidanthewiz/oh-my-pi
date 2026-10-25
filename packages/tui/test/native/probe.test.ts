@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { TspHello } from "@oh-my-pi/pi-tui/native/encode";
 import { ProcessTerminal } from "@oh-my-pi/pi-tui/terminal";
+import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import * as utils from "@oh-my-pi/pi-utils";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
 
@@ -33,6 +34,25 @@ function mockTmux(ternTsp: string): string[][] {
 		return { exitCode: 0, stdout: Buffer.from(stdout), success: true };
 	}) as never);
 	return commands;
+}
+
+/**
+ * Run `body` in a pane whose TSP-relevant environment is exactly `env`, with the
+ * probe enabled as outside `bun test` (no `PI_TUI_NATIVE`); restores the environment.
+ */
+function inPane(env: Record<string, string>, body: () => void): void {
+	const saved = { ...Bun.env };
+	try {
+		for (const key of [...TERMINAL_MULTIPLEXER_ENV_KEYS, "TERM_PROGRAM", "DEVENV_RELOAD_FILE", "PI_TUI_NATIVE"]) {
+			delete Bun.env[key];
+		}
+		Bun.env.PI_TUI_TSP_PROBE = "1";
+		Object.assign(Bun.env, env);
+		body();
+	} finally {
+		for (const key of Object.keys(Bun.env)) if (!(key in saved)) delete Bun.env[key];
+		Object.assign(Bun.env, saved);
+	}
 }
 
 const GATE_OFF = ["set-option", "-p", "-t", "%3", "allow-set-title", "off"];
@@ -163,6 +183,72 @@ describe("TSP hello probe", () => {
 			for (const key of Object.keys(Bun.env)) if (!(key in saved)) delete Bun.env[key];
 			Object.assign(Bun.env, saved);
 		}
+	});
+
+	it.each([
+		// A dev shell or rc file rewrote TERM; Tern's identity survives and no session marker exists.
+		["a Tern pane with a rewritten screen TERM", { TERM_PROGRAM: "tern", TERM: "screen-256color" }, true, true],
+		[
+			"a Tern pane inside screen",
+			{ TERM_PROGRAM: "tern", TERM: "screen-256color", STY: "4242.pts-0.host" },
+			false,
+			false,
+		],
+		["a Tern pane inside zellij", { TERM_PROGRAM: "tern", TERM: "xterm-kitty", ZELLIJ: "0" }, false, false],
+		// devenv 2.x redraws its shell from its own emulator: DA1 passes, APC does not.
+		[
+			"a Tern pane inside devenv's reloading shell",
+			{ TERM_PROGRAM: "tern", TERM: "xterm-kitty", DEVENV_RELOAD_FILE: "/p/.devenv/reload-env.sh" },
+			false,
+			false,
+		],
+		// Without Tern's identity, a screen TERM still stands for a session whose markers were stripped.
+		["a screen TERM without Tern's identity", { TERM: "screen-256color" }, false, false],
+		// PI_TUI_NATIVE=1 still forces the probe past a multiplexer, never the optimistic surface.
+		["a forced probe inside zellij", { TERM_PROGRAM: "tern", ZELLIJ: "0", PI_TUI_NATIVE: "1" }, true, false],
+	])("decides the probe for %s", (_name, env, probes, expected) => {
+		inPane(env, () => {
+			const { terminal, writes, hellos } = setup();
+			try {
+				expect(writes.join("").includes("\x1b_tsp;")).toBe(probes);
+				expect(terminal.tspExpected).toBe(expected);
+				if (!probes) expect(hellos).toEqual([null]);
+			} finally {
+				terminal.stop();
+			}
+		});
+	});
+
+	it("never probes in a Tern pane inside tmux without @tern-tsp", () => {
+		inPane({ TERM_PROGRAM: "tern", TERM: "tmux-256color" }, () => {
+			mockTmux("");
+			const { terminal, writes, hellos } = setup();
+			try {
+				expect(writes.join("")).not.toContain("tsp;");
+				expect(hellos).toEqual([null]);
+			} finally {
+				terminal.stop();
+			}
+		});
+	});
+
+	it("keeps classic rendering when a Tern pane answers DA1 before hello, including after restart", () => {
+		inPane({ TERM_PROGRAM: "tern", TERM: "xterm-kitty" }, () => {
+			const { terminal, hellos } = setup();
+			try {
+				for (let i = 0; i < 10 && hellos.length === 0; i++) process.stdin.emit("data", DA1_REPLY);
+				expect(hellos).toEqual([null]);
+				terminal.stop();
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				for (let i = 0; i < 10 && terminal.tspProbePending; i++) process.stdin.emit("data", DA1_REPLY);
+				expect(terminal.tspProbePending).toBe(false);
+			} finally {
+				terminal.stop();
+			}
+		});
 	});
 
 	it("never probes with PI_TUI_NATIVE=0", () => {

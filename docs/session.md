@@ -444,6 +444,9 @@ fields include `agent`, `modelRole`, `resolvedModel`, `retryFallback`, `readOnly
 as a single block.
 `extractSessionInit()` and read-only `peekSessionInit()` expose this contract.
 
+Successful plain subagent reports from an explicit follow-up or parent-requested wake replace the parent's result artifact. They remove any older structured sidecar.
+Peer-only replies can deliver a completion without replacing that artifact. Cancelled plain turns retain the previous result and stay cancellation-owned through finalization.
+
 ### `mode_change`
 
 ```json
@@ -555,11 +558,13 @@ Ordinary completed appends update memory and local file storage synchronously on
 - Afterwards, entries append incrementally.
 - Saving an editor draft forces a discoverable header and stores `draft.txt` with a marker; if the draft disappears while only startup metadata remains, close removes that draft-only session. Explicit `ensureOnDisk()` sessions remain resumable.
 - Concurrent completed appends supersede an in-flight atomic rewrite with an authoritative full-body rewrite so stale publication cannot clobber them.
+- A queued indexed full rewrite stays non-current until confirmation. A landed superseded rewrite advances confirmed size, raw-content fingerprint, and title metadata only after authoritative readback. It does not become current.
 
 ### Durability operations
 
 - `flush()` drains async disk/storage queues and the open writer (no `fsync`); `flushSync()` drains synchronously supported work or rewrites a non-current file. It cannot confirm queued remote publication; those backends still require awaited `flush()`/drain.
 - Atomic full rewrites use `writeTextAtomic` with a commit guard, expected byte size, and confirmed content fingerprint. Indexed backends also compare title metadata from the same snapshot.
+- Indexed synchronous rewrites queue the same content and title preconditions as asynchronous rewrites. Title-overlaid presentation content cannot establish a raw-content fingerprint.
 - Appends and publication share a cross-process publish lock. Changed content or title metadata raises `SessionWriteConflictError`; lock failures raise `SessionLockError` without publication. Fingerprints detect stale writes, not malicious modification.
 - `FileSessionStorage` holds a process-owned OS lease on each session a process writes, keyed by the session id rather than the file's path, so every process that reaches one journal (through a symlink, a hard link, or after a move) meets the same lease. The lease is `pi-utils` `tryAcquireFileLock` on `<session-owners>/<session-id>`, where `<session-owners>` is `~/.omp/run/session-owners` (XDG: `$XDG_STATE_HOME/omp/run/session-owners`), shared across profiles: on Linux an abstract socket and on Windows a named mutex, neither of which creates a file; on macOS and other non-Linux Unix a `flock` on a sidecar in that directory. Only write paths claim it, so the first process to write a session owns it; opening a session to inspect it (`omp share`, `--export`, `render`) never does. Managers in one process share the lease; it is released on close or a session switch, and the kernel drops it when its process exits. Processes with different home or state directories do not meet in this lease. A plain copy of a session file keeps its id, so a process writing the copy while the original's writer is live moves to a sibling; a collab guest's replica takes its own id (`parentSession` is the host's) so it never contends with the host.
 - A process never writes a session whose lease another live process holds: its first write moves the session to a fresh sibling `<timestamp>_<new-session-id>.jsonl` in the same directory, publishes the whole in-memory transcript there once, and continues appending incrementally. The owner's file is left untouched. Like `fork`, the sibling gets a new session id with `parentSession` pointing at the old one and keeps the provider prompt-cache key, so resume-by-id, the title index, and the picker never see two files for one id. The artifacts directory is copied in the background without overwriting files the moved session has already written; its artifact manager waits for the copy before allocating ids or resolving `artifact://`, and `flush()`/`close()` await it. `local://` and `agent://` reads that bypass the artifact manager can miss pre-move files until the copy finishes.
@@ -594,6 +599,8 @@ These projections leave the live entries unchanged. On load, ordinary persisted 
 ## Storage Abstractions
 
 `SessionStorage` owns filesystem-like operations used by `SessionManager`: synchronous directory/existence/write/stat/list operations; async read, sliced read, write, guarded atomic write, rename, unlink, artifact-aware deletion, title update, writer creation, and backend drain. Optional capabilities include synchronous reads, confirmed remote writes, assistant-turn scans, file locking, session ownership claims, and conditional artifact-aware deletion.
+
+Indexed `readTextSnapshot()` and optional `readCommittedState()` return `{ content, rawContent, titleMeta }` from one snapshot. `content` includes the current title projection. Only `rawContent` establishes the durable fingerprint; `titleMeta` supplies its separate title fence. Backends without `readCommittedState()` retain file-like raw readback.
 
 Implementations and adapters:
 

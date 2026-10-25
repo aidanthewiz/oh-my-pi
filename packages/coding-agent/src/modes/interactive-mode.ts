@@ -127,7 +127,7 @@ import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compa
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents } from "../registry/persisted-agents";
-import type { AgentMetrics } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
+import type { AgentCostSnapshot } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import { sumSubagentTreeCost } from "./agent-hub-runtime";
 import {
 	type AgentSession,
@@ -1763,7 +1763,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#runningSubagentCount = 0;
 	#agentRegistryUnsubscribe?: () => void;
 	#agentRegistrySubscriptionTarget?: AgentHubRegistry;
-	#subagentSessionMetrics = new WeakMap<object, { metrics: AgentMetrics | undefined }>();
+	#subagentSessionCosts = new WeakMap<object, AgentCostSnapshot>();
 	#subagentCostHydratedRoot?: string;
 	#mcpStatusOrder: string[] = [];
 	#mcpPendingServers = new Set<string>();
@@ -1836,7 +1836,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
 		this.mcpManager?.setAuthHandler((serverName, challenge, context) =>
-			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge, context),
+			this.session.waitForUser(() =>
+				new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge, context),
+			),
 		);
 		this.mcpManager?.setAuthQueueHandler(event => this.#handleMcpAuthQueueEvent(event));
 		this.#eventBus = eventBus;
@@ -2204,10 +2206,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		// FIRST and its dispose() would otherwise persist the generic "dispose".
 		this.#cleanupUnsubscribe = postmortem.register("session-teardown", reason => this.#signalTeardown!(reason));
 
-		// Subagent device writes share this process-global bridge to the parent UI.
 		setCoreforgeReportHandler((tool, report) => this.#deferCoreforgeReport(tool, report));
 		setCfgApprovalHost({
-			approve: (request, options) => this.#promptCfgChange(request, options?.signal),
+			// With `ask.timeout` set the prompt settles on its own and the turn goes on, so it stays agent time,
+			// like a timed `ask`.
+			approve: (request, options) =>
+				askTimeoutMs(this.session.settings) === undefined
+					? this.session.waitForUser(() => this.#promptCfgChange(request, options?.signal))
+					: this.#promptCfgChange(request, options?.signal),
 			applied: change => {
 				if (change.settings !== this.session.settings) return;
 				this.#selectorController.handleSettingChange(change.path, change.value);
@@ -2280,6 +2286,32 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.hookWidgetContainerBelow,
 			],
 			{
+				// Roots that collapse without new transcript output must not raise the
+				// post-run chrome floor: user-driven ones (editor drafts, dialogs and
+				// selectors, staged attachments, reports, queued messages, dismissible
+				// panels and the error banner). Any root listed in neither set counts
+				// as persistent: once it holds its height after a run the floor rises
+				// to it, and its later collapse floats the editor until output fills
+				// in. Classify every new root that can collapse on its own.
+				transientChrome: [
+					this.editorContainer,
+					this.attachmentChipsContainer,
+					this.reportContainer,
+					this.pendingMessagesContainer,
+					this.btwContainer,
+					this.omfgContainer,
+					this.cleanseContainer,
+					this.errorBannerContainer,
+				],
+				// HUDs that clear themselves on a timer or registry change (todos,
+				// background subagents, model cycle, progress). Their first paint can be
+				// their tallest (a restored todo list on resume), so it is never a baseline.
+				selfClearingChrome: [
+					this.todoContainer,
+					this.subagentContainer,
+					this.modelCycleContainer,
+					this.progressHudContainer,
+				],
 				// Natively the HUD pills lead the dock, queued messages sit between
 				// the working row and the composer, and the attachment chips live
 				// inside the composer.
@@ -3909,7 +3941,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					refs: AgentRegistry.global().list(),
 					observers: this.#observerRegistry,
 					rootSessionFile,
-					sessionMetrics: this.#subagentSessionMetrics,
+					sessionCosts: this.#subagentSessionCosts,
 				}),
 			);
 		}
@@ -5132,10 +5164,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		// write/edit guard. The standing handler below consumes plan-approval
 		// dispatches.
 		const planAugmentations: string[] = [];
+		// A shadowing extension tool named `write` has no `xd://` transport, so plan
+		// approval would never dispatch and the turn would loop on propose writes
+		// forever (issue #14030). Drop it from the active set rather than carrying it
+		// over: keeping it active breaks both the read-only guarantee and approval.
 		if (this.session.hasBuiltInTool("write")) {
 			planAugmentations.push("write");
+		} else if (previousTools.includes("write")) {
+			this.showWarning(
+				"Plan mode: the `write` tool is provided by an extension and cannot submit plans. Disable it to use plan mode.",
+			);
 		}
-		const uniquePlanTools = [...new Set([...previousTools, ...planAugmentations])];
+		const uniquePlanTools = [...new Set([...previousTools.filter(name => name !== "write"), ...planAugmentations])];
 
 		this.#planModePreviousToolPresentation = {
 			enabled: previousTools.filter(name => !isMCPToolName(name)),
@@ -7067,9 +7107,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	async #promptCoreforgeReport(tool: string, report: string): Promise<boolean | null> {
 		const summary = truncateToWidth(report.replace(/\s+/g, " ").trim(), 120);
-		const choice = await this.#extensionUiController.showCollabAwareSelector(
-			`Tool issue detected: ${tool}\nPrepare Coreforge /report with this failure?\n${summary}\nNothing is filed until you approve the issue draft.`,
-			["Prepare /report", "Dismiss"],
+		const choice = await this.session.waitForUser(() =>
+			this.#extensionUiController.showCollabAwareSelector(
+				`Tool issue detected: ${tool}\nPrepare Coreforge /report with this failure?\n${summary}\nNothing is filed until you approve the issue draft.`,
+				["Prepare /report", "Dismiss"],
+			),
 		);
 		if (choice === undefined) return null;
 		if (choice !== "Prepare /report") return false;

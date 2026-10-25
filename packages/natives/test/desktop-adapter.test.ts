@@ -52,6 +52,8 @@ describe("desktop native ABI requirements", () => {
 			releaseControl() {}
 			controlState() {}
 			bringToCurrentSpace() {}
+			holdDisplayUntilReleased() {}
+			releaseDisplayAwake() {}
 		}
 		const DesktopSession = adaptDesktopSession(PriorDesktopSession);
 		expect(() => new DesktopSession({ display: "active" })).toThrow(/Unsupported:.*screenState/);
@@ -85,9 +87,48 @@ describe("desktop native ABI requirements", () => {
 			releaseControl() {}
 			controlState() {}
 			bringToCurrentSpace() {}
+			holdDisplayUntilReleased() {}
+			releaseDisplayAwake() {}
 		}
 		expect<unknown>(adaptDesktopSession(CurrentDesktopSession)).toBe(CurrentDesktopSession);
 		expect(reads).toBe(0);
 		expect(opened).toBe(false);
 	});
+
+	it.each(["holdDisplayUntilReleased", "releaseDisplayAwake"] as const)(
+		"rejects an addon without %s before opening a native desktop session",
+		method => {
+			let opened = false;
+			class PriorDesktopSession {
+				constructor() {
+					opened = true;
+				}
+				get screenState() {
+					throw new Error("Native screen state requires an instance");
+				}
+				click() {}
+				capture() {}
+				captureRegion() {}
+				cancel() {}
+				retire() {}
+				observe() {}
+				listApplications() {}
+				openApplication() {}
+				menuItems() {}
+				menuSelect() {}
+				holdKeys() {}
+				holdMouse() {}
+				acquireControl() {}
+				releaseControl() {}
+				controlState() {}
+				bringToCurrentSpace() {}
+				holdDisplayUntilReleased() {}
+				releaseDisplayAwake() {}
+			}
+			Reflect.deleteProperty(PriorDesktopSession.prototype, method);
+			const DesktopSession = adaptDesktopSession(PriorDesktopSession);
+			expect(() => new DesktopSession({ display: "active" })).toThrow(/^Unsupported:/);
+			expect(opened).toBe(false);
+		},
+	);
 });

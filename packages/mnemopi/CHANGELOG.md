@@ -6,6 +6,12 @@
 
 - Rebuild stored local E5-large and all-MiniLM vectors after fastembed's CLS-to-mean pooling change, without deleting memories or changing configured model names.
 - Keep cached query vectors isolated between local mean-pooling models and API or custom providers.
+## [18.11.2] - 2026-10-16
+
+### Fixed
+
+- Fixed `MNEMOPI_<LABEL>_WEIGHT` and `MNEMOPI_TIER<N>_WEIGHT` having no effect on recall ranking ([#13824](https://github.com/can1357/oh-my-pi/pull/13824) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.11.1] - 2026-10-15
 
 ### Fixed

@@ -7,8 +7,8 @@ use std::{
 	fs,
 	io::{self},
 	sync::{
-		Arc,
-		atomic::{AtomicBool, Ordering},
+		Arc, Weak,
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::Duration,
 };
@@ -41,26 +41,44 @@ use crate::{
 };
 
 struct ShellSessionCore {
-	shell:      BrushShell,
+	shell:           BrushShell,
 	/// Session filesystem; each run installs a cancellation-scoped view of it
 	/// (or of the run's own override) and restores it afterwards.
-	filesystem: Fs,
+	filesystem:      Fs,
+	retained_spawns: Arc<process::SpawnRegistry>,
+	spawn_target:    SessionSpawnTarget,
+}
+
+struct ShellAbortOwner {
+	spawns: Arc<process::SpawnRegistry>,
+	token:  AbortToken,
 }
 
 #[derive(Clone, Default)]
-struct ShellAbortState(Arc<TokioMutex<Option<AbortToken>>>);
+struct ShellAbortState(Arc<TokioMutex<Option<ShellAbortOwner>>>);
 
 impl ShellAbortState {
-	async fn set(&self, abort_token: AbortToken) {
-		*self.0.lock().await = Some(abort_token);
+	async fn set(&self, abort_token: AbortToken, owner: Arc<process::SpawnRegistry>) {
+		*self.0.lock().await = Some(ShellAbortOwner { spawns: owner, token: abort_token });
 	}
 
-	async fn clear(&self) {
-		*self.0.lock().await = None;
+	async fn clear(&self, owner: &Arc<process::SpawnRegistry>) {
+		let mut state = self.0.lock().await;
+		if state
+			.as_ref()
+			.is_some_and(|current| Arc::ptr_eq(&current.spawns, owner))
+		{
+			*state = None;
+		}
 	}
 
 	async fn abort(&self) {
-		let abort_token = self.0.lock().await.clone();
+		let abort_token = self
+			.0
+			.lock()
+			.await
+			.as_ref()
+			.map(|current| current.token.clone());
 		if let Some(abort_token) = abort_token {
 			abort_token.abort(AbortReason::Signal);
 		}
@@ -179,6 +197,75 @@ pub type ShellExecuteResult = ShellRunResult;
 /// [`Shell::pids`] can read it while the run is in flight.
 type ActiveSpawns = Arc<parking_lot::Mutex<Option<Arc<process::SpawnRegistry>>>>;
 
+type SessionSpawnTarget = Arc<parking_lot::Mutex<SessionSpawnState>>;
+
+struct SessionSpawnState {
+	registry:          Weak<process::SpawnRegistry>,
+	generation:        u64,
+	/// Cancelled origins remain cancelled after a successor acquires the
+	/// session.
+	cancelled_through: u64,
+}
+
+impl SessionSpawnState {
+	fn new(registry: &Arc<process::SpawnRegistry>) -> Self {
+		Self {
+			registry:          Arc::downgrade(registry),
+			generation:        1,
+			cancelled_through: 0,
+		}
+	}
+}
+
+struct RunSpawns {
+	current:        Arc<process::SpawnRegistry>,
+	cleanup:        Arc<process::SpawnRegistry>,
+	session_target: parking_lot::Mutex<SessionSpawnTarget>,
+	cancelled:      AtomicBool,
+	generation:     AtomicU64,
+}
+
+impl Default for RunSpawns {
+	fn default() -> Self {
+		let cleanup = Arc::new(process::SpawnRegistry::new());
+		let session_target = Arc::new(parking_lot::Mutex::new(SessionSpawnState::new(&cleanup)));
+		Self {
+			current: Arc::default(),
+			cleanup,
+			session_target: parking_lot::Mutex::new(session_target),
+			cancelled: AtomicBool::new(false),
+			generation: AtomicU64::new(1),
+		}
+	}
+}
+
+// Lock order: observer slot, session target, then one process registry at a
+// time.
+impl RunSpawns {
+	fn inherit_session(&self, session: &mut ShellSessionCore) {
+		let mut session_target = self.session_target.lock();
+		let mut target = session.spawn_target.lock();
+		*session_target = session.spawn_target.clone();
+		self.cleanup.inherit_from(&session.retained_spawns);
+		session.retained_spawns = self.cleanup.clone();
+		target.generation += 1;
+		self.generation.store(target.generation, Ordering::Relaxed);
+		target.registry = Arc::downgrade(&self.cleanup);
+		if self.cancelled.load(Ordering::Acquire) {
+			target.cancelled_through = target.generation;
+		}
+	}
+
+	fn cancel(&self) {
+		let session_target = self.session_target.lock();
+		let mut target = session_target.lock();
+		self.cancelled.store(true, Ordering::Release);
+		target.cancelled_through = target
+			.cancelled_through
+			.max(self.generation.load(Ordering::Relaxed));
+	}
+}
+
 /// Publishes a run's registry in [`ActiveSpawns`] for as long as it lives;
 /// dropping it (normal return, error, cancellation, or task abort) clears the
 /// slot.
@@ -291,6 +378,7 @@ impl Shell {
 		let Some(core) = guard.as_mut() else {
 			return 0;
 		};
+		core.retained_spawns.prune();
 		let jobs = core.shell.jobs_mut();
 		// Fail closed: a poll error leaves the job table in an unknown state, so
 		// report 0 (drop the shell) rather than pin a retained session forever on
@@ -389,6 +477,23 @@ const CANCEL_RUN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const CANCEL_RUN_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a cancelled POSIX run's processes get to finish TERM cleanup
+/// (traps, lock/marker removal) before the KILL wave.
+#[cfg(unix)]
+const TERM_GRACE: Duration = Duration::from_secs(1);
+
+/// Delay between cancellation and cancelling the output readers. Readers stay
+/// open so pipeline consumers can flush after their producers die, and so a
+/// TERM trap that writes output during [`TERM_GRACE`] does not hit EPIPE and
+/// die before finishing its cleanup. Windows needs a wider budget for the same
+/// reason as `CANCEL_RUN_GRACE`: the consumer's flush depends on the
+/// producer's exit becoming visible through several thread wakeups. The
+/// delayed fallback still releases readers whose writers never close.
+#[cfg(windows)]
+const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
+#[cfg(not(windows))]
+const CANCEL_READER_GRACE: Duration = Duration::from_millis(1250);
+
 async fn run_shell_session(
 	session: Arc<TokioMutex<Option<ShellSessionCore>>>,
 	abort_state: ShellAbortState,
@@ -399,13 +504,14 @@ async fn run_shell_session(
 	ct: &mut CancelToken,
 ) -> Result<ShellRunResult> {
 	let tokio_cancel = CancellationToken::new();
-	let spawn_registry = Arc::new(process::SpawnRegistry::new());
+	let spawn_registry = Arc::new(RunSpawns::default());
 	let process_cancel_bridge = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
 		let spawn_registry = spawn_registry.clone();
 		async move {
 			tokio_cancel.cancelled().await;
-			terminate_run(&spawn_registry).await;
+			spawn_registry.cancel();
+			terminate_run(&spawn_registry.cleanup).await;
 		}
 	});
 
@@ -417,10 +523,14 @@ async fn run_shell_session(
 		let spawn_registry = spawn_registry.clone();
 		async move {
 			let mut session_guard = session.lock().await;
+			if tokio_cancel.is_cancelled() {
+				return Err(Error::msg("Aborted before acquiring shell session"));
+			}
 			// Published only once this run owns the session, so a run queued
 			// behind another never shadows the executing run's pids. Declared
 			// after `session_guard`, so it clears before the lock is released.
-			let _active_spawns = ActiveSpawnsGuard::publish(&active_spawns, spawn_registry.clone());
+			let _active_spawns =
+				ActiveSpawnsGuard::publish(&active_spawns, spawn_registry.current.clone());
 
 			let session = match &mut *session_guard {
 				Some(session) => session,
@@ -433,7 +543,8 @@ async fn run_shell_session(
 					.await?,
 				),
 			};
-			abort_state.set(at).await;
+			spawn_registry.inherit_session(session);
+			abort_state.set(at, spawn_registry.cleanup.clone()).await;
 			run_shell_command(session, &run_config, on_chunk, tokio_cancel, spawn_registry).await
 		}
 	});
@@ -447,11 +558,15 @@ async fn run_shell_session(
 				run_task.abort();
 				let _ = run_task.await;
 			}
-			abort_state.clear().await;
+			abort_state.clear(&spawn_registry.cleanup).await;
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
 			// holding task finishes.
-			if let Ok(mut guard) = session.try_lock() {
+			if let Ok(mut guard) = session.try_lock()
+				&& guard.as_ref().is_some_and(|core| {
+					Arc::ptr_eq(&core.retained_spawns, &spawn_registry.cleanup)
+				})
+			{
 				*guard = None;
 			}
 			let _ = process_cancel_bridge.await;
@@ -468,11 +583,17 @@ async fn run_shell_session(
 		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	process_cancel_bridge.abort();
 	let _ = process_cancel_bridge.await;
-	abort_state.clear().await;
+	abort_state.clear(&spawn_registry.cleanup).await;
 
 	let keepalive = res.as_ref().is_ok_and(|(exec, ..)| session_keepalive(exec));
 	if !keepalive {
-		*session.lock().await = None;
+		let mut guard = session.lock().await;
+		if guard
+			.as_ref()
+			.is_some_and(|core| Arc::ptr_eq(&core.retained_spawns, &spawn_registry.cleanup))
+		{
+			*guard = None;
+		}
 	}
 	let (exec, minimized, working_dir) = res?;
 	Ok(ShellRunResult {
@@ -491,13 +612,14 @@ async fn run_shell_oneshot(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
-	let spawn_registry = Arc::new(process::SpawnRegistry::new());
+	let spawn_registry = Arc::new(RunSpawns::default());
 	let process_cancel_bridge = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
 		let spawn_registry = spawn_registry.clone();
 		async move {
 			tokio_cancel.cancelled().await;
-			terminate_run(&spawn_registry).await;
+			spawn_registry.cancel();
+			terminate_run(&spawn_registry.cleanup).await;
 		}
 	});
 
@@ -556,13 +678,14 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
-	let spawn_registry = Arc::new(process::SpawnRegistry::new());
+	let spawn_registry = Arc::new(RunSpawns::default());
 	let process_cancel_bridge = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
 		let spawn_registry = spawn_registry.clone();
 		async move {
 			tokio_cancel.cancelled().await;
-			terminate_run(&spawn_registry).await;
+			spawn_registry.cancel();
+			terminate_run(&spawn_registry.cleanup).await;
 		}
 	});
 
@@ -807,7 +930,7 @@ fn copy_env_into_shell(
 
 async fn create_session_for_run(
 	config: &ShellConfig,
-	spawn_registry: Option<Arc<process::SpawnRegistry>>,
+	spawn_registry: Option<Arc<RunSpawns>>,
 	cancel_token: Option<CancellationToken>,
 ) -> Result<ShellSessionCore> {
 	// Session setup (snapshot sourcing) belongs to the creating run, so its
@@ -909,16 +1032,28 @@ async fn create_session_for_run(
 	configure_windows_path(&mut shell)?;
 
 	if let Some(snapshot_path) = config.snapshot_path.as_ref() {
-		source_snapshot(&mut shell, snapshot_path, spawn_registry, cancel_token).await?;
+		source_snapshot(&mut shell, snapshot_path, spawn_registry.clone(), cancel_token).await?;
 	}
+	let retained_spawns = spawn_registry
+		.as_ref()
+		.map_or_else(Arc::default, |spawns| spawns.cleanup.clone());
+	let spawn_target = spawn_registry.map_or_else(
+		|| Arc::new(parking_lot::Mutex::new(SessionSpawnState::new(&retained_spawns))),
+		|spawns| spawns.session_target.lock().clone(),
+	);
 
-	Ok(ShellSessionCore { shell, filesystem: config.filesystem.clone() })
+	Ok(ShellSessionCore {
+		shell,
+		filesystem: config.filesystem.clone(),
+		retained_spawns,
+		spawn_target,
+	})
 }
 
 async fn source_snapshot(
 	shell: &mut BrushShell,
 	snapshot_path: &str,
-	spawn_registry: Option<Arc<process::SpawnRegistry>>,
+	spawn_registry: Option<Arc<RunSpawns>>,
 	cancel_token: Option<CancellationToken>,
 ) -> Result<()> {
 	let mut params = shell.default_exec_params();
@@ -1038,13 +1173,16 @@ async fn run_shell_command(
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>, Option<String>)> {
 	install_run_filesystem(session, options, &cancel_token);
+	let current_spawns = spawn_registry.current.clone();
 	let result =
 		run_shell_command_in_filesystem(session, options, on_chunk, cancel_token, spawn_registry)
 			.await;
 	restore_session_filesystem(session);
+	current_spawns.prune();
+	session.retained_spawns.prune();
 	result
 }
 
@@ -1053,7 +1191,7 @@ async fn run_shell_command_in_filesystem(
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>, Option<String>)> {
 	if let Some(cwd) = options.cwd.as_deref() {
 		set_shell_working_dir_if_changed(&mut session.shell, cwd).await?;
@@ -1104,7 +1242,7 @@ async fn run_shell_command_single(
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 	minimizer_mode: minimizer::engine::MinimizerMode,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>)> {
 	debug_assert!(!matches!(minimizer_mode, minimizer::engine::MinimizerMode::SegmentedChain));
@@ -1191,7 +1329,7 @@ async fn run_shell_command_segmented_chain(
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>)> {
 	let Some(config) = options.minimizer.as_ref() else {
 		return run_shell_command_single(
@@ -1338,7 +1476,7 @@ async fn run_shell_command_once(
 	mut params: ExecutionParameters,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 	capture_mode: CommandCaptureMode,
 ) -> Result<CommandRunOutput> {
 	let (reader_file, writer_file) = pipe_to_files("output")?;
@@ -1391,16 +1529,6 @@ async fn run_shell_command_once(
 			}
 		}
 	});
-	// Let pipeline consumers flush output after cancellation kills their
-	// producers. The outer run cancellation remains bounded, and this delayed
-	// fallback still releases readers whose writers never close. Windows needs
-	// a wider budget for the same reason as `CANCEL_RUN_GRACE`: the consumer's
-	// flush depends on the producer's exit becoming visible through several
-	// thread wakeups.
-	#[cfg(windows)]
-	const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
-	#[cfg(not(windows))]
-	const CANCEL_READER_GRACE: Duration = Duration::from_millis(500);
 	let cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let reader_cancel = reader_cancel.clone();
@@ -1424,7 +1552,7 @@ async fn run_shell_command_once(
 	drop(diagnostics);
 
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&mut session.shell);
+		terminate_background_jobs(&mut session.shell, &spawn_registry.cleanup).await;
 	}
 
 	drop(params);
@@ -1489,9 +1617,10 @@ async fn run_shell_command_streams(
 	options: &ShellRunConfig,
 	streams: StreamSinks,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 ) -> Result<(ExecutionResult, Option<String>)> {
 	install_run_filesystem(session, options, &cancel_token);
+	let current_spawns = spawn_registry.current.clone();
 	let result = run_shell_command_streams_in_filesystem(
 		session,
 		options,
@@ -1501,6 +1630,8 @@ async fn run_shell_command_streams(
 	)
 	.await;
 	restore_session_filesystem(session);
+	current_spawns.prune();
+	session.retained_spawns.prune();
 	result
 }
 
@@ -1509,7 +1640,7 @@ async fn run_shell_command_streams_in_filesystem(
 	options: &ShellRunConfig,
 	streams: StreamSinks,
 	cancel_token: CancellationToken,
-	spawn_registry: Arc<process::SpawnRegistry>,
+	spawn_registry: Arc<RunSpawns>,
 ) -> Result<(ExecutionResult, Option<String>)> {
 	if let Some(cwd) = options.cwd.as_deref() {
 		set_shell_working_dir_if_changed(&mut session.shell, cwd).await?;
@@ -1555,6 +1686,7 @@ async fn run_shell_command_streams_in_filesystem(
 		let reader_cancel = reader_cancel.clone();
 		async move {
 			cancel_token.cancelled().await;
+			time::sleep(CANCEL_READER_GRACE).await;
 			reader_cancel.cancel();
 		}
 	});
@@ -1573,7 +1705,7 @@ async fn run_shell_command_streams_in_filesystem(
 	drop(diagnostics);
 
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&mut session.shell);
+		terminate_background_jobs(&mut session.shell, &spawn_registry.cleanup).await;
 	}
 
 	if env_scope_pushed {
@@ -1704,7 +1836,7 @@ async fn read_output_bytes(
 	}
 }
 
-impl SpawnObserver for process::SpawnRegistry {
+impl SpawnObserver for RunSpawns {
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>) {
 		// Pin a stable process reference *now*, before the pid can be recycled.
 		// On Windows an open handle keeps the pid slot reserved for the lifetime
@@ -1713,17 +1845,34 @@ impl SpawnObserver for process::SpawnRegistry {
 		// to `build_targets` (as the old code did) let a recycled pid resolve
 		// to an unrelated process — issue #4605.
 		let process = process::Process::from_pid(pid);
-		self.record(pgid, process);
+		let session_target = self.session_target.lock();
+		let target = session_target.lock();
+		if self.cancelled.load(Ordering::Acquire)
+			|| self.generation.load(Ordering::Relaxed) <= target.cancelled_through
+		{
+			let mut targets = process::TerminationTargets::new();
+			if let Some(pgid) = pgid {
+				targets.add_pgid(pgid);
+			}
+			if let Some(process) = process {
+				targets.add_process(process);
+			}
+			targets.signal(process::KILL_SIGNAL);
+			return;
+		}
+		self.current.record(pgid, process.clone());
+		if let Some(latest) = target.registry.upgrade()
+			&& !Arc::ptr_eq(&latest, &self.cleanup)
+		{
+			latest.record(pgid, process.clone());
+		}
+		self.cleanup.record(pgid, process);
 	}
 }
 
-// Escalating TERM -> KILL waves over the processes this run spawned, scoped via
-// the per-run `SpawnRegistry`. The kill set is rebuilt each wave so a child
-// spawned in a grace window — or a grandchild whose recorded parent already
-// exited but whose process group is still live — is still reaped, and the loop
-// stops as soon as the run's whole tree is gone. Scoping to the registry (vs a
-// process-global descendant diff) is what keeps a cancel from reaping a
-// concurrent run's children in a shared host process.
+// TERM/KILL waves cover originally pinned current and retained session jobs.
+// Rebuilding targets catches descendants born during grace and live process
+// groups whose original parent exited, without adopting another shell's work.
 async fn terminate_run(registry: &process::SpawnRegistry) {
 	const WAVES: u32 = 3;
 	let mut saw_targets = false;
@@ -1743,41 +1892,44 @@ async fn terminate_run(registry: &process::SpawnRegistry) {
 			targets.signal(signal);
 		}
 		if wave + 1 < WAVES {
-			let pause = if wave == 0 {
-				Duration::from_millis(75)
+			if wave == 0 {
+				wait_for_term_grace(registry).await;
 			} else {
-				Duration::from_millis(150)
-			};
-			time::sleep(pause).await;
+				time::sleep(Duration::from_millis(150)).await;
+			}
 		}
 	}
 }
 
-fn terminate_background_jobs(shell: &mut BrushShell) {
-	let mut targets = process::TerminationTargets::new();
+#[cfg_attr(
+	not(unix),
+	expect(clippy::unused_async, reason = "the TERM grace wait only awaits on unix")
+)]
+async fn wait_for_term_grace(registry: &process::SpawnRegistry) {
+	// Windows TERM is already hard termination; there is no trap to wait for.
+	#[cfg(unix)]
+	{
+		let deadline = time::Instant::now() + TERM_GRACE;
+		while !registry.build_targets().is_empty() {
+			let now = time::Instant::now();
+			if now >= deadline {
+				break;
+			}
+			time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
+		}
+	}
+	#[cfg(not(unix))]
+	let _ = registry;
+}
+
+async fn terminate_background_jobs(shell: &mut BrushShell, registry: &process::SpawnRegistry) {
+	// The run's cancellation bridge owns TERM/KILL, including background jobs.
+	// Aborting their internal tasks sooner drops ChildProcess and hard-kills
+	// children while their TERM traps are still running.
+	wait_for_term_grace(registry).await;
 	for job in &mut shell.jobs_mut().jobs {
 		job.abort_internal_tasks();
 	}
-	for job in &shell.jobs().jobs {
-		if let Some(pgid) = job.process_group_id() {
-			targets.add_pgid(pgid);
-		}
-		if let Some(pid) = job.representative_pid() {
-			targets.add_pid(pid);
-		}
-	}
-	if targets.is_empty() {
-		// Shell-internal jobs were aborted above. Pure descendant cleanup is
-		// handled by `process_cancel_bridge` while the cancel was in flight;
-		// without job-tracked pgids or pids there is nothing else to signal here.
-		return;
-	}
-
-	targets.signal(process::TERM_SIGNAL);
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(150)).await;
-		targets.signal(process::KILL_SIGNAL);
-	});
 }
 
 /// Apply per-command environment variables onto a freshly pushed
@@ -2221,7 +2373,6 @@ mod tests {
 	#[cfg(unix)]
 	use std::os::unix::process::ExitStatusExt as _;
 
-	#[cfg(unix)]
 	use tokio::process::Command;
 
 	use super::*;
@@ -7078,6 +7229,119 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		);
 	}
 
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() {
+		let _guard = shell_test_lock().lock().await;
+		let root = tempfile::tempdir().expect("cleanup directory");
+		let script = root.path().join("cleanup.sh");
+		fs::write(
+			&script,
+			"trap 'sleep 0.2; printf cleaned >> cleaned; exit 0' TERM\n: > ready\nwhile :; do :; \
+			 done\n",
+		)
+		.expect("cleanup script");
+		let shell = Shell::new(None);
+		let mut cancel = CancelToken::default();
+		let abort = cancel.emplace_abort_token();
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		let task = tokio::spawn(async move {
+			shell
+				.run(
+					ShellRunOptions {
+						command: "sh cleanup.sh & sleep 30".into(),
+						cwd: Some(cwd),
+						..Default::default()
+					},
+					None,
+					cancel,
+				)
+				.await
+		});
+		time::timeout(Duration::from_secs(5), async {
+			while !root.path().join("ready").exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("background child ready");
+		abort.abort(AbortReason::Signal);
+		let result = time::timeout(Duration::from_secs(5), task)
+			.await
+			.expect("cancel finished")
+			.expect("run task")
+			.expect("shell result");
+		assert!(result.cancelled);
+		assert_eq!(fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup"), "cleaned");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
+		let _guard = shell_test_lock().lock().await;
+		let root = tempfile::tempdir().expect("cleanup directory");
+		fs::write(
+			root.path().join("cleanup.sh"),
+			"trap 'sleep 0.7; echo flushing; printf cleaned > cleaned; exit 0' TERM\n: > \
+			 ready\nwhile :; do :; done\n",
+		)
+		.expect("cleanup script");
+		let shell = Shell::new(None);
+		let mut cancel = CancelToken::default();
+		let abort = cancel.emplace_abort_token();
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		let task = tokio::spawn(async move {
+			shell
+				.run(
+					ShellRunOptions {
+						command: "sh cleanup.sh".into(),
+						cwd: Some(cwd),
+						..Default::default()
+					},
+					None,
+					cancel,
+				)
+				.await
+		});
+		time::timeout(Duration::from_secs(5), async {
+			while !root.path().join("ready").exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("child ready");
+		abort.abort(AbortReason::Signal);
+		let result = time::timeout(Duration::from_secs(5), task)
+			.await
+			.expect("cancel finished")
+			.expect("run task")
+			.expect("shell result");
+		assert!(result.cancelled);
+		assert_eq!(
+			fs::read_to_string(root.path().join("cleaned"))
+				.expect("TERM cleanup after writing output"),
+			"cleaned"
+		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn termination_returns_early_after_the_child_exits() {
+		let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+		if cfg!(windows) {
+			command.args(["/c", "ping -n 30 127.0.0.1"]);
+		} else {
+			command.args(["-c", "exec sleep 30"]);
+		}
+		let mut child = command.kill_on_drop(true).spawn().expect("child");
+		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits");
+		let registry = process::SpawnRegistry::new();
+		registry.record(None, process::Process::from_pid(pid));
+		let started = time::Instant::now();
+		let ((), status) = tokio::join!(terminate_run(&registry), child.wait());
+		assert!(status.is_ok(), "terminated child must be reaped");
+		assert!(started.elapsed() < Duration::from_millis(750), "exited child consumed TERM grace");
+	}
+
 	/// Cancelling one `Shell::run` must only signal processes spawned by that
 	/// run. Run B starts first so its old host-descendant baseline would not
 	/// include run A's later-spawned child; pre-fix, cancelling B classified A's
@@ -7455,13 +7719,419 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		let mut cancel_token = CancelToken::default();
 		let abort_token = cancel_token.emplace_abort_token();
 
-		abort_state.set(abort_token).await;
+		abort_state.set(abort_token, Arc::default()).await;
 		abort_state.abort().await;
 
 		let reason = time::timeout(Duration::from_millis(100), cancel_token.wait())
 			.await
 			.expect("cancel token should be signalled");
 		assert!(matches!(reason, AbortReason::Signal));
+	}
+
+	#[tokio::test]
+	async fn stale_abort_owner_cannot_disarm_a_successor() {
+		let state = ShellAbortState::default();
+		let old_owner = Arc::new(process::SpawnRegistry::new());
+		let new_owner = Arc::new(process::SpawnRegistry::new());
+		let mut old = CancelToken::default();
+		let mut new = CancelToken::default();
+		state
+			.set(old.emplace_abort_token(), old_owner.clone())
+			.await;
+		state.set(new.emplace_abort_token(), new_owner).await;
+		state.clear(&old_owner).await;
+		state.abort().await;
+		assert!(matches!(new.abort_reason(), Some(AbortReason::Signal)));
+		assert!(old.abort_reason().is_none());
+	}
+
+	#[cfg(unix)]
+	struct AbortTestRun(AbortToken);
+
+	#[cfg(unix)]
+	impl Drop for AbortTestRun {
+		fn drop(&mut self) {
+			self.0.abort(AbortReason::Signal);
+		}
+	}
+
+	#[cfg(unix)]
+	async fn wait_for_test_pid(path: &std::path::Path) -> i32 {
+		time::timeout(Duration::from_secs(5), async {
+			loop {
+				if let Some(pid) = fs::read_to_string(path)
+					.ok()
+					.and_then(|text| text.trim().parse().ok())
+				{
+					return pid;
+				}
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("child readiness pid")
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn retained_jobs_get_term_grace_without_borrowing_current_run_pid_attribution() {
+		let _guard = shell_test_lock().lock().await;
+		let root = tempfile::tempdir().expect("private scripts");
+		fs::write(
+			root.path().join("previous.sh"),
+			"trap 'sleep 0.2; printf cleaned > previous-cleaned; exit 0' TERM\necho $$ > \
+			 previous-pid\nwhile :; do :; done\n",
+		)
+		.expect("previous script");
+		fs::write(root.path().join("current.sh"), "echo $$ > current-pid\nwhile :; do :; done\n")
+			.expect("current script");
+		let shell = Arc::new(Shell::new(None));
+		let cwd = root.path().to_string_lossy().into_owned();
+		shell
+			.run(
+				ShellRunOptions {
+					command: "sh previous.sh >/dev/null 2>&1 &".into(),
+					cwd: Some(cwd.clone()),
+					..Default::default()
+				},
+				None,
+				CancelToken::default(),
+			)
+			.await
+			.expect("start retained child");
+		wait_for_test_pid(&root.path().join("previous-pid")).await;
+		assert!(shell.pids().is_empty(), "completed run must have no current attribution");
+
+		let mut cancel = CancelToken::default();
+		let abort = cancel.emplace_abort_token();
+		let _abort_on_drop = AbortTestRun(abort.clone());
+		let running = tokio::spawn({
+			let shell = shell.clone();
+			async move {
+				shell
+					.run(
+						ShellRunOptions {
+							command: "sh current.sh >/dev/null 2>&1".into(),
+							cwd: Some(cwd),
+							..Default::default()
+						},
+						None,
+						cancel,
+					)
+					.await
+			}
+		});
+		let current_pid = wait_for_test_pid(&root.path().join("current-pid")).await;
+		time::timeout(Duration::from_secs(5), async {
+			while !shell.pids().contains(&current_pid) {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("current spawn attribution");
+		assert_eq!(shell.pids(), vec![current_pid]);
+		abort.abort(AbortReason::Signal);
+		let result = time::timeout(Duration::from_secs(5), running)
+			.await
+			.expect("cancel completed")
+			.expect("run joined")
+			.expect("shell result");
+		assert!(result.cancelled);
+		assert_eq!(
+			fs::read_to_string(root.path().join("previous-cleaned")).expect("previous TERM trap"),
+			"cleaned",
+		);
+		assert!(shell.pids().is_empty());
+		assert!(shell.session.lock().await.is_none());
+	}
+
+	#[cfg(unix)]
+	async fn wait_for_test_marker(path: &std::path::Path) {
+		time::timeout(Duration::from_secs(5), async {
+			while !path.exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("internal job readiness");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn retained_internal_jobs_own_children_spawned_before_or_after_successor_acquisition() {
+		let _guard = shell_test_lock().lock().await;
+		for launch_before_successor in [true, false] {
+			let root = tempfile::tempdir().expect("delayed child workspace");
+			fs::write(
+				root.path().join("late.sh"),
+				"trap 'sleep 0.2; printf cleaned > late-cleaned; exit 0' TERM\necho $$ > \
+				 late-pid\nwhile :; do :; done\n",
+			)
+			.expect("late child script");
+			let shell = Arc::new(Shell::new(None));
+			let cwd = root.path().to_string_lossy().into_owned();
+			shell
+				.run(
+					ShellRunOptions {
+						command: "{ : > parked; while [ ! -f launch ]; do sleep 0.01; done; sh late.sh; \
+						          } >/dev/null 2>&1 &"
+							.into(),
+						cwd: Some(cwd.clone()),
+						..Default::default()
+					},
+					None,
+					CancelToken::default(),
+				)
+				.await
+				.expect("retained internal job");
+			wait_for_test_marker(&root.path().join("parked")).await;
+			if launch_before_successor {
+				fs::write(root.path().join("launch"), "").expect("release before handoff");
+				wait_for_test_pid(&root.path().join("late-pid")).await;
+			}
+			let spawn_target = shell
+				.session
+				.lock()
+				.await
+				.as_ref()
+				.expect("retained session")
+				.spawn_target
+				.clone();
+			let mut cancel = CancelToken::default();
+			let abort = cancel.emplace_abort_token();
+			let _cleanup = AbortTestRun(abort.clone());
+			let running = tokio::spawn({
+				let shell = shell.clone();
+				async move {
+					shell
+						.run(
+							ShellRunOptions {
+								command: ": > successor-ready; sleep 30".into(),
+								cwd: Some(cwd),
+								..Default::default()
+							},
+							None,
+							cancel,
+						)
+						.await
+				}
+			});
+			wait_for_test_marker(&root.path().join("successor-ready")).await;
+			if !launch_before_successor {
+				fs::write(root.path().join("launch"), "").expect("release after handoff");
+			}
+			let late_pid = wait_for_test_pid(&root.path().join("late-pid")).await;
+			time::timeout(Duration::from_secs(5), async {
+				loop {
+					let recorded = spawn_target
+						.lock()
+						.registry
+						.upgrade()
+						.is_some_and(|scope| scope.live_pids().contains(&late_pid));
+					if recorded {
+						break;
+					}
+					time::sleep(Duration::from_millis(10)).await;
+				}
+			})
+			.await
+			.expect("delayed child cancellation ownership");
+			assert!(shell.pids().is_empty(), "an old job's new child is not current-run attribution");
+			abort.abort(AbortReason::Signal);
+			let result = time::timeout(Duration::from_secs(5), running)
+				.await
+				.expect("successor cancel")
+				.expect("successor joined")
+				.expect("successor result");
+			assert!(result.cancelled);
+			assert_eq!(
+				fs::read_to_string(root.path().join("late-cleaned"))
+					.expect("delayed child TERM cleanup"),
+				"cleaned",
+			);
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancelled_origins_cannot_resurrect_or_adopt_a_successors_new_child() {
+		use std::process::Stdio;
+
+		use tokio::io::AsyncWriteExt as _;
+
+		let _guard = shell_test_lock().lock().await;
+		let previous = Arc::new(RunSpawns::default());
+		let config = ShellConfig {
+			session_env:   None,
+			clear_env:     true,
+			snapshot_path: None,
+			minimizer:     None,
+			filesystem:    Fs::native(),
+		};
+		let mut session = create_session_for_run(&config, Some(previous.clone()), None)
+			.await
+			.expect("session");
+		previous.inherit_session(&mut session);
+		let mut original = tokio::process::Command::new("sleep")
+			.arg("30")
+			.kill_on_drop(true)
+			.spawn()
+			.expect("original child");
+		previous.on_spawn(i32::try_from(original.id().expect("original pid")).unwrap(), None);
+
+		let cancelled = Arc::new(RunSpawns::default());
+		cancelled.inherit_session(&mut session);
+		cancelled.cancel();
+		let successor = Arc::new(RunSpawns::default());
+		successor.inherit_session(&mut session);
+		let mut sentinel = tokio::process::Command::new("sh")
+			.args(["-c", "IFS= read -r marker; printf '%s\\n' \"$marker\""])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.kill_on_drop(true)
+			.spawn()
+			.expect("successor child");
+		let sentinel_pid = i32::try_from(sentinel.id().expect("sentinel pid")).unwrap();
+		successor.on_spawn(sentinel_pid, None);
+		terminate_run(&cancelled.cleanup).await;
+		assert!(
+			!time::timeout(Duration::from_secs(5), original.wait())
+				.await
+				.expect("old child reaped")
+				.expect("old status")
+				.success()
+		);
+
+		for origin in [&previous, &cancelled] {
+			let mut late = tokio::process::Command::new("sleep")
+				.arg("30")
+				.kill_on_drop(true)
+				.spawn()
+				.expect("late cancelled-origin child");
+			origin.on_spawn(i32::try_from(late.id().expect("late pid")).unwrap(), None);
+			assert!(
+				!time::timeout(Duration::from_secs(5), late.wait())
+					.await
+					.expect("late child rejected")
+					.expect("late status")
+					.success()
+			);
+			assert_eq!(successor.current.live_pids(), vec![sentinel_pid]);
+		}
+		drop(previous);
+		drop(cancelled);
+		let mut input = sentinel.stdin.take().expect("successor stdin");
+		input
+			.write_all(b"preserved\n")
+			.await
+			.expect("successor still accepts input");
+		drop(input);
+		let output = time::timeout(Duration::from_secs(5), sentinel.wait_with_output())
+			.await
+			.expect("successor completed")
+			.expect("successor output");
+		assert!(output.status.success());
+		assert_eq!(output.stdout, b"preserved\n");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancelling_a_queued_run_preserves_the_executing_session_and_its_output() {
+		let _guard = shell_test_lock().lock().await;
+		let root = tempfile::tempdir().expect("private queued run");
+		fs::write(
+			root.path().join("first.sh"),
+			"echo $$ > ready\nwhile [ ! -f release ]; do sleep 0.01; done\nprintf survived\n",
+		)
+		.expect("first script");
+		let shell = Arc::new(Shell::new(None));
+		let cwd = root.path().to_string_lossy().into_owned();
+		let mut first_cancel = CancelToken::default();
+		let _first_cleanup = AbortTestRun(first_cancel.emplace_abort_token());
+		let (tx, rx) = flume::unbounded();
+		let first = tokio::spawn({
+			let shell = shell.clone();
+			let cwd = cwd.clone();
+			async move {
+				shell
+					.run(
+						ShellRunOptions {
+							command: "sh first.sh".into(),
+							cwd: Some(cwd),
+							..Default::default()
+						},
+						Some(tx),
+						first_cancel,
+					)
+					.await
+			}
+		});
+		let first_pid = wait_for_test_pid(&root.path().join("ready")).await;
+		let mut queued_cancel = CancelToken::default();
+		let queued_abort = queued_cancel.emplace_abort_token();
+		let _queued_cleanup = AbortTestRun(queued_abort.clone());
+		let queued = tokio::spawn({
+			let shell = shell.clone();
+			async move {
+				shell
+					.run(
+						ShellRunOptions {
+							command: "printf wrong > should-not-run".into(),
+							cwd: Some(cwd),
+							..Default::default()
+						},
+						None,
+						queued_cancel,
+					)
+					.await
+			}
+		});
+		queued_abort.abort(AbortReason::Signal);
+		let cancelled = time::timeout(Duration::from_secs(5), queued)
+			.await
+			.expect("queued cancel completed")
+			.expect("queued joined")
+			.expect("queued result");
+		assert!(cancelled.cancelled);
+		assert!(!root.path().join("should-not-run").exists());
+		assert_eq!(shell.pids(), vec![first_pid], "queued cleanup must preserve the executing owner");
+		fs::write(root.path().join("release"), "").expect("release first child");
+		let result = time::timeout(Duration::from_secs(5), first)
+			.await
+			.expect("first completed")
+			.expect("first joined")
+			.expect("first result");
+		assert_eq!(result.exit_code, Some(0));
+		assert!(!result.cancelled);
+		assert_eq!(rx.try_iter().collect::<String>(), "survived");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn completed_foreground_runs_release_retained_process_handles_without_another_run() {
+		let _guard = shell_test_lock().lock().await;
+		let shell = Shell::new(None);
+		for _ in 0..4 {
+			let result = shell
+				.run(
+					ShellRunOptions { command: "sh -c 'exit 0'".into(), ..Default::default() },
+					None,
+					CancelToken::default(),
+				)
+				.await
+				.expect("foreground command");
+			assert_eq!(result.exit_code, Some(0));
+			let guard = shell.session.lock().await;
+			assert_eq!(
+				guard
+					.as_ref()
+					.expect("retained session")
+					.retained_spawns
+					.retained_count(),
+				0
+			);
+		}
+		assert_eq!(shell.live_background_job_count().await, 0);
 	}
 
 	#[cfg(unix)]

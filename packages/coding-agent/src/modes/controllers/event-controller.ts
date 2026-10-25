@@ -295,8 +295,13 @@ export class EventController {
 	#compactionOwnsProgress = false;
 	/** Bumped at every `agent_start`; a settle watch stands down once a new run begins. */
 	#runEpoch = 0;
+	#viewGeneration = 0;
 	/** Epoch of the in-flight {@link #finishWhenRunSettles} watch, if any. */
 	#settleWatchEpoch: number | undefined = undefined;
+	// Composer activity: a host run or idle maintenance (auto-compaction) owns
+	// turn-scoped chrome, so the post-run chrome floor must not settle on it.
+	#runActive = false;
+	#maintenanceActive = false;
 	// Coalescing window for `message_update` events at the subscription boundary.
 	// `message_update` carries the CUMULATIVE assistant message (every update
 	// re-lists all content blocks), so when a burst of deltas arrives faster than
@@ -798,8 +803,11 @@ export class EventController {
 			this.#enqueueMessageUpdate(event);
 			return;
 		}
+		const view = this.ctx.viewSession;
+		const generation = this.#viewGeneration;
 		await this.#runSerialized(async () => {
 			await this.#flushPendingMessageUpdate();
+			if (this.#viewGeneration !== generation || this.ctx.viewSession !== view) return;
 			await this.handleEvent(event);
 		});
 	}
@@ -912,6 +920,30 @@ export class EventController {
 		return this.#executionStartedCallIds.has(toolCallId);
 	}
 
+	/** The viewed session was swapped for an idle one: no run owns the chrome any more. */
+	markViewIdle(): void {
+		this.#runActive = false;
+		this.#maintenanceActive = false;
+		this.#syncComposerActivity();
+	}
+
+	#syncComposerActivity(): void {
+		this.ctx.composer.setRunActive(this.#runActive || this.#maintenanceActive);
+	}
+
+	#viewOwnerGuard(): () => boolean {
+		const view = this.ctx.viewSession;
+		const generation = this.#viewGeneration;
+		const epoch = this.#runEpoch;
+		const runId = view.lifecycleState?.runId;
+		return () =>
+			!this.#disposed &&
+			this.ctx.viewSession === view &&
+			this.#viewGeneration === generation &&
+			this.#runEpoch === epoch &&
+			view.lifecycleState?.runId === runId;
+	}
+
 	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
 	 * session focus proxy when re-pointing the transcript at another session:
@@ -919,6 +951,8 @@ export class EventController {
 	 * session's transcript and must not bleed into the new one.
 	 */
 	resetTranscriptAnchors(): void {
+		this.#viewGeneration++;
+		this.#runEpoch++;
 		if (this.#messageUpdateTimer) {
 			clearTimeout(this.#messageUpdateTimer);
 			this.#messageUpdateTimer = undefined;
@@ -991,7 +1025,9 @@ export class EventController {
 	async handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (this.#disposed) return;
 		if (!this.ctx.isInitialized) {
+			const isCurrent = this.#viewOwnerGuard();
 			await this.ctx.init();
+			if (!isCurrent()) return;
 		}
 		if (this.#disposed) return;
 
@@ -1116,6 +1152,8 @@ export class EventController {
 		this.#compactionOwnsProgress = false;
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
+		this.#runActive = true;
+		this.#syncComposerActivity();
 		setRunStatus({ state: "working" });
 		this.ctx.ui.requestRender();
 	}
@@ -2242,18 +2280,26 @@ export class EventController {
 		}
 	}
 	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		// A superseded agent_end: the agent is already streaming a fresh turn, so
-		// this event belongs to a turn that has already been replaced. The session
-		// dispatches to listeners fire-and-forget across an async extension-emit hop
-		// (#emitSessionEvent), so an interrupted turn's agent_end can land AFTER the
-		// resumed turn's agent_start (e.g. any post-turn agent.continue()). Running
-		// the turn-end teardown now would stop the loader the live turn just created,
-		// leaving "Working…" gone while the agent keeps running. The live turn owns
-		// the loader and finalizes it at its own agent_end (isStreaming === false by
-		// then). Mirrors the collab guest's !isStreaming loader reconciler.
-		if (this.ctx.session.isStreaming) return;
+		const view = this.ctx.viewSession;
+		const isCurrent = this.#viewOwnerGuard();
 		if (this.ctx.collabGuest && (!("runId" in event) || event.runId !== this.ctx.session.lifecycleState?.runId))
 			return;
+		if (view !== this.ctx.session && view.lifecycleState?.phase === "running" && view.isStreaming) {
+			this.#runActive = true;
+			this.#syncComposerActivity();
+			return;
+		}
+		if (this.ctx.session.isStreaming) {
+			if (view !== this.ctx.session) {
+				if (this.ctx.loadingAnimation) {
+					this.#stopWorkingLoader();
+					this.ctx.statusContainer.disposeChildren();
+				}
+				this.#runActive = false;
+				this.#syncComposerActivity();
+			}
+			return;
+		}
 		// A non-terminal settle (`isTerminal: false`) is a scheduling pause, not the
 		// end of the run: the agent's own continuation (reminder, retry, queued
 		// steer/follow-up, IRC wake) follows, or background work may re-wake it.
@@ -2273,6 +2319,7 @@ export class EventController {
 			if (event.awaitingAsyncWork === true) setTerminalTitleState("idle");
 			if (!this.ctx.collabGuest) void this.#finishWhenRunSettles(event);
 			await this.ctx.flushPendingModelSwitch();
+			if (!isCurrent()) return;
 			// Reaching here means the first guard passed, so `isStreaming` is already
 			// false: a command issued from now on mounts immediately. Leaving earlier
 			// panels queued would render them out of order, minutes later, after the
@@ -2291,10 +2338,10 @@ export class EventController {
 		}
 		setRunStatus(this.#settledRunStatus(event));
 
-		await this.#finishAgentEnd(event);
+		await this.#finishAgentEnd(event, isCurrent);
 		// This settle may belong to an extension-started turn while the main
 		// input loop remains asleep. Do not await session-idle from its own event.
-		if (this.ctx.shutdownRequested) this.ctx.requestShutdown();
+		if (isCurrent() && this.ctx.shutdownRequested) this.ctx.requestShutdown();
 	}
 
 	/**
@@ -2312,11 +2359,12 @@ export class EventController {
 		const epoch = this.#runEpoch;
 		if (this.#settleWatchEpoch === epoch) return;
 		this.#settleWatchEpoch = epoch;
-		const session = this.ctx.session;
+		const session = this.ctx.viewSession;
+		const isCurrent = this.#viewOwnerGuard();
 		// No `hasAdmittedSubmission` gate: this very settle is emitted while the
 		// prompt that produced it is still admitted, and a new submission starts a
 		// run whose `agent_start` bumps the epoch anyway.
-		const superseded = () => this.#runEpoch !== epoch || this.ctx.session !== session || session.isStreaming;
+		const superseded = () => !isCurrent() || (session.lifecycleState?.phase === "running" && session.isStreaming);
 		try {
 			while (!superseded()) {
 				await session.waitForIdle();
@@ -2333,8 +2381,8 @@ export class EventController {
 					return;
 				}
 				setRunStatus(this.#settledRunStatus(event));
-				await this.#finishAgentEnd(event);
-				if (this.ctx.shutdownRequested) this.ctx.requestShutdown();
+				await this.#finishAgentEnd(event, isCurrent);
+				if (isCurrent() && this.ctx.shutdownRequested) this.ctx.requestShutdown();
 			});
 		} catch (error) {
 			logger.warn("Non-terminal settle teardown failed", { error: String(error) });
@@ -2364,7 +2412,12 @@ export class EventController {
 		return { state: "done" };
 	}
 
-	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+	async #finishAgentEnd(
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+		isCurrent = this.#viewOwnerGuard(),
+	): Promise<void> {
+		await this.ctx.flushPendingModelSwitch();
+		if (!isCurrent()) return;
 		this.#setTerminalProgress(false);
 		this.ctx.statusLine.markActivityEnd();
 		this.#lastAgentEndAt = Date.now();
@@ -2375,7 +2428,8 @@ export class EventController {
 			this.ctx.loadingAnimation = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
-		await this.ctx.flushPendingModelSwitch();
+		this.#runActive = false;
+		this.#syncComposerActivity();
 		this.#sealAbandonedForegroundTools();
 		this.#blockingPrompts.clear();
 		this.#readToolCallArgs.clear();
@@ -2494,6 +2548,8 @@ export class EventController {
 			() => this.ctx.interruptFromPointer(),
 		);
 		this.ctx.statusContainer.addChild(this.ctx.autoCompactionLoader);
+		this.#maintenanceActive = true;
+		this.#syncComposerActivity();
 		this.ctx.ui.requestRender();
 	}
 
@@ -2509,6 +2565,8 @@ export class EventController {
 			this.ctx.autoCompactionLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
+		this.#maintenanceActive = false;
+		this.#syncComposerActivity();
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";

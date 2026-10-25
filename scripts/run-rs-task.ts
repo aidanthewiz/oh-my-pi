@@ -14,14 +14,8 @@ const RUST_AFFECTING_FILE_NAMES = [
 	"rustfmt.toml",
 	".rustfmt.toml",
 ] as const satisfies readonly string[];
-// Vendored path-patched crates are workspace members for Bazel hermeticity
-// (path-patch rendering is machine-local), but cargo dev tasks keep their
-// historical scope: the forks are not held to workspace format/lint/test gates.
-//
-// pi-builtins is NOT excluded. It is first-party, and although it opts out of
-// the workspace's pedantic/nursery lints in its own manifest (most of it is
-// ported third-party code), it is held to default clippy and to zero rustc
-// warnings like everything else.
+// Path-patched crates remain workspace members for hermetic Bazel rendering.
+// Cranelift retains upstream lint policy but participates in the test tasks.
 const VENDORED_FORK_EXCLUDES = [
 	"--exclude",
 	"brush-core",
@@ -32,10 +26,15 @@ const VENDORED_FORK_EXCLUDES = [
 	"--exclude",
 	"napi",
 ] as const satisfies readonly string[];
+const VENDORED_CLIPPY_EXCLUDES = [
+	...VENDORED_FORK_EXCLUDES,
+	"--exclude",
+	"cranelift-codegen",
+] as const satisfies readonly string[];
 const TASK_COMMANDS = {
 	"check:rs": [
 		["cargo", "fmt", "--all", "--", "--check"],
-		["cargo", "clippy", "--workspace", ...VENDORED_FORK_EXCLUDES, "--no-deps", "--", "-D", "warnings"],
+		["cargo", "clippy", "--workspace", ...VENDORED_CLIPPY_EXCLUDES, "--no-deps", "--", "-D", "warnings"],
 	],
 	"fix:rs": [
 		["cargo", "fmt", "--all"],
@@ -43,7 +42,7 @@ const TASK_COMMANDS = {
 			"cargo",
 			"clippy",
 			"--workspace",
-			...VENDORED_FORK_EXCLUDES,
+			...VENDORED_CLIPPY_EXCLUDES,
 			"--fix",
 			"--allow-dirty",
 			"--no-deps",
@@ -52,7 +51,7 @@ const TASK_COMMANDS = {
 		],
 	],
 	"fmt:rs": [["cargo", "fmt", "--all"]],
-	"lint:rs": [["cargo", "clippy", "--workspace", ...VENDORED_FORK_EXCLUDES, "--no-deps", "--", "-D", "warnings"]],
+	"lint:rs": [["cargo", "clippy", "--workspace", ...VENDORED_CLIPPY_EXCLUDES, "--no-deps", "--", "-D", "warnings"]],
 	"test:rs": [
 		[
 			"cargo",
@@ -63,14 +62,8 @@ const TASK_COMMANDS = {
 			"--status-level=fail",
 			"--final-status-level=fail",
 		],
-		// nextest cannot run doctests (no stable libtest-json interface for
-		// them), so they need their own libtest pass. It runs every runnable
-		// doctest in the workspace's lib crates; today that is tree-sitter-go's
-		// one example, since pi-natives is a `cdylib`, which rustdoc refuses to
-		// collect doctests from, and pi-builtins' 16 examples are `ignore`d
-		// vendored uutils docs. `--doc` overrides a crate's own
-		// `doctest = false`, so a vendored crate whose examples do not compile
-		// (napi-rs's) has to be in VENDORED_FORK_EXCLUDES.
+		// nextest cannot run doctests, so they need a separate libtest pass.
+		// --doc overrides doctest=false, including the excluded napi examples.
 		["cargo", "test", "--doc", "--workspace", ...VENDORED_FORK_EXCLUDES],
 	],
 } as const satisfies Record<string, readonly (readonly string[])[]>;

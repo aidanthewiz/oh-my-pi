@@ -1071,6 +1071,69 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test.each(["allowed", "disabled-model", "scoped-models", "scoped-provider"] as const)(
+		"keeps cross-provider env alias fallback inside %s model policy",
+		async policy => {
+			const fallbackId = DEFAULT_MODEL_PER_PROVIDER["xai-oauth"];
+			const settings = Settings.isolated({
+				"retry.modelFallback": true,
+				"retry.fallbackChains": { default: [`xai-oauth/${fallbackId}`] },
+				...(policy === "disabled-model" ? { disabledModels: [`xai-oauth/${fallbackId}`] } : {}),
+				...(policy === "scoped-models" ? { enabledModels: ["openai/gpt-4o-mini"] } : {}),
+				...(policy === "scoped-provider"
+					? { disabledProviders: [{ paths: [process.cwd(), path.dirname(tempDir)], providers: ["xai-oauth"] }] }
+					: {}),
+			});
+			settings.setModelRole("default", "missing-provider/missing-model");
+			const authStorage = createInMemoryAuthStorage();
+			authStoragesToClose.push(authStorage);
+			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "alias-fallback-models.yml"));
+			const originalXaiApiKey = Bun.env.XAI_API_KEY;
+			const originalXaiOauthToken = Bun.env.XAI_OAUTH_TOKEN;
+			// XAI_API_KEY authenticates `xai-oauth` requests through an alias, but
+			// default availability ignores that alias and offers `xai` instead.
+			Bun.env.XAI_API_KEY = "xai-env-key";
+			delete Bun.env.XAI_OAUTH_TOKEN;
+			try {
+				const { session, modelFallbackMessage } = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					authStorage,
+					modelRegistry,
+					settings,
+					sessionManager: SessionManager.inMemory(),
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					rules: [],
+					preloadedCustomToolPaths: [],
+					toolNames: ["read"],
+				});
+				try {
+					if (policy === "allowed") {
+						expect(session.model?.provider).toBe("xai-oauth");
+						expect(session.model?.id).toBe(fallbackId);
+						expect(modelFallbackMessage).toBeUndefined();
+					} else {
+						expect(session.model?.provider).not.toBe("xai-oauth");
+					}
+				} finally {
+					await session.dispose();
+				}
+			} finally {
+				if (originalXaiApiKey === undefined) delete Bun.env.XAI_API_KEY;
+				else Bun.env.XAI_API_KEY = originalXaiApiKey;
+				if (originalXaiOauthToken === undefined) delete Bun.env.XAI_OAUTH_TOKEN;
+				else Bun.env.XAI_OAUTH_TOKEN = originalXaiOauthToken;
+			}
+		},
+	);
+
 	test("preserves deferred bare role fallback chains", async () => {
 		const settings = Settings.isolated();
 		settings.setModelRole("task", "runtime-provider/runtime-model,runtime-provider/runtime-fallback-model");

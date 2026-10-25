@@ -39,13 +39,7 @@ import { formatTurnUsage, type TurnUsageSummary } from "../overlays/usage-row";
 import { FigureMarkdown } from "./figure-markdown";
 import { svgFigureRendering } from "./svg-figure";
 import { type FigureSegment, hasSvgFence, splitSvgFences } from "./svg-source";
-import {
-	type ChartSegment,
-	describeTableChart,
-	hasChartTable,
-	lookupTableChart,
-	splitTableCharts,
-} from "./table-chart";
+import { type ChartSegment, chartFence, hasChartTable, lookupTableChart, splitTableCharts } from "./table-chart";
 
 /**
  * Max wrapped rows of a turn-ending provider error rendered inline in the
@@ -947,7 +941,7 @@ export class AssistantMessageComponent extends Container {
 						}
 						const chart = lookupTableChart(segment.table);
 						if (chart instanceof Promise) this.#awaitChart(chart);
-						else if (chart) children.push(describeTableChart(chart, slot));
+						else if (chart) children.push(markdown(slot, slot, chartFence(chart), false));
 					});
 				} else if (content.type === "thinking") {
 					const display = resolveThinkingDisplay(content, this.#proseOnlyThinking);

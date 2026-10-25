@@ -6,7 +6,6 @@ import type { DescribeContext, NativeChild, NativeNode } from "@oh-my-pi/pi-tui/
 import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { COMPOSER_DEFAULTS, Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { type ComposerNativeState, CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
-import { QueuedMessagesBand } from "@oh-my-pi/pi-tui/prompt/queued-messages";
 import { createStartupStatusLine } from "@oh-my-pi/pi-tui/status-line/startup";
 import { getEditorTheme, getSelectListTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TspHarness } from "./native/tsp-harness";
@@ -455,29 +454,6 @@ describe("native working row", () => {
 		);
 		expect(nodes(row).find(n => n.k === "progress")?.p).toEqual({ value: null });
 		expect(byRole(row, "omp.working.stop")).toBeUndefined();
-	});
-});
-
-describe("native queued messages", () => {
-	it("counts the queue in the first pill only and edits through the dequeue path", () => {
-		const onEdit = vi.fn();
-		const band = new QueuedMessagesBand(
-			[
-				{ label: "Steering", messages: ["one", "two"] },
-				{ label: "After yield", messages: ["three"] },
-			],
-			"alt+up",
-			onEdit,
-		);
-		const pills = (band.describe().c ?? []).filter(isNode);
-		expect(pills).toHaveLength(3);
-		const counts = pills.map(pill => byRole(pill, "omp.queue.count")?.p);
-		expect(counts).toEqual([{ text: "3", role: "omp.queue.count" }, undefined, undefined]);
-		band.handleNativeEvent({ type: "action", key: "x/edit", act: "queue.edit", mods: [] });
-		expect(onEdit).toHaveBeenCalledTimes(1);
-
-		const single = new QueuedMessagesBand([{ label: "Steering", messages: ["only"] }], "alt+up", onEdit);
-		expect(byRole(single.describe(), "omp.queue.count")).toBeUndefined();
 	});
 });
 
