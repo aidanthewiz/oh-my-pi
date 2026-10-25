@@ -259,19 +259,44 @@ describe("MCP fallback and prompt formatting", () => {
 		]);
 	});
 
+	it("rejects an unsolicited session grant from the approval UI", async () => {
+		const ui = {
+			select: async () => undefined,
+			approve: async () => "session" as const,
+		};
+
+		expect(await requestApproval(ui, tool("bash", "exec"), {})).toBe("deny");
+		expect(await requestApproval(ui, tool("bash", "exec"), {}, { sessionSubject: "bash commands" })).toBe("session");
+	});
+
+	it("rejects a session selection when the caller offered only one-time approval", async () => {
+		const ui = { select: async () => "Approve bash commands for this session" };
+
+		expect(await requestApproval(ui, tool("bash", "exec"), {})).toBe("deny");
+		expect(await requestApproval(ui, tool("bash", "exec"), {}, { sessionSubject: "bash commands" })).toBe("session");
+	});
+
 	it("the dialog's compact prompt summarizes the details to one row, keeping origin, reason, and appendix", async () => {
 		const prompts: { full: string; compact: string }[] = [];
 		const ui = {
 			select: async () => undefined,
 			approve: async (prompt: { full: string; compact: string }) => {
 				prompts.push(prompt);
-				return true;
+				return "once" as const;
 			},
 		};
 		const write = tool("mcp__server__write", undefined, () => ["Path: /tmp/out", "Content:\nsecret\nbody"]);
-		expect(await requestApproval(ui, write, {}, "Critical pattern", ["Provider safety checks:", "- check"])).toBe(
-			true,
-		);
+		expect(
+			await requestApproval(
+				ui,
+				write,
+				{},
+				{
+					reason: "Critical pattern",
+					appendix: ["Provider safety checks:", "- check"],
+				},
+			),
+		).toBe("once");
 		expect(prompts[0]!.compact.split("\n")).toEqual([
 			"Allow tool: mcp__server__write",
 			"Origin: MCP server tool",

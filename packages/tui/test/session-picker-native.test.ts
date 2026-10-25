@@ -62,6 +62,7 @@ describe("session selector picker", () => {
 			() => {},
 			() => {},
 			() => {},
+			{ onDelete: async () => true },
 		);
 		try {
 			for (const label of ["🧪 TITLE: Plain title", "Plain title", "🧪 TITLE: Plain title"]) {

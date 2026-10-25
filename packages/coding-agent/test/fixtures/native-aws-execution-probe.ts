@@ -320,6 +320,8 @@ const wrappedWrite = new ExtensionToolWrapper(
 		consumeToolCallEmitted: () => false,
 		hasHandlers: () => false,
 		hasUI: () => false,
+		hasSessionApproval: () => false,
+		grantSessionApproval: () => assert.fail("Headless approval cannot grant session permission"),
 		runScoped: <T>(fn: () => T): T => fn(),
 	} as unknown as ExtensionRunner,
 );
@@ -451,6 +453,8 @@ for (const [profile, failure] of [
 		{
 			hasHandlers: (event: string) => failure === "resolution" && event === "tool_approval_resolved",
 			hasUI: () => true,
+			hasSessionApproval: () => false,
+			grantSessionApproval: () => assert.fail("Interrupted approval cannot grant session permission"),
 			consumeToolCallEmitted: () => false,
 			runScoped: <T>(fn: () => T): T => fn(),
 			getUIContext: () => ({
@@ -1059,6 +1063,8 @@ let choice: string | undefined = sessionLabel;
 const sessionRunner = {
 	hasHandlers: () => false,
 	hasUI: () => true,
+	hasSessionApproval: () => false,
+	grantSessionApproval: () => assert.fail("AWS approval must not grant general tool permission"),
 	consumeToolCallEmitted: () => false,
 	runScoped: <T>(fn: () => T): T => fn(),
 	getUIContext: () => ({

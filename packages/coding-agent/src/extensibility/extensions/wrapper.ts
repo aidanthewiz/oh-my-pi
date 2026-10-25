@@ -22,6 +22,7 @@ import {
 	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
+	sessionApprovalScope,
 	truncateForPrompt,
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -249,6 +250,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// preflight again. Direct and nested xd:// calls have no loop marker:
 		// their final-input preflight still runs below.
 		const dispatchKey = `${toolCallId}:${this.tool.name}`;
+		const approvalSessionId = this.runner.sessionId;
 		const inheritedLoopDispatch =
 			(context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === dispatchKey;
 		const loopDispatchedToolCall =
@@ -339,6 +341,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			signal,
 			context,
 		);
+		try {
+			signal?.throwIfAborted();
+			if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
+		} catch (error) {
+			cancelPreflight();
+			runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
+			throw error;
+		}
 		if (runtimeApproval && !runtimeApprovalTool.approveRuntimeApproval) {
 			throw new Error(`Tool "${this.tool.name}" requested runtime approval without a grant handler.`);
 		}
@@ -352,6 +362,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
 			cancelPreflight();
+			runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
 			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
@@ -366,11 +377,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			context !== undefined &&
 			Object.hasOwn(context, "acpApprovedArgs") &&
 			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
+		// A prompt the approval mode raised can be approved for the rest of the session; provider
+		// safety checks are per-call, so they never offer it.
+		const sessionScope =
+			pendingSafetyChecks.length === 0 && !runtimeApproval && !runtimeApprovalTool.sessionApproval
+				? sessionApprovalScope(resolved, this.tool.name)
+				: undefined;
+		const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
 		const approvalCheck = {
 			required:
 				runtimeApproval !== undefined ||
 				pendingSafetyChecks.length > 0 ||
-				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
+				(resolved.policy === "prompt" && !acpBypass && !sessionApproved && (explicitPrompt || !xdevBypass)),
 			reason: runtimeApproval?.reason ?? resolved.reason,
 		};
 
@@ -457,6 +475,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						? capability
 						: undefined;
 				let approveSession = false;
+				let approveModeSession = false;
 				let approved: boolean;
 				const denialReason = "denied by user";
 				try {
@@ -484,21 +503,23 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							pendingSafetyChecks.length > 0
 								? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)]
 								: [];
-						approved = await requestApproval(
-							uiContext,
-							this.tool,
-							resolvedArgs,
-							approvalCheck.reason,
-							safetyAppendix,
-						);
+						const answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
+							reason: approvalCheck.reason,
+							appendix: safetyAppendix,
+							sessionSubject: sessionScope?.subject,
+						});
+						approveModeSession = answer === "session" && sessionScope !== undefined;
+						approved = answer === "once" || approveModeSession;
 					}
 					signal?.throwIfAborted();
+					if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
 				} catch (err) {
 					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 					throw err;
 				}
 				await emitApprovalResolved(approved, approved ? undefined : denialReason);
 				signal?.throwIfAborted();
+				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
 				if (!approved) {
 					throw new Error(`Tool call denied by user: ${this.tool.name}`);
 				}
@@ -509,7 +530,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					if (!context) throw new Error("Provider safety approval context is unavailable");
 					context.providerSafetyApproved = true;
 				}
+				signal?.throwIfAborted();
+				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
 				if (approveSession) sessionApproval!.approve();
+				if (approveModeSession) this.runner.grantSessionApproval(sessionScope!.key);
 			} catch (error) {
 				cancelPreflight();
 				runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);

@@ -293,7 +293,7 @@ describe("ExtensionUiController docked approval", () => {
 			expect(start).not.toHaveBeenCalled();
 			expect(timedOut).not.toHaveBeenCalled();
 			firstAbort.abort();
-			expect(await first).toBe(false);
+			expect(await first).toBe("deny");
 			const active = harness.getFocused();
 			expect(active).toBeInstanceOf(ApprovalDialogComponent);
 			expect(start).toHaveBeenCalledTimes(1);
@@ -305,7 +305,7 @@ describe("ExtensionUiController docked approval", () => {
 			vi.advanceTimersByTime(200);
 			expect(timedOut).not.toHaveBeenCalled();
 			vi.advanceTimersByTime(800);
-			expect(await second).toBe(false);
+			expect(await second).toBe("deny");
 			expect(timedOut).toHaveBeenCalledTimes(1);
 			expect(harness.getFocused()).toBe(harness.editor);
 		} finally {
@@ -584,6 +584,45 @@ describe("ExtensionUiController tool approval", () => {
 		compact: "Allow tool: bash\nCommand: rm -rf build",
 	};
 
+	it("does not restore a stale approval composer over a replacement view", async () => {
+		const harness = makeHarness();
+		const abort = new AbortController();
+		const pending = harness.controller.showCollabAwareApproval(prompt, { signal: abort.signal });
+		const replacement = new CustomEditor(getEditorTheme());
+		replacement.setText("incoming view draft");
+		harness.editorContainer.clear();
+		harness.editorContainer.addChild(replacement);
+		harness.setFocus(replacement);
+		abort.abort();
+		expect(await pending).toBe("deny");
+		expect(harness.editorContainer.children).toEqual([replacement]);
+		expect(harness.getFocused()).toBe(replacement);
+		expect(replacement.getText()).toBe("incoming view draft");
+	});
+
+	it("lists the choices over a live composer: with it empty, the arrows and Enter take the session approval", async () => {
+		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+		try {
+			const harness = makeHarness();
+			const pending = harness.controller.showCollabAwareApproval({
+				...prompt,
+				session: "Approve bash for this session",
+			});
+			const [dialog] = harness.editorContainer.children;
+			expect(harness.editorContainer.children).toEqual([dialog, harness.editor]);
+			// The composer's cursor stays visible: typing there steers instead.
+			expect(harness.editor.focused).toBe(true);
+			now.mockReturnValue(2_000);
+			harness.handleInput("\x1b[B");
+			harness.handleInput("\r");
+			expect(await pending).toBe("session");
+			expect(harness.editorContainer.children).toEqual([harness.editor]);
+			expect(harness.getFocused()).toBe(harness.editor);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
 	it("lets the composer steer while a call waits: the queued message denies the call", async () => {
 		const harness = makeHarness();
 		// A steer queued before the prompt appeared does not answer it.
@@ -592,13 +631,13 @@ describe("ExtensionUiController tool approval", () => {
 		const pending = harness.controller.showCollabAwareApproval(prompt);
 		const [dialog] = harness.editorContainer.children;
 		expect(harness.editorContainer.children).toEqual([dialog, harness.editor]);
-		// Enter on an empty composer is swallowed: the dialog stays up (settling unmounts it synchronously).
+		// An Enter as the prompt appears is ignored: the dialog stays up (settling unmounts it synchronously).
 		harness.handleInput("\r");
 		expect(harness.editorContainer.children).toEqual([dialog, harness.editor]);
 		for (const key of "keep the build dir") harness.handleInput(key);
 		expect(harness.editor.getText()).toBe("keep the build dir");
 		harness.handleInput("\r");
-		expect(await pending).toBe(false);
+		expect(await pending).toBe("deny");
 		expect(harness.editorContainer.children).toEqual([harness.editor]);
 		expect(harness.getFocused()).toBe(harness.editor);
 	});
@@ -610,8 +649,8 @@ describe("ExtensionUiController tool approval", () => {
 		const second = harness.controller.showCollabAwareApproval({ ...prompt, full: "Allow tool: write" });
 		for (const key of "stop") harness.handleInput(key);
 		harness.handleInput("\r");
-		expect(await first).toBe(false);
-		expect(await second).toBe(false);
+		expect(await first).toBe("deny");
+		expect(await second).toBe("deny");
 		expect(harness.editorContainer.children).toEqual([harness.editor]);
 	});
 
@@ -621,9 +660,9 @@ describe("ExtensionUiController tool approval", () => {
 		const first = harness.controller.showCollabAwareApproval(prompt);
 		for (const key of "stop") harness.handleInput(key);
 		harness.handleInput("\r");
-		expect(await first).toBe(false);
+		expect(await first).toBe("deny");
 		// An exclusive call asks only after the denied one settled; the steer is still queued.
-		expect(await harness.controller.showCollabAwareApproval(prompt)).toBe(false);
+		expect(await harness.controller.showCollabAwareApproval(prompt)).toBe("deny");
 		// Delivered at the batch boundary: the next turn's approvals ask again.
 		harness.deliverSteering();
 		void harness.controller.showCollabAwareApproval(prompt);
@@ -637,7 +676,7 @@ describe("ExtensionUiController tool approval", () => {
 		const pending = harness.controller.showCollabAwareApproval(prompt);
 		for (const key of "keep the build dir") harness.handleInput(key);
 		harness.handleInput("\r");
-		expect(await pending).toBe(false);
+		expect(await pending).toBe("deny");
 		// One-at-a-time delivery takes the head at the batch boundary.
 		expect(harness.agent.peekSteeringQueue().map(message => message.role === "user" && message.content)).toEqual([
 			"keep the build dir",
@@ -651,7 +690,7 @@ describe("ExtensionUiController tool approval", () => {
 		const first = harness.controller.showCollabAwareApproval(prompt);
 		for (const key of "[Image]") harness.handleInput(key);
 		harness.handleInput("\r");
-		expect(await first).toBe(false);
+		expect(await first).toBe("deny");
 		harness.deliverSteering();
 		// A later turn's steer with the same chip text predates the next prompt.
 		harness.queueSteer("[Image]");

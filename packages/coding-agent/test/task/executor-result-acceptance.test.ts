@@ -595,6 +595,110 @@ describe("runSubprocess result acceptance", () => {
 		}
 	});
 
+	it("delivers a user-resumed message result when all execution slots are occupied", async () => {
+		const tempDir = TempDir.createSync("@omp-user-resumed-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+		const blocker = Promise.withResolvers<string>();
+		manager.register("bash", "busy", () => blocker.promise, { ownerId: "Other" });
+		expect(manager.atCapacity).toBe(true);
+		const delivered: string[] = [];
+		manager.registerDeliverySink("Parent", (_jobId, text) => {
+			delivered.push(text);
+		});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+
+		try {
+			// The initial run died on a provider error before reporting.
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), "");
+			const finish = observer([
+				{
+					role: "user",
+					content: "credits are back, finish the report",
+					attribution: "user",
+					timestamp: Date.now(),
+				},
+			]);
+			harness.emitAssistantText("## Report\nroot cause found");
+			await finish?.(undefined);
+			expect(manager.atCapacity).toBe(true);
+			await manager.drainDeliveries({ timeoutMs: 1000 });
+			AgentRegistry.global().setStatus(AGENT_ID, "idle");
+
+			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
+			expect(resolved.content).toBe("## Report\nroot cause found");
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]).toContain("root cause found");
+		} finally {
+			InternalUrlRouter.resetForTests();
+			blocker.resolve("finished");
+			resetRegisteredArtifactDirsForTests();
+			await manager.waitForAll();
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
+	it("does not publish a focused result through a replaced registry generation sharing its session", async () => {
+		const tempDir = TempDir.createSync("@omp-stale-focused-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const delivered: string[] = [];
+		manager.registerDeliverySink("Parent", (_id, text) => {
+			delivered.push(text);
+		});
+		const harness = createHarness({ asyncJobManager: manager });
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const accepted = '{"report":"accepted verdict"}';
+		try {
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const finish = observer([{ role: "user", content: "go on", attribution: "user", timestamp: Date.now() }]);
+			harness.emitAssistantText("stale report");
+			const replacement = registry.register({
+				id: AGENT_ID,
+				displayName: AGENT_ID,
+				kind: "sub",
+				parentId: "Parent",
+				session: harness.session,
+				status: "running",
+			});
+			await finish?.();
+			await manager.drainDeliveries({ timeoutMs: 1000 });
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+			expect(delivered).toEqual([]);
+			expect(replacement.status).toBe("running");
+			expect(replacement.lifecycle?.acceptedAt).toBeUndefined();
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
 	it("keeps the accepted artifact and sidecar when the parent cancels its wake job before finalization", async () => {
 		const tempDir = TempDir.createSync("@omp-cancelled-wake-result-");
 		const artifactsDir = tempDir.path();

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
 import type {
 	AssistantMessage,
@@ -472,6 +472,73 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		expect(lines).toHaveLength(2); // role chunk + error envelope
 		const payloads = lines.map(parseSseLine) as Array<Record<string, unknown>>;
 		expect(payloads[1]).toEqual({ error: { message: "upstream went away", type: "upstream_error" } });
+	});
+
+	it.each(["abort", "cancel"] as const)("retires silent-stream keepalives immediately on %s", async ending => {
+		vi.useFakeTimers();
+		const baselineTimers = vi.getTimerCount();
+		const release = Promise.withResolvers<void>();
+		const heldEvents: AsyncIterable<AssistantMessageEvent> = {
+			[Symbol.asyncIterator]: () => ({
+				next: async () => {
+					await release.promise;
+					return { done: true as const, value: undefined };
+				},
+			}),
+		};
+		const requestController = new AbortController();
+		const stream = encodeStream(heldEvents as unknown as AssistantMessageEventStream, "gpt-test", undefined, {
+			signal: requestController.signal,
+		});
+		const reader = stream.getReader();
+		try {
+			const role = await reader.read();
+			expect(new TextDecoder().decode(role.value)).toContain('"role":"assistant"');
+			expect(vi.getTimerCount()).toBe(baselineTimers + 1);
+			let receivedKeepalive = false;
+			const keepalive = reader.read().then(chunk => {
+				receivedKeepalive = true;
+				return chunk;
+			});
+			vi.advanceTimersByTime(14_999);
+			await Promise.resolve();
+			expect(receivedKeepalive).toBe(false);
+			vi.advanceTimersByTime(1);
+			expect(new TextDecoder().decode((await keepalive).value)).toBe(": keepalive\n\n");
+
+			if (ending === "abort") requestController.abort("request ended");
+			else await reader.cancel("client timeout");
+			expect(vi.getTimerCount()).toBe(baselineTimers);
+		} finally {
+			release.resolve();
+			await reader.cancel();
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["done", "error", "throw"] as const)("retires keepalives when the upstream ends with %s", async ending => {
+		vi.useFakeTimers();
+		const baselineTimers = vi.getTimerCount();
+		const message = emptyAssistant();
+		async function* terminalEvents(): AsyncGenerator<AssistantMessageEvent> {
+			if (ending === "throw") throw new Error("upstream failed");
+			if (ending === "error") {
+				yield { type: "error", reason: "error", error: { ...message, errorMessage: "upstream failed" } };
+			} else {
+				yield { type: "done", reason: "stop", message };
+			}
+		}
+		try {
+			const lines = await collectStream(
+				encodeStream(terminalEvents() as unknown as AssistantMessageEventStream, "gpt-test"),
+			);
+			const terminal = parseSseLine(lines.at(-1)!);
+			if (ending === "done") expect(terminal).toBe("[DONE]");
+			else expect(terminal).toEqual({ error: { message: "upstream failed", type: "upstream_error" } });
+			expect(vi.getTimerCount()).toBe(baselineTimers);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("aborts the upstream gateway request when the client cancels the response body", async () => {

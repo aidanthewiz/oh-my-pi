@@ -198,6 +198,120 @@ describe("SessionManager.forkFrom", () => {
 		expect(await Bun.file(path.join(sourceArtifactsDir, "1.read.log")).text()).toBe("tool output");
 	});
 
+	it("forks a seance in place: source untouched, history kept, startup contracts inert, artifacts not copied", async () => {
+		using tempDir = TempDir.createSync("@omp-session-seance-fork-");
+		const { cwd, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(tempDir.path());
+		const timestamp = new Date().toISOString();
+		const sourceHeader: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "source-session",
+			timestamp,
+			cwd,
+			additionalDirectories: [path.join(tempDir.path(), "parent-workspace")],
+		};
+		const inheritedInit = {
+			type: "session_init",
+			id: "inherited-init",
+			parentId: null,
+			timestamp,
+			systemPrompt: ["unrestricted source prompt"],
+			task: "unrestricted source task",
+			tools: ["read", "write", "task"],
+			agent: "task",
+			spawns: "*",
+		};
+		const request = {
+			type: "message",
+			id: "witness-request",
+			parentId: "inherited-init",
+			timestamp,
+			message: { role: "user", content: "early request before resume", timestamp: 1 },
+		};
+		const laterInit = {
+			...inheritedInit,
+			id: "later-inherited-init",
+			parentId: "witness-request",
+			systemPrompt: ["later unrestricted resume prompt"],
+		};
+		const laterMessage = {
+			type: "message",
+			id: "later-source-message",
+			parentId: "later-inherited-init",
+			timestamp,
+			message: { role: "user", content: "later source turn", timestamp: 3 },
+		};
+		const sourceText = `${[sourceHeader, inheritedInit, request, laterInit, laterMessage]
+			.map(entry => JSON.stringify(entry))
+			.join("\n")}\n`;
+		await Bun.write(sourceFile, sourceText);
+
+		const forkFile = path.join(tempDir.path(), "forks", "seance.jsonl");
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, undefined, undefined, {
+			seance: true,
+			suppressBreadcrumb: true,
+			sessionFile: forkFile,
+			resetInheritedCost: true,
+			repairInterruptedTail: true,
+		});
+		try {
+			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
+			const asSourceInit = { type: "custom", customType: "source_session_init" };
+			expect(await loadHistory(forkFile)).toEqual([
+				{ ...asSourceInit, id: inheritedInit.id, parentId: null, timestamp, data: inheritedInit },
+				request,
+				{ ...asSourceInit, id: laterInit.id, parentId: laterInit.parentId, timestamp, data: laterInit },
+				laterMessage,
+			] as unknown as SessionEntry[]);
+			// Revival reads the header's source pointer and finds no inherited contract to resurrect.
+			expect(await SessionManager.peekSessionInit(forkFile)).toMatchObject({
+				seanceSource: await fs.realpath(sourceFile),
+				init: null,
+			});
+			expect(forked.getSeanceSourceArtifactsDir()).toBe(await fs.realpath(sourceArtifactsDir));
+			expect(forked.getAdditionalDirectories()).toEqual([]);
+			await expect(fs.stat(forkFile.slice(0, -".jsonl".length))).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await forked.close();
+		}
+	});
+
+	it("keeps a memory-backed seance source key authoritative over a physical symlink at that key", async () => {
+		using root = TempDir.createSync("@omp-memory-seance-source-");
+		const storage = new MemorySessionStorage();
+		const dir = path.join(root.path(), "sessions");
+		const source = SessionManager.create(root.path(), dir, storage);
+		source.appendMessage({ role: "user", content: "memory-owned history", timestamp: 1 });
+		await source.ensureOnDisk();
+		const sourceFile = source.getSessionFile()!;
+		const sourceId = source.getSessionId();
+		const physicalTarget = path.join(root.path(), "physical.jsonl");
+		const decoy = '{"type":"session","version":3,"id":"physical-decoy","timestamp":"2026-10-01T00:00:00.000Z"}\n';
+		await Bun.write(physicalTarget, decoy);
+		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
+		await fs.symlink(physicalTarget, sourceFile, "file");
+		const fork = await SessionManager.forkFrom(sourceFile, root.path(), dir, storage, {
+			seance: true,
+			suppressBreadcrumb: true,
+		});
+		try {
+			expect(fork.getHeader()?.parentSession).toBe(sourceId);
+			expect(fork.getSeanceSourceArtifactsDir()).toBe(sourceFile.slice(0, -6));
+			expect(fork.getEntries()).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "message",
+						message: expect.objectContaining({ content: "memory-owned history" }),
+					}),
+				]),
+			);
+			expect(await fs.readFile(physicalTarget, "utf8")).toBe(decoy);
+		} finally {
+			await fork.close();
+			await source.close();
+		}
+	});
+
 	it("does not copy artifacts when the caller opts out", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-no-artifacts-");
 		const { cwd, sessionDir, sourceFile } = await createSessionWithArtifacts(tempDir.path());

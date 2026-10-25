@@ -135,9 +135,11 @@ async function spawnKeptAliveChild(structured = true) {
 
 	const deliveries: string[] = [];
 	const firstDelivery = Promise.withResolvers<string>();
+	const secondDelivery = Promise.withResolvers<string>();
 	const unregisterSink = manager.registerDeliverySink(PARENT_ID, (_jobId, text) => {
 		deliveries.push(text);
 		firstDelivery.resolve(text);
+		if (deliveries.length === 2) secondDelivery.resolve(text);
 	});
 	const close = (): void => {
 		unregisterSink();
@@ -183,7 +185,14 @@ async function spawnKeptAliveChild(structured = true) {
 		close();
 		throw new Error("kept-alive subagent has no live session");
 	}
-	return { session, artifact, deliveries, firstDelivery: firstDelivery.promise, close };
+	return {
+		session,
+		artifact,
+		deliveries,
+		firstDelivery: firstDelivery.promise,
+		secondDelivery: secondDelivery.promise,
+		close,
+	};
 }
 
 it("a focused manual prompt's yield rewrites the artifact and notifies the parent", async () => {
@@ -242,9 +251,7 @@ it.each([true, false])(
 			await child.session.settleAsyncWork();
 			releasePublication.resolve();
 
-			await child.firstDelivery;
-			await manager.waitForOwnerJobs(PARENT_ID);
-			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+			await child.secondDelivery;
 			// One completion per turn, each carrying only that turn's yield.
 			const manual = child.deliveries.filter(text => text.includes("manual result"));
 			const final = child.deliveries.filter(text => text.includes("final result"));
@@ -269,13 +276,67 @@ it("a focused plain result rewrites its artifact and notifies the parent", async
 	const child = await spawnKeptAliveChild(false);
 	try {
 		await child.session.prompt("go on");
-		await manager.waitForOwnerJobs(PARENT_ID);
-		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+		await child.firstDelivery;
 		expect({
 			artifact: (await Bun.file(child.artifact).text()).includes("manual result"),
 			delivered: child.deliveries.filter(text => text.includes("manual result")).length,
 		}).toEqual({ artifact: true, delivered: 1 });
 	} finally {
+		child.close();
+	}
+}, 15_000);
+
+it("delivers a durable focused plain result without reserving a full execution slot", async () => {
+	const child = await spawnKeptAliveChild(false);
+	const blocker = Promise.withResolvers<string>();
+	const publicationStarted = Promise.withResolvers<void>();
+	const releasePublication = Promise.withResolvers<void>();
+	const delivered = Promise.withResolvers<{ text: string; artifact: string; hasSidecar: boolean }>();
+	const sidecar = child.artifact.replace(/\.md$/, ".json");
+	await Bun.write(sidecar, '{"report":"superseded structured result"}');
+	const unregisterSink = manager.registerDeliverySink(PARENT_ID, async (_jobId, text) => {
+		delivered.resolve({
+			text,
+			artifact: await Bun.file(child.artifact).text(),
+			hasSidecar: await Bun.file(sidecar).exists(),
+		});
+	});
+	const realWrite = Bun.write.bind(Bun);
+	const writeSpy = vi.spyOn(Bun, "write").mockImplementation(async (target, content, options) => {
+		if (
+			String(target).startsWith(`${child.artifact}.tmp-`) &&
+			typeof content === "string" &&
+			content.includes("manual result")
+		) {
+			publicationStarted.resolve();
+			await releasePublication.promise;
+		}
+		return (realWrite as (...args: unknown[]) => Promise<number>)(target, content, options);
+	});
+	try {
+		for (let index = 0; index < 4; index++) {
+			manager.register("bash", `busy-${index}`, () => blocker.promise, { ownerId: "Other" });
+		}
+		expect(manager.atCapacity).toBe(true);
+		await child.session.prompt("go on");
+		await publicationStarted.promise;
+		expect(manager.getRunningJobs({ ownerId: PARENT_ID })).toEqual([]);
+		expect(await Bun.file(child.artifact).text()).toContain("initial result");
+		expect(await Bun.file(sidecar).json()).toEqual({ report: "superseded structured result" });
+		expect(manager.getAllJobs().filter(job => job.ownerId === PARENT_ID)).toEqual([]);
+		releasePublication.resolve();
+		const snapshot = await delivered.promise;
+		expect(snapshot.text).toContain("manual result");
+		expect(snapshot.artifact).toContain("manual result");
+		expect(snapshot.hasSidecar).toBe(false);
+		expect(manager.atCapacity).toBe(true);
+		expect(manager.getRunningJobs({ ownerId: PARENT_ID })).toEqual([]);
+	} finally {
+		releasePublication.resolve();
+		blocker.resolve("finished");
+		await manager.waitForAll();
+		unregisterSink();
+		writeSpy.mockRestore();
 		child.close();
 	}
 }, 15_000);
