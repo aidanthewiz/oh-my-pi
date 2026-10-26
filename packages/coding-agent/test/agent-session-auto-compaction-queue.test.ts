@@ -208,8 +208,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 			}
 		}
 	});
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

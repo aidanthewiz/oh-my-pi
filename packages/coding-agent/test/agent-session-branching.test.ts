@@ -39,7 +39,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () =>
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);

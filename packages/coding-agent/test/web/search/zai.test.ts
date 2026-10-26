@@ -10,8 +10,8 @@ const modelRegistry = new ModelRegistry(authStorage);
 const zaiModel = modelRegistry.find("web", "zai");
 if (!zaiModel) throw new Error("Expected bundled web/zai model");
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 interface CapturedRequest {

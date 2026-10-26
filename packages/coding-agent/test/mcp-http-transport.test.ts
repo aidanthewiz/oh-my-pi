@@ -1,7 +1,11 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import { analyzeAuthError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
+import { MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import type { MCPHttpServerConfig, MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
 import { postmortem } from "@oh-my-pi/pi-utils";
 
@@ -164,7 +168,7 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		expect(message("Basic dXNlcjpwYXNz==")).toBe("Basic [redacted]");
 	});
 
-	it("classifies an abrupt socket reset without leaking Bun fetch advice", async () => {
+	it("treats a reset after an attempted POST as an unknown outcome", async () => {
 		const tcp = Bun.listen({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -191,10 +195,9 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 				transport: "http",
 				stage: "send",
 				failure: "reset",
-				retryable: true,
+				retryable: false,
 				code: "ECONNRESET",
 			});
-			expect(error.message).not.toContain("verbose");
 		} finally {
 			await transport.close();
 			tcp.stop(true);
@@ -304,6 +307,191 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		expect(auth.requiresAuth).toBe(true);
 		expect(auth.resourceMetadataUrl).toBe(metadataUrl);
 	});
+});
+
+describe("MCP Streamable HTTP action delivery", () => {
+	it.each(["reset", "eof", "decode-reset", "fetch-failed", "gateway-error"] as const)(
+		"does not replay a committed action after %s",
+		async failure => {
+			const effects = new Database(":memory:");
+			effects.run("CREATE TABLE effects (units INTEGER NOT NULL)");
+			const transports: HttpTransport[] = [];
+			let received = 0;
+			let reconnects = 0;
+			const config: MCPHttpServerConfig = {
+				type: "http",
+				url: "https://owned-mcp-action.invalid/mcp",
+				timeout: REQUEST_TIMEOUT_MS,
+			};
+			const receiver = Object.assign(
+				async (...[input, init]: Parameters<typeof fetch>) => {
+					const request =
+						input instanceof Request
+							? new Request(input, init as RequestInit)
+							: new Request(String(input), init as RequestInit);
+					expect(request.url).toBe(config.url);
+					const body = (await request.json()) as {
+						id: number;
+						method: string;
+						params: { arguments: { units: number } };
+					};
+					expect(body.method).toBe("tools/call");
+					effects.run("INSERT INTO effects(units) VALUES (?)", [body.params.arguments.units]);
+					received++;
+					if (received === 1) {
+						if (failure === "reset")
+							throw Object.assign(new Error("response lost after commit"), { code: "ECONNRESET" });
+						if (failure === "eof")
+							throw Object.assign(new Error("socket closed after commit"), { code: "EPIPE" });
+						if (failure === "fetch-failed") throw new TypeError("fetch failed");
+						if (failure === "gateway-error")
+							return new Response("gateway lost the committed response", { status: 503 });
+						return new Response(
+							new ReadableStream({
+								start(controller) {
+									controller.error(
+										Object.assign(new Error("response body reset after commit"), { code: "ECONNRESET" }),
+									);
+								},
+							}),
+							{ headers: { "Content-Type": "application/json" } },
+						);
+					}
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: { content: [{ type: "text", text: "committed" }] },
+					});
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			);
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(receiver);
+			const connect = async (): Promise<MCPServerConnection> => {
+				const transport = new HttpTransport(config);
+				transports.push(transport);
+				await transport.connect();
+				return {
+					name: "owned-actions",
+					config,
+					transport,
+					capabilities: { tools: {} },
+					serverInfo: { name: "owned-actions", version: "1" },
+				};
+			};
+			try {
+				const tool = new MCPTool(
+					await connect(),
+					{
+						name: "append_action",
+						annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+						inputSchema: { type: "object", properties: { units: { type: "number" } }, required: ["units"] },
+					},
+					async () => {
+						reconnects++;
+						return connect();
+					},
+				);
+				const result = await tool.execute(
+					"one-authorized-action",
+					{ units: 7 },
+					undefined,
+					{} as CustomToolContext,
+				);
+				expect(effects.query("SELECT units FROM effects").all()).toEqual([{ units: 7 }]);
+				expect(result.isError).toBe(true);
+				expect(reconnects).toBe(0);
+			} finally {
+				for (const transport of transports.reverse()) await transport.close();
+				fetchSpy.mockRestore();
+				effects.close();
+			}
+		},
+	);
+
+	it.each(["refused", "dns", "stale-session"] as const)(
+		"recovers a known %s refusal before executing an action",
+		async refusal => {
+			const effects = new Database(":memory:");
+			effects.run("CREATE TABLE effects (units INTEGER NOT NULL)");
+			const transports: HttpTransport[] = [];
+			let attempts = 0;
+			let reconnects = 0;
+			const config: MCPHttpServerConfig = {
+				type: "http",
+				url: "https://owned-mcp-action.invalid/mcp",
+				timeout: REQUEST_TIMEOUT_MS,
+			};
+			const receiver = Object.assign(
+				async (...[input, init]: Parameters<typeof fetch>) => {
+					const request =
+						input instanceof Request
+							? new Request(input, init as RequestInit)
+							: new Request(String(input), init as RequestInit);
+					expect(request.url).toBe(config.url);
+					attempts++;
+					if (attempts === 1) {
+						if (refusal === "stale-session") return new Response("unknown MCP session", { status: 404 });
+						throw Object.assign(new TypeError("fetch failed"), {
+							code: refusal === "dns" ? "ENOTFOUND" : "ECONNREFUSED",
+						});
+					}
+					const body = (await request.json()) as {
+						id: number;
+						method: string;
+						params: { arguments: { units: number } };
+					};
+					expect(body.method).toBe("tools/call");
+					effects.run("INSERT INTO effects(units) VALUES (?)", [body.params.arguments.units]);
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: { content: [{ type: "text", text: "committed" }] },
+					});
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			);
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(receiver);
+			const connect = async (): Promise<MCPServerConnection> => {
+				const transport = new HttpTransport(config);
+				transports.push(transport);
+				await transport.connect();
+				return {
+					name: "owned-actions",
+					config,
+					transport,
+					capabilities: { tools: {} },
+					serverInfo: { name: "owned-actions", version: "1" },
+				};
+			};
+			try {
+				const tool = new MCPTool(
+					await connect(),
+					{
+						name: "append_action",
+						annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+						inputSchema: { type: "object", properties: { units: { type: "number" } }, required: ["units"] },
+					},
+					async () => {
+						reconnects++;
+						return connect();
+					},
+				);
+				const result = await tool.execute(
+					"one-authorized-action",
+					{ units: 7 },
+					undefined,
+					{} as CustomToolContext,
+				);
+				expect(effects.query("SELECT units FROM effects").all()).toEqual([{ units: 7 }]);
+				expect(result.isError).not.toBe(true);
+				expect(reconnects).toBe(1);
+			} finally {
+				for (const transport of transports.reverse()) await transport.close();
+				fetchSpy.mockRestore();
+				effects.close();
+			}
+		},
+	);
 });
 
 describe("MCP Streamable HTTP transport timeouts", () => {

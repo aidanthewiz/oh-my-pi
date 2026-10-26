@@ -67,8 +67,8 @@ describe("createAgentSession skills option", () => {
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir, "models.yml"));
 	});
 
-	afterAll(() => {
-		sharedAuthStorage.close();
+	afterAll(async () => {
+		await sharedAuthStorage.close();
 		removeSyncWithRetries(sharedDir);
 	});
 

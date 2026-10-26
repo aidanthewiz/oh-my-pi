@@ -309,10 +309,10 @@ describe("searchCodex model selection", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		capturedRequest = null;
-		oauthAuthStorage.close();
-		emailOnlyAuthStorage.close();
-		proxyAuthStorage.close();
-		oauthOnlyAuthStorage.close();
+		await oauthAuthStorage.close();
+		await emailOnlyAuthStorage.close();
+		await proxyAuthStorage.close();
+		await oauthOnlyAuthStorage.close();
 		await tempDir.remove();
 	});
 
@@ -362,7 +362,7 @@ describe("searchCodex model selection", () => {
 			expect(headers.get("authorization")).toBe("Bearer env-bearer-token");
 			expect(result.answer).toBe("Codex answer");
 		} finally {
-			envAuthStorage.close();
+			await envAuthStorage.close();
 			if (previous === undefined) delete process.env.OPENAI_CODEX_OAUTH_TOKEN;
 			else process.env.OPENAI_CODEX_OAUTH_TOKEN = previous;
 		}

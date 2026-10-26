@@ -17,8 +17,8 @@ function requirePublicModel() {
 
 const publicModel = requirePublicModel();
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 function makeParams(query: string, fetch: FetchImpl): SearchParams {

@@ -31,8 +31,8 @@ describe("local memory injection scope", () => {
 		model = bundled;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	afterEach(async () => {

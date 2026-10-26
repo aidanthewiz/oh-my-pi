@@ -60,7 +60,7 @@ describe("advisor tool-call loop guard", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await tempDir.remove();
 	});
 

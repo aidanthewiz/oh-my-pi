@@ -262,7 +262,7 @@ describe("task subagent OAuth pin inheritance", () => {
 			});
 		} finally {
 			for (const session of sessions.reverse()) await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -323,7 +323,7 @@ describe("task subagent OAuth pin inheritance", () => {
 			return await resolveApiKeyOnce(await childGetApiKey(model));
 		} finally {
 			await child?.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	}
@@ -399,7 +399,7 @@ describe("task subagent OAuth pin inheritance", () => {
 			expect(await resolveApiKeyOnce(await childGetApiKey(model))).toBe("access-b");
 		} finally {
 			await child?.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -495,7 +495,7 @@ describe("task subagent OAuth pin inheritance", () => {
 			);
 		} finally {
 			for (const session of sessions.reverse()) await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -590,7 +590,7 @@ describe("task subagent OAuth pin inheritance", () => {
 			);
 		} finally {
 			for (const session of sessions.reverse()) await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});

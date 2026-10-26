@@ -68,7 +68,7 @@ describe("issue #2372 pre-streaming chat rebuild preserves optimistic submission
 	afterAll(async () => {
 		mode.stop();
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		vi.restoreAllMocks();
 		resetSettingsForTest();

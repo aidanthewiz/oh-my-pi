@@ -65,7 +65,7 @@ describe("ModelRegistry", () => {
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetSettingsForTest();
 		for (const spy of spies.splice(0)) spy.mockRestore();
 		if (originalOllamaBaseUrl === undefined) {
@@ -83,7 +83,7 @@ describe("ModelRegistry", () => {
 		} else {
 			Bun.env.OLLAMA_CONTEXT_LENGTH = originalOllamaContextLength;
 		}
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}
@@ -109,8 +109,8 @@ describe("ModelRegistry", () => {
 		sharedBuiltin.getAvailable();
 	});
 
-	afterAll(() => {
-		sharedAuth.close();
+	afterAll(async () => {
+		await sharedAuth.close();
 		removeSyncWithRetries(sharedDir);
 		if (bootOllamaBaseUrl === undefined) delete Bun.env.OLLAMA_BASE_URL;
 		else Bun.env.OLLAMA_BASE_URL = bootOllamaBaseUrl;

@@ -66,9 +66,9 @@ describe("withHardTimeout", () => {
 });
 
 describe("Anthropic provider hard-timeout wiring", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		for (const authStorage of openAuthStorages.splice(0)) authStorage.close();
+		for (const authStorage of openAuthStorages.splice(0)) await authStorage.close();
 	});
 
 	it("passes a composed signal to fetch even when the caller did not supply one", async () => {
@@ -118,9 +118,9 @@ describe("Anthropic provider hard-timeout wiring", () => {
 });
 
 describe("Brave provider hard-timeout wiring", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		for (const authStorage of openAuthStorages.splice(0)) authStorage.close();
+		for (const authStorage of openAuthStorages.splice(0)) await authStorage.close();
 	});
 
 	it("hands fetch a composed signal even with no caller signal — confirms the rollout reaches non-Anthropic providers", async () => {
@@ -147,10 +147,10 @@ describe("Brave provider hard-timeout wiring", () => {
 });
 
 describe("executeSearch abort propagation", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
-		for (const authStorage of openAuthStorages.splice(0)) authStorage.close();
+		for (const authStorage of openAuthStorages.splice(0)) await authStorage.close();
 	});
 
 	function fakeProvider(

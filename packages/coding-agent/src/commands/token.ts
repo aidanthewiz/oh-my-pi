@@ -223,7 +223,7 @@ export default class Token extends Command {
 
 			process.stdout.write(`${apiKey}\n`);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 }

@@ -144,7 +144,11 @@ export class CredentialSelector {
 	/**
 	 * Selects a credential of the specified type for a provider.
 	 * Returns both the credential and its index in the original array (for updates/removal).
-	 * Uses deterministic hashing for session stickiness and skips blocked credentials when possible.
+	 * With `sessionId` the scan starts at the session's hashed index; without one it starts at the
+	 * first stored credential and never advances round-robin. Model discovery peeks through this,
+	 * and credential-scoped catalogs (e.g. GitHub Copilot) key their cache rows on the credential
+	 * picked, so a rotating pick would read another account's cache namespace on every pass.
+	 * Blocked credentials are skipped when possible.
 	 */
 	selectByType<T extends AuthCredential["type"]>(
 		provider: string,
@@ -176,7 +180,9 @@ export class CredentialSelector {
 		if (credentials.length === 1) return credentials[0];
 
 		const providerKey = providerTypeKey(provider, type);
-		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		const order = sessionId
+			? this.#getCredentialOrder(providerKey, sessionId, credentials.length)
+			: credentials.map((_, index) => index);
 		const fallback = credentials[order[0]];
 
 		for (const idx of order) {
@@ -526,7 +532,15 @@ export class CredentialSelector {
 	 * {@link OAuthCredential} so callers needing identity metadata (account id,
 	 * project id, etc.) do not have to dereference the snapshot themselves.
 	 */
-	async resolveOAuth(
+	resolveOAuth(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+	): Promise<OAuthResolutionResult | undefined> {
+		return this.#deps.refresher.runWithLifetime(() => this.#resolveOAuth(provider, sessionId, options));
+	}
+
+	async #resolveOAuth(
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
@@ -918,7 +932,7 @@ export class CredentialSelector {
 				const candidateAccountKey = oauthAccountKey(candidate.selection.credential);
 				if (pass.enforceAccounts && (candidateAccountKey === undefined || !accountIds?.has(candidateAccountKey)))
 					continue;
-				const resolved = await this.tryOAuth(provider, candidate.selection, providerKey, sessionId, options, {
+				const resolved = await this.#tryOAuth(provider, candidate.selection, providerKey, sessionId, options, {
 					checkUsage,
 					allowBlocked: pass.allowBlocked,
 					prefetchedUsage: candidate.usage,
@@ -991,7 +1005,20 @@ export class CredentialSelector {
 	}
 
 	/** Attempts to use a single OAuth credential, checking usage and refreshing token. */
-	async tryOAuth(
+	tryOAuth(
+		provider: Provider,
+		selection: OAuthSelection,
+		providerKey: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		usageOptions: TryOAuthOptions,
+	): Promise<OAuthResolutionResult | undefined> {
+		return this.#deps.refresher.runWithLifetime(() =>
+			this.#tryOAuth(provider, selection, providerKey, sessionId, options, usageOptions),
+		);
+	}
+
+	async #tryOAuth(
 		provider: Provider,
 		selection: OAuthSelection,
 		providerKey: string,
@@ -1164,12 +1191,12 @@ export class CredentialSelector {
 					errorMsg,
 				);
 				if (outcome === "peer-rotated") {
-					if (allowFallback) return this.resolveOAuth(provider, sessionId, options);
+					if (allowFallback) return this.#resolveOAuth(provider, sessionId, options);
 					return undefined;
 				}
 				if (outcome === "cas-lost") return undefined;
 				if (this.#deps.pool.credentials(provider).some(credential => credential.type === "oauth")) {
-					if (allowFallback) return this.resolveOAuth(provider, sessionId, options);
+					if (allowFallback) return this.#resolveOAuth(provider, sessionId, options);
 				}
 			} else {
 				usageOptions.onTransientRefreshFailure?.(error);

@@ -41,7 +41,7 @@ describe("AgentSession mid-turn compaction dead-end", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		await tempDir?.remove();
 		vi.restoreAllMocks();
 	});

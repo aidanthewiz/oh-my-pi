@@ -205,7 +205,7 @@ it("revives a subagent a crash cut off mid tool call, runs the call again, and d
 		try {
 			await session.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 }, 20_000);
@@ -445,7 +445,7 @@ it("does not replay interrupted child effects when /new cancels its registered j
 				try {
 					await session.dispose();
 				} finally {
-					authStorage.close();
+					await authStorage.close();
 				}
 			}
 		}

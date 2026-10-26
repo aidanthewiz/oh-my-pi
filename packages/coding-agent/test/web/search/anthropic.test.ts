@@ -102,7 +102,7 @@ describe("Anthropic search request body", () => {
 			expect(cap.body()?.model).toBe("claude-selected-grounding");
 			expect(cap.body()?.metadata).toEqual({ user_id: "session-2295" });
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -135,7 +135,7 @@ describe("Anthropic search request body", () => {
 			expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
 		} finally {
 			vi.restoreAllMocks();
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -160,7 +160,7 @@ describe("Anthropic search request body", () => {
 			const messages = body?.messages as { content: string }[];
 			expect(messages[0]?.content).toBe("sdk docs");
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -185,7 +185,7 @@ describe("Anthropic search request body", () => {
 			const messages = body?.messages as { content: string }[];
 			expect(messages[0]?.content).toBe("rust async runtime");
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -206,7 +206,7 @@ describe("Anthropic search request body", () => {
 			expect(cap.body()?.model).toBe("claude-opus-5");
 			expect(cap.body()).not.toHaveProperty("temperature");
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -227,7 +227,7 @@ describe("Anthropic search request body", () => {
 			expect(cap.body()?.model).toBe("claude-haiku-4-5");
 			expect(cap.body()?.temperature).toBe(0.1);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -252,7 +252,7 @@ describe("Anthropic search request body", () => {
 			const metadata = cap.body()?.metadata as { user_id: string } | undefined;
 			expect(JSON.parse(metadata!.user_id).session_id).toBe("session-custom");
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -272,7 +272,7 @@ describe("Anthropic search request body", () => {
 			expect(cap.headers()?.get("authorization")).toBe("Bearer sk-ant-api03-console-key");
 			expect(cap.headers()?.get("x-tenant")).toBe("tenant-a");
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 });

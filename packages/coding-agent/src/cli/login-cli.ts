@@ -66,6 +66,6 @@ export async function runLoginCommand(provider: string | undefined): Promise<voi
 		process.exitCode = 1;
 	} finally {
 		rl.close();
-		authStorage.close();
+		await authStorage.close();
 	}
 }

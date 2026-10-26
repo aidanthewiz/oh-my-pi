@@ -27,8 +27,8 @@ describe("env-redirected implicit provider discovery warning", () => {
 		}
 	});
 
-	afterEach(() => {
-		authStorage?.close();
+	afterEach(async () => {
+		await authStorage?.close();
 		authStorage = undefined;
 		for (const [key, value] of Object.entries(savedEnv)) {
 			if (value === undefined) delete Bun.env[key];

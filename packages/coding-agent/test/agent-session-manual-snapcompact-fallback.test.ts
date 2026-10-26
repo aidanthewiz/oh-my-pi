@@ -34,7 +34,7 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 		try {
 			await session?.dispose();
 		} finally {
-			authStorage?.close();
+			await authStorage?.close();
 			await tempDir?.remove();
 			vi.restoreAllMocks();
 			session = undefined;

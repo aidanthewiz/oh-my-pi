@@ -58,7 +58,7 @@ describe("auth-broker migrate", () => {
 
 	afterEach(async () => {
 		await handle?.close();
-		brokerStorage?.close();
+		await brokerStorage?.close();
 		brokerStore?.close();
 		await removeWithRetries(agentDir);
 		await removeWithRetries(brokerAgentDir);

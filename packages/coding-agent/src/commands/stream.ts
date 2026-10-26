@@ -61,7 +61,7 @@ export default class Stream extends Command {
 			process.stderr.write(`stream: ${error instanceof Error ? error.message : String(error)}\n`);
 			process.exitCode = 1;
 		} finally {
-			credential.close();
+			await credential.close();
 		}
 	}
 }

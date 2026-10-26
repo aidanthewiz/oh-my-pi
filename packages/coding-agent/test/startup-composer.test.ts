@@ -271,7 +271,7 @@ describe("outer startup collaboration gate", () => {
 			stopPendingStartupComposer();
 			vi.restoreAllMocks();
 			uninstallInMemoryRelay();
-			authStorage.close();
+			await authStorage.close();
 			// setProjectDir chdir'd into tempDir; Windows cannot delete the process cwd.
 			setProjectDir(originalProject);
 			await testSession.cleanup();

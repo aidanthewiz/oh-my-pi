@@ -76,7 +76,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		vi.restoreAllMocks();
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		mode = undefined;
 		session = undefined;

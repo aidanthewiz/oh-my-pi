@@ -74,10 +74,10 @@ describe("auth broker OAuth refresh backoff", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		unregisterOAuthProviders(SOURCE);
-		clientStorage?.close();
+		await clientStorage?.close();
 		remote?.close();
 		await handle?.close();
-		brokerStorage?.close();
+		await brokerStorage?.close();
 		store?.close();
 		if (tempDir) await removeWithRetries(tempDir);
 	});

@@ -25,7 +25,7 @@ describe("ModelRegistry managed models overlay", () => {
 	});
 
 	afterEach(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await tempDir.remove().catch(() => {});
 	});
 

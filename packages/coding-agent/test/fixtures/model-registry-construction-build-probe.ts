@@ -27,6 +27,6 @@ try {
 	process.stdout.write(JSON.stringify({ buildCalls: buildSpy.mock.calls.length }));
 } finally {
 	buildSpy.mockRestore();
-	authStorage.close();
+	await authStorage.close();
 	await tempDir.remove().catch(() => {});
 }

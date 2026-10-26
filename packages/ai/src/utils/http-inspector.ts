@@ -256,24 +256,30 @@ function sanitizeDump(dump: RawHttpRequestDump): RawHttpRequestDump {
  * matches arbitrary header names, and dumps exist to diagnose the request body,
  * not the query.
  */
-function redactUrlQuery(url: string | undefined): string | undefined {
+export function redactUrlQuery(url: string | undefined): string | undefined {
 	if (!url) return url;
 	try {
 		const parsed = new URL(url);
-		if (!parsed.search) return url;
+		if (!parsed.search && !parsed.username && !parsed.password && !parsed.hash) return url;
+		const hadQuery = Boolean(parsed.search);
+		parsed.username = "";
+		parsed.password = "";
 		parsed.search = "";
-		return `${parsed.toString()}[redacted-query]`;
+		parsed.hash = "";
+		return `${parsed.toString()}${hadQuery ? "[redacted-query]" : ""}`;
 	} catch {
-		return url;
+		return "[redacted-url]";
 	}
 }
 
-function redactHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+export function redactHeaders<T extends string | string[]>(
+	headers: Record<string, T> | undefined,
+): Record<string, T | string> | undefined {
 	if (!headers) {
 		return undefined;
 	}
 
-	const redacted: Record<string, string> = {};
+	const redacted: Record<string, T | string> = {};
 	for (const [key, value] of Object.entries(headers)) {
 		if (SENSITIVE_HEADER_PATTERN.test(key)) {
 			redacted[key] = "[redacted]";

@@ -22,9 +22,9 @@ describe("Portkey gateway custom models", () => {
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetSettingsForTest();
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}

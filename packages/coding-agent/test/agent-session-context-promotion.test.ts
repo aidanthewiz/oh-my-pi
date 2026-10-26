@@ -67,7 +67,7 @@ describe("AgentSession context promotion", () => {
 		} finally {
 			session = undefined;
 			vi.restoreAllMocks();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});

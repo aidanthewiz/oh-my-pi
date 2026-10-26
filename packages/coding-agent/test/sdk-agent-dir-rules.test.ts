@@ -118,7 +118,7 @@ describe("createAgentSession with agentDir", () => {
 			expect(rebuilt).not.toContain(defaultRule);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -134,7 +134,7 @@ describe("createAgentSession with agentDir", () => {
 			expect(toolNames).not.toContain("default_agent_dir_tool");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

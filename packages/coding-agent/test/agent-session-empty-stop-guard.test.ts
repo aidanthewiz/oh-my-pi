@@ -28,8 +28,8 @@ const sharedAuthStorage = await AuthStorage.create(path.join(sharedDir.path(), "
 sharedAuthStorage.keys.setRuntime("mock", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 
-afterAll(() => {
-	sharedAuthStorage.close();
+afterAll(async () => {
+	await sharedAuthStorage.close();
 	sharedDir.removeSync();
 });
 

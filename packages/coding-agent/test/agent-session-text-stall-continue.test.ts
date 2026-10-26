@@ -33,8 +33,8 @@ describe("AgentSession text-only stream stall", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

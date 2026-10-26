@@ -58,8 +58,8 @@ describe("AgentSession prewalk", () => {
 		modelRegistry.clearSuppressedSelectors();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

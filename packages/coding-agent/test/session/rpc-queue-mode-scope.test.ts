@@ -55,7 +55,7 @@ describe("AgentSession queue-mode controls are session-scoped by default", () =>
 	});
 
 	afterEach(async () => {
-		authStorage.close();
+		await authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}

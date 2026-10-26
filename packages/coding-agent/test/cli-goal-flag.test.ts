@@ -84,7 +84,7 @@ async function launchInteractive(rawArgs: string[]): Promise<{ thrown: unknown; 
 		vi.restoreAllMocks();
 		Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
 		setInteractiveHost(previousHost);
-		authStorage.close();
+		await authStorage.close();
 	}
 }
 

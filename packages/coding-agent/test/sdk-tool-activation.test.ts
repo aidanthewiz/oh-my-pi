@@ -131,9 +131,9 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		// The discovered auth DB lives in registryAuthDir; Windows cannot delete it while open.
-		modelRegistry.authStorage.close();
+		await modelRegistry.authStorage.close();
 		removeSyncWithRetries(registryAuthDir);
 	});
 

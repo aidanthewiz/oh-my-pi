@@ -59,11 +59,11 @@ describe("restricted sessions sharing extension providers", () => {
 		providerRequests = 0;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		try {
 			vi.restoreAllMocks();
 			modelRegistry.clearSourceRegistrations(sourceId);
-			authStorage.close();
+			await authStorage.close();
 		} finally {
 			restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
 			restoreEnv("PI_PROFILE", originalPiProfile);

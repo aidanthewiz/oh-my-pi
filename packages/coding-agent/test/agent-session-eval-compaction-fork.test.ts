@@ -21,7 +21,7 @@ let auth: AuthStorage | undefined;
 afterEach(async () => {
 	await fork?.dispose();
 	await session?.dispose();
-	auth?.close();
+	await auth?.close();
 	temp.removeSync();
 });
 

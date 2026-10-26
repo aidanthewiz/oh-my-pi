@@ -141,8 +141,8 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	it("uses soft compaction when snapcompact is unavailable for the active model", async () => {

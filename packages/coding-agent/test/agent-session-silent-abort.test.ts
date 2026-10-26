@@ -105,8 +105,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		fixtureDir.removeSync();
 	});
 

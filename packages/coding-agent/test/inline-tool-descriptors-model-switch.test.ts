@@ -33,7 +33,7 @@ describe("inline tool descriptors across model switches", () => {
 
 	afterAll(async () => {
 		for (const session of sessions) await session.dispose().catch(() => {});
-		authStorage.close();
+		await authStorage.close();
 		await removeWithRetries(dir);
 	});
 

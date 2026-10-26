@@ -55,6 +55,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -873,7 +874,7 @@ describe("AgentSession message pipeline", () => {
 			expect(Buffer.from(historicalImage.data.slice(0, 16), "base64").toString("ascii", 8, 12)).toBe("WEBP");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -947,7 +948,7 @@ describe("AgentSession message pipeline", () => {
 			]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -1253,7 +1254,7 @@ describe("AgentSession message pipeline", () => {
 						...options,
 						apiKey: "test-key",
 						fetch: async (_url, init) => {
-							bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+							bodies.push(JSON.parse(requestBodyText(init) ?? "{}") as Record<string, unknown>);
 							// Exercise the real encoder but stop at the HTTP boundary, without inference.
 							return new Response(JSON.stringify({ error: { message: "Request captured" } }), { status: 400 });
 						},
@@ -1479,7 +1480,7 @@ describe("AgentSession message pipeline", () => {
 						...options,
 						apiKey: "test-key",
 						fetch: async (_url, init) => {
-							bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+							bodies.push(JSON.parse(requestBodyText(init) ?? "{}") as Record<string, unknown>);
 							return new Response(JSON.stringify({ error: { message: "Request captured" } }), { status: 400 });
 						},
 					}),
@@ -2258,7 +2259,7 @@ describe("AgentSession message pipeline", () => {
 			]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("rewrites finalized assistant text before it reaches history and session persistence", async () => {
@@ -2325,7 +2326,7 @@ describe("AgentSession message pipeline", () => {
 			expect(persisted.message.content).toEqual([{ type: "text", text: "original rewritten" }]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("retains completed assistant text in history when aborted during a pending rewrite", async () => {
@@ -2408,7 +2409,7 @@ describe("AgentSession message pipeline", () => {
 		} finally {
 			release.resolve();
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("applies a tool_call input revision at arg-prep time across events, execution, and history", async () => {
@@ -2513,7 +2514,7 @@ describe("AgentSession message pipeline", () => {
 			expect(text).not.toContain("original");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it.each([
@@ -2637,7 +2638,7 @@ describe("AgentSession message pipeline", () => {
 				}
 			} finally {
 				await session.dispose();
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 	);
@@ -2761,7 +2762,7 @@ describe("AgentSession message pipeline", () => {
 			]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("exposes ctx.invokeTool to a re-registered built-in so it can delegate to the native tool", async () => {
@@ -2860,7 +2861,7 @@ describe("AgentSession message pipeline", () => {
 			expect(delegatedText).not.toContain("from-model");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -2958,7 +2959,7 @@ describe("AgentSession message pipeline", () => {
 			expect(persisted?.content).toEqual(expected);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -3073,7 +3074,7 @@ describe("AgentSession message pipeline", () => {
 			expect(delegatedText).not.toContain("from-model");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -3168,7 +3169,7 @@ describe("AgentSession message pipeline", () => {
 			expect(text?.type === "text" ? text.text : "").toBe("custom-web-search-result");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 

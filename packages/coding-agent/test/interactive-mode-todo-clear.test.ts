@@ -72,7 +72,7 @@ describe("InteractiveMode todo HUD persistence", () => {
 	afterAll(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});
@@ -615,7 +615,7 @@ describe("InteractiveMode todo HUD anchor", () => {
 	afterAll(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

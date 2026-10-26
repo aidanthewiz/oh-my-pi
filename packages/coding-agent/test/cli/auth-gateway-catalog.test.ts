@@ -22,8 +22,8 @@ async function createAuthStorage(): Promise<AuthStorage> {
 	return storage;
 }
 
-afterEach(() => {
-	for (const storage of authStores.splice(0)) storage.close();
+afterEach(async () => {
+	for (const storage of authStores.splice(0)) await storage.close();
 });
 
 describe("indexModelsByRequestId (auth-gateway catalog)", () => {

@@ -536,7 +536,7 @@ describe("compaction skill re-invocation", () => {
 			expect(fixture.session.messages).toEqual([]);
 		} finally {
 			await fixture.session.dispose();
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 			fixture.tempDir.removeSync();
 		}
 	});
@@ -635,7 +635,7 @@ describe("AgentSession derived queued custom display", () => {
 	afterEach(async () => {
 		if (fixture) {
 			await fixture.session.dispose();
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 			fixture.tempDir.removeSync();
 			fixture = undefined;
 		}
@@ -850,7 +850,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 	afterEach(async () => {
 		if (fixture) {
 			await fixture.session.dispose();
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 			fixture.tempDir.removeSync();
 			fixture = undefined;
 		}

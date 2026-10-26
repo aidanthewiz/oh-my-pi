@@ -109,7 +109,7 @@ describe("snapcompact archive read by a Claude model", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		setAgentDir(originalAgentDir);
 		await fs.rm(tempDir, { recursive: true, force: true });
 	});

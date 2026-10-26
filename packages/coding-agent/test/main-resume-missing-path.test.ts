@@ -87,7 +87,7 @@ describe("--resume <path> — missing path (#13928)", () => {
 			thrown = err;
 		} finally {
 			vi.restoreAllMocks();
-			authStorage.close();
+			await authStorage.close();
 		}
 
 		expect(thrown).toBeInstanceOf(ProcessExitSignal);

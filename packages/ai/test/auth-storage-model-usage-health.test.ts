@@ -101,8 +101,8 @@ function makeUsageProvider(reports: Record<string, UsageReport | null>): UsagePr
 
 describe("AuthStorage model usage health", () => {
 	const storages: AuthStorage[] = [];
-	afterEach(() => {
-		for (const storage of storages) storage.close();
+	afterEach(async () => {
+		for (const storage of storages) await storage.close();
 		storages.length = 0;
 	});
 
@@ -411,8 +411,8 @@ function sqliteCorruptError(): Error & { code: string } {
 
 describe("AuthStorage corrupt persisted block store", () => {
 	const storages: AuthStorage[] = [];
-	afterEach(() => {
-		for (const storage of storages) storage.close();
+	afterEach(async () => {
+		for (const storage of storages) await storage.close();
 		storages.length = 0;
 		vi.restoreAllMocks();
 	});
@@ -615,8 +615,8 @@ describe("AuthStorage corrupt persisted block store", () => {
 
 describe("AuthStorage Claude tier reserve health", () => {
 	const storages: AuthStorage[] = [];
-	afterEach(() => {
-		for (const storage of storages) storage.close();
+	afterEach(async () => {
+		for (const storage of storages) await storage.close();
 		storages.length = 0;
 	});
 

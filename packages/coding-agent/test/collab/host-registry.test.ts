@@ -330,7 +330,7 @@ describe("collab host registry lifecycle (#6099)", () => {
 				keyLookup.mockRestore();
 				submission.mockRestore();
 				await session.dispose();
-				auth.close();
+				await auth.close();
 			}
 		},
 	);

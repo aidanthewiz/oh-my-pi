@@ -244,7 +244,7 @@ export async function aiStage(options: AiStageOptions): Promise<AiStageOutcome> 
 			wholeFiles: binaryAccepted.length + untrackedAccepted.length,
 		};
 	} finally {
-		close();
+		await close();
 	}
 }
 

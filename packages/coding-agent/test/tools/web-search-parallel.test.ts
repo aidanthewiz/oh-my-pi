@@ -13,8 +13,8 @@ const modelRegistry = new ModelRegistry(anonymousAuthStorage);
 const parallelModel = modelRegistry.find("web", "parallel");
 if (!parallelModel) throw new Error("Expected bundled web/parallel model");
 
-afterAll(() => {
-	anonymousAuthStorage.close();
+afterAll(async () => {
+	await anonymousAuthStorage.close();
 });
 
 describe("Parallel web search", () => {
@@ -461,7 +461,7 @@ describe("Parallel web search", () => {
 			});
 			expect(fetchMock).not.toHaveBeenCalled();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 

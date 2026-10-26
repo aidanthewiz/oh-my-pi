@@ -23,7 +23,7 @@ async function withLocalAuthStorage<T>(run: (authStorage: AuthStorage) => Promis
 	try {
 		return await run(authStorage);
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 		await removeWithRetries(dir);
 	}
 }

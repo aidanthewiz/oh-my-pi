@@ -52,9 +52,9 @@ beforeEach(async () => {
 	});
 });
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
-	auth.close();
+	await auth.close();
 });
 
 describe("model mentions", () => {

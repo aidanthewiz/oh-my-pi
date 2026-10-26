@@ -159,9 +159,9 @@ describe("createAgentSession credential_disabled subscription", () => {
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 	};
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		for (const storage of authStorages.splice(0)) storage.close();
+		for (const storage of authStorages.splice(0)) await storage.close();
 		for (const dir of tempDirs.splice(0)) {
 			removeSyncWithRetries(dir);
 		}
@@ -520,7 +520,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 				error: "boom",
 			});
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 

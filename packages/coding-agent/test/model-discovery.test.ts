@@ -10,9 +10,14 @@ import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shar
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { resolveModelCacheProviderId, resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import { googleAntigravityModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/google";
+import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import {
+	cursorModelManagerOptions,
+	resolveModelCacheProviderId,
+	resolveOllamaModelCacheProviderId,
+} from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import {
@@ -109,7 +114,7 @@ describe("ModelRegistry runtime discovery", () => {
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetSettingsForTest();
 		if (originalOllamaBaseUrl === undefined) {
 			delete Bun.env.OLLAMA_BASE_URL;
@@ -138,7 +143,7 @@ describe("ModelRegistry runtime discovery", () => {
 		} else {
 			Bun.env.LLAMA_CPP_BASE_URL = originalLlamaCppBaseUrl;
 		}
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}
@@ -208,7 +213,7 @@ describe("ModelRegistry runtime discovery", () => {
 	}
 
 	async function useAuthStorageWithRefreshTracker() {
-		authStorage.close();
+		await authStorage.close();
 		const refreshCalls: string[] = [];
 		authStorage = await AuthStorage.create(":memory:", {
 			refreshOAuthCredential: async (provider, _credentialId, credential): Promise<OAuthCredentials> => {
@@ -875,7 +880,7 @@ describe("ModelRegistry runtime discovery", () => {
 		// refresh throws so getOAuthAccesses reports ok:false. A partial union would
 		// be cached as the authoritative catalog and hide the failed account's
 		// models, so discovery must abort and keep bundled models.
-		authStorage.close();
+		await authStorage.close();
 		authStorage = await AuthStorage.create(":memory:", {
 			refreshOAuthCredential: async (_provider, _credentialId, credential): Promise<OAuthCredentials> => {
 				if (credential.access.includes("expired")) {
@@ -4239,6 +4244,77 @@ describe("ModelRegistry runtime discovery", () => {
 
 		const restored = registry.find("github-copilot", "gpt-5.6-sol-1m");
 		expect(restored?.headers).toEqual(bundledBase.headers);
+	});
+
+	test("repeated Copilot cache hydration keeps the cached catalog with two signed-in accounts", async () => {
+		// Startup hydrates credential-scoped caches twice (CLI, then session
+		// creation). Discovery keys the Copilot cache on the account it peeks; a
+		// rotating pick read account A's row first, then account B's empty
+		// namespace, whose bundled fallback replaced A's cached `-1m` variants.
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot base to carry transport headers");
+		}
+		const cachedVariant = buildModel({
+			...(bundledBase as ModelSpec<"openai-responses">),
+			id: "gpt-5.6-sol-1m",
+			name: "GPT-5.6 Sol (1M)",
+			requestModelId: "gpt-5.6-sol",
+			contextWindow: 1_050_000,
+		});
+		const expires = Date.now() + 3_600_000;
+		await authStorage.credentials.set("github-copilot", [
+			{ type: "oauth", access: "gho_account_a", refresh: "refresh-a", expires },
+			{ type: "oauth", access: "gho_account_b", refresh: "refresh-b", expires },
+		]);
+		// Discovery's Copilot key is the structured peek of account A.
+		const accountACacheId = resolveModelCacheProviderId("github-copilot", {
+			apiKey: JSON.stringify({ token: "gho_account_a" }),
+		});
+		writeModelCache(accountACacheId, Date.now(), [cachedVariant], true, "", cacheDbPath, [bundledBase]);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.hydrateCredentialScopedModelCaches();
+		await registry.hydrateCredentialScopedModelCaches();
+
+		expect(registry.find("github-copilot", "gpt-5.6-sol-1m")?.headers).toEqual(bundledBase.headers);
+	});
+
+	test("Cursor startup hydration reads the row discovery wrote after the access token expired", async () => {
+		// Cursor rows are keyed on the token's account subject, so a rotated token
+		// keys the same row. Startup hydration reads offline, where peek drops an
+		// expired token; without the credential the read could not key that row and
+		// discovery-only Cursor models stayed missing until a refresh minted a token.
+		const jwt = (claims: Record<string, unknown>) =>
+			`${Buffer.from('{"alg":"HS256"}').toString("base64url")}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
+		const bundledBase = getBundledModel("cursor", "claude-opus-5-5");
+		if (!bundledBase) {
+			throw new Error("Expected bundled Cursor claude-opus-5-5 model to exist");
+		}
+		const discovered = buildModel({
+			...(bundledBase as ModelSpec<"cursor-agent">),
+			id: "claude-opus-5-5-1m",
+			name: "Claude Opus 5.5 (1M)",
+			contextWindow: 1_000_000,
+		});
+		const tokenAtWrite = jwt({ sub: "auth0|user_a", iat: 1_800_000_000, exp: 1_800_003_600 });
+		const expiredStoredToken = jwt({ sub: "auth0|user_a", iat: 1_800_086_400, exp: 1_800_090_000 });
+		const writeKey = cursorModelManagerOptions({ apiKey: tokenAtWrite }).cacheProviderId;
+		if (!writeKey) throw new Error("Expected Cursor manager options to name a cache namespace");
+		// Cursor discovery is authoritative: the row carries the manager's static fingerprint.
+		const fingerprint = fingerprintStaticModels(getBundledModels("cursor"), true);
+		writeModelCache(writeKey, Date.now(), [discovered], true, fingerprint, cacheDbPath);
+		await authStorage.credentials.set("cursor", {
+			type: "oauth",
+			access: expiredStoredToken,
+			refresh: "cursor-refresh",
+			expires: Date.now() - 60_000,
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.hydrateCredentialScopedModelCaches();
+
+		expect(registry.find("cursor", "claude-opus-5-5-1m")?.contextWindow).toBe(1_000_000);
 	});
 
 	test("startup drops a current Copilot alias whose headers differ from its bundled base", () => {

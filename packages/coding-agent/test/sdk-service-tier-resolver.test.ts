@@ -158,10 +158,10 @@ describe.serial("createAgentSession resolveServiceTierByFamily", () => {
 	});
 	const authStorages: AuthStorage[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		globalThis.WebSocket = originalWebSocket;
 		vi.restoreAllMocks();
-		for (const authStorage of authStorages) authStorage.close();
+		for (const authStorage of authStorages) await authStorage.close();
 		authStorages.length = 0;
 		if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 		else Bun.env.PI_NO_TITLE = originalNoTitle;

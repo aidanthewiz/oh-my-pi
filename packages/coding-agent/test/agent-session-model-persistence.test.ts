@@ -41,8 +41,8 @@ describe("AgentSession model persistence", () => {
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
-	afterAll(() => {
-		sharedAuthStorage.close();
+	afterAll(async () => {
+		await sharedAuthStorage.close();
 		sharedDir.removeSync();
 	});
 
@@ -371,7 +371,7 @@ describe("AgentSession model persistence", () => {
 		} finally {
 			await session?.dispose();
 			session = undefined;
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -722,7 +722,7 @@ describe("AgentSession model persistence", () => {
 		} finally {
 			await session?.dispose();
 			session = undefined;
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 

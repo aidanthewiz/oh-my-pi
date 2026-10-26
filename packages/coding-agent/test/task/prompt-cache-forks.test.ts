@@ -125,7 +125,7 @@ async function fixture() {
 		context,
 		async [Symbol.asyncDispose]() {
 			await Promise.all(sessions.map(session => session.dispose()));
-			auth.close();
+			await auth.close();
 			dir[Symbol.dispose]();
 		},
 	};

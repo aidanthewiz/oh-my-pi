@@ -56,7 +56,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			await session.dispose();
 		}
 		for (const authStorage of authStorages.splice(0)) {
-			authStorage.close();
+			await authStorage.close();
 		}
 		AsyncJobManager.resetForTests();
 	});

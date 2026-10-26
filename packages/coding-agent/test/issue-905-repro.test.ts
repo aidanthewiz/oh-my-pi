@@ -163,7 +163,7 @@ test("omp models surfaces extension-registered providers (issue #905)", async ()
 		expect(output).toContain("test-gw");
 		expect(output).toContain("test-model");
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 });
 
@@ -195,7 +195,7 @@ test("omp models does not execute ambient hooks while retaining explicit provide
 		expect(await Bun.file(ambientHookMarkerPath).exists()).toBe(false);
 		expect(await Bun.file(configuredHookMarkerPath).exists()).toBe(false);
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 });
 
@@ -214,7 +214,7 @@ test("omp models emits extension shutdown after listing (issue #6297)", async ()
 
 		expect(await Bun.file(shutdownPath).text()).toBe("shutdown");
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 });
 
@@ -248,7 +248,7 @@ test("omp models explicit-only mode resolves a package and excludes settings pro
 		expect(output).not.toContain("ambient-gw");
 		expect(output).not.toContain("ambient-model");
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 });
 
@@ -302,6 +302,6 @@ test("omp models prints invalid models.yml schema errors before listing output",
 		expect(output).toContain("providers.myprovider.compat.thinkingFormat");
 		expect(output).toContain("deepseek");
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 });

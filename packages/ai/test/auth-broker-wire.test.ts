@@ -89,7 +89,7 @@ describe("auth-broker wire surface", () => {
 	async function closeFixture(): Promise<void> {
 		await handle?.close();
 		handle = undefined;
-		storage?.close();
+		await storage?.close();
 		storage = undefined;
 		store?.close();
 		store = undefined;
@@ -213,7 +213,7 @@ describe("auth-broker wire surface", () => {
 		const bindUrl = new URL(handle!.url);
 		const bind = `${bindUrl.hostname}:${bindUrl.port}`;
 		await handle!.close();
-		storage!.close();
+		await storage!.close();
 		store!.close();
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		storage = new AuthStorage(store);
@@ -1268,7 +1268,7 @@ describe("auth-broker wire surface", () => {
 		} finally {
 			controller.abort();
 			await localHandle.close();
-			localStorage.close();
+			await localStorage.close();
 			localStore.close();
 		}
 	});

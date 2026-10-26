@@ -137,8 +137,8 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
-	afterAll(() => {
-		sharedAuthStorage.close();
+	afterAll(async () => {
+		await sharedAuthStorage.close();
 		sharedDir.removeSync();
 	});
 

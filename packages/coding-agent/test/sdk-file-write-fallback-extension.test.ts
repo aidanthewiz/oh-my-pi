@@ -137,9 +137,9 @@ describe("registerFileWriteFallback end-to-end (real extension, real session)", 
 		modelRegistry = new ModelRegistry(await discoverAuthStorage(registryAuthDir));
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		// The discovered auth DB lives in registryAuthDir; Windows cannot delete it while open.
-		modelRegistry.authStorage.close();
+		await modelRegistry.authStorage.close();
 		removeSyncWithRetries(registryAuthDir);
 	});
 

@@ -27,8 +27,8 @@ sharedAuthStorage.keys.setRuntime("mock", "test-key");
 sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
 
-afterAll(() => {
-	sharedAuthStorage.close();
+afterAll(async () => {
+	await sharedAuthStorage.close();
 });
 
 const recordTool: AgentTool<typeof recordToolSchema, { value: string }> = {

@@ -46,10 +46,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		fs.mkdirSync(tempDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		for (const authStorage of authStoragesToClose) {
-			authStorage.close();
+			await authStorage.close();
 		}
 		authStoragesToClose.length = 0;
 		// Sessions without explicit settings run `Settings.init({ agentDir: tempDir })`, which
@@ -61,8 +61,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
-	afterAll(() => {
-		fixtureAuthStorage.close();
+	afterAll(async () => {
+		await fixtureAuthStorage.close();
 		removeSyncWithRetries(fixtureDir);
 	});
 
@@ -1421,7 +1421,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			}
 		} finally {
 			getApiKeySpy.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -2406,7 +2406,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(session.thinkingLevel).toBe(Effort.XHigh);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -2480,7 +2480,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(session.model?.id).toBe("runtime-model");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 

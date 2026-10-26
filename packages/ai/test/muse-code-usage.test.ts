@@ -141,7 +141,7 @@ describe("Muse Code subscription usage", () => {
 			expect(await storage.usage.reports()).toHaveLength(1);
 			expect(requests).toBe(2);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -166,7 +166,7 @@ describe("Muse Code subscription usage", () => {
 			expect(result.ok).toBe(false);
 			expect(result.reason).toContain("inactive");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });

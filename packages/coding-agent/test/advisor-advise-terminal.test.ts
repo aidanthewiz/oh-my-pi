@@ -39,7 +39,7 @@ describe("advisor advise-only turn terminates the review", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await tempDir.remove();
 	});
 

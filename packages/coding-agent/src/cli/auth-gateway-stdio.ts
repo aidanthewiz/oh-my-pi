@@ -253,7 +253,7 @@ export async function runAuthGatewayStdio(): Promise<void> {
 	const unregister = postmortem.register("auth-gateway-stdio", () => {
 		controller.abort();
 		router?.close();
-		storage?.close();
+		return storage?.close();
 	});
 	try {
 		const cwd = getProjectDir();
@@ -277,7 +277,7 @@ export async function runAuthGatewayStdio(): Promise<void> {
 	} finally {
 		controller.abort();
 		router?.close();
-		storage?.close();
+		await storage?.close();
 		await input.cancel().catch(() => {});
 		unregister();
 	}

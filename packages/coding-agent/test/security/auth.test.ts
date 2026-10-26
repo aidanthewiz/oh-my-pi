@@ -241,10 +241,10 @@ describe("exact security OAuth resolver", () => {
 			expect(await exact({ lastChance: false, error: serverError })).toBe("access-2");
 			expect(mints).toBe(2);
 		} finally {
-			clientStorage?.close();
+			await clientStorage?.close();
 			remote?.close();
 			await handle.close();
-			brokerStorage.close();
+			await brokerStorage.close();
 			store.close();
 			exchange.mockRestore();
 			unregisterOAuthProviders(sourceId);

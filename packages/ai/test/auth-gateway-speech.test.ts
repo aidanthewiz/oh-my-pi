@@ -50,7 +50,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await gateway.close();
-	storage.close();
+	await storage.close();
 });
 
 describe("auth-gateway speech", () => {

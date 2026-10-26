@@ -83,7 +83,7 @@ describe("InteractiveMode LSP startup events", () => {
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

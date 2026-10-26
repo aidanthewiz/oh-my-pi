@@ -51,6 +51,7 @@ describe("startup timing after a headless runner starts", () => {
 			subscribe: () => {},
 			addDisposer: () => {},
 			getAllToolNames: () => [],
+			validateRetryFallbackChains: () => {},
 			getLastAssistantMessage: () => undefined,
 			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
@@ -76,7 +77,7 @@ describe("startup timing after a headless runner starts", () => {
 			if (savedTiming !== undefined) process.env.PI_TIMING = savedTiming;
 			logger.endTiming();
 			quitSpy.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 			await manager.close().catch(() => undefined);
 		}
 		expect(recordedDuringPrompt).toBe(false);
@@ -102,7 +103,7 @@ describe("startup timing after a headless runner starts", () => {
 			if (error !== stopServing) throw error;
 		} finally {
 			logger.endTiming();
-			authStorage.close();
+			await authStorage.close();
 		}
 		expect(recordedWhileServing).toBe(false);
 	}, 15_000);

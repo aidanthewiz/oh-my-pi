@@ -35,9 +35,9 @@ describe("issue #6114 fresh launch default role from discovery-only local provid
 		delete Bun.env.LM_STUDIO_BASE_URL;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		for (const authStorage of authStoragesToClose) {
-			authStorage.close();
+			await authStorage.close();
 		}
 		authStoragesToClose.length = 0;
 		if (originalLmStudioBaseUrl === undefined) {

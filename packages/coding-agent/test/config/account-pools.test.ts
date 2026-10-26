@@ -92,7 +92,7 @@ describe("task.agentAccountPools", () => {
 			await expect(resolveApiKeyOnce(scoped.resolver(model.provider))).rejects.toThrow(MissingApiKeyError);
 		} finally {
 			scope.release();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -157,12 +157,12 @@ describe("SessionAccountPoolScope lease ownership", () => {
 		model = configured;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		refreshGate?.resume.resolve();
 		for (const scope of scopes) scope.release();
 		vi.restoreAllMocks();
 		unregisterOAuthProviders(sourceId);
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

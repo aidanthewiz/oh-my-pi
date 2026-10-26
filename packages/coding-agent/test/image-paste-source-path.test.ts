@@ -130,7 +130,7 @@ describe("path-pasted image source path (#12244)", () => {
 		applyHyperlinkSetting("auto");
 		await session?.dispose();
 		session = undefined;
-		authStorage?.close();
+		await authStorage?.close();
 		await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 		restoreSettingsTestState(settingsState);
 		settingsState = undefined;

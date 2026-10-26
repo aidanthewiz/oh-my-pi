@@ -29,7 +29,7 @@ describe("ModelRegistry lazy bundled composition", () => {
 
 	afterEach(async () => {
 		for (const spy of spies.splice(0)) spy.mockRestore();
-		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 		await Promise.all(tempDirs.splice(0).map(tempDir => tempDir.remove().catch(() => {})));
 	});
 

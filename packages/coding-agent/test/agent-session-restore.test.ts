@@ -53,8 +53,8 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

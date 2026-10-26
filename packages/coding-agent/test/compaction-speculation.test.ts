@@ -192,8 +192,8 @@ describe("async speculative compaction", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	it("reminds only near threshold once per experimental window, including the first and reset windows", async () => {

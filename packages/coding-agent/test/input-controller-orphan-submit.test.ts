@@ -199,7 +199,7 @@ describe("InputController orphaned submit", () => {
 			expect(session.agent.hasQueuedMessages()).toBe(false);
 		} finally {
 			await session?.dispose();
-			authStorage?.close();
+			await authStorage?.close();
 			tempDir.removeSync();
 		}
 	});

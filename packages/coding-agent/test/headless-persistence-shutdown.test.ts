@@ -125,6 +125,7 @@ async function createHarness(): Promise<ShutdownHarness> {
 		subscribe: () => {},
 		addDisposer: () => {},
 		getAllToolNames: () => [],
+		validateRetryFallbackChains: () => {},
 		getLastAssistantMessage: () => undefined,
 		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
@@ -176,7 +177,7 @@ async function teardown(
 	stderr.restore();
 	harness.restoreWrites();
 	quitSpy?.mockRestore();
-	harness.authStorage.close();
+	await harness.authStorage.close();
 	await harness.manager.close().catch(() => undefined);
 }
 

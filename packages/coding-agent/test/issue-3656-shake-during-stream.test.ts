@@ -93,7 +93,7 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		HistoryStorage.close();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

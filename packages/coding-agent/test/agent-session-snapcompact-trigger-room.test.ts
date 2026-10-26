@@ -39,8 +39,8 @@ describe("snapcompact archive sized by the compaction trigger", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	function opus(contextWindow: number): Model {

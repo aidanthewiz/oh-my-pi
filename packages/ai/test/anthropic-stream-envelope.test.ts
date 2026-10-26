@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import { convertAnthropicMessages, streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import {
 	AnthropicMessages,
@@ -2031,7 +2032,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(JSON.stringify(capturedParams)).not.toContain("Private refused prompt");
 	});
 
-	it("redeems fallback credit token with frozen request body and continuation prefill", async () => {
+	it("redeems fallback credit through streamSimple with frozen request body and continuation prefill", async () => {
 		let capturedParams: any;
 		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(((params: any) => {
 			capturedParams = params;
@@ -2068,7 +2069,7 @@ describe("anthropic stream envelope handling", () => {
 		}) as never);
 
 		const fallbackModel = { ...model, id: "claude-opus-4-8" };
-		const stream = streamAnthropic(fallbackModel, context, {
+		const stream = streamSimple(fallbackModel, context, {
 			apiKey: "sk-ant-test",
 			fallbackCreditRedemption: {
 				token: "fct_test_456",

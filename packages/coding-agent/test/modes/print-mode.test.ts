@@ -87,7 +87,7 @@ describe("print-mode extension completion", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		session = undefined;
 		authStorage = undefined;
 	});

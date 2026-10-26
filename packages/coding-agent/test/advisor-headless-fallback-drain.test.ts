@@ -39,7 +39,7 @@ describe("headless advisor drain with a fallback reviewer", () => {
 			await session?.dispose();
 		} finally {
 			session = undefined;
-			authStorage?.close();
+			await authStorage?.close();
 			authStorage = undefined;
 		}
 	});

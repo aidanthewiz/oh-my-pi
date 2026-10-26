@@ -33,8 +33,8 @@ describe("settings-gated tools in a live session", () => {
 		for (const session of sessions.splice(0)) await session.dispose().catch(() => {});
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		if (fs.existsSync(registryDir)) removeSyncWithRetries(registryDir);
 	});
 

@@ -81,7 +81,7 @@ describe("AgentSession.getAllToolInfos", () => {
 			expect(byName.get("my_ext_tool")?.sourceInfo.path).toBe("<extension:my_ext_tool>");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -141,7 +141,7 @@ describe("AgentSession.getAllToolInfos", () => {
 			expect(info?.sourceInfo.path).toBe(sourcePath);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});

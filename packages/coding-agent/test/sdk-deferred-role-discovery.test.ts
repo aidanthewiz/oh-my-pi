@@ -34,13 +34,13 @@ describe("createAgentSession deferred role alias on discoverable provider (#8863
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		for (const key of ["OLLAMA_BASE_URL", "OLLAMA_HOST", "OLLAMA_CONTEXT_LENGTH"] as const) {
 			const original = savedOllamaEnv[key];
 			if (original === undefined) delete Bun.env[key];
 			else Bun.env[key] = original;
 		}
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
 	});
 

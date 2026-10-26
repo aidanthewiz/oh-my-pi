@@ -44,8 +44,8 @@ describe("SDK session dialogs and the computer display hold", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		removeSyncWithRetries(tempDir);
 	});
 

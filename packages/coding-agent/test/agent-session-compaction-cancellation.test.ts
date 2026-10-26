@@ -43,7 +43,7 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		vi.restoreAllMocks();
 	});

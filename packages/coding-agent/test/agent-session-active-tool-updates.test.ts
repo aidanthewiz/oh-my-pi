@@ -54,7 +54,7 @@ describe("AgentSession.activeToolExecutionUpdates cache lifecycle", () => {
 
 	afterEach(async () => {
 		if (session) await session.dispose();
-		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 	});
 
 	async function makeSession(): Promise<AgentSession> {

@@ -34,8 +34,8 @@ authStorage.keys.setRuntime("anthropic", "test-key");
 authStorage.keys.setRuntime("mock", "test-key");
 const modelRegistry = new ModelRegistry(authStorage);
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 function user(text: string): UserMessage {

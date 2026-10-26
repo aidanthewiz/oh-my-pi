@@ -11,7 +11,7 @@ import { type ChainJudge, resolveJudge, sharedJudgmentCache } from ".";
 export interface StandaloneJudge {
 	judge: ChainJudge;
 	/** Release the auth store; the judge must not be used afterwards. */
-	close(): void;
+	close(): Promise<void>;
 }
 
 /**
@@ -37,7 +37,7 @@ export async function openStandaloneJudge(cwd: string, purpose: string): Promise
 			close: () => authStorage.close(),
 		};
 	} catch (error) {
-		authStorage.close();
+		await authStorage.close();
 		throw error;
 	}
 }

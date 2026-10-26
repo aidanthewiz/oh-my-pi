@@ -20,7 +20,8 @@ pub struct PromptTurn {
 	/// Last assistant message in `messages`, else the last one carried by any
 	/// event.
 	pub assistant_message: Option<AssistantMessage>,
-	/// Visible text of `assistant_message` (thinking excluded).
+	/// Visible text of `assistant_message`, including narration but not ordinary
+	/// thinking.
 	pub assistant_text:    Option<String>,
 	/// The prompt's `prompt_result`; `None` when the server handled it without
 	/// the agent.
@@ -67,7 +68,7 @@ fn assistant(message: &AgentMessage) -> Option<AssistantMessage> {
 	}
 }
 
-/// Joined text blocks; `None` when there are none.
+/// Joined visible text and narration; `None` when there are none.
 fn visible_text(message: &AssistantMessage) -> Option<String> {
 	let text: String = message
 		.content
@@ -75,6 +76,9 @@ fn visible_text(message: &AssistantMessage) -> Option<String> {
 		.flatten()
 		.filter_map(|block| match block {
 			AssistantContent::Text(block) => block.text.as_deref(),
+			AssistantContent::Thinking(block) if block.narration == Some(true) => {
+				block.thinking.as_deref()
+			},
 			_ => None,
 		})
 		.collect();

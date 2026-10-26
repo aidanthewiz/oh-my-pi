@@ -80,6 +80,22 @@ export class MCPTransportError extends Error {
 	}
 }
 
+/** Prevent replay once a request may have reached the server. */
+export function nonRetryableMCPTransportError(error: MCPTransportError): MCPTransportError {
+	if (!error.retryable) return error;
+	return new MCPTransportError({
+		transport: error.transport,
+		stage: error.stage,
+		failure: error.failure,
+		message: error.message,
+		retryable: false,
+		code: error.code,
+		data: error.data,
+		traceId: error.traceId,
+		cause: error,
+	});
+}
+
 function errorCode(error: unknown): string | number | undefined {
 	if (!isRecord(error)) return undefined;
 	if (typeof error.code === "string" || typeof error.code === "number") return error.code;
@@ -207,6 +223,8 @@ export function normalizeMCPTransportError(
 		normalizedCode === "CONNECTIONREFUSED" ||
 		normalizedCode === "ENETUNREACH" ||
 		normalizedCode === "EHOSTUNREACH" ||
+		normalizedCode === "ENOTFOUND" ||
+		normalizedCode === "EAI_AGAIN" ||
 		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH)\b/i.test(message)
 	) {
 		failure = "connect";
@@ -247,6 +265,16 @@ export function normalizeMCPTransportError(
 }
 
 function nextStep(error: MCPTransportError): string {
+	if (
+		!error.retryable &&
+		(error.failure === "connect" ||
+			error.failure === "eof" ||
+			error.failure === "reset" ||
+			error.failure === "closed" ||
+			(error.failure === "http_status" && (error.code === 502 || error.code === 503)))
+	) {
+		return "The request may already have run; inspect its effect before retrying.";
+	}
 	switch (error.failure) {
 		case "connect":
 			return "Check that the MCP server is running and reachable, then retry.";

@@ -169,8 +169,8 @@ describe("InteractiveMode goal mode integration", () => {
 		shared = await createSharedFixture();
 	});
 
-	afterAll(() => {
-		shared.authStorage.close();
+	afterAll(async () => {
+		await shared.authStorage.close();
 		shared.baseDir.removeSync();
 	});
 

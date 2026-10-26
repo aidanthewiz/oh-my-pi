@@ -107,5 +107,5 @@ try {
 	);
 } finally {
 	await Promise.all(sessions.map(session => session.dispose()));
-	authStorage.close();
+	await authStorage.close();
 }

@@ -67,7 +67,7 @@ export async function discoverSharedInfra(options: DiscoverSharedInfraOptions = 
 		const modelRegistry = new ModelRegistry(authStorage);
 		return { authStorage, modelRegistry };
 	} catch (error) {
-		authStorage.close();
+		await authStorage.close();
 		throw error;
 	}
 }

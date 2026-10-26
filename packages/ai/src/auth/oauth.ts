@@ -3,8 +3,8 @@ import * as AIError from "../error";
 import { getProviderDefinition, PASTE_CODE_LOGIN_PROVIDERS } from "../registry";
 import { getOAuthProvider } from "../registry/oauth";
 import type { OAuthProviderId } from "../registry/oauth/types";
-import { providerTypeKey } from "./blocks";
 import type { SessionAffinity } from "./affinity";
+import { providerTypeKey } from "./blocks";
 import type { KeyOverrides } from "./cascade";
 import type { AccountPolicies } from "./policy";
 import type { CredentialPool } from "./pool";
@@ -178,33 +178,62 @@ export class OAuthAccounts implements OAuthApi {
 	}
 
 	/** Refresh one stored OAuth selection and shape it as an {@link OAuthAccessResolution}. */
-	async #resolveStoredOAuthAccess(
+	#resolveStoredOAuthAccess(
 		provider: string,
 		selection: StoredOAuthSelection,
 		providerKey: string,
 		options: AuthApiKeyOptions | undefined,
 	): Promise<OAuthAccessResolution> {
-		try {
-			// tryOAuth refreshes only expired tokens; it resyncs this row from the store after a forced re-mint.
-			let index = selection.index;
-			if (options?.forceRefresh) {
-				await this.refresh(selection.credentialId, options.signal, {
-					reuseRecentMint: options.refreshReason === "auth-recovery",
-					reason: options.refreshReason,
-				});
-				// The refresh re-lists rows, so a concurrently removed row can shift this one's position.
-				index = this.#deps.pool.entries(provider).findIndex(entry => entry.id === selection.credentialId);
-				if (index === -1) throw new Error(`OAuth credential ${selection.credentialId} was removed during refresh`);
-			}
-			const resolved = await this.#deps.selector.tryOAuth(
-				provider,
-				{ credential: selection.credential, index },
-				providerKey,
-				undefined,
-				options,
-				{ checkUsage: false, allowBlocked: true, allowFallback: false },
-			);
-			if (!resolved) {
+		return this.#deps.refresher.runWithLifetime(async () => {
+			try {
+				// tryOAuth refreshes only expired tokens; it resyncs this row from the store after a forced re-mint.
+				let index = selection.index;
+				if (options?.forceRefresh) {
+					await this.refresh(selection.credentialId, options.signal, {
+						reuseRecentMint: options.refreshReason === "auth-recovery",
+						reason: options.refreshReason,
+					});
+					// The refresh re-lists rows, so a concurrently removed row can shift this one's position.
+					index = this.#deps.pool.entries(provider).findIndex(entry => entry.id === selection.credentialId);
+					if (index === -1)
+						throw new Error(`OAuth credential ${selection.credentialId} was removed during refresh`);
+				}
+				const resolved = await this.#deps.selector.tryOAuth(
+					provider,
+					{ credential: selection.credential, index },
+					providerKey,
+					undefined,
+					options,
+					{ checkUsage: false, allowBlocked: true, allowFallback: false },
+				);
+				if (!resolved) {
+					return {
+						ok: false,
+						credentialId: selection.credentialId,
+						accountId: selection.credential.accountId,
+						email: selection.credential.email,
+						projectId: selection.credential.projectId,
+						enterpriseUrl: selection.credential.enterpriseUrl,
+						orgId: selection.credential.orgId,
+						orgName: selection.credential.orgName,
+						error: "OAuth access unavailable",
+					};
+				}
+				const { credential } = resolved;
+				return {
+					ok: true,
+					credentialId: selection.credentialId,
+					accessToken: credential.access,
+					accountId: credential.accountId,
+					email: credential.email,
+					projectId: credential.projectId,
+					enterpriseUrl: credential.enterpriseUrl,
+					orgId: credential.orgId,
+					orgName: credential.orgName,
+					region: credential.region,
+					inferenceRegion: credential.inferenceRegion,
+				};
+			} catch (error) {
 				return {
 					ok: false,
 					credentialId: selection.credentialId,
@@ -214,36 +243,10 @@ export class OAuthAccounts implements OAuthApi {
 					enterpriseUrl: selection.credential.enterpriseUrl,
 					orgId: selection.credential.orgId,
 					orgName: selection.credential.orgName,
-					error: "OAuth access unavailable",
+					error: error instanceof Error ? error.message : String(error),
 				};
 			}
-			const { credential } = resolved;
-			return {
-				ok: true,
-				credentialId: selection.credentialId,
-				accessToken: credential.access,
-				accountId: credential.accountId,
-				email: credential.email,
-				projectId: credential.projectId,
-				enterpriseUrl: credential.enterpriseUrl,
-				orgId: credential.orgId,
-				orgName: credential.orgName,
-				region: credential.region,
-				inferenceRegion: credential.inferenceRegion,
-			};
-		} catch (error) {
-			return {
-				ok: false,
-				credentialId: selection.credentialId,
-				accountId: selection.credential.accountId,
-				email: selection.credential.email,
-				projectId: selection.credential.projectId,
-				enterpriseUrl: selection.credential.enterpriseUrl,
-				orgId: selection.credential.orgId,
-				orgName: selection.credential.orgName,
-				error: error instanceof Error ? error.message : String(error),
-			};
-		}
+		});
 	}
 
 	/**

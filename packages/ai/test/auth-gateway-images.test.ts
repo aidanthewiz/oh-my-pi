@@ -51,7 +51,7 @@ async function withGateway(
 		await test(handle.url, storage);
 	} finally {
 		await handle.close();
-		storage.close();
+		await storage.close();
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }

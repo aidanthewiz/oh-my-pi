@@ -76,8 +76,8 @@ describe("AgentSession queued steer delivery", () => {
 		removeSyncWithRetries(tempDir);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		removeSyncWithRetries(fixtureDir);
 	});
 

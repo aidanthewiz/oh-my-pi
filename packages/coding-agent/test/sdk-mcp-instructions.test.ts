@@ -89,8 +89,8 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		// The model registry opened the shared `<isolatedAgentDir>/models.db` cache;
 		// release it so Windows can delete the isolated home.
 		closeModelCache();

@@ -47,8 +47,8 @@ describe("session lifecycle environment reaches bash commands", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		sharedTempDir.removeSync();
 	});
 

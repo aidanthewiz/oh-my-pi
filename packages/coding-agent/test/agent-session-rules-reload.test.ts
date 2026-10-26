@@ -111,7 +111,7 @@ async function expectStickyRuleReload(
 		if (opts.seedInitial) expect(rebuilt).not.toContain(original);
 	} finally {
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 		if (opts.scope === "user") restoreAgentDir();
 	}
 }
@@ -187,7 +187,7 @@ describe("AgentSession session-local rule snapshot reload on session reset", () 
 			expect(await readRule("after")).toContain(body);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

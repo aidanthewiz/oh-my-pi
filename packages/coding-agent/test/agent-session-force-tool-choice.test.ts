@@ -76,7 +76,7 @@ beforeEach(() => {
 
 afterEach(async () => {
 	await session.dispose();
-	authStorage?.close();
+	await authStorage?.close();
 	authStorage = undefined;
 	tempDir.removeSync();
 });

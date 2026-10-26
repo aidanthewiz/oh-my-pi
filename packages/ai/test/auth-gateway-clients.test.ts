@@ -61,7 +61,7 @@ describe("auth-gateway scoped clients", () => {
 		gateway = undefined;
 		vi.restoreAllMocks();
 		clearCustomApis();
-		storage.close();
+		await storage.close();
 		await fs.rm(dir, { recursive: true, force: true });
 	});
 

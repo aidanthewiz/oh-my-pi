@@ -111,9 +111,9 @@ describe("broker-backed MCP OAuth refresh", () => {
 	});
 
 	afterEach(async () => {
-		clientStorage?.close();
+		await clientStorage?.close();
 		await handle?.close();
-		serverStorage?.close();
+		await serverStorage?.close();
 		serverStore?.close();
 		tokenServer?.stop(true);
 		await removeWithRetries(tempDir);

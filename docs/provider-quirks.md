@@ -96,7 +96,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/open
 - **Responses Lite transport**: Normal inference uses full Responses by default; callers opt into Lite with the `responsesLite` request option or `PI_CODEX_RESPONSES_LITE=1`, while provider-native compaction explicitly follows the catalog's `useResponsesLite` flag. Function `applyCodexResponsesLiteShape` embeds declared tools into a leading `additional_tools` developer item, system instructions into a developer message, strips image `detail`, turns off parallel tool calls, forces `reasoning.context: "all_turns"`, and appends `x-openai-internal-codex-responses-lite: true` header (or `ws_request_header_x_openai_internal_codex_responses_lite` in WS `client_metadata`). Hosted tool choices (`tool_choice`) fall back to `"auto"` if no matching declared tool is present (#5771).
 - **Tool call/output pair repair**: `repairToolCallPairs` in `request-transformer.ts` rewrites orphaned `function_call_output`/`custom_tool_call_output` lacking prior calls into assistant messages (`[Previous tool result; call_id=...]`), and injects synthetic outputs (`[No tool output recorded...]`) for orphaned calls missing outputs, preventing backend HTTP 400 validation failures.
 - **Session affinity & headers**: Emits session headers including `session_id`, `session-id`, `x-codex-installation-id`, `x-codex-window-id`, `x-codex-turn-metadata` (JSON containing `turn_id`, `installation_id`, `parent_turn_id`, `request_kind`), `x-codex-parent-thread-id`, and `x-openai-subagent` defined in `packages/catalog/src/wire/codex.ts` and `openai-codex-responses.ts`.
-- **Attestation & compression**: Consults process-wide DeviceCheck attestation hook `setCodexAttestationProvider` for `x-oai-attestation` header (`getCodexAttestationHeader`). Compresses request body payloads with zstd (`compressCodexRequestBody`) for official origins when `PI_CODEX_ZSTD` is active.
+- **Attestation & compression**: Consults process-wide DeviceCheck attestation hook `setCodexAttestationProvider` for `x-oai-attestation` header (`getCodexAttestationHeader`). Request bodies to `chatgpt.com` are zstd-compressed by the shared `wrapFetchForRequestCompression` (`packages/ai/src/utils/request-compression.ts`), driven by the `request-encodings` axis in `packages/catalog/src/compat/rules/providers/openai-codex.kdl` and gated on the provider's own endpoint (`isCatalogEndpointUrl`), unless `PI_REQUEST_COMPRESSION=0`.
 - **Region-pinned workspace residency**: Enterprise ChatGPT workspaces can be pinned to a data-residency region, and reject any Codex request whose egress region differs — HTTP 401 `Workspace is not authorized in this region.` — unless the client declares the workspace residency itself. Codex request builders read it from the OAuth access token (`getCodexResidency` in `packages/catalog/src/wire/codex.ts`, claim `chatgpt_data_residency` with `chatgpt_compute_residency` as fallback) and send `x-openai-internal-codex-residency` on chat SSE and WebSocket transports, web search, remote compaction, and `generate_image`. Accounts without the claim (personal ChatGPT, opaque proxy keys that are not JWTs) send no header, and a caller-supplied header of the same name is never overwritten.
 - **Harmony control token escaping**: Sanitizes replayed input text with `escapeHarmonyControlTokens` for models operating on the Harmony dialect (`isHarmonyDialectModel`).
 
@@ -825,7 +825,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/clou
 ### Catalog model handling
 - **Provider entry (`cloudflare-ai-gateway`)**: `packages/catalog/src/compat/rules/providers/cloudflare-ai-gateway.kdl` declares default model `anthropic/claude-opus-5`. Environment keys: `CLOUDFLARE_AI_GATEWAY_API_KEY`.
 - **Authored seeds**: `claude-sonnet-4-5`; bundle policy `empty`. Limits, capabilities, and prices are authored alongside these rows.
-- **Priority Wiring**: Assigned catalog priority level 39 in `providerPriority` (`packages/catalog/src/identity/priority.ts`).
+- **Provider ordering**: Canonical fallback ordering comes from `buildModelProviderPriorityRank` (`packages/catalog/src/identity/priority.ts`), with configured providers first.
 
 ## CoreWeave Serverless Inference (`coreweave`)
 CoreWeave Serverless Inference provides hosted AI model inference powered by Weights & Biases (W&B) infrastructure at `https://api.inference.wandb.ai/v1`. It operates using the "OpenAI Chat Completions" transport.
@@ -1070,7 +1070,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/goog
 
 ### Catalog model handling
 - **Provider entry (`google-gemini-cli`)**: `packages/catalog/src/compat/rules/providers/google-gemini-cli.kdl` declares default model `gemini-3.1-pro-preview`.
-- **Generator Integration & Priority**: Serves as fallback OAuth token provider in `fetchAntigravityModels` (`packages/catalog/scripts/generate-models.ts`) if `google-antigravity` access is unavailable. Ranked second in provider priority (`packages/catalog/src/identity/priority.ts`).
+- **Generator integration and ordering**: `fetchAntigravityModels` can use Gemini CLI OAuth credentials when Antigravity access is unavailable. Canonical ordering comes from `buildModelProviderPriorityRank` (`packages/catalog/src/identity/priority.ts`).
 
 ## Groq (`groq`)
 Groq provides high-speed LLM inference powered by custom LPU hardware for open-weights models using the OpenAI Chat Completions transport (`https://api.groq.com/openai/v1`).
@@ -1087,7 +1087,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/groq
 ### Auth & usage
 - **Auth**: Authenticates via `GROQ_API_KEY` environment variable (`packages/catalog/src/compat/rules/providers/groq.kdl`).
 - **Provider Registry**: Declared in `packages/catalog/src/compat/rules/auth/groq.kdl` and compiled into `packages/ai/src/registry/registry.ts`.
-- **Priority**: Listed 19th in provider priority ordering (`packages/catalog/src/identity/priority.ts`).
+- **Provider ordering**: `buildModelProviderPriorityRank` (`packages/catalog/src/identity/priority.ts`) places Groq among first-party and native account providers, after configured preferences.
 
 ### Catalog model handling
 - **Provider entry (`groq`)**: `packages/catalog/src/compat/rules/providers/groq.kdl` declares default model `openai/gpt-oss-120b`. Environment keys: `GROQ_API_KEY`.

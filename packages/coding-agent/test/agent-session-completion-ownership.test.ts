@@ -192,7 +192,7 @@ test.each([
 					await session?.dispose();
 				}
 			} finally {
-				authStorage.close();
+				await authStorage.close();
 				await jobs.dispose();
 				bus.clear();
 			}
@@ -330,7 +330,7 @@ test.each(outcomeCases)(
 					await session?.dispose();
 				} finally {
 					await jobs.dispose();
-					authStorage.close();
+					await authStorage.close();
 				}
 			}
 		}

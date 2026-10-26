@@ -309,7 +309,7 @@ describe("task sibling prompt-cache routing", () => {
 				}
 			} finally {
 				await Promise.all(sessions.splice(0).map(session => session.dispose()));
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 	);
@@ -368,7 +368,7 @@ describe("task sibling prompt-cache routing", () => {
 				expect(requests[0]?.cacheKey).toBe(expected);
 			} finally {
 				await Promise.all(sessions.splice(0).map(session => session.dispose()));
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 	);
@@ -502,7 +502,7 @@ describe("task sibling prompt-cache routing", () => {
 			]);
 		} finally {
 			await Promise.all(sessions.splice(0).map(session => session.dispose()));
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

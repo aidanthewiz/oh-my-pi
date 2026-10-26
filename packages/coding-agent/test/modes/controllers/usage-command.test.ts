@@ -349,10 +349,10 @@ describe("interactive /usage account visibility", () => {
 		}
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		mounted?.dispose();
 		mounted = undefined;
-		authStorage?.close();
+		await authStorage?.close();
 		if (terminalRows) Object.defineProperty(process.stdout, "rows", terminalRows);
 		else Reflect.deleteProperty(process.stdout, "rows");
 		vi.restoreAllMocks();

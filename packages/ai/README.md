@@ -1189,6 +1189,12 @@ Use `keys.get` for availability probes; it returns `undefined` for these failure
 Transient failures retain the stored credential. A restricted session cannot
 use another account or a static key to bypass its account pool.
 
+Await `authStorage.close()` before exiting or removing its database.
+It drains OAuth account recovery, credential validation, rotations, and rate-limit mutations.
+OAuth exchanges whose requesting caller was canceled can finish persisting their rotated tokens.
+`replaceStore()` drains the originating generation before exposing replacement credentials.
+Shutdown prevents new local or broker-delegated token exchanges.
+
 When an auth-broker client requests recovery after a provider rejects an OAuth
 bearer, the broker may reuse a still-fresh token that it minted in the previous
 five minutes instead of rotating the refresh token again. The process-local

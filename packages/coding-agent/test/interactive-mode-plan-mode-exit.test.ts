@@ -70,8 +70,8 @@ describe("InteractiveMode plan mode exit", () => {
 		resetSettingsForTest();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

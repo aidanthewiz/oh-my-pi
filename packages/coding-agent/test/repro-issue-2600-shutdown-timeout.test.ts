@@ -50,8 +50,8 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		sharedTempDir.removeSync();
 	});
 

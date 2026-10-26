@@ -46,8 +46,8 @@ describe("AgentSession payload-rejection 413 handling", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage?.close();
+	afterAll(async () => {
+		await authStorage?.close();
 	});
 	async function createSession(
 		contextWindow: number | null,

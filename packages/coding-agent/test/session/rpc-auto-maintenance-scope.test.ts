@@ -115,7 +115,7 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 	afterEach(async () => {
 		warmer.cancel();
 		vi.useRealTimers();
-		authStorage.close();
+		await authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}

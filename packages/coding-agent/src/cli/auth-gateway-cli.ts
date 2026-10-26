@@ -485,16 +485,21 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		clearInterval(catalogRefresh);
 		clearInterval(credentialSync);
 		clearInterval(clientsReload);
-		let closeError: unknown;
+		const closeErrors: unknown[] = [];
 		try {
 			await handle.close();
 		} catch (error) {
-			closeError = error;
-		} finally {
-			storage.close();
+			closeErrors.push(error);
 		}
-		if (closeError) {
-			stopped.reject(closeError);
+		try {
+			await storage.close();
+		} catch (error) {
+			closeErrors.push(error);
+		}
+		if (closeErrors.length > 0) {
+			stopped.reject(
+				closeErrors.length === 1 ? closeErrors[0] : new AggregateError(closeErrors, "Auth gateway shutdown failed"),
+			);
 		} else {
 			stopped.resolve();
 		}
@@ -676,6 +681,7 @@ const RETRYABLE_MODEL_ERROR_RE =
  * router entries with negative/missing cost.
  */
 function pickProbeCandidates(provider: string, settings: Settings): Model<Api>[] {
+	if (cfgDisabledProviders.get(settings).includes(provider)) return [];
 	const bundled = getBundledModels(provider as GeneratedProvider);
 	if (bundled.length === 0) return [];
 	const candidates = filterModelsByConfiguredScope(bundled, settings).filter(model => {
@@ -916,7 +922,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 			if (failed > 0 || chatFailed > 0) process.exitCode = 1;
 		}
 	} finally {
-		storage.close();
+		await storage.close();
 	}
 }
 

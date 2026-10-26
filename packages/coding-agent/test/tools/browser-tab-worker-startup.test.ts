@@ -49,6 +49,10 @@ class FakeStartupWorker {
 		return () => this.#errorHandlers.delete(handler);
 	}
 
+	onExit(): () => void {
+		return () => {};
+	}
+
 	async terminate(): Promise<void> {}
 
 	emitReady(info: ReadyInfo): void {

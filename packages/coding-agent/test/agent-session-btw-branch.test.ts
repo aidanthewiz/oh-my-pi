@@ -66,7 +66,7 @@ describe("AgentSession.branchFromBtw", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		await fs.promises
 			.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
 			.catch(() => undefined);

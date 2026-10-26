@@ -46,7 +46,7 @@ describe("InteractiveMode live mode vs. composer dictation", () => {
 		vi.restoreAllMocks();
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

@@ -41,7 +41,7 @@ describe("plan mode thinking level", () => {
 
 	afterAll(async () => {
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	});
 
 	function configureRoles(modelRoles: Record<string, string>): AgentSession {

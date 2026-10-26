@@ -65,9 +65,9 @@ describe("auth-broker preserves extra OAuth credential fields", () => {
 	});
 
 	afterEach(async () => {
-		clientStorage?.close();
+		await clientStorage?.close();
 		await handle?.close();
-		serverStorage?.close();
+		await serverStorage?.close();
 		serverStore?.close();
 		await removeWithRetries(tempDir);
 	});

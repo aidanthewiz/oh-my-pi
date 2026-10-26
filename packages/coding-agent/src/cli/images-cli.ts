@@ -530,7 +530,7 @@ async function collectDoctor(
 				detail: "Provider authentication storage could not be inspected",
 			});
 		} finally {
-			storage?.close();
+			await storage?.close();
 		}
 	}
 	const daemon = await deps.queryDoctor(projectDir, { probe: true });
@@ -652,7 +652,7 @@ async function purgeProviderFiles(
 		}
 		if (deleted > 0) cache.save();
 	} finally {
-		storage.close();
+		await storage.close();
 	}
 	return { selected: entries.length, bytes, deleted, skippedAuth, errors };
 }

@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import {
 	buildAnthropicClientOptions,
 	regionFromAnthropicAwsBaseUrl,
 	streamAnthropic,
 } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { clearAwsCredentialCache } from "@oh-my-pi/pi-ai/providers/aws-credentials";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { withEnv } from "./helpers";
 
 // Claude Platform on AWS: Anthropic's first-party Messages API on the
 // `aws-external-anthropic.{region}.api.aws` gateway. Auth is either an API key
@@ -186,6 +189,107 @@ describe("Claude Platform on AWS auth config", () => {
 		expect(headerCaseInsensitive(options.defaultHeaders, "authorization")).toBeUndefined();
 		expect(headerCaseInsensitive(options.defaultHeaders, "x-api-key")).toBeUndefined();
 		expect(headerCaseInsensitive(options.defaultHeaders, "anthropic-workspace-id")).toBe("wrkspc_testworkspace01");
+	});
+
+	it("keeps stock AWS credential and endpoint ownership when direct-provider metadata is disabled", async () => {
+		await withEnv(
+			{
+				ANTHROPIC_BASE_URL: "https://aws-external-anthropic.us-east-1.api.aws",
+				ANTHROPIC_AWS_API_KEY: "synthetic-stock-aws-bearer",
+				ANTHROPIC_AWS_WORKSPACE_ID: "synthetic-stock-workspace",
+				ANTHROPIC_API_KEY: "synthetic-direct-key-must-not-send",
+				ANTHROPIC_OAUTH_TOKEN: undefined,
+				ANTHROPIC_CUSTOM_HEADERS: undefined,
+				CLAUDE_CODE_USE_FOUNDRY: undefined,
+				FOUNDRY_BASE_URL: undefined,
+			},
+			async () => {
+				const model = buildModel({
+					...makeAwsClaudeModel(),
+					provider: "anthropic",
+					baseUrl: "https://api.anthropic.com",
+					compat: { firstPartyProvider: false },
+				});
+				const storage = new AuthStorage(await SqliteAuthCredentialStore.open(":memory:"));
+				try {
+					await storage.credentials.set("anthropic", [
+						{
+							type: "oauth",
+							access: "synthetic-stored-oauth-must-not-send",
+							refresh: "synthetic-stored-refresh",
+							expires: Date.now() + 3_600_000,
+						},
+					]);
+					storage.keys.setConfig("anthropic", "synthetic-config-key-must-not-send");
+					storage.keys.setRuntime("anthropic", "synthetic-runtime-key-must-not-send");
+					const apiKey = await storage.keys.get("anthropic", undefined, {
+						baseUrl: model.baseUrl,
+						modelId: model.id,
+					});
+					expect(apiKey).toBe("synthetic-stock-aws-bearer");
+					const requests: Array<{ url: string; headers: Headers }> = [];
+					const captureFetch = async (
+						input: Parameters<typeof fetch>[0],
+						init?: Parameters<typeof fetch>[1],
+					): Promise<Response> => {
+						requests.push({
+							url: input instanceof Request ? input.url : String(input),
+							headers: new Headers(input instanceof Request ? input.headers : init?.headers),
+						});
+						const frames = [
+							{
+								type: "message_start",
+								message: {
+									id: "synthetic-stock-aws-message",
+									type: "message",
+									role: "assistant",
+									model: model.id,
+									content: [],
+									stop_reason: null,
+									stop_sequence: null,
+									usage: { input_tokens: 1, output_tokens: 0 },
+								},
+							},
+							{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+							{
+								type: "content_block_delta",
+								index: 0,
+								delta: { type: "text_delta", text: "routed through AWS" },
+							},
+							{ type: "content_block_stop", index: 0 },
+							{
+								type: "message_delta",
+								delta: { stop_reason: "end_turn", stop_sequence: null },
+								usage: { output_tokens: 3 },
+							},
+							{ type: "message_stop" },
+						];
+						return new Response(
+							frames.map(frame => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(""),
+							{ headers: { "content-type": "text/event-stream" } },
+						);
+					};
+					vi.spyOn(globalThis, "fetch").mockImplementation(
+						Object.assign(captureFetch, {
+							preconnect: () => {
+								throw new Error("Synthetic inference must not open a prewarm connection");
+							},
+						}),
+					);
+					const result = await streamSimple(model, testContext, { apiKey, fetch: globalThis.fetch }).result();
+					expect(result.stopReason).toBe("stop");
+					expect(result.content).toEqual([{ type: "text", text: "routed through AWS" }]);
+					expect(requests.map(request => request.url)).toEqual([
+						"https://aws-external-anthropic.us-east-1.api.aws/v1/messages",
+					]);
+					expect(requests[0]?.headers.get("authorization")).toBe("Bearer synthetic-stock-aws-bearer");
+					expect(requests[0]?.headers.get("anthropic-workspace-id")).toBe("synthetic-stock-workspace");
+					expect(requests[0]?.headers.get("x-api-key")).toBeNull();
+				} finally {
+					await storage.close();
+				}
+			},
+		);
 	});
 
 	it("SigV4-signs the request with service aws-external-anthropic and signs the workspace header", async () => {

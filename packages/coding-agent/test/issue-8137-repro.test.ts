@@ -75,7 +75,7 @@ describe("issue #8137 — inline /skill in mode-command prompts", () => {
 		mode?.stop();
 		HistoryStorage.close();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

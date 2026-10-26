@@ -51,7 +51,7 @@ describe("issue 3555 Ollama usage registration", () => {
 			});
 			expect(report?.notes?.[0]).toContain("does not expose a standalone quota usage API");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });

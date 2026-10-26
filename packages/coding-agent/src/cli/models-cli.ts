@@ -478,6 +478,6 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			disableExtensionDiscovery: Boolean(command.flags.noExtensions),
 		});
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 }

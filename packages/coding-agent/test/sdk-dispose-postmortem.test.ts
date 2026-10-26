@@ -30,8 +30,8 @@ describe("createAgentSession dispose releases postmortem registrations", () => {
 		fs.mkdirSync(tempDir, { recursive: true });
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		removeSyncWithRetries(tempDir);
 	});
 

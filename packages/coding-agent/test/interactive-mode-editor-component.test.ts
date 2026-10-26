@@ -59,7 +59,7 @@ describe("InteractiveMode editor and report handoff", () => {
 		vi.useRealTimers();
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

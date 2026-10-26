@@ -26,7 +26,7 @@ async function setup(): Promise<void> {
 }
 
 async function teardown(): Promise<void> {
-	authStorage.close();
+	await authStorage.close();
 	sharedDir.removeSync();
 }
 

@@ -93,7 +93,7 @@ describe("OpenRouter grounded search", () => {
 				},
 			]);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -111,7 +111,7 @@ describe("OpenRouter grounded search", () => {
 				}),
 			).rejects.toMatchObject({ provider: "openrouter", status: 503 });
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 });

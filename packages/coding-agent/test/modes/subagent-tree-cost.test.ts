@@ -208,7 +208,7 @@ describe("sumSubagentTreeCost", () => {
 			for (const reads of statsReads) expect(reads).not.toHaveBeenCalled();
 		} finally {
 			await Promise.all(sessions.map(session => session.dispose()));
-			auth.close();
+			await auth.close();
 		}
 	});
 
@@ -265,7 +265,7 @@ describe("sumSubagentTreeCost", () => {
 		} finally {
 			await lifecycle.dispose();
 			await resumed?.dispose();
-			auth.close();
+			await auth.close();
 		}
 	});
 });

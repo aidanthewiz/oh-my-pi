@@ -33,6 +33,7 @@ from omp_rpc import (
     parse_session_state,
 )
 from omp_rpc._wire import parse_bash_result
+from omp_rpc.protocol import message_text, message_text_with_thinking
 
 GOAL = {
     "id": "goal-1",
@@ -713,6 +714,25 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertEqual(assistant_text(message), "visible")
         self.assertEqual(assistant_text_with_thinking(message), "internalvisible")
+
+    def test_signed_narration_is_visible_once_in_content_order(self) -> None:
+        message = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "narration": False},
+                {"type": "thinking", "thinking": "First ", "narration": True, "thinkingSignature": "signed-one"},
+                {"type": "text", "text": "answer"},
+                {"type": "thinking", "thinking": " last", "narration": True, "thinkingSignature": "signed-two"},
+            ],
+        }
+        for helper in (assistant_text, message_text):
+            self.assertEqual(helper(message), "First answer last")
+            self.assertEqual(helper(message, include_thinking=True), "privateFirst answer last")
+        for helper in (assistant_text_with_thinking, message_text_with_thinking):
+            self.assertEqual(helper(message), "privateFirst answer last")
+        self.assertEqual(message["content"][1]["type"], "thinking")
+        self.assertEqual(message["content"][1]["thinkingSignature"], "signed-one")
+        self.assertEqual(message["content"][3]["thinkingSignature"], "signed-two")
 
     def test_parse_session_state_rejects_invalid_thinking_level(self) -> None:
         with self.assertRaises(ValueError):

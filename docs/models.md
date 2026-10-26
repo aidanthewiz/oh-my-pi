@@ -157,7 +157,9 @@ Model `headers` carry routing or custom authentication headers. Model metadata d
 
 Judgment requests can share image attachments with vision-chat requests. Native OpenAI Decisions, TypeSafe Jev, OpenRouter Jev, and Workers AI judges, plus prompted vision-chat models, support images; text-only candidates are skipped for image requests. `Judge.supportsImages` identifies compatible candidates, and a judge chain with no image-capable model fails explicitly rather than dropping images. Prompted judgments normalize images for the selected candidate, including upscaling undersized rasters and converting WebP for models with STB-backed decoders; native judges continue to receive the original image bytes. When constructing a `NativeJudge` directly for System One, set `supportsImages: true`; `createNativeJudge` derives this flag from the catalog.
 
-OpenAI Decisions forwards embedded `ImageContent.detail` when supplied. Native image-judgment cache identities include the effective detail: different fidelity settings have separate cached answers, while omitted detail and explicit `auto` share the default setting.
+Catalog-backed native judges apply the selected model's image bounds. Direct `NativeJudge` constructors can supply `imageInput` bounds explicitly; opting into images does not inherit Jev's size limits for unrelated System One models.
+
+OpenAI Decisions forwards embedded `ImageContent.detail`, and different explicit fidelity settings retain separate native image-judgment cache entries. TypeSafe Jev has no image-detail equivalent: detail is ignored on the wire and in cache identity, so requests that differ only by detail can reuse an answer. Omitted detail and explicit `auto` share the default setting.
 
 Image inputs are validated before any candidate runs; malformed images fail as caller errors rather than exhausting the chain. Providers may enforce additional limits. Workers AI Clef accepts at most 4 PNG, JPEG, or WebP images of up to 4 MiB and 16 MP each, 8 MiB in total. Valid padded and unpadded base64, and MIME case variants, share one cache identity.
 
@@ -174,6 +176,8 @@ Text-only requests retain their original request shape and bytes. Image support 
 Both paths accept PNG and JPEG of 280–1568 pixels per side and 78,400–2,458,624 pixels in total, and send their original bytes without resizing. TypeSafe Jev has no image-detail equivalent, so `ImageContent.detail` is ignored on direct TypeSafe requests.
 
 See TypeSafe's [image documentation](https://docs.typesafe.ai/images) and OpenRouter's [multimodal Decisions guide](https://openrouter.ai/docs/guides/community/multimodal-decisions) for their image constraints.
+
+OpenRouter's guide lists a 256 px minimum side, but a [report of a live Jev 1.14 request](https://github.com/can1357/oh-my-pi/pull/15887#issuecomment-6218295982) says a 270×300 PNG received HTTP 400; the 280 px minimum side is intentional and remains in effect.
 
 For example, configure TypeSafe Jev as the judge and attach an image in JavaScript or Python:
 

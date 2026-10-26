@@ -233,7 +233,7 @@ describe("buildSessionOptions --models scope selection", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await tempDir.remove();
 	});
 

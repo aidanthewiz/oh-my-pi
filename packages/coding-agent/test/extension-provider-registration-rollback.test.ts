@@ -222,7 +222,7 @@ describe("extension provider registration rollback", () => {
 			);
 		} finally {
 			unregisterOAuthProvider("cliproxyapi");
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -289,7 +289,7 @@ describe("extension provider registration rollback", () => {
 			modelRegistry.unregisterProvider("synthetic");
 			expect(authStorage.usage.providerFor("synthetic")).toBe(builtinUsage);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});

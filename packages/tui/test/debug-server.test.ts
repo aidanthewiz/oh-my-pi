@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
+import { IpcConnection, IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { type Component, Input, Text, TUI, TuiDebugServer, type TuiDebugTreeNode } from "../src";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -88,7 +88,7 @@ async function paintedText(client: DebugClient): Promise<DebugReply> {
 test("OMP_TUI_DEBUG drives and inspects a live TUI", async () => {
 	const previousDebugPath = process.env.OMP_TUI_DEBUG;
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tui-debug-"));
-	const socketPath = path.join(root, "debug.sock");
+	const socketPath = ipcEndpoint(root, "debug");
 	process.env.OMP_TUI_DEBUG = socketPath;
 	const terminal = new VirtualTerminal(50, 12);
 	const tui = new TUI(terminal);

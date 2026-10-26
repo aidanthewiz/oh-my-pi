@@ -326,7 +326,7 @@ describe("persisted subagent revival", () => {
 			expect(await Bun.file(ambientMarker).exists()).toBe(false);
 		} finally {
 			await revived?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -386,7 +386,7 @@ describe("persisted subagent revival", () => {
 			expect(revived.getEnabledToolNames()).not.toContain("owner_policy_escalation");
 		} finally {
 			await revived?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -606,7 +606,7 @@ describe("persisted subagent revival", () => {
 			expect(await modelRegistry.getApiKeyForProvider("anthropic", "unrestricted")).toBe("runtime-key");
 		} finally {
 			await revived?.dispose();
-			authStorage.close();
+			await authStorage.close();
 			AgentRegistry.resetGlobalForTests();
 			AgentLifecycleManager.resetGlobalForTests();
 		}
@@ -743,7 +743,7 @@ describe("persisted subagent revival", () => {
 				expect(await modelRegistry.getApiKeyForProvider("anthropic", "unrestricted")).toBe("runtime-key");
 			} finally {
 				await revived?.dispose();
-				authStorage.close();
+				await authStorage.close();
 				AgentRegistry.resetGlobalForTests();
 				AgentLifecycleManager.resetGlobalForTests();
 			}
@@ -787,7 +787,7 @@ describe("persisted subagent revival", () => {
 					});
 					await reopened.close();
 				} finally {
-					authStorage.close();
+					await authStorage.close();
 					AgentRegistry.resetGlobalForTests();
 					AgentLifecycleManager.resetGlobalForTests();
 				}

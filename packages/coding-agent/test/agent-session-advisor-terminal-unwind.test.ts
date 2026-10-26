@@ -48,7 +48,7 @@ let active: { session: AgentSession; auth: AuthStorage; temp: TempDir } | undefi
 
 afterEach(async () => {
 	await active?.session.dispose().catch(() => {});
-	active?.auth.close();
+	await active?.auth.close();
 	await active?.temp.remove().catch(() => {});
 	active = undefined;
 });

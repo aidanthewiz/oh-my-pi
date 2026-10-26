@@ -112,8 +112,8 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	/** Appends a 4.8 MB three-frame archive: over the 3 MB default, inside half of Anthropic's 24 MB inline-image budget. */

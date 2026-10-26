@@ -61,8 +61,8 @@ describe("InteractiveMode paused-plan guard message", () => {
 		resetSettingsForTest();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

@@ -100,7 +100,7 @@ afterEach(async () => {
 			await extraSession.dispose();
 		}
 		await harness?.session.dispose();
-		harness?.authStorage.close();
+		await harness?.authStorage.close();
 		harness?.tempDir.removeSync();
 	}
 });

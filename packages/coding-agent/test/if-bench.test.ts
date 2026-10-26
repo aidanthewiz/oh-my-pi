@@ -80,7 +80,7 @@ async function runScripted(reply: (turn: number, expected: string) => string, fl
 	const summary = await runIfBenchCommand(
 		{ models: ["acme/if-bench-model"], flags: { turns: 4, par: 1, ...flags } },
 		{
-			createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+			createRuntime: async () => ({ modelRegistry: registry }),
 			randomSessionId: () => "sess-0",
 			writeStdout: () => {},
 			writeStderr: () => {},
@@ -203,7 +203,7 @@ describe("if-bench run", () => {
 		const summary = await runIfBenchCommand(
 			{ models: ["acme/if-bench-model"], flags: { turns: 2, par: 1 } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => `sess-${crypto.randomUUID()}`,
 				sleep: () => Promise.resolve(),
 				writeStdout: () => {},
@@ -231,7 +231,7 @@ describe("if-bench run", () => {
 		const summary = await runIfBenchCommand(
 			{ models: ["acme/if-bench-model"], flags: { turns: 1, par: 1 } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => "sess-x",
 				sleep: () => Promise.resolve(),
 				writeStdout: () => {},
@@ -252,7 +252,7 @@ describe("if-bench run", () => {
 		const summary = await runIfBenchCommand(
 			{ models: ["acme/if-bench-model"], flags: { turns: 2, par: 1 } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => "sess-0",
 				writeStdout: () => {},
 				writeStderr: text => captured.push(text),

@@ -30,7 +30,7 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 	});
 

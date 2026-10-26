@@ -115,7 +115,7 @@ async function openModel(modelSpec: string): Promise<RewriteModel> {
 	} finally {
 		// Broker-backed storage runs a background SSE/long-poll loop that keeps
 		// the event loop alive; release it once the key is captured.
-		storage.close();
+		await storage.close();
 	}
 }
 

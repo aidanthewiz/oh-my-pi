@@ -135,6 +135,6 @@ it("releases a parked subagent's persistent shell so a revive starts a fresh one
 		expect(checked).not.toContain("kept");
 	} finally {
 		mock.reset();
-		authStorage.close();
+		await authStorage.close();
 	}
 }, 20_000);

@@ -40,8 +40,8 @@ describe("per-profile MCP OAuth binding", () => {
 		manager.setAuthStorage(authStorage);
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		setProfile(originalProfile);
 		vi.restoreAllMocks();
 	});

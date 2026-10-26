@@ -38,12 +38,8 @@ import { filterModelsDevCatalogRows } from "../src/provider-models/models-dev-po
 import {
 	buildFireworksFastSeed,
 	buildXaiOAuthStaticSeed,
-	clampFireworksKimiMaxTokens,
-	clampKimiK27CodeMaxTokens,
 	deriveAnthropicAwsModels,
 	fetchWellKnownModels,
-	isFireworksKimiK2ModelId,
-	isKimiK27CodeModelId,
 	kimiCodeMaxTokens,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
@@ -195,7 +191,7 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 				}
 			}
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	} catch (err) {
 		console.warn(
@@ -412,28 +408,15 @@ function applyCodexPricingFallback(models: readonly ModelSpec[]): ModelSpec[] {
 }
 
 /**
- * Provider discovery sometimes reports context-sized Kimi output ceilings. Keep
- * the bundled catalog at the documented/provider-safe caps so request builders
- * that always send `max_tokens` do not over-allocate.
+ * Kimi Code discovery snapshots carried maxTokens=32000 uniformly (#6711); pin
+ * the documented per-family output ceilings and leave legacy K2 rows as-is.
+ * Other hosts' Kimi output caps are rule-owned (`max-tokens-ceiling`).
  */
-function applyKimiMaxTokensCap(models: readonly ModelSpec[]): ModelSpec[] {
-	const FIREWORKS_KIMI_PROVIDERS = new Set(["fireworks", "firepass"]);
+function applyKimiCodeMaxTokens(models: readonly ModelSpec[]): ModelSpec[] {
 	return models.map(model => {
-		if (FIREWORKS_KIMI_PROVIDERS.has(model.provider) && isFireworksKimiK2ModelId(model.id)) {
-			const capped = clampFireworksKimiMaxTokens(model.id, model.maxTokens);
-			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
-		}
-		if (model.provider === "venice" && isKimiK27CodeModelId(model.id)) {
-			const capped = clampKimiK27CodeMaxTokens(model.id, model.maxTokens);
-			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
-		}
-		if (model.provider === "kimi-code") {
-			// Discovery snapshots carried maxTokens=32000 uniformly (#6711); pin the
-			// documented per-family output ceilings and leave legacy K2 rows as-is.
-			const capped = kimiCodeMaxTokens(model.id, model.maxTokens);
-			return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
-		}
-		return model;
+		if (model.provider !== "kimi-code") return model;
+		const capped = kimiCodeMaxTokens(model.id, model.maxTokens);
+		return capped === model.maxTokens ? model : { ...model, maxTokens: capped };
 	});
 }
 
@@ -475,7 +458,7 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
 			}
 			return access ?? null;
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	} catch (err) {
 		console.warn(
@@ -540,7 +523,7 @@ async function fetchCodexDiscoveryModels(): Promise<ModelSpec<"openai-codex-resp
 				accounts.push({ accessToken: access.accessToken, accountId: access.accountId });
 			}
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	} catch (error) {
 		console.warn(
@@ -690,7 +673,7 @@ async function generateModels(selectedProvider?: string) {
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyPricingPeerFallback(allModels);
-	allModels = applyKimiMaxTokensCap(allModels);
+	allModels = applyKimiCodeMaxTokens(allModels);
 	allModels = applyFireworksDeepSeekReasoningShape(allModels);
 	allModels = filterModelsDevCatalogRows(allModels);
 	allModels = normalizeAntigravityEndpoint(allModels);

@@ -134,8 +134,8 @@ describe("AuthStorage usage history recording", () => {
 		await storage.credentials.reload();
 	});
 
-	afterEach(() => {
-		storage.close();
+	afterEach(async () => {
+		await storage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -220,9 +220,9 @@ describe("OpenCode Go usage via the upstream endpoint", () => {
 		await storage.credentials.set("opencode-go", { type: "api_key", key: "opencode-go-key" });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		setSystemTime();
-		storage.close();
+		await storage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -287,7 +287,7 @@ describe("OpenCode Go usage via the upstream endpoint", () => {
 			expect(fetchCalls[0]?.headers.authorization).toBe("Bearer sk-resolved-secret");
 			expect(reports?.some(candidate => candidate.provider === "opencode-go")).toBe(true);
 		} finally {
-			referenceStorage.close();
+			await referenceStorage.close();
 		}
 	});
 
@@ -334,7 +334,7 @@ describe("OpenCode Go usage via the upstream endpoint", () => {
 			const afterRevocation = await transitionStorage.usage.reports();
 			expect(afterRevocation?.some(candidate => candidate.provider === "opencode-go")).toBe(false);
 		} finally {
-			transitionStorage.close();
+			await transitionStorage.close();
 		}
 	});
 
@@ -375,7 +375,7 @@ describe("OpenCode Go usage via the upstream endpoint", () => {
 			const retained = afterPartial?.find(candidate => candidate.provider === "opencode-go");
 			expect(retained?.limits.map(limit => limit.id)).toEqual(["rolling-5h", "weekly", "monthly"]);
 		} finally {
-			partialStorage.close();
+			await partialStorage.close();
 		}
 	});
 
@@ -422,7 +422,7 @@ describe("OpenCode Go usage via the upstream endpoint", () => {
 			const expired = await failingStorage.usage.reports();
 			expect(expired?.some(candidate => candidate.provider === "opencode-go")).toBe(false);
 		} finally {
-			failingStorage.close();
+			await failingStorage.close();
 		}
 	});
 });

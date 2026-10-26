@@ -20,8 +20,8 @@ function requireTavilyModel() {
 
 const tavilyModel = requireTavilyModel();
 
-afterAll(() => {
-	catalogAuthStorage.close();
+afterAll(async () => {
+	await catalogAuthStorage.close();
 });
 
 describe("Tavily buildRequestBody", () => {

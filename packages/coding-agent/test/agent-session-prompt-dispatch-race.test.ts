@@ -50,7 +50,7 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		if (sessionDir) await fs.rm(sessionDir, { recursive: true, force: true });
 		sessionDir = undefined;

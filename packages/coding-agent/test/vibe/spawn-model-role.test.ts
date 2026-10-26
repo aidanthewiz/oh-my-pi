@@ -161,7 +161,7 @@ describe("vibe worker spawn options", () => {
 			await expect(worker.modelRegistry.getApiKey(model)).rejects.toThrow("restricted to its OAuth account pool");
 		} finally {
 			await worker?.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});

@@ -73,8 +73,8 @@ describe("issue #970 custom provider discovery", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}

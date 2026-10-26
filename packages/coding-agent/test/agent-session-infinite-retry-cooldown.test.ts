@@ -35,8 +35,8 @@ describe("AgentSession infinite retry via cooldown-expiry revert", () => {
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

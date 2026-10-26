@@ -770,7 +770,7 @@ describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => 
 				{ identity_key: "email:user-2@example.com", disabled_cause: null },
 			]);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -804,7 +804,7 @@ describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => 
 			}
 			expect(selectedKeys).toEqual(new Set(["nvapi-first", "nvapi-second"]));
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });
@@ -855,7 +855,7 @@ describe("AuthStorage persistent session stickiness", () => {
 			expect(key2).toBe("access-token-1");
 
 			// 4. Close AuthStorage to simulate process restart
-			authStorage.close();
+			await authStorage.close();
 
 			// 5. Re-instantiate AuthStorage using the same DB
 			authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(dbPath)));
@@ -865,7 +865,7 @@ describe("AuthStorage persistent session stickiness", () => {
 			const key3 = await authStorage.keys.get("unit-session-stickiness", "session-1");
 			expect(key3).toBe("access-token-1");
 
-			authStorage.close();
+			await authStorage.close();
 		} finally {
 			// No-op
 		}
@@ -912,13 +912,13 @@ describe("AuthStorage persistent session stickiness", () => {
 				}
 			}
 		} finally {
-			control.close();
+			await control.close();
 		}
 		expect(session).toBeDefined();
 		expect(freshToken).toBeDefined();
 
 		expect(await authStorage.credentials.removeById(provider, rows[0].id)).toBe(true);
-		authStorage.close();
+		await authStorage.close();
 
 		authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(dbPath)));
 		await authStorage.credentials.reload();
@@ -926,7 +926,7 @@ describe("AuthStorage persistent session stickiness", () => {
 		expect(rows.findIndex(row => row.id === stuckId)).toBe(stuckIndex - 1);
 
 		const resolved = await authStorage.keys.get(provider, session);
-		authStorage.close();
+		await authStorage.close();
 		expect(resolved).toBe(freshToken);
 		expect(resolved).not.toBe(stuckToken);
 	});

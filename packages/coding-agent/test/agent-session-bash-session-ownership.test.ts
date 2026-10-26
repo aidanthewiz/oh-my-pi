@@ -47,7 +47,7 @@ describe("AgentSession bash session ownership", () => {
 		vi.restoreAllMocks();
 		await session?.dispose();
 		await Promise.all(additionalManagers.map(manager => manager.close()));
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		resetSettingsForTest();
 	});

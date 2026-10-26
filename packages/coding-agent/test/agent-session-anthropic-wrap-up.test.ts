@@ -41,7 +41,7 @@ describe("AgentSession Anthropic wrap-up hint", () => {
 		await session?.dispose();
 		session = undefined;
 		anthropicSlowModeLanes.lane(LANE).reset();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

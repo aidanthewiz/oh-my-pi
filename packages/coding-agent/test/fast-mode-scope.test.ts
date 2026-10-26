@@ -31,8 +31,8 @@ describe("/fast targets the current model's service-tier family", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

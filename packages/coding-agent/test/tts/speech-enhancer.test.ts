@@ -26,9 +26,9 @@ async function createRegistry(settings: Settings, models: Model[]): Promise<Mode
 	return registry;
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
-	for (const authStorage of authStorages.splice(0)) authStorage.close();
+	for (const authStorage of authStorages.splice(0)) await authStorage.close();
 	for (const configDir of modelConfigDirs.splice(0)) fs.rmSync(configDir, { recursive: true, force: true });
 });
 

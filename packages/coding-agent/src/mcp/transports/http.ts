@@ -22,6 +22,7 @@ import {
 	type MCPFailureStage,
 	MCPTransportError,
 	mcpTraceIdFromHeaders,
+	nonRetryableMCPTransportError,
 	normalizeMCPTransportError,
 } from "../errors";
 import { RequestIdAllocator } from "../request-id";
@@ -564,7 +565,19 @@ export class HttpTransport implements MCPTransport {
 				});
 			}
 			if (error instanceof Error && error.name === "AbortError") throw error;
-			throw normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+			const diagnostic = normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+			const refusedBeforeDispatch =
+				stage === "send" &&
+				diagnostic.failure === "connect" &&
+				(diagnostic.code === "ECONNREFUSED" ||
+					diagnostic.code === "ConnectionRefused" ||
+					diagnostic.code === "CONNECTIONREFUSED" ||
+					diagnostic.code === "ENETUNREACH" ||
+					diagnostic.code === "EHOSTUNREACH" ||
+					diagnostic.code === "ENOTFOUND" ||
+					diagnostic.code === "EAI_AGAIN");
+			const staleSession = diagnostic.failure === "http_status" && diagnostic.code === 404;
+			throw refusedBeforeDispatch || staleSession ? diagnostic : nonRetryableMCPTransportError(diagnostic);
 		} finally {
 			releaseCaller?.();
 			operation.clear();

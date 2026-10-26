@@ -15,6 +15,7 @@ import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { SessionAccountPoolScope } from "@oh-my-pi/pi-coding-agent/config/account-pool-scope";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -48,18 +49,24 @@ describe("AgentSession advisor provider-options parity", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let model: Model;
+	let cacheDir: TempDir;
 
 	beforeAll(() => {
 		authStorage = createInMemoryAuthStorage();
 		authStorage.keys.setRuntime("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
+		// An isolated discovery cache keeps the bundled catalog authoritative; the
+		// developer's `~/.omp` models.db can drop models these tests select.
+		cacheDir = TempDir.createSync("@pi-advisor-parity-cache-");
+		modelRegistry = new ModelRegistry(authStorage, undefined, { cacheDbPath: cacheDir.join("models.db") });
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected built-in anthropic model to exist");
 		model = bundled;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
+		closeModelCache();
+		cacheDir.removeSync();
 	});
 
 	let tempDir: TempDir;
@@ -396,7 +403,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			expect(await pooledStorage.keys.get("anthropic", mainProviderSessionId)).toBe("runtime-key");
 		} finally {
 			await session.dispose();
-			pooledStorage.close();
+			await pooledStorage.close();
 		}
 	});
 });

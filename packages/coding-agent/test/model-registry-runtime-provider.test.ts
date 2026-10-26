@@ -47,13 +47,13 @@ describe("ModelRegistry runtime provider registration", () => {
 		registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: offlineFetch });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.useRealTimers();
 		clearCustomApis();
 		for (const sourceId of sourceIds) {
 			unregisterOAuthProviders(sourceId);
 		}
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}

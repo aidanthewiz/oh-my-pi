@@ -28,8 +28,8 @@ describe("ExtensionContext.agent", () => {
 		fs.mkdirSync(tempDir, { recursive: true });
 	});
 
-	afterEach(() => {
-		for (const authStorage of authStorages.splice(0)) authStorage.close();
+	afterEach(async () => {
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 

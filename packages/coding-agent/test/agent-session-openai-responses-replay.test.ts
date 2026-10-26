@@ -302,8 +302,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		sharedModelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		sharedModelRegistry?.authStorage.close();
+	afterAll(async () => {
+		await sharedModelRegistry?.authStorage.close();
 		if (sharedRegistryDir && fs.existsSync(sharedRegistryDir)) {
 			removeSyncWithRetries(sharedRegistryDir);
 		}

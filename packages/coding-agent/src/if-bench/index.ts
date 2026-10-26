@@ -134,6 +134,6 @@ export async function runIfBenchCommand(
 		return summary;
 	} finally {
 		board?.close();
-		runtime.close?.();
+		await runtime.close?.();
 	}
 }

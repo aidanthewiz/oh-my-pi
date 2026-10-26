@@ -38,7 +38,7 @@ describe("SelectorController model hub writes", () => {
 		state = undefined;
 		await session?.dispose();
 		session = undefined;
-		authStorage.close();
+		await authStorage.close();
 		AgentStorage.close();
 		// SQLite keeps agent.db open until GC finalizes its statements; Windows cannot delete an open file.
 		Bun.gc(true);

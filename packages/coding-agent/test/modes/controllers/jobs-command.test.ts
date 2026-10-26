@@ -112,7 +112,7 @@ describe("/jobs in the native terminal", () => {
 		manager.cancelAll();
 		await manager.dispose({ timeoutMs: 1_000 });
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

@@ -49,7 +49,7 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
-	startupAuthStorage.close();
+	await startupAuthStorage.close();
 	await startupDir.remove();
 });
 
@@ -476,7 +476,7 @@ describe("ACP lazy startup", () => {
 			expect(deferredUsageReserveConfirmation).toBe(true);
 			await session.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}, 15_000);
 });

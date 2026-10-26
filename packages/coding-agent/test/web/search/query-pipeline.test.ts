@@ -46,10 +46,10 @@ async function stubRoleProvider(id: SearchProviderId, behaviour: (params: Search
 }
 
 describe("web search directive pipeline", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
-		for (const authStorage of openAuthStorages.splice(0)) authStorage.close();
+		for (const authStorage of openAuthStorages.splice(0)) await authStorage.close();
 	});
 
 	it("passes the parsed query to the role-selected provider and post-filters ignored constraints", async () => {

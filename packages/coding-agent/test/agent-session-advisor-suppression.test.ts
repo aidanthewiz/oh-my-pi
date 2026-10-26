@@ -81,7 +81,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		try {
 			await session?.dispose();
 		} finally {
-			for (const authStorage of authStorages.splice(0)) authStorage.close();
+			for (const authStorage of authStorages.splice(0)) await authStorage.close();
 		}
 	});
 

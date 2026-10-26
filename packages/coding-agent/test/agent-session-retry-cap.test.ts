@@ -119,10 +119,10 @@ describe("AgentSession retry delay cap", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		if (previousAnthropicBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
 		else process.env.ANTHROPIC_BASE_URL = previousAnthropicBaseUrl;
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 
@@ -809,7 +809,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -893,7 +893,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -977,7 +977,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -1054,7 +1054,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(session.model?.provider).toBe(primaryModel.provider);
 			expect(session.model?.id).toBe(primaryModel.id);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -1171,7 +1171,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(primaryKeys.at(-1)).not.toBe(primaryKeys[0]);
 			expect(lastAssistant(session).content).toContainEqual({ type: "text", text: `ok:${primarySelector}` });
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -1269,7 +1269,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -1364,7 +1364,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -1456,7 +1456,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 
@@ -1576,8 +1576,8 @@ describe("AgentSession retry delay cap", () => {
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			priorStorage.close();
-			restartedStorage.close();
+			await priorStorage.close();
+			await restartedStorage.close();
 		}
 	});
 
@@ -1655,7 +1655,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(last.errorMessage).toContain("quota exceeded");
 			expect(session.isRetrying).toBe(false);
 		} finally {
-			localStorage.close();
+			await localStorage.close();
 		}
 	});
 

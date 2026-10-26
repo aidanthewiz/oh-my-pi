@@ -132,7 +132,7 @@ describe("/tan extension auth over a shared registry", () => {
 			await tanChild.dispose();
 			await parent.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}, 20_000);
 
@@ -178,7 +178,7 @@ describe("/tan extension auth over a shared registry", () => {
 			await tanChild.dispose();
 			await parent.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}, 20_000);
 });

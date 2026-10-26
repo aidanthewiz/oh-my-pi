@@ -115,7 +115,7 @@ describe("skill description failure caching and shutdown", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		for (const storage of authStorages.splice(0)) storage.close();
+		for (const storage of authStorages.splice(0)) await storage.close();
 		await fs.promises.rm(tempDir, { recursive: true, force: true });
 	});
 

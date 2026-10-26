@@ -88,7 +88,7 @@ async function createHarness(options?: { goalEnabled?: boolean }): Promise<Guide
 		cleanup: async () => {
 			mode.stop();
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			await tempDir.remove();
 			resetSettingsForTest();
 		},

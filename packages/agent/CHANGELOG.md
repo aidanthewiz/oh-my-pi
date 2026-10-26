@@ -4,9 +4,16 @@
 
 ### Fixed
 
+- Preserve visible signed narration in compaction summaries without retaining private reasoning.
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
 - Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 - Recount cross-model Claude signed thinking when the same reader's endpoint or prefix-binding policy changes.
+## [18.12.0] - 2026-10-17
+
+### Fixed
+
+- Fixed Cursor turns failing with `PROVIDER_ERROR` when a follow-up (a finished background job, a late diagnostic, a reminder) arrived while the previous turn was still streaming ([#15821](https://github.com/can1357/oh-my-pi/pull/15821) by [@robfeldmann](https://github.com/robfeldmann))
+
 ## [18.11.3] - 2026-10-16
 
 ### Added

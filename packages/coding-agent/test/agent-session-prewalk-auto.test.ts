@@ -39,7 +39,7 @@ describe("AgentSession auto-prewalk", () => {
 	afterEach(async () => {
 		if (session) await session.dispose();
 		session = undefined;
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		vi.restoreAllMocks();
 	});

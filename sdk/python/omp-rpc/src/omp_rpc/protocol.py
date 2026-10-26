@@ -47,7 +47,11 @@ def message_text(message: AgentMessage, *, include_thinking: bool = False) -> st
         block_type = block.get("type")
         if block_type == "text" and isinstance(block.get("text"), str):
             fragments.append(cast(str, block["text"]))
-        elif include_thinking and block_type == "thinking" and isinstance(block.get("thinking"), str):
+        elif (
+            block_type == "thinking"
+            and (include_thinking or block.get("narration") is True)
+            and isinstance(block.get("thinking"), str)
+        ):
             fragments.append(cast(str, block["thinking"]))
     return "".join(fragments) or None
 

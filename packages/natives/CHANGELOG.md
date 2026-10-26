@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Reject fractional, non-finite, negative, and wrapping SIXEL background values before native integer conversion.
 - Reject multi-hunk character matches that would discard unmatched surrounding text.
 - Native patch application and checks now convert only affected source and destination paths, ignoring unrelated required filter failures.
 - Keep create-new cloning compatible with descriptor-returning Linux and Windows backends.
@@ -25,6 +26,17 @@
 - Preserve original process identities when later shell runs cancel retained background jobs. Keep current-run PID attribution separate.
 - Prune completed shell process references at command completion instead of retaining handles until another command runs.
 - Backport Cranelift's full-width SSA index representation for GHSA-897f-g5gm-fmxm without disabling on-demand grammars or upgrading Wasmtime.
+## [18.12.0] - 2026-10-17
+
+### Breaking Changes
+
+- `encodeSixel` and `encodeSixelAsync` now require a fourth terminal-background RGB argument packed as `0xRRGGBB` ([#15891](https://github.com/can1357/oh-my-pi/pull/15891) by [@Bouska](https://github.com/Bouska)).
+
+### Fixed
+
+- Fixed Windows file-lock contention returning permission errors when an existing lease allows synchronization but not full mutex access ([#15930](https://github.com/can1357/oh-my-pi/pull/15930) by [@jchanghong023](https://github.com/jchanghong023)).
+- Fixed SIXEL images dropping translucent details or showing dark, discolored edges when resized, while preserving fully transparent pixels ([#15891](https://github.com/can1357/oh-my-pi/pull/15891) by [@Bouska](https://github.com/Bouska)).
+
 ## [18.11.3] - 2026-10-16
 
 ### Changed

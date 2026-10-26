@@ -36,7 +36,7 @@ describe("AgentSession concurrent disposal", () => {
 		const current = session;
 		session = undefined;
 		if (current) await current.dispose();
-		authStorage.close();
+		await authStorage.close();
 		AsyncJobManager.resetForTests();
 		vi.restoreAllMocks();
 		tempDir.removeSync();

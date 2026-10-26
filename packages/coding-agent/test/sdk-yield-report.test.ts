@@ -25,7 +25,7 @@ function reminder(budgetStop = false): AgentMessage {
 
 afterEach(async () => {
 	for (const session of sessions.splice(0)) await session.dispose();
-	for (const registry of stores.splice(0)) registry.authStorage.close();
+	for (const registry of stores.splice(0)) await registry.authStorage.close();
 	for (const root of roots.splice(0)) root.removeSync();
 });
 

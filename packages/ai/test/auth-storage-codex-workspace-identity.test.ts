@@ -335,8 +335,8 @@ function emailOnlyReport(email: string): UsageReport {
 describe("openai-codex usage report dedupe partitions by workspace", () => {
 	let storage: AuthStorage | null = null;
 
-	afterEach(() => {
-		storage?.close();
+	afterEach(async () => {
+		await storage?.close();
 		storage = null;
 		vi.restoreAllMocks();
 	});

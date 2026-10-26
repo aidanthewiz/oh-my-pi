@@ -33,8 +33,8 @@ describe("AgentSession model switch auth pre-flight", () => {
 		registry = new ModelRegistry(authStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		sharedDir.removeSync();
 	});
 

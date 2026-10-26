@@ -47,10 +47,10 @@ describe("default web chain", () => {
 		vi.spyOn(provider, "getSearchProvider").mockResolvedValue(recorder);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
-		authStorage.close();
+		await authStorage.close();
 	});
 
 	function sessionModel(provider: string, id: string): Model<Api> {

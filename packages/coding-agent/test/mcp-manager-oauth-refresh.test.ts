@@ -105,8 +105,8 @@ async function withSharedSQLiteAuth<T>(
 		await authB.credentials.reload();
 		return await fn({ authA, authB, storeA, storeB });
 	} finally {
-		authA?.close();
-		authB?.close();
+		await authA?.close();
+		await authB?.close();
 		await removeWithRetries(tempDir);
 	}
 }
@@ -146,9 +146,9 @@ describe("MCPManager OAuth refresh failure", () => {
 		};
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.useRealTimers();
-		authStorage.close();
+		await authStorage.close();
 		vi.restoreAllMocks();
 	});
 

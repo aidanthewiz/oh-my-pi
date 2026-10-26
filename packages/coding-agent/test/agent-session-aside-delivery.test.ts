@@ -47,7 +47,7 @@ describe("AgentSession aside delivery", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		AsyncJobManager.resetForTests();
 	});

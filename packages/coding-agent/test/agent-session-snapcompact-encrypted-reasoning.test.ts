@@ -90,7 +90,7 @@ describe("AgentSession snapcompact no-reduction guard: opaque reasoning", () => 
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		vi.restoreAllMocks();
 	});
 

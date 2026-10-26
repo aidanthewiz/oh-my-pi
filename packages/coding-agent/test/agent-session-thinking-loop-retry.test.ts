@@ -128,8 +128,8 @@ describe("AgentSession thinking-loop retry", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	it("drops a chunked thinking-loop error and retries the turn", async () => {

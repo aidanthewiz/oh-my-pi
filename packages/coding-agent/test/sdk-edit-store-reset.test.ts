@@ -20,7 +20,7 @@ describe("sdk edit-store session reset", () => {
 	afterEach(async () => {
 		await session?.dispose();
 		session = undefined;
-		authStorage?.close();
+		await authStorage?.close();
 		try {
 			await tempDir.remove();
 		} catch {}

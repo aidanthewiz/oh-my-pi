@@ -60,8 +60,8 @@ describe("AgentSession session stats", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	afterEach(async () => {

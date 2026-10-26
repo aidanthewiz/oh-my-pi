@@ -38,7 +38,7 @@ async function captureRefreshResource(
 			forceRefresh: true,
 			recoverServerUrlFromCredentialId,
 		});
-		storage.close();
+		await storage.close();
 		return { resources, access: result.credential?.access };
 	} finally {
 		tokenServer.stop(true);
@@ -90,7 +90,7 @@ test("token refreshes and persists a rotating local MCP OAuth grant", async () =
 			tokenUrl: `http://127.0.0.1:${tokenServer.port}/token`,
 		};
 		await authStorage.credentials.set(provider, credential);
-		authStorage.close();
+		await authStorage.close();
 
 		const proc = Bun.spawn([process.execPath, cliEntry, "token", provider, "--force-refresh"], {
 			cwd: path.resolve(import.meta.dir, "../../.."),
@@ -123,7 +123,7 @@ test("token refreshes and persists a rotating local MCP OAuth grant", async () =
 			expect(persisted.access).toBe("access-1");
 			expect(persisted.refresh).toBe("refresh-1");
 		}
-		persistedStorage.close();
+		await persistedStorage.close();
 
 		const db = new Database(dbPath, { readonly: true });
 		const blockCount = db.query<{ count: number }, []>("SELECT count(*) AS count FROM auth_credential_blocks").get();
@@ -148,7 +148,7 @@ test("token refuses a managed MCP id scoped to another profile", async () => {
 		refresh: "work-refresh",
 		expires: Date.now() + 3_600_000,
 	});
-	authStorage.close();
+	await authStorage.close();
 
 	const proc = Bun.spawn([process.execPath, cliEntry, "token", foreignProvider], {
 		cwd: path.resolve(import.meta.dir, "../../.."),

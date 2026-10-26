@@ -27,7 +27,7 @@ afterEach(async () => {
 	else Bun.env.PI_NO_TITLE = previousNoTitle;
 	vi.restoreAllMocks();
 	await session?.dispose();
-	authStorage?.close();
+	await authStorage?.close();
 	session = undefined;
 	authStorage = undefined;
 });

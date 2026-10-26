@@ -24,8 +24,8 @@ describe("HookToolWrapper tool_call contract", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		sharedTempDir.removeSync();
 	});
 

@@ -89,8 +89,8 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		else Bun.env.PI_NO_TITLE = previousNoTitle;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

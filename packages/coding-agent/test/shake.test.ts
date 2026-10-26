@@ -66,7 +66,7 @@ describe("AgentSession shake", () => {
 
 	afterEach(async () => {
 		if (session) await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}

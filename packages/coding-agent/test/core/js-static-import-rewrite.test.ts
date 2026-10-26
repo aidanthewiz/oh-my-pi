@@ -235,6 +235,76 @@ describe("wrapCode cross-cell persistence", () => {
 			delete globals.ompPersistedVar;
 		}
 	});
+	it("retains block var bindings after await without exposing block lexicals or function locals", async () => {
+		const global = globalThis;
+		const wrapped = await wrapCode(`await Promise.resolve();
+if (true) { var ompBranchVar = 47; let ompBlockLet = 12; }
+if (false) { var ompSkippedVar = 1; }
+function nested() { var ompLocalVar = 9; return ompLocalVar; }
+function readBranch() { return ompBranchVar; }
+if (nested() !== 9) throw new Error("function local was lost");`);
+		try {
+			await indirectEval(wrapped.source);
+			expect(indirectEval("ompBranchVar")).toBe(47);
+			expect(indirectEval("typeof ompSkippedVar")).toBe("undefined");
+			expect(Reflect.has(global, "ompSkippedVar")).toBe(true);
+			expect(indirectEval("typeof ompBlockLet")).toBe("undefined");
+			expect(indirectEval("typeof ompLocalVar")).toBe("undefined");
+			indirectEval("ompBranchVar = 48");
+			expect(indirectEval("readBranch()")).toBe(48);
+		} finally {
+			Reflect.deleteProperty(global, "ompBranchVar");
+			Reflect.deleteProperty(global, "ompSkippedVar");
+			Reflect.deleteProperty(global, "nested");
+			Reflect.deleteProperty(global, "readBranch");
+		}
+	});
+
+	it("keeps a catch-parameter var initializer on the catch binding after await", async () => {
+		const global = globalThis;
+		const wrapped = await wrapCode(`await Promise.resolve();
+try { throw 0; } catch (ompCaught) { var ompCaught = 1; var ompAfterCatch = ompCaught + 1; }`);
+		try {
+			await indirectEval(wrapped.source);
+			expect(indirectEval("[typeof ompCaught, ompAfterCatch]")).toEqual(["undefined", 2]);
+			expect(Reflect.has(global, "ompCaught")).toBe(true);
+		} finally {
+			Reflect.deleteProperty(global, "ompCaught");
+			Reflect.deleteProperty(global, "ompAfterCatch");
+		}
+	});
+
+	it("retains var bindings declared by top-level for loops after await", async () => {
+		const global = globalThis;
+		const wrapped = await wrapCode(`await Promise.resolve();
+for (var ompLoopIndex = 0; ompLoopIndex < 2; ompLoopIndex++) {}
+for (var ompLoopItem of [3, 5]) {}
+for (var ompLoopKey in { a: 1 }) {}`);
+		try {
+			await indirectEval(wrapped.source);
+			expect(indirectEval("[ompLoopIndex, ompLoopItem, ompLoopKey]")).toEqual([2, 5, "a"]);
+		} finally {
+			Reflect.deleteProperty(global, "ompLoopIndex");
+			Reflect.deleteProperty(global, "ompLoopItem");
+			Reflect.deleteProperty(global, "ompLoopKey");
+		}
+	});
+
+	it.each([
+		["for", "for (var ompBodyIndex = 0; ompBodyIndex < 1; ompBodyIndex++) var ompBodyValue = ompBodyIndex + 7;", 7],
+		["for-in", "for (var ompBodyKey in { a: 1 }) var ompBodyValue = ompBodyKey + ':body';", "a:body"],
+		["for-of", "for (var ompBodyItem of [2, 3]) var ompBodyValue = ompBodyItem * 4;", 12],
+	])("retains unbraced %s body initializers after await", async (_kind, loop, expected) => {
+		const wrapped = await wrapCode(`await Promise.resolve();\n${loop}`);
+		try {
+			await indirectEval(wrapped.source);
+			expect(indirectEval("ompBodyValue")).toBe(expected);
+		} finally {
+			for (const name of ["ompBodyIndex", "ompBodyKey", "ompBodyItem", "ompBodyValue"]) {
+				Reflect.deleteProperty(globalThis, name);
+			}
+		}
+	});
 });
 
 // Runtime call-site identity: wrapCode wraps bare `tool.read(...)` calls in

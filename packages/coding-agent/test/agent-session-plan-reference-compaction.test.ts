@@ -135,8 +135,8 @@ describe("AgentSession approved-plan reference re-injection after compaction (is
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		fixtureDir.removeSync();
 	});
 

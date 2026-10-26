@@ -1701,6 +1701,6 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		process.stderr.write(`${chalk.red(`Error: auth broker request failed: ${error.message}`)}\n`);
 		process.exitCode = 1;
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 }

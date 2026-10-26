@@ -50,7 +50,7 @@ test("model listing exposes one provider-qualified route per upstream model", as
 		});
 	} finally {
 		await handle.close();
-		storage.close();
+		await storage.close();
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 });

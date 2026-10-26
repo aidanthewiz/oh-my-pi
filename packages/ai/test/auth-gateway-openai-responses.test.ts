@@ -1422,7 +1422,7 @@ describe("auth-gateway OpenAI Responses multimodal tool outputs", () => {
 			expect(mock.calls).toHaveLength(0);
 		} finally {
 			await gateway.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 			clearCustomApis();
 		}
@@ -1469,7 +1469,7 @@ describe("auth-gateway OpenAI Responses computer option bridge", () => {
 			]);
 		} finally {
 			await gateway.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 			clearCustomApis();
 		}

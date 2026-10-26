@@ -55,7 +55,7 @@ describe("libkitty end-to-end", () => {
 	afterEach(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

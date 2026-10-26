@@ -16,8 +16,8 @@ function requireDuckDuckGoModel() {
 
 const duckDuckGoModel = requireDuckDuckGoModel();
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 describe("localeToKl", () => {

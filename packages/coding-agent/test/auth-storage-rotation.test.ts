@@ -41,7 +41,7 @@ describe("AuthStorage account rotation", () => {
 				}
 			}
 		} finally {
-			control.close();
+			await control.close();
 		}
 
 		throw new Error("expected at least one session whose fresh credential selection changes after login");
@@ -106,10 +106,10 @@ describe("AuthStorage account rotation", () => {
 		});
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		oauth.unregisterOAuthProviders(stickyInvalidationSource);
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}
@@ -399,7 +399,7 @@ describe("AuthStorage account rotation", () => {
 	test("provider login invalidates only that provider's persisted session stickiness", async () => {
 		tempDir = path.join(os.tmpdir(), `pi-test-auth-rotation-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
-		authStorage.close();
+		await authStorage.close();
 		authStorage = await createRotationStorage(path.join(tempDir, "testauth.db"));
 		const targetInitialCredentials: OAuthCredential[] = [
 			{
@@ -464,7 +464,7 @@ describe("AuthStorage account rotation", () => {
 		});
 		nextLoginCredential = undefined;
 
-		authStorage.close();
+		await authStorage.close();
 		authStorage = await createRotationStorage(path.join(tempDir, "testauth.db"));
 		await authStorage.credentials.reload();
 

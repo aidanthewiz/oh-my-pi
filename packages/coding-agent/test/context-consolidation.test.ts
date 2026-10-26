@@ -54,7 +54,7 @@ describe("Context usage consolidation", () => {
 
 	afterAll(async () => {
 		statusLines.dispose();
-		authStorage.close();
+		await authStorage.close();
 		try {
 			await sharedDir.remove();
 		} catch {}

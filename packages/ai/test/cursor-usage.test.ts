@@ -521,7 +521,7 @@ describe("cursor usage provider", () => {
 				expect(await storage.keys.get("cursor", "session-grok", { modelId: "grok-4.7-xhigh" })).toBe("api-acct-a");
 			} finally {
 				vi.restoreAllMocks();
-				storage.close();
+				await storage.close();
 				store.close();
 				await fs.rm(tempDir, { recursive: true, force: true });
 			}
@@ -560,7 +560,7 @@ describe("cursor usage provider", () => {
 			try {
 				expect(storage.usage.providerFor("cursor")).toBe(cursorUsageProvider);
 			} finally {
-				storage.close();
+				await storage.close();
 			}
 		});
 	});

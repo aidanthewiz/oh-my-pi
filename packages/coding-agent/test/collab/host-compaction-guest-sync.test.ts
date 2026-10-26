@@ -169,7 +169,7 @@ beforeAll(() => {
 
 afterAll(async () => {
 	uninstallInMemoryRelay();
-	authStorage.close();
+	await authStorage.close();
 	homedirSpy?.mockRestore();
 	refreshDirsFromEnv();
 	await homeDir?.remove().catch(() => {});

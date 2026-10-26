@@ -200,7 +200,7 @@ describe("seance startup contracts", () => {
 				if (session) await session.dispose();
 				else await forked.close();
 			} finally {
-				authStorage.close();
+				await authStorage.close();
 			}
 		}
 	});
@@ -279,7 +279,7 @@ describe("seance startup contracts", () => {
 			expect(extensionRootsRead).toBe(false);
 			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 			setAgentDir(previousAgentDir);
 		}
 	});
@@ -427,7 +427,7 @@ describe("seance startup contracts", () => {
 					if (liveSession) await liveSession.dispose();
 					else if (!forkManagerClosed) await forked.close();
 				} finally {
-					authStorage.close();
+					await authStorage.close();
 					setAgentDir(previousAgentDir);
 				}
 			}

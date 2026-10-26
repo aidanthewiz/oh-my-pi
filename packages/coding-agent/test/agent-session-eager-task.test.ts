@@ -76,7 +76,7 @@ describe("AgentSession eager task prelude", () => {
 	afterEach(async () => {
 		for (const harness of harnesses) {
 			await harness.session.dispose();
-			harness.authStorage.close();
+			await harness.authStorage.close();
 		}
 		harnesses.length = 0;
 		tempDir.removeSync();

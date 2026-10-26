@@ -196,7 +196,7 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 	afterEach(async () => {
 		if (skip) return;
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		if (fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);

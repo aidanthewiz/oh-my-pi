@@ -109,7 +109,7 @@ describe("AgentSession snapcompact no-reduction guard", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		vi.restoreAllMocks();
 	});
 

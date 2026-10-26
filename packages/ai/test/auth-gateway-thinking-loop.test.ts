@@ -63,7 +63,7 @@ describe("auth-gateway non-streaming thinking-loop retries", () => {
 		} finally {
 			waitSpy.mockRestore();
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -99,7 +99,7 @@ describe("auth-gateway non-streaming thinking-loop retries", () => {
 			expect(THINKING_LOOP_ERROR_MARKER.length).toBeGreaterThan(0);
 		} finally {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -176,7 +176,7 @@ describe("auth-gateway auth retry", () => {
 			markUsageLimitSpy.mockRestore();
 			invalidateSpy.mockRestore();
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});

@@ -98,7 +98,7 @@ afterEach(async () => {
 	try {
 		await session?.dispose();
 	} finally {
-		authStorage?.close();
+		await authStorage?.close();
 		vi.restoreAllMocks();
 		session = undefined;
 		authStorage = undefined;

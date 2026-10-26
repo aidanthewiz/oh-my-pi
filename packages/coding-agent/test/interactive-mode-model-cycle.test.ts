@@ -57,7 +57,7 @@ describe("InteractiveMode model-cycle track", () => {
 	afterEach(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		vi.useRealTimers();
 		vi.restoreAllMocks();

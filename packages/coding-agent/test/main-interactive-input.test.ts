@@ -72,7 +72,7 @@ describe("system prompt template CLI resolution", () => {
 				Settings.isolated(),
 			);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 

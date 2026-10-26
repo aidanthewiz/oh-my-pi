@@ -53,7 +53,7 @@ describe("live routing config files", () => {
 	let state: SettingsTestState | undefined;
 	let tempDir: TempDir;
 	let settings: Settings;
-	const cleanups: Array<() => void> = [];
+	const cleanups: Array<() => void | Promise<void>> = [];
 
 	beforeEach(() => {
 		state = beginSettingsTest();
@@ -63,7 +63,7 @@ describe("live routing config files", () => {
 
 	afterEach(async () => {
 		settings?.cancelPendingSaves();
-		for (const cleanup of cleanups.splice(0)) cleanup();
+		for (const cleanup of cleanups.splice(0)) await cleanup();
 		AgentStorage.close();
 		restoreSettingsTestState(state);
 		await tempDir.remove();

@@ -70,8 +70,8 @@ function makeStorage(usage: UsageReport, scope = ""): { storage: AuthStorage; bl
 
 describe("ZAI usage-block healing", () => {
 	const storages: AuthStorage[] = [];
-	afterEach(() => {
-		for (const storage of storages) storage.close();
+	afterEach(async () => {
+		for (const storage of storages) await storage.close();
 		storages.length = 0;
 	});
 

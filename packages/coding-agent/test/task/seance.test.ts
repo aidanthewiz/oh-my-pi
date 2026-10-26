@@ -298,7 +298,7 @@ describe("seance cold restore", () => {
 				restoreSeanceSession({ init: { ...init, tools: ["grep", "glob", "yield"] }, cwd, modelRegistry }),
 			).resolves.toBeUndefined();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

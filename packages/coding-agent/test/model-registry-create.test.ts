@@ -34,7 +34,7 @@ describe("ModelRegistry.create() factory (F6)", () => {
 			new ModelRegistry(authStorage, yml);
 			expect(fs.existsSync(yml)).toBe(true);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 

@@ -1072,7 +1072,7 @@ describe("Agent hub data refresh coalescing", () => {
 		} finally {
 			await parentSession?.dispose();
 			await childSession?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("captures the final assistant charge before parking without replacing history metrics", async () => {
@@ -1149,7 +1149,7 @@ describe("Agent hub data refresh coalescing", () => {
 		} finally {
 			await lifecycle?.dispose();
 			await session?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("refreshes live cost for a late off-branch model_usage entry without a message change", async () => {
@@ -1204,7 +1204,7 @@ describe("Agent hub data refresh coalescing", () => {
 			expect(run()).toBeCloseTo(0.65);
 		} finally {
 			await session?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

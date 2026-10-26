@@ -36,7 +36,7 @@ describe("--service-tier", () => {
 
 			expect(options.openAIServiceTier).toBeNull();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -65,7 +65,7 @@ describe("--service-tier", () => {
 				await session.dispose();
 			}
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -126,7 +126,7 @@ describe("--service-tier", () => {
 				await resumed.dispose();
 			}
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

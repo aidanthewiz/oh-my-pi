@@ -116,6 +116,7 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	sessionPublishTarget,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
@@ -1206,11 +1207,17 @@ export class SessionManager {
 			!(error instanceof SessionWriteConflictError) ||
 			error.expectedSize === null ||
 			!sessionFile ||
-			path.resolve(error.path) !== path.resolve(sessionFile) ||
 			!this.#persist ||
 			this.#released ||
 			this.#sessionFileRelocating ||
 			this.#storage.defersSyncPublish
+		) {
+			return undefined;
+		}
+		if (
+			path.resolve(error.path) !== path.resolve(sessionFile) &&
+			(!(this.#storage instanceof FileSessionStorage) ||
+				sessionPublishTarget(error.path) !== sessionPublishTarget(sessionFile))
 		) {
 			return undefined;
 		}

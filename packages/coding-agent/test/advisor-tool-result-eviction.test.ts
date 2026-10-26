@@ -36,7 +36,7 @@ describe("advisor stale tool-result eviction", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await tempDir.remove();
 	});
 

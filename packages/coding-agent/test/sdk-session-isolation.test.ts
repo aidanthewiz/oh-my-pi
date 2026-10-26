@@ -110,8 +110,8 @@ describe("createAgentSession session storage isolation", () => {
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
 	});
 
-	afterAll(() => {
-		sharedAuthStorage.close();
+	afterAll(async () => {
+		await sharedAuthStorage.close();
 	});
 
 	afterEach(async () => {

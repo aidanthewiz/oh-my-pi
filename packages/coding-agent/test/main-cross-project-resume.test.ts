@@ -294,7 +294,7 @@ describe("runRootCommand — cross-project --resume", () => {
 			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
 		} finally {
 			access.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 			await resumedManager?.close();
 		}
 		expect(deniedProbes).toBe(0);
@@ -343,7 +343,7 @@ describe("runRootCommand — cross-project --resume", () => {
 			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
 		} finally {
 			reloadForCwd.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 			await resumedManager?.close();
 		}
 
@@ -389,7 +389,7 @@ describe("runRootCommand — cross-project --resume", () => {
 			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
 		} finally {
 			chdir.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 			await resumedManager?.close();
 		}
 
@@ -432,7 +432,7 @@ describe("runRootCommand — cross-project --resume", () => {
 		} catch (error) {
 			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 			await resumedManager?.close();
 		}
 

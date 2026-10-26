@@ -65,8 +65,8 @@ describe("AgentSession advisor descriptor thinking level", () => {
 		devinModel = devin;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	let session: AgentSession;

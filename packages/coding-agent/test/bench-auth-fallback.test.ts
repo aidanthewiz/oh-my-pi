@@ -94,7 +94,7 @@ async function runBench(
 	const summary = await runBenchCommand(
 		{ models: [selector], flags: { runs: 1, maxTokens: 64, json: false } },
 		{
-			createRuntime: async () => ({ modelRegistry: registry, settings, close: () => {} }),
+			createRuntime: async () => ({ modelRegistry: registry, settings, close: async () => {} }),
 			randomSessionId: () => "sess-1",
 			writeStdout: () => {},
 			writeStderr: text => stderr.push(text),
@@ -278,7 +278,7 @@ describe("default bench runtime", () => {
 					);
 					console.log(target.model.provider + "/" + target.model.id);
 				} finally {
-					runtime.close?.();
+					await runtime.close?.();
 				}
 			`;
 			const child = Bun.spawn([process.execPath, "-e", script], {
@@ -419,7 +419,7 @@ async function captureServiceTier(opts: {
 			createRuntime: async () => ({
 				modelRegistry: registry,
 				settings: settingsStub(opts.setting),
-				close: () => {},
+				close: async () => {},
 			}),
 			randomSessionId: () => "sess-1",
 			writeStdout: () => {},
@@ -449,7 +449,7 @@ describe("bench provider session state and websocket preference", () => {
 				createRuntime: async () => ({
 					modelRegistry: registry,
 					settings: undefined,
-					close: () => {},
+					close: async () => {},
 				}),
 				randomSessionId: () => "sess-1",
 				writeStdout: () => {},

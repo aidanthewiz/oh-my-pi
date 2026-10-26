@@ -32,11 +32,11 @@ describe("runtime provider apiKey vs /login credential", () => {
 		delete process.env[envName];
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		delete process.env[envName];
 		clearCustomApis();
 		unregisterOAuthProviders(sourceId);
-		authStorage.close();
+		await authStorage.close();
 		removeSyncWithRetries(tempDir);
 	});
 

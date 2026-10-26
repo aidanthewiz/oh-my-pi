@@ -29,7 +29,7 @@ describe("AgentSession.fork(entryId)", () => {
 	afterEach(async () => {
 		await session?.dispose();
 		session = undefined;
-		authStorage?.close();
+		await authStorage?.close();
 		await removeWithRetries(tempDir);
 		vi.restoreAllMocks();
 	});

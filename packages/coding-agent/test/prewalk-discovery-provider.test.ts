@@ -40,8 +40,8 @@ describe("issue #11820 prewalk into a models.yml discovery provider target", () 
 		requestedUrls = [];
 	});
 
-	afterEach(() => {
-		for (const storage of authStoragesToClose) storage.close();
+	afterEach(async () => {
+		for (const storage of authStoragesToClose) await storage.close();
 		authStoragesToClose.length = 0;
 		if (tempDir && fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
 	});

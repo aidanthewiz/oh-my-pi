@@ -27,7 +27,7 @@ describe("AgentSession prompt admission via extension command routing", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 	});
 
 	it("fires onPromptAdmitted once the command is routed, before its handler runs", async () => {

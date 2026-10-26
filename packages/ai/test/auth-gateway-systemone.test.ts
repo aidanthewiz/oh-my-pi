@@ -116,7 +116,7 @@ async function boot(respond: (init: RequestInit | undefined) => Response): Promi
 		storage,
 		close: async () => {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		},
 	};
@@ -292,6 +292,28 @@ describe("auth-gateway POST /v1/systemone", () => {
 			error: {
 				type: "invalid_request_error",
 				message: expect.stringContaining("images[0] is 16777217 bytes"),
+			},
+		});
+		expect(credentialLookup).not.toHaveBeenCalled();
+		expect(harness.upstream).toHaveLength(0);
+	});
+
+	it("rejects a Jev image below the catalog minimum before gateway credential lookup", async () => {
+		harness = await boot(() => Response.json(UPSTREAM_ANSWER));
+		harness.storage.keys.removeRuntime("typesafe");
+		const credentialLookup = spyOn(harness.storage.keys, "getWithCredential");
+		const response = await post(harness.url, "/v1/systemone", {
+			model: "typesafe/jev-latest",
+			state: "Inspect this tiny image.",
+			questions: REQUEST.questions,
+			images: [{ type: "image", data: PNG_DATA, mimeType: "image/png" }],
+		});
+
+		expect(response.status).toBe(422);
+		expect(await response.json()).toMatchObject({
+			error: {
+				type: "invalid_request_error",
+				message: expect.stringContaining("at least 78400 pixels"),
 			},
 		});
 		expect(credentialLookup).not.toHaveBeenCalled();

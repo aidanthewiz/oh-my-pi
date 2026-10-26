@@ -146,7 +146,7 @@ describe("AgentSession model-change prompt refresh", () => {
 			await session.dispose();
 			session = undefined;
 		}
-		authStorage.close();
+		await authStorage.close();
 		removeSyncWithRetries(tempDir);
 	});
 

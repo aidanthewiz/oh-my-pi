@@ -86,7 +86,7 @@ describe("runRootCommand — startup --resume picker cancellation", () => {
 			thrown = err;
 		} finally {
 			vi.restoreAllMocks();
-			authStorage.close();
+			await authStorage.close();
 		}
 
 		expect(pickerCalled).toBe(true);

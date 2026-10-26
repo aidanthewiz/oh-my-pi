@@ -101,7 +101,7 @@ describe("experimental context tool registration", () => {
 			}
 		} finally {
 			fetchSpy.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

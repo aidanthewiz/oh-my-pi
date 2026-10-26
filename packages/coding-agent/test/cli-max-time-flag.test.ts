@@ -104,7 +104,7 @@ describe("parseArgs — --max-time flag", () => {
 				throw error;
 			}
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 		const afterRun = Date.now();
 

@@ -171,7 +171,7 @@ describe("AgentSession idle compaction async-job deferral", () => {
 		await session.dispose();
 		manager.cancelAll();
 		await manager.dispose();
-		authStorage.close();
+		await authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}

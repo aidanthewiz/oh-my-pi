@@ -100,7 +100,7 @@ describe("AgentSession skill prompt keyword steering", () => {
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		tempDir.removeSync();
 	});

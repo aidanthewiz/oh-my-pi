@@ -35,8 +35,8 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 		modelRegistry = new ModelRegistry(authStorage, path.join(sharedDir, "models.yml"));
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		removeSyncWithRetries(sharedDir);
 	});
 

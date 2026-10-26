@@ -110,8 +110,8 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	function buildSession(options: {

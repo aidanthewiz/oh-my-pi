@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { realpathSync } from "node:fs";
 import * as path from "node:path";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -9,8 +10,9 @@ afterEach(() => {
 
 describe("FileSessionStorage streamed rewrite durability", () => {
 	it("preserves the saved transcript when a pending write later fails with ENOSPC", async () => {
-		using tempDir = TempDir.createSync("omp-streamed-rewrite-");
+		using tempDir = TempDir.createSync("@omp-streamed-rewrite-");
 		const sessionPath = path.join(tempDir.path(), "session.jsonl");
+		const stagingDir = realpathSync(tempDir.path());
 		const storage = new FileSessionStorage();
 		const saved = '{"type":"session","id":"saved"}\n{"type":"message","text":"durable history"}\n';
 		storage.writeTextSync(sessionPath, saved);
@@ -26,7 +28,7 @@ describe("FileSessionStorage streamed rewrite durability", () => {
 					: typeof input === "string" || input instanceof URL
 						? createFile(input, options)
 						: createFile(input, options);
-			if (typeof input !== "string" || path.dirname(input) !== tempDir.path() || !input.endsWith(".tmp")) {
+			if (typeof input !== "string" || path.dirname(input) !== stagingDir || !input.endsWith(".tmp")) {
 				return file;
 			}
 			const createWriter = file.writer.bind(file);

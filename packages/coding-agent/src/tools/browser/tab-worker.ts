@@ -1504,6 +1504,8 @@ export class WorkerCore {
 	#targetId?: string;
 	/** Last viewport read from the page; reported while a dialog or failure blocks a fresh read. */
 	#lastViewport?: ReadyInfo["viewport"];
+	#pageInitialization?: Promise<{ ok: true } | { ok: false; error: unknown }>;
+	#pageInitialized = false;
 	#elementCache = new Map<number, ElementHandle>();
 	#observedElements = new Map<number, ObservedElement>();
 	#elementCounter = 0;
@@ -1694,62 +1696,31 @@ export class WorkerCore {
 			// page acquisition so the supervisor's cold-start budget bounds only the
 			// realm setup; page creation runs under the ready wait.
 			this.#transport.send({ type: "setup" });
-			if (payload.mode === "headless") {
-				// Create the target directly so its id is reportable before
-				// Puppeteer waits for target/page initialization. If that wait
-				// wedges, the supervisor can still close the created target.
-				this.#page = await createTrackedHeadlessPage(this.#browser, targetId => {
-					this.#transport.send({ type: "page-created", targetId });
-				});
-				this.#observeDialogs();
-				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
-				if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
-				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
-			} else {
-				const target = await this.#findAttachedTarget(payload.targetId);
-				// Post-timeout recycle: unblock the target BEFORE adopting the page — an open
-				// modal dialog or hung navigation can stall `target.page()` / ready info, and a
-				// stalled init used to time out and force-kill the tab.
-				if (payload.recover) await this.#recoverAttachedTarget(target);
-				const page = await target.page();
-				if (!page) throw new ToolError(`Target ${payload.targetId} is no longer available on the attached browser`);
-				this.#page = page;
-				await this.#claimRelayTarget(page);
-				this.#observeDialogs();
-				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
-			}
-			this.#page.mainFrame().client.on("Page.frameNavigated", this.#onFrameNavigated);
-			this.#page.mainFrame().client.on("OMP.debuggerDetached", this.#onDebuggerDetached);
-			this.#page.on("error", this.#onPageCrashed);
-			if (payload.mode === "headless" || payload.emulateFocus) {
-				// Background Chromium tabs stop producing frames, stalling rAF,
-				// IntersectionObserver, and input acknowledgements. Keep owned tabs
-				// interactive without raising a window; explicit settle-freeze still applies.
-				await this.#page.emulateFocusedPage(true);
-			}
-			this.#webmcp = await installWebMcp(this.#page);
-			await installVitalsObservers(this.#page);
-			if (payload.userAgent !== undefined) await applyUserAgentOverride(this.#page, payload.userAgent);
-			if (payload.ignoreHttpsErrors) await applyIgnoreHttpsErrors(this.#page);
-			this.#targetId = await targetIdForPage(this.#page);
-			this.#initScripts = new InitScriptManager(this.#page);
-			for (const source of payload.initScripts ?? []) await this.#initScripts.add(source);
-			this.#downloads = new DownloadManager(this.#browser, this.#page, this.#targetId, {
-				perTab: payload.mode === "headless" || payload.userDriven !== true,
-			});
-			if (payload.downloadsPath) await this.#downloads.enable(payload.downloadsPath);
-			const baseUserAgent = await this.#page.evaluate(() => navigator.userAgent);
-			this.#emulation = new BrowserEmulationController(
-				this.#page,
-				loadedKnownDevices(),
-				loadedNetworkConditions(),
-				baseUserAgent,
+			// Page.getFrameTree can wait for an accepted navigation's response.
+			const knownInfo = payload.mode === "attach" && payload.recover === false ? payload.knownInfo : undefined;
+			const target =
+				payload.mode === "attach" && knownInfo ? await this.#findAttachedTarget(payload.targetId) : undefined;
+			this.#pageInitialization = this.#initializePage(payload, target).then(
+				() => {
+					this.#pageInitialized = true;
+					if (this.#started) void this.#postReadyInfo();
+					return { ok: true as const };
+				},
+				error => ({ ok: false as const, error }),
 			);
-			await this.#consoleCapture.install(this.#page);
-			this.#tracing = new BrowserTracingController(this.#page);
-			this.#network = new BrowserNetworkManager(this.#page, payload.allowedDomains);
-			await this.#network.start();
-			const info = await this.#currentReadyInfo();
+			let info: ReadyInfo;
+			if (payload.mode === "attach" && knownInfo && target) {
+				info = {
+					url: redactUrlCredentials(target.url()),
+					title: knownInfo.title,
+					viewport: knownInfo.viewport,
+					targetId: payload.targetId,
+				};
+			} else {
+				const initialized = await this.#pageInitialization;
+				if (!initialized.ok) throw initialized.error;
+				info = await this.#currentReadyInfo();
+			}
 			this.#started = true;
 			this.#transport.send({ type: "ready", info });
 		} catch (error) {
@@ -1764,6 +1735,58 @@ export class WorkerCore {
 			}
 			this.#transport.send({ type: "init-failed", error: errorPayload(error) });
 		}
+	}
+
+	async #initializePage(payload: WorkerInitPayload, attachedTarget?: Target): Promise<void> {
+		const browser = this.#requireBrowser();
+		if (payload.mode === "headless") {
+			// Report ownership before Puppeteer waits for page initialization.
+			this.#page = await createTrackedHeadlessPage(browser, targetId => {
+				this.#transport.send({ type: "page-created", targetId });
+			});
+			this.#observeDialogs();
+			await applyStealthPatches(browser, this.#page, { browserSession: null, override: null });
+			if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
+			if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
+		} else {
+			const target = attachedTarget ?? (await this.#findAttachedTarget(payload.targetId));
+			if (payload.recover) await this.#recoverAttachedTarget(target);
+			const page = await target.page();
+			if (!page) throw new ToolError(`Target ${payload.targetId} is no longer available on the attached browser`);
+			this.#page = page;
+			await this.#claimRelayTarget(page);
+			this.#observeDialogs();
+			if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
+		}
+		const page = this.#requirePage();
+		page.mainFrame().client.on("Page.frameNavigated", this.#onFrameNavigated);
+		page.mainFrame().client.on("OMP.debuggerDetached", this.#onDebuggerDetached);
+		page.on("error", this.#onPageCrashed);
+		if (payload.mode === "headless" || payload.emulateFocus) await page.emulateFocusedPage(true);
+		const targetId = await targetIdForPage(page);
+		this.#targetId = targetId;
+		this.#lastViewport = payload.mode === "headless" ? payload.viewport : payload.knownInfo?.viewport;
+		this.#webmcp = await installWebMcp(page);
+		await installVitalsObservers(page);
+		if (payload.userAgent !== undefined) await applyUserAgentOverride(page, payload.userAgent);
+		if (payload.ignoreHttpsErrors) await applyIgnoreHttpsErrors(page);
+		this.#initScripts = new InitScriptManager(page);
+		for (const source of payload.initScripts ?? []) await this.#initScripts.add(source);
+		this.#downloads = new DownloadManager(browser, page, targetId, {
+			perTab: payload.mode === "headless" || payload.userDriven !== true,
+		});
+		if (payload.downloadsPath) await this.#downloads.enable(payload.downloadsPath);
+		const baseUserAgent = await page.evaluate(() => navigator.userAgent);
+		this.#emulation = new BrowserEmulationController(
+			page,
+			loadedKnownDevices(),
+			loadedNetworkConditions(),
+			baseUserAgent,
+		);
+		await this.#consoleCapture.install(page);
+		this.#tracing = new BrowserTracingController(page);
+		this.#network = new BrowserNetworkManager(page, payload.allowedDomains);
+		await this.#network.start();
 	}
 
 	async #findAttachedTarget(targetId: string): Promise<Target> {
@@ -1857,11 +1880,11 @@ export class WorkerCore {
 		const page = this.#requirePage();
 		const targetId = this.#targetId ?? (await targetIdForPage(page));
 		this.#targetId = targetId;
-		const dialogPending = this.#dialogs?.state().open ?? false;
+		const documentUnavailable = !this.#pageInitialized || (this.#dialogs?.state().open ?? false);
 		return {
 			url: redactUrlCredentials(page.url()),
-			title: dialogPending ? undefined : await page.title().catch(() => undefined),
-			viewport: dialogPending
+			title: documentUnavailable ? undefined : await page.title().catch(() => undefined),
+			viewport: documentUnavailable
 				? (page.viewport() ?? this.#lastViewport ?? DEFAULT_VIEWPORT)
 				: await this.#viewport().catch(() => this.#lastViewport ?? DEFAULT_VIEWPORT),
 			targetId,
@@ -1948,6 +1971,23 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
+			if (this.#pageInitialization) {
+				try {
+					const initialized = await untilAborted(signal, this.#pageInitialization);
+					if (!initialized.ok) throw initialized.error;
+				} catch (error) {
+					if (
+						timeoutSignal.aborted &&
+						!ac.signal.aborted &&
+						!runAc.signal.aborted &&
+						error instanceof Error &&
+						error.name === "AbortError"
+					) {
+						throw new ToolError(`Browser page initialization timed out after ${msg.timeoutMs}ms`);
+					}
+					throw error;
+				}
+			}
 			await untilAborted(signal, () => this.#emulation?.reapply() ?? Promise.resolve());
 			runPage = createRunPageScope(this.#requirePage(), () => this.#requireNetwork().restoreInterception());
 			const browser = this.#requireBrowser();

@@ -68,7 +68,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		testUsageProviders = undefined;
 		vi.restoreAllMocks();
 		await handle?.close();
-		serverStorage?.close();
+		await serverStorage?.close();
 		serverStore?.close();
 		for (const key of ANTHROPIC_ENV) {
 			if (savedEnv[key] === undefined) delete process.env[key];
@@ -120,7 +120,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		expect(overrideCalls).toBe(1);
 		// The local oauth refresh helper was used exactly once — by the broker server.
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
-		clientStorage.close();
+		await clientStorage.close();
 	});
 	test("suspect credential refresh updates the client snapshot from the broker response", async () => {
 		const rotated = {
@@ -262,7 +262,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		expect(serverStore!.listAuthCredentials("anthropic").map(row => row.id)).not.toContain(first.credentialId);
 		const next = await clientStorage.oauth.access("anthropic", "invalidated-session");
 		expect(next?.credentialId).not.toBe(first.credentialId);
-		clientStorage.close();
+		await clientStorage.close();
 		remoteStore.close();
 	});
 
@@ -1298,7 +1298,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		// Client reflects the new key through the broker's `POST /v1/credential`
 		// response without waiting for the long-poll snapshot tick.
 		expect(clientStorage.credentials.get("kagi")).toEqual({ type: "api_key", key: "new-key" });
-		clientStorage.close();
+		await clientStorage.close();
 	});
 	test("snapshot with a login-sourced api_key passes client wire validation", async () => {
 		// Regression: keys stored via the /login flow carry `source: "login"`.
@@ -1338,7 +1338,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 
 		expect(serverStore!.listAuthCredentials("kagi")).toEqual([]);
 		expect(clientStorage.credentials.get("kagi")).toBeUndefined();
-		clientStorage.close();
+		await clientStorage.close();
 	});
 
 	test.each(["", "tier:fable"])("scoped block deletion removes only the exact broker row (%s)", async blockScope => {
@@ -1572,7 +1572,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		await remoteStore.invalidateUsageCache();
 
 		expect(serverInvalidateSpy).toHaveBeenCalled();
-		clientStorage.close();
+		await clientStorage.close();
 	});
 
 	test("broker invalidation drops server-side last-good usage reports", async () => {
@@ -1618,7 +1618,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			expect(await clientStorage.usage.reports()).toEqual([]);
 			expect(fetchSpy).toHaveBeenCalledTimes(2);
 		} finally {
-			clientStorage.close();
+			await clientStorage.close();
 		}
 	});
 
@@ -1670,7 +1670,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			expect(await clientStorage.usage.reports()).toEqual([]);
 			expect(fetchSpy).toHaveBeenCalledTimes(2);
 		} finally {
-			clientStorage.close();
+			await clientStorage.close();
 		}
 	});
 
@@ -1768,7 +1768,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			);
 		} finally {
 			for (const release of refreshReleases.values()) release.resolve();
-			clientStorage.close();
+			await clientStorage.close();
 		}
 	});
 

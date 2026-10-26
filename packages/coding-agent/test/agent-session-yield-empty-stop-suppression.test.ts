@@ -30,8 +30,8 @@ const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.keys.setRuntime("mock", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
 
-afterAll(() => {
-	sharedAuthStorage.close();
+afterAll(async () => {
+	await sharedAuthStorage.close();
 });
 
 const yieldTool: AgentTool<typeof yieldToolSchema, { value: unknown }> = {

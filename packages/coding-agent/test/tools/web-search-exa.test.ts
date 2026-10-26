@@ -30,7 +30,7 @@ async function withInMemoryAuthStorage<T>(run: (authStorage: AuthStorage) => Pro
 	try {
 		return await run(authStorage);
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 }
 

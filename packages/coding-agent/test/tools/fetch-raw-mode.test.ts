@@ -183,3 +183,168 @@ describe("read URL with multi-range selector (regression: was stuck on URL → 4
 		expect(loadSpy).toHaveBeenCalledWith("https://example.com/file.txt", expect.anything());
 	});
 });
+
+interface StubPage {
+	content: string;
+	contentType: string;
+	truncated: boolean;
+}
+
+interface TruncationSourceCase {
+	name: string;
+	url: string;
+	pages: Record<string, StubPage>;
+	method: string;
+	truncated: boolean;
+}
+
+const PAGE_WITH_MD_ALTERNATE = `<html><head><link rel="alternate" type="text/markdown" href="/docs/page.md"></head><body>x</body></html>`;
+const MD_ALTERNATE = `# Page\n\n${"markdown body ".repeat(20)}`;
+
+const truncationSourceCases: TruncationSourceCase[] = [
+	{
+		name: "a cut markdown alternate of a complete HTML page",
+		url: "https://example.com/docs/page",
+		pages: {
+			"https://example.com/docs/page": {
+				content: PAGE_WITH_MD_ALTERNATE,
+				contentType: "text/html",
+				truncated: false,
+			},
+			"https://example.com/docs/page.md": { content: MD_ALTERNATE, contentType: "text/markdown", truncated: true },
+		},
+		method: "alternate-markdown",
+		truncated: true,
+	},
+	{
+		name: "a complete markdown alternate of a cut HTML page",
+		url: "https://example.com/docs/page",
+		pages: {
+			"https://example.com/docs/page": {
+				content: PAGE_WITH_MD_ALTERNATE,
+				contentType: "text/html",
+				truncated: true,
+			},
+			"https://example.com/docs/page.md": { content: MD_ALTERNATE, contentType: "text/markdown", truncated: false },
+		},
+		method: "alternate-markdown",
+		truncated: false,
+	},
+	{
+		name: "a cut GitHub raw blob",
+		url: "https://github.com/owner/repo/blob/main/data.txt",
+		pages: {
+			"https://raw.githubusercontent.com/owner/repo/main/data.txt": {
+				content: "partial blob",
+				contentType: "text/plain",
+				truncated: true,
+			},
+		},
+		method: "github-raw",
+		truncated: true,
+	},
+	{
+		name: "a cut GitLab raw blob",
+		url: "https://gitlab.com/owner/repo/-/blob/main/data.txt",
+		pages: {
+			"https://gitlab.com/api/v4/projects/owner%2Frepo": {
+				content: '{"id":123}',
+				contentType: "application/json",
+				truncated: false,
+			},
+			"https://gitlab.com/api/v4/projects/123/repository/files/data.txt/raw?ref=main": {
+				content: "partial GitLab blob",
+				contentType: "text/plain",
+				truncated: true,
+			},
+		},
+		method: "gitlab-raw",
+		truncated: true,
+	},
+];
+
+describe("read URL beyond the inline preview (regression: tail past 500,000 chars was discarded)", () => {
+	let testDir: string;
+	beforeEach(() => {
+		testDir = path.join(os.tmpdir(), `fetch-large-body-${Snowflake.next()}`);
+		fs.mkdirSync(testDir, { recursive: true });
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+		removeSyncWithRetries(testDir);
+	});
+
+	it("keeps the full response body reachable through tail selectors and the full-output artifact", async () => {
+		const session = makeSession(testDir);
+		const tool = new ReadTool(session);
+		const marker = "COMPLETE_TAIL_MARKER";
+		const lines = Array.from({ length: 12_000 }, (_, i) => `+line-${i + 1} ${"x".repeat(80)}`);
+		stubLoadPage(`${lines.join("\n")}\n${marker}\n`, "text/plain");
+
+		const preview = await tool.execute("preview", { path: "https://example.com/big.diff" });
+		const artifactId = preview.details?.meta?.truncation?.artifactId;
+		expect(artifactId).toBeDefined();
+		const artifact = fs.readdirSync(path.join(testDir, "session")).find(file => file.startsWith(`${artifactId}.`));
+		expect(fs.readFileSync(path.join(testDir, "session", artifact ?? ""), "utf8")).toEndWith(marker);
+
+		const tail = await tool.execute("tail", { path: "https://example.com/big.diff:-2" });
+		const tailText = tail.content.find(c => c.type === "text")?.text ?? "";
+		expect(tailText).toContain("+line-12000");
+		expect(tailText).toContain(marker);
+	});
+
+	it("renders GitLab merge-request descriptions after asynchronous Markdown conversion", async () => {
+		const marker = "SYNTHETIC GITLAB MR DESCRIPTION";
+		vi.spyOn(scrapers, "loadPage").mockImplementation(async url => ({
+			ok: true,
+			status: 200,
+			finalUrl: url,
+			contentType: "application/json",
+			content: JSON.stringify(
+				url.endsWith("/merge_requests/7")
+					? {
+							title: "Synthetic MR",
+							description: `<p>${marker}</p>`,
+							state: "opened",
+							author: { name: "Synthetic", username: "synthetic" },
+							created_at: "2026-01-01T00:00:00Z",
+							updated_at: "2026-01-01T00:00:00Z",
+							source_branch: "synthetic",
+							target_branch: "main",
+							labels: [],
+							upvotes: 0,
+							downvotes: 0,
+							user_notes_count: 0,
+							draft: false,
+							merge_status: "can_be_merged",
+						}
+					: { id: 123 },
+			),
+		}));
+		const result = await new ReadTool(makeSession(testDir)).execute("gitlab-mr", {
+			path: "https://gitlab.com/synthetic/project/-/merge_requests/7",
+		});
+		const text = result.content.find(part => part.type === "text")?.text ?? "";
+		expect(result.details?.method).toBe("gitlab-mr");
+		expect(text).toContain(marker);
+		expect(text).not.toContain("[object Promise]");
+	});
+
+	it.each(truncationSourceCases)(
+		"reports truncation of the response that supplied the content: $name",
+		async ({ url, pages, method, truncated }) => {
+			vi.spyOn(scrapers, "loadPage").mockImplementation(async (requestedUrl: string) => {
+				const page = pages[requestedUrl];
+				return page
+					? { ok: true, status: 200, finalUrl: requestedUrl, ...page }
+					: { ok: false, status: 404, finalUrl: requestedUrl, contentType: "", content: "" };
+			});
+
+			const result = await new ReadTool(makeSession(testDir)).execute("call", { path: url });
+			const text = result.content.find(c => c.type === "text")?.text ?? "";
+
+			expect(result.details?.method).toBe(method);
+			expect(text.includes("was cut mid-stream; content is incomplete")).toBe(truncated);
+		},
+	);
+});

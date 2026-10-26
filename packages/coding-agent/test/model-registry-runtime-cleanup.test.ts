@@ -30,9 +30,9 @@ describe("ModelRegistry runtime source cleanup", () => {
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		clearCustomApis();
-		authStorage.close();
+		await authStorage.close();
 	});
 
 	test("clearSourceRegistrations removes runtime overlays and fallback auth for that source", () => {

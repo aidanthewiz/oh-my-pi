@@ -119,7 +119,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 				accountPolicies: [],
 				authStorageOptions: { defaultReservePct: 17 },
 			});
-			storage.close();
+			await storage.close();
 
 			await expect(
 				discoverAuthStorage({
@@ -186,7 +186,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 
 				expect(selected?.email).toBe("preferred@example.com");
 			} finally {
-				storage.close();
+				await storage.close();
 			}
 		});
 	});
@@ -307,7 +307,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 				try {
 					expect(storage.keys.source("anthropic") !== undefined).toBeTrue();
 				} finally {
-					storage.close();
+					await storage.close();
 				}
 			},
 		);

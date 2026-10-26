@@ -120,7 +120,7 @@ describe("provider prompt-cache key session affinity", () => {
 			expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
 		} finally {
 			await session?.dispose();
-			authStorage?.close();
+			await authStorage?.close();
 		}
 	});
 
@@ -147,7 +147,7 @@ describe("provider prompt-cache key session affinity", () => {
 			expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
 		} finally {
 			await session?.dispose();
-			authStorage?.close();
+			await authStorage?.close();
 		}
 	});
 
@@ -190,7 +190,7 @@ describe("provider prompt-cache key session affinity", () => {
 				expect(session.agent.promptCacheKey, entry.name).toBeUndefined();
 			} finally {
 				await session?.dispose();
-				authStorage?.close();
+				await authStorage?.close();
 			}
 		}
 	});
@@ -227,7 +227,7 @@ describe("provider prompt-cache key session affinity", () => {
 			expect(options.model).toBe(OPENAI_TEST_MODEL);
 			expect(options.providerPromptCacheKey).toBeUndefined();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

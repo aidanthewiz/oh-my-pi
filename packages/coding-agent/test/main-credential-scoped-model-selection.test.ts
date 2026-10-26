@@ -94,7 +94,7 @@ it("--model resolves a cached-only Copilot model exactly instead of its bundled 
 	} catch (error) {
 		if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 
 	expect(observedOptions?.model && `${observedOptions.model.provider}/${observedOptions.model.id}`).toBe(

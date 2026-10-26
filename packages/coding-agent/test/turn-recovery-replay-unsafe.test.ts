@@ -130,8 +130,8 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { settings: modelRegistrySettings });
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

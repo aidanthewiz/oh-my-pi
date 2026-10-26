@@ -206,8 +206,8 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		}
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	function collectNotices() {

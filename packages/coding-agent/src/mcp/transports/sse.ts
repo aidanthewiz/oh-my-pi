@@ -10,6 +10,7 @@ import type {
 	MCPTransport,
 } from "../../mcp/types";
 import { toJsonRpcError } from "../../mcp/types";
+import { MCPTransportError, nonRetryableMCPTransportError, normalizeMCPTransportError } from "../errors";
 import { RequestIdAllocator } from "../request-id";
 import { createMCPTimeout, getNeverAbortSignal, resolveMCPTimeoutMs } from "../timeout";
 import { type MCPFetchInit, mcpFetch } from "./header-policy";
@@ -18,12 +19,14 @@ interface MCPTimeoutOperation {
 	signal?: AbortSignal;
 	clear: () => void;
 	isTimeoutAbort: (error: unknown) => boolean;
+	timedOut: () => boolean;
 }
 
 interface PendingLegacySseRequest {
 	resolve: (value: unknown) => void;
 	reject: (reason?: unknown) => void;
 	operation: MCPTimeoutOperation;
+	postController: AbortController;
 	abortHandler?: () => void;
 }
 
@@ -188,12 +191,24 @@ export class LegacySseTransport implements MCPTransport {
 			} else if (error instanceof Error && error.name !== "AbortError") {
 				logger.debug("Legacy SSE stream error", { url: this.#config.url, error: error.message });
 				this.onError?.(error);
-				this.#rejectPending(error);
+				this.#rejectPending(
+					nonRetryableMCPTransportError(
+						normalizeMCPTransportError(error, { transport: "http", stage: "receive" }),
+					),
+				);
 			}
 		} finally {
 			operation.clear();
 			if (endpointReceived) {
-				this.#rejectPending(new Error("Transport closed: legacy SSE stream closed"));
+				this.#rejectPending(
+					new MCPTransportError({
+						transport: "http",
+						stage: "receive",
+						failure: "closed",
+						message: "Transport closed: legacy SSE stream closed",
+						retryable: false,
+					}),
+				);
 			}
 		}
 	}
@@ -228,6 +243,7 @@ export class LegacySseTransport implements MCPTransport {
 		params?: Record<string, unknown>,
 		options?: MCPRequestOptions,
 	): Promise<T> {
+		options?.signal?.throwIfAborted();
 		if (!this.#connected || !this.#endpointUrl) {
 			throw new Error("Transport not connected");
 		}
@@ -240,7 +256,9 @@ export class LegacySseTransport implements MCPTransport {
 			params: params ?? {},
 		};
 		const timeout = resolveMCPTimeoutMs(this.#config.timeout);
-		const operation = createMCPTimeout(timeout, this.#operationSignal(options?.signal));
+		const postController = new AbortController();
+		const signal = options?.signal ? AbortSignal.any([options.signal, postController.signal]) : postController.signal;
+		const operation = createMCPTimeout(timeout, this.#operationSignal(signal));
 		const deferred = Promise.withResolvers<unknown>();
 		// Observe the response promise synchronously so a stream-close rejection
 		// from `#rejectPending` that lands while `request()` is still awaiting the
@@ -251,6 +269,7 @@ export class LegacySseTransport implements MCPTransport {
 			resolve: deferred.resolve,
 			reject: deferred.reject,
 			operation,
+			postController,
 		};
 		if (operation.signal) {
 			pending.abortHandler = () => {
@@ -271,11 +290,21 @@ export class LegacySseTransport implements MCPTransport {
 		}
 		this.#pending.set(id, pending);
 
+		let postStatus: number | undefined;
 		try {
+			operation.signal?.throwIfAborted();
 			const response = await this.#postJson(body, operation.signal);
+			postStatus = response.status;
 			if (!response.ok) {
 				const text = await response.text();
-				throw new Error(`HTTP ${response.status}: ${text}`);
+				throw new MCPTransportError({
+					transport: "http",
+					stage: "receive",
+					failure: "http_status",
+					message: `HTTP ${response.status}: ${text}`,
+					code: response.status,
+					retryable: response.status === 404,
+				});
 			}
 			await response.body?.cancel();
 			return (await deferred.promise) as T;
@@ -283,10 +312,37 @@ export class LegacySseTransport implements MCPTransport {
 			this.#pending.delete(id);
 			operation.clear();
 			if (pending.abortHandler) operation.signal?.removeEventListener("abort", pending.abortHandler);
-			if (operation.isTimeoutAbort(error)) {
+			if (operation.timedOut()) {
 				throw new Error(`Request timeout after ${timeout}ms`);
 			}
-			throw error;
+			if (operation.signal?.aborted) throw operation.signal.reason;
+			const normalized = normalizeMCPTransportError(error, {
+				transport: "http",
+				stage: postStatus === undefined ? "send" : "receive",
+			});
+			if (
+				postStatus === 404 &&
+				error instanceof MCPTransportError &&
+				error.failure === "http_status" &&
+				error.code === 404 &&
+				error.retryable
+			) {
+				throw error;
+			}
+			// A rejected POST can follow server receipt; only a refused, unreachable, or unresolved connection proves no dispatch.
+			if (
+				postStatus === undefined &&
+				normalized.failure === "connect" &&
+				(/^(?:ECONNREFUSED|CONNECTIONREFUSED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN)$/i.test(
+					String(normalized.code),
+				) ||
+					/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN)\b/i.test(
+						normalized.message,
+					))
+			) {
+				throw normalized;
+			}
+			throw nonRetryableMCPTransportError(normalized);
 		}
 	}
 
@@ -379,6 +435,7 @@ export class LegacySseTransport implements MCPTransport {
 			pending.operation.clear();
 			if (pending.abortHandler) pending.operation.signal?.removeEventListener("abort", pending.abortHandler);
 			pending.reject(error);
+			pending.postController.abort(error);
 		}
 	}
 

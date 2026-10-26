@@ -56,7 +56,7 @@ describe("issue #927 optimistic pending spinner", () => {
 		HistoryStorage.close();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

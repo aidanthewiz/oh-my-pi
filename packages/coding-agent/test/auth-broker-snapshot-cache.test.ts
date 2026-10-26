@@ -90,7 +90,7 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 		try {
 			expect(await storage.keys.get(PROVIDER)).toBe("cached-api-key");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -134,9 +134,9 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			const entry = cached?.credentials.find(candidate => candidate.provider === PROVIDER);
 			expect(entry?.credential).toEqual({ type: "api_key", key: "broker-api-key" });
 		} finally {
-			storage?.close();
+			await storage?.close();
 			await handle?.close();
-			brokerStorage.close();
+			await brokerStorage.close();
 			brokerStore.close();
 		}
 	});
@@ -164,7 +164,7 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			storage = await discoverAuthStorage(tempDir);
 			expect(await storage.keys.get(PROVIDER)).toBe("cached-api-key");
 		} finally {
-			storage?.close();
+			await storage?.close();
 			server.stop(true);
 		}
 	});

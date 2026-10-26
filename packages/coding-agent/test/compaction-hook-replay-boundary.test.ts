@@ -30,8 +30,8 @@ describe("hook-provided compaction replay boundary", () => {
 		await dir?.remove();
 	});
 
-	afterAll(() => {
-		authStorage?.close();
+	afterAll(async () => {
+		await authStorage?.close();
 	});
 
 	it("replays the uncovered tail after a hook compaction, reload, and fork", async () => {

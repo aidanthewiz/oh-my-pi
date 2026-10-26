@@ -52,8 +52,8 @@ async function setupRepoMocks() {
 	return commitCreateSpy;
 }
 
-afterEach(() => {
-	authStorage?.close();
+afterEach(async () => {
+	await authStorage?.close();
 	authStorage = undefined;
 	vi.restoreAllMocks();
 	delete process.env.PI_COMMIT_TEST_FALLBACK;

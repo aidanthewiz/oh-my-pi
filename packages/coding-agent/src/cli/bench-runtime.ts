@@ -54,7 +54,7 @@ export interface BenchModelRegistry {
 export interface BenchRuntime {
 	modelRegistry: BenchModelRegistry;
 	settings?: Settings;
-	close?: () => void;
+	close?: () => Promise<void>;
 }
 
 /** One resolved benchmark subject: the selector the user typed and what it became. */
@@ -79,7 +79,7 @@ export async function createDefaultBenchRuntime(): Promise<BenchRuntime> {
 			close: () => authStorage.close(),
 		};
 	} catch (error) {
-		authStorage.close();
+		await authStorage.close();
 		throw error;
 	}
 }

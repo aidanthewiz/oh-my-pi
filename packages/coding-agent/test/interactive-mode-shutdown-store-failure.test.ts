@@ -110,7 +110,7 @@ describe("InteractiveMode shutdown when the session store keeps failing (#12238)
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		resetSettingsForTest();
 	});

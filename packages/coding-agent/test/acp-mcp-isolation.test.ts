@@ -24,8 +24,8 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 const authStorage = createInMemoryAuthStorage();
 const modelRegistry = new ModelRegistry(authStorage);
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {

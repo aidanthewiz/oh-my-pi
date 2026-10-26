@@ -35,7 +35,7 @@ describe("issue #12247 mid-turn transcript rebuild", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await tempDir.remove();
 	});
 

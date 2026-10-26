@@ -27,8 +27,8 @@ describe("AsyncJobManager ownership across concurrent top-level sessions", () =>
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedTempDir, "models.yml"));
 	});
 
-	afterAll(() => {
-		sharedAuthStorage.close();
+	afterAll(async () => {
+		await sharedAuthStorage.close();
 		removeSyncWithRetries(sharedTempDir);
 	});
 

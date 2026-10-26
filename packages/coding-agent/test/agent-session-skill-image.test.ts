@@ -74,7 +74,7 @@ function setup(options: { responses?: MockResponseSource; beforeVisionReply?: ()
 	cleanup.push(async () => {
 		fetchSpy.mockRestore();
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 	const visionCalls = () =>

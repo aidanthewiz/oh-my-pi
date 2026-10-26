@@ -34,6 +34,7 @@ import type {
 	TokenTaskBudget,
 	Tool,
 } from "@oh-my-pi/pi-ai/types";
+import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isRecord, removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { withEnv, withOfficialAnthropicEndpoint } from "./helpers";
@@ -223,6 +224,43 @@ describe("Anthropic request fingerprint alignment", () => {
 			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01",
 		);
 		expect(headers["x-client-request-id"]).toBeUndefined();
+	});
+
+	it("keeps native AWS endpoint, credentials, and TLS separate from direct-provider metadata", async () => {
+		const aws = buildModel({
+			...ANTHROPIC_MODEL_SPEC,
+			provider: "anthropic-aws",
+			baseUrl: "https://aws-external-anthropic.us-east-1.api.aws",
+		});
+		const model = { ...aws, compat: { ...aws.compat, firstPartyProvider: true } };
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: "1",
+				FOUNDRY_BASE_URL: "https://foundry.synthetic.invalid",
+				CLAUDE_CODE_CLIENT_CERT: "/nonexistent/direct-client.pem",
+				CLAUDE_CODE_CLIENT_KEY: undefined,
+				ANTHROPIC_AWS_WORKSPACE_ID: "synthetic-workspace",
+				ANTHROPIC_AWS_API_KEY: "synthetic-aws-key",
+				ANTHROPIC_API_KEY: "synthetic-direct-key",
+				ANTHROPIC_CUSTOM_HEADERS: "X-Gateway-Key: synthetic-gateway-key",
+			},
+			async () => {
+				const options = buildAnthropicClientOptions({
+					model,
+					apiKey: "stored-oauth",
+					isOAuth: true,
+					extraBetas: [],
+				});
+				expect(options.baseURL).toMatch(/^https:\/\/aws-external-anthropic\.[a-z0-9-]+\.api\.aws$/);
+				const headers = new Headers(options.defaultHeaders);
+				expect(headers.get("authorization")).toBe("Bearer synthetic-aws-key");
+				expect(headers.get("anthropic-workspace-id")).toBe("synthetic-workspace");
+				expect(headers.get("x-api-key")).toBeNull();
+				expect(headers.get("x-gateway-key")).toBeNull();
+				expect(options.isOAuthToken).toBe(false);
+				expect(options.fetchOptions?.tls).toBeUndefined();
+			},
+		);
 	});
 
 	it("omits the legacy redact-thinking beta from Claude Code requests", () => {
@@ -545,7 +583,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		let capturedBody: { output_config?: { effort?: string }; tool_choice?: { type?: string } } | undefined;
 		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
 			capturedBeta = (init?.headers as Record<string, string> | undefined)?.["anthropic-beta"];
-			capturedBody = JSON.parse(String(init?.body ?? "{}")) as {
+			capturedBody = JSON.parse(requestBodyText(init) ?? "{}") as {
 				output_config?: { effort?: string };
 				tool_choice?: { type?: string };
 			};
@@ -643,7 +681,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			let capturedBody: unknown;
 			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
 				capturedBeta = (init?.headers as Record<string, string> | undefined)?.["anthropic-beta"];
-				capturedBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+				capturedBody = JSON.parse(requestBodyText(init) ?? "{}");
 				return new Response(
 					JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
 					{ status: 400, headers: { "Content-Type": "application/json" } },
@@ -722,14 +760,11 @@ describe("Anthropic request fingerprint alignment", () => {
 			| undefined;
 		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
 			capturedBeta = (init?.headers as Record<string, string> | undefined)?.["anthropic-beta"] ?? "";
-			capturedBody =
-				typeof init?.body === "string"
-					? (JSON.parse(init.body) as {
-							messages?: Array<{ role?: string }>;
-							inference_geo?: string;
-							fallbacks?: unknown;
-						})
-					: undefined;
+			capturedBody = JSON.parse(requestBodyText(init) ?? "{}") as {
+				messages?: Array<{ role?: string }>;
+				inference_geo?: string;
+				fallbacks?: unknown;
+			};
 			return new Response(
 				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
 				{ status: 400, headers: { "Content-Type": "application/json" } },
@@ -777,10 +812,8 @@ describe("Anthropic request fingerprint alignment", () => {
 		let capturedFallbacks: unknown;
 		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
 			capturedBeta = new Headers(init?.headers).get("anthropic-beta") ?? "";
-			if (typeof init?.body === "string") {
-				const parsed: unknown = JSON.parse(init.body);
-				capturedFallbacks = isRecord(parsed) ? parsed.fallbacks : undefined;
-			}
+			const parsed: unknown = JSON.parse(requestBodyText(init) ?? "{}");
+			capturedFallbacks = isRecord(parsed) ? parsed.fallbacks : undefined;
 			return new Response(
 				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
 				{ status: 400, headers: { "Content-Type": "application/json" } },
@@ -817,7 +850,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		} = {};
 		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
 			capturedHeader = new Headers(init?.headers).get("anthropic-beta") ?? "";
-			capturedBody = JSON.parse(String(init?.body ?? "{}"));
+			capturedBody = JSON.parse(requestBodyText(init) ?? "{}");
 			return new Response(
 				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
 				{ status: 400, headers: { "Content-Type": "application/json" } },
@@ -876,7 +909,7 @@ describe("Anthropic request fingerprint alignment", () => {
 							}
 						: {
 								fetch: (async (_input, init) => {
-									capturedBody = JSON.parse(String(init?.body));
+									capturedBody = JSON.parse(requestBodyText(init) ?? "{}");
 									capturedHeader = new Headers(init?.headers).get("anthropic-beta") ?? "";
 									return new Response('{"error":{"type":"invalid_request_error","message":"captured"}}', {
 										status: 400,
@@ -953,7 +986,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			| undefined;
 		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
 			capturedBeta = (init?.headers as Record<string, string> | undefined)?.["anthropic-beta"];
-			capturedBody = JSON.parse(String(init?.body ?? "{}"));
+			capturedBody = JSON.parse(requestBodyText(init) ?? "{}");
 			return new Response(
 				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
 				{ status: 400, headers: { "Content-Type": "application/json" } },
@@ -3266,14 +3299,14 @@ describe("Anthropic request fingerprint alignment", () => {
 });
 
 describe("cch attestation", () => {
-	it("wrapFetchForCch: replaces cch=00000 with correct XXHash64 in outgoing request body", async () => {
+	it("wrapFetchForCch: patches cch over the uncompressed body before the transport gzips it", async () => {
 		const { promise: bodyPromise, resolve: bodyResolve } = Promise.withResolvers<string>();
 		const controller = new AbortController();
 
+		let gzipped = false;
 		const fakeFetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			const raw = init?.body;
-			const body = typeof raw === "string" ? raw : new TextDecoder().decode(raw as Uint8Array);
-			bodyResolve(body);
+			gzipped = new Headers(init?.headers).get("content-encoding") === "gzip";
+			bodyResolve(requestBodyText(init) ?? "");
 			controller.abort();
 			return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
 				status: 200,
@@ -3285,12 +3318,14 @@ describe("cch attestation", () => {
 			ANTHROPIC_MODEL,
 			{
 				systemPrompt: ["Be helpful."],
-				messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+				// Above the gzip floor, so the official-API request is compressed.
+				messages: [{ role: "user", content: "hello ".repeat(500), timestamp: Date.now() }],
 			},
 			{ apiKey: "sk-ant-oat-test", isOAuth: true, signal: controller.signal, fetch: fakeFetch },
 		);
 
 		const capturedBody = await bodyPromise;
+		expect(gzipped).toBe(true);
 
 		// The placeholder must have been replaced before the request was sent.
 		expect(capturedBody).toContain("cch=");

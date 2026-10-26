@@ -103,5 +103,5 @@ try {
 } finally {
 	mode.stop();
 	await session.dispose();
-	auth.close();
+	await auth.close();
 }

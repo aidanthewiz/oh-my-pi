@@ -35,7 +35,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir.removeSync();
 	});
 

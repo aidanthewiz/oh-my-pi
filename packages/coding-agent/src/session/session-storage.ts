@@ -41,6 +41,38 @@ export function sessionStagingPath(target: string): string {
 	return path.join(path.dirname(target), `.${path.basename(target)}.${Snowflake.next()}.tmp`);
 }
 
+/** Canonical transcript identity for I/O and locks, including dangling links and missing descendants. */
+export function sessionPublishTarget(fpath: string): string {
+	fpath = path.resolve(fpath);
+	let suffix: string[] | undefined;
+	let seenLinks: Set<string> | undefined;
+	for (;;) {
+		try {
+			const resolved = fs.realpathSync(fpath);
+			return suffix ? path.join(resolved, ...suffix) : resolved;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			try {
+				if (fs.lstatSync(fpath).isSymbolicLink()) {
+					seenLinks ??= new Set();
+					if (seenLinks.has(fpath)) {
+						throw Object.assign(new Error(`Session symlink cycle: ${fpath}`), { code: "ELOOP" });
+					}
+					seenLinks.add(fpath);
+					fpath = path.resolve(path.dirname(fpath), fs.readlinkSync(fpath));
+					continue;
+				}
+			} catch (linkError) {
+				if (!isEnoent(linkError)) throw linkError;
+			}
+			const parent = path.dirname(fpath);
+			if (parent === fpath) throw error;
+			(suffix ??= []).unshift(path.basename(fpath));
+			fpath = parent;
+		}
+	}
+}
+
 export interface SessionStorageStat {
 	size: number;
 	mtimeMs: number;
@@ -1013,24 +1045,28 @@ export class FileSessionStorage implements SessionStorage {
 		stage: (tempPath: string) => void,
 		options: SessionStorageWriteOptions | undefined,
 	): void {
-		const dir = path.dirname(fpath);
+		// A symlinked transcript is rewritten through its referent: the rename
+		// below would otherwise replace the link and strand the transcript it
+		// points at.
+		const target = sessionPublishTarget(fpath);
+		const dir = path.dirname(target);
 		this.ensureDirSync(dir);
-		const tempPath = sessionStagingPath(fpath);
-		const stagingLease = this.#acquireStagingLease(fpath, tempPath);
+		const tempPath = sessionStagingPath(target);
+		const stagingLease = this.#acquireStagingLease(target, tempPath);
 		try {
 			stage(tempPath);
 			// Publish freshness checks and rename share one cross-process gate.
-			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedState(fpath, options);
+			this.#withPublishLock(target, () => {
+				this.#assertExpectedState(target, options);
 				try {
-					this.renameSync(tempPath, fpath);
+					this.renameSync(tempPath, target);
 				} catch (err) {
 					if (!hasFsCode(err, "EPERM")) throw toError(err);
-					this.#replaceSessionFileAfterEpermSync(tempPath, fpath, err);
+					this.#replaceSessionFileAfterEpermSync(tempPath, target, err);
 				}
 			});
 		} catch (err) {
-			this.#discardTemp(tempPath, fpath);
+			this.#discardTemp(tempPath, target);
 			throw toError(err);
 		} finally {
 			stagingLease.release();
@@ -1042,6 +1078,7 @@ export class FileSessionStorage implements SessionStorage {
 		update: SessionTitleUpdate,
 		options?: SessionStorageWriteOptions,
 	): Promise<Hash> {
+		fpath = sessionPublishTarget(fpath);
 		if (!titleFitsSlot(update)) {
 			const content = await this.readText(fpath);
 			const body = overlayTitleSlotContent(content, update);
@@ -1082,6 +1119,9 @@ export class FileSessionStorage implements SessionStorage {
 
 	listFilesSync(dir: string, pattern: string): string[] {
 		try {
+			// Bun.Glob walks no symlink unless asked, and a transcript placed in
+			// a session directory as one — a launcher's, a supervisor's — is a
+			// transcript like any other (#15878)
 			return Array.from(new Bun.Glob(pattern).scanSync({ cwd: dir, followSymlinks: true })).map(name =>
 				path.join(dir, name),
 			);
@@ -1153,31 +1193,32 @@ export class FileSessionStorage implements SessionStorage {
 		stage: (tempPath: string) => Promise<void>,
 		options: WriteTextAtomicOptions | undefined,
 	): Promise<void> {
-		const dir = path.resolve(fpath, "..");
-		const tempPath = sessionStagingPath(fpath);
+		// As {@link #publishSync}: a symlinked transcript is rewritten through
+		// its referent, so the rename does not replace the link.
+		const target = sessionPublishTarget(fpath);
+		const dir = path.resolve(target, "..");
+		const tempPath = sessionStagingPath(target);
 		await fs.promises.mkdir(dir, { recursive: true });
 		const stagingLease = this.#acquireStagingLease(fpath, tempPath);
 		try {
 			await stage(tempPath);
-			if (options?.commitGuard && !options.commitGuard()) {
-				this.#discardTemp(tempPath, fpath);
-				return;
-			}
-			// The publish lock spans the freshness check through the rename (and
-			// its EPERM fallback): a cooperating appender or rewrite cannot
-			// interleave, and appenders re-open a replaced path before writing.
-			this.#withPublishLock(fpath, () => {
-				this.#assertExpectedState(fpath, options);
+			// The publish lock spans the freshness check through the rename.
+			this.#withPublishLock(target, () => {
+				if (options?.commitGuard && !options.commitGuard()) {
+					this.#discardTemp(tempPath, target);
+					return;
+				}
+				this.#assertExpectedState(target, options);
 				try {
-					this.renameSync(tempPath, fpath);
+					this.renameSync(tempPath, target);
 					return;
 				} catch (err) {
 					if (!hasFsCode(err, "EPERM")) throw toError(err);
-					this.#replaceSessionFileAfterEpermSync(tempPath, fpath, err, options?.commitGuard);
+					this.#replaceSessionFileAfterEpermSync(tempPath, target, err, options?.commitGuard);
 				}
 			});
 		} catch (err) {
-			this.#discardTemp(tempPath, fpath);
+			this.#discardTemp(tempPath, target);
 			throw toError(err);
 		} finally {
 			stagingLease.release();
@@ -1293,6 +1334,7 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	openWriter(fpath: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
+		fpath = sessionPublishTarget(fpath);
 		const lockPath = this.#publishLockPath(fpath);
 		const gatePath = this.#osGatePath(lockPath);
 		return new FileSessionStorageWriter(fpath, {
@@ -1303,7 +1345,7 @@ export class FileSessionStorage implements SessionStorage {
 
 	/** Run a synchronous session mutation under its cross-process lock. */
 	withSessionFileLockSync<T>(sessionPath: string, operation: () => T): T {
-		return withFileLockSync(sessionPath, operation);
+		return withFileLockSync(sessionPublishTarget(sessionPath), operation);
 	}
 
 	/**
@@ -1313,6 +1355,7 @@ export class FileSessionStorage implements SessionStorage {
 	 * Throws {@link SessionLockError} while another writer holds the lock.
 	 */
 	replaceSessionFileSync(fpath: string, replacement: string, unchanged: () => boolean): boolean {
+		fpath = sessionPublishTarget(fpath);
 		let replaced = false;
 		this.#withPublishLock(fpath, () => {
 			if (!unchanged()) return;

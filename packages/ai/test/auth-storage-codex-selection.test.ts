@@ -1900,7 +1900,7 @@ describe("AuthStorage codex oauth ranking", () => {
 	test("protects a fresh Codex block after reopening SQLite storage", async () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-codex-selection-"));
 		const dbPath = path.join(tempDir, "agent.db");
-		authStorage?.close();
+		await authStorage?.close();
 		store = await SqliteAuthCredentialStore.open(dbPath);
 		authStorage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
@@ -1966,7 +1966,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(markResult.switched).toBe(true);
 		expect(store.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBeDefined();
 
-		authStorage.close();
+		await authStorage.close();
 		authStorage = null;
 		store = null;
 
@@ -1984,7 +1984,7 @@ describe("AuthStorage codex oauth ranking", () => {
 			expect(selectionAfterReopen).toBe(`api-${healthyAccountId}`);
 			expect(reopenedStore.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBeDefined();
 		} finally {
-			reopenedAuthStorage.close();
+			await reopenedAuthStorage.close();
 		}
 	});
 
@@ -2093,8 +2093,8 @@ describe("AuthStorage codex oauth ranking", () => {
 				expect(remoteStoreB.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBeDefined();
 				expect(store.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBeDefined();
 			} finally {
-				clientStorageA.close();
-				clientStorageB.close();
+				await clientStorageA.close();
+				await clientStorageB.close();
 				remoteStoreA.close();
 				remoteStoreB.close();
 			}
@@ -2237,7 +2237,7 @@ describe("AuthStorage codex oauth ranking", () => {
 				expect(remoteStoreB.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBe(blockedUntilMs);
 				expect(store.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBe(blockedUntilMs);
 			} finally {
-				clientStorageB.close();
+				await clientStorageB.close();
 				remoteStoreB.close();
 			}
 		} finally {
@@ -2369,7 +2369,7 @@ describe("AuthStorage codex oauth ranking", () => {
 					["shared", blockedUntilMs],
 				]);
 			} finally {
-				clientStorage.close();
+				await clientStorage.close();
 				remoteStore.close();
 			}
 		} finally {
@@ -2506,11 +2506,11 @@ describe("AuthStorage codex oauth ranking", () => {
 					expect(remoteStoreB.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBeDefined();
 					expect(store.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "chat")).toBeDefined();
 				} finally {
-					clientStorageB.close();
+					await clientStorageB.close();
 					remoteStoreB.close();
 				}
 			} finally {
-				clientStorageA.close();
+				await clientStorageA.close();
 				remoteStoreA.close();
 			}
 		} finally {
@@ -2700,7 +2700,7 @@ describe("AuthStorage codex oauth ranking", () => {
 					"api-acct-broker-blocked",
 				);
 			} finally {
-				clientStorage.close();
+				await clientStorage.close();
 				remoteStore.close();
 			}
 		} finally {

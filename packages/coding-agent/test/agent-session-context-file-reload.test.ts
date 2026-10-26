@@ -69,7 +69,7 @@ async function expectContextReload(reset: (session: AgentSession) => Promise<unk
 		expect(rebuilt).not.toContain(original);
 	} finally {
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	}
 }
 

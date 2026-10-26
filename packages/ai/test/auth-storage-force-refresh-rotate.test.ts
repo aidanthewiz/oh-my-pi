@@ -458,7 +458,7 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 
 	test("usage marking does not block a sibling when its target disappears during usage lookup", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
-		authStorage.close();
+		await authStorage.close();
 		const concurrentStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		store = concurrentStore;
 		let targetRemoved = false;

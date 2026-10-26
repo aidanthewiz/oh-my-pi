@@ -41,7 +41,7 @@ describe("AgentSession peek at consumed background completions", () => {
 		for (const gate of gates) gate.resolve("released");
 		await session?.dispose();
 		session = undefined;
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		AsyncJobManager.resetForTests();
 		AgentRegistry.resetGlobalForTests();

@@ -61,6 +61,22 @@ Transport implementations own framing and I/O details:
 
 `connectToServer()` always installs an `onRequest` handler for standard server-to-client requests. `MCPManager` installs notification handlers, OAuth refresh hooks for HTTP-like OAuth servers, and `onClose` reconnect handling for managed connections.
 
+### Request replay safety
+
+A lost response does not prove that a tool did not run.
+After an attempted POST or stdio write, ambiguous reset, EOF, decode, and close failures cannot authorize automatic replay.
+HTTP 502 and 503 responses also leave the action outcome uncertain.
+The tool bridge honors non-retryable transport errors instead of reconnecting and repeating the call.
+
+Known connection refusal, unreachable-network, and DNS failures can recover before dispatch.
+An explicit HTTP 404 stale-session refusal can also reconnect.
+A disconnected transport can reconnect before its next write.
+
+Caller cancellation remains authoritative, but it does not prove that server work stopped.
+Legacy SSE stream loss also aborts each pending request's outstanding POST so the request cannot remain suspended.
+Inspect the action's effect before manually retrying an uncertain outcome.
+
+
 ## Transport selection
 
 `client.ts:createTransport()` chooses transport from config:

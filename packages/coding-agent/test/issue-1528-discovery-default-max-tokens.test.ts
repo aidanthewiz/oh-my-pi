@@ -28,8 +28,8 @@ describe("issue #1528 discovery maxTokens default", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}

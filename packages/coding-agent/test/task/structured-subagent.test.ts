@@ -339,7 +339,7 @@ describe("structured subagent primitive", () => {
 			);
 			expect(overridden.modelOverride).toEqual(["anthropic/claude-sonnet-4-5"]);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -383,7 +383,7 @@ describe("structured subagent primitive", () => {
 			expect(await fs.readdir(tempDir)).toEqual(["source.jsonl"]);
 			expect(await fs.readFile(sourceFile)).toEqual(sourceBefore);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -418,7 +418,7 @@ describe("structured subagent primitive", () => {
 				),
 			).rejects.toThrow("No available saved model can serve this source.");
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -830,7 +830,7 @@ describe("structured subagent primitive", () => {
 					if (artifactsDir) await fs.rm(artifactsDir, { recursive: true, force: true });
 				} finally {
 					unregisterCustomApis(sourceId);
-					authStorage.close();
+					await authStorage.close();
 					await fs.rm(root, { recursive: true, force: true });
 				}
 			}
@@ -918,7 +918,7 @@ describe("structured subagent primitive", () => {
 					if (artifactDir) await fs.rm(artifactDir, { recursive: true, force: true });
 				} finally {
 					unregisterCustomApis(sourceId);
-					authStorage.close();
+					await authStorage.close();
 					await fs.rm(root, { recursive: true, force: true });
 				}
 			}
@@ -1454,7 +1454,7 @@ describe("agent frontmatter structured opt-in", () => {
 					}
 				}
 			} finally {
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 		30_000,

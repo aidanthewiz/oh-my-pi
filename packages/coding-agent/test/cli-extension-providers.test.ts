@@ -84,6 +84,6 @@ test("loadCliExtensionProviders makes extension providers resolvable by selector
 		expect(after.model?.provider).toBe("bench-gw");
 		expect(after.model?.id).toBe("bench-model");
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 });

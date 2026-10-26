@@ -70,7 +70,7 @@ describe("runRootCommand — --no-session --resume", () => {
 			thrown = err;
 		} finally {
 			vi.restoreAllMocks();
-			authStorage.close();
+			await authStorage.close();
 		}
 
 		expect(pickerCalled).toBe(false);

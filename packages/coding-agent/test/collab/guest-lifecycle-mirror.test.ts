@@ -464,7 +464,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await harness?.cleanup();
 			await guestSession.dispose();
 			await hostSession.dispose();
-			auth.close();
+			await auth.close();
 			bus.clear();
 			homedirSpy.mockRestore();
 			refreshDirsFromEnv();
@@ -782,7 +782,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await guestSession.dispose();
 			await guestWithoutExtensions.dispose();
 			await hostSession.dispose();
-			auth.close();
+			await auth.close();
 			bus.clear();
 			controller.dispose();
 			sendSpy.mockRestore();
@@ -1001,7 +1001,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				notificationSpy.mockRestore();
 				showErrorSpy.mockRestore();
 				sendSpy.mockRestore();
-				auth.close();
+				await auth.close();
 				resetSettingsForTest();
 				homedirSpy.mockRestore();
 				refreshDirsFromEnv();
@@ -1406,7 +1406,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			release.resolve();
 			await harness.cleanup();
 			await session.dispose();
-			auth.close();
+			await auth.close();
 			writeSpy.mockRestore();
 			renameSpy.mockRestore();
 		}
@@ -1505,7 +1505,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			await Promise.allSettled(executions);
 			await harness.cleanup();
 			await session.dispose();
-			auth.close();
+			await auth.close();
 			writeSpy.mockRestore();
 			renameSpy.mockRestore();
 			resetSettingsForTest();

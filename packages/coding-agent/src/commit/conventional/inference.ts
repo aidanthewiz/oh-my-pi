@@ -171,8 +171,8 @@ export class OmpCommitInference implements CommitInference {
 	}
 
 	/** Release the cache and auth-storage handles after generation completes. */
-	dispose(): void {
+	async dispose(): Promise<void> {
 		this.#cache?.close();
-		this.#authStorage?.close();
+		await this.#authStorage?.close();
 	}
 }

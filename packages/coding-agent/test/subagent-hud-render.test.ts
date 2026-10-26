@@ -926,7 +926,7 @@ describe("InteractiveMode subagent observer UI sync", () => {
 	afterEach(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		vi.useRealTimers();
 		setSystemTime();

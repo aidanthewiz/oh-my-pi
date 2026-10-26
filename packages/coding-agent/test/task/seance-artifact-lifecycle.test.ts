@@ -223,7 +223,7 @@ describe("seance artifact lifecycle", () => {
 			await AgentLifecycleManager.global()
 				.release(AGENT_ID)
 				.catch(() => false);
-			authStorage.close();
+			await authStorage.close();
 			setAgentDir(previousAgentDir);
 		}
 	});
@@ -350,7 +350,7 @@ describe("seance artifact lifecycle", () => {
 			await AgentLifecycleManager.global()
 				.release(UNSTRUCTURED_AGENT_ID)
 				.catch(() => false);
-			authStorage.close();
+			await authStorage.close();
 			setAgentDir(previousAgentDir);
 		}
 	});
@@ -614,7 +614,7 @@ describe("seance artifact lifecycle", () => {
 					.release(id)
 					.catch(() => false);
 			}
-			authStorage.close();
+			await authStorage.close();
 			setAgentDir(previousAgentDir);
 		}
 	});

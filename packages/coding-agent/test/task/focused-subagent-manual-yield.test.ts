@@ -141,9 +141,10 @@ async function spawnKeptAliveChild(structured = true) {
 		firstDelivery.resolve(text);
 		if (deliveries.length === 2) secondDelivery.resolve(text);
 	});
-	const close = (): void => {
+	const close = async (): Promise<void> => {
 		unregisterSink();
-		authStorage.close();
+		await AgentLifecycleManager.global().dispose();
+		await authStorage.close();
 	};
 	try {
 		const result = await runSubprocess({
@@ -175,14 +176,14 @@ async function spawnKeptAliveChild(structured = true) {
 		});
 		expect(result.exitCode).toBe(0);
 	} catch (error) {
-		close();
+		await close();
 		throw error;
 	}
 	const artifact = path.join(artifactsDir, `${AGENT_ID}.md`);
 	expect(await Bun.file(artifact).text()).toContain("initial result");
 	const session = AgentRegistry.global().get(AGENT_ID)?.session;
 	if (!session) {
-		close();
+		await close();
 		throw new Error("kept-alive subagent has no live session");
 	}
 	return {
@@ -205,7 +206,7 @@ it("a focused manual prompt's yield rewrites the artifact and notifies the paren
 		expect(await child.firstDelivery).toContain("manual result");
 		expect(await Bun.file(child.artifact).text()).toContain("manual result");
 	} finally {
-		child.close();
+		await child.close();
 	}
 }, 15_000);
 
@@ -266,7 +267,7 @@ it.each([true, false])(
 		} finally {
 			releasePublication.resolve();
 			writeSpy.mockRestore();
-			child.close();
+			await child.close();
 		}
 	},
 	15_000,
@@ -282,7 +283,7 @@ it("a focused plain result rewrites its artifact and notifies the parent", async
 			delivered: child.deliveries.filter(text => text.includes("manual result")).length,
 		}).toEqual({ artifact: true, delivered: 1 });
 	} finally {
-		child.close();
+		await child.close();
 	}
 }, 15_000);
 
@@ -337,7 +338,7 @@ it("delivers a durable focused plain result without reserving a full execution s
 		await manager.waitForAll();
 		unregisterSink();
 		writeSpy.mockRestore();
-		child.close();
+		await child.close();
 	}
 }, 15_000);
 
@@ -359,7 +360,7 @@ it.each(["empty report", "failed report"])(
 			expect(await Bun.file(child.artifact).text()).toBe(accepted);
 			expect(child.deliveries).toEqual(acceptedDeliveries);
 		} finally {
-			child.close();
+			await child.close();
 		}
 	},
 	15_000,

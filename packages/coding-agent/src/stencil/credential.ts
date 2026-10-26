@@ -27,8 +27,9 @@ export class StencilCredential {
 		return `a stencil.so account is required: run ${CF_COMMAND} and use /login → Stencil, or set ${STREAM_AUTH_ENV}`;
 	}
 
-	close(): void {
-		this.#storage?.close();
+	async close(): Promise<void> {
+		const storage = this.#storage;
 		this.#storage = undefined;
+		await storage?.close();
 	}
 }

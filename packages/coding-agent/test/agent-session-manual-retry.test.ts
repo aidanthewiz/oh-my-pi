@@ -47,8 +47,8 @@ describe("AgentSession manual retry", () => {
 		}
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

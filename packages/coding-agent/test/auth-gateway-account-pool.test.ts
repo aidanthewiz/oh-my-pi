@@ -63,7 +63,7 @@ describe("auth-gateway account pool", () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
 		await handle?.close();
-		brokerStorage?.close();
+		await brokerStorage?.close();
 		brokerStore?.close();
 		if (tempDir) await removeWithRetries(tempDir);
 		for (const key of ENV_KEYS) {

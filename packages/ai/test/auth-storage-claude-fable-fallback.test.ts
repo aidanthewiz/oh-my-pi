@@ -138,8 +138,8 @@ describe("AuthStorage Claude Fable tier fallback", () => {
 		await storage.credentials.reload();
 	});
 
-	afterEach(() => {
-		storage.close();
+	afterEach(async () => {
+		await storage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -367,7 +367,7 @@ describe("AuthStorage Claude Fable tier fallback", () => {
 	});
 
 	it("does not mark a credential when aborted during target resolution", async () => {
-		storage.close();
+		await storage.close();
 		const provider = "no-usage-provider";
 		store = makeStore([oauthRow(1, "a@example.com", provider)]);
 		storage = new AuthStorage(store);

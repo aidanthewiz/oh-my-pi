@@ -1,15 +1,20 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
+import type { Subprocess } from "bun";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
+import { MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import {
 	resolveStdioSpawnCommand,
 	StdioTransport,
 	terminateStdioProcess,
 	writeFrame,
 } from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import type { MCPServerConnection, MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 
 describe("resolveStdioSpawnCommand", () => {
 	it("resolves bare Windows commands through PATHEXT and wraps .cmd shims with cmd.exe", async () => {
@@ -617,6 +622,29 @@ describe("writeFrame", () => {
 			tracker.release();
 		}
 	});
+
+	it("observes a rejected write even when flush throws synchronously", async () => {
+		const tracker = trackUnhandled();
+		try {
+			expect(
+				writeFrame(
+					{
+						write() {
+							return Promise.reject(new Error("EPIPE: broken pipe, write"));
+						},
+						flush() {
+							throw new Error("EPIPE: broken pipe, flush");
+						},
+					},
+					"frame\n",
+				),
+			).toBe(false);
+			await new Promise<void>(resolve => setImmediate(resolve));
+			expect(tracker.capture()).toEqual([]);
+		} finally {
+			tracker.release();
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -718,29 +746,6 @@ describe("StdioTransport request failure diagnostics", () => {
 		transport = undefined;
 	});
 
-	it("reports abrupt subprocess termination as EOF instead of a generic close", async () => {
-		transport = new StdioTransport({
-			type: "stdio",
-			command: "bun",
-			args: ["-e", "process.stdin.once('data', () => process.exit(23)); process.stdin.resume()"],
-			timeout: 1_000,
-		});
-		await transport.connect();
-		const error = await transport.request("tools/list").then(
-			() => undefined,
-			reason => reason,
-		);
-		if (!(error instanceof MCPTransportError)) throw error;
-
-		expect(error).toMatchObject({
-			transport: "stdio",
-			stage: "receive",
-			failure: "eof",
-			retryable: true,
-		});
-		expect(error.message).toContain("MCP subprocess");
-	});
-
 	it("reports malformed subprocess JSON at the decode stage", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
@@ -756,6 +761,246 @@ describe("StdioTransport request failure diagnostics", () => {
 			failure: "malformed_response",
 			retryable: false,
 		});
+	});
+});
+
+describe("StdioTransport delivery safety", () => {
+	let root: string;
+	let connections: MCPServerConnection[];
+
+	beforeEach(async () => {
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-stdio-delivery-"));
+		connections = [];
+	});
+
+	afterEach(async () => {
+		try {
+			await Promise.all(connections.map(connection => connection.transport.close()));
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
+	async function connect(
+		outcome: "exit" | "reply" | "hold",
+		onNotification?: (method: string, params: unknown) => void,
+	): Promise<MCPServerConnection> {
+		const script = `
+			import { Database } from "bun:sqlite";
+			import { createInterface } from "node:readline";
+			const db = new Database(${JSON.stringify(path.join(root, "actions.sqlite"))});
+			db.run("CREATE TABLE IF NOT EXISTS actions (marker TEXT NOT NULL)");
+			const reply = (id, result) => process.stdout.write(JSON.stringify({jsonrpc: "2.0", id, result}) + "\\n");
+			createInterface({input: process.stdin}).on("line", line => {
+				const request = JSON.parse(line);
+				if (request.method === "initialize") {
+					reply(request.id, {
+						protocolVersion: request.params.protocolVersion,
+						capabilities: {tools: {}},
+						serverInfo: {name: "stdio-delivery-fixture", version: "1"}
+					});
+				} else if (request.method === "tools/call") {
+					const marker = request.params.arguments.marker;
+					db.run("INSERT INTO actions (marker) VALUES (?)", [marker]);
+					if (${JSON.stringify(outcome)} === "exit") {
+						db.close();
+						process.exit(23);
+					}
+					if (${JSON.stringify(outcome)} === "reply") {
+						reply(request.id, {content: [{type: "text", text: "committed:" + marker}]});
+					} else {
+						process.stdout.write(JSON.stringify({
+							jsonrpc: "2.0", method: "committed", params: {marker}
+						}) + "\\n");
+					}
+				}
+			});
+		`;
+		const config: MCPStdioServerConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["--no-env-file", "-e", script],
+			cwd: root,
+			timeout: 2_000,
+		};
+		const connection = await connectToServer("stdio-delivery-fixture", config, { onNotification });
+		connections.push(connection);
+		return connection;
+	}
+
+	function actions(): unknown[] {
+		const db = new Database(path.join(root, "actions.sqlite"), { readonly: true });
+		try {
+			return db.query("SELECT marker FROM actions ORDER BY rowid").all();
+		} finally {
+			db.close();
+		}
+	}
+
+	const definition = {
+		name: "commit",
+		inputSchema: { type: "object" as const, properties: { marker: { type: "string" } }, required: ["marker"] },
+	};
+
+	it("surfaces a lost response without replaying an action committed before subprocess exit", async () => {
+		const connection = await connect("exit");
+		let reconnects = 0;
+		const tool = new MCPTool(connection, definition, async () => {
+			reconnects++;
+			await connection.transport.close();
+			return connect("reply");
+		});
+
+		const result = await withTimeout(
+			tool.execute("lost-response", { marker: "charged" }, undefined, {} as never),
+			1_000,
+			new Error("Lost-response tool call did not settle"),
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("MCP subprocess") }),
+		]);
+		expect(reconnects).toBe(0);
+		expect(actions()).toEqual([{ marker: "charged" }]);
+		expect(connection.transport.connected).toBe(false);
+	});
+
+	it("settles every pending request without permitting replay after subprocess EOF", async () => {
+		const connection = await connect("exit");
+		const payload = "x".repeat(1024 * 1024);
+		const results = await withTimeout(
+			Promise.allSettled([
+				connection.transport.request("tools/call", { name: "commit", arguments: { marker: "first", payload } }),
+				connection.transport.request("tools/call", { name: "commit", arguments: { marker: "second", payload } }),
+			]),
+			1_000,
+			new Error("Pending requests did not settle on EOF"),
+		);
+
+		for (const result of results) {
+			expect(result.status).toBe("rejected");
+			if (result.status !== "rejected") throw new Error("Expected a lost-response rejection");
+			expect(result.reason).toBeInstanceOf(MCPTransportError);
+			expect(result.reason).toMatchObject({ transport: "stdio", retryable: false });
+			expect(["eof", "reset"]).toContain(result.reason.failure);
+		}
+		expect(actions()).toEqual([{ marker: "first" }]);
+		await connection.transport.close();
+		expect(connection.transport.connected).toBe(false);
+	});
+
+	it("recovers a known pre-write disconnection and performs the action exactly once", async () => {
+		const connection = await connect("reply");
+		await connection.transport.close();
+		let reconnects = 0;
+		const tool = new MCPTool(connection, definition, async () => {
+			reconnects++;
+			return connect("reply");
+		});
+
+		const result = await tool.execute("pre-write", { marker: "once" }, undefined, {} as never);
+
+		expect(result.isError).not.toBe(true);
+		expect(result.content).toEqual([{ type: "text", text: "committed:once" }]);
+		expect(reconnects).toBe(1);
+		expect(actions()).toEqual([{ marker: "once" }]);
+	});
+
+	it.each(["write-reject", "flush-reject", "write-throw", "flush-throw"] as const)(
+		"does not replay a committed action after %s",
+		async failure => {
+			const committed = Promise.withResolvers<void>();
+			const spawnSpy = spyOn(Bun, "spawn");
+			let connection: MCPServerConnection;
+			let child: Subprocess<"pipe", "pipe", "pipe">;
+			try {
+				connection = await connect("hold", method => {
+					if (method === "committed") committed.resolve();
+				});
+				child = spawnSpy.mock.results[0]?.value as Subprocess<"pipe", "pipe", "pipe">;
+			} finally {
+				spawnSpy.mockRestore();
+			}
+			const sink = child.stdin;
+			const originalWrite = sink.write.bind(sink);
+			const originalFlush = sink.flush.bind(sink);
+			const error = Object.assign(new Error("ECONNRESET: response lost after commit"), { code: "ECONNRESET" });
+			const sendSpy = failure.startsWith("write")
+				? spyOn(sink, "write").mockImplementationOnce(chunk => {
+						Promise.resolve(originalWrite(chunk)).catch(() => {});
+						if (failure === "write-throw") {
+							Promise.resolve(originalFlush()).catch(() => {});
+							throw error;
+						}
+						return committed.promise.then(() => {
+							throw error;
+						});
+					})
+				: spyOn(sink, "flush").mockImplementationOnce(() => {
+						Promise.resolve(originalFlush()).catch(() => {});
+						if (failure === "flush-throw") throw error;
+						return committed.promise.then(() => {
+							throw error;
+						});
+					});
+			const tracker = trackUnhandled();
+			let reconnects = 0;
+			const tool = new MCPTool(connection, definition, async () => {
+				reconnects++;
+				await connection.transport.close();
+				return connect("reply");
+			});
+			try {
+				const result = await withTimeout(
+					tool.execute("send-failure", { marker: failure }, undefined, {} as never),
+					1_000,
+					new Error("Send failure did not settle"),
+				);
+				await withTimeout(committed.promise, 1_000, new Error("Child did not commit the action"));
+				expect(result.isError).toBe(true);
+				expect(reconnects).toBe(0);
+				expect(actions()).toEqual([{ marker: failure }]);
+				await connection.transport.close();
+				expect(connection.transport.connected).toBe(false);
+				expect(tracker.capture()).toEqual([]);
+			} finally {
+				sendSpy.mockRestore();
+				tracker.release();
+			}
+		},
+	);
+
+	it("keeps caller cancellation authoritative after a committed action and settles remaining work on close", async () => {
+		const committed = Promise.withResolvers<void>();
+		let accepted = 0;
+		const connection = await connect("hold", method => {
+			if (method === "committed" && ++accepted === 2) committed.resolve();
+		});
+		const controller = new AbortController();
+		const cancelled = connection.transport
+			.request("tools/call", { name: "commit", arguments: { marker: "cancelled" } }, { signal: controller.signal })
+			.then(
+				() => undefined,
+				error => error,
+			);
+		const pending = connection.transport
+			.request("tools/call", {
+				name: "commit",
+				arguments: { marker: "pending" },
+			})
+			.then(
+				() => undefined,
+				error => error,
+			);
+		await withTimeout(committed.promise, 1_000, new Error("Child did not accept both pending requests"));
+		const reason = new Error("ECONNRESET: caller cancelled");
+		controller.abort(reason);
+		expect(await withTimeout(cancelled, 1_000, new Error("Caller cancellation did not settle"))).toBe(reason);
+		await connection.transport.close();
+		expect(await pending).toMatchObject({ failure: "closed", retryable: false });
+		expect(actions()).toEqual([{ marker: "cancelled" }, { marker: "pending" }]);
+		expect(connection.transport.connected).toBe(false);
 	});
 });
 
@@ -1198,6 +1443,35 @@ describe.skipIf(process.platform === "win32")("StdioTransport request write stal
 		} finally {
 			process.off("unhandledRejection", captureOrphan);
 			await transport.close();
+		}
+	}, 8000);
+
+	it("settles caller cancellation while a write is blocked by an unread pipe", async () => {
+		const transport = new StdioTransport({
+			command: "sleep",
+			args: ["60"],
+			timeout: 0,
+		});
+		const tracker = trackUnhandled();
+		try {
+			await transport.connect();
+			const controller = new AbortController();
+			const pending = transport.request(
+				"tools/call",
+				{ name: "commit", arguments: { payload: "x".repeat(1024 * 1024) } },
+				{ signal: controller.signal },
+			);
+			const reason = new Error("Caller cancelled a blocked write");
+			controller.abort(reason);
+			await expect(withTimeout(pending, 1_000, new Error("Blocked write ignored cancellation"))).rejects.toBe(
+				reason,
+			);
+			await transport.close();
+			expect(transport.connected).toBe(false);
+			expect(tracker.capture()).toEqual([]);
+		} finally {
+			await transport.close();
+			tracker.release();
 		}
 	}, 8000);
 });

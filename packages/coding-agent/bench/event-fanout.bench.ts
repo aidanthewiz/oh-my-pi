@@ -98,7 +98,7 @@ async function measureSession(hasHandler: boolean): Promise<void> {
 	});
 	unsubscribe();
 	await session.dispose();
-	authStorage.close();
+	await authStorage.close();
 }
 
 async function measureRpc(): Promise<void> {

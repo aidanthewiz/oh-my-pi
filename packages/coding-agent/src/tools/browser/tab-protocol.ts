@@ -71,6 +71,8 @@ export type WorkerInitPayload =
 			/** The tab's upload staging folder, which outlives a recycled worker; see `UploadStaging`. */
 			uploadDir: string;
 			targetId: string;
+			/** Last confirmed metadata while the adopted document is still loading. */
+			knownInfo?: ReadyInfo;
 			dialogs?: "accept" | "dismiss";
 			/** Hostname patterns allowed for every page request. */
 			allowedDomains?: string[];

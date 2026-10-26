@@ -139,7 +139,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			await mcpManager.disconnectAll();
 			if (MCPManager.instance() === mcpManager) MCPManager.setInstance(undefined);
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		// Saves unsaved IDA changes and drops the host sockets that would keep the event loop alive.
 		await releaseIdaDatabases();
 		await closeDaemonClients();

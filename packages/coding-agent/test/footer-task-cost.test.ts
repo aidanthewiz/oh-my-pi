@@ -96,7 +96,7 @@ describe("FooterComponent session cost", () => {
 			component.dispose();
 			await session.dispose();
 			await manager.close();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -157,7 +157,7 @@ describe("FooterComponent session cost", () => {
 			component.dispose();
 			await session.dispose();
 			await manager.close();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

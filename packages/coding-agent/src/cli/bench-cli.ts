@@ -1392,6 +1392,6 @@ export async function runBenchCommand(command: BenchCommandArgs, deps: BenchDepe
 		return summary;
 	} finally {
 		board?.close();
-		runtime.close?.();
+		await runtime.close?.();
 	}
 }

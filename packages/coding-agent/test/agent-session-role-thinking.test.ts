@@ -44,8 +44,8 @@ describe("AgentSession role model thinking behavior", () => {
 		tempDir.removeSync();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		fixtureDir.removeSync();
 	});
 

@@ -55,8 +55,8 @@ describe("AgentSession advisor toggle", () => {
 		replacementModel = replacement;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
 		restoreEnv("PI_PROFILE", originalPiProfile);
 		restoreEnv("OMP_PROFILE", originalOmpProfile);

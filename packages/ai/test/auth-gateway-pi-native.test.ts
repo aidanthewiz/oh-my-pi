@@ -276,7 +276,7 @@ describe("pi-native gateway cache controls", () => {
 			});
 		} finally {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 			clearCustomApis();
 		}
@@ -330,7 +330,7 @@ describe("pi-native gateway retry budgets", () => {
 			expect(upstreamRequests).toBe(3);
 		} finally {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -372,7 +372,7 @@ describe("pi-native gateway reasoning flags", () => {
 			expect(mock.calls[0]?.options).toMatchObject({ reasoning: Effort.Medium, forceReasoningOff: true });
 		} finally {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 			clearCustomApis();
 		}
@@ -456,7 +456,7 @@ describe("pi-native gateway usage attribution", () => {
 		} finally {
 			spy.mockRestore();
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 			clearCustomApis();
 		}

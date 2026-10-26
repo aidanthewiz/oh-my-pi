@@ -10,6 +10,7 @@ import {
 	type UsageResetCredit,
 } from "@oh-my-pi/pi-ai";
 import { AuthBrokerClient, RemoteAuthCredentialStore, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir, withFileLock } from "@oh-my-pi/pi-utils";
 import {
 	buildRedactionMap,
@@ -1636,7 +1637,7 @@ describe("omp usage accounts", () => {
 		vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
 		vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
 		// The command closes the storage it discovered; keep it open to check the keys after.
-		vi.spyOn(authStorage, "close").mockImplementation(() => {});
+		vi.spyOn(authStorage, "close").mockImplementation(async () => {});
 		const output: string[] = [];
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			output.push(String(chunk));
@@ -1668,7 +1669,7 @@ describe("omp usage accounts", () => {
 			expect(text).not.toMatch(/access-|refresh-|sk-stored/);
 		} finally {
 			vi.restoreAllMocks();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -1917,6 +1918,8 @@ describe("omp usage reset", () => {
 			else process.env[key] = value;
 		}
 		__resetDirsFromEnvForTests();
+		// The command's ModelRegistry opened `<agentDir>/models.db`; Windows cannot delete it while open.
+		closeModelCache();
 		tempDir.removeSync();
 	});
 
@@ -2280,10 +2283,10 @@ describe("omp usage reset", () => {
 				["Bearer broker-codex", "credit-soon"],
 			]);
 		} finally {
-			clientStorage.close();
+			await clientStorage.close();
 			remote.close();
 			await handle.close();
-			brokerStorage.close();
+			await brokerStorage.close();
 			brokerStore.close();
 		}
 	});

@@ -106,7 +106,7 @@ describe("auth-gateway stdio routing boundaries", () => {
 			expect(isRecord(unknownBody) ? unknownBody.error : undefined).toEqual(expect.any(String));
 		} finally {
 			router.close();
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -123,7 +123,7 @@ describe("auth-gateway stdio routing boundaries", () => {
 			expect(blocked.status).toBe(404);
 		} finally {
 			router.close();
-			storage.close();
+			await storage.close();
 		}
 	});
 });
@@ -173,9 +173,9 @@ async function streamingFixture(
 	return {
 		router,
 		calls,
-		close() {
+		async close() {
 			router.close();
-			storage.close();
+			await storage.close();
 			unregisterCustomApi(api, api);
 		},
 	};
@@ -289,7 +289,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 				expect(fixture.calls).toEqual(["first", "second"]);
 			} finally {
 				encoder.mockRestore();
-				fixture.close();
+				await fixture.close();
 			}
 		});
 
@@ -315,7 +315,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 				expect(payload).not.toContain("timed-out-partial");
 				expect(fixture.calls).toEqual(["first", "second"]);
 			} finally {
-				fixture.close();
+				await fixture.close();
 			}
 		});
 
@@ -353,7 +353,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 				expect(fixture.calls).toEqual(["first"]);
 			} finally {
 				encoder.mockRestore();
-				fixture.close();
+				await fixture.close();
 			}
 		});
 
@@ -374,7 +374,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 				expect(payload).not.toContain("first-real-error");
 				expect(fixture.calls).toEqual(["first", "second"]);
 			} finally {
-				fixture.close();
+				await fixture.close();
 			}
 		});
 
@@ -391,7 +391,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 					expect(await response.text()).toContain(`HTTP ${status}: invalid request payload`);
 					expect(fixture.calls).toEqual(["first"]);
 				} finally {
-					fixture.close();
+					await fixture.close();
 				}
 			});
 		}
@@ -411,7 +411,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 			expect(response.status).toBe(400);
 			expect(fixture.calls).toEqual([]);
 		} finally {
-			fixture.close();
+			await fixture.close();
 		}
 	});
 
@@ -444,7 +444,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 				await cancelled.promise;
 				expect(fixture.calls).toEqual(["first"]);
 			} finally {
-				fixture.close();
+				await fixture.close();
 			}
 		});
 	}
@@ -464,7 +464,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 			expect(payload).not.toContain("native iterator failed");
 			expect(fixture.calls).toEqual(["first", "second"]);
 		} finally {
-			fixture.close();
+			await fixture.close();
 		}
 	});
 
@@ -482,7 +482,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 			expect(payload).toContain('"reason":"aborted"');
 			expect(fixture.calls).toEqual(["first"]);
 		} finally {
-			fixture.close();
+			await fixture.close();
 		}
 	});
 
@@ -512,7 +512,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 			}
 			expect(fixture.calls).toEqual(["first", "first", "first"]);
 		} finally {
-			fixture.close();
+			await fixture.close();
 		}
 	});
 
@@ -558,7 +558,7 @@ describe("auth-gateway stdio completed stream fallback", () => {
 			expect(fixture.calls).toEqual(["first"]);
 		} finally {
 			encoder.mockRestore();
-			fixture.close();
+			await fixture.close();
 		}
 	});
 });

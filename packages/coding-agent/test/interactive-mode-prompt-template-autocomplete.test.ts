@@ -84,8 +84,8 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage?.close();
+	afterAll(async () => {
+		await authStorage?.close();
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
 		tempDir?.removeSync();

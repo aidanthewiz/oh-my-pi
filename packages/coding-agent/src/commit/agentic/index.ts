@@ -38,7 +38,7 @@ export async function runAgenticCommit(args: CommitCommandArgs): Promise<{ usedF
 	try {
 		return await runAgenticCommitWithAuth(args, cwd, repo, settings, authStorage);
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 }
 

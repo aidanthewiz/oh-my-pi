@@ -65,7 +65,7 @@ describe("AgentSession memory backend lifecycle", () => {
 		session = undefined;
 		resetMemoryForTests();
 		vi.restoreAllMocks();
-		authStorage.close();
+		await authStorage.close();
 		// `Settings.loadIsolated` opens agent.db under tempDir; close it before the directory goes away.
 		AgentStorage.close();
 		tempDir.removeSync();

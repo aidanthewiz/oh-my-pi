@@ -51,7 +51,7 @@ async function withSession<T>(
 		try {
 			await session?.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 }

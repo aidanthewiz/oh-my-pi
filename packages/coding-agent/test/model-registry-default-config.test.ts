@@ -26,7 +26,7 @@ describe("ModelRegistry default custom models config", () => {
 	});
 
 	afterEach(async () => {
-		authStorage.close();
+		await authStorage.close();
 		setAgentDir(originalAgentDir);
 		if (originalAgentDirEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDirEnv;

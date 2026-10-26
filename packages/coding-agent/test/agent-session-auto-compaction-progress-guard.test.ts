@@ -164,8 +164,8 @@ describe("AgentSession auto-compaction progress guard", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage?.close();
+	afterAll(async () => {
+		await authStorage?.close();
 	});
 
 	/** Build a threshold-tripping assistant turn (contextWindow 200k, ~80% threshold). */

@@ -378,7 +378,7 @@ export async function runSearchQuery(
 			signal: options.signal,
 		});
 	} finally {
-		createdAuthStorage?.close();
+		await createdAuthStorage?.close();
 	}
 }
 

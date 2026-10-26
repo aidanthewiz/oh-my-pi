@@ -68,7 +68,7 @@ async function withGuardedSession(run: (session: AgentSession, settings: Setting
 		await run(session, settings);
 	} finally {
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	}
 }
 

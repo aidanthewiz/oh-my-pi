@@ -137,7 +137,7 @@ describe("AgentSession interrupted thinking persistence", () => {
 			await session?.dispose();
 		} finally {
 			session = undefined;
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 			vi.restoreAllMocks();
 		}

@@ -27,7 +27,13 @@ import {
 import type { Theme, ThemeColor } from "../theme/theme";
 import type { Component } from "../tui";
 import type { OutputMeta } from "./output-meta";
-import type { NativeToolHead, NativeToolView, RenderResultOptions, ToolRenderer } from "./renderer";
+import type {
+	NativeToolHead,
+	NativeToolView,
+	RenderResultContextOptions,
+	RenderResultOptions,
+	ToolRenderer,
+} from "./renderer";
 import type { TspTone } from "@oh-my-pi/pi-wire";
 import { code, col, compact, keyed, node, span, text } from "../native/describe";
 import type { NativeChild, NativeNode } from "../native/node";
@@ -57,12 +63,22 @@ export interface FindHit {
 	truncated: boolean;
 }
 
+/**
+ * How much of a search the judge actually covered. `unavailable`: every judge
+ * request failed, so an empty result is not evidence of absence. `partial`:
+ * some requests failed. `complete`: none failed (or none were needed).
+ */
+export type FindCoverage = "complete" | "partial" | "unavailable";
+
 /** Search accounting reported alongside the hits. */
 export interface FindStats {
 	/** Eligible files under the root. */
 	listed: number;
 	requests: number;
-	errors: number;
+	/** Judge requests that failed outright; decides {@link FindCoverage}. */
+	failed: number;
+	/** Questions a successful response left without a usable answer. */
+	unanswered: number;
 	/** Entries judged by name. */
 	judged: number;
 	/** Files whose content was read and sent. */
@@ -87,6 +103,7 @@ export interface FindToolDetails {
 	/** Verified-passage probability at or above which a file is a hit. */
 	threshold: number;
 	hits: FindHit[];
+	coverage: FindCoverage;
 	stats: FindStats;
 	elapsedMs: number;
 	/** Session cwd; hit paths are relative to it. */
@@ -129,13 +146,32 @@ function gauge(p: number, theme: Theme): string {
 	});
 }
 
-function renderHit(hit: FindHit, rangeLimit: number, cwd: string | undefined, theme: Theme): string[] {
+/** Raw metadata is used only for file link targets, never for displayed text. */
+function findLinkTargets(details: FindToolDetails, rawDetails: unknown) {
+	const raw = rawDetails !== null && typeof rawDetails === "object" ? rawDetails : undefined;
+	const cwd = raw && "cwd" in raw && typeof raw.cwd === "string" ? raw.cwd : details.cwd;
+	const rawHits: unknown[] = raw && "hits" in raw && Array.isArray(raw.hits) ? raw.hits : [];
+	return {
+		cwd,
+		rel(hit: FindHit, index: number): string {
+			const candidate = rawHits[index];
+			return candidate !== null &&
+				typeof candidate === "object" &&
+				"rel" in candidate &&
+				typeof candidate.rel === "string"
+				? candidate.rel
+				: hit.rel;
+		},
+	};
+}
+
+function renderHit(hit: FindHit, rangeLimit: number, cwd: string | undefined, rawRel: string, theme: Theme): string[] {
 	// `scheme://` hits (e.g. virtual docs) are not files under `cwd`: link the
 	// URL itself instead of joining it onto a filesystem base.
 	const isUrlHit = splitUrlScheme(hit.rel) !== undefined;
 	const link = (text: string, line?: number): string => {
 		if (isUrlHit) return uriHyperlink(line === undefined ? hit.rel : `${hit.rel}:${line}`, text);
-		const absPath = cwd === undefined ? undefined : path.join(cwd, hit.rel);
+		const absPath = cwd === undefined ? undefined : path.join(cwd, rawRel);
 		return absPath === undefined ? text : fileHyperlink(absPath, text, { line });
 	};
 	const coverage = hit.truncated ? `${hit.linesSeen} lines judged, partial` : `${hit.linesSeen} lines judged`;
@@ -161,7 +197,7 @@ function scoreTone(p: number): TspTone {
  * One hit (§7.3 find): a 22px row of the score bar, the path and `12 lines
  * judged`, then its strongest ranges as numbered `code` (no path header).
  */
-function describeHit(hit: FindHit, rangeLimit: number, cwd: string | undefined): NativeNode {
+function describeHit(hit: FindHit, rangeLimit: number, cwd: string | undefined, rawRel: string): NativeNode {
 	const ranges = [...hit.ranges].sort((a, b) => b.p - a.p || a.start - b.start).slice(0, rangeLimit);
 	const tone = scoreTone(hit.contentScore);
 	const score = hit.contentScore.toFixed(2);
@@ -175,7 +211,7 @@ function describeHit(hit: FindHit, rangeLimit: number, cwd: string | undefined):
 				"muted",
 			),
 		],
-		href: isUrlHit || cwd === undefined ? undefined : fileHref(path.join(cwd, hit.rel)),
+		href: isUrlHit || cwd === undefined ? undefined : fileHref(path.join(cwd, rawRel)),
 		key: "hit",
 	});
 	const lang = getLanguageFromPath(hit.rel);
@@ -222,7 +258,7 @@ export const findToolRenderer = {
 
 	renderResult(
 		result: { content: Array<{ type: string; text?: string }>; details?: FindToolDetails; isError?: boolean },
-		options: RenderResultOptions,
+		options: RenderResultContextOptions,
 		uiTheme: Theme,
 		args?: FindRenderArgs,
 	): Component {
@@ -249,7 +285,12 @@ export const findToolRenderer = {
 			return new Text(header, 1, 0);
 		}
 
+		if (details.coverage === "unavailable") {
+			return new Text(formatErrorMessage(text || "Search unavailable: no judge requests succeeded", uiTheme), 1, 0);
+		}
+
 		const { hits, stats, threshold } = details;
+		const linkTargets = findLinkTargets(details, options.renderContext?.rawDetails);
 		const description = quoteQuery(details.query);
 		const scope = details.scopePath === undefined ? [] : [`in ${details.scopePath}`];
 		const meta = [
@@ -261,16 +302,24 @@ export const findToolRenderer = {
 			`$${stats.cost.toFixed(4)}`,
 			formatDuration(details.elapsedMs),
 		];
-		if (stats.errors > 0) meta.push(uiTheme.fg("warning", `${stats.errors} failed`));
+		const failed = stats.failed > 0 ? `${stats.failed}/${stats.requests} requests failed` : undefined;
+		if (failed) meta.push(uiTheme.fg("warning", failed));
+		const unanswered = stats.unanswered > 0 ? `${stats.unanswered} unanswered` : undefined;
+		if (unanswered) meta.push(uiTheme.fg("warning", unanswered));
 
 		if (hits.length === 0) {
 			const emptyMeta = ["0 hits", ...scope, `$${stats.cost.toFixed(4)}`, formatDuration(details.elapsedMs)];
-			if (stats.errors > 0) emptyMeta.push(uiTheme.fg("warning", `${stats.errors} failed`));
+			if (failed) emptyMeta.push(uiTheme.fg("warning", failed));
+			if (unanswered) emptyMeta.push(uiTheme.fg("warning", unanswered));
 			const header = renderStatusLine(
 				{ icon: "warning", title: "Find", titleColor: "toolTitle", description, meta: emptyMeta },
 				uiTheme,
 			);
-			const lines = [header, formatEmptyMessage("No relevant passages found", uiTheme)];
+			const empty =
+				details.coverage === "partial" || stats.unanswered > 0
+					? "No relevant passages found in the judged files"
+					: "No relevant passages found";
+			const lines = [header, formatEmptyMessage(empty, uiTheme)];
 			for (const failure of stats.failures) lines.push(uiTheme.fg("warning", failure));
 			return new Text(lines.join("\n"), 1, 0);
 		}
@@ -296,8 +345,14 @@ export const findToolRenderer = {
 						maxCollapsed: COLLAPSED_HITS,
 						maxCollapsedLines: PREVIEW_LIMITS.EXPANDED_LINES,
 						itemType: "hit",
-						renderItem: hit =>
-							renderHit(hit, expanded ? RANGES_EXPANDED : RANGES_COLLAPSED, details.cwd, uiTheme),
+						renderItem: (hit, context) =>
+							renderHit(
+								hit,
+								expanded ? RANGES_EXPANDED : RANGES_COLLAPSED,
+								linkTargets.cwd,
+								linkTargets.rel(hit, context.index),
+								uiTheme,
+							),
 					},
 					uiTheme,
 				);
@@ -329,7 +384,7 @@ export const findToolRenderer = {
 	 */
 	describeResult(
 		result: { content: Array<{ type: string; text?: string }>; details?: FindToolDetails; isError?: boolean },
-		options: RenderResultOptions,
+		options: RenderResultContextOptions,
 		args?: FindRenderArgs,
 	): NativeToolView {
 		const details = result.details;
@@ -342,9 +397,18 @@ export const findToolRenderer = {
 				inline: true,
 			};
 		}
+		if (details.coverage === "unavailable") {
+			return inlineErrorView(
+				findNativeHead(query, []),
+				progress || "Search unavailable: no judge requests succeeded",
+			);
+		}
 		const { hits, stats, threshold } = details;
+		const linkTargets = findLinkTargets(details, options.renderContext?.rawDetails);
 		const scope = details.scopePath === undefined ? undefined : `in ${details.scopePath}`;
-		const failed = stats.errors > 0 ? [span(`${stats.errors} failed`, "warning")] : undefined;
+		const failed =
+			stats.failed > 0 ? [span(`${stats.failed}/${stats.requests} requests failed`, "warning")] : undefined;
+		const unanswered = stats.unanswered > 0 ? [span(`${stats.unanswered} unanswered`, "warning")] : undefined;
 		const accounting = [
 			`${stats.filesRead} files read`,
 			`τ ${threshold.toFixed(2)}`,
@@ -357,7 +421,15 @@ export const findToolRenderer = {
 		);
 		if (hits.length === 0) {
 			return {
-				tool: findNativeHead(query, compact(["0 hits", scope, failed])),
+				tool: findNativeHead(
+					query,
+					compact([
+						details.coverage === "partial" || stats.unanswered > 0 ? "0 hits in judged files" : "0 hits",
+						scope,
+						failed,
+						unanswered,
+					]),
+				),
 				tone: "warning",
 				inline: true,
 				body: failures.length > 0 ? failures : undefined,
@@ -378,11 +450,16 @@ export const findToolRenderer = {
 		return {
 			tool: findNativeHead(
 				query,
-				compact([`${formatCount("hit", hits.length)} · ${formatCount("file", stats.filesRead)}`, scope, failed]),
+				compact([
+					`${formatCount("hit", hits.length)} · ${formatCount("file", stats.filesRead)}`,
+					scope,
+					failed,
+					unanswered,
+				]),
 			),
 			inline: true,
 			body: compact<NativeChild>([
-				...shown.map(hit => describeHit(hit, rangeLimit, details.cwd)),
+				...shown.map((hit, index) => describeHit(hit, rangeLimit, linkTargets.cwd, linkTargets.rel(hit, index))),
 				...failures,
 				foot,
 			]),

@@ -37,8 +37,8 @@ const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
 
-afterAll(() => {
-	sharedAuthStorage.close();
+afterAll(async () => {
+	await sharedAuthStorage.close();
 });
 
 describe("AgentSession mid-run todo reconciliation nudge", () => {

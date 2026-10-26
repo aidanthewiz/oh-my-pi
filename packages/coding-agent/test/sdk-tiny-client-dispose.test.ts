@@ -115,7 +115,15 @@ describe("tiny-model client shutdown on session dispose", () => {
 			sessions.push(session);
 			return session;
 		};
-		return { start, close: () => authStorage.close() };
+		return {
+			start,
+			close: async () => {
+				for (const session of sessions.splice(0)) {
+					if (!session.isDisposed) await session.dispose();
+				}
+				await authStorage.close();
+			},
+		};
 	};
 
 	it("keeps pending requests alive until the parent's first dispose", async () => {
@@ -156,7 +164,7 @@ describe("tiny-model client shutdown on session dispose", () => {
 			worker.emit({ type: "text", id: thirdRequest.id, text: "after" });
 			expect(await third).toBe("after");
 		} finally {
-			close();
+			await close();
 		}
 	});
 });

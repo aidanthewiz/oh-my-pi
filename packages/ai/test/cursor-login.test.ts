@@ -73,7 +73,7 @@ describe("Cursor account email", () => {
 
 			expect(auth.oauth.accounts("cursor").map(account => account.email)).toEqual([EMAIL]);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -99,8 +99,8 @@ describe("Cursor account email", () => {
 			await restarted.credentials.reload();
 			expect(restarted.oauth.accounts("cursor").map(account => account.email)).toEqual([EMAIL]);
 		} finally {
-			auth.close();
-			restarted.close();
+			await auth.close();
+			await restarted.close();
 			store.close();
 		}
 	});
@@ -136,7 +136,7 @@ describe("Cursor account email", () => {
 
 			expect(await auth.keys.get("cursor", "session")).toBe(fresh);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -181,7 +181,7 @@ describe("Cursor session refresh", () => {
 				expires: payload.exp * 1000 - 5 * 60 * 1000,
 			});
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -203,7 +203,7 @@ describe("Cursor session refresh", () => {
 				{ type: "oauth", access: fresh, refresh: rotated },
 			]);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -221,7 +221,7 @@ describe("Cursor session refresh", () => {
 			expect(store.listAuthCredentials("cursor")).toEqual([]);
 			expect(await store.listDisabledCredentials("cursor")).toHaveLength(1);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -249,7 +249,7 @@ describe("Cursor session refresh", () => {
 				expect(store.listAuthCredentials("cursor").map(row => row.credential)).toEqual(original);
 				expect(await store.listDisabledCredentials("cursor")).toEqual([]);
 			} finally {
-				auth.close();
+				await auth.close();
 				store.close();
 			}
 		},

@@ -19,8 +19,8 @@ describe("startup model cache header restoration (#5780)", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
 	});
 

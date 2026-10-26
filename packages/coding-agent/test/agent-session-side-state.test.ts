@@ -224,7 +224,7 @@ describe("one-shot side request state", () => {
 			finishParent.resolve();
 			await parent.catch(() => {});
 			await session.dispose();
-			auth.close();
+			await auth.close();
 			server.stop(true);
 		}
 	}, 20_000);

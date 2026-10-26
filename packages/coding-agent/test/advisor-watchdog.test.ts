@@ -81,7 +81,7 @@ describe("advisor watchdog prompt discovery", () => {
 			try {
 				await session?.dispose();
 			} finally {
-				authStorage.close();
+				await authStorage.close();
 			}
 		}
 	});

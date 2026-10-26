@@ -118,7 +118,7 @@ describe("AuthStorage.health.check", () => {
 			expect(result.reason).toBeUndefined();
 			expect(result.report).toBeDefined();
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -144,7 +144,7 @@ describe("AuthStorage.health.check", () => {
 			expect(result.email).toBe("bob@example.com");
 			expect(result.accountId).toBe("account-7");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -162,7 +162,7 @@ describe("AuthStorage.health.check", () => {
 			expect(result.ok).toBeNull();
 			expect(result.reason).toMatch(/no data/);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -189,7 +189,7 @@ describe("AuthStorage.health.check", () => {
 			expect(probe).not.toHaveBeenCalled();
 			expect(refreshSpy).toHaveBeenCalledTimes(1);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -216,7 +216,7 @@ describe("AuthStorage.health.check", () => {
 			});
 			expect(result.reason).toMatch(/no usage probe configured/);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -260,7 +260,7 @@ describe("AuthStorage.health.check", () => {
 			expect(results[1].email).toBe("beta@example.com");
 			expect(results[2].email).toBe("gamma@example.com");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -310,7 +310,7 @@ describe("AuthStorage.health.check", () => {
 			expect(result.completion).toEqual({ ok: true, modelId: "test-probe-model", latencyMs: 42 });
 			expect(result.ok).toBe(true); // usage probe independently succeeded
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -369,7 +369,7 @@ describe("AuthStorage.health.check", () => {
 			if (updated?.type !== "oauth") throw new Error("expected OAuth credential update");
 			expect(updated.apiEndpoint).toBe(apiEndpoint);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -397,7 +397,7 @@ describe("AuthStorage.health.check", () => {
 			expect(result.reason).toMatch(/no usage probe configured/);
 			expect(result.completion).toEqual({ ok: false, reason: "401 invalid_api_key" });
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -424,7 +424,7 @@ describe("AuthStorage.health.check", () => {
 			expect(probe).toHaveBeenCalledTimes(1);
 			expect(result.completion).toEqual({ ok: false, reason: "401 invalid_api_key" });
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -451,7 +451,7 @@ describe("AuthStorage.health.check", () => {
 			expect(probe).not.toHaveBeenCalled();
 			expect(result.completion).toBeUndefined();
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -478,7 +478,7 @@ describe("AuthStorage.health.check", () => {
 			expect(result.completion?.ok).toBe(false);
 			expect(result.completion?.reason).toContain("ECONNRESET");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -521,7 +521,7 @@ describe("AuthStorage.health.check", () => {
 				expect(input.credential.accessToken).toBe("oat-13");
 			}
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -555,7 +555,7 @@ describe("AuthStorage.health.check", () => {
 			expect(seenKeys).toEqual(["sk-resolved-secret"]);
 			expect(result.ok).toBe(true);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -580,7 +580,7 @@ describe("AuthStorage.health.check", () => {
 			expect(results.map(row => row.provider)).toEqual(["anthropic"]);
 			expect(probed).toEqual(["anthropic"]);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });

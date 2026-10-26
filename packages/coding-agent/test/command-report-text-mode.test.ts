@@ -52,7 +52,7 @@ describe("text-mode command reports on a real terminal core", () => {
 	afterEach(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

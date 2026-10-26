@@ -231,7 +231,7 @@ describe("date-cwd reminder on the provider wire", () => {
 			expect(typeof secondFirst.content).toBe(typeof firstUser.content);
 			expect(secondFirst.content).toEqual(firstUser.content);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -332,7 +332,7 @@ describe("date-cwd reminder on the provider wire", () => {
 			expect(wire[4]!.filter(message => message === reminder)).toHaveLength(1);
 		} finally {
 			setSystemTime();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

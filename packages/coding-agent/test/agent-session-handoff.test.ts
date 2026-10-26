@@ -73,7 +73,7 @@ describe("AgentSession handoff", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		try {
 			await sharedDir.remove();
 		} catch {}

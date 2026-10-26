@@ -30,8 +30,8 @@ function createRuntime(overrides: Parameters<typeof Settings.isolated>[0] = {}) 
 	return { authStorage, settings, modelRegistry, pool };
 }
 
-afterEach(() => {
-	for (const authStorage of storages) authStorage.close();
+afterEach(async () => {
+	for (const authStorage of storages) await authStorage.close();
 	storages.clear();
 	restoreEnv("PERPLEXITY_API_KEY", originalPerplexityApiKey);
 	restoreEnv("PERPLEXITY_COOKIES", originalPerplexityCookies);

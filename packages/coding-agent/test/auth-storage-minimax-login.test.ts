@@ -26,8 +26,8 @@ describe("AuthStorage MiniMax login", () => {
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 	});
 
 	test("relogin with a different API key keeps both stored keys", async () => {

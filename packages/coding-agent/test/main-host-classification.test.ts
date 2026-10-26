@@ -78,7 +78,7 @@ it("standalone auth discovery routes by PI_CONFIG_FILES policy over main config"
 			]);
 			expect(await storage.keys.get("test-provider", "standalone-policy-session")).toBe("preferred-token");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	} finally {
 		if (previousOverlay === undefined) delete process.env.PI_CONFIG_FILES;

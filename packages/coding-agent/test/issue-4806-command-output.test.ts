@@ -60,7 +60,7 @@ describe("issue #4806 command output during streaming", () => {
 		HistoryStorage.close();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

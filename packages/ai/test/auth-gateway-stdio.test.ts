@@ -61,7 +61,7 @@ describe("auth-gateway stdio transport", () => {
 			});
 		} finally {
 			router.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -450,7 +450,7 @@ describe("auth-gateway stdio transport", () => {
 			expect(next.status).toBe(400);
 		} finally {
 			router.close();
-			storage.close();
+			await storage.close();
 		}
 	});
 });

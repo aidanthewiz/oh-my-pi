@@ -143,7 +143,7 @@ describe("legacy pi SettingsManager shim (issue #10397)", () => {
 			expect(observed).toBe(sdkSettings);
 			expect(observed?.getGlobalSettings().piVim).toEqual({ session: "sdk" });
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -203,7 +203,7 @@ describe("legacy pi SettingsManager shim (issue #10397)", () => {
 			// Without the scope the same call leaks the newest same-cwd manager.
 			expect(SettingsManager.create(projectDir)).toBe(singleton);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("scopes registered tool execution to the active session settings", async () => {
@@ -253,7 +253,7 @@ describe("legacy pi SettingsManager shim (issue #10397)", () => {
 			expect(observed).toBe(sdkSettings);
 			expect(SettingsManager.create(projectDir)).toBe(singleton);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

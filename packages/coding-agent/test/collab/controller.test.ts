@@ -471,7 +471,7 @@ describe("interactive collaboration startup", () => {
 			).rejects.toBe(finished);
 		} finally {
 			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -818,7 +818,7 @@ describe("interactive collaboration startup", () => {
 				expect(await registry.listCollabHosts({ dir: tmp })).toEqual([]);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 	);
