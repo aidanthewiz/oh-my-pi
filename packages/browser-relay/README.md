@@ -6,14 +6,18 @@ The companion relay server lives in the Coreforge CLI (`coreforge browser-relay`
 
 ## Setup
 
-1. `coreforge browser-relay install` — creates a machine-local relay token, writes the bundled extension with that token, and saves it to `~/.omp/browser-relay/extension`; then load it via `chrome://extensions` → Developer mode → *Load unpacked*. (Or get `coreforge-browser-relay-extension.zip` from an authenticated Coreforce engine release and set the token in the extension options.)
+1. `coreforge browser-relay install` — creates a machine-local relay token, writes the bundled extension with that token, and saves it to `~/.omp/browser-relay/extension`; then load it via `chrome://extensions` → Developer mode → _Load unpacked_. (Or get `coreforge-browser-relay-extension.zip` from an authenticated Coreforce engine release and set the token in the extension options.)
 2. Opt in, one of two ways:
    - **Per call** — pass `app: { relay: true }` to `browser.open(...)` in Eval. Works without any setting and persists nothing: the configured default for every other call and session stays whatever it already was.
-   - **As the default** — `coreforge config set browser.relay true` makes the relay the default for **every session using this profile, in every project** (project-level settings, `PI_BROWSER_RELAY`, and an explicit `app` choice still take precedence). Any session's ordinary `browser.open(...)` call will then drive your real browser — including background sessions you aren't watching; without `app.target` such a call adopts the currently visible tab, and if it carries a `url` it navigates that tab away from what you were reading.
+   - **As the default** — `coreforge config set browser.relay true` makes the relay the default for **every session using this profile, in every project** (project-level settings, `PI_BROWSER_RELAY`, and an explicit `app` choice still take precedence). Any session's ordinary `browser.open(...)` call will then drive your real browser — including background sessions you aren't watching; without `app.target` such a call opens its own background tab in your logged-in profile.
 
 The relay server and extension share the token in `~/.omp/browser-relay/token`. The token file uses mode `0600`; its parent directory uses mode `0700`. Automatic relay startup uses this token. `coreforge browser-relay --token <secret>` replaces it only after the server binds successfully. After changing it, either set the same extension override, or clear the override, rerun `install`, and reload the extension.
 
 The relay server auto-starts under Coreforge's profile-independent global daemon broker the first time Eval's browser API needs it. Every relay consumer holds a broker lease, so one project exiting cannot interrupt another. The server stops after the last consumer across all projects exits. The extension badge turns **on** when connected. Run `coreforge browser-relay` manually only for `--token`, `--no-group`, or a non-default port. A relay already serving the port is adopted, never replaced.
+
+`app.target` borrows a specific tab by URL/title substring; without it, Coreforge opens its own tab in the background, leaving your selected tab and focus alone, and closes it when the managed tab closes. An older extension selects that tab instead; rerun `coreforge browser-relay install` and reload it. Reopening an open name keeps its tab.
+
+New tabs prefer the browser Coreforge used last on this relay. If that browser disconnects, the relay waits up to 12 seconds for it to reconnect, then may select another connected browser. This does not guarantee the same signed-in account. Confirm the destination before consequential actions.
 
 ## Development
 

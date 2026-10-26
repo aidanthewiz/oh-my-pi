@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Personality } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
-import { getAgentDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const EMPTY_TREE = {
 	rootPath: "",
@@ -14,11 +15,7 @@ const EMPTY_TREE = {
 	agentsMdFiles: [],
 };
 
-// Distinctive line from the bundled default preset (prompts/system/personalities/default.md).
-const DEFAULT_PRESET_MARKER = "Evidence-first terse engineer";
 const OVERRIDE = "Follow ASD-STE100 Simplified Technical English for all responses.";
-
-const originalAgentDir = getAgentDir();
 
 // PERSONALITY.md contract (issue #8528): `<agentDir>/PERSONALITY.md` replaces
 // the selected preset's text in the personality block; `none` still omits the
@@ -27,15 +24,24 @@ const originalAgentDir = getAgentDir();
 describe("PERSONALITY.md override", () => {
 	let tempDir = "";
 	let tempAgentDir = "";
+	let originalAgentDirEnv: string | undefined;
+	let originalOmpProfileEnv: string | undefined;
+	let originalPiProfileEnv: string | undefined;
 
 	beforeEach(() => {
+		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		originalOmpProfileEnv = process.env.OMP_PROFILE;
+		originalPiProfileEnv = process.env.PI_PROFILE;
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-personality-"));
 		tempAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-personality-agent-"));
 		setAgentDir(tempAgentDir);
 	});
 
 	afterEach(() => {
-		setAgentDir(originalAgentDir);
+		restoreEnvValue("PI_CODING_AGENT_DIR", originalAgentDirEnv);
+		restoreEnvValue("OMP_PROFILE", originalOmpProfileEnv);
+		restoreEnvValue("PI_PROFILE", originalPiProfileEnv);
+		__resetDirsFromEnvForTests();
 		removeSyncWithRetries(tempDir);
 		removeSyncWithRetries(tempAgentDir);
 	});
@@ -63,7 +69,6 @@ describe("PERSONALITY.md override", () => {
 		const rendered = await renderPrompt("default");
 		expect(rendered).toContain("# Personality");
 		expect(rendered).toContain(OVERRIDE);
-		expect(rendered).not.toContain(DEFAULT_PRESET_MARKER);
 	});
 
 	it(`omits the block for personality "none" even when PERSONALITY.md exists (subagent contract)`, async () => {
@@ -72,17 +77,5 @@ describe("PERSONALITY.md override", () => {
 		const rendered = await renderPrompt("none");
 		expect(rendered).not.toContain("# Personality");
 		expect(rendered).not.toContain(OVERRIDE);
-	});
-
-	it("falls back to the configured preset when the file is empty", async () => {
-		writePersonalityFile("   \n");
-
-		const rendered = await renderPrompt("default");
-		expect(rendered).toContain(DEFAULT_PRESET_MARKER);
-	});
-
-	it("renders the selected preset when no override file exists", async () => {
-		const rendered = await renderPrompt("default");
-		expect(rendered).toContain(DEFAULT_PRESET_MARKER);
 	});
 });

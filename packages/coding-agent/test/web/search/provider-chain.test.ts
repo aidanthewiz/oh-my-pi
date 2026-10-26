@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgDisabledModels, cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import {
 	resolveModelRoleValue,
 	resolveRoleChain,
@@ -170,7 +171,7 @@ describe("web search transport authorization", () => {
 		}
 	});
 
-	it("keeps an explicitly selected hosted swap on the session provider", async () => {
+	it("keeps hosted swaps on the admitted session provider and refuses later policy denial", async () => {
 		const settings = await Settings.init({ inMemory: true });
 		const authStorage = createInMemoryAuthStorage();
 		storages.add(authStorage);
@@ -204,6 +205,21 @@ describe("web search transport authorization", () => {
 			);
 			expect(result.details.response.sources[0]?.url).toBe("https://example.org/result");
 			expect(attempted).toEqual(["anthropic/claude-sonnet-4-5"]);
+			for (const policy of ["deny", "allowlist"] as const) {
+				cfgDisabledModels.override(settings, policy === "deny" ? ["anthropic/*"] : []);
+				cfgEnabledModels.override(settings, policy === "allowlist" ? ["web/hosted"] : []);
+				const denied = await runSearchQuery(
+					{ query: "example", model: "web/hosted" },
+					{
+						authStorage,
+						modelRegistry,
+						sessionModel: { ...activeModel, webSearchModel: "openai/gpt-6-luna" },
+					},
+				);
+				expect(denied.details.response.sources).toEqual([]);
+				expect(denied.details.error).toBeDefined();
+				expect(attempted).toEqual(["anthropic/claude-sonnet-4-5"]);
+			}
 		} finally {
 			vi.restoreAllMocks();
 			resetSettingsForTest();

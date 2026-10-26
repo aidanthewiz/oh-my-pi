@@ -1,5 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { adaptDesktopSession } from "../native/desktop-adapter.js";
+import { desktopEscapeStops, forgetDesktopEscapeStops } from "../native/desktop.js";
+import * as loaderState from "../native/loader-state.js";
 
 describe("desktop native ABI requirements", () => {
 	it.each([
@@ -41,6 +43,10 @@ describe("desktop native ABI requirements", () => {
 			captureRegion() {}
 			cancel() {}
 			retire() {}
+			setRunDeadline() {}
+			get escapeStops() {
+				throw new Error("Native Escape state requires an instance");
+			}
 			observe() {}
 			listApplications() {}
 			openApplication() {}
@@ -52,6 +58,9 @@ describe("desktop native ABI requirements", () => {
 			releaseControl() {}
 			controlState() {}
 			bringToCurrentSpace() {}
+			axSelectText() {}
+			axType() {}
+			axKeyChord() {}
 			holdDisplayUntilReleased() {}
 			releaseDisplayAwake() {}
 		}
@@ -71,11 +80,16 @@ describe("desktop native ABI requirements", () => {
 				reads++;
 				throw new Error("Native screen state requires an instance");
 			}
+			get escapeStops() {
+				reads++;
+				throw new Error("Native Escape state requires an instance");
+			}
 			click() {}
 			capture() {}
 			captureRegion() {}
 			cancel() {}
 			retire() {}
+			setRunDeadline() {}
 			observe() {}
 			listApplications() {}
 			openApplication() {}
@@ -87,6 +101,9 @@ describe("desktop native ABI requirements", () => {
 			releaseControl() {}
 			controlState() {}
 			bringToCurrentSpace() {}
+			axSelectText() {}
+			axType() {}
+			axKeyChord() {}
 			holdDisplayUntilReleased() {}
 			releaseDisplayAwake() {}
 		}
@@ -95,40 +112,94 @@ describe("desktop native ABI requirements", () => {
 		expect(opened).toBe(false);
 	});
 
-	it.each(["holdDisplayUntilReleased", "releaseDisplayAwake"] as const)(
-		"rejects an addon without %s before opening a native desktop session",
-		method => {
-			let opened = false;
-			class PriorDesktopSession {
-				constructor() {
-					opened = true;
-				}
-				get screenState() {
-					throw new Error("Native screen state requires an instance");
-				}
-				click() {}
-				capture() {}
-				captureRegion() {}
-				cancel() {}
-				retire() {}
-				observe() {}
-				listApplications() {}
-				openApplication() {}
-				menuItems() {}
-				menuSelect() {}
-				holdKeys() {}
-				holdMouse() {}
-				acquireControl() {}
-				releaseControl() {}
-				controlState() {}
-				bringToCurrentSpace() {}
-				holdDisplayUntilReleased() {}
-				releaseDisplayAwake() {}
+	it.each([
+		"holdDisplayUntilReleased",
+		"releaseDisplayAwake",
+		"setRunDeadline",
+		"axSelectText",
+		"axType",
+		"axKeyChord",
+	] as const)("rejects an addon without %s before opening a native desktop session", method => {
+		let opened = false;
+		class PriorDesktopSession {
+			constructor() {
+				opened = true;
 			}
-			Reflect.deleteProperty(PriorDesktopSession.prototype, method);
-			const DesktopSession = adaptDesktopSession(PriorDesktopSession);
-			expect(() => new DesktopSession({ display: "active" })).toThrow(/^Unsupported:/);
-			expect(opened).toBe(false);
-		},
-	);
+			get screenState() {
+				throw new Error("Native screen state requires an instance");
+			}
+			get escapeStops() {
+				throw new Error("Native Escape state requires an instance");
+			}
+			click() {}
+			capture() {}
+			captureRegion() {}
+			cancel() {}
+			retire() {}
+			setRunDeadline() {}
+			observe() {}
+			listApplications() {}
+			openApplication() {}
+			menuItems() {}
+			menuSelect() {}
+			holdKeys() {}
+			holdMouse() {}
+			acquireControl() {}
+			releaseControl() {}
+			controlState() {}
+			bringToCurrentSpace() {}
+			axSelectText() {}
+			axType() {}
+			axKeyChord() {}
+			holdDisplayUntilReleased() {}
+			releaseDisplayAwake() {}
+		}
+		Reflect.deleteProperty(PriorDesktopSession.prototype, method);
+		const DesktopSession = adaptDesktopSession(PriorDesktopSession);
+		expect(() => new DesktopSession({ display: "active" })).toThrow(/^Unsupported:/);
+		expect(opened).toBe(false);
+	});
+	it("rejects an addon built before the Escape stop count", () => {
+		// Every method present, so only the getter can decide; without it the worker reads each run as stopped.
+		const prototype = (escapeStops: boolean) =>
+			new Proxy(
+				{},
+				{
+					get: () => () => {},
+					has: (_target, key) => escapeStops || key !== "escapeStops",
+					getOwnPropertyDescriptor: (_target, key) =>
+						key === "screenState" ? { configurable: true, get: () => undefined } : undefined,
+				},
+			);
+		const Current = { prototype: prototype(true) };
+		expect<unknown>(adaptDesktopSession(Current)).toBe(Current);
+		const Stale = adaptDesktopSession({ prototype: prototype(false) });
+		expect(() => new Stale({ display: "active" })).toThrow(/^Unsupported: .*\(missing escapeStops\)/);
+	});
+});
+
+describe("lazy desktop exports", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("report a stale addon's missing Escape exports with the stale-addon stub", () => {
+		// A workspace addon built before the Escape exports, which the loader tolerates as stale.
+		const missingNativeExport = loaderState.missingNativeExport;
+		const stale = {
+			path: "/w/packages/natives/native/pi_natives.darwin-arm64.node",
+			version: "18.8.7",
+			packageVersion: "18.12.1",
+			stale: true,
+		};
+		vi.spyOn(loaderState, "loadNative").mockReturnValue({});
+		vi.spyOn(loaderState, "missingNativeExport").mockImplementation(name => missingNativeExport(name, stale));
+		for (const [name, call] of [
+			["desktopEscapeStops", () => desktopEscapeStops("k")],
+			["forgetDesktopEscapeStops", () => forgetDesktopEscapeStops("k")],
+		] as const) {
+			expect(call).toThrow(`\`${name}\` is missing`);
+			expect(call).toThrow("bun run build:native");
+		}
+	});
 });

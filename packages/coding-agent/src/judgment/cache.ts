@@ -89,8 +89,9 @@ function questionKey(name: string, question: Question): QuestionKey {
 		name,
 		type: question.type,
 		instruction: question.instructions,
-		// `null`, not SQL NULL: NULLs never collide under UNIQUE, which would let duplicates in.
-		criteria: stableStringifyJson(question.criteria ?? null),
+		// `null`, not SQL NULL: NULLs never collide under UNIQUE, which would let duplicates in. A box
+		// question's `image` stays local (answers are cached as measured on the sent image), so it is no key.
+		criteria: stableStringifyJson(question.type === "box" ? null : (question.criteria ?? null)),
 	};
 }
 
@@ -183,16 +184,17 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 	lookup(model: string, request: JudgmentRequest): CachedAnswers {
 		const state = cacheStateIdentity(request);
 		const stateId = new Bun.CryptoHasher("sha256").update(state).digest("hex");
-		const answers: Record<string, Answer> = {};
+		const answers: Record<string, Answer> = Object.create(null);
 		try {
 			for (const name in request.questions) {
+				if (!Object.hasOwn(request.questions, name)) continue;
 				const key = questionKey(name, request.questions[name]);
 				const row = this.#answer.get(stateId, model, key.name, key.type, key.instruction, key.criteria);
 				if (row) answers[name] = JSON.parse(row.answer);
 			}
 		} catch (error) {
 			logger.warn("judgment cache lookup failed", { error: String(error) });
-			return { stateId, state, answers: {} };
+			return { stateId, state, answers: Object.create(null) };
 		}
 		return { stateId, state, answers };
 	}
@@ -209,6 +211,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 				this.#insertState.run(cached.stateId, cached.state, now);
 				const results: number[] = [];
 				for (const name in questions) {
+					if (!Object.hasOwn(questions, name)) continue;
 					const key = questionKey(name, questions[name]);
 					const row = this.#upsertOracle.get(
 						cached.stateId,

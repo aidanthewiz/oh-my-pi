@@ -5,6 +5,13 @@
 ### Fixed
 
 - Share mnemopi embedding endpoints across profiles while keeping session data and configured cache identities separate.
+
+## [18.12.2] - 2026-10-18
+
+### Added
+
+- Added `readSalvageableRows()` to read the rows of a damaged SQLite table that are still readable, skipping only the damaged pages ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+
 ## [18.12.0] - 2026-10-17
 
 ### Added
@@ -78,6 +85,7 @@
 - Added `hueDistance`, the angular distance between two OKLCH hues
 
 ## [18.8.8] - 2026-10-10
+
 ### Added
 
 - `ptree.exec({ keepStdinOpen: true })` keeps a private input channel open until process completion without reading the user's terminal ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).

@@ -1,7 +1,7 @@
 /**
  * Unified Web Search Tool
  *
- * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
+ * Single tool supporting Anthropic, Perplexity, Exa, Brave, DeepSeek, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
  * providers with provider-specific parameters exposed conditionally.
  */
 
@@ -12,6 +12,7 @@ import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { formatAge, formatCount, prompt, truncate } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../config/model-registry";
 import {
+	isModelEnabledBySettings,
 	type RoleChainCandidate,
 	resolveModelRoleValue,
 	resolveRoleChain,
@@ -182,8 +183,12 @@ async function executeSearch(
 			})()
 		: resolveRoleChain("web", settings, pool);
 	const parsedQuery = parseSearchQuery(params.query);
+	const sessionModel =
+		options.sessionModel && isModelEnabledBySettings(options.sessionModel, settings, modelRegistry)
+			? options.sessionModel
+			: undefined;
 	let expanded = rankXAIProviders(
-		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),
+		candidates.flatMap(candidate => expandHostedCandidate(candidate, sessionModel, pool)),
 		candidate => candidate.model,
 		settings,
 	);

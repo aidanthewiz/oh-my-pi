@@ -571,6 +571,8 @@ interface ManagedBashJobHandle {
 	jobId: string;
 	completion: Promise<ManagedBashJobCompletion>;
 	getLatestText: () => string;
+	/** Notices for this call's results, including one added once the run starts (temporary shell). */
+	notices: readonly string[];
 	/** Hand the call's card to the job: later frames carry `details.async` and the last one settles it. */
 	background: () => void;
 }
@@ -583,6 +585,10 @@ interface BashProgressDetails extends BashToolDetails {
 
 /** Pid probe of a background job with no command in flight. */
 const NO_PIDS = (): readonly number[] => [];
+
+/** Shown when a call overlapped another one (parallel or backgrounded) and could not use the session's shell. */
+const SESSION_SHELL_BUSY_NOTICE =
+	"Ran in a temporary shell while the session shell is busy with another command: session variables and functions were unavailable, and nothing set here persists.";
 
 function normalizeResultOutput(result: BashResult | BashInteractiveResult): string {
 	return result.output || "";
@@ -1177,6 +1183,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		foreground: boolean;
 		/** Approval tier bounding the job's URL filesystem. */
 		approvalTier: ToolTier;
+		/** Session the call started in; its shell, even if the session changes before the job runs. */
+		sessionId: string | undefined;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -1191,6 +1199,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let latestProgressDetails: BashProgressDetails | undefined;
 		let backgrounded = !options.foreground;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
+		const notices = [...(options.notices ?? [])];
 
 		const jobId = manager.register(
 			"bash",
@@ -1217,7 +1226,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const result = await executeBash(options.command, {
 						settings: this.session.settings,
 						cwd: options.commandCwd,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+						// A call that starts in the foreground runs in the session's
+						// persistent shell, like the direct path, so its variables,
+						// functions, and options reach the next call even after it is
+						// backgrounded. A job that starts in the background gets its own
+						// shell, so it never holds the session's.
+						sessionKey: options.foreground ? options.sessionId : `${options.sessionId ?? ""}:async:${jobId}`,
+						isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === options.sessionId,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
 						preflight: options.preflight,
@@ -1233,6 +1248,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						onStart: probe => {
 							pids = probe;
 						},
+						onSessionShellBusy: () => notices.push(SESSION_SHELL_BUSY_NOTICE),
 					}).finally(() => {
 						pids = NO_PIDS;
 					});
@@ -1240,7 +1256,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
-						notices: options.notices ?? [],
+						notices,
 						wallTimeMs,
 					});
 					const finalText = this.#extractTextResult(finalResult);
@@ -1288,6 +1304,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			jobId,
 			completion: completion.promise,
 			getLatestText: () => latestText,
+			notices,
 			background: () => {
 				backgrounded = true;
 			},
@@ -1301,6 +1318,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
+		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const normalizedInput = normalizeBashInput(input);
 		const cached = this.#preparedExecutions.get(input);
 		if (cached) this.#preparedExecutions.delete(input);
@@ -1455,6 +1473,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				foreground: false,
 				approvalTier,
+				sessionId,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1493,6 +1512,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				foreground: !startBackgrounded,
 				approvalTier,
+				sessionId,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
@@ -1526,10 +1546,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			autoBgManager.backgroundJob(job.jobId);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.
+			// `job.notices` also carries the temporary-shell notice once the run started.
 			const notices =
 				waitResult.kind === "steer"
-					? [...pendingNotices, "Backgrounded early to handle an incoming message; the command keeps running."]
-					: pendingNotices;
+					? [...job.notices, "Backgrounded early to handle an incoming message; the command keeps running."]
+					: job.notices;
 			return this.#buildBackgroundStartResult(job.jobId, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices,
@@ -1828,7 +1849,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: await executeBash(command, {
 						settings: this.session.settings,
 						cwd: commandCwd,
-						sessionKey: this.session.getSessionId?.() ?? undefined,
+						sessionKey: sessionId,
+						isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === sessionId,
 						timeout: timeoutMs ?? 0,
 						signal,
 						preflight: prepared.preflight,
@@ -1840,6 +1862,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							? text => onUpdate({ content: [{ type: "text", text }], details: {} })
 							: undefined,
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+						onSessionShellBusy: () => pendingNotices.push(SESSION_SHELL_BUSY_NOTICE),
 					});
 		const wallTimeMs = performance.now() - wallTimeStart;
 		if (result.cancelled) {

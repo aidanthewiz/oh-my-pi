@@ -141,18 +141,6 @@ describe("InteractiveMode.showStatus", () => {
 		}
 	});
 
-	test("labels the Coreforge updater as an external terminal command", () => {
-		const { ctx, helpers } = createInitialRenderHarness();
-
-		helpers.showNewVersionNotification("1.3.1");
-
-		const notification = renderContainer(ctx.chatContainer);
-		expect(notification).toContain("New version 1.3.1 is available.");
-		expect(notification).toContain("terminal command, not a chat command");
-		expect(notification).toContain("Exit Coreforge, then run:");
-		expect(notification).toContain("coreforge update");
-	});
-
 	test("preserves optimistic user signatures when rebuilding transcript state", () => {
 		const ctx = {
 			chatContainer: new Container(),

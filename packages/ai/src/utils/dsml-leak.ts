@@ -1,15 +1,24 @@
 /**
- * Removal of DeepSeek DSML tool-call markup left in visible assistant text.
+ * Removal of DeepSeek tool-call markup left in visible assistant text.
  *
  * DeepSeek models on OpenAI-compatible hosts sometimes emit their tool calls as
- * raw `<｜DSML｜…>` markup in `content`. A well-formed envelope is healed into a
- * structured call by `StreamMarkupHealing`, but a degraded model can drop the
- * opening `<｜DSML｜tool_calls>` / `<｜DSML｜invoke name="…">` tags (or the host
- * runs no healer at all). That markup must not stay in history: replaying it
- * teaches the model to keep writing tool calls as text (issue #10556). Callers
- * strip it before the message is committed and tell the model its call failed.
+ * text in `content`: the V4 `<｜DSML｜…>` envelope or the V3 chat-template
+ * tokens (`<｜tool▁calls▁begin｜>` …). A well-formed call is healed into a
+ * structured call by `StreamMarkupHealing`, but a degraded model can drop
+ * required tags (or the host runs no healer at all). That markup must not stay
+ * in history: replaying it teaches the model to keep writing tool calls as text
+ * (issue #10556). Callers strip it before the message is committed and tell the
+ * model its call failed.
  */
 
+import {
+	DEEPSEEK_TOOL_CALL_BEGIN,
+	DEEPSEEK_TOOL_CALLS_BEGIN,
+	DEEPSEEK_TOOL_CALL_END,
+	DEEPSEEK_TOOL_CALL_TOKENS,
+	DEEPSEEK_TOOL_CALLS_END,
+	findDeepSeekTemplateToken,
+} from "../dialect/deepseek";
 import type { AssistantMessage, Model } from "../types";
 
 // Structural DSML tags in either pipe spelling (fullwidth `｜` U+FF5C or ASCII),
@@ -23,8 +32,15 @@ const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|(?<!`)(`+)(?!`)[^\n]*?\2(
 // broken call, so it goes with the markup.
 const TRAILING_TOOL_NAME_LINE = /(^|\n)[ \t]*[A-Za-z_][\w.-]*[ \t]*\r?\n[ \t]*$/;
 
-function hasCompleteHeader(tag: RegExpExecArray): boolean {
-	const header = tag[0];
+interface MarkupTag {
+	readonly index: number;
+	readonly end: number;
+	readonly kind: string;
+	readonly closing: boolean;
+	readonly complete: boolean;
+}
+
+function hasCompleteHeader(header: string): boolean {
 	if (!header.endsWith(">")) return false;
 	let quote = 0;
 	for (let index = 0; index < header.length; index++) {
@@ -38,9 +54,37 @@ function hasCompleteHeader(tag: RegExpExecArray): boolean {
 /** Only a complete leaf's matching closer identifies its unquoted payload. */
 function stripUnquoted(text: string): string {
 	const quoted = [...text.matchAll(QUOTED_CODE_PATTERN)];
-	const tags: RegExpExecArray[] = [];
-	let quoteIndex = 0;
+	const allTags: MarkupTag[] = [];
 	for (const tag of text.matchAll(DSML_TAG_PATTERN)) {
+		allTags.push({
+			index: tag.index,
+			end: tag.index + tag[0].length,
+			kind: tag[2] === "calls" ? "tool_calls" : tag[2]!,
+			closing: !!tag[1],
+			complete: hasCompleteHeader(tag[0]),
+		});
+	}
+	for (
+		let tag = findDeepSeekTemplateToken(text, DEEPSEEK_TOOL_CALL_TOKENS);
+		tag;
+		tag = findDeepSeekTemplateToken(text, DEEPSEEK_TOOL_CALL_TOKENS, tag.index + tag.raw.length)
+	) {
+		allTags.push({
+			index: tag.index,
+			end: tag.index + tag.raw.length,
+			kind:
+				tag.token === DEEPSEEK_TOOL_CALL_BEGIN || tag.token === DEEPSEEK_TOOL_CALL_END
+					? "template_call"
+					: tag.token === DEEPSEEK_TOOL_CALLS_BEGIN || tag.token === DEEPSEEK_TOOL_CALLS_END
+						? "template_calls"
+						: "template_separator",
+			closing: tag.token === DEEPSEEK_TOOL_CALL_END || tag.token === DEEPSEEK_TOOL_CALLS_END,
+			complete: true,
+		});
+	}
+	const tags: MarkupTag[] = [];
+	let quoteIndex = 0;
+	for (const tag of allTags.sort((a, b) => a.index - b.index)) {
 		while (quoteIndex < quoted.length && quoted[quoteIndex]!.index + quoted[quoteIndex]![0].length <= tag.index) {
 			quoteIndex++;
 		}
@@ -54,23 +98,33 @@ function stripUnquoted(text: string): string {
 	let parameterizedInvoke: number | undefined;
 	for (let index = 0; index < tags.length; index++) {
 		const tag = tags[index]!;
-		const kind = tag[2] === "calls" ? "tool_calls" : tag[2]!;
+		const kind = tag.kind;
+		if (kind.startsWith("template_")) {
+			const opener = open.get("template_call");
+			if (tag.closing && opener !== undefined) {
+				ends.set(opener, tag.end);
+				open.delete("template_call");
+			}
+			if (!tag.closing && kind === "template_call") open.set(kind, index);
+			if (!tag.closing && kind === "template_calls") open.delete("template_call");
+			continue;
+		}
 		if (kind === "parameter") parameterizedInvoke = open.get("invoke");
 		for (const [name, opener] of open) {
 			if (name !== kind && kind !== "tool_calls" && !(kind === "invoke" && name === "parameter")) continue;
 			if (
-				tag[1] &&
+				tag.closing &&
 				name === kind &&
 				kind !== "tool_calls" &&
 				opener !== parameterizedInvoke &&
-				hasCompleteHeader(tags[opener]!) &&
-				hasCompleteHeader(tag)
+				tags[opener]!.complete &&
+				tag.complete
 			) {
-				ends.set(opener, tag.index + tag[0].length);
+				ends.set(opener, tag.end);
 			}
 			open.delete(name);
 		}
-		if (!tag[1]) open.set(kind, index);
+		if (!tag.closing) open.set(kind, index);
 	}
 
 	const parts: string[] = [];
@@ -80,10 +134,10 @@ function stripUnquoted(text: string): string {
 		if (tag.index < cursor) continue;
 		let start = tag.index;
 		const nameLine =
-			!tag[1] && tag[2] === "parameter" ? TRAILING_TOOL_NAME_LINE.exec(text.slice(cursor, start)) : null;
+			!tag.closing && tag.kind === "parameter" ? TRAILING_TOOL_NAME_LINE.exec(text.slice(cursor, start)) : null;
 		if (nameLine) start = cursor + nameLine.index + nameLine[1]!.length;
 		parts.push(text.slice(cursor, start).trim());
-		cursor = ends.get(index) ?? tag.index + tag[0].length;
+		cursor = ends.get(index) ?? tag.end;
 	}
 	parts.push(text.slice(cursor).trim());
 	return parts.filter(part => part.length > 0).join("\n\n");
@@ -92,8 +146,8 @@ function stripUnquoted(text: string): string {
 /**
  * Whether DSML leak recovery applies to `model`: a DeepSeek-class model, or one
  * explicitly configured with the `dsml` stream healer (e.g. a `models.yml` entry
- * whose id the classifier cannot place). Other models never write DSML tool
- * calls, so DSML text from them is prose and is left alone.
+ * whose id the classifier cannot place). Other models never write DeepSeek tool
+ * calls, so such markup from them is prose and is left alone.
  */
 export function isDsmlLeakRecoveryTarget(model: Model): boolean {
 	if (model.identity?.class === "deepseek") return true;
@@ -104,11 +158,12 @@ export function isDsmlLeakRecoveryTarget(model: Model): boolean {
 }
 
 /**
- * Strip leaked DSML tool-call markup from `text`, leaving quoted code intact.
- * Returns `undefined` when `text` carries no such markup.
+ * Strip leaked DeepSeek tool-call markup (DSML or chat-template tokens) from
+ * `text`, leaving quoted code intact. Returns `undefined` when `text` carries
+ * no such markup.
  */
 export function stripDsmlToolMarkup(text: string): string | undefined {
-	if (!text.includes("DSML")) return undefined;
+	if (!text.includes("DSML") && !text.includes("｜")) return undefined;
 	const stripped = stripUnquoted(text);
 	return stripped !== text ? stripped : undefined;
 }

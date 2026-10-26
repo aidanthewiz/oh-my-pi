@@ -201,7 +201,7 @@ class Engine {
 		}
 		try {
 			const page = db.query<{ id: number; prompt: string }, [number, number]>(
-				"SELECT id, prompt FROM history WHERE id > ? ORDER BY id LIMIT ?",
+				"SELECT id, prompt FROM history WHERE id > ? AND typeof(prompt) = 'text' ORDER BY id LIMIT ?",
 			);
 			for (;;) {
 				const rows = page.all(this.cursor, INGEST_BATCH);
