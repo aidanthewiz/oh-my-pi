@@ -654,7 +654,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		// enables search. There we collapse every option to its label and show
 		// only the highlighted option's description, so the whole menu stays
 		// visible on short terminals instead of collapsing to a single entry.
-		const compact = this.#isSearchEnabled(renderWidth, mdTheme);
+		const compact = this.#optionsOverflow(renderWidth, mdTheme);
 		const { startIndex, endIndex } =
 			total === 0
 				? { startIndex: 0, endIndex: 0 }
@@ -711,7 +711,7 @@ export class HookSelectorComponent extends OverlayPanel {
 			rows.push({ text: theme.fg("dim", "  No matching options"), highlight: false });
 		}
 
-		if (startIndex > 0 || endIndex < total || this.#shouldRenderSearchStatus(renderWidth, mdTheme)) {
+		if (startIndex > 0 || endIndex < total || this.#isSearchEnabled(renderWidth, mdTheme)) {
 			rows.push({ text: this.#renderStatusLine(total), highlight: false });
 		}
 		if (this.#outlinedList) {
@@ -760,12 +760,12 @@ export class HookSelectorComponent extends OverlayPanel {
 		slider.onChange?.(next);
 	}
 
-	#isSearchEnabled(renderWidth = this.#lastRenderWidth, mdTheme?: MarkdownTheme): boolean {
+	#optionsOverflow(renderWidth = this.#lastRenderWidth, mdTheme?: MarkdownTheme): boolean {
 		return this.#totalOptionRows(this.#options, renderWidth, mdTheme) > this.#maxVisible;
 	}
 
-	#shouldRenderSearchStatus(renderWidth = this.#lastRenderWidth, mdTheme?: MarkdownTheme): boolean {
-		return this.#isSearchEnabled(renderWidth, mdTheme) || this.#menu.query.length > 0;
+	#isSearchEnabled(renderWidth = this.#lastRenderWidth, mdTheme?: MarkdownTheme): boolean {
+		return this.#menu.query.length > 0 || this.#optionsOverflow(renderWidth, mdTheme);
 	}
 
 	#renderStatusLine(total: number): string {
@@ -919,7 +919,7 @@ export class HookSelectorComponent extends OverlayPanel {
 			size: "md",
 			layout: "rows",
 			preview: "none",
-			...pickerQuery(this.#isSearchEnabled() || query.length > 0 ? this.#search : null),
+			...pickerQuery(this.#isSearchEnabled() ? this.#search : null),
 			items: this.#pickerItems,
 			...(query.length > 0 ? { order: items.map(filtered => String(filtered.index)) } : {}),
 			selected: selected ?? null,

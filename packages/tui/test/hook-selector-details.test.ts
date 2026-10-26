@@ -127,6 +127,57 @@ function context(cols: number, scroll = true): DescribeContext {
 }
 
 describe("selector detail viewport", () => {
+	it("keeps a no-match filter editable after terminal growth so Deny remains reachable", () => {
+		const h = fixture(80, 7, "Choose\nDetails");
+		try {
+			h.selector.render(80);
+			h.selector.handleInput("zz");
+			h.selector.render(80);
+			h.terminal.resize(80, 24);
+			h.selector.render(80);
+			h.selector.handleInput("\x7f");
+			h.selector.handleInput("\x7f");
+			h.selector.handleInput("\n");
+			expect(h.picked).toEqual(["Deny"]);
+			expect(h.cancellations()).toBe(0);
+		} finally {
+			h.selector.dispose();
+		}
+	});
+
+	it.each(["j", "k", "h", "l"])("keeps %s as search text instead of navigation after terminal growth", key => {
+		const terminal = new VirtualTerminal(80, 7);
+		const picked: string[] = [];
+		const changes: number[] = [];
+		const selector = new HookSelectorComponent(
+			"Choose\nDetails",
+			["Deny", "Grant j", "Grant k", "Grant h", "Grant l"],
+			value => picked.push(value),
+			() => {},
+			{
+				tui: new TUI(terminal),
+				slider: {
+					segments: [{ label: "Low" }, { label: "Middle" }, { label: "High" }],
+					index: 1,
+					onChange: index => changes.push(index),
+				},
+			},
+		);
+		try {
+			selector.render(80);
+			selector.handleInput("Grant ");
+			selector.render(80);
+			terminal.resize(80, 24);
+			selector.render(80);
+			selector.handleInput(key);
+			selector.handleInput("\n");
+			expect(picked).toEqual([`Grant ${key}`]);
+			expect(changes).toEqual([]);
+		} finally {
+			selector.dispose();
+		}
+	});
+
 	it("pages every approval detail in the real composer above lower widgets and the status footer without consent", () => {
 		const h = composedFixture(28, 8);
 		try {
