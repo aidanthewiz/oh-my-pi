@@ -5,6 +5,7 @@ import type { AssistantMessage, ImageContent, Model, Usage, UsageReport } from "
 import type { Component, Container, EditorTheme, KeyId, Loader, TUI } from "@oh-my-pi/pi-tui";
 import type { TspText } from "@oh-my-pi/pi-wire";
 import type { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
+import type { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import type { CollabController } from "../collab/controller";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
@@ -119,6 +120,7 @@ export interface AgentHubOpenOptions {
 export interface InteractiveModeContext {
 	// UI access
 	ui: TUI;
+	readonly composer: Composer;
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;

@@ -21,7 +21,6 @@ import {
 	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
-	truncateForPrompt,
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
@@ -178,8 +177,7 @@ function approvalData(value: string): string {
 	const sanitized = sanitizeText(value)
 		.replace(/[\r\n\t]+/g, " ")
 		.trim();
-	const truncated = truncateForPrompt(sanitized, 500);
-	return truncated.replace(/([\\`*_{}[\]()<>#+\-.!|])/g, "\\$1");
+	return sanitized.replace(/([\\`*_{}[\]()<>#+\-.!|])/g, "\\$1");
 }
 
 function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
@@ -459,31 +457,27 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 								: "";
 						const choice = await uiContext.select(
-							`${runtimeApproval.prompt}${safetySuffix}`,
+							`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
 							sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
 							{ tuiStyle: runtimeApproval.tuiStyle },
 						);
 						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 						approved = choice === "Approve once" || approveSession;
-					} else if (sessionApproval) {
+					} else if (sessionApproval || pendingSafetyChecks.length > 0) {
+						// Provider safety details have no transcript preview and must remain fully readable.
+						const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+						const safetyPrompt =
+							pendingSafetyChecks.length > 0
+								? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+								: basePrompt;
 						const choice = await uiContext.select(
-							formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason),
-							["Approve", "Deny", sessionApproval.label],
+							safetyPrompt,
+							sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
 						);
-						approveSession = choice === sessionApproval.label;
+						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 						approved = choice === "Approve" || approveSession;
 					} else {
-						const safetyAppendix =
-							pendingSafetyChecks.length > 0
-								? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)]
-								: [];
-						approved = await requestApproval(
-							uiContext,
-							this.tool,
-							resolvedArgs,
-							approvalCheck.reason,
-							safetyAppendix,
-						);
+						approved = await requestApproval(uiContext, this.tool, resolvedArgs, approvalCheck.reason);
 					}
 					signal?.throwIfAborted();
 				} catch (err) {
