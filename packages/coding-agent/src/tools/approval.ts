@@ -190,7 +190,8 @@ function normalizeDecision(value: unknown): Omit<ResolvedApproval, "policy"> & {
 	return { tier: "exec", override: false };
 }
 
-function getToolDecision(
+/** Evaluate the tool's declaration without discarding its policy, reason, or override. */
+export function resolveToolDecision(
 	tool: ApprovalSubject,
 	args: unknown,
 ): Omit<ResolvedApproval, "policy"> & { policy?: ApprovalPolicy } {
@@ -202,12 +203,10 @@ function getToolDecision(
 /**
  * Evaluate a tool's own approval declaration against `args` and return the
  * resulting capability tier, defaulting to `exec` when the tool omits an
- * approval. Unlike reading `tool.approval` directly, this runs function-valued
- * approvals — the write tool's `xd://` gate uses it to take a mounted device's
- * argument-dependent tier instead of falling back to `exec`.
+ * approval. Callers that also enforce policy must use {@link resolveToolDecision}.
  */
 export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
-	return getToolDecision(tool, args).tier;
+	return resolveToolDecision(tool, args).tier;
 }
 
 function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
@@ -236,7 +235,7 @@ export function resolveApproval(
 	mode: ApprovalMode,
 	userConfig: Record<string, unknown> = {},
 ): ResolvedApproval {
-	const decision = getToolDecision(tool, args);
+	const decision = resolveToolDecision(tool, args);
 	const policyKey = decision.policyKey ?? tool.name;
 	const userPolicy = Object.hasOwn(userConfig, policyKey) ? normalizePolicy(userConfig[policyKey]) : undefined;
 	const fallbackPolicy =

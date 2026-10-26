@@ -31,6 +31,9 @@
 - Include the protocol version in launch-client cancellation envelopes.
 - Retain reserved worker reply allocations until their owning promises settle.
 - Reject unconfirmed browser click delivery after transport failure or page closure. Retire delivery listeners and handles when acquisition or verification is cancelled, including watches returned after cancellation.
+- Keep complete selected permissions, AWS commands, identity, and safety details readable above status lines and lower hook widgets after resizing.
+- Keep complete provider safety checks readable in approval dialogs even when tool activity is visible.
+- Avoid repeat AWS permission prompts in eval and nested device batches after granting session access.
 - Force physical APFS copies during session compression; cloned files otherwise retain uncompressed storage.
 - Discard delayed archive renders after a model or session change, or once disposal begins; preserve the current reader's live history.
 - Restrict extension plan-review actions to the collaboration host and refuse plans that become blank before presentation.

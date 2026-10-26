@@ -206,6 +206,17 @@ function rowTargetCandidates(target: Component): ((local: number) => string[]) |
 	};
 }
 
+interface BelowRootRows {
+	lines: string[];
+	spans: ViewportClickSpan[];
+}
+
+interface BelowLayout {
+	roots: readonly Component[];
+	width: number;
+	rendered: (BelowRootRows | undefined)[];
+}
+
 /**
  * Canonical interactive composer, usable before session/settings exist and updatable in place.
  * It owns the terminal, welcome header, and editor; InteractiveMode later supplies authoritative
@@ -311,6 +322,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#idleChromeTimer: RenderTimer | undefined;
 	/** Rows the chrome below each below-transcript root took in the last frame (see {@link rowsBelow}). */
 	#rowsBelow = new Map<Component, number>();
+	#belowLayout: BelowLayout | undefined;
 	#lastInterruptAt = 0;
 	/** Last described surface; its arrays are reused while their children are unchanged. */
 	#nativeSurface: NativeSurface = { main: [], dock: [] };
@@ -384,10 +396,19 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	}
 	/**
 	 * Rows the below-transcript chrome under `root` (editor, status line, …)
-	 * took in the last frame, so a root that grows upward can cap itself to
-	 * the screen rows left above them; `undefined` before `root` was laid out.
+	 * takes at the current frame width, measured on demand during layout.
+	 * Outside layout, returns the last measurement; undefined before mounting.
 	 */
 	rowsBelow(root: Component): number | undefined {
+		const layout = this.#belowLayout;
+		const index = layout?.roots.indexOf(root) ?? -1;
+		if (layout && index >= 0) {
+			let rows = 0;
+			for (let next = index + 1; next < layout.roots.length; next++) {
+				rows += this.#renderBelowAt(layout, next).lines.length;
+			}
+			return rows;
+		}
 		return this.#rowsBelow.get(root);
 	}
 
@@ -407,30 +428,17 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
 			this.#lastClickSpans = [];
-			const viewport: string[] = [];
-			for (const root of roots) {
-				const rendered = root.render(width);
-				if (!this.#runtimeMounted && root === this.editor) this.#recordBootstrapEditorRows(rendered.length);
-				viewport.push(...rendered);
-			}
-			return { viewport: viewport.slice(-rows) };
+			return { viewport: this.#renderBelowRoots(roots, width).lines.slice(-rows) };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
 		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
 		const afterRoots = roots.slice(transcriptIndex + 1);
-		const after: string[] = [];
-		const afterSpans: ViewportClickSpan[] = [];
-		const ends: { root: Component; end: number }[] = [];
-		let transientRows = 0;
-		let selfClearingRows = 0;
-		for (const root of afterRoots) {
-			const start = after.length;
-			this.#renderBelowRoot(root, width, after, afterSpans);
-			if (this.#selfClearingChrome.has(root)) selfClearingRows += after.length - start;
-			else if (this.#transientChrome.has(root)) transientRows += after.length - start;
-			ends.push({ root, end: after.length });
-		}
-		this.#rowsBelow = new Map(ends.map(({ root, end }) => [root, after.length - end]));
+		const {
+			lines: after,
+			spans: afterSpans,
+			transientRows,
+			selfClearingRows,
+		} = this.#renderBelowRoots(afterRoots, width);
 		const transientFloor = this.#syncTransientFloor(transientRows);
 		// Eligible chrome excludes user-driven transient rows above their resting height and every
 		// self-clearing row; contraction, floor and rebaseline all use it.
@@ -556,6 +564,51 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			this.#nativeSurface = { main: nextMain, dock: nextDock };
 		}
 		return this.#nativeSurface;
+	}
+
+	#renderBelowAt(layout: BelowLayout, index: number): BelowRootRows {
+		const cached = layout.rendered[index];
+		if (cached) return cached;
+		const rendered: BelowRootRows = { lines: [], spans: [] };
+		this.#renderBelowRoot(layout.roots[index]!, layout.width, rendered.lines, rendered.spans);
+		if (!this.#runtimeMounted && layout.roots[index] === this.editor) {
+			this.#recordBootstrapEditorRows(rendered.lines.length);
+		}
+		layout.rendered[index] = rendered;
+		return rendered;
+	}
+
+	#renderBelowRoots(
+		roots: readonly Component[],
+		width: number,
+	): BelowRootRows & { transientRows: number; selfClearingRows: number } {
+		const layout: BelowLayout = { roots, width, rendered: [] };
+		const result = { lines: [] as string[], spans: [] as ViewportClickSpan[], transientRows: 0, selfClearingRows: 0 };
+		this.#belowLayout = layout;
+		try {
+			for (let index = 0; index < roots.length; index++) {
+				const rendered = this.#renderBelowAt(layout, index);
+				const offset = result.lines.length;
+				result.lines.push(...rendered.lines);
+				const root = roots[index]!;
+				if (this.#selfClearingChrome.has(root)) result.selfClearingRows += rendered.lines.length;
+				else if (this.#transientChrome.has(root)) result.transientRows += rendered.lines.length;
+				for (const span of rendered.spans) {
+					span.start += offset;
+					span.end += offset;
+					result.spans.push(span);
+				}
+			}
+			this.#rowsBelow.clear();
+			let below = 0;
+			for (let index = roots.length - 1; index >= 0; index--) {
+				this.#rowsBelow.set(roots[index]!, below);
+				below += layout.rendered[index]!.lines.length;
+			}
+			return result;
+		} finally {
+			this.#belowLayout = undefined;
+		}
 	}
 
 	/**
@@ -904,9 +957,9 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#renderResizeTail(width: number, rows: number): string[] {
 		const roots = [...this.#runtimeChildren, this.#statusHost];
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
-		if (transcriptIndex < 0) return this.#renderRoots(roots, width);
+		if (transcriptIndex < 0) return this.#renderBelowRoots(roots, width).lines;
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
-		const after = this.#renderRoots(roots.slice(transcriptIndex + 1), width);
+		const after = this.#renderBelowRoots(roots.slice(transcriptIndex + 1), width).lines;
 		const transcriptRows = transcript.renderTail(width, Math.max(0, rows - after.length));
 		const pre =
 			transcriptRows.length + after.length >= rows ? [] : this.#renderRoots(roots.slice(0, transcriptIndex), width);

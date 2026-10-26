@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Keep active selector searches editable after terminal growth without interpreting typed letters as navigation.
+- Keep complete selected permissions readable on short terminals while preserving detail paging and lower status rows.
+- Keep long selector details scrollable above status lines and lower hook widgets, including the first composed frame and terminal resizes.
 - Deliver Git raster and SVG previews through captured image blobs. Unsupported binary and media previews retain their existing fact and ANSI fallbacks.
 - Preserve quoted code and authored whitespace when resolving native Markdown links across quote and list containers.
 - Preserve session-relative native table links across escaped pipes and normalized cells.

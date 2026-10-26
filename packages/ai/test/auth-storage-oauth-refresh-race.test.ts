@@ -9,9 +9,13 @@ import {
 	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { removeWithRetries } from "../../utils/src/temp";
+import { mapCredentials, postTokenRequest } from "../src/registry/engine/common";
 import { defaultRankingStrategy } from "../src/usage/registry";
 import { withEnv } from "./helpers";
 
@@ -24,6 +28,24 @@ const SUPPRESS_ANTHROPIC_ENV = {
 	CLAUDE_CODE_USE_FOUNDRY: undefined,
 	FOUNDRY_BASE_URL: undefined,
 } as const;
+
+function mockAnthropicRefreshTransport(
+	fetchImpl: FetchImpl = async () => Response.json({ error: "invalid_grant" }, { status: 400 }),
+) {
+	const refresh = authPolicyFor("anthropic")?.refresh;
+	if (refresh?.kind !== "request") throw new Error("expected Anthropic token refresh request");
+	return vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (provider, credentials, signal) => {
+		if (provider !== "anthropic") throw new Error(`unexpected OAuth refresh provider: ${provider}`);
+		const { body } = await postTokenRequest(
+			refresh.token,
+			{ grant_type: "refresh_token", refresh_token: credentials.refresh },
+			{},
+			{ provider, fetch: fetchImpl, signal },
+			"token-refresh",
+		);
+		return mapCredentials(refresh.credential, body, provider, credentials);
+	});
+}
 
 describe("AuthStorage OAuth refresh race", () => {
 	let tempDir = "";
@@ -83,16 +105,7 @@ describe("AuthStorage OAuth refresh race", () => {
 			expires: Date.now() + 60 * 60_000,
 		});
 
-		// Mock mirrors Anthropic: only the stale refresh token is rejected, because
-		// real rotation invalidates the previous refresh token on use.
-		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
-			if (credential.refresh === "stale-refresh") {
-				throw new Error(
-					'HTTP 400 invalid_grant {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
-				);
-			}
-			return credential;
-		});
+		mockAnthropicRefreshTransport();
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			const apiKey = await authStorage!.keys.get("anthropic", "session-race");
@@ -130,27 +143,14 @@ describe("AuthStorage OAuth refresh race", () => {
 		expect(storedBefore).toHaveLength(1);
 		const credentialId = storedBefore[0]!.id;
 
-		// Refresh genuinely fails — the pre-check that compares the persisted
-		// refresh token to our snapshot will therefore see the SAME stale token
-		// and fall through to the disable. We then race a peer rotation into the
-		// window between the pre-check and the CAS, which the CAS must detect.
-		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
-			if (credential.refresh === "stale-refresh") {
-				throw new Error(
-					'HTTP 400 invalid_grant {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
-				);
-			}
-			return credential;
-		});
+		const refreshSpy = mockAnthropicRefreshTransport();
 
 		const sharedStore = store;
 		const originalTryDisable = sharedStore.tryDisableAuthCredentialIfMatches.bind(sharedStore);
 		const tryDisableSpy = vi
 			.spyOn(sharedStore, "tryDisableAuthCredentialIfMatches")
 			.mockImplementation((id, expectedData, disabledCause, lease) => {
-				// Simulate the peer's successful rotation landing in the window
-				// between the pre-check (which saw the stale token) and the CAS
-				// disable. The CAS predicate `data = expectedData` must now miss.
+				// Rotate after refresh rejection, immediately before the fenced disable CAS.
 				sharedStore.updateAuthCredential(id, {
 					type: "oauth",
 					access: "fresh-access-from-peer",
@@ -166,7 +166,8 @@ describe("AuthStorage OAuth refresh race", () => {
 			// CAS lost → reload → pick up the peer-rotated credential.
 			expect(apiKey).toBe("fresh-access-from-peer");
 			expect(events).toHaveLength(0);
-			expect(tryDisableSpy).toHaveBeenCalled();
+			expect(tryDisableSpy).toHaveBeenCalledTimes(1);
+			expect(refreshSpy).toHaveBeenCalledTimes(1);
 
 			// Row must still be active, with the peer's rotated tokens.
 			const stored = sharedStore.listAuthCredentials("anthropic");
@@ -194,9 +195,8 @@ describe("AuthStorage OAuth refresh race", () => {
 			},
 		]);
 
-		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
-			throw new Error('invalid_grant {"error":"invalid_grant"}');
-		});
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+		mockAnthropicRefreshTransport();
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			const apiKey = await authStorage!.keys.get("anthropic", "session-real-failure");
@@ -204,10 +204,50 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(apiKey).toBeUndefined();
 			expect(events).toHaveLength(1);
 			expect(events[0]?.disabledCause).toContain("invalid_grant");
+			expect(events[0]?.credentialId).toBe(credentialId);
 			expect(authStorage!.credentials.has("anthropic")).toBe(false);
 			expect(store!.listAuthCredentials("anthropic")).toEqual([]);
+			expect(await store!.listDisabledCredentials?.("anthropic")).toEqual([
+				expect.objectContaining({ id: credentialId, provider: "anthropic", cause: events[0]!.disabledCause }),
+			]);
 		});
 	});
+
+	test.each([
+		{
+			failure: "transport failure",
+			fetchImpl: async () => {
+				throw new TypeError("fetch failed: ECONNRESET");
+			},
+		},
+		{
+			failure: "temporary provider outage",
+			fetchImpl: async () => Response.json({ error: "temporarily_unavailable" }, { status: 503 }),
+		},
+	])("keeps the durable credential active after $failure", async ({ fetchImpl }) => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const credential = {
+			type: "oauth" as const,
+			access: "expired-access",
+			refresh: "still-valid-refresh",
+			expires: Date.now() - 60_000,
+		};
+		await authStorage.credentials.set("anthropic", [credential]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+		mockAnthropicRefreshTransport(fetchImpl);
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			await expect(
+				authStorage!.keys.getWithCredential("anthropic", "session-transient-failure"),
+			).rejects.toBeInstanceOf(AIError.OAuthRefreshUnavailableError);
+			expect(events).toEqual([]);
+			expect(store!.listAuthCredentials("anthropic")).toEqual([
+				expect.objectContaining({ id: credentialId, credential, disabledCause: null }),
+			]);
+			expect(await store!.listDisabledCredentials?.("anthropic")).toEqual([]);
+		});
+	});
+
 	test("persists every credential refreshed during candidate preflight", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 
