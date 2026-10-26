@@ -32,7 +32,7 @@ Drive browser tabs from JavaScript or Python Eval with the global `browser` obje
 - JavaScript `await tab.run(fnOrCode, { args?, timeout? })` runs a function or code string. Functions receive `{ tab, page, browser, wait, assert }`; cell closures are not captured. Plain data, functions, and `RegExp` values are supported in `args`.
 - Python `await tab.run(code, timeout=…)` accepts a JavaScript code string only. Direct Python helpers use the same method names; keyword arguments become a trailing JavaScript options object.
 - `tab.run` executes in an isolated JavaScript tab runtime with backend-specific `page`/`browser` objects, ordinary Eval helpers, and full Bun/Node + tool-bridge access. It is not sandboxed.
-- Direct helpers and `tab.run` return real structured values. Nonempty inner `display` text prints in the outer Eval cell; screenshots surface as Eval images.
+- Direct helpers and `tab.run` return real structured values. Nonempty text printed inside `tab.run` prints in the outer Eval cell; screenshots surface as Eval images.
 - Selectors accept CSS plus Puppeteer `aria/…`, `text/…`, `xpath/…`, `pierce/…`, `label/…`, `placeholder/…`, `testid/…`, `alt/…`, `title/…`, and `role/<role>[name="…"]` query handlers; append ` exact` inside the role name filter for exact matching.
 - Navigation and re-renders invalidate observed ids and refs. Re-observe, then act in the same cell. Use `pushState(url)` for SPA navigation without a document load.
 - Use `tab.select` for `<select>` elements; `tab.fill` does not support them.
@@ -53,7 +53,7 @@ Application modes:
 - Tern tabs: input is trusted native mouse/keyboard events at element centres; `tab.evaluate` runs in the page world. Console, `requests`, `route`, and HAR cover the page's `fetch`/XHR plus navigation responses only (no images/scripts/styles; `route` accepts only `resourceType` `fetch`/`xhr`); request bodies exist only for the current document. Frames inside CSS-scaled/rotated elements cannot be driven. `emulate` supports viewport/device, userAgent, colorScheme, credentials, geolocation, locale, offline (JS-visible); timezone, headers, any reducedMotion, CPU and network throttling throw. Clipboard helpers use the system clipboard. `pdf` supports only `path`. `a11y`, `webmcp*` cover the main frame; `loadState` restores storage for the current origin only. `traceStart`/`traceStop`/`profileStart`/`profileStop` are unsupported; raw `page`/`browser` in `tab.run` are a Puppeteer-like subset (`goto`, `evaluate`, `content`, `$`, `$$`, `locator`, waits, `screenshot`, `keyboard`, `mouse`, `cookies`).
 - Closing releases the managed tab. It never closes relay/CDP-attached pages or adopted Tern blocks. `kill: true` terminates only applications spawned by this process, never reused browser processes.
 - Coreforge-owned headless Chromium tabs auto-freeze at turn settle (animated pages stop burning CPU/GPU) and unfreeze on next use. These tabs and Tern PiPs idle past the idle-close timeout are closed. Pass `persist: true` on `open` to keep either live across turns (e.g. multi-step login); `browser.close` still releases explicitly.
- </instruction>
+  </instruction>
 
 <examples>
 ```javascript
@@ -71,6 +71,7 @@ await tab.id(observed["elements"][0]["id"]).click()
 title = await tab.run("return await tab.title();", timeout=30)
 await tab.close()
 ```
+
 </examples>
 
 <critical>

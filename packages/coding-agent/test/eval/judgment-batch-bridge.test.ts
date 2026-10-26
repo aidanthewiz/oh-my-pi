@@ -705,7 +705,7 @@ async function runPythonJudgeBatchInSubprocess(tempDir: TempDir): Promise<Python
 		"    unknown_image_error = str(error)",
 		"else:",
 		'    raise AssertionError("unknown image key was accepted")',
-		'display({"boundary": [2**53 - 1, -(2**53 - 1)], "nested": {"large": (2**53, -(2**53), 10**40), "flag": True}})',
+		'print({"boundary": [2**53 - 1, -(2**53 - 1)], "nested": {"large": (2**53, -(2**53), 10**40), "flag": True}})',
 		`print(${JSON.stringify(PYTHON_BATCH_REPORT)} + json.dumps({"id": b.id, "total": b.total, "items": [[k, i.ok, i.answers or i.error] for k, i in items], "single": single, "image_items": image_results, "unknown_image_error": unknown_image_error}))`,
 	].join("\n");
 	const cellTwo = [
@@ -800,14 +800,17 @@ describe("judge_batch() Python prelude", () => {
 			});
 			expect(String(one.id)).toMatch(/^jdgb-/);
 			expect(two).toEqual({ rest: [], status: 2, results: ["a", "b"] });
-			expect(result.displayOutputs).toContainEqual({
-				type: "json",
-				data: {
-					boundary: [9007199254740991, -9007199254740991],
-					nested: {
-						large: ["9007199254740992", "-9007199254740992", "10000000000000000000000000000000000000000"],
-						flag: true,
-					},
+			const precision = result.displayOutputs.find(output => output.type === "view" && output.view.kind === "json");
+			if (precision?.type !== "view" || precision.view.kind !== "json") throw new Error("Expected precision view");
+			expect(result.output).toContain(precision.text);
+			expect(precision.text).toContain("9007199254740992");
+			expect(precision.text).toContain("-9007199254740992");
+			expect(precision.text).toContain("10000000000000000000000000000000000000000");
+			expect(precision.view.value).toEqual({
+				boundary: [9007199254740991, -9007199254740991],
+				nested: {
+					large: ["9007199254740992", "-9007199254740992", "10000000000000000000000000000000000000000"],
+					flag: true,
 				},
 			});
 			expect(one.image_items).toEqual({

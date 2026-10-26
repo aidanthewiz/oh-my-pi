@@ -176,6 +176,44 @@ describe("SessionAnonymizer", () => {
 		expect(at(result, "message", "details")).toEqual({ wallTimeNoticeEmitted: false });
 	});
 
+	test("keeps historical eval display metadata opaque without trusting embedded tool shapes", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = anonymizer.entry({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "eval",
+				details: {
+					jsonOutputs: [
+						{
+							"/home/alice/acme/private.ts": 123456789,
+							name: "grep",
+							arguments: { status: "customer-acme", path: "/home/alice/acme/private.ts" },
+						},
+					],
+					cells: [
+						{
+							index: 0,
+							output: "display[1]: customer-acme",
+							textOutput: "customer-acme",
+							status: "complete",
+						},
+					],
+				},
+			},
+		});
+		const details = at(result, "message", "details");
+		const opaqueKey = anonymizer.placeholder("jsonOutputs");
+		expect(at(details, opaqueKey)).toMatch(/^\[redacted #\d+: \d+ chars, 1 line\]$/);
+		expect(at(details, "cells", 0, "output")).toMatch(/^\[redacted #\d+:/);
+		const serialized = JSON.stringify(result);
+		for (const secret of ["alice", "acme", "123456789", "private.ts"]) {
+			expect(serialized).not.toContain(secret);
+		}
+		expect(serialized).not.toContain('"name":"grep"');
+		expect(serialized).not.toContain('"status":"customer-acme"');
+	});
+
 	test("rewrites shell commands keeping programs, flags, and operators", () => {
 		const anonymizer = new SessionAnonymizer();
 		const out = anonymizer.command(
@@ -219,14 +257,26 @@ describe("SessionAnonymizer", () => {
 					role: "toolResult",
 					toolName: "eval",
 					details: {
-						jsonOutputs: {
-							"/home/alice/acme/x.ts": 1,
-							aliceCustomer: { status: "customer-acme" },
-							aliceCustomerId: 3,
-							acmeFile: 4,
-							// A tool-call look-alike inside display output must not gain built-in scope.
-							forged: { name: "grep", arguments: { status: "customer-acme" } },
-						},
+						cells: [
+							{
+								views: [
+									{
+										text: "aliceCustomer",
+										view: {
+											kind: "json",
+											value: {
+												"/home/alice/acme/x.ts": 1,
+												aliceCustomer: { status: "customer-acme" },
+												aliceCustomerId: 3,
+												acmeFile: 4,
+												// A tool-call look-alike inside printed output must not gain built-in scope.
+												forged: { name: "grep", arguments: { status: "customer-acme" } },
+											},
+										},
+									},
+								],
+							},
+						],
 					},
 				},
 			}),
@@ -266,7 +316,7 @@ describe("SessionAnonymizer", () => {
 		expect(json).toContain('"op":"start"');
 		expect(json).not.toContain('"status"');
 		expect(json).toMatch(/"arguments":"\[redacted #\d+: \d+ chars, 1 line\]"/);
-		expect(json).toMatch(/"jsonOutputs":"\[redacted #\d+/);
+		expect(json).toMatch(/"views":"\[redacted #\d+/);
 		expect(json).toMatch(/"data":"\[redacted #\d+/);
 		expect(json).toMatch(/"preserveData":"\[redacted #\d+/);
 		// A dotted task name and its agent:// URI share one token index.

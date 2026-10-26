@@ -735,17 +735,16 @@ for (const mode of ["cell", "invocation"]) {
 	const barrier = waitForMessage(message => message.type === "result" && message.runId === barrierId);
 	send({ type: "run", runId: barrierId, snapshot, filename: "[barrier].js", code: "undefined;" });
 	await barrier;
-	const premature = outbound.some(message => message.runId === runId &&
-		(message.type === "result" || (message.type === "display" && message.output.type === "json")));
+	const premature = outbound.some(message => message.runId === runId && message.type === "result");
 	send({ type: "tool-reply", id: call.id, reply: { ok: false, error: { message: "delayed host failure" } } });
 	const result = await completed;
 	outcomes.push({
 		mode, premature, ok: result.ok, error: result.error?.message,
-		successDisplay: outbound.some(message => message.runId === runId &&
-			message.type === "display" && message.output.type === "json"),
+		successEnvelope: outbound.some(message => message.runId === runId &&
+			message.type === "result" && "value" in message),
 	});
 }
-await finish(outcomes, outcomes.every(result => !result.premature && !result.ok && !result.successDisplay));
+await finish(outcomes, outcomes.every(result => !result.premature && !result.ok && !result.successEnvelope));
 `);
 		expect(output).toEqual(
 			["cell", "invocation"].map(mode => ({
@@ -753,7 +752,7 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 				premature: false,
 				ok: false,
 				error: "Unhandled rejection (missing await?): delayed host failure",
-				successDisplay: false,
+				successEnvelope: false,
 			})),
 		);
 		expect(exitCode).toBe(0);
@@ -778,7 +777,7 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 				runId: "chain",
 				snapshot,
 				filename: "[chain].js",
-				code: 'void tool.first({}).then(() => tool.second({})).catch(() => display("recovered"));',
+				code: 'void tool.first({}).then(() => tool.second({})).catch(() => print("recovered"));',
 			});
 			const first = await firstCall;
 			if (first.type !== "tool-call") throw new Error("expected first tool call");
@@ -806,7 +805,7 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 		}
 	});
 
-	it("fails a tool invocation with a floated read rejection before displaying success", async () => {
+	it("fails a tool invocation with a floated read rejection before publishing success", async () => {
 		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
 const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");
 send({
@@ -827,25 +826,29 @@ for (const name of ["floatedRead", "caughtRead", "awaitedRead", "failedRead"]) {
 const result = {
 	floatedFailed: results.floatedRead.ok === false &&
 		results.floatedRead.error?.message.includes("Unhandled rejection (missing await?)"),
-	floatedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "floatedRead"),
-	caughtValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "caughtRead")?.output.data.value,
-	awaitedValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "awaitedRead")?.output.data.value,
+	floatedHasValue: "value" in results.floatedRead,
+	caughtValue: results.caughtRead.value?.value,
+	awaitedValue: results.awaitedRead.value?.value,
+	caughtEnvelopeOk: results.caughtRead.value?.ok === true,
+	awaitedEnvelopeOk: results.awaitedRead.value?.ok === true,
 	caughtOk: results.caughtRead.ok,
 	awaitedOk: results.awaitedRead.ok,
 	failedOk: results.failedRead.ok,
-	failedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "failedRead"),
+	failedHasValue: "value" in results.failedRead,
 };
-await finish(result, result.floatedFailed && !result.floatedDisplayed && result.caughtOk && result.awaitedOk && !result.failedOk && !result.failedDisplayed);
+await finish(result, result.floatedFailed && !result.floatedHasValue && result.caughtOk && result.awaitedOk && result.caughtEnvelopeOk && result.awaitedEnvelopeOk && !result.failedOk && !result.failedHasValue);
 `);
 		expect(output).toEqual({
 			floatedFailed: true,
-			floatedDisplayed: false,
+			floatedHasValue: false,
 			caughtValue: "caught",
 			awaitedValue: "awaited",
+			caughtEnvelopeOk: true,
+			awaitedEnvelopeOk: true,
 			caughtOk: true,
 			awaitedOk: true,
 			failedOk: false,
-			failedDisplayed: false,
+			failedHasValue: false,
 		});
 		expect(exitCode).toBe(0);
 		expect(stderr).not.toContain("[Unhandled Rejection]");

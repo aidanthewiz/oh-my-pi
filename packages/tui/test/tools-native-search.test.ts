@@ -41,7 +41,7 @@ function plain(text: TspText | undefined): string {
 	return typeof text === "string" ? text : (text ?? []).map(s => s.t).join("");
 }
 
-function codeProps(children: readonly NativeChild[] | undefined): { start?: number; text?: string; lang?: string }[] {
+function codeProps(children: readonly NativeChild[] | undefined): { start?: number; text?: string }[] {
 	return collect(children, n => n.k === "code").flatMap(n => (n.k === "code" && n.p ? [n.p] : []));
 }
 
@@ -96,9 +96,9 @@ describe("grep native view", () => {
 		);
 		const body = (view.body ?? []).filter(isNode);
 		expect(body.map(role)).toEqual(["omp.tool.search.file"]);
-		expect(codeProps(body[0]!.c).map(p => ({ start: p.start, text: p.text, lang: p.lang }))).toEqual([
-			{ start: 9, text: "ctx\nhit", lang: "typescript" },
-			{ start: 40, text: "far", lang: "typescript" },
+		expect(codeProps(body[0]!.c).map(p => ({ start: p.start, text: p.text }))).toEqual([
+			{ start: 9, text: "ctx\nhit" },
+			{ start: 40, text: "far" },
 		]);
 		expect(codeStarts(body[0]!.c)).toEqual([9, 40]);
 	});
@@ -115,7 +115,7 @@ describe("grep native view", () => {
 		);
 		const files = collect(view.body, n => role(n) === "omp.tool.search.file");
 		expect(files.map(n => n.key)).toEqual(["f:src/a.ts"]);
-		expect(codeProps(files[0]!.c).map(p => [p.start, p.text, p.lang])).toEqual([[7, "match", "typescript"]]);
+		expect(codeProps(files[0]!.c).map(p => [p.start, p.text])).toEqual([[7, "match"]]);
 	});
 });
 

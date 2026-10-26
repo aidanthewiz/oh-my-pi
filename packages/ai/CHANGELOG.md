@@ -42,6 +42,13 @@
 - Preserved lease-owned account restrictions alongside durable credential admission, and kept branded callback errors inert during OAuth completion.
 - Kept official fallback-credit payloads off Factory routes and isolated Droid capture credentials without overriding account entitlements.
 - Preserve effective-endpoint fallback replay restrictions while collapsing incompatible Anthropic reasoning chains. Keep quoted prose during doubled-pipe DSML cleanup.
+
+## [18.12.1] - 2026-10-17
+
+### Fixed
+
+- Fixed every request failing behind a TLS-inspecting proxy that refuses compressed uploads: a 400/403/415 whose body is not JSON, or the Anthropic API's "request body is not valid JSON" after a proxy drops `Content-Encoding`, now resends the body uncompressed and stops compressing for that host ([#16108](https://github.com/can1357/oh-my-pi/pull/16108) by [@alphastorm](https://github.com/alphastorm))
+
 ## [18.12.0] - 2026-10-17
 
 ### Breaking Changes
@@ -1837,6 +1844,7 @@
 - Fixed an issue in the Responses API where empty tool results were incorrectly serialized with a "(see attached image)" placeholder, causing models to look for non-existent attachments.
 - Fixed OpenAI Responses server non-streaming envelopes to always include the required "incomplete_details" field, using null for completed responses.
 - Preserved Cloud Code Assist tool schemas when mixed-type unions carry branch-local validation descriptions.
+
 ### Added
 
 - Added the `openai-aws` provider (**OpenAI on AWS**, Amazon Bedrock's `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint). Reuses the standard `openai-responses` transport; the provider branch rewrites the endpoint region from `AWS_REGION`/`AWS_DEFAULT_REGION` and authenticates with either an Amazon Bedrock API key (`OPENAI_AWS_API_KEY`, or the AWS-documented `AWS_BEARER_TOKEN_BEDROCK`) sent as an `Authorization: Bearer` token (IAM action `bedrock-mantle:CallWithBearerToken`), or AWS SigV4 request signing (service `bedrock-mantle`) through the standard credential chain — the same dual-auth shape as `anthropic-aws`. On 401/403 the cached chain credentials are invalidated so rotated keys re-resolve without a restart. `OPENAI_API_KEY` is never read: the first-party key cannot authenticate against Bedrock and must not advertise availability. Every `openai-aws` request carries an explicit `store: false` and stateful `previous_response_id` chaining stays off — Bedrock-Mantle retains stored responses for 30 days, and this provider is used under a zero-retention policy (guaranteed only when the account's `data_retention_mode` is `none`).
@@ -2058,6 +2066,7 @@
 - Fixed certificate verification errors for custom gateways behind private CA bundles by ensuring NODE_EXTRA_CA_CERTS is respected across all provider fetches.
 - Fixed Claude Fable demoted-thinking replay to use markdown-italic assistant prose instead of <thinking> tags, preventing context issues after model switches.
 - Fixed OpenAI Responses replay errors (400 Bad Request) caused by missing reasoning items during history replay.
+
 ### Added
 
 - Added transport support for the `anthropic-aws` provider (**Claude Platform on AWS**, `aws-external-anthropic.{region}.api.aws`). Injects the required `anthropic-workspace-id` header (`ANTHROPIC_AWS_WORKSPACE_ID`) and rewrites the endpoint region from `AWS_REGION`/`AWS_DEFAULT_REGION`. Dual auth: an `ANTHROPIC_AWS_API_KEY` sent as an `Authorization: Bearer` token (authorized by the `aws-external-anthropic:CallWithBearerToken` IAM action), or AWS SigV4 request signing (service `aws-external-anthropic`, using the standard credential provider chain) when no key is set. Pins data residency per request via `ANTHROPIC_AWS_INFERENCE_GEO` (`us`/`global`) on models that support it (Opus 4.6 / Sonnet 4.6 and later).
@@ -2393,25 +2402,4 @@
 
 - Removed the `partial-json` dependency; streaming JSON parsing now uses the in-house `RelaxedJson` parser.
 
-## [16.1.9] - 2026-06-21
-
-### Added
-
-- Added `llama.cpp` to the interactive `/login` provider list, accepting an optional API key while defaulting to local no-auth mode.
-
-### Changed
-
-- Optimized generated AI tool schemas by collapsing verbose `anyOf` unions into standard `enum` types
-
-### Fixed
-
-- Fixed tool-call argument validation dropping nested keys that were accidentally double-encoded
-- Fixed the `moonshot` provider being locked to the international Kimi host (`api.moonshot.ai`): OpenAI-completions requests now honor a `MOONSHOT_BASE_URL` override so users can reach the Kimi China platform (`api.moonshot.cn`), which rejects keys issued for the international endpoint. ([#2883](https://github.com/can1357/oh-my-pi/issues/2883))
-- Fixed tool-call argument validation dropping fields whose object keys were accidentally JSON-encoded a second time (e.g. `{ "\"op\"": "done" }`), which surfaced as spurious missing-required errors. A schema-agnostic pre-validation pass now recursively unwraps such double-encoded keys — through arrays and nested objects, and again after a JSON-string container is parsed — before the unrecognized-key repair can delete them.
-
-### Removed
-
-- Removed the `setNextRequestDebugPath`, `clearNextRequestDebugPath`, and `getNextRequestDebugPath` utility functions for request debugging, as request/response recording now relies exclusively on the `PI_REQ_DEBUG` environment variable.
-- Removed Wafer Pass (`wafer-pass`) login support; Wafer Serverless remains available as `wafer-serverless`.
-
-Older entries are archived in [packages/ai/CHANGELOG.md@50ec66f75d57](https://github.com/can1357/oh-my-pi/blob/50ec66f75d57ad55838a9fe4da5e66f29af4d73c/packages/ai/CHANGELOG.md).
+Older entries are archived in [packages/ai/CHANGELOG.md@bb602d67c9b6](https://github.com/can1357/oh-my-pi/blob/bb602d67c9b685535bbf8ef1a1cc9de3c944ede4/packages/ai/CHANGELOG.md).

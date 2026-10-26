@@ -399,7 +399,7 @@ export class WorkerCore {
 				cwd: snapshot.cwd,
 				localRoots: snapshot.localRoots ?? {},
 			});
-			runtime.displayValue(value, hooks);
+			runtime.echo(value, hooks);
 			result = { type: "result", runId, ok: true };
 		} catch (error) {
 			result = { type: "result", runId, ok: false, error: errorPayload(error) };
@@ -471,16 +471,13 @@ export class WorkerCore {
 				}
 				envelope = { ok: true, value: cloneable };
 			}
-			result = { type: "result", runId: msg.runId, ok: true };
+			result = { type: "result", runId: msg.runId, ok: true, value: envelope };
 		} catch (error) {
 			result = { type: "result", runId: msg.runId, ok: false, error: errorPayload(error) };
 		}
 		try {
 			await this.#drainTools(active);
 			result = foldFloatingRejections(active, result, hooks);
-			if (result.ok && envelope) {
-				this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
-			}
 		} finally {
 			this.#runs.delete(msg.runId);
 			this.#rememberCell(msg.runId, active.filename);

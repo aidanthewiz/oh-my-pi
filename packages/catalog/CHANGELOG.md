@@ -18,6 +18,13 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+
+## [18.12.1] - 2026-10-17
+
+### Fixed
+
+- Anthropic's `request-encoding-rejection` now also matches the API's "request body is not valid JSON" 400, which a gzip body gets when a proxy drops its `Content-Encoding` header ([#16108](https://github.com/can1357/oh-my-pi/pull/16108) by [@alphastorm](https://github.com/alphastorm))
+
 ## [18.12.0] - 2026-10-17
 
 ### Added
@@ -1413,6 +1420,7 @@
 
 - Fixed parsing of SAP AI Core Claude model IDs in version-first format (e.g., anthropic--claude-4.8-opus), restoring adaptive thinking metadata and capability gates.
 - Fixed GitHub Copilot Business and Enterprise model discovery to correctly preserve vision capabilities instead of downgrading models to text-only.
+
 ### Added
 
 - Added `openai-aws` as a first-class provider for **OpenAI on AWS** — OpenAI models served by Amazon Bedrock through the `bedrock-mantle.{region}.api.aws` OpenAI-compatible Responses endpoint. Frontier entries (`openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`, `openai.gpt-5.6-luna`) are cloned from the first-party `openai` specs at generation time (capabilities/thinking stay in sync) with AWS Bedrock pricing and the Bedrock-served 272K context window; the open-weight `openai.gpt-oss-120b` / `openai.gpt-oss-20b` are curated statics. Every entry uses the shared `/v1` surface and must be Mantle-available, Responses-compatible, and permit `data_retention_mode: none` in the account's Models API metadata; GPT-5.5 and GPT-5.4 fail the retention requirement and are deliberately absent. First-party promotion targets are dropped so a Mantle model never promotes to a direct OpenAI endpoint; cross-provider overflow escalation is configured in org policy (models overlay), not the bundle.
@@ -1592,6 +1600,7 @@
 - Fixed CoreWeave Serverless Inference project-header detection to ensure blank OpenAI-Project overrides do not block the `COREWEAVE_PROJECT` fallback.
 - Fixed LiteLLM MiniMax M3 discovery to remove reseller-only display suffixes and invalidated the model cache to clear stale suffixes immediately.
 - Fixed ZenMux's `anthropic-messages` proxy being misclassified as a non-signing reasoning endpoint (`replayUnsignedThinking: true`), matching the GitHub Copilot fix (#2851). ZenMux's `zenmux.ai/api/anthropic` route forwards to signature-enforcing Anthropic, so replaying a stripped/unsigned historical `thinking` block as `signature: ""` — most visibly an end_turn-bound checkpoint/branch-return turn whose signature the transform must strip — caused `400 messages.1.content.0: Invalid signature in thinking` on Claude Sonnet 5 and other reasoning models. ([#4192](https://github.com/can1357/oh-my-pi/issues/4192))
+
 ### Added
 
 - Added `anthropic-aws` as a first-class provider for **Claude Platform on AWS** — Anthropic's first-party Messages API served through AWS (`aws-external-anthropic.{region}.api.aws`), distinct from Amazon Bedrock (Anthropic operates the stack; AWS provides auth + Marketplace billing). Uses the same `/v1` surface, model IDs, and capabilities as the first-party Claude API (extended/adaptive thinking, prompt caching, tool use incl. the web-search server tool, batch, PDF, vision, 1M context). Dual auth mirrors the `AnthropicAWS` SDK: an API key via `ANTHROPIC_AWS_API_KEY` (sent as an `Authorization: Bearer` token, authorized by the `aws-external-anthropic:CallWithBearerToken` IAM action), or the AWS SigV4 credential chain (service `aws-external-anthropic`) when no key is set. Reads `ANTHROPIC_AWS_WORKSPACE_ID` (required `anthropic-workspace-id` header) and `AWS_REGION`/`AWS_DEFAULT_REGION` (endpoint region). First-party-only billing features not offered by the platform (priority service tier, fast mode) remain gated to the `anthropic` provider.

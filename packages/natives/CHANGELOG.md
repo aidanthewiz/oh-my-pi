@@ -26,6 +26,13 @@
 - Preserve original process identities when later shell runs cancel retained background jobs. Keep current-run PID attribution separate.
 - Prune completed shell process references at command completion instead of retaining handles until another command runs.
 - Backport Cranelift's full-width SSA index representation for GHSA-897f-g5gm-fmxm without disabling on-demand grammars or upgrading Wasmtime.
+
+## [18.12.1] - 2026-10-17
+
+### Fixed
+
+- Fixed native memory growing without bound, and eventually crashing the process, when files in a downloaded (WASM) grammar language such as C# were parsed repeatedly ([#16067](https://github.com/can1357/oh-my-pi/issues/16067))
+
 ## [18.12.0] - 2026-10-17
 
 ### Breaking Changes

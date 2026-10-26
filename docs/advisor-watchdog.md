@@ -35,10 +35,10 @@ Example:
 
 ```yaml
 modelRoles:
-  advisor: anthropic/claude-sonnet-4-5:medium
+   advisor: anthropic/claude-sonnet-4-5:medium
 
 advisor:
-  enabled: true
+   enabled: true
 ```
 
 Model selectors use normal role/model resolution, including provider-prefixed ids, canonical ids, fallback lists, and optional thinking suffixes.
@@ -53,13 +53,13 @@ When the advisor's model fails (outage, rate limit, unreachable endpoint), the a
 
 ```yaml
 modelRoles:
-  advisor: openai/gpt-5.5:medium
+   advisor: openai/gpt-5.5:medium
 
 retry:
-  fallbackChains:
-    advisor:
-      - anthropic/claude-sonnet-4-5:medium
-      - google-vertex/gemini-3-pro
+   fallbackChains:
+      advisor:
+         - anthropic/claude-sonnet-4-5:medium
+         - google-vertex/gemini-3-pro
 ```
 
 This follows the same rules as the primary's fallback: `retry.enabled` and `retry.modelFallback` must be on, candidates still cooling down, without credentials, or incompatible with native advisor history are skipped, and `retry.fallbackRevertPolicy: cooldown-expiry` returns the advisor to its primary model once the cooldown ends. Credential rotation is attempted before switching models. Short usage-limit blocks can instead be waited out within `retry.maxDelayMs` and the retry budget; longer/exhausted blocks pause the advisor.
@@ -98,15 +98,15 @@ While a primary prompt is running, eligible advisor notes can steer that run. Af
 
 Slash commands:
 
-| Command              | Effect                                                                                                                               |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `/advisor`           | Toggle the advisor subsystem for this session (session-scoped override; does not change persisted `advisor.enabled`).                |
-| `/advisor on`        | Enable the configured/default advisor runtimes for this session. Session-scoped; not persisted to config.                            |
-| `/advisor off`       | Disable the advisor subsystem for this session and stop its runtimes. Session-scoped; not persisted to config.                       |
-| `/advisor status`    | Show each advisor's runtime state, model, context usage, token usage, and cost.                                                      |
+| Command              | Effect                                                                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `/advisor`           | Toggle the advisor subsystem for this session (session-scoped override; does not change persisted `advisor.enabled`).                 |
+| `/advisor on`        | Enable the configured/default advisor runtimes for this session. Session-scoped; not persisted to config.                             |
+| `/advisor off`       | Disable the advisor subsystem for this session and stop its runtimes. Session-scoped; not persisted to config.                        |
+| `/advisor status`    | Show each advisor's runtime state, model, context usage, token usage, and cost.                                                       |
 | `/advisor dump`      | In the TUI, copy the compact transcript (all active advisors when a roster is present) to the clipboard; other hosts return the text. |
-| `/advisor dump raw`  | Copy/return the full dump, including system prompt, tools, thinking, and calls.                                                      |
-| `/advisor configure` | Open the interactive TUI editor for project- or user-level `WATCHDOG.yml`. Non-TUI command hosts report that the editor is TUI-only. |
+| `/advisor dump raw`  | Copy/return the full dump, including system prompt, tools, thinking, and calls.                                                       |
+| `/advisor configure` | Open the interactive TUI editor for project- or user-level `WATCHDOG.yml`. Non-TUI command hosts report that the editor is TUI-only.  |
 
 If the subsystem is enabled but no legacy/default or roster model resolves, status reports the configured advisors as inactive/`no_model`.
 
@@ -148,11 +148,11 @@ Advisor tools are built against the isolated advisor `ToolSession` and wrapped w
 
 The `advise` tool accepts one note and an optional severity:
 
-| Severity        | Delivery                                                                                                                                                             | Intended use                                                                 |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| omitted / `nit` | Non-interrupting aside, batched into the primary transcript at the next turn boundary.                                                                               | Cleanup, simplification, low-risk edge cases.                                |
-| `concern`       | Interrupting steering when delivery constraints permit it. After a terminal answer, only an `agent-end` reviewer may request continuation; a turn reviewer leaves a visible card. | Material risk, likely wrong direction, missing constraint, hallucinated API. |
-| `blocker`       | Interrupting steering message when the delivery constraints below permit it. Unlike a `concern`, a terminal answer alone does not prevent it from triggering a turn. | Continuing would clearly waste work or produce broken output.                |
+| Severity        | Delivery                                                                                                                                                                                                                 | Intended use                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| omitted / `nit` | Non-interrupting aside, batched into the primary transcript at the next turn boundary. After a terminal answer it leaves a visible card unless `advisor.continueSeverity` is `nit`.                                      | Cleanup, simplification, low-risk edge cases.                                |
+| `concern`       | Interrupting steering when delivery constraints permit it. After a terminal answer it requests a continuation at the default `advisor.continueSeverity`; set the threshold to `blocker` to leave a visible card instead. | Material risk, likely wrong direction, missing constraint, hallucinated API. |
+| `blocker`       | Interrupting steering message when the delivery constraints below permit it. A terminal answer never prevents it from triggering a turn.                                                                                 | Continuing would clearly waste work or produce broken output.                |
 
 Accepted notes are rendered into the primary transcript as XML-escaped `<advisory>` elements. Named roster advisors add an `advisor` attribute:
 
@@ -168,15 +168,15 @@ A normal yield the agent drove itself is treated differently from a deliberate i
 
 - **While the loop is still streaming**, blockers can steer into the live turn. Nits and concerns from an in-progress review remain deferred until a final boundary.
 - **Once the loop has yielded and gone idle**, delivery keys on how the turn ended:
-  - If the primary's tail is a **terminal text answer with no queued work**, a late turn-mode `concern` is preserved as a visible card rather than waking the agent to restate a completed turn (#4840). A `blocker`, or a concern from an `agent-end` reviewer, can request a continuation instead. All stop, cooldown, plan-mode, and client constraints still apply.
-  - Otherwise (the agent yielded mid-work, no terminal answer), an idle `concern`/`blocker` normally triggers a fresh turn so the advice is acted on immediately.
+   - If the primary's tail is a **terminal text answer with no queued work**, `advisor.continueSeverity` (default `concern`) decides: a note at or above it requests one continuation; a note below it is preserved as a visible card at the end of the transcript rather than waking the agent to restate a completed turn (#4840), and reaches the agent with your next message. All stop, cooldown, plan-mode, and client constraints still apply; a continuation they block is preserved as a card.
+   - Otherwise (the agent yielded mid-work, no terminal answer), an idle `concern`/`blocker` normally triggers a fresh turn so the advice is acted on immediately.
 
 Session/client constraints can preserve a note whose normal delivery path is steering:
 
 - **Plan mode:** every would-be advisor steer is preserved as a visible card, even while the primary loop is streaming, because only user-driven turns converge on ask/resolve.
 - **ACP with deferred agent-initiated turns:** when `deferAgentInitiatedTurns` is enabled and the bridge has not allowed agent-initiated turns, an idle would-be steer is preserved because the client cannot represent the triggered turn as busy. Advice raised while the primary loop is already streaming can still steer into that live turn.
 
-So the advisor can steer and resume a run the agent ended on its own **while it is running or yielded mid-work and the current mode/client permits steering**. When steering is blocked instead, the note is either preserved as a card (the terminal-answer, plan-mode, and deferred-ACP cases above) or, for a concern, downgraded to a non-interrupting aside during the `advisor.immuneTurns` cooldown; either way it waits for the next turn boundary or resume rather than waking the agent.
+So the advisor can steer and resume a run the agent ended on its own **while it is running or yielded mid-work and the current mode/client permits steering**. When steering is blocked instead, the note is either preserved as a card (the terminal-answer, plan-mode, and deferred-ACP cases above) or, for a concern while the agent is running or yielded mid-work, downgraded to a non-interrupting aside during the `advisor.immuneTurns` cooldown; either way it waits for the next turn boundary or resume rather than waking the agent.
 
 `advisor.immuneTurns` limits concern interruption frequency independently of review cadence. After the advisor successfully delivers a `concern` or `blocker` through the steering channel, later concerns are routed as non-interrupting asides until the configured number of primary turns has completed. Tool-loop continuations count toward that cooldown even for an `agent-end` reviewer. The default is `3`. Blockers are exempt from this cooldown, but still obey preservation constraints such as deliberate interrupts and plan mode. `nit` notes are unchanged.
 
@@ -224,18 +224,18 @@ Practical interpretation:
 
 `strict` with an `agent-end` advisor provides synchronous final review: the primary reaches its final boundary, the advisor reviews the accumulated run, then the primary can finish. Notes delivered at that boundary merge into one message, ordered newest turn first, then severity (`blocker` → `concern` → `nit`). Notes about earlier turns carry a `turns_ago` attribute and a dim `T-N` transcript marker between severity and advisor name. The first merged delivery, then at most once every 50 primary turns, includes guidance that findings may be outdated or wrong and may be ignored.
 
-A batch containing a blocker or an `agent-end` concern can request at most one permitted continuation, even when several advisors report findings together. Stop/abort suppression, concern cooldown, plan-mode policy, and client preservation constraints apply to both buffered and live delivery. Otherwise the notes remain visible without restarting the primary. A continuation an advisor delivery starts does not schedule another review or advance cadence; its updates are captured and sent with the next review, without feeding advisor notes back into them.
+A batch containing a note at or above `advisor.continueSeverity` can request at most one permitted continuation, even when several advisors report findings together. Stop/abort suppression, concern cooldown, plan-mode policy, and client preservation constraints apply to both buffered and live delivery. Otherwise the notes remain visible without restarting the primary. A continuation an advisor delivery starts does not schedule another review or advance cadence; its updates are captured and sent with the next review, without feeding advisor notes back into them.
 
 Keep turn reviews asynchronous while waiting for final reviews:
 
 ```yaml
 advisors:
-  - name: Turn reviewer
-    reviewMode: turn
-    syncBacklog: off
-  - name: Final reviewer
-    reviewMode: agent-end
-    syncBacklog: strict
+   - name: Turn reviewer
+     reviewMode: turn
+     syncBacklog: off
+   - name: Final reviewer
+     reviewMode: agent-end
+     syncBacklog: strict
 ```
 
 Advisor failures do not permanently stall the primary. The host first attempts its credential/fallback recovery. Retriable failures are attempted up to three times before that backlog is dropped; three dropped-backlog cycles halt the runtime until an explicit reset, and a permanent request rejection can halt it after one cycle. A quota/usage-limit failure that cannot recover through credential rotation, model fallback, or a bounded cooldown wait pauses the advisor with its batch retained until `/advisor` rebuilds it, configuration is reloaded, a new session starts, or the process restarts. The primary's catch-up waiters (`advisor.syncBacklog`) are released as soon as an advisor is failing; only the headless shutdown drain waits through recovery.
@@ -329,33 +329,33 @@ Example:
 
 ```yaml
 instructions: |
-  Everyone: prefer diffs that keep tests unified.
+   Everyone: prefer diffs that keep tests unified.
 
 advisors:
-  - name: Architecture
-    enabled: true
-    model: anthropic/claude-sonnet-4-5:medium
-    tools: [read, grep, glob]
-    instructions: |
-      Watch cross-module coupling and public-API growth.
+   - name: Architecture
+     enabled: true
+     model: anthropic/claude-sonnet-4-5:medium
+     tools: [read, grep, glob]
+     instructions: |
+        Watch cross-module coupling and public-API growth.
 
-  - name: Fixer
-    enabled: false
-    model: anthropic/claude-sonnet-4-5:high
-    tools: [read, grep, glob, edit, bash]
-    instructions: |
-      You may edit and run tests to prove a fix locally, then advise.
+   - name: Fixer
+     enabled: false
+     model: anthropic/claude-sonnet-4-5:high
+     tools: [read, grep, glob, edit, bash]
+     instructions: |
+        You may edit and run tests to prove a fix locally, then advise.
 ```
 
 For a final-yield reviewer that runs every third completed primary turn:
 
 ```yaml
 advisors:
-  - name: Final reviewer
-    reviewMode: agent-end
-    reviewInterval: 3
-    instructions: |
-      Review the complete turn. Stay silent unless concrete evidence shows a material problem.
+   - name: Final reviewer
+     reviewMode: agent-end
+     reviewInterval: 3
+     instructions: |
+        Review the complete turn. Stay silent unless concrete evidence shows a material problem.
 ```
 
 Fields:
