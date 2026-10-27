@@ -30,6 +30,12 @@
 - Preserve original process identities when later shell runs cancel retained background jobs. Keep current-run PID attribution separate.
 - Prune completed shell process references at command completion instead of retaining handles until another command runs.
 - Backport Cranelift's full-width SSA index representation for GHSA-897f-g5gm-fmxm without disabling on-demand grammars or upgrading Wasmtime.
+## [18.12.5] - 2026-10-21
+
+### Fixed
+
+- Fixed a macOS background action leaving its target in front of your app after you clicked another of your windows, when placing the click took longer than the click itself ([#16217](https://github.com/can1357/oh-my-pi/pull/16217))
+
 ## [18.12.4] - 2026-10-20
 
 ### Changed

@@ -362,6 +362,61 @@ export function applyOpenAIServiceTier(
 	params.service_tier = serviceTier;
 }
 
+export function resolveOpenAIResponsesPromptCacheOptions(
+	model: Model,
+	options: Pick<StreamOptions, "cacheRetention" | "promptCache"> | undefined,
+): NonNullable<ResponseCreateParamsStreaming["prompt_cache_options"]> | undefined {
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") return undefined;
+	const promptCache = options?.promptCache;
+	const compat = model.compat;
+	if (!compat || !("supportsPromptCacheBreakpoints" in compat) || !compat.supportsPromptCacheBreakpoints) {
+		if (promptCache?.mode === "explicit") {
+			throw new AIError.ConfigurationError(
+				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
+			);
+		}
+		return undefined;
+	}
+	const ttl = promptCache?.ttl ?? (cacheRetention === "long" ? "12h" : undefined);
+	if (!promptCache && ttl === undefined) return undefined;
+	return { mode: promptCache?.mode ?? "implicit", ttl: ttl ?? compat.promptCacheBreakpointTtl };
+}
+
+function withOpenAI12hCacheWriteRate<T extends Model["cost"]>(cost: T): T {
+	return {
+		...cost,
+		cacheWrite: cost.input * 2.5,
+		...(cost.longContext ? { longContext: { ...cost.longContext, cacheWrite: cost.longContext.input * 2.5 } } : {}),
+	};
+}
+
+export function resolveOpenAIResponsesAccountingModel<TApi extends Api>(
+	model: Model<TApi>,
+	params: Pick<ResponseCreateParamsStreaming, "prompt_cache_options">,
+): Model<TApi> {
+	const compat = model.compat;
+	if (
+		model.api !== "openai-responses" ||
+		model.provider !== "openai" ||
+		!compat ||
+		!("officialEndpoint" in compat) ||
+		!compat.officialEndpoint ||
+		!("supportsPromptCacheBreakpoints" in compat) ||
+		!compat.supportsPromptCacheBreakpoints ||
+		params.prompt_cache_options?.ttl !== "12h"
+	)
+		return model;
+	const cost = withOpenAI12hCacheWriteRate(model.cost);
+	if (cost.timeBased?.effectiveRates) {
+		cost.timeBased = {
+			...cost.timeBased,
+			effectiveRates: cost.timeBased.effectiveRates.map(withOpenAI12hCacheWriteRate),
+		};
+	}
+	return { ...model, cost };
+}
+
 /**
  * Standard OpenAI Responses service-tier cost multipliers. The non-Codex
  * Responses path bills the tier it was served (or requested): Flex processing is

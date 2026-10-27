@@ -112,6 +112,8 @@ import {
 	resolveOpenAICompatPolicy,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
+	resolveOpenAIResponsesAccountingModel,
+	resolveOpenAIResponsesPromptCacheOptions,
 	resolveOpenAIResponsesOutputClamp,
 	resolveReasoningSummaryOption,
 	shouldDropAutoToolChoiceForReasoning,
@@ -824,6 +826,7 @@ const streamOpenAIResponsesOnce = (
 			let pendingReasoningEffortFallback: { key: string; fallback: OpenAIReasoningEffortFallback } | undefined;
 			let activeReasoningEffortFallbackKey: string | undefined;
 			let activeRequestParams: OpenAIResponsesSamplingParams | undefined;
+			let accountingModel = model;
 			const applyReasoningEffortFallbackForRequest = (requestParams: OpenAIResponsesSamplingParams): string => {
 				const fallbackKey = createOpenAIReasoningEffortFallbackKey(
 					"responses",
@@ -887,6 +890,7 @@ const streamOpenAIResponsesOnce = (
 					typeof requestParams.model === "string" ? requestParams.model : model.id,
 				);
 				activeRequestParams = requestParams;
+				accountingModel = resolveOpenAIResponsesAccountingModel(model, requestParams);
 				lastSubmittedRequestWasFullReplay = requestParams.previous_response_id === undefined;
 				let requestTimeout: NodeJS.Timeout | undefined;
 				if (requestTimeoutMs !== undefined) {
@@ -1115,7 +1119,7 @@ const streamOpenAIResponsesOnce = (
 				})();
 
 				try {
-					await processResponsesStream(observedOpenaiStream, output, attemptStream, model, {
+					await processResponsesStream(observedOpenaiStream, output, attemptStream, accountingModel, {
 						onFirstToken: () => {
 							if (!firstTokenTime) firstTokenTime = performance.now();
 						},
@@ -1208,7 +1212,7 @@ const streamOpenAIResponsesOnce = (
 									resumeOpenAIResponsesEventStream(resumedResponse),
 									output,
 									attemptStream,
-									model,
+									accountingModel,
 									{
 										onFirstToken: () => {
 											if (!firstTokenTime) firstTokenTime = performance.now();
@@ -1575,22 +1579,11 @@ function applyOpenAIResponsesPromptCachePolicy(
 	options: OpenAIResponsesOptions | undefined,
 	statefulCacheBaseline?: ResponseInput,
 ): void {
+	const promptCacheOptions = resolveOpenAIResponsesPromptCacheOptions(model, options);
+	if (!promptCacheOptions) return;
+	params.prompt_cache_options = promptCacheOptions;
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
-	if (!model.compat.supportsPromptCacheBreakpoints) {
-		if (promptCache.mode === "explicit") {
-			throw new AIError.ConfigurationError(
-				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
-			);
-		}
-		return;
-	}
-
-	params.prompt_cache_options = {
-		mode: promptCache.mode,
-		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
-	};
-	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
+	if (promptCache?.mode === "explicit" && promptCache.breakpoint !== "none")
 		markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
 }
 
@@ -1672,11 +1665,14 @@ export function buildParams(
 		instructions: systemInstructions,
 		stream: true,
 		prompt_cache_key: promptCacheKey,
-		prompt_cache_retention: promptCacheKey
-			? cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention
+		// GPT-5.6+ ignores the legacy retention field; its lifetime rides `prompt_cache_options.ttl`.
+		prompt_cache_retention:
+			promptCacheKey &&
+			cacheRetention === "long" &&
+			model.compat.supportsLongPromptCacheRetention &&
+			!model.compat.supportsPromptCacheBreakpoints
 				? "24h"
-				: undefined
-			: undefined,
+				: undefined,
 		// Gateway routing: OpenRouter-only Responses wire field for sticky upstream
 		// routing + observability grouping; no equivalent on direct OpenAI.
 		session_id: model.compat.isOpenRouterHost ? getOpenRouterResponsesSessionId(options) : undefined,

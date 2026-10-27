@@ -385,6 +385,30 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		expect(JSON.stringify(params.input)).not.toContain("prompt_cache_breakpoint");
 	});
 
+	it("maps long retention to the 12h lifetime instead of the legacy 24h field", () => {
+		const params = buildParams(
+			openAI56ResponsesModel,
+			historicalContext,
+			{ sessionId: "cache-key", cacheRetention: "long" },
+			undefined,
+		).params;
+
+		expect(params.prompt_cache_options).toEqual({ mode: "implicit", ttl: "12h" });
+		expect(params.prompt_cache_retention).toBeUndefined();
+		expect(JSON.stringify(params.input)).not.toContain("prompt_cache_breakpoint");
+	});
+
+	it("lets an explicit policy ttl override long retention", () => {
+		const params = buildParams(
+			openAI56ResponsesModel,
+			historicalContext,
+			{ sessionId: "cache-key", cacheRetention: "long", promptCache: { mode: "explicit", ttl: "30m" } },
+			undefined,
+		).params;
+
+		expect(params.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" });
+	});
+
 	it("marks the latest eligible stable history block", () => {
 		const params = buildParams(
 			openAI56ResponsesModel,
@@ -903,5 +927,240 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.session_id).toBeUndefined();
 		expect(captured.body?.prompt_cache_key).toBeUndefined();
 		expect(captured.body?.cache_control).toBeUndefined();
+	});
+});
+
+describe("OpenAI Responses request-aware cache-write accounting", () => {
+	const pricedModel: Model<"openai-responses"> = {
+		...openAI56ResponsesModel,
+		cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
+	};
+	const mixedUsage = {
+		input_tokens: 100_000,
+		output_tokens: 1_000,
+		total_tokens: 101_000,
+		input_tokens_details: { cached_tokens: 30_000, cache_write_tokens: 50_000 },
+	};
+
+	async function decodeCost(
+		options: OpenAIResponsesOptions,
+		requestModel = pricedModel,
+		usage: Record<string, unknown> = mixedUsage,
+		serviceTier?: string,
+	) {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchSynthetic: FetchImpl = async (_input, init) => {
+			if (typeof init?.body !== "string") throw new Error("Expected a serialized Responses request");
+			bodies.push(JSON.parse(init.body));
+			return createSseResponse([
+				{
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_cost", role: "assistant", status: "in_progress", content: [] },
+				},
+				{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+				{ type: "response.output_text.delta", delta: "Priced response" },
+				{
+					type: "response.output_item.done",
+					item: {
+						type: "message",
+						id: "msg_cost",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "Priced response" }],
+					},
+				},
+				{ type: "response.completed", response: { status: "completed", usage, service_tier: serviceTier } },
+			]);
+		};
+		const result = await streamOpenAIResponses(
+			requestModel,
+			{ messages: [{ role: "user", content: "Synthetic accounting request", timestamp: 1 }] },
+			{ ...options, apiKey: "test-key", statefulResponses: false, fetch: fetchSynthetic },
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.provider).toBe(requestModel.provider);
+		expect(result.model).toBe(requestModel.id);
+		expect(result.content.some(block => block.type === "text" && block.text === "Priced response")).toBe(true);
+		return { result, body: bodies[0] };
+	}
+
+	it.each([
+		{ retention: "long", promptCache: undefined, ttl: "12h", write: 0.5 },
+		{ retention: "short", promptCache: { mode: "explicit", ttl: "12h" }, ttl: "12h", write: 0.5 },
+		{ retention: "long", promptCache: { mode: "explicit", ttl: "30m" }, ttl: "30m", write: 0.25 },
+		{ retention: "short", promptCache: { mode: "implicit" }, ttl: "30m", write: 0.25 },
+		{ retention: "none", promptCache: { mode: "explicit", ttl: "12h" }, ttl: undefined, write: 0.25 },
+	] as const)("prices mixed usage for $retention retention and $ttl effective TTL", async scenario => {
+		const { result, body } = await decodeCost({
+			cacheRetention: scenario.retention,
+			promptCache: scenario.promptCache,
+		});
+		expect(body?.prompt_cache_options).toEqual(
+			scenario.ttl ? { mode: scenario.promptCache?.mode ?? "implicit", ttl: scenario.ttl } : undefined,
+		);
+		expect(result.usage).toMatchObject({
+			input: 20_000,
+			output: 1_000,
+			cacheRead: 30_000,
+			cacheWrite: 50_000,
+			totalTokens: 101_000,
+		});
+		expect(result.usage.cost.input).toBeCloseTo(0.08, 10);
+		expect(result.usage.cost.output).toBeCloseTo(0.02, 10);
+		expect(result.usage.cost.cacheRead).toBeCloseTo(0.012, 10);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(scenario.write, 10);
+		expect(result.usage.cost.total).toBeCloseTo(0.112 + scenario.write, 10);
+	});
+
+	it.each([
+		{ retention: "short", replacementTtl: "12h", write: 0.5 },
+		{ retention: "long", replacementTtl: "30m", write: 0.25 },
+		{ retention: "long", replacementTtl: undefined, write: 0.25 },
+	] as const)("prices the final submitted TTL $replacementTtl after payload replacement", async scenario => {
+		const { result, body } = await decodeCost({
+			cacheRetention: scenario.retention,
+			onPayload: payload => ({
+				...(payload as Record<string, unknown>),
+				prompt_cache_options: scenario.replacementTtl
+					? { mode: "implicit", ttl: scenario.replacementTtl }
+					: undefined,
+			}),
+		});
+		expect(body?.prompt_cache_options).toEqual(
+			scenario.replacementTtl ? { mode: "implicit", ttl: scenario.replacementTtl } : undefined,
+		);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(scenario.write, 10);
+	});
+
+	it.each([
+		{ served: "default", multiplier: 1 },
+		{ served: "flex", multiplier: 0.5 },
+		{ served: "priority", multiplier: 2 },
+		{ served: undefined, multiplier: 2 },
+	] as const)("preserves served-tier precedence for $served", async scenario => {
+		const { result } = await decodeCost(
+			{ cacheRetention: "long", serviceTier: "priority" },
+			pricedModel,
+			mixedUsage,
+			scenario.served,
+		);
+		expect(result.serviceTier).toBe(scenario.served ?? "priority");
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(0.5 * scenario.multiplier, 10);
+		expect(result.usage.cost.total).toBeCloseTo(0.612 * scenario.multiplier, 10);
+	});
+
+	it.each([false, true])("preserves long-context pricing with effective schedule %s", async scheduled => {
+		const longContext = { inputThreshold: 90_000, input: 8, output: 30, cacheRead: 0.8, cacheWrite: 10 };
+		const requestModel: Model<"openai-responses"> = {
+			...pricedModel,
+			cost: {
+				...pricedModel.cost,
+				longContext,
+				...(scheduled
+					? {
+							timeBased: {
+								offPeakMultiplier: 0.5,
+								peakWindows: [],
+								effectiveRates: [
+									{
+										effectiveFrom: 0,
+										input: 6,
+										output: 25,
+										cacheRead: 0.6,
+										cacheWrite: 7.5,
+										longContext: {
+											inputThreshold: 90_000,
+											input: 12,
+											output: 40,
+											cacheRead: 1.2,
+											cacheWrite: 15,
+										},
+									},
+								],
+							},
+						}
+					: {}),
+			},
+		};
+		const before = structuredClone(requestModel);
+		const { result } = await decodeCost({ cacheRetention: "long" }, requestModel);
+		const expected = scheduled
+			? { input: 0.12, output: 0.02, cacheRead: 0.018, cacheWrite: 0.75, total: 0.908 }
+			: { input: 0.16, output: 0.03, cacheRead: 0.024, cacheWrite: 1, total: 1.214 };
+		for (const component of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+			expect(result.usage.cost[component]).toBeCloseTo(expected[component], 10);
+		}
+		expect(requestModel).toEqual(before);
+		const short = await decodeCost({ cacheRetention: "short", promptCache: { mode: "implicit" } }, requestModel);
+		expect(short.result.usage.cost.cacheWrite).toBeCloseTo(scheduled ? 0.375 : 0.5, 10);
+	});
+
+	it("prices a due effective base card without activating a future long-context tier", async () => {
+		const requestModel: Model<"openai-responses"> = {
+			...pricedModel,
+			cost: {
+				...pricedModel.cost,
+				timeBased: {
+					offPeakMultiplier: 0.5,
+					peakWindows: [],
+					effectiveRates: [
+						{
+							effectiveFrom: 0,
+							input: 6,
+							output: 25,
+							cacheRead: 0.6,
+							cacheWrite: 7.5,
+							longContext: { inputThreshold: 200_000, input: 12, output: 40, cacheRead: 1.2, cacheWrite: 15 },
+						},
+					],
+				},
+			},
+		};
+		const { result } = await decodeCost({ cacheRetention: "long" }, requestModel);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(0.375, 10);
+		expect(result.usage.cost.total).toBeCloseTo(0.4565, 10);
+	});
+
+	it.each([
+		{ monetary: { cost: 7.25 }, expected: 7.25 },
+		{ monetary: { cost: 0 }, expected: 0 },
+		{ monetary: { cost: 0.75, is_byok: true, cost_details: { upstream_inference_cost: 7 } }, expected: 7.75 },
+	])("preserves provider-reported monetary total $expected with a forwarded 12h policy", async scenario => {
+		const gateway: Model<"openai-responses"> = {
+			...pricedModel,
+			provider: "openrouter",
+			id: "openai/gpt-5.6",
+			baseUrl: "https://openrouter.ai/api/v1",
+			identity: classifyModel("openrouter", "openai/gpt-5.6"),
+		};
+		const { result, body } = await decodeCost({ cacheRetention: "long" }, gateway, {
+			...mixedUsage,
+			...scenario.monetary,
+		});
+		expect(body?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "12h" });
+		expect(result.usage.cost.total).toBe(scenario.expected);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo((scenario.expected * 0.25) / 0.362, 10);
+	});
+
+	it("does not infer 12h gateway rates when no monetary cost is reported", async () => {
+		const gateway: Model<"openai-responses"> = {
+			...pricedModel,
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+		};
+		const { result } = await decodeCost({ cacheRetention: "long" }, gateway);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(0.25, 10);
+		expect(result.usage.cost.total).toBeCloseTo(0.362, 10);
+	});
+
+	it("does not infer official OpenAI prices on a custom endpoint with breakpoint overrides", async () => {
+		const proxy: Model<"openai-responses"> = {
+			...pricedModel,
+			baseUrl: "https://proxy.example/v1",
+			compat: { ...pricedModel.compat, officialEndpoint: false },
+		};
+		const { result, body } = await decodeCost({ cacheRetention: "long" }, proxy);
+		expect(body?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "12h" });
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(0.25, 10);
 	});
 });

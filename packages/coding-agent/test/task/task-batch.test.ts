@@ -12,22 +12,35 @@
  *    item; with `async.enabled=false`, it blocks and returns merged results.
  *    Both modes forward the shared `context`; the flat form stays accepted at
  *    runtime for internal callers.
+ * 4. `task.enableEffort` gates stale runtime effort fields in both shapes.
+ *    Disabled effort preserves configured, automatic, and explicit model thinking.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { AUTO_THINKING, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 import { cfgTaskEnableEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
 
@@ -667,6 +680,161 @@ describe("task.batch spawning", () => {
 			"# Goal\nShared synchronous context.",
 		]);
 	});
+
+	it.each([
+		[false, false],
+		[false, true],
+		[true, false],
+		[true, true],
+	] as const)(
+		"selects real child thinking with batch=%s and enableEffort=%s",
+		async (batch, enableEffort) => {
+			using directory = TempDir.createSync("@omp-task-effort-");
+			const authStorage = createInMemoryAuthStorage();
+			const sessions: AgentSession[] = [];
+			const createAgentSession = sdkModule.createAgentSession;
+			vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network is disabled in task effort tests"));
+			vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+			try {
+				const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+				if (!model) throw new Error("Expected bundled task effort model");
+				const lowestEffort = getSupportedEfforts(model)[0];
+				authStorage.keys.setRuntime("anthropic", "synthetic-task-effort-key");
+				const source = authStorage.keys.source.bind(authStorage.keys);
+				vi.spyOn(authStorage.keys, "source").mockImplementation((provider, options) =>
+					provider === "anthropic" ? source(provider, options) : undefined,
+				);
+				const modelRegistry = new ModelRegistry(authStorage, directory.join("models.yml"));
+				const modelSelector = `${model.provider}/${model.id}`;
+				mockDiscovery([
+					{ ...taskAgent, tools: [], thinkingLevel: Effort.Medium },
+					{ ...taskAgent, name: "automatic", tools: [], thinkingLevel: AUTO_THINKING },
+					{ ...taskAgent, name: "model-thinking", tools: [], model: [`${modelSelector}:low`] },
+				]);
+				const parent = await createAgentSession({
+					cwd: directory.path(),
+					agentDir: directory.path(),
+					hasUI: false,
+					agentId: `${path.basename(directory.path())}-parent`,
+					authStorage,
+					modelRegistry,
+					model,
+					settings: Settings.isolated({
+						"async.enabled": false,
+						"task.batch": batch,
+						"task.enableEffort": enableEffort,
+						"task.maxEffort": Effort.High,
+						"task.structured": false,
+						"task.isolation.enabled": false,
+						"task.enableLsp": false,
+						"memory.backend": "off",
+						"compaction.enabled": false,
+						"retry.enabled": false,
+						"todo.enabled": false,
+						"advisor.enabled": false,
+						modelRoles: { default: modelSelector, task: modelSelector, smol: modelSelector },
+					}),
+					sessionManager: SessionManager.inMemory(directory.path()),
+					toolNames: ["task"],
+					spawns: "*",
+					contextFiles: [],
+					skills: [],
+					rules: [],
+					promptTemplates: [],
+					slashCommands: [],
+					disableExtensionDiscovery: true,
+					enableMCP: false,
+					enableLsp: false,
+					enableIrc: false,
+					skipPythonPreflight: true,
+					cacheWarming: false,
+				});
+				sessions.push(parent.session);
+				const observed = new Map<
+					string,
+					{
+						configured: ConfiguredThinkingLevel | undefined;
+						effective: AgentSession["thinkingLevel"];
+						reasoning: Effort | undefined;
+					}
+				>();
+				vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+					const child = await createAgentSession({
+						...options,
+						agentDir: directory.path(),
+						slashCommands: [],
+						disableExtensionDiscovery: true,
+						skipPythonPreflight: true,
+					});
+					sessions.push(child.session);
+					const transport = createMockModel({ handler: { content: ["synthetic task complete"] } });
+					child.session.agent.streamFn = (requestModel, context, streamOptions) => {
+						const id = child.session.getAgentId();
+						if (!id) throw new Error("Child session has no agent identity");
+						observed.set(id, {
+							configured: child.session.configuredThinkingLevel(),
+							effective: child.session.thinkingLevel,
+							reasoning: streamOptions?.reasoning,
+						});
+						return transport.stream(requestModel, context, streamOptions);
+					};
+					return child;
+				});
+				const tool = parent.session.getToolByName("task") as TaskTool | undefined;
+				if (!tool) throw new Error("Parent task tool is unavailable");
+				const items = [
+					{ name: "Fixed", task: "Return the synthetic report.", effort: "hi" as const },
+					{ name: "Auto", agent: "automatic", task: "Return the synthetic report.", effort: "lo" as const },
+					{
+						name: "Model",
+						agent: "model-thinking",
+						task: "Return the synthetic report.",
+						effort: "hi" as const,
+					},
+					{ name: "Default", task: "Return the synthetic report." },
+				].map(item => ({ ...item, solutionSpace: "One fixed synthetic report." }));
+				const results: SingleResult[] = [];
+				if (batch) {
+					const result = await tool.execute("effort-batch", {
+						context: "Independent synthetic reports.",
+						effort: "hi",
+						tasks: items,
+					} as TaskParams);
+					expect(result.isError, getFirstText(result)).not.toBe(true);
+					results.push(...(result.details?.results ?? []));
+				} else {
+					for (const item of items) {
+						const result = await tool.execute(`effort-${item.name}`, item);
+						expect(result.isError, getFirstText(result)).not.toBe(true);
+						results.push(...(result.details?.results ?? []));
+					}
+				}
+				expect(results.map(result => [result.id, result.exitCode, result.output]).sort()).toEqual(
+					items.map(item => [item.name, 0, "synthetic task complete"]).sort(),
+				);
+				const fixed = enableEffort ? Effort.High : Effort.Medium;
+				const automatic = enableEffort ? lowestEffort : Effort.Medium;
+				const selectedModel = enableEffort ? Effort.High : Effort.Low;
+				expect(Object.fromEntries(observed)).toEqual({
+					Fixed: { configured: fixed, effective: fixed, reasoning: fixed },
+					Auto: {
+						configured: enableEffort ? lowestEffort : AUTO_THINKING,
+						effective: automatic,
+						reasoning: automatic,
+					},
+					Model: { configured: selectedModel, effective: selectedModel, reasoning: selectedModel },
+					Default: { configured: Effort.Medium, effective: Effort.Medium, reasoning: Effort.Medium },
+				});
+			} finally {
+				try {
+					await Promise.all(sessions.map(session => session.dispose()));
+				} finally {
+					await authStorage.close();
+				}
+			}
+		},
+		20_000,
+	);
 
 	it("keeps a long result inline when no readable output artifact exists", async () => {
 		mockDiscovery();

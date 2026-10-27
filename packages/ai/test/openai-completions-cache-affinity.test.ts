@@ -163,6 +163,41 @@ describe("OpenAI Chat Completions explicit prompt cache policy", () => {
 		expect(JSON.stringify(body.messages)).not.toContain("prompt_cache_breakpoint");
 	});
 
+	it("rejects the Responses-only 12h lifetime before sending a request", async () => {
+		let sent = false;
+		const fetchMock: FetchImpl = async () => {
+			sent = true;
+			return chatCompletionsSse();
+		};
+		const result = await streamOpenAICompletions(openAI56CompletionsModel, context, {
+			apiKey: "test-key",
+			promptCache: { mode: "implicit", ttl: "12h" },
+			fetch: fetchMock,
+		}).result();
+
+		expect(sent).toBe(false);
+		expect(result.stopReason).toBe("error");
+	});
+
+	it("lets cache-off suppress a Responses-only lifetime without rejecting the completion", async () => {
+		let body: Record<string, unknown> | undefined;
+		const fetchSynthetic: FetchImpl = async (_input, init) => {
+			if (typeof init?.body !== "string") throw new Error("Expected a serialized Chat Completions request");
+			body = JSON.parse(init.body);
+			return chatCompletionsSse();
+		};
+		const result = await streamOpenAICompletions(openAI56CompletionsModel, context, {
+			apiKey: "test-key",
+			cacheRetention: "none",
+			promptCache: { mode: "explicit", ttl: "12h" },
+			fetch: fetchSynthetic,
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content.some(block => block.type === "text" && block.text === "ok")).toBe(true);
+		expect(body?.prompt_cache_options).toBeUndefined();
+		expect(JSON.stringify(body?.messages)).not.toContain("prompt_cache_breakpoint");
+	});
+
 	it("does not synthesize first-turn content or a caller-disabled breakpoint", async () => {
 		const firstTurn: Context = {
 			messages: [{ role: "user", content: "only prompt", timestamp: 0 }],
