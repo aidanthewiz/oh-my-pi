@@ -67,7 +67,7 @@ function createControllerContext() {
 		setFocus: vi.fn(),
 		start: vi.fn(),
 		stop: vi.fn(),
-		terminal: { columns: 120 },
+		terminal: { columns: 120, rows: 24 },
 	} as unknown as TestContext["ui"] & {
 		setFocus: Mock<any>;
 		requestRender: Mock<any>;
@@ -76,6 +76,7 @@ function createControllerContext() {
 		editor,
 		editorContainer,
 		ui,
+		composer: { rowsBelow: () => undefined },
 		hookEditor: undefined,
 	} as unknown as TestContext;
 

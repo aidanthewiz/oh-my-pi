@@ -35,6 +35,10 @@ Ordinary authentication failures cannot cancel a pending sign-in. Only that sign
 
 The session grant removes ordinary command consent prompts; it does not authenticate to AWS. The user must still complete browser SSO authentication when required. Grants are not saved to configuration or restored in a new process.
 
+Approval dialogs show the complete redacted command and identity details below a short heading. When the terminal cannot fit the selected permission beside the details, they share one scrollable view. Use Page Up and Page Down to read the complete permission and details. Arrow keys select a permission; Enter confirms it. Scrolling does not approve a command.
+
+The session grant also covers native AWS calls made through eval and `write xd://aws`. It does not grant unrelated filesystem writes or bypass mandatory per-command safety approvals.
+
 ECS `execute-command` and SSM `start-session` require the Session Manager plugin.
 Install `session-manager-plugin` on your employee PATH, then restart Coreforge.
 The launcher captures its absolute path before adding repository tools.
