@@ -321,7 +321,6 @@ describe("cache warmer lifecycle", () => {
 		expect(h.replays[0]?.consumed).toEqual(["start", "thinking_start"]);
 		expect(h.warmed).toHaveLength(1);
 		expect(h.warmed[0]?.message.usage.cacheRead).toBe(PROMPT_TOKENS);
-		expect(h.warmed[0]?.message.usage.cost.total).toBeGreaterThan(0);
 		expect(h.warmer.status.state).toBe("scheduled");
 		expect(h.refreshes).toEqual([
 			{ type: "start", phase: "streaming", provider: "anthropic", model: "claude-sonnet-5" },
@@ -695,6 +694,40 @@ describe("cache warmer lifecycle", () => {
 		]);
 		expect(h.warmer.status.state).toBe("scheduled");
 		h.warmer.cancel();
+	});
+
+	test.each([
+		{ cacheRetention: "long", promptCache: undefined, write: 0.06, action: "warm" },
+		{ cacheRetention: "short", promptCache: { mode: "implicit", ttl: "12h" }, write: 0.06, action: "warm" },
+		{ cacheRetention: "long", promptCache: { mode: "implicit", ttl: "30m" }, write: 0.03, action: "stop" },
+	] as const)("uses effective cache pricing for the paid $action decision", scenario => {
+		const model = buildModel({
+			id: "gpt-5.6",
+			name: "GPT-5.6",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			input: ["text"],
+			reasoning: true,
+			cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
+			contextWindow: 400_000,
+			maxTokens: 128_000,
+		});
+		model.promptCache = { short: 300, long: 3600 };
+		const before = structuredClone(model);
+		const h = harness();
+		h.promptTokens = 6_000;
+		try {
+			h.warmer.start({ model, context: { messages: [] }, options: scenario }, () => true);
+			const decision = h.warmer.status.decision;
+			expect(decision?.action).toBe(scenario.action);
+			expect(decision?.missCost).toBeCloseTo(scenario.write - 0.0024, 10);
+			expect(decision?.expectedSavings).toBeCloseTo(scenario.write - 0.00482, 10);
+			expect(h.replays).toEqual([]);
+			expect(model).toEqual(before);
+		} finally {
+			h.warmer.cancel();
+		}
 	});
 
 	test("mode off refuses to arm", () => {

@@ -31,7 +31,12 @@ import {
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
-import { ArtifactManager } from "./artifacts";
+import {
+	artifactFileGeneration,
+	ArtifactManager,
+	parseStructuredArtifactSidecar,
+	serializeStructuredArtifactSidecar,
+} from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
 import {
@@ -204,6 +209,80 @@ export async function copySessionArtifacts(sourceSessionFile: string, destinatio
 	}
 }
 
+async function copyBoundStructuredArtifact(from: string, to: string): Promise<boolean> {
+	const sourceSidecar = `${from.slice(0, -3)}.json`;
+	const destinationSidecar = `${to.slice(0, -3)}.json`;
+	const primary = await fs.promises.open(from, "r");
+	let sidecar: fs.promises.FileHandle | undefined;
+	try {
+		try {
+			sidecar = await fs.promises.open(sourceSidecar, "r");
+		} catch (error) {
+			if (isEnoent(error)) return false;
+			throw error;
+		}
+		const primaryBefore = await primary.stat({ bigint: true });
+		const sidecarBefore = await sidecar.stat({ bigint: true });
+		if (!sidecarBefore.isFile()) return false;
+		const primaryGeneration = artifactFileGeneration(primaryBefore);
+		const sidecarGeneration = artifactFileGeneration(sidecarBefore);
+		let envelope: { data: unknown } | undefined;
+		try {
+			envelope = parseStructuredArtifactSidecar(await sidecar.readFile("utf8"), primaryGeneration);
+		} catch (error) {
+			if (error instanceof SyntaxError) return false;
+			throw error;
+		}
+		if (!envelope) return false;
+		const nonce = crypto.randomUUID();
+		const stagedPrimary = `${to}.copy-${nonce}`;
+		const stagedSidecar = `${destinationSidecar}.copy-${nonce}`;
+		try {
+			await fs.promises.copyFile(from, stagedPrimary, fs.constants.COPYFILE_EXCL);
+			const [primaryAfter, sidecarAfter, namedPrimary, namedSidecar] = await Promise.all([
+				primary.stat({ bigint: true }),
+				sidecar.stat({ bigint: true }),
+				fs.promises.lstat(from, { bigint: true }),
+				fs.promises.lstat(sourceSidecar, { bigint: true }),
+			]);
+			if (
+				artifactFileGeneration(primaryAfter) !== primaryGeneration ||
+				artifactFileGeneration(namedPrimary) !== primaryGeneration ||
+				primaryAfter.ctimeNs !== primaryBefore.ctimeNs ||
+				namedPrimary.ctimeNs !== primaryBefore.ctimeNs ||
+				artifactFileGeneration(sidecarAfter) !== sidecarGeneration ||
+				artifactFileGeneration(namedSidecar) !== sidecarGeneration ||
+				sidecarAfter.ctimeNs !== sidecarBefore.ctimeNs ||
+				namedSidecar.ctimeNs !== sidecarBefore.ctimeNs
+			)
+				throw new Error(`Structured artifact changed while copying: ${from}`);
+			const copiedGeneration = artifactFileGeneration(await fs.promises.stat(stagedPrimary, { bigint: true }));
+			await fs.promises.writeFile(
+				stagedSidecar,
+				serializeStructuredArtifactSidecar(JSON.stringify(envelope.data), copiedGeneration),
+				{ flag: "wx", mode: 0o600 },
+			);
+			try {
+				await fs.promises.link(stagedPrimary, to);
+			} catch (error) {
+				if (isEexist(error)) return true;
+				throw error;
+			}
+			try {
+				await fs.promises.link(stagedSidecar, destinationSidecar);
+			} catch (error) {
+				if (!isEexist(error)) throw error;
+			}
+			return true;
+		} finally {
+			await fs.promises.rm(stagedPrimary, { force: true });
+			await fs.promises.rm(stagedSidecar, { force: true });
+		}
+	} finally {
+		await Promise.all([sidecar?.close(), primary.close()]);
+	}
+}
+
 async function copyArtifactDirectoryWithoutReplacing(source: string, destination: string): Promise<void> {
 	if (!(await fs.promises.lstat(source)).isDirectory()) {
 		throw new Error(`Session artifacts path is not a real directory: ${source}`);
@@ -216,13 +295,21 @@ async function copyArtifactDirectoryWithoutReplacing(source: string, destination
 	if (!(await fs.promises.lstat(destination)).isDirectory()) {
 		throw new Error(`Fork artifacts destination is not a real directory: ${destination}`);
 	}
-	for (const entry of await fs.promises.readdir(source, { withFileTypes: true })) {
+	const entries = await fs.promises.readdir(source, { withFileTypes: true });
+	entries.sort((left, right) => Number(right.name.endsWith(".md")) - Number(left.name.endsWith(".md")));
+	const pairedSidecars = new Set<string>();
+	for (const entry of entries) {
+		if (pairedSidecars.has(entry.name)) continue;
 		const from = path.join(source, entry.name);
 		const to = path.join(destination, entry.name);
 		const current = await fs.promises.lstat(from);
 		if (current.isDirectory()) {
 			await copyArtifactDirectoryWithoutReplacing(from, to);
 		} else if (current.isFile()) {
+			if (entry.name.endsWith(".md") && (await copyBoundStructuredArtifact(from, to))) {
+				pairedSidecars.add(`${entry.name.slice(0, -3)}.json`);
+				continue;
+			}
 			try {
 				await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL);
 			} catch (error) {

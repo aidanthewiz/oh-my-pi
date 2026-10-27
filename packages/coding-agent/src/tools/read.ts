@@ -2875,10 +2875,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							// at least one conflict — otherwise pay nothing on clean files.
 							let totalInFile = entries.length;
 							let truncatedAtLine: number | undefined;
+							let continuationLine: number | undefined;
 							try {
 								const fileScan = await scanFileForConflicts(absolutePath);
 								totalInFile = Math.max(entries.length, fileScan.blocks.length);
 								truncatedAtLine = fileScan.truncatedAtLine;
+								continuationLine = fileScan.continuationLine;
 							} catch {
 								// Best-effort enrichment; fall back to window-only count.
 							}
@@ -2886,6 +2888,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								totalInFile,
 								displayPath: displayPathForWarning,
 								truncatedAtLine,
+								continuationLine,
 							});
 							details.conflictCount = entries.length;
 						}
@@ -2969,9 +2972,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		let summary: string;
 		if (entries.length > 0) {
-			summary = formatConflictSummary(entries, { displayPath, truncatedAtLine: scan.truncatedAtLine });
+			summary = formatConflictSummary(entries, {
+				displayPath,
+				truncatedAtLine: scan.truncatedAtLine,
+				continuationLine: scan.continuationLine,
+			});
 		} else if (scan.truncatedAtLine !== undefined) {
-			summary = `No unresolved git merge conflicts before line ${scan.truncatedAtLine} of ${displayPath}.\n${formatScanCapNote(displayPath, scan.truncatedAtLine)}`;
+			const continuationLine = scan.continuationLine ?? scan.truncatedAtLine;
+			summary = `No unresolved git merge conflicts before line ${continuationLine} of ${displayPath}.\n${formatScanCapNote(displayPath, scan.truncatedAtLine, continuationLine)}`;
 		} else {
 			summary = `No unresolved git merge conflicts in ${displayPath}.`;
 		}

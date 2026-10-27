@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { all } from "@oh-my-pi/pi-coding-agent/config/registry";
@@ -7,7 +8,7 @@ import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui
 import { createPluginSettingsHost } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/settings-host";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { initTheme, setTheme } from "@oh-my-pi/pi-tui/theme";
-import { cfgRetryUsageAwareFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgProvidersCacheRetention, cfgRetryUsageAwareFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 
 beforeAll(async () => {
@@ -118,6 +119,55 @@ describe("settings layout", () => {
 		expect(defs[1]?.condition?.()).toBe(true);
 		expect(defs[2]?.condition?.()).toBe(true);
 	});
+
+	it.each([64, 40])(
+		"shows the complete highlighted cache choice at %i columns and commits only on confirmation",
+		width => {
+			cfgProvidersCacheRetention.set(Settings.instance, "short");
+			const settings = createSettingsHost();
+			const def = SETTING_TABS.flatMap(tab => getSettingsForTab(settings.entries, tab)).find(
+				def => def.path === "providers.cacheRetention",
+			);
+			if (def?.type !== "submenu") throw new Error("Cache retention must be selectable");
+			const longDescription = def.options.find(option => option.value === "long")?.description;
+			const shortDescription = def.options.find(option => option.value === "short")?.description;
+			if (!longDescription || !shortDescription) throw new Error("Cache choices must disclose their policy");
+			const selector = new SettingsSelectorComponent(
+				{
+					availableThinkingLevels: [],
+					thinkingLevel: undefined,
+					availableThemes: ["dark"],
+					providers: [],
+					settings,
+					plugins: createPluginSettingsHost(process.cwd()),
+				},
+				{ onChange: () => {}, onCancel: () => {} },
+			);
+			const visibleText = () =>
+				selector
+					.render(width)
+					.map(stripVTControlCharacters)
+					.join("\n")
+					.replace(/[│\n]/g, " ")
+					.replace(/\s+/g, " ");
+
+			for (const character of "prompt cache retention") selector.handleInput(character);
+			selector.handleInput("\n");
+			selector.handleInput("\x1b[B");
+			expect(visibleText()).toContain(longDescription);
+			expect(cfgProvidersCacheRetention.get(Settings.instance)).toBe("short");
+			selector.handleInput("\x1b[A");
+			expect(visibleText()).toContain(shortDescription);
+			expect(visibleText()).not.toContain(longDescription);
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\x1b");
+			expect(cfgProvidersCacheRetention.get(Settings.instance)).toBe("short");
+			selector.handleInput("\n");
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\n");
+			expect(cfgProvidersCacheRetention.get(Settings.instance)).toBe("long");
+		},
+	);
 
 	it("renders preview inside SettingsSelectorComponent submenu without crashing", async () => {
 		await setTheme("dark");

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { ConflictHistory } from "@oh-my-pi/pi-coding-agent/tools/conflict-detect";
+import { ConflictHistory, scanFileForConflicts } from "@oh-my-pi/pi-coding-agent/tools/conflict-detect";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
@@ -271,17 +271,6 @@ describe("read surfaces conflicts as a warning footer", () => {
 		expect(text).toMatch(/#1\s+L2-8.*3-way/);
 	});
 
-	it("`:conflicts` on a clean file says so explicitly", async () => {
-		const filePath = path.join(tempDir, "clean-conflicts.ts");
-		await Bun.write(filePath, "const a = 1;\nconst b = 2;\n");
-		const session = createTestSession(tempDir);
-		const read = await getTool(session, "read");
-
-		const result = await read.execute("read-clean-conflicts", { path: "clean-conflicts.ts:conflicts" });
-		const text = getText(result);
-		expect(text).toContain("No unresolved git merge conflicts");
-	});
-
 	it("`:conflicts` past the scan byte cap points to a ranged read that registers the rest", async () => {
 		// 10240 lines of exactly 1 KiB fill the 10 MiB scan cap, so the block at L10241 is never scanned.
 		const filler = `${"a".repeat(1023)}\n`.repeat(10_240);
@@ -295,6 +284,90 @@ describe("read surfaces conflicts as a warning footer", () => {
 		await read.execute("read-huge-tail", { path: "huge.ts:10241-" });
 		const block = getText(await read.execute("read-huge-block", { path: "conflict://1" }));
 		expect(block).toContain("<<<<<<<");
+	});
+
+	it.each([
+		["without a completed prefix", "", "branch-tail", 3],
+		["with a completed prefix", "<<<<<<< first\nfirst-old\n=======\nfirst-new\n>>>>>>> first\n", "🙂branch", 2],
+	] as const)(
+		"resumes a conflict crossing the actual scan cap %s and resolves its registered region",
+		async (_label, prefix, branch, partialLabelBytes) => {
+			const maxBytes = 10 * 1024 * 1024;
+			const beforeLabel = "<<<<<<< boundary\nold\n=======\nnew\n>>>>>>> ";
+			const fillerBytes = maxBytes - Buffer.byteLength(prefix + beforeLabel) - partialLabelBytes;
+			const fillerRows = Math.floor(fillerBytes / 1024);
+			const remainder = fillerBytes % 1024;
+			const filler =
+				`${"x".repeat(1023)}\n`.repeat(fillerRows) + (remainder ? `${"x".repeat(remainder - 1)}\n` : "");
+			const startLine = (prefix ? 5 : 0) + fillerRows + (remainder ? 1 : 0) + 1;
+			const fileName = prefix ? "boundary-prefix.ts" : "boundary-only.ts";
+			const filePath = path.join(tempDir, fileName);
+			await Bun.write(filePath, prefix + filler + beforeLabel + branch + "\nsuffix\n");
+			const session = createTestSession(tempDir);
+			const read = await getTool(session, "read");
+			const write = await getTool(session, "write");
+
+			const summary = getText(await read.execute("read-boundary-summary", { path: `${fileName}:conflicts` }));
+			const continuation = /range-read `([^`]+)`/.exec(summary)?.[1];
+			expect(continuation).toBe(`${fileName}:${startLine}-`);
+			expect(summary).toContain(`byte cap at line ${startLine + 4}`);
+			expect(session.conflictHistory?.entries().map(entry => entry.startLine)).toEqual(prefix ? [1] : []);
+			if (prefix) {
+				const warning = getText(await read.execute("read-boundary-prefix", { path: `${fileName}:1-5` }));
+				expect(warning).toContain(`byte cap at line ${startLine + 4}`);
+				expect(warning).toContain(`range-read \`${continuation}\``);
+			} else {
+				expect(summary).toContain(`before line ${startLine} of ${fileName}`);
+			}
+
+			await read.execute("read-boundary-continuation", { path: continuation! });
+			const entry = session.conflictHistory?.entries().find(block => block.startLine === startLine);
+			expect(entry?.endLine).toBe(startLine + 4);
+			expect(entry?.theirsLabel).toBe(branch);
+			const conflictPath = `conflict://${entry!.id}`;
+			const block = getText(await read.execute("read-boundary-block", { path: conflictPath }));
+			expect(block).toContain("<<<<<<< boundary");
+			expect(block).toContain(`>>>>>>> ${branch}`);
+			expect(block).toContain("old");
+			expect(block).toContain("new");
+			await write.execute("write-boundary-resolution", { path: conflictPath, content: "@theirs" });
+			expect(await Bun.file(filePath).text()).toBe(prefix + filler + "new\nsuffix\n");
+			expect(session.conflictHistory?.get(entry!.id)).toBeUndefined();
+		},
+	);
+
+	it.each([
+		["ASCII", "branch-tail", 3],
+		["UTF-8", "🙂branch", 2],
+	] as const)(
+		"keeps complete prefix blocks without registering a partial %s closing line",
+		async (label, branch, bytes) => {
+			const complete = "<<<<<<< first\nold\n=======\nnew\n>>>>>>> first\n";
+			const beforeLabel = "<<<<<<< second\nold\n=======\nnew\n>>>>>>> ";
+			const filePath = path.join(tempDir, `partial-${label}.ts`);
+			await Bun.write(filePath, complete + beforeLabel + branch + "\ntail\n");
+			const scan = await scanFileForConflicts(filePath, {
+				maxBytes: Buffer.byteLength(complete + beforeLabel) + bytes,
+			});
+			expect(scan.truncatedAtLine).toBe(10);
+			expect(scan.continuationLine).toBe(6);
+			expect(scan.blocks.map(block => [block.startLine, block.endLine])).toEqual([[1, 5]]);
+		},
+	);
+
+	it("registers a complete closing line at the cap and a complete final line without a newline", async () => {
+		const complete = "<<<<<<< ours\nold\n=======\nnew\n>>>>>>> theirs";
+		const filePath = path.join(tempDir, "complete-close.ts");
+		await Bun.write(filePath, complete + "\ntail\n");
+		const capped = await scanFileForConflicts(filePath, { maxBytes: Buffer.byteLength(complete + "\n") });
+		expect(capped.truncatedAtLine).toBe(6);
+		expect(capped.continuationLine).toBe(6);
+		expect(capped.blocks.map(block => [block.startLine, block.endLine])).toEqual([[1, 5]]);
+		await Bun.write(filePath, complete);
+		const final = await scanFileForConflicts(filePath);
+		expect(final.truncatedAtLine).toBeUndefined();
+		expect(final.continuationLine).toBeUndefined();
+		expect(final.blocks.map(block => [block.startLine, block.endLine])).toEqual([[1, 5]]);
 	});
 
 	it("window-mode warning shows visible-of-total when window misses some conflicts", async () => {

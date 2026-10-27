@@ -39,6 +39,15 @@ const THEIRS_PREFIX = ">>>>>>>";
  */
 export function scanConflictLines(lines: readonly string[], firstLineNumber: number): ConflictBlock[] {
 	const blocks: ConflictBlock[] = [];
+	scanConflictLinesInto(lines, firstLineNumber, blocks);
+	return blocks;
+}
+
+function scanConflictLinesInto(
+	lines: readonly string[],
+	firstLineNumber: number,
+	blocks: ConflictBlock[],
+): number | undefined {
 	let phase: "idle" | "ours" | "base" | "theirs" = "idle";
 	let partial: {
 		startLine: number;
@@ -118,7 +127,7 @@ export function scanConflictLines(lines: readonly string[], firstLineNumber: num
 		else if (phase === "theirs" && partial.theirsLines) partial.theirsLines.push(line);
 	}
 
-	return blocks;
+	return partial?.startLine;
 }
 
 const SCAN_FILE_DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
@@ -128,6 +137,8 @@ export interface ConflictFileScan {
 	blocks: ConflictBlock[];
 	/** First line the byte cap left unscanned (possibly partial); unset when the whole file was scanned. */
 	truncatedAtLine?: number;
+	/** Restart at an unfinished opener, or the first unscanned line; unset for a whole-file scan. */
+	continuationLine?: number;
 }
 
 /**
@@ -148,19 +159,22 @@ export async function scanFileForConflicts(
 	const truncated = size > maxBytes;
 	const bytes = truncated ? new Uint8Array(await file.slice(0, maxBytes).arrayBuffer()) : await file.bytes();
 	const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-	// `split("\n")` over a truncated read may leave a partial last line; the
-	// scanner already tolerates an unclosed opener, so no extra trimming.
 	const lines = text.split("\n");
-	const blocks = scanConflictLines(lines, 1);
-	return truncated ? { blocks, truncatedAtLine: lines.length } : { blocks };
+	const truncatedAtLine = lines.length;
+	if (truncated && !text.endsWith("\n")) lines.pop();
+	const blocks: ConflictBlock[] = [];
+	const unfinishedStartLine = scanConflictLinesInto(lines, 1, blocks);
+	return truncated
+		? { blocks, truncatedAtLine, continuationLine: unfinishedStartLine ?? truncatedAtLine }
+		: { blocks };
 }
 
 /**
- * Note for a scan the byte cap stopped at `line`: `:conflicts` cannot list or
- * register blocks from there on, but a ranged read that shows them registers them.
+ * Disclose the actual byte-cap line separately from the range that includes
+ * any unfinished block's opener so a ranged read can register it.
  */
-export function formatScanCapNote(displayPath: string, line: number): string {
-	return `- note: the conflict scan stopped at the byte cap at line ${line}; blocks from there on are not counted or registered here — range-read \`${displayPath}:${line}-\` to show and register them.`;
+export function formatScanCapNote(displayPath: string, line: number, continuationLine = line): string {
+	return `- note: the conflict scan stopped at the byte cap at line ${line}; blocks from line ${continuationLine} on are not counted or registered here — range-read \`${displayPath}:${continuationLine}-\` to show and register them.`;
 }
 
 /**
@@ -611,6 +625,8 @@ export interface FormatConflictWarningOptions {
 	displayPath?: string;
 	/** Line where the underlying file scan hit its byte cap, if it did. */
 	truncatedAtLine?: number;
+	/** First line to range-read to include any block crossing the scan cap. */
+	continuationLine?: number;
 }
 
 export function formatConflictWarning(
@@ -632,7 +648,7 @@ export function formatConflictWarning(
 		out.push(`⚠ ${total} unresolved ${word} detected`);
 	}
 	if (options.truncatedAtLine !== undefined) {
-		out.push(formatScanCapNote(options.displayPath ?? "<file>", options.truncatedAtLine));
+		out.push(formatScanCapNote(options.displayPath ?? "<file>", options.truncatedAtLine, options.continuationLine));
 	}
 
 	const oursLabel = pickLabel(entries, e => e.oursLabel);
@@ -695,14 +711,14 @@ export function formatConflictWarning(
  */
 export function formatConflictSummary(
 	entries: readonly ConflictEntry[],
-	options: { displayPath: string; truncatedAtLine?: number } = { displayPath: "" },
+	options: { displayPath: string; truncatedAtLine?: number; continuationLine?: number } = { displayPath: "" },
 ): string {
 	const lines: string[] = [];
 	const total = entries.length;
 	const word = total === 1 ? "conflict" : "conflicts";
 	lines.push(`⚠ ${total} unresolved ${word} in ${options.displayPath || "<file>"}`);
 	if (options.truncatedAtLine !== undefined) {
-		lines.push(formatScanCapNote(options.displayPath || "<file>", options.truncatedAtLine));
+		lines.push(formatScanCapNote(options.displayPath || "<file>", options.truncatedAtLine, options.continuationLine));
 	}
 	const oursLabel = pickLabel(entries, e => e.oursLabel);
 	const theirsLabel = pickLabel(entries, e => e.theirsLabel);

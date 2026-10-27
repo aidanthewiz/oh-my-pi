@@ -26,6 +26,10 @@ import {
 	type SimpleStreamOptions,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import {
+	resolveOpenAIResponsesAccountingModel,
+	resolveOpenAIResponsesPromptCacheOptions,
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../extensibility/shared-events";
@@ -549,12 +553,10 @@ export class CacheWarmer {
 		}
 	}
 
-	async #refresh(run: ActiveRun): Promise<void> {
-		run.timer = undefined;
-		if (!this.#validateRun(run)) return;
-		const decision = this.#evaluate(run);
+	async #admitRefresh(run: ActiveRun, decision: CacheWarmingDecision): Promise<boolean> {
+		if (!this.#validateRun(run)) return false;
 		const action = await this.#decide(decision);
-		if (!this.#validateRun(run)) return;
+		if (!this.#validateRun(run)) return false;
 		const extensionOverride = action !== decision.action;
 		if (action === "stop") {
 			const reason = extensionOverride
@@ -563,10 +565,17 @@ export class CacheWarmer {
 					? "expected savings below threshold"
 					: "cache economics unavailable";
 			this.#stop(reason, { decision, extensionOverride });
-			return;
+			return false;
 		}
-
 		run.extensionOverride = extensionOverride;
+		return true;
+	}
+
+	async #refresh(run: ActiveRun): Promise<void> {
+		run.timer = undefined;
+		if (!this.#validateRun(run)) return;
+		const decision = this.#evaluate(run);
+		if (!(await this.#admitRefresh(run, decision)) || !this.#validateRun(run)) return;
 		const refresh: CacheWarmingRefreshStart = {
 			phase: run.phase,
 			provider: run.model.provider,
@@ -577,12 +586,12 @@ export class CacheWarmer {
 		let usage: Usage | undefined;
 		const sentAt = Date.now();
 		try {
-			const message = await this.#replay(run);
+			const message = await this.#replay(run, decision);
 			// Record before the abort check: a refresh cancelled or replaced after the
 			// provider accepted it was still billed, and spend tracking must see it.
 			const onWarmed = run.onWarmed ?? this.onWarmed;
 			if (message && (reportedTokens(message.usage) > 0 || message.usage.cost.total > 0) && onWarmed) {
-				onWarmed(message, extensionOverride);
+				onWarmed(message, run.extensionOverride);
 				usage = message.usage;
 			}
 			if (this.#run !== run) {
@@ -625,7 +634,7 @@ export class CacheWarmer {
 	 * adaptive allowance and runs to terminal metadata under a true one-token
 	 * total-generation cap.
 	 */
-	async #replay(run: ActiveRun): Promise<AssistantMessage | undefined> {
+	async #replay(run: ActiveRun, decision: CacheWarmingDecision): Promise<AssistantMessage | undefined> {
 		const cutoff = new AbortController();
 		let stream: CacheWarmStream;
 		const replayOptions: SimpleStreamOptions = {
@@ -633,6 +642,35 @@ export class CacheWarmer {
 			maxTokens: 1,
 			signal: AbortSignal.any([run.controller.signal, cutoff.signal]),
 		};
+		if (run.model.api === "openai-responses") {
+			let admittedDecision = decision;
+			replayOptions.onPayload = async (payload, model, signal) => {
+				if (!this.#validateRun(run)) throw new DOMException("Cache warming stopped", "AbortError");
+				const replacement = await run.options.onPayload?.(payload, model, signal);
+				if (!this.#validateRun(run)) throw new DOMException("Cache warming stopped", "AbortError");
+				const finalPayload = replacement === undefined ? payload : replacement;
+				const accountingModel = resolveOpenAIResponsesAccountingModel(
+					run.model,
+					finalPayload as Parameters<typeof resolveOpenAIResponsesAccountingModel>[1],
+				);
+				const finalDecision = this.#evaluate(run, accountingModel);
+				if (
+					finalDecision.phase !== admittedDecision.phase ||
+					finalDecision.warmCost !== admittedDecision.warmCost ||
+					finalDecision.missCost !== admittedDecision.missCost ||
+					finalDecision.continuationProbability !== admittedDecision.continuationProbability ||
+					finalDecision.economicsAvailable !== admittedDecision.economicsAvailable ||
+					finalDecision.action !== admittedDecision.action
+				) {
+					if (!(await this.#admitRefresh(run, finalDecision))) {
+						throw new DOMException("Cache warming stopped", "AbortError");
+					}
+					admittedDecision = finalDecision;
+				}
+				if (!this.#validateRun(run)) throw new DOMException("Cache warming stopped", "AbortError");
+				return replacement;
+			};
+		}
 		if (run.model.api === "bedrock-converse-stream" && run.model.thinking?.mode === "anthropic-adaptive") {
 			// Adaptive Converse ignores thinkingBudgets on the wire. Zero each
 			// supported effort so the generic mapper cannot inflate maxTokens,
@@ -671,9 +709,7 @@ export class CacheWarmer {
 			// The deliberate cutoff surfaces as an aborted result.
 		}
 		if (!partial) return undefined;
-		const usage: Usage = { ...partial.usage };
-		usage.cost = calculateCost(run.model, usage);
-		return { ...partial, usage, stopReason: "aborted" };
+		return { ...partial, stopReason: "aborted" };
 	}
 
 	#validateRun(run: ActiveRun): boolean {
@@ -691,8 +727,13 @@ export class CacheWarmer {
 		return undefined;
 	}
 
-	#evaluate(run: ActiveRun): CacheWarmingDecision {
-		const model = run.model;
+	#evaluate(run: ActiveRun, accountingModel?: Model<Api>): CacheWarmingDecision {
+		let model = accountingModel ?? run.model;
+		if (accountingModel === undefined && model.api === "openai-responses") {
+			model = resolveOpenAIResponsesAccountingModel(model, {
+				prompt_cache_options: resolveOpenAIResponsesPromptCacheOptions(model, run.options),
+			});
+		}
 		const promptTokens = this.#deps.getPromptTokens();
 		const cacheHitCost = price(model, { cacheRead: promptTokens });
 		const cacheMissCost = price(

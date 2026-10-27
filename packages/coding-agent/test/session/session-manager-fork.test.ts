@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
@@ -18,11 +18,18 @@ import {
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { copySessionArtifacts, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { isTaskToolDetails, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { getAgentDir, getTerminalSessionsDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import {
+	writeArtifact,
+	artifactFileGeneration,
+	serializeStructuredArtifactSidecar,
+	parseStructuredArtifactSidecar,
+} from "../../src/session/artifacts";
+import { promises } from "node:fs";
 
 interface JsonlMessageEntry {
 	type: "message";
@@ -65,6 +72,152 @@ async function loadHistory(file: string): Promise<SessionEntry[]> {
 	const entries = await loadEntriesFromFile(file);
 	return entries.filter((entry): entry is SessionEntry => entry.type !== "session");
 }
+
+async function writeStructuredArtifact(dir: string, id: string, data: unknown, markdown: string): Promise<string> {
+	const primary = path.join(dir, `${id}.md`);
+	await fs.mkdir(path.dirname(primary), { recursive: true });
+	await writeArtifact(primary, markdown);
+	const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+	await fs.writeFile(
+		path.join(dir, `${id}.json`),
+		serializeStructuredArtifactSidecar(JSON.stringify(data), generation),
+	);
+	return generation;
+}
+
+async function readStructuredArtifact(dir: string, id: string): Promise<unknown> {
+	const primary = path.join(dir, `${id}.md`);
+	const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+	try {
+		return parseStructuredArtifactSidecar(await fs.readFile(path.join(dir, `${id}.json`), "utf8"), generation)?.data;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
+		throw error;
+	}
+}
+
+describe("structured fork artifacts", () => {
+	it("preserves complete schema-invalid results through persisted fork and cold reopen", async () => {
+		using root = TempDir.createSync("@omp-structured-fork-");
+		const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const data = { invalidForSchema: "complete submitted data".repeat(10_000), sentinel: "not in the preview" };
+		const markdown = "Schema validation failed. Submitted preview: complete submitted data…";
+		const sourceGenerations = new Map<string, string>();
+		for (const id of ["Worker", "nested/Worker"]) {
+			sourceGenerations.set(id, await writeStructuredArtifact(sourceArtifactsDir, id, data, markdown));
+		}
+		const fork = await SessionManager.forkFrom(sourceFile, cwd, sessionDir);
+		const forkFile = fork.getSessionFile()!;
+		try {
+			fork.appendMessage({ role: "user", content: "Keep the fork and its complete result", timestamp: 1 });
+			await fork.flush();
+			const destination = fork.getArtifactsDir()!;
+			for (const id of sourceGenerations.keys()) {
+				expect(await fs.readFile(path.join(destination, `${id}.md`), "utf8")).toBe(markdown);
+				expect(
+					artifactFileGeneration(await fs.stat(path.join(destination, `${id}.md`), { bigint: true })),
+				).not.toBe(sourceGenerations.get(id));
+				expect(await readStructuredArtifact(destination, id)).toEqual(data);
+				expect(await readStructuredArtifact(sourceArtifactsDir, id)).toEqual(data);
+			}
+		} finally {
+			await fork.close();
+		}
+		const reopened = await SessionManager.open(forkFile, sessionDir);
+		try {
+			expect(await readStructuredArtifact(reopened.getArtifactsDir()!, "Worker")).toEqual(data);
+			expect(await readStructuredArtifact(reopened.getArtifactsDir()!, "nested/Worker")).toEqual(data);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it.each(["stale", "legacy"] as const)("does not rebind a %s sidecar onto a copied primary", async state => {
+		using root = TempDir.createSync("@omp-unbound-fork-");
+		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const markdown = "The current non-JSON Markdown result";
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { privateResult: "older generation" }, markdown);
+		if (state === "stale") await writeArtifact(path.join(sourceArtifactsDir, "Worker.md"), markdown);
+		else await fs.writeFile(path.join(sourceArtifactsDir, "Worker.json"), '{"privateResult":"legacy unbound data"}');
+		const destinationFile = path.join(sessionDir, "copied.jsonl");
+		await copySessionArtifacts(sourceFile, destinationFile);
+		const destination = destinationFile.slice(0, -6);
+		expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
+		expect(await readStructuredArtifact(destination, "Worker")).toBeUndefined();
+	});
+
+	it.each(["md", "json"] as const)(
+		"preserves an occupied destination %s and never makes its sidecar authoritative",
+		async kind => {
+			using root = TempDir.createSync("@omp-occupied-fork-");
+			const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+			await writeStructuredArtifact(sourceArtifactsDir, "Worker", { from: "source" }, "Source report");
+			const destinationFile = path.join(sessionDir, "occupied.jsonl");
+			const destination = destinationFile.slice(0, -6);
+			await fs.mkdir(destination);
+			const occupied = path.join(destination, `Worker.${kind}`);
+			await fs.writeFile(occupied, "Destination-owned content");
+			await copySessionArtifacts(sourceFile, destinationFile);
+			expect(await fs.readFile(occupied, "utf8")).toBe("Destination-owned content");
+			expect(await readStructuredArtifact(destination, "Worker")).toBeUndefined();
+			if (kind === "md")
+				await expect(fs.stat(path.join(destination, "Worker.json"))).rejects.toMatchObject({ code: "ENOENT" });
+		},
+	);
+
+	it("rejects a source pair replaced while its Markdown is being copied", async () => {
+		using root = TempDir.createSync("@omp-changing-fork-");
+		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "old" }, "Schema error preview");
+		const primary = await fs.realpath(path.join(sourceArtifactsDir, "Worker.md"));
+		const copyFile = promises.copyFile;
+		let replaced = false;
+		const copy = vi.spyOn(promises, "copyFile").mockImplementation(async (...args) => {
+			await copyFile(...args);
+			if (args[0] === primary && !replaced) {
+				replaced = true;
+				await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "new" }, "Schema error preview");
+			}
+		});
+		const destinationFile = path.join(sessionDir, "changing.jsonl");
+		try {
+			await copySessionArtifacts(sourceFile, destinationFile);
+		} finally {
+			copy.mockRestore();
+		}
+		expect(replaced).toBe(true);
+		expect(await readStructuredArtifact(sourceArtifactsDir, "Worker")).toEqual({ generation: "new" });
+		await expect(fs.stat(path.join(destinationFile.slice(0, -6), "Worker.md"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+
+	it("preserves a newer same-Markdown destination pair published before the sidecar link", async () => {
+		using root = TempDir.createSync("@omp-racing-fork-");
+		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const markdown = "The same shortened schema-error preview";
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, markdown);
+		const destinationFile = path.join(sessionDir, "racing.jsonl");
+		const destination = destinationFile.slice(0, -6);
+		const link = promises.link;
+		let replaced = false;
+		const publication = vi.spyOn(promises, "link").mockImplementation(async (...args) => {
+			if (args[1] === path.join(destination, "Worker.json") && !replaced) {
+				replaced = true;
+				await writeStructuredArtifact(destination, "Worker", { generation: "destination" }, markdown);
+			}
+			await link(...args);
+		});
+		try {
+			await copySessionArtifacts(sourceFile, destinationFile);
+		} finally {
+			publication.mockRestore();
+		}
+		expect(replaced).toBe(true);
+		expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
+		expect(await readStructuredArtifact(destination, "Worker")).toEqual({ generation: "destination" });
+	});
+});
 
 describe("SessionManager.forkFrom", () => {
 	it("retains the bound tuple through clone, persisted copy, full fork, branch, import and cold reopen", async () => {

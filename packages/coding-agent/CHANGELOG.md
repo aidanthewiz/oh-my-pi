@@ -13,6 +13,10 @@
 
 ### Fixed
 
+- Refuse conflict blocks whose closing line was cut by the scan byte cap. Resume ranged reads from unfinished openers while preserving complete prefix blocks.
+- Preserve provider-computed cache-warming charges, including partial responses and authoritative zero. Recheck final payload TTL, extension policy and cancellation before paid refreshes.
+- Show each selected settings option's complete description at narrow widths, including cache-retention prices. Preserve previews and confirmation-only selection.
+- Preserve complete structured task results when copying session artifacts. Rebind only stable source pairs and keep newer destination files and stale-sidecar refusal.
 - Apply the consuming session's model and provider policy to CLI, RPC, TUI and setup login, including delayed credential entry.
 - Keep queued memory extraction and usage bound to the originating session, branch and credential authority across session changes.
 - Bind optional structured task sidecars to the accepted Markdown generation. Preserve successful Markdown without serving stale JSON after sidecar failures.

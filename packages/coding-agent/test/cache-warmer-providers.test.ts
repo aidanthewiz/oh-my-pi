@@ -1,11 +1,27 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model, Usage } from "@oh-my-pi/pi-ai/types";
+import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	FetchImpl,
+	Model,
+	SimpleStreamOptions,
+	Usage,
+} from "@oh-my-pi/pi-ai/types";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { encodeBedrockFrame as encodeBedrockTestFrame } from "../../ai/test/helpers/bedrock-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import { CacheWarmer, type CacheWarmStream, type CacheWarmingRefreshEnd } from "../src/session/cache-warmer";
+import {
+	CacheWarmer,
+	type CacheWarmerDeps,
+	type CacheWarmStream,
+	type CacheWarmingRefreshEnd,
+} from "../src/session/cache-warmer";
 
 const PROMPT_TOKENS = 100_000;
 // buildModel reapplies catalog TTLs; this fixture resets it for a 1ms timer.
@@ -370,6 +386,96 @@ function makeUsage(cacheRead: number, cacheWrite: number): Usage {
 	};
 }
 
+function createResponsesPayloadHarness(
+	options: Pick<SimpleStreamOptions, "onPayload" | "cacheRetention">,
+	decide?: CacheWarmerDeps["decide"],
+) {
+	const bundled = getBundledModel<"openai-responses">("openai", "gpt-5.6");
+	if (!bundled) throw new Error("Expected bundled openai/gpt-5.6");
+	const model: Model<"openai-responses"> = {
+		...bundled,
+		promptCache: { short: ACCELERATED_CACHE_TTL_SECONDS, long: ACCELERATED_CACHE_TTL_SECONDS },
+	};
+	const bodies: Record<string, unknown>[] = [];
+	const warmed: { message: AssistantMessage; extensionOverride: boolean }[] = [];
+	const ended = Promise.withResolvers<CacheWarmingRefreshEnd>();
+	const fetchSynthetic: FetchImpl = async (_input, init) => {
+		if (typeof init?.body !== "string") throw new Error("Expected serialized Responses request");
+		bodies.push(JSON.parse(init.body));
+		const item = {
+			type: "message",
+			id: "msg_warm_payload",
+			role: "assistant",
+			status: "completed",
+			content: [{ type: "output_text", text: "Synthetic cache refresh" }],
+		};
+		const completed = {
+			type: "response.completed",
+			response: {
+				id: "resp_warm_payload",
+				status: "completed",
+				output: [item],
+				usage: {
+					input_tokens: 6000,
+					output_tokens: 0,
+					total_tokens: 6000,
+					input_tokens_details: { cached_tokens: 6000 },
+				},
+			},
+		};
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { ...item, status: "in_progress", content: [] },
+			},
+			{
+				type: "response.content_part.added",
+				output_index: 0,
+				content_index: 0,
+				part: { type: "output_text", text: "" },
+			},
+			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "Synthetic cache refresh" },
+			{ type: "response.output_item.done", output_index: 0, item },
+			completed,
+		];
+		return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+			headers: { "content-type": "text/event-stream" },
+		});
+	};
+	const warmer = new CacheWarmer({
+		stream: (requestModel, context, replayOptions) => {
+			const source = streamOpenAIResponses(requestModel as Model<"openai-responses">, context, {
+				...replayOptions,
+				apiKey: "test-key",
+				reasoning: undefined,
+				fetch: fetchSynthetic,
+				statefulResponses: false,
+			});
+			return {
+				async *[Symbol.asyncIterator]() {
+					await source.result();
+					yield* source;
+				},
+				result: () => source.result(),
+			};
+		},
+		getPromptTokens: () => 6000,
+		getMode: () => "streaming",
+		decide,
+	});
+	warmers.add(warmer);
+	warmer.onWarmed = (message, extensionOverride) => warmed.push({ message, extensionOverride });
+	warmer.onRefreshEnd = ended.resolve;
+	const request = {
+		model,
+		context: CONTEXT,
+		options: { apiKey: "test-key", cacheRetention: "long" as const, ...options },
+	};
+	warmer.start(request, () => true);
+	return { warmer, request, bodies, warmed, ended: ended.promise };
+}
+
 const warmers = new Set<CacheWarmer>();
 
 beforeEach(() => vi.useFakeTimers());
@@ -481,5 +587,356 @@ describe("cache warmer provider replay behavior", () => {
 		warmer.start({ model, context: CONTEXT, options: { reasoning: Effort.High } }, () => true);
 		expect(warmer.status).toMatchObject({ state: "inactive", reason: "request cannot be replayed safely" });
 		expect(streamCalls).toBe(0);
+	});
+});
+
+describe("cache warmer preserves real Responses accounting", () => {
+	for (const partial of [true, false]) {
+		test.each([
+			{ provider: "openai", servedTier: undefined, money: {}, expected: 1 },
+			{ provider: "openai", servedTier: "priority", money: {}, expected: 2 },
+			{ provider: "openrouter", servedTier: undefined, money: { cost: 7.25 }, expected: 7.25 },
+			{ provider: "openrouter", servedTier: undefined, money: { cost: 0 }, expected: 0 },
+			{
+				provider: "openrouter",
+				servedTier: undefined,
+				money: { cost: 0.75, is_byok: true, cost_details: { upstream_inference_cost: 7 } },
+				expected: 7.75,
+			},
+		] as const)(
+			`${partial ? "partial cutoff" : "normal done"} retains $provider monetary total $expected`,
+			async scenario => {
+				const official = buildModel({
+					id: "gpt-5.6",
+					name: "GPT-5.6",
+					api: "openai-responses",
+					provider: "openai",
+					baseUrl: "https://api.openai.com/v1",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
+					contextWindow: 400_000,
+					maxTokens: 128_000,
+				});
+				const model: Model<"openai-responses"> = {
+					...official,
+					provider: scenario.provider,
+					id: scenario.provider === "openai" ? "gpt-5.6" : "openai/gpt-5.6",
+					baseUrl: scenario.provider === "openai" ? official.baseUrl : "https://openrouter.ai/api/v1",
+					identity: classifyModel(
+						scenario.provider,
+						scenario.provider === "openai" ? "gpt-5.6" : "openai/gpt-5.6",
+					),
+					promptCache: { short: ACCELERATED_CACHE_TTL_SECONDS, long: ACCELERATED_CACHE_TTL_SECONDS },
+				};
+				const originalModel = structuredClone(model);
+				const bodies: Record<string, unknown>[] = [];
+				const consumed: AssistantMessageEvent["type"][] = [];
+				const warmed: AssistantMessage[] = [];
+				const ended = Promise.withResolvers<CacheWarmingRefreshEnd>();
+				let decoded: AssistantMessage | undefined;
+				let originalUsage: Usage | undefined;
+				const fetchSynthetic: FetchImpl = async (_input, init) => {
+					if (typeof init?.body !== "string") throw new Error("Expected serialized Responses request");
+					bodies.push(JSON.parse(init.body));
+					const item = {
+						type: "message",
+						id: "msg_warming",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "Accounted warm response" }],
+					};
+					const events = [
+						...(partial
+							? [
+									{
+										type: "response.output_item.added",
+										output_index: 0,
+										item: { ...item, status: "in_progress", content: [] },
+									},
+									{
+										type: "response.content_part.added",
+										output_index: 0,
+										content_index: 0,
+										part: { type: "output_text", text: "" },
+									},
+									{
+										type: "response.output_text.delta",
+										output_index: 0,
+										content_index: 0,
+										delta: "Accounted warm response",
+									},
+								]
+							: []),
+						{ type: "response.output_item.done", output_index: 0, item },
+						{
+							type: "response.completed",
+							response: {
+								status: "completed",
+								service_tier: scenario.servedTier,
+								usage: {
+									input_tokens: 100_000,
+									output_tokens: 0,
+									total_tokens: 100_000,
+									input_tokens_details: { cached_tokens: 0, cache_write_tokens: 100_000 },
+									...scenario.money,
+								},
+							},
+						},
+					];
+					return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					});
+				};
+				const warmer = new CacheWarmer({
+					stream: (requestModel, context, options) => {
+						const source = streamSimple(requestModel, context, {
+							...options,
+							fetch: fetchSynthetic,
+							statefulResponses: false,
+						});
+						return {
+							async *[Symbol.asyncIterator]() {
+								// Let the real producer finish before the slower consumer drains its queued events.
+								decoded = await source.result();
+								originalUsage = structuredClone(decoded.usage);
+								for await (const event of source) {
+									consumed.push(event.type);
+									yield event;
+								}
+							},
+							result: () => source.result(),
+						};
+					},
+					getPromptTokens: () => PROMPT_TOKENS,
+					getMode: () => "streaming",
+				});
+				warmers.add(warmer);
+				warmer.onWarmed = message => warmed.push(message);
+				warmer.onRefreshEnd = ended.resolve;
+				warmer.start(
+					{
+						model,
+						context: CONTEXT,
+						options: {
+							apiKey: "test-key",
+							cacheRetention: "long",
+							serviceTier: scenario.servedTier ? "flex" : undefined,
+						},
+					},
+					() => true,
+				);
+				await advanceWarmTimer();
+				const refresh = await ended.promise;
+				expect(bodies).toHaveLength(1);
+				expect(bodies[0]?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "12h" });
+				expect(originalUsage?.cost.total).toBeCloseTo(scenario.expected, 10);
+				expect(decoded?.usage).toEqual(originalUsage);
+				expect(model).toEqual(originalModel);
+				expect(consumed.includes("done")).toBe(!partial);
+				expect(warmed).toHaveLength(1);
+				expect(warmed[0]?.stopReason).toBe(partial ? "aborted" : "stop");
+				expect(warmed[0]?.usage.cacheWrite).toBe(100_000);
+				expect(warmed[0]?.usage.cost.total).toBeCloseTo(scenario.expected, 10);
+				expect(refresh.usage?.cost.total).toBeCloseTo(scenario.expected, 10);
+			},
+		);
+	}
+});
+
+describe("cache warmer admits the final Responses payload", () => {
+	for (const mutation of ["replacement", "in-place"] as const) {
+		test(`${mutation} shortening to 30m stops before fetch`, async () => {
+			const onPayload = vi.fn((payload: unknown) => {
+				if (!isRecord(payload)) throw new Error("Expected Responses payload");
+				const prompt_cache_options = { mode: "implicit", ttl: "30m" };
+				if (mutation === "replacement") return { ...payload, prompt_cache_options };
+				payload.prompt_cache_options = prompt_cache_options;
+				return undefined;
+			});
+			const decide = vi.fn<NonNullable<CacheWarmerDeps["decide"]>>(async event => event.action);
+			const h = createResponsesPayloadHarness({ onPayload }, decide);
+			await advanceWarmTimer();
+			const ended = await h.ended;
+			expect(h.bodies).toHaveLength(0);
+			expect(onPayload).toHaveBeenCalledTimes(1);
+			expect(decide).toHaveBeenCalledTimes(2);
+			expect(decide.mock.calls[0]?.[0].action).toBe("warm");
+			expect(decide.mock.calls[1]?.[0].action).toBe("stop");
+			expect(h.warmed).toHaveLength(0);
+			expect(ended.outcome).toBe("aborted");
+			expect(ended.usage).toBeUndefined();
+			expect(h.warmer.status).toMatchObject({
+				state: "inactive",
+				reason: "expected savings below threshold",
+				decision: { action: "stop" },
+				extensionOverride: false,
+			});
+		});
+	}
+
+	test("a revised extension stop vetoes a final beneficial request", async () => {
+		const onPayload = vi.fn((payload: unknown) => {
+			if (!isRecord(payload)) throw new Error("Expected Responses payload");
+			return { ...payload, prompt_cache_options: { mode: "implicit", ttl: "12h" } };
+		});
+		const decide = vi.fn<NonNullable<CacheWarmerDeps["decide"]>>(async event =>
+			event.action === "stop" ? "warm" : "stop",
+		);
+		const h = createResponsesPayloadHarness({ cacheRetention: "short", onPayload }, decide);
+		await advanceWarmTimer();
+		const ended = await h.ended;
+		expect(h.bodies).toHaveLength(0);
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(decide).toHaveBeenCalledTimes(2);
+		expect(h.warmed).toHaveLength(0);
+		expect(ended.outcome).toBe("aborted");
+		expect(ended.usage).toBeUndefined();
+		expect(h.warmer.status).toMatchObject({
+			state: "inactive",
+			reason: "stopped by extension",
+			decision: { action: "warm" },
+			extensionOverride: true,
+		});
+	});
+
+	test("unchanged beneficial 12h payload fetches once without repeating extension decisions", async () => {
+		const onPayload = vi.fn((payload: unknown) => payload);
+		const decide = vi.fn<NonNullable<CacheWarmerDeps["decide"]>>(async event => event.action);
+		const h = createResponsesPayloadHarness({ onPayload }, decide);
+		const originalModel = structuredClone(h.request.model);
+		await advanceWarmTimer();
+		const ended = await h.ended;
+		expect(h.bodies).toHaveLength(1);
+		expect(h.bodies[0]?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "12h" });
+		expect(h.bodies[0]?.max_output_tokens).toBe(1);
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(decide).toHaveBeenCalledTimes(1);
+		expect(h.warmed).toHaveLength(1);
+		expect(h.warmed[0]?.extensionOverride).toBe(false);
+		expect(h.warmed[0]?.message.usage.cacheRead).toBe(6000);
+		expect(h.warmed[0]?.message.usage.cost.total).toBeCloseTo(0.0024, 10);
+		expect(ended.usage?.cost.total).toBeCloseTo(0.0024, 10);
+		expect(ended.outcome).toBe("hit");
+		expect(h.request.model).toEqual(originalModel);
+		expect(h.warmer.status.state).toBe("scheduled");
+	});
+
+	test("a revised extension warm override permits the final low-benefit request and attributes its cost", async () => {
+		const onPayload = vi.fn((payload: unknown) => {
+			if (!isRecord(payload)) throw new Error("Expected Responses payload");
+			return { ...payload, prompt_cache_options: { mode: "implicit", ttl: "30m" } };
+		});
+		const decide = vi.fn(async () => "warm" as const);
+		const h = createResponsesPayloadHarness({ onPayload }, decide);
+		await advanceWarmTimer();
+		const ended = await h.ended;
+		expect(h.bodies).toHaveLength(1);
+		expect(h.bodies[0]?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" });
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(decide).toHaveBeenCalledTimes(2);
+		expect(h.warmed).toHaveLength(1);
+		expect(h.warmed[0]?.extensionOverride).toBe(true);
+		expect(h.warmed[0]?.message.usage.cost.total).toBeCloseTo(0.0024, 10);
+		expect(ended.usage?.cost.total).toBeCloseTo(0.0024, 10);
+		expect(ended.outcome).toBe("hit");
+	});
+
+	test("a final beneficial request removes an earlier extension override attribution", async () => {
+		const onPayload = vi.fn((payload: unknown) => {
+			if (!isRecord(payload)) throw new Error("Expected Responses payload");
+			return { ...payload, prompt_cache_options: { mode: "implicit", ttl: "12h" } };
+		});
+		const decide = vi.fn(async () => "warm" as const);
+		const h = createResponsesPayloadHarness({ cacheRetention: "short", onPayload }, decide);
+		await advanceWarmTimer();
+		const ended = await h.ended;
+		expect(h.bodies).toHaveLength(1);
+		expect(h.bodies[0]?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "12h" });
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(decide).toHaveBeenCalledTimes(2);
+		expect(h.warmed).toHaveLength(1);
+		expect(h.warmed[0]?.extensionOverride).toBe(false);
+		expect(ended.outcome).toBe("hit");
+	});
+
+	test("an explicit extension stop never evaluates a payload hook or submits", async () => {
+		const onPayload = vi.fn((payload: unknown) => payload);
+		const decide = vi.fn(async () => "stop" as const);
+		const h = createResponsesPayloadHarness({ onPayload }, decide);
+		await advanceWarmTimer();
+		await h.warmer.drain();
+		expect(onPayload).toHaveBeenCalledTimes(0);
+		expect(decide).toHaveBeenCalledTimes(1);
+		expect(h.bodies).toHaveLength(0);
+		expect(h.warmed).toHaveLength(0);
+		expect(h.warmer.status).toMatchObject({
+			state: "inactive",
+			reason: "stopped by extension",
+			extensionOverride: true,
+		});
+	});
+
+	for (const interruption of ["cancel", "replace", "context"] as const) {
+		test(`${interruption} during an awaited payload hook prevents submission`, async () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let current = true;
+			const onPayload = vi.fn(async (payload: unknown) => {
+				entered.resolve();
+				await release.promise;
+				return payload;
+			});
+			const h = createResponsesPayloadHarness({ onPayload });
+			if (interruption === "context") h.warmer.start(h.request, () => current);
+			try {
+				await advanceWarmTimer();
+				await entered.promise;
+				if (interruption === "cancel") h.warmer.cancel();
+				if (interruption === "replace") h.warmer.start(h.request, () => true);
+				if (interruption === "context") current = false;
+			} finally {
+				release.resolve();
+			}
+			const ended = await h.ended;
+			expect(h.bodies).toHaveLength(0);
+			expect(onPayload).toHaveBeenCalledTimes(1);
+			expect(h.warmed).toHaveLength(0);
+			expect(ended.outcome).toBe("aborted");
+			expect(h.warmer.status.state).toBe(interruption === "replace" ? "scheduled" : "inactive");
+		});
+	}
+
+	test("cancellation during a revised awaited extension decision prevents submission", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const onPayload = vi.fn((payload: unknown) => {
+			if (!isRecord(payload)) throw new Error("Expected Responses payload");
+			return { ...payload, prompt_cache_options: { mode: "implicit", ttl: "30m" } };
+		});
+		const decide = vi.fn<NonNullable<CacheWarmerDeps["decide"]>>(async event => {
+			if (event.action === "stop") {
+				entered.resolve();
+				await release.promise;
+				return "warm";
+			}
+			return event.action;
+		});
+		const h = createResponsesPayloadHarness({ onPayload }, decide);
+		try {
+			await advanceWarmTimer();
+			await entered.promise;
+			h.warmer.cancel();
+		} finally {
+			release.resolve();
+		}
+		const ended = await h.ended;
+		expect(h.bodies).toHaveLength(0);
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(decide).toHaveBeenCalledTimes(2);
+		expect(h.warmed).toHaveLength(0);
+		expect(ended.outcome).toBe("aborted");
+		expect(h.warmer.status.state).toBe("inactive");
 	});
 });
