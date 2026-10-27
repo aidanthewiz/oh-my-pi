@@ -16,6 +16,7 @@
 
 - Honor effective MCP enable overrides for extension calls and prepare managed AWS profiles before their first signed dispatch without replaying unsafe transport failures.
 - Apply MCP replay contracts to tool-level authentication challenges, HTTP/SSE OAuth retries, and AWS errors. Unsafe calls retain their first failure without resubmission.
+- Keep MCP catalogs bound to the current configuration and connection through startup, refresh, reconnect, and disconnect. Completed discovery cannot restore disconnected host-only tools or replace a newer catalog.
 - Keep complete selected permissions, AWS commands, identity, and safety details readable above status lines and lower hook widgets after resizing.
 - Keep complete provider safety checks readable in approval dialogs even when tool activity is visible.
 - Avoid repeat AWS permission prompts in eval and nested device batches after granting session access.

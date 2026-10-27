@@ -1047,6 +1047,7 @@ export class MCPManager {
 					this.#reconnectServerForTool(name, options);
 				this.#replaceServerTools(
 					name,
+					config,
 					DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
 				);
 				this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
@@ -1173,8 +1174,9 @@ export class MCPManager {
 					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 						this.#reconnectServerForTool(name, options);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
-					this.#replaceServerTools(name, customTools);
+					if (!this.#replaceServerTools(name, connectionConfig, customTools, connection)) return;
 					await this.#notifyOwnerToolsChanged();
+					if (!this.#ownsConnection(name, connection)) return;
 					void this.toolCache?.set(name, connectionConfig, serverTools);
 
 					notify({ type: "connected", serverName: name });
@@ -1243,13 +1245,8 @@ export class MCPManager {
 			for (const task of connectionTasks) {
 				const { name } = task;
 				if (task.tracked.status === "fulfilled") {
-					const value = task.tracked.value;
-					if (!value) continue;
-					const { connection, serverTools } = value;
-					connectedServers.add(name);
-					const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
-						this.#reconnectServerForTool(name, options);
-					this.#replaceServerTools(name, MCPTool.fromTools(connection, serverTools, reconnect));
+					const connection = task.tracked.value?.connection;
+					if (connection && this.#ownsConnection(name, connection)) connectedServers.add(name);
 				} else if (task.tracked.status === "rejected" && !task.cached?.length) {
 					if (isAbortedHandshake(task.connectSignal, task.tracked.reason)) continue;
 					if (task.tracked.reason instanceof MCPOAuthCancelledError) continue;
@@ -1268,9 +1265,13 @@ export class MCPManager {
 		return {
 			tools: this.#tools,
 			errors,
-			connectedServers: Array.from(connectedServers),
+			connectedServers: Array.from(connectedServers).filter(name => this.#connections.has(name)),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
 		};
+	}
+
+	#ownsConnection(name: string, connection: MCPServerConnection): boolean {
+		return this.#connections.get(name) === connection && this.#serverConfigs.get(name) === connection.config;
 	}
 
 	/**
@@ -1279,13 +1280,22 @@ export class MCPManager {
 	 * can prefix another's (`atlassian` vs `atlassian:atlassian`) and a name
 	 * with sanitized characters never prefix-matches its own tools at all.
 	 */
-	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
+	#replaceServerTools(
+		name: string,
+		config: MCPServerConfig,
+		tools: CustomTool<TSchema, MCPToolDetails>[],
+		connection?: MCPServerConnection,
+	): boolean {
+		if (this.#serverConfigs.get(name) !== config || (connection && !this.#ownsConnection(name, connection))) {
+			return false;
+		}
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
-		if (this.#serverConfigs.get(name)?.exposeTools !== false) this.#tools.push(...tools);
+		if (config.exposeTools !== false) this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(this.#tools);
 		this.#emitToolsChanged();
+		return this.#serverConfigs.get(name) === config && (!connection || this.#ownsConnection(name, connection));
 	}
 
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): Promise<void> {
@@ -1704,9 +1714,7 @@ export class MCPManager {
 		}
 		this.#subscribedResources.delete(name);
 
-		if (connection) {
-			await this.#discardConnection(name, connection);
-		}
+		const disconnecting = connection ? this.#discardConnection(name, connection) : undefined;
 
 		const hadTools = this.#tools.some(t => t.mcpServerName === name);
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
@@ -1716,6 +1724,7 @@ export class MCPManager {
 		}
 
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
+		await disconnecting;
 	}
 
 	/**
@@ -1919,6 +1928,7 @@ export class MCPManager {
 		let config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
+		const reconnectSignal = this.#connectionAbortControllers.get(name)?.signal ?? this.#connectAbort.signal;
 
 		if (authorizedConfig) {
 			config = authorizedConfig;
@@ -1934,6 +1944,7 @@ export class MCPManager {
 			}
 			try {
 				const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
+				if (reconnectSignal.aborted || this.#serverConfigs.get(name) !== config) return null;
 				if (!refreshedConfig) {
 					this.#declinedAuthServers.add(name);
 					return null;
@@ -1978,7 +1989,7 @@ export class MCPManager {
 		// attempt is a single quiet probe; its pacing is the schedule itself.
 		const delays = scheduled ? [] : this.reconnectPolicy.ladderMs;
 		for (let attempt = 0; attempt <= delays.length; attempt++) {
-			if (this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
+			if (reconnectSignal.aborted || this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
 				logger.debug("MCP reconnect aborted before attempt after configuration changed", {
 					path: `mcp:${name}`,
 					storedEpoch: reconnectEpoch,
@@ -1992,14 +2003,16 @@ export class MCPManager {
 					config,
 					source,
 					reconnectEpoch,
+					reconnectSignal,
 					options.awsProfile ?? oldConnection?.awsPreferredProfile,
 				);
+				if (!this.#ownsConnection(name, connection)) return null;
 				this.#pendingAuthChallenges.delete(name);
 				logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
 				this.#emitConnectionStatus({ type: "connected", serverName: name });
 				return connection;
 			} catch (error) {
-				if (this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
+				if (reconnectSignal.aborted || this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
 					logger.debug("MCP reconnect aborted after configuration changed", {
 						path: `mcp:${name}`,
 						storedEpoch: reconnectEpoch,
@@ -2044,9 +2057,9 @@ export class MCPManager {
 		config: MCPServerConfig,
 		source: SourceMeta | undefined,
 		reconnectEpoch: number,
+		connectSignal: AbortSignal,
 		awsPreferredProfile?: string,
 	): Promise<MCPServerConnection> {
-		const connectSignal = this.#connectAbort.signal;
 		const resolvedConfig = await this.#resolveAuthConfig(config, {
 			sourceLevel: source?.level,
 			signal: connectSignal,
@@ -2070,7 +2083,7 @@ export class MCPManager {
 
 		// Bail out if the server was disconnected or the manager was reset
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
-		if (this.#serverConfigs.get(name) !== config || this.#epoch !== reconnectEpoch) {
+		if (connectSignal.aborted || this.#serverConfigs.get(name) !== config || this.#epoch !== reconnectEpoch) {
 			this.#detachConnection(name, connection);
 			void disconnectServer(connection).catch(() => {});
 			throw new Error(`Server "${name}" was disconnected during reconnection`);
@@ -2101,12 +2114,14 @@ export class MCPManager {
 			void this.reconnectServer(name);
 		};
 		try {
-			const serverTools = await listTools(connection);
+			const serverTools = await listTools(connection, { signal: connectSignal });
 			const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 				this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+			if (!this.#replaceServerTools(name, config, customTools, connection)) {
+				throw new Error(`Server "${name}" was disconnected during tool discovery`);
+			}
 			void this.toolCache?.set(name, config, serverTools);
-			this.#replaceServerTools(name, customTools);
 			this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
 			void this.#loadServerResourcesAndPrompts(name, connection);
 			return connection;
@@ -2126,6 +2141,7 @@ export class MCPManager {
 	 * of blanking the catalog for a second listing.
 	 */
 	async #loadServerResourcesAndPrompts(name: string, connection: MCPServerConnection): Promise<void> {
+		if (!this.#ownsConnection(name, connection)) return;
 		if (serverSupportsResources(connection.capabilities)) {
 			try {
 				await this.ensureServerResources(name);
@@ -2134,6 +2150,7 @@ export class MCPManager {
 			}
 		}
 
+		if (!this.#ownsConnection(name, connection)) return;
 		if (serverSupportsPrompts(connection.capabilities)) {
 			try {
 				await this.refreshServerPrompts(name);
@@ -2195,10 +2212,10 @@ export class MCPManager {
 		const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 			this.#reconnectServerForTool(name, options);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
-		void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server
-		this.#replaceServerTools(name, customTools);
+		if (!this.#replaceServerTools(name, connection.config, customTools, connection)) return;
+		void this.toolCache?.set(name, connection.config, serverTools);
 		await this.#notifyOwnerToolsChanged();
 	}
 

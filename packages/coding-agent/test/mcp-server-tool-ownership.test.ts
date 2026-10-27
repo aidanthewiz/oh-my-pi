@@ -23,7 +23,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import type { MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { MCPHttpServerConfig, MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { MANY_TOOL_COUNT, manyToolName } from "./fixtures/many-tools-mcp";
 
@@ -39,9 +39,63 @@ function fixtureConfig(): MCPStdioServerConfig {
 	return { type: "stdio", command: process.execPath, args: [FIXTURE_PATH] };
 }
 
-describe("MCP tool ownership with prefix-colliding server names", () => {
+describe("MCP tool ownership", () => {
 	let workDir: string;
 	let manager: MCPManager;
+	const servers: Bun.Server<undefined>[] = [];
+
+	function loopbackConfig(label: string, toolNames: string[], toolsGate?: Promise<void>) {
+		const toolsRequested = Promise.withResolvers<void>();
+		let nextInitialization: { gate: Promise<void>; started: () => void } | undefined;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.method !== "POST") return new Response(null, { status: 405 });
+				const rpc = (await request.json()) as { id?: number | string; method: string };
+				if (rpc.id === undefined) return new Response(null, { status: 202 });
+				let result: unknown;
+				if (rpc.method === "initialize") {
+					const pending = nextInitialization;
+					nextInitialization = undefined;
+					pending?.started();
+					await pending?.gate;
+					result = {
+						protocolVersion: "2025-11-25",
+						serverInfo: { name: label, version: "1" },
+						capabilities: { tools: {} },
+					};
+				} else if (rpc.method === "tools/list") {
+					toolsRequested.resolve();
+					await toolsGate;
+					result = {
+						tools: toolNames.map(name => ({
+							name,
+							inputSchema: { type: "object" },
+							annotations: { readOnlyHint: true },
+						})),
+					};
+				} else if (rpc.method === "tools/call") {
+					result = {
+						content: [{ type: "text", text: label }],
+						structuredContent: { owner: label },
+					};
+				} else result = {};
+				return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+			},
+		});
+		servers.push(server);
+		const config: MCPHttpServerConfig = { type: "http", url: server.url.href };
+		return {
+			config,
+			toolsRequested: toolsRequested.promise,
+			holdNextInitialization(gate: Promise<void>): Promise<void> {
+				const started = Promise.withResolvers<void>();
+				nextInitialization = { gate, started: started.resolve };
+				return started.promise;
+			},
+		};
+	}
 
 	beforeEach(() => {
 		workDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-mcp-ownership-"));
@@ -51,6 +105,7 @@ describe("MCP tool ownership with prefix-colliding server names", () => {
 	afterEach(async () => {
 		await manager.disconnectAll();
 		removeSyncWithRetries(workDir);
+		for (const server of servers.splice(0)) server.stop(true);
 	});
 
 	it("refreshing one server keeps the sibling server's tools registered", async () => {
@@ -97,4 +152,135 @@ describe("MCP tool ownership with prefix-colliding server names", () => {
 		expect(payloads.at(-1)?.some(name => name === COLON_TOOL)).toBe(false);
 		expect(payloads.at(-1)).toHaveLength(MANY_TOOL_COUNT);
 	}, 20_000);
+
+	it.each([
+		["retained", false],
+		["retained", true],
+		["refreshed", true],
+		["disconnected", false],
+		["disconnected", true],
+		["replaced", false],
+	] as const)(
+		"keeps only the %s owner when startup completes (exposeTools=%s)",
+		async (ownership, exposeTools) => {
+			const retained = ownership === "retained" || ownership === "refreshed";
+			const gate = Promise.withResolvers<void>();
+			const fastTools = ["read_state"];
+			const fast = loopbackConfig("original", fastTools);
+			const slow = loopbackConfig("slow", ["zulu", "alpha"], gate.promise);
+			const fastConnected = Promise.withResolvers<void>();
+			const catalogs: string[][] = [];
+			manager.setOnToolsChanged(tools => {
+				catalogs.push(tools.map(tool => tool.name));
+			});
+			const loading = manager.connectServers(
+				{ fast: { ...fast.config, exposeTools }, slow: slow.config },
+				{},
+				event => {
+					if (event.type === "connected" && event.serverName === "fast") fastConnected.resolve();
+				},
+				0,
+			);
+			try {
+				await Promise.all([fastConnected.promise, slow.toolsRequested]);
+				expect(manager.getTools().map(tool => tool.name)).toEqual(exposeTools ? ["mcp__fast_read_state"] : []);
+				expect((await manager.callTool("fast", "read_state")).structuredContent?.owner).toBe("original");
+
+				if (!retained) await manager.disconnectServer("fast");
+				if (ownership === "refreshed") {
+					fastTools.splice(0, fastTools.length, "current_state");
+					await manager.refreshServerTools("fast");
+				}
+				if (ownership === "replaced") {
+					const current = loopbackConfig("current", ["current_state"]);
+					await manager.connectServers({ fast: current.config }, {}, undefined, 0);
+				}
+				const catalogsBeforeCompletion = catalogs.length;
+				gate.resolve();
+				const result = await loading;
+				await manager.waitForStartup(0);
+
+				const expected = ["mcp__slow_alpha", "mcp__slow_zulu"];
+				if (ownership === "retained" && exposeTools) expected.unshift("mcp__fast_read_state");
+				if (ownership === "replaced" || ownership === "refreshed") expected.unshift("mcp__fast_current_state");
+				expect(result.tools.map(tool => tool.name)).toEqual(expected);
+				expect(manager.getTools().map(tool => tool.name)).toEqual(expected);
+				for (const catalog of catalogs.slice(catalogsBeforeCompletion)) expect(catalog).toEqual(expected);
+				expect(result.connectedServers).toEqual(retained ? ["fast", "slow"] : ["slow"]);
+
+				if (ownership === "disconnected") {
+					expect(manager.getConnectionStatus("fast")).toBe("disconnected");
+					expect(manager.getServerConfig("fast")).toBeUndefined();
+					await expect(manager.callTool("fast", "read_state")).rejects.toThrow("not enabled");
+				} else {
+					const toolName = ownership === "replaced" || ownership === "refreshed" ? "current_state" : "read_state";
+					const result = await manager.callTool("fast", toolName);
+					expect(result.structuredContent?.owner).toBe(ownership === "replaced" ? "current" : "original");
+					if (ownership === "replaced" || ownership === "refreshed") {
+						await expect(manager.callTool("fast", "read_state")).rejects.toThrow("not found");
+					}
+				}
+			} finally {
+				gate.resolve();
+				await loading;
+			}
+		},
+		10_000,
+	);
+
+	it("does not let a disconnected reconnect replace a new owner that reuses the same config", async () => {
+		const fixture = loopbackConfig("retained", ["read_state"]);
+		const config = { ...fixture.config, exposeTools: false };
+		await manager.connectServers({ fast: config }, {}, undefined, 0);
+		const gate = Promise.withResolvers<void>();
+		const reconnectStarted = fixture.holdNextInitialization(gate.promise);
+		const reconnecting = manager.reconnectServer("fast", { manual: true });
+		try {
+			await reconnectStarted;
+			await manager.disconnectServer("fast");
+			const replacement = await manager.connectServers({ fast: config }, {}, undefined, 0);
+			const current = manager.getConnection("fast");
+			gate.resolve();
+
+			expect(await reconnecting).toBeNull();
+			expect(manager.getConnection("fast")).toBe(current);
+			expect(replacement.tools).toEqual([]);
+			expect(manager.getTools()).toEqual([]);
+			expect((await manager.callTool("fast", "read_state")).structuredContent?.owner).toBe("retained");
+		} finally {
+			gate.resolve();
+			await reconnecting;
+		}
+	}, 10_000);
+
+	it("does not report a disconnected startup owner after its catalog callback resumes", async () => {
+		const fixture = loopbackConfig("original", ["read_state"]);
+		const callbackEntered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const statuses: string[] = [];
+		manager.setOnToolsChanged(async () => {
+			callbackEntered.resolve();
+			await gate.promise;
+		});
+		const loading = manager.connectServers(
+			{ fast: { ...fixture.config, exposeTools: false } },
+			{},
+			event => statuses.push(event.type),
+			0,
+		);
+		try {
+			await callbackEntered.promise;
+			const drained = manager.waitForStartup(0);
+			await manager.disconnectServer("fast");
+			gate.resolve();
+			await Promise.all([loading, drained]);
+
+			expect(statuses).toEqual(["connecting"]);
+			expect(manager.getConnectionStatus("fast")).toBe("disconnected");
+			expect(manager.getTools()).toEqual([]);
+		} finally {
+			gate.resolve();
+			await loading;
+		}
+	}, 10_000);
 });
