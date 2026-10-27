@@ -14,11 +14,11 @@ static LINE_REF_RE: LazyLock<Regex> =
 	LazyLock::new(|| Regex::new(r"^\s*[>+\-*]*\s*(\d+)(?::.*)?\s*$").expect("valid regex"));
 
 /// Context needed to explain a stale or unrecognized snapshot tag.
-pub struct MismatchDetails {
+pub struct MismatchDetails<'a> {
 	pub path:               Option<String>,
 	pub expected_file_hash: String,
 	pub actual_file_hash:   String,
-	pub file_lines:         Vec<String>,
+	pub file_lines:         Vec<&'a str>,
 	pub anchor_lines:       Vec<u32>,
 	pub hash_recognized:    bool,
 	/// Absolute paths this session has already issued `expected_file_hash` for.
@@ -72,7 +72,7 @@ pub fn validate_line_ref(line: u32, file_lines: &[String]) -> Result<(), EditErr
 }
 
 /// Format the complete model-facing snapshot mismatch diagnostic.
-pub fn format_mismatch_message(details: &MismatchDetails) -> String {
+pub fn format_mismatch_message(details: &MismatchDetails<'_>) -> String {
 	let path = details
 		.path
 		.as_ref()
@@ -139,6 +139,6 @@ pub fn format_header_only_message(path: &str, actual_file_hash: &str) -> String 
 }
 
 /// Construct a match failure from mismatch details.
-pub fn mismatch_error(details: &MismatchDetails) -> EditError {
+pub fn mismatch_error(details: &MismatchDetails<'_>) -> EditError {
 	EditError::matched(format_mismatch_message(details))
 }

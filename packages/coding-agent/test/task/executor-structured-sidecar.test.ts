@@ -6,6 +6,7 @@
  * full payload stays recoverable via `agent://<id>` (PR #10625 review).
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,6 +21,12 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
+import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
+import {
+	artifactFileGeneration,
+	parseStructuredArtifactSidecar,
+	serializeStructuredArtifactSidecar,
+} from "../../src/session/artifacts";
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
@@ -160,7 +167,8 @@ describe("structured output sidecar lifecycle", () => {
 						session: replacement,
 					});
 					await fs.writeFile(outputPath, accepted);
-					await fs.writeFile(sidecarPath, accepted);
+					const generation = artifactFileGeneration(await fs.stat(outputPath, { bigint: true }));
+					await fs.writeFile(sidecarPath, serializeStructuredArtifactSidecar(accepted, generation));
 					throw new Error("simulated disk failure after owner replacement");
 				})();
 			}
@@ -183,7 +191,10 @@ describe("structured output sidecar lifecycle", () => {
 			expect(result.aborted).toBe(true);
 			expect(result.outputPath).toBeUndefined();
 			expect(await fs.readFile(outputPath, "utf8")).toBe(accepted);
-			expect(await fs.readFile(sidecarPath, "utf8")).toBe(accepted);
+			const generation = artifactFileGeneration(await fs.stat(outputPath, { bigint: true }));
+			expect(parseStructuredArtifactSidecar(await fs.readFile(sidecarPath, "utf8"), generation)?.data).toEqual(
+				JSON.parse(accepted),
+			);
 			expect(AgentRegistry.global().get(id)?.session).toBe(replacement);
 		} finally {
 			AgentRegistry.global().unregister(id);
@@ -266,7 +277,135 @@ describe("structured output sidecar lifecycle", () => {
 		expect(result.structuredOutput?.status).toBe("invalid");
 		const sidecarPath = path.join(artifactsDir, `${id}.json`);
 		await expect(fs.stat(sidecarPath)).resolves.toBeDefined();
-		const sidecar = JSON.parse(await fs.readFile(sidecarPath, "utf-8"));
-		expect(sidecar).toEqual({ ok: "not-a-boolean" });
+		const generation = artifactFileGeneration(await fs.stat(result.outputPath!, { bigint: true }));
+		const sidecar = parseStructuredArtifactSidecar(await fs.readFile(sidecarPath, "utf8"), generation);
+		expect(sidecar?.data).toEqual({ ok: "not-a-boolean" });
 	});
+
+	it.each(["write", "rename", "remove", "serialize"] as const)(
+		"keeps accepted identical Markdown authoritative after optional %s and cleanup failure",
+		async fault => {
+			artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-generation-"));
+			const id = `Generation-${fault}`;
+			const primary = path.join(artifactsDir, `${id}.md`);
+			const sidecar = path.join(artifactsDir, `${id}.json`);
+			const options = {
+				cwd: "/tmp",
+				agent: baseAgent,
+				task: "do work",
+				index: 0,
+				id,
+				settings: Settings.isolated(),
+				modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+				enableLsp: false,
+				artifactsDir,
+				outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+			};
+			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () =>
+				createSessionResult(yieldEmittingSession({ ok: true })),
+			);
+			const first = await runSubprocess(options);
+			expect(first.exitCode).toBe(0);
+			const firstMarkdown = await fs.readFile(primary, "utf8");
+			const firstSidecar = await fs.readFile(sidecar, "utf8");
+			const previousGeneration = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+			const originalRemove = fsSync.rmSync;
+			vi.spyOn(fsSync, "rmSync").mockImplementation((file, options) => {
+				if (String(file) === sidecar) throw new Error("Synthetic optional cleanup failure");
+				return originalRemove(file, options);
+			});
+			if (fault === "write") {
+				const originalWrite = Bun.write.bind(Bun);
+				vi.spyOn(Bun, "write").mockImplementation(((dest: unknown, ...rest: unknown[]) => {
+					if (typeof dest === "string" && dest.includes(`${id}.json.tmp-`))
+						return Promise.reject(new Error("Synthetic optional write failure"));
+					return (originalWrite as (...args: unknown[]) => unknown)(dest, ...rest);
+				}) as typeof Bun.write);
+			} else if (fault === "rename") {
+				const originalRename = fsSync.renameSync;
+				vi.spyOn(fsSync, "renameSync").mockImplementation((source, destination) => {
+					if (String(destination) === sidecar) throw new Error("Synthetic optional rename failure");
+					return originalRename(source, destination);
+				});
+			} else if (fault === "serialize") {
+				let primaryStaged = false;
+				const originalWrite = Bun.write.bind(Bun);
+				vi.spyOn(Bun, "write").mockImplementation(((dest: unknown, ...rest: unknown[]) => {
+					if (typeof dest === "string" && dest.includes(`${id}.md.tmp-`)) primaryStaged = true;
+					return (originalWrite as (...args: unknown[]) => unknown)(dest, ...rest);
+				}) as typeof Bun.write);
+				const originalStringify = JSON.stringify.bind(JSON);
+				vi.spyOn(JSON, "stringify").mockImplementation(((value: unknown, ...rest: unknown[]) => {
+					if (
+						primaryStaged &&
+						value !== null &&
+						typeof value === "object" &&
+						Object.keys(value).length === 1 &&
+						"ok" in value
+					)
+						throw new Error("Synthetic optional serialization failure");
+					return (originalStringify as (...args: unknown[]) => unknown)(value, ...rest);
+				}) as typeof JSON.stringify);
+			}
+			const second = await runSubprocess({
+				...options,
+				outputSchema: fault === "remove" ? undefined : options.outputSchema,
+			});
+			expect(second.exitCode, JSON.stringify(second)).toBe(0);
+			expect(second.outputPath).toBe(primary);
+			expect(await fs.readFile(primary, "utf8")).toBe(firstMarkdown);
+			expect(await fs.readFile(sidecar, "utf8")).toBe(firstSidecar);
+			expect(artifactFileGeneration(await fs.stat(primary, { bigint: true }))).not.toBe(previousGeneration);
+			const extracted = await new AgentProtocolHandler().resolve(
+				new URL(`agent://${id}/ok`) as never,
+				{
+					session: { seanceSourceArtifactsDir: artifactsDir },
+				} as never,
+			);
+			expect(JSON.parse(extracted.content)).toBe(true);
+			expect(extracted.sourcePath).toBe(primary);
+		},
+	);
+
+	it.each(["write", "rename"] as const)(
+		"retains the accepted artifact and fails the result when primary %s fails",
+		async fault => {
+			artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-primary-failure-"));
+			const id = "PrimaryFailure";
+			const primary = path.join(artifactsDir, `${id}.md`);
+			const accepted = "previous accepted report";
+			await fs.writeFile(primary, accepted);
+			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+				createSessionResult(yieldEmittingSession({ ok: true })),
+			);
+			if (fault === "write") {
+				const originalWrite = Bun.write.bind(Bun);
+				vi.spyOn(Bun, "write").mockImplementation(((dest: unknown, ...rest: unknown[]) => {
+					if (typeof dest === "string" && dest.includes(`${id}.md.tmp-`))
+						return Promise.reject(new Error("Synthetic primary write failure"));
+					return (originalWrite as (...args: unknown[]) => unknown)(dest, ...rest);
+				}) as typeof Bun.write);
+			} else {
+				const originalRename = fsSync.renameSync;
+				vi.spyOn(fsSync, "renameSync").mockImplementation((source, destination) => {
+					if (String(destination) === primary) throw new Error("Synthetic primary rename failure");
+					return originalRename(source, destination);
+				});
+			}
+			const result = await runSubprocess({
+				cwd: "/tmp",
+				agent: baseAgent,
+				task: "work",
+				index: 0,
+				id,
+				artifactsDir,
+				settings: Settings.isolated(),
+				modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+				enableLsp: false,
+			});
+			expect(result.exitCode).toBe(1);
+			expect(result.outputPath).toBeUndefined();
+			expect(await fs.readFile(primary, "utf8")).toBe(accepted);
+		},
+	);
 });

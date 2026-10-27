@@ -4,7 +4,7 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
-import { renameSync, rmSync } from "node:fs";
+import { renameSync, rmSync, statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
@@ -84,7 +84,12 @@ import {
 	PromptDroppedError,
 	type PromptOptions,
 } from "../session/agent-session";
-import { type ArtifactManager, writeArtifact } from "../session/artifacts";
+import {
+	artifactFileGeneration,
+	type ArtifactManager,
+	serializeStructuredArtifactSidecar,
+	writeArtifact,
+} from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
@@ -2932,6 +2937,7 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 		const stagedSidecar = `${sidecarPath}.tmp-${nonce}`;
 		try {
 			await writeArtifact(stagedOutput, rawOutput);
+			const primaryGeneration = artifactFileGeneration(statSync(stagedOutput, { bigint: true }));
 			let sidecarReady = false;
 			try {
 				const structuredOutput = finalized.structuredOutput;
@@ -2940,7 +2946,8 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 						? JSON.stringify(structuredOutput.data, null, 2)
 						: undefined;
 				if (serialized !== undefined) {
-					await writeArtifact(stagedSidecar, `${serialized}\n`);
+					const envelope = serializeStructuredArtifactSidecar(serialized, primaryGeneration);
+					await writeArtifact(stagedSidecar, envelope);
 					sidecarReady = true;
 				}
 			} catch (error) {
@@ -2952,19 +2959,34 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 			}
 			// No event-loop yield separates the ownership check from either commit.
 			if (args.isPublicationCurrent() && !signal?.aborted && !monitor.runtimeLimitExceeded()) {
-				if (!sidecarReady) rmSync(sidecarPath, { force: true });
+				if (artifactFileGeneration(statSync(stagedOutput, { bigint: true })) !== primaryGeneration)
+					throw new Error("Subagent staged primary changed before publication.");
 				renameSync(stagedOutput, candidatePath);
 				outputPath = candidatePath;
 				outputMeta = { lineCount: rawOutput.split("\n").length, charCount: rawOutput.length };
 				try {
 					if (sidecarReady) renameSync(stagedSidecar, sidecarPath);
+					else rmSync(sidecarPath, { force: true });
 				} catch (error) {
-					rmSync(sidecarPath, { force: true });
 					logger.warn("Failed to persist subagent structured output sidecar", {
 						agentId: id,
 						path: sidecarPath,
 						error: error instanceof Error ? error.stack || error.message : String(error),
 					});
+					try {
+						if (
+							sidecarReady &&
+							args.isPublicationCurrent() &&
+							artifactFileGeneration(statSync(candidatePath, { bigint: true })) === primaryGeneration
+						)
+							rmSync(sidecarPath, { force: true });
+					} catch (cleanupError) {
+						logger.warn("Failed to remove stale subagent structured output sidecar", {
+							agentId: id,
+							path: sidecarPath,
+							error: String(cleanupError),
+						});
+					}
 				}
 			}
 		} catch (error) {

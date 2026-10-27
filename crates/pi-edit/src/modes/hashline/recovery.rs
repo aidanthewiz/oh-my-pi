@@ -368,15 +368,15 @@ fn context_preserved(
 }
 
 /// Share of the current lines at its authored numbers a replacement body must
-/// keep before it counts as written for them (see [`aimed_at_authored_lines`]).
+/// keep before it counts as written for them (see [`refuse_remapped_body`]).
 const AUTHORED_LINES_FLOOR: f64 = 0.5;
 
 /// How much more of those lines than of the remap target the body must keep.
 const AUTHORED_LINES_MARGIN: f64 = 0.3;
 
 /// `window chars × body chars` products [`kept_share`] may spend across one
-/// recovery; past it the check abstains rather than run quadratic work on a
-/// large or many-hunk rewrite.
+/// recovery; exhaustion refuses the remap rather than skipping its evidence
+/// check or running quadratic work on a large or many-hunk rewrite.
 const KEPT_SHARE_BUDGET: usize = 1 << 23;
 
 /// Minimum trimmed length, in chars, for a line to count as content evidence.
@@ -423,8 +423,8 @@ fn kept_share(
 	Some(total / window.len() as f64)
 }
 
-/// Whether a remapped replacement reads as written for the current lines at
-/// its authored numbers rather than for the lines the remap moves it onto.
+/// Refuse bodies aimed at authored current lines or lacking budget to check
+/// them.
 ///
 /// The remap is right when the line numbers came from the tagged read. Agents
 /// also pair an old tag with numbers taken from an untagged view of the
@@ -435,7 +435,7 @@ fn kept_share(
 /// heuristic: a tagged-read rewrite whose new text happens to resemble the
 /// lines `offset` away is refused too, at the cost of one retry under the
 /// current tag the mismatch reject prints.
-fn aimed_at_authored_lines(current: &str, authored: &[Edit], offset: i64) -> bool {
+fn refuse_remapped_body(current: &str, authored: &[Edit], offset: i64) -> bool {
 	let mut groups = Vec::new();
 	let mut start = 0;
 	while start < authored.len() {
@@ -479,13 +479,13 @@ fn aimed_at_authored_lines(current: &str, authored: &[Edit], offset: i64) -> boo
 		}
 		let verbatim = body.iter().copied().collect::<HashSet<_>>();
 		let Some(kept) = kept_share(&window(range, 0), &body, &verbatim, &mut budget) else {
-			return false;
+			return true;
 		};
 		if kept < AUTHORED_LINES_FLOOR {
 			continue;
 		}
 		let Some(target_kept) = kept_share(&target, &body, &verbatim, &mut budget) else {
-			return false;
+			return true;
 		};
 		if kept > target_kept + AUTHORED_LINES_MARGIN {
 			return true;
@@ -521,7 +521,7 @@ pub fn try_recover(
 	if !context_preserved(&snapshot.text, args.current_text, args.path, args.edits, &edits) {
 		return Ok(None);
 	}
-	if offset != 0 && aimed_at_authored_lines(args.current_text, args.edits, offset) {
+	if offset != 0 && refuse_remapped_body(args.current_text, args.edits, offset) {
 		return Ok(None);
 	}
 	// The parse check below can refuse after the apply has cut into registers,

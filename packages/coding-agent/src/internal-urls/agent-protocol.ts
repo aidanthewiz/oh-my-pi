@@ -20,6 +20,7 @@
  * - agent://<id>?q=<query> - JSON extraction with jq-style field syntax
  *   (`agent://Parent.Child?q=.reports[0].data`)
  */
+import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -33,6 +34,7 @@ import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "tex
 import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
 import agentSupersededTemplate from "../prompts/tools/agent-url-superseded.md" with { type: "text" };
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
+import { artifactFileGeneration, parseStructuredArtifactSidecar } from "../session/artifacts";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type {
 	InternalResource,
@@ -259,7 +261,20 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			}
 		});
 
-		const rawContent = await Bun.file(scan.foundPath).text();
+		const primary = await fs.open(scan.foundPath, "r");
+		let snapshot: { content: string; generation: string; ctime: bigint };
+		try {
+			const before = await primary.stat({ bigint: true });
+			const generation = artifactFileGeneration(before);
+			const content = await primary.readFile("utf8");
+			const after = await primary.stat({ bigint: true });
+			if (artifactFileGeneration(after) !== generation || after.ctimeNs !== before.ctimeNs)
+				throw new Error(`Output ${outputId} changed while reading`);
+			snapshot = { content, generation, ctime: after.ctimeNs };
+		} finally {
+			await primary.close();
+		}
+		const rawContent = snapshot.content;
 		const notes: string[] = [];
 		let content = rawContent;
 		// A published file belongs to a finished run. If the agent is streaming
@@ -278,16 +293,33 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		let contentType: InternalResource["contentType"] = "text/markdown";
 
 		let extractedFrom = scan.foundPath;
+		let sidecarSnapshot: { generation: string; ctime: bigint } | undefined;
 		if (extraction || hasQueryExtraction) {
 			let jsonValue: unknown;
 			let parsed = false;
 			if (scan.jsonPath) {
 				try {
-					jsonValue = JSON.parse(await Bun.file(scan.jsonPath).text());
-					extractedFrom = scan.jsonPath;
-					parsed = true;
+					const sidecar = await fs.open(scan.jsonPath, "r");
+					try {
+						const before = await sidecar.stat({ bigint: true });
+						const generation = artifactFileGeneration(before);
+						const envelope = parseStructuredArtifactSidecar(await sidecar.readFile("utf8"), snapshot.generation);
+						const after = await sidecar.stat({ bigint: true });
+						if (
+							artifactFileGeneration(after) === generation &&
+							after.ctimeNs === before.ctimeNs &&
+							envelope !== undefined
+						) {
+							jsonValue = envelope.data;
+							extractedFrom = scan.jsonPath;
+							sidecarSnapshot = { generation, ctime: after.ctimeNs };
+							parsed = true;
+						}
+					} finally {
+						await sidecar.close();
+					}
 				} catch {
-					// Corrupt or partially written sidecar: fall back to <id>.md.
+					// Invalid or stale optional data cannot override the primary artifact.
 				}
 			}
 			if (!parsed) {
@@ -316,6 +348,17 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			}
 			notes.push(`Extracted: ${hasQueryExtraction ? queryParam : `/${decodedSegments.join("/")}`}`);
 			if (parsed) notes.push(`Source: ${path.basename(extractedFrom!)}`);
+		}
+		const currentPrimary = statSync(scan.foundPath, { bigint: true });
+		if (artifactFileGeneration(currentPrimary) !== snapshot.generation || currentPrimary.ctimeNs !== snapshot.ctime)
+			throw new Error(`Output ${outputId} changed while reading`);
+		if (sidecarSnapshot && scan.jsonPath) {
+			const currentSidecar = statSync(scan.jsonPath, { bigint: true });
+			if (
+				artifactFileGeneration(currentSidecar) !== sidecarSnapshot.generation ||
+				currentSidecar.ctimeNs !== sidecarSnapshot.ctime
+			)
+				throw new Error(`Output ${outputId} structured data changed while reading`);
 		}
 
 		return {

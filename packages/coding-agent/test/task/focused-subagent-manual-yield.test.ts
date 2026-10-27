@@ -16,6 +16,11 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import * as sdk from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	artifactFileGeneration,
+	parseStructuredArtifactSidecar,
+	serializeStructuredArtifactSidecar,
+} from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import type { TaskToolDetails, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -274,7 +279,9 @@ it.each([true, false])(
 			expect(manual[0]).not.toContain("final result");
 			expect(await Bun.file(child.artifact).text()).toContain("final result");
 			if (structured) {
-				expect(await Bun.file(child.artifact.replace(/\.md$/, ".json")).json()).toBe("final result");
+				const generation = artifactFileGeneration(await fs.stat(child.artifact, { bigint: true }));
+				const sidecar = await Bun.file(child.artifact.replace(/\.md$/, ".json")).text();
+				expect(parseStructuredArtifactSidecar(sidecar, generation)?.data).toBe("final result");
 			}
 		} finally {
 			releasePublication.resolve();
@@ -306,7 +313,11 @@ it("delivers a durable focused plain result without reserving a full execution s
 	const releasePublication = Promise.withResolvers<void>();
 	const delivered = Promise.withResolvers<{ text: string; artifact: string; hasSidecar: boolean }>();
 	const sidecar = child.artifact.replace(/\.md$/, ".json");
-	await Bun.write(sidecar, '{"report":"superseded structured result"}');
+	const generation = artifactFileGeneration(await fs.stat(child.artifact, { bigint: true }));
+	await Bun.write(
+		sidecar,
+		serializeStructuredArtifactSidecar('{"report":"superseded structured result"}', generation),
+	);
 	const unregisterSink = manager.registerDeliverySink(PARENT_ID, async (_jobId, text) => {
 		delivered.resolve({
 			text,
@@ -335,7 +346,9 @@ it("delivers a durable focused plain result without reserving a full execution s
 		await publicationStarted.promise;
 		expect(manager.getRunningJobs({ ownerId: PARENT_ID })).toEqual([]);
 		expect(await Bun.file(child.artifact).text()).toContain("initial result");
-		expect(await Bun.file(sidecar).json()).toEqual({ report: "superseded structured result" });
+		expect(parseStructuredArtifactSidecar(await Bun.file(sidecar).text(), generation)?.data).toEqual({
+			report: "superseded structured result",
+		});
 		expect(manager.getAllJobs().filter(job => job.ownerId === PARENT_ID)).toEqual([]);
 		releasePublication.resolve();
 		const snapshot = await delivered.promise;
@@ -463,7 +476,11 @@ it.each(["cancel", "replace"] as const)(
 			handler: async () => ({ content: [++request === 1 ? "INITIAL_FINAL" : "CANDIDATE_NEW_REPORT"] }),
 		});
 		const sidecar = child.artifact.replace(/\.md$/, ".json");
-		await Bun.write(sidecar, '{"report":"accepted structured source"}');
+		const generation = artifactFileGeneration(await fs.stat(child.artifact, { bigint: true }));
+		await Bun.write(
+			sidecar,
+			serializeStructuredArtifactSidecar('{"report":"accepted structured source"}', generation),
+		);
 		const accepted = await Bun.file(child.artifact).text();
 		const acceptedJson = await Bun.file(sidecar).text();
 		const preparing = Promise.withResolvers<void>();

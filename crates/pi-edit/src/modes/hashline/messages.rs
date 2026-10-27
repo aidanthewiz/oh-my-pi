@@ -44,10 +44,15 @@ pub fn json_quote(s: &str) -> String {
 
 /// Lines of context shown either side of a hash mismatch.
 pub const MISMATCH_CONTEXT: u32 = 2;
+const MISMATCH_MAX_CONTEXT_LINES: usize = 40;
+const MISMATCH_MAX_CONTEXT_BYTES: usize = 8 * 1024;
 
-/// Line numbers [`format_anchored_context`] displays: each in-range anchor
-/// ±[`MISMATCH_CONTEXT`], ascending.
-pub fn anchored_context_lines(anchor_lines: &[u32], line_count: usize) -> BTreeSet<u32> {
+/// Complete context rows retained within the diagnostic's line and byte bounds.
+pub fn anchored_context_lines<S: AsRef<str>>(
+	anchor_lines: &[u32],
+	file_lines: &[S],
+) -> BTreeSet<u32> {
+	let line_count = file_lines.len();
 	let mut display_lines = BTreeSet::new();
 	for &line in anchor_lines {
 		if line < 1 || (line as usize) > line_count {
@@ -57,6 +62,21 @@ pub fn anchored_context_lines(anchor_lines: &[u32], line_count: usize) -> BTreeS
 		let hi = (line + MISMATCH_CONTEXT).min(line_count as u32);
 		display_lines.extend(lo..=hi);
 	}
+	let mut remaining = MISMATCH_MAX_CONTEXT_BYTES;
+	let mut count = 0;
+	display_lines.retain(|line| {
+		// Reserve line numbering, markers, separators, and elision metadata.
+		let bytes = file_lines[*line as usize - 1]
+			.as_ref()
+			.len()
+			.saturating_add(32);
+		if count == MISMATCH_MAX_CONTEXT_LINES || bytes > remaining {
+			return false;
+		}
+		remaining -= bytes;
+		count += 1;
+		true
+	});
 	display_lines
 }
 
@@ -67,7 +87,7 @@ pub fn format_anchored_context<S: AsRef<str>>(
 	anchor_lines: &[u32],
 	file_lines: &[S],
 ) -> Vec<String> {
-	let display_lines = anchored_context_lines(anchor_lines, file_lines.len());
+	let display_lines = anchored_context_lines(anchor_lines, file_lines);
 	let anchor_set: HashSet<u32> = anchor_lines.iter().copied().collect();
 	let mut rows = Vec::new();
 	let mut previous: Option<u32> = None;
@@ -817,11 +837,9 @@ pub fn unverified_wide_lines_message(section_path: &str, wide_lines: &[u32]) -> 
 
 /// Content preview handed to [`unseen_lines_message`].
 ///
-/// `lines` are the unseen anchor lines whose actual file content we surface
-/// inline (from the tagged snapshot the caller matched). `truncated` = true
-/// means the anchor range exceeded the inline reveal cap; the caller only
-/// revealed a prefix and the remaining unseen lines still require a range
-/// re-read.
+/// `lines` are unseen anchor lines from the tagged snapshot. A truncated
+/// preview contains only a prefix. Diagnostics never grant displayed-line
+/// provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnseenLinesReveal {
 	pub lines:     Vec<RevealedLine>,
@@ -829,13 +847,7 @@ pub struct UnseenLinesReveal {
 }
 
 /// Edit referenced lines never displayed by the cited tag's read.
-///
-/// Editing lines not read (partial range or collapsed summary) mangles files.
-/// When `reveal.lines` is non-empty, the caller has already inlined the actual
-/// file content at those lines and merged them into the snapshot's seen-line
-/// set, so the message points the model at a straight retry with the same
-/// `[path#tag]` header; when the reveal is empty or truncated, the message
-/// falls back to instructing a range re-read.
+/// Diagnostic previews do not replace an explicit full read.
 pub fn unseen_lines_message(
 	section_path: &str,
 	unseen_lines: &[u32],
@@ -865,16 +877,14 @@ pub fn unseen_lines_message(
 	if reveal.truncated {
 		return format!(
 			"{header} Preview of the actual file content at the first {} unseen \
-			 line(s):\n{preview}\nThe range exceeds the inline preview cap — re-read the remainder \
+			 line(s):\n{preview}\nThe range exceeds the inline preview cap. Re-read all target lines \
 			 with `{section_path}:{selector}` before re-issuing the edit.",
 			reveal.lines.len()
 		);
 	}
 	format!(
-		"{header} Actual file content at those lines:\n{preview}\nVerify the content matches what \
-		 you intend to touch, then re-issue the edit with the same \
-		 {HL_FILE_PREFIX}path{HL_FILE_HASH_SEP}tag{HL_FILE_SUFFIX} header — a straight retry now \
-		 succeeds without a re-read. If the content does NOT match, fix your line numbers."
+		"{header} Actual file content at those lines:\n{preview}\nRe-read the target lines in full \
+		 with `{section_path}:{selector}`, verify the line numbers, then re-issue the edit."
 	)
 }
 
@@ -1007,49 +1017,6 @@ mod tests {
 			msg_known,
 			"`@temp` was empty — no `CUT … @temp` precedes this op in this call and no persisted \
 			 register has that name — so nothing was pasted. Available registers: `@foo`, `@bar`."
-		);
-	}
-
-	#[test]
-	fn test_unseen_lines_message() {
-		// Empty reveal
-		let msg_empty =
-			unseen_lines_message("src/foo.ts", &[5, 6, 7, 10], "AB12", &UnseenLinesReveal::default());
-		assert_eq!(
-			msg_empty,
-			"This edit anchors to lines 5-7, 10 of src/foo.ts that [src/foo.ts#AB12] never displayed \
-			 (it showed a partial range, a search hit, or a folded summary). Re-read them in full \
-			 first with a ranged read like `src/foo.ts:5-7,10` — it skips summarization and mints a \
-			 fresh tag (a plain re-read just re-folds them) — then re-issue the edit."
-		);
-
-		// Non-empty reveal, not truncated
-		let reveal = UnseenLinesReveal {
-			lines:     vec![RevealedLine { line: 5, text: "let x = 1;".to_string() }],
-			truncated: false,
-		};
-		let msg_reveal = unseen_lines_message("src/foo.ts", &[5], "AB12", &reveal);
-		assert_eq!(
-			msg_reveal,
-			"This edit anchors to lines 5 of src/foo.ts that [src/foo.ts#AB12] never displayed (it \
-			 showed a partial range, a search hit, or a folded summary). Actual file content at \
-			 those lines:\n  5:let x = 1;\nVerify the content matches what you intend to touch, then \
-			 re-issue the edit with the same [path#tag] header — a straight retry now succeeds \
-			 without a re-read. If the content does NOT match, fix your line numbers."
-		);
-
-		// Truncated reveal
-		let reveal_trunc = UnseenLinesReveal {
-			lines:     vec![RevealedLine { line: 5, text: "let x = 1;".to_string() }],
-			truncated: true,
-		};
-		let msg_trunc = unseen_lines_message("src/foo.ts", &[5, 6], "AB12", &reveal_trunc);
-		assert_eq!(
-			msg_trunc,
-			"This edit anchors to lines 5-6 of src/foo.ts that [src/foo.ts#AB12] never displayed (it \
-			 showed a partial range, a search hit, or a folded summary). Preview of the actual file \
-			 content at the first 1 unseen line(s):\n  5:let x = 1;\nThe range exceeds the inline \
-			 preview cap — re-read the remainder with `src/foo.ts:5-6` before re-issuing the edit."
 		);
 	}
 

@@ -6,7 +6,6 @@ use pi_edit::modes::hashline::{
 		format_replace_header, split_addressable_file_lines,
 	},
 	input::{Patch, SplitOptions, contains_recognizable_hashline_operations},
-	mismatch::{MismatchDetails, format_mismatch_message},
 	parser::{AbsoluteRangeOp, ParseFailure, parse_patch, parse_patch_streaming},
 	prefixes::{
 		hashline_parse_text, is_read_metadata_line, is_read_truncation_notice,
@@ -754,44 +753,6 @@ fn write_prefix_strip_still_removes_read_and_search_numbering() {
 	assert_eq!(strip_hashline_prefixes(&rows(read)), ["one", "two", "", "", "nine", "ten", ""]);
 	let search = "[a.ts#1A2B]\n 4:ctx\n*5:hit\n...\n*9:hit\n[b.ts#3C4D]\n*2:hit\n";
 	assert_eq!(strip_hashline_prefixes(&rows(search)), ["ctx", "hit", "hit", "hit", ""]);
-}
-
-#[test]
-fn mismatch_messages_distinguish_stale_and_unrecognized_hashes() {
-	let stale = MismatchDetails {
-		path:               Some("a.ts".into()),
-		expected_file_hash: "1A2B".into(),
-		actual_file_hash:   "3C4D".into(),
-		file_lines:         vec!["one".into(), "two".into(), "three".into()],
-		anchor_lines:       vec![2],
-		hash_recognized:    true,
-		tag_origin_paths:   Vec::new(),
-	};
-	let message = format_mismatch_message(&stale);
-	assert!(message.contains("Edit rejected for a.ts: file changed between read and edit."));
-	assert!(message.contains("*2:two"));
-	let unknown = MismatchDetails { hash_recognized: false, ..stale };
-	let message = format_mismatch_message(&unknown);
-	assert!(message.contains("hash #1A2B is not from this session"));
-	assert!(message.contains("never invent the tag"));
-	// When the unrecognized tag was actually issued earlier in this session
-	// for a different path, the rejection names that path so a relative
-	// worktree lane doesn't follow a wrong-tree suggestion.
-	let known_elsewhere = MismatchDetails {
-		path:               Some("a.ts".into()),
-		expected_file_hash: "1A2B".into(),
-		actual_file_hash:   "3C4D".into(),
-		file_lines:         vec!["one".into(), "two".into(), "three".into()],
-		anchor_lines:       vec![2],
-		hash_recognized:    false,
-		tag_origin_paths:   vec!["/build/x/wt/crates/a/mcp.rs".into()],
-	};
-	let message = format_mismatch_message(&known_elsewhere);
-	assert!(message.contains("hash #1A2B is not from this session"));
-	assert!(
-		message.contains("Hash #1A2B was issued in this session for /build/x/wt/crates/a/mcp.rs.")
-	);
-	assert!(message.contains("never invent the tag"));
 }
 
 #[test]

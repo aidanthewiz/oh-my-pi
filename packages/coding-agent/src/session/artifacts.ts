@@ -4,9 +4,38 @@
  * Artifacts are stored in a directory alongside the session file,
  * accessible via artifact:// URLs.
  */
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { replaceFileAtomically } from "../utils/atomic-file";
+
+const TASK_STRUCTURED_SIDECAR_SCHEMA = "coreforge.task-structured-sidecar.v1";
+
+/** Rename changes ctime, but preserves this staged file generation. */
+export function artifactFileGeneration(stat: BigIntStats): string {
+	if (!stat.isFile()) throw new Error("Artifact is not a regular file.");
+	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}:${stat.mtimeNs}:${stat.size}`;
+}
+
+export function serializeStructuredArtifactSidecar(serializedData: string, primaryGeneration: string): string {
+	return `{"schema":${JSON.stringify(TASK_STRUCTURED_SIDECAR_SCHEMA)},"primaryGeneration":${JSON.stringify(primaryGeneration)},"data":${serializedData}}\n`;
+}
+
+export function parseStructuredArtifactSidecar(
+	content: string,
+	primaryGeneration: string,
+): { data: unknown } | undefined {
+	const envelope: unknown = JSON.parse(content);
+	if (
+		!isRecord(envelope) ||
+		envelope.schema !== TASK_STRUCTURED_SIDECAR_SCHEMA ||
+		envelope.primaryGeneration !== primaryGeneration ||
+		!Object.hasOwn(envelope, "data")
+	)
+		return undefined;
+	return { data: envelope.data };
+}
 
 /**
  * Sanitize a tool name for safe use as the middle segment of the artifact

@@ -1,5 +1,6 @@
 //! Streaming section previews
 //! (`packages/coding-agent/src/edit/hashline/diff.ts`).
+//! Preview diagnostics never publish displayed-line provenance.
 
 use std::borrow::Cow;
 
@@ -141,25 +142,6 @@ fn preview_section(
 			Ok(None) => {
 				return Err(crate::error::EditError::apply(format!("File not found: {}", target.path)));
 			},
-			// Whole-file delete preview needs existence, not text. Streaming
-			// sections parse partially, so a trailing-incomplete section must
-			// not claim the delete preview; the drop at preview_patch already
-			// hides the last section while more payload may arrive.
-			Err(err) if err.is_invalid_utf8() => {
-				let is_delete = !streaming
-					|| parse_patch_streaming(&target.diff)
-						.is_ok_and(|parsed| !parsed.edits.is_empty() || parsed.file_op.is_some());
-				let is_delete = is_delete
-					&& target.parse().is_ok_and(|parsed| {
-						target.file_hash.is_some() && matches!(parsed.file_op, Some(FileOp::Rem))
-					});
-				if !is_delete {
-					return Err(err);
-				}
-				result.op = Some(EngineFileOp::Delete);
-				result.diff = Some(String::new());
-				return Ok(());
-			},
 			Err(err) => return Err(err),
 		};
 		if streaming {
@@ -176,15 +158,23 @@ fn preview_section(
 		}
 		let parsed = target.parse()?;
 		if target.file_hash.is_none() {
-			return Err(mismatch(target, &read.canonical, &read.text, "", store));
+			return Err(mismatch(target, &read.canonical, &read.text, "", store, false));
 		}
 		let edits = if matches!(parsed.file_op, Some(FileOp::Rem)) {
 			&[][..]
 		} else {
 			parsed.edits.as_slice()
 		};
-		let applied =
-			apply_with_recovery(target, &read.canonical, &read.text, edits, clipboard, store, None)?;
+		let applied = apply_with_recovery(
+			target,
+			&read.canonical,
+			&read.text,
+			edits,
+			clipboard,
+			store,
+			None,
+			false,
+		)?;
 		result.op = Some(if matches!(parsed.file_op, Some(FileOp::Rem)) {
 			EngineFileOp::Delete
 		} else {

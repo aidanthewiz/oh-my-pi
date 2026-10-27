@@ -4,7 +4,7 @@
 mod common;
 
 use common::{DiskWriter, Workspace};
-use pi_edit::{ApplyRequest, EditError, EditMode, FileOp, UrlResolution, session::PreviewBatch};
+use pi_edit::{ApplyRequest, EditError, EditMode, UrlResolution, session::PreviewBatch};
 
 const SOURCE: &str = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
 
@@ -310,11 +310,12 @@ async fn update_after_delete_rejects_missing_file_without_writing() {
 }
 
 #[tokio::test]
-async fn hashline_streaming_rem_previews_invalid_utf8_deletion_before_later_sections() {
+async fn hashline_streaming_rem_rejects_invalid_utf8_before_later_sections() {
 	let mut ws = Workspace::new(EditMode::Hashline);
 	ws.config.raw_input = true;
 	let path = ws.cwd().join("legacy.txt");
-	std::fs::write(&path, b"name=caf\xe9\n").unwrap();
+	let original = b"name=caf\xe9\n";
+	std::fs::write(&path, original).unwrap();
 	ws.write("next.txt", "next\n");
 	let tag = ws.snapshot("next.txt", "next\n", None);
 	let mut session = ws.session();
@@ -326,9 +327,15 @@ async fn hashline_streaming_rem_previews_invalid_utf8_deletion_before_later_sect
 		.iter()
 		.find(|file| file.display == "legacy.txt")
 		.expect("completed deletion section must remain visible while streaming");
-	assert!(deletion.error.is_none(), "{streaming:?}");
-	assert_eq!(deletion.op, Some(FileOp::Delete));
-	assert!(path.exists(), "preview must not delete the file");
+	assert!(
+		deletion
+			.error
+			.as_deref()
+			.is_some_and(|error| error.contains("UTF-8"))
+	);
+	assert_eq!(deletion.op, None);
+	assert_eq!(deletion.diff, None);
+	assert_eq!(std::fs::read(&path).unwrap(), original);
 
 	session.finish();
 	let final_preview = session.preview();
@@ -337,16 +344,23 @@ async fn hashline_streaming_rem_previews_invalid_utf8_deletion_before_later_sect
 		.iter()
 		.find(|file| file.display == "legacy.txt")
 		.expect("final preview must retain the deletion");
-	assert!(deletion.error.is_none(), "{final_preview:?}");
-	assert_eq!(deletion.op, Some(FileOp::Delete));
+	assert!(
+		deletion
+			.error
+			.as_deref()
+			.is_some_and(|error| error.contains("UTF-8"))
+	);
+	assert_eq!(deletion.op, None);
+	assert_eq!(deletion.diff, None);
 	let writer = DiskWriter::default();
-	session
+	let error = session
 		.apply(ApplyRequest::default(), &writer)
 		.await
-		.expect("apply deletions");
-	assert!(!path.exists());
-	assert!(!ws.cwd().join("next.txt").exists());
-	assert_eq!(writer.requests.lock().len(), 2);
+		.expect_err("unverifiable deletion rejects the whole batch");
+	assert!(error.is_invalid_utf8());
+	assert_eq!(std::fs::read(&path).unwrap(), original);
+	assert_eq!(ws.read("next.txt").as_deref(), Some("next\n"));
+	assert!(writer.requests.lock().is_empty());
 }
 
 #[tokio::test]
@@ -392,59 +406,40 @@ async fn hashline_streaming_utf8_bypass_requires_an_allowed_tagged_rem() {
 }
 
 #[tokio::test]
-async fn hashline_rem_removes_invalid_utf8_file() {
+async fn hashline_rem_rejects_invalid_utf8_without_deleting() {
 	let ws = Workspace::new(EditMode::Hashline);
 	let path = ws.cwd().join("legacy.txt");
-	std::fs::write(&path, b"name=caf\xe9\n").unwrap();
+	let original = b"name=caf\xe9\n";
+	std::fs::write(&path, original).unwrap();
 	let writer = DiskWriter::default();
-	let outcome = ws
+	let error = ws
 		.apply_json(&serde_json::json!({ "input": "[legacy.txt#FFFF]\nREM" }), &writer)
 		.await
-		.expect("REM needs existence, not text");
-	assert!(!path.exists(), "invalid UTF-8 file must be deletable");
-	assert!(outcome.text.contains("Deleted legacy.txt"), "{}", outcome.text);
+		.expect_err("a hashline deletion must validate readable content");
+	assert!(error.is_invalid_utf8());
+	assert_eq!(std::fs::read(&path).unwrap(), original);
+	assert!(writer.requests.lock().is_empty());
 }
 
 #[tokio::test]
-async fn hashline_rem_streaming_preview_does_not_error_on_invalid_utf8() {
-	use pi_edit::{
-		EditStore, PathPolicy,
-		session::{Session, SessionConfig},
-	};
-
-	let dir = tempfile::tempdir().expect("tempdir");
-	let cwd = dir.path().canonicalize().expect("canonical tempdir");
-	std::fs::write(cwd.join("legacy.txt"), b"name=caf\xe9\n").unwrap();
-	let config = SessionConfig {
-		mode:               EditMode::Hashline,
-		policy:             PathPolicy {
-			cwd:                  cwd.clone(),
-			home_dir:             cwd,
-			url_schemes:          Vec::new(),
-			url_alias_schemes:    Vec::new(),
-			plan_writable_roots:  Vec::new(),
-			plan_active:          false,
-			block_auto_generated: true,
-		},
-		allow_fuzzy:        true,
-		fuzzy_threshold:    0.95,
-		enforce_seen_lines: false,
-		max_columns:        512,
-		raw_input:          false,
-	};
-	let mut session = Session::new(config, EditStore::new());
-	// Completed REM section followed by an incomplete trailing section.
+async fn hashline_rem_json_streaming_preview_rejects_invalid_utf8() {
+	let ws = Workspace::new(EditMode::Hashline);
+	let path = ws.cwd().join("legacy.txt");
+	let original = b"name=caf\xe9\n";
+	std::fs::write(&path, original).unwrap();
+	let mut session = ws.session();
 	session.set_args_json(
 		&serde_json::json!({ "input": "[legacy.txt#FFFF]\nREM\n[other.txt#FFFF]\nPUT " }).to_string(),
 	);
 	let batch = session.preview();
 	assert!(batch.streaming);
-	let completed = batch
-		.files
-		.iter()
-		.find(|file| file.display == "legacy.txt")
-		.expect("completed REM section previews");
-	assert_eq!(completed.error, None, "{completed:?}");
+	assert!(
+		batch
+			.files
+			.iter()
+			.all(|file| file.op.is_none() && file.diff.is_none())
+	);
+	assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
 #[tokio::test]

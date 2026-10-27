@@ -5,6 +5,7 @@
  * and on an autonomous IRC wake turn.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
 import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -21,6 +22,11 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	artifactFileGeneration,
+	serializeStructuredArtifactSidecar,
+} from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
 	attachIrcWakeTurnMonitor,
 	runSubagentFollowUpTurn,
@@ -45,6 +51,14 @@ const baseAgent: AgentDefinition = {
 	systemPrompt: "test",
 	source: "bundled",
 };
+
+async function writeBoundAcceptedSidecar(artifactsDir: string, serializedData: string): Promise<string> {
+	const primary = path.join(artifactsDir, `${AGENT_ID}.md`);
+	const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+	const envelope = serializeStructuredArtifactSidecar(serializedData, generation);
+	await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), envelope);
+	return envelope;
+}
 
 function assistantStopMessage(content: AssistantMessage["content"]): AssistantMessage {
 	return {
@@ -147,7 +161,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		sessionManager: SessionManager.inMemory(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		getToolByName: () => undefined,
@@ -516,7 +530,7 @@ describe("runSubprocess result acceptance", () => {
 		try {
 			// A completed first run left a structured payload on disk.
 			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), '{"reports":[{"verdict":"round-1"}]}');
-			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), '{"reports":[{"verdict":"round-1"}]}');
+			await writeBoundAcceptedSidecar(artifactsDir, '{"reports":[{"verdict":"round-1"}]}');
 			const finish = observer([
 				{
 					role: "custom",
@@ -573,6 +587,7 @@ describe("runSubprocess result acceptance", () => {
 				kind: "main",
 				status: "running",
 				session: {
+					sessionManager: SessionManager.inMemory(),
 					deliverIrcMessage: async (message: { body: string }) => {
 						relayed[id].push(message.body);
 						return "injected";
@@ -594,7 +609,7 @@ describe("runSubprocess result acceptance", () => {
 		const accepted = '{"report":"accepted verdict"}';
 		try {
 			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
-			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const acceptedSidecar = await writeBoundAcceptedSidecar(artifactsDir, accepted);
 			const finish = observer([
 				{
 					role: "custom",
@@ -619,7 +634,7 @@ describe("runSubprocess result acceptance", () => {
 			expect(relayed.OtherAgent[0]).toContain("line 42 is fine");
 			expect(manager.getJob(AGENT_ID)?.ownerId).toBe("Parent");
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
-			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(acceptedSidecar);
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
 			tempDir.removeSync();
@@ -638,7 +653,7 @@ describe("runSubprocess result acceptance", () => {
 		});
 		try {
 			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), '{"report":"old"}');
-			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), '{"report":"old"}');
+			await writeBoundAcceptedSidecar(artifactsDir, '{"report":"old"}');
 			const result = await runSubagentFollowUpTurn({
 				id: AGENT_ID,
 				agent: baseAgent,
@@ -735,7 +750,7 @@ describe("runSubprocess result acceptance", () => {
 		const accepted = '{"report":"accepted verdict"}';
 		try {
 			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
-			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const acceptedSidecar = await writeBoundAcceptedSidecar(artifactsDir, accepted);
 			const finish = observer([{ role: "user", content: "go on", attribution: "user", timestamp: Date.now() }]);
 			harness.emitAssistantText("stale report");
 			const replacement = registry.register({
@@ -749,7 +764,7 @@ describe("runSubprocess result acceptance", () => {
 			await finish?.();
 			await manager.drainDeliveries({ timeoutMs: 1000 });
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
-			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(acceptedSidecar);
 			expect(delivered).toEqual([]);
 			expect(replacement.status).toBe("running");
 			expect(replacement.lifecycle?.acceptedAt).toBeUndefined();
@@ -780,7 +795,7 @@ describe("runSubprocess result acceptance", () => {
 
 		try {
 			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
-			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const acceptedSidecar = await writeBoundAcceptedSidecar(artifactsDir, accepted);
 			const finish = observer([
 				{
 					role: "custom",
@@ -796,7 +811,7 @@ describe("runSubprocess result acceptance", () => {
 			expect(manager.cancel(AGENT_ID)).toBe(true);
 			await finish?.(undefined);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
-			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(acceptedSidecar);
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
 			tempDir.removeSync();
@@ -898,7 +913,7 @@ describe("runSubprocess result acceptance", () => {
 
 		try {
 			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
-			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const acceptedSidecar = await writeBoundAcceptedSidecar(artifactsDir, accepted);
 			const result = await runSubagentFollowUpTurn({
 				id: AGENT_ID,
 				agent: baseAgent,
@@ -909,7 +924,7 @@ describe("runSubprocess result acceptance", () => {
 			});
 			expect(result.aborted).toBe(true);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
-			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(acceptedSidecar);
 		} finally {
 			tempDir.removeSync();
 		}
@@ -998,6 +1013,7 @@ describe("runSubprocess result acceptance", () => {
 			displayName: "Parent",
 			kind: "main",
 			session: {
+				sessionManager: SessionManager.inMemory(),
 				deliverIrcMessage: async (message: { body: string }) => {
 					ircReplies.push(message.body);
 					return "injected";
@@ -1084,6 +1100,7 @@ describe("runSubprocess result acceptance", () => {
 					displayName: id,
 					kind: "main",
 					session: {
+						sessionManager: SessionManager.inMemory(),
 						deliverIrcMessage: async (message: { body: string }) => {
 							ircReplies[id].push(message.body);
 							return "injected";

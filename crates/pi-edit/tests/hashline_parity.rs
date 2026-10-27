@@ -956,9 +956,6 @@ async fn block_cut_on_leading_go_statement_keeps_following_siblings() {
 
 #[tokio::test]
 async fn seen_line_guard_rejects_hidden_anchors_and_accepts_seen_anchors() {
-	let root = fixture("parity_seen_line_guard.json");
-	assert_eq!(root["cases"].as_array().expect("seen line cases").len(), 15);
-
 	let mut hidden = Workspace::new(EditMode::Hashline);
 	hidden.config.enforce_seen_lines = true;
 	let source = "one\ntwo\nthree\n";

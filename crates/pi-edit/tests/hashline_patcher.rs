@@ -1,13 +1,6 @@
 mod common;
 
-use pi_edit::{
-	EditMode, ModeEngine,
-	modes::hashline::{
-		HashlineEngine,
-		patcher::{no_change_diagnostic, no_change_loop_diagnostic},
-	},
-	stream_json::ArgSnapshot,
-};
+use pi_edit::{EditMode, ModeEngine, modes::hashline::HashlineEngine, stream_json::ArgSnapshot};
 use serde_json::json;
 
 #[tokio::test]
@@ -31,21 +24,6 @@ fn matcher_paths_accept_partial_sections_and_header_noise() {
 		("one.ts".into(), "one".into()),
 		("dir with spaces/two.ts".into(), "two".into())
 	]);
-}
-
-#[test]
-fn no_op_diagnostics_preserve_model_guidance() {
-	assert_eq!(
-		no_change_diagnostic("a.ts"),
-		"Edits to a.ts parsed and applied cleanly, but produced no change: your body row(s) are \
-		 byte-identical to the file at the targeted lines. The bug is somewhere else — re-read the \
-		 file before issuing another edit. Do NOT widen the payload or add lines; verify the anchor \
-		 first."
-	);
-	assert!(
-		no_change_loop_diagnostic("a.ts", 3)
-			.starts_with("STOP. Edits to a.ts have been a byte-identical no-op 3 times in a row")
-	);
 }
 
 #[tokio::test]
@@ -98,7 +76,7 @@ async fn mismatch_tag(workspace: &common::Workspace, input: &str) -> String {
 }
 
 #[tokio::test]
-async fn tag_from_a_mismatch_reply_covers_only_the_rows_it_displayed() {
+async fn mismatch_rows_require_an_explicit_read_before_they_authorize_writes() {
 	let mut workspace = common::Workspace::new(EditMode::Hashline);
 	workspace.config.enforce_seen_lines = true;
 	let text = numbered_lines(30);
@@ -115,11 +93,19 @@ async fn tag_from_a_mismatch_reply_covers_only_the_rows_it_displayed() {
 	assert!(writer.requests.lock().is_empty());
 	assert_eq!(workspace.read("a.txt").as_deref(), Some(text.as_str()));
 
-	// Rows the reply displayed (anchor 5 ± 2) are seen.
+	for _ in 0..2 {
+		workspace
+			.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 7.=7:\n+Z\n") }), &writer)
+			.await
+			.expect_err("an error reveal is not a delivered read");
+	}
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(workspace.read("a.txt").as_deref(), Some(text.as_str()));
+	workspace.snapshot("a.txt", &text, Some(&[7]));
 	workspace
 		.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 7.=7:\n+Z\n") }), &writer)
 		.await
-		.expect("line 7 was displayed");
+		.expect("the explicit read displayed line 7");
 	assert!(
 		workspace
 			.read("a.txt")
@@ -147,7 +133,7 @@ async fn mismatch_reply_keeps_the_provenance_of_recorded_content() {
 }
 
 #[tokio::test]
-async fn each_mismatch_reply_adds_the_rows_it_displayed() {
+async fn repeated_mismatch_errors_do_not_expand_read_authority() {
 	let mut workspace = common::Workspace::new(EditMode::Hashline);
 	workspace.config.enforce_seen_lines = true;
 	let text = numbered_lines(30);
@@ -162,11 +148,22 @@ async fn each_mismatch_reply_adds_the_rows_it_displayed() {
 	workspace
 		.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 20.=20:\n+Y\n") }), &writer)
 		.await
-		.expect("the second reply displayed line 20");
+		.expect_err("the error may have been suppressed");
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(workspace.read("a.txt").as_deref(), Some(text.as_str()));
+	workspace.snapshot("a.txt", &text, Some(&[20]));
+	workspace
+		.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 20.=20:\n+Y\n") }), &writer)
+		.await
+		.expect("an explicit read displayed line 20");
+	assert_eq!(
+		workspace.read("a.txt").as_deref(),
+		Some(text.replacen("line 20\n", "Y\n", 1).as_str())
+	);
 }
 
 #[tokio::test]
-async fn wide_row_a_mismatch_reply_prints_whole_counts_as_seen() {
+async fn a_complete_wide_error_row_does_not_replace_read_authority() {
 	let mut workspace = common::Workspace::new(EditMode::Hashline);
 	workspace.config.enforce_seen_lines = true;
 	let wide = format!("{}TAIL", "x".repeat(600));
@@ -182,7 +179,15 @@ async fn wide_row_a_mismatch_reply_prints_whole_counts_as_seen() {
 	workspace
 		.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 11.=11:\n+y\n") }), &writer)
 		.await
-		.expect("line 11 was printed whole");
+		.expect_err("a full error row is not proof of delivery");
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(workspace.read("a.txt").as_deref(), Some(text.as_str()));
+	workspace.snapshot("a.txt", &text, Some(&[11]));
+	workspace
+		.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 11.=11:\n+y\n") }), &writer)
+		.await
+		.expect("an explicit read displayed the full wide row");
+	assert_eq!(workspace.read("a.txt").as_deref(), Some(text.replacen(&wide, "y", 1).as_str()));
 }
 
 #[tokio::test]
@@ -519,4 +524,152 @@ async fn head_insert_still_applies_across_a_stale_tag() {
 	assert_eq!(workspace.read("a.txt"), None);
 	assert_eq!(workspace.read("b.txt").as_deref(), Some("head\ncurrent\n"));
 	assert!(outcome.text.contains("despite a stale snapshot tag"), "{}", outcome.text);
+}
+
+#[tokio::test]
+async fn undecodable_rem_rejects_invented_and_previously_valid_tags_without_writes() {
+	for recorded in [false, true] {
+		let workspace = common::Workspace::new(EditMode::Hashline);
+		let path = workspace.write("a.txt", "previously readable\n");
+		let tag = if recorded {
+			workspace.snapshot("a.txt", "previously readable\n", Some(&[1]))
+		} else {
+			"0000".to_owned()
+		};
+		let original = b"current\xff\n";
+		std::fs::write(&path, original).unwrap();
+		let writer = common::DiskWriter::default();
+		let error = workspace
+			.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nREM\n") }), &writer)
+			.await
+			.expect_err("undecodable bytes cannot validate the tag");
+		assert!(error.is_invalid_utf8(), "{error}");
+		assert!(writer.requests.lock().is_empty());
+		assert_eq!(std::fs::read(&path).unwrap(), original);
+	}
+}
+
+#[tokio::test]
+async fn discarded_completed_previews_do_not_grant_write_provenance() {
+	for header in ["a.txt#AUTO", "a.txt#0000"] {
+		let mut workspace = common::Workspace::new(EditMode::Hashline);
+		workspace.config.enforce_seen_lines = true;
+		let text = numbered_lines(30);
+		workspace.write("a.txt", &text);
+		let tag = workspace.snapshot("a.txt", &text, Some(&[1]));
+		assert_ne!(tag, "0000");
+		let mut session = workspace.session();
+		session.set_args_json(
+			&json!({ "input": format!("[{header}]\nPUT 20.=20:\n+replacement\n") }).to_string(),
+		);
+		session.finish();
+		let preview = session.preview();
+		assert!(preview.files[0].error.is_some());
+		let writer = common::DiskWriter::default();
+		workspace
+			.apply_json(
+				&json!({ "input": format!("[a.txt#{tag}]\nPUT 20.=20:\n+replacement\n") }),
+				&writer,
+			)
+			.await
+			.expect_err("a discarded preview never displayed line 20 to the caller");
+		assert!(writer.requests.lock().is_empty());
+		assert_eq!(workspace.read("a.txt").as_deref(), Some(text.as_str()));
+	}
+}
+
+#[tokio::test]
+async fn mismatch_context_bounds_never_promote_omitted_rows() {
+	for wide in [false, true] {
+		let mut workspace = common::Workspace::new(EditMode::Hashline);
+		workspace.config.enforce_seen_lines = true;
+		let text = if wide {
+			format!("{}TAIL\n", "界".repeat(3000))
+		} else {
+			numbered_lines(100)
+		};
+		workspace.write("a.txt", &text);
+		let input = if wide {
+			"[a.txt#0000]\nPUT 1.=1:\n+replacement\n"
+		} else {
+			"[a.txt#0000]\nPUT 1.=100:\n+replacement\n"
+		};
+		let (error, tag) = mismatch_reply(&workspace, input).await;
+		assert!(error.len() < 9 * 1024);
+		assert!(!error.contains(if wide { "TAIL" } else { "90:line 90" }));
+		let line = if wide { 1 } else { 90 };
+		let writer = common::DiskWriter::default();
+		workspace
+			.apply_json(
+				&json!({ "input": format!("[a.txt#{tag}]\nPUT {line}.={line}:\n+replacement\n") }),
+				&writer,
+			)
+			.await
+			.expect_err("an omitted row cannot gain write provenance");
+		assert!(writer.requests.lock().is_empty());
+		assert_eq!(workspace.read("a.txt").as_deref(), Some(text.as_str()));
+	}
+}
+
+#[tokio::test]
+async fn stale_recovery_cannot_write_rows_missing_from_its_restricted_snapshot() {
+	let mut workspace = common::Workspace::new(EditMode::Hashline);
+	workspace.config.enforce_seen_lines = true;
+	let previous = numbered_lines(30);
+	workspace.write("a.txt", &previous);
+	let tag = workspace.snapshot("a.txt", &previous, Some(&[1]));
+	let current = format!("external header\n{previous}");
+	workspace.write("a.txt", &current);
+	let writer = common::DiskWriter::default();
+	workspace
+		.apply_json(
+			&json!({ "input": format!("[a.txt#{tag}]\nPUT 20.=20:\n+replacement\n") }),
+			&writer,
+		)
+		.await
+		.expect_err("stale recovery must not bypass the snapshot's displayed rows");
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(workspace.read("a.txt").as_deref(), Some(current.as_str()));
+}
+
+#[tokio::test]
+async fn trailing_comma_and_ambiguous_placement_rejections_preserve_file_bytes() {
+	let list = "{\n  \"a\": [\n    \"x\",\n    \"y\"\n  ]\n}\n";
+	for (before, body) in [
+		(list, "    \"z\","),
+		(list, "    \"z\",  \n+"),
+		(list, "    \"z\",\u{a0}"),
+		("{\n  \"a\": [\n    \"x\"\n  ],\n  \"b\": 1\n}\n", "  \"c\": 2,"),
+	] {
+		let workspace = common::Workspace::new(EditMode::Hashline);
+		workspace.write("a.json", before);
+		let tag = workspace.snapshot("a.json", before, None);
+		let writer = common::DiskWriter::default();
+		workspace
+			.apply_json(&json!({ "input": format!("[a.json#{tag}]\nPUT 4.=4:\n+{body}\n") }), &writer)
+			.await
+			.expect_err("invalid payload must not be repaired by silently dropping its comma");
+		assert!(writer.requests.lock().is_empty());
+		assert_eq!(workspace.read("a.json").as_deref(), Some(before));
+	}
+}
+
+#[tokio::test]
+async fn stale_recovery_preserves_authority_for_explicitly_read_rows() {
+	let mut workspace = common::Workspace::new(EditMode::Hashline);
+	workspace.config.enforce_seen_lines = true;
+	let previous = numbered_lines(30);
+	workspace.write("a.txt", &previous);
+	let tag = workspace.snapshot("a.txt", &previous, Some(&[20]));
+	workspace.write("a.txt", &format!("external header\n{previous}"));
+	workspace
+		.apply_json(
+			&json!({ "input": format!("[a.txt#{tag}]\nPUT 20.=20:\n+replacement\n") }),
+			&common::DiskWriter::default(),
+		)
+		.await
+		.expect("a fully read stale anchor can follow a uniform line shift");
+	let expected =
+		format!("external header\n{}", previous.replacen("line 20\n", "replacement\n", 1));
+	assert_eq!(workspace.read("a.txt").as_deref(), Some(expected.as_str()));
 }
