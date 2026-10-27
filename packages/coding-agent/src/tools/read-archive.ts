@@ -193,68 +193,79 @@ export async function readArchive(
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	throwIfAborted(signal);
 	const archive = await openArchiveCached(resolvedArchivePath.absolutePath);
-	throwIfAborted(signal);
+	try {
+		throwIfAborted(signal);
 
-	const details: ReadToolDetails = markMarkdownContentType(
-		session,
-		{
-			resolvedPath: resolvedArchivePath.absolutePath,
-			suffixResolution: resolvedArchivePath.suffixResolution,
-		},
-		resolvedArchivePath.archiveSubPath,
-	);
+		const details: ReadToolDetails = markMarkdownContentType(
+			session,
+			{
+				resolvedPath: resolvedArchivePath.absolutePath,
+				suffixResolution: resolvedArchivePath.suffixResolution,
+			},
+			resolvedArchivePath.archiveSubPath,
+		);
 
-	let archiveSubPath = resolvedArchivePath.archiveSubPath;
-	let sel = parsedSel;
-	let node = archive.getNode(archiveSubPath);
-	if (!node && archiveSubPath) {
-		// `archive.zip:500` / `archive.zip:raw`: the whole subPath is a
-		// selector on the archive root, not a member name. Member names take
-		// precedence (getNode above); fall back to root + selector.
-		const wholeSel = parseSel(archiveSubPath);
-		if (wholeSel.kind !== "none") {
-			node = archive.getNode("");
-			archiveSubPath = "";
-			sel = wholeSel;
+		let archiveSubPath = resolvedArchivePath.archiveSubPath;
+		let sel = parsedSel;
+		let node = archive.getNode(archiveSubPath);
+		if (!node && archiveSubPath) {
+			// `archive.zip:500` / `archive.zip:raw`: the whole subPath is a
+			// selector on the archive root, not a member name. Member names take
+			// precedence (getNode above); fall back to root + selector.
+			const wholeSel = parseSel(archiveSubPath);
+			if (wholeSel.kind !== "none") {
+				node = archive.getNode("");
+				archiveSubPath = "";
+				sel = wholeSel;
+			}
 		}
-	}
-	if (!node) {
-		throw new ToolError(`Path '${readPath}' not found inside archive`);
-	}
-
-	if (node.isDirectory) {
-		if (isMultiRange(sel)) {
-			throw new ToolError("Multi-range line selectors are not supported for archive directory listings.");
+		if (!node) {
+			throw new ToolError(`Path '${readPath}' not found inside archive`);
 		}
-		return readArchiveDirectory(archive, resolvedArchivePath.absolutePath, archiveSubPath, sel, details, signal);
-	}
 
-	const entry = await archive.readFile(archiveSubPath);
-	const text = decodeUtf8Text(entry.bytes);
-	if (text === null) {
-		return toolResult<ReadToolDetails>(details)
-			.text(
-				prependSuffixResolutionNotice(
-					`[Cannot read binary archive entry '${entry.path}' (${formatBytes(entry.size)})]`,
-					resolvedArchivePath.suffixResolution,
-				),
-			)
-			.sourcePath(resolvedArchivePath.absolutePath)
-			.done();
-	}
+		if (node.isDirectory) {
+			if (isMultiRange(sel)) {
+				throw new ToolError("Multi-range line selectors are not supported for archive directory listings.");
+			}
+			return await readArchiveDirectory(
+				archive,
+				resolvedArchivePath.absolutePath,
+				archiveSubPath,
+				sel,
+				details,
+				signal,
+			);
+		}
 
-	// Archive members are immutable: there is no edit path for bytes inside
-	// an archive, and a hashline tag keyed to the archive file would invite
-	// (and fail) edits while clobbering sibling members' snapshots.
-	const result = await buildInMemorySelectorResult(session, text, sel, {
-		details,
-		sourcePath: resolvedArchivePath.absolutePath,
-		entityLabel: "archive entry",
-		immutable: true,
-	});
-	const firstText = result.content.find((content): content is TextContent => content.type === "text");
-	if (firstText) {
-		firstText.text = prependSuffixResolutionNotice(firstText.text, resolvedArchivePath.suffixResolution);
+		const entry = await archive.readFile(archiveSubPath);
+		const text = decodeUtf8Text(entry.bytes);
+		if (text === null) {
+			return toolResult<ReadToolDetails>(details)
+				.text(
+					prependSuffixResolutionNotice(
+						`[Cannot read binary archive entry '${entry.path}' (${formatBytes(entry.size)})]`,
+						resolvedArchivePath.suffixResolution,
+					),
+				)
+				.sourcePath(resolvedArchivePath.absolutePath)
+				.done();
+		}
+
+		// Archive members are immutable: there is no edit path for bytes inside
+		// an archive, and a hashline tag keyed to the archive file would invite
+		// (and fail) edits while clobbering sibling members' snapshots.
+		const result = await buildInMemorySelectorResult(session, text, sel, {
+			details,
+			sourcePath: resolvedArchivePath.absolutePath,
+			entityLabel: "archive entry",
+			immutable: true,
+		});
+		const firstText = result.content.find((content): content is TextContent => content.type === "text");
+		if (firstText) {
+			firstText.text = prependSuffixResolutionNotice(firstText.text, resolvedArchivePath.suffixResolution);
+		}
+		return result;
+	} finally {
+		if (!CACHEABLE_ARCHIVE_FORMATS[archive.format]) await archive.dispose();
 	}
-	return result;
 }

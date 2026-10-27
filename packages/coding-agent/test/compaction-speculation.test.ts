@@ -7,13 +7,13 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { CompactionMethod } from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
+import { type CompactionMethod, resolveSpeculationMethod } from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as snapcompactModule from "@oh-my-pi/snapcompact";
 
-import { cfgCompactionMethodOrder } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { cfgCompaction, cfgCompactionMethodOrder } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 
 const CONTEXT_WINDOW = 100_000;
 const THRESHOLD = 50_000;
@@ -196,6 +196,22 @@ describe("async speculative compaction", () => {
 		await authStorage.close();
 	});
 
+	it("does not dispatch a captured compaction after its session changes during key lookup", async () => {
+		const started = Promise.withResolvers<void>();
+		const key = Promise.withResolvers<string>();
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementationOnce(() => {
+			started.resolve();
+			return key.promise;
+		});
+		const summarize = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error("Unexpected dispatch"));
+		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		await started.promise;
+		await sessionManager.newSession();
+		key.resolve("test-key");
+		await waitForState("idle");
+		expect(summarize).not.toHaveBeenCalled();
+		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toEqual([]);
+	});
 	it("reminds only near threshold once per experimental window, including the first and reset windows", async () => {
 		maintenance = createMaintenance({ experimental: true });
 		const network = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected network request"));
@@ -963,5 +979,14 @@ describe("async speculative compaction", () => {
 		expect(entry?.type === "compaction" ? entry.tokensAfter : undefined).toBe(
 			agent.tokenizer.countMessages(convertToLlm(agent.state.messages), { excludeEncryptedReasoning: true }),
 		);
+	});
+});
+
+describe("resolveSpeculationMethod", () => {
+	it("speculates past snapcompact when the model's wire strips image input", () => {
+		const settings = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": ["snapcompact", "soft"] }));
+		// Same declared input; only the second drops images on the wire.
+		expect(resolveSpeculationMethod(getBundledModel("anthropic", "claude-sonnet-4-5"), settings)).toBeUndefined();
+		expect(resolveSpeculationMethod(getBundledModel("venice", "deepseek-v4-1-flash"), settings)).toBe("soft");
 	});
 });

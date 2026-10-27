@@ -430,7 +430,7 @@ answers or relax these branch guards.
 
 | Command | Source |
 |---|---|
-| `/annotate code-review [focus]` | Local base-branch, working-copy, or commit diff, or a GitHub PR |
+| `/annotate code-review [focus]` | Local base-branch, working-copy, or commit diff, a GitHub PR, or a GitLab MR |
 | `/annotate last` | Latest non-empty assistant reply on the active branch |
 | `/annotate session` | A message or block picked in the `/copy` selector |
 | `/annotate path/to/file` | Text read from a file |
@@ -444,7 +444,7 @@ The whole remainder after `/annotate` is one source specification (`CustomComman
 
 Argument completion offers the modes, a `./` file-path starter, and a quote starter. `CustomCommand.getArgumentCompletions(prefix, cwd)` receives the live session cwd, so file suggestions follow `/move` and `/wt`.
 
-**Code review.** The menu lists up to three GitHub PRs referenced in the conversation, then the local diff kinds. `/annotate code-review pr://owner/repo/N [focus]` skips the menu. The diff is resolved once in the live session cwd and frozen (`ResolvedReviewTarget`); the overlay and the reviewer prompt read the same snapshot, filtered by the same exclusion rules as `/review` (`src/extensibility/custom-commands/bundled/review/diff.ts`). The overlay offers **Continue with LLM review** (submits the `/review` prompt with the notes as operator focus) and **Paste annotations into prompt**. Both include the optional `[focus]` text. Nothing is posted to GitHub.
+**Code review.** The menu lists up to three GitHub PRs or GitLab MRs referenced in the conversation, then the local diff kinds. `/annotate code-review pr://owner/repo/N [focus]` (or a GitLab MR URL) skips the menu. The diff is resolved once in the live session cwd and frozen (`ResolvedReviewTarget`); the overlay and the reviewer prompt read the same snapshot, filtered by the same exclusion rules as `/review` (`src/extensibility/custom-commands/bundled/review/diff.ts`). The overlay offers **Continue with LLM review** (submits the `/review` prompt with the notes as operator focus) and **Paste annotations into prompt**. Both include the optional `[focus]` text. Nothing is posted to GitHub or GitLab.
 
 Without an interactive UI, `code-review` delegates to `/review` instead of opening the annotation overlay; text-source annotation refuses to send a message.
 
@@ -459,3 +459,17 @@ Without an interactive UI, `code-review` delegates to `/review` instead of openi
 ## 13) Built-in command note: `/plan-review`
 
 `/plan-review` reopens the Plan Review overlay for the latest plan (plan mode only). In the Contents sidebar `a` annotates the selected section; in the plan body `a` annotates the top visible line. `e` edits the annotation(s) at that section or line (with a chooser when several apply) and `u` undoes the latest section deletion or annotation change. The note editor behaves like `/annotate`'s: Enter saves, Shift+Enter inserts a newline, Escape discards the draft, the external-editor key replaces the draft without saving, and saving an empty edit deletes the annotation.
+
+## 14) Built-in command note: `/restart`
+
+`/restart` resumes the persisted session with its current cwd, session directory, settings provenance, and active profile.
+It replaces stale scope and profile flags from the original launch arguments.
+An unwritten session starts without a resume flag.
+Source relaunches retain the trusted preload and neutral startup directory before restoring the session cwd.
+Compiled relaunches retain the captured launcher policy.
+Sessions with an in-process OAuth account-pool policy refuse restart rather than losing that policy.
+
+## 15) Jobs panel disclosure
+
+The jobs panel wraps complete exit and artifact facts in terminal fallback views.
+Long commands have a bounded preview; the omission count does not replace those facts.

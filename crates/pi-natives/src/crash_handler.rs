@@ -24,6 +24,10 @@
 //!   XDG (i.e. that directory already exists and `PI_CODING_AGENT_DIR` isn't
 //!   pointed somewhere custom), otherwise `<home>/<PI_CONFIG_DIR>/logs/`
 //!   (defaulting to `~/.omp/logs/`).
+//! - This crate's own unit-test build writes to a private temp dir instead (see
+//!   `test_logs_dir`). The release addon a `bun test` process loads is not a
+//!   test build, so its crash reports still go to the path above while that
+//!   process's JS logs go to the temp dir.
 //! - Hook installation is idempotent across repeated module loads.
 
 use std::{
@@ -37,7 +41,7 @@ use std::{
 	path::{Path, PathBuf},
 	process,
 	sync::{
-		Once,
+		LazyLock, Once,
 		atomic::{AtomicBool, Ordering},
 	},
 	thread,
@@ -256,8 +260,39 @@ fn persist(report: &str, kind: CrashKind, echo_stderr: bool) {
 }
 
 fn crash_log_path(kind: CrashKind) -> Option<PathBuf> {
-	let dir = logs_dir()?;
+	// Unit tests panic, many on purpose; keep their reports out of the
+	// developer's real logs dir.
+	let dir = if cfg!(test) {
+		test_logs_dir()?
+	} else {
+		logs_dir()?
+	};
 	Some(build_crash_log_path(&dir, kind, process::id(), unix_millis()))
+}
+
+fn test_logs_dir() -> Option<PathBuf> {
+	static DIRECTORY: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.ok()?
+			.as_nanos();
+		create_test_logs_dir(
+			std::env::temp_dir().join(format!("pi-natives-test-logs-{}-{now}", process::id())),
+		)
+	});
+	DIRECTORY.clone()
+}
+
+fn create_test_logs_dir(path: PathBuf) -> Option<PathBuf> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt as _;
+		let mut builder = fs::DirBuilder::new();
+		builder.mode(0o700).create(&path).ok()?;
+	}
+	#[cfg(not(unix))]
+	fs::create_dir(&path).ok()?;
+	Some(path)
 }
 
 fn build_crash_log_path(dir: &Path, kind: CrashKind, pid: u32, now_ms: u128) -> PathBuf {
@@ -603,5 +638,23 @@ mod tests {
 			alloc_log,
 			PathBuf::from("/tmp/pi-natives-test-home/.omp/logs/native-alloc-99-1.log")
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn test_crash_logs_refuse_precreated_paths() {
+		use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+		let root = test_logs_dir().expect("private test logs");
+		assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o077, 0);
+		let target = root.join("target");
+		fs::create_dir(&target).unwrap();
+		let link = root.join("precreated");
+		symlink(&target, &link).unwrap();
+		assert_eq!(create_test_logs_dir(link.clone()), None);
+		assert_eq!(create_test_logs_dir(target.clone()), None);
+		assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+		fs::remove_file(link).unwrap();
+		fs::remove_dir(target).unwrap();
 	}
 }

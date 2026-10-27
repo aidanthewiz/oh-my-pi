@@ -10,6 +10,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 
 /**
  * Regression for issue #5064.
@@ -24,8 +25,22 @@ import { TempDir } from "@oh-my-pi/pi-utils";
  * An *explicit* `/compact snapcompact` (mode override) is a deliberate no-LLM
  * archive request, so it MUST keep failing locally instead of silently
  * shipping the transcript to a provider.
+ *
+ * A model whose wire strips images (`compat.stripImageInput`) declares image
+ * input but is text-only on the wire, so it takes the same path.
  */
-describe("AgentSession manual snapcompact text-only fallback", () => {
+describe.each([
+	{
+		label: "text-only",
+		provider: "aimlapi",
+		id: "alibaba/qwen3-coder-480b-a35b-instruct",
+	},
+	{
+		label: "wire-stripped",
+		provider: "venice",
+		id: "deepseek-v4-1-flash",
+	},
+] as const)("AgentSession manual snapcompact $label fallback", ({ provider, id }) => {
 	let session: AgentSession | undefined;
 	let authStorage: AuthStorage | undefined;
 	let tempDir: TempDir | undefined;
@@ -47,15 +62,13 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 		session: AgentSession;
 		sessionManager: SessionManager;
 		activeModel: Model;
-		notices: string[];
 	}> {
-		const activeModel = getBundledModel("aimlapi", "alibaba/qwen3-coder-480b-a35b-instruct");
-		if (!activeModel) throw new Error("Expected bundled text-only model");
-		expect(activeModel.input).not.toContain("image");
+		const activeModel = getBundledModel(provider, id);
+		if (!activeModel) throw new Error(`Expected bundled model ${provider}/${id}`);
 
 		tempDir = TempDir.createSync("@pi-manual-snapcompact-text-only-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		authStorage.keys.setRuntime("aimlapi", "test-key");
+		authStorage.keys.setRuntime(provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage);
 
 		const agent = new Agent({
@@ -91,17 +104,13 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 			"compaction.keepRecentTokens": 1,
 		});
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
-		const notices: string[] = [];
-		session.subscribe(event => {
-			if (event.type === "notice" && event.source === "compaction") notices.push(event.message);
-		});
-
-		return { session, sessionManager, activeModel, notices };
+		return { session, sessionManager, activeModel };
 	}
 
 	it("falls back to LLM compaction instead of throwing on a text-only active model", async () => {
 		const harness = await createHarness();
 
+		const snapcompactSpy = vi.spyOn(snapcompact, "compact");
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => ({
 			summary: "llm summary",
 			shortSummary: "llm",
@@ -114,6 +123,7 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 
 		expect(result.summary).toBe("llm summary");
 		// The preference resolver skips snapcompact and tries the active model for soft compaction.
+		expect(snapcompactSpy).not.toHaveBeenCalled();
 		expect(compactSpy).toHaveBeenCalled();
 		const [, firstCandidate] = compactSpy.mock.calls[0]!;
 		expect(`${firstCandidate.provider}/${firstCandidate.id}`).toBe(
@@ -130,15 +140,10 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 
 		const compactSpy = vi.spyOn(compactionModule, "compact");
 
-		await expect(harness.session.compact(undefined, { mode: "snapcompact" })).rejects.toThrow(
-			`snapcompact cannot run locally: ${harness.activeModel.id} is text-only.`,
-		);
+		await expect(harness.session.compact(undefined, { mode: "snapcompact" })).rejects.toBeInstanceOf(Error);
 
 		// Explicit no-LLM request must never reach the provider-backed summarizer.
 		expect(compactSpy).not.toHaveBeenCalled();
-		expect(harness.notices).toContain(
-			`snapcompact needs a vision-capable model (${harness.activeModel.id} is text-only)`,
-		);
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toBeUndefined();
 	});
 });

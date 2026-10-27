@@ -89,6 +89,19 @@ function recorderDefinition(session: ToolSession, calls: unknown[]): EvalPrelude
 	};
 }
 
+function recordingFacade() {
+	const calls: unknown[] = [];
+	const context = createContext({
+		__omp_log__: () => {},
+		__omp_prelude__: async (_name: string, parameters: unknown) => {
+			calls.push(parameters);
+			return responseFor(parameters);
+		},
+	});
+	runInContext(createBrowserPrelude(makeSession()).javascript, context);
+	return { calls, context };
+}
+
 afterAll(async () => {
 	await Promise.all([disposeAllVmContexts(), disposeAllKernelSessions()]);
 });
@@ -181,15 +194,7 @@ describe("browser JavaScript facade", () => {
 	});
 
 	it("refuses run args it would drop before anything runs, and still runs empty or null args", async () => {
-		const calls: unknown[] = [];
-		const context = createContext({
-			__omp_log__: () => {},
-			__omp_prelude__: async (_name: string, parameters: unknown) => {
-				calls.push(parameters);
-				return responseFor(parameters);
-			},
-		});
-		runInContext(createBrowserPrelude(makeSession()).javascript, context);
+		const { calls, context } = recordingFacade();
 
 		await expect(
 			runInContext(
@@ -208,6 +213,28 @@ describe("browser JavaScript facade", () => {
 			{ name: "docs", code: "return 1;", action: "run" },
 			{ name: "docs", fn: "async () => 1", args: [], action: "run" },
 		]);
+	});
+
+	it("rejects invalid tab.run options before dispatching any browser action", async () => {
+		const { calls, context } = recordingFacade();
+
+		await expect(
+			runInContext('browser.tab("docs").run(async (_scope, url) => url, ["https://example.test"])', context),
+		).rejects.toThrow();
+		for (const call of ['run(async () => 1, "fast")', 'run("return 1;", [1])']) {
+			await expect(runInContext(`browser.tab("docs").${call}`, context)).rejects.toThrow();
+		}
+		expect(calls).toEqual([]);
+	});
+
+	it("rejects invalid browser.open options before dispatching any browser action", async () => {
+		const { calls, context } = recordingFacade();
+
+		await expect(
+			runInContext('browser.open("https://example.test", { viewport: { width: 1280, height: 900 } })', context),
+		).rejects.toThrow();
+		await expect(runInContext("browser.open(42)", context)).rejects.toThrow();
+		expect(calls).toEqual([]);
 	});
 });
 

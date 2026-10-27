@@ -6,7 +6,7 @@ Shared utilities for [omp](https://github.com/can1357/oh-my-pi) packages. Zero c
 
 | Module                                                                                                             | Purpose                                                                                      |
 | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `logger`                                                                                                           | Centralized logger writing to `~/.omp/logs/` with rotation (TUI-safe — never stdout)         |
+| `logger`                                                                                                           | Centralized logger writing to `~/.omp/logs/` (`bun test`: temp dir), rotating, never stdout  |
 | `prompt`                                                                                                           | Handlebars-based prompt templating and formatting helpers                                    |
 | `dirs`                                                                                                             | Path helpers for omp config directories (`~/.omp`, XDG-aware on Linux)                       |
 | `stream`                                                                                                           | `readStream` / `readLines` helpers over `ReadableStream`                                     |
@@ -22,6 +22,17 @@ Shared utilities for [omp](https://github.com/can1357/oh-my-pi) packages. Zero c
 | `frontmatter`, `glob`, `mime`, `temp`, `format`, `color`, `snowflake`, `tab-spacing`, `path-tree`, `sanitize-text` | Smaller single-purpose helpers                                                               |
 
 Import from the root barrel or per-module subpaths (`@oh-my-pi/pi-utils/<module>`).
+
+## Archive lifetime
+
+Use `await using archive = await openArchive(source)` or call `await archive.dispose()` in `finally`.
+Disposal waits for admitted member reads and closes retained streaming decoders.
+Forward member reads reuse one decompression pass until disposal.
+New reads fail after disposal starts.
+File-backed sources reject inode or timestamp changes.
+HTTP sources preserve advertised strong ETags or modification dates across range reads.
+Unversioned custom or HTTP sources must remain unchanged for the reader's lifetime.
+
 
 ## Install
 

@@ -14,7 +14,7 @@ import { hindsightBackend, rebindMemoryBackendForCwd } from "@oh-my-pi/pi-coding
 import { MEMORY_BACKEND_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/memory-backend/tool-names";
 import { computeMnemopiBankScope } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
-import { getMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
+import { getMnemopiSessionState, mnemopiRequestOwner } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -25,6 +25,7 @@ import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { resetMemoryForTests } from "@oh-my-pi/pi-mnemopi";
 import { getProjectAgentDir, getProjectDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { asGlobalFetch } from "./helpers/fetch-mock";
 
 import { cfgAutolearnEnabled } from "@oh-my-pi/pi-coding-agent/autolearn/settings";
 import { cfgHindsightApiUrl, cfgHindsightMentalModelsEnabled } from "@oh-my-pi/pi-coding-agent/hindsight/settings";
@@ -71,7 +72,10 @@ describe("AgentSession memory backend lifecycle", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(createMemoryTools: () => Promise<AgentTool[]>): AgentSession {
+	function createSession(
+		createMemoryTools: () => Promise<AgentTool[]>,
+		sessionManager: SessionManager = SessionManager.inMemory(tempDir.path()),
+	): AgentSession {
 		const model = buildModel({
 			id: "mock",
 			name: "mock",
@@ -96,7 +100,7 @@ describe("AgentSession memory backend lifecycle", () => {
 		const toolRegistry = new Map<string, AgentTool>([[read.name, read]]);
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(tempDir.path()),
+			sessionManager,
 			settings,
 			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
 			memoryAgentDir: tempDir.path(),
@@ -111,17 +115,25 @@ describe("AgentSession memory backend lifecycle", () => {
 		return session;
 	}
 
-	async function startMemoryCompletion(models: Model<Api>[]) {
+	async function startMemoryCompletion(
+		models: Model<Api>[],
+		thinking: readonly (string | undefined)[] = [],
+		sessionManager?: SessionManager,
+	) {
+		const selectors = models.map((model, index) => {
+			const level = thinking[index];
+			return `${model.provider}/${model.id}${level ? `:${level}` : ""}`;
+		});
 		settings = Settings.isolated({
 			"compaction.enabled": false,
 			"memory.backend": "mnemopi",
 			"mnemopi.noEmbeddings": true,
 			"mnemopi.llmMode": "smol",
 			"mnemopi.autoRetain": false,
-			modelRoles: { memory: `${models[0]!.provider}/${models[0]!.id}` },
-			"retry.fallbackChains": { memory: models.slice(1).map(model => `${model.provider}/${model.id}`) },
+			modelRoles: { memory: selectors[0]! },
+			"retry.fallbackChains": { memory: selectors.slice(1) },
 		});
-		const current = createSession(async () => []);
+		const current = createSession(async () => [], sessionManager);
 		for (const model of models) authStorage.keys.setRuntime(model.provider, "test-key");
 		spyOn(current.modelRegistry, "getAvailable").mockReturnValue(models);
 		spyOn(current.modelRegistry, "getApiKeyForProvider").mockResolvedValue(undefined);
@@ -156,6 +168,36 @@ describe("AgentSession memory backend lifecycle", () => {
 			errorMessage: stopReason === "error" ? "Invalid request" : undefined,
 			timestamp: Date.now(),
 		};
+	}
+
+	function memoryWireResponse(model: string): Response {
+		const events = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_memory",
+					type: "message",
+					role: "assistant",
+					model,
+					content: [],
+					stop_reason: null,
+					stop_sequence: null,
+					usage: { input_tokens: 8, output_tokens: 0 },
+				},
+			},
+			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Sam works at Globex." } },
+			{ type: "content_block_stop", index: 0 },
+			{
+				type: "message_delta",
+				delta: { stop_reason: "end_turn", stop_sequence: null },
+				usage: { output_tokens: 4 },
+			},
+			{ type: "message_stop" },
+		];
+		return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
+			headers: { "content-type": "text/event-stream" },
+		});
 	}
 
 	it("journals one remote memory completion with its reported usage on the active branch", async () => {
@@ -213,6 +255,211 @@ describe("AgentSession memory backend lifecycle", () => {
 				errorMessage: "Invalid request",
 			},
 			{ purpose: "memory", role: "memory", model: backup.id, usage: succeeded.usage, stopReason: "stop" },
+		]);
+		expect(usage[1]!.parentId).toBe(usage[0]!.id);
+		expect(current.sessionManager.getLeafId()).toBe(usage[1]!.id);
+	});
+
+	it("journals an in-flight memory request beneath its initiating branch", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const response = memoryReply(model);
+		spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			started.resolve();
+			await finish.promise;
+			options?.onAttempt?.(response);
+			return response;
+		});
+		const { current, complete } = await startMemoryCompletion([model]);
+		const manager = current.sessionManager;
+		const first = manager.appendMessage({ role: "user", content: "first branch", timestamp: 1 });
+		const origin = manager.appendMessage({ role: "user", content: "remember employer", timestamp: 2 });
+		const pending = complete("Sam works at Globex.");
+		await started.promise;
+		manager.branch(first);
+		const active = manager.appendMessage({ role: "user", content: "new branch", timestamp: 3 });
+		finish.resolve();
+		await pending;
+		expect(manager.getLeafId()).toBe(active);
+		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ parentId: origin, purpose: "memory", model: model.id, usage: response.usage, activeLeafId: active },
+		]);
+	});
+
+	it("keeps every billed fallback attempt on the initiating branch after a branch switch", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;
+		const backup = { ...model, id: "memory-backup" };
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const failed = memoryReply(model, "error");
+		const succeeded = memoryReply(backup);
+		spyOn(ai, "completeSimple").mockImplementation(async (candidate, _context, options) => {
+			if (candidate.id === model.id) {
+				started.resolve();
+				await finish.promise;
+			}
+			const response = candidate.id === model.id ? failed : succeeded;
+			options?.onAttempt?.(response);
+			return response;
+		});
+		const { current, complete } = await startMemoryCompletion([model, backup]);
+		const manager = current.sessionManager;
+		const first = manager.appendMessage({ role: "user", content: "first branch", timestamp: 1 });
+		const origin = manager.appendMessage({ role: "user", content: "remember employer", timestamp: 2 });
+		const pending = complete("Sam works at Globex.");
+		await started.promise;
+		manager.branch(first);
+		const active = manager.appendMessage({ role: "user", content: "new branch", timestamp: 3 });
+		finish.resolve();
+
+		expect(await pending).toBe("Sam works at Globex.");
+		const usage = manager.getEntries().filter(entry => entry.type === "model_usage");
+		expect(usage).toMatchObject([
+			{ parentId: origin, model: model.id, usage: failed.usage, stopReason: "error", activeLeafId: active },
+			{ model: backup.id, usage: succeeded.usage, stopReason: "stop", activeLeafId: active },
+		]);
+		expect(usage[1]!.parentId).toBe(usage[0]!.id);
+		expect(manager.getLeafId()).toBe(active);
+		expect(manager.getBranch().filter(entry => entry.type === "model_usage")).toEqual([]);
+		manager.branch(usage[1]!.id);
+		expect(manager.getBranch().filter(entry => entry.type === "model_usage")).toEqual(usage);
+	});
+
+	it("drains accepted extraction usage to its original journal before starting a new session", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const response = memoryReply(model);
+		spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			started.resolve();
+			await finish.promise;
+			options?.onAttempt?.(response);
+			return response;
+		});
+		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+		const { current } = await startMemoryCompletion([model], [], manager);
+		const originSessionId = manager.getSessionId();
+		const originFile = manager.getSessionFile()!;
+		const originLeaf = manager.appendMessage({ role: "user", content: "remember employer", timestamp: 1 });
+		const state = getMnemopiSessionState(current)!;
+		state.rememberScoped("Sam works at Globex.", { source: "test", extract: true });
+		await started.promise;
+		const switching = current.newSession();
+		await Promise.resolve();
+		try {
+			expect(manager.getSessionId()).toBe(originSessionId);
+		} finally {
+			finish.resolve();
+		}
+		await switching;
+		expect(manager.getSessionId()).not.toBe(originSessionId);
+		const reopened = await SessionManager.open(originFile);
+		try {
+			expect(reopened.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+				{
+					parentId: originLeaf,
+					purpose: "memory",
+					provider: model.provider,
+					model: model.id,
+					usage: response.usage,
+				},
+			]);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("does not dispatch queued extraction after its journal changes during key lookup", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;
+		const { current } = await startMemoryCompletion([model]);
+		const started = Promise.withResolvers<void>();
+		const key = Promise.withResolvers<string>();
+		spyOn(current.modelRegistry, "getApiKey").mockImplementationOnce(() => {
+			started.resolve();
+			return key.promise;
+		});
+		const dispatch = spyOn(ai, "completeSimple").mockResolvedValue(memoryReply(model));
+		const state = getMnemopiSessionState(current)!;
+		state.rememberScoped("Sam works at Globex.", { source: "test", extract: true });
+		await started.promise;
+		try {
+			await current.sessionManager.newSession();
+		} finally {
+			key.resolve("test-key");
+		}
+		await state.memory.flushExtractions();
+		expect(dispatch).not.toHaveBeenCalled();
+		expect(current.sessionManager.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);
+	});
+
+	it("fails closed at the real extraction boundary when its captured context is lost", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;
+		const { current } = await startMemoryCompletion([model]);
+		spyOn(mnemopiRequestOwner, "getStore").mockReturnValue(undefined);
+		const credentials = spyOn(current.modelRegistry, "getApiKey");
+		const dispatch = spyOn(ai, "completeSimple").mockResolvedValue(memoryReply(model));
+		const state = getMnemopiSessionState(current)!;
+		state.rememberScoped("Sam works at Globex.", { source: "test", extract: true });
+		await state.memory.flushExtractions();
+		expect(credentials).not.toHaveBeenCalled();
+		expect(dispatch).not.toHaveBeenCalled();
+		expect(current.sessionManager.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);
+	});
+
+	it.each(["low", "off"] as const)(
+		"applies memory :%s to the actual Anthropic request and journals the response",
+		async suffix => {
+			const model = { ...getBundledModel("anthropic", "claude-sonnet-4-6")!, baseUrl: "http://127.0.0.1:1" };
+			const bodies: Array<Record<string, unknown>> = [];
+			spyOn(globalThis, "fetch").mockImplementation(
+				asGlobalFetch(async (_input, init) => {
+					if (typeof init?.body !== "string") throw new Error("Expected JSON request body");
+					bodies.push(JSON.parse(init.body));
+					return memoryWireResponse(model.id);
+				}),
+			);
+			const { current, complete } = await startMemoryCompletion([model], [suffix]);
+			await complete("Sam works at Globex.");
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0]!.output_config).toMatchObject({ effort: "low" });
+			if (suffix === "off") expect(bodies[0]!.thinking).toBeUndefined();
+			else expect(bodies[0]!.thinking).toMatchObject({ type: "adaptive" });
+			expect(current.sessionManager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+				{ purpose: "memory", model: model.id, usage: { input: 8, output: 4 }, stopReason: "stop" },
+			]);
+		},
+	);
+
+	it("applies the fallback memory candidate's effort on the wire after a primary rejection", async () => {
+		const model = { ...getBundledModel("anthropic", "claude-sonnet-4-6")!, baseUrl: "http://127.0.0.1:1" };
+		const backup = { ...model, id: "memory-backup" };
+		const bodies: Array<Record<string, unknown>> = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async (_input, init) => {
+				if (typeof init?.body !== "string") throw new Error("Expected JSON request body");
+				const body = JSON.parse(init.body);
+				bodies.push(body);
+				if (body.model === model.id)
+					return new Response(
+						JSON.stringify({
+							type: "error",
+							error: { type: "invalid_request_error", message: "Primary request rejected" },
+						}),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				return memoryWireResponse(backup.id);
+			}),
+		);
+		const { current, complete } = await startMemoryCompletion([model, backup], ["off", "high"]);
+		await complete("Sam works at Globex.");
+		expect(bodies.map(body => [body.model, body.thinking, body.output_config])).toMatchObject([
+			[model.id, undefined, { effort: "low" }],
+			[backup.id, { type: "adaptive" }, { effort: "high" }],
+		]);
+		expect(current.sessionManager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
+			{ model: model.id, stopReason: "error" },
+			{ model: backup.id, stopReason: "stop", usage: { input: 8, output: 4 } },
 		]);
 	});
 

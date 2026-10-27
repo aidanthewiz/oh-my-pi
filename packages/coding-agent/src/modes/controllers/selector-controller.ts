@@ -45,7 +45,11 @@ import {
 	resolveModelRoleValue,
 } from "../../config/model-resolver";
 import { getRoleInfo } from "../../config/model-roles";
-import { filterOAuthLoginProviders } from "../../config/oauth-login-gate";
+import {
+	assertOAuthLoginProviderAllowed,
+	filterOAuthLoginProviders,
+	isOAuthLoginProviderAllowed,
+} from "../../config/oauth-login-gate";
 import { settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
@@ -124,12 +128,9 @@ import { createExtensionDashboardRuntime } from "../components/extensions/dashbo
 import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search";
 import type { LoginDialogComponent as LoginDialogComponentType } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import type { LogoutAccountSelectorComponent as LogoutAccountSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
-import type {
-	ModelHubComponent as ModelHubComponentType,
-	ModelRoleSelectionScope,
-} from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { ModelHubComponent, type ModelRoleSelectionScope } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
-import type { ModelPickerComponent as ModelPickerComponentType } from "@oh-my-pi/pi-tui/overlays/model-picker";
+import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { OAuthSelectorComponent as OAuthSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
 import { type ResetUsageAccount, ResetUsageSelectorComponent } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
@@ -162,19 +163,6 @@ import {
 	cfgTreeFilterMode,
 } from "../settings";
 import { cfgTaskAgentModelOverrides } from "../../task/settings";
-
-interface ModelOverlayModules {
-	ModelHubComponent: typeof ModelHubComponentType;
-	ModelPickerComponent: typeof ModelPickerComponentType;
-}
-
-/** Synchronous first-use boundary for model overlays; key callbacks require immediate mounting. */
-function loadModelOverlayComponents(): ModelOverlayModules {
-	return {
-		ModelHubComponent: require("@oh-my-pi/pi-tui/overlays/model-hub.js").ModelHubComponent,
-		ModelPickerComponent: require("@oh-my-pi/pi-tui/overlays/model-picker.js").ModelPickerComponent,
-	};
-}
 
 interface ProviderAuthUiModules {
 	PASTE_CODE_LOGIN_PROVIDERS: typeof PasteCodeLoginProviders;
@@ -294,18 +282,6 @@ export class SelectorController {
 	 */
 	async #acquireDefaultRoleMutation(): Promise<() => void> {
 		return acquireModelRoleMutation();
-	}
-
-	async #refreshOAuthProviderAuthState(): Promise<void> {
-		const { getOAuthProviders } = loadProviderAuthUi();
-		const oauthProviders = getOAuthProviders();
-		await Promise.all(
-			oauthProviders.map(provider =>
-				this.ctx.session.modelRegistry
-					.getApiKeyForProvider(provider.id, this.ctx.session.sessionId)
-					.catch(() => undefined),
-			),
-		);
 	}
 
 	/**
@@ -852,7 +828,6 @@ export class SelectorController {
 			closeOpenMenu("model-picker-select");
 			if (this.#focusOpenMenu("model-picker")) return;
 		}
-		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const viewed = this.ctx.viewSession;
 		const viewedSessionId = viewed.sessionId;
 		const focusedAgentId = this.ctx.focusedAgentId;
@@ -982,7 +957,6 @@ export class SelectorController {
 	 */
 	#showModelHub(hubOptions: { initialProviderId?: string }): void {
 		if (this.#focusOpenMenu("model-hub")) return;
-		const { ModelHubComponent } = loadModelOverlayComponents();
 		let closed = false;
 		const done = () => {
 			// Re-entrant guard: cancel paths (Esc, login forward) may race;
@@ -2161,8 +2135,24 @@ export class SelectorController {
 		const sessionId = session.sessionId;
 		const isCurrent = () => this.ctx.session === session && session.sessionId === sessionId && !session.isDisposed;
 		if (!isCurrent()) return false;
+		const { getOAuthCredentialProvider, getOAuthProviders, LoginDialogComponent, PASTE_CODE_LOGIN_PROVIDERS } =
+			loadProviderAuthUi();
+		const provider = getOAuthProviders().find(entry => entry.id === providerId);
+		if (!provider) {
+			this.ctx.showError(`Unknown OAuth provider: ${providerId}`);
+			return false;
+		}
+		const assertLoginAllowed = () => {
+			if (!isCurrent()) throw new Error("Login session is no longer active");
+			assertOAuthLoginProviderAllowed(provider, session.settings);
+		};
+		try {
+			assertLoginAllowed();
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			return false;
+		}
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
-		const { getOAuthCredentialProvider, LoginDialogComponent, PASTE_CODE_LOGIN_PROVIDERS } = loadProviderAuthUi();
 		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
 		let restored = false;
 		const restoreEditor = () => {
@@ -2190,16 +2180,24 @@ export class SelectorController {
 		this.ctx.ui.setFocus(dialog);
 		this.ctx.ui.requestRender();
 		try {
+			assertLoginAllowed();
 			const identity = await session.modelRegistry.authStorage.oauth.login(providerId as OAuthProvider, {
 				signal: dialog.signal,
 				onBrowserSession: captureBrowserSession,
 				onAuth: (info: { url: string; launchUrl?: string; instructions?: string }) => {
+					assertLoginAllowed();
 					// The dialog renders the full URL (SSH-safe copy target) and
 					// opens the browser best-effort.
 					dialog.showAuth(info.url, info.instructions, info.launchUrl);
 				},
-				onPrompt: prompt => dialog.showPrompt(prompt),
+				onPrompt: async prompt => {
+					assertLoginAllowed();
+					const value = await dialog.showPrompt(prompt);
+					assertLoginAllowed();
+					return value;
+				},
 				onProgress: (message: string) => {
+					assertLoginAllowed();
 					dialog.showProgress(message);
 				},
 				// Paste-code providers (e.g. Codex) may need the user to paste the
@@ -2209,14 +2207,19 @@ export class SelectorController {
 				// editor's `/login <url>` path is unreachable while the dialog holds
 				// focus (#5339).
 				onManualCodeInput: useManualInput
-					? signal =>
-							dialog.showManualInput(
+					? async signal => {
+							assertLoginAllowed();
+							const value = await dialog.showManualInput(
 								`Paste the authorization code (or full redirect URL), then press ${editorKey("tui.input.submit")}:`,
 								signal,
-							)
+							);
+							assertLoginAllowed();
+							return value;
+						}
 					: undefined,
 			});
 			if (!isCurrent() || dialog.signal.aborted) return false;
+			assertLoginAllowed();
 			// Scope the post-login refresh to the just-authenticated provider with an
 			// `online` strategy: the default all-provider `online-if-uncached` reuses
 			// a fresh authoritative cache row (e.g. an empty result fetched before
@@ -2352,7 +2355,6 @@ export class SelectorController {
 
 		const { getOAuthProviders, OAuthSelectorComponent } = loadProviderAuthUi();
 		if (mode === "logout") {
-			await this.#refreshOAuthProviderAuthState();
 			const oauthProviders = getOAuthProviders();
 			const loggedInProviders = oauthProviders.filter(provider =>
 				this.ctx.session.modelRegistry.authStorage.credentials.has(provider.id),
@@ -2364,6 +2366,9 @@ export class SelectorController {
 		}
 
 		this.showSelector(done => {
+			const session = this.ctx.session;
+			const sessionId = session.sessionId;
+			const providers = getOAuthProviders();
 			const selector = new OAuthSelectorComponent(
 				mode,
 				this.ctx.session.modelRegistry.authStorage,
@@ -2382,15 +2387,34 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				{
-					disabledProviders: cfgDisabledProviders.get(settings),
-					providers: mode === "login" ? filterOAuthLoginProviders(getOAuthProviders()) : undefined,
-					validateAuth: async (selectedProviderId: string) => {
-						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
-							selectedProviderId,
-							this.ctx.session.sessionId,
-						);
-						return !!apiKey;
-					},
+					disabledProviders: cfgDisabledProviders.get(session.settings),
+					providers: mode === "login" ? filterOAuthLoginProviders(providers, session.settings) : undefined,
+					validateAuth:
+						mode === "login"
+							? async (selectedProviderId: string) => {
+									const provider = providers.find(entry => entry.id === selectedProviderId);
+									if (
+										!provider ||
+										this.ctx.session !== session ||
+										session.sessionId !== sessionId ||
+										session.isDisposed ||
+										!isOAuthLoginProviderAllowed(provider, session.settings)
+									)
+										return false;
+									const apiKey = await session.modelRegistry.getApiKeyForProvider(
+										selectedProviderId,
+										sessionId,
+									);
+									if (
+										this.ctx.session !== session ||
+										session.sessionId !== sessionId ||
+										session.isDisposed ||
+										!isOAuthLoginProviderAllowed(provider, session.settings)
+									)
+										return false;
+									return !!apiKey;
+								}
+							: undefined,
 					requestRender: () => {
 						this.ctx.ui.requestRender();
 					},

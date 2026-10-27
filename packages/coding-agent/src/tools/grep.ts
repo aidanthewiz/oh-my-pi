@@ -299,57 +299,71 @@ async function resolveArchiveSearchPaths(
 	const unreadable: string[] = [];
 	let tempDir: string | undefined;
 	const archiveCache = new Map<string, ArchiveReader>();
+	let disposalFailure: PromiseRejectedResult | undefined;
 
-	for (let idx = 0; idx < pathSpecs.length; idx++) {
-		const spec = pathSpecs[idx];
-		if (!spec) continue;
-		const entry = spec.clean;
-		const member = archiveSearchMember(spec);
-		if (!member) continue;
+	try {
+		for (let idx = 0; idx < pathSpecs.length; idx++) {
+			const spec = pathSpecs[idx];
+			if (!spec) continue;
+			const entry = spec.clean;
+			const member = archiveSearchMember(spec);
+			if (!member) continue;
 
-		const archiveAbs = resolveReadPath(member.archivePath, cwd);
-		let archive = archiveCache.get(archiveAbs);
-		if (!archive) {
+			const archiveAbs = resolveReadPath(member.archivePath, cwd);
+			let archive = archiveCache.get(archiveAbs);
+			if (!archive) {
+				try {
+					archive = await openArchive(archiveAbs);
+				} catch (err) {
+					unreadable.push(`${entry} (cannot open archive: ${(err as Error).message})`);
+					continue;
+				}
+				archiveCache.set(archiveAbs, archive);
+			}
+
+			let extracted: ExtractedArchiveFile;
 			try {
-				archive = await openArchive(archiveAbs);
+				extracted = await archive.readFile(member.subPath);
 			} catch (err) {
-				unreadable.push(`${entry} (cannot open archive: ${(err as Error).message})`);
+				unreadable.push(`${entry} (${(err as Error).message})`);
 				continue;
 			}
-			archiveCache.set(archiveAbs, archive);
-		}
+			// UTF-8 only — binary members would just produce noise through ripgrep.
+			if (extracted.bytes.some(byte => byte === 0)) {
+				unreadable.push(`${entry} (binary archive entry)`);
+				continue;
+			}
+			let text: string;
+			try {
+				text = new TextDecoder("utf-8", { fatal: true }).decode(extracted.bytes);
+			} catch {
+				unreadable.push(`${entry} (non-UTF-8 archive entry)`);
+				continue;
+			}
 
-		let extracted: ExtractedArchiveFile;
-		try {
-			extracted = await archive.readFile(member.subPath);
-		} catch (err) {
-			unreadable.push(`${entry} (${(err as Error).message})`);
-			continue;
+			if (!tempDir) {
+				tempDir = await mkdtemp(path.join(tmpdir(), "omp-search-archive-"));
+			}
+			// Per-entry filename keeps the scratch path unique even when two selectors
+			// resolve to members with the same basename.
+			const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
+			const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
+			await writeFile(tempPath, text);
+			resolvedPaths[idx] = tempPath;
+			displayMap.set(tempPath, entry);
+			displaySet.add(entry);
 		}
-		// UTF-8 only — binary members would just produce noise through ripgrep.
-		if (extracted.bytes.some(byte => byte === 0)) {
-			unreadable.push(`${entry} (binary archive entry)`);
-			continue;
-		}
-		let text: string;
-		try {
-			text = new TextDecoder("utf-8", { fatal: true }).decode(extracted.bytes);
-		} catch {
-			unreadable.push(`${entry} (non-UTF-8 archive entry)`);
-			continue;
-		}
-
-		if (!tempDir) {
-			tempDir = await mkdtemp(path.join(tmpdir(), "omp-search-archive-"));
-		}
-		// Per-entry filename keeps the scratch path unique even when two selectors
-		// resolve to members with the same basename.
-		const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
-		const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
-		await writeFile(tempPath, text);
-		resolvedPaths[idx] = tempPath;
-		displayMap.set(tempPath, entry);
-		displaySet.add(entry);
+	} catch (error) {
+		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+		throw error;
+	} finally {
+		disposalFailure = (await Promise.allSettled([...archiveCache.values()].map(archive => archive.dispose()))).find(
+			result => result.status === "rejected",
+		);
+	}
+	if (disposalFailure) {
+		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+		throw disposalFailure.reason;
 	}
 
 	const cleanup = async () => {

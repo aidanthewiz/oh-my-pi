@@ -81,6 +81,8 @@ export interface ExtractedArchiveFile extends ArchiveNode {
  * hundreds of thousands of members.
  */
 export interface MemberSource {
+	/** Shared format-owned resource, released once by the archive owner after admitted reads settle. */
+	readonly resource?: AsyncDisposable;
 	/**
 	 * Read this member's bytes. `size` is the entry's declared uncompressed
 	 * size (already bounds-checked); `memberPath` is for error messages.

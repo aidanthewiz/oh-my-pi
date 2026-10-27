@@ -3,7 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseEnv } from "node:util";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
+import { isBunTestRuntime } from "./test-runtime";
 
+export * from "./test-runtime";
 export * from "./worker-host";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -375,6 +377,7 @@ interface ChildEnvPolicy {
 	preserveExplicitCredentials: boolean;
 	preserveGitCredentials: boolean;
 	preserveOperationalAws: boolean;
+	forgeCredentialNames?: Readonly<Record<string, true>>;
 }
 
 function scrubChildCredentials(
@@ -382,6 +385,7 @@ function scrubChildCredentials(
 	protectedValues: ReadonlySet<string>,
 	policy: ChildEnvPolicy,
 	explicitOverlayNames: ReadonlySet<string> = new Set(),
+	forbiddenForgeValues?: ReadonlySet<string>,
 ): void {
 	for (const key in result) {
 		const normalized = managedEnvName(key);
@@ -403,11 +407,16 @@ function scrubChildCredentials(
 			explicitOverlayNames.has(normalized) &&
 			!managedName &&
 			!managedValue;
+		const forgeCredential =
+			policy.forgeCredentialNames?.[normalized] === true &&
+			!managedName &&
+			!managedValue &&
+			!forbiddenForgeValues?.has(result[key]);
 		if (
 			managedName ||
 			managedValue ||
-			(credentialName && !trustedAws && !trustedGitCredential && !explicitCredential) ||
-			(protectedValue && !trustedAws && !trustedGitCredential && !explicitCredential)
+			(credentialName && !trustedAws && !trustedGitCredential && !explicitCredential && !forgeCredential) ||
+			(protectedValue && !trustedAws && !trustedGitCredential && !explicitCredential && !forgeCredential)
 		) {
 			delete result[key];
 		}
@@ -430,6 +439,7 @@ function filterChildShellEnvInternal(
 	onDotenvValue?: (value: string) => void,
 ): Record<string, string> {
 	const protectedValues = new Set(managedAgentEnvValues);
+	const forbiddenForgeValues = policy.forgeCredentialNames ? new Set(managedAgentEnvValues) : undefined;
 	for (const [key, value] of Object.entries(env)) {
 		const name = managedEnvName(key);
 		// Routing selectors must not erase unrelated variables with the same ordinary value.
@@ -438,12 +448,14 @@ function filterChildShellEnvInternal(
 			name !== "OMP_OPERATIONAL_AWS_PROFILE" &&
 			name !== "OMP_OPERATIONAL_AWS_REGION" &&
 			hasCredentialValue(key)
-		)
+		) {
 			protectedValues.add(value);
+			if (policy.forgeCredentialNames?.[name] !== true) forbiddenForgeValues?.add(value);
+		}
 	}
 	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);
-	scrubChildCredentials(result, protectedValues, policy);
+	scrubChildCredentials(result, protectedValues, policy, undefined, forbiddenForgeValues);
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;
@@ -534,7 +546,7 @@ function filterChildShellEnvInternal(
 			else result[key] = value;
 		}
 	}
-	scrubChildCredentials(result, protectedValues, policy, explicitOverlayNames);
+	scrubChildCredentials(result, protectedValues, policy, explicitOverlayNames, forbiddenForgeValues);
 	applyLauncherCapturedChildPolicy(result);
 	const hasExplicitAwsCredentials =
 		policy.preserveExplicitCredentials &&
@@ -616,6 +628,36 @@ export function filterGitChildShellEnv(
 		env,
 		cwd,
 		overlays,
+	);
+}
+
+const FORGE_CREDENTIAL_ENV_NAMES: Record<"gh" | "glab", Readonly<Record<string, true>>> = {
+	gh: {
+		GH_TOKEN: true,
+		GITHUB_TOKEN: true,
+		GH_ENTERPRISE_TOKEN: true,
+		GITHUB_ENTERPRISE_TOKEN: true,
+		GH_CONFIG_DIR: true,
+	},
+	glab: { GITLAB_TOKEN: true, GITLAB_ACCESS_TOKEN: true, OAUTH_TOKEN: true, GLAB_CONFIG_DIR: true },
+};
+
+/** Preserve only the selected forge's own credentials, never managed credentials or secret aliases. */
+export function filterForgeChildEnv(
+	env: Record<string, string | undefined>,
+	cwd: string,
+	bin: "gh" | "glab",
+): Record<string, string> {
+	return filterChildShellEnvInternal(
+		{
+			preserveExplicitCredentials: false,
+			preserveGitCredentials: true,
+			preserveOperationalAws: false,
+			forgeCredentialNames: FORGE_CREDENTIAL_ENV_NAMES[bin],
+		},
+		env,
+		cwd,
+		[],
 	);
 }
 
@@ -817,15 +859,6 @@ export function $envpos(name: string, defaultValue: number): number {
 	const parsed = Number.parseInt(raw, 10);
 	if (Number.isNaN(parsed) || parsed <= 0) return defaultValue;
 	return parsed;
-}
-
-const BUN_TEST_ENTRY_PATTERN = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
-
-/** True when the process is an explicitly marked test child or Bun is running a test entrypoint. */
-export function isBunTestRuntime(): boolean {
-	if (Bun.env.PI_TEST_RUNTIME === "1") return true;
-	const hasTestEnvironment = Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
-	return hasTestEnvironment && BUN_TEST_ENTRY_PATTERN.test(Bun.main);
 }
 
 let terminalHeadless = isBunTestRuntime();

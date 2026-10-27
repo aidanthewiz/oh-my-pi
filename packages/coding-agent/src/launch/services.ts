@@ -27,9 +27,10 @@ export interface ServiceStart {
 	command: string;
 	cwd?: string;
 	pty?: boolean;
-	env?: Record<string, string>;
 	shell: { shell: string; args: string[]; prefix?: string; env: Record<string, string> };
 	ready?: ServiceReady;
+	/** Overlay on the configured shell env; wins over it. */
+	env?: Record<string, string>;
 }
 
 const serviceStateKey = Symbol("ownedServices");

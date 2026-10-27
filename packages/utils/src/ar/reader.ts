@@ -27,14 +27,48 @@ export class ArchiveReader {
 	readonly format: ArchiveFormat;
 	readonly limits: ArchiveLimits;
 	#entries = new Map<string, ArchiveIndexEntry>();
+	#resources?: Set<AsyncDisposable>;
+	#reads?: Set<Promise<ExtractedArchiveFile>>;
+	#closed = false;
+	#disposal?: Promise<void>;
 
 	constructor(format: ArchiveFormat, entries: ArchiveIndexEntry[], limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS) {
 		this.format = format;
 		this.limits = limits;
 		for (const entry of entries) {
 			upsertArchiveEntry(this.#entries, entry);
+			if (entry.storage?.type === "member" && entry.storage.source.resource) {
+				(this.#resources ??= new Set()).add(entry.storage.source.resource);
+			}
 		}
 		ensureParentDirectories(this.#entries, limits);
+	}
+
+	/** Close the archive after all admitted member reads, including any retained streaming decoder. */
+	dispose(): Promise<void> {
+		if (this.#disposal) return this.#disposal;
+		this.#closed = true;
+		this.#disposal = this.#close();
+		return this.#disposal;
+	}
+
+	async [Symbol.asyncDispose](): Promise<void> {
+		await this.dispose();
+	}
+
+	async #close(): Promise<void> {
+		if (this.#reads) await Promise.allSettled(this.#reads);
+		const outcomes = this.#resources
+			? await Promise.allSettled([...this.#resources].map(resource => resource[Symbol.asyncDispose]()))
+			: [];
+		this.#entries.clear();
+		this.#resources?.clear();
+		const failed = outcomes.find(outcome => outcome.status === "rejected");
+		if (failed?.status === "rejected") throw failed.reason;
+	}
+
+	#assertOpen(): void {
+		if (this.#closed) throw new ArchiveError("Archive is closed");
 	}
 
 	/**
@@ -43,11 +77,13 @@ export class ArchiveReader {
 	 * use {@link getNode}/{@link readFile}, which resolve symlink aliases.
 	 */
 	indexEntries(): IterableIterator<ArchiveIndexEntry> {
+		this.#assertOpen();
 		return this.#entries.values();
 	}
 
 	/** Resolve a path to its node, or `undefined` when absent or escaping the root. */
 	getNode(subPath?: string): ArchiveNode | undefined {
+		this.#assertOpen();
 		const normalizedPath = normalizeArchiveLookupPath(subPath);
 		if (normalizedPath === undefined) return undefined;
 		if (normalizedPath === "") {
@@ -71,6 +107,7 @@ export class ArchiveReader {
 
 	/** List one directory's children, sorted case-insensitively by name. */
 	listDirectory(subPath?: string): ArchiveDirectoryEntry[] {
+		this.#assertOpen();
 		const normalizedPath = normalizeArchiveLookupPath(subPath);
 		if (normalizedPath === undefined) {
 			throw new ArchiveError("Archive path cannot contain '..'");
@@ -124,7 +161,18 @@ export class ArchiveReader {
 	}
 
 	/** Extract one file member's bytes, following symlink aliases. */
-	async readFile(subPath: string): Promise<ExtractedArchiveFile> {
+	readFile(subPath: string): Promise<ExtractedArchiveFile> {
+		if (this.#closed) return Promise.reject(new ArchiveError("Archive is closed"));
+		const read = this.#readFile(subPath);
+		(this.#reads ??= new Set()).add(read);
+		const release = () => {
+			this.#reads?.delete(read);
+		};
+		void read.then(release, release);
+		return read;
+	}
+
+	async #readFile(subPath: string): Promise<ExtractedArchiveFile> {
 		const normalizedPath = normalizeArchiveLookupPath(subPath);
 		if (!normalizedPath) {
 			throw new ArchiveError("Archive file path is required");

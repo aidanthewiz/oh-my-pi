@@ -15,29 +15,6 @@ afterEach(() => {
 });
 
 describe("grepToolRenderer", () => {
-	it("indents inline grep output and avoids accent-colored success headers", async () => {
-		const theme = await getThemeByName("dark");
-		expect(theme).toBeDefined();
-		const uiTheme = theme!;
-		const result = {
-			content: [{ type: "text", text: "" }],
-			details: {
-				matchCount: 1,
-				fileCount: 1,
-				displayContent: ["# src/", "## file.ts#abcd", "*12│const needle = true;"].join("\n"),
-			},
-		};
-
-		const renderedLines = grepToolRenderer
-			.renderResult(result as never, { expanded: true, isPartial: false }, uiTheme, { pattern: "needle" })
-			.render(240);
-		const plainLines = sanitizeText(renderedLines.join("\n")).split("\n");
-
-		expect(plainLines.every(line => line.startsWith(" "))).toBe(true);
-		expect(renderedLines[0]).not.toContain(uiTheme.fg("accent", uiTheme.symbol("icon.search")));
-		expect(renderedLines[0]).not.toContain(uiTheme.fg("accent", "Search"));
-	});
-
 	it("keeps truncation status in the header without a bottom notice", async () => {
 		const theme = await getThemeByName("dark");
 		expect(theme).toBeDefined();

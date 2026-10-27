@@ -148,8 +148,9 @@ export async function runTerminalOAuthLogin(
 	rl: readline.Interface,
 	storage: AuthStorage,
 	provider: OAuthProviderId,
-	options: { openBrowser?: boolean } = {},
+	options: { openBrowser?: boolean; assertLoginAllowed?: () => void } = {},
 ): Promise<OAuthLoginIdentity | undefined> {
+	options.assertLoginAllowed?.();
 	const ask = (msg: string, signal?: AbortSignal) => promptLine(rl, `${msg} `, signal);
 	// Only paste-code providers (fixed non-loopback redirect, e.g. GitLab Duo
 	// Agent's vscode:// URI) get the manual paste fallback. An explicit
@@ -161,6 +162,7 @@ export async function runTerminalOAuthLogin(
 	const usesManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(provider);
 	return storage.oauth.login(provider, {
 		onAuth({ url, launchUrl, instructions }) {
+			options.assertLoginAllowed?.();
 			process.stdout.write("\nOpen this URL in your browser:\n");
 			// Full URL first so the CLI works from any machine, including SSH
 			// sessions where a `launchUrl` (loopback `/launch` on the OMP
@@ -178,15 +180,22 @@ export async function runTerminalOAuthLogin(
 			if (options.openBrowser) openPath(url);
 		},
 		onProgress(message) {
+			options.assertLoginAllowed?.();
 			process.stdout.write(`${message}\n`);
 		},
-		onPrompt(p) {
-			return ask(`${p.message}${p.placeholder ? ` (${p.placeholder})` : ""}:`);
+		async onPrompt(p) {
+			options.assertLoginAllowed?.();
+			const answer = await ask(`${p.message}${p.placeholder ? ` (${p.placeholder})` : ""}:`);
+			options.assertLoginAllowed?.();
+			return answer;
 		},
 		...(usesManualInput
 			? {
-					onManualCodeInput(signal) {
-						return ask("Paste the authorization code (or full redirect URL):", signal);
+					async onManualCodeInput(signal) {
+						options.assertLoginAllowed?.();
+						const answer = await ask("Paste the authorization code (or full redirect URL):", signal);
+						options.assertLoginAllowed?.();
+						return answer;
 					},
 				}
 			: undefined),

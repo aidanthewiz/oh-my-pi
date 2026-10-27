@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
+import * as os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import * as reportIssue from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import {
 	__resetAutoQaFlushStateForTests,
 	__resetCoreforgeReportHandlerForTests,
@@ -84,6 +86,12 @@ function restoreAutoQaEnv(): void {
 		return;
 	}
 	Bun.env.PI_AUTO_QA = originalPiAutoQa;
+}
+
+/** Pin the home directory and login name the redaction reads. */
+function stubIdentity(home: string, username: string): void {
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	vi.spyOn(os, "userInfo").mockReturnValue({ username, uid: 501, gid: 20, shell: "/bin/zsh", homedir: home });
 }
 
 describe("flushGrievances", () => {
@@ -426,30 +434,47 @@ describe("flushGrievances", () => {
 		expect(selectPushedIds(db).length).toBe(firstBatch);
 		expect(selectUnpushedIds(db).length).toBe(secondBatch);
 	});
+
+	it("redacts the home directory from rows recorded before record-time redaction", async () => {
+		stubIdentity("/Users/jdoe", "jdoe");
+		insertGrievance(db, "read /Users/jdoe/notes.md", "selector dropped /Users/jdoe/notes.md:4");
+
+		let sentBody: unknown;
+		const fetchSpy = vi.fn(async (_input: string | URL | Request, init: RequestInit | undefined) => {
+			sentBody = JSON.parse(String(init?.body));
+			return new Response("", { status: 200 });
+		});
+
+		const result = await flushGrievances(db, pushSettings(), { fetch: mockFetch(fetchSpy) });
+
+		expect(result).toEqual({ pushed: 1, ok: true });
+		expect(sentBody).toMatchObject({
+			entries: [{ tool: "read ~/notes.md", report: "selector dropped ~/notes.md:4" }],
+		});
+	});
 });
 
 describe("dispatchReportIssueDevice", () => {
 	const session = {} as ToolSession;
 
+	beforeEach(() => {
+		stubIdentity("/home/omp-test-user", "omp-test-user");
+	});
+
 	afterEach(() => {
+		vi.restoreAllMocks();
 		__resetCoreforgeReportHandlerForTests();
 	});
 
-	it("forwards the same tool failure to the Coreforge report handler", async () => {
-		let received: { tool: string; report: string } | undefined;
-		setCoreforgeReportHandler(async (tool, report) => {
-			received = { tool, report };
-			return true;
+	it("never stores or uploads a device report, including when the native handoff is accepted", async () => {
+		const open = vi.spyOn(reportIssue, "openAutoQaDb").mockImplementation(() => {
+			throw new Error("Device reports must not open the telemetry database");
 		});
-
-		const { result, xdev } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
-
-		expect(received).toEqual({ tool: "read", report: "selector parse dropped trailing line" });
-		expect(result.content[0]).toEqual({
-			type: "text",
-			text: "Coreforge /report queued. The issue will still require draft approval before filing.",
-		});
-		expect(xdev.tool).toBe("report_issue");
+		const send = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Device reports must not upload"));
+		setCoreforgeReportHandler(async () => true);
+		await dispatchReportIssueDevice({ settings: pushSettings() } as ToolSession, "read: dropped selected rows");
+		expect(open).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
 	});
 
 	it("accepts the two-line fallback body format", async () => {
@@ -495,6 +520,93 @@ describe("dispatchReportIssueDevice", () => {
 			type: "text",
 			text: "Coreforge /report requires an interactive parent session. Nothing was filed.",
 		});
+	});
+
+	it.each([
+		[
+			"xd://tui: start fails because kitty-vt-wasm is missing",
+			"xd://tui",
+			"start fails because kitty-vt-wasm is missing",
+		],
+		["write xd://tui: start fails before executing bun", "write xd://tui", "start fails before executing bun"],
+		[
+			'write conflict://*: per-id content "2:\ttext" was read as a hashline prefix',
+			"write conflict://*",
+			'per-id content "2:\ttext" was read as a hashline prefix',
+		],
+	])("keeps the URI in the tool name of %p", async (text, tool, report) => {
+		let received: { tool: string; report: string } | undefined;
+		setCoreforgeReportHandler(async (tool, report) => {
+			received = { tool, report };
+			return false;
+		});
+		await dispatchReportIssueDevice(session, text);
+		expect(received).toEqual({ tool, report });
+	});
+
+	it.each([
+		"read agent://ReviewLifecycleLever returned an empty response",
+		"browser.open({name:'jio-terms',url:'https://www.jio.com/'}) navigated the attached relay tab",
+	])("rejects %p, which has no `: ` separator, instead of splitting inside it", async text => {
+		await expect(dispatchReportIssueDevice(session, text)).rejects.toThrow("Invalid report format");
+	});
+
+	it("clamps a prose first line so the stored tool stays within the collector limit", async () => {
+		const prose =
+			"eval içindeki tool.glob exact ve var olmayan yolu çağırınca beklenmedik şekilde RuntimeError fırlatıyor, sessizce boş dönmüyor";
+		let received: { tool: string; report: string } | undefined;
+		setCoreforgeReportHandler(async (tool, report) => {
+			received = { tool, report };
+			return false;
+		});
+		await dispatchReportIssueDevice(session, `${prose}\nglob threw instead of returning empty`);
+		expect(Buffer.byteLength(received!.tool, "utf8")).toBeLessThanOrEqual(128);
+		expect(prose.startsWith(received!.tool)).toBe(true);
+		expect(received!.report).toBe(`${prose}\nglob threw instead of returning empty`);
+	});
+
+	async function recordAsWill(report: string): Promise<string> {
+		stubIdentity("/Users/will", "will");
+		let received = "";
+		setCoreforgeReportHandler(async (_tool, text) => {
+			received = text;
+			return false;
+		});
+		await dispatchReportIssueDevice(session, `bash: ${report}`);
+		return received;
+	}
+
+	it.each([
+		[
+			"launchctl print gui/501/com.will.agent failed in /Users/will/code (not /Users/willa)",
+			"launchctl print gui/501/com.<user>.agent failed in ~/code (not /Users/willa)",
+		],
+		["see /Users/will. Then ssh will@build-host", "see ~. Then ssh <user>@build-host"],
+		[
+			"transcript -Users-will-codebases-app/x.jsonl and /c/Users/will/AppData",
+			"transcript -Users-<user>-codebases-app/x.jsonl and /c/Users/<user>/AppData",
+		],
+	])("redacts the user's identity from %p", async (report, expected) => {
+		expect(await recordAsWill(report)).toBe(expected);
+	});
+
+	it("leaves the login name alone where it is a word or an unrelated path segment", async () => {
+		const report = "Ask will. It will-do: will/max under ./will_modules/x and /srv/will/test";
+		expect(await recordAsWill(report)).toBe(report);
+	});
+
+	it("redacts a Windows home written in another case", async () => {
+		stubIdentity("C:\\Users\\Will", "Will");
+		let received = "";
+		setCoreforgeReportHandler(async (_tool, report) => {
+			received = report;
+			return false;
+		});
+		await dispatchReportIssueDevice(
+			session,
+			"read: c:\\users\\will\\secret.txt and C:/USERS/WILL/x and -users-will-proj",
+		);
+		expect(received).toBe("~\\secret.txt and ~/x and -users-<user>-proj");
 	});
 
 	it("rejects malformed body text with a usage hint", async () => {

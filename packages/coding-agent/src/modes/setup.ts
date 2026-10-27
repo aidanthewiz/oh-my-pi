@@ -53,7 +53,7 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 			return cfgDisabledProviders.get(ctx.settings);
 		},
 		get oauthProviders() {
-			return filterOAuthLoginProviders(getOAuthProviders());
+			return filterOAuthLoginProviders(getOAuthProviders(), ctx.settings);
 		},
 		get authStorage() {
 			return ctx.session.modelRegistry.authStorage;

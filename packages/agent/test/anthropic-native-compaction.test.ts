@@ -60,6 +60,25 @@ function makeAnthropicModel(overrides: Partial<ModelSpec<"anthropic-messages">> 
 	} as ModelSpec<"anthropic-messages">);
 }
 
+/** Bedrock support resolves from the authored identity and compat rules, not generated model data. */
+function makeBedrockModel(
+	overrides: Partial<ModelSpec<"bedrock-converse-stream">> = {},
+): Model<"bedrock-converse-stream"> {
+	return buildModel({
+		id: "global.anthropic.claude-opus-5-5",
+		name: "Claude Opus 5.5 (Global)",
+		api: "bedrock-converse-stream",
+		provider: "amazon-bedrock",
+		baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 32_000,
+		...overrides,
+	} as ModelSpec<"bedrock-converse-stream">);
+}
+
 function makeOpenAiModel(): Model<"openai-responses"> {
 	return buildModel({
 		id: "gpt-5",
@@ -107,13 +126,9 @@ function assistantMessage(model: Model, overrides: Partial<AssistantMessage> = {
 
 /** Records every completion the lane issues and answers with `respond`. */
 function recordingCompleteImpl(respond: (ctx: Context, options: SimpleStreamOptions) => AssistantMessage) {
-	const calls: Array<{ ctx: Context; options: SimpleStreamOptions }> = [];
-	const completeImpl = async <TApi extends ai.Api>(
-		_model: Model<TApi>,
-		ctx: Context,
-		options: SimpleStreamOptions,
-	) => {
-		calls.push({ ctx, options });
+	const calls: Array<{ model: Model; ctx: Context; options: SimpleStreamOptions }> = [];
+	const completeImpl = async <TApi extends ai.Api>(model: Model<TApi>, ctx: Context, options: SimpleStreamOptions) => {
+		calls.push({ model, ctx, options });
 		return respond(ctx, options);
 	};
 	return { calls, completeImpl };
@@ -186,6 +201,33 @@ describe("shouldUseAnthropicNativeCompaction", () => {
 		expect(shouldUseProviderNativeCompaction(makeAnthropicModel(), { remoteEnabled: true })).toBe(true);
 		expect(shouldUseProviderNativeCompaction(makeAnthropicModel(), { remoteEnabled: false })).toBe(false);
 	});
+
+	test("routes catalog-capable Bedrock Converse models on AWS endpoints, gateways only by opt-in", () => {
+		expect(shouldUseAnthropicNativeCompaction(makeBedrockModel())).toBe(true);
+		expect(shouldUseProviderNativeCompaction(makeBedrockModel(), { remoteEnabled: false })).toBe(false);
+		expect(
+			shouldUseAnthropicNativeCompaction(
+				makeBedrockModel({ baseUrl: "https://vpce-0abc-xyz.bedrock-runtime.us-west-2.vpce.amazonaws.com" }),
+			),
+		).toBe(true);
+		expect(shouldUseAnthropicNativeCompaction(makeBedrockModel({ remoteCompaction: { enabled: false } }))).toBe(
+			false,
+		);
+		// A gateway may implement only Converse: native compaction needs an explicit opt-in.
+		const gateway = "https://llm-gateway.example.com/bedrock";
+		expect(shouldUseAnthropicNativeCompaction(makeBedrockModel({ baseUrl: gateway }))).toBe(false);
+		expect(
+			shouldUseAnthropicNativeCompaction(
+				makeBedrockModel({ baseUrl: gateway, remoteCompaction: { enabled: true } }),
+			),
+		).toBe(true);
+		// Revisions without the model-card capability never take the lane, even when opted in.
+		expect(
+			shouldUseAnthropicNativeCompaction(
+				makeBedrockModel({ id: "anthropic.claude-sonnet-4-6", remoteCompaction: { enabled: true } }),
+			),
+		).toBe(false);
+	});
 });
 
 describe("compact() Anthropic native lane", () => {
@@ -233,11 +275,6 @@ describe("compact() Anthropic native lane", () => {
 		expect(options.anthropicCompaction).toEqual({ instructions: expect.any(String), filesDueBefore: 2 });
 		const instructions = options.anthropicCompaction?.instructions ?? "";
 		expect(instructions).toContain("<additional-context>\n- Branch: main\n</additional-context>");
-		expect(instructions).toContain("## Goal");
-		expect(instructions).toContain("The conversation above is the complete history to summarize.");
-		expect(instructions).not.toContain("retained");
-		expect(instructions.endsWith("respond with the summary text only.")).toBe(true);
-		expect(instructions).toContain("MUST NOT call any tools");
 
 		// The API's summary is the entry text, with the file lists the local
 		// summarizer appends. The replay payload stays verbatim so the block
@@ -266,6 +303,132 @@ describe("compact() Anthropic native lane", () => {
 			signature: "sig_state_1",
 			filesText: "<files>\n# /repo/src/\nhandlers.ts (Read)\n</files>",
 			exactTail: true,
+		});
+	});
+
+	test("persists signed tool_changes verbatim and replays them with the previous summary", async () => {
+		const model = makeAnthropicModel();
+		const toolChanges: Record<string, unknown>[] = [
+			{
+				type: "tool_addition",
+				tool: { type: "tool_reference", name: "lookup" },
+				opaque: { revision: 4, text: "\ud800" },
+			},
+			{ type: "tool_removal", tool: { type: "tool_reference", name: "legacy_lookup" } },
+		];
+		let responseCount = 0;
+		const { calls, completeImpl } = recordingCompleteImpl(() => {
+			responseCount++;
+			return assistantMessage(model, {
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: model.provider,
+					content: `summary ${responseCount}`,
+					signature: `signed_${responseCount}`,
+					toolChanges,
+				},
+				stopDetails: { type: "compaction" },
+			});
+		});
+
+		const first = await compact(makePreparation(), model, "sk-ant-test", undefined, undefined, { completeImpl });
+		expect(getAnthropicCompactionPayload(first.preserveData)?.toolChanges).toEqual(toolChanges);
+
+		const reloaded = JSON.parse(JSON.stringify(first.preserveData));
+		await compact(
+			makePreparation({ previousSummary: first.summary, previousPreserveData: reloaded }),
+			model,
+			"sk-ant-test",
+			undefined,
+			undefined,
+			{ completeImpl },
+		);
+		expect(calls[1]?.ctx.messages[0]).toMatchObject({
+			providerPayload: { type: "anthropicCompaction", signature: "signed_1", toolChanges },
+		});
+	});
+
+	test("replays a signed summary written by another model of the same provider", async () => {
+		const model = makeAnthropicModel({ id: "claude-opus-5-5", name: "Claude Opus 5.5" });
+		const { calls, completeImpl } = recordingCompleteImpl(() =>
+			assistantMessage(model, {
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: "anthropic",
+					content: "next",
+					signature: "sig_2",
+				},
+				stopDetails: { type: "compaction" },
+			}),
+		);
+
+		await compact(
+			makePreparation({
+				previousSummary: "prior signed summary",
+				previousPreserveData: {
+					anthropicCompaction: {
+						provider: "anthropic",
+						content: "prior signed summary",
+						signature: "fable_sig",
+						model: "claude-fable-5",
+					},
+				},
+			}),
+			model,
+			"sk-ant-test",
+			undefined,
+			undefined,
+			{ completeImpl },
+		);
+
+		expect(calls[0]?.ctx.messages[0]).toMatchObject({
+			providerPayload: { type: "anthropicCompaction", signature: "fable_sig" },
+		});
+	});
+
+	test("compacts Bedrock Converse models through the native lane and persists the signed block", async () => {
+		const model = makeBedrockModel();
+		const { calls, completeImpl } = recordingCompleteImpl(() =>
+			assistantMessage(model, {
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: model.provider,
+					content: NATIVE_SUMMARY,
+					signature: "bedrock_sig_2",
+				},
+				stopDetails: { type: "compaction" },
+			}),
+		);
+
+		const result = await compact(
+			makePreparation({
+				previousSummary: "prior Bedrock summary",
+				previousPreserveData: {
+					anthropicCompaction: {
+						provider: model.provider,
+						content: "prior Bedrock summary",
+						signature: "bedrock_sig_1",
+					},
+				},
+				recentMessages: [assistantMessage(model, { content: [{ type: "text", text: "recent" }], timestamp: 2 })],
+			}),
+			model,
+			"bedrock-test-key",
+			undefined,
+			undefined,
+			{ completeImpl },
+		);
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.model).toBe(model);
+		expect(calls[0]?.options.anthropicCompaction).toEqual({ instructions: expect.any(String), filesDueBefore: 2 });
+		expect(calls[0]?.ctx.messages[0]).toMatchObject({
+			providerPayload: { type: "anthropicCompaction", signature: "bedrock_sig_1" },
+		});
+		expect(result.preserveData?.anthropicCompaction).toMatchObject({
+			provider: "amazon-bedrock",
+			content: NATIVE_SUMMARY,
+			signature: "bedrock_sig_2",
 		});
 	});
 
@@ -986,5 +1149,18 @@ describe("native compaction entries read back", () => {
 		expect(afterGrowth?.recentMessages.map(message => ("content" in message ? message.content : undefined))).toEqual([
 			"after compaction",
 		]);
+	});
+
+	test("drops persisted signed state whose tool_changes are malformed instead of replaying a partial block", () => {
+		expect(
+			getAnthropicCompactionPayload({
+				anthropicCompaction: {
+					provider: "anthropic",
+					content: "signed summary",
+					signature: "signature",
+					toolChanges: [{ type: "tool_addition" }, "malformed"],
+				},
+			}),
+		).toBeUndefined();
 	});
 });

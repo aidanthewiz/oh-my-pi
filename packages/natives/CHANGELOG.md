@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- Keep hashline mismatch diagnostics and previews non-authorizing. Require explicit reads for unseen rows and refuse ambiguous recovery after budget exhaustion.
+- Reject undecodable files in hashline mode; preserve explicit binary deletion in Patch mode.
+- Keep native crash reports private and validate macOS capture value types before conversion.
 - Reject fractional, non-finite, negative, and wrapping SIXEL background values before native integer conversion.
 - Release tapped Windows pipe producers when an idle downstream consumer closes. Preserve buffered bytes, backpressure, and exactly-once mirror closure.
 - Reject multi-hunk character matches that would discard unmatched surrounding text.
@@ -27,6 +30,25 @@
 - Preserve original process identities when later shell runs cancel retained background jobs. Keep current-run PID attribution separate.
 - Prune completed shell process references at command completion instead of retaining handles until another command runs.
 - Backport Cranelift's full-width SSA index representation for GHSA-897f-g5gm-fmxm without disabling on-demand grammars or upgrading Wasmtime.
+## [18.12.4] - 2026-10-20
+
+### Changed
+
+- Reduced native Git diff allocation overhead ([#16349](https://github.com/can1357/oh-my-pi/pull/16349) by [@kyle-elliott](https://github.com/kyle-elliott))
+- Reduced native memory-reranking allocations when candidate text contains repeated words ([#16348](https://github.com/can1357/oh-my-pi/pull/16348) by [@kyle-elliott](https://github.com/kyle-elliott))
+- Reduced allocation overhead when collecting directory grep results, including paginated searches ([#16226](https://github.com/can1357/oh-my-pi/pull/16226) by [@kyle-elliott](https://github.com/kyle-elliott))
+- Token counting for OpenAI, Qwen, DeepSeek, Kimi, GLM and Jev models is 11-30% faster on English text, code and Markdown ([#16399](https://github.com/can1357/oh-my-pi/pull/16399) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed `index.d.ts` drifting from the generated bindings, so building the natives no longer leaves the checkout modified ([#16306](https://github.com/can1357/oh-my-pi/pull/16306) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `cargo test` writing crash reports from panicking Rust tests into your real `~/.omp/logs`: they now go to a per-user `pi-natives-test-logs-<uid>/` under the OS temp dir ([#16386](https://github.com/can1357/oh-my-pi/pull/16386) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed the bash tool's `rm -rf` reporting `No such file or directory` for entries another process removed first and leaving the parent directories behind; under `-f` an entry already gone now counts as removed, as in GNU rm ([#16433](https://github.com/can1357/oh-my-pi/pull/16433) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed the bash tool's `rg -c` and `rg --count-matches` printing `path:0` for every file without a match; zero counts are now printed only with `--include-zero`, as in ripgrep ([#16432](https://github.com/can1357/oh-my-pi/pull/16432) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `ln -s local://… <path>` in the bash tool creating a host symlink that holds the URL text, which nothing can follow; a symlink on the host to a file-backed URL now stores the file it stands for ([#16428](https://github.com/can1357/oh-my-pi/pull/16428) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS background input leaving the target app in front of yours when it came forward just as you clicked another window of your app; your app comes back with the window you clicked ([#16217](https://github.com/can1357/oh-my-pi/pull/16217) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed omp sessions on macOS adding a terminal icon to the Dock after the `computer` tool listed displays ([#13455](https://github.com/can1357/oh-my-pi/pull/13455) by [@VelizarSeleznev](https://github.com/VelizarSeleznev))
+
 ## [18.12.3] - 2026-10-19
 
 ### Added

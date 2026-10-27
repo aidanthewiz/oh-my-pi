@@ -20,6 +20,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { assertOAuthLoginProviderAllowed, filterOAuthLoginProviders } from "../../config/oauth-login-gate";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -58,6 +59,7 @@ import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import type { EventBus } from "../../utils/event-bus";
 import { selectRpcEntries } from "./rpc-compat";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
@@ -2252,7 +2254,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "set_todos": {
 				session.setTodoPhases(command.phases);
-				return success(id, "set_todos", { todoPhases: session.getTodoPhases() });
+				const phases = session.getTodoPhases();
+				session.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+				return success(id, "set_todos", { todoPhases: phases });
 			}
 
 			case "set_host_tools": {
@@ -2596,7 +2600,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "get_login_providers": {
-				const providers = getOAuthProviders().map(provider => ({
+				const providers = filterOAuthLoginProviders(getOAuthProviders(), session.settings).map(provider => ({
 					id: provider.id,
 					name: provider.name,
 					available: provider.available,
@@ -2618,8 +2622,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// onAuth, prompt input is the pasted OAuth code/redirect URL path.
 				let authEmitted = false;
 				try {
+					assertOAuthLoginProviderAllowed(knownProvider, session.settings);
 					await session.modelRegistry.authStorage.oauth.login(command.providerId, {
 						onAuth: info => {
+							assertOAuthLoginProviderAllowed(knownProvider, session.settings);
 							authEmitted = true;
 							output({
 								type: "extension_ui_request",
@@ -2631,9 +2637,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 							} as RpcExtensionUIRequest);
 						},
 						onProgress: message => {
+							assertOAuthLoginProviderAllowed(knownProvider, session.settings);
 							uiCtx.notify(message, "info");
 						},
 						onPrompt: async prompt => {
+							assertOAuthLoginProviderAllowed(knownProvider, session.settings);
 							if (prompt.secret) {
 								throw new Error(
 									`Provider '${command.providerId}' requires secret input, ` +
@@ -2650,9 +2658,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 									),
 								);
 							}
-							return (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
+							const value = (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
+							assertOAuthLoginProviderAllowed(knownProvider, session.settings);
+							return value;
 						},
 					});
+					assertOAuthLoginProviderAllowed(knownProvider, session.settings);
 					// Provider-scoped online refresh so the just-persisted credential
 					// re-runs discovery instead of reusing a fresh authoritative cache
 					// row (#5780).

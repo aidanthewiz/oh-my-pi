@@ -1,5 +1,5 @@
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
-import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
+import { getOAuthProviders, PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
 import type { OAuthPrompt, OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import { type Component, type Focusable, Container } from "../../tui";
 import { Spacer } from "../../components/spacer";
@@ -102,6 +102,7 @@ export class SignInScene implements SetupSceneController {
 	#loginAbort: AbortController | undefined;
 	#loggingInProvider: string | undefined;
 	#disposed = false;
+	#requiresProviderRoster = false;
 	#step: WizardStep | undefined;
 	#native = new Memo();
 
@@ -311,6 +312,8 @@ export class SignInScene implements SetupSceneController {
 	}
 
 	#createSelector(): OAuthSelectorComponent {
+		const providers = this.#host.ctx.oauthProviders;
+		if (providers !== undefined) this.#requiresProviderRoster = true;
 		return new OAuthSelectorComponent(
 			"login",
 			this.#authStorage,
@@ -321,7 +324,7 @@ export class SignInScene implements SetupSceneController {
 			{
 				requestRender: () => this.#host.requestRender(),
 				disabledProviders: this.#host.ctx.disabledProviders,
-				providers: this.#host.ctx.oauthProviders,
+				providers,
 			},
 		);
 	}
@@ -337,11 +340,34 @@ export class SignInScene implements SetupSceneController {
 		this.#loginAbort = new AbortController();
 		this.#host.restoreFocus();
 		this.#host.requestRender();
+		const credentialTarget =
+			getOAuthProviders().find(provider => provider.id === providerId)?.storeCredentialsAs ?? providerId;
+		const assertLoginAllowed = (): void => {
+			const providers = this.#host.ctx.oauthProviders;
+			if (providers !== undefined) this.#requiresProviderRoster = true;
+			const selected = providers?.find(provider => provider.id === providerId);
+			const disabled = this.#host.ctx.disabledProviders;
+			if (
+				(this.#requiresProviderRoster && !selected) ||
+				disabled.includes(providerId) ||
+				disabled.includes(credentialTarget) ||
+				(selected?.storeCredentialsAs !== undefined && disabled.includes(selected.storeCredentialsAs))
+			) {
+				throw new Error(`Provider '${providerId}' is excluded by the current login policy.`);
+			}
+		};
 		try {
+			assertLoginAllowed();
 			await this.#authStorage.oauth.login(providerId as OAuthProvider, {
 				signal: this.#loginAbort.signal,
-				onBrowserSession: (request, signal) => this.#host.ctx.captureBrowserSession(request, signal),
+				onBrowserSession: async (request, signal) => {
+					assertLoginAllowed();
+					const result = await this.#host.ctx.captureBrowserSession(request, signal);
+					assertLoginAllowed();
+					return result;
+				},
 				onAuth: info => {
+					assertLoginAllowed();
 					// Store the full authorization URL as the primary copy/display
 					// target: it works from any machine, including SSH boxes where
 					// the OMP-hosted `launchUrl` would resolve against the user's
@@ -365,14 +391,28 @@ export class SignInScene implements SetupSceneController {
 					this.#host.ctx.openInBrowser(info.url);
 					this.#host.requestRender();
 				},
-				onPrompt: prompt => this.#showPrompt(prompt),
+				onPrompt: async prompt => {
+					assertLoginAllowed();
+					const answer = await this.#showPrompt(prompt);
+					assertLoginAllowed();
+					return answer;
+				},
 				onProgress: message => {
+					assertLoginAllowed();
 					this.#statusLines = [...this.#statusLines, { text: message, color: "dim" }];
 					this.#host.requestRender();
 				},
-				onManualCodeInput: signal =>
-					this.#showPrompt({ message: "Paste the authorization code (or full redirect URL):" }, signal),
+				onManualCodeInput: async signal => {
+					assertLoginAllowed();
+					const answer = await this.#showPrompt(
+						{ message: "Paste the authorization code (or full redirect URL):" },
+						signal,
+					);
+					assertLoginAllowed();
+					return answer;
+				},
 			});
+			assertLoginAllowed();
 			// Provider-scoped online refresh so the just-persisted credential re-runs
 			// discovery instead of reusing a fresh authoritative cache row (#5780).
 			await this.#host.ctx.refreshProvider(providerId);

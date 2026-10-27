@@ -671,9 +671,9 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			if (args.length > 0) {
 				const matchedProvider = getOAuthProviders().find(provider => provider.id === args);
 				if (matchedProvider) {
-					if (!filterOAuthLoginProviders([matchedProvider]).length) {
+					if (!filterOAuthLoginProviders([matchedProvider], runtime.ctx.session.settings).length) {
 						runtime.ctx.showWarning(
-							`Provider "${args}" is off the org model allowlist (enabledModels); its models cannot be selected, so sign-in is disabled.`,
+							`Provider "${args}" is excluded by the current login policy, so sign-in is disabled.`,
 						);
 						clearSubmittedText(runtime);
 						return;

@@ -591,6 +591,68 @@ describe("structured subagent primitive", () => {
 		expect(dispatched[0]?.inheritedSessionAgents).toEqual([inheritedAgent]);
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+	it("holds the parent on an inline child until it settles, but not on a detached one", async () => {
+		mockDiscovery();
+		const awaits = AgentRegistry.global().awaits;
+		const heldDuringRun: boolean[] = [];
+		const childIds: string[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			childIds.push(options.id);
+			heldDuringRun.push(awaits.blocksOn("Main", options.id, Date.now()));
+			return result();
+		});
+
+		const inline = await runStructuredSubagent(request({ detached: false, retainArtifacts: true }));
+		const detached = await runStructuredSubagent(request({ detached: true, retainArtifacts: true }));
+
+		expect(heldDuringRun).toEqual([true, false]);
+		expect(awaits.blocksOn("Main", childIds[0]!, 0)).toBe(false);
+		await fs.rm(inline.artifactsDir, { recursive: true, force: true });
+		await fs.rm(detached.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("releases an inline dependency when execution rejects", async () => {
+		mockDiscovery();
+		const awaits = AgentRegistry.global().awaits;
+		let childId = "";
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			childId = options.id;
+			expect(awaits.blocksOn("Main", childId, Date.now())).toBe(true);
+			throw new Error("worker failed");
+		});
+		await expect(runStructuredSubagent(request({ detached: false }))).rejects.toThrow("worker failed");
+		expect(awaits.blocksOn("Main", childId, 0)).toBe(false);
+	});
+
+	it("reserves an unborn child generation and never lets its old release clear a replacement hold", () => {
+		const registry = new AgentRegistry();
+		const releaseOld = registry.awaits.hold("Parent", ["Child"], { interruptible: false });
+		registry.register({ id: "Parent", displayName: "Parent", kind: "main", session: null });
+		registry.register({ id: "Child", displayName: "Child", kind: "sub", session: null });
+		expect(registry.awaits.blocksOn("Parent", "Child", 0)).toBe(true);
+		registry.register({ id: "Child", displayName: "Child", kind: "sub", session: null });
+		expect(registry.awaits.blocksOn("Parent", "Child", 0)).toBe(false);
+		const releaseNew = registry.awaits.hold("Parent", ["Child"], { interruptible: false });
+		releaseOld();
+		expect(registry.awaits.blocksOn("Parent", "Child", 0)).toBe(true);
+		releaseNew();
+		expect(registry.awaits.blocksOn("Parent", "Child", 0)).toBe(false);
+	});
+
+	it("does not let a retired intermediate hold close a successor's dependency cycle", () => {
+		const registry = new AgentRegistry();
+		for (const id of ["A", "B", "C"]) registry.register({ id, displayName: id, kind: "sub", session: null });
+		const releaseA = registry.awaits.hold("A", ["B"], { interruptible: false });
+		const releaseB = registry.awaits.hold("B", ["C"], { interruptible: false });
+		expect(registry.awaits.blocksOn("A", "C", 0)).toBe(true);
+		registry.setStatus("B", "aborted");
+		expect(registry.awaits.blocksOn("A", "C", 0)).toBe(false);
+		registry.unregister("B");
+		registry.register({ id: "B", displayName: "B", kind: "sub", session: null });
+		expect(registry.awaits.blocksOn("A", "C", 0)).toBe(false);
+		releaseA();
+		releaseB();
+	});
 	it("propagates a custom thinking-suffixed role alias through policy, dispatch, and settlement", async () => {
 		const customAgent = { ...AGENT, model: ["@reviewer:high"] };
 		mockDiscovery(customAgent);

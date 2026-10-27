@@ -65,6 +65,8 @@ Users can tag models with `^` in the composer. The resulting session-local `m1`,
 
 Runtime stays permissive: the flat form is accepted even while `task.batch` is on (internal callers such as the commit flow's `analyze_files`, and stale transcripts). The model only ever sees one shape.
 
+Batch calls reject a top-level `agent` rather than silently discarding a specialist selector and spawning the default agent. Put `agent` on each `tasks[]` item when selecting `reviewer`, `scout`, or a custom agent; the agent name is not inferred from the task text.
+
 There is no legacy per-call `schema` parameter. Use `outputSchema` and optional `schemaMode`; when absent, structured output falls back to the agent definition's `output` frontmatter and then the inherited parent session schema.
 
 ## Outputs
@@ -96,12 +98,13 @@ Settled response (`async.enabled=false`, no job manager, every item's agent `blo
 
 Artifacts and side channels:
 - A current initial run writes `<id>.md`; `agent://<id>` resolves to that file. Cancelled or retired publication cannot replace accepted output.
-- Structured payloads with a `data` value also write `<id>.json`, even when schema-invalid. JSON-path reads prefer this sidecar. Plain accepted reports remove stale sidecars.
+- Structured payloads with a `data` value also write `<id>.json`, even when schema-invalid. This private envelope binds data to the accepted Markdown file generation. JSON-path reads reject stale or unbound sidecars and fall back to the Markdown body.
 - A subagent's own children are dot-qualified (`<id>.<child>`); `agent://<id>.<child>` reads that nested output. A slash path is always JSON extraction: `agent://<id>/<key>/<index>/…` extracts that value from a JSON output (e.g. `agent://<id>.<child>/reports/0/data`).
 - Each subagent gets `<id>.jsonl` session history when the parent persists artifacts; `history://<id>` renders it as a concise transcript (works for live and parked agents).
 - Isolated patch mode writes `<id>.patch` before merge; nested changes write `<id>.nested-<n>-<path>.patch` files in both merge modes.
 - Initial, explicit follow-up, and wake finalizers share per-path ordering. Publication checks the originating registry generation and session after preparing output.
 - Markdown and JSON remain separate files; these writes do not provide a filesystem-wide atomic pair transaction.
+- Optional sidecar serialization, write, rename, or cleanup failures do not discard successful Markdown publication. Primary publication failures still fail the result.
 
 Task widgets read finished tool calls from the originating run's `tools` tap. Nested job sources use `<jobId>:<sourceId>`.
 Each finished result retains its newest 64 Ki characters. The adapter exposes at most 64 sources and retires replaced or absent sources.
@@ -214,6 +217,7 @@ Missing originating-root widget readiness permits local derivation only, never r
 - Agent discovery precedence is first-wins by exact name: project `.omp` agents before user `.omp`, then OMP extension-package roots, Claude marketplace plugin agents (project before user), and bundled agents. Direct `.claude/agents`, `.codex/agents`, and `.gemini/agents` roots are skipped. Create-time discovery is memoized per cwd/effective extension roots; execution-time discovery stays fresh.
 - Ordinary child sessions do not inherit conversation history. Built-in carry-over is the workspace tree/skills/context files, the shared `local://` root, and the approved-plan reference when one exists. Seance consultations instead fork the selected transcript under the restrictions below.
 - Nested Mnemopi sessions keep their parent-state alias. Prompt clones such as `/tan` instead inherit recall values captured with their copied system prompt.
+- Queued Mnemopi extraction captures its originating session, branch, credential source, and settings before scheduling. Session transitions drain accepted extraction usage before changing journals.
 - When the parent passes `mcpManager`, child sessions disable standalone MCP discovery and get proxy tools that reuse parent connections.
 - Branch-mode merge temporarily stashes the parent repo before cherry-picking; a stash-pop conflict leaves the landed commits on HEAD and preserves the stash, reported as `stashConflict`. Patch mode uses `repo.canApplyPatch(...)` before applying the root patch; reverse-only applicability is treated as already applied, while failed forward checks retain the artifact for recovery.
 - Nested git repos are diffed independently inside isolated workspaces and merged separately with `applyNestedPatches(...)`.

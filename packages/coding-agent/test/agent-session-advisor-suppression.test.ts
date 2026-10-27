@@ -28,7 +28,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -111,6 +111,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
 			streamFn: mock.stream,
+			convertToLlm,
 		});
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated({ "compaction.enabled": false });
@@ -835,5 +836,55 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(userMessageText([...session.agent.peekFollowUpQueue()])).toContain("then add the test");
 		expect(userMessageText(session.agent.state.messages)).not.toContain("then add the test");
 		expect(mock.calls.length).toBe(2);
+	});
+
+	it("folds a background completion into context after a user interrupt instead of restarting the run", async () => {
+		// Reported bug: Esc stopped the main agent, then the next background subagent
+		// completion (async-result via the yield queue's idle flush) started a fresh
+		// turn on its own. While the interrupt is in effect the completion must land in
+		// context (and the session file) without a model call.
+		const { session, sessionManager, mock, streamStarted } = await createParkedSession([
+			{ content: ["must not auto-resume"] },
+		]);
+		session.yieldQueue.register<string>("test-background", {
+			build: entries => ({
+				role: "custom",
+				customType: "test-background",
+				content: entries.join("\n"),
+				display: true,
+				attribution: "agent",
+				timestamp: Date.now(),
+			}),
+		});
+
+		const running = session.prompt("do the thing");
+		await streamStarted;
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		await session.waitForIdle();
+		await running.catch(() => {});
+
+		await session.yieldQueue.enqueueWithReceipt("test-background", "subagent finished");
+		await session.waitForIdle();
+
+		expect(mock.calls.length).toBe(1);
+		expect(
+			session.agent.state.messages.filter(m => "customType" in m && m.customType === "test-background"),
+		).toHaveLength(1);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "test-background"),
+		).toHaveLength(1);
+
+		await session.prompt("continue deliberately");
+		await session.waitForIdle();
+		expect(mock.calls).toHaveLength(2);
+		expect(
+			mock.calls[1]!.context.messages.filter(message =>
+				typeof message.content === "string"
+					? message.content.includes("subagent finished")
+					: message.content.some(block => block.type === "text" && block.text.includes("subagent finished")),
+			),
+		).toHaveLength(1);
 	});
 });

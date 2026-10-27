@@ -11,6 +11,7 @@
 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { AgentAwaits } from "./agent-awaits";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 
 import { MAIN_AGENT_ID, type AgentStatus, type AgentMetricsSummary } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
@@ -138,6 +139,24 @@ export class AgentRegistry {
 
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	readonly #awaitIdentities = new Map<string, { sessionId?: string }>();
+	/** Which of these agents are blocked until others finish. */
+	readonly awaits = new AgentAwaits(id => this.#awaitIdentity(id));
+
+	#awaitIdentity(id: string): object {
+		const sessionId = this.#refs.get(id)?.session?.sessionManager?.getSessionId();
+		let identity = this.#awaitIdentities.get(id);
+		if (
+			!identity ||
+			(sessionId !== undefined && identity.sessionId !== undefined && identity.sessionId !== sessionId)
+		) {
+			identity = { sessionId };
+			this.#awaitIdentities.set(id, identity);
+		} else if (sessionId !== undefined) {
+			identity.sessionId = sessionId;
+		}
+		return identity;
+	}
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
 		return expected === undefined || ref === expected || ref.session === expected;
@@ -149,6 +168,7 @@ export class AgentRegistry {
 	}
 
 	register(input: RegisterInput): AgentRef {
+		if (this.#refs.has(input.id)) this.#awaitIdentities.delete(input.id);
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,
@@ -247,6 +267,7 @@ export class AgentRegistry {
 		if (ref.status === status) return true;
 		const leftRunning = ref.status === "running";
 		ref.status = status;
+		if (status === "aborted") this.#awaitIdentities.delete(id);
 		// Activity describes current work; it is meaningless once the agent
 		// leaves `running`, so drop it to avoid showing stale work in rosters.
 		if (status !== "running") ref.activity = undefined;
@@ -366,6 +387,7 @@ export class AgentRegistry {
 		const ref = this.#refs.get(id);
 		if (!ref || !this.#matchesExpected(ref, expected)) return false;
 		this.#refs.delete(id);
+		this.#awaitIdentities.delete(id);
 		this.#emit({ type: "removed", ref });
 		return true;
 	}

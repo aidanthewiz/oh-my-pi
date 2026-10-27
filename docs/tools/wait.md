@@ -16,8 +16,10 @@
 - Interruption and cancellation cover service discovery as well as the blocked wait. Already-aborted calls do not discover services or consume queued results.
 - Cancelled, switched, or disposed discovery cannot attach a later broker subscription or update service ownership. Pending completions remain available when the owning session resumes.
 - Broker failures do not hide in-process job results or erase the last known owned-service state. User cancellation and session invalidation still propagate.
-- An owned-job or owned-service wait has a 30-minute safety cap. There is no caller-selectable timeout.
-- Without a queued message or an owned job/service, reports a “Nothing to wait for” error. A running peer alone does not sustain a wait.
+- Every wait has a 30-minute safety cap. There is no caller-selectable timeout.
+- With no owned job or service running, `wait` blocks for a reply when the caller sent a direct message (not a broadcast) during its current run to an agent that has not messaged it back since and is still running. Any incoming message ends it, a woken subagent's relayed turn output included. It also ends, without an error, once no agent asked can still answer: each one finished its turn without replying, or is blocked on the caller (a `wait` only the caller's result can end, entered after the question; an inline `task` spawn of it; an untimed eval handle wait on it). A reply that cannot come is what would park both sides.
+- Reply accounting and dependency holds retain their initiating registry generation and transcript. Reusing an agent id cannot inherit an old question or dependency.
+- Otherwise returns immediately with “Nothing to wait for”, naming any agent asked that finished without replying or cannot reply before the caller finishes.
 - With no owned jobs, a service finishing returns a notice directing the caller to `proc://` for status/output; with jobs, the call returns their current snapshot/result instead.
 - Results and peer messages also auto-deliver without calling `wait`. Continue useful work instead of polling.
 - Queued peer messages are checked first. Already-settled but undelivered owned jobs are returned without another wait. If a peer message wins a race with job completion, that job remains eligible for normal async delivery.

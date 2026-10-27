@@ -4023,6 +4023,12 @@ interface SubagentPromptInputs {
 	ircEnabled: boolean;
 	/** Root resolved by the latest roster ensure; peer rows render scoped to it, so a session switch hides stale parked trees. */
 	ircRoot: { sessionFile?: string };
+	/** Peer roster each prompt block the live session rendered shows, keyed by that block. */
+	ircRenders: Map<string, IrcPeerRosterData>;
+	/** Peer roster of the prompt the parked session held; a warm revive renders it again. */
+	ircRoster?: IrcPeerRosterData;
+	/** Set while a warm revive rebuilds the session. */
+	reviving: boolean;
 }
 
 /**
@@ -4079,9 +4085,15 @@ function buildSubagentSessionOptions(
 		resolveServiceTierByFamily: launch?.resolveServiceTierByFamily,
 		onFirstChatDispatch: launch?.onFirstChatDispatch,
 		systemPrompt: defaultPrompt => {
-			const ircRoster = inputs.ircEnabled
-				? collectIrcPeerRoster(AgentRegistry.global(), inputs.id, inputs.ircRoot.sessionFile)
-				: undefined;
+			// A revive shows the roster the parked session's prompt held, as the cached prompt prefix
+			// does: a live one would make every revival a cache miss for a change it would not have
+			// seen had it stayed live.
+			const ircRoster =
+				inputs.reviving && inputs.ircRoster
+					? inputs.ircRoster
+					: inputs.ircEnabled
+						? collectIrcPeerRoster(AgentRegistry.global(), inputs.id, inputs.ircRoot.sessionFile)
+						: undefined;
 			const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 				agent: inputs.agentSystemPrompt,
 				context: inputs.context,
@@ -4103,6 +4115,7 @@ function buildSubagentSessionOptions(
 				ircOmittedCount: ircRoster?.omittedCount ?? 0,
 				ircSelfId: inputs.ircEnabled ? inputs.id : "",
 			});
+			if (ircRoster) recordIrcRender(inputs, subagentPrompt, ircRoster);
 			// Per-spawn text (context, worktree, IRC roster) goes after the trailing
 			// `<project-context>` block so spawns of the same agent share the static
 			// prompt prefix as a cache hit.
@@ -4110,6 +4123,31 @@ function buildSubagentSessionOptions(
 			return [...defaultPrompt, subagentPrompt, ...(seancePrompt ? [seancePrompt] : [])];
 		},
 	};
+}
+
+/** Remembers the roster `block` shows, dropping blocks the live session's base prompt no longer holds. */
+function recordIrcRender(inputs: SubagentPromptInputs, block: string, roster: IrcPeerRosterData): void {
+	const held = AgentRegistry.global().get(inputs.id)?.session?.baseSystemPrompt;
+	if (held) {
+		for (const rendered of inputs.ircRenders.keys()) {
+			if (!held.includes(rendered)) inputs.ircRenders.delete(rendered);
+		}
+	}
+	inputs.ircRenders.set(block, roster);
+}
+
+/**
+ * When `session` is disposed, keeps the roster its base prompt held for the next warm revive to
+ * render again. The base, not the effective prompt: a `before_agent_start` override may rewrite
+ * the block, and the revived turn re-runs that hook over the same base.
+ */
+function trackSubagentIrcRoster(session: AgentSession, inputs: SubagentPromptInputs): void {
+	session.addDisposer(() => {
+		inputs.ircRoster = session.baseSystemPrompt
+			.map(block => inputs.ircRenders.get(block))
+			.find(roster => roster !== undefined);
+		inputs.ircRenders.clear();
+	});
 }
 
 /** Re-resolves the IRC roster root a subagent's prompt scopes its peer rows to. */
@@ -4206,6 +4244,7 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 		});
 		let revived: AgentSession | undefined;
 		let mcpFollower: MCPToolFollower | undefined;
+		capture.spec.prompt.reviving = true;
 		try {
 			if (!hasConversationalHistory(reopened.getEntries())) {
 				throw new Error(
@@ -4234,6 +4273,7 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 			mcpFollower?.bind(revived);
 			bindSubagentOwnerLifetime(revived, id, capture.isOwnerLifetimeCurrent);
 			trackSubagentSettings(revived, capture);
+			trackSubagentIrcRoster(revived, capture.spec.prompt);
 			const withoutParentOwnedTools = (toolNames: string[]): string[] =>
 				capture.keepTodo ? toolNames : toolNames.filter(name => name !== "todo");
 			const revivedToolNames = revived.getEnabledToolNames();
@@ -4254,6 +4294,8 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 			if (revived) await revived.dispose();
 			else await reopened.close();
 			throw error;
+		} finally {
+			capture.spec.prompt.reviving = false;
 		}
 	};
 }
@@ -4845,6 +4887,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
 					ircEnabled,
 					ircRoot: {},
+					ircRenders: new Map(),
+					reviving: false,
 				},
 			};
 
@@ -4965,6 +5009,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					captureOwnerCurrent: options.captureReviveOwnerCurrent,
 				};
 				trackSubagentSettings(session, reviveCapture);
+				trackSubagentIrcRoster(session, sessionSpec.prompt);
 				reviveSession = createWarmSubagentReviver(reviveCapture);
 			}
 

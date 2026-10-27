@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
 import * as fs from "node:fs/promises";
@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
 import type { MCPServerConnection, MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
+import { trackUnhandled } from "./helpers/rejection";
 
 describe("resolveStdioSpawnCommand", () => {
 	it("resolves bare Windows commands through PATHEXT and wraps .cmd shims with cmd.exe", async () => {
@@ -662,21 +663,6 @@ describe("writeFrame", () => {
 // hand stdout-writing child processes an unusable fd on some hosts.
 // ---------------------------------------------------------------------------
 
-function trackUnhandled(): { release: () => unknown[]; capture: () => unknown[] } {
-	const seen: unknown[] = [];
-	const listener = (reason: unknown) => {
-		seen.push(reason);
-	};
-	process.on("unhandledRejection", listener);
-	return {
-		release: () => {
-			process.off("unhandledRejection", listener);
-			return seen.slice();
-		},
-		capture: () => seen.slice(),
-	};
-}
-
 describe("StdioTransport.notify", () => {
 	let transport: StdioTransport | undefined;
 
@@ -744,6 +730,29 @@ describe("StdioTransport request failure diagnostics", () => {
 	afterEach(async () => {
 		await transport?.close().catch(() => {});
 		transport = undefined;
+	});
+
+	it("reports abrupt subprocess termination as EOF instead of a generic close", async () => {
+		transport = new StdioTransport({
+			type: "stdio",
+			command: "bun",
+			args: ["-e", "process.stdin.once('data', () => process.exit(23)); process.stdin.resume()"],
+			timeout: 1_000,
+		});
+		await transport.connect();
+		const error = await transport.request("tools/list").then(
+			() => undefined,
+			reason => reason,
+		);
+		if (!(error instanceof MCPTransportError)) throw error;
+
+		expect(error).toMatchObject({
+			transport: "stdio",
+			stage: "receive",
+			failure: "eof",
+			retryable: false,
+		});
+		expect(error.message).toContain("MCP subprocess");
 	});
 
 	it("reports malformed subprocess JSON at the decode stage", async () => {
@@ -1002,6 +1011,52 @@ describe("StdioTransport delivery safety", () => {
 		expect(actions()).toEqual([{ marker: "cancelled" }, { marker: "pending" }]);
 		expect(connection.transport.connected).toBe(false);
 	});
+});
+
+describe("StdioTransport send acceptance", () => {
+	let transport: StdioTransport | undefined;
+	let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await transport?.close();
+		if (child?.exitCode === null) child.kill();
+		await child?.exited;
+		transport = undefined;
+		child = undefined;
+	});
+
+	for (const { operation, asynchronous, retryable } of [
+		{ operation: "write", asynchronous: false, retryable: false },
+		{ operation: "write", asynchronous: true, retryable: false },
+		{ operation: "flush", asynchronous: false, retryable: false },
+		{ operation: "flush", asynchronous: true, retryable: false },
+	] as const) {
+		it(`${asynchronous ? "asynchronous" : "synchronous"} ${operation} failures are ${retryable ? "retryable before dispatch" : "not replayable after acceptance"}`, async () => {
+			child = Bun.spawn([process.execPath, "-e", "process.stdin.resume()"], {
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const spawn = vi.spyOn(Bun, "spawn").mockReturnValueOnce(child);
+			transport = new StdioTransport({ type: "stdio", command: process.execPath, timeout: 100 });
+			await transport.connect();
+			spawn.mockRestore();
+			const brokenPipe = Object.assign(new Error(`EPIPE: broken pipe, ${operation}`), { code: "EPIPE" });
+			vi.spyOn(child.stdin, operation).mockImplementationOnce(() => {
+				if (asynchronous) return Promise.reject(brokenPipe);
+				throw brokenPipe;
+			});
+
+			await expect(transport.request("tools/list")).rejects.toMatchObject({
+				transport: "stdio",
+				stage: "send",
+				failure: "eof",
+				retryable,
+				code: "EPIPE",
+			});
+		});
+	}
 });
 
 // ---------------------------------------------------------------------------

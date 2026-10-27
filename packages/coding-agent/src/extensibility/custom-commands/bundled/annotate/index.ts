@@ -7,12 +7,14 @@ import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { CombinedAutocompleteProvider } from "@oh-my-pi/pi-tui/autocomplete";
 import type { CodeReviewOverlayResult, TextReviewSource } from "@oh-my-pi/pi-tui/overlays/annotation-types";
 import {
+	captureReviewGlabContext,
 	extractReviewPrRefFromArgs,
 	liveCommandCwd,
 	resolvePrReviewTarget,
 	ReviewCommand,
 	selectReviewChoice,
 	type ReviewPrRef,
+	type ReviewGlabContext,
 } from "../review";
 import { buildCodeReviewFeedback } from "../review/prompt";
 import {
@@ -33,6 +35,7 @@ import {
 import { generateTextReviewContextSummary } from "./text-summary";
 
 interface CodeReviewDependencies {
+	glabContext?: ReviewGlabContext;
 	resolveLocalReviewTarget(
 		kind: LocalReviewKind,
 		cwd: string,
@@ -42,6 +45,7 @@ interface CodeReviewDependencies {
 		cwd: string,
 		ctx: CustomCommandContext,
 		ref: ReviewPrRef,
+		glabContext?: ReviewGlabContext,
 	): Promise<ResolvedReviewTarget | undefined>;
 	showCodeReviewOverlay(
 		ctx: CustomCommandContext,
@@ -102,7 +106,7 @@ const ANNOTATE_MODE_COMPLETIONS: readonly AutocompleteItem[] = [
 	{
 		value: "code-review ",
 		label: "code-review",
-		description: "Annotate local changes or a GitHub pull request",
+		description: "Annotate local changes, a GitHub pull request, or a GitLab merge request",
 	},
 ];
 
@@ -205,17 +209,20 @@ export async function runCodeReviewCommand(
 	dependencies: Partial<CodeReviewDependencies> = {},
 ): Promise<string | undefined> {
 	if (!ctx.hasUI) {
-		return new ReviewCommand(api).execute(splitReviewArgs(args), ctx);
+		return new ReviewCommand(api, dependencies.glabContext).execute(splitReviewArgs(args), ctx);
 	}
 	const resolved = { ...defaultCodeReviewDependencies, ...dependencies };
-	const cwd = liveCommandCwd(api, ctx);
+	const glabContext = dependencies.glabContext ?? captureReviewGlabContext(liveCommandCwd(api, ctx));
+	const cwd = glabContext.cwd;
 	const parsed = extractReviewPrRefFromArgs(splitReviewArgs(args));
 	const focus = parsed.extraInstructions || undefined;
-	const choice = parsed.prRef ? { kind: "pr" as const, ref: parsed.prRef } : await selectReviewChoice(ctx, cwd);
+	const choice = parsed.prRef
+		? { kind: "pr" as const, ref: parsed.prRef }
+		: await selectReviewChoice(ctx, cwd, { includeCustom: false, glabContext });
 	if (!choice) return undefined;
 	const target =
 		choice.kind === "pr"
-			? await resolved.resolvePrReviewTarget(cwd, ctx, choice.ref)
+			? await resolved.resolvePrReviewTarget(cwd, ctx, choice.ref, glabContext)
 			: await resolved.resolveLocalReviewTarget(choice.kind, cwd, ctx.ui);
 	return target ? finishCodeReview(ctx, target, focus, resolved.showCodeReviewOverlay) : undefined;
 }
@@ -227,6 +234,11 @@ export async function runAnnotateCommand(
 	ctx: CustomCommandContext,
 	dependencies: Partial<TextAnnotationDependencies & CodeReviewDependencies> = {},
 ): Promise<string | undefined> {
+	const cwd = liveCommandCwd(api, ctx);
+	dependencies = {
+		...dependencies,
+		glabContext: dependencies.glabContext ?? captureReviewGlabContext(cwd),
+	};
 	const codeReviewFocus = parseCodeReviewFocus(args);
 	if (codeReviewFocus !== undefined) {
 		return runCodeReviewCommand(api, codeReviewFocus, ctx, dependencies);

@@ -795,6 +795,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return new InternalUrlFilesystem({ context: sessionResolveContext(this.session, { signal }), tier });
 	}
 
+	/**
+	 * Session identity for a command, read when its tool call starts, so
+	 * `/fork`, `/new`, and `/resume` take effect on the next call while a call
+	 * already under way keeps the session it began in. Always set both keys: an
+	 * empty value replaces a stale one inherited from a parent omp process,
+	 * since an env overlay cannot unset.
+	 */
+	#sessionEnv(): Record<string, string> {
+		return {
+			PI_SESSION_ID: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? "",
+			PI_SESSION_FILE: this.session.getSessionFile() ?? "",
+		};
+	}
+
 	/** Service launch mode: live `launch.enabled` while `bash` itself is an active tool. */
 	get #launchEnabled(): boolean {
 		return cfgLaunchEnabled.get(this.session.settings) === true && (this.session.isToolActive?.("bash") ?? true);
@@ -834,6 +848,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		input: BashToolInput,
 		signal?: AbortSignal,
 		ctx?: AgentToolContext,
+		sessionEnv = this.#sessionEnv(),
 	): Promise<PreparedBashExecution> {
 		const rawCommand = input.command;
 		let command = rawCommand;
@@ -932,6 +947,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			);
 		}
 		const preflight = await applyDirenvPreflight(command, commandCwd, {
+			callerEnv: sessionEnv,
 			signal,
 			timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
 			callerTimeoutMs: input.timeout && input.timeout > 0 ? input.timeout * 1000 : undefined,
@@ -1188,6 +1204,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		/** Session the call started in; its shell, even if the session changes before the job runs. */
 		sessionId: string | undefined;
 		widgetOwnerCurrent?: () => boolean;
+		/** That session's identity for the command (see {@link BashTool.#sessionEnv}). */
+		sessionEnv: Record<string, string>;
 		/** The model's `i` intent on the call, for the job's widget author. */
 		intent?: string;
 	}): ManagedBashJobHandle {
@@ -1237,6 +1255,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const result = await executeBash(options.command, {
 						settings: this.session.settings,
 						cwd: options.commandCwd,
+						env: options.sessionEnv,
 						// A call that starts in the foreground runs in the session's
 						// persistent shell, like the direct path, so its variables,
 						// functions, and options reach the next call even after it is
@@ -1344,18 +1363,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const sessionId = this.session.getSessionId?.() ?? undefined;
+		const sessionEnv = this.#sessionEnv();
 		const widgetOwnerCurrent = this.session.captureWidgetOwnerCurrent?.();
 		const normalizedInput = normalizeBashInput(input);
 		const cached = this.#preparedExecutions.get(input);
 		if (cached) this.#preparedExecutions.delete(input);
 		const cacheMatches = cached?.toolCallId === toolCallId && cached.inputFingerprint === bashInputFingerprint(input);
 		const runtimeApproved = cacheMatches === true && cached.approved;
-		let prepared = cacheMatches ? cached.execution : await this.#prepareExecution(normalizedInput, signal, ctx);
+		let prepared = cacheMatches
+			? cached.execution
+			: await this.#prepareExecution(normalizedInput, signal, ctx, sessionEnv);
 		if (cacheMatches) {
 			if (!sameBashBackend(prepared.backend, this.#resolveExecutionBackend(normalizedInput, ctx))) {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
-			const materialized = await this.#prepareExecution(normalizedInput, signal, ctx);
+			const materialized = await this.#prepareExecution(normalizedInput, signal, ctx, sessionEnv);
 			if (!sameBashBackend(prepared.backend, materialized.backend)) {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
@@ -1420,7 +1442,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					command,
 					cwd: commandCwd,
 					pty: normalizedInput.pty,
-					env: prepared.preflight.env,
+					env: { ...prepared.preflight.env, ...sessionEnv },
 					ready: normalizedInput.ready,
 					shell: { ...backend.shellConfig, prefix: undefined },
 				},
@@ -1501,6 +1523,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				approvalTier,
 				sessionId,
 				widgetOwnerCurrent,
+				sessionEnv,
 				intent: this.session.getToolCallIntent?.(toolCallId),
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
@@ -1542,6 +1565,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				approvalTier,
 				sessionId,
 				widgetOwnerCurrent,
+				sessionEnv,
 				intent: this.session.getToolCallIntent?.(toolCallId),
 			});
 			if (startBackgrounded) {
@@ -1648,7 +1672,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			signal?.addEventListener("abort", onAbortSignal, { once: true });
 
 			try {
-				const bridgeEnv = prepared.preflight.env;
+				const bridgeEnv = { ...prepared.preflight.env, ...sessionEnv };
 				const shellSpawn = wrapShellLineForClientTerminal(command, backend.shellConfig);
 				const createP = backend.createTerminal.call(backend.bridge, {
 					command: shellSpawn.command,
@@ -1871,7 +1895,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						cwd: commandCwd,
 						timeoutMs,
 						signal,
-						env: prepared.preflight.env,
+						env: { ...prepared.preflight.env, ...sessionEnv },
 						artifactPath,
 						artifactId,
 						shell: backend.shellConfig,
@@ -1879,6 +1903,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: await executeBash(command, {
 						settings: this.session.settings,
 						cwd: commandCwd,
+						env: sessionEnv,
 						sessionKey: sessionId,
 						isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === sessionId,
 						timeout: timeoutMs ?? 0,

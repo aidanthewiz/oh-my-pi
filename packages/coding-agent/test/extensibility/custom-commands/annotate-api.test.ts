@@ -256,10 +256,10 @@ ${DIFF}`;
 	});
 
 	it("resolves a PR reference through the central fetcher and rejects a malformed reference", async () => {
-		spyOn(review, "fetchPrReviewTarget").mockImplementation(async (cwd, ref) =>
+		const fetchTarget = spyOn(review, "fetchPrReviewTarget").mockImplementation(async (cwd, ref) =>
 			createResolvedReviewTarget("pr", `PR ${ref.repo}#${ref.number} in ${cwd}`, DIFF, "empty"),
 		);
-		const { api } = createContext({ cwd: "/live-worktree" });
+		const { api, sendUserMessage, pasteToEditor } = createContext({ cwd: "/live-worktree" });
 
 		const result = await api.submit({
 			source: { kind: "pr", ref: "https://github.com/acme/project/pull/42" },
@@ -270,9 +270,13 @@ ${DIFF}`;
 
 		expect(result.text).toContain("PR acme/project#42 in /live-worktree");
 		expect(result.text).toContain("pr note");
+		fetchTarget.mockClear();
 		await expect(
 			api.submit({ source: { kind: "pr", ref: "not a pr" }, notes: [{ path: "x", note: "y" }] }),
-		).rejects.toThrow("Not a GitHub pull request reference");
+		).rejects.toBeInstanceOf(Error);
+		expect(fetchTarget).not.toHaveBeenCalled();
+		expect(sendUserMessage).not.toHaveBeenCalled();
+		expect(pasteToEditor).not.toHaveBeenCalled();
 	});
 });
 

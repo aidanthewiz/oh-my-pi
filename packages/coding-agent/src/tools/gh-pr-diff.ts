@@ -1,6 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { github } from "../utils/github";
+import { captureForgeCliEnvironment, ForgeCredentialsChangedError } from "../utils/forge-cli";
 import { appendRepoFlag, ghApiHostArgs, parseRepoRef } from "./gh-common";
 import type { ViewLookupResult } from "./gh-view";
 import { getOrFetchView, resolveGithubCacheAuthKey } from "./github-cache";
@@ -44,6 +45,7 @@ export interface PrDiffLookupOptions {
 	signal?: AbortSignal;
 	settings?: Settings;
 	cacheAuthKey?: string | null;
+	env?: Readonly<Record<string, string | undefined>>;
 }
 /**
  * Split `gh pr diff` output on `^diff --git ` boundaries and parse per-file
@@ -372,13 +374,14 @@ export async function fetchPrDiffViaFilesApi(
 	repo: string,
 	number: number,
 	signal: AbortSignal | undefined,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<string> {
 	const ref = parseRepoRef(repo);
 	const pull = await github.json<GhPrApi>(
 		cwd,
 		["api", ...ghApiHostArgs(ref), "--method", "GET", `/repos/${ref.slug}/pulls/${number}`],
 		signal,
-		{ repoProvided: true },
+		{ repoProvided: true, env },
 	);
 	if ((pull.changed_files ?? 0) > PR_DIFF_FILES_MAX) {
 		throw new ToolError(
@@ -403,7 +406,7 @@ export async function fetchPrDiffViaFilesApi(
 				`page=${page}`,
 			],
 			signal,
-			{ repoProvided: true },
+			{ repoProvided: true, env },
 		);
 		for (const file of response) {
 			const section = buildSyntheticDiffSection(file);
@@ -424,12 +427,13 @@ export async function fetchPrDiffFresh(
 	repo: string,
 	number: number,
 	signal: AbortSignal | undefined,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<{ rendered: string; sourceUrl: string | undefined; payload: PrDiffPayload }> {
 	const args = ["pr", "diff", String(number), "--color", "never"];
 	appendRepoFlag(args, repo, String(number));
 	let text: string;
 	try {
-		text = await github.text(cwd, args, signal, { repoProvided: true, trimOutput: false });
+		text = await github.text(cwd, args, signal, { repoProvided: true, trimOutput: false, env });
 	} catch (err) {
 		if (!isPrDiffTooLargeError(err)) throw err;
 		logger.debug("gh pr diff exceeded GitHub's aggregate line limit; falling back to per-file API", {
@@ -437,7 +441,7 @@ export async function fetchPrDiffFresh(
 			number,
 			err: String(err),
 		});
-		text = await fetchPrDiffViaFilesApi(cwd, repo, number, signal);
+		text = await fetchPrDiffViaFilesApi(cwd, repo, number, signal, env);
 	}
 	const payload = parsePrUnifiedDiff(text);
 	// `rendered` already carries the verbatim diff; blank the payload copy so
@@ -453,8 +457,24 @@ export async function fetchPrDiffFresh(
  * invocation.
  */
 export async function getOrFetchPrDiff(options: PrDiffLookupOptions): Promise<ViewLookupResult<PrDiffPayload>> {
-	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
-	const doFetch = () => fetchPrDiffFresh(options.cwd, options.repo, options.number, options.signal);
+	const env = options.env ?? captureForgeCliEnvironment(options.cwd, "gh");
+	const credentialIdentity = resolveGithubCacheAuthKey(undefined, env);
+	const authKey =
+		options.cacheAuthKey === undefined
+			? (resolveGithubCacheAuthKey(parseRepoRef(options.repo).host, env) ?? null)
+			: options.cacheAuthKey;
+	const doFetch = async () => {
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError("GitHub credentials changed before the request.");
+		}
+		const fresh = await fetchPrDiffFresh(options.cwd, options.repo, options.number, options.signal, env);
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError(
+				"GitHub credentials changed during the request; no cache entry was written.",
+			);
+		}
+		return fresh;
+	};
 	const lookup = await getOrFetchView<PrDiffPayload>({
 		repo: options.repo,
 		kind: "pr-diff",

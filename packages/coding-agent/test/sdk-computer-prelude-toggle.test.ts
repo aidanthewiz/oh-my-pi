@@ -13,7 +13,13 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
-import { cfgBrowserEnabled } from "@oh-my-pi/pi-coding-agent/tools/browser/settings";
+import {
+	cfgBrowserCdpUrl,
+	cfgBrowserCmux,
+	cfgBrowserEnabled,
+	cfgBrowserRelay,
+	cfgBrowserTern,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/settings";
 import { cfgComputerEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
 // Guards the SDK/session boundary: browser and computer stay outside the tool
@@ -135,6 +141,8 @@ describe("AgentSession eval preludes", () => {
 		await session.prompt("first");
 		await toggle(true);
 		expect(session.getEvalPreludes().map(definition => definition.name)).toEqual(["computer"]);
+		const computerGuidance = session.getEvalPreludes()[0]?.guidance;
+		if (!computerGuidance) throw new Error("Expected enabled computer prelude guidance");
 		await session.prompt("second");
 		await toggle(false);
 		await session.prompt("third");
@@ -149,15 +157,139 @@ describe("AgentSession eval preludes", () => {
 		const notices = session.agent.state.messages.filter(
 			message => message.role === "custom" && message.customType === "eval-prelude-notice",
 		);
-		expect(notices.map(notice => (notice.role === "custom" ? notice.details : undefined))).toEqual([
+		expect(notices.map(notice => (notice.role === "custom" ? notice.details : undefined))).toMatchObject([
 			{ added: ["computer"], removed: [] },
 			{ added: [], removed: ["computer"] },
 		]);
 		const secondText = requestText(second!);
 		expect(secondText).toContain("xd://eval/computer");
-		expect(secondText).toContain("# Computer Use");
-		expect(secondText).toContain("Only direct user messages authorize consequential computer actions.");
+		expect(secondText).toContain(computerGuidance);
 		expect(requestText(fourth!).match(/<system-notice id="prelude-extension">/g)).toHaveLength(2);
+	});
+
+	it("refreshes same-name browser guidance without changing earlier prompt snapshots or leaking endpoints", async () => {
+		const envKeys = [
+			"PI_BROWSER_RELAY",
+			"PI_BROWSER_TERN",
+			"PI_BROWSER_CMUX",
+			"TERN_PANE_SOCKET",
+			"TERN_PANE",
+			"CMUX_SOCKET_PATH",
+		] as const;
+		const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+		for (const key of envKeys) delete process.env[key];
+		try {
+			const settings = Settings.isolated({
+				"browser.enabled": true,
+				"browser.relay": false,
+				"browser.tern": false,
+				"browser.cmux": false,
+				"archive.enabled": false,
+			});
+			const { session } = await createAgentSession({
+				cwd: registryDir,
+				agentDir: registryDir,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			});
+			sessions.push(session);
+			const mock = createMockModel({ handler: { content: ["ok"] } });
+			session.agent.streamFn = mock.stream;
+			const original = session.getEvalPreludes().find(prelude => prelude.name === "browser");
+			if (!original) throw new Error("Expected the enabled browser prelude");
+			expect(original.guidance).toBeUndefined();
+			await session.prompt("baseline");
+			const baselinePrompt = structuredClone(mock.calls[0]!.context.systemPrompt);
+			const baselineEval = mock.calls[0]!.context.tools?.find(tool => tool.name === "eval")?.description;
+
+			const endpoint =
+				"http://synthetic-user:synthetic-password@127.0.0.1:19333/secret-path?token=secret-token&session=secret-session#secret-fragment";
+			cfgBrowserCdpUrl.override(settings, endpoint);
+			cfgBrowserRelay.override(settings, true);
+			const relay = session.getEvalPreludes().find(prelude => prelude.name === "browser");
+			if (!relay) throw new Error("Expected the enabled relay prelude");
+			const relayGuidance = relay.guidance;
+			expect(relayGuidance).toContain("browser.cdpUrl");
+			expect(original.guidance).toBeUndefined();
+			await session.prompt("step one");
+
+			cfgBrowserCdpUrl.override(settings, "");
+			cfgBrowserTern.override(settings, true);
+			process.env.TERN_PANE_SOCKET = "/tmp/synthetic-guidance-tern.sock";
+			process.env.TERN_PANE = "1";
+			await session.prompt("step two");
+			expect(relay.guidance).toBe(relayGuidance);
+
+			delete process.env.TERN_PANE_SOCKET;
+			delete process.env.TERN_PANE;
+			cfgBrowserCmux.override(settings, true);
+			process.env.CMUX_SOCKET_PATH = "/tmp/synthetic-guidance-cmux.sock";
+			await session.prompt("step three");
+			cfgBrowserRelay.override(settings, false);
+			await session.prompt("step four");
+			await session.prompt("step five");
+
+			const notices = session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "eval-prelude-notice",
+			);
+			expect(notices.map(notice => (notice.role === "custom" ? notice.details : undefined))).toEqual([
+				{ added: [], removed: [], guidance: { browser: expect.stringContaining("browser.cdpUrl") } },
+				{ added: [], removed: [], guidance: { browser: expect.stringContaining("Tern") } },
+				{ added: [], removed: [], guidance: { browser: expect.stringContaining("cmux") } },
+				{ added: [], removed: [], guidance: { browser: "" } },
+			]);
+			for (const { context } of mock.calls) {
+				expect(context.systemPrompt).toEqual(baselinePrompt);
+				expect(context.tools?.find(tool => tool.name === "eval")?.description).toBe(baselineEval);
+			}
+			const requestTexts = mock.calls.map(({ context }) =>
+				context.messages
+					.flatMap(message =>
+						typeof message.content === "string"
+							? [message.content]
+							: message.content.flatMap(part => (part.type === "text" ? [part.text] : [])),
+					)
+					.join("\n"),
+			);
+			expect(requestTexts[1]).toContain("browser.cdpUrl");
+			expect(requestTexts[2]).toContain("Tern");
+			expect(requestTexts[3]).toContain("cmux");
+			for (const request of requestTexts.slice(4)) {
+				expect(request.match(/<system-notice id="prelude-extension">/g)).toHaveLength(4);
+				const latest = request.split('<system-notice id="prelude-extension">').at(-1);
+				expect(latest).not.toContain("browser.cdpUrl");
+				expect(latest).not.toContain("Tern");
+				expect(latest).not.toContain("cmux");
+			}
+			const providerContexts = JSON.stringify(mock.calls.map(call => call.context));
+			for (const secret of [
+				endpoint,
+				"synthetic-user",
+				"synthetic-password",
+				"secret-path",
+				"secret-token",
+				"secret-session",
+				"secret-fragment",
+			]) {
+				expect(providerContexts).not.toContain(secret);
+				expect(JSON.stringify(notices)).not.toContain(secret);
+			}
+		} finally {
+			for (const key of envKeys) {
+				if (savedEnv[key] === undefined) delete process.env[key];
+				else process.env[key] = savedEnv[key];
+			}
+		}
 	});
 
 	it("exposes enabled host preludes to user-initiated Python cells", async () => {

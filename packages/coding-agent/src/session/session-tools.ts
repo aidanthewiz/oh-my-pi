@@ -266,10 +266,11 @@ interface XdevMountNoticeDetails {
 	removed: string[];
 }
 
-/** Prelude names added/removed by one hidden {@link EVAL_PRELUDE_NOTICE_MESSAGE_TYPE} message. */
+/** Prelude roster and provider-visible guidance committed by one hidden notice. */
 interface EvalPreludeNoticeDetails {
 	added: string[];
 	removed: string[];
+	guidance?: Record<string, string>;
 }
 
 /** Agent descriptions in a hidden notice are needed to detect a reused pseudonym after branching. */
@@ -1595,19 +1596,39 @@ export class SessionTools {
 	 * the live set), compaction (which drops old notices), and resume.
 	 */
 	takeEvalPreludeNotice(): CustomMessage<EvalPreludeNoticeDetails> | undefined {
-		const known = new Set(this.#promptSurface.evalPreludes.map(definition => definition.name));
+		const known = new Map(
+			this.#promptSurface.evalPreludes.map(
+				definition => [definition.name, definition.guidance?.trim() ?? ""] as const,
+			),
+		);
 		for (const message of this.#host.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== EVAL_PRELUDE_NOTICE_MESSAGE_TYPE) continue;
 			const details = message.details;
 			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
-			for (const name of details.added) if (typeof name === "string") known.add(name);
+			for (const name of details.added) {
+				if (typeof name === "string" && !known.has(name)) known.set(name, "");
+			}
 			for (const name of details.removed) if (typeof name === "string") known.delete(name);
+			if (isRecord(details.guidance)) {
+				for (const [name, guidance] of Object.entries(details.guidance)) {
+					if (known.has(name) && typeof guidance === "string") known.set(name, guidance);
+				}
+			}
 		}
 		const live = this.#host.evalPreludes();
 		const liveNames = new Set(live.map(definition => definition.name));
 		const added = live.filter(definition => !known.has(definition.name));
-		const removed = [...known].filter(name => !liveNames.has(name));
-		if (added.length === 0 && removed.length === 0) return undefined;
+		const updated = live.filter(
+			definition => known.has(definition.name) && known.get(definition.name) !== (definition.guidance?.trim() ?? ""),
+		);
+		const removed = [...known.keys()].filter(name => !liveNames.has(name));
+		if (added.length === 0 && removed.length === 0 && updated.length === 0) return undefined;
+		const guidance =
+			updated.length > 0 || added.some(definition => definition.guidance?.trim())
+				? Object.fromEntries(
+						[...added, ...updated].map(definition => [definition.name, definition.guidance?.trim() ?? ""]),
+					)
+				: undefined;
 		// Topic docs are served through `read`; sessions without it get them inline,
 		// matching the eval description's `inlineTopics` fallback.
 		const canRead = this.getActiveToolNames().includes("read");
@@ -1618,12 +1639,18 @@ export class SessionTools {
 				added: added.map(definition => ({ name: definition.name, summary: evalPreludeSummary(definition) })),
 				removed,
 				canRead,
-				sections: added.flatMap(definition => [
-					...(canRead ? [] : [definition.documentation.trim()]),
-					...(definition.guidance ? [definition.guidance.trim()] : []),
-				]),
+				sections: [
+					...added.flatMap(definition => [
+						...(canRead ? [] : [definition.documentation.trim()]),
+						...(definition.guidance ? [definition.guidance.trim()] : []),
+					]),
+					...updated.map(
+						definition =>
+							`Current guidance for \`${definition.name}\` supersedes all earlier guidance for that prelude:\n${definition.guidance?.trim() || "No additional guidance currently applies."}`,
+					),
+				],
 			}),
-			details: { added: added.map(definition => definition.name), removed },
+			details: { added: added.map(definition => definition.name), removed, ...(guidance ? { guidance } : {}) },
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),

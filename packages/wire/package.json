@@ -1,6 +1,6 @@
 {
 	"name": "@oh-my-pi/pi-wire",
-	"version": "18.12.3",
+	"version": "18.12.4",
 	"description": "Shared wire protocol types for omp packages",
 	"keywords": [
 		"collab",

@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import { Readable, type Transform } from "node:stream";
+import { formatBytes } from "../format";
 import { LRUCache } from "../lru";
 import { ArchiveError } from "./error";
 
@@ -37,10 +40,20 @@ export function memoryByteSource(buffer: Uint8Array): ByteSource {
 	};
 }
 
+function sameArchiveFile(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
 /** Lazily read ranges of a file on disk as a {@link ByteSource}. */
 export function fileByteSource(filePath: string): ByteSource {
-	const file = Bun.file(filePath);
-	const size = file.size;
+	const identity = fs.statSync(filePath, { bigint: true });
+	const size = Number(identity.size);
 	if (!Number.isSafeInteger(size)) {
 		throw new ArchiveError("Archive is too large to read safely");
 	}
@@ -48,11 +61,29 @@ export function fileByteSource(filePath: string): ByteSource {
 		size,
 		async read(start, end) {
 			assertValidRange(start, end);
-			const bytes = await file.slice(start, end).bytes();
-			if (bytes.byteLength !== end - start) {
-				throw new ArchiveError("Invalid archive: truncated data");
+			const handle = await fs.promises.open(filePath, "r");
+			try {
+				if (!sameArchiveFile(identity, await handle.stat({ bigint: true }))) {
+					throw new ArchiveError("Archive changed after it was opened");
+				}
+				if (end > size) throw new ArchiveError("Invalid archive: truncated data");
+				const bytes = new Uint8Array(end - start);
+				let filled = 0;
+				while (filled < bytes.byteLength) {
+					const { bytesRead } = await handle.read(bytes, filled, bytes.byteLength - filled, start + filled);
+					if (bytesRead === 0) throw new ArchiveError("Invalid archive: truncated data");
+					filled += bytesRead;
+				}
+				if (
+					!sameArchiveFile(identity, await handle.stat({ bigint: true })) ||
+					!sameArchiveFile(identity, await fs.promises.stat(filePath, { bigint: true }))
+				) {
+					throw new ArchiveError("Archive changed after it was opened");
+				}
+				return bytes;
+			} finally {
+				await handle.close();
 			}
-			return bytes;
 		},
 	};
 }
@@ -60,6 +91,45 @@ export function fileByteSource(filePath: string): ByteSource {
 /** Materialize an entire {@link ByteSource}; use only under a limits check. */
 export async function readAllBytes(source: ByteSource): Promise<Uint8Array> {
 	return source.read(0, source.size);
+}
+
+/** Chunk size for streamed decompression, on both the compressed and the decompressed side. */
+export const STREAM_CHUNK_SIZE = 1024 * 1024;
+
+async function* readChunks(source: ByteSource): AsyncGenerator<Uint8Array> {
+	for (let start = 0; start < source.size; start += STREAM_CHUNK_SIZE) {
+		yield await source.read(start, Math.min(source.size, start + STREAM_CHUNK_SIZE));
+	}
+}
+
+/**
+ * Decompress a {@link ByteSource} through `decoder` chunk by chunk, so neither
+ * the compressed nor the decompressed stream is ever held whole. Output past
+ * `maxOutput` bytes fails, so a decompression bomb cannot run without bound.
+ */
+export async function* decodeByteSource(
+	source: ByteSource,
+	decoder: Transform,
+	maxOutput: number,
+): AsyncGenerator<Uint8Array> {
+	const input = Readable.from(readChunks(source));
+	input.once("error", error => decoder.destroy(error));
+	let output = 0;
+	try {
+		for await (const chunk of input.pipe(decoder)) {
+			output += chunk.byteLength;
+			if (output > maxOutput) {
+				throw new ArchiveError(`Archive decompresses past the ${formatBytes(maxOutput)} stream limit`);
+			}
+			yield chunk;
+		}
+	} catch (error) {
+		if (error instanceof ArchiveError) throw error;
+		throw new ArchiveError(error instanceof Error ? error.message : String(error));
+	} finally {
+		input.destroy();
+		decoder.destroy();
+	}
 }
 
 /** Options for {@link httpByteSource}. */
@@ -114,17 +184,32 @@ export async function httpByteSource(url: string | URL, options: HttpByteSourceO
 	if (!Number.isSafeInteger(total) || total < 0) {
 		throw new ArchiveError("Remote archive did not report a valid size in Content-Range");
 	}
+	const etag = probe.headers.get("etag");
+	const strongEtag = etag && !etag.startsWith("W/") ? etag : undefined;
+	const modified = probe.headers.get("last-modified");
+	const versionHeaders: Record<string, string> = strongEtag
+		? { "if-match": strongEtag }
+		: modified
+			? { "if-unmodified-since": modified }
+			: {};
 	return {
 		size: total,
 		async read(start, end) {
 			assertValidRange(start, end);
 			if (start === end) return new Uint8Array(0);
 			const response = await doFetch(url, {
-				headers: { ...options.headers, range: `bytes=${start}-${end - 1}` },
+				headers: { ...options.headers, ...versionHeaders, range: `bytes=${start}-${end - 1}` },
 			});
 			if (response.status !== 206) {
 				await response.body?.cancel();
 				throw new ArchiveError(`Remote archive range request failed (HTTP ${response.status})`);
+			}
+			if (
+				(strongEtag && response.headers.get("etag") !== strongEtag) ||
+				(!strongEtag && modified && response.headers.get("last-modified") !== modified)
+			) {
+				await response.body?.cancel();
+				throw new ArchiveError("Remote archive changed after it was opened");
 			}
 			const bytes = new Uint8Array(await response.arrayBuffer());
 			if (bytes.byteLength !== end - start) {

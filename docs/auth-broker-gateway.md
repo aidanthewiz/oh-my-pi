@@ -189,7 +189,7 @@ omp auth-gateway check   [--strict] [--json]
 
 - `tokenSha256` is the hex SHA-256 of the token the client sends as `Authorization: Bearer <token>` (`printf %s "$TOKEN" | shasum -a 256`); the file never holds a raw token. A digest shared by two clients, or equal to the gateway token's, is rejected.
 - `models` lists exact `provider/id` grants or `provider/*`. Absent allows every served model; `[]` allows none. A model outside the list answers `404 Unknown model` before any credential lookup, and `GET /v1/models` lists only granted models. A bare id resolves to the first served model of that id the client may call; a provider-qualified id is never reread as another provider's bare id.
-- `accounts` maps a provider to the OAuth identity keys (the `identityKey` values of [account pools](#client-account-pools-routing-not-authorization), which `omp usage accounts` lists) its requests to that provider may use. Selection, refresh, usage-limit blocking and auth-recovery rotation stay inside the list, stored, runtime and environment API keys are never used, and a request fails rather than borrow another account. An empty list allows no account. When `accounts` is present it is also a provider allow-list: a provider it omits is refused like a model outside `models`, so a binding cannot be sidestepped through another provider. A `models` grant for a provider `accounts` omits rejects the file, as does a provider id with surrounding whitespace. Without `accounts`, every provider resolves credentials as for the gateway token.
+- `accounts` maps a provider to the OAuth identity keys (the `identityKey` values of [account pools](#client-account-pools), which `coreforge usage accounts` lists) its requests to that provider may use. Selection, refresh, usage-limit blocking and auth-recovery rotation stay inside the list, stored, runtime and environment API keys are never used, and a request fails rather than borrow another account. An empty list allows no account. When `accounts` is present it is also a provider allow-list: a provider it omits is refused like a model outside `models`, so a binding cannot be sidestepped through another provider. A `models` grant for a provider `accounts` omits rejects the file, as does a provider id with surrounding whitespace. Without `accounts`, every provider resolves credentials as for the gateway token.
 - A client's conversations share one account pin per listed provider: with several accounts listed, the client's traffic stays on one of them until usage-limit blocking or auth recovery moves it, rather than spreading conversations across them. They never share retained provider state (learned fallbacks, Codex transport sessions) with another client's or with gateway-token traffic.
 - `/v1/usage` and `/v1/credentials/check` cover every account the gateway holds, so client tokens get `403` there.
 - The gateway token stays valid and unscoped. `--clients` cannot be combined with `--no-auth`.
@@ -287,9 +287,9 @@ Freshness is anchored to `snapshot.generatedAt`, not local write time. Default T
 
 If the broker is down at boot and a fresh cache exists, startup succeeds from the cache. If the cache is missing, expired, corrupt, incompatible, written for another URL, or encrypted with another token, startup requires a live snapshot and fails when that fetch fails; it never silently opens the local credential store instead.
 
-## Client account pools (routing, not authorization)
+## Client account pools
 
-Broker clients can restrict their visible OAuth accounts by setting `OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` to a JSON file. The file maps provider IDs to exact `identityKey` values from the broker snapshot protocol:
+Broker clients can restrict which broker credentials they see by setting `OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` to a JSON file. Each key is a provider ID (or `"*"`, see below); each value is a rule for that provider's credentials:
 
 ```json
 {
@@ -298,18 +298,35 @@ Broker clients can restrict their visible OAuth accounts by setting `OMP_AUTH_BR
 }
 ```
 
-`identityKey` is the token-free identity field already carried by each authenticated `/v1/snapshot` credential entry. `omp usage accounts` lists visible OAuth identity keys and organization names without tokens. Operator tooling must not retain or print the accompanying credential payload.
+An array lists exact `identityKey` values from the broker snapshot protocol. `identityKey` is the token-free identity field already carried by each authenticated `/v1/snapshot` credential entry. `coreforge usage accounts` lists visible OAuth identity keys and organization names without tokens. Operator tooling must not retain or print the accompanying credential payload.
 
-SDK hosts can supply the same provider-to-identity mapping as `accountPool` in `discoverAuthStorage()` or `RemoteAuthCredentialStore`. An explicit programmatic pool takes precedence over the environment file.
+| Value | OAuth accounts visible | API keys visible |
+| --- | --- | --- |
+| `["id", …]` | only exact identity matches, including organization/workspace qualifiers; `[]` hides all | yes |
+| `true` | all | yes |
+| `false` | none | no |
+| `{ "accounts"?: ["id", …], "apiKeys"?: boolean }` | `accounts` as with the array form; omitted means all | `apiKeys`; omitted means yes |
 
-- A missing provider is unrestricted.
-- An empty array hides every OAuth credential for that provider.
-- A non-empty array exposes only exact identity matches, including organization/workspace qualifiers.
-- API-key credentials remain visible; the pool applies only to OAuth accounts.
+Providers without their own key follow the `"*"` rule, and with no `"*"` key they are unrestricted. `"*": false` turns the file into an allow-list: only listed providers are visible, OAuth and API keys alike. For example, this exposes one Codex account and OpenRouter API keys, and nothing else:
 
-The file is parsed once when broker-backed auth storage starts. An unreadable file, malformed JSON, or invalid provider entry aborts initialization rather than silently broadening the pool. Full snapshots, SSE updates, refresh responses, and aggregate usage are filtered consistently. For a provider named in the pool, aggregate reports are returned only when they can be attributed to a visible OAuth identity; reports attributable only to an API key or lacking matching identity metadata fail closed. The encrypted snapshot cache remains a raw broker snapshot so trusted processes sharing that cache can apply different pools.
+```json
+{
+  "*": false,
+  "openai-codex": { "accounts": ["account:acct-123"], "apiKeys": false },
+  "openrouter": true
+}
+```
 
-This is a **trusted-client routing policy, not an authorization boundary**. The client still holds a broker bearer token, receives raw broker responses before applying its local view, and can call broker endpoints directly. Use server-side authorization—not account pools—when clients must be prevented from retrieving other credentials.
+SDK hosts can supply the same rules as `accountPool` in `discoverAuthStorage()` or `RemoteAuthCredentialStore` (a `Set` of identities, or `{ accounts?: Set, apiKeys?: boolean }`, keyed by provider or `"*"`). An explicit programmatic pool takes precedence over the environment file.
+
+The file is parsed once when broker-backed auth storage starts. An unreadable file, malformed JSON, or invalid entry aborts initialization rather than silently broadening the pool. Full snapshots, SSE updates, refresh responses, and aggregate usage are filtered consistently. For a provider whose OAuth accounts or API keys are restricted, aggregate reports are returned only when they can be attributed to a visible OAuth identity; reports attributable only to an API key or lacking matching identity metadata fail closed. The encrypted snapshot cache remains a raw broker snapshot so trusted processes sharing that cache can apply different pools.
+
+Where the pool applies decides what it protects:
+
+- **Direct broker clients:** a **trusted-client routing policy, not an authorization boundary**. The client holds the broker bearer token, receives raw broker responses before applying its local view, and can call broker endpoints directly.
+- **Clients of `omp auth-gateway serve`:** the pool runs inside the gateway process, and the gateway's clients hold only the gateway token. Credentials the pool hides are not in the gateway's credential view, so its routes cannot list, use, or report them. For those clients the pool is the effective boundary, provided they cannot read the gateway host's environment, the pool file, or the broker token.
+
+Use server-side broker authorization, not account pools, when a process holding the broker token must be prevented from retrieving other credentials.
 
 The broker bearer token authorizes the trusted transport and can expose the broker's full credential snapshot to its holder. The client-side pool filters which OAuth identities that client selects for requests; it does not constrain what the bearer holder can retrieve from the broker.
 
@@ -329,6 +346,8 @@ Direct callers must pass the returned lease to `authStorage.sessions.unrestrict(
 
 Broker-backed credential storage is **off** unless `OMP_AUTH_BROKER_URL` (or `auth.broker.url` in the agent's `config.yml`/`config.yaml`) is set. SDK discovery delegates through `packages/coding-agent/src/session/auth-broker-config.ts` to the shared `pi-ai` resolver and selects `RemoteAuthCredentialStore` instead of local SQLite. Runtime/config/env key overrides still participate in the normal credential ladder; selecting broker storage does not make those keys remote.
 
+Coreforge CLI and session login apply the consuming settings' `enabledModels` and `disabledProviders` policy before credential entry and validation. Explicit provider denial also excludes credential aliases. Logout remains available without validation. Standalone broker administration and SDK login callbacks are trusted caller interfaces; they do not inherit a global settings policy. SDK hosts must apply their own admission and present any paid-validation disclosure.
+
 ### Environment variables
 
 | Variable                            | Purpose                                                                                                                                                                | Required when                                                                                                             |
@@ -337,7 +356,7 @@ Broker-backed credential storage is **off** unless `OMP_AUTH_BROKER_URL` (or `au
 | `OMP_AUTH_BROKER_TOKEN`             | Bearer token used for every broker endpoint except `/v1/healthz`.                                                                                                      | When `OMP_AUTH_BROKER_URL` is set and no token is available from `auth.broker.token` or `<config-dir>/auth-broker.token`. |
 | `OMP_AUTH_BROKER_SNAPSHOT_TTL_MS`   | Freshness window for the encrypted local snapshot cache. Default `3600000` (1 h); `0` disables cache reads and writes.                                                 | Optional in broker mode.                                                                                                  |
 | `OMP_AUTH_BROKER_SNAPSHOT_CACHE`    | Path override for the encrypted local snapshot cache. Default `~/.omp/cache/auth-broker-snapshot.enc` (or XDG cache equivalent).                                       | Optional in broker mode.                                                                                                  |
-| `OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` | JSON file mapping provider IDs to OAuth `identityKey` values visible to this trusted client. Parsed once; invalid files abort initialization. API keys are unaffected. | Optional in broker mode.                                                                                                  |
+| `OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` | JSON file of per-provider visibility rules for broker credentials (OAuth `identityKey` lists, API-key toggle, `"*"` default for unlisted providers). Parsed once; invalid files abort initialization. | Optional in broker mode.                                                                                                  |
 
 Resolution order in `resolveAuthBrokerConfig()`:
 
@@ -353,10 +372,12 @@ The gateway uses the same broker URL/token resolution and account-pool environme
 | ------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `auth.broker.url`   | unset   | Same as `OMP_AUTH_BROKER_URL`; env wins. Hidden from the settings UI. Values are resolved as a literal, an environment variable name, or `!<shell command>` to use trimmed stdout. |
 | `auth.broker.token` | unset   | Same as `OMP_AUTH_BROKER_TOKEN`; env wins. Values are resolved the same way.                                                                                                       |
-| `auth.accountPolicies` | `[]` | Per-account OAuth routing rules: `provider`, identity selector `account` (`email`, `accountId`, `projectId`, optional `orgId`), optional `priority` and `reservePct` (0–100). |
+| `auth.accountPolicies` | `[]` | Per-account OAuth routing rules: `provider`, identity selector `account` (`email`, `accountId`, `projectId`, optional `orgId`), optional `priority`, `reservePct` (0–100) and `reclaimAbovePct`. With `reclaimAbovePct` (above the account's effective reserve, at most 100), sessions automatically pinned to a lower-priority account move back on their next request once this account has that much quota left; explicitly chosen accounts never move. |
 | `retry.usageReservePct` | `10` | Default protected remaining-quota percentage when an account has no `reservePct` override. |
 
 Broker connection values come from the agent's main config file, not project settings. Account policies/reserve use effective settings (including project/explicit config layers). Long-lived SDK sessions follow policy changes and can replace the credential store in place when effective broker settings change; failed changes leave the current store active.
+
+Account policies control routing, not paid-action permission. Reserve and reclaim never replace credit, consent, model, or session admission checks.
 
 #### How sessions choose and keep an account
 
@@ -365,8 +386,8 @@ When a provider has account policies, OMP ranks its accounts whenever it selects
 That ranking picks the account for a **new** session. A running session remembers the account it used last (its pin) and keeps it while the pin is warm, so the provider's prompt cache and signed reasoning stay valid:
 
 - Anthropic pins go cold after an hour without a request; other providers' pins stay warm indefinitely. A cold or blocked pin re-ranks.
-- A warm pin moves only away from a bad account: when the pinned account enters its reserve and another account is measured outside its own reserve, or when its allowance is spent and an unblocked sibling still has allowance.
-- A warm pin does not move back when a higher-priority account recovers. New sessions use the recovered account; running ones stay where they are until one of the cases above applies.
+- A warm automatic pin moves when the pinned account enters its reserve and another account is measured outside its own reserve, or when its allowance is spent and an unblocked sibling still has allowance.
+- Without `reclaimAbovePct`, a warm pin does not move back when a higher-priority account recovers. With that opt-in, the next request can reclaim a higher-priority account only when it wins ranking, has measured remaining quota at or above its threshold, and survives refresh preflight. An explicit pin remains exempt.
 - An account the user chose explicitly for a session is never moved by ranking or reserve. It is still skipped while blocked, after a failed token refresh, or when it fails a required plan check; the session then falls through to a sibling.
 - Pins are saved with the session. A resumed session restores its pin with its original last-use time, and subagents start on their parent's pins. When a parked subagent is revived in the same session, its saved pin wins over the parent's automatic affinity; an explicit parent pin still wins, subject to the child's account pool.
 

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
@@ -5,6 +6,7 @@ import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
 import { logger, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { all as allSettings } from "../config/registry";
 import {
 	composeRecallQuery,
 	prepareEmbeddableRetentionTranscript,
@@ -30,6 +32,63 @@ import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with
 import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
+
+export interface MnemopiRequestOwner {
+	readonly sessionId: string;
+	readonly parentId: string | null;
+	readonly file: string | undefined;
+	readonly cwd: string;
+	readonly manager: AgentSession["sessionManager"];
+	readonly isCurrent: () => boolean;
+}
+
+export const mnemopiRequestOwner = new AsyncLocalStorage<MnemopiRequestOwner>();
+
+/** Capture before the memory library schedules extraction behind other queued work. */
+export function captureMnemopiRequestOwner(session: AgentSession): MnemopiRequestOwner {
+	const manager = session.sessionManager;
+	const sessionId = manager.getSessionId();
+	const parentId = manager.getLeafId();
+	const file = manager.getSessionFile();
+	const cwd = manager.getCwd();
+	const settings = session.settings;
+	const auth = session.modelRegistry.authStorage;
+	const credentials = auth.credentials;
+	const sourceIdentity = auth.sourceIdentity;
+	const policy = allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]);
+	const providers = [...new Set(credentials.list().map(credential => credential.provider))]
+		.sort()
+		.filter(provider => auth.oauth.accounts(provider, sessionId).some(account => account.active));
+	const accountSnapshot = () =>
+		providers.flatMap(provider =>
+			auth.oauth
+				.accounts(provider, sessionId)
+				.filter(account => account.active)
+				.map(account => [provider, account.credentialId, account.accountId, account.orgId, account.projectId]),
+		);
+	const accounts = accountSnapshot();
+	return Object.freeze({
+		sessionId,
+		parentId,
+		file,
+		cwd,
+		manager,
+		isCurrent: () =>
+			!session.isDisposed &&
+			!session.isSessionTransitioning &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionFile() === file &&
+			manager.getCwd() === cwd &&
+			!auth.isClosed &&
+			auth.credentials === credentials &&
+			auth.sourceIdentity === sourceIdentity &&
+			Bun.deepEquals(accounts, accountSnapshot()) &&
+			Bun.deepEquals(
+				policy,
+				allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]),
+			),
+	});
+}
 
 /** A rendered recall block and where each tracked memory's text starts in it. */
 interface RecallBlock {
@@ -527,7 +586,10 @@ export class MnemopiSessionState {
 	): string {
 		return withLoopPhase("mnemopi.retain", () => {
 			const [scrubbed, scrubbedOptions] = redactRememberWrite(memory, options);
-			return target.memory.remember(scrubbed, scrubbedOptions);
+			if (this.config.llmMode === "none" && this.config.providerOptions.noEmbeddings)
+				return target.memory.remember(scrubbed, scrubbedOptions);
+			const owner = captureMnemopiRequestOwner(this.aliasOf?.session ?? this.session);
+			return mnemopiRequestOwner.run(owner, () => target.memory.remember(scrubbed, scrubbedOptions));
 		});
 	}
 

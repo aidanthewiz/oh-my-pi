@@ -1,6 +1,7 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import type { AuthStorage } from "@oh-my-pi/pi-ai";
-import type { OAuthLoginCallbacks, OAuthProviderId } from "@oh-my-pi/pi-ai/oauth/types";
+import { AuthStorage, getOAuthProviders, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import type { OAuthLoginCallbacks, OAuthProviderId, OAuthProviderInfo } from "@oh-my-pi/pi-ai/oauth/types";
 import { providersSetupScene, SignInScene } from "@oh-my-pi/pi-tui/setup/scenes/sign-in";
 import type { SetupHost, SetupSceneHost } from "@oh-my-pi/pi-tui/setup/scenes/types";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -198,6 +199,166 @@ describe("SignInScene", () => {
 			tab.dispose();
 			loginGate.resolve();
 			await loginGate.promise;
+		}
+	});
+});
+
+async function mountPaidSignIn(managed = true, providerId = "inception") {
+	const provider = getOAuthProviders().find(entry => entry.id === providerId);
+	if (!provider) throw new Error("expected login provider");
+	const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+	await storage.credentials.reload();
+	const policy: {
+		providers: readonly OAuthProviderInfo[] | undefined;
+		disabled: string[];
+		error: Error | undefined;
+	} = { providers: managed ? [{ ...provider, available: true }] : undefined, disabled: [], error: undefined };
+	const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+	const fetchHandler = Object.assign(
+		async (url: string | Request | URL, init?: RequestInit) => {
+			requests.push({ url: String(url), init });
+			return Response.json({});
+		},
+		{ preconnect: fetch.preconnect },
+	);
+	vi.spyOn(globalThis, "fetch").mockImplementation(fetchHandler);
+	const login = vi.spyOn(storage.oauth, "login");
+	const prompted = Promise.withResolvers<void>();
+	let focused: Component | undefined;
+	const openInBrowser = vi.fn((_url: string) => {});
+	const host = {
+		ctx: {
+			authStorage: storage,
+			get oauthProviders() {
+				if (policy.error) throw policy.error;
+				return policy.providers;
+			},
+			get disabledProviders() {
+				return policy.disabled;
+			},
+			copyToClipboard: async (_text: string) => {},
+			refreshProvider: async (_providerId: string) => {},
+			openInBrowser,
+		},
+		requestRender() {},
+		finish() {},
+		setFocus(component: Component | null) {
+			focused = component ?? undefined;
+			if (focused) prompted.resolve();
+		},
+		restoreFocus() {},
+	} as unknown as SetupSceneHost;
+	const scene = new SignInScene(host);
+	return {
+		scene,
+		storage,
+		policy,
+		requests,
+		login,
+		openInBrowser,
+		prompted: prompted.promise,
+		start() {
+			for (const char of provider.id) scene.handleInput(char);
+			scene.handleInput("\n");
+		},
+		enterKey() {
+			if (!focused?.handleInput) throw new Error("expected focused credential input");
+			focused.handleInput("setup-synthetic-inception-key");
+			focused.handleInput("\n");
+		},
+		result() {
+			const result = login.mock.results[0];
+			if (!result || result.type !== "return") throw new Error("expected actual login attempt");
+			return result.value;
+		},
+		async close() {
+			scene.dispose();
+			await storage.close();
+		},
+	};
+}
+
+describe("setup paid login admission", () => {
+	it("rejects a removed provider from a previously rendered roster before login or browser dispatch", async () => {
+		const harness = await mountPaidSignIn();
+		try {
+			harness.policy.providers = [];
+			harness.start();
+			expect(harness.login).not.toHaveBeenCalled();
+			expect(harness.openInBrowser).not.toHaveBeenCalled();
+			expect(harness.requests).toEqual([]);
+			expect(harness.storage.credentials.list("inception")).toEqual([]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("denies a selected login alias when its credential provider becomes disabled", async () => {
+		const harness = await mountPaidSignIn(true, "openai-codex-device");
+		try {
+			harness.policy.disabled.push("openai-codex");
+			harness.start();
+			expect(harness.login).not.toHaveBeenCalled();
+			expect(harness.openInBrowser).not.toHaveBeenCalled();
+			expect(harness.requests).toEqual([]);
+			expect(harness.storage.credentials.list("openai-codex")).toEqual([]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("refuses removed, unavailable, and throwing managed rosters after delayed credential entry", async () => {
+		for (const mode of ["removed", "unavailable", "throwing"] as const) {
+			const harness = await mountPaidSignIn();
+			try {
+				harness.start();
+				await harness.prompted;
+				if (mode === "throwing") harness.policy.error = new Error("policy unavailable");
+				else harness.policy.providers = mode === "removed" ? [] : undefined;
+				harness.enterKey();
+				await expect(harness.result()).rejects.toThrow();
+				expect(harness.requests).toEqual([]);
+				expect(harness.storage.credentials.list("inception")).toEqual([]);
+			} finally {
+				await harness.close();
+				vi.restoreAllMocks();
+			}
+		}
+	});
+
+	it("refuses a provider disabled while credential input waits without validating or saving the key", async () => {
+		const harness = await mountPaidSignIn();
+		try {
+			harness.start();
+			await harness.prompted;
+			harness.policy.disabled.push("inception");
+			harness.enterKey();
+			await expect(harness.result()).rejects.toThrow();
+			expect(harness.requests).toEqual([]);
+			expect(harness.storage.credentials.list("inception")).toEqual([]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("preserves explicit unmanaged login when the host never supplies a roster", async () => {
+		const harness = await mountPaidSignIn(false);
+		try {
+			harness.start();
+			await harness.prompted;
+			harness.enterKey();
+			await harness.result();
+			expect(harness.requests).toHaveLength(1);
+			expect(harness.requests[0].url).toBe("https://api.inceptionlabs.ai/v1/chat/completions");
+			expect(JSON.parse(String(harness.requests[0].init?.body))).toMatchObject({
+				model: "mercury-3",
+				max_completion_tokens: 1,
+			});
+			expect(harness.storage.credentials.list("inception")).toMatchObject([
+				{ credential: { type: "api_key", key: "setup-synthetic-inception-key" } },
+			]);
+		} finally {
+			await harness.close();
 		}
 	});
 });

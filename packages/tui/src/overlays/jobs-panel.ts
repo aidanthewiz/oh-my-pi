@@ -6,12 +6,13 @@
  * (cwd, live pids, exit code, artifact) and live output.
  */
 import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
-import { formatDuration } from "@oh-my-pi/pi-utils";
+import { formatDuration, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { Component } from "../tui";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
 import { matchesKey } from "../keys";
-import { truncateToWidth } from "../utils";
+import { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "../utils";
 import { collapseCommand } from "../apps/ps-data";
+import { PREVIEW_LIMITS, shortenEmbeddedPaths } from "../render/render-utils";
 import { ansi, code, col, compact, item, node, row, span, stableKey, text } from "../native/describe";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { actionBar, actionButton, selectList } from "../native/overlay";
@@ -206,16 +207,36 @@ export class JobsSheet implements Component {
 		}
 		const detail = selected && this.#source.inspect(selected.id);
 		if (detail) {
+			const indent = " ".repeat(Math.min(3, Math.max(0, width - 1)));
+			const detailWidth = Math.max(1, width - indent.length);
+			// Rows show the cut label; the selected job's command wraps here,
+			// bounded so a long script never pushes the facts and output off the sheet.
+			if (detail.command) {
+				const commandRows = wrapTextWithAnsi(
+					shortenEmbeddedPaths(replaceTabs(sanitizeText(detail.command))),
+					detailWidth,
+				);
+				for (const line of commandRows.slice(0, PREVIEW_LIMITS.EXPANDED_LINES)) {
+					lines.push(truncateToWidth(`${indent}${line}`, width));
+				}
+				const hidden = commandRows.length - PREVIEW_LIMITS.EXPANDED_LINES;
+				if (hidden > 0) lines.push(truncateToWidth(`${indent}… ${hidden} more command lines`, width));
+			}
 			const facts = compact([
 				detail.cwd && `cwd ${detail.cwd}`,
 				detail.pids.length > 0 && `pid ${detail.pids.join(", ")}`,
 				detail.exitCode !== undefined && `exit ${detail.exitCode}`,
 				detail.artifactId && `artifact://${detail.artifactId}`,
 			]);
-			if (facts.length > 0) lines.push(truncateToWidth(`   ${facts.join(" · ")}`, width));
+			if (facts.length > 0) {
+				const text = shortenEmbeddedPaths(replaceTabs(sanitizeText(facts.join(" · "))));
+				for (const line of wrapTextWithAnsi(text, detailWidth)) {
+					lines.push(truncateToWidth(`${indent}${line}`, width));
+				}
+			}
 			if (detail.widget) {
-				for (const line of renderJobWidgetLines(detail.widget, Math.max(0, width - 3), theme)) {
-					lines.push(`   ${line}`);
+				for (const line of renderJobWidgetLines(detail.widget, detailWidth, theme)) {
+					lines.push(truncateToWidth(`${indent}${line}`, width));
 				}
 			}
 			for (const line of this.#tailLines(selected.id, detail.output ?? "")) {

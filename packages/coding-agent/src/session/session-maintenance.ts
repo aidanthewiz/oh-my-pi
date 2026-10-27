@@ -64,14 +64,16 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isRecord, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
 import type { ModelRegistry } from "../config/model-registry";
-import { getAllowedAvailableModels } from "../config/model-resolver";
+import { getAllowedAvailableModels, isModelEnabledBySettings } from "../config/model-resolver";
 import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
+import { all as allSettings } from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -162,15 +164,16 @@ function hasConfiguredCompactionMethod(settings: CompactionSettings): boolean {
 	return resolveCompactionMethodOrder(settings.methodOrder).length > 0;
 }
 
-/** Kept Anthropic thinking requires compaction by the same live model. */
+/** Kept Claude thinking (Anthropic Messages or Bedrock Converse) requires compaction by the same live model. */
 function canUseLiveProviderNativeCompaction(
 	candidate: Model,
 	liveModel: Model,
 	settings: EngineCompactionSettings,
 ): boolean {
+	const requiresSameModel = candidate.api === "anthropic-messages" || candidate.api === "bedrock-converse-stream";
 	return (
 		candidate.provider === liveModel.provider &&
-		(candidate.api !== "anthropic-messages" || (candidate.api === liveModel.api && candidate.id === liveModel.id)) &&
+		(!requiresSameModel || (candidate.api === liveModel.api && candidate.id === liveModel.id)) &&
 		shouldUseProviderNativeCompaction(candidate, settings)
 	);
 }
@@ -196,7 +199,7 @@ function isCompactionMethodUsable(
 	return candidate === "remote"
 		? canUseRemoteCompaction(model, resolveMethodSettings(settings, candidate))
 		: candidate === "snapcompact"
-			? !excludeMedia && model?.input.includes("image") === true
+			? !excludeMedia && model !== undefined && sendsImageInputOnWire(model)
 			: candidate === "handoff"
 				? reason !== "overflow"
 				: true;
@@ -1253,7 +1256,7 @@ export class SessionMaintenance {
 				if (method === "snapcompact") {
 					if (
 						explicitSnapcompact ||
-						(!customInstructions && !options?.internalGuidance && activeModel.input.includes("image"))
+						(!customInstructions && !options?.internalGuidance && sendsImageInputOnWire(activeModel))
 					) {
 						selectedMethod = method;
 						selectedMethodIndex = index;
@@ -1341,13 +1344,12 @@ export class SessionMaintenance {
 			const snapcompactShapeSetting = cfgSnapcompactShape.get(this.#host.settings);
 			let snapcompactShape: snapcompact.Shape | undefined;
 			const snapcompactIncludeThinking = snapcompact.readerIncludesThinking(this.#model);
-			if (wantsSnapcompact && !this.#model.input.includes("image")) {
-				this.#host.emitNotice(
-					"warning",
-					`snapcompact needs a vision-capable model (${this.#model.id} is text-only)`,
-					"compaction",
-				);
-				throw new Error(`snapcompact cannot run locally: ${this.#model.id} is text-only.`);
+			if (wantsSnapcompact && !sendsImageInputOnWire(this.#model)) {
+				const reason = this.#model.input.includes("image")
+					? `${this.#model.id}'s provider strips image input`
+					: `${this.#model.id} is text-only`;
+				this.#host.emitNotice("warning", `snapcompact needs a vision-capable model (${reason})`, "compaction");
+				throw new Error(`snapcompact cannot run locally: ${reason}.`);
 			} else if (snapcompactReady) {
 				const text = snapcompact.serializeConversation(
 					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
@@ -3587,15 +3589,73 @@ export class SessionMaintenance {
 		options?: SummaryOptions,
 		precomputedCandidates?: Model[],
 	): Promise<CompactionResult> {
+		const host = this.#host;
+		const sessionId = host.sessionId();
+		const sessionFile = host.sessionManager.getSessionFile();
+		const cwd = host.sessionManager.getCwd();
+		const generation = host.promptGeneration();
+		const liveModel = host.model();
+		const auth = host.modelRegistry.authStorage;
+		const credentials = auth.credentials;
+		const sourceIdentity = auth.sourceIdentity;
+		const policy = allSettings().map(setting => [
+			setting.id,
+			setting.get(host.settings),
+			host.settings.getProvenance(setting),
+		]);
+		const providerSessionState = host.providerSessionState;
+		const thinkingLevel = host.thinkingLevel();
+		const tools = host.agent.state.tools;
+		const promptCacheKey = host.agent.promptCacheKey ?? host.agent.sessionId;
+		const preferWebsockets = host.preferWebsockets();
+		const assertOwnerCurrent = (candidate: Model): void => {
+			signal.throwIfAborted();
+			if (
+				host.isDisposed() ||
+				host.sessionId() !== sessionId ||
+				host.sessionManager.getSessionFile() !== sessionFile ||
+				host.sessionManager.getCwd() !== cwd ||
+				host.promptGeneration() !== generation ||
+				host.model() !== liveModel ||
+				auth.isClosed ||
+				auth.credentials !== credentials ||
+				auth.sourceIdentity !== sourceIdentity ||
+				!isModelEnabledBySettings(candidate, host.settings, host.modelRegistry) ||
+				!Bun.deepEquals(
+					policy,
+					allSettings().map(setting => [
+						setting.id,
+						setting.get(host.settings),
+						host.settings.getProvenance(setting),
+					]),
+				)
+			) {
+				throw new Error("Compaction owner changed before provider dispatch.");
+			}
+		};
 		const candidates =
 			precomputedCandidates ??
 			this.#getCompactionModelCandidates(getAllowedAvailableModels(this.#host.modelRegistry, this.#host.settings));
-		const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
+		const telemetry = resolveTelemetry(host.agent.telemetry, sessionId);
 		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+			assertOwnerCurrent(candidate);
+			const apiKey = await host.modelRegistry.getApiKey(candidate, sessionId, { signal });
+			assertOwnerCurrent(candidate);
 			if (!apiKey) continue;
+			const accounts = () =>
+				auth.oauth
+					.accounts(candidate.provider, sessionId)
+					.filter(account => account.active)
+					.map(account => [account.credentialId, account.accountId, account.orgId, account.projectId]);
+			const accountSnapshot = accounts();
+			const assertDispatchCurrent = (): void => {
+				assertOwnerCurrent(candidate);
+				if (!Bun.deepEquals(accountSnapshot, accounts()))
+					throw new Error("Compaction account changed before provider dispatch.");
+			};
+			const resolver = host.modelRegistry.resolver(candidate, sessionId);
 			if (
 				nativeCompactionFailure &&
 				(candidate.provider !== nativeCompactionFailure.provider ||
@@ -3608,7 +3668,12 @@ export class SessionMaintenance {
 				return await compact(
 					this.#host.obfuscatePreparationForProvider(preparation),
 					candidate,
-					this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
+					async request => {
+						assertDispatchCurrent();
+						const resolved = await resolver(request);
+						assertDispatchCurrent();
+						return resolved;
+					},
 					this.#host.obfuscateTextForProvider(customInstructions),
 					signal,
 					{
@@ -3623,12 +3688,12 @@ export class SessionMaintenance {
 						// the manual `/compact` path. Clamped per-model inside compact()
 						// via resolveCompactionEffort so unsupported-effort models
 						// (xai-oauth/grok-build) don't trip requireSupportedEffort.
-						thinkingLevel: this.#host.thinkingLevel(),
-						tools: this.#host.agent.state.tools,
-						sessionId: this.#host.sessionId(),
-						promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
-						providerSessionState: this.#host.providerSessionState,
-						preferWebsockets: this.#host.preferWebsockets(),
+						thinkingLevel,
+						tools,
+						sessionId,
+						promptCacheKey,
+						providerSessionState,
+						preferWebsockets,
 						// Route every summarization HTTP request through the
 						// session's side-stream transport so the provider
 						// concurrency cap (e.g. providers.ollama-cloud.maxConcurrency)
@@ -3638,6 +3703,7 @@ export class SessionMaintenance {
 						// summary requests in parallel (chatgpt-codex review on
 						// #3751).
 						completeImpl: async (requestModel, requestContext, requestOptions) => {
+							assertDispatchCurrent();
 							const stream = await this.#host.sideStreamFn(requestModel, requestContext, requestOptions);
 							return stream.result();
 						},
@@ -4398,7 +4464,7 @@ export class SessionMaintenance {
 		// Re-rendering frames needs a vision-capable model, same gate as the
 		// snapcompact method.
 		const model = this.#model;
-		if (!model?.input.includes("image")) return undefined;
+		if (!model || !sendsImageInputOnWire(model)) return undefined;
 		const staleEntry = getLatestCompactionEntry(branchEntries);
 		if (!staleEntry) return undefined;
 		// Only rescue when the archive is the actual source of the overflow.

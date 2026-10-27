@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
+import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { searchAnthropic } from "@oh-my-pi/pi-coding-agent/web/search/providers/anthropic";
@@ -60,9 +61,8 @@ function makeCaptureFetch(): {
 	const fetch: FetchImpl = async (input, init) => {
 		capturedUrl = String(input);
 		capturedHeaders = new Headers(init?.headers);
-		const raw = init?.body;
-		const text =
-			typeof raw === "string" ? raw : raw instanceof Uint8Array ? new TextDecoder().decode(raw) : String(raw);
+		const text = requestBodyText(init);
+		if (text === undefined) throw new Error("Expected a JSON request body");
 		capturedBody = JSON.parse(text);
 		return new Response(
 			JSON.stringify({
@@ -133,6 +133,58 @@ describe("Anthropic search request body", () => {
 			expect(userId.session_id).toBe("session-2295");
 			expect(userId.account_uuid).toBe(accountUuid);
 			expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/);
+		} finally {
+			vi.restoreAllMocks();
+			await fixture.authStorage.close();
+		}
+	});
+
+	it("attributes an authentication retry to the account selected for that attempt", async () => {
+		const fixture = createCustomProviderFixture();
+		const accounts = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"];
+		let accountId: string | undefined;
+		let selections = 0;
+		vi.spyOn(fixture.authStorage.oauth, "identity").mockImplementation(() => ({ accountId }));
+		vi.spyOn(fixture.modelRegistry, "resolver").mockReturnValue(async () => {
+			accountId = accounts[selections++];
+			return `sk-ant-oat-account-${selections}`;
+		});
+		const attempts: Array<{ account: string; authorization: string | null }> = [];
+		const request: FetchImpl = async (_input, init) => {
+			const text = requestBodyText(init);
+			if (text === undefined) throw new Error("Expected a JSON request body");
+			const body = JSON.parse(text) as { metadata: { user_id: string } };
+			const userId = JSON.parse(body.metadata.user_id) as { account_uuid: string };
+			attempts.push({
+				account: userId.account_uuid,
+				authorization: new Headers(init?.headers).get("authorization"),
+			});
+			if (attempts.length === 1) return new Response("unauthorized", { status: 401 });
+			return new Response(
+				JSON.stringify({
+					id: "msg_rotated",
+					model: fixture.model.id,
+					content: [{ type: "text", text: "Selected account answer." }],
+					usage: { input_tokens: 3, output_tokens: 4 },
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		};
+		try {
+			const result = await searchAnthropic({
+				query: "account attribution",
+				systemPrompt: "Use web search.",
+				sessionId: "session-account-rotation",
+				authStorage: fixture.authStorage,
+				modelRegistry: fixture.modelRegistry,
+				model: fixture.model,
+				fetch: request,
+			});
+			expect(result.answer).toBe("Selected account answer.");
+			expect(attempts).toEqual([
+				{ account: accounts[0], authorization: ["Bearer", "sk-ant-oat-account-1"].join(" ") },
+				{ account: accounts[1], authorization: ["Bearer", "sk-ant-oat-account-2"].join(" ") },
+			]);
 		} finally {
 			vi.restoreAllMocks();
 			await fixture.authStorage.close();
@@ -273,6 +325,49 @@ describe("Anthropic search request body", () => {
 			expect(cap.headers()?.get("x-tenant")).toBe("tenant-a");
 		} finally {
 			await fixture.authStorage.close();
+		}
+	});
+});
+
+describe("Anthropic search answer", () => {
+	it("keeps cited fragments in one paragraph and breaks only where text resumes after a search", async () => {
+		const fixture = createFixture();
+		const citation = { type: "web_search_result_location", url: "https://pi.dev", title: "Pi", cited_text: "MCP" };
+		const fetch: FetchImpl = async () =>
+			new Response(
+				JSON.stringify({
+					id: "msg_test",
+					model: "claude-haiku-4-5",
+					content: [
+						{ type: "text", text: "Let me look that up." },
+						{ type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "pi mcp" } },
+						{ type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [] },
+						{ type: "text", text: "" },
+						{ type: "text", text: "His objection was that " },
+						{ type: "text", text: "MCP floods the context window", citations: [citation] },
+						{ type: "text", text: ". There is also a " },
+						{ type: "text", text: "model router", citations: [citation] },
+						{ type: "text", text: "." },
+					],
+					usage: { input_tokens: 1, output_tokens: 2 },
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		try {
+			const response = await searchAnthropic({
+				query: "pi mcp",
+				systemPrompt: "Use web search.",
+				authStorage: fixture.authStorage,
+				modelRegistry: fixture.modelRegistry,
+				model: fixture.model,
+				fetch,
+			});
+
+			expect(response.answer).toBe(
+				"Let me look that up.\n\nHis objection was that MCP floods the context window. There is also a model router.",
+			);
+		} finally {
+			fixture.authStorage.close();
 		}
 	});
 });

@@ -1,10 +1,15 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { type } from "@oh-my-pi/omptype";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import type { AssistantMessage, Context, Model, Tool } from "@oh-my-pi/pi-ai/types";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { bedrockHappyPathFrames, bedrockTestModel, withSkippedBedrockAuth } from "./helpers/bedrock-stream";
+import {
+	bedrockEvent,
+	bedrockHappyPathFrames,
+	bedrockTestModel,
+	withSkippedBedrockAuth,
+} from "./helpers/bedrock-stream";
 
 const PREFIX_BINDING_ERROR =
 	'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". That setting requires the "thinking-binding-controls-2026-08-01" value in the "anthropic-beta" header. The "system" prompt differs from the one this block was created with.';
@@ -73,8 +78,7 @@ function readRequest(init?: RequestInit): CapturedRequest {
 	return JSON.parse(json) as CapturedRequest;
 }
 
-function eventStreamResponse(): Response {
-	const frames = bedrockHappyPathFrames();
+function eventStreamResponse(frames = bedrockHappyPathFrames()): Response {
 	let index = 0;
 	return new Response(
 		new ReadableStream<Uint8Array>({
@@ -100,6 +104,10 @@ function mockedFetch(reply: (requestIndex: number) => Response) {
 }
 
 describe("Bedrock signed-thinking prefix mismatch recovery", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	it("retries without replayed reasoning while preserving tool history", async () => {
 		const { fetch, requests, wireRequests } = mockedFetch(requestIndex =>
 			requestIndex === 0 ? new Response(PREFIX_BINDING_ERROR, { status: 400 }) : eventStreamResponse(),
@@ -212,5 +220,44 @@ describe("Bedrock signed-thinking prefix mismatch recovery", () => {
 		});
 		expect(result?.stopReason).toBe("error");
 		expect(result?.errorMessage).toContain("bound to a different conversation");
+	});
+
+	it("keeps signed reasoning replayable after the API reports multiple drops", async () => {
+		const dropped = ["messages.1.content.0", "messages.1.content.1"].map(path => ({
+			type: "thinking_dropped",
+			path,
+			reason: "prefix_binding_mismatch",
+		}));
+		const frames = bedrockHappyPathFrames();
+		frames[3] = bedrockEvent(
+			"messageStop",
+			JSON.stringify({ stopReason: "end_turn", additionalModelResponseFields: { input_transformations: dropped } }),
+		);
+		const { fetch, requests } = mockedFetch(() => eventStreamResponse(frames));
+		let result: AssistantMessage | undefined;
+
+		await withSkippedBedrockAuth(async () => {
+			result = await streamBedrock(boundTarget, context, {
+				fetch,
+				maxTokens: 64,
+				reasoning: Effort.Medium,
+			}).result();
+			await streamBedrock(boundTarget, context, {
+				fetch,
+				maxTokens: 64,
+				reasoning: Effort.Medium,
+			}).result();
+		});
+
+		expect(result?.inputTransformations).toEqual(dropped);
+		expect(requests).toHaveLength(2);
+		const firstAssistant = requests[0]?.messages.find(message => message.role === "assistant");
+		const replayedAssistant = requests[1]?.messages.find(message => message.role === "assistant");
+		expect(
+			firstAssistant?.content.some(
+				block => typeof block === "object" && block !== null && "reasoningContent" in block,
+			),
+		).toBe(true);
+		expect(replayedAssistant?.content).toEqual(firstAssistant?.content);
 	});
 });

@@ -2123,6 +2123,14 @@ export class AgentSession implements SettingsScope {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
+				// A user interrupt is still in effect: background completions (async job
+				// results, launch completions, MCP/LSP/advisor asides) must not restart
+				// the run the user stopped. Fold them into context so the next deliberate
+				// prompt sees them — same policy as #resumeStrandedIrcAsides.
+				if (this.#advisors.autoResumeSuppressed) {
+					this.#foldStrandedIrcAsidesIntoContext(messages);
+					return;
+				}
 				const inFlightEpoch = this.#beginInFlight();
 				try {
 					await this.agent.prompt(messages.length === 1 ? first : messages);
@@ -5852,16 +5860,22 @@ export class AgentSession implements SettingsScope {
 		}
 		return this.#sessionTransitionScope;
 	}
-	/** Keep the journal stable until accepted widget and cache-warm usage settles. */
+	/** Keep the journal stable until accepted widget, extraction, and cache-warm usage settles. */
 	async #drainCacheWarmerForTransition(): Promise<void> {
 		await this.#ownedAsyncJobManager?.widgets?.drain();
-		if (!this.#cacheWarmer) return;
-		const timeout = new Error("Timed out draining cache warmer before session transition");
+		const state = getMnemopiSessionState(this);
+		const memory = state?.aliasOf ?? state;
+		if (!this.#cacheWarmer && !memory) return;
+		const timeout = new Error("Timed out draining utility usage before session transition");
 		try {
-			await withTimeout(this.#cacheWarmer.drain(), POST_PROMPT_DRAIN_TIMEOUT_MS, timeout);
+			await withTimeout(
+				Promise.all([this.#cacheWarmer?.drain(), memory?.consolidate({ retain: false, sleep: false })]),
+				POST_PROMPT_DRAIN_TIMEOUT_MS,
+				timeout,
+			);
 		} catch (error) {
 			if (error !== timeout) throw error;
-			logger.warn("Cache warmer still draining at session transition deadline", { error: String(error) });
+			logger.warn("Utility usage still draining at session transition deadline", { error: String(error) });
 			throw error;
 		}
 	}
@@ -6810,6 +6824,11 @@ export class AgentSession implements SettingsScope {
 	/** Current effective system prompt blocks (includes any per-turn extension modifications) */
 	get systemPrompt(): string[] {
 		return this.agent.state.systemPrompt;
+	}
+
+	/** Base system prompt blocks the next turn builds on, before any `before_agent_start` override. */
+	get baseSystemPrompt(): string[] {
+		return this.#tools.baseSystemPrompt;
 	}
 
 	/**
@@ -13184,7 +13203,11 @@ export class AgentSession implements SettingsScope {
 				isError: reanswer.isError === true,
 				timestamp: Date.now(),
 			};
-			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
+			// The new sibling answer itself becomes the leaf below (`branch(newLeafId)`),
+			// so it must not record the pre-navigation leaf as its own.
+			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId, {
+				preserveActiveLeaf: false,
+			});
 			isAskReanswerCompletion = true;
 		} else {
 			// Non-user message (or an agent/autoload skill-prompt injection): land the

@@ -23,6 +23,8 @@ import * as path from "node:path";
 import { getGithubCacheDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { defaultGhHost, parseRepoRef } from "./gh-common";
+import { ForgeCredentialsChangedError } from "../utils/forge-cli";
+import { getGithubConfigPath } from "../utils/github";
 import { cfgGithubCacheEnabled, cfgGithubCacheHardTtlSec, cfgGithubCacheSoftTtlSec } from "./settings";
 import { ToolAbortError } from "./tool-errors";
 
@@ -30,7 +32,7 @@ import { ToolAbortError } from "./tool-errors";
 // Storage layer
 // ────────────────────────────────────────────────────────────────────────────
 
-export type CacheKind = "issue" | "pr" | "pr-diff";
+export type CacheKind = "issue" | "pr" | "pr-diff" | "mr-diff";
 
 const DEFAULT_CACHE_AUTH_KEY = "default";
 
@@ -107,14 +109,14 @@ export function openDb(): Database | null {
 		// prepare() keeps the closed connection alive and the file locked on Windows.
 		const userVersion = (db.query("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
-		if (userVersion !== undefined && userVersion < 3) {
+		if (userVersion !== undefined && userVersion < 4) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
 		}
 		db.run(`
 			CREATE TABLE IF NOT EXISTS github_view_cache (
 				auth_key        TEXT    NOT NULL,
 				repo             TEXT    NOT NULL,
-				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-diff')),
+				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-diff','mr-diff')),
 				number           INTEGER NOT NULL,
 				include_comments INTEGER NOT NULL,
 				fetched_at       INTEGER NOT NULL,
@@ -124,7 +126,7 @@ export function openDb(): Database | null {
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
 			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
-			PRAGMA user_version = 3;
+			PRAGMA user_version = 4;
 		`);
 		protectDbFiles(dbPath);
 		cachedDb = db;
@@ -166,32 +168,146 @@ function sweepIfDue(hardTtlMs: number): void {
 	evictExpired(db, hardTtlMs);
 }
 
-function getGhConfigDir(): string {
-	const override = process.env.GH_CONFIG_DIR;
-	if (override) return override;
-	const xdg = process.env.XDG_CONFIG_HOME;
-	if (xdg) return path.join(xdg, "gh");
-	return path.join(os.homedir(), ".config", "gh");
-}
-
 function hashCacheIdentity(parts: string[]): string {
-	return Bun.hash(parts.map(part => `${part.length}:${part}`).join("|")).toString(36);
+	return new Bun.CryptoHasher("sha256").update(parts.map(part => `${part.length}:${part}`).join("|")).digest("hex");
 }
 
 /**
- * Memo for {@link resolveGithubCacheAuthKey}. Recomputed only when the token
- * env vars or the hosts.yml path/mtime change, so the per-lookup cost on the
- * cache hot path is four env reads plus one `stat` instead of a full file
- * read + hash.
+ * glab config file, following glab's search order: `GLAB_CONFIG_DIR` wins
+ * outright; otherwise the legacy `~/.config/glab-cli` path, then the
+ * XDG/platform config dir. Returns the first existing candidate, else the first.
  */
-interface AuthKeyMemoEntry {
-	envSig: string;
-	hostsPath: string;
-	hostsMtimeMs: number;
-	value: string | undefined;
+export function getGlabConfigPath(env: Readonly<Record<string, string | undefined>> = process.env): string {
+	const override = env.GLAB_CONFIG_DIR;
+	if (override) return path.join(override, "config.yml");
+	const home = (process.platform === "win32" ? env.USERPROFILE : env.HOME) || os.homedir();
+	const candidates = [path.join(home, ".config", "glab-cli", "config.yml")];
+	const xdg = env.XDG_CONFIG_HOME;
+	if (xdg) {
+		candidates.push(path.join(xdg, "glab-cli", "config.yml"));
+	} else if (process.platform === "darwin") {
+		candidates.push(path.join(home, "Library", "Application Support", "glab-cli", "config.yml"));
+	} else if (process.platform === "win32") {
+		const localAppData = env.LOCALAPPDATA ?? path.join(home, "AppData", "Local");
+		candidates.push(path.join(localAppData, "glab-cli", "config.yml"));
+	}
+	if (process.platform !== "win32") {
+		for (const directory of (env.XDG_CONFIG_DIRS || "/etc/xdg").split(path.delimiter)) {
+			if (path.isAbsolute(directory)) candidates.push(path.join(directory, "glab-cli", "config.yml"));
+		}
+	}
+	for (const candidate of candidates) {
+		try {
+			if (fs.statSync(candidate, { throwIfNoEntry: false })) return candidate;
+		} catch (err) {
+			logger.debug("github cache: failed to stat glab config candidate", { err: String(err), path: candidate });
+		}
+	}
+	return candidates[0]!;
 }
+
 const AUTH_KEY_TOKEN_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
-const authKeyMemo = new Map<string, AuthKeyMemoEntry>();
+/** Env vars glab reads tokens from; they apply to every host glab talks to. */
+export const GITLAB_TOKEN_ENV_VARS = ["GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "OAUTH_TOKEN"];
+
+/** Host-independent file/environment generation; does not assert keyring account identity. */
+export function getGlabCredentialSourceIdentity(
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+	return resolveCliCacheAuthKey(
+		"gitlab-source",
+		GITLAB_TOKEN_ENV_VARS,
+		getGlabConfigPath(env),
+		"glab-config",
+		env,
+		true,
+	)!;
+}
+
+function resolveCliCacheAuthKey(
+	host: string,
+	tokenEnvVars: readonly string[],
+	configPath: string,
+	configLabel: string,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+	sourceOnly = false,
+): string | undefined {
+	const parts: string[] = [`host:${host}`, `config-path:${configPath}`];
+	if (sourceOnly) {
+		for (const name of Object.keys(env).sort()) {
+			if (name !== "GLAB_CONFIG_DIR" && env[name] !== undefined) parts.push(`env:${name}:${env[name]}`);
+		}
+		parts.push(`env:GLAB_CONFIG_DIR:${path.dirname(configPath)}`);
+	}
+	let hasCredentialMaterial = sourceOnly;
+	for (const name of tokenEnvVars) {
+		const value = env[name];
+		if (!value) continue;
+		hasCredentialMaterial = true;
+		parts.push(`${name}:${value}`);
+	}
+	if (configLabel === "glab-config") {
+		for (const name of [
+			"GITLAB_API_HOST",
+			"GLAB_API_PROTOCOL",
+			"API_PROTOCOL",
+			"GITLAB_SUBFOLDER",
+			"GLAB_PROXY",
+			"PROXY",
+			"GLAB_CA_CERT",
+			"CA_CERT",
+			"GLAB_CLIENT_CERT",
+			"CLIENT_CERT",
+			"GLAB_CLIENT_KEY",
+			"CLIENT_KEY",
+			"GLAB_SKIP_TLS_VERIFY",
+			"SKIP_TLS_VERIFY",
+		]) {
+			if (env[name]) parts.push(`${name}:${env[name]}`);
+		}
+	}
+	try {
+		const contents = fs.readFileSync(configPath, "utf8");
+		const stat = fs.statSync(configPath, { bigint: true });
+		const link = fs.lstatSync(configPath, { bigint: true });
+		parts.push(
+			`source:${fs.realpathSync(configPath)}:${stat.dev}:${stat.ino}:${stat.ctimeNs}:${stat.mtimeNs}:${link.ino}:${link.ctimeNs}`,
+		);
+		parts.push(`${configLabel}:${contents}`);
+		if (!hasCredentialMaterial) {
+			const config = Bun.YAML.parse(contents) as Record<string, unknown> | null;
+			const entry =
+				configLabel === "glab-config"
+					? (config?.hosts as Record<string, unknown> | undefined)?.[host]
+					: config?.[host];
+			if (entry && typeof entry === "object") {
+				const auth = entry as {
+					token?: unknown;
+					oauth_token?: unknown;
+					user?: unknown;
+					users?: Record<string, { oauth_token?: unknown }>;
+					use_keyring?: unknown;
+				};
+				const keyring = auth.use_keyring === true || config?.use_keyring === true;
+				const token =
+					configLabel === "glab-config"
+						? auth.token
+						: (auth.oauth_token ??
+							(typeof auth.user === "string" ? auth.users?.[auth.user]?.oauth_token : undefined));
+				hasCredentialMaterial = !keyring && typeof token === "string" && token.length > 0;
+			}
+		}
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+			if (sourceOnly)
+				throw new ForgeCredentialsChangedError("Cannot bind the GitLab credential configuration source.");
+			logger.debug("github cache: failed to read CLI config for cache identity");
+		}
+	}
+	const digest = hashCacheIdentity(parts);
+	const value = hasCredentialMaterial ? `${host}:${digest}` : undefined;
+	return value;
+}
 
 /**
  * Best-effort local fingerprint for the active GitHub CLI credentials.
@@ -203,44 +319,20 @@ const authKeyMemo = new Map<string, AuthKeyMemoEntry>();
  * The DB stores only a hash, never the token or hosts.yml contents. If no
  * credential source is visible, callers should pass `null` to bypass caching.
  */
-export function resolveGithubCacheAuthKey(host: string = defaultGhHost()): string | undefined {
-	const hostsPath = path.join(getGhConfigDir(), "hosts.yml");
-	let envSig = "";
-	for (const name of AUTH_KEY_TOKEN_ENV_VARS) {
-		const value = process.env[name];
-		if (value) envSig += `${name}=${value.length}:${value}\0`;
-	}
-	let hostsMtimeMs = -1;
-	try {
-		hostsMtimeMs = fs.statSync(hostsPath, { throwIfNoEntry: false })?.mtimeMs ?? -1;
-	} catch (err) {
-		logger.debug("github cache: failed to stat gh hosts config for cache identity", { err: String(err) });
-	}
-	const memo = authKeyMemo.get(host);
-	if (memo && memo.envSig === envSig && memo.hostsPath === hostsPath && memo.hostsMtimeMs === hostsMtimeMs) {
-		return memo.value;
-	}
+export function resolveGithubCacheAuthKey(
+	host?: string,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string | undefined {
+	const resolvedHost = (host ?? (env.GH_HOST || "github.com")).toLowerCase();
+	return resolveCliCacheAuthKey(resolvedHost, AUTH_KEY_TOKEN_ENV_VARS, getGithubConfigPath(env), "hosts", env);
+}
 
-	const parts: string[] = [`host:${host}`];
-	let hasCredentialMaterial = false;
-	for (const name of AUTH_KEY_TOKEN_ENV_VARS) {
-		const value = process.env[name];
-		if (!value) continue;
-		hasCredentialMaterial = true;
-		parts.push(`${name}:${value}`);
-	}
-	try {
-		const hosts = fs.readFileSync(hostsPath, "utf8");
-		hasCredentialMaterial = true;
-		parts.push(`hosts:${hosts}`);
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-			logger.debug("github cache: failed to read gh hosts config for cache identity", { err: String(err) });
-		}
-	}
-	const value = hasCredentialMaterial ? `${host}:${hashCacheIdentity(parts)}` : undefined;
-	authKeyMemo.set(host, { envSig, hostsPath, hostsMtimeMs, value });
-	return value;
+/** GitLab counterpart of {@link resolveGithubCacheAuthKey}: glab token env vars and/or glab's config.yml. */
+export function resolveGitlabCacheAuthKey(
+	host: string,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string | undefined {
+	return resolveCliCacheAuthKey(host, GITLAB_TOKEN_ENV_VARS, getGlabConfigPath(env), "glab-config", env);
 }
 
 /**
@@ -431,7 +523,6 @@ export function resetForTests(): void {
 	cachedDb = null;
 	openAttempted = false;
 	lastSweepAt = 0;
-	authKeyMemo.clear();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -587,7 +678,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 				status: "fresh",
 				fetchedAt: cached.fetchedAt,
 			};
-		} else if (options.kind === "pr-diff") {
+		} else if (options.kind === "pr-diff" || options.kind === "mr-diff") {
 			scheduleBackgroundRefresh(
 				authKey,
 				options.repo,
@@ -610,7 +701,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 				storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
 				return { ...fresh, status: "refreshed", fetchedAt };
 			} catch (err) {
-				if (err instanceof ToolAbortError) throw err;
+				if (err instanceof ToolAbortError || err instanceof ForgeCredentialsChangedError) throw err;
 				logger.debug("github cache: synchronous refresh failed; returning stale view", {
 					err: String(err),
 					repo: options.repo,

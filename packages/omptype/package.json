@@ -1,6 +1,6 @@
 {
 	"name": "@oh-my-pi/omptype",
-	"version": "18.12.3",
+	"version": "18.12.4",
 	"description": "ArkType-compatible runtime schema validation with lazy JIT compilation",
 	"keywords": [
 		"arktype",

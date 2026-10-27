@@ -154,6 +154,87 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser click timeouts", () => {
 		}
 	}, 30_000);
 
+	test("bounds failed selector probes and disposes handles delivered after probe expiry", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const context = { session, toolCallId: "browser-uncountable" };
+		const tabName = `uncountable-${crypto.randomUUID()}`;
+		await prelude.invoke(
+			{
+				action: "open",
+				name: tabName,
+				url: `data:text/html,${encodeURIComponent('<!doctype html><p id="present">Present</p>')}`,
+			},
+			context,
+		);
+		try {
+			for (const [probe, timeout] of [
+				[`async () => { throw new Error("probe refused"); }`, 3],
+				[`() => Promise.withResolvers().promise`, 12],
+			] as const) {
+				const result = await prelude.invoke(
+					{
+						action: "run",
+						name: tabName,
+						code: `const original = Object.getOwnPropertyDescriptor(page, "$$");
+page.$$ = ${probe};
+try { await tab.click("#missing"); return "clicked"; }
+catch (error) { return error.name; }
+finally {
+	if (original) Object.defineProperty(page, "$$", original);
+	else delete page.$$;
+}`,
+						timeout,
+					},
+					context,
+				);
+				expect(valueFrom<string>(result)).toBe("ToolError");
+			}
+			const late = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `const original = Object.getOwnPropertyDescriptor(page, "$$");
+const query = page.$$;
+const released = Promise.withResolvers();
+const delivery = Promise.withResolvers();
+let disposed = 0;
+page.$$ = async () => {
+	const handles = await query("#present");
+	for (const handle of handles) {
+		const dispose = handle.dispose.bind(handle);
+		handle.dispose = async () => {
+			await dispose();
+			if (++disposed === 2) released.resolve();
+		};
+	}
+	await delivery.promise;
+	return handles;
+};
+try {
+	let errorName;
+	try { await tab.click("#missing"); } catch (error) { errorName = error.name; }
+	delivery.resolve();
+	await released.promise;
+	return { errorName, disposed };
+} finally {
+	delivery.resolve();
+	if (original) Object.defineProperty(page, "$$", original);
+	else delete page.$$;
+}`,
+					timeout: 12,
+				},
+				context,
+			);
+			expect(valueFrom<{ errorName: string; disposed: number }>(late)).toEqual({
+				errorName: "ToolError",
+				disposed: 2,
+			});
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 30_000);
+
 	test("rejects promptly when a text-click candidate evaluation is aborted", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");

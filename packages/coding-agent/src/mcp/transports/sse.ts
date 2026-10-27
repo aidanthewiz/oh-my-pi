@@ -10,8 +10,14 @@ import type {
 	MCPTransport,
 } from "../../mcp/types";
 import { toJsonRpcError } from "../../mcp/types";
-import { MCPTransportError, nonRetryableMCPTransportError, normalizeMCPTransportError } from "../errors";
+import {
+	createMCPJsonRpcError,
+	MCPTransportError,
+	nonRetryableMCPTransportError,
+	normalizeMCPTransportError,
+} from "../errors";
 import { RequestIdAllocator } from "../request-id";
+import { routeProgressNotification, withProgressToken } from "../progress";
 import { createMCPTimeout, getNeverAbortSignal, resolveMCPTimeoutMs } from "../timeout";
 import { type MCPFetchInit, mcpFetch } from "./header-policy";
 
@@ -28,6 +34,7 @@ interface PendingLegacySseRequest {
 	operation: MCPTimeoutOperation;
 	postController: AbortController;
 	abortHandler?: () => void;
+	onProgress?: MCPRequestOptions["onProgress"];
 }
 
 /** Identifies a legacy SSE transport whose endpoint handshake timed out. */
@@ -218,11 +225,9 @@ export class LegacySseTransport implements MCPTransport {
 			const pending = this.#pending.get(message.id);
 			if (pending) {
 				this.#pending.delete(message.id);
-				pending.operation.clear();
-				if (pending.abortHandler) pending.operation.signal?.removeEventListener("abort", pending.abortHandler);
 				const response = message as JsonRpcResponse;
 				if (response.error) {
-					pending.reject(new Error(`MCP error ${response.error.code}: ${response.error.message}`));
+					pending.reject(createMCPJsonRpcError("http", response.error));
 				} else {
 					pending.resolve(response.result);
 				}
@@ -234,6 +239,7 @@ export class LegacySseTransport implements MCPTransport {
 			return;
 		}
 		if ("method" in message && !("id" in message)) {
+			routeProgressNotification(message.method, message.params, token => this.#pending.get(token)?.onProgress);
 			this.onNotification?.(message.method, message.params);
 		}
 	}
@@ -253,7 +259,7 @@ export class LegacySseTransport implements MCPTransport {
 			jsonrpc: "2.0" as const,
 			id,
 			method,
-			params: params ?? {},
+			params: options?.onProgress ? withProgressToken(params, id) : (params ?? {}),
 		};
 		const timeout = resolveMCPTimeoutMs(this.#config.timeout);
 		const postController = new AbortController();
@@ -270,6 +276,7 @@ export class LegacySseTransport implements MCPTransport {
 			reject: deferred.reject,
 			operation,
 			postController,
+			onProgress: options?.onProgress,
 		};
 		if (operation.signal) {
 			pending.abortHandler = () => {
@@ -343,6 +350,10 @@ export class LegacySseTransport implements MCPTransport {
 				throw normalized;
 			}
 			throw nonRetryableMCPTransportError(normalized);
+		} finally {
+			this.#pending.delete(id);
+			operation.clear();
+			if (pending.abortHandler) operation.signal?.removeEventListener("abort", pending.abortHandler);
 		}
 	}
 
