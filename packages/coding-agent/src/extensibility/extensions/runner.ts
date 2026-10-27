@@ -34,6 +34,7 @@ import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
+import type { ExtensionMCPContext } from "../../mcp/types";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -283,6 +284,20 @@ function createHandlerContext(
 		enumerable: true,
 		configurable: true,
 	});
+	const mcp = ctx.mcp;
+	if (mcp) {
+		Object.defineProperty(scoped, "mcp", {
+			value: {
+				callTool: (serverName, toolName, args, options) =>
+					mcp.callTool(serverName, toolName, args, {
+						...options,
+						signal: options?.signal ? AbortSignal.any([options.signal, handlerSignal]) : handlerSignal,
+					}),
+			} satisfies ExtensionMCPContext,
+			enumerable: true,
+			configurable: true,
+		});
+	}
 	return scoped;
 }
 
@@ -509,6 +524,11 @@ export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
 
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	#mcp: ExtensionMCPContext = {
+		callTool: async () => {
+			throw new Error("MCP is unavailable for this session");
+		},
+	};
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
@@ -1059,6 +1079,10 @@ export class ExtensionRunner {
 		return this.#uiContext !== noOpUIContext;
 	}
 
+	setMCPContext(mcp: ExtensionMCPContext): void {
+		this.#mcp = mcp;
+	}
+
 	getExtensionPaths(): string[] {
 		return this.extensions.map(e => e.path);
 	}
@@ -1393,8 +1417,20 @@ export class ExtensionRunner {
 		const createAnnotations = this.#createAnnotations;
 		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
 			this.runtime.sendUserMessage(text, options);
+		const delegationSignal = delegation?.signal;
 		return {
 			ui: this.#uiContext,
+			mcp: delegationSignal
+				? {
+						callTool: (serverName, toolName, args, options) =>
+							this.#mcp.callTool(serverName, toolName, args, {
+								...options,
+								signal: options?.signal
+									? AbortSignal.any([options.signal, delegationSignal])
+									: delegationSignal,
+							}),
+					}
+				: this.#mcp,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),

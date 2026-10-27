@@ -122,6 +122,11 @@
           "type": "boolean",
           "description": "Whether OMP should try to connect this server."
         },
+        "exposeTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Set false to connect and cache normally but keep raw tools out of model catalogs. Session extensions can still call them. Supported by OMP-owned and managed configurations."
+        },
         "timeout": {
           "type": "number",
           "minimum": 0,
@@ -156,6 +161,7 @@
           "required": ["command"],
           "properties": {
             "enabled": {},
+            "exposeTools": {},
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},
@@ -204,6 +210,7 @@
           "required": ["type", "url"],
           "properties": {
             "enabled": {},
+            "exposeTools": {},
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},
@@ -241,6 +248,7 @@
           "required": ["type", "url"],
           "properties": {
             "enabled": {},
+            "exposeTools": {},
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},

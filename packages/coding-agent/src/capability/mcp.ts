@@ -17,6 +17,8 @@ export interface MCPServer {
 	name: string;
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Keep connected, but expose tools only to extension callers. */
+	exposeTools?: boolean;
 	/** Connection timeout in milliseconds */
 	timeout?: number;
 	/** Encoding for outgoing JSON-RPC request ids (default: `"number"`) */

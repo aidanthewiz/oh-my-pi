@@ -89,6 +89,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	const transport = server.transport ?? (server.command ? "stdio" : server.url ? "http" : "stdio");
 	const shared = {
 		enabled: server.enabled,
+		exposeTools: server.exposeTools,
 		timeout: server.timeout,
 		requestIdFormat: server.requestIdFormat,
 		instructions: server.instructions,
@@ -218,6 +219,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let sources: Record<string, SourceMeta> = {};
 	for (const server of result.items) {
 		configs[server.name] = convertToLegacyConfig(server);
+		if (forcedEnabled.has(server.name)) configs[server.name].enabled = true;
 		sources[server.name] = server._source;
 	}
 

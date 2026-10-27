@@ -167,6 +167,7 @@ import {
 } from "./mcp";
 import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
+import { createExtensionMCPContext } from "./mcp/extension-api";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
@@ -3450,6 +3451,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
 		toolSession.getToolContext = () => toolContextStore.getContext();
+		extensionRunner.setMCPContext(
+			createExtensionMCPContext(
+				() => toolSession.mcpManager,
+				extensionRunner,
+				() => toolContextStore.getContext(),
+			),
+		);
 		const setSessionActiveToolNames = (names: Iterable<string>): void => {
 			const snapshot = Array.from(names);
 			setActiveToolNames(snapshot);

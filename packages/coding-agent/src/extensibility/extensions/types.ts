@@ -82,6 +82,7 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
+import type { ExtensionMCPContext } from "../../mcp/types";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
@@ -276,6 +277,8 @@ export interface ExtensionApprovalPrompt {
 // and may be invoked from event handlers that have already taken the agent
 // loop's lock — hooks intentionally cannot.
 export interface ExtensionUIContext {
+	/** True only when this surface renders custom extension components. */
+	supportsCustomUI?: boolean;
 	/** True when selector timeouts start only after the dialog is presented. */
 	timeoutStartsOnPresentation?: boolean;
 	/** True when pasteToEditor updates a local or remote composer; absent means unsupported. */
@@ -640,6 +643,8 @@ export type ExtensionAnnotationsFactory = (
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
+	/** Session-scoped MCP calls when this context has an extension runner. */
+	mcp?: ExtensionMCPContext;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
 	mode: ExtensionMode;
 	/** Get current context usage for the active model. */

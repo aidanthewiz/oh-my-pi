@@ -373,6 +373,7 @@ export async function callTool(
 	args: Record<string, unknown> = {},
 	options?: MCPRequestOptions,
 ): Promise<MCPToolCallResult> {
+	options?.signal?.throwIfAborted();
 	if (connection.awsAnonymousBootstrap && isAuthenticatedAwsTool(connection.name, toolName)) {
 		throw new Error("AUTH_REQUIRED: authenticated AWS calls require a signed proxy connection.");
 	}
