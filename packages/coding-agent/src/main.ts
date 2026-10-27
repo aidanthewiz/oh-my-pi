@@ -192,7 +192,12 @@ import {
 	cfgOmitThinking,
 	cfgPrewalkEnabled,
 } from "./session/settings";
-import { cfgDisabledProviders, cfgEnabledModels } from "./config/model-settings";
+import {
+	cfgDisabledModels,
+	cfgDisabledProviders,
+	cfgEnabledModels,
+	cfgEnabledProviders,
+} from "./config/model-settings";
 import { cfgTaskAgentIdleTtlMs } from "./task/settings";
 import {
 	cfgPluginsPersistentAllowlist,
@@ -653,6 +658,7 @@ async function runInteractiveMode(
 	startupLease?: ComposerLease,
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
+	refreshScopedModelsAfterLogin?: () => Promise<void>,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -667,6 +673,7 @@ async function runInteractiveMode(
 			eventBus,
 			startupLease?.composer,
 			subagentEventBus,
+			refreshScopedModelsAfterLogin,
 		);
 		startupLease?.adopt();
 	} catch (error) {
@@ -1092,19 +1099,29 @@ export function toSessionScopedModels(
 	});
 }
 
-/** Whether two scope lists reference the same set of models (order-independent). */
-function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
-	if (a.length !== b.length) return false;
-	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
-	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
+/** Whether picker entries retain their order, catalog metadata, and thinking levels. */
+function sameScopedModelSet(
+	a: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+	b: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+): boolean {
+	return (
+		a.length === b.length &&
+		a.every(
+			(entry, index) =>
+				Bun.deepEquals(entry.model, b[index]?.model) && entry.thinkingLevel === b[index]?.thinkingLevel,
+		)
+	);
 }
 
 /** Minimal session surface the post-discovery scope rebuild mutates. */
 export interface ScopedModelSink {
 	readonly isDisposed: boolean;
+	readonly sessionId: string;
 	readonly scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void;
 }
+
+const scopedModelRebuildGenerations = new WeakMap<ScopedModelSink, number>();
 
 /**
  * Startup resolves an explicit model scope before background provider discovery.
@@ -1119,7 +1136,9 @@ export async function rebuildScopedModelsAfterDiscovery(
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "awaitBackgroundRefresh">,
 	activeSettings: Settings,
 ): Promise<void> {
+	const sessionId = session.sessionId;
 	await modelRegistry.awaitBackgroundRefresh();
+	if (session.isDisposed || session.sessionId !== sessionId) return;
 	await rebuildScopedModels(session, parsed, modelRegistry, activeSettings);
 }
 
@@ -1133,10 +1152,17 @@ export async function rebuildScopedModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 	activeSettings: Settings,
 ): Promise<ScopedModel[] | undefined> {
-	const patterns = parsed.models ?? cfgEnabledModels.get(activeSettings);
-	if (!patterns || patterns.length === 0) return undefined;
+	const generation = (scopedModelRebuildGenerations.get(session) ?? 0) + 1;
+	scopedModelRebuildGenerations.set(session, generation);
+	const sessionId = session.sessionId;
 	if (session.isDisposed) return undefined;
 	const rebuilt = await resolveEffectiveModelScope(parsed, modelRegistry, activeSettings);
+	if (
+		session.isDisposed ||
+		session.sessionId !== sessionId ||
+		scopedModelRebuildGenerations.get(session) !== generation
+	)
+		return undefined;
 	const mapped = toSessionScopedModels(rebuilt, activeSettings);
 	if (mapped.length === 0 || sameScopedModelSet(session.scopedModels, mapped)) return undefined;
 	session.setScopedModels(mapped);
@@ -1144,7 +1170,12 @@ export async function rebuildScopedModels(
 }
 
 /** Settings the scoped model list follows (see {@link watchScopedModelSettings}). */
-const cfgScopedModelInputs = combine({ enabledModels: cfgEnabledModels, disabledProviders: cfgDisabledProviders });
+const cfgScopedModelInputs = combine({
+	enabledModels: cfgEnabledModels,
+	disabledModels: cfgDisabledModels,
+	enabledProviders: cfgEnabledProviders,
+	disabledProviders: cfgDisabledProviders,
+});
 
 /**
  * Keep the Ctrl+P / scoped `/models` list in step with live settings: an
@@ -1160,23 +1191,24 @@ export function watchScopedModelSettings(
 	activeSettings: Settings,
 ): void {
 	const stop = cfgScopedModelInputs.listen(activeSettings, async (next, previous) => {
-		const providersChanged = !Bun.deepEquals(next.disabledProviders, previous.disabledProviders);
-		if (parsed.models && !providersChanged) return;
+		const generation = (scopedModelRebuildGenerations.get(session) ?? 0) + 1;
+		scopedModelRebuildGenerations.set(session, generation);
+		const sessionId = session.sessionId;
+		const providersChanged =
+			!Bun.deepEquals(next.disabledProviders, previous.disabledProviders) ||
+			!Bun.deepEquals(next.enabledProviders, previous.enabledProviders);
 		if (providersChanged) await modelRegistry.reapplyModelPolicies();
-		if (session.isDisposed) return;
-		const patterns = parsed.models ?? cfgEnabledModels.get(activeSettings);
-		const rebuilt =
-			patterns.length === 0
-				? []
-				: await resolveModelScope(
-						patterns,
-						modelRegistry,
-						getModelMatchPreferences(activeSettings),
-						activeSettings,
-					);
-		const mapped = toSessionScopedModels(rebuilt, activeSettings);
-		if (sameScopedModelSet(session.scopedModels, mapped)) return;
-		session.setScopedModels(mapped);
+		if (
+			session.isDisposed ||
+			session.sessionId !== sessionId ||
+			scopedModelRebuildGenerations.get(session) !== generation
+		)
+			return;
+		if ((parsed.models ?? next.enabledModels).length === 0) {
+			if (session.scopedModels.length > 0) session.setScopedModels([]);
+		} else {
+			await rebuildScopedModels(session, parsed, modelRegistry, activeSettings);
+		}
 	});
 	session.addDisposer(stop);
 }
@@ -2540,6 +2572,8 @@ export async function runRootCommand(
 
 			const {
 				session,
+				captureOwnerCurrent,
+				captureOwnerLifetimeCurrent,
 				setToolUIContext,
 				modelFallbackMessage,
 				lspServers,
@@ -2581,6 +2615,8 @@ export async function runRootCommand(
 			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
 				createPersistedSubagentReviverFactory({
 					session,
+					captureOwnerCurrent,
+					captureOwnerLifetimeCurrent,
 					authStorage,
 					modelRegistry,
 					settings: settingsInstance,
@@ -2630,6 +2666,9 @@ export async function runRootCommand(
 					);
 				}
 				void startBackgroundModelDiscovery?.();
+			};
+			const refreshScopedModelsAfterLogin = async () => {
+				await rebuildScopedModels(session, parsedArgs, modelRegistry, settingsInstance);
 			};
 			watchScopedModelSettings(session, parsedArgs, modelRegistry, settingsInstance);
 
@@ -2750,6 +2789,7 @@ export async function runRootCommand(
 						startupLease,
 						initialArgs.goal,
 						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
+						refreshScopedModelsAfterLogin,
 					);
 				} finally {
 					startupLease?.dispose();

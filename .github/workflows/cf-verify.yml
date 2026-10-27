@@ -208,9 +208,28 @@ jobs:
         env:
           OMP_NATIVE_CARGO_PROFILE: ci
         run: bun scripts/bazel-natives.ts host --dest packages/natives/native
+      - name: Verify Windows pipe relay closure
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows == '1'
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p brush-core --lib pipetap::tests:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($name in @("idle_producer_is_released_when_consumer_exits", "producer_eof_preserves_every_byte_and_closes_the_mirror", "windows_query_failure_is_not_eof")) {
+            if (-not ($relayOutput -match "^test pipetap::tests::$name \.\.\. ok$")) {
+              throw "Windows pipe relay case did not pass: $name"
+            }
+          }
       - name: Install verified released native addon
         if: needs.prepare.outputs.native_changed != 'true'
         run: bun scripts/ci-released-native.ts install "${{ needs.prepare.outputs.release_tag }}" "${{ matrix.target }}" packages/natives/native "${{ runner.temp }}/released-native"
+      - name: Install project-local TUI test dependencies
+        if: matrix.windows == '1'
+        run: bun install --cwd .omp/tools --frozen-lockfile
+      - name: Verify project-local Windows PTY behavior
+        if: matrix.windows == '1'
+        run: bun test ./.omp/tests/tui.test.ts --timeout 30000
       - name: Verify embedded Apple Foundation Models bridge
         if: matrix.target == 'darwin-arm64'
         run: |

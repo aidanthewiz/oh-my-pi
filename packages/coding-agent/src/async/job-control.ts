@@ -165,15 +165,17 @@ export function snapshotJobs(
 ): JobSnapshot[] {
 	const now = Date.now();
 	return jobs.map(j => {
-		const current = session.asyncJobManager?.getJob(j.id);
-		const latest = current ?? j;
-		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
+		const retained = session.asyncJobManager?.getJob(j.id);
+		const current = retained === j ? retained : undefined;
+		const latest = j;
+		const resultConsumed = current !== undefined && session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
 		let resolvedModel: string | undefined;
 		const exitCode = typeof latest.latestDetails?.exitCode === "number" ? latest.latestDetails.exitCode : undefined;
 		let resolvedModelIdentity: string | undefined;
 		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
 		let advisor = false;
 		let completionPercent: number | undefined;
+		let stage: string | undefined;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
 			if (Array.isArray(progressValue)) {
@@ -206,8 +208,17 @@ export function snapshotJobs(
 				if (typeof completionValue === "number" && Number.isFinite(completionValue)) {
 					completionPercent = completionValue;
 				}
+				const stageValue = progressRecord?.stage;
+				if (typeof stageValue === "string") {
+					const trimmed = stageValue.trim();
+					if (trimmed) stage = trimmed;
+				}
 			}
 		}
+		const widget =
+			current && (!resultConsumed || options.includeResults === false)
+				? session.asyncJobManager?.widgets?.view(current)
+				: undefined;
 		return {
 			id: latest.id,
 			type: latest.type,
@@ -220,6 +231,8 @@ export function snapshotJobs(
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
 			...(completionPercent !== undefined && latest.status === "running" ? { completionPercent } : {}),
+			...(stage ? { stage } : {}),
+			...(widget ? { widget } : {}),
 			...(!resultConsumed && options.includeResults !== false && latest.resultText
 				? { resultText: latest.resultText }
 				: {}),
@@ -253,10 +266,16 @@ export function buildJobResult(
 		return true;
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs, { includeResults: op !== "jobs" });
-	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
+	const alreadyConsumed = new Set(
+		uniqueJobs
+			.filter(job => manager.getJob(job.id) === job && manager.isJobResultConsumed(job.id))
+			.map(job => job.id),
+	);
 
 	if (op !== "jobs") {
-		manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+		manager.consumeJobResults(
+			uniqueJobs.filter(job => manager.getJob(job.id) === job && job.status !== "running").map(job => job.id),
+		);
 	}
 
 	const completed = jobResults.filter(j => j.status !== "running");
@@ -430,16 +449,17 @@ export async function cancelAgentRegistration(
 	if (ref.parentId !== ownerId) {
 		return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
 	}
+	const live = ref.session;
 	const lifecycle = session.agentLifecycle?.();
 	try {
-		if (ref.status === "running" && ref.session) {
-			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+		if (ref.status === "running" && live) {
+			await live.abort({ reason: USER_INTERRUPT_LABEL });
 		}
 		if (lifecycle) {
-			await lifecycle.release(id);
+			if (!(await lifecycle.release(id, ref))) await live?.dispose();
 		} else {
-			await ref.session?.dispose();
-			registry?.unregister(id);
+			await live?.dispose();
+			registry?.unregister(id, ref);
 		}
 	} catch (error) {
 		return {

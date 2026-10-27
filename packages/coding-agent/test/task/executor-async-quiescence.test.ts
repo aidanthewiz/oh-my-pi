@@ -74,6 +74,7 @@ function createAsyncSession(
 	let pendingAsync = true;
 	let runningJobs: Array<{ id: string; label?: string }> = [{ id: "job-1", label: "background build" }];
 	let toolCallSeq = 0;
+	let disposed = false;
 
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
@@ -131,6 +132,9 @@ function createAsyncSession(
 
 	const session = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -161,7 +165,10 @@ function createAsyncSession(
 			abortCount += 1;
 			await options.abort?.();
 		},
-		dispose: options.dispose ?? (async () => {}),
+		dispose: async () => {
+			disposed = true;
+			await options.dispose?.();
+		},
 	};
 	harness.session = session as unknown as AgentSession;
 	return harness;
@@ -170,6 +177,8 @@ function createAsyncSession(
 function mockCreateAgentSession(session: AgentSession) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

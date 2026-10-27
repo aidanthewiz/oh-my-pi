@@ -18,6 +18,7 @@
  * await auth.credentials.reload();
  * const apiKey = await auth.keys.get("anthropic", sessionId, { modelId });
  */
+import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import { SessionAffinity, type SessionRestrictions } from "./auth/affinity";
 import { BlockStoreHealth, CredentialBlocks } from "./auth/blocks";
@@ -94,13 +95,23 @@ export class AuthStorage {
 	#storeTransition: Promise<void> = Promise.resolve();
 	#closePromise?: Promise<void>;
 	#closed = false;
+	#sourceIdentity: string | undefined;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#options = options;
+		this.#sourceIdentity = options.sourceIdentity;
 		this.#overrides = new KeyOverrides(options.configValueResolver);
 		this.#policies = new AccountPolicies(options.accountPolicies ?? [], options.defaultReservePct);
 		this.#modules = this.#compose(store, options.sourceLabel);
 		if (options.onCredentialDisabled) this.#modules.pool.onDisabled(options.onCredentialDisabled);
+	}
+
+	get isClosed(): boolean {
+		return this.#closed;
+	}
+
+	get sourceIdentity(): string | undefined {
+		return this.#sourceIdentity;
 	}
 
 	/** Stored credential rows, change/disable events, broker snapshot. */
@@ -162,7 +173,10 @@ export class AuthStorage {
 	 * overrides, and credential event subscribers carry over. On a load failure,
 	 * `store` closes and the current store stays active.
 	 */
-	replaceStore(store: AuthCredentialStore, options: { sourceLabel?: string } = {}): Promise<void> {
+	replaceStore(
+		store: AuthCredentialStore,
+		options: { sourceLabel?: string; sourceIdentity?: string } = {},
+	): Promise<void> {
 		return this.#transitionStore(async () => {
 			const next = this.#compose(store, options.sourceLabel ?? this.#options.sourceLabel);
 			const previous = this.#modules;
@@ -179,6 +193,7 @@ export class AuthStorage {
 			next.pool.adoptSubscribers(previous.pool);
 			next.usage.adoptRuntimeProviders(previous.usage);
 			this.#modules = next;
+			this.#sourceIdentity = options.sourceIdentity;
 			previous.pool.close();
 			next.pool.bump("store-replaced");
 		});
@@ -313,7 +328,11 @@ export class AuthStorage {
 	/** Open the SQLite store at `dbPath` and wrap it (standalone use, e.g. the pi-ai CLI). */
 	static async create(dbPath: string, options: AuthStorageOptions = {}): Promise<AuthStorage> {
 		const store = await SqliteAuthCredentialStore.open(dbPath);
-		return new AuthStorage(store, options);
+		return new AuthStorage(store, {
+			...options,
+			sourceIdentity:
+				options.sourceIdentity ?? (dbPath && dbPath !== ":memory:" ? `sqlite:${path.resolve(dbPath)}` : undefined),
+		});
 	}
 
 	/** Drain admitted OAuth resolution and rate-limit operations before closing their store; do not reuse this instance. */

@@ -9,6 +9,7 @@ import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
+	AgentTool,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolApproval,
@@ -221,6 +222,11 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 
 	/** Capability tier declaration used by approval gates. Omitted means "exec". */
 	approval?: ToolApproval;
+
+	/** Exact targets an approval mode may remember for this call (`always-ask-cached`), one key per
+	 *  target, derived from the call's args. Omit it and approvals are never remembered per target. */
+	approvalCacheTargets?: AgentTool["approvalCacheTargets"];
+	approvalCacheIdentity?: AgentTool["approvalCacheIdentity"];
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;

@@ -462,6 +462,16 @@ describe("interactive collaboration startup", () => {
 						await options.sessionManager?.close();
 						return {
 							session: testSession.session,
+							captureOwnerCurrent: () => {
+								const ownerId = testSession.sessionManager.getSessionId();
+								return () =>
+									!testSession.session.isDisposed && testSession.sessionManager.getSessionId() === ownerId;
+							},
+							captureOwnerLifetimeCurrent: () => {
+								const ownerId = testSession.sessionManager.getSessionId();
+								return () =>
+									!testSession.session.isDisposed && testSession.sessionManager.getSessionId() === ownerId;
+							},
 							setToolUIContext: () => {},
 							extensionsResult: options.preloadedExtensions,
 							eventBus: options.eventBus,
@@ -803,6 +813,16 @@ describe("interactive collaboration startup", () => {
 							await options?.sessionManager?.close();
 							return {
 								session: testSession.session,
+								captureOwnerCurrent: () => {
+									const ownerId = testSession.sessionManager.getSessionId();
+									return () =>
+										!testSession.session.isDisposed && testSession.sessionManager.getSessionId() === ownerId;
+								},
+								captureOwnerLifetimeCurrent: () => {
+									const ownerId = testSession.sessionManager.getSessionId();
+									return () =>
+										!testSession.session.isDisposed && testSession.sessionManager.getSessionId() === ownerId;
+								},
 								setToolUIContext: () => {},
 								extensionsResult: options.preloadedExtensions,
 								eventBus: options.eventBus,

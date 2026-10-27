@@ -452,6 +452,7 @@ export class ChainJudge implements Judge {
 				rejections.delete(identity);
 			}
 			try {
+				this.#assertModelEnabled(candidate.model);
 				const fitted =
 					isJudgmentApi(candidate.model.api) && request?.images?.length
 						? await fitNativeImages(candidate.model, request.images)
@@ -474,7 +475,15 @@ export class ChainJudge implements Judge {
 					continue;
 				}
 				compatibleCandidate = true;
-				return await run(judge, kindOf(candidate), candidate.model, fitted);
+				const admittedJudge: Judge = {
+					label: judge.label,
+					...(judge.supportsImages === undefined ? {} : { supportsImages: judge.supportsImages }),
+					judge: (request, options) => {
+						this.#assertModelEnabled(candidate.model);
+						return judge.judge(request, options);
+					},
+				};
+				return await run(admittedJudge, kindOf(candidate), candidate.model, fitted);
 			} catch (error) {
 				if (signal?.aborted) {
 					throw signal.reason instanceof Error ? signal.reason : new AIError.AbortError("judgment aborted");
@@ -546,13 +555,22 @@ export class ChainJudge implements Judge {
 		return list;
 	}
 
+	#assertModelEnabled(model: Model): void {
+		if (!isModelEnabledBySettings(model, this.#deps.settings, this.#deps.registry)) {
+			throw new Error(`judgment: model disabled by settings: ${formatModelStringWithRouting(model)}`);
+		}
+	}
+
 	async #createJudge(candidate: RoleChainCandidate, signal: AbortSignal | undefined): Promise<Judge | undefined> {
 		const model = candidate.model;
+		this.#assertModelEnabled(model);
 		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id));
 		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
+		this.#assertModelEnabled(model);
 		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);
 		if (isJudgmentApi(model.api)) {
 			const headers = await this.#deps.registry.resolveModelHeaders(model, signal);
+			this.#assertModelEnabled(model);
 			const judge = createNativeJudge(model, { apiKey, headers });
 			return nativeJudge(judge, model, this.#deps.cache, attempt => this.#report(attempt));
 		}

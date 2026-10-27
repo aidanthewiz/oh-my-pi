@@ -22,7 +22,16 @@ import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file
 import { type FileMatchSection, formatFileMatches } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
 
-import { relativeSearchResultPath, resolveSearchResultPath, resolveToolSearchScope } from "./path-utils";
+import {
+	expandDelimitedPathEntries,
+	parseSearchPathPreferringLiteral,
+	relativeSearchResultPath,
+	resolveSearchResultPath,
+	resolveToolSearchScope,
+	searchPathTier,
+} from "./path-utils";
+import { searchApprovalCacheTargets } from "./search-approval-targets";
+import { approvalTargetIdentities } from "./approval-targets";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isRawSelector } from "./read-selector";
 import { capParseErrors, formatCodeFrameLine, formatParseErrors } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -135,7 +144,26 @@ async function runMultiTargetAstGrep(
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
 	readonly name = "ast_grep";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	readonly approvalCacheTargets = (args: unknown): Promise<readonly string[]> => this.#approvalTargets(args);
+	readonly approvalCacheIdentity = async (args: unknown) =>
+		approvalTargetIdentities(
+			this.session.cwd,
+			await this.#approvalTargets(args, true),
+			sessionResolveContext(this.session),
+		);
+
+	async #approvalTargets(args: unknown, includePublic = false): Promise<readonly string[]> {
+		const roots = toPathList((args as { path?: string } | null | undefined)?.path);
+		return searchApprovalCacheTargets(
+			await expandDelimitedPathEntries(roots.length > 0 ? roots : ["."], this.session.cwd),
+			this.session.cwd,
+			async entry => (await parseSearchPathPreferringLiteral(entry, this.session.cwd)).basePath,
+			() => true,
+			includePublic,
+			sessionResolveContext(this.session),
+		);
+	}
 	readonly label = "AST Grep";
 	readonly summary = "Search code with AST patterns (structural grep)";
 	get description(): string {

@@ -3,7 +3,7 @@
  *
  * Replaces the old auto-reply model: a `send` never blocks on the recipient
  * generating anything. Delivery resolves the recipient via the global
- * AgentRegistry — parked agents are revived through the
+ * AgentRegistry — parked and killed agents are revived through the
  * AgentLifecycleManager, idle agents are woken with a real turn, and busy
  * agents receive the message as a non-interrupting aside at the next step
  * boundary (see AgentSession.deliverIrcMessage).
@@ -109,13 +109,6 @@ export class IrcBus {
 				error: `Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`,
 			};
 		}
-		if (ref.status === "aborted") {
-			return {
-				to: message.to,
-				outcome: "failed",
-				error: `Agent "${message.to}" was hard-aborted and cannot be messaged or revived. Its transcript remains readable at history://${message.to}.`,
-			};
-		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {
 			return {
@@ -125,25 +118,37 @@ export class IrcBus {
 			};
 		}
 
-		// A `parked` recipient always needs the lifecycle to revive it — this is
-		// read from *this* bus's registry, so it holds for any registry. The
-		// mid-park / adopted checks below query the lifecycle's own state, which
-		// only describes the registry it manages: consult them only when the
-		// lifecycle owns this bus's registry, otherwise a custom-registry bus
-		// (fallen back to the global manager) would gate a live recipient on
-		// unrelated global park state. Main/non-adopted live peers skip the gate,
-		// and pending waiters still win without a session.
+		// A `parked` or killed (`aborted`) recipient always needs the lifecycle to
+		// revive it from its transcript — this is read from *this* bus's registry,
+		// so it holds for any registry. The mid-park / adopted checks below query
+		// the lifecycle's own state, which only describes the registry it manages:
+		// consult them only when the lifecycle owns this bus's registry, otherwise
+		// a custom-registry bus (fallen back to the global manager) would gate a
+		// live recipient on unrelated global park state. Main/non-adopted live
+		// peers skip the gate, and pending waiters still win without a session.
 		const lifecycle = this.#lifecycle();
 		const lifecycleOwnsRegistry = lifecycle.manages(this.#registry);
 		const needsLifecycleGate =
 			ref.status === "parked" ||
+			ref.status === "aborted" ||
 			(lifecycleOwnsRegistry && (lifecycle.isParking(message.to) || lifecycle.has(message.to)));
 
 		const priorSession = ref.session;
+		let deliveryRef = ref;
+		let session = priorSession;
 		let revived = false;
 		if (needsLifecycleGate) {
+			if (!lifecycleOwnsRegistry) {
+				return { to: message.to, outcome: "failed", error: "Recipient lifecycle does not own this registry." };
+			}
 			try {
 				const liveSession = await untilAborted(opts?.signal, () => lifecycle.ensureLive(message.to));
+				const liveRef = this.#registry.get(message.to);
+				if (!liveRef || liveRef.session !== liveSession || liveRef.status === "aborted") {
+					throw new Error(`Agent "${message.to}" changed before its message could be delivered.`);
+				}
+				deliveryRef = liveRef;
+				session = liveSession;
 				// Revival = we did not keep the same live instance (parked start, or
 				// park completed and a fresh session was rebuilt).
 				revived = !priorSession || liveSession !== priorSession;
@@ -162,6 +167,13 @@ export class IrcBus {
 		if (opts?.signal?.aborted) {
 			return { to: message.to, outcome: "failed", error: "Peer delivery was cancelled or timed out." };
 		}
+		if (
+			this.#registry.get(message.to) !== deliveryRef ||
+			deliveryRef.session !== session ||
+			deliveryRef.status === "aborted"
+		) {
+			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" changed before delivery.` };
+		}
 
 		// A pending `wait` from the recipient consumes the message directly —
 		// it is returned from their irc tool call and never hits the inbox or
@@ -173,7 +185,6 @@ export class IrcBus {
 			return { to: message.to, outcome: revived ? "revived" : "injected" };
 		}
 
-		const session = this.#registry.get(message.to)?.session;
 		if (!session) {
 			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" has no live session.` };
 		}
@@ -187,7 +198,7 @@ export class IrcBus {
 			// the message so a later `wait`/`inbox` from the recipient can still
 			// pick it up. The receipt stays "failed" — the recipient has not
 			// seen it.
-			this.#enqueue(message);
+			if (this.#registry.get(message.to) === deliveryRef && deliveryRef.session === session) this.#enqueue(message);
 			return {
 				to: message.to,
 				outcome: "failed",

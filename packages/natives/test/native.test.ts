@@ -19,14 +19,18 @@ import {
 	highlightCode,
 	htmlToMarkdown,
 	invalidateFsScanCache,
+	LineMatcher,
 	listWorkspace,
 	macOSCheckSpelling,
 	macOSSpellCheckerAvailable,
 	matchesKey,
+	normalizePtyDimensions,
 	PowerAssertion,
 	PtySession,
 	parseKey,
 	pdfToMarkdown,
+	PipeStreams,
+	Shell,
 	summarizeCode,
 	supportsLanguage,
 	truncateToWidth,
@@ -104,6 +108,41 @@ describe("countTokens", () => {
 			expect(typeof n).toBe("number");
 			expect(n).toBeGreaterThan(0);
 		}
+	});
+});
+
+describe("LineMatcher", () => {
+	it("returns UTF-16 captures in line and rule order with absent groups", () => {
+		const matcher = new LineMatcher([String.raw`(?<mark>\S) (?<name>\S+) (?<n>\d+)(?<unit>ms)?`, "(?<n>7)"]);
+		expect(matcher.groupNames()).toEqual([["mark", "name", "n", "unit"], ["n"]]);
+		const result = matcher.matchLines("𝄞 x 12\r\nnone\n✓ y 7");
+		expect(result.lines).toEqual(new Uint32Array([0, 2, 2]));
+		expect(result.rules).toEqual(new Uint32Array([0, 0, 1]));
+		expect(result.spans).toEqual(new Int32Array([0, 2, 3, 4, 5, 7, -1, -1, 0, 1, 2, 3, 4, 5, -1, -1, 4, 5]));
+	});
+});
+
+describe("PipeStreams", () => {
+	it("keeps raw completed pipeline bytes isolated between runs of one shell", async () => {
+		const shell = new Shell({ clearEnv: true });
+		const first = new PipeStreams();
+		const second = new PipeStreams();
+		const run = await shell.run({ command: "printf '界𝄞' | cat", streams: first });
+		expect(run.exitCode).toBe(0);
+		expect(first.read(1)).toEqual({ start: 0, end: 7, data: Buffer.from("界𝄞"), open: false });
+		const next = await shell.run({ command: "printf 'next' | cat", streams: second });
+		expect(next.exitCode).toBe(0);
+		expect(second.read(1)).toEqual({ start: 0, end: 4, data: Buffer.from("next"), open: false });
+		expect(first.read(1, 3)).toEqual({ start: 3, end: 7, data: Buffer.from("𝄞"), open: false });
+		expect(first.read(2)).toBeNull();
+	});
+});
+
+describe("normalizePtyDimensions", () => {
+	it("truncates and clamps the screen viewport to native PTY bounds", () => {
+		expect(normalizePtyDimensions(119.9, 39.9)).toEqual({ cols: 119, rows: 39 });
+		expect(normalizePtyDimensions(-50, 0)).toEqual({ cols: 20, rows: 5 });
+		expect(normalizePtyDimensions(1000, 1000)).toEqual({ cols: 400, rows: 200 });
 	});
 });
 
@@ -1157,6 +1196,42 @@ try {
 
 			expect(cleaned).toContain("Main content");
 			// Navigation/footer may or may not be removed depending on preprocessing
+		});
+
+		it("keeps collapsed sections only with hiddenContent reachable, never template content", async () => {
+			const html = `<main>
+<h2>Product information</h2>
+<button aria-expanded="false">Item details</button>
+<div style="display:none"><p>Country of Origin: India</p></div>
+<template><p>Template-only claim</p></template>
+</main>`;
+
+			const dropped = await htmlToMarkdown(html);
+			const reachable = await htmlToMarkdown(html, { hiddenContent: "reachable" });
+
+			expect(dropped).toContain("Product information");
+			expect(dropped).not.toContain("Country of Origin: India");
+			expect(reachable).toContain("Country of Origin: India");
+			expect(reachable).not.toContain("Template-only claim");
+		});
+
+		it("includes inert content only with hiddenContent all", async () => {
+			const html =
+				"<main><p>Visible text</p><template><p>Template text</p></template><noscript><p>Fallback text</p></noscript></main>";
+			for (const hiddenContent of ["drop", "reachable"]) {
+				const markdown = await htmlToMarkdown(html, { hiddenContent });
+				expect(markdown).toContain("Visible text");
+				expect(markdown).not.toContain("Template text");
+				expect(markdown).not.toContain("Fallback text");
+			}
+			const markdown = await htmlToMarkdown(html, { hiddenContent: "all" });
+			expect(markdown).toContain("Visible text");
+			expect(markdown).toContain("Template text");
+			expect(markdown).toContain("Fallback text");
+		});
+
+		it("rejects an unknown hiddenContent value", async () => {
+			expect(() => htmlToMarkdown("<p>text</p>", { hiddenContent: "visible" })).toThrow(/hiddenContent/);
 		});
 
 		it("should reject depth-truncated HTML", async () => {

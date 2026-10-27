@@ -57,6 +57,8 @@ Per-call model overrides are supported only for seance consultations. For ordina
 | `isolated` | `boolean` | No | Run in an isolated workspace and capture patches/branch changes. Present only when `task.isolation.enabled` is true and plan mode is disabled. Kept-alive task agents retain their workspace through idle/parked transitions and can be revived; release captures final changes and cleans the workspace. Item field in batch shape, top-level in flat shape. |
 
 
+Runtime applies the shared agent-id sanitizer in both execution modes: `[A-Za-z0-9_-]`, at most 48 characters. Separators cannot escape artifact directories or nested source namespaces.
+
 There is no wire label field: the one-line UI label shown in the TUI/registry is generated automatically from the `task` text by the tiny/title model (fire-and-forget), so callers never provide it.
 
 Users can tag models with `^` in the composer. The resulting session-local `m1`, `m2`, … pseudonyms are accepted as `agent` by task, eval `agent()`, and `workpool()`; each uses the bundled task template pinned to the tagged selector. See [user-tagged model agents](../task-agent-discovery.md#user-tagged-model-agents) for persistence, boundaries, and precedence.
@@ -77,7 +79,7 @@ Background response (`async.enabled=true`):
 
 - `content`: `` Spawned agent `<id>` (job `<jobId>`). `` A batch call instead returns `` Spawned N background agents using <agent types>. ... `` (the deduped per-item agent types, comma-joined) with a per-agent `- `<id>` (job `<jobId>`)` listing.
 - `details`: `{ projectAgentsDir, results, totalDurationMs, progress: [<AgentProgress per spawn>], async: { state, jobId, type: "task" } }`. The call keeps one shared `progress[]` snapshot; `async.jobId` is the first started job and `async.state` aggregates over the async spawns ("running" until every job settles, "failed" if any spawn failed) — jobs that settled before the call returned are already reflected. A mixed call's `results` carries the blocking spawns' inline `SingleResult`s (pure background calls return `results: []`).
-- Live progress streams into the same tool block via `onUpdate(...)`; final results arrive as async-result injections. Non-isolated completions get an idle/follow-up hint when messaging is enabled. Budget-stopped resumable agents get a resume hint; hard aborts point at the transcript. The current `task-follow-up.md` template still labels isolated runs non-resumable, despite the retained-workspace lifecycle described below.
+- Live progress streams into the same tool block via `onUpdate(...)`; final results arrive as async-result injections. Non-isolated completions get an idle/follow-up hint when messaging is enabled. Aborted agents that can be resumed get a resume hint; isolated runs point at the transcript. The current `task-follow-up.md` template still labels isolated runs non-resumable, despite the retained-workspace lifecycle described below.
 
 Settled response (`async.enabled=false`, no job manager, every item's agent `blocking: true`, or async job body):
 - `content`: summary rendered from `packages/coding-agent/src/prompts/tools/task-summary.md` with a preview capped at 5000 chars; `agent://<id>` holds the full output. A sync batch concatenates the per-spawn summaries.
@@ -93,11 +95,22 @@ Settled response (`async.enabled=false`, no job manager, every item's agent `blo
 - extracted tool data: `extractedToolData?` from registered subprocess tool handlers such as `yield`
 
 Artifacts and side channels:
-- Every subagent with an artifacts dir writes `<id>.md`; `agent://<id>` resolves to that file.
-- Structured payloads with a `data` value also write `<id>.json`, even when schema-invalid. JSON-path reads prefer this sidecar and fall back to parsing `<id>.md`; a later output without structured data removes a stale sidecar.
+- A current initial run writes `<id>.md`; `agent://<id>` resolves to that file. Cancelled or retired publication cannot replace accepted output.
+- Structured payloads with a `data` value also write `<id>.json`, even when schema-invalid. JSON-path reads prefer this sidecar. Plain accepted reports remove stale sidecars.
 - A subagent's own children are dot-qualified (`<id>.<child>`); `agent://<id>.<child>` reads that nested output. A slash path is always JSON extraction: `agent://<id>/<key>/<index>/…` extracts that value from a JSON output (e.g. `agent://<id>.<child>/reports/0/data`).
 - Each subagent gets `<id>.jsonl` session history when the parent persists artifacts; `history://<id>` renders it as a concise transcript (works for live and parked agents).
 - Isolated patch mode writes `<id>.patch` before merge; nested changes write `<id>.nested-<n>-<path>.patch` files in both merge modes.
+- Initial, explicit follow-up, and wake finalizers share per-path ordering. Publication checks the originating registry generation and session after preparing output.
+- Markdown and JSON remain separate files; these writes do not provide a filesystem-wide atomic pair transaction.
+
+Task widgets read finished tool calls from the originating run's `tools` tap. Nested job sources use `<jobId>:<sourceId>`.
+Each finished result retains its newest 64 Ki characters. The adapter exposes at most 64 sources and retires replaced or absent sources.
+Stage, watch, and parent intent describe progress. Widget visibility does not authorize model requests, tools, provider access, or cancellation.
+Completion probes return bounded JSON percentage, stage, and watch fields. They remain restricted to enabled, interactive, direct-child runs.
+Initial dispatch retains its original caller admission through successful startup. Parking retains the same transcript lifetime, not the disposed execution harness.
+Each explicit resume captures fresh admission from the original owner. Model dispatch and publication still refuse retired root, journal, credential, and account authority.
+Missing originating-root widget readiness permits local derivation only, never remote widget authoring.
+
 
 ## Flow
 1. `TaskTool.create(...)` discovers agents through a process-level memo keyed by resolved cwd and effective extension roots (`discoverAgentsForCreate`). `refreshAgentDiscovery(...)` replaces the matching description snapshot after explicit reloads.
@@ -122,12 +135,13 @@ Artifacts and side channels:
 13. Child tool availability starts from explicit `agent.tools` when provided; auto-add `task` for declared spawns below the depth limit. Explicit lists containing `task`/`bash` gain `wait` unless restricted, and the registry still requires an async/IRC/service wake source. `exec` expands to `bash` plus `eval` when a backend is enabled. Outbound messaging requires explicit `write`, while inbound steering does not. Parent-owned `todo` is stripped unless prewalk is armed.
 14. Ordinary task agents must finish through the hidden `yield` tool; up to 3 reminder prompts, the last forcing `toolChoice = yield` when supported. `finalizeSubprocessOutput(...)` reconciles raw text, `yield` payloads, structured schemas, and abort states. Seance consultations use the completion contract below.
 15. End-of-run lifecycle (keep-alive, in the run finalizer):
-    - caller signal, wall-clock timeout, or internal hard abort → registry status `aborted`, session disposed — terminal;
-    - soft-request-budget abort on a kept-alive agent with a reviver → treated as resumable: the agent becomes `idle` and may receive a follow-up/revival;
-    - manager shutdown → dispose/unregister the process-local session without a hard-kill tombstone;
+    - caller signal, user interrupt, wall-clock timeout, or soft-request-budget abort on a kept-alive agent with a reviver → only the run stops: the agent becomes `idle` and may receive a follow-up/revival;
+    - explicit kill (Agent Hub, RPC `cancel_subagent`, collab, vibe), or an aborted agent without a reviver → registry status `aborted`, session disposed, kill tombstone written; a later message or Hub revive reopens the transcript as a fresh `parked` generation, removes the tombstone, and revives it;
+    - manager shutdown → dispose/unregister the process-local session without a kill tombstone;
+    - a retired root session, account admission, or credential store cannot revive through a captured child owner; normal idle parking does not grant new authority;
     - isolated kept-alive run → follows the same idle/parking/revival path while retaining its workspace; explicit release captures final patches/branch state and cleans the isolation handle;
     - everything else (success and failure alike) → status `idle` with the live session attached, and `AgentLifecycleManager.global().adopt(id, { idleTtlMs, revive })` arms the park timer. The reviver reopens the session JSONL.
-16. Lifecycle thereafter: `idle` agents are parked after `task.agentIdleTtlMs` (session disposed; `AgentRef` + session file retained); `write agent://<id>` or the Agent Hub revives them back to `idle`. `"Main"` is never parked.
+16. Lifecycle thereafter: `idle` agents are parked after `task.agentIdleTtlMs` (session disposed; `AgentRef` + session file retained); `write agent://<id>` or the Agent Hub revives parked and killed agents back to `idle`. `"Main"` is never parked.
 
 ## Modes / Variants
 - Execution mode
@@ -161,7 +175,7 @@ Artifacts and side channels:
   - Allocates session-scoped output ids through `AgentOutputManager` so `agent://` stays unique across invocations.
   - Shares the parent `local://` root and `ArtifactManager` with subagents.
 - Background work / cancellation
-  - `write proc://<jobId>/kill` (no `content` needed) or parent tool-call abort cancels background jobs; parent tool-call abort cancels sync runs through the call signal. A hard-aborted run lands `aborted` and is torn down. An owned running subagent without a job can be cancelled through `proc://<agentId>/kill`, which aborts and releases its session.
+  - `write proc://<jobId>/kill` (no `content` needed) or parent tool-call abort cancels background jobs; parent tool-call abort cancels sync runs through the call signal. A cancelled run stops but its agent stays `idle` and resumable. An owned running subagent without a job can be cancelled through `proc://<agentId>/kill`, which aborts and releases its session.
   - Missing-`yield` recovery sends up to three internal reminder prompts to the child session.
 
 ## Limits & Caps
@@ -199,6 +213,7 @@ Artifacts and side channels:
 - Peer-messaging availability is derived, not configured (`isIrcEnabled` in the messaging helper): it requires a caller with `write` and someone to message — the session can spawn subagents, or it is a subagent itself. Without peer messaging, the follow-up hint does not suggest it.
 - Agent discovery precedence is first-wins by exact name: project `.omp` agents before user `.omp`, then OMP extension-package roots, Claude marketplace plugin agents (project before user), and bundled agents. Direct `.claude/agents`, `.codex/agents`, and `.gemini/agents` roots are skipped. Create-time discovery is memoized per cwd/effective extension roots; execution-time discovery stays fresh.
 - Ordinary child sessions do not inherit conversation history. Built-in carry-over is the workspace tree/skills/context files, the shared `local://` root, and the approved-plan reference when one exists. Seance consultations instead fork the selected transcript under the restrictions below.
+- Nested Mnemopi sessions keep their parent-state alias. Prompt clones such as `/tan` instead inherit recall values captured with their copied system prompt.
 - When the parent passes `mcpManager`, child sessions disable standalone MCP discovery and get proxy tools that reuse parent connections.
 - Branch-mode merge temporarily stashes the parent repo before cherry-picking; a stash-pop conflict leaves the landed commits on HEAD and preserves the stash, reported as `stashConflict`. Patch mode uses `repo.canApplyPatch(...)` before applying the root patch; reverse-only applicability is treated as already applied, while failed forward checks retain the artifact for recovery.
 - Nested git repos are diffed independently inside isolated workspaces and merged separately with `applyNestedPatches(...)`.
@@ -216,6 +231,8 @@ Only the transcript is forked; artifacts stay in the source. In the consult, `hi
 
 The consult excludes additional roots, workspace tree, context files, skills, rules, inherited agents, extensions, MCP, IRC, and LSP. It is limited to `read`, `grep`, and `glob` as enabled; `task.structured` (default off) adds hidden `yield`, otherwise the final assistant message completes the report. Cold revival requires the `seanceSource` header and `read` in the persisted tools, restores the persisted prompt, and keeps only seance tools.
 
-Warm or revived IRC follow-ups preserve this completion contract. A yielded follow-up republishes canonical `agent://<id>` output; successful, nonempty unstructured follow-ups also republish their final report when parent-woken or user-prompted, removing a stale `<id>.json` sidecar; peer-only unstructured replies and cancelled or empty follow-ups do not publish.
+Warm or revived IRC follow-ups preserve this completion contract. A terminal yield republishes canonical output. Successful, nonempty plain reports publish only for direct parent or user requests.
+A queued parent steer grants publication only after its own `message_end` confirms consumption. Peer-only reports remain durable deliveries without replacing the accepted artifact.
+Broadcast legs do not trigger automatic replies. Cancelled, empty, replaced-generation, and retired-owner follow-ups preserve prior accepted output.
 
 Inherited source charges are zeroed; new consultation turns use existing task/Agent Hub usage tracking.

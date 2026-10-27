@@ -537,8 +537,8 @@ function resetNestedTaskBilling(extractedToolData: Record<string, unknown[]> | u
 	for (const task of tasks) resetTaskResultBilling(task);
 }
 
-function isAssistantEntry(entry: SessionEntry): boolean {
-	return entry.type === "message" && entry.message.role === "assistant";
+function requiresSessionFile(entry: SessionEntry): boolean {
+	return entry.type === "model_usage" || (entry.type === "message" && entry.message.role === "assistant");
 }
 
 function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
@@ -1725,12 +1725,12 @@ export class SessionManager {
 		return { lines, bytes, fingerprint, titleMeta: title ? JSON.stringify(title) : null, stamp };
 	}
 
-	#historyContainsAssistantMessage(): boolean {
-		return this.#entries.some(isAssistantEntry);
+	#historyRequiresSessionFile(): boolean {
+		return this.#entries.some(requiresSessionFile);
 	}
 
 	#shouldHaveSessionFile(): boolean {
-		return this.#forceFileCreation || this.#fileIsCurrent || this.#historyContainsAssistantMessage();
+		return this.#forceFileCreation || this.#fileIsCurrent || this.#historyRequiresSessionFile();
 	}
 
 	/** Live path for appends while a session file moves without replacing a preexisting destination. */
@@ -1971,9 +1971,8 @@ export class SessionManager {
 			this.#rewriteRequired = true;
 		}
 
-		// Lazy gate: a brand-new session is not written until it has an assistant
-		// message (or someone forced creation), so sessions that never produce
-		// output never create a file.
+		// Completed model usage is durable even before the first assistant message.
+		// Startup-only sessions remain lazy unless creation was explicitly forced.
 		if (!this.#shouldHaveSessionFile()) {
 			this.#fileIsCurrent = false;
 			return;
@@ -2889,8 +2888,8 @@ export class SessionManager {
 
 			// Rewrite at the new location when the file already existed (update cwd) or
 			// there is in-memory output worth materializing; otherwise stay lazy.
-			const hasAssistant = this.#historyContainsAssistantMessage();
-			if (this.#persist && this.#sessionFile && (sessionFileExisted || hasAssistant)) {
+			const hasDurableHistory = this.#historyRequiresSessionFile();
+			if (this.#persist && this.#sessionFile && (sessionFileExisted || hasDurableHistory)) {
 				this.#forceFileCreation = true;
 				await this.#rewriteAtomically();
 			}

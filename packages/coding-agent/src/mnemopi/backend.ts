@@ -78,8 +78,22 @@ export function resolveMemoryCompletionInput(
 	return { prompt };
 }
 
-async function installMnemopiState(session: AgentSession, config: MnemopiBackendConfig): Promise<MnemopiSessionState> {
-	const state = new MnemopiSessionState({ sessionId: session.sessionId, config, session });
+/**
+ * Installs session-owned state. A prompt clone supplies the recall snapshot
+ * captured with its copied prompt, not a mutable parent backend.
+ */
+async function installMnemopiState(
+	session: AgentSession,
+	config: MnemopiBackendConfig,
+	inherited?: Pick<MnemopiSessionState, "hasRecalledForFirstTurn" | "lastRecallSnippet">,
+): Promise<MnemopiSessionState> {
+	const state = new MnemopiSessionState({
+		sessionId: session.sessionId,
+		config,
+		session,
+		hasRecalledForFirstTurn: inherited?.hasRecalledForFirstTurn,
+	});
+	state.lastRecallSnippet = inherited?.lastRecallSnippet;
 	const previous = setMnemopiSessionState(session, state);
 	await previous?.dispose();
 	try {
@@ -129,7 +143,7 @@ export const mnemopiBackend: MemoryBackend = {
 				session.sessionManager,
 			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-			await installMnemopiState(session, config);
+			await installMnemopiState(session, config, options.inheritedMnemopiRecall);
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}

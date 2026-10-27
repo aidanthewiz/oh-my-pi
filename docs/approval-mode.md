@@ -17,13 +17,34 @@ When an execute-time caller supplies neither settings nor `autoApprove`, approva
 
 Configure with `tools.approvalMode`:
 
-| Mode             | Auto-approves           | Prompts for     |
-| ---------------- | ----------------------- | --------------- |
-| `always-ask`     | `read`                  | `write`, `exec` |
-| `write`          | `read`, `write`         | `exec`          |
-| `yolo` (default) | `read`, `write`, `exec` | none            |
+| Mode                | Auto-approves                                          | Prompts for                 |
+| ------------------- | ------------------------------------------------------ | --------------------------- |
+| `always-ask`        | `read`                                                 | `write`, `exec`             |
+| `always-ask-cached` | `read` without file targets, granted files and folders | file reads, `write`, `exec` |
+| `write`             | `read`, `write`                                        | `exec`                      |
+| `yolo` (default)    | `read`, `write`, `exec`                                | none                        |
 
 `--approval-mode <mode>` overrides the configured mode for the session. `--auto-approve` and `--yolo` force yolo execution even when an explicit `--approval-mode` is also supplied; tool/user denies and explicit tool prompt policies still apply.
+
+### Ask and remember (`always-ask-cached`)
+
+Ask and remember prompts like `always-ask`, and also before a tool reads a file it has not been granted. Its prompts can remember what the call touched:
+
+- **Approve Directory: `<folder>`** grants the folder around the call. A folder grant covers the files directly inside it, never a subfolder or anything below one. The prompt names the folder and lists its entries (directories end in `/`): the first few in the dock, up to 24 in the expanded prompt (`Ctrl+O`). Larger folders show the rest as a count.
+- **Approve File** (or **Approve** for a directory or URL target) grants the exact targets.
+- **Approve Once** approves this call only.
+
+The **Remember across sessions** toggle selects the grant lifetime. Session grants stay in this conversation's memory. Persistent grants use `approval-cache.db` in the agent directory. Both bind the effective policy, project/cwd, account, and resolved destination. Persistent choices require a verified credential-source identity and active account; unknown sources or accounts offer session choices only. Credential-module replacement during approval invalidates the request. RPC, ACP, and collab hosts expose permitted lifetimes as separate choices.
+
+- Grants record the capability tier they authorized. A write grant also covers reads of the same target; a read grant never covers a write or exec call.
+- The tools that read files report the files and folders they touch: `read`, `grep`, `glob`, `ast_grep`, `find`, and the legacy `read`/`grep`/`find`/`ls` shims. A recursive search reaches below subfolders, so it needs a tree grant of its own; approving one also records the folder grant it includes. A root list such as `src;other` is keyed one root at a time.
+- Other read-tier tools (`lsp`, `debug`, `github`, `todo`, …) stay auto-approved as in `always-ask`. This mode decides when you are asked; it does not sandbox reads.
+- Public-only web reads need no target grant. Mixed public/local lists still require approval for every protected target. Internal URLs bind their resolved destination; an unresolved destination cannot receive a cached grant.
+- Exec or write calls without targets prompt as in `always-ask`. A mode-owned session choice also binds the captured project, policy, and account context.
+- Target derivation uses the execution parser, including literal filenames, selectors, archives, lists, and traversal depth. Exact paths and covering folders bind their resolved filesystem identity. Failed derivation is not a harmless no-target operation.
+- Grant answers appear only on prompts the mode raised. Prompts forced by a tool policy, an `override` (bash critical commands), a `tools.approval.<tool>: prompt` rule, or a pending provider safety check keep plain Approve/Deny and record nothing.
+- `/forget-approvals` clears the database and every conversation's session grants for the active agent directory. A persistent-store failure reports failure, not successful revocation.
+- Approval is captured before asynchronous prompts and checked again before execution. Changed arguments, policy, account, session, symlinks, mounts, or resolved destinations require new approval. Session replacement refuses the old call.
 
 ## User overrides
 
@@ -55,7 +76,7 @@ Resolution per tool call:
 3. In `yolo`, an explicit tool `allow`/`prompt` policy wins; otherwise the valid user policy wins, or the call is allowed. The `override` flag alone does not force a prompt in `yolo`.
 4. In non-yolo modes, an `override: true` decision allows only an accompanying tool `policy: allow`; every other non-denied case prompts.
 5. Without an override, an explicit tool `allow`/`prompt` policy wins, then a valid user policy wins.
-6. With no explicit policy, the active mode auto-approves or prompts by tier.
+6. With no explicit policy, the active mode auto-approves or prompts by tier. In `always-ask-cached`, a call whose `approvalCacheTargets` are all granted is allowed instead.
 
 Policy strings are trimmed and case-normalized. Invalid user values are ignored.
 
@@ -104,7 +125,9 @@ Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The
 
 In the interactive UI the prompt docks above the composer until answered with a list of choices: **Approve**, **Approve `<tool>` for this session**, and **Deny**. With an empty composer the arrow keys move between them and `Enter` takes the highlighted one (Approve on mount); `Ctrl+Enter` (or `Ctrl+Q`; rebind `app.approval.approve`) approves this call outright and `Esc` denies. `Enter` and the approve key are ignored for the first half second, so a key meant for the composer (or the follow-up key, pressed mid-run) as the prompt appears cannot answer it. The session choice approves later calls of the same tool (or `xd://` device) at the same tier until the session ends or changes; it is offered only for prompts the approval mode raised, never for critical-command overrides, explicit `prompt` policies, or provider safety checks, which ask every time. The composer keeps its cursor and takes typing, to deny and steer instead: while it holds a draft, the highlight sits on Deny, relabeled **Deny and send message**, the arrows and `Enter` edit and send the draft, and `Ctrl+C` clears it rather than denying. Sending a message while calls wait (from the composer, Tern, or a collab guest) denies every pending approval, and any the same tool batch asks for before the message is delivered, then steers the turn with that message, so the agent learns why instead of guessing at a bare denial. To leave the composer its room, the prompt summarizes the tool's details to one row (each detail's first line, `…` when more is left out), always built from the input that will run; `Ctrl+O` (`app.tools.expand`, or Details in Tern) shows every detail in full, and `PgUp`/`PgDn` scroll them. In Tern, a click on a choice takes it. RPC, ACP, and other hosts without an approval dialog get a select with the same choices and the full details.
 
-Runtime safety prompts and eligible session-access choices retain their explicit selectors and runtime-owned grants. A mode-tier grant never bypasses runtime safety checks. Aborted requests, failed approval hooks, and session changes do not retain a new grant.
+Runtime safety prompts and eligible session-access choices retain their explicit selectors and runtime-owned grants. Mode and target grants never bypass runtime safety checks. Aborted requests, failed approval hooks, and session changes retain no new grant.
+
+An Ask and remember prompt lists **Remember across sessions** and its grant choices above **Approve Once**. `Ctrl+Enter` approves only this call.
 
 ## Defining approval on tools
 
@@ -125,7 +148,15 @@ export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprov
 
 approval?: ToolApproval;
 formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
+approvalCacheTargets?: (args: unknown) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
+approvalCacheIdentity?: (args: unknown) =>
+  readonly { target: string; identity: string }[] |
+  Promise<readonly { target: string; identity: string }[]>;
 ```
+
+`approvalCacheTargets` returns every executed target's key. `approvalCacheIdentity` binds exact and covering subjects to their resolved destination. Built-in filesystem targets use realpath, device, and inode identity. Both hooks may be asynchronous; derivation failures must throw. The execution wrapper captures and checks their results. Synchronous previews cannot authorize remembered access.
+
+An approval prompt sets `allowPersistentGrants: false` when persistent authority is unavailable. Hosts must hide the remember toggle and Always choices. The resolver also rejects those answers and skips global grants.
 
 Examples:
 
@@ -176,3 +207,16 @@ For `delete`, `move`, and `edit` patches containing deletion or rename operation
 ## Subagents
 
 Subagents run headless with `tools.approvalMode: yolo` so ordinary tier-based prompts do not stall them. The parent `task` approval is the authorization boundary. Per-tool policies still use the normal resolver: user `deny` remains absolute, and any call that resolves to `prompt` rejects because a headless subagent cannot satisfy it.
+
+Parked references retain their exact journal, root, credential source, and account lifetime independently of model or UI settings.
+Each warm revival captures fresh model and policy admission before startup.
+Initial queued execution retains its original strict guard until the first successful startup.
+
+## Background widget authoring
+
+`async.widgets` controls local widget display. It does not authorize inference.
+Remote authoring stays off by default. A managed setting or explicit SDK runtime override must set `async.widgetRemoteAuthoring: true`.
+Project settings and display reads cannot grant this consent.
+The root session filters model capability and provider/model policy before credential resolution.
+Requests use that session's `ModelRegistry` and `AuthStorage` account/credit routing, or its explicit credential resolver.
+Disable, account, and session transitions invalidate pending authoring. Accepted requests drain before the originating usage journal closes.

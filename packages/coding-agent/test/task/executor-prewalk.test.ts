@@ -34,12 +34,19 @@ function yieldEmittingSession(
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	let activeTools = initialTools;
+	let disposed = false;
 	// `servingModel` mirrors the real session: attribution names the model that
 	// produced output, so a prewalk hand-off moves it along with `model`.
 	const serving = (model: Model | undefined): { selector: string; isFallback: boolean } | undefined =>
 		model ? { selector: `${model.provider}/${model.id}`, isFallback: false } : undefined;
 	const session = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: modelSwitch?.from,
@@ -88,6 +95,8 @@ function yieldEmittingSession(
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: { extensions: [], errors: [], runtime: {} as unknown } as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

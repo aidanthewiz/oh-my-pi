@@ -24,7 +24,7 @@ import {
 	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { ensureChromiumExecutable, loadPuppeteer } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -35,7 +35,14 @@ import { acquireTab, getTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
+import {
+	type Browser,
+	type ConnectionTransport,
+	type HTTPRequest,
+	type Page,
+	type Target,
+	TimeoutError,
+} from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
@@ -903,18 +910,36 @@ describe("pickElectronTarget relay path", () => {
 		expect(await pickElectronTarget(browser, { relayJson, matcher: "whole foods" })).toBe(cartPage);
 	});
 
-	it("rejects an unavailable selected target without adopting a different page", async () => {
-		const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
-		const browser = Object.assign(makeBrowser([other.target]), {
-			waitForTarget: async () => {
-				throw Object.assign(new Error("Waiting for target failed"), { name: "TimeoutError" });
+	it("does not adopt another page when the selected target times out with a minified error class", async () => {
+		const transport: ConnectionTransport = {
+			send(message) {
+				const { id, method } = JSON.parse(message) as { id: number; method: string };
+				const result = method === "Target.getBrowserContexts" ? { browserContextIds: [] } : {};
+				queueMicrotask(() => transport.onmessage?.(JSON.stringify({ id, result })));
 			},
-		});
+			close() {
+				transport.onclose?.();
+			},
+		};
+		const puppeteerBrowser = await (await loadPuppeteer()).connect({ transport, defaultViewport: null });
+		const nameDescriptor = Object.getOwnPropertyDescriptor(TimeoutError, "name")!;
+		// Release builds minify class names, so Puppeteer names its timeout like this there.
+		Object.defineProperty(TimeoutError, "name", { ...nameDescriptor, value: "Og" });
+		try {
+			const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
+			const browser = Object.assign(makeBrowser([other.target]), {
+				waitForTarget: (predicate: (target: Target) => boolean) =>
+					puppeteerBrowser.waitForTarget(predicate, { timeout: 50 }),
+			});
 
-		const error = await rejectionOf(pickElectronTarget(browser, { relayJson, matcher: "whole foods" }));
+			const error = await rejectionOf(pickElectronTarget(browser, { relayJson, matcher: "whole foods" }));
 
-		expect(error).toBeInstanceOf(ToolError);
-		expect(other.pageSpy).not.toHaveBeenCalled();
+			expect(error).toBeInstanceOf(ToolError);
+			expect(other.pageSpy).not.toHaveBeenCalled();
+		} finally {
+			Object.defineProperty(TimeoutError, "name", nameDescriptor);
+			await puppeteerBrowser.disconnect();
+		}
 	});
 
 	it("keeps cancellation during metadata settling distinct from a missing target", async () => {

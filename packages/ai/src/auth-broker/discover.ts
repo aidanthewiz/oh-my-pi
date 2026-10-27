@@ -4,6 +4,7 @@
  * token file → local SQLite) in one place so build-time tooling sees the same
  * credentials as the TUI.
  */
+import { createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -49,7 +50,10 @@ export interface DiscoverAuthStorageOptions {
 	/** Programmatic pool for SDK hosts. Takes precedence over the environment file. */
 	accountPool?: AuthBrokerAccountPool;
 	accountPolicies?: AuthAccountPolicies;
-	authStorageOptions?: Omit<AuthStorageOptions, "accountPolicies" | "configValueResolver" | "sourceLabel">;
+	authStorageOptions?: Omit<
+		AuthStorageOptions,
+		"accountPolicies" | "configValueResolver" | "sourceLabel" | "sourceIdentity"
+	>;
 }
 
 /** Path to the local bearer token file. Created by `omp auth-broker token`. */
@@ -379,6 +383,7 @@ export interface OpenAuthCredentialStoreOptions {
 export interface OpenedAuthCredentialStore {
 	store: AuthCredentialStore;
 	sourceLabel: string;
+	sourceIdentity: string;
 }
 
 /**
@@ -449,12 +454,19 @@ export async function openAuthCredentialStore(
 			onSnapshot: persist,
 			accountPool,
 		});
-		return { store, sourceLabel: options.sourceLabel ?? `broker ${brokerConfig.url}` };
+		const sourceIdentity = createHmac("sha256", brokerConfig.token)
+			.update(`coreforge-auth-source-v1\0${brokerConfig.url.replace(/\/+$/, "")}`)
+			.digest("hex");
+		return { store, sourceLabel: options.sourceLabel ?? `broker ${brokerConfig.url}`, sourceIdentity };
 	}
 
 	const dbPath = getAgentDbPath(options.agentDir ?? getAgentDir());
 	const store = await SqliteAuthCredentialStore.open(dbPath);
-	return { store, sourceLabel: options.sourceLabel ?? `local ${dbPath}` };
+	return {
+		store,
+		sourceLabel: options.sourceLabel ?? `local ${dbPath}`,
+		sourceIdentity: `sqlite:${path.resolve(dbPath)}`,
+	};
 }
 
 /**
@@ -473,7 +485,7 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		accountPolicies: options.accountPolicies,
 		usageReservePct: options.authStorageOptions?.defaultReservePct,
 	});
-	const { store, sourceLabel } = await openAuthCredentialStore({
+	const { store, sourceLabel, sourceIdentity } = await openAuthCredentialStore({
 		brokerConfig,
 		agentDir,
 		cachePath: options.cachePath,
@@ -484,6 +496,7 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		...options.authStorageOptions,
 		configValueResolver: options.configValueResolver,
 		sourceLabel,
+		sourceIdentity,
 		accountPolicies,
 		defaultReservePct,
 	});

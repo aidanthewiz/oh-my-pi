@@ -1,6 +1,6 @@
 {
 	"name": "@oh-my-pi/omp-stats",
-	"version": "18.12.2",
+	"version": "18.12.3",
 	"description": "Local observability dashboard for omp AI usage statistics",
 	"keywords": [
 		"ai",

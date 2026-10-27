@@ -3,8 +3,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { procmgr, setProcessName, TempDir } from "@oh-my-pi/pi-utils";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import type { PipeStreams } from "@oh-my-pi/pi-natives";
+import type { AgentSession } from "../../src/session/agent-session";
 import { Settings } from "../../src/config/settings";
 import { AsyncJobManager } from "../../src/async/job-manager";
+import { buildJobResult } from "../../src/async/job-control";
 import { ProcProtocolHandler } from "../../src/internal-urls/proc-protocol";
 import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { AgentRegistry } from "../../src/registry/agent-registry";
@@ -61,7 +64,11 @@ async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
 	throw new Error("Expected the promise to reject");
 }
 
-function toolSession(cwd: string, manager?: AsyncJobManager, options: { launch?: boolean } = {}): ToolSession {
+function toolSession(
+	cwd: string,
+	manager?: AsyncJobManager,
+	options: { launch?: boolean; async?: boolean } = {},
+): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
@@ -71,7 +78,7 @@ function toolSession(cwd: string, manager?: AsyncJobManager, options: { launch?:
 		asyncJobManager: manager,
 		settings: Settings.isolated({
 			"launch.enabled": options.launch ?? true,
-			"async.enabled": false,
+			"async.enabled": options.async ?? false,
 			"bash.autoBackground.enabled": false,
 			"bash.autoBackground.thresholdMs": 60_000,
 			"bashInterceptor.enabled": false,
@@ -101,6 +108,161 @@ function steeringContext(steeringSignal: AbortSignal): AgentToolContext {
 }
 
 describe("proc:// background jobs", () => {
+	it("reads what a pipeline stage wrote while a later stage still holds it back", async () => {
+		const manager = new AsyncJobManager({});
+		const session = toolSession(process.cwd(), manager, { launch: false, async: true });
+		const proc = new ProcProtocolHandler();
+		try {
+			await new BashTool(session).execute("piped", {
+				command: "{ printf 'one\\r\\ntwo\\rthree\\n'; sleep 30; } | tail -n 1",
+				async: true,
+				pty: false,
+			});
+			const [job] = manager.getAllJobs({ ownerId: "Main" });
+			if (!job) throw new Error("no bash job started");
+			const read = (url: string) => proc.resolve(parseInternalUrl(url), { session });
+
+			// Real-time poll: the stream fills from a real child's pipe write, and
+			// nothing in-process signals when the relay thread has copied it.
+			let stream = "";
+			for (let waited = 0; stream !== "one\ntwo\nthree\n" && waited < 10_000; waited += 20) {
+				await Bun.sleep(20);
+				const opened = (await read(`proc://${job.id}/streams`)).content.startsWith(`proc://${job.id}/streams/1 `);
+				if (opened) stream = (await read(`proc://${job.id}/streams/1`)).content;
+			}
+			// CRLF and bare-CR progress both read as lines.
+			expect(stream).toBe("one\ntwo\nthree\n");
+			// The job's own output is still empty: `tail` prints only at EOF.
+			expect((await read(`proc://${job.id}`)).details).toMatchObject({ proc: { log: "" } });
+			const listing = await read(`proc://${job.id}/streams`);
+			expect(listing.isDirectory).toBeTrue();
+			expect(listing.content).toMatch(new RegExp(`^proc://${job.id}/streams/1 open 15B — .*printf.* → tail -n 1$`));
+			expect(await rejectionMessage(read(`proc://${job.id}/streams/2`))).toContain(
+				`List them with proc://${job.id}/streams`,
+			);
+		} finally {
+			await manager.dispose({ timeoutMs: 2_000 });
+		}
+	}, 20_000);
+
+	it("does not read or consume a replacement job through a retained foreground snapshot", async () => {
+		const manager = new AsyncJobManager({});
+		try {
+			const id = manager.register("bash", "owned command", async () => "owned completion", {
+				ownerId: "Main",
+				foreground: true,
+			});
+			const original = manager.getJob(id)!;
+			await original.promise;
+			manager.releaseForegroundJob(id);
+			const replacementId = manager.register("bash", "private command", async () => "private completion", {
+				ownerId: "Other",
+			});
+			expect(replacementId).toBe(id);
+			await manager.getJob(replacementId)!.promise;
+			const result = buildJobResult(
+				toolSession(process.cwd(), manager, { launch: false }),
+				manager,
+				"wait",
+				[original],
+				[],
+			);
+			const text = result.content.map(block => (block.type === "text" ? block.text : "")).join("");
+			expect(text).toContain("owned completion");
+			expect(text).not.toContain("private completion");
+			expect(result.details?.jobs?.[0]?.label).toBe("owned command");
+			expect(manager.isJobResultConsumed(replacementId)).toBe(false);
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("reads retained pipe byte ranges without splitting live UTF-8 or exposing another owner's output", async () => {
+		const manager = new AsyncJobManager({});
+		let open = true;
+		const streams = {
+			list: () => [{ id: 1, producer: "printf", consumer: "tail", total: 20, open }],
+			read: () => ({
+				start: 10,
+				end: open ? 19 : 20,
+				data: Buffer.from(
+					open
+						? [0x82, 0xac, 0x52, 0x45, 0x41, 0x44, 0x59, 0xe2, 0x82]
+						: [0x82, 0xac, 0x52, 0x45, 0x41, 0x44, 0x59, 0xe2, 0x82, 0xac],
+				),
+				open,
+			}),
+		} as unknown as PipeStreams;
+		const id = manager.register("bash", "retained pipeline", async () => "done", {
+			ownerId: "Main",
+			process: { command: "printf | tail", cwd: process.cwd(), pids: () => [], streams },
+		});
+		const protocol = new ProcProtocolHandler();
+		const session = toolSession(process.cwd(), manager, { launch: false });
+		try {
+			await manager.getJob(id)!.promise;
+			const url = parseInternalUrl(`proc://${id}/streams/1`);
+			expect((await protocol.resolve(url, { session })).content).toBe("[first 12B no longer kept]\nREADY");
+			open = false;
+			expect((await protocol.resolve(url, { session })).content).toBe("[first 12B no longer kept]\nREADY€");
+			expect(manager.isJobResultConsumed(id)).toBe(false);
+			const foreignSession = { ...session, getAgentId: () => "Other" };
+			await expect(protocol.resolve(url, { session: foreignSession })).rejects.toThrow("not found");
+			await expect(
+				protocol.resolve(parseInternalUrl(`proc://${id}/streams`), { session: foreignSession }),
+			).rejects.toThrow("not found");
+			await expect(protocol.write(url, "", { session })).rejects.toThrow("read-only");
+			await expect(
+				protocol.resolve(parseInternalUrl(`proc://${id}/streams/9007199254740992`), { session }),
+			).rejects.toThrow("Invalid pipe stream id");
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("does not cancel or unregister a same-id replacement after the original abort finishes", async () => {
+		const registry = new AgentRegistry();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const oldDispose = vi.fn(async () => {});
+		registry.register({
+			id: "Worker",
+			displayName: "Worker",
+			kind: "sub",
+			parentId: "Main",
+			session: {
+				abort: async () => {
+					entered.resolve();
+					await release.promise;
+				},
+				dispose: oldDispose,
+			} as unknown as AgentSession,
+		});
+		const session = toolSession(process.cwd(), undefined, { launch: false });
+		session.agentRegistry = registry;
+		const pending = new ProcProtocolHandler().write(parseInternalUrl("proc://Worker/kill"), "", { session });
+		try {
+			await entered.promise;
+			const replacementDispose = vi.fn(async () => {});
+			registry.register({
+				id: "Worker",
+				displayName: "Replacement",
+				kind: "sub",
+				parentId: "Other",
+				session: { dispose: replacementDispose } as unknown as AgentSession,
+			});
+			const replacement = registry.get("Worker");
+			release.resolve();
+			await pending;
+			expect(registry.get("Worker")).toBe(replacement);
+			expect(replacementDispose).not.toHaveBeenCalled();
+			expect(oldDispose).toHaveBeenCalledTimes(1);
+		} finally {
+			release.resolve();
+			await pending;
+		}
+	});
+
 	it("lists owned jobs, preserves delivery on read, and scopes kill to the owner", async () => {
 		const manager = new AsyncJobManager({});
 		const pending = Promise.withResolvers<string>();

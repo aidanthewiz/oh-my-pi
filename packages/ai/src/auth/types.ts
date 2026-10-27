@@ -381,6 +381,8 @@ export type AuthStorageOptions = {
 	 * as this process's mints for auth-recovery reuse.
 	 */
 	refreshOAuthCredentialMints?: boolean;
+	/** Stable, non-secret authority identifier for this credential store; absent for unbound custom stores. */
+	sourceIdentity?: string;
 	/**
 	 * Human-readable description of the credential store backing this
 	 * AuthStorage instance. Surfaced through {@link AuthStorage.keys.describe}

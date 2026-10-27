@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import * as ai from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -9,6 +9,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 let session: AgentSession | undefined;
@@ -23,6 +24,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	vi.useRealTimers();
 	if (previousNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 	else Bun.env.PI_NO_TITLE = previousNoTitle;
 	vi.restoreAllMocks();
@@ -35,36 +37,60 @@ afterEach(async () => {
 const FIRST_MESSAGE = "fix the flaky park tests";
 const CARD_REPLY = '<title nf="nf-md-flask" emoji="🧪" code="FLAKY">Fix flaky park tests</title>';
 
-/** A session whose main turns answer from `main` and whose side turns (the title fork) from `side`. */
+/**
+ * A session whose main turns answer from `main` and whose side turns (the title fork) from `side`;
+ * `todo` gives the agent the todo tool, whose replans refresh the title.
+ */
 async function createSession(
 	main: MockModel,
 	side: MockModel,
 	settings: Record<string, unknown> = {},
-	autoTitle = true,
+	{ autoTitle = true, todo = false }: { autoTitle?: boolean; todo?: boolean } = {},
 ): Promise<AgentSession> {
 	authStorage = await AuthStorage.create(":memory:");
 	authStorage.keys.setRuntime("anthropic", "test-key");
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+	const sessionManager = SessionManager.inMemory();
+	const sessionSettings = Settings.isolated({
+		"compaction.enabled": false,
+		"retry.enabled": false,
+		"title.generator": "fork",
+		modelRoles: { tiny: `${model.provider}/${model.id}` },
+		...settings,
+	});
+	const tools: AgentTool[] = [];
+	if (todo) {
+		const toolSession: ToolSession = {
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			settings: sessionSettings,
+			setTodoPhases: phases => session?.setTodoPhases(phases),
+		};
+		tools.push(new TodoTool(toolSession) as unknown as AgentTool);
+	}
 	session = new AgentSession({
 		agent: new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model, systemPrompt: ["Test"], tools, messages: [] },
 			streamFn: main.stream,
 		}),
-		sessionManager: SessionManager.inMemory(),
-		settings: Settings.isolated({
-			"compaction.enabled": false,
-			"retry.enabled": false,
-			"title.generator": "fork",
-			modelRoles: { tiny: `${model.provider}/${model.id}` },
-			...settings,
-		}),
+		sessionManager,
+		settings: sessionSettings,
 		modelRegistry: new ModelRegistry(authStorage),
+		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		sideStreamFn: side.stream,
 		autoTitle,
 	});
 	return session;
+}
+
+/** The text of a title-model request: the title prompt's input, or the title a card request heads. */
+function titleRequestInput(context: ai.Context): string {
+	const content = context.messages[0]?.content;
+	return typeof content === "string" ? content : "";
 }
 
 /** Resolves on the session's next title change. */
@@ -110,15 +136,15 @@ describe("AgentSession title fork", () => {
 	it.each<[string, MockResponse, MockResponse]>([
 		["the fork declines", { content: ["Reading the park tests first."] }, { content: ["<title/>"] }],
 		["the fork request fails", { content: ["Reading the park tests first."] }, { throw: "overloaded" }],
-	])("falls back to the title model when %s", async (_case, mainResponse, sideResponse) => {
+	])("falls back to the title model, then cards its title, when %s", async (_case, mainResponse, sideResponse) => {
 		const main = createMockModel({ responses: [mainResponse] });
 		const side = createMockModel({ handler: sideResponse });
 		const target = await createSession(main, side);
 		const titleInputs: string[] = [];
+		const replies = ["<title>Fix flaky park tests</title>", "<title>🧪 FLAKY</title>"];
 		vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, context) => {
-			const content = context.messages[0]?.content;
-			titleInputs.push(typeof content === "string" ? content : "");
-			return createAssistantMessage("<title>Fix flaky park tests</title>");
+			titleInputs.push(titleRequestInput(context));
+			return createAssistantMessage(replies[titleInputs.length - 1] ?? "<title/>");
 		});
 		const titled = nextTitle(target);
 
@@ -126,8 +152,73 @@ describe("AgentSession title fork", () => {
 		await titled;
 
 		expect(target.sessionName).toBe("Fix flaky park tests");
-		expect(titleInputs).toHaveLength(1);
+		expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "FLAKY", emoji: "🧪" });
 		expect(titleInputs[0]).toContain(FIRST_MESSAGE);
+		expect(titleInputs[1]).toContain("Fix flaky park tests");
+	});
+
+	it.each([
+		["omits the code", '<title nf="nf-md-flask" emoji="🧪">Fix flaky park tests</title>'],
+		[
+			"names a code over 6 letters",
+			'<title nf="nf-md-flask" emoji="🧪" code="FLAKIEST">Fix flaky park tests</title>',
+		],
+	])("cards the title of a fork reply that %s", async (_case, reply) => {
+		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+		const side = createMockModel({ handler: { content: [reply] } });
+		const target = await createSession(main, side);
+		const titleInputs: string[] = [];
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, context) => {
+			titleInputs.push(titleRequestInput(context));
+			return createAssistantMessage("<title>🅿️ PARK</title>");
+		});
+		const titled = nextTitle(target);
+
+		await target.prompt(FIRST_MESSAGE);
+		await titled;
+
+		expect(target.sessionName).toBe("Fix flaky park tests");
+		expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "PARK", emoji: "🅿️" });
+	});
+
+	it("keeps the fork's card when a todo replan lands while the fork is still naming the session", async () => {
+		// The first reply opens with a todo init; its replan refresh ran on the fast title
+		// model, named the session first, and made the fork drop its card reply.
+		const main = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							name: "todo",
+							arguments: { op: "init", list: [{ phase: "Park", items: ["Stabilize park test timing"] }] },
+						},
+					],
+				},
+				{ content: ["Planned the park fixes."] },
+			],
+		});
+		const turnEnded = Promise.withResolvers<void>();
+		const side = createMockModel({
+			handler: async () => {
+				await turnEnded.promise;
+				return { content: [CARD_REPLY] };
+			},
+		});
+		const target = await createSession(main, side, {}, { todo: true });
+		const titleModel = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(createAssistantMessage("<title>Stabilize park test timing</title>"));
+		const titled = nextTitle(target);
+
+		await target.prompt(FIRST_MESSAGE);
+		turnEnded.resolve();
+		await titled;
+
+		expect(target.getTodoPhases()).toHaveLength(1);
+		expect(target.sessionName).toBe("Fix flaky park tests");
+		expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" });
+		expect(titleModel).not.toHaveBeenCalled();
 	});
 
 	it("forks a title for a message that arrived while a declining title request still ran", async () => {
@@ -215,7 +306,7 @@ describe("AgentSession title fork", () => {
 	it("carries metadata when branching before the root user message creates an empty session", async () => {
 		const main = createMockModel({ handler: { content: ["Unused"] } });
 		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
-		const target = await createSession(main, side, {}, false);
+		const target = await createSession(main, side, {}, { autoTitle: false });
 		const user = { role: "user" as const, content: FIRST_MESSAGE, timestamp: 1 };
 		const entryId = target.sessionManager.appendMessage(user);
 		target.agent.appendMessage(user);
@@ -230,10 +321,40 @@ describe("AgentSession title fork", () => {
 		expect(target.sessionManager.getSessionTitleCard()).toEqual(card);
 	});
 
+	it.each(["abort", "replace-session", "rename"] as const)(
+		"does not apply an automatic title after %s interrupts its card request",
+		async operation => {
+			const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+			const side = createMockModel({
+				handler: { content: ['<title emoji="🧪">Fix flaky park tests</title>'] },
+			});
+			const target = await createSession(main, side);
+			const cardStarted = Promise.withResolvers<void>();
+			const cardReply = Promise.withResolvers<ai.AssistantMessage>();
+			vi.spyOn(ai, "completeSimple").mockImplementation(() => {
+				cardStarted.resolve();
+				return cardReply.promise;
+			});
+			const generated = vi.spyOn(target, "generateTitle");
+			await target.prompt(FIRST_MESSAGE);
+			await cardStarted.promise;
+			if (operation === "replace-session") await target.newSession();
+			else if (operation === "rename") await target.sessionManager.setSessionName("Operator title", "user");
+			else await target.abort({ reason: USER_INTERRUPT_LABEL });
+			vi.useFakeTimers();
+			cardReply.resolve(createAssistantMessage("<title>🧪 FLAKY</title>"));
+			await generated.mock.results[0]!.value;
+			vi.runAllTimers();
+			await Promise.resolve();
+			expect(target.sessionName).toBe(operation === "rename" ? "Operator title" : undefined);
+			expect(target.sessionManager.getSessionTitleCard()).toBeUndefined();
+		},
+	);
+
 	it("leaves sessions without autoTitle unnamed", async () => {
 		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
 		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
-		const target = await createSession(main, side, {}, false);
+		const target = await createSession(main, side, {}, { autoTitle: false });
 		const titleModel = vi.spyOn(ai, "completeSimple");
 
 		await target.prompt(FIRST_MESSAGE);

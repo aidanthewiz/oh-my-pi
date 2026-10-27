@@ -84,6 +84,7 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
 	resolveSessionModelSelector,
+	roleCandidatePool,
 	sessionModelDiscoveryProviders,
 } from "./config/model-resolver";
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -303,6 +304,8 @@ import {
 	xdevEntries,
 } from "./tools";
 import { resolveYieldReportText } from "./tools/yield";
+import { forgetSessionApprovals } from "./tools/approval-cache";
+import { createModelJobWidgetAuthor, type JobWidgetAuthor, JobWidgets, resolveToolCallIntent } from "./job-widgets";
 import { createBrowserPrelude } from "./tools/browser";
 import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
 import { createComputerPrelude } from "./tools/computer";
@@ -330,6 +333,8 @@ import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 import {
 	cfgArchiveEnabled,
 	cfgAsyncMaxJobs,
+	cfgAsyncWidgets,
+	cfgAsyncWidgetRemoteAuthoring,
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
 	cfgGenerateImageEnabled,
@@ -829,8 +834,10 @@ export interface CreateAgentSessionOptions {
 	taskDepth?: number;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionState;
-	/** Parent Mnemopi state to alias for subagent memory tools. */
+	/** Parent Mnemopi state shared by nested agents. */
 	parentMnemopiSessionState?: MnemopiSessionState;
+	/** Delivered recall captured when a top-level fork is dispatched. */
+	inheritedMnemopiRecall?: Pick<MnemopiSessionState, "hasRecalledForFirstTurn" | "lastRecallSnippet">;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
@@ -853,6 +860,8 @@ export interface CreateAgentSessionOptions {
 	parentTaskPrefix?: string;
 	/** Parent's async jobs and delivery sinks; child sessions never resolve a process-global manager. */
 	asyncJobManager?: AsyncJobManager;
+	/** Host-owned local author. Child sessions share their root's registry. */
+	jobWidgetAuthor?: JobWidgetAuthor;
 	/**
 	 * Registry id of the spawning agent, recorded as this subagent's parent in
 	 * the agent registry. Distinct from `parentTaskPrefix`, which is this agent's
@@ -950,6 +959,10 @@ export interface CreateAgentSessionOptions {
 export interface CreateAgentSessionResult {
 	/** The created session */
 	session: AgentSession;
+	/** Capture this session's launch authority before asynchronous work. */
+	captureOwnerCurrent: (options?: { allowParked?: boolean }) => () => boolean;
+	/** Capture retained reference/journal/account lifetime without model or UI settings. */
+	captureOwnerLifetimeCurrent: () => () => boolean;
 	/** Extensions result (loaded extensions + runtime) */
 	extensionsResult: LoadExtensionsResult;
 	/** Update tool UI context (interactive mode) */
@@ -1442,6 +1455,12 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		deferrable: tool.deferrable,
 		readsSkillUris: tool.readsSkillUris,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
+		// Extension tools take part in Ask-and-remember grants through the same bridge.
+		approvalCacheTargets:
+			typeof tool.approvalCacheTargets === "function"
+				? tool.approvalCacheTargets.bind(tool)
+				: tool.approvalCacheTargets,
+		approvalCacheIdentity: tool.approvalCacheIdentity?.bind(tool),
 		// Preserved through RegisteredToolAdapter so MCP-backed tools' explicit
 		// `strict: false` (#4336/#4340) survives the custom-tool → definition bridge.
 		strict: tool.strict,
@@ -1748,15 +1767,23 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const inheritedWidgetOwnerCurrent = options.asyncJobManager?.captureWidgetOwnerCurrent?.();
+	const inheritedOwnerLifetimeCurrent = options.asyncJobManager?.captureOwnerLifetimeCurrent?.();
 	registerLocalInferenceApi();
 	await loadRuntimeIdentity();
 	const extensionRoots = options.extensionRoots?.();
 	const explicit = extensionRoots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
-	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options));
+	return await withOmpExtensionRootScope(explicit, mode, () =>
+		createAgentSessionScoped(options, inheritedWidgetOwnerCurrent, inheritedOwnerLifetimeCurrent),
+	);
 }
 
-async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+async function createAgentSessionScoped(
+	options: CreateAgentSessionOptions,
+	inheritedWidgetOwnerCurrent?: () => boolean,
+	inheritedOwnerLifetimeCurrent?: () => boolean,
+): Promise<CreateAgentSessionResult> {
 	if (options.systemPromptTemplate !== undefined && options.customSystemPrompt !== undefined) {
 		throw new Error("systemPromptTemplate cannot be combined with a literal custom system prompt");
 	}
@@ -2297,6 +2324,135 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(settings)),
 			})
 		: undefined;
+	let widgetGeneration = 0;
+	const remoteWidgetEnabled = (): boolean =>
+		cfgAsyncWidgets.get(settings) &&
+		cfgAsyncWidgetRemoteAuthoring.get(settings) &&
+		(settings.getProvenance(cfgAsyncWidgetRemoteAuthoring) === "managed" ||
+			settings.getProvenance(cfgAsyncWidgetRemoteAuthoring) === "runtime") &&
+		hasSession &&
+		!session.isDisposed &&
+		!session.isSessionTransitioning;
+	const invalidateWidgets = (): void => {
+		widgetGeneration++;
+		asyncJobManager?.widgets?.invalidate();
+	};
+	if (asyncJobManager) {
+		asyncJobManager.widgets = new JobWidgets({
+			enabled: () => cfgAsyncWidgets.get(settings),
+			authorEnabled: remoteWidgetEnabled,
+			author:
+				options.jobWidgetAuthor ??
+				createModelJobWidgetAuthor({
+					settings,
+					modelRegistry,
+					isEnabled: remoteWidgetEnabled,
+					telemetry: () => agent?.telemetry,
+					obfuscate: () => {
+						const originObfuscator = obfuscator;
+						return originObfuscator?.hasSecrets() ? text => originObfuscator.obfuscate(text) : undefined;
+					},
+					admit: async (candidate, signal, request) => {
+						const modelAdmitted = (): boolean =>
+							roleCandidatePool("widget", settings, modelRegistry).some(
+								model =>
+									model.provider === candidate.provider &&
+									model.id === candidate.id &&
+									model.api === candidate.api &&
+									model.baseUrl === candidate.baseUrl,
+							);
+						if (!remoteWidgetEnabled() || signal.aborted || request.canAuthor?.() !== true || !modelAdmitted())
+							return undefined;
+						const owner = {
+							sessionId: sessionManager.getSessionId(),
+							parentId: sessionManager.getLeafId(),
+							file: sessionManager.getSessionFile(),
+							cwd: sessionManager.getCwd(),
+							generation: widgetGeneration,
+							credentials: modelRegistry.authStorage.credentials,
+						};
+						const accountIdentity = () =>
+							JSON.stringify(
+								modelRegistry.authStorage.oauth
+									.accounts(candidate.provider, owner.sessionId)
+									.filter(account => account.active)
+									.map(account => [account.credentialId, account.accountId, account.orgId, account.projectId]),
+							);
+						let capturedAccount = accountIdentity();
+						let credentialSelected = false;
+						let selectedCredentialId: number | undefined;
+						const isCurrent = (): boolean =>
+							remoteWidgetEnabled() &&
+							!signal.aborted &&
+							request.canAuthor?.() === true &&
+							owner.generation === widgetGeneration &&
+							owner.sessionId === sessionManager.getSessionId() &&
+							owner.file === sessionManager.getSessionFile() &&
+							owner.cwd === sessionManager.getCwd() &&
+							!modelRegistry.authStorage.isClosed &&
+							owner.credentials === modelRegistry.authStorage.credentials &&
+							capturedAccount === accountIdentity() &&
+							modelAdmitted();
+						const supplied = options.getApiKey
+							? await options.getApiKey(candidate)
+							: modelRegistry.resolver(candidate, owner.sessionId);
+						if (!isCurrent() || supplied === undefined) return undefined;
+						return {
+							sessionId: owner.sessionId,
+							isCurrent,
+							apiKey:
+								typeof supplied === "function"
+									? async request => {
+											if (!isCurrent()) throw new Error("Job widget authorization changed");
+											const resolved = await supplied({
+												...request,
+												signal: request.signal ? AbortSignal.any([signal, request.signal]) : signal,
+											});
+											const credentialId = typeof resolved === "object" ? resolved?.credentialId : undefined;
+											if (selectedCredentialId !== undefined && credentialId !== selectedCredentialId) {
+												throw new Error("Job widget account changed");
+											}
+											selectedCredentialId ??= credentialId;
+											const currentAccount = accountIdentity();
+											if (currentAccount !== capturedAccount) {
+												const selected = modelRegistry.authStorage.oauth
+													.accounts(candidate.provider, owner.sessionId)
+													.filter(account => account.active);
+												if (
+													credentialSelected ||
+													capturedAccount !== "[]" ||
+													credentialId === undefined ||
+													selected.length !== 1 ||
+													selected[0]!.credentialId !== credentialId
+												) {
+													throw new Error("Job widget account changed");
+												}
+												capturedAccount = currentAccount;
+											}
+											credentialSelected = true;
+											if (!isCurrent()) throw new Error("Job widget authorization changed");
+											return resolved;
+										}
+									: supplied,
+							onUsage: message => {
+								if (!message.usage) return;
+								sessionManager.appendModelUsage(
+									{
+										purpose: "job-widget",
+										api: message.api,
+										provider: message.provider,
+										model: message.model,
+										usage: message.usage,
+										stopReason: message.stopReason,
+									},
+									owner,
+								);
+							},
+						};
+					},
+				}),
+		});
+	}
 	const scopedAsyncJobManager = asyncJobManager ?? options.asyncJobManager;
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
@@ -2342,6 +2498,80 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			for (const name of names) {
 				activeToolNames.add(name);
 			}
+		};
+		const captureOwnerScope = () => {
+			const credentials = modelRegistry.authStorage.credentials;
+			const sourceIdentity = modelRegistry.authStorage.sourceIdentity;
+			const ownerId = sessionManager.getSessionId();
+			const ownerFile = sessionManager.getSessionFile();
+			const ownerCwd = sessionManager.getCwd();
+			const ownerRef = registeredAgentRef;
+			const providers = [...new Set(credentials.list().map(credential => credential.provider))]
+				.sort()
+				.filter(provider =>
+					modelRegistry.authStorage.oauth.accounts(provider, ownerId).some(account => account.active),
+				);
+			const accountSnapshot = () =>
+				providers.flatMap(provider =>
+					modelRegistry.authStorage.oauth
+						.accounts(provider, ownerId)
+						.filter(account => account.active)
+						.map(account => [
+							provider,
+							account.credentialId,
+							account.accountId,
+							account.orgId,
+							account.projectId,
+						]),
+				);
+			const accounts = accountSnapshot();
+			return {
+				isCurrent: (allowParked: boolean): boolean => {
+					if (
+						!hasSession ||
+						modelRegistry.authStorage.isClosed ||
+						credentials !== modelRegistry.authStorage.credentials ||
+						sourceIdentity !== modelRegistry.authStorage.sourceIdentity ||
+						ownerId !== sessionManager.getSessionId() ||
+						ownerFile !== sessionManager.getSessionFile() ||
+						ownerCwd !== sessionManager.getCwd() ||
+						ownerRef !== registeredAgentRef ||
+						(ownerRef !== undefined && agentRegistry.get(resolvedAgentId) !== ownerRef) ||
+						!Bun.deepEquals(accounts, accountSnapshot())
+					)
+						return false;
+					if (options.asyncJobManager && inheritedOwnerLifetimeCurrent?.() !== true) return false;
+					if (ownerRef?.status === "aborted" || (asyncJobManager && ownerRef?.status === "parked")) return false;
+					if (
+						(allowParked || ownerRef?.status !== "parked") &&
+						!session.isDisposed &&
+						!session.isSessionTransitioning &&
+						(ownerRef === undefined || ownerRef.session === session)
+					)
+						return true;
+					if (
+						!allowParked ||
+						asyncJobManager ||
+						ownerRef === undefined ||
+						ownerRef.sessionFile !== (ownerFile ?? null)
+					)
+						return false;
+					if (ownerRef.status === "parked" && ownerRef.session === null) return true;
+					const current = ownerRef.session;
+					return (
+						current !== null &&
+						!current.isDisposed &&
+						!current.isSessionTransitioning &&
+						current.sessionManager.getSessionId() === ownerId &&
+						current.sessionManager.getSessionFile() === ownerFile &&
+						current.sessionManager.getCwd() === ownerCwd
+					);
+				},
+				modelSnapshot: () => {
+					const current = ownerRef?.session?.agent.state.model ?? agent.state.model;
+					return current && [current.provider, current.id, current.api, current.baseUrl];
+				},
+			};
 		};
 		const toolSession: ToolSession = {
 			get cwd() {
@@ -2415,6 +2645,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			isDisposed: () => session?.isDisposed ?? false,
+			captureOwnerCurrent: ({ allowParked = false } = {}) => {
+				const owner = captureOwnerScope();
+				const model = owner.modelSnapshot();
+				const policy = allSettings().map(setting => [
+					setting.id,
+					setting.get(settings),
+					settings.getProvenance(setting),
+				]);
+				return () =>
+					owner.isCurrent(allowParked) &&
+					Bun.deepEquals(model, owner.modelSnapshot()) &&
+					Bun.deepEquals(
+						policy,
+						allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]),
+					);
+			},
+			captureOwnerLifetimeCurrent: () => {
+				const owner = captureOwnerScope();
+				return () => owner.isCurrent(true);
+			},
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
@@ -2473,6 +2723,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getWorkPoolYieldItems: () => session?.getWorkPoolYieldItems() ?? [],
 			getLastAssistantText: () => session?.getLastAssistantText(),
 			getYieldReportText: toolCallId => resolveYieldReportText(session?.messages ?? [], toolCallId),
+			getToolCallIntent: toolCallId => resolveToolCallIntent(session?.messages ?? [], toolCallId),
 			setWorkPoolYieldItems: items => session.setWorkPoolYieldItems(items),
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
@@ -2541,6 +2792,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// SessionTools owns the advertised snapshot; before it exists the base
 		// prompt is built from, and therefore advertises, the live set.
 		toolSession.getAdvertisedEvalPreludes = () => session?.getAdvertisedEvalPreludes() ?? getEvalPreludes();
+		if (asyncJobManager) {
+			const captureRootOwnerCurrent = toolSession.captureOwnerCurrent!;
+			const captureWidgetOwnerCurrent = () => {
+				const isCurrent = captureRootOwnerCurrent();
+				const generation = widgetGeneration;
+				return () => generation === widgetGeneration && isCurrent();
+			};
+			asyncJobManager.captureWidgetOwnerCurrent = captureWidgetOwnerCurrent;
+			toolSession.captureWidgetOwnerCurrent = captureWidgetOwnerCurrent;
+			asyncJobManager.captureOwnerLifetimeCurrent = toolSession.captureOwnerLifetimeCurrent!;
+		} else if (inheritedWidgetOwnerCurrent) {
+			toolSession.captureWidgetOwnerCurrent = () => inheritedWidgetOwnerCurrent;
+		}
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
@@ -4935,6 +5199,46 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// after a reset (#13370). The tools snapshot into THIS store, not the
 		// AgentSession's own lazy field.
 		session.registerSessionChangeCallback(() => toolSession.editStore?.clear());
+		let approvalGrantSessionId = sessionManager.getSessionId();
+		session.registerSessionChangeCallback(() => {
+			forgetSessionApprovals(agentDir, approvalGrantSessionId);
+			approvalGrantSessionId = sessionManager.getSessionId();
+		});
+		session.addDisposer(() => forgetSessionApprovals(agentDir, approvalGrantSessionId));
+		if (asyncJobManager) {
+			session.registerSessionChangeCallback(invalidateWidgets);
+			const credentials = modelRegistry.authStorage.credentials;
+			const credentialAuthority = () => {
+				const rows = modelRegistry.authStorage.credentials.list();
+				const providers = [...new Set(rows.map(row => row.provider))].sort();
+				return JSON.stringify([
+					rows.map(row => [row.provider, row.id, row.disabledCause]),
+					providers.flatMap(provider =>
+						modelRegistry.authStorage.oauth
+							.accounts(provider)
+							.map(account => [
+								provider,
+								account.credentialId,
+								account.accountId,
+								account.email,
+								account.orgId,
+								account.projectId,
+								account.enterpriseUrl,
+							]),
+					),
+				]);
+			};
+			let authority = credentialAuthority();
+			session.addDisposer(
+				modelRegistry.authStorage.credentials.onGeneration(() => {
+					const next = credentialAuthority();
+					if (credentials !== modelRegistry.authStorage.credentials || authority !== next) invalidateWidgets();
+					authority = next;
+				}),
+			);
+			session.addDisposer(modelRegistry.authStorage.credentials.onDisabled(invalidateWidgets));
+			session.addDisposer(settings.onEffectiveChange(allSettings(), invalidateWidgets));
+		}
 		if (ownedSkillDescriptionStore) {
 			// Let in-flight compressions land before releasing the file.
 			session.addDisposer(
@@ -5405,6 +5709,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				taskDepth,
 				parentHindsightSessionState: options.parentHindsightSessionState,
 				parentMnemopiSessionState: options.parentMnemopiSessionState,
+				inheritedMnemopiRecall: options.inheritedMnemopiRecall,
 			});
 		};
 
@@ -5613,6 +5918,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		startupCleanup.move();
 		return {
 			session,
+			captureOwnerCurrent: toolSession.captureOwnerCurrent!,
+			captureOwnerLifetimeCurrent: toolSession.captureOwnerLifetimeCurrent!,
 			extensionsResult,
 			setToolUIContext,
 			mcpManager,

@@ -194,7 +194,7 @@ describe("wait", () => {
 	});
 
 	for (const phase of ["before", "during"] as const) {
-		test(`a queued message interrupts ${phase} service discovery without consuming the message`, async () => {
+		test(`a queued message interrupts ${phase} service discovery and returns the message once`, async () => {
 			await withDiscoveryClient(async fixture => {
 				const registry = AgentRegistry.global();
 				const bridge = new IrcBridge({
@@ -235,19 +235,14 @@ describe("wait", () => {
 				}
 				const result = await waiting;
 				expect(result.isError).toBeUndefined();
-				expect(result.details).toMatchObject({ op: "wait", jobs: [], interrupted: true });
-				expect(result.useless).toBe(true);
+				expect(result.details?.waited).toMatchObject({ from: "Peer", body: "released" });
 				if (phase === "before") expect(fixture.acquired()).toBe(0);
-				expect((await tool.execute("queued-message", {})).details?.waited).toMatchObject({
-					from: "Peer",
-					body: "released",
-				});
 				expect(bridge.hasPending()).toBe(false);
 				fixture.release();
 			});
 		});
 
-		test(`a native completion interrupts ${phase} service discovery and auto-delivers once`, async () => {
+		test(`a native completion interrupts ${phase} service discovery and is recovered once`, async () => {
 			await withDiscoveryClient(async fixture => {
 				const manager = new AsyncJobManager({});
 				const controller = new AbortController();
@@ -277,15 +272,16 @@ describe("wait", () => {
 					}
 					const result = await waiting;
 					expect(result.isError).toBeUndefined();
-					expect(result.details).toMatchObject({ op: "wait", jobs: [], interrupted: true });
-					expect(manager.isJobResultConsumed(id)).toBe(false);
-					expect(manager.isDeliverySuppressed(id)).toBe(false);
+					expect(result.details?.jobs).toMatchObject([
+						{ id, status: "completed", resultText: "completion payload" },
+					]);
+					expect(manager.isJobResultConsumed(id)).toBe(true);
+					expect(manager.isDeliverySuppressed(id)).toBe(true);
 					if (phase === "before") expect(fixture.acquired()).toBe(0);
 					injected.resolve();
 					await manager.waitForAll();
 					expect(await manager.drainDeliveries({ timeoutMs: 500 })).toBe(true);
 					expect(delivered).toEqual([[id, "completion payload"]]);
-					expect(manager.isJobResultConsumed(id)).toBe(true);
 					fixture.release();
 					expect(await manager.drainDeliveries({ timeoutMs: 500 })).toBe(true);
 					expect(delivered).toEqual([[id, "completion payload"]]);

@@ -1,6 +1,8 @@
+import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { extractUriScheme } from "../internal-urls/parse";
 import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
 import { splitPathAndSel, isReadableUrlPath } from "@oh-my-pi/pi-tui/tools/read";
+import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +12,7 @@ import {
 	hasFsCode,
 	isEnoent,
 	isEnotdir,
+	isRecord,
 	isWsl,
 	stripWindowsExtendedLengthPathPrefix,
 	windowsPathToWslMount,
@@ -1494,6 +1497,32 @@ export interface ToolScopeResolution {
 	immutableSourcePaths: Set<string>;
 }
 
+/** Approval tier for a search tool's raw `path` (or legacy `paths`) input: the highest scheme read tier named anywhere in it. */
+export function searchPathTier(args: unknown): ToolTier {
+	const raw = isRecord(args) ? (args.path ?? args.paths) : undefined;
+	// The tools decode JSON-encoded arrays (`["ssh:\/\/host"]`) the same way before resolving.
+	const entries =
+		typeof raw === "string"
+			? toPathList(raw)
+			: Array.isArray(raw)
+				? raw.filter(entry => typeof entry === "string")
+				: [];
+	// Substring scan over the raw entries: delimited lists are only split after approval.
+	return InternalUrlRouter.instance().readTier(entries.join("\n"));
+}
+
+/** Strict URLs fetch; fuzzy URL spellings fetch only when no literal filesystem entry exists. */
+export async function isExternalSearchUrl(rawPath: string, cwd: string): Promise<boolean> {
+	if (/^(?:https?|ftp|ws|wss):\/\//i.test(rawPath)) return true;
+	if (!isReadableUrlPath(rawPath) || hasGlobPathChars(rawPath)) return false;
+	try {
+		await fs.promises.stat(resolveToCwd(rawPath, cwd));
+		return false;
+	} catch (error) {
+		return isEnoent(error) || isEnotdir(error);
+	}
+}
+
 /**
  * Shared path-input pipeline for `search`, `ast_grep`, and `ast_edit`:
  *  1. normalize + reject empty paths,
@@ -1512,29 +1541,11 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("Search scope entries must be non-empty paths or globs");
 	}
-	// Strict external-URL schemes. `file://` is intentionally absent: it has
-	// local-path semantics (expandPath strips it downstream), so it flows through
-	// the ordinary filesystem pipeline instead of the external-URL resolver.
-	const strictExternalUrlRe = /^(?:https?|ftp|ws|wss):\/\//i;
 	const internalRouter = InternalUrlRouter.instance();
 	const resolvedPathInputs: string[] = [];
 	const immutableSourcePaths = new Set<string>();
 	for (const rawPath of rawPaths) {
-		let externalUrl = strictExternalUrlRe.test(rawPath);
-		if (!externalUrl && isReadableUrlPath(rawPath) && !hasGlobPathChars(rawPath)) {
-			// Fuzzy spelling the read parser accepts (`www.host/…`, collapsed
-			// `https:/host/…`). An existing local path wins over URL
-			// interpretation so a directory literally named `www.foo` stays
-			// searchable; only a definitive ENOENT/ENOTDIR flips to URL handling
-			// (any other stat error means the path exists — let the local
-			// pipeline surface it).
-			try {
-				await fs.promises.stat(resolveToCwd(rawPath, cwd));
-			} catch (err) {
-				externalUrl = isEnoent(err) || isEnotdir(err);
-			}
-		}
-		if (externalUrl) {
+		if (await isExternalSearchUrl(rawPath, cwd)) {
 			const resolved = opts.resolveExternalUrl ? await opts.resolveExternalUrl(rawPath) : undefined;
 			if (resolved) {
 				resolvedPathInputs.push(resolved.sourcePath);

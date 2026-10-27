@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
@@ -8,11 +8,14 @@ import { resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolv
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildSessionOptions,
+	rebuildScopedModels,
 	rebuildScopedModelsAfterDiscovery,
 	resolveScopedModels,
 	type ScopedModelSink,
 	toSessionScopedModels,
 } from "@oh-my-pi/pi-coding-agent/main";
+import { createSetupHost } from "@oh-my-pi/pi-coding-agent/modes/setup";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -59,6 +62,7 @@ class FakeRegistry {
 
 class FakeSession implements ScopedModelSink {
 	isDisposed = false;
+	sessionId = "scope-owner";
 	scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	setCalls = 0;
 	constructor(initial: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>) {
@@ -170,6 +174,156 @@ describe("rebuildScopedModelsAfterDiscovery", () => {
 
 		expect(session.setCalls).toBe(0);
 		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a"]);
+	});
+});
+
+describe("rebuildScopedModels after login", () => {
+	it("adds a newly available allowed model to the existing scope", async () => {
+		const settings = Settings.isolated();
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a", "prov/b"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModels(session, parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+	});
+
+	it("keeps a newly available model outside the explicit CLI scope", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModels(session, parseArgs(["--models", "prov/a"]), registry, settings);
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+	});
+
+	it("uses the current enabledModels scope when no CLI scope is provided", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModels(session, parseArgs([]), registry, settings);
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+	});
+
+	it("rejects an in-flight rebuild after disposal", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const active = model("a");
+		const registry = new FakeRegistry([active, model("b")]);
+		const session = new FakeSession([{ model: active }]);
+		const pending = rebuildScopedModels(session, parseArgs([]), registry, settings);
+		session.isDisposed = true;
+		await pending;
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+		expect(session.setCalls).toBe(0);
+	});
+
+	it("rejects an in-flight rebuild after a session switch", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const active = model("a");
+		const session = new FakeSession([{ model: active }]);
+		const pending = rebuildScopedModels(session, parseArgs([]), new FakeRegistry([active, model("b")]), settings);
+		session.sessionId = "replacement-owner";
+		await pending;
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+		expect(session.setCalls).toBe(0);
+	});
+
+	it("commits only the newest concurrent scope request", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const active = model("a");
+		const registry = new FakeRegistry([active, model("b"), model("c")]);
+		const session = new FakeSession([{ model: active }]);
+		const old = rebuildScopedModels(session, parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+		const latest = rebuildScopedModels(session, parseArgs(["--models", "prov/a,prov/c"]), registry, settings);
+		await Promise.all([old, latest]);
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "c"]);
+		expect(session.setCalls).toBe(1);
+	});
+
+	it("does not unpin an explicit scope when discovery temporarily finds no matching model", async () => {
+		const settings = Settings.isolated();
+		const active = model("a");
+		const session = new FakeSession([{ model: active }]);
+		await rebuildScopedModels(session, parseArgs(["--models", "prov/a"]), new FakeRegistry([model("b")]), settings);
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+		expect(session.setCalls).toBe(0);
+	});
+
+	it("refreshes catalog metadata and explicit effort for an unchanged model id", async () => {
+		const settings = Settings.isolated();
+		const previous = model("a");
+		const refreshed = model("a");
+		refreshed.contextWindow = 256_000;
+		refreshed.reasoning = true;
+		const session = new FakeSession([{ model: previous, thinkingLevel: ThinkingLevel.Low }]);
+		await rebuildScopedModels(
+			session,
+			parseArgs(["--models", "prov/a:high"]),
+			new FakeRegistry([refreshed]),
+			settings,
+		);
+		expect(session.scopedModels[0]?.model.contextWindow).toBe(256_000);
+		expect(session.scopedModels[0]?.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("makes setup-discovered models selectable without changing the active model", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const active = model("a");
+		const refreshed: string[] = [];
+		const registry = Object.assign(new FakeRegistry([active]), {
+			async refreshProvider(this: FakeRegistry, provider: string) {
+				refreshed.push(provider);
+				this.available = [active, model("b")];
+			},
+		});
+		const session = new FakeSession([{ model: active }]);
+		const ctx = {
+			settings,
+			session: { model: active, modelRegistry: registry },
+			refreshScopedModelsAfterLogin: async () => {
+				await rebuildScopedModels(session, parseArgs([]), registry, settings);
+			},
+		};
+
+		await createSetupHost(ctx as unknown as InteractiveModeContext).refreshProvider("prov");
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+		expect(ctx.session.model).toBe(active);
+
+		// An OAuth alias refreshes the provider its credential is stored under.
+		await createSetupHost(ctx as unknown as InteractiveModeContext).refreshProvider("openai-codex-device");
+		expect(refreshed).toEqual(["prov", "openai-codex"]);
+	});
+
+	it.each(["switch", "dispose"])("does not publish setup discoveries after owner %s", async transition => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const active = model("a");
+		const discovery = Promise.withResolvers<void>();
+		const registry = Object.assign(new FakeRegistry([active, model("b")]), {
+			refreshProvider: () => discovery.promise,
+		});
+		const scope = new FakeSession([{ model: active }]);
+		const owner = { model: active, modelRegistry: registry, sessionId: "original", isDisposed: false };
+		const ctx = {
+			settings,
+			session: owner,
+			refreshScopedModelsAfterLogin: async () => {
+				await rebuildScopedModels(scope, parseArgs([]), registry, settings);
+			},
+		};
+		const pending = createSetupHost(ctx as unknown as InteractiveModeContext).refreshProvider("prov");
+		if (transition === "switch") owner.sessionId = "replacement";
+		else owner.isDisposed = true;
+		discovery.resolve();
+		await pending;
+		expect(scope.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+		expect(ctx.session.model).toBe(active);
 	});
 });
 

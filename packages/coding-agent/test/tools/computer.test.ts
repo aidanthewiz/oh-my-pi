@@ -2423,7 +2423,9 @@ describe("expanded computer APIs", () => {
 				await shown.promise;
 				expect(native.acquireCount).toBe(0);
 				answer.resolve(approved);
-				expect((await acquiring).details).toMatchObject({ value: { active: approved } });
+				expect((await acquiring).details).toMatchObject({
+					value: approved ? { active: true } : { active: false, reason: "denied" },
+				});
 				expect(
 					(await supervisor.run("return await desktop.control.state()", 2000, snapshot(true))).returnValue,
 				).toEqual({ active: approved });
@@ -2446,6 +2448,39 @@ describe("expanded computer APIs", () => {
 		},
 	);
 
+	it("does not request confirmation from a UI marked noninteractive", async () => {
+		const native = new FakeNativeSession();
+		const supervisor = new ComputerSupervisor(
+			toolSession(),
+			() => liveWorker(native),
+			undefined,
+			undefined,
+			NO_ESCAPE_STOPS,
+		);
+		let asked = false;
+		const context = {
+			...confirmationContext(async () => {
+				asked = true;
+				return true;
+			}),
+			hasUI: false,
+		};
+		try {
+			const result = await supervisor.run(
+				'return await desktop.control.acquire({ reason: "Noninteractive" })',
+				2000,
+				snapshot(),
+				undefined,
+				context,
+			);
+			expect(result.returnValue).toEqual({ active: false, reason: "no-ui" });
+			expect(asked).toBe(false);
+			expect(native.acquireCount).toBe(0);
+		} finally {
+			await supervisor.close();
+		}
+	});
+
 	it("denies headless control and ignores a late yes after cancellation", async () => {
 		const native = new FakeNativeSession();
 		const supervisor = new ComputerSupervisor(
@@ -2459,7 +2494,7 @@ describe("expanded computer APIs", () => {
 			expect(
 				(await supervisor.run('return await desktop.control.acquire({ reason: "Headless" })', 2000, snapshot()))
 					.returnValue,
-			).toEqual({ active: false });
+			).toEqual({ active: false, reason: "no-ui" });
 			expect(native.acquireCount).toBe(0);
 			const answer = Promise.withResolvers<boolean>();
 			const shown = Promise.withResolvers<void>();
@@ -3515,13 +3550,39 @@ describe("display hold follows the agent turn", () => {
 		expect(native.displayHolds).toEqual(["turn", "release"]);
 		transport.inbound({ type: "resume-display", from: 1, turn: 2 });
 		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
-		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: true } });
+		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: "approved" } });
 		await transport.waitFor(message => message.type === "result" && message.id === "confirming");
 
 		// With no run of that turn active, a resume holds nothing.
 		transport.inbound({ type: "resume-display", from: 2, turn: 3 });
 		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
 	});
+
+	it.each([true, false, "unknown", "APPROVED", null, undefined, {}])(
+		"refuses an unrecognized control verdict: %j",
+		async verdict => {
+			const native = new FakeNativeSession();
+			const transport = new MemoryTransport();
+			new ComputerWorkerCore(transport, () => native);
+			transport.inbound({
+				type: "run",
+				id: "unknown-verdict",
+				code: 'return await desktop.control.acquire({ reason: "Edit" });',
+				timeoutMs: 2_000,
+				session: snapshot(),
+				escape: escapeScope(),
+			});
+			const confirm = await transport.waitFor(message => message.type === "control-request");
+			if (confirm.type !== "control-request") throw new Error("Expected the run's control confirmation");
+			transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: verdict } });
+			const result = await transport.waitFor(
+				message => message.type === "result" && message.id === "unknown-verdict",
+			);
+			if (result.type !== "result" || !result.ok) throw new Error("control.acquire failed");
+			expect(result.payload.returnValue).toEqual({ active: false, reason: "denied" });
+			expect(native.acquireCount).toBe(0);
+		},
+	);
 
 	it("carries a turn resumed while a cold run starts into that run's hold", async () => {
 		const native = new FakeNativeSession();

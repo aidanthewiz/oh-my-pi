@@ -23,7 +23,10 @@ import {
 	resolveExplicitFindPatterns,
 	resolveSearchBase,
 	resolveSearchResultPath,
+	searchPathTier,
 } from "./path-utils";
+import { searchApprovalCacheTargets } from "./search-approval-targets";
+import { approvalTargetIdentities } from "./approval-targets";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -116,7 +119,40 @@ interface NativePreparedTarget {
 
 export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	readonly name = "glob";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	readonly approvalCacheTargets = (args: unknown): Promise<readonly string[]> => this.#approvalTargets(args);
+	readonly approvalCacheIdentity = async (args: unknown) =>
+		approvalTargetIdentities(
+			this.session.cwd,
+			await this.#approvalTargets(args, true),
+			sessionResolveContext(this.session),
+		);
+
+	async #patterns(pathInput: string | string[] | undefined): Promise<string[]> {
+		const paths = toPathList(pathInput);
+		const effectivePaths = paths.length > 0 ? paths : ["."];
+		const entries = this.#customOps
+			? effectivePaths
+			: await expandDelimitedPathEntries(effectivePaths, this.session.cwd, { splitter: parseFindPattern });
+		const patterns = entries.map(input => normalizePathLikeInput(input).replace(/\\/g, "/"));
+		return this.#rootPathAlias ? patterns.map(pattern => (/^\/+$/.test(pattern) ? "." : pattern)) : patterns;
+	}
+
+	async #approvalTargets(args: unknown, includePublic = false): Promise<readonly string[]> {
+		if (this.#customOps) throw new ToolError("Cannot bind approval destination for a custom glob backend");
+		const a = args as { path?: string | string[] } | null | undefined;
+		return searchApprovalCacheTargets(
+			await this.#patterns(a?.path),
+			this.session.cwd,
+			entry => parseFindPattern(entry).basePath,
+			entry => {
+				const { globPattern } = parseFindPattern(entry);
+				return globPattern.includes("/") || globPattern.includes("**");
+			},
+			includePublic,
+			sessionResolveContext(this.session),
+		);
+	}
 	readonly loadMode = "essential";
 	readonly label = "Glob";
 	get description(): string {
@@ -183,15 +219,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 		const immediateAbortSignal = this.#customOps?.glob ? signal : preparationController?.signal;
 		const execution = untilAborted(immediateAbortSignal, async () => {
 			const formatScopePath = (targetPath: string): string => formatPathRelativeToCwd(targetPath, this.session.cwd);
-			const scopedPaths = toPathList(pathInput);
-			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
-			const rawPatternInputs = this.#customOps
-				? effectivePaths
-				: await expandDelimitedPathEntries(effectivePaths, this.session.cwd, { splitter: parseFindPattern });
-			const rawPatterns = rawPatternInputs.map(input => normalizePathLikeInput(input).replace(/\\/g, "/"));
-			const aliasResolvedPatterns = this.#rootPathAlias
-				? rawPatterns.map(pattern => (/^\/+$/.test(pattern) ? "." : pattern))
-				: rawPatterns;
+			const aliasResolvedPatterns = await this.#patterns(pathInput);
 			if (aliasResolvedPatterns.some(pattern => /^\/+$/.test(pattern))) {
 				throw new ToolError("Searching from root directory '/' is not allowed");
 			}

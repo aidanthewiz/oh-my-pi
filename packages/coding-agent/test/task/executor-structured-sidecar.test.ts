@@ -13,6 +13,7 @@ import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-regis
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -22,11 +23,18 @@ import { createSessionDefaults } from "../helpers/session-defaults";
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
+	let disposed = false;
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
 	};
 	const session = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -67,6 +75,8 @@ function yieldEmittingSession(data: unknown): AgentSession {
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: { extensions: [], errors: [], runtime: {} as unknown } as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
@@ -119,13 +129,65 @@ describe("structured output sidecar lifecycle", () => {
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 		});
 
-		expect(result.exitCode).toBe(0);
+		expect(result.exitCode, JSON.stringify(result)).toBe(0);
 		expect(result.structuredOutput).toMatchObject({ status: "valid", data: { ok: true } });
 		// The <id>.md artifact republished successfully...
 		expect(result.outputPath).toBe(path.join(artifactsDir, `${id}.md`));
+		expect(await fs.readFile(result.outputPath!, "utf8")).toBe(result.output);
 		// ...but the sidecar write failed, so the stale sidecar must not survive
 		// to keep answering agent://<id>/<field> with the superseded payload.
 		await expect(fs.stat(sidecarPath)).rejects.toThrow();
+	});
+
+	it("preserves a replacement owner's accepted artifacts when the staged sidecar write fails", async () => {
+		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sidecar-owner-test-"));
+		const id = "ReplacedSidecarProbe";
+		const outputPath = path.join(artifactsDir, `${id}.md`);
+		const sidecarPath = path.join(artifactsDir, `${id}.json`);
+		const accepted = JSON.stringify({ report: "replacement owner's accepted result" });
+		const session = yieldEmittingSession({ ok: true });
+		const replacement = yieldEmittingSession({ replacement: true });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const originalWrite = Bun.write.bind(Bun);
+		vi.spyOn(Bun, "write").mockImplementation(((dest: unknown, ...rest: unknown[]) => {
+			if (typeof dest === "string" && dest.includes(`${id}.json.tmp-`)) {
+				return (async () => {
+					AgentRegistry.global().register({
+						id,
+						displayName: id,
+						kind: "sub",
+						status: "idle",
+						session: replacement,
+					});
+					await fs.writeFile(outputPath, accepted);
+					await fs.writeFile(sidecarPath, accepted);
+					throw new Error("simulated disk failure after owner replacement");
+				})();
+			}
+			return (originalWrite as (...args: unknown[]) => unknown)(dest, ...rest);
+		}) as typeof Bun.write);
+		try {
+			const result = await runSubprocess({
+				cwd: "/tmp",
+				agent: baseAgent,
+				task: "do work",
+				index: 0,
+				id,
+				settings: Settings.isolated(),
+				modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+				enableLsp: false,
+				artifactsDir,
+				outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+			});
+			expect(result.exitCode, JSON.stringify(result)).toBe(1);
+			expect(result.aborted).toBe(true);
+			expect(result.outputPath).toBeUndefined();
+			expect(await fs.readFile(outputPath, "utf8")).toBe(accepted);
+			expect(await fs.readFile(sidecarPath, "utf8")).toBe(accepted);
+			expect(AgentRegistry.global().get(id)?.session).toBe(replacement);
+		} finally {
+			AgentRegistry.global().unregister(id);
+		}
 	});
 
 	it("removes a stale sidecar instead of leaving it when the serialized data is undefined", async () => {

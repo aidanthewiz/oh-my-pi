@@ -25,28 +25,27 @@ import {
 import type { EventBus } from "../utils/event-bus";
 import {
 	attachIrcWakeTurnMonitor,
+	bindSubagentOwnerLifetime,
 	compactionThresholdSettings,
 	createMCPProxyTools,
 	createSubagentSettings,
 	followMCPTools,
 	subagentRetryFallbackRole,
 } from "./executor";
+import { isCompletionProbeEnabled } from "./completion-probe";
 import { cfgTaskAgentAccountPools } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { seanceIsolationOptions } from "./seance-policy";
 import type { AgentDefinition } from "./types";
 
-/**
- * Ambient context the reviver needs at revive time. The top-level session is
- * kept LIVE (cwd / artifact manager read on demand) so a later `/new` or cwd
- * move is followed rather than snapshotted; auth/models/settings are
- * process-stable and captured by reference.
- */
+/** Ambient dependencies remain bound to the originating root-session and credential-store lifetime. */
 export interface PersistedSubagentReviveContext {
 	session: AgentSession;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
 	settings: Settings;
+	captureOwnerCurrent?: () => () => boolean;
+	captureOwnerLifetimeCurrent?: () => () => boolean;
 	/** LSP policy of the top-level session; revived subagents inherit it rather than defaulting on. */
 	enableLsp: boolean;
 	/**
@@ -93,7 +92,20 @@ export function createPersistedSubagentReviverFactory(
 	ctx: PersistedSubagentReviveContext,
 ): PersistedSubagentReviverFactory {
 	const registry = AgentRegistry.global();
+	const ownerSessionId = ctx.session.sessionId;
+	const credentials = ctx.authStorage.credentials;
+	const ownerLifetimeCurrent = ctx.captureOwnerLifetimeCurrent?.();
+	const isRootCurrent = (): boolean =>
+		ownerLifetimeCurrent?.() !== false &&
+		!ctx.session.isDisposed &&
+		!ctx.authStorage.isClosed &&
+		ctx.session.sessionId === ownerSessionId &&
+		ctx.authStorage.credentials === credentials;
 	return async ref => {
+		if (!isRootCurrent()) return undefined;
+		const attemptOwnerCurrent = ctx.captureOwnerCurrent?.();
+		const isOwnerCurrent = (): boolean => isRootCurrent() && attemptOwnerCurrent?.() !== false;
+		if (!isOwnerCurrent()) return undefined;
 		const sessionFile = ref.sessionFile;
 		if (!sessionFile) return undefined;
 		const peek = await SessionManager.peekSessionInit(sessionFile);
@@ -142,7 +154,12 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 			parentId = registry.get(parentId)?.parentId;
 		}
+		if (!isOwnerCurrent()) return undefined;
 		return async expectedRef => {
+			if (!isRootCurrent()) throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
+			const revivedAdmission = ctx.captureOwnerCurrent?.();
+			const isOwnerCurrent = (): boolean => isRootCurrent() && revivedAdmission?.() !== false;
+			if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
 			// Re-open fresh on every revive: park closes the writer, so this takes
 			// the single-writer lock cleanly and restores the full message history.
 			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
@@ -257,6 +274,7 @@ export function createPersistedSubagentReviverFactory(
 
 			let session: AgentSession;
 			try {
+				if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
 				({ session } = await createAgentSession({
 					cwd: restoredSeance?.cwd ?? ctx.session.sessionManager.getCwd(),
 					authStorage: ctx.authStorage,
@@ -324,47 +342,71 @@ export function createPersistedSubagentReviverFactory(
 				}));
 			} catch (error) {
 				mcpFollower?.dispose();
+				await reopened.close();
 				throw error;
 			}
-			mcpFollower?.bind(session);
-			// Clamp the active set to the persisted list: createAgentSession's
-			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
-			// the original run didn't carry. Unknown/missing names are ignored.
-			await session.setActiveToolsByName(
-				restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
-			);
-			// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
-			if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
-			// Wire the extension runtime exactly as the live executor does. Without
-			// this the runner stays pre-init, every action method throws
-			// `ExtensionRuntimeNotInitializedError`, and a `tool_call` handler that
-			// touches a runtime action trips the fail-closed gate in `emitToolCall`,
-			// blocking every tool — including the hidden `yield` — in the revived
-			// agent. `session_start` also re-runs so extensions restore per-session
-			// state (issue #8824).
-			await initializeExtensions(session, {
-				reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
-				reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
-			});
-			// Cold revives must drive registry status themselves — createAgentSession
-			// doesn't wire this generically (the live path does it in the executor).
-			// The internal run-state signal precedes deferrable public `agent_end`,
-			// keeping idle-TTL ownership synchronized even while prompts unwind.
-			registry.syncSessionStatus(ref.id, session);
-			attachIrcWakeTurnMonitor(session, {
-				id: ref.id,
-				agent: persistedAgentDefinition(ref.displayName, init),
-				eventBus: ctx.eventBus,
-				subagentEventBus: ctx.subagentEventBus,
-				sessionFile,
-				structured,
-				outputSchema: init.outputSchema,
-				outputSchemaMode: init.outputSchemaMode,
-				// Anchor artifacts to the revived ref's own dir (its parent's children
-				// dir), not the live root session's, matching the spawn callers (#11563).
-				artifactsDir: path.dirname(sessionFile),
-			});
-			return session;
+			if (!isOwnerCurrent()) {
+				await session.dispose();
+				throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
+			}
+			try {
+				mcpFollower?.bind(session);
+				bindSubagentOwnerLifetime(session, ref.id, isRootCurrent);
+				// Clamp the active set to the persisted list: createAgentSession's
+				// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
+				// the original run didn't carry. Unknown/missing names are ignored.
+				await session.setActiveToolsByName(
+					restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
+				);
+				// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
+				if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
+				// Wire the extension runtime exactly as the live executor does. Without
+				// this the runner stays pre-init, every action method throws
+				// `ExtensionRuntimeNotInitializedError`, and a `tool_call` handler that
+				// touches a runtime action trips the fail-closed gate in `emitToolCall`,
+				// blocking every tool — including the hidden `yield` — in the revived
+				// agent. `session_start` also re-runs so extensions restore per-session
+				// state (issue #8824).
+				await initializeExtensions(session, {
+					reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
+					reportRuntimeError: err =>
+						logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+				});
+				if (!isOwnerCurrent()) {
+					throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
+				}
+				// Cold revives must drive registry status themselves — createAgentSession
+				// doesn't wire this generically (the live path does it in the executor).
+				// The internal run-state signal precedes deferrable public `agent_end`,
+				// keeping idle-TTL ownership synchronized even while prompts unwind.
+				registry.syncSessionStatus(ref.id, session);
+				attachIrcWakeTurnMonitor(session, {
+					id: ref.id,
+					agent: persistedAgentDefinition(ref.displayName, init),
+					isOwnerCurrent,
+					isOwnerLifetimeCurrent: isRootCurrent,
+					captureReviveOwnerCurrent: ctx.captureOwnerCurrent,
+					widgetOwnerCurrent: isOwnerCurrent,
+					completionProbe: isCompletionProbeEnabled(
+						ctx.settings,
+						taskDepth - 1,
+						ctx.session.extensionRunner?.hasUI() === true,
+					),
+					eventBus: ctx.eventBus,
+					subagentEventBus: ctx.subagentEventBus,
+					sessionFile,
+					structured,
+					outputSchema: init.outputSchema,
+					outputSchemaMode: init.outputSchemaMode,
+					// Anchor artifacts to the revived ref's own dir (its parent's children
+					// dir), not the live root session's, matching the spawn callers (#11563).
+					artifactsDir: path.dirname(sessionFile),
+				});
+				return session;
+			} catch (error) {
+				await session.dispose();
+				throw error;
+			}
 		};
 	};
 }

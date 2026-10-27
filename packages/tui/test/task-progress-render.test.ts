@@ -151,6 +151,44 @@ describe("task progress rendering", () => {
 		expect(recent).not.toContain("Searching the workspace");
 	});
 
+	it("shows the agent's probe stage on running rows only, sanitized to one line", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const render = (progress: AgentProgress) =>
+			Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(120)
+					.join("\n"),
+			);
+		const running = render(runningProgress({ stage: "benchmarking\tthe \x1b[31mdecoder" }));
+		expect(running).toContain("benchmarking");
+		expect(running).toContain("decoder");
+		expect(running).not.toContain("\t");
+		expect(running).not.toContain("[31m");
+		expect(render(runningProgress({ status: "completed", stage: "benchmarking the decoder" }))).not.toContain(
+			"benchmarking the decoder",
+		);
+		for (const status of ["running", "completed", "failed", "aborted"] as const) {
+			const progress = runningProgress({ status, stage: "CURRENT_STAGE", watch: "PRIVATE_WATCH_BRIEF" });
+			const ansi = render(progress);
+			const native = JSON.stringify(
+				taskToolRenderer.describeResult(
+					{ content: [], details: detailsFor(progress) },
+					{ expanded: false, isPartial: status === "running", renderContext: { nowMs: 1 } },
+				),
+			);
+			for (const output of [ansi, native]) {
+				expect(output).not.toContain("PRIVATE_WATCH_BRIEF");
+				if (status === "running") expect(output).toContain("CURRENT_STAGE");
+				else expect(output).not.toContain("CURRENT_STAGE");
+			}
+		}
+	});
+
 	it("shortens home paths in keyless arguments and in each call's intent on the card", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const file = `${os.homedir()}/private/file`;

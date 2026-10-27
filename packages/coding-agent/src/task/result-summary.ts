@@ -7,13 +7,20 @@
  */
 import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, isResumable, type AgentRef } from "../registry/agent-registry";
 import { escapeHarnessTags } from "../session/harness-tags";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
 /** Inline preview budget before the envelope points at `agent://<id>` instead. */
 const FULL_OUTPUT_THRESHOLD = 5000;
+
+const resultOwners = new WeakMap<SingleResult, WeakRef<AgentRef>>();
+
+/** Keeps summary resume guidance bound to the result's originating generation. */
+export function recordTaskResultOwner(result: SingleResult, owner: AgentRef): void {
+	resultOwners.set(result, new WeakRef(owner));
+}
 
 /**
  * Preview text for a child result. Falls back to "(no output)" — annotated
@@ -59,12 +66,13 @@ export function formatTaskResultSummary(
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
 	const truncated = outputCharCount > FULL_OUTPUT_THRESHOLD && result.outputPath !== undefined;
 	const preview = truncated ? previewHead(output) : output;
-	// A stopped-but-adopted agent (soft-budget stop) stays messageable; tell
-	// the parent so it can resume via irc instead of redoing the work. Isolated
-	// runs are parked without a reviver (their worktree is gone), so their
-	// "parked" status must not read as resumable.
-	const refStatus = AgentRegistry.global().get(result.id)?.status;
-	const resumable = result.aborted && !result.isolated && (refStatus === "idle" || refStatus === "parked");
+	const owner = resultOwners.get(result)?.deref();
+	const resumable =
+		result.aborted &&
+		!result.isolated &&
+		owner !== undefined &&
+		AgentRegistry.global().get(result.id) === owner &&
+		isResumable(owner);
 	return prompt.render(taskSummaryTemplate, {
 		agentName: result.agent,
 		id: result.id,

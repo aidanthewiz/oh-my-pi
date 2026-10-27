@@ -2,19 +2,23 @@
  * Focused subagent views are chat-only, except for viewer-scoped commands: `/btw`
  * asks a side question about the focused transcript, `/export` writes the focused
  * agent's own transcript (with its nested subagents), `/jobs` lists the focused
- * agent's background jobs, and `/usage` reports account-wide limits. Everything
- * else, and mutating forms such as `/usage reset` and `/jobs kill`, still requires
- * returning to main.
+ * agent's background jobs, `/usage` reports account-wide limits, and the model and
+ * thinking controls (`/model`, `/switch`, `/effort`, their keys) act on the focused
+ * agent's session. Everything else, and mutating forms such as `/usage reset` and
+ * `/jobs kill`, still requires returning to main.
  *
  * Failure mode if this regresses: these commands silently do nothing (or steer the
- * agent) in a focused view, or `/export` writes the main session instead of the viewed one.
+ * agent) in a focused view, `/export` writes the main session instead of the viewed
+ * one, or a model/thinking change lands on the main session instead of the agent.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
+import { beginSettingsTest, restoreSettingsTestState } from "./helpers/settings-test-state";
 
 function createFocusedContext() {
 	let editorText = "";
@@ -105,6 +109,57 @@ describe("focused subagent view slash commands", () => {
 		expect(editor.getText()).toBe(".");
 		expect(raw.showError).toHaveBeenCalledTimes(1);
 		expect(prompt).toHaveBeenCalledWith(manualContinuePrompt, { synthetic: true, userInitiated: true });
+	});
+
+	it("changes focused effort without changing the main effort", async () => {
+		const focused = createFocusedContext();
+		let childLevel = "low";
+		let mainLevel = "medium";
+		Object.assign(focused.raw.viewSession, {
+			model: { provider: "anthropic", id: "claude-sonnet", reasoning: true },
+			getAvailableEffortSelectors: () => ["off", "auto", "low", "medium", "high"],
+			setThinkingLevel: (level: string) => {
+				childLevel = level;
+			},
+		});
+		Object.assign(focused.raw.session, {
+			setThinkingLevel: (level: string) => {
+				mainLevel = level;
+			},
+		});
+		const controller = new InputController(focused.ctx);
+		controller.setupEditorSubmitHandler();
+		focused.editor.setText("/effort high");
+		await focused.ctx.editor.onSubmit?.("/effort high");
+		expect(childLevel).toBe("high");
+		expect(mainLevel).toBe("medium");
+		expect(focused.editor.getText()).toBe("");
+		expect(focused.prompt).not.toHaveBeenCalled();
+	});
+
+	it("does not update a new view after an older role cycle finishes", async () => {
+		const focused = createFocusedContext();
+		const pending = Promise.withResolvers<{ role: string }>();
+		Object.assign(focused.raw.viewSession, { cycleRoleModels: () => pending.promise });
+		let track: unknown;
+		Object.assign(focused.raw, {
+			statusLine: { invalidate() {} },
+			updateEditorBorderColor() {},
+			showModelCycleTrack: (...args: unknown[]) => {
+				track = args;
+			},
+		});
+		const settingsState = beginSettingsTest();
+		try {
+			await Settings.init({ inMemory: true });
+			const cycle = new InputController(focused.ctx).cycleRoleModel("forward");
+			focused.raw.viewSession = { ...focused.raw.viewSession };
+			pending.resolve({ role: "slow" });
+			await cycle;
+			expect(track).toBeUndefined();
+		} finally {
+			restoreSettingsTestState(settingsState);
+		}
 	});
 
 	it("keeps other commands gated to the main session, draft intact", async () => {

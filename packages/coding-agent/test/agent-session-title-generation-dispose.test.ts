@@ -39,6 +39,8 @@ afterEach(async () => {
  */
 const declineTitleFork = createMockModel({ handler: { content: ["<title/>"] } }).stream;
 
+const PLAIN_TITLES = { "title.generator": "tiny" };
+
 /** Assistant reply long enough (>= 40 words) to trigger a deferred retitle. */
 const TOKENIZER_REPLY =
 	"The screenshot shows a TypeError thrown by the tokenizer. It happens because the input stream is read after it was already closed, so the next token lookup dereferences an undefined buffer. Guarding the read and resetting the cursor when the stream closes should fix it without changing the public API.";
@@ -171,6 +173,7 @@ describe("AgentSession title generation disposal", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			modelRoles: { tiny: `${model.provider}/${model.id}` },
+			...PLAIN_TITLES,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -233,6 +236,7 @@ describe("AgentSession title generation disposal", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			modelRoles: { tiny: `${model.provider}/${model.id}` },
+			...PLAIN_TITLES,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -275,6 +279,7 @@ describe("AgentSession title generation disposal", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			modelRoles: { tiny: `${model.provider}/${model.id}` },
+			...PLAIN_TITLES,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",

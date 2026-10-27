@@ -739,12 +739,17 @@ export class SelectorController {
 		this.ctx.session.setThinkingLevel(level);
 	}
 
+	/**
+	 * Open a model selector. A focused subagent always gets the session-only
+	 * picker: the hub assigns persistent roles, which configure the main session
+	 * and future spawns rather than the agent being viewed.
+	 */
 	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void {
 		if (options?.selectOnly) {
 			this.#showModelPicker({ selectOnly: options.selectOnly });
 			return;
 		}
-		if (options?.temporaryOnly) {
+		if (options?.temporaryOnly || this.ctx.focusedAgentId) {
 			this.#showModelPicker();
 			return;
 		}
@@ -752,30 +757,35 @@ export class SelectorController {
 	}
 
 	/**
-	 * Session-only model switch (`/switch <selector>`): applies the resolved
-	 * model without persisting it. Compacts first when the transcript exceeds
-	 * the target's context window, mirroring an over-context pick in the alt+p
-	 * picker. Failures surface as status errors.
+	 * Session-only model switch (`/switch <selector>`) for the viewed session:
+	 * applies the resolved model without persisting it. Compacts first when the
+	 * transcript exceeds the target's context window, mirroring an over-context
+	 * pick in the alt+p picker. Failures surface as status errors.
 	 */
 	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, role?: string): Promise<void> {
-		const contextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
+		const target = this.ctx.viewSession;
+		const sessionId = target.sessionId;
+		const contextTokens = target.getContextUsage()?.tokens ?? 0;
 		const contextWindow = model.contextWindow ?? 0;
 		const overContext = contextWindow > 0 && contextTokens > contextWindow;
 		try {
 			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext, role);
 		} catch (error) {
+			if (this.ctx.viewSession !== target || target.sessionId !== sessionId || target.isDisposed) return;
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
 	}
 
 	/**
-	 * Apply a session-only model: update agent state but never persist to
-	 * settings. `compactFirst` runs compaction with the current model before
-	 * switching (the target cannot fit the transcript); the switch runs in the
-	 * before-flush hook so any prompt queued during compaction executes on the
-	 * target model, and the idempotent post-return call covers the early
-	 * "nothing to compact" return that skips the hook. A cancelled or failed
-	 * compaction keeps the current model.
+	 * Apply a session-only model to the viewed session: update agent state but
+	 * never persist to settings. `compactFirst` runs compaction with the current
+	 * model before switching (the target cannot fit the transcript); the switch
+	 * runs in the before-flush hook so any prompt queued during compaction
+	 * executes on the target model, and the idempotent post-return call covers
+	 * the early "nothing to compact" return that skips the hook. A cancelled or
+	 * failed compaction keeps the current model. A focused subagent switches
+	 * directly: `/compact` drives the main session, and the agent's own context
+	 * maintenance recovers an oversized transcript on its next turn.
 	 */
 	async #applySessionModel(
 		model: Model,
@@ -784,15 +794,30 @@ export class SelectorController {
 		compactFirst: boolean,
 		role?: string,
 	): Promise<void> {
+		const target = this.ctx.viewSession;
+		const focusedAgentId = this.ctx.focusedAgentId;
+		const sessionId = target.sessionId;
+		const previousModel = target.model;
+		const isCurrent = () =>
+			this.ctx.viewSession === target &&
+			target.sessionId === sessionId &&
+			!target.isDisposed &&
+			this.ctx.focusedAgentId === focusedAgentId;
 		const apply = async () => {
-			const level = thinkingLevel ?? this.ctx.session.resolveTemporaryModelThinkingLevel(model);
-			await this.ctx.session.setModelTemporary(model, level, role ? { role } : undefined);
+			if (!isCurrent() || target.model !== previousModel) return;
+			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
+			await target.setModelTemporary(model, level, role ? { role } : undefined);
+			if (!isCurrent()) return;
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
+			if (focusedAgentId) {
+				this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
+				return;
+			}
 			const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");
 			this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
 		};
-		if (!compactFirst) {
+		if (!compactFirst || focusedAgentId) {
 			await apply();
 			return;
 		}
@@ -828,10 +853,13 @@ export class SelectorController {
 			if (this.#focusOpenMenu("model-picker")) return;
 		}
 		const { ModelPickerComponent } = loadModelOverlayComponents();
-		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
-		const current = this.ctx.session.model;
+		const viewed = this.ctx.viewSession;
+		const viewedSessionId = viewed.sessionId;
+		const focusedAgentId = this.ctx.focusedAgentId;
+		const currentContextTokens = viewed.getContextUsage()?.tokens ?? 0;
+		const current = viewed.model;
 		const quickRoleOrder = cfgCycleOrder.get(this.ctx.settings);
-		const quickRoleCycle = this.ctx.session.getRoleModelCycle(quickRoleOrder);
+		const quickRoleCycle = viewed.getRoleModelCycle(quickRoleOrder);
 		const currentSelector = selectOnly
 			? selectOnly.currentSelector
 			: current
@@ -855,20 +883,27 @@ export class SelectorController {
 		const isCurrent = () =>
 			this.#openMenus.get(menuKind) === menu &&
 			this.ctx.session === owningSession &&
-			owningSession.sessionId === owningSessionId;
+			owningSession.sessionId === owningSessionId &&
+			!owningSession.isDisposed &&
+			this.ctx.viewSession === viewed &&
+			viewed.sessionId === viewedSessionId &&
+			!viewed.isDisposed &&
+			this.ctx.focusedAgentId === focusedAgentId;
 		const picker = new ModelPickerComponent(
 			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
+			createModelBrowserSource(this.ctx.settings, model => viewed.effectiveServiceTier(model)),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
 				onPick: async (model, selector, { overContext }) => {
-					if (!isCurrent()) return;
+					if (!isCurrent() || viewed.model !== current) return;
 					if (selectOnly) {
 						done();
 						try {
 							await selectOnly.onSelect(selector);
 						} catch (error) {
+							if (this.ctx.viewSession !== viewed || viewed.sessionId !== viewedSessionId || viewed.isDisposed)
+								return;
 							this.ctx.showError(sanitizeErrorLine(error));
 						}
 						return;
@@ -880,13 +915,16 @@ export class SelectorController {
 						await this.#applySessionModel(model, selector, undefined, overContext);
 						if (!overContext) done();
 					} catch (error) {
+						if (this.ctx.viewSession !== viewed || viewed.sessionId !== viewedSessionId || viewed.isDisposed)
+							return;
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
 				},
 				onPickRole: async entry => {
-					if (!isCurrent() || selectOnly) return;
+					if (!isCurrent() || viewed.model !== current || selectOnly) return;
 					try {
-						await this.ctx.session.applyRoleModel(entry);
+						await viewed.applyRoleModel(entry);
+						if (!isCurrent()) return;
 						this.ctx.statusLine.invalidate();
 						this.ctx.updateEditorBorderColor();
 						this.ctx.showModelCycleTrack(
@@ -895,11 +933,12 @@ export class SelectorController {
 						);
 						done();
 					} catch (error) {
+						if (!isCurrent()) return;
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
 				},
 				onPickTask: (_model, selector) => {
-					if (!isCurrent() || selectOnly) return;
+					if (!isCurrent() || viewed.model !== current || selectOnly || focusedAgentId) return;
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
 					cfgTaskAgentModelOverrides.override(this.ctx.settings, {
@@ -914,7 +953,7 @@ export class SelectorController {
 			{
 				currentContextTokens,
 				currentSelector,
-				taskModeKeys: this.ctx.keybindings.getKeys("app.model.selectTemporary"),
+				taskModeKeys: focusedAgentId ? [] : this.ctx.keybindings.getKeys("app.model.selectTemporary"),
 				taskSelector,
 				quickRoles: quickRoleCycle?.models,
 				quickRoleOrder,
@@ -2118,6 +2157,10 @@ export class SelectorController {
 	 * credentials were stored.
 	 */
 	async #handleOAuthLogin(providerId: string): Promise<boolean> {
+		const session = this.ctx.session;
+		const sessionId = session.sessionId;
+		const isCurrent = () => this.ctx.session === session && session.sessionId === sessionId && !session.isDisposed;
+		if (!isCurrent()) return false;
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const { getOAuthCredentialProvider, LoginDialogComponent, PASTE_CODE_LOGIN_PROVIDERS } = loadProviderAuthUi();
 		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
@@ -2125,6 +2168,7 @@ export class SelectorController {
 		const restoreEditor = () => {
 			if (restored) return;
 			restored = true;
+			if (!isCurrent() || !this.ctx.editorContainer.children.includes(dialog)) return;
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
 			this.ctx.ui.setFocus(this.ctx.editor);
@@ -2137,7 +2181,7 @@ export class SelectorController {
 				// Fires on Esc: unblock the editor immediately; the aborted flow's
 				// rejection settles the awaited login below.
 				restoreEditor();
-				if (message) this.ctx.showStatus(message);
+				if (message && isCurrent()) this.ctx.showStatus(message);
 			},
 			openPath,
 		);
@@ -2146,7 +2190,7 @@ export class SelectorController {
 		this.ctx.ui.setFocus(dialog);
 		this.ctx.ui.requestRender();
 		try {
-			const identity = await this.ctx.session.modelRegistry.authStorage.oauth.login(providerId as OAuthProvider, {
+			const identity = await session.modelRegistry.authStorage.oauth.login(providerId as OAuthProvider, {
 				signal: dialog.signal,
 				onBrowserSession: captureBrowserSession,
 				onAuth: (info: { url: string; launchUrl?: string; instructions?: string }) => {
@@ -2172,6 +2216,7 @@ export class SelectorController {
 							)
 					: undefined,
 			});
+			if (!isCurrent() || dialog.signal.aborted) return false;
 			// Scope the post-login refresh to the just-authenticated provider with an
 			// `online` strategy: the default all-provider `online-if-uncached` reuses
 			// a fresh authoritative cache row (e.g. an empty result fetched before
@@ -2179,7 +2224,14 @@ export class SelectorController {
 			// models would stay unavailable in-session (#5780). Unrelated providers
 			// are left untouched. `refreshProvider` swallows discovery failures, so
 			// awaiting cannot reject the login.
-			await this.ctx.session.modelRegistry.refreshProvider(getOAuthCredentialProvider(providerId), "online");
+			await session.modelRegistry.refreshProvider(getOAuthCredentialProvider(providerId), "online");
+			if (!isCurrent() || dialog.signal.aborted) return false;
+			try {
+				await this.ctx.refreshScopedModelsAfterLogin?.();
+			} catch (error) {
+				logger.warn("Scoped model refresh after login failed", { error: String(error) });
+			}
+			if (!isCurrent() || dialog.signal.aborted) return false;
 			const block = new TranscriptBlock();
 			// Name the account (and Anthropic organization) that was stored so a
 			// login that lands on an unintended account/subscription is visible
@@ -2199,6 +2251,7 @@ export class SelectorController {
 			this.ctx.present(block);
 			return true;
 		} catch (error: unknown) {
+			if (!isCurrent()) return false;
 			if (dialog.signal.aborted) {
 				// User-cancelled: the dialog already restored the editor and
 				// surfaced "Login cancelled".
@@ -2488,16 +2541,27 @@ export class SelectorController {
 		});
 	}
 
+	/** Open the `/effort` picker for the viewed session (the focused subagent's, else main). */
 	showThinkingSelector(): void {
-		const configured = this.ctx.session.configuredThinkingLevel();
+		const viewed = this.ctx.viewSession;
+		const sessionId = viewed.sessionId;
+		const model = viewed.model;
+		const configured = viewed.configuredThinkingLevel();
 		this.showSelector(done => {
 			const selector = new ThinkingSelectorComponent(
 				configured === ThinkingLevel.Inherit ? ThinkingLevel.Off : configured,
-				this.ctx.session.getAvailableEffortSelectors(),
+				viewed.getAvailableEffortSelectors(),
 				level => {
+					if (
+						this.ctx.viewSession !== viewed ||
+						viewed.sessionId !== sessionId ||
+						viewed.isDisposed ||
+						viewed.model !== model
+					)
+						return;
 					done();
 					// thinking_level_changed refreshes the status line and editor border.
-					this.ctx.session.setThinkingLevel(level);
+					viewed.setThinkingLevel(level);
 					this.ctx.ui.requestRender();
 				},
 				() => {

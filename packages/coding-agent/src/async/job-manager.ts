@@ -1,7 +1,9 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { PipeStreams } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import type { JobWidgetInputs, JobWidgetRegistry } from "../job-widgets/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -111,6 +113,8 @@ export interface AsyncJob {
 	agentId?: string;
 	/** The process the job runs, when it spawns one. */
 	process?: AsyncJobProcess;
+	/** What the job's live widget reads; set by bash and task jobs. */
+	widgetInputs?: JobWidgetInputs;
 	/**
 	 * Job is registered but parked behind a caller-managed gate (e.g. a task
 	 * batch semaphore). Queued jobs do not count toward the running-job limit
@@ -146,6 +150,8 @@ export interface AsyncJobProcess {
 	readonly cwd: string;
 	/** Live pids the command spawned, in spawn order; empty before it starts and after it ends. */
 	pids(): readonly number[];
+	/** Copies of the bytes crossing the command's pipes, kept with the job row (`proc://<id>/streams`). */
+	readonly streams?: PipeStreams;
 }
 
 /** Delivery callback for a settled job's result text. */
@@ -236,6 +242,8 @@ export interface AsyncJobRegisterOptions {
 	foreground?: boolean;
 	/** The process the job runs; see {@link AsyncJob.process}. */
 	process?: AsyncJobProcess;
+	/** See {@link AsyncJob.widgetInputs}. */
+	widgetInputs?: JobWidgetInputs;
 }
 
 /**
@@ -285,6 +293,11 @@ export class AsyncJobManager {
 	#deliveryLoop: Promise<void> | undefined;
 	#deliveryQueueChanged = Promise.withResolvers<void>();
 	#disposed = false;
+	/** Live widgets of this root's jobs; set by the root session when widgets are available. */
+	widgets: JobWidgetRegistry | undefined;
+	/** Root SDK authority; child producers capture but never replace it. */
+	captureWidgetOwnerCurrent: (() => () => boolean) | undefined;
+	captureOwnerLifetimeCurrent: (() => () => boolean) | undefined;
 
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
 		if (!filter) return Array.from(jobs);
@@ -379,6 +392,7 @@ export class AsyncJobManager {
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
 			process: options?.process,
+			widgetInputs: options?.widgetInputs,
 			queued: options?.queued === true,
 			...(options?.foreground ? { foreground: true } : {}),
 		};
@@ -807,19 +821,30 @@ export class AsyncJobManager {
 
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
 		this.#disposed = true;
+		const widgets = this.widgets;
+		widgets?.dispose();
+		const widgetDrain = widgets?.drain();
+		this.widgets = undefined;
 		this.#clearEvictionTimers();
 		this.#cancelJobs(undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 		const timeoutMs = Math.max(options?.timeoutMs ?? 3_000, 0);
 		const deadline = Date.now() + timeoutMs;
 		const jobsSettled = await this.#waitForAllUntil(deadline);
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
+		await widgetDrain;
+		this.captureWidgetOwnerCurrent = undefined;
+		this.captureOwnerLifetimeCurrent = undefined;
 		this.#clearEvictionTimers();
 		// Bypass the grace-period sleep: dispose has already drained/cancelled
 		// deliveries above, so there is nothing left for the model to read via
 		// `agent://<id>` — sleeping the retention window here would only leak
 		// temp dirs for up to `retainedArtifactsCleanupGraceMs` (or past
 		// process exit, since dispose does not await these cleanups).
-		for (const job of this.#jobs.values()) this.#runRetainedArtifactsCleanup(job, { bypassGrace: true });
+		for (const job of this.#jobs.values()) {
+			this.#runRetainedArtifactsCleanup(job, { bypassGrace: true });
+			job.widgetInputs = undefined;
+			job.process = undefined;
+		}
 		this.#jobs.clear();
 		this.#deliveries.length = 0;
 		this.#notifyDeliveryQueueChanged();
@@ -1001,7 +1026,12 @@ export class AsyncJobManager {
 		this.#watchedJobs.delete(jobId);
 		this.#consumedJobResults.delete(jobId);
 		const job = this.#jobs.get(jobId);
-		if (job) this.#runRetainedArtifactsCleanup(job);
+		if (job) {
+			this.#runRetainedArtifactsCleanup(job);
+			job.widgetInputs = undefined;
+			job.process = undefined;
+		}
+		this.widgets?.forget(jobId);
 		return this.#jobs.delete(jobId);
 	}
 

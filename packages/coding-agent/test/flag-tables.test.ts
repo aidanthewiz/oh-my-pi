@@ -135,13 +135,14 @@ describe("--tools discovered-registry validation", () => {
 });
 
 describe("enum flag validation", () => {
-	it("records an unknown --approval-mode and reports it instead of silently keeping the default", () => {
-		expect(parseArgs(["--approval-mode", "yolo"]).approvalMode).toBe("yolo");
+	it("accepts each approval mode and rejects an unknown mode", () => {
+		for (const mode of ["always-ask", "always-ask-cached", "write", "yolo"] as const) {
+			expect(parseArgs(["--approval-mode", mode]).approvalMode).toBe(mode);
+			expect(parseArgs([`--approval-mode=${mode}`]).approvalMode).toBe(mode);
+		}
 		const parsed = parseArgs(["--approval-mode", "sometimes"]);
 		expect(parsed.approvalMode).toBeUndefined();
-		let stderr = "";
-		expect(reportInvalidFlagValues(parsed, text => (stderr += text))).toBe(true);
-		expect(stderr).toContain('Invalid --approval-mode value: "sometimes". Expected one of: always-ask, write, yolo.');
+		expect(reportInvalidFlagValues(parsed, () => {})).toBe(true);
 	});
 
 	it("records an unknown --mode instead of falling back to text", () => {

@@ -2015,8 +2015,8 @@ export class EventController {
 		const session = this.ctx.viewSession;
 		const tool = session.getToolByName(toolName);
 		if (!tool) return undefined;
-		const mode = cfgToolsApprovalMode.get(settings);
-		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(settings);
+		const mode = cfgToolsApprovalMode.get(session.settings);
+		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(session.settings);
 		const approval = resolveApproval(tool, args, mode, userPolicies);
 		if (approval.policy !== "prompt") return undefined;
 		// Approved for this session: the wrapper runs it without asking.

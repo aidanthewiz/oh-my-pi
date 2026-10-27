@@ -6,7 +6,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
+import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { AsyncJob } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -26,6 +27,7 @@ import {
 	runSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import * as completionProbeModule from "@oh-my-pi/pi-coding-agent/task/completion-probe";
@@ -44,10 +46,10 @@ const baseAgent: AgentDefinition = {
 	source: "bundled",
 };
 
-function assistantStopMessage(text: string): AssistantMessage {
+function assistantStopMessage(content: AssistantMessage["content"]): AssistantMessage {
 	return {
 		role: "assistant",
-		content: [{ type: "text", text }],
+		content,
 		api: "openai-responses",
 		provider: "openai",
 		model: "mock",
@@ -73,6 +75,12 @@ interface SessionHarness {
 	/** End an assistant message carrying `text` and no tool calls. */
 	emitAssistantText: (text: string, stop?: Pick<AssistantMessage, "stopReason" | "errorMessage">) => void;
 	abortEntered: Promise<void>;
+	/** End an assistant message carrying `content`, tool calls included. */
+	emitAssistantContent: (content: AssistantMessage["content"]) => void;
+	/** End the agent loop with every assistant message emitted so far. */
+	emitAgentEnd: () => void;
+	/** Finish a `toolName` call whose result is `text`. */
+	emitToolResult: (toolName: string, text: string) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -92,15 +100,32 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 	const hangingPrompt = Promise.withResolvers<void>();
 	const abortEntered = Promise.withResolvers<void>();
 	let yieldSeq = 0;
+	let toolSeq = 0;
+	let disposed = false;
 	let wakeObserver: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...listeners]) listener(event);
 	};
-	const emitAssistantText = (text: string, stop?: Pick<AssistantMessage, "stopReason" | "errorMessage">) => {
-		const message = { ...assistantStopMessage(text), ...stop };
+	const emitAssistantContent = (
+		content: AssistantMessage["content"],
+		stop?: Pick<AssistantMessage, "stopReason" | "errorMessage">,
+	) => {
+		const message = { ...assistantStopMessage(content), ...stop };
 		messages.push(message);
 		emit({ type: "message_end", message } as AgentSessionEvent);
+	};
+	const emitAssistantText = (text: string, stop?: Pick<AssistantMessage, "stopReason" | "errorMessage">) =>
+		emitAssistantContent([{ type: "text", text }], stop);
+	const emitAgentEnd = () => emit({ type: "agent_end", messages: [...messages] } as AgentSessionEvent);
+	const emitToolResult = (toolName: string, text: string) => {
+		toolSeq += 1;
+		emit({
+			type: "tool_execution_end",
+			toolCallId: `${toolName}-${toolSeq}`,
+			toolName,
+			result: { content: [{ type: "text", text }] },
+		} as AgentSessionEvent);
 	};
 	const emitTerminalYield = (data: unknown) => {
 		yieldSeq += 1;
@@ -115,6 +140,9 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		} as AgentSessionEvent);
 	};
 	const session = {
+		get isDisposed() {
+			return disposed;
+		},
 		state: { messages },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -153,7 +181,9 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		abort: async () => {
 			abortEntered.resolve();
 		},
-		dispose: async () => {},
+		dispose: async () => {
+			disposed = true;
+		},
 		setIrcWakeTurnObserver: (
 			observer: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
 		) => {
@@ -161,6 +191,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		},
 		trackIrcReply: () => {},
 		subscribeRunState: () => () => {},
+		isParentIrcSteer: () => false,
 		asyncJobManager: options?.asyncJobManager,
 	};
 	return {
@@ -169,6 +200,9 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		abortEntered: abortEntered.promise,
 		emitTerminalYield,
 		emitAssistantText,
+		emitAssistantContent,
+		emitAgentEnd,
+		emitToolResult,
 		wakeObserver: () => wakeObserver,
 	};
 }
@@ -207,6 +241,19 @@ describe("runSubprocess result acceptance", () => {
 		const ref = registerRunning(harness.session);
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session: harness.session,
+			captureOwnerCurrent:
+				({ allowParked = false } = {}) =>
+				() =>
+					!harness.session.isDisposed &&
+					AgentRegistry.global().get(AGENT_ID) === ref &&
+					ref.session === harness.session &&
+					ref.status !== "aborted" &&
+					(allowParked || ref.status !== "parked"),
+			captureOwnerLifetimeCurrent: () => () =>
+				!harness.session.isDisposed &&
+				AgentRegistry.global().get(AGENT_ID) === ref &&
+				ref.session === harness.session &&
+				ref.status !== "aborted",
 			extensionsResult: {} as unknown as LoadExtensionsResult,
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),
@@ -236,6 +283,19 @@ describe("runSubprocess result acceptance", () => {
 		const ref = registerRunning(harness.session);
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session: harness.session,
+			captureOwnerCurrent:
+				({ allowParked = false } = {}) =>
+				() =>
+					!harness.session.isDisposed &&
+					AgentRegistry.global().get(AGENT_ID) === ref &&
+					ref.session === harness.session &&
+					ref.status !== "aborted" &&
+					(allowParked || ref.status !== "parked"),
+			captureOwnerLifetimeCurrent: () => () =>
+				!harness.session.isDisposed &&
+				AgentRegistry.global().get(AGENT_ID) === ref &&
+				ref.session === harness.session &&
+				ref.status !== "aborted",
 			extensionsResult: {} as unknown as LoadExtensionsResult,
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),
@@ -325,9 +385,9 @@ describe("runSubprocess result acceptance", () => {
 			});
 			try {
 				await entered.promise;
-				probe?.onEstimate(42, 0.1);
+				probe?.onEstimate({ percent: 42 }, 0.1);
 				harness.emitTerminalYield({ report: "submitted" });
-				probe?.onEstimate(15, 0.3);
+				probe?.onEstimate({ percent: 15 }, 0.3);
 				expect(progress.at(-1)?.completionPercent).toBe(enabled ? 99 : undefined);
 				expect(progress.at(-1)?.cost).toBeCloseTo(enabled ? 0.4 : 0);
 				await Promise.resolve();
@@ -743,6 +803,88 @@ describe("runSubprocess result acceptance", () => {
 		}
 	});
 
+	it("gives a turn the owner woke a job whose widget reads the turn's tool calls and whose progress wait reads", async () => {
+		const tempDir = TempDir.createSync("@omp-wake-job-widget-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "label every bash output",
+					display: false,
+					details: { id: "msg-owner", from: "Parent", message: "label every bash output" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			harness.emitToolResult("bash", "BENCH tok_s_stream=171");
+			const inputs = manager.getJob(AGENT_ID)?.widgetInputs;
+			const [tools] = inputs?.sources() ?? [];
+			expect(tools?.id).toBe("tools");
+			expect(tools?.read(0)).toMatchObject({ open: true });
+			expect(tools?.read(0).text).toContain("BENCH tok_s_stream=171");
+			expect(inputs?.brief()).toMatchObject({ kind: "task", task: "label every bash output" });
+
+			harness.emitAssistantText("labelled");
+			await finish?.(undefined);
+			const details = manager.getJob(AGENT_ID)?.latestDetails;
+			expect(details?.progress).toMatchObject([{ id: AGENT_ID, status: "completed" }]);
+			expect(tools?.read(0).open).toBe(false);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
+	it("does not offer a successor generation as the resume target of an old cancelled result", async () => {
+		const harness = createHarness();
+		registerRunning(harness.session);
+		const registry = AgentRegistry.global();
+		const owner = registry.get(AGENT_ID)!;
+		const result = await runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: baseAgent,
+			message: "continue",
+			signal: AbortSignal.abort("cancelled"),
+		});
+		registry.setStatus(AGENT_ID, "idle", owner);
+		expect(formatTaskResultSummary(result, { totalDurationMs: result.durationMs })).toContain(
+			`write agent://${AGENT_ID}`,
+		);
+		registry.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			session: createHarness().session,
+			status: "idle",
+		});
+		expect(formatTaskResultSummary(result, { totalDurationMs: result.durationMs })).not.toContain(
+			`write agent://${AGENT_ID}`,
+		);
+	});
+
+	it("does not replay the previous accepted report when a wake produced no new assistant message", async () => {
+		const body = await peerWakeRelay(() => {}, "PRIOR_ACCEPTED_REPORT");
+		expect(body).not.toContain("PRIOR_ACCEPTED_REPORT");
+		expect(body).toContain("produced no output");
+	});
+
 	it("keeps the accepted artifact and sidecar when an unstructured follow-up starts aborted", async () => {
 		const tempDir = TempDir.createSync("@omp-aborted-agent-result-");
 		const artifactsDir = tempDir.path();
@@ -1111,5 +1253,76 @@ describe("runSubprocess result acceptance", () => {
 			expect(deliveries).toEqual([]);
 			expect(ircReplies.Parent).toEqual(["reply despite unavailable manager"]);
 		});
+	});
+
+	/** Wake an idle agent from a peer, play `turn`, and return the relay body the peer receives. */
+	async function peerWakeRelay(
+		turn: (harness: SessionHarness) => void,
+		previousReport?: string,
+	): Promise<string | undefined> {
+		const harness = createHarness();
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "OtherAgent",
+			displayName: "OtherAgent",
+			kind: "sub",
+			session: createHarness().session,
+			status: "running",
+		});
+		registry.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		if (previousReport) harness.emitAssistantText(previousReport);
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+
+		const finish = observer([
+			{
+				role: "custom",
+				customType: "irc:incoming",
+				content: "is line 42 fine?",
+				display: false,
+				details: { id: "msg-peer", from: "OtherAgent", message: "is line 42 fine?" },
+				attribution: "agent",
+				timestamp: Date.now(),
+			} as unknown as AgentMessage,
+		]);
+		const relay = IrcBus.global().wait("OtherAgent", { from: AGENT_ID }, 1000);
+		turn(harness);
+		harness.emitAgentEnd();
+		await finish?.(undefined);
+		return (await relay)?.body;
+	}
+
+	it("relays only a woken agent's final report, not the narration before its tool calls", async () => {
+		const body = await peerWakeRelay(harness => {
+			harness.emitAssistantContent([
+				{ type: "text", text: "Checking." },
+				{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "src/a.ts" } },
+			]);
+			harness.emitAssistantText("Answer.");
+		});
+		expect(body).toBe("Answer.");
+	});
+
+	it("does not relay narration that preceded a woken agent's last Cursor-resolved call", async () => {
+		const body = await peerWakeRelay(harness => {
+			const resolvedCall: ToolCall & CursorExecResolvedCarrier = {
+				type: "toolCall",
+				id: "exec-1",
+				name: "bash",
+				arguments: { command: "bun test" },
+			};
+			resolvedCall[kCursorExecResolved] = true;
+			harness.emitAssistantContent([{ type: "text", text: "Running the tests." }, resolvedCall]);
+		});
+		expect(body).not.toContain("Running the tests.");
+		expect(body).toContain("produced no output");
 	});
 });

@@ -58,7 +58,7 @@ function harness(options: { reasoning?: boolean; efforts?: readonly Effort[]; ce
 		getAvailableThinkingLevels: () => controls.getAvailableThinkingLevels(),
 		getAvailableEffortSelectors: () => controls.getAvailableEffortSelectors(),
 	} as unknown as AgentSession;
-	const tuiRuntime = { ctx: { session } } as unknown as TuiSlashCommandRuntime;
+	const tuiRuntime = { ctx: { session, viewSession: session } } as unknown as TuiSlashCommandRuntime;
 	return {
 		outputs,
 		runtime: {
@@ -103,6 +103,26 @@ describe("/effort slash command", () => {
 		expect(effort?.getInlineHint?.("me")).toBe("dium");
 		expect(effort?.getInlineHint?.("me ")).toBeNull();
 		expect(effort?.getInlineHint?.("low")).toBeNull();
+	});
+
+	it("sets effort on a distinct viewed session without changing the main session", async () => {
+		const main = harness({ efforts: [Effort.Low] });
+		const viewed = harness({ efforts: [Effort.High] });
+		const runtime = {
+			ctx: {
+				session: main.runtime.session,
+				viewSession: viewed.runtime.session,
+				showStatus: () => {},
+			},
+			draftDetached: true,
+		} as unknown as TuiSlashCommandRuntime;
+		const effort = buildTuiBuiltinSlashCommands(runtime).find(item => item.name === "effort");
+		const completions = await effort?.getArgumentCompletions?.("");
+		expect(completions?.map(item => item.label)).toEqual(["off", "auto", "high"]);
+		await executeBuiltinSlashCommand("/effort high", runtime);
+		expect(viewed.level()).toBe(ThinkingLevel.High);
+		expect(main.level()).toBeUndefined();
+		expect(main.configChanges()).toBe(0);
 	});
 
 	it("rejects levels above the session ceiling and keeps cycling within it", async () => {

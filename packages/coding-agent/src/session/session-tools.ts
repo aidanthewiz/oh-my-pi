@@ -921,6 +921,12 @@ export class SessionTools {
 					onUpdate: never,
 					ctx: AgentToolContext | undefined,
 				) => {
+					const sessionId = this.#host.sessionManager.getSessionId();
+					const sessionFile = this.#host.sessionManager.getSessionFile();
+					const agentDir = this.#host.settings.getAgentDir();
+					const model = this.#host.model();
+					const approvedInput = structuredCloneJSON(args);
+					const approvedInputJson = JSON.stringify(approvedInput);
 					let cacheable = true;
 					if (target.name === "bash") {
 						const explicitAutoApprove = this.#isExplicitAutoApproveMode();
@@ -944,7 +950,7 @@ export class SessionTools {
 					}
 					// Preserve the exact arguments authorized by a selected or
 					// persisted ACP grant; inner handlers may mutate `args` in place.
-					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: structuredCloneJSON(args) } : ctx) as never;
+					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: approvedInput } : ctx) as never;
 					const command =
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")
@@ -997,6 +1003,16 @@ export class SessionTools {
 					}
 					if (raced.kind === "aborted" || signal?.aborted) {
 						throw new ToolAbortError("Permission request cancelled");
+					}
+					if (
+						this.#host.sessionManager.getSessionId() !== sessionId ||
+						this.#host.sessionManager.getSessionFile() !== sessionFile ||
+						this.#host.settings.getAgentDir() !== agentDir ||
+						this.#host.model() !== model ||
+						this.#host.clientBridge() !== bridge ||
+						JSON.stringify(args) !== approvedInputJson
+					) {
+						throw new ToolError("Tool permission context changed; request permission again.");
 					}
 					const outcome = raced.outcome;
 					if (outcome.outcome === "cancelled") {

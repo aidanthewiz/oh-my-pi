@@ -258,6 +258,26 @@ For PTY execution, live rendering is handled by custom UI overlay, not by `onUpd
 
 When `async.enabled` is true and the call passes `async: true`, `BashTool` starts a managed bash job immediately, returns a running result with a job id, and stores completion through the session job manager. Auto-backgrounding (`bash.autoBackground.enabled`, default `true`) can also use this path after `bash.autoBackground.thresholdMs` (default 60,000 ms); it is skipped for PTY and client-bridge terminal routes and falls back to foreground execution when the job manager is at capacity. A queued steering message can background a still-running auto-background candidate early.
 
+### Pipe streams (`proc://<id>/streams`)
+
+Each managed embedded-shell run gets its own native `PipeStreams` handle (`ShellRunOptions.streams`). Pipe relays copy bytes without rerunning commands or changing backpressure, EOF, or early-consumer exit behavior. Each stream retains the newest 1 MiB. A run retains at most 16 streams and evicts older finished streams while keeping the newest four finished streams. When all slots contain open streams, additional pipes run without capture.
+
+`read proc://<id>/streams` lists only the caller's jobs, with stream identity, open/closed state, and total byte counts. `proc://<id>/streams/<n>` returns decoded, sanitized retained text. A gap notice reports omitted bytes. Reads omit incomplete UTF-8 edges while a stream remains open; closed streams remain readable until job eviction. Reading does not consume or acknowledge the job result.
+
+User-shell and PTY runs have no pipe capture. Each stage's stderr remains part of the job's own output. Capture never retains the finished shell or grants cancellation authority over another owner's process.
+
+### Job widgets
+
+Bash jobs register `widgetInputs` (`src/job-widgets/`): an `out` source receives output chunks, and bounded `pipe:<n>` adapters read captured pipes. The brief contains the command and the call's `i` intent. Task jobs supply their tool-result tap and current owned nested sources.
+
+Widgets use deterministic local rendering without remote authoring by default. Remote authoring requires explicit managed consent plus provider, model, credit, account, and originating-session admission. Showing a descendant's widget does not grant model-call or cancellation authority. The author bounds and redacts the complete outbound payload, including previous specifications and validation errors.
+
+Each producer captures remote-source authority before its first asynchronous step. Child sources keep their original root authority instead of adopting a successor session. A missing or stale guard permits local rendering, not a paid author request. Parking a child does not replace root ownership.
+
+An admitted author can produce a validated declarative specification. Linear-time native `LineMatcher` rules update bounded series and blocks from new source text. Source offsets use bytes for pipes and UTF-16 units for text taps. Readers reset on retention gaps and retire removed or same-id replacement sources. `snapshotJobs` attaches the view to `JobSnapshot.widget` for the wait card, HUD, and jobs sheet.
+
+`async.widgets` disables widgets. Disable transitions, root session transitions, and disposal invalidate pending author requests. Job eviction retires its widget and captured sources. Late paid usage remains attributed to the originating session and store.
+
 ## Result shaping, metadata, and error mapping
 
 After execution:

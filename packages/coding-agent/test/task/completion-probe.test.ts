@@ -52,7 +52,7 @@ describe("subagent completion probing", () => {
 			startCompletionProbe({
 				session: () => session,
 				signal: controller.signal,
-				onEstimate: percent => estimates.push(percent),
+				onEstimate: estimate => estimates.push(estimate.percent),
 			});
 			for (const minutes of [2, 5, 10, 30, 60, 60]) {
 				const before = estimates.length;
@@ -84,7 +84,7 @@ describe("subagent completion probing", () => {
 			startCompletionProbe({
 				session: () => session,
 				signal: controller.signal,
-				onEstimate: percent => estimates.push(percent),
+				onEstimate: estimate => estimates.push(estimate.percent),
 			});
 			await advance(2 * 60_000);
 			await advance(60 * 60_000);

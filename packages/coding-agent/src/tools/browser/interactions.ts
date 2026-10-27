@@ -14,6 +14,7 @@ import type {
 import { ToolAbortError, throwIfAborted } from "../tool-errors";
 import { splitKeyCombo, ternKey } from "./tern/keys";
 import { devtoolsFrameId } from "./frames";
+import { untilAbortedOrReleased } from "./op-timeouts";
 import {
 	createFilePicker,
 	openUploadSources,
@@ -1175,22 +1176,6 @@ async function releaseDropReadWatch(watch: JSHandle<DropReadWatch>): Promise<voi
 	} finally {
 		await watch.dispose();
 	}
-}
-
-/**
- * Wait for an allocation under `signal`, releasing a handle that arrives after cancellation.
- */
-async function untilAbortedOrReleased<T>(
-	signal: AbortSignal | undefined,
-	allocate: () => Promise<T>,
-	release: (late: T) => Promise<unknown>,
-): Promise<T> {
-	throwIfAborted(signal);
-	const pending = allocate();
-	return await untilAborted(signal, () => pending).catch(error => {
-		void pending.then(release).catch(() => undefined);
-		throw error;
-	});
 }
 
 /**

@@ -38,7 +38,7 @@ import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -168,6 +168,11 @@ export interface StructuredSubagentRequest {
 	workPoolYieldItems?: WorkPoolYieldItem[];
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	/** See {@link ExecutorOptions.onToolResult}. */
+	onToolResult?: (result: SubagentToolResult) => void;
+	onAgentRegistered?: ExecutorOptions["onAgentRegistered"];
+	isOwnerCurrent?: () => boolean;
+	widgetOwnerCurrent?: () => boolean;
 }
 
 /** A normalized preflight result, reusable by tests and adapters. */
@@ -655,6 +660,9 @@ function buildExecutorOptions(
 		eventBus: session.eventBus,
 		subagentEventBus: session.subagentEventBus,
 		onProgress: request.onProgress,
+		onToolResult: request.onToolResult,
+		onAgentRegistered: request.onAgentRegistered,
+		widgetOwnerCurrent: request.widgetOwnerCurrent,
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,
@@ -836,6 +844,29 @@ function describeSalvagedWork(result: SingleResult): string {
  * lease or child dispatch; callers keep responsibility for their result text.
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
+	const ownerSession = request.session;
+	const invocationOwnerCurrent = request.isOwnerCurrent;
+	if (invocationOwnerCurrent?.() === false)
+		throw new StructuredSubagentError("preflight", "Subagent owner was retired before dispatch.");
+	const capturedOwnerCurrent = ownerSession.captureOwnerCurrent?.();
+	const isOwnerLifetimeCurrent = ownerSession.captureOwnerLifetimeCurrent?.();
+	const sourceAdmissionFactory = ownerSession.captureOwnerCurrent;
+	const captureReviveOwnerCurrent = sourceAdmissionFactory
+		? () => sourceAdmissionFactory.call(ownerSession, { allowParked: true })
+		: undefined;
+	const sourceSessionId = capturedOwnerCurrent ? undefined : ownerSession.getSessionId?.();
+	const credentialSourceSessionId = capturedOwnerCurrent ? undefined : ownerSession.getCredentialSourceSessionId?.();
+	const credentials = capturedOwnerCurrent ? undefined : ownerSession.authStorage?.credentials;
+	const isOwnerCurrent = (): boolean =>
+		invocationOwnerCurrent?.() !== false &&
+		(capturedOwnerCurrent
+			? capturedOwnerCurrent()
+			: ownerSession.isDisposed?.() !== true &&
+				ownerSession.getSessionId?.() === sourceSessionId &&
+				ownerSession.getCredentialSourceSessionId?.() === credentialSourceSessionId &&
+				ownerSession.authStorage?.credentials === credentials &&
+				ownerSession.authStorage?.isClosed !== true);
+	if (!isOwnerCurrent()) throw new StructuredSubagentError("preflight", "Subagent owner was retired before dispatch.");
 	const policy = await applySpawnHook(request, await resolveEffectiveSubagentPolicy(request));
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	const canRetainForLifecycle =
@@ -848,6 +879,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let artifactCleanup: Promise<void> | undefined;
 	const cleanupArtifacts = (): Promise<void> =>
 		(artifactCleanup ??= (async () => {
+			await deferredCleanup;
 			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
 			lease.unregister?.();
 		})());
@@ -874,6 +906,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		});
 		if (policy.preparedSession === undefined) await refreshSkillsForAutoload(request.session, policy.agent);
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
+		baseOptions.isOwnerCurrent = isOwnerCurrent;
+		baseOptions.isOwnerLifetimeCurrent = isOwnerLifetimeCurrent ?? isOwnerCurrent;
+		baseOptions.captureReviveOwnerCurrent = captureReviveOwnerCurrent;
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;
 		};

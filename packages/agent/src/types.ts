@@ -1078,6 +1078,12 @@ export type ToolApprovalDecision =
 	  };
 export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprovalDecision);
 
+/** Resolved execution identity bound to one remembered approval target. */
+export interface ToolApprovalCacheIdentity {
+	readonly target: string;
+	readonly identity: string;
+}
+
 /**
  * Context passed to tool execution.
  * Apps can extend via declaration merging.
@@ -1170,7 +1176,7 @@ export interface AgentTool<
 	 * before ordinary dispatch commits its result.
 	 */
 	speculation?: ToolSpeculationPolicy;
-	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. Malformed argument JSON still returns the parse error. */
+	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM, and unknown root keys a closed schema would drop stay on the args. Malformed argument JSON still returns the parse error. */
 	lenientArgValidation?: boolean;
 	/**
 	 * Whether the agent loop may abort this tool mid-execution — or skip it
@@ -1228,6 +1234,17 @@ export interface AgentTool<
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
+
+	/**
+	 * Files or URL targets covered by this call's remembered approval.
+	 * Unavailable target derivation returns `undefined`; it is not an empty access set.
+	 */
+	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
+
+	/** Bind every target to its current execution destination; failures must reject. */
+	approvalCacheIdentity?: (
+		args: unknown,
+	) => readonly ToolApprovalCacheIdentity[] | Promise<readonly ToolApprovalCacheIdentity[]>;
 
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;

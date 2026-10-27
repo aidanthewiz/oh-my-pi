@@ -7,6 +7,10 @@
  */
 import type { AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import { TextTap } from "../job-widgets/text-tap";
+import { TOOLS_SOURCE_ID } from "../job-widgets/types";
+import type { AgentRef } from "../registry/agent-registry";
+import { TOOLS_SOURCE_LABEL } from "./widget-inputs";
 
 /** Wall-clock stamps a spawn reports to the executor: call time and permit time. */
 export interface SpawnLaunchTiming {
@@ -26,6 +30,9 @@ export interface SpawnRunBody {
 	timing: SpawnLaunchTiming;
 	onUpdate: AgentToolUpdateCallback<TaskToolDetails>;
 	onArtifactsRetained: (cleanup: () => Promise<void>) => void;
+	/** The run's {@link SpawnRun.tools} tap. */
+	tools: TextTap;
+	onAgentRegistered: (ref: AgentRef) => void;
 }
 
 /** Owner bindings applied before a run starts. */
@@ -39,6 +46,15 @@ export class SpawnRun {
 	readonly #controller = new AbortController();
 	#onUpdate: AgentToolUpdateCallback<TaskToolDetails> | undefined;
 	#onArtifactsRetained: ((cleanup: () => Promise<void>) => void) | undefined;
+	/**
+	 * The subagent's finished tool calls with their results, as the `tools`
+	 * source of its job widget; closed once the run settles.
+	 */
+	readonly tools = new TextTap(TOOLS_SOURCE_ID, TOOLS_SOURCE_LABEL);
+	#ownerRef: WeakRef<AgentRef> | undefined;
+	get ownerRef(): AgentRef | undefined {
+		return this.#ownerRef?.deref();
+	}
 	/** Resolves once the permit is held; rejects with the acquire error when aborted first. */
 	readonly started: Promise<SpawnLaunchTiming>;
 	/** The run's payload; rejects only when `started` does. */
@@ -58,12 +74,17 @@ export class SpawnRun {
 						if (this.#onArtifactsRetained) this.#onArtifactsRetained(cleanup);
 						else void cleanup();
 					},
+					tools: this.tools,
+					onAgentRegistered: ref => {
+						this.#ownerRef = new WeakRef(ref);
+					},
 				});
 			} finally {
 				permit.release();
 			}
 		});
-		void this.result.catch(() => undefined);
+		const closeTools = () => this.tools.close();
+		void this.result.then(closeTools, closeTools);
 	}
 
 	/** Bind the owner's abort signal and progress/artifact sinks. */

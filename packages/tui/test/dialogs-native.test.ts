@@ -321,6 +321,85 @@ describe("dialogs under a native surface", () => {
 		}
 	});
 
+	it("approval: keyboard and native choices retain the selected grant lifetime", () => {
+		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+		try {
+			const callbacks = { onApprove: vi.fn(), onDeny: vi.fn() };
+			const onGrant = vi.fn();
+			const folder = { label: "Approve Directory: ~/src", alwaysLabel: "Always Approve Directory: ~/src" };
+			const file = { label: "Approve File", alwaysLabel: "Always Approve File" };
+			const dialog = new ApprovalDialogComponent("Allow tool: write\nPath: a.ts", callbacks, {
+				grants: [folder, file],
+				onGrant,
+			});
+			now.mockReturnValue(1_000 + APPROVE_ARM_MS);
+			// Approve Once is highlighted on mount: the least the call can be granted.
+			for (let step = 0; step < 3; step++) dialog.handleInput(UP);
+			dialog.handleInput(ENTER);
+			dialog.handleInput(DOWN);
+			dialog.handleInput(DOWN);
+			dialog.handleInput(ENTER);
+			expect(onGrant).toHaveBeenCalledWith(file, true);
+			expect(callbacks.onApprove).not.toHaveBeenCalled();
+
+			const clicked = vi.fn();
+			const pointed = new ApprovalDialogComponent("Allow tool: write\nPath: a.ts", callbacks, {
+				grants: [folder, file],
+				onGrant: clicked,
+			});
+			const list = find(pointed.describe(), node => node.p?.role === "omp.approval.choices")!;
+			pointed.handleNativeEvent({ type: "select", key: list.path, item: "grant0" });
+			expect(clicked).toHaveBeenCalledWith(folder, false);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it("approval: an unbound authority cannot enable persistent grants through native choices", () => {
+		const onGrant = vi.fn();
+		const grant = { label: "Session file grant", alwaysLabel: "Persistent file grant" };
+		const dialog = new ApprovalDialogComponent(
+			"Allow tool: write\nPath: a.ts",
+			{
+				onApprove: vi.fn(),
+				onDeny: vi.fn(),
+			},
+			{
+				grants: [grant],
+				allowPersistentGrants: false,
+				onGrant,
+			},
+		);
+		try {
+			const list = find(dialog.describe(), node => node.p?.role === "omp.approval.choices")!;
+			expect(find(dialog.describe(), node => node.key === "remember")).toBeUndefined();
+			dialog.handleNativeEvent({ type: "select", key: list.path, item: "remember" });
+			dialog.handleNativeEvent({ type: "select", key: list.path, item: "grant0" });
+			expect(onGrant).toHaveBeenCalledTimes(1);
+			expect(onGrant).toHaveBeenCalledWith(grant, false);
+		} finally {
+			dialog.dispose();
+		}
+	});
+
+	it("approval: an unsupported grant denies exactly once instead of leaving the decision pending", () => {
+		const answers: string[] = [];
+		const dialog = new ApprovalDialogComponent(
+			"Allow tool: write\nPath: a.ts",
+			{
+				onApprove: () => answers.push("once"),
+				onDeny: () => answers.push("deny"),
+			},
+			{
+				grants: [{ label: "Approve File", alwaysLabel: "Always Approve File" }],
+			},
+		);
+		const list = find(dialog.describe(), node => node.p?.role === "omp.approval.choices")!;
+		dialog.handleNativeEvent({ type: "select", key: list.path, item: "grant0" });
+		dialog.handleNativeEvent({ type: "select", key: list.path, item: "once" });
+		expect(answers).toEqual(["deny"]);
+	});
+
 	it("approval: while a draft holds Enter, the highlight sits on Deny, relabeled to say Enter sends, and returns once cleared", () => {
 		let draft = "";
 		const dialog = new ApprovalDialogComponent(

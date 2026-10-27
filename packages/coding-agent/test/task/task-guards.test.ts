@@ -110,12 +110,19 @@ function incrementalYieldToolEnd(toolCallId = "tool-yield-inc"): AgentSessionEve
 
 function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 	let abortCount = 0;
+	let disposed = false;
 	const steerCalls: SteerCall[] = [];
 	const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
 	if (!config.hang) releaseHang();
 
 	const session: Partial<AgentSession> = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		extensionRunner: undefined as never,
@@ -160,6 +167,8 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 function mockCreateAgentSession(session: AgentSession) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

@@ -320,7 +320,7 @@ function formatResponseHeaderBlock(statusLine: string, headers?: RequestDebugHea
 
 function headersToRecord(headers: RequestDebugHeaders): Record<string, string | string[]> | undefined {
 	if (!headers) return undefined;
-	const record: Record<string, string | string[]> = {};
+	const record: Record<string, string | string[]> = Object.create(null);
 	let hasHeaders = false;
 	if (headers instanceof Headers) {
 		headers.forEach((value, key) => {
@@ -328,8 +328,7 @@ function headersToRecord(headers: RequestDebugHeaders): Record<string, string | 
 			record[key] = value;
 		});
 	} else {
-		for (const key in headers) {
-			const value = headers[key];
+		for (const [key, value] of Object.entries(headers)) {
 			if (value === undefined || value === null) continue;
 			hasHeaders = true;
 			record[key] = Array.isArray(value) ? value.map(String) : String(value);

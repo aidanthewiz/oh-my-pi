@@ -56,6 +56,7 @@ function createMockSession(
 	const prompts: Array<{ text: string; options?: PromptOptions }> = [];
 	let abortCount = 0;
 	let promptIndex = 0;
+	let disposed = false;
 	const asyncPending = { value: false };
 
 	const emit = (event: AgentSessionEvent) => {
@@ -65,6 +66,12 @@ function createMockSession(
 
 	const session: Partial<AgentSession> = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		model: { api: "anthropic-messages" } as never,
@@ -116,6 +123,8 @@ function createMockSession(
 function mockCreateAgentSession(session: AgentSession) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

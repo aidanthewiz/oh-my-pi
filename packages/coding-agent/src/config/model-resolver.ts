@@ -1121,12 +1121,14 @@ function shouldInheritDefaultBeforePriority(role: ModelRole): boolean {
  * role — the override for online title/classifier tasks — resolves through
  * `smol` so it picks the same configured, inherited, or built-in fast model.
  * The `memory` role first reuses a configured/effective `tiny` role, then the
- * same `smol` priority list.
+ * same `smol` priority list. The `widget` role — the author of background-job
+ * widget specs — resolves exactly like `smol` until configured on its own.
  */
 const ROLE_PRIORITY_ALIAS: Partial<Record<ModelRole, string>> = {
 	advisor: "slow",
 	memory: "smol",
 	tiny: "smol",
+	widget: "smol",
 };
 
 interface ConfiguredRoleFallback {
@@ -1139,6 +1141,7 @@ const ROLE_CONFIGURED_FALLBACK: Partial<Record<ModelRole, ConfiguredRoleFallback
 	advisor: { role: "slow", configuredOnly: true },
 	memory: { role: "tiny", configuredOnly: false },
 	tiny: { role: "smol", configuredOnly: false },
+	widget: { role: "smol", configuredOnly: false },
 };
 
 function hasOwnKey<T extends object>(value: T, key: PropertyKey): key is keyof T {
@@ -1935,8 +1938,8 @@ export async function resolveModelScope(
 
 /**
  * Resolve the set of models a session may use under the active model policy.
- * `enabledModels` narrows the available inventory when configured, then
- * `disabledModels` removes matching entries from that result.
+ * `disabledProviders` removes providers, `enabledModels` narrows the remaining
+ * inventory when configured, then `disabledModels` removes matching entries.
  *
  * An empty `enabledModels` list starts from every available model. A configured
  * allowlist that matches nothing stays empty rather than falling back globally
@@ -2023,11 +2026,16 @@ export function excludeModelsByDisabledPatterns(models: Model<Api>[], patterns: 
 	return models.filter(model => !excludedKeys.has(formatModelString(model)));
 }
 
-/** Apply the effective allowlist and denylist to any model inventory. */
+/** Apply the effective provider denylist, model allowlist, and model denylist to any inventory. */
 export function filterModelsByConfiguredScope(models: Model<Api>[], settings?: Settings): Model<Api>[] {
+	const disabledProviders = disabledProviderIds(settings);
+	const enabledProviders =
+		disabledProviders.size === 0 ? models : models.filter(model => !disabledProviders.has(model.provider));
 	const enabledPatterns = settings ? cfgEnabledModels.get(settings) : [];
 	const allowed =
-		enabledPatterns.length === 0 ? models : filterAvailableModelsByEnabledPatterns(models, enabledPatterns, settings);
+		enabledPatterns.length === 0
+			? enabledProviders
+			: filterAvailableModelsByEnabledPatterns(enabledProviders, enabledPatterns, settings);
 	return excludeModelsByDisabledPatterns(allowed, settings ? cfgDisabledModels.get(settings) : []);
 }
 
@@ -2044,6 +2052,7 @@ export function isModelEnabledBySettings(
 	settings: Settings | undefined,
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 ): boolean {
+	if (settings && cfgDisabledProviders.get(settings).includes(model.provider)) return false;
 	const enabledPatterns = settings ? cfgEnabledModels.get(settings) : [];
 	const disabledPatterns = settings ? cfgDisabledModels.get(settings) : [];
 	if (enabledPatterns.length === 0 && disabledPatterns.length === 0) return true;
@@ -2094,11 +2103,8 @@ function findExactCliModel(
 
 /**
  * Settings-scoped sync companion to {@link resolveAllowedModels}. It applies
- * `enabledModels` and `disabledModels` from the given settings instance, so
- * path-scoped model policy follows the caller's working directory.
- *
- * `disabledProviders` remains applied inside `getAvailable()` through the
- * global settings context.
+ * `disabledProviders`, `enabledModels`, and `disabledModels` from the given
+ * settings instance, so path-scoped model policy follows the caller's working directory.
  */
 export function getAllowedAvailableModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
@@ -2172,7 +2178,8 @@ export function resolveCliModel(options: CliModelOptions): ResolveCliModelResult
 	}
 
 	const scoped = { ...options, cliModel };
-	const allModels = filterModelsByConfiguredScope(modelRegistry.getAll(), settings);
+	const catalogModels = modelRegistry.getAll();
+	const allModels = filterModelsByConfiguredScope(catalogModels, settings);
 	let availableModels = preferredModels ?? modelRegistry.getAvailable();
 	if (settings && (cfgEnabledModels.get(settings).length > 0 || cfgDisabledModels.get(settings).length > 0)) {
 		const allowedKeys = new Set(allModels.map(formatModelString));
@@ -2192,8 +2199,8 @@ export function resolveCliModel(options: CliModelOptions): ResolveCliModelResult
 	// directly; otherwise re-resolve unfiltered to see what the selector was
 	// aiming at, so the refusal names the provider instead of reading as a typo.
 	const blocked = cliProvider
-		? scope.all.find(model => model.provider.toLowerCase() === cliProvider.toLowerCase())?.provider
-		: resolveCliModelInScope(scoped, scope).model?.provider;
+		? catalogModels.find(model => model.provider.toLowerCase() === cliProvider.toLowerCase())?.provider
+		: resolveCliModelInScope(scoped, { all: catalogModels, available: scope.available }).model?.provider;
 	if (blocked === undefined || !disabled.has(blocked)) return enabled;
 	return {
 		model: undefined,

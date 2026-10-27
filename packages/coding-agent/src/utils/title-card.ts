@@ -22,6 +22,11 @@ const RGI_EMOJI = /^\p{RGI_Emoji}$/v;
 const CODE = /^[A-Z0-9]{1,6}$/;
 /** The card form, `<icon> <CODE>: <title>`. */
 const CARD_LINE = /^(\S+) ([A-Z0-9]{1,6}): (\S.*)$/u;
+/**
+ * A code heading the title text instead of filling `code` (`WAIT Observe agent
+ * waits`); two characters at least, so a leading `A` or `I` stays a word.
+ */
+const LEADING_CODE = /^([A-Z0-9]{2,6}):? (\S.*)$/;
 /** Tern reads at most 8 characters as the icon. */
 const MAX_ICON_CODEPOINTS = 8;
 
@@ -107,6 +112,13 @@ export function parseCardTitleReply(reply: string, sourceText?: string): Generat
 	if (line) {
 		if (!card && attrs.code === undefined) card = buildCard(line.code, line.icon, attrs.nf);
 		if (card) text = line.title;
+	} else if (!card && attrs.code === undefined) {
+		const lead = LEADING_CODE.exec(text);
+		const leadCard = lead ? buildCard(lead[1], attrs.emoji, attrs.nf) : undefined;
+		if (leadCard) {
+			card = leadCard;
+			text = lead![2]!;
+		}
 	}
 	const title = normalizeGeneratedTitle(text, sourceText);
 	return title ? { title, ...(card ? { card } : {}) } : null;

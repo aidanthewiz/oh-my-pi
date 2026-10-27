@@ -5,6 +5,12 @@
 ### Breaking Changes
 
 - Collaboration protocol version 4 requires loop ownership on lifecycle events and activity snapshots. Version 3 peers are rejected during the handshake.
+## [18.12.3] - 2026-10-19
+
+### Added
+
+- Added `min`, `max` and dashed reference `marks` to bars/spark `chart` nodes, a `tone` per series column, and the common `hovercard` prop: a node tree Tern floats over the node while the pointer rests on it
+
 ## [18.10.2] - 2026-10-12
 
 ### Added

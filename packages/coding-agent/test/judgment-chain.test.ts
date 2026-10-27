@@ -6,7 +6,11 @@ import type { Api, AssistantMessage, ChoiceQuestion, ImageContent, Model, NoulQu
 import * as ai from "@oh-my-pi/pi-ai";
 import { openrouterDecisionsWire, typesafeWire } from "@oh-my-pi/pi-ai/judgment/systemone";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import {
+	cfgDisabledModels,
+	cfgDisabledProviders,
+	cfgModelRoles,
+} from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ChainJudge, hasNativeJudge, JudgmentCache, journalJudgmentUsage } from "@oh-my-pi/pi-coding-agent/judgment";
@@ -954,6 +958,126 @@ describe("ChainJudge", () => {
 			expect(attempted).not.toContain(VISION_CHAT.id);
 		},
 	);
+
+	it("enforces session provider scope even when the real registry uses a different settings instance", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime(ONLINE.provider, "synthetic-online-key");
+		const registry = new ModelRegistry(authStorage, "/nonexistent/judgment-chain-models.yml", {
+			settings: Settings.isolated({}),
+		});
+		expect(
+			registry.getAvailable("all").some(model => model.provider === ONLINE.provider && model.id === ONLINE.id),
+		).toBe(true);
+		const settings = Settings.isolated({
+			modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` },
+			"retry.fallbackChains": { judge: [] },
+			disabledProviders: [ONLINE.provider],
+		});
+		const credentials = vi.spyOn(registry, "getApiKey");
+		const chat = vi.spyOn(ai, "completeSimple");
+
+		await expect(
+			new ChainJudge({ settings, registry, purpose: "test", sessionModel: ONLINE }).judge({
+				state: "rename a local",
+				questions: { level: TIER_QUESTION },
+			}),
+		).rejects.toThrow("no judge model available");
+
+		expect(credentials).not.toHaveBeenCalled();
+		expect(chat).not.toHaveBeenCalled();
+	});
+
+	it.each(["model", "provider"] as const)(
+		"rechecks %s scope after credential preparation and uses a permitted session fallback",
+		async policy => {
+			const settings = Settings.isolated({ modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` } });
+			const registry = makeRegistry([ONLINE], { [ONLINE.provider]: "online-key" });
+			vi.spyOn(registry, "getApiKey").mockImplementation(async () => {
+				await Promise.resolve();
+				if (policy === "model") cfgDisabledModels.override(settings, [`${ONLINE.provider}/${ONLINE.id}`]);
+				else cfgDisabledProviders.override(settings, [ONLINE.provider]);
+				return "online-key";
+			});
+			const chat = vi.spyOn(ai, "completeSimple");
+			vi.spyOn(tinyModelClient, "complete").mockResolvedValue("low");
+			const metadataResolver = vi.fn();
+			const onUsage = vi.fn();
+
+			const result = await new ChainJudge({
+				settings,
+				registry,
+				purpose: "test",
+				sessionModel: LOCAL,
+				metadataResolver,
+				onUsage,
+			}).judge({ state: "rename a local", questions: { level: TIER_QUESTION } });
+
+			expect(result.answers.level.choice).toBe("low");
+			expect(result.provider).toBe(LOCAL.provider);
+			expect(chat).not.toHaveBeenCalled();
+			expect(metadataResolver).not.toHaveBeenCalled();
+			expect(onUsage).not.toHaveBeenCalled();
+		},
+	);
+
+	it("rejects a candidate disabled while its caller prepares the judgment", async () => {
+		const settings = Settings.isolated({ modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` } });
+		const registry = makeRegistry([ONLINE], { [ONLINE.provider]: "online-key" });
+		const chat = vi.spyOn(ai, "completeSimple");
+		const onUsage = vi.fn();
+
+		await expect(
+			new ChainJudge({ settings, registry, purpose: "test", onUsage }).withCandidate(async candidate => {
+				await Promise.resolve();
+				cfgDisabledProviders.override(settings, [ONLINE.provider]);
+				return candidate.judge({ state: "rename a local", questions: { level: TIER_QUESTION } });
+			}),
+		).rejects.toThrow("model disabled by settings");
+
+		expect(chat).not.toHaveBeenCalled();
+		expect(onUsage).not.toHaveBeenCalled();
+	});
+
+	it("rechecks native scope after awaited headers before reading cached answers or sending a request", async () => {
+		const settings = Settings.isolated({ modelRoles: { judge: "typesafe/jev-preview" } });
+		const registry = makeRegistry([JEV_PREVIEW], { typesafe: "ts-key" });
+		vi.spyOn(registry, "resolveModelHeaders").mockImplementation(async () => {
+			await Promise.resolve();
+			cfgDisabledProviders.override(settings, [JEV_PREVIEW.provider]);
+			return {};
+		});
+		const native = vi.spyOn(globalThis, "fetch");
+		const cache = { lookup: vi.fn() } as unknown as JudgmentCache;
+
+		await expect(
+			new ChainJudge({ settings, registry, purpose: "test", cache }).judge({
+				state: "rename a local",
+				questions: { level: TIER_QUESTION },
+			}),
+		).rejects.toThrow("model disabled by settings");
+
+		expect(native).not.toHaveBeenCalled();
+		expect(cache.lookup).not.toHaveBeenCalled();
+	});
+
+	it("applies provider scope edits to a cached explicit session fallback without waiting for the TTL", async () => {
+		const settings = Settings.isolated({ modelRoles: { judge: "missing/unavailable" } });
+		const registry = makeRegistry([], { [ONLINE.provider]: "online-key" });
+		const judge = new ChainJudge({ settings, registry, purpose: "test", sessionModel: ONLINE });
+		expect(judge.primaryModel()).toBe(ONLINE);
+		const credentials = vi.spyOn(registry, "getApiKey");
+		const chat = vi.spyOn(ai, "completeSimple").mockResolvedValue(reply(ONLINE, "low"));
+		const request = { state: "rename a local", questions: { level: TIER_QUESTION } };
+
+		cfgDisabledProviders.override(settings, [ONLINE.provider]);
+		await expect(judge.judge(request)).rejects.toThrow("no judge model available");
+		expect(credentials).not.toHaveBeenCalled();
+		expect(chat).not.toHaveBeenCalled();
+
+		cfgDisabledProviders.override(settings, []);
+		expect((await judge.judge(request)).answers.level.choice).toBe("low");
+		expect(chat).toHaveBeenCalledTimes(1);
+	});
 
 	it("follows a judge role change inside the chain reuse window, agreeing with the native gate", () => {
 		const settings = Settings.isolated({ modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` } });

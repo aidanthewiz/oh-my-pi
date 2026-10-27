@@ -47,11 +47,9 @@ import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { launchTerminal } from "../../subprocess/terminal-launch";
+import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
 
 const MAX_WIDGET_LINES = 10;
-/** Approval answers, as a collab guest's select shows them. */
-const APPROVE_OPTION = "Approve";
-const DENY_OPTION = "Deny";
 
 /**
  * Footer hint for a guest-rendered ask selector. The guest's selector handles
@@ -696,8 +694,9 @@ export class ExtensionUiController {
 
 	/**
 	 * The tool-approval prompt in the composer's place; a collab guest answers it as a select over
-	 * the full prompt with the same choices: Approve, the prompt's "for this session" choice when it
-	 * offers one, and Deny. Locally it shows the compact prompt (the details summarized to a
+	 * the full prompt with the same choices ({@link approvalChoiceLabels}): the prompt's grants when
+	 * it offers any, Approve, its "for this session" choice when it offers one, and Deny. Locally it
+	 * shows the compact prompt (the details summarized to a
 	 * row, so the composer beneath keeps its room) over that list, and the expand key
 	 * swaps in the full one, wrapped — even when the two match, since a row the summary kept whole
 	 * can still clip. The composer stays mounted beneath it and takes the typing: a user message
@@ -710,12 +709,14 @@ export class ExtensionUiController {
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionApprovalAnswer> {
 		const sessionLabel = prompt.session;
+		const onceLabel = approvalOnceLabel(prompt);
 		const request: CollabUiRequestDraft = {
 			kind: "select",
 			title: prompt.full,
-			options: sessionLabel ? [APPROVE_OPTION, sessionLabel, DENY_OPTION] : [APPROVE_OPTION, DENY_OPTION],
+			options: approvalChoiceLabels(prompt),
 		};
 		const session = this.ctx.session;
+		const sessionId = session.sessionId;
 		const agent = session.agent;
 		const pendingSteering = agent.peekSteeringQueue();
 		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return "deny";
@@ -742,23 +743,30 @@ export class ExtensionUiController {
 		try {
 			const choice = await this.#raceCollabDialog(request, signal, localSignal =>
 				this.#presentDialog(localSignal, settle => {
-					if (this.ctx.session !== session) {
+					if (this.ctx.session !== session || session.sessionId !== sessionId || session.isDisposed) {
 						settle(undefined);
 						return;
 					}
 					const editor = this.ctx.editor;
 					const dialog = new ApprovalDialogComponent(
 						prompt.compact,
-						{ onApprove: () => settle(APPROVE_OPTION), onDeny: () => settle(DENY_OPTION) },
+						{ onApprove: () => settle(onceLabel), onDeny: () => settle("Deny") },
 						{
 							tui: this.ctx.ui,
 							fullPrompt: prompt.full,
+							allowPersistentGrants: prompt.allowPersistentGrants,
 							timeout: dialogOptions?.timeout,
 							onTimeout: dialogOptions?.onTimeout,
 							onTimeoutStart: dialogOptions?.onTimeoutStart,
 							onTimeoutReset: dialogOptions?.onTimeoutReset,
 							...(sessionLabel
 								? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
+								: {}),
+							...(prompt.grants?.length
+								? {
+										grants: prompt.grants,
+										onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
+									}
 								: {}),
 							draft: {
 								hasDraft: () =>
@@ -778,7 +786,12 @@ export class ExtensionUiController {
 					this.ctx.ui.requestRender();
 					return () => {
 						dialog.dispose();
-						if (this.ctx.session !== session || !this.ctx.editorContainer.children.includes(dialog)) return;
+						if (
+							this.ctx.session !== session ||
+							session.sessionId !== sessionId ||
+							!this.ctx.editorContainer.children.includes(dialog)
+						)
+							return;
 						this.ctx.approvalOwnsComposer = false;
 						this.ctx.editorContainer.clear();
 						this.ctx.editorContainer.addChild(this.ctx.editor);
@@ -787,9 +800,9 @@ export class ExtensionUiController {
 					};
 				}),
 			);
-			if (this.ctx.session !== session || signal.aborted) return "deny";
-			if (choice === APPROVE_OPTION) return "once";
-			return sessionLabel !== undefined && choice === sessionLabel ? "session" : "deny";
+			if (this.ctx.session !== session || session.sessionId !== sessionId || session.isDisposed || signal.aborted)
+				return "deny";
+			return approvalAnswerForChoice(prompt, choice);
 		} finally {
 			unsubscribe();
 		}

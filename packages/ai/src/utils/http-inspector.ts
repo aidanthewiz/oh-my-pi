@@ -272,20 +272,20 @@ export function redactUrlQuery(url: string | undefined): string | undefined {
 	}
 }
 
-export function redactHeaders<T extends string | string[]>(
-	headers: Record<string, T> | undefined,
-): Record<string, T | string> | undefined {
+/** Copy of headers with credential values removed from persisted metadata. */
+export function redactHeaders<T>(headers: Record<string, T> | undefined): Record<string, T | string> | undefined {
 	if (!headers) {
 		return undefined;
 	}
 
 	const redacted: Record<string, T | string> = {};
 	for (const [key, value] of Object.entries(headers)) {
-		if (SENSITIVE_HEADER_PATTERN.test(key)) {
-			redacted[key] = "[redacted]";
-			continue;
-		}
-		redacted[key] = value;
+		Object.defineProperty(redacted, key, {
+			value: SENSITIVE_HEADER_PATTERN.test(key) ? "[redacted]" : value,
+			enumerable: true,
+			writable: true,
+			configurable: true,
+		});
 	}
 	return redacted;
 }

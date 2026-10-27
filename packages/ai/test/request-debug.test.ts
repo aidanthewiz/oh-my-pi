@@ -241,6 +241,29 @@ describe("PI_REQ_DEBUG request/response recording", () => {
 		expect(request).toContain("request-id");
 	});
 
+	it("retains own header names as data and excludes inherited headers from persisted sessions", async () => {
+		const headers = JSON.parse(
+			'{"__proto__":"safe-prototype-name","constructor":"safe-constructor-name","X-Api-Secret":"synthetic-header-secret"}',
+		);
+		Object.setPrototypeOf(headers, { "x-inherited": "inherited-not-a-header" });
+		const session = await createRequestDebugSession({
+			method: "GET",
+			url: "https://provider.test",
+			headers,
+		});
+		const log = await session.openResponseLog("HTTP 200", headers);
+		await log.close();
+		const dumpText = await fs.readFile(session.requestPath, "utf8");
+		const responseText = await fs.readFile(session.responsePath, "utf8");
+		const persisted = JSON.parse(dumpText).headers;
+		expect(Object.getOwnPropertyDescriptor(persisted, "__proto__")?.value).toBe("safe-prototype-name");
+		expect(Object.getOwnPropertyDescriptor(persisted, "constructor")?.value).toBe("safe-constructor-name");
+		expect(dumpText + responseText).not.toContain("synthetic-header-secret");
+		expect(dumpText + responseText).not.toContain("inherited-not-a-header");
+		expect(responseText).toContain("__proto__: safe-prototype-name");
+		expect(headers["X-Api-Secret"]).toBe("synthetic-header-secret");
+	});
+
 	it("keeps the partial response log when the response body is cancelled", async () => {
 		Bun.env.PI_REQ_DEBUG = "1";
 		const firstChunk = enc.encode("partial");

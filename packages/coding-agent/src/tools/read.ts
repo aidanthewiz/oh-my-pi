@@ -83,7 +83,19 @@ import {
 	scanFileForConflicts,
 } from "./conflict-detect";
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
-import { postProcessToolResult, resolveOutputMaxColumns } from "./output-meta";
+import { approvalDirectoryKey } from "./approval-cache";
+import {
+	approvalTargetIdentities,
+	approvalTargetKey,
+	approvalTreeSearchKey,
+	isApprovalPublicUrl,
+} from "./approval-targets";
+import {
+	postProcessToolResult,
+	resolveArtifactSpillThreshold,
+	resolveInlineByteCapBudget,
+	resolveOutputMaxColumns,
+} from "./output-meta";
 import {
 	expandPath,
 	formatPathRelativeToCwd,
@@ -1020,6 +1032,105 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const target = splitPathAndSel(readPath);
 		return target.sel === undefined && splitPdfImageReadPath(readPath) ? "exec" : "read";
 	};
+	readonly approvalCacheTargets = async (args: unknown): Promise<readonly string[]> => {
+		const targets = await this.#approvalReadTargets(args);
+		return targets.filter(target => !isApprovalPublicUrl(target) || !parseReadUrlTarget(target));
+	};
+	readonly approvalCacheIdentity = async (args: unknown) =>
+		approvalTargetIdentities(
+			this.session.cwd,
+			await this.#approvalReadTargets(args),
+			sessionResolveContext(this.session),
+		);
+
+	async #approvalReadTargets(args: unknown): Promise<readonly string[]> {
+		const rawPath = args && typeof args === "object" && "path" in args ? String(args.path ?? "") : "";
+		if (!rawPath) throw new ToolError("Cannot derive approval target for an empty read path");
+		return [...new Set(await this.#approvalReadEntry(rawPath))];
+	}
+
+	async #approvalReadEntry(rawPath: string): Promise<string[]> {
+		const entry = await this.#parseReadEntry(rawPath);
+		if (entry.parts) return (await Promise.all(entry.parts.map(part => this.#approvalReadEntry(part)))).flat();
+		const readPath = entry.path;
+		const external = parseReadUrlTarget(readPath);
+		if (external) return [external.path];
+		const router = InternalUrlRouter.instance();
+		const normalized = router.normalize(readPath);
+		if (router.canResolve(normalized)) {
+			if (router.spec(extractUriScheme(normalized) ?? "")?.backing !== "file") {
+				throw new ToolError(`Cannot bind approval destination: ${normalized}`);
+			}
+			const target = await router.target(normalized, sessionResolveContext(this.session));
+			if (target?.kind !== "file") throw new ToolError(`Cannot bind approval destination: ${normalized}`);
+			return this.#approvalFilesystemEntry(target.path, entry, { sel: target.sel });
+		}
+		return this.#approvalFilesystemEntry(readPath, entry);
+	}
+
+	async #approvalFilesystemEntry(
+		readPath: string,
+		entry: { literalQueryPath: boolean; question?: string },
+		located?: { sel?: string },
+	): Promise<string[]> {
+		const literalSplit = located
+			? { path: readPath, sel: located.sel }
+			: await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
+		const literal =
+			!located &&
+			literalSplit.sel === undefined &&
+			(entry.literalQueryPath || splitPathAndSel(readPath).sel !== undefined);
+		const suffixCache: SuffixMatchCache = new Map();
+		let source: string | undefined;
+		if (!literal) {
+			const archive = await resolveArchiveReadPath(this.session, readPath, suffixCache);
+			if (archive) source = archive.absolutePath;
+			if (!source) source = (await resolveSqliteReadPath(this.session, readPath, suffixCache))?.absolutePath;
+			if (!source) source = (await resolveJsonReadPath(this.session, literalSplit.path, suffixCache))?.absolutePath;
+		}
+		const pdf = !literal && literalSplit.sel === undefined ? splitPdfImageReadPath(readPath) : null;
+		const localTarget =
+			pdf && (await probeLiteralPathExists(readPath, this.session.cwd)) === "missing"
+				? { path: pdf.pdfPath, sel: undefined }
+				: await this.#applyVideoSelectorFallback(literalSplit, readPath);
+		if (
+			!source &&
+			!literal &&
+			entry.question === undefined &&
+			!isVideoPath(localTarget.path) &&
+			!isRawSelector(parseSel(localTarget.sel))
+		) {
+			source = (await resolveBinaryViewPath(this.session, localTarget.path))?.absolutePath;
+		}
+		let absolute = source ?? (await resolveReadPathAsync(localTarget.path, this.session.cwd));
+		try {
+			await fs.stat(absolute);
+		} catch (error) {
+			if (!isNotFoundError(error)) throw error;
+			if (readPath.includes(";")) {
+				const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, {
+					queryOwner: part => ownsReadQuery(part, this.session.cwd),
+				});
+				if (parts) return (await Promise.all(parts.map(part => this.#approvalReadEntry(part)))).flat();
+			}
+			const suffix = isRemoteMountPath(absolute)
+				? null
+				: await findSuffixMatchCached(this.session, suffixCache, localTarget.path);
+			const recovered = suffix?.absolutePath ?? (await this.#approvedPlanAlias(absolute));
+			if (recovered) absolute = recovered;
+			else {
+				const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, {
+					queryOwner: part => ownsReadQuery(part, this.session.cwd),
+				});
+				if (parts) return (await Promise.all(parts.map(part => this.#approvalReadEntry(part)))).flat();
+				throw error;
+			}
+		}
+		const stat = await fs.stat(absolute);
+		const key = approvalTargetKey(this.session.cwd, absolute);
+		if (key === undefined) throw new ToolError(`Cannot derive approval target: ${readPath}`);
+		return [stat.isDirectory() ? approvalTreeSearchKey(approvalDirectoryKey(absolute)) : key];
+	}
 	readonly label = "Read";
 	readonly loadMode = "essential";
 	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
@@ -1195,6 +1306,34 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return approvedPlanPath !== null && path.basename(requestedPath) === path.basename(approvedPlanPath)
 			? approvedPlanPath
 			: undefined;
+	}
+	async #parseReadEntry(rawPath: string): Promise<{
+		path: string;
+		parts: string[] | null;
+		literalQueryPath: boolean;
+		question?: string;
+	}> {
+		const readPath = recoverConflictUriPrefix(rawPath.startsWith("file://") ? expandPath(rawPath) : rawPath).path;
+		const parts = await splitMixedUrlPathList(
+			readPath,
+			this.session.cwd,
+			part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
+			entry => ownsReadQuery(entry, this.session.cwd),
+		);
+		if (parts) return { path: readPath, parts, literalQueryPath: false };
+		const literalQueryPath =
+			readPath.includes("?") &&
+			parseReadUrlTarget(readPath) === null &&
+			!InternalUrlRouter.instance().canResolve(readPath) &&
+			!(await ownsReadQuery(readPath, this.session.cwd));
+		if (literalQueryPath) {
+			const literalParts = await splitDelimitedPathEntry(readPath, this.session.cwd, {
+				queryOwner: entry => ownsReadQuery(entry, this.session.cwd),
+			});
+			if (literalParts) return { path: readPath, parts: literalParts, literalQueryPath };
+		}
+		const imageQuestion = literalQueryPath ? { path: readPath } : splitImageQuestionTarget(readPath);
+		return { ...imageQuestion, parts: null, literalQueryPath };
 	}
 
 	async #tryReadDelimitedPaths(
@@ -1737,34 +1876,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		onConflictMarkers?: () => void,
 		lexicalAbsolutePath?: string,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		let { path: readPath } = params;
-		if (readPath.startsWith("file://")) {
-			readPath = expandPath(readPath);
-		}
-		readPath = recoverConflictUriPrefix(readPath).path;
-		// A `;` list mixing URLs with local paths must split before URL detection
-		// claims the whole string as one fetch or one internal/MCP resource.
-		const mixedParts = await splitMixedUrlPathList(
-			readPath,
-			this.session.cwd,
-			part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
-			entry => ownsReadQuery(entry, this.session.cwd),
-		);
-		if (mixedParts) return this.#readDelimitedParts(mixedParts, signal, toolContext);
-		const literalQueryPath =
-			readPath.includes("?") &&
-			parseReadUrlTarget(readPath) === null &&
-			!InternalUrlRouter.instance().canResolve(readPath) &&
-			!(await ownsReadQuery(readPath, this.session.cwd));
-		if (literalQueryPath) {
-			const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, toolContext);
-			if (delimitedResult) return delimitedResult;
-		}
-		const imageQuestion = literalQueryPath
-			? { path: readPath, question: undefined }
-			: splitImageQuestionTarget(readPath);
-		readPath = imageQuestion.path;
-		const question = imageQuestion.question;
+		const entry = await this.#parseReadEntry(params.path);
+		if (entry.parts) return this.#readDelimitedParts(entry.parts, signal, toolContext);
+		const readPath = entry.path;
+		const { literalQueryPath, question } = entry;
 
 		const parsedUrlTarget = parseReadUrlTarget(readPath);
 		if (parsedUrlTarget) {
@@ -2386,9 +2501,22 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const effectiveLimit = limit ?? DEFAULT_LIMIT;
 					const maxLinesToCollect = Math.min(effectiveLimit + leadingContext + trailingContext, DEFAULT_MAX_LINES);
 					const selectedLineLimit = effectiveLimit + leadingContext + trailingContext;
-					// Scale byte budget with line limit so the configured line count actually fits.
-					// Assume ~512 bytes/line average; never go below the shared default.
-					const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					// Scale byte budget with line limit so the configured line count actually fits
+					// (~512 bytes/line, never below the shared default). Pages that would otherwise
+					// spill also stop at the spill threshold: past it the page would be middle-elided
+					// into an artifact, while stopping here pages at a line boundary with an exact
+					// `:N` continuation. Row prefixes (`N|`/`N:`) count against that threshold, so
+					// their worst-case width is reserved (at most half the threshold). Artifact-storage
+					// pages never spill, so they keep the full budget.
+					const scaledBudget = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					let maxBytesForRead = scaledBudget;
+					if (!located?.spec.artifactStore) {
+						const threshold = resolveArtifactSpillThreshold(this.session.settings);
+						const prefixWidth =
+							!rawSelector && displayMode.lineNumbers ? String(startLine + maxLinesToCollect).length + 1 : 0;
+						const prefixReserve = Math.min(maxLinesToCollect * prefixWidth, Math.floor(threshold / 2));
+						maxBytesForRead = Math.min(scaledBudget, threshold - prefixReserve);
+					}
 
 					const lineWindow = buffered
 						? collectLineWindowFromBuffer(
@@ -2745,10 +2873,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					}
 
 					content = [{ type: "text", text: outputText }];
+					// `maxBytesForRead` bounds only the selected source lines; row prefixes and
+					// off-window block context ride on top. Skip the spill only while the final page
+					// still fits the inline cap, so block context can never bypass the bound.
+					pagedSource =
+						Buffer.byteLength(outputText, "utf-8") <= resolveInlineByteCapBudget(this.session.settings);
 				}
 			}
 			// A page of artifact storage is re-readable with selectors: spilling it would only
-			// duplicate it into another artifact. Every other located read spills like a plain file.
+			// duplicate it into another artifact. Every other unpaged located read spills like a plain file.
 			if (located?.spec.artifactStore) pagedSource = true;
 			// Immutable sources have no write path, so the hint never lands in a written-back file.
 			if (located && immutable && !isRawSelector(parsed) && fileSize > MAX_URL_RAW_INLINE_BYTES) {

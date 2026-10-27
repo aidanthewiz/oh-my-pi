@@ -57,12 +57,16 @@ function mockSession(opts: {
 }): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
+	let disposed = false;
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const l of [...listeners]) l(event);
 	};
 	return {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -89,7 +93,10 @@ function mockSession(opts: {
 		getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
 		settleAsyncWork: async () => {},
 		abort: opts.abort ?? (async () => {}),
-		dispose: opts.dispose ?? (async () => {}),
+		dispose: async () => {
+			disposed = true;
+			await opts.dispose?.();
+		},
 	} as unknown as AgentSession;
 }
 
@@ -109,6 +116,8 @@ describe("runSubprocess deferred cleanup outcome (issue #9670)", () => {
 		});
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session,
+			captureOwnerCurrent: () => () => !session.isDisposed,
+			captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 			extensionsResult: {} as unknown as LoadExtensionsResult,
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),

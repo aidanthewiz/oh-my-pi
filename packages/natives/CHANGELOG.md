@@ -9,6 +9,7 @@
 ### Fixed
 
 - Reject fractional, non-finite, negative, and wrapping SIXEL background values before native integer conversion.
+- Release tapped Windows pipe producers when an idle downstream consumer closes. Preserve buffered bytes, backpressure, and exactly-once mirror closure.
 - Reject multi-hunk character matches that would discard unmatched surrounding text.
 - Native patch application and checks now convert only affected source and destination paths, ignoring unrelated required filter failures.
 - Keep create-new cloning compatible with descriptor-returning Linux and Windows backends.
@@ -26,6 +27,21 @@
 - Preserve original process identities when later shell runs cancel retained background jobs. Keep current-run PID attribution separate.
 - Prune completed shell process references at command completion instead of retaining handles until another command runs.
 - Backport Cranelift's full-width SSA index representation for GHSA-897f-g5gm-fmxm without disabling on-demand grammars or upgrading Wasmtime.
+## [18.12.3] - 2026-10-19
+
+### Added
+
+- Added a `hiddenContent` option to `htmlToMarkdown`: `"drop"` (default) omits hidden content, `"reachable"` keeps content the page can reveal such as collapsed sections and inactive tab panels, and `"all"` also keeps `<template>` and `<noscript>` content; other values throw ([#16246](https://github.com/can1357/oh-my-pi/issues/16246))
+- Added `normalizePtyDimensions(cols, rows)` to size screen emulators with the same effective dimensions as native PTY sessions ([#16192](https://github.com/can1357/oh-my-pi/pull/16192) by [@C-W-Z](https://github.com/C-W-Z))
+- Added `LineMatcher`, a native multi-pattern line matcher: `matchLines` returns a batch's matches column-wise as typed arrays (line, pattern, and the UTF-16 span of each named group in `groupNames()` order)
+- Added `PipeStreams` and the `streams` option of `Shell.run`: every pipe the run opens keeps a readable copy of its newest megabyte, so a stage's output stays visible while a later stage (`| tail`) holds it back
+
+### Fixed
+
+- Fixed the output minimizer altering what `ssh` commands print in the bash tool: remote lines were cut to 120 characters and blank lines dropped; ssh's own login and connection notices are still stripped ([#16314](https://github.com/can1357/oh-my-pi/pull/16314) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed X11 background shortcuts and typing reporting `Cancelled` when you stopped them right after the last key went down: the key releases now always go out and the call succeeds ([#16235](https://github.com/can1357/oh-my-pi/pull/16235) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `wrapTextWithAnsi` leaving rows half-empty in Chinese and Japanese text: CJK runs now break between characters to fill each row, closing punctuation such as `，。！」` never starts a row, and opening brackets never end one ([#16219](https://github.com/can1357/oh-my-pi/issues/16219))
+- Fixed a cancelled or timed-out macOS `computer` call finishing its lookup of a sheet, popover or menu window, up to 5,000 accessibility elements, before it stopped and let the next request run ([#16233](https://github.com/can1357/oh-my-pi/pull/16233) by [@will-bogusz](https://github.com/will-bogusz))
 
 ## [18.12.2] - 2026-10-18
 

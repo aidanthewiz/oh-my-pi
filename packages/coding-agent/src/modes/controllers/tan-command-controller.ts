@@ -77,6 +77,14 @@ export class TanCommandController {
 			session.agent.promptCacheKey ?? (taskPromptCacheKey === undefined ? parentSessionId : undefined);
 		const thinkingLevel = session.configuredThinkingLevel();
 		const systemPrompt = [...session.systemPrompt];
+		const memoryState = session.getMnemopiSessionState?.();
+		const primaryMemoryState = memoryState?.aliasOf ?? memoryState;
+		const inheritedMnemopiRecall = primaryMemoryState
+			? {
+					hasRecalledForFirstTurn: primaryMemoryState.hasRecalledForFirstTurn,
+					lastRecallSnippet: primaryMemoryState.lastRecallSnippet,
+				}
+			: undefined;
 		const toolNames = session.getEnabledToolNames();
 		const activeToolNames = session.getActiveToolNames();
 		const mountedToolNames = session.getMountedXdevToolNames();
@@ -185,6 +193,7 @@ export class TanCommandController {
 								preloadedExtensionPaths: parentExtensionPaths?.length ? [...parentExtensionPaths] : undefined,
 								extensionRoots: () => parentExtensionRoots,
 								localProtocolOptions,
+								inheritedMnemopiRecall,
 							});
 							clone = created.session;
 							await clone.setActiveToolPresentation(toolNames, mountedToolNames);

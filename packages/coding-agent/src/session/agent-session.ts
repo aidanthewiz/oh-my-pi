@@ -181,6 +181,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
@@ -918,6 +919,8 @@ export class AgentSession implements SettingsScope {
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
 	#unsubscribeQueueChange?: () => void;
+	/** Agent message count when {@link #disconnectFromAgent} unsubscribed; messages past it reached no persisting handler. */
+	#disconnectedMessageCount?: number;
 	#cancelExitRecorder?: () => void;
 	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
@@ -998,6 +1001,7 @@ export class AgentSession implements SettingsScope {
 	/** Name the session from the operator's messages (see {@link AgentSessionConfig.autoTitle}). */
 	readonly #autoTitle: boolean;
 	#titleGenerationInFlightFor: string | undefined;
+	#titleGenerationRequest = 0;
 	/** First-message auto-title that may be retried from conversation context.
 	 *  Once the title model declines the message (greeting-like or too ambiguous,
 	 *  e.g. a pasted image plus "help") AND the assistant has replied, the title is
@@ -1156,6 +1160,8 @@ export class AgentSession implements SettingsScope {
 	#userWaitEndedTurn = false;
 	#inFlightEpoch = 0;
 	#abortInProgress = false;
+	/** In-flight {@link abort} calls; each settles after scheduling its stranded-queue drain, which {@link waitForIdle} must observe. */
+	#abortUnwinds = new Set<Promise<void>>();
 	/** Submissions accepted by prompt()/promptCustomMessage()/sendCustomMessage() that have not
 	 *  yet dispatched a turn, queued, or bailed. Preprocessing (manual-compaction wait, slash
 	 *  commands, image normalization, vision description) runs before #promptInFlightCount is
@@ -3048,6 +3054,23 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Live widgets of this session's running async jobs (the owner scope of
+	 * {@link getAsyncJobSnapshot}), in job order. Reading a widget marks it
+	 * shown, which is what lets its spec be written.
+	 */
+	getRunningJobWidgets(): JobWidgetEntry[] {
+		const manager = this.#asyncJobManager;
+		const widgets = manager?.widgets;
+		if (!manager || !widgets) return [];
+		const entries: JobWidgetEntry[] = [];
+		for (const job of manager.getRunningJobs(this.#agentId ? { ownerId: this.#agentId } : undefined)) {
+			const view = widgets.view(job);
+			if (view) entries.push({ id: job.id, type: job.type, view });
+		}
+		return entries;
+	}
+
+	/**
 	 * Async jobs of this agent and every subagent below it: the running ones and
 	 * the `recentLimit` (default 10) newest settled ones across the tree, with the subagents
 	 * that own them and the ancestors linking those to this agent. Lineage comes
@@ -3099,6 +3122,7 @@ export class AgentSession implements SettingsScope {
 			exitCode,
 			output,
 			artifactId: details?.meta?.truncation?.artifactId,
+			widget: this.#asyncJobManager?.widgets?.view(job),
 		};
 	}
 
@@ -3915,6 +3939,38 @@ export class AgentSession implements SettingsScope {
 			this.#rewoundToolResultIds.delete(message.toolCallId);
 		if (!skipPersistedRewindResult) {
 			this.#appendSessionMessage(message);
+		}
+	}
+
+	/**
+	 * Session transitions (`/compact`, `/new`, session switch) disconnect before
+	 * `await abort()`, so the result the abort gives a running tool reaches no
+	 * persisting handler. Record it before the transition rewrites or leaves the
+	 * session; otherwise its call is left without a result and replay fills in a
+	 * synthetic one. Only results of calls the last assistant turn before the
+	 * disconnect made qualify: that turn was persisted at its `message_end`. A turn
+	 * the abort cut short mid-stream was never persisted, so its synthetic results
+	 * would be orphans. A successful `rewind` result is the exception too: the
+	 * aborted turn never applies it, so recording "rewind requested" would claim
+	 * a branch cut that never happened.
+	 */
+	#persistToolResultsEndedWhileDisconnected(): void {
+		const start = this.#disconnectedMessageCount;
+		if (start === undefined) return;
+		// Once per disconnect: the transition may replace the agent's messages next (compaction, reset).
+		this.#disconnectedMessageCount = undefined;
+		const messages = this.agent.state.messages;
+		let lastAssistant: AgentMessage | undefined;
+		for (let index = Math.min(start, messages.length) - 1; index >= 0 && !lastAssistant; index--) {
+			if (messages[index].role === "assistant") lastAssistant = messages[index];
+		}
+		if (lastAssistant?.role !== "assistant") return;
+		const knownCalls = new Set(lastAssistant.content.flatMap(block => (block.type === "toolCall" ? [block.id] : [])));
+		for (let index = start; index < messages.length; index++) {
+			const message = messages[index];
+			if (message.role !== "toolResult" || !knownCalls.has(message.toolCallId)) continue;
+			if (!message.isError && semanticToolResult(message.toolName, message)?.toolName === "rewind") continue;
+			this.#persistSessionMessageIfMissing(message);
 		}
 	}
 
@@ -5788,6 +5844,7 @@ export class AgentSession implements SettingsScope {
 
 	#beginSessionTransition(): Disposable {
 		this.#cacheWarmer?.cancel();
+		this.#ownedAsyncJobManager?.widgets?.invalidate();
 		if (this.#sessionTransitionDepth++ === 0) {
 			const settled = Promise.withResolvers<void>();
 			this.#sessionTransitionSettled = settled.promise;
@@ -5795,8 +5852,9 @@ export class AgentSession implements SettingsScope {
 		}
 		return this.#sessionTransitionScope;
 	}
-	/** Keep the owner stable until paid warm usage settles; reject if cancellation does not finish. */
+	/** Keep the journal stable until accepted widget and cache-warm usage settles. */
 	async #drainCacheWarmerForTransition(): Promise<void> {
+		await this.#ownedAsyncJobManager?.widgets?.drain();
 		if (!this.#cacheWarmer) return;
 		const timeout = new Error("Timed out draining cache warmer before session transition");
 		try {
@@ -5844,6 +5902,7 @@ export class AgentSession implements SettingsScope {
 		if (this.#unsubscribeAgent) {
 			this.#unsubscribeAgent();
 			this.#unsubscribeAgent = undefined;
+			this.#disconnectedMessageCount = this.agent.state.messages.length;
 		}
 		if (this.#unsubscribeQueueChange) {
 			this.#unsubscribeQueueChange();
@@ -5857,6 +5916,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	#reconnectToAgent(): void {
 		if (this.#unsubscribeAgent) return; // Already connected
+		this.#disconnectedMessageCount = undefined;
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 		this.#unsubscribeQueueChange = this.agent.onQueueChange(() => this.#emitQueueUpdateIfChanged());
 	}
@@ -6165,6 +6225,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
+		const widgets = this.#ownedAsyncJobManager?.widgets;
+		widgets?.invalidate();
+		const widgetDrain = widgets?.drain();
 		this.beginDispose();
 		if (this.#cacheWarmer) {
 			this.#cacheWarmer.onRefreshStart = undefined;
@@ -6286,6 +6349,7 @@ export class AgentSession implements SettingsScope {
 		// rewrites at their commit guard; hot-path appends drained above are
 		// already durable, and close() (scheduled post-seal) still flushes and
 		// closes the writer.
+		await widgetDrain;
 		this.sessionManager.seal();
 		await this.sessionManager.close();
 
@@ -6674,12 +6738,23 @@ export class AgentSession implements SettingsScope {
 	async waitForIdle(): Promise<void> {
 		while (true) {
 			await this.agent.waitForIdle();
+			// The agent loop stops before abort() finishes unwinding; only its last
+			// step schedules the turn that delivers a queued steer (interrupt-and-send).
+			await Promise.all(this.#abortUnwinds);
 			await this.#advisors.waitForPendingCardEvents();
 			// Core subscribers run asynchronously. Retry recovery can still be
 			// rewriting entries before it publishes auto_retry_end.
 			await this.#drainInFlightEventHandlers();
 			await this.#waitForPostPromptRecovery();
-			if (!this.agent.state.isStreaming && this.#inFlightEventHandlers.size === 0) return;
+			// An abort can finish (and schedule its drain) after the waits above returned.
+			if (
+				!this.agent.state.isStreaming &&
+				this.#inFlightEventHandlers.size === 0 &&
+				this.#abortUnwinds.size === 0 &&
+				this.#postPromptTasks.size === 0
+			) {
+				return;
+			}
 		}
 	}
 	/** Stop todo reminders from starting extra turns in a single-shot print run. */
@@ -7036,8 +7111,10 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Compact the active session history. */
-	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		return this.#maintenance.compact(customInstructions, options);
+	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		using _transition = this.#beginSessionTransition();
+		await this.#drainCacheWarmerForTransition();
+		return await this.#maintenance.compact(customInstructions, options);
 	}
 
 	/** Cancel active manual, automatic, and handoff maintenance, preserving an optional source reason. */
@@ -9512,6 +9589,15 @@ export class AgentSession implements SettingsScope {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
 				return false;
 			}
+			// The generation check suspends after the isStreaming check above, so a concurrent
+			// send (two asides in one tick) can start its turn in between. Re-check and queue
+			// behind that turn like the streaming branch, instead of losing the prompt race to
+			// AgentBusyError; no await sits between this check and #beginInFlight below.
+			if (this.isStreaming) {
+				outcome.sessionClaimed = this.agent.state.isStreaming;
+				this.#irc.queueAside([normalizedAppMessage]);
+				return false;
+			}
 			outcome.sessionClaimed = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
 				acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
 			});
@@ -9972,6 +10058,9 @@ export class AgentSession implements SettingsScope {
 		// no focusable UI exists (print/RPC/ACP/eval/SDK/CI).
 		if (this.#agentKind === "sub" && !isInteractiveHost()) return;
 		if (this.#replanTitleRefreshInFlight) return;
+		// The first title is still being named: a replan title landing first would
+		// make that request, which carries the card, drop its reply.
+		if (this.#titleGenerationInFlightFor === this.sessionManager.getSessionId()) return;
 		if (!cfgTitleRefreshOnReplan.get(this.settings)) return;
 		if (this.sessionManager.titleSource === "user") return;
 		const context = this.#buildReplanTitleContext();
@@ -10010,6 +10099,8 @@ export class AgentSession implements SettingsScope {
 	 * own reading of the task, and asks for both validated card candidates.
 	 * The title model ({@link generateTitle}) takes over when the fork fails, times out or
 	 * declines, and is the only path under `tiny` or a TITLE_SYSTEM.md override.
+	 * Under `fork`, a title that comes back without a card gets one from a card
+	 * request ({@link #cardTitle}).
 	 *
 	 * Returns whether a request started.
 	 */
@@ -10020,11 +10111,7 @@ export class AgentSession implements SettingsScope {
 		if (this.#titleGenerationInFlightFor === sessionId) return false;
 		input.tried = true;
 		this.#deferredTitle = { sessionId, declined: false, replied: false, words: 0 };
-		const forkable =
-			cfgTitleGenerator.get(this.settings) === "fork" &&
-			this.model !== undefined &&
-			this.#titleSystemPrompt === undefined;
-		if (forkable) this.#forkTitle(input);
+		if (this.#cardsAutoTitles() && this.model !== undefined) this.#forkTitle(input);
 		else this.#titleWithTitleModel(input);
 		return true;
 	}
@@ -10046,6 +10133,7 @@ export class AgentSession implements SettingsScope {
 	#forkTitle(input: TitleInput): void {
 		const { sessionId } = input;
 		this.#titleGenerationInFlightFor = sessionId;
+		const request = ++this.#titleGenerationRequest;
 		const signal = this.#titleGenerationAbortController.signal;
 		const started = performance.now();
 		const titleRevision = this.sessionManager.titleRevision;
@@ -10058,6 +10146,7 @@ export class AgentSession implements SettingsScope {
 		})
 			.then(
 				async ({ replyText, assistantMessage }) => {
+					if (request !== this.#titleGenerationRequest) return;
 					const title = parseCardTitleReply(replyText, input.text);
 					logger.debug("title-generator: fork reply", {
 						sessionId,
@@ -10066,21 +10155,28 @@ export class AgentSession implements SettingsScope {
 						reply: replyText.slice(0, 300),
 						title,
 					});
-					if (this.#titleGenerationInFlightFor === sessionId) this.#titleGenerationInFlightFor = undefined;
 					if (signal.aborted || !title) {
+						if (this.#titleGenerationInFlightFor === sessionId) this.#titleGenerationInFlightFor = undefined;
 						this.#fallBackFromTitleFork(input, signal);
 						return;
 					}
+					const named = await this.#cardTitle(title, signal).finally(() => {
+						if (request === this.#titleGenerationRequest && this.#titleGenerationInFlightFor === sessionId)
+							this.#titleGenerationInFlightFor = undefined;
+					});
 					if (
+						request !== this.#titleGenerationRequest ||
+						signal.aborted ||
 						this.sessionManager.getSessionId() !== sessionId ||
 						this.sessionName ||
 						this.sessionManager.titleRevision !== titleRevision
 					)
 						return;
-					await this.sessionManager.setSessionName(title.title, "auto", undefined, title.card);
+					await this.sessionManager.setSessionName(named.title, "auto", undefined, named.card);
 					this.#deferredTitle = undefined;
 				},
 				(err: unknown) => {
+					if (request !== this.#titleGenerationRequest) return;
 					logger.debug("title-generator: fork failed", {
 						sessionId,
 						ms: Math.round(performance.now() - started),
@@ -10098,6 +10194,10 @@ export class AgentSession implements SettingsScope {
 			});
 	}
 
+	#cardsAutoTitles(): boolean {
+		return cfgTitleGenerator.get(this.settings) === "fork" && this.#titleSystemPrompt === undefined;
+	}
+
 	#fallBackFromTitleFork(input: TitleInput, signal: AbortSignal): void {
 		if (signal.aborted) {
 			this.#cancelTitle(input.sessionId);
@@ -10113,16 +10213,25 @@ export class AgentSession implements SettingsScope {
 	 */
 	#startAutoTitle(text: string, sessionId: string): void {
 		this.#titleGenerationInFlightFor = sessionId;
+		const request = ++this.#titleGenerationRequest;
 		const signal = this.#titleGenerationAbortController.signal;
 		this.generateTitle(text)
 			.then(async title => {
+				if (request !== this.#titleGenerationRequest) return;
 				// Re-check after generation so a later completion cannot replace
 				// the first title, and a request from a replaced session cannot
 				// name the current one.
-				if (signal.aborted || this.sessionManager.getSessionId() !== sessionId) return;
-				if (title && !this.sessionName) {
-					await this.sessionManager.setSessionName(title, "auto");
-				}
+				if (signal.aborted || this.sessionManager.getSessionId() !== sessionId || !title || this.sessionName)
+					return;
+				const named = this.#cardsAutoTitles() ? await this.#cardTitle({ title }, signal) : { title };
+				if (
+					request !== this.#titleGenerationRequest ||
+					signal.aborted ||
+					this.sessionManager.getSessionId() !== sessionId ||
+					this.sessionName
+				)
+					return;
+				await this.sessionManager.setSessionName(named.title, "auto", undefined, named.card);
 			})
 			.catch(err => {
 				logger.warn("title-generator: uncaught auto-title error", {
@@ -10132,6 +10241,7 @@ export class AgentSession implements SettingsScope {
 				});
 			})
 			.finally(() => {
+				if (request !== this.#titleGenerationRequest) return;
 				if (this.#titleGenerationInFlightFor === sessionId) {
 					this.#titleGenerationInFlightFor = undefined;
 				}
@@ -10270,9 +10380,15 @@ export class AgentSession implements SettingsScope {
 		const named: GeneratedSessionTitle | null =
 			context === undefined ? { title: title! } : await this.#retitle(context, signal);
 		if (stale()) return undefined;
-		if (!named || named.card || splitCardTitle(named.title)) return named;
+		if (!named) return null;
+		const carded = await this.#cardTitle(named, signal);
+		return stale() ? undefined : carded;
+	}
+
+	async #cardTitle(named: GeneratedSessionTitle, signal?: AbortSignal): Promise<GeneratedSessionTitle> {
+		if (named.card || splitCardTitle(named.title)) return named;
+		const titleSignal = this.titleGenerationSignal;
 		const reply = await this.generateTitle(named.title, prompt.render(titleCardPrompt, { nerdFonts: true }), signal);
-		if (stale()) return undefined;
 		return {
 			title: named.title,
 			card: reply && !titleSignal.aborted && !signal?.aborted ? parseCardReply(reply) : undefined,
@@ -10297,9 +10413,11 @@ export class AgentSession implements SettingsScope {
 		const updatedAt = this.sessionManager.titleUpdatedAt;
 		const revision = this.sessionManager.titleRevision;
 		const signal = this.titleGenerationSignal;
-		const title = await this.#retitle(context);
-		if (!title || signal.aborted) return;
+		const retitled = await this.#retitle(context, signal);
+		if (!retitled || signal.aborted) return;
+		const title = this.#cardsAutoTitles() ? await this.#cardTitle(retitled, signal) : retitled;
 		if (
+			signal.aborted ||
 			this.sessionManager.getSessionId() !== sessionId ||
 			this.sessionManager.titleRevision !== revision ||
 			this.sessionManager.titleUpdatedAt !== updatedAt
@@ -10358,7 +10476,12 @@ export class AgentSession implements SettingsScope {
 		// auto-starting a fresh turn during cleanup.
 		this.#abortInProgress = true;
 		this.#cacheWarmer?.cancel();
+		const unwind = Promise.withResolvers<void>();
+		this.#abortUnwinds.add(unwind.promise);
 		try {
+			this.#titleGenerationRequest++;
+			this.#titleGenerationInFlightFor = undefined;
+			this.#cancelTitle(this.sessionManager.getSessionId());
 			this.#titleGenerationAbortController.abort();
 			if (!this.#isDisposed) this.#titleGenerationAbortController = new AbortController();
 			this.#abortAutolearnCapture();
@@ -10392,6 +10515,7 @@ export class AgentSession implements SettingsScope {
 			this.agent.abort(options?.reason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
+			this.#persistToolResultsEndedWhileDisconnected();
 			// agent_end maintenance can enqueue a retry after the first cancellation.
 			// Keep the abort barrier up until those handlers settle, then cancel
 			// anything they scheduled before making the session revivable. Only
@@ -10433,8 +10557,10 @@ export class AgentSession implements SettingsScope {
 				this.#preserveAdvisorCard(card);
 			}
 		} finally {
-			this.#abortInProgress = false;
+			this.#abortUnwinds.delete(unwind.promise);
+			this.#abortInProgress = this.#abortUnwinds.size > 0;
 			this.#drainStrandedQueuedMessages();
+			unwind.resolve();
 		}
 	}
 
@@ -11753,6 +11879,11 @@ export class AgentSession implements SettingsScope {
 	/** Delivers an IRC message into this recipient session. */
 	deliverIrcMessage(msg: IrcMessage): Promise<"injected" | "woken"> {
 		return this.#irc.deliver(msg);
+	}
+
+	/** Recognizes parent IRC steering at message consumption, without promoting queued requests. */
+	isParentIrcSteer(message: AgentMessage): boolean {
+		return this.#irc.isParentSteer(message);
 	}
 
 	/** Waits for any in-flight IRC wake-turn relays. */

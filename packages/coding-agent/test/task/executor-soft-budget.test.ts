@@ -33,8 +33,8 @@ import { createSessionDefaults } from "../helpers/session-defaults";
  * 2. If the agent still refuses to yield (grace exhausted → hard abort), a
  *    kept-alive agent stays adopted (`idle`), so `irc` can message/resume it
  *    with the same RPC lifecycle/progress frames as the original run.
- * 3. Caller-signal aborts remain terminal, and the irc bus names the aborted
- *    agent precisely instead of claiming it is unknown.
+ * 3. Caller-signal aborts only stop the run: the agent stays resumable via
+ *    `irc`.
  */
 
 interface MockSessionHandle {
@@ -106,6 +106,7 @@ function createMockSession(
 			ircWakeTurnObserver = observer;
 		},
 		trackIrcReply: () => {},
+		isParentIrcSteer: () => false,
 		deliverIrcMessage: async msg => {
 			const record: CustomMessage = {
 				role: "custom",
@@ -150,6 +151,9 @@ function createMockSession(
 			abortCount += 1;
 			await onAbort?.();
 		},
+		get isDisposed() {
+			return disposeCount > 0;
+		},
 		dispose: async () => {
 			disposeCount += 1;
 		},
@@ -164,13 +168,19 @@ function createMockSession(
 	};
 }
 
-function mockCreateAgentSession(session: AgentSession) {
-	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+function createSessionResult(session: AgentSession): CreateAgentSessionResult {
+	return {
 		session,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
-	} satisfies CreateAgentSessionResult);
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
+	} satisfies CreateAgentSessionResult;
+}
+
+function mockCreateAgentSession(session: AgentSession) {
+	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 }
 // Use a bundled scout so these runSubprocess tests exercise the built-in
 // ceiling together with a lower task.softRequestBudget setting.
@@ -338,7 +348,10 @@ describe("runSubprocess soft request budget", () => {
 			}
 		});
 		const advisorActive = vi.spyOn(handle.session, "isAdvisorActive");
-		mockCreateAgentSession(handle.session);
+		const revived = createMockSession(() => {
+			throw new Error("The revived scout must resume through IRC delivery.");
+		});
+		mockCreateAgentSession(revived.session).mockResolvedValueOnce(createSessionResult(handle.session));
 		registerRunning(id, handle.session);
 
 		const result = await runSubprocess({
@@ -366,7 +379,7 @@ describe("runSubprocess soft request budget", () => {
 				// The badge must appear before the awakened agent emits its first request.
 				expect(firstProgress?.payload.progress.requests).toBe(0);
 			}
-			expect(frames.at(-1)).toMatchObject({
+			expect(frames.at(-1), JSON.stringify(frames)).toMatchObject({
 				type: "subagent_lifecycle",
 				payload: { id, status: "completed" },
 			});
@@ -382,6 +395,7 @@ describe("runSubprocess soft request budget", () => {
 
 		await AgentLifecycleManager.global().park(id);
 		expect(AgentRegistry.global().get(id)?.status).toBe("parked");
+		expect(handle.session.isDisposed).toBe(true);
 		const parked = await SessionManager.open(`${tempDir.path()}/${id}.jsonl`);
 		parked.appendMessage({
 			role: "user",
@@ -396,6 +410,8 @@ describe("runSubprocess soft request budget", () => {
 		const revivedTerminal = waitForFollowUpTerminal();
 		const revivedReceipt = await new IrcBus().send({ from: "Main", to: id, body: "resume after parking" });
 		expect(revivedReceipt.outcome).toBe("revived");
+		expect(AgentRegistry.global().get(id)?.session).toBe(revived.session);
+		expect(revived.session.isDisposed).toBe(false);
 		await revivedTerminal;
 		expectRpcTurn(false);
 		rpcRegistry.dispose();
@@ -585,6 +601,8 @@ describe("runSubprocess soft request budget", () => {
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),
+				captureOwnerCurrent: () => () => !handle.session.isDisposed,
+				captureOwnerLifetimeCurrent: () => () => !handle.session.isDisposed,
 			} satisfies CreateAgentSessionResult;
 		});
 		registerRunning(id, handle.session);
@@ -629,6 +647,8 @@ describe("runSubprocess soft request budget", () => {
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),
+				captureOwnerCurrent: () => () => !handle.session.isDisposed,
+				captureOwnerLifetimeCurrent: () => () => !handle.session.isDisposed,
 			} satisfies CreateAgentSessionResult;
 		});
 		registerRunning(id, handle.session);
@@ -639,7 +659,7 @@ describe("runSubprocess soft request budget", () => {
 		expect(settled).toEqual(["completed"]);
 	});
 
-	it("a caller-signal abort stays terminal and irc names the aborted agent precisely", async () => {
+	it("a caller-signal abort keeps the kept-alive agent resumable via irc", async () => {
 		const id = "CancelledScout";
 		const controller = new AbortController();
 		const handle = createMockSession(({ promptIndex, emit, pushMessage }) => {
@@ -655,13 +675,12 @@ describe("runSubprocess soft request budget", () => {
 		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
 
 		expect(result.aborted).toBe(true);
-		expect(AgentRegistry.global().get(id)?.status).toBe("aborted");
-		expect(handle.disposeCalls()).toBeGreaterThanOrEqual(1);
+		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
+		expect(AgentLifecycleManager.global().has(id)).toBe(true);
+		expect(handle.disposeCalls()).toBe(0);
 
 		const receipt = await new IrcBus().send({ from: "Main", to: id, body: "resume" });
-		expect(receipt.outcome).toBe("failed");
-		expect(receipt.error).toMatch(/hard-aborted/);
-		expect(receipt.error).toMatch(new RegExp(`history://${id}`));
+		expect(receipt.outcome).toBe("woken");
 	});
 });
 

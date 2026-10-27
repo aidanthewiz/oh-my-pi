@@ -43,10 +43,10 @@ import { type AgentDefinition, canSpawnAtDepth, getTaskSchema, type TaskToolSche
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, isResumable, type AgentRef } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
-import { generateTaskName } from "./name-generator";
+import { generateTaskName, sanitizeAgentId } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
@@ -58,6 +58,9 @@ import {
 	type StructuredSubagentRequest,
 } from "./structured-subagent";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
+import type { TextTap } from "../job-widgets/text-tap";
+import type { SubagentToolResult } from "./executor";
+import { appendToolResult, createTaskWidgetInputs } from "./widget-inputs";
 
 import { cfgAsyncEnabled } from "../tools/settings";
 import {
@@ -785,6 +788,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		index: number;
 		agentId?: string;
 		detached: boolean;
+		isOwnerCurrent?: () => boolean;
+		widgetOwnerCurrent?: () => boolean;
 	}): SpawnRun {
 		return new SpawnRun(this.#permit, run =>
 			this.#runSpawn(
@@ -797,6 +802,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				spawn.detached,
 				run.timing,
 				spawn.detached ? run.onArtifactsRetained : undefined,
+				run.tools,
+				run.onAgentRegistered,
+				spawn.isOwnerCurrent,
+				spawn.widgetOwnerCurrent,
 			),
 		);
 	}
@@ -863,6 +872,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof plan === "string") {
 			return createTaskModeError(plan);
 		}
+		const isOwnerCurrent = this.session.captureOwnerCurrent?.();
+		const widgetOwnerCurrent = this.session.captureWidgetOwnerCurrent?.();
 		const { params, items: spawnItems, spawns: normalizedSpawnParams } = plan;
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
@@ -948,6 +959,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				defaultAgent,
 				signal,
 				onUpdate,
+				isOwnerCurrent,
+				widgetOwnerCurrent,
 			);
 			if (!advisory) return result;
 			let appended = false;
@@ -1007,7 +1020,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const agentType = resolvedAgents[index]!;
 			const policy = policies[index]!;
 			const agentSource = policy.agent.source;
-			const agentId = await outputManager.allocate(item.name?.trim() || generateTaskName());
+			const agentId = await outputManager.allocate(sanitizeAgentId(item.name) ?? generateTaskName());
 			const assignment = (item.task ?? "").trim();
 			spawns.push({
 				agentId,
@@ -1078,6 +1091,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					ircEnabled,
 					buildDetails: buildAsyncDetails,
 					onUpdate,
+					isOwnerCurrent,
+					widgetOwnerCurrent,
 					onSettled: failed => {
 						settledCount += 1;
 						if (failed) failedCount += 1;
@@ -1176,6 +1191,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			params,
 			defaultAgent,
 			signal,
+			isOwnerCurrent,
+			widgetOwnerCurrent,
 			spawns: syncSpawns.map(spawn => ({
 				item: spawn.item,
 				index: spawn.index,
@@ -1244,9 +1261,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 		onSettled?: (failed: boolean) => void;
+		isOwnerCurrent?: () => boolean;
+		widgetOwnerCurrent?: () => boolean;
 	}): string {
 		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
 			options;
+		let spawnRun: SpawnRun | undefined;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			// Isolated runs are parked without a reviver once the run ends
 			// (`finalizeSubagentLifecycle`), so "message it" would point the
@@ -1254,14 +1274,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// nothing about the worktree itself: the runner keeps it when captured
 			// changes could not be written, and names that path in the result.
 			const isolated = spawnParams.isolated === true;
-			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
+			const transcriptAvailable = aborted ? await hasResolvableTranscript(agentId) : true;
+			const owner = spawnRun?.ownerRef;
+			const ref = aborted && AgentRegistry.global().get(agentId) === owner ? owner : undefined;
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
 				agentId,
 				aborted,
 				isolated,
 				ircEnabled,
-				resumable: !isolated && (ref?.status === "idle" || ref?.status === "parked"),
-				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
+				resumable: !isolated && isResumable(ref),
+				transcriptAvailable,
 			})}`;
 		};
 		return manager.register(
@@ -1285,6 +1307,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							: undefined;
 						progress.advisor = nextProgress.advisor ?? progress.advisor;
 						progress.completionPercent = nextProgress.completionPercent ?? progress.completionPercent;
+						progress.stage = nextProgress.stage ?? progress.stage;
+						progress.watch = nextProgress.watch ?? progress.watch;
 						progress.resolvedModelRoute = nextProgress.resolvedModelRoute ?? progress.resolvedModelRoute;
 						progress.tokens = nextProgress.tokens;
 						progress.requests = nextProgress.requests;
@@ -1307,13 +1331,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						update.content.find(part => part.type === "text")?.text ?? `Running background task ${agentId}...`;
 					await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
 				};
-				const spawnRun = this.#launch({
+				spawnRun = this.#launch({
 					toolCallId,
 					params: spawnParams,
 					index: progress.index,
 					agentId,
 					detached: true,
+					isOwnerCurrent: options.isOwnerCurrent,
+					widgetOwnerCurrent: options.widgetOwnerCurrent,
 				});
+				const activeRun = spawnRun;
 				spawnRun.attach({
 					signal: runSignal,
 					onUpdate: forwardSyncProgress,
@@ -1334,7 +1361,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// path: progress + onSettled have to fire even when the spawn
 				// never reached the executor, otherwise the batch aggregate state
 				// stays "running" forever.
-				const permitHeld = await spawnRun.started.then(
+				const permitHeld = await activeRun.started.then(
 					() => true,
 					() => false,
 				);
@@ -1350,7 +1377,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						`Running background task ${agentId}...`,
 						buildDetails() as unknown as Record<string, unknown>,
 					);
-					const result = await spawnRun.result;
+					const result = await activeRun.result;
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
 					// A missing result means the sync path failed at the tool level
@@ -1372,7 +1399,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.requests = singleResult?.requests ?? 0;
 					progress.contextTokens = singleResult?.contextTokens;
 					progress.contextWindow = singleResult?.contextWindow;
-					progress.cost = singleResult?.usage?.cost.total ?? 0;
+					progress.cost = Math.max(progress.cost, singleResult?.usage?.cost.total ?? 0);
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
@@ -1419,6 +1446,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agentId,
 				queued: true,
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				widgetInputs: createTaskWidgetInputs({
+					manager,
+					agentId,
+					tools: () => spawnRun?.tools,
+					widgetOwnerCurrent: options.widgetOwnerCurrent,
+					owner: () => spawnRun?.ownerRef,
+					progress,
+					intent: this.session.getToolCallIntent?.(toolCallId),
+				}),
 				onProgress: text => {
 					onUpdate?.({ content: [{ type: "text", text }], details: buildDetails() });
 				},
@@ -1440,6 +1476,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		defaultAgent: string,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		isOwnerCurrent?: () => boolean,
+		widgetOwnerCurrent?: () => boolean,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
@@ -1449,6 +1487,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				index: spawn.index,
 				agentId: spawn.preAllocatedId,
 				detached: false,
+				isOwnerCurrent,
+				widgetOwnerCurrent,
 			});
 			run.attach({ signal, onUpdate });
 			return await run.result;
@@ -1475,6 +1515,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			params,
 			defaultAgent,
 			signal,
+			isOwnerCurrent,
+			widgetOwnerCurrent,
 			spawns,
 			onItemProgress: onUpdate
 				? (index, progress) => {
@@ -1513,6 +1555,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawns: SyncSpawnRef[];
 		signal?: AbortSignal;
 		onItemProgress?: (index: number, progress: AgentProgress) => void;
+		isOwnerCurrent?: () => boolean;
+		widgetOwnerCurrent?: () => boolean;
 	}): Promise<(AgentToolResult<TaskToolDetails> | undefined)[]> {
 		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
 		const { results } = await mapWithConcurrencyLimitAllSettled(
@@ -1525,6 +1569,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					index: spawn.index,
 					agentId: spawn.preAllocatedId,
 					detached: false,
+					isOwnerCurrent: args.isOwnerCurrent,
+					widgetOwnerCurrent: args.widgetOwnerCurrent,
 				});
 				run.attach({
 					signal: workerSignal,
@@ -1573,6 +1619,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+		tools?: TextTap,
+		onAgentRegistered?: (ref: AgentRef) => void,
+		isOwnerCurrent?: () => boolean,
+		widgetOwnerCurrent?: () => boolean,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -1620,6 +1670,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 				maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 				signal,
+				...(tools ? { onToolResult: (result: SubagentToolResult) => appendToolResult(tools, result) } : {}),
+				onAgentRegistered,
+				isOwnerCurrent,
+				widgetOwnerCurrent,
 				onProgress: progress => {
 					latestProgress = { ...progress, recentTools: progress.recentTools.slice() };
 					onUpdate?.({

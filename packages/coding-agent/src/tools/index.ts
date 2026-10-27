@@ -232,6 +232,12 @@ export interface ToolSession {
 	settingsApproval?: boolean;
 	/** Whether this session has begun disposal. */
 	isDisposed?: () => boolean;
+	/** Capture the root/session/account/policy authority for one asynchronous launch. */
+	captureOwnerCurrent?: (options?: { allowParked?: boolean }) => () => boolean;
+	/** Capture retained root/reference/journal/account lifetime for warm revival. */
+	captureOwnerLifetimeCurrent?: () => () => boolean;
+	/** Capture the originating root authority for one background widget source. */
+	captureWidgetOwnerCurrent?: () => () => boolean;
 	/**
 	 * Suppress the spawn specialization/coordination advisory appended to `task`
 	 * results. Set by internal/programmatic callers (e.g. the commit agent's
@@ -493,6 +499,8 @@ export interface ToolSession {
 	getLastAssistantText?: () => string | undefined;
 	/** Resolve a terminal yield's current or immediately preceding report, bound to its call ID. */
 	getYieldReportText?: (toolCallId: string) => string | undefined;
+	/** The `i` intent the model wrote on a tool call of the current turn, by call ID. */
+	getToolCallIntent?: (toolCallId: string) => string | undefined;
 	/** Replace the active workpool item contract and refresh its provider-facing prompt. */
 	setWorkPoolYieldItems?: (items: readonly WorkPoolYieldItem[]) => Promise<void>;
 	/** The tool-choice queue used to force forthcoming tool invocations and carry invocation handlers. */

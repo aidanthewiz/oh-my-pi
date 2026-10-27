@@ -36,6 +36,7 @@ import type { ToolSession } from "../sdk";
 
 import { routeWriteThroughBridge, shouldRouteWriteThroughBridge } from "./acp-bridge";
 import { formatApprovalArguments, truncateForPrompt } from "./approval";
+import { approvalTargetIdentities, approvalTargetKey } from "./approval-targets";
 import { assertEditableFile } from "./auto-generated-guard";
 
 import { isReadTruncationNotice } from "@oh-my-pi/pi-tui/tools/hashline-format";
@@ -70,6 +71,10 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
 import { resolveXdevTool } from "./xdev";
+import { REPORT_ISSUE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
+import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
+import { dispatchReportIssueDevice } from "./report-tool-issue";
+import { dispatchResolutionDevice } from "./resolve";
 
 import {
 	cfgLspDiagnosticsDeduplicate,
@@ -459,6 +464,9 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 	return { table, key };
 }
 
+const approvalDeviceInstances = new WeakMap<object, number>();
+let nextApprovalDeviceInstance = 0;
+
 /**
  * Write tool implementation.
  *
@@ -514,6 +522,66 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		}
 		return [`Path: ${truncateForPrompt(targetPath)}`, `Content:\n${truncateForPrompt(content)}`];
 	};
+	/**
+	 * `always-ask-cached` key: the path this write targets, unwrapped from a
+	 * hashline `[path#TAG]` header exactly like the approval tier above, so all
+	 * writes to one file share a single grant.
+	 */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const rawPath = (args as Partial<WriteParams> | null | undefined)?.path;
+		if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
+		const unwrapped = unwrapHashlineHeaderPath(rawPath);
+		const target = InternalUrlRouter.instance().writeTarget(unwrapped);
+		if (target?.url.protocol === "xd:" && target.spec.backing === "device") {
+			this.#approvalDeviceInstance(target.url.rawHref ?? target.url.href);
+			return [];
+		}
+		const key = approvalTargetKey(this.session.cwd, unwrapped);
+		return key === undefined ? undefined : [key];
+	};
+	readonly approvalCacheIdentity = async (args: unknown) => {
+		const rawPath = (args as Partial<WriteParams> | null | undefined)?.path;
+		const target =
+			typeof rawPath === "string"
+				? InternalUrlRouter.instance().writeTarget(unwrapHashlineHeaderPath(rawPath))
+				: undefined;
+		if (target?.url.protocol === "xd:" && target.spec.backing === "device") {
+			const instance = this.#approvalDeviceInstance(target.url.rawHref ?? target.url.href);
+			const identities: number[] = [];
+			for (const object of [instance, this.session]) {
+				let identity = approvalDeviceInstances.get(object);
+				if (identity === undefined) {
+					identity = ++nextApprovalDeviceInstance;
+					approvalDeviceInstances.set(object, identity);
+				}
+				identities.push(identity);
+			}
+			return [
+				{
+					target: target.url.rawHref ?? target.url.href,
+					identity: JSON.stringify({
+						device: identities[0],
+						session: identities[1],
+						cwd: this.session.cwd,
+						sessionId: this.session.getSessionId?.() ?? this.session.getSessionFile(),
+					}),
+				},
+			];
+		}
+		return approvalTargetIdentities(
+			this.session.cwd,
+			this.approvalCacheTargets(args) ?? [],
+			sessionResolveContext(this.session),
+		);
+	};
+	#approvalDeviceInstance(href: string): object {
+		const name = parseXdUrl(href)?.name;
+		if (name === REPORT_ISSUE_DEVICE_NAME) return dispatchReportIssueDevice;
+		if (name && isResolutionDeviceName(name)) return dispatchResolutionDevice;
+		const instance = name && this.session.xdev ? resolveXdevTool(this.session.xdev, name) : undefined;
+		if (!instance) throw new ToolError("Cannot bind approval destination for an unavailable device");
+		return instance;
+	}
 	readonly label = "Write";
 	get description(): string {
 		const deviceOnly = this.session.deviceOnlyWrite === true && this.session.pendingFullWriteDescription !== true;

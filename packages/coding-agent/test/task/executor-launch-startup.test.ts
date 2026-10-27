@@ -39,9 +39,16 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 
 	const sessionCreationStarted = Promise.withResolvers<void>();
 	let sessionCreated = false;
+	let disposed = false;
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const session = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -71,6 +78,8 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		sessionCreated = true;
 		const result: CreateAgentSessionResult = {
 			session,
+			captureOwnerCurrent: () => () => !session.isDisposed,
+			captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 			extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),

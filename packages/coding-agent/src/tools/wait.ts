@@ -79,8 +79,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<CoordinationDetails>,
 	): Promise<AgentToolResult<CoordinationDetails>> {
-		const interrupted = abortedWaitResult(signal);
-		if (interrupted) return interrupted;
+		if (signal?.aborted && signal.reason !== TOOL_INTERRUPT_ABORT_REASON) throwIfAborted(signal);
 		const registry = this.session.agentRegistry;
 		const senderId = this.session.getAgentId?.() ?? undefined;
 		const messaging = registry && senderId ? { registry, senderId } : undefined;
@@ -88,23 +87,26 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 
 		const pending = takeQueuedMessage(messaging);
 		if (pending && messaging) return messageResult(messaging.senderId, pending);
-		if (cfgLaunchEnabled.get(this.session.settings)) {
-			if (signal) {
-				const abort = Promise.withResolvers<void>();
-				const onAbort = () => abort.resolve();
-				signal.addEventListener("abort", onAbort, { once: true });
-				if (signal.aborted) onAbort();
-				try {
-					await Promise.race([listServicesTolerant(this.session, signal), abort.promise]);
-				} finally {
-					signal.removeEventListener("abort", onAbort);
+		if (cfgLaunchEnabled.get(this.session.settings) && !signal?.aborted) {
+			try {
+				if (signal) {
+					const abort = Promise.withResolvers<void>();
+					const onAbort = () => abort.resolve();
+					signal.addEventListener("abort", onAbort, { once: true });
+					if (signal.aborted) onAbort();
+					try {
+						await Promise.race([listServicesTolerant(this.session, signal), abort.promise]);
+					} finally {
+						signal.removeEventListener("abort", onAbort);
+					}
+				} else {
+					await listServicesTolerant(this.session);
 				}
-			} else {
-				await listServicesTolerant(this.session);
+			} catch (error) {
+				if (signal?.reason !== TOOL_INTERRUPT_ABORT_REASON) throw error;
 			}
 		}
-		const interruptedAfterDiscovery = abortedWaitResult(signal);
-		if (interruptedAfterDiscovery) return interruptedAfterDiscovery;
+		if (signal?.aborted && signal.reason !== TOOL_INTERRUPT_ABORT_REASON) throwIfAborted(signal);
 		const queued = takeQueuedMessage(messaging);
 		if (queued && messaging) return messageResult(messaging.senderId, queued);
 		const jobs = manager?.getRunningJobs({ ownerId: senderId }) ?? [];
@@ -115,6 +117,8 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		if (manager && undelivered.length > 0) {
 			return buildJobResult(this.session, manager, "wait", [...undelivered, ...jobs], []);
 		}
+		const interruptedAfterDiscovery = abortedWaitResult(signal);
+		if (interruptedAfterDiscovery) return interruptedAfterDiscovery;
 		const serviceRunning = hasLiveOwnedService(this.session);
 		if (jobs.length === 0 && !serviceRunning) {
 			throw new ToolError(
@@ -184,6 +188,10 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 			// deliverable, whereas a lost message cannot be recovered from the bus.
 			const message = await busLeg;
 			if (message && messaging) return messageResult(messaging.senderId, message);
+			if (signal?.aborted && signal.reason !== TOOL_INTERRUPT_ABORT_REASON) throwIfAborted(signal);
+			if (manager && jobs.some(job => job.status !== "running")) {
+				return buildJobResult(this.session, manager, "wait", jobs, []);
+			}
 			const interrupted = abortedWaitResult(signal);
 			if (interrupted) return interrupted;
 			if (manager && jobs.length > 0) return buildJobResult(this.session, manager, "wait", jobs, []);

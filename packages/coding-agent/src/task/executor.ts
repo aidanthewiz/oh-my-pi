@@ -4,13 +4,23 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
+import { renameSync, rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
-import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	isRecord,
+	logger,
+	popLoopPhase,
+	prompt,
+	pushLoopPhase,
+	sanitizeText,
+	Snowflake,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -59,7 +69,7 @@ import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pendi
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import {
 	type CreateAgentSessionOptions,
@@ -100,11 +110,14 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { isCompletionProbeEnabled, startCompletionProbe } from "./completion-probe";
+import { appendToolResult, createTaskWidgetInputs, TOOLS_SOURCE_LABEL } from "./widget-inputs";
+import { TextTap } from "../job-widgets/text-tap";
+import { TOOLS_SOURCE_ID } from "../job-widgets/types";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
-import { formatTaskResultSummary } from "./result-summary";
+import { formatTaskResultSummary, recordTaskResultOwner } from "./result-summary";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
@@ -408,6 +421,13 @@ export interface ExecutorOptions {
 	asyncJobManager?: AsyncJobManager;
 	/** Parent session whose stored credential affinities seed the child session. */
 	credentialSourceSessionId?: string;
+	/** Captures the exact registry generation created for this run. */
+	onAgentRegistered?: (ref: AgentRef) => void;
+	/** Captured parent-session and credential-store lifetime. */
+	isOwnerCurrent?: () => boolean;
+	isOwnerLifetimeCurrent?: () => boolean;
+	captureReviveOwnerCurrent?: () => () => boolean;
+	widgetOwnerCurrent?: () => boolean;
 	worktree?: string;
 	agent: AgentDefinition;
 	task: string;
@@ -497,6 +517,8 @@ export interface ExecutorOptions {
 	restrictToolNames?: boolean;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	/** Receives each tool call the subagent finishes, with its result text; feeds the task job's widget. */
+	onToolResult?: (result: SubagentToolResult) => void;
 	/**
 	 * Epochs (ms, `Date.now()`) bracketing the concurrency-semaphore wait:
 	 * `invokedAt` is stamped at the spawn boundary before `acquire()`,
@@ -1198,6 +1220,16 @@ export function createSubagentSettings(
 
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
 
+/** A tool call a subagent finished, as {@link ExecutorOptions.onToolResult} reports it. */
+export interface SubagentToolResult {
+	tool: string;
+	/** Intent the model attached to the call, when it carried one. */
+	intent?: string;
+	/** The result's text parts, joined by newlines; empty when it had none. */
+	text: string;
+	isError: boolean;
+}
+
 const MAX_YIELD_TOOL_ERRORS = 6;
 
 /** Inputs for the run monitor driving one subagent assignment. */
@@ -1219,6 +1251,8 @@ interface RunMonitorArgs {
 	modelRoute?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	/** See {@link ExecutorOptions.onToolResult}. */
+	onToolResult?: (result: SubagentToolResult) => void;
 	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
@@ -1304,6 +1338,8 @@ interface SubagentRunMonitor {
 	 * further work started. Source for `yield`'s data-less finalize.
 	 */
 	lastReportTurnText(): string | undefined;
+	/** Whether any assistant message ended while this monitor was attached. */
+	sawAssistantMessage(): boolean;
 	/** Final raw output: end-of-run assistant text when available, else accumulated chunks. */
 	rawOutput(): string;
 	scheduleProgress(flush?: boolean): void;
@@ -1373,6 +1409,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const abortSignal = abortController.signal;
 	let activeSession: AgentSession | null = null;
 	let completionProbeStarted = false;
+	let probeCost = 0;
 	let yieldCalled = false;
 	let yieldCallPending = false;
 	/**
@@ -1413,6 +1450,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// following the last such call qualifies. A text-less yield turn may still
 	// finalize the preceding report.
 	let lastReportTurnText: string | undefined;
+	let sawAssistantMessage = false;
 	let activeSessionAbortPromise: Promise<void> | undefined;
 
 	const abortActiveSession = (): Promise<void> => {
@@ -1432,14 +1470,14 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 
 	const requestAbort = (reason: AbortReason) => {
 		if (abortSent) {
-			// Shutdown is a superseding external abort: a process teardown that
-			// races a self-inflicted budget hard-abort must still follow the
-			// shutdown release path (dispose + unregister) instead of the
-			// budget-resumable path, which would leave the subagent adopted and
-			// alive past AgentLifecycleManager.dispose(). Genuine kills
-			// (signal/timeout/terminate) already dispose terminally, and shutdown
-			// is never downgraded back to signal.
-			if (reason === "shutdown" && abortReason === "budget") {
+			// Shutdown supersedes every resumable abort: a process teardown that
+			// races a budget, timeout, or caller abort must still follow the
+			// shutdown release path (dispose + unregister, restorable from disk)
+			// instead of the resumable path, which would leave the subagent
+			// adopted and alive past AgentLifecycleManager.dispose(). A committed
+			// `terminate` keeps its outcome, and shutdown is never downgraded
+			// back to signal.
+			if (reason === "shutdown" && abortReason !== "terminate") {
 				abortReason = "shutdown";
 			} else if (
 				reason === "signal" &&
@@ -1885,6 +1923,22 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						progress.recentTools.pop();
 					}
 				}
+				if (args.onToolResult) {
+					const content: unknown = isRecord(event.result) ? event.result.content : undefined;
+					const text = Array.isArray(content)
+						? content
+								.flatMap(part =>
+									isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+								)
+								.join("\n")
+						: "";
+					args.onToolResult({
+						tool: event.toolName,
+						intent: finished?.intent,
+						text,
+						isError: event.isError === true,
+					});
+				}
 				if (visibleToolCallId === event.toolCallId) {
 					const remaining = activeTools.entries().next().value;
 					visibleToolCallId = remaining?.[0];
@@ -2043,6 +2097,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				const role = event.message?.role;
 				if (role === "assistant") {
 					assistantStreaming = false;
+					sawAssistantMessage = true;
 					progress.requests += 1;
 					const eventContent = isRecord(event) && "content" in event ? event.content : undefined;
 					const messageContent = getMessageContent(event.message) || eventContent;
@@ -2109,7 +2164,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							accumulatedUsage.cost.cacheRead += getNumberField(costRecord, "cacheRead") ?? 0;
 							accumulatedUsage.cost.cacheWrite += getNumberField(costRecord, "cacheWrite") ?? 0;
 							accumulatedUsage.cost.total += getNumberField(costRecord, "total") ?? 0;
-							progress.cost = accumulatedUsage.cost.total;
+							progress.cost = accumulatedUsage.cost.total + probeCost;
 						}
 					}
 					// Accumulate tokens for progress display
@@ -2315,11 +2370,17 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				startCompletionProbe({
 					session: () => activeSession,
 					signal: AbortSignal.any([listenerSignal, abortSignal]),
-					onEstimate: (percent, cost) => {
+					onEstimate: (estimate, cost) => {
 						if (resolved) return;
-						// A probe in flight when the yield landed must not pull the bar back from 99%.
-						if (!yieldCalled) progress.completionPercent = percent;
-						progress.cost += cost;
+						// A probe in flight when the yield landed must not pull the bar back from 99%
+						// or relabel the finished run with a stale step.
+						if (!yieldCalled) {
+							progress.completionPercent = estimate.percent;
+							if (estimate.stage !== undefined) progress.stage = estimate.stage;
+						}
+						if (estimate.watch !== undefined) progress.watch = estimate.watch;
+						probeCost += cost;
+						progress.cost = accumulatedUsage.cost.total + probeCost;
 						scheduleProgress(true);
 					},
 				});
@@ -2334,6 +2395,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		captureSalvage,
 		lastAssistantSalvageText: () => lastAssistantSalvageText,
 		lastReportTurnText: () => lastReportTurnText,
+		sawAssistantMessage: () => sawAssistantMessage,
 		rawOutput: () => (finalOutputChunks.length > 0 ? finalOutputChunks.join("") : outputChunks.join("")),
 		scheduleProgress,
 		finish: () => {
@@ -2751,6 +2813,8 @@ interface FinalizeRunArgs {
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	signal?: AbortSignal;
 	artifactsDir?: string;
+	isPublicationCurrent: () => boolean;
+	resultOwner?: AgentRef;
 	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
@@ -2766,13 +2830,30 @@ interface FinalizeRunArgs {
 	startTime: number;
 }
 
+const observedTurnFinalizations = new Map<string, Promise<void>>();
+
+async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
+	if (!args.artifactsDir) return finalizeOwnedRunResult(args);
+	const key = path.resolve(args.artifactsDir, `${args.id}.md`);
+	const previous = observedTurnFinalizations.get(key);
+	const completed = Promise.withResolvers<void>();
+	observedTurnFinalizations.set(key, completed.promise);
+	try {
+		if (previous) await previous;
+		return await finalizeOwnedRunResult(args);
+	} finally {
+		completed.resolve();
+		if (observedTurnFinalizations.get(key) === completed.promise) observedTurnFinalizations.delete(key);
+	}
+}
+
 /**
  * Turn a settled run into a {@link SingleResult}: resolve the yield payload via
  * {@link finalizeSubprocessOutput}, salvage cancelled-run output, write the
  * `<id>.md` output artifact, flush final progress, and emit the lifecycle end
  * event.
  */
-async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
+async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, modelRole } = args;
 	const progress = monitor.progress;
 	let exitCode = done.exitCode;
@@ -2834,6 +2915,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// the parent's accepted artifact.
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
+	let publicationFailure: string | undefined;
 	const hasMessageResult =
 		args.publishMessageResult &&
 		!structured &&
@@ -2842,67 +2924,81 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		!signal?.aborted &&
 		!monitor.runtimeLimitExceeded() &&
 		rawOutput.trim().length > 0;
-	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
+	if (args.artifactsDir && args.isPublicationCurrent() && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
+		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
+		const nonce = Snowflake.next();
+		const stagedOutput = `${candidatePath}.tmp-${nonce}`;
+		const stagedSidecar = `${sidecarPath}.tmp-${nonce}`;
 		try {
-			await writeArtifact(candidatePath, rawOutput);
-			outputPath = candidatePath;
-			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
-				charCount: rawOutput.length,
-			};
+			await writeArtifact(stagedOutput, rawOutput);
+			let sidecarReady = false;
+			try {
+				const structuredOutput = finalized.structuredOutput;
+				const serialized =
+					structuredOutput && Object.hasOwn(structuredOutput, "data")
+						? JSON.stringify(structuredOutput.data, null, 2)
+						: undefined;
+				if (serialized !== undefined) {
+					await writeArtifact(stagedSidecar, `${serialized}\n`);
+					sidecarReady = true;
+				}
+			} catch (error) {
+				logger.warn("Failed to persist subagent structured output sidecar", {
+					agentId: id,
+					path: sidecarPath,
+					error: error instanceof Error ? error.stack || error.message : String(error),
+				});
+			}
+			// No event-loop yield separates the ownership check from either commit.
+			if (args.isPublicationCurrent() && !signal?.aborted && !monitor.runtimeLimitExceeded()) {
+				if (!sidecarReady) rmSync(sidecarPath, { force: true });
+				renameSync(stagedOutput, candidatePath);
+				outputPath = candidatePath;
+				outputMeta = { lineCount: rawOutput.split("\n").length, charCount: rawOutput.length };
+				try {
+					if (sidecarReady) renameSync(stagedSidecar, sidecarPath);
+				} catch (error) {
+					rmSync(sidecarPath, { force: true });
+					logger.warn("Failed to persist subagent structured output sidecar", {
+						agentId: id,
+						path: sidecarPath,
+						error: error instanceof Error ? error.stack || error.message : String(error),
+					});
+				}
+			}
 		} catch (error) {
+			publicationFailure = error instanceof Error ? error.message : String(error);
 			logger.warn("Failed to persist subagent output artifact", {
 				agentId: id,
 				path: candidatePath,
 				error: error instanceof Error ? error.message : String(error),
 			});
+		} finally {
+			await Promise.all(
+				[stagedOutput, stagedSidecar].map(file =>
+					fs.rm(file, { force: true }).catch(error => {
+						logger.warn("Failed to remove staged subagent output", {
+							agentId: id,
+							path: file,
+							error: String(error),
+						});
+					}),
+				),
+			);
 		}
-		const structured = finalized.structuredOutput;
-		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
-		if (outputPath && structured && Object.hasOwn(structured, "data")) {
-			try {
-				const serialized = JSON.stringify(structured.data, null, 2);
-				// `structured.data === undefined` (an own "data" key holding
-				// `undefined`) makes JSON.stringify return `undefined` too —
-				// neither a write nor a removal, which would leave a stale
-				// sidecar from an earlier turn answering agent://<id>/<field>
-				// with superseded data (PR #10625 review).
-				if (serialized !== undefined) await writeArtifact(sidecarPath, `${serialized}\n`);
-				else await fs.rm(sidecarPath, { force: true });
-			} catch (error) {
-				logger.warn("Failed to persist subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-				// A stale sidecar from an earlier turn must not outlive this
-				// turn's <id>.md just because the replacement write failed —
-				// agent://<id>/<field> would keep answering with superseded data.
-				try {
-					await fs.rm(sidecarPath, { force: true });
-				} catch (rmError) {
-					logger.warn("Failed to drop stale subagent structured output sidecar", {
-						agentId: id,
-						path: sidecarPath,
-						error: rmError instanceof Error ? rmError.message : String(rmError),
-					});
-				}
-			}
-		} else if (outputPath) {
-			// This turn republished <id>.md; a stale sidecar from an earlier
-			// turn would keep answering agent://<id>/<field> with the
-			// superseded payload, so it must not outlive its <id>.md.
-			try {
-				await fs.rm(sidecarPath, { force: true });
-			} catch (error) {
-				logger.warn("Failed to drop stale subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
+	}
+	const retiredOwner = !args.isPublicationCurrent();
+	const cancelledBeforePublication =
+		Boolean(signal?.aborted) && args.artifactsDir !== undefined && outputPath === undefined;
+	if (retiredOwner || cancelledBeforePublication || publicationFailure !== undefined) {
+		exitCode = 1;
+		stderr ||=
+			publicationFailure !== undefined
+				? `Subagent output publication failed: ${publicationFailure}`
+				: retiredOwner
+					? "Subagent result owner was retired before publication."
+					: monitor.resolveSignalAbortReason();
 	}
 
 	// Update final progress. A wall-clock timeout always wins: if the runtime
@@ -2915,17 +3011,24 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		exitCode = 1;
 	}
 	const wasAborted =
-		runtimeLimitExceeded || Boolean(done.aborted) || abortedViaYield || (!hasYield && Boolean(signal?.aborted));
+		retiredOwner ||
+		cancelledBeforePublication ||
+		runtimeLimitExceeded ||
+		Boolean(done.aborted) ||
+		abortedViaYield ||
+		(!hasYield && Boolean(signal?.aborted));
 	const finalAbortReason = wasAborted
-		? runtimeLimitExceeded
-			? monitor.resolveAbortReasonText()
-			: done.aborted
-				? (done.abortReason ?? monitor.resolveAbortReasonText())
-				: abortedViaYield
-					? yieldAbortReason
-					: signal?.aborted
-						? monitor.resolveSignalAbortReason()
-						: monitor.resolveAbortReasonText()
+		? retiredOwner
+			? "Subagent result owner was retired before publication."
+			: runtimeLimitExceeded
+				? monitor.resolveAbortReasonText()
+				: done.aborted
+					? (done.abortReason ?? monitor.resolveAbortReasonText())
+					: abortedViaYield
+						? yieldAbortReason
+						: signal?.aborted
+							? monitor.resolveSignalAbortReason()
+							: monitor.resolveAbortReasonText()
 		: undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	monitor.scheduleProgress(true);
@@ -2944,7 +3047,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	};
 	emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);
 
-	return {
+	const result: SingleResult = {
 		index,
 		id,
 		agent: agent.name,
@@ -2979,6 +3082,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		retryFailure: progress.retryFailure,
 		outputMeta,
 	};
+	if (args.resultOwner) recordTaskResultOwner(result, args.resultOwner);
+	return result;
 }
 
 /** Inputs for {@link attachIrcWakeTurnMonitor}. */
@@ -2997,6 +3102,15 @@ export interface IrcWakeTurnMonitorOptions {
 	/** Fallback session file when the registry ref carries none. */
 	sessionFile?: string;
 	maxRuntimeMs?: number;
+	/**
+	 * Whether a turn the owner's own message woke asks for completion estimates
+	 * (see {@link isCompletionProbeEnabled}); a peer-woken turn never does.
+	 */
+	completionProbe?: boolean;
+	isOwnerCurrent?: () => boolean;
+	isOwnerLifetimeCurrent?: () => boolean;
+	captureReviveOwnerCurrent?: () => () => boolean;
+	widgetOwnerCurrent?: () => boolean;
 	/** `false` = the session has no `yield` tool; see {@link ExecutorOptions.structured}. */
 	structured?: boolean;
 	outputSchema?: unknown;
@@ -3019,8 +3133,11 @@ function wakeSources(records: AgentMessage[], selfId: string): WakeSource[] {
 		const from = details ? Reflect.get(details, "from") : undefined;
 		if (typeof from !== "string" || from === selfId || sources.some(source => source.from === from)) continue;
 		// Automated wake-turn relays are answers, not wake sources: relaying one
-		// back would ping-pong two idle peers forever.
-		if (details && Reflect.get(details, "wakeRelay") === true) continue;
+		// back would ping-pong two idle peers forever. A broadcast leg is not one
+		// either: it asks no one in particular, so relaying every woken peer's
+		// turn back would flood the broadcaster with "not for me" replies.
+		if (details && (Reflect.get(details, "wakeRelay") === true || Reflect.get(details, "broadcast") === true))
+			continue;
 		const messageId = details ? Reflect.get(details, "id") : undefined;
 		sources.push({ from, messageId: typeof messageId === "string" ? messageId : undefined });
 	}
@@ -3161,8 +3278,6 @@ function extractIrcRecordText(content: string | ReadonlyArray<{ type: string; te
 		.join("\n");
 }
 
-const observedTurnFinalizations = new Map<string, Promise<void>>();
-
 /**
  * Bracket a kept-alive subagent's undriven turns — autonomous IRC wakes and
  * user prompts from focused-session steering — with a task run monitor so
@@ -3173,9 +3288,9 @@ const observedTurnFinalizations = new Map<string, Promise<void>>();
  * blind spots. The observer runs after the session has flushed its post-prompt
  * settle (see {@link AgentSession.setIrcWakeTurnObserver}).
  *
- * The turn's output reaches the parent as an async job when the parent's
- * message woke the turn, the turn yielded, or a user prompt completed a
- * message result, and the other waking peers via
+ * The turn's output reaches the parent as an async job when its message woke
+ * the turn, its mid-turn request was consumed, the turn yielded, or a user
+ * prompt completed a message result, and the other waking peers via
  * {@link relayWakeTurnOutput}; the relay is registered as a pending reply on
  * the session up front so a `send await:true` waiter holds its "stopped
  * without replying" verdict until the relay has been delivered.
@@ -3185,6 +3300,23 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 	const index = options.index ?? 0;
 	const maxRuntimeMs = options.maxRuntimeMs ?? 0;
 	session.setIrcWakeTurnObserver(records => {
+		const ownerLifetimeCurrent = options.isOwnerLifetimeCurrent ?? options.isOwnerCurrent;
+		const attemptOwnerCurrent =
+			ownerLifetimeCurrent?.() === false ? undefined : options.captureReviveOwnerCurrent?.();
+		let wakeReady = false;
+		const isOwnerCurrent = (): boolean =>
+			ownerLifetimeCurrent?.() !== false && (wakeReady || attemptOwnerCurrent?.() !== false);
+		const releaseAdmission: (() => void) | undefined = options.captureReviveOwnerCurrent
+			? session.agent.addBeforeModelCallHook(() => {
+					try {
+						if (!isOwnerCurrent())
+							throw new Error(`Subagent "${id}" owner admission retired before wake dispatch.`);
+						wakeReady = true;
+					} finally {
+						releaseAdmission?.();
+					}
+				})
+			: undefined;
 		// Autonomous IRC wake turns reuse the session's YieldTool just like
 		// runSubagentFollowUpTurn; clear the prior run's incremental-section flag
 		// and retry counters so this wake turn's guards see only its own state.
@@ -3207,19 +3339,18 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				.filter(Boolean)
 				.join("\n\n") || "IRC follow-up";
 		const turnStartTime = Date.now();
+		const assistantBeforeTurn = session.getLastAssistantMessage();
 		const relay = Promise.withResolvers<void>();
 		session.trackIrcReply(relay.promise);
 		const turnRef = AgentRegistry.global().get(id);
+		const weakTurnRef = turnRef ? new WeakRef(turnRef) : undefined;
 		const sessionFile = turnRef?.sessionFile ?? options.sessionFile ?? undefined;
-		const finalizationKey = options.artifactsDir ? path.join(options.artifactsDir, `${id}.md`) : undefined;
-		// The parent receives this turn's outcome through an owner-routed job: the
-		// ordinary async-result delivery, and what its `wait` blocks on. A turn
-		// woken by the parent's own message is work the parent started, so the job
-		// spans the whole turn. Otherwise a yield or clean plain report registers
-		// the job before the ref goes idle; finalization settles its outcome.
 		const ownerId = turnRef?.parentId;
 		// Cancelling the job cancels the turn it stands for.
 		const jobCancel = new AbortController();
+		// The turn's finished tool calls, which the job's widget reads like a first run's.
+		const tools = new TextTap(TOOLS_SOURCE_ID, TOOLS_SOURCE_LABEL);
+		let reportJobProgress: ((progress: AgentProgress) => void) | undefined;
 		let wakeJob: { ownerId: string; outcome: PromiseWithResolvers<AsyncJobRunResult> } | undefined;
 		const registerWakeJob = (): void => {
 			if (wakeJob) return;
@@ -3230,18 +3361,32 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				manager.register(
 					"task",
 					id,
-					async ({ signal }) => {
+					async ({ signal, reportProgress }) => {
 						const cancelTurn = () => jobCancel.abort(signal.reason);
 						if (signal.aborted) cancelTurn();
 						else signal.addEventListener("abort", cancelTurn, { once: true });
+						reportJobProgress = progress => {
+							void reportProgress(`Running background task ${id}...`, { progress: [progress] });
+						};
 						try {
-							// Cancellation owns the turn until its session and finalization settle.
 							return await outcome.promise;
 						} finally {
 							signal.removeEventListener("abort", cancelTurn);
 						}
 					},
-					{ id, agentId: id, ownerId },
+					{
+						id,
+						agentId: id,
+						ownerId,
+						widgetInputs: createTaskWidgetInputs({
+							manager,
+							agentId: id,
+							owner: () => weakTurnRef?.deref(),
+							widgetOwnerCurrent: options.widgetOwnerCurrent,
+							tools: () => tools,
+							progress: turnMonitor.progress,
+						}),
+					},
 				);
 				wakeJob = { ownerId, outcome };
 			} catch (error) {
@@ -3251,7 +3396,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				});
 			}
 		};
-		const ownerWoken = wakeSources(records, id).some(source => source.from === ownerId);
+		const directWakers = wakeSources(records, id);
+		const ownerWoken = directWakers.some(source => source.from === ownerId);
+		let ownerPrompted = false;
 		const focusedPrompt = records.some(
 			record =>
 				(record.role === "user" && record.attribution === "user") ||
@@ -3273,14 +3420,17 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			softRequestBudget: 0,
 			softRequestBudgetNotice: false,
 			maxRuntimeMs,
-			// Autonomous wake turns answer a peer message; too short to probe.
-			completionProbe: false,
+			// A peer's message gets a short answer, too short to probe; the owner's message is an
+			// assignment the owner waits on.
+			completionProbe: ownerWoken && options.completionProbe === true,
 			signal: jobCancel.signal,
+			onProgress: progress => reportJobProgress?.(progress),
+			onToolResult: result => appendToolResult(tools, result),
 			onYieldAccepted: registerWakeJob,
 			onReportTurnCompleted:
 				options.structured === false
 					? () => {
-							if (!focusedPrompt) registerWakeJob();
+							if (!focusedPrompt && (directWakers.length > 0 || ownerPrompted)) registerWakeJob();
 						}
 					: undefined,
 		});
@@ -3301,11 +3451,21 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		turnMonitor.setActiveSession(session);
 		const unsubscribeTurn = turnMonitor.attach(session);
 		if (ownerWoken) registerWakeJob();
+		// Only a message_end from the agent loop proves the queued parent steer
+		// entered this turn. Receipt alone cannot claim a peer's earlier answer.
+		const unsubscribeParentSteer = session.subscribe(event => {
+			if (event.type !== "message_end" || !session.isParentIrcSteer(event.message)) return;
+			ownerPrompted = true;
+			registerWakeJob();
+		});
 		return async turnError => {
 			unsubscribeTurn();
+			unsubscribeParentSteer();
+			releaseAdmission?.();
 			const activeSession = turnMonitor.takeActiveSession();
-			if (activeSession) turnMonitor.captureSalvage(activeSession);
-			const lastAssistant = session.getLastAssistantMessage();
+			const candidateAssistant = session.getLastAssistantMessage();
+			const lastAssistant = candidateAssistant === assistantBeforeTurn ? undefined : candidateAssistant;
+			if (activeSession && lastAssistant) turnMonitor.captureSalvage(activeSession);
 			const yielded = turnMonitor.yieldCalled();
 			const runtimeLimitExceeded = turnMonitor.runtimeLimitExceeded();
 			const aborted =
@@ -3335,23 +3495,26 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				options.structured !== false,
 			);
 			turnMonitor.finish();
-			if (delivered && AgentRegistry.global().get(id) === turnRef) {
+			if (
+				delivered &&
+				(options.structured !== false || ownerWoken || ownerPrompted || focusedPrompt) &&
+				AgentRegistry.global().get(id) === turnRef
+			) {
 				AgentRegistry.global().markResultAccepted(id, session, turnMonitor.yieldAcceptedAt());
 			}
 			// Read before finalization: a schema-bearing agent that answered in
 			// prose gets a missing-yield warning prepended to `result.output`.
-			const turnText = turnMonitor.rawOutput() || (turnMonitor.lastAssistantSalvageText() ?? "");
+			// Like a first run's message result, the answer is the final report
+			// turn; the session's last assistant text stands in only when the
+			// monitor saw no assistant message, never for narration it set aside.
+			const turnText =
+				turnMonitor.lastReportTurnText() ??
+				(turnMonitor.sawAssistantMessage() ? undefined : turnMonitor.lastAssistantSalvageText()) ??
+				"";
 			const abortReason = aborted ? turnMonitor.resolveAbortReasonText() : undefined;
 			let result: SingleResult | undefined;
 			let finalizeError: unknown;
-			// Detach and snapshot before waiting: a successor turn owns subsequent
-			// session events, while artifact and sidecar writes retain close order.
-			const previousFinalization = finalizationKey ? observedTurnFinalizations.get(finalizationKey) : undefined;
-			const finalized = Promise.withResolvers<void>();
-			if (finalizationKey) observedTurnFinalizations.set(finalizationKey, finalized.promise);
 			try {
-				await previousFinalization;
-				const currentRef = AgentRegistry.global().get(id);
 				result = await finalizeRunResult({
 					monitor: turnMonitor,
 					done: {
@@ -3371,16 +3534,27 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					outputSchema: options.outputSchema,
 					outputSchemaMode: options.outputSchemaMode,
 					outputSchemaSource: options.outputSchemaSource,
-					artifactsDir:
-						currentRef === turnRef && currentRef?.session === session && currentRef.status !== "aborted"
-							? options.artifactsDir
-							: undefined,
+					artifactsDir: options.artifactsDir,
+					resultOwner: turnRef,
+					isPublicationCurrent: () => {
+						const current = AgentRegistry.global().get(id);
+						return (
+							isOwnerCurrent() &&
+							current !== undefined &&
+							current === turnRef &&
+							current.status !== "aborted" &&
+							((current.session === session && !session.isDisposed) ||
+								(current.status === "parked" &&
+									current.session === null &&
+									current.sessionFile === sessionFile))
+						);
+					},
 					eventBus: options.eventBus,
 					subagentEventBus: options.subagentEventBus,
 					parentToolCallId: options.parentToolCallId,
 					detached: true,
 					followUpTurn: true,
-					publishMessageResult: ownerWoken || focusedPrompt,
+					publishMessageResult: ownerWoken || ownerPrompted || focusedPrompt,
 					// A cancelled wake job must not replace the accepted result.
 					signal: jobCancel.signal,
 					sessionFile,
@@ -3395,7 +3569,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			} finally {
 				const currentRef = AgentRegistry.global().get(id);
 				const messageResult =
-					focusedPrompt &&
+					(focusedPrompt || ownerPrompted) &&
 					options.structured === false &&
 					delivered &&
 					result?.exitCode === 0 &&
@@ -3404,7 +3578,10 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					!jobCancel.signal.aborted &&
 					result?.outputPath !== undefined &&
 					currentRef === turnRef &&
-					currentRef?.session === session &&
+					(currentRef?.session === session ||
+						(currentRef?.status === "parked" &&
+							currentRef.session === null &&
+							currentRef.sessionFile === sessionFile)) &&
 					currentRef.status !== "aborted";
 				if (messageResult && !wakeJob && ownerId && session.asyncJobManager && result) {
 					const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
@@ -3446,10 +3623,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					if (wakeTurnFailed(outcome)) wakeJob.outcome.reject(new Error(text));
 					else wakeJob.outcome.resolve({ text });
 				}
-				finalized.resolve();
-				if (finalizationKey && observedTurnFinalizations.get(finalizationKey) === finalized.promise) {
-					observedTurnFinalizations.delete(finalizationKey);
-				}
+				tools.close();
 				// Unconditional: a failed, cancelled, empty, or even un-finalized
 				// wake turn must still tell whoever woke it, or a `send await:true`
 				// waiter mistakes a dead peer for a healthy-but-silent one.
@@ -3481,17 +3655,18 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 }
 
 /**
- * Settle a subagent's registry lifecycle after a run: terminal teardown for
- * hard aborts, unregister for one-shot helpers, and idle + lifecycle adoption
- * for kept-alive agents. A soft-budget abort on a kept-alive, revivable agent
- * is treated as a self-inflicted stop rather than a kill — the agent stays
- * interrogable and resumable (IRC wake / revival).
+ * Settle a subagent's registry lifecycle after a run: unregister for one-shot
+ * helpers, idle + lifecycle adoption for kept-alive agents. An aborted run
+ * (caller cancel, user interrupt, wall-clock timeout, soft budget) only stops
+ * the run: a kept-alive, revivable agent stays interrogable and resumable
+ * (IRC wake / revival) from its transcript. Terminal teardown is reserved for
+ * explicit kills and agents nothing can revive.
  */
 export async function finalizeSubagentLifecycle(args: {
 	id: string;
 	session: AgentSession;
 	aborted: boolean;
-	/** Which watchdog (if any) requested the abort; decides revivability. */
+	/** Which watchdog (if any) requested the abort; `shutdown` releases instead of adopting. */
 	abortKind?: AbortReason;
 	keepAlive: boolean;
 	isolated: boolean;
@@ -3538,11 +3713,14 @@ export async function finalizeSubagentLifecycle(args: {
 		}
 	};
 
-	// A budget abort leaves a consistent session with its transcript on disk.
+	// An aborted run leaves a consistent session with its transcript on disk, so
+	// a kept-alive agent with a reviver stays resumable like a finished one.
 	// Manager shutdown also preserves the transcript, but disposes and unregisters
-	// the process-local session. Caller signals, wall-clock timeouts, and internal
-	// terminations are genuine kills and stay terminal.
-	const resumableAbort = args.abortKind === "budget" && args.keepAlive && args.reviveSession !== null;
+	// the process-local session (restorable as parked). An explicit kill (Agent
+	// Hub, RPC `cancel_subagent`, collab, vibe) publishes the `aborted` tombstone
+	// before the run observes its abort, and stays terminal.
+	const resumableAbort =
+		args.abortKind !== "shutdown" && args.keepAlive && args.reviveSession !== null && ref?.status !== "aborted";
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
 			if (args.abortKind === "shutdown") {
@@ -3806,6 +3984,18 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		outputSchemaSource: options.outputSchemaSource,
 		signal,
 		artifactsDir: options.artifactsDir,
+		resultOwner: ref,
+		isPublicationCurrent: () => {
+			const current = AgentRegistry.global().get(id);
+			return (
+				subagentOwnerLifetimes.get(session)?.() !== false &&
+				current !== undefined &&
+				current === ref &&
+				current.status !== "aborted" &&
+				((current.session === session && !session.isDisposed) ||
+					(current.status === "parked" && current.session === null && current.sessionFile === sessionFile))
+			);
+		},
 		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
@@ -3968,6 +4158,8 @@ interface WarmReviveCapture {
 	wake: IrcWakeTurnMonitorOptions;
 	/** Exact agent name the live `task.agentAccountPools` entry is looked up by on revive. */
 	agentName: string;
+	isOwnerLifetimeCurrent?: () => boolean;
+	captureOwnerCurrent?: () => () => boolean;
 }
 
 /** Keeps `capture.settings` current with `session`'s overlay writes until the session is disposed. */
@@ -3975,6 +4167,20 @@ function trackSubagentSettings(session: AgentSession, capture: WarmReviveCapture
 	const parent = capture.settings.parent;
 	session.addDisposer(() => {
 		capture.settings = captureSubagentSettings(parent, session.settings);
+	});
+}
+const subagentOwnerLifetimes = new WeakMap<AgentSession, () => boolean>();
+
+/** Rejects model dispatch after the originating owner lifetime ends. */
+export function bindSubagentOwnerLifetime(
+	session: AgentSession,
+	id: string,
+	isCurrent: (() => boolean) | undefined,
+): void {
+	if (!isCurrent) return;
+	subagentOwnerLifetimes.set(session, isCurrent);
+	session.agent.addBeforeModelCallHook(() => {
+		if (!isCurrent()) throw new Error(`Subagent "${id}" owner was retired before model dispatch.`);
 	});
 }
 
@@ -3988,28 +4194,31 @@ function trackSubagentSettings(session: AgentSession, capture: WarmReviveCapture
 function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 	return async expectedAgentRef => {
 		const { id } = capture.spec.prompt;
+		if (capture.isOwnerLifetimeCurrent?.() === false)
+			throw new Error(`Cannot revive subagent "${id}": its owner was retired.`);
+		const attemptOwnerCurrent = capture.captureOwnerCurrent?.();
+		const isOwnerCurrent = (): boolean =>
+			capture.isOwnerLifetimeCurrent?.() !== false && attemptOwnerCurrent?.() !== false;
+		if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${id}": its owner was retired.`);
 		const reopened = await SessionManager.open(capture.sessionFile, undefined, undefined, {
 			suppressBreadcrumb: true,
 			throwIfMissing: true,
 		});
-		if (!hasConversationalHistory(reopened.getEntries())) {
-			await reopened.close();
-			throw new Error(
-				`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
-					`(truncated to header/session_init). The agent was not revived.`,
-			);
-		}
-		if (capture.parentArtifactManager) {
-			reopened.adoptArtifactManager(capture.parentArtifactManager);
-		}
-		await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
-		const mcpManager = capture.spec.options.mcpManager;
-		const mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
-		let revived: AgentSession;
-		// Account pools are owner policy: take the live exact-name entry, as
-		// dispatch and persisted revival do, never the spawn-time copy.
-		const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
+		let revived: AgentSession | undefined;
+		let mcpFollower: MCPToolFollower | undefined;
 		try {
+			if (!hasConversationalHistory(reopened.getEntries())) {
+				throw new Error(
+					`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
+						`(truncated to header/session_init). The agent was not revived.`,
+				);
+			}
+			if (capture.parentArtifactManager) reopened.adoptArtifactManager(capture.parentArtifactManager);
+			await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
+			const mcpManager = capture.spec.options.mcpManager;
+			mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
+			const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
+			if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${id}": its owner was retired.`);
 			({ session: revived } = await createAgentSession({
 				...buildSubagentSessionOptions(
 					capture.spec,
@@ -4021,23 +4230,31 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 					? agentAccountPools[capture.agentName]
 					: undefined,
 			}));
+			if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${id}": its owner was retired.`);
+			mcpFollower?.bind(revived);
+			bindSubagentOwnerLifetime(revived, id, capture.isOwnerLifetimeCurrent);
+			trackSubagentSettings(revived, capture);
+			const withoutParentOwnedTools = (toolNames: string[]): string[] =>
+				capture.keepTodo ? toolNames : toolNames.filter(name => name !== "todo");
+			const revivedToolNames = revived.getEnabledToolNames();
+			const subagentToolNames = withoutParentOwnedTools(revivedToolNames);
+			if (subagentToolNames.length !== revivedToolNames.length)
+				await revived.setActiveToolsByName(subagentToolNames);
+			await initializeExtensions(revived, {
+				reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
+				reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+				filterActiveTools: withoutParentOwnedTools,
+			});
+			if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${id}": its owner was retired.`);
+			AgentRegistry.global().syncSessionStatus(id, revived);
+			attachIrcWakeTurnMonitor(revived, capture.wake);
+			return revived;
 		} catch (error) {
 			mcpFollower?.dispose();
+			if (revived) await revived.dispose();
+			else await reopened.close();
 			throw error;
 		}
-		mcpFollower?.bind(revived);
-		trackSubagentSettings(revived, capture);
-		// Re-run the executor's extension wiring on the rebuilt session. Skipping it leaves the
-		// runner pre-init, so a `tool_call` handler touching a runtime action trips the
-		// fail-closed gate and blocks every tool (including `yield`) in the revived agent (issue #8824).
-		await initializeExtensions(revived, {
-			reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
-			reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
-			filterActiveTools: toolNames => (capture.keepTodo ? toolNames : toolNames.filter(name => name !== "todo")),
-		});
-		AgentRegistry.global().syncSessionStatus(id, revived);
-		attachIrcWakeTurnMonitor(revived, capture.wake);
-		return revived;
 	};
 }
 
@@ -4202,6 +4419,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const lspEnabled = enableLsp ?? true;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
+	const completionProbe = isCompletionProbeEnabled(settings, parentDepth, options.parentHasUI === true);
 	const monitor = createSubagentRunMonitor({
 		index,
 		id,
@@ -4216,6 +4434,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		modelRoute: options.modelRoute,
 		signal,
 		onProgress,
+		onToolResult: options.onToolResult,
 		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
@@ -4224,11 +4443,31 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
-		completionProbe: isCompletionProbeEnabled(settings, parentDepth, options.parentHasUI === true),
+		completionProbe,
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
 	let registryAbortUnsubscribe: (() => void) | null = null;
+	let publicationRef: AgentRef | undefined;
+	let publicationSession: AgentSession | undefined;
+	let publicationRetired = false;
+	let allowRemovedPublication = false;
+	let unsubscribePublication: (() => void) | undefined;
+	let startupComplete = false;
+	const isOwnerCurrent = (): boolean =>
+		(startupComplete ? (options.isOwnerLifetimeCurrent ?? options.isOwnerCurrent) : options.isOwnerCurrent)?.() !==
+		false;
+	const isPublicationCurrent = (): boolean => {
+		if (publicationRetired || !isOwnerCurrent()) return false;
+		const current = AgentRegistry.global().get(id);
+		if (!publicationRef) return current === undefined;
+		if (!current) return allowRemovedPublication;
+		return (
+			current === publicationRef &&
+			current.status !== "aborted" &&
+			(current.session === publicationSession || (current.status === "parked" && current.session === null))
+		);
+	};
 	let reviveSession: AgentReviver | null = null;
 	let pendingSessionManager: Promise<SessionManager> | undefined;
 	let openedSessionManager: SessionManager | undefined;
@@ -4238,6 +4477,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		id,
 		index,
 		agent,
+		isOwnerCurrent: options.isOwnerCurrent,
+		isOwnerLifetimeCurrent: options.isOwnerLifetimeCurrent ?? options.isOwnerCurrent,
+		captureReviveOwnerCurrent: options.captureReviveOwnerCurrent,
+		widgetOwnerCurrent: options.widgetOwnerCurrent,
+		completionProbe,
 		description: options.description,
 		modelOverride,
 		modelRole,
@@ -4267,6 +4511,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let aborted = false;
 		let abortReasonText: string | undefined;
 		const checkAbort = () => {
+			if (!isOwnerCurrent()) {
+				monitor.requestAbort("shutdown");
+				throw new ToolAbortError();
+			}
 			if (abortSignal.aborted) {
 				throw new ToolAbortError();
 			}
@@ -4651,6 +4899,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				throw err;
 			}
 			mcpFollower?.bind(session);
+			bindSubagentOwnerLifetime(session, id, options.isOwnerLifetimeCurrent);
 			// The SDK records a new session's initial model as the default role.
 			// Pin the child's own chain so a parent default sharing that model
 			// cannot steal its fallback routing. Resumed history keeps its role.
@@ -4673,6 +4922,19 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			registry.syncSessionStatus(id, session);
 			const runRef = registry.get(id);
 			if (runRef) {
+				if (runRef.session === session) options.onAgentRegistered?.(runRef);
+				publicationRef = runRef;
+				publicationSession = session;
+				publicationRetired = runRef.session !== session;
+				unsubscribePublication = registry.onChange(event => {
+					if (event.ref.id !== id) return;
+					if (
+						event.ref !== runRef ||
+						event.ref.status === "aborted" ||
+						(event.type === "removed" && !allowRemovedPublication)
+					)
+						publicationRetired = true;
+				});
 				// Agent Hub kills bypass this run's caller signal: lifecycle.release()
 				// detaches the session and publishes an `aborted` tombstone directly.
 				// Bridge that exact registry generation back into the monitor so the
@@ -4699,6 +4961,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					keepTodo: prewalk !== undefined,
 					wake: wakeOptions,
 					agentName: agent.name,
+					isOwnerLifetimeCurrent: options.isOwnerLifetimeCurrent ?? options.isOwnerCurrent,
+					captureOwnerCurrent: options.captureReviveOwnerCurrent,
 				};
 				trackSubagentSettings(session, reviveCapture);
 				reviveSession = createWarmSubagentReviver(reviveCapture);
@@ -4813,6 +5077,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
+			checkAbort();
+			startupComplete = true;
 			readyAt = performance.now();
 			const outcome = await driveSessionToResult(session, monitor, task, {
 				solutionSpace: options.solutionSpace,
@@ -4908,6 +5174,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				monitor.captureSalvage(session);
 				if (options.keepAlive !== false && (!preparedSession || readyAt !== undefined)) {
 					attachIrcWakeTurnMonitor(session, wakeOptions);
+				}
+				allowRemovedPublication =
+					options.keepAlive === false && monitor.abortKind() !== "shutdown" && isPublicationCurrent();
+				if (!isOwnerCurrent()) {
+					reviveSession = null;
+					aborted = true;
+					monitor.requestAbort("shutdown");
 				}
 				await finalizeSubagentLifecycle({
 					id,
@@ -5046,32 +5319,44 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		};
 	};
 
-	const done = await runSubagent();
-	monitor.finish();
+	try {
+		const done = await runSubagent();
+		monitor.finish();
 
-	const result = await finalizeRunResult({
-		monitor,
-		done,
-		index,
-		id,
-		agent,
-		task,
-		assignment,
-		modelOverride,
-		modelRole,
-		structured,
-		outputSchema,
-		outputSchemaMode: options.outputSchemaMode,
-		outputSchemaSource: options.outputSchemaSource,
-		signal,
-		artifactsDir: options.artifactsDir,
-		eventBus: options.eventBus,
-		subagentEventBus: options.subagentEventBus,
-		parentToolCallId: options.parentToolCallId,
-		detached: options.detached,
-		sessionFile: subtaskSessionFile,
-		startTime,
-	});
-	AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
-	return result;
+		const result = await finalizeRunResult({
+			monitor,
+			done,
+			index,
+			id,
+			agent,
+			task,
+			assignment,
+			modelOverride,
+			modelRole,
+			structured,
+			outputSchema,
+			outputSchemaMode: options.outputSchemaMode,
+			outputSchemaSource: options.outputSchemaSource,
+			signal,
+			artifactsDir: options.artifactsDir,
+			isPublicationCurrent,
+			resultOwner: publicationRef,
+			eventBus: options.eventBus,
+			subagentEventBus: options.subagentEventBus,
+			parentToolCallId: options.parentToolCallId,
+			detached: options.detached,
+			sessionFile: subtaskSessionFile,
+			startTime,
+		});
+		if (isPublicationCurrent() && publicationRef && AgentRegistry.global().get(id) === publicationRef) {
+			AgentRegistry.global().setHistory(
+				id,
+				{ outputPath: result.outputPath },
+				publicationRef.sessionFile ?? undefined,
+			);
+		}
+		return result;
+	} finally {
+		unsubscribePublication?.();
+	}
 }

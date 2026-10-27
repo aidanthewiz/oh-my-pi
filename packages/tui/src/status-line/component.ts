@@ -45,6 +45,7 @@ import { col, node, span } from "../native/describe";
 import { getContextMeterThresholds } from "../chrome/context-thresholds";
 import { isNativeRendering, onNativeRenderingChange } from "../native/state";
 import { getSeparator } from "./separators";
+import { formatJobWidgetGlance, type JobWidgetEntry, latestJobWidget } from "../tools/job-widget";
 import type {
 	CollabStatus,
 	ComposerFacts,
@@ -58,6 +59,9 @@ import type {
 	StatusLineSettings,
 	StatusResetExpiry,
 } from "./types";
+
+/** Sparkline cells the ANSI jobs segment draws after the freshest widget's headline. */
+const JOBS_SEGMENT_SPARK_CELLS = 8;
 
 /** What a click on a native status segment asks omp to open. */
 export type StatusLineNativeAction = "status.model" | "status.context" | "status.git" | "status.cost" | "status.path";
@@ -446,6 +450,7 @@ class StatusLineExternalInputs {
 	isFastModeActive = false;
 	anthropicSlowModeLabel: string | undefined = undefined;
 	compactionSpeculation: unknown = undefined;
+	jobWidgetKey: string | undefined = undefined;
 }
 
 interface CachedStatusLine {
@@ -2796,6 +2801,13 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				? this.session.getAnthropicSlowModeLabel()
 				: undefined;
 		target.compactionSpeculation = this.session.compactionSpeculation;
+		target.jobWidgetKey = JSON.stringify(this.#latestJobWidget()?.view);
+	}
+
+	/** The running job widget that saw data last; the ANSI jobs segment appends its glance. */
+	#latestJobWidget(): JobWidgetEntry | undefined {
+		const entries = this.session.getRunningJobWidgets?.();
+		return entries ? latestJobWidget(entries) : undefined;
 	}
 
 	#sameStatusLineExternalInputs(left: StatusLineExternalInputs, right: StatusLineExternalInputs): boolean {
@@ -2849,7 +2861,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			left.isAutoThinking === right.isAutoThinking &&
 			left.isFastModeActive === right.isFastModeActive &&
 			left.anthropicSlowModeLabel === right.anthropicSlowModeLabel &&
-			left.compactionSpeculation === right.compactionSpeculation
+			left.compactionSpeculation === right.compactionSpeculation &&
+			left.jobWidgetKey === right.jobWidgetKey
 		);
 	}
 
@@ -3058,7 +3071,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		if (layout !== "plain-left") {
 			const runningBackgroundJobs = this.runningBackgroundJobCount();
 			if (runningBackgroundJobs > 0) {
-				rightParts.unshift(theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`));
+				const widget = this.#latestJobWidget();
+				const glance = widget ? formatJobWidgetGlance(widget.view, theme, JOBS_SEGMENT_SPARK_CELLS) : "";
+				const count = theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`);
+				rightParts.unshift(glance ? `${count} ${glance}` : count);
 			}
 			if (subagentBadge) rightParts.unshift(subagentBadge);
 		}

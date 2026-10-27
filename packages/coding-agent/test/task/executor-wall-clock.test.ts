@@ -30,9 +30,16 @@ interface HangingSessionHandle {
 
 function createHangingSession(): HangingSessionHandle {
 	let abortCount = 0;
+	let disposed = false;
 	const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
 	const session: Partial<AgentSession> = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		extensionRunner: undefined as never,
@@ -61,8 +68,16 @@ function createHangingSession(): HangingSessionHandle {
 }
 
 function mockCreateAgentSession(session: AgentSession) {
+	let disposed = false;
+	const dispose = session.dispose.bind(session);
+	vi.spyOn(session, "dispose").mockImplementation(async () => {
+		disposed = true;
+		await dispose();
+	});
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		captureOwnerCurrent: () => () => !disposed && !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !disposed && !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
@@ -175,6 +190,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			await new Promise(resolve => setTimeout(resolve, 200));
 			return {
 				session: handle.session,
+				captureOwnerCurrent: () => () => !handle.session.isDisposed,
+				captureOwnerLifetimeCurrent: () => () => !handle.session.isDisposed,
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),
@@ -202,9 +219,16 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		const creationGate = Promise.withResolvers<void>();
 		const creationStarted = Promise.withResolvers<CreateAgentSessionOptions>();
 		const lateDisposed = Promise.withResolvers<void>();
+		let disposed = false;
 		const lateSession = {
 			...createSessionDefaults(),
-			dispose: async () => lateDisposed.resolve(),
+			get isDisposed() {
+				return disposed;
+			},
+			dispose: async () => {
+				disposed = true;
+				lateDisposed.resolve();
+			},
 		} as unknown as AgentSession;
 		let lateInstall = registry.get("late-generation");
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
@@ -223,6 +247,23 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			);
 			return {
 				session: lateSession,
+				captureOwnerCurrent: ({ allowParked = false } = {}) => {
+					const ownerRef = lateInstall;
+					return () =>
+						!disposed &&
+						ownerRef !== undefined &&
+						registry.get("late-generation") === ownerRef &&
+						ownerRef.status !== "aborted" &&
+						(allowParked || ownerRef.status !== "parked");
+				},
+				captureOwnerLifetimeCurrent: () => {
+					const ownerRef = lateInstall;
+					return () =>
+						!disposed &&
+						ownerRef !== undefined &&
+						registry.get("late-generation") === ownerRef &&
+						ownerRef.status !== "aborted";
+				},
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),

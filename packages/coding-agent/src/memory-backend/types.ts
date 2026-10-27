@@ -90,6 +90,7 @@ export interface MemoryBackendStartOptions {
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
+	inheritedMnemopiRecall?: Pick<MnemopiSessionState, "hasRecalledForFirstTurn" | "lastRecallSnippet">;
 }
 
 /** A successful recall, including an empty result, staged until user-turn delivery. */

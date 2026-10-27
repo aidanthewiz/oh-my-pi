@@ -55,6 +55,7 @@ function createMockSession(
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
 	let promptIndex = 0;
+	let disposed = false;
 
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
@@ -62,6 +63,12 @@ function createMockSession(
 
 	const session = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -93,6 +100,8 @@ function createMockSession(
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
@@ -415,6 +424,14 @@ describe("runSubprocess yield reminders", () => {
 				isError: false,
 			});
 		});
+		const registry = AgentRegistry.global();
+		const ref = registry.register({
+			id: "subagent-revive",
+			displayName: "subagent-revive",
+			kind: "sub",
+			status: "idle",
+			session: stale,
+		});
 		// Mock sessions lack the real yield-contract method; attach a tracker.
 		const staleMutable = stale as unknown as {
 			setWorkPoolYieldItems: (items: unknown[]) => Promise<void>;
@@ -434,13 +451,20 @@ describe("runSubprocess yield reminders", () => {
 		const ensureLive = vi
 			.spyOn(AgentLifecycleManager.global(), "ensureLive")
 			.mockResolvedValueOnce(stale)
-			.mockResolvedValue(revived);
+			.mockImplementation(async () => {
+				await stale.dispose();
+				registry.attachSession(ref.id, revived, ref.sessionFile, ref);
+				return revived;
+			});
 		try {
 			const result = await runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-revive", message: "batch work" });
 			expect(ensureLive).toHaveBeenCalledTimes(3);
 			expect(calls).toEqual(["setYield:stale", "setYield:revived"]);
-			expect(result.exitCode).toBe(0);
+			expect(result.exitCode, JSON.stringify(result)).toBe(0);
 			expect(result.output).toContain('"revived": true');
+			expect(stale.isDisposed).toBe(true);
+			expect(registry.get(ref.id)).toBe(ref);
+			expect(ref.session).toBe(revived);
 		} finally {
 			AgentRegistry.global().unregister("subagent-revive");
 		}
@@ -491,6 +515,14 @@ describe("runSubprocess yield reminders", () => {
 				isError: false,
 			});
 		});
+		const registry = AgentRegistry.global();
+		const ref = registry.register({
+			id: "subagent-revive-wake",
+			displayName: "subagent-revive-wake",
+			kind: "sub",
+			status: "idle",
+			session: stale,
+		});
 		// Mock sessions lack the real session surface; attach trackers.
 		const staleMutable = stale as unknown as {
 			setWorkPoolYieldItems: (items: unknown[]) => Promise<void>;
@@ -514,7 +546,13 @@ describe("runSubprocess yield reminders", () => {
 		// Parking swaps the worker mid-install while an IRC delivery revives the
 		// replacement straight into an ordinary wake: the follow-up must wait out
 		// that wake before installing the keyed contract, not reject its yield.
-		vi.spyOn(AgentLifecycleManager.global(), "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
+		vi.spyOn(AgentLifecycleManager.global(), "ensureLive")
+			.mockResolvedValueOnce(stale)
+			.mockImplementation(async () => {
+				await stale.dispose();
+				registry.attachSession(ref.id, revived, ref.sessionFile, ref);
+				return revived;
+			});
 		try {
 			const result = await runSubagentFollowUpTurn({
 				...baseOptions,
@@ -522,8 +560,11 @@ describe("runSubprocess yield reminders", () => {
 				message: "batch work",
 			});
 			expect(calls).toEqual(["setYield:stale", "waitForIdle:revived", "setYield:revived"]);
-			expect(result.exitCode).toBe(0);
+			expect(result.exitCode, JSON.stringify(result)).toBe(0);
 			expect(result.output).toContain('"revived": true');
+			expect(stale.isDisposed).toBe(true);
+			expect(registry.get(ref.id)).toBe(ref);
+			expect(ref.session).toBe(revived);
 		} finally {
 			AgentRegistry.global().unregister("subagent-revive-wake");
 		}

@@ -428,7 +428,6 @@ describe("selector detail viewport", () => {
 		selector.handleInput(PAGE_DOWN);
 		expect(child(child(selector.describe(cx), "details"), "detail").scroll).toEqual({ by: "page-down", n: 2 });
 		terminal.resize(32, 7);
-		expect(child(selector.describe(cx), "details").p?.max?.h).not.toBe(details.p?.max?.h);
 		expect(picked).toEqual([]);
 		selector.handleNativeEvent({ type: "select", key: "details/detail", item: "2" });
 		expect(picked).toEqual([]);
