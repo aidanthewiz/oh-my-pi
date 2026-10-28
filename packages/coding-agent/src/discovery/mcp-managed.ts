@@ -33,6 +33,8 @@ interface ManagedMCPConfigFile {
 		string,
 		{
 			enabled?: boolean;
+			exposeTools?: boolean;
+			instructions?: boolean;
 			timeout?: number;
 			command?: string;
 			args?: string[];
@@ -97,6 +99,8 @@ function transformManagedConfig(config: ManagedMCPConfigFile, source: SourceMeta
 			const server: MCPServer = {
 				name,
 				enabled,
+				exposeTools: typeof serverConfig.exposeTools === "boolean" ? serverConfig.exposeTools : undefined,
+				instructions: typeof serverConfig.instructions === "boolean" ? serverConfig.instructions : undefined,
 				timeout,
 				command: serverConfig.command,
 				args: serverConfig.args,

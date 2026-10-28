@@ -86,6 +86,12 @@ export class LegacySseTransport implements MCPTransport {
 		return signal ? AbortSignal.any([signal, this.#lifecycleController.signal]) : this.#lifecycleController.signal;
 	}
 
+	#assertRequestOwner(options?: MCPRequestOptions): void {
+		if (options?.mcpOwnerCurrent?.() === false) {
+			throw new DOMException("MCP request owner changed", "AbortError");
+		}
+	}
+
 	get connected(): boolean {
 		return this.#connected;
 	}
@@ -250,6 +256,7 @@ export class LegacySseTransport implements MCPTransport {
 		options?: MCPRequestOptions,
 	): Promise<T> {
 		options?.signal?.throwIfAborted();
+		this.#assertRequestOwner(options);
 		if (!this.#connected || !this.#endpointUrl) {
 			throw new Error("Transport not connected");
 		}
@@ -300,7 +307,7 @@ export class LegacySseTransport implements MCPTransport {
 		let postStatus: number | undefined;
 		try {
 			operation.signal?.throwIfAborted();
-			const response = await this.#postJson(body, operation.signal);
+			const response = await this.#postJson(body, operation.signal, options);
 			postStatus = response.status;
 			if (!response.ok) {
 				const text = await response.text();
@@ -314,8 +321,11 @@ export class LegacySseTransport implements MCPTransport {
 				});
 			}
 			await response.body?.cancel();
-			return (await deferred.promise) as T;
+			const result = await deferred.promise;
+			this.#assertRequestOwner(options);
+			return result as T;
 		} catch (error) {
+			this.#assertRequestOwner(options);
 			this.#pending.delete(id);
 			operation.clear();
 			if (pending.abortHandler) operation.signal?.removeEventListener("abort", pending.abortHandler);
@@ -391,6 +401,7 @@ export class LegacySseTransport implements MCPTransport {
 	async #postJson(
 		body: JsonRpcRequest | JsonRpcResponse | { jsonrpc: "2.0"; method: string; params: Record<string, unknown> },
 		signal?: AbortSignal,
+		options?: MCPRequestOptions,
 	): Promise<Response> {
 		const endpointUrl = this.#endpointUrl;
 		if (!endpointUrl) throw new Error("Transport not connected");
@@ -399,13 +410,23 @@ export class LegacySseTransport implements MCPTransport {
 			Accept: "application/json, text/event-stream",
 		};
 		const payload = JSON.stringify(body);
+		this.#assertRequestOwner(options);
 		let response = await this.#fetch(endpointUrl, { method: "POST", body: payload, signal }, generated);
 		const status = AIError.status(response);
-		if (!this.onAuthError || (status !== 401 && status !== 403)) return response;
+		if (options?.allowAuthRetry === false || !this.onAuthError || (status !== 401 && status !== 403)) return response;
 
-		const refreshedHeaders = await this.onAuthError();
+		let refreshedHeaders: Record<string, string> | null;
+		try {
+			this.#assertRequestOwner(options);
+			refreshedHeaders = await this.onAuthError();
+			this.#assertRequestOwner(options);
+		} catch (error) {
+			await response.body?.cancel();
+			throw error;
+		}
 		if (!refreshedHeaders) return response;
 		await response.body?.cancel();
+		this.#assertRequestOwner(options);
 		this.#config.headers = refreshedHeaders;
 		response = await this.#fetch(endpointUrl, { method: "POST", body: payload, signal }, generated);
 		return response;

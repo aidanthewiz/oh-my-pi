@@ -196,6 +196,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 			result.push({
 				name: serverName,
 				enabled,
+				exposeTools: typeof serverConfig.exposeTools === "boolean" ? serverConfig.exposeTools : undefined,
 				timeout,
 				requestIdFormat,
 				instructions,

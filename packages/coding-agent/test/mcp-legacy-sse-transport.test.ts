@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
 import { MCPConnectionTimeoutError, connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
-import { isRetriableConnectionError } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { dispatchMCPTool, isRetriableConnectionError } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { LegacySseTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/sse";
 import type { JsonRpcMessage, JsonRpcRequest } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import type { MCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
@@ -726,4 +726,212 @@ describe("legacy MCP HTTP+SSE transport", () => {
 			db.close();
 		}
 	});
+});
+
+describe("legacy SSE authentication replay contracts", () => {
+	for (const scenario of [
+		{ label: "explicit never mutation", status: 401, retry: "never", readOnly: false, safe: false },
+		{ label: "never overriding readonly metadata", status: 403, retry: "never", readOnly: true, safe: false },
+		{ label: "default unannotated mutation", status: 403, retry: undefined, readOnly: false, safe: false },
+		{ label: "annotated safe read", status: 401, retry: undefined, readOnly: true, safe: true },
+		{ label: "explicit safe read", status: 403, retry: "read", readOnly: false, safe: true },
+	] as const) {
+		it(`honors HTTP authentication replay policy for ${scenario.label}`, async () => {
+			const definition = {
+				name: scenario.safe ? "read_state" : "apply_change",
+				inputSchema: { type: "object" as const },
+				...(scenario.readOnly ? { annotations: { readOnlyHint: true } } : {}),
+			};
+			const effects: string[] = [];
+			let attempts = 0;
+			let refreshes = 0;
+			let activeStreams = 0;
+			let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+			const streamClosed = Promise.withResolvers<void>();
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					const url = new URL(request.url);
+					if (request.method === "GET" && url.pathname === "/mcp/sse") {
+						activeStreams++;
+						let closed = false;
+						const finish = () => {
+							if (closed) return;
+							closed = true;
+							activeStreams--;
+							streamClosed.resolve();
+						};
+						request.signal.addEventListener("abort", finish, { once: true });
+						return new Response(
+							new ReadableStream<Uint8Array>({
+								start(controller) {
+									streamController = controller;
+									controller.enqueue(
+										encoder.encode("event: endpoint\ndata: /mcp/messages?session_id=synthetic-auth\n\n"),
+									);
+								},
+								cancel: finish,
+							}),
+							{ headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+					if (request.method !== "POST" || url.pathname !== "/mcp/messages") {
+						return new Response("not found", { status: 404 });
+					}
+					const rpc = (await request.json()) as JsonRpcMessage;
+					if (!("method" in rpc) || !("id" in rpc)) return new Response(null, { status: 202 });
+					let result: unknown = {};
+					if (rpc.method === "initialize") {
+						result = {
+							protocolVersion: "2024-11-05",
+							capabilities: { tools: {} },
+							serverInfo: { name: "synthetic-auth", version: "1" },
+						};
+					} else if (rpc.method === "tools/list") {
+						result = { tools: [definition] };
+					} else if (rpc.method === "tools/call") {
+						attempts++;
+						if (!scenario.safe) effects.push("synthetic-effect");
+						if (request.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+							return new Response("synthetic challenge after processing", { status: scenario.status });
+						}
+						result = {
+							content: [{ type: "text", text: "synthetic state" }],
+							structuredContent: { state: "synthetic-state" },
+						};
+					} else if (rpc.method === "ping") {
+						result = { state: "stream-still-usable" };
+					}
+					if (!streamController) return new Response("stream missing", { status: 500 });
+					streamController.enqueue(
+						encoder.encode(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result })}\n\n`),
+					);
+					return new Response(null, { status: 202 });
+				},
+			});
+			const connection = await connectToServer("synthetic-auth", {
+				type: "sse",
+				url: `${server.url.origin}/mcp/sse`,
+				headers: { Authorization: "Bearer synthetic-expired" },
+				timeout: 1000,
+			});
+			try {
+				if (!(connection.transport instanceof LegacySseTransport)) throw new Error("Expected legacy SSE transport");
+				connection.transport.onAuthError = async () => {
+					refreshes++;
+					return { Authorization: "Bearer synthetic-refreshed" };
+				};
+				const [tool] = await listTools(connection);
+				if (!tool) throw new Error("Synthetic server exposed no tool");
+				const outcome = await dispatchMCPTool(connection, tool, {}, undefined, { retry: scenario.retry }).then(
+					attempt => ({ result: attempt.result, error: undefined }),
+					(error: unknown) => ({ result: undefined, error }),
+				);
+				if (scenario.safe) {
+					expect(outcome.error).toBeUndefined();
+					expect(outcome.result?.structuredContent?.state).toBe("synthetic-state");
+					expect(attempts).toBe(2);
+					expect(refreshes).toBe(1);
+					expect(effects).toEqual([]);
+				} else {
+					expect(effects).toEqual(["synthetic-effect"]);
+					expect(attempts).toBe(1);
+					expect(refreshes).toBe(0);
+					expect(outcome.result).toBeUndefined();
+					expect(outcome.error).toBeInstanceOf(MCPTransportError);
+					expect(outcome.error).toMatchObject({
+						transport: "http",
+						stage: "receive",
+						failure: "http_status",
+						code: scenario.status,
+						retryable: false,
+					});
+				}
+				await expect(connection.transport.request("ping")).resolves.toEqual({ state: "stream-still-usable" });
+			} finally {
+				await connection.transport.close();
+				await withTimeout(streamClosed.promise, 2_000, "authentication replay test leaked its SSE stream");
+				expect(activeStreams).toBe(0);
+			}
+		});
+	}
+
+	it.each(["before-dispatch", "before-refresh", "during-refresh", "during-refresh-reject", "after-response"])(
+		"rejects an expired request owner at %s without credential or request replay",
+		async phase => {
+			let ownerCurrent = phase !== "before-dispatch";
+			let posts = 0;
+			let refreshes = 0;
+			let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+			const refreshEntered = Promise.withResolvers<void>();
+			const releaseRefresh = Promise.withResolvers<void>();
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					if (request.method === "GET") {
+						return new Response(
+							new ReadableStream<Uint8Array>({
+								start(controller) {
+									stream = controller;
+									controller.enqueue(encoder.encode("event: endpoint\ndata: /messages\n\n"));
+								},
+							}),
+							{ headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+					const rpc = (await request.json()) as JsonRpcRequest;
+					posts++;
+					if (phase === "before-refresh" || phase === "after-response") ownerCurrent = false;
+					if (phase === "after-response") {
+						stream?.enqueue(
+							encoder.encode(
+								`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { state: "obsolete-owner" } })}\n\n`,
+							),
+						);
+						return new Response(null, { status: 202 });
+					}
+					return new Response("synthetic auth challenge", { status: 401 });
+				},
+			});
+			const transport = new LegacySseTransport({ type: "sse", url: server.url.href, timeout: 1000 });
+			transport.onAuthError = async () => {
+				refreshes++;
+				refreshEntered.resolve();
+				await releaseRefresh.promise;
+				if (phase === "during-refresh-reject") throw new Error("synthetic refresh failure");
+				return { Authorization: "Bearer synthetic-refreshed" };
+			};
+			try {
+				await transport.connect();
+				const outcome = transport
+					.request(
+						"tools/call",
+						{},
+						{
+							allowAuthRetry: true,
+							mcpOwnerCurrent: () => ownerCurrent,
+						},
+					)
+					.then(
+						result => ({ result, error: undefined }),
+						(error: unknown) => ({ result: undefined, error }),
+					);
+				if (phase.startsWith("during-refresh")) {
+					await withTimeout(refreshEntered.promise, 2_000, "owner-fenced auth refresh did not start");
+					ownerCurrent = false;
+					releaseRefresh.resolve();
+				}
+				const result = await withTimeout(outcome, 2_000, "owner-fenced request did not settle");
+				expect(result.error).toMatchObject({ name: "AbortError" });
+				expect(result.result).toBeUndefined();
+				expect(posts).toBe(phase === "before-dispatch" ? 0 : 1);
+				expect(refreshes).toBe(phase.startsWith("during-refresh") ? 1 : 0);
+			} finally {
+				releaseRefresh.resolve();
+				await transport.close();
+			}
+		},
+	);
 });

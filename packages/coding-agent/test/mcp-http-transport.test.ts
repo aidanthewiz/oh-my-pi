@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
+import { connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import { analyzeAuthError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
-import { MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { dispatchMCPTool, MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import type { MCPHttpServerConfig, MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
@@ -154,6 +154,7 @@ describe("MCP Streamable HTTP request progress", () => {
 		const lateReceived = Promise.withResolvers<void>();
 		const updates: MCPProgress[] = [];
 		transport.onNotification = (_method, params) => {
+			if ((params as Record<string, unknown>).progress === 1) progressReceived.resolve();
 			if ((params as Record<string, unknown>).progress === 2) lateReceived.resolve();
 		};
 		try {
@@ -164,17 +165,14 @@ describe("MCP Streamable HTTP request progress", () => {
 				{
 					onProgress: progress => {
 						updates.push(progress);
-						progressReceived.resolve();
 					},
 				},
 			);
-			const receivedWhilePending = await Promise.race([
-				progressReceived.promise.then(() => true),
-				Bun.sleep(150).then(() => false),
-			]);
+			void pending.catch(() => {});
+			await withPendingGuard(progressReceived.promise, "pending GET progress fanout");
+			expect(updates).toEqual([{ progress: 1 }]);
 			release.resolve();
 			await pending;
-			expect(receivedWhilePending).toBe(true);
 			expect(updates).toEqual([{ progress: 1 }]);
 			stream?.enqueue(
 				encoder.encode(
@@ -694,6 +692,230 @@ describe("MCP Streamable HTTP action delivery", () => {
 	);
 });
 
+describe("MCP Streamable HTTP authentication replay policy", () => {
+	for (const scenario of [
+		{ label: "explicit never mutation", retry: "never", hint: false, safe: false, status: 401 },
+		{ label: "explicit never overrides readonly metadata", retry: "never", hint: true, safe: false, status: 403 },
+		{ label: "default unannotated mutation", retry: undefined, hint: false, safe: false, status: 403 },
+		{ label: "default annotated read", retry: undefined, hint: true, safe: true, status: 401 },
+		{ label: "explicit safe read", retry: "read", hint: false, safe: true, status: 403 },
+	] as const) {
+		it(`honors transport authentication replay policy for ${scenario.label}`, async () => {
+			const effects: string[] = [];
+			let calls = 0;
+			let refreshes = 0;
+			const definition = {
+				name: scenario.safe ? "get_state" : "create_record",
+				inputSchema: { type: "object" },
+				annotations: scenario.hint ? { readOnlyHint: true } : undefined,
+			};
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(req) {
+					if (req.method !== "POST") return new Response(null, { status: 405 });
+					const rpc = (await req.json()) as { id?: string | number; method: string };
+					if (rpc.id === undefined) return new Response(null, { status: 202 });
+					let result: unknown = {};
+					if (rpc.method === "initialize") {
+						result = {
+							protocolVersion: "2025-11-25",
+							capabilities: { tools: {} },
+							serverInfo: { name: "synthetic-http-auth", version: "1" },
+						};
+					} else if (rpc.method === "tools/list") {
+						result = { tools: [definition] };
+					} else if (rpc.method === "tools/call") {
+						calls++;
+						if (!scenario.safe) effects.push("synthetic-record");
+						if (req.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+							return new Response("synthetic auth rejection after processing", {
+								status: scenario.status,
+								headers: {
+									"WWW-Authenticate": 'Bearer realm="synthetic"',
+									"X-Request-Id": "synthetic-original-response",
+								},
+							});
+						}
+						result = {
+							content: [{ type: "text", text: "Recovered synthetic state" }],
+							structuredContent: { state: "synthetic-state" },
+						};
+					}
+					return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+				},
+			});
+			const connection = await connectToServer("synthetic-http-auth", {
+				type: "http",
+				url: server.url.href,
+				timeout: REQUEST_TIMEOUT_MS,
+			});
+			try {
+				const [tool] = await listTools(connection);
+				if (!tool) throw new Error("Synthetic server exposed no tool");
+				if (!(connection.transport instanceof HttpTransport)) throw new Error("Expected HTTP transport");
+				connection.transport.onAuthError = async () => {
+					refreshes++;
+					return { Authorization: "Bearer synthetic-refreshed" };
+				};
+				const outcome = await dispatchMCPTool(connection, tool, {}, undefined, { retry: scenario.retry }).then(
+					attempt => ({ result: attempt.result, error: undefined }),
+					(error: unknown) => ({ result: undefined, error }),
+				);
+				if (scenario.safe) {
+					expect(outcome.error).toBeUndefined();
+					expect(outcome.result?.structuredContent).toEqual({ state: "synthetic-state" });
+					expect(calls).toBe(2);
+					expect(refreshes).toBe(1);
+					expect(effects).toEqual([]);
+				} else {
+					expect(effects).toEqual(["synthetic-record"]);
+					expect(calls).toBe(1);
+					expect(refreshes).toBe(0);
+					expect(outcome.error).toBeInstanceOf(MCPTransportError);
+					expect(outcome.error).toMatchObject({
+						transport: "http",
+						stage: "receive",
+						failure: "http_status",
+						code: scenario.status,
+						traceId: "synthetic-original-response",
+					});
+				}
+			} finally {
+				await connection.transport.close();
+			}
+		});
+	}
+
+	it("enforces allowAuthRetry false at the direct request boundary", async () => {
+		const effects: string[] = [];
+		let refreshes = 0;
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const rpc = (await req.json()) as { id: number };
+				effects.push("synthetic-record");
+				if (req.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+					return new Response("synthetic mutation recorded", { status: 401 });
+				}
+				return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { applied: true } });
+			},
+		});
+		const transport = await connectedTransport();
+		transport.onAuthError = async () => {
+			refreshes++;
+			return { Authorization: "Bearer synthetic-refreshed" };
+		};
+		try {
+			const error = await transport.request("tools/call", { name: "create_record" }, { allowAuthRetry: false }).then(
+				() => undefined,
+				reason => reason,
+			);
+			expect(effects).toEqual(["synthetic-record"]);
+			expect(refreshes).toBe(0);
+			expect(error).toMatchObject({ failure: "http_status", code: 401, retryable: false });
+		} finally {
+			await transport.close();
+		}
+	});
+
+	it("retains auth recovery for discovery requests without a replay override", async () => {
+		let refreshes = 0;
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const rpc = (await req.json()) as { id: number };
+				if (req.headers.get("Authorization") !== "Bearer synthetic-refreshed") {
+					return new Response("synthetic discovery auth rejection", { status: 403 });
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: rpc.id,
+					result: { tools: [{ name: "discovered", inputSchema: { type: "object" } }] },
+				});
+			},
+		});
+		const transport = await connectedTransport();
+		transport.onAuthError = async () => {
+			refreshes++;
+			return { Authorization: "Bearer synthetic-refreshed" };
+		};
+		try {
+			await expect(transport.request<ToolList>("tools/list")).resolves.toEqual({
+				tools: [{ name: "discovered", inputSchema: { type: "object" } }],
+			});
+			expect(refreshes).toBe(1);
+		} finally {
+			await transport.close();
+		}
+	});
+
+	it.each(["before-dispatch", "before-refresh", "during-refresh", "during-refresh-reject", "after-response"])(
+		"rejects an expired request owner at %s without credential or request replay",
+		async phase => {
+			let ownerCurrent = phase !== "before-dispatch";
+			let posts = 0;
+			let refreshes = 0;
+			const refreshEntered = Promise.withResolvers<void>();
+			const releaseRefresh = Promise.withResolvers<void>();
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					if (request.method !== "POST") return new Response(null, { status: 405 });
+					const rpc = (await request.json()) as JsonRpcRequest;
+					posts++;
+					if (phase === "before-refresh" || phase === "after-response") ownerCurrent = false;
+					if (phase === "after-response") {
+						return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { state: "obsolete-owner" } });
+					}
+					return new Response("synthetic auth challenge", { status: 401 });
+				},
+			});
+			const transport = await connectedTransport();
+			transport.onAuthError = async () => {
+				refreshes++;
+				refreshEntered.resolve();
+				await releaseRefresh.promise;
+				if (phase === "during-refresh-reject") throw new Error("synthetic refresh failure");
+				return { Authorization: "Bearer synthetic-refreshed" };
+			};
+			try {
+				const outcome = transport
+					.request(
+						"tools/call",
+						{},
+						{
+							allowAuthRetry: true,
+							mcpOwnerCurrent: () => ownerCurrent,
+						},
+					)
+					.then(
+						result => ({ result, error: undefined }),
+						(error: unknown) => ({ result: undefined, error }),
+					);
+				if (phase.startsWith("during-refresh")) {
+					await withPendingGuard(refreshEntered.promise, "owner-fenced auth refresh");
+					ownerCurrent = false;
+					releaseRefresh.resolve();
+				}
+				const result = await withPendingGuard(outcome, "owner-fenced request");
+				expect(result.error).toMatchObject({ name: "AbortError" });
+				expect(result.result).toBeUndefined();
+				expect(posts).toBe(phase === "before-dispatch" ? 0 : 1);
+				expect(refreshes).toBe(phase.startsWith("during-refresh") ? 1 : 0);
+			} finally {
+				releaseRefresh.resolve();
+				await transport.close();
+			}
+		},
+	);
+});
+
 describe("MCP Streamable HTTP transport timeouts", () => {
 	it("keeps the request timeout active until a JSON response body is fully read", async () => {
 		server = Bun.serve({
@@ -1174,49 +1396,55 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		expect(observed.protocolVersion).toBe("2025-11-25");
 		expect(observed.resumedAt - observed.postClosedAt).toBeGreaterThanOrEqual(15);
 	});
-	it("refreshes auth on a 401 resume GET without replaying the POST", async () => {
-		const observed = { posts: 0, gets: 0, auth: [] as (string | null)[], lastEventId: null as string | null };
-		server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch(req) {
-				if (req.method === "POST") {
-					observed.posts++;
-					return new Response("id: stream-1\nretry: 10\ndata:\n\n", {
-						headers: { "Content-Type": "text/event-stream" },
-					});
-				}
-				observed.gets++;
-				observed.auth.push(req.headers.get("Authorization"));
-				observed.lastEventId = req.headers.get("Last-Event-ID");
-				if (req.headers.get("Authorization") !== "Bearer fresh") {
-					return new Response("expired", { status: 401 });
-				}
-				return new Response(
-					'id: stream-2\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"resumed","inputSchema":{"type":"object"}}]}}\n\n',
-					{ headers: { "Content-Type": "text/event-stream" } },
-				);
-			},
-		});
-		if (!server) throw new Error("Test server was not started");
-		const transport = new HttpTransport({
-			type: "http",
-			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
-			headers: { Authorization: "Bearer stale" },
-		});
-		transport.onAuthError = async () => ({ Authorization: "Bearer fresh" });
-		await transport.connect();
+	it.each([undefined, false])(
+		"refreshes auth on a 401 resume GET without replaying the POST (allowAuthRetry=%s)",
+		async allowAuthRetry => {
+			const observed = { posts: 0, gets: 0, auth: [] as (string | null)[], lastEventId: null as string | null };
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(req) {
+					if (req.method === "POST") {
+						observed.posts++;
+						return new Response("id: stream-1\nretry: 10\ndata:\n\n", {
+							headers: { "Content-Type": "text/event-stream" },
+						});
+					}
+					observed.gets++;
+					observed.auth.push(req.headers.get("Authorization"));
+					observed.lastEventId = req.headers.get("Last-Event-ID");
+					if (req.headers.get("Authorization") !== "Bearer fresh") {
+						return new Response("expired", { status: 401 });
+					}
+					return new Response(
+						'id: stream-2\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"resumed","inputSchema":{"type":"object"}}]}}\n\n',
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				},
+			});
+			if (!server) throw new Error("Test server was not started");
+			const transport = new HttpTransport({
+				type: "http",
+				url: `http://127.0.0.1:${server.port}/mcp`,
+				timeout: GUARD_TIMEOUT_MS,
+				headers: { Authorization: "Bearer stale" },
+			});
+			transport.onAuthError = async () => ({ Authorization: "Bearer fresh" });
+			await transport.connect();
 
-		const tools = await withPendingGuard(transport.request<ToolList>("tools/list"), "request");
-		expect(tools).toEqual({ tools: [{ name: "resumed", inputSchema: { type: "object" } }] });
-		// One POST only: replaying it after the server accepted the request
-		// could double-execute a state-changing tool.
-		expect(observed.posts).toBe(1);
-		expect(observed.gets).toBe(2);
-		expect(observed.auth).toEqual(["Bearer stale", "Bearer fresh"]);
-		expect(observed.lastEventId).toBe("stream-1");
-	});
+			const tools = await withPendingGuard(
+				transport.request<ToolList>("tools/list", undefined, { allowAuthRetry }),
+				"request",
+			);
+			expect(tools).toEqual({ tools: [{ name: "resumed", inputSchema: { type: "object" } }] });
+			// One POST only: replaying it after the server accepted the request
+			// could double-execute a state-changing tool.
+			expect(observed.posts).toBe(1);
+			expect(observed.gets).toBe(2);
+			expect(observed.auth).toEqual(["Bearer stale", "Bearer fresh"]);
+			expect(observed.lastEventId).toBe("stream-1");
+		},
+	);
 
 	it("does not replay an accepted POST when resume auth refresh throws", async () => {
 		const observed = { posts: 0, gets: 0, authRefreshes: 0 };

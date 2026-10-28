@@ -234,6 +234,11 @@ For `notify()`:
 
 For HTTP-like transports with a resolvable managed OAuth credential, `MCPManager` wires one auth-refresh retry on 401/403. Streamable HTTP applies it to requests, server-request responses, and resume GETs, not ordinary notifications; legacy SSE applies it to POSTs, including notifications. A failed resume never replays the accepted originating POST.
 
+`MCPRequestOptions.allowAuthRetry: false` prevents credential refresh and resending the originating request POST.
+The tool bridge sets this guard when the tool's replay contract forbids another attempt.
+An accepted Streamable HTTP response stream can still refresh once to resume with GET and `Last-Event-ID`.
+That GET continues the accepted operation; it never repeats its POST.
+
 ## HTTP error propagation
 
 Stdio, Streamable HTTP, and legacy SSE use `MCPTransportError` to carry `transport`, `stage`, `failure`, `retryable`, and optional `code`, `data`, and `traceId`. Tool diagnostics render these as an `MCP failure` report with sanitized, bounded server data and next-step guidance; remaining plain errors are normalized by the tool bridge.
@@ -302,7 +307,7 @@ The shared `readSseEvents` decoder supports LF, CRLF, and lone CR, including del
 
 Current transport implementations do **not**:
 
-- retry ordinary failed requests, except HTTP-like transports' single OAuth-refresh retry when `onAuthError` is wired
+- retry ordinary failed requests, except HTTP-like transports' single OAuth-refresh retry when `onAuthError` is wired and request options permit it
 - reconnect after stdio process exit
 - recreate failed logical SSE sessions by themselves (Streamable HTTP can resume individual physical streams using event IDs)
 - resend in-flight requests after disconnect
@@ -315,15 +320,15 @@ They fail fast and propagate errors.
 
 For previously connected HTTP/SSE servers that remain unavailable after that ladder, the manager schedules quiet reconnect attempts after 15s, doubling up to 5 minutes until recovery, disconnect, or reconfiguration. Stdio and never-connected remote servers do not get this background schedule. A per-server crash-storm breaker limits rapid reconnect invocations; manual reconnect resets it.
 
-`MCPTool` and `DeferredMCPTool` also attempt one reconnect + retry for retriable connection errors during a tool call. This is tool availability recovery, not transport-level retry.
+`MCPTool` and `DeferredMCPTool` also attempt one reconnect + retry for retriable connection errors during a tool call. This is tool availability recovery, not transport-level retry. Native extension calls obey `retry: "never"` or `"read"`; absent an override, replay after possible delivery requires trusted `readOnlyHint: true` or `idempotentHint: true` metadata.
 
-Connection loss is non-retryable once the request may have reached the server: after writing a stdio frame to stdin, after a Streamable HTTP or legacy SSE POST connection is reset or closed once established (before or after its response starts), after receiving a Streamable HTTP 2xx response (JSON or SSE), or after a legacy SSE POST is accepted. These calls are never replayed automatically; check the operation's effect before retrying manually. Failures that prove the request never left OMP, such as `Transport not connected` or a refused connection, retain reconnect + retry.
+Connection loss is non-retryable once the request may have reached the server: after writing a stdio frame to stdin, after a Streamable HTTP or legacy SSE POST connection is reset or closed once established (before or after its response starts), after receiving a Streamable HTTP 2xx response (JSON or SSE), or after a legacy SSE POST is accepted. Unknown mutations are never replayed automatically; check the operation's effect before retrying manually. Failures that prove the request never left OMP, such as `Transport not connected` or a refused connection, retain availability recovery unless an explicit `retry: "never"` forbids resending.
 
 ## Failure scenarios summary
 
 - **Malformed stdio message shape**: dropped; stream continues. Malformed JSON that makes the JSONL parser throw closes the connection.
 - **Stdio stream/process ends**: transport closes; pending requests receive a non-retryable structured EOF error; manager-managed connections trigger reconnect without replaying those calls.
-- **HTTP non-2xx**: request/notify throws HTTP error; managed OAuth requests can refresh auth and retry once on 401/403.
+- **HTTP non-2xx**: request/notify throws HTTP error; managed OAuth requests can refresh auth and retry once on 401/403 unless `allowAuthRetry: false` forbids resending the originating request.
 - **Invalid JSON response**: Streamable HTTP normalizes it to a non-retryable malformed-response error.
 - **Legacy SSE stream ends**: accepted pending requests fail non-retryably with `Transport closed: legacy SSE stream closed`; manager-managed connections trigger reconnect without replaying those calls.
 - **Request SSE ends without matching id**: resumes with `Last-Event-ID` if possible; without an event ID, fails with `No response received for request ID ...`.

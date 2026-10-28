@@ -31,6 +31,7 @@ export * from "./types";
 
 export type {
 	MCPToolDetails,
+	MCPProtocolDiagnostic,
 	MCPTextContent,
 	MCPImageContent,
 	MCPResourceContent,

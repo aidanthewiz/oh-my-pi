@@ -1,3 +1,4 @@
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type {
 	MCPContent,
 	MCPImageContent,
@@ -73,6 +74,8 @@ export type MCPRequestIdFormat = "string" | "number";
 interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Keep connected and cached, but hide raw tools from the model catalog. */
+	exposeTools?: boolean;
 	/** MCP request timeout in milliseconds (default: 30000, 0 to disable) */
 	timeout?: number;
 	/**
@@ -310,6 +313,26 @@ export interface MCPToolCallResult {
 	_meta?: Record<string, unknown>;
 }
 
+/** Trusted host context; extension call options cannot supply lifecycle authority. */
+export interface MCPHostCallContext extends AgentToolContext {
+	mcpOwnerCurrent?: () => boolean;
+}
+
+/** Explicit replay contract for trusted extension callers. */
+export interface MCPCallToolOptions {
+	retry?: "never" | "read";
+	signal?: AbortSignal;
+}
+
+export interface ExtensionMCPContext {
+	callTool(
+		serverName: string,
+		toolName: string,
+		args?: Record<string, unknown>,
+		options?: MCPCallToolOptions,
+	): Promise<MCPToolCallResult>;
+}
+
 // =============================================================================
 // Transport Types
 // =============================================================================
@@ -322,6 +345,10 @@ export interface MCPRequestOptions {
 	 * `notifications/progress` while pending. Progress never extends its deadline.
 	 */
 	onProgress?: (progress: MCPProgress) => void;
+	/** False forbids refreshing credentials to resend this request after an authentication failure. */
+	allowAuthRetry?: boolean;
+	/** Host-only lifecycle fence; never serialized into protocol parameters. */
+	mcpOwnerCurrent?: () => boolean;
 }
 
 /** Transport interface - abstracts stdio/http */

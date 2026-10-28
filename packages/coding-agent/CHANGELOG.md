@@ -10,6 +10,7 @@
 
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
+- Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
 
 ### Fixed
 
@@ -24,6 +25,7 @@
 - Dispose streaming archive readers and reject file or HTTP generation changes during a read.
 - Keep hashline previews and diagnostics from granting read authority. Reject unseen stale remaps, corrupt text deletion and ambiguous recovery after budget exhaustion.
 - Prevent duplicate MCP actions after uncertain HTTP, legacy SSE, or stdio delivery. Keep safe pre-dispatch recovery and caller cancellation; settle pending legacy SSE POSTs when their response stream closes.
+- Preserve explicit MCP replay policy through HTTP and SSE authentication recovery. Refuse retired session or account owners before retry or result publication.
 - Bind remembered file and folder grants to current policy, credential authority, and resolved destinations. Preserve runtime device approvals and refuse stale or ambiguous targets.
 - Preserve parked subagent lifetimes across legitimate model and display changes. Reject queued starts, wakes, publication, and model dispatch after their root, account, reference, or journal retires.
 - Capture queued clone recall state with its system prompt, and keep async task names inside the existing agent and artifact namespace.
@@ -45,6 +47,14 @@
 - Include the protocol version in launch-client cancellation envelopes.
 - Retain reserved worker reply allocations until their owning promises settle.
 - Reject unconfirmed browser click delivery after transport failure or page closure. Retire delivery listeners and handles when acquisition or verification is cancelled, including watches returned after cancellation.
+- Extensions can call session-owned MCP servers with cancellation, policy hooks, and explicit replay contracts. Host-only MCP servers stay connected without exposing raw tools.
+- Custom extension surfaces advertise `ui.supportsCustomUI`.
+
+### Fixed
+
+- Honor effective MCP enable overrides for extension calls and prepare managed AWS profiles before their first signed dispatch without replaying unsafe transport failures.
+- Apply MCP replay contracts to tool-level authentication challenges, HTTP/SSE OAuth retries, and AWS errors. Unsafe calls retain their first failure without resubmission.
+- Keep MCP catalogs bound to the current configuration and connection through startup, refresh, reconnect, and disconnect. Completed discovery cannot restore disconnected host-only tools or replace a newer catalog.
 - Keep complete selected permissions, AWS commands, identity, and safety details readable above status lines and lower hook widgets after resizing.
 - Keep complete provider safety checks readable in approval dialogs even when tool activity is visible.
 - Avoid repeat AWS permission prompts in eval and nested device batches after granting session access.
@@ -94,6 +104,7 @@
 - Session archives retain readable children when another transcript fails. Anonymized archives use private, non-overwriting temporary files and preserve malformed-record accounting after session rollback.
 - Anonymized exports retain IDs, timestamps, models, and usage. Review them before sharing; redaction does not guarantee anonymity or upload any data.
 - Browser metadata-settle and `waitForTarget` cancellation retain `ToolAbortError`. Missing selected targets never adopt another live page.
+- Never replay unknown MCP writes after connection failures. Preserve bounded, redacted protocol diagnostics in typed tool details.
 - Preserve pending AWS SSO approvals when unrelated native or managed requests report authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 - Keep successful ECS Exec and SSM output successful when it contains text resembling helper diagnostics ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).
 - Preserve newer AWS SSO sign-ins when older operations report delayed authentication failures ([#97](https://github.com/Coreforce-CAD/oh-my-pi/pull/97)).

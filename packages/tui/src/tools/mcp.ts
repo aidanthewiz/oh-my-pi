@@ -429,6 +429,18 @@ export function formatMCPProgress(progress: MCPProgress, maxWidth = 200): string
 	return messageWidth > 0 ? `${truncateToWidth(message, messageWidth)}${suffix}` : truncateToWidth(amount, maxWidth);
 }
 
+/** Bounded, credential-redacted protocol failure data. */
+export interface MCPProtocolDiagnostic {
+	transport: "http" | "stdio" | "unknown";
+	stage: "connect" | "send" | "receive" | "decode" | "protocol";
+	failure: string;
+	message: string;
+	retryable: boolean;
+	code?: string | number;
+	data?: string;
+	traceId?: string;
+}
+
 /** MCP result details shared by renderers and programmatic tool consumers. */
 export interface MCPToolDetails {
 	/** Server name */
@@ -437,6 +449,8 @@ export interface MCPToolDetails {
 	mcpToolName: string;
 	/** Whether the call resulted in an error */
 	isError?: boolean;
+	/** Safe transport or JSON-RPC diagnostics, never the original exception. */
+	protocolError?: MCPProtocolDiagnostic;
 	/** Raw content from MCP response */
 	rawContent?: MCPContent[];
 	/** Server-supplied structured data, independent of the model-facing text rendering. */

@@ -241,6 +241,35 @@ describe("MCPManager initial connection ownership", () => {
 		await manager.disconnectAll();
 	});
 
+	it("keeps a replacement owner's tools when an earlier disconnect finishes closing", async () => {
+		const manager = new MCPManager(process.cwd());
+		const stale = fakeConnection("server");
+		const current = fakeConnection("server");
+		const closing = Promise.withResolvers<void>();
+		stale.transport.gateClose(closing.promise);
+		vi.spyOn(mcpClient, "connectToServer")
+			.mockResolvedValueOnce(stale.connection)
+			.mockResolvedValueOnce(current.connection);
+		vi.spyOn(mcpClient, "listTools")
+			.mockResolvedValueOnce([{ name: "old_state", inputSchema: { type: "object" } }])
+			.mockResolvedValueOnce([{ name: "current_state", inputSchema: { type: "object" } }]);
+
+		try {
+			await manager.connectServers({ server: CONFIG }, {}, undefined, 0);
+			const disconnecting = manager.disconnectServer("server");
+			await manager.connectServers({ server: CONFIG }, {}, undefined, 0);
+			closing.resolve();
+			await disconnecting;
+
+			expect(manager.getConnection("server")).toBe(current.connection);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__server_current_state"]);
+			expect(current.transport.connected).toBe(true);
+		} finally {
+			closing.resolve();
+			await manager.disconnectAll();
+		}
+	});
+
 	it("reports a tools/list failure and re-enables connects even when close hangs", async () => {
 		const manager = new MCPManager(process.cwd());
 		const failed = fakeConnection("server");

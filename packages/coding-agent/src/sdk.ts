@@ -171,6 +171,7 @@ import {
 } from "./mcp";
 import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
+import { createExtensionMCPContext } from "./mcp/extension-api";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
@@ -2511,24 +2512,21 @@ async function createAgentSessionScoped(
 			const ownerFile = sessionManager.getSessionFile();
 			const ownerCwd = sessionManager.getCwd();
 			const ownerRef = registeredAgentRef;
-			const providers = [...new Set(credentials.list().map(credential => credential.provider))]
-				.sort()
-				.filter(provider =>
-					modelRegistry.authStorage.oauth.accounts(provider, ownerId).some(account => account.active),
-				);
 			const accountSnapshot = () =>
-				providers.flatMap(provider =>
-					modelRegistry.authStorage.oauth
-						.accounts(provider, ownerId)
-						.filter(account => account.active)
-						.map(account => [
-							provider,
-							account.credentialId,
-							account.accountId,
-							account.orgId,
-							account.projectId,
-						]),
-				);
+				[...new Set(modelRegistry.authStorage.credentials.list().map(credential => credential.provider))]
+					.sort()
+					.flatMap(provider =>
+						modelRegistry.authStorage.oauth
+							.accounts(provider, ownerId)
+							.filter(account => account.active)
+							.map(account => [
+								provider,
+								account.credentialId,
+								account.accountId,
+								account.orgId,
+								account.projectId,
+							]),
+					);
 			const accounts = accountSnapshot();
 			return {
 				isCurrent: (allowParked: boolean): boolean => {
@@ -3833,6 +3831,14 @@ async function createAgentSessionScoped(
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext, trackUserWait);
 		toolSession.getToolContext = () => toolContextStore.getContext();
+		extensionRunner.setMCPContext(
+			createExtensionMCPContext(
+				() => toolSession.mcpManager,
+				extensionRunner,
+				() => toolContextStore.getContext(),
+				() => toolSession.captureOwnerCurrent!(),
+			),
+		);
 		const setSessionActiveToolNames = (names: Iterable<string>): void => {
 			const snapshot = Array.from(names);
 			setActiveToolNames(snapshot);

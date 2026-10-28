@@ -144,6 +144,12 @@ export class HttpTransport implements MCPTransport {
 		return signal ? AbortSignal.any([signal, this.#lifecycleController.signal]) : this.#lifecycleController.signal;
 	}
 
+	#assertRequestOwner(options?: MCPRequestOptions): void {
+		if (options?.mcpOwnerCurrent?.() === false) {
+			throw new DOMException("MCP request owner changed", "AbortError");
+		}
+	}
+
 	/**
 	 * Keep a rejection observer on public requests even if a timeout wrapper
 	 * abandons the returned promise. The original promise is returned unchanged,
@@ -346,12 +352,14 @@ export class HttpTransport implements MCPTransport {
 	 * Failures throw {@link SSEResumeError} so `request()` never replays the
 	 * originating POST in response.
 	 */
-	async #fetchSSEResume(resume: SSEResumeState, signal: AbortSignal): Promise<Response> {
+	async #fetchSSEResume(resume: SSEResumeState, signal: AbortSignal, options?: MCPRequestOptions): Promise<Response> {
 		if (resume.lastEventId === null) {
 			throw new SSEResumeError("SSE stream ended without a resumable event ID");
 		}
 		try {
+			this.#assertRequestOwner(options);
 			await waitForSSERetry(resume.retryMs, signal);
+			this.#assertRequestOwner(options);
 			const generated: Record<string, string> = {
 				Accept: "text/event-stream",
 				"Last-Event-ID": resume.lastEventId,
@@ -361,7 +369,9 @@ export class HttpTransport implements MCPTransport {
 			const refreshAuth = this.onAuthError;
 			if (refreshAuth && (response.status === 401 || response.status === 403)) {
 				await response.body?.cancel();
+				this.#assertRequestOwner(options);
 				const newHeaders = await untilAborted(signal, () => refreshAuth.call(this));
+				this.#assertRequestOwner(options);
 				if (!newHeaders) {
 					throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: auth refresh failed`);
 				}
@@ -416,19 +426,34 @@ export class HttpTransport implements MCPTransport {
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
 		try {
-			return await this.#executeRequest<T>(method, params, options);
+			const result = await this.#executeRequest<T>(method, params, options);
+			this.#assertRequestOwner(options);
+			return result;
 		} catch (error) {
+			this.#assertRequestOwner(options);
 			// Retry once on auth failure if onAuthError is wired. Never replay
 			// after an SSE resume failure: the server already accepted the
 			// original POST and may have executed it — replaying could run a
 			// state-changing tool twice.
 			const status = error instanceof Error ? AIError.status(error) : undefined;
-			if (!(error instanceof SSEResumeError) && this.onAuthError && (status === 401 || status === 403)) {
-				const newHeaders = await this.onAuthError();
+			if (
+				options?.allowAuthRetry !== false &&
+				!(error instanceof SSEResumeError) &&
+				this.onAuthError &&
+				(status === 401 || status === 403)
+			) {
+				let newHeaders: Record<string, string> | null;
+				try {
+					newHeaders = await this.onAuthError();
+				} finally {
+					this.#assertRequestOwner(options);
+				}
 				if (newHeaders) {
 					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
-					return this.#executeRequest<T>(method, params, options);
+					const result = await this.#executeRequest<T>(method, params, options);
+					this.#assertRequestOwner(options);
+					return result;
 				}
 			}
 			throw error;
@@ -440,6 +465,7 @@ export class HttpTransport implements MCPTransport {
 		params: Record<string, unknown> | undefined,
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
+		this.#assertRequestOwner(options);
 		if (!this.#connected) {
 			throw new MCPTransportError({
 				transport: "http",
@@ -489,6 +515,7 @@ export class HttpTransport implements MCPTransport {
 
 		try {
 			if (options?.onProgress) this.#progressCallbacks.set(id, options.onProgress);
+			this.#assertRequestOwner(options);
 			const response = await this.#fetch(
 				{ method: "POST", body: JSON.stringify(body), signal: operation.signal },
 				generated,
@@ -530,7 +557,7 @@ export class HttpTransport implements MCPTransport {
 			// share one logical deadline; returning the promise would let finally
 			// clear the fetch timer before the response body is read.
 			if (contentType.includes("text/event-stream")) {
-				return await this.#parseSSEResponse<T>(response, id, operation, timeout, releaseCaller);
+				return await this.#parseSSEResponse<T>(response, id, operation, timeout, releaseCaller, options);
 			}
 
 			stage = "decode";
@@ -595,6 +622,7 @@ export class HttpTransport implements MCPTransport {
 		operation: MCPTimeoutOperation,
 		timeout: number,
 		releaseCaller?: () => void,
+		options?: MCPRequestOptions,
 	): Promise<T> {
 		const traceId = mcpTraceIdFromHeaders(response.headers);
 		if (!response.body) {
@@ -628,6 +656,7 @@ export class HttpTransport implements MCPTransport {
 					if (!current.body) throw new Error("SSE response did not include a body");
 					try {
 						for await (const event of readSseEvents(current.body, signal)) {
+							this.#assertRequestOwner(options);
 							if (event.id !== undefined) resume.lastEventId = event.id || null;
 							if (event.retry !== undefined) resume.retryMs = event.retry;
 							if (event.data === "") continue;
@@ -663,6 +692,7 @@ export class HttpTransport implements MCPTransport {
 						// exists; the request timeout still bounds the total wait.
 						if (captured) return;
 						if (signal.aborted || resume.lastEventId === null) throw error;
+						this.#assertRequestOwner(options);
 						logger.debug("MCP SSE response stream dropped; resuming", {
 							url: this.config.url,
 							error: error instanceof Error ? error.message : String(error),
@@ -682,7 +712,7 @@ export class HttpTransport implements MCPTransport {
 							traceId,
 						});
 					}
-					current = await this.#fetchSSEResume(resume, signal);
+					current = await this.#fetchSSEResume(resume, signal, options);
 				}
 			} catch (error) {
 				if (captured) return;
