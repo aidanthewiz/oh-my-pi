@@ -21,6 +21,10 @@ Identify skipped checks and environment blockers. Do not mark them as successful
 Update each affected package's `[Unreleased]` changelog for user-facing changes.
 Read back the published pull request description and check only verified items.
 
+Pull request verification uses Bun 1.4.4 in `cf-verify.yml` and `relay.yml`.
+The release binary compiler and container runtime have separate version contracts.
+Qualify those distributions separately before changing their runtime versions.
+
 ## Dependency releases
 
 A verified pull request merged into `coreforge` triggers `.github/workflows/cf-release.yml`.
