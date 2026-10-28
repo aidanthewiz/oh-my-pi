@@ -22,6 +22,7 @@ Update each affected package's `[Unreleased]` changelog for user-facing changes.
 Read back the published pull request description and check only verified items.
 
 Pull request verification uses Bun 1.4.4 in `cf-verify.yml` and `relay.yml`.
+Release preparation and packaging also use Bun 1.4.4 without changing the embedded binary runtime.
 The release binary compiler and container runtime have separate version contracts.
 Qualify those distributions separately before changing their runtime versions.
 
