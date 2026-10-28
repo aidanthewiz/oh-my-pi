@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.2"
+          bun-version: "1.4.4"
       - name: Verify selective LLVM extraction
         run: python3 -m unittest discover -s bazel/toolchains -p test_extract_llvm.py
       - name: Select native verification source
@@ -154,7 +154,7 @@ jobs:
           "$RUNNER_TEMP/applefm-gate-test"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.2"
+          bun-version: "1.4.4"
       - name: Resolve verification version
         if: matrix.windows != '1'
         run: |
@@ -311,7 +311,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.2"
+          bun-version: "1.4.4"
       - run: bun install --frozen-lockfile
       - name: Build Coreforge Browser Relay extension
         run: |
