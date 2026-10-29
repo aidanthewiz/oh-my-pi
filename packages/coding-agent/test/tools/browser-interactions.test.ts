@@ -274,7 +274,7 @@ try {
 					};
 					return page.document.querySelector("#abort-candidate")?.dataset.closestEntered === "1";
 				},
-				{ timeout: 1_000 },
+				{ timeout: 1_000, polling: "mutation" },
 			);
 
 			controller.abort(reason);
