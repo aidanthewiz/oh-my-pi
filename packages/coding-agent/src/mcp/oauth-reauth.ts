@@ -29,6 +29,7 @@ import {
 	discoverOAuthEndpoints,
 	fetchResourceMetadataScopes,
 	type OAuthEndpoints,
+	preserveOAuthDiscoveryHints,
 } from "./oauth-discovery";
 import {
 	hasMcpAuthorizationHeader,
@@ -543,6 +544,7 @@ export async function resolveMcpOAuthEndpointsFromServer(
 	const authError = opts.authChallenge
 		? new Error(`${connectionError?.message ?? "HTTP 401"}\n${opts.authChallenge.wwwAuthenticate.join("\n")}`)
 		: connectionError!;
+	if (opts.authChallenge && connectionError) preserveOAuthDiscoveryHints(authError, connectionError);
 	const authResult = analyzeAuthError(authError, "url" in config ? config.url : undefined);
 	let oauth = authResult.authType === "oauth" ? (authResult.oauth ?? null) : null;
 

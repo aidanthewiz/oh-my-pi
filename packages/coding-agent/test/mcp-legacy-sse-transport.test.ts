@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
 import { MCPConnectionTimeoutError, connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
+import { analyzeAuthError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
 import { dispatchMCPTool, isRetriableConnectionError } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { LegacySseTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/sse";
 import type { JsonRpcMessage, JsonRpcRequest } from "@oh-my-pi/pi-coding-agent/mcp/types";
@@ -48,6 +49,86 @@ function installLegacySseReceiver(
 }
 
 describe("legacy MCP HTTP+SSE transport", () => {
+	it.each(["connect", "request", "notify"] as const)(
+		"keeps OAuth body and header discovery private and usable when %s is rejected",
+		async operation => {
+			let posts = 0;
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					if (request.method === "GET" && operation !== "connect") {
+						return new Response(
+							new ReadableStream<Uint8Array>({
+								start(controller) {
+									controller.enqueue(encoder.encode("event: endpoint\ndata: /messages\n\n"));
+								},
+							}),
+							{ headers: { "Content-Type": "text/event-stream" } },
+						);
+					}
+					if (request.method === "POST") posts++;
+					return Response.json(
+						{
+							oauth: {
+								authorization_url: "https://auth.example/authorize",
+								token_url: "https://auth.example/token",
+								issuer: "https://auth.example",
+								client_secret: "wire-secret",
+							},
+							access_token: "wire-secret",
+						},
+						{
+							status: 401,
+							headers: {
+								"WWW-Authenticate": 'Bearer resource_metadata="https://mcp.example/metadata", scope="read"',
+								"Mcp-Auth-Server": "https://auth.example",
+							},
+						},
+					);
+				},
+			});
+			const transport = new LegacySseTransport({
+				type: "sse",
+				url: `http://127.0.0.1:${server.port}/sse`,
+				timeout: 1_000,
+			});
+			try {
+				if (operation !== "connect") await transport.connect();
+				const failed =
+					operation === "connect"
+						? transport.connect()
+						: operation === "request"
+							? transport.request("initialize")
+							: transport.notify("notifications/initialized");
+				const error = await failed.then(
+					() => undefined,
+					reason => reason,
+				);
+				if (!(error instanceof MCPTransportError)) throw new Error("Expected a transport rejection");
+				expect(analyzeAuthError(error, transport.url)).toMatchObject({
+					requiresAuth: true,
+					authType: "oauth",
+					authServerUrl: "https://auth.example/",
+					resourceMetadataUrl: "https://mcp.example/metadata",
+					scopes: "read",
+					oauth: {
+						authorizationUrl: "https://auth.example/authorize",
+						tokenUrl: "https://auth.example/token",
+						issuerUrl: "https://auth.example",
+						scopes: "read",
+					},
+				});
+				expect(error.message).not.toContain("wire-secret");
+				expect(JSON.stringify(error)).not.toContain("wire-secret");
+				expect(error.retryable).toBe(false);
+				expect(posts).toBe(operation === "connect" ? 0 : 1);
+			} finally {
+				await transport.close();
+			}
+		},
+	);
+
 	it("routes GET-stream progress only while its POST request is pending and preserves notification fanout", async () => {
 		let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
 		let sent: JsonRpcRequest | undefined;

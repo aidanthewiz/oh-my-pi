@@ -11,6 +11,7 @@ import type {
 } from "../../mcp/types";
 import { toJsonRpcError } from "../../mcp/types";
 import {
+	createMCPHttpStatusError,
 	createMCPJsonRpcError,
 	MCPTransportError,
 	nonRetryableMCPTransportError,
@@ -126,7 +127,7 @@ export class LegacySseTransport implements MCPTransport {
 
 			if (!response.ok) {
 				const text = await response.text();
-				throw new Error(`HTTP ${response.status}: ${text}`);
+				throw createMCPHttpStatusError(response, text, { stage: "connect", retryable: false });
 			}
 			if (!response.body) {
 				throw new Error("Legacy SSE response did not include a body");
@@ -311,12 +312,8 @@ export class LegacySseTransport implements MCPTransport {
 			postStatus = response.status;
 			if (!response.ok) {
 				const text = await response.text();
-				throw new MCPTransportError({
-					transport: "http",
+				throw createMCPHttpStatusError(response, text, {
 					stage: "receive",
-					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}`,
-					code: response.status,
 					retryable: response.status === 404,
 				});
 			}
@@ -386,7 +383,7 @@ export class LegacySseTransport implements MCPTransport {
 			operation.clear();
 			if (!response.ok) {
 				const text = await response.text();
-				throw new Error(`HTTP ${response.status}: ${text}`);
+				throw createMCPHttpStatusError(response, text, { stage: "receive", retryable: false });
 			}
 			await response.body?.cancel();
 		} catch (error) {

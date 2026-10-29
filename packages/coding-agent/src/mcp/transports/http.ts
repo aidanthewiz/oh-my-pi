@@ -19,6 +19,7 @@ import type {
 import { toJsonRpcError } from "../../mcp/types";
 import {
 	createMCPJsonRpcError,
+	createMCPHttpStatusError,
 	type MCPFailureStage,
 	MCPTransportError,
 	mcpTraceIdFromHeaders,
@@ -531,23 +532,9 @@ export class HttpTransport implements MCPTransport {
 
 			if (!response.ok) {
 				const text = await response.text();
-				const wwwAuthenticate = response.headers.get("WWW-Authenticate");
-				const mcpAuthServer = response.headers.get("Mcp-Auth-Server");
-				const authHints = [
-					wwwAuthenticate ? `WWW-Authenticate: ${wwwAuthenticate}` : null,
-					mcpAuthServer ? `Mcp-Auth-Server: ${mcpAuthServer}` : null,
-				]
-					.filter(Boolean)
-					.join("; ");
-				const suffix = authHints ? ` [${authHints}]` : "";
-				throw new MCPTransportError({
-					transport: "http",
+				throw createMCPHttpStatusError(response, text, {
 					stage,
-					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}${suffix}`,
 					retryable: response.status === 404 || response.status === 502 || response.status === 503,
-					code: response.status,
-					traceId,
 				});
 			}
 
@@ -863,14 +850,9 @@ export class HttpTransport implements MCPTransport {
 			// 202 Accepted is success for notifications
 			if (!response.ok && response.status !== 202) {
 				const text = await response.text();
-				throw new MCPTransportError({
-					transport: "http",
+				throw createMCPHttpStatusError(response, text, {
 					stage,
-					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}`,
 					retryable: response.status === 404 || response.status === 502 || response.status === 503,
-					code: response.status,
-					traceId,
 				});
 			}
 

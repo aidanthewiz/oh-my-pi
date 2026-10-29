@@ -56,12 +56,41 @@ export interface AuthDetectionResult {
 	message?: string;
 }
 
+interface OAuthDiscoveryHints {
+	oauth: OAuthEndpoints | null;
+	authServerUrl?: string;
+	resourceMetadataUrl?: string;
+	scopes?: string;
+}
+
+// Protocol hints must survive diagnostic redaction without retaining response bodies on errors.
+const oauthDiscoveryHints = new WeakMap<Error, OAuthDiscoveryHints>();
+
+/** Retain only discovery fields before sanitizing or cloning a transport error. */
+export function preserveOAuthDiscoveryHints(error: Error, source: Error): void {
+	const previous = oauthDiscoveryHints.get(source);
+	const hints: OAuthDiscoveryHints = {
+		oauth: extractOAuthEndpoints(source) ?? extractOAuthEndpoints(error),
+		authServerUrl:
+			previous?.authServerUrl ??
+			source.message.match(/Mcp-Auth-Server:\s*([^;\]\s]+)/i)?.[1] ??
+			error.message.match(/Mcp-Auth-Server:\s*([^;\]\s]+)/i)?.[1],
+		resourceMetadataUrl:
+			previous?.resourceMetadataUrl ??
+			source.message.match(/resource_metadata\s*=\s*"([^"]+)"/i)?.[1] ??
+			error.message.match(/resource_metadata\s*=\s*"([^"]+)"/i)?.[1],
+		scopes: extractOAuthChallengeScopes(source) ?? extractOAuthChallengeScopes(error),
+	};
+	oauthDiscoveryHints.set(error, hints);
+}
+
 export function extractMcpAuthServerUrl(error: Error, serverUrl?: string): string | undefined {
-	const match = error.message.match(/Mcp-Auth-Server:\s*([^;\]\s]+)/i);
-	if (!match?.[1]) return undefined;
+	const value =
+		oauthDiscoveryHints.get(error)?.authServerUrl ?? error.message.match(/Mcp-Auth-Server:\s*([^;\]\s]+)/i)?.[1];
+	if (!value) return undefined;
 
 	try {
-		return new URL(match[1], serverUrl).toString();
+		return new URL(value, serverUrl).toString();
 	} catch {
 		return undefined;
 	}
@@ -76,6 +105,8 @@ export function extractMcpAuthServerUrl(error: Error, serverUrl?: string): strin
  * `undefined` when the challenge does not carry one.
  */
 export function extractOAuthChallengeScopes(error: Error): string | undefined {
+	const preserved = oauthDiscoveryHints.get(error)?.scopes;
+	if (preserved !== undefined) return preserved;
 	const entries = error.message.matchAll(/([a-zA-Z_][a-zA-Z0-9_-]*)="([^"]+)"/g);
 	for (const [, rawKey, value] of entries) {
 		const key = rawKey.toLowerCase();
@@ -91,7 +122,19 @@ export function extractOAuthChallengeScopes(error: Error): string | undefined {
  * Looks for WWW-Authenticate header format or JSON error bodies.
  */
 export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
+	const preserved = oauthDiscoveryHints.get(error)?.oauth;
+	if (preserved) return { ...preserved };
 	const errorMsg = error.message;
+
+	const endpointUrl = (value: unknown): value is string => {
+		if (typeof value !== "string") return false;
+		try {
+			const url = new URL(value);
+			return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
+		} catch {
+			return false;
+		}
+	};
 
 	const readEndpointsFromObject = (obj: Record<string, unknown>): OAuthEndpoints | null => {
 		const authorizationUrl =
@@ -109,7 +152,7 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			(obj.token_uri as string | undefined) ||
 			(obj.tokenUri as string | undefined);
 
-		if (!authorizationUrl || !tokenUrl) return null;
+		if (!endpointUrl(authorizationUrl) || !endpointUrl(tokenUrl)) return null;
 
 		const scopeFromArray = Array.isArray(obj.scopes_supported)
 			? (obj.scopes_supported as unknown[]).filter(v => typeof v === "string").join(" ")
@@ -131,9 +174,9 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			tokenUrl,
 			issuerUrl: readIssuerUrl(obj),
 			registrationUrl: readRegistrationUrl(obj),
-			clientId,
-			scopes,
-			resource,
+			clientId: typeof clientId === "string" ? clientId : undefined,
+			scopes: typeof scopes === "string" ? scopes : undefined,
+			resource: typeof resource === "string" ? resource : undefined,
 		};
 	};
 
@@ -203,7 +246,7 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			challengeValues.get("token_url") || challengeValues.get("token_uri") || challengeValues.get("token_endpoint");
 		const resource = challengeValues.get("resource") || challengeValues.get("resource_uri");
 
-		if (authorizationUrl && tokenUrl) {
+		if (endpointUrl(authorizationUrl) && endpointUrl(tokenUrl)) {
 			return {
 				authorizationUrl,
 				tokenUrl,
@@ -217,18 +260,6 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 				resource,
 			};
 		}
-	}
-
-	// Try to extract from WWW-Authenticate header format
-	// Example: Bearer realm="https://auth.example.com/oauth/authorize" token_url="https://auth.example.com/oauth/token"
-	const wwwAuthMatch = errorMsg.match(/realm="([^"]+)".*token_url="([^"]+)"/);
-	if (wwwAuthMatch) {
-		return {
-			authorizationUrl: wwwAuthMatch[1],
-			tokenUrl: wwwAuthMatch[2],
-			clientId: clientIdFromAuthUrl(wwwAuthMatch[1]),
-			scopes: scopeFromAuthUrl(wwwAuthMatch[1]),
-		};
 	}
 
 	return null;
@@ -250,7 +281,10 @@ export function analyzeAuthError(error: Error, serverUrl?: string): AuthDetectio
 	// RFC 9728 / MCP: when WWW-Authenticate omits resource_metadata, still probe
 	// the path-inserted protected-resource URL. Origin-root authorization-server
 	// documents on shared gateways often name a different issuer.
-	const resourceMetadataUrl = resourceMetaMatch?.[1] ?? rfc9728ProtectedResourceMetadataUrl(serverUrl);
+	const resourceMetadataUrl =
+		oauthDiscoveryHints.get(error)?.resourceMetadataUrl ??
+		resourceMetaMatch?.[1] ??
+		rfc9728ProtectedResourceMetadataUrl(serverUrl);
 
 	// Try to extract OAuth endpoints
 	const oauth = extractOAuthEndpoints(error);

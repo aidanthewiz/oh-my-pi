@@ -489,7 +489,9 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 			fetch() {
 				return new Response("rejected Authorization: Bearer server-secret", {
 					status: 401,
-					headers: { "WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}"` },
+					headers: {
+						"WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}", authorization_uri="https://auth.example.test/authorize", token_uri="https://auth.example.test/token", scope="read"`,
+					},
 				});
 			},
 		});
@@ -504,6 +506,11 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		const auth = analyzeAuthError(error, `http://127.0.0.1:${server.port}/mcp`);
 		expect(auth.requiresAuth).toBe(true);
 		expect(auth.resourceMetadataUrl).toBe(metadataUrl);
+		expect(auth.oauth).toMatchObject({
+			authorizationUrl: "https://auth.example.test/authorize",
+			tokenUrl: "https://auth.example.test/token",
+			scopes: "read",
+		});
 	});
 });
 

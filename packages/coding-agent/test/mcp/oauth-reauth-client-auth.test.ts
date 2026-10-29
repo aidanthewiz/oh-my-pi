@@ -296,6 +296,79 @@ describe("reconnectMcpManagerServer", () => {
 		expect(manager.getServerConfig("server")).toBe(config);
 		expect(manager.reconnected).toEqual([]);
 	});
+
+	test("terminates a freshly initialized remote session when its reconnect owner becomes invalid", async () => {
+		const initializing = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const terminated = Promise.withResolvers<string | null>();
+		let ownsReconnect = true;
+		let toolLists = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.method === "DELETE") {
+					terminated.resolve(request.headers.get("Mcp-Session-Id"));
+					return new Response(null, { status: 204 });
+				}
+				if (request.method !== "POST") return new Response(null, { status: 405 });
+				const body = (await request.json()) as { id?: number; method?: string };
+				if (body.method === "initialize") {
+					initializing.resolve();
+					await release.promise;
+					return Response.json(
+						{
+							jsonrpc: "2.0",
+							id: body.id,
+							result: {
+								protocolVersion: "2025-03-26",
+								capabilities: { tools: {} },
+								serverInfo: { name: "fixture", version: "1" },
+							},
+						},
+						{ headers: { "Mcp-Session-Id": "abandoned-session" } },
+					);
+				}
+				if (body.method === "tools/list") {
+					toolLists++;
+					return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+		const manager = new MCPManager(os.tmpdir());
+		manager.updateServerConfig("server", {
+			type: "http",
+			url: `http://127.0.0.1:${server.port}/mcp`,
+			timeout: 1_000,
+		});
+		const reconnect = manager
+			.reconnectServer("server", {
+				manual: true,
+				isCurrent: () => {
+					if (!ownsReconnect) throw new MCPOAuthCancelledError();
+					return true;
+				},
+			})
+			.then(
+				value => value,
+				error => error,
+			);
+		try {
+			await initializing.promise;
+			ownsReconnect = false;
+			release.resolve();
+			expect(await reconnect).toBeInstanceOf(MCPOAuthCancelledError);
+			expect(await terminated.promise).toBe("abandoned-session");
+			expect(toolLists).toBe(0);
+			expect(manager.getConnectedServers()).toEqual([]);
+			expect(manager.getTools()).toEqual([]);
+		} finally {
+			release.resolve();
+			await manager.disconnectAll();
+			await server.stop(true);
+		}
+	});
 });
 
 describe("MCPManager.updateServerConfig", () => {
@@ -348,50 +421,59 @@ describe("MCPManager.updateServerConfig", () => {
 });
 
 describe("MCP OAuth persistence and discovery boundaries", () => {
-	test("never sends a supplied bearer on the anonymous initialization probe", async () => {
-		const requests: Array<{ method: string; authorization: string | null; custom: string | null }> = [];
-		const server = Bun.serve({
-			port: 0,
-			async fetch(request) {
-				if (request.method === "POST") {
-					const body = (await request.json()) as { method?: string };
-					requests.push({
-						method: body.method ?? "",
-						authorization: request.headers.get("authorization"),
-						custom: request.headers.get("x-routing"),
-					});
-				}
-				return Response.json(
-					{
-						authorization_url: "https://auth.example/authorize",
-						token_url: "https://auth.example/token",
-					},
-					{ status: 401 },
-				);
-			},
-		});
-		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
-		try {
-			const endpoints = await resolveMcpOAuthEndpointsFromServer(
-				{
-					type: "http",
-					url: `http://127.0.0.1:${server.port}/mcp`,
-					auth: staleAuth,
-					headers: { aUtHoRiZaTiOn: "Bearer must-not-leave", "X-Routing": "tenant-a" },
+	test.each([false, true])(
+		"never sends a supplied bearer on the anonymous initialization probe (tool challenge: %s)",
+		async toolChallenge => {
+			const requests: Array<{ method: string; authorization: string | null; custom: string | null }> = [];
+			const server = Bun.serve({
+				port: 0,
+				async fetch(request) {
+					if (request.method === "POST") {
+						const body = (await request.json()) as { method?: string };
+						requests.push({
+							method: body.method ?? "",
+							authorization: request.headers.get("authorization"),
+							custom: request.headers.get("x-routing"),
+						});
+					}
+					return Response.json(
+						{
+							authorization_url: "https://auth.example/authorize",
+							token_url: "https://auth.example/token",
+						},
+						{ status: 401 },
+					);
 				},
-				{ authStorage: storage, sourceLevel: "user" },
-			);
-			expect(requests.find(request => request.method === "initialize")).toEqual({
-				method: "initialize",
-				authorization: null,
-				custom: "tenant-a",
 			});
-			expect(endpoints.tokenUrl).toBe("https://auth.example/token");
-		} finally {
-			await server.stop(true);
-			await storage.close();
-		}
-	});
+			const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+			try {
+				const endpoints = await resolveMcpOAuthEndpointsFromServer(
+					{
+						type: "http",
+						url: `http://127.0.0.1:${server.port}/mcp`,
+						auth: staleAuth,
+						headers: { aUtHoRiZaTiOn: "Bearer must-not-leave", "X-Routing": "tenant-a" },
+					},
+					{
+						authStorage: storage,
+						sourceLevel: "user",
+						authChallenge: toolChallenge ? { wwwAuthenticate: ['Bearer scope="read"'] } : undefined,
+					},
+				);
+				expect(requests.find(request => request.method === "initialize")).toEqual({
+					method: "initialize",
+					authorization: null,
+					custom: "tenant-a",
+				});
+				expect(endpoints.tokenUrl).toBe("https://auth.example/token");
+				expect(endpoints.authorizationUrl).toBe("https://auth.example/authorize");
+				if (toolChallenge) expect(endpoints.scopes).toBe("read");
+			} finally {
+				await server.stop(true);
+				await storage.close();
+			}
+		},
+	);
 
 	test("does not overwrite a source replaced while authorization was in progress", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-reauth-config-"));

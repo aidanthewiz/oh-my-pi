@@ -1,5 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { inspect } from "node:util";
+import {
+	MCPTransportError,
+	formatMCPToolFailure,
+	nonRetryableMCPTransportError,
+	normalizeMCPTransportError,
+} from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import {
 	analyzeAuthError,
 	discoverOAuthEndpoints,
@@ -12,6 +19,107 @@ import {
 import { type FetchInput, mockFetch } from "./helpers/fetch-mock";
 
 describe("mcp oauth discovery", () => {
+	it.each([
+		["authorization_url", "token_url"],
+		["authorizationUrl", "tokenUrl"],
+		["authorization_endpoint", "token_endpoint"],
+		["authorizationEndpoint", "tokenEndpoint"],
+		["authorization_uri", "token_uri"],
+		["authorizationUri", "tokenUri"],
+	])("recovers %s/%s JSON discovery without exposing credential bodies", (authorizationKey, tokenKey) => {
+		for (const container of [undefined, "oauth", "authorization", "auth"]) {
+			const metadata = {
+				[authorizationKey]: "https://auth.example/authorize?client_id=public-client&scope=read",
+				[tokenKey]: "https://auth.example/token?tenant=original",
+				issuer: "https://auth.example",
+				registration_endpoint: "https://auth.example/register",
+				resource: "https://mcp.example/service",
+				client_secret: "wire-secret",
+			};
+			const body = {
+				access_token: "wire-secret",
+				padding: "x".repeat(1_100),
+				...(container ? { [container]: metadata } : metadata),
+			};
+			const normalized = normalizeMCPTransportError(new Error(`HTTP 401: ${JSON.stringify(body)}`), {
+				transport: "http",
+				stage: "receive",
+			});
+			const cloned = new MCPTransportError({
+				transport: "http",
+				stage: "receive",
+				failure: "http_status",
+				message: normalized.message,
+				code: 401,
+				retryable: true,
+				cause: normalized,
+			});
+			const error = nonRetryableMCPTransportError(cloned);
+			const auth = analyzeAuthError(error, "https://mcp.example/service");
+			expect(auth.oauth).toEqual({
+				authorizationUrl: metadata[authorizationKey],
+				tokenUrl: metadata[tokenKey],
+				issuerUrl: metadata.issuer,
+				registrationUrl: metadata.registration_endpoint,
+				resource: metadata.resource,
+				clientId: "public-client",
+				scopes: "read",
+			});
+			expect(error.retryable).toBe(false);
+			for (const printed of [
+				inspect(error, { depth: 10 }),
+				JSON.stringify(error),
+				formatMCPToolFailure(error, "server", "tool"),
+			]) {
+				expect(printed).not.toContain("wire-secret");
+			}
+		}
+	});
+
+	it.each([
+		["authorization_uri", "token_uri"],
+		["authorization_url", "token_url"],
+		["authorization_endpoint", "token_endpoint"],
+		["authorize_url", "token_url"],
+		["realm", "token_url"],
+	])("preserves %s/%s challenge endpoints through redaction and normalization", (authorizationKey, tokenKey) => {
+		const error = normalizeMCPTransportError(
+			new Error(
+				`HTTP 403: {"client_secret":"wire-secret"} [WWW-Authenticate: Bearer ${authorizationKey}="https://auth.example/authorize", ${tokenKey}="https://auth.example/token", scope="read write", issuer="https://auth.example", registration_uri="https://auth.example/register", resource_uri="https://mcp.example/service", resource_metadata="https://mcp.example/metadata"; Mcp-Auth-Server: /tenant/oauth]`,
+			),
+			{ transport: "http", stage: "receive" },
+		);
+		const auth = analyzeAuthError(error, "https://mcp.example/service");
+		expect(auth).toMatchObject({
+			requiresAuth: true,
+			authType: "oauth",
+			authServerUrl: "https://mcp.example/tenant/oauth",
+			resourceMetadataUrl: "https://mcp.example/metadata",
+			scopes: "read write",
+			oauth: {
+				authorizationUrl: "https://auth.example/authorize",
+				tokenUrl: "https://auth.example/token",
+				issuerUrl: "https://auth.example",
+				registrationUrl: "https://auth.example/register",
+				resource: "https://mcp.example/service",
+				scopes: "read write",
+			},
+		});
+		expect(inspect(error, { depth: 10 })).not.toContain("wire-secret");
+	});
+
+	it.each(["[redacted]", "javascript:alert(1)", "https://user:secret@auth.example/token"])(
+		"does not treat an unusable token endpoint as discovery: %s",
+		tokenUrl => {
+			const auth = analyzeAuthError(
+				new Error(
+					`HTTP 401: ${JSON.stringify({ authorization_url: "https://auth.example/authorize", token_url: tokenUrl })}`,
+				),
+			);
+			expect(auth.oauth).toBeUndefined();
+		},
+	);
+
 	it("extracts Mcp-Auth-Server from transport error headers", () => {
 		const error = new Error(
 			'HTTP 401: unauthorized [WWW-Authenticate: Bearer resource_metadata="https://mcp.figma.com/.well-known/oauth-protected-resource"; Mcp-Auth-Server: https://www.figma.com]',

@@ -1,6 +1,7 @@
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { JsonRpcError } from "./types";
 import type { MCPProtocolDiagnostic } from "@oh-my-pi/pi-tui/tools/mcp";
+import { preserveOAuthDiscoveryHints } from "./oauth-discovery";
 
 /** MCP transport used by a failed operation. */
 export type MCPTransportKind = "http" | "stdio" | "unknown";
@@ -68,8 +69,19 @@ export class MCPTransportError extends Error {
 	constructor(options: MCPTransportErrorOptions) {
 		super(
 			sanitizeDiagnosticText(options.message, MAX_MESSAGE_CHARS),
-			options.cause === undefined ? undefined : { cause: options.cause },
+			options.cause === undefined
+				? undefined
+				: {
+						cause: new Error(
+							sanitizeDiagnosticText(
+								options.cause instanceof Error ? options.cause.message : String(options.cause),
+								MAX_MESSAGE_CHARS,
+							),
+						),
+					},
 		);
+		preserveOAuthDiscoveryHints(this, { name: "Error", message: options.message });
+		if (options.cause instanceof Error) preserveOAuthDiscoveryHints(this, options.cause);
 		this.name = "MCPTransportError";
 		this.transport = options.transport;
 		this.stage = options.stage;
@@ -200,6 +212,31 @@ export function mcpTraceIdFromHeaders(headers: Headers): string | undefined {
 	return undefined;
 }
 
+/** Preserve public OAuth challenges separately from redacted HTTP diagnostics. */
+export function createMCPHttpStatusError(
+	response: Response,
+	text: string,
+	options: { stage: MCPFailureStage; retryable: boolean },
+): MCPTransportError {
+	const wwwAuthenticate = response.headers.get("WWW-Authenticate");
+	const mcpAuthServer = response.headers.get("Mcp-Auth-Server");
+	const hints = [
+		wwwAuthenticate ? `WWW-Authenticate: ${wwwAuthenticate}` : null,
+		mcpAuthServer ? `Mcp-Auth-Server: ${mcpAuthServer}` : null,
+	]
+		.filter(Boolean)
+		.join("; ");
+	return new MCPTransportError({
+		transport: "http",
+		stage: options.stage,
+		failure: "http_status",
+		message: `HTTP ${response.status}: ${text}${hints ? ` [${hints}]` : ""}`,
+		retryable: options.retryable,
+		code: response.status,
+		traceId: mcpTraceIdFromHeaders(response.headers),
+	});
+}
+
 /** Preserve a server-provided JSON-RPC error without exposing credential-shaped data. */
 export function createMCPJsonRpcError(
 	transport: MCPTransportKind,
@@ -269,7 +306,7 @@ export function normalizeMCPTransportError(
 		transport: options.transport,
 		stage: failure === "connect" ? "connect" : failure === "malformed_response" ? "decode" : options.stage,
 		failure,
-		message: message || "Unknown MCP transport failure",
+		message: (error instanceof Error ? error.message : String(error)) || "Unknown MCP transport failure",
 		retryable,
 		code,
 		traceId: safeTraceId(options.traceId),
