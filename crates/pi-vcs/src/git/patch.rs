@@ -1883,9 +1883,9 @@ fn unstaged_changed_paths(
 }
 
 /// Materialize `changed` paths into the worktree (from `worktree`) and index
-/// (from the committed `merged` tree), keeping every other index entry and its
-/// stat cache untouched. `unstaged` paths keep a zeroed stat so their local
-/// edits still read as modified.
+/// (from the committed `merged` tree), preserving unrelated entries and their
+/// non-racy stat caches. Retained racy entries and selected paths with local
+/// edits keep zeroed stats so their contents are checked after the index write.
 fn checkout_changed_paths(
 	repo: &GitRepo,
 	gix_repo: &gix::Repository,
@@ -1922,7 +1922,14 @@ fn checkout_changed_paths(
 		}
 	}
 	let mut index = load_index_or_head(gix_repo, "git cherry-pick index")?;
-	index.remove_entries(|_, path, _| changed.contains(path.to_str_lossy().as_ref()));
+	let racy_from = index.timestamp();
+	index.remove_entries(|_, path, entry| {
+		let remove = changed.contains(path.to_str_lossy().as_ref());
+		if !remove && entry.stat.is_racy(racy_from, Default::default()) {
+			entry.stat = Stat::default();
+		}
+		remove
+	});
 	for path in changed {
 		let Some(entry) = merged.get(path) else {
 			continue;
@@ -3247,6 +3254,55 @@ mod tests {
 				.expect("conflict check")
 		);
 		assert_eq!(fs::read(temp.path().join("b")).unwrap(), b"untouched\n");
+	}
+
+	#[test]
+	fn patch_cherry_pick_keeps_racy_unrelated_edits_visible() {
+		let temp = init(&[("picked.txt", b"base\n"), ("unrelated.txt", b"base\n")]);
+		let base = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+		fs::write(temp.path().join("picked.txt"), b"topic\n").unwrap();
+		git(temp.path(), &["add", "picked.txt"]);
+		git(temp.path(), &["commit", "-qm", "picked change"]);
+		let topic = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+		git(temp.path(), &["checkout", "-q", &base]);
+		fs::write(temp.path().join("unrelated.txt"), b"edit\n").unwrap();
+		fs::OpenOptions::new()
+			.write(true)
+			.open(temp.path().join("unrelated.txt"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+			.unwrap();
+
+		let repository = repo(temp.path());
+		let original_id = {
+			let index = repository.gix().unwrap().open_index().unwrap();
+			index.entry_by_path("unrelated.txt".into()).unwrap().id
+		};
+		git(temp.path(), &["add", "unrelated.txt"]);
+		let mut index = repository.gix().unwrap().open_index().unwrap();
+		let entry = index
+			.entry_index_by_path_and_stage("unrelated.txt".into(), Stage::Unconflicted)
+			.unwrap();
+		index.entries_mut()[entry].id = original_id;
+		index.entries_mut()[entry].stat.size = b"edit\n".len().try_into().unwrap();
+		index.remove_tree();
+		index.write(gix::index::write::Options::default()).unwrap();
+		fs::OpenOptions::new()
+			.write(true)
+			.open(temp.path().join(".git/index"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+			.unwrap();
+		let status = ["--no-optional-locks", "status", "--porcelain", "--", "unrelated.txt"];
+		let staged = git(temp.path(), &["ls-files", "--stage", "--", "unrelated.txt"]);
+		assert_eq!(git(temp.path(), &status), " M unrelated.txt\n");
+
+		repository.cherry_pick(&topic).unwrap();
+
+		assert_eq!(fs::read(temp.path().join("unrelated.txt")).unwrap(), b"edit\n");
+		assert_eq!(git(temp.path(), &status), " M unrelated.txt\n");
+		assert_eq!(git(temp.path(), &["ls-files", "--stage", "--", "unrelated.txt"]), staged);
+		assert_eq!(fs::read(temp.path().join("picked.txt")).unwrap(), b"topic\n");
 	}
 
 	#[test]
