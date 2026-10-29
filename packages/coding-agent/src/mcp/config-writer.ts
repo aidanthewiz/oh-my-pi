@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { invalidate as invalidateFsCache } from "../capability/fs";
@@ -56,7 +57,12 @@ export async function readMCPConfigFile(filePath: string): Promise<MCPConfigFile
  * Write an MCP config file atomically.
  * Creates parent directories if they don't exist.
  */
-export async function writeMCPConfigFile(filePath: string, config: MCPConfigFile): Promise<void> {
+export async function writeMCPConfigFile(
+	filePath: string,
+	config: MCPConfigFile,
+	assertCurrent?: () => void,
+): Promise<void> {
+	assertCurrent?.();
 	// Ensure parent directory exists
 	const dir = path.dirname(filePath);
 	await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -69,8 +75,9 @@ export async function writeMCPConfigFile(filePath: string, config: MCPConfigFile
 	const content = JSON.stringify(withSchema(config), null, 2);
 	try {
 		await fs.promises.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+		assertCurrent?.();
 		// Rename to final path (atomic on most systems)
-		await fs.promises.rename(tmpPath, filePath);
+		fs.renameSync(tmpPath, filePath);
 	} catch (error) {
 		await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
 		throw error;
@@ -109,7 +116,13 @@ export function validateServerName(name: string): string | undefined {
  *
  * @throws Error if server name already exists or validation fails
  */
-export async function addMCPServer(filePath: string, name: string, config: MCPServerConfig): Promise<void> {
+export async function addMCPServer(
+	filePath: string,
+	name: string,
+	config: MCPServerConfig,
+	options?: { assertCurrent?: () => void },
+): Promise<void> {
+	options?.assertCurrent?.();
 	// Validate server name
 	const nameError = validateServerName(name);
 	if (nameError) {
@@ -127,6 +140,7 @@ export async function addMCPServer(filePath: string, name: string, config: MCPSe
 	// against cross-process writers sharing the same config file.
 	await withConfigLock(filePath, async () => {
 		const existing = await readMCPConfigFile(filePath);
+		options?.assertCurrent?.();
 
 		// Check for duplicate name
 		if (existing.mcpServers?.[name]) {
@@ -140,7 +154,7 @@ export async function addMCPServer(filePath: string, name: string, config: MCPSe
 				[name]: config,
 			},
 		};
-		await writeMCPConfigFile(filePath, updated);
+		await writeMCPConfigFile(filePath, updated, options?.assertCurrent);
 	});
 }
 
@@ -150,7 +164,13 @@ export async function addMCPServer(filePath: string, name: string, config: MCPSe
  *
  * @throws Error if validation fails
  */
-export async function updateMCPServer(filePath: string, name: string, config: MCPServerConfig): Promise<void> {
+export async function updateMCPServer(
+	filePath: string,
+	name: string,
+	config: MCPServerConfig,
+	options?: { expectedConfig?: MCPServerConfig; assertCurrent?: () => void },
+): Promise<void> {
+	options?.assertCurrent?.();
 	// Validate server name
 	const nameError = validateServerName(name);
 	if (nameError) {
@@ -166,6 +186,14 @@ export async function updateMCPServer(filePath: string, name: string, config: MC
 	// Serialize the read-modify-write (see addMCPServer).
 	await withConfigLock(filePath, async () => {
 		const existing = await readMCPConfigFile(filePath);
+		options?.assertCurrent?.();
+		if (
+			options &&
+			"expectedConfig" in options &&
+			!isDeepStrictEqual(existing.mcpServers?.[name], options.expectedConfig)
+		) {
+			throw new Error(`MCP server "${name}" changed during authentication`);
+		}
 
 		const updated: MCPConfigFile = {
 			...existing,
@@ -174,7 +202,7 @@ export async function updateMCPServer(filePath: string, name: string, config: MC
 				[name]: config,
 			},
 		};
-		await writeMCPConfigFile(filePath, updated);
+		await writeMCPConfigFile(filePath, updated, options?.assertCurrent);
 	});
 }
 

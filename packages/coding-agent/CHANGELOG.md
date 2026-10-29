@@ -21,6 +21,7 @@
 - Finish initial model discovery before headless commands capture session ownership. Keep browser authorization limited to explicit host consent.
 - Keep deferred extension tools and source metadata bound to the active registration. Roll back failed activations without replacing newer tools or prompts. Preserve surviving event policies and shutdown cleanup during extension changes.
 - Return promptly from cancelled MCP logins while preventing conflicting logins until pending work settles. Keep accepted credential persistence serialized.
+- Close freshly initialized MCP sessions when reconnect ownership retires before registration.
 - Preserve the stable MCP tool collision winner before late same-owner registrations replace its declaration.
 - Render tool descriptions against candidate prompt activity without granting execution before publication. Revoke removed tools while rebuilding and restore prior authority after failure.
 - Preserve text-only asides when a session switch rolls back. Finish cancellation cleanup before a focused turn releases its result ownership.

@@ -51,6 +51,8 @@ import {
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../session/agent-session";
 import { SessionBusyError } from "../../session/agent-session";
+import type { MCPManager } from "../../mcp/manager";
+import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
@@ -1430,6 +1432,10 @@ export interface RpcModeOptions {
 	input?: ReadableStream<Uint8Array>;
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
+	/** The session's MCP manager, so `/mcp` builtins resolve and reconnect live servers. */
+	mcpManager?: MCPManager;
+	/** Host browser consent; only an unchanged, explicit client auth command may use it. */
+	allowMcpBrowserAuth?: boolean;
 }
 
 /**
@@ -1438,6 +1444,18 @@ export interface RpcModeOptions {
  */
 export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
 	const { setToolUIContext, headless = false, subagentEventBus, input = claimRpcInput(), createLiveSession } = options;
+	let hostActive = true;
+	const builtinCommandAborts = new Set<AbortController>();
+	const abortBuiltinCommands = (reason: string): void => {
+		for (const controller of builtinCommandAborts) controller.abort(reason);
+		builtinCommandAborts.clear();
+	};
+	const builtinPersistenceTasks = new Set<Promise<unknown>>();
+	const drainBuiltinPersistence = async (): Promise<void> => {
+		while (builtinPersistenceTasks.size > 0) {
+			await Promise.allSettled(builtinPersistenceTasks);
+		}
+	};
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -1453,7 +1471,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const stdout = process.platform === "win32" ? fs.createWriteStream("", { fd: 1, autoClose: false }) : process.stdout;
 	const outputWriter = new RpcOutputWriter(stdout, failure => {
 		logger.error("RPC output delivery failed", { error: String(failure) });
-		void session.dispose().finally(() => process.exit(1));
+		hostActive = false;
+		abortBuiltinCommands("RPC output delivery failed");
+		void drainBuiltinPersistence()
+			.then(() => session.dispose())
+			.finally(() => process.exit(1));
 	});
 	outputWriter.write(
 		frameEncoder.encodeFrames({
@@ -1508,7 +1530,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const hostUriBridge = new RpcHostUriBridge(output);
 	// Live frames go straight to `output`, so `set_event_filter` (session events only) never drops them.
 	const liveBridge = new RpcLiveBridge(session, output, createLiveSession);
-	session.setSessionBeforeSwitchReconciler(() => liveBridge.stop());
+	session.setSessionBeforeSwitchReconciler(async () => {
+		abortBuiltinCommands("RPC session replaced");
+		await drainBuiltinPersistence();
+		await liveBridge.stop();
+	});
 	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
@@ -1756,6 +1782,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		},
 		onShutdown: () => {
 			shutdownState.requested = true;
+			abortBuiltinCommands("RPC host shutting down");
 		},
 		trackAgentInvokingMessage: task => {
 			extensionUserMessageTracker.trackAgentMessageTask(task);
@@ -1868,9 +1895,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		inputGate.enqueue(async () => {
 			const sessionId = session.sessionManager.getSessionId();
 			const isCurrent = () =>
+				!session.isDisposed &&
 				inputGate.isCurrent(command) &&
 				!shutdownState.requested &&
 				session.sessionManager.getSessionId() === sessionId;
+			if (!isCurrent()) return "cancelled";
+			await session.loadDeferredExtensions();
 			if (!isCurrent()) return "cancelled";
 			let text = command.message;
 			let images = command.images;
@@ -1908,21 +1938,73 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				});
 				if (skillResult === "cancelled") return "cancelled";
 				if (skillResult) return "admitted";
+				const builtinAbort = new AbortController();
+				builtinCommandAborts.add(builtinAbort);
+				const originalModel = session.model;
+				const originalAuthStorage = session.modelRegistry.authStorage;
+				const originalCredentialPool = originalAuthStorage?.credentials;
+				const originalManager = options.mcpManager;
+				const builtinIsCurrent = (): boolean =>
+					hostActive &&
+					isCurrent() &&
+					!builtinAbort.signal.aborted &&
+					session.model === originalModel &&
+					session.modelRegistry.authStorage === originalAuthStorage &&
+					originalAuthStorage?.credentials === originalCredentialPool &&
+					options.mcpManager === originalManager;
+				let backgroundedBuiltin = false;
 				const builtinResult = await executeAcpBuiltinSlashCommand(text, {
 					session,
 					sessionManager: session.sessionManager,
 					settings: session.settings,
 					cwd: session.sessionManager.getCwd(),
-					output: commandOutput => output({ type: "command_output", text: commandOutput }),
+					output: commandOutput => {
+						if (builtinIsCurrent()) output({ type: "command_output", text: commandOutput });
+					},
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
-					runCommandInBackground: task => shutdownCoordinator.track(task()),
+					mcpManager: options.mcpManager,
+					reconnectMcpServer: options.mcpManager
+						? async (mcpName, selected, committedConfig) => {
+								const manager = options.mcpManager!;
+								if (!builtinIsCurrent()) return undefined;
+								const state = await reconnectMcpManagerServer(manager, mcpName, selected, committedConfig, {
+									signal: builtinAbort.signal,
+									isCurrent: builtinIsCurrent,
+								});
+								if (state && builtinIsCurrent()) {
+									// RPC mode wires no tools-changed callback; refresh the
+									// session binding so later prompts see the recovered tools.
+									await session.refreshMCPTools(manager.getTools());
+								}
+								if (!builtinIsCurrent()) return undefined;
+								return state;
+							}
+						: undefined,
+					signal: builtinAbort.signal,
+					isCurrent: builtinIsCurrent,
+					allowMcpBrowserAuth: options.allowMcpBrowserAuth === true && text === command.message,
+					runCancellationBarrier: async operation => {
+						const task = operation();
+						builtinPersistenceTasks.add(task);
+						try {
+							return await task;
+						} finally {
+							builtinPersistenceTasks.delete(task);
+						}
+					},
+					runCommandInBackground: task => {
+						backgroundedBuiltin = true;
+						shutdownCoordinator.track(task().finally(() => builtinCommandAborts.delete(builtinAbort)));
+					},
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 					},
 					notifyConfigChanged: async () => {
 						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
 					},
+				}).finally(() => {
+					if (!backgroundedBuiltin) builtinCommandAborts.delete(builtinAbort);
 				});
 				if (!isCurrent()) return "cancelled";
 				if (builtinResult !== false) {
@@ -2039,7 +2121,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "abort": {
 				goalController.stopForHostAbort();
+				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				await drainBuiltinPersistence();
 				return success(id, "abort");
 			}
 
@@ -2049,13 +2133,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// abort()'s stranded-queue drain can run it.
 				const restored = session.clearQueue({ forInterrupt: true });
 				goalController.stopForHostAbort();
+				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				await drainBuiltinPersistence();
 				return fitAbortAndRestoreQueueResponse(id, restored, frameEncoder.maxResponseBytes);
 			}
 
 			case "abort_and_prompt": {
 				goalController.stopForHostAbort();
+				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				await drainBuiltinPersistence();
 				const ticket = promptResults.begin(id);
 				void dispatchOrderedUserInput(command, ticket).then(
 					outcome => {
@@ -2083,6 +2171,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				}
 				const requestedModel =
 					command.type === "switch_session" ? await resolveRequestedRpcModel(session, command) : undefined;
+				abortBuiltinCommands("RPC session changing");
+				await drainBuiltinPersistence();
 				// Validation first: a refused change must not cancel the running side question.
 				await btw.close();
 				await goalController.beginSessionChange();
@@ -2114,6 +2204,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "open_session": {
 				const requestedModel = await resolveRequestedRpcModel(session, command);
+				abortBuiltinCommands("RPC session opening");
+				await drainBuiltinPersistence();
 				const fileBeforeOpen = session.sessionFile;
 				await btw.close();
 				await goalController.beginSessionChange();
@@ -2394,11 +2486,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (!model) {
 					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
 				}
+				abortBuiltinCommands("RPC model changing");
+				await drainBuiltinPersistence();
 				await session.setModel(model);
 				return success(id, "set_model", model);
 			}
 
 			case "cycle_model": {
+				abortBuiltinCommands("RPC model changing");
+				await drainBuiltinPersistence();
 				const result = await session.cycleModel();
 				if (!result) {
 					return success(id, "cycle_model", null);
@@ -2612,6 +2708,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "login": {
+				abortBuiltinCommands("RPC account changing");
+				await drainBuiltinPersistence();
 				const knownProvider = getOAuthProviders().find(p => p.id === command.providerId);
 				if (!knownProvider) {
 					return error(id, "login", `Unknown OAuth provider: ${command.providerId}`);
@@ -2691,6 +2789,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "logout": {
+				abortBuiltinCommands("RPC account changing");
+				await drainBuiltinPersistence();
 				if (typeof command.providerId !== "string" || !Number.isInteger(command.credentialId)) {
 					return error(id, "logout", "providerId must be a string and credentialId an integer");
 				}
@@ -2811,12 +2911,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		parsed => inputDispatcher.dispatch(parsed),
 		message => output(error(undefined, "parse", message)),
 	);
+	hostActive = false;
+	abortBuiltinCommands("RPC client disconnected");
 
 	// stdin closed — RPC client is gone. Fail pending side-channel requests
 	// first so active/queued commands can settle, then drain accepted work.
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
+	await drainBuiltinPersistence();
 	await liveBridge.stop();
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();

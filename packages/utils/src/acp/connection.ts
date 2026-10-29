@@ -48,10 +48,8 @@ export interface CreateTerminalResponse {
 /** Client callbacks handled by a client-side connection. */
 export interface Client {
 	/**
-	 * Serve a permission elicit. `options.signal` aborts when the agent
-	 * cancels the request (`$/cancel_request`) — e.g. user steering superseded
-	 * the dialog — so a held handler can end instead of stranding the
-	 * connection's clean-EOF drain.
+	 * Serve a permission elicit. `options.signal` aborts on peer cancellation,
+	 * transport close, or clean EOF. End the dialog when it aborts.
 	 */
 	requestPermission(
 		params: RequestPermissionRequest,
@@ -101,8 +99,8 @@ export class AgentSideConnection {
 	}
 	/**
 	 * Requests permission from the client, returning a handle that cancels the
-	 * pending wire request (`$/cancel_request`) — used when user steering
-	 * supersedes an open permission dialog instead of waiting behind it.
+	 * pending wire request (`$/cancel_request`) when the dialog is superseded
+	 * or its owning operation is aborted.
 	 */
 	requestPermissionWithCancel(params: RequestPermissionRequest): {
 		promise: Promise<RequestPermissionResponse>;
@@ -188,17 +186,15 @@ export class ClientSideConnection {
 	#connection: RpcConnection;
 
 	constructor(toClient: (connection: ClientSideConnection) => Client, stream: Stream) {
-		// Client handlers receive the cancel signal (`requestPermission`'s
-		// `options.signal`), so a peer `$/cancel_request` may answer `-32800`
-		// at once. The agent side keeps the default: its handlers ignore the
-		// signal, and `session/cancel` is ACP's cancellation path for prompts.
+		// Only permission handlers receive a cancellation signal. File, terminal,
+		// and extension handlers retain authority over their real completion.
 		this.#connection = new RpcConnection(
 			stream,
 			async (method, params, notification, signal) => {
 				if (!client) throw RequestError.internalError(undefined, "Client is not initialized");
 				return dispatchClient(client, method, params, notification, signal);
 			},
-			{ honorsInboundCancellation: true },
+			{ honorsInboundCancellation: method => method === "session/request_permission" },
 		);
 		const client = toClient(this);
 	}
@@ -351,8 +347,7 @@ async function dispatchClient(
 				params as CompleteElicitationNotification,
 			);
 		default:
-			// The transport already aborted the matching inbound handler;
-			// like the agent side, the notification itself carries no work.
+			// Cancellation notifications carry no extension work.
 			if (method === "$/cancel_request") return;
 			if (notification && client.extNotification)
 				return client.extNotification(method, params as Record<string, unknown>);

@@ -23,6 +23,7 @@ import { mapWaitUntil } from "./cmux/rpc";
 import { runInProcessTab } from "./in-process-run";
 import { browserConnection, DEFAULT_VIEWPORT } from "./launch";
 import {
+	CdpTargetCloseTimeoutError,
 	closeCdpTarget,
 	closeRelayTarget,
 	forgetSharedTarget,
@@ -311,7 +312,8 @@ async function waitForTabCleanup<T>(
 	try {
 		return await withTimeout(promise, timeoutMs, message);
 	} catch (error) {
-		if (error instanceof Error && error.message === message) throw new ToolError(message);
+		if (error instanceof CdpTargetCloseTimeoutError || (error instanceof Error && error.message === message))
+			throw new ToolError(message);
 		throw error;
 	}
 }
@@ -1057,6 +1059,7 @@ async function runInTabWithSnapshot(
 			return result;
 		} catch (error) {
 			if (error instanceof RendererCrashedError) {
+				for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
 				const reattached = await recoverWorkerTab(
 					tab,
 					name,
@@ -1325,11 +1328,8 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	await tab.worker.terminate().catch(() => undefined);
 	// omp closes the pages it owns, and with them goes the last reader of their staged uploads.
 	if (tab.ownsPage) await removeUploadStaging(tab.uploadDir);
-	// Close a live tab's owned page by id as well, which confirms it is gone: a worker's own
-	// close can fail and still report `closed` (its CDP socket broke), and the relay retracts a
-	// target whose debugger the user dismissed, so the worker cannot close it at all. A dead
-	// tab's page was closed by the teardown that killed it.
-	if (tab.ownsPage && wasAlive) {
+	// Worker acknowledgment and a dead tab state do not prove the owned target disappeared.
+	if (tab.ownsPage) {
 		try {
 			// `false` is "not confirmed closed" (the CDP session could not be
 			// created, or `Target.getTargets` failed) — the same unconfirmed
@@ -1864,6 +1864,7 @@ async function dispatchToolCall(
 	tab: WorkerTabSession,
 	msg: Extract<WorkerOutbound, { type: "tool-call" }>,
 ): Promise<void> {
+	const worker = tab.worker;
 	const pending = tab.pending.get(msg.runId);
 	if (!pending?.session.cwd) {
 		safeSend(tab, {
@@ -1881,7 +1882,15 @@ async function dispatchToolCall(
 	const onParentAbort = (): void => ctrl.abort(pending.signal?.reason);
 	if (pending.signal?.aborted) onParentAbort();
 	else pending.signal?.addEventListener("abort", onParentAbort, { once: true });
+	const canReply = (): boolean =>
+		tabs.get(tab.name) === tab &&
+		tab.state === "alive" &&
+		tab.worker === worker &&
+		tab.pending.get(msg.runId) === pending &&
+		pending.toolCalls.get(msg.id) === ctrl &&
+		!ctrl.signal.aborted;
 	try {
+		if (!canReply()) return;
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.session,
 			signal: ctrl.signal,
@@ -1890,11 +1899,12 @@ async function dispatchToolCall(
 				// already pushes its own helper status via the display channel.
 			},
 		});
-		safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
+		if (canReply()) safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
 	} catch (error) {
-		safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toWorkerErrorPayload(error) } });
+		if (canReply())
+			safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toWorkerErrorPayload(error) } });
 	} finally {
-		pending.toolCalls.delete(msg.id);
+		if (pending.toolCalls.get(msg.id) === ctrl) pending.toolCalls.delete(msg.id);
 		pending.signal?.removeEventListener("abort", onParentAbort);
 	}
 }
@@ -1941,7 +1951,11 @@ function safeSend(tab: WorkerTabSession, msg: WorkerInbound): void {
  * when the new worker exits too within {@link WORKER_EXIT_RETRY_WINDOW_MS}.
  */
 function attachTabWorker(tab: WorkerTabSession, worker: WorkerHandle): void {
-	worker.onMessage(msg => handleTabMessage(tab, msg));
+	worker.onMessage(msg => {
+		if (tabs.get(tab.name) !== tab || tab.worker !== worker || tab.state !== "alive" || releaseInflight.has(tab))
+			return;
+		handleTabMessage(tab, msg);
+	});
 	let lastError: Error | undefined;
 	worker.onError(error => {
 		// A message that failed to deserialize leaves the worker running, so it is no exit's cause.
@@ -2065,7 +2079,11 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	killedTabs.set(name, reason);
 	tab.state = "dead";
 	const error = postmortem.markExpectedCleanupError(new ToolError(reason));
-	for (const pending of tab.pending.values()) pending.reject(error);
+	for (const pending of tab.pending.values()) {
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
+		pending.closeAc?.abort(error);
+		pending.reject(error);
+	}
 	tab.pending.clear();
 	// Published before the first await so a release landing during the close
 	// below joins instead of tearing the same tab down a second time. The
@@ -2129,10 +2147,10 @@ async function forceKillTabTeardown(tab: WorkerTabSession): Promise<void> {
 async function closeTargetById(
 	browser: PuppeteerBrowserHandle,
 	targetId: string,
-	confirmTimeoutMs?: number,
+	timeoutMs?: number,
 ): Promise<boolean> {
 	if (browser.kind.kind === "relay") return await closeRelayTarget(browserConnection(browser.browser), targetId);
-	return await closeCdpTarget(browser.browser, targetId, confirmTimeoutMs);
+	return await closeCdpTarget(browser.browser, targetId, timeoutMs);
 }
 
 /**
@@ -2169,11 +2187,10 @@ function recheckSharedBrowser(scope: SharedTargetScope): void {
  * browser is still in the registry; the tab's browser is the only place that
  * page can be, so no targetId guesswork across multiple sessions.
  *
- * `budgetMs` is the caller's bound on the whole close. The `targetDestroyed`
- * wait gets half of it, leaving the rest for the `Target.getTargets` fallback.
+ * `budgetMs` bounds the whole close; the CDP owner reserves half for absence confirmation.
  */
 async function closeOrphanTarget(tab: WorkerTabSession, budgetMs: number): Promise<boolean> {
-	return await closeTargetById(tab.browser, tab.targetId, budgetMs / 2);
+	return await closeTargetById(tab.browser, tab.targetId, budgetMs);
 }
 
 /**
@@ -2194,9 +2211,15 @@ function closeAbandonedWorkerPage(browser: PuppeteerBrowserHandle, worker: Worke
 	// (and the dispose behind it) rather than cancelling one, so the refCount
 	// ends where it would have, one turn later.
 	holdBrowser(browser);
-	void closeTargetById(browser, targetId)
-		.catch(() => undefined)
-		.finally(() => void releaseBrowser(browser, { kill: false }).catch(() => undefined));
+	const scope = sharedScopeOf(browser);
+	void (async () => {
+		if (scope) await recordSharedTarget(scope, targetId);
+		const closed = await closeTargetById(browser, targetId).catch(() => false);
+		if (scope) {
+			if (closed) await forgetSharedTarget(scope, targetId);
+			else recheckSharedBrowser(scope);
+		}
+	})().finally(() => void releaseBrowser(browser, { kill: false }).catch(() => undefined));
 }
 
 async function waitForClosed(tab: WorkerTabSession): Promise<void> {

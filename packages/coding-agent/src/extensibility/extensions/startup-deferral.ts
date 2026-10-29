@@ -2,14 +2,11 @@
  * Decides which discovered extensions may bind after the interactive composer
  * accepts input instead of before the session exists.
  *
- * Only a previous load can tell whether an extension's factory registers state
- * that must exist before the first frame: model providers (startup model
- * resolution), keyboard shortcuts (bound once at editor setup), composer shapes
- * (installed at UI init), or file-mutation fallbacks (installed at runner
- * init). Each load records that verdict in agent.db, keyed by the module's
- * resolved path and fingerprinted by its size and mtime. A source with no
- * verdict for its current fingerprint loads eagerly and records one, so a
- * changed module is never deferred on stale knowledge.
+ * Previous factory registrations provide a startup scheduling hint, not trust
+ * authority. The cache fingerprints only the entry file's size and mtime;
+ * imported dependencies, environment changes and same-stat replacements can
+ * change registrations without invalidating it. Admission and mandatory eager
+ * loading remain the caller's responsibility.
  */
 import * as fs from "node:fs/promises";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
@@ -41,9 +38,9 @@ async function fingerprintSource(resolvedPath: string): Promise<string | undefin
 }
 
 function readVerdict(storage: AgentStorage, resolvedPath: string): StartupVerdict | undefined {
-	const raw = storage.getCache(`${CACHE_PREFIX}${resolvedPath}`);
-	if (!raw) return undefined;
 	try {
+		const raw = storage.getCache(`${CACHE_PREFIX}${resolvedPath}`);
+		if (!raw) return undefined;
 		const parsed: unknown = JSON.parse(raw);
 		if (!isRecord(parsed) || typeof parsed.fingerprint !== "string" || typeof parsed.deferrable !== "boolean") {
 			return undefined;
@@ -54,7 +51,7 @@ function readVerdict(storage: AgentStorage, resolvedPath: string): StartupVerdic
 	}
 }
 
-/** Whether a bound extension registered nothing that has to exist before the first frame. */
+/** Whether observed factory registrations contain no startup-sensitive state. */
 export function canBindAfterStartup(extension: Extension): boolean {
 	return (
 		extension.registersProviders !== true &&
@@ -66,8 +63,8 @@ export function canBindAfterStartup(extension: Extension): boolean {
 }
 
 /**
- * Split extension paths into those that must load before session creation and
- * those a recorded verdict for their current source proves safe to bind later.
+ * Split admitted extension paths using a prior factory's scheduling hint.
+ * A matching entry-file fingerprint does not establish trust or current behavior.
  * Order within each list follows `paths`.
  */
 export async function partitionStartupExtensions(
@@ -91,8 +88,8 @@ export async function partitionStartupExtensions(
 }
 
 /**
- * Record each freshly bound file-backed extension's startup verdict. Call right
- * after binding: registrations made later (session_start) never affect startup.
+ * Record each freshly bound file-backed extension's observed startup verdict.
+ * Later registrations and dependency/environment changes are not classified.
  */
 export async function recordStartupVerdicts(storage: AgentStorage, extensions: readonly Extension[]): Promise<void> {
 	const expiresAtSec = Math.floor((Date.now() + CACHE_TTL_MS) / 1000);

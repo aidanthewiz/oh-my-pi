@@ -22,7 +22,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, withTimeout } from "@oh-my-pi/pi-utils";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { daemonRuntimeDir } from "../../launch/paths";
 
@@ -212,11 +212,13 @@ export async function collectOrphanTargets(
 	return { owners };
 }
 
-/**
- * How long {@link closeCdpTarget} waits by default for Chromium to destroy a target whose close it accepted.
- * Past it the close counts as unconfirmed, as a failed one does.
- */
-const CLOSE_CONFIRM_TIMEOUT_MS = 5_000;
+const CLOSE_TIMEOUT_MS = 10_000;
+
+export class CdpTargetCloseTimeoutError extends Error {
+	constructor() {
+		super("Timed out confirming CDP target closure");
+	}
+}
 
 /**
  * Close a page target by id through a fresh CDP session. Returns true only
@@ -229,49 +231,79 @@ const CLOSE_CONFIRM_TIMEOUT_MS = 5_000;
  * unloaded it. Its `Target.targetDestroyed` confirms the close instead, as it
  * does for Puppeteer's own `page.close()`.
  *
- * A caller that bounds the whole close MUST pass a `confirmTimeoutMs` well below
- * its budget, so a missed `targetDestroyed` still leaves time for the
- * `Target.getTargets` absence check to decide the result.
+ * `timeoutMs` bounds session creation, discovery, close and absence confirmation
+ * together. Destruction gets at most half that original budget; the remainder
+ * is reserved for the absence check.
  */
 export async function closeCdpTarget(
 	browser: Browser,
 	targetId: string,
-	confirmTimeoutMs = CLOSE_CONFIRM_TIMEOUT_MS,
+	timeoutMs = CLOSE_TIMEOUT_MS,
 ): Promise<boolean> {
-	const session = await browser
-		.target()
-		.createCDPSession()
-		.catch(() => null);
-	if (!session) return false;
+	const startedAt = performance.now();
+	const deadline = startedAt + timeoutMs;
+	const confirmationDeadline = startedAt + timeoutMs / 2;
+	const timeoutError = new CdpTargetCloseTimeoutError();
+	const bounded = <T>(operation: () => Promise<T>, until = deadline): Promise<T> => {
+		const remaining = until - performance.now();
+		if (!(remaining > 0)) return Promise.reject(timeoutError);
+		return withTimeout(operation(), remaining, timeoutError).then(value => {
+			if (performance.now() >= until) throw timeoutError;
+			return value;
+		});
+	};
+	let session: CDPSession | undefined;
+	let finished = false;
 	const destroyed = Promise.withResolvers<boolean>();
 	const onDestroyed = (event: { targetId: string }): void => {
 		if (event.targetId === targetId) destroyed.resolve(true);
 	};
-	session.on("Target.targetDestroyed", onDestroyed);
-	let timer: NodeJS.Timeout | undefined;
 	try {
+		const cdp = await bounded(() =>
+			browser
+				.target()
+				.createCDPSession()
+				.then(created => {
+					if (finished || performance.now() >= deadline) {
+						void created.detach().catch(() => undefined);
+						throw timeoutError;
+					}
+					session = created;
+					return created;
+				}),
+		);
+		cdp.on("Target.targetDestroyed", onDestroyed);
 		try {
-			// Discovery is on before the close, so its `targetDestroyed` cannot be missed.
-			await session.send("Target.setDiscoverTargets", { discover: true });
-			const result = await session.send("Target.closeTarget", { targetId });
-			if (result.success) {
-				timer = setTimeout(() => destroyed.resolve(false), confirmTimeoutMs);
-				if (await destroyed.promise) return true;
-			}
-		} catch {
-			// A concurrent reaper or the page itself may already have closed the
-			// target. Confirm absence before treating the cleanup as complete.
+			await bounded(() => cdp.send("Target.setDiscoverTargets", { discover: true }), confirmationDeadline);
+			const result = await bounded(
+				() =>
+					Promise.race([
+						cdp.send("Target.closeTarget", { targetId }).then(result => result.success),
+						destroyed.promise,
+					]),
+				confirmationDeadline,
+			);
+			if (result && (await bounded(() => destroyed.promise, confirmationDeadline))) return true;
+		} catch (error) {
+			if (error === timeoutError && performance.now() >= deadline) throw error;
+			// A concurrent reaper or the page itself may already have closed the target.
 		}
 		try {
-			const { targetInfos } = await session.send("Target.getTargets");
+			const { targetInfos } = await bounded(() => cdp.send("Target.getTargets"));
 			return !targetInfos.some(info => info.targetId === targetId);
-		} catch {
+		} catch (error) {
+			if (error === timeoutError) throw error;
 			return false;
 		}
+	} catch (error) {
+		if (error === timeoutError) throw error;
+		return false;
 	} finally {
-		clearTimeout(timer);
-		session.off("Target.targetDestroyed", onDestroyed);
-		await session.detach().catch(() => undefined);
+		finished = true;
+		if (session) {
+			session.off("Target.targetDestroyed", onDestroyed);
+			void session.detach().catch(() => undefined);
+		}
 	}
 }
 
@@ -334,7 +366,7 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 	for (const owner of scan.owners) {
 		const retained: string[] = [];
 		for (const targetId of owner.targetIds) {
-			if (await closeCdpTarget(browser, targetId)) {
+			if (await closeCdpTarget(browser, targetId).catch(() => false)) {
 				closed++;
 			} else {
 				retained.push(targetId);

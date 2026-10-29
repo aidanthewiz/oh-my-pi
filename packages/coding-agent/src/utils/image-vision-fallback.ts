@@ -19,7 +19,15 @@ import {
 	resolveTelemetry,
 } from "@oh-my-pi/pi-agent-core";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
-import type { Api, completeSimple, ImageContent, Model, TextContent } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	completeSimple,
+	ImageContent,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+} from "@oh-my-pi/pi-ai";
 import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -73,6 +81,9 @@ export interface DescribeAttachedImagesDeps {
 	activeModelString?: string;
 	telemetryConfig?: AgentTelemetryConfig;
 	sessionId?: string;
+	isCurrent?: () => boolean;
+	prepareStreamOptions?: (model: Model<Api>) => SimpleStreamOptions;
+	onUsage?: (message: AssistantMessage) => void;
 	/** Test seam: overrides the underlying completeSimple call. */
 	completeImpl?: typeof completeSimple;
 }
@@ -148,6 +159,10 @@ async function describeImage(
 	signal: AbortSignal | undefined,
 ): Promise<string | null> {
 	try {
+		signal?.throwIfAborted();
+		if (deps.isCurrent?.() === false) throw new Error("Image description owner is no longer current");
+		const streamOptions = deps.prepareStreamOptions?.(visionModel);
+		const resolveCredential = deps.modelRegistry.resolver(visionModel, deps.sessionId);
 		const response = await instrumentedCompleteSimple(
 			visionModel,
 			{
@@ -163,9 +178,38 @@ async function describeImage(
 					},
 				],
 			},
-			{ apiKey: deps.modelRegistry.resolver(visionModel, deps.sessionId), signal },
+			{
+				...streamOptions,
+				apiKey: async context => {
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed before credentials");
+					const resolved = await resolveCredential(context);
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during credentials");
+					return resolved;
+				},
+				signal,
+				onPayload: async (payload, model, requestSignal) => {
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed before dispatch");
+					const replacement = await streamOptions?.onPayload?.(payload, model, requestSignal);
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during admission");
+					return replacement ?? payload;
+				},
+				onResponse: async (response, model, requestSignal) => {
+					if (signal?.aborted || deps.isCurrent?.() === false) return;
+					await streamOptions?.onResponse?.(response, model, requestSignal);
+				},
+				onSseEvent: (event, model) => {
+					if (!signal?.aborted && deps.isCurrent?.() !== false) streamOptions?.onSseEvent?.(event, model);
+				},
+			},
 			{ telemetry, oneshotKind: ONESHOT_KIND, completeImpl: deps.completeImpl },
 		);
+		deps.onUsage?.(response);
+		signal?.throwIfAborted();
+		if (deps.isCurrent?.() === false) return null;
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			logger.warn("image attachment description did not complete", {
 				stopReason: response.stopReason,
@@ -195,15 +239,23 @@ export async function describeAttachedImagesForTextModel(
 	deps: DescribeAttachedImagesDeps,
 	signal?: AbortSignal,
 ): Promise<TextContent[]> {
+	signal?.throwIfAborted();
+	if (deps.isCurrent?.() === false) throw new Error("Image description owner is no longer current");
 	const localRoot = resolveLocalRoot(deps.localProtocolOptions);
 	const visionModel = resolveVisionModel(deps);
-	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId) : undefined;
+	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId, { signal }) : undefined;
+	signal?.throwIfAborted();
+	if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during credential resolution");
 	const canDescribe = Boolean(visionModel && apiKey);
 	const telemetry = resolveTelemetry(deps.telemetryConfig, deps.sessionId);
 
-	return Promise.all(
+	const results = await Promise.allSettled(
 		images.map(async (image): Promise<TextContent> => {
+			signal?.throwIfAborted();
+			if (deps.isCurrent?.() === false) throw new Error("Image description owner changed before saving attachment");
 			const localUrl = await saveImage(image, localRoot);
+			signal?.throwIfAborted();
+			if (deps.isCurrent?.() === false) throw new Error("Image description owner changed while saving attachment");
 			let description: string;
 			if (canDescribe && visionModel) {
 				description =
@@ -214,4 +266,10 @@ export async function describeAttachedImagesForTextModel(
 			return { type: "text", text: formatImageBlock(localUrl, description) };
 		}),
 	);
+	const descriptions: TextContent[] = [];
+	for (const result of results) {
+		if (result.status === "rejected") throw result.reason;
+		descriptions.push(result.value);
+	}
+	return descriptions;
 }

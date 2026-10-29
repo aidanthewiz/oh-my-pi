@@ -875,9 +875,10 @@ export interface CredentialsApi {
 	 */
 	getOAuth(provider: string): OAuthCredential | undefined;
 	/**
-	 * Set credential for a provider.
+	 * Set credential for a provider. The guard runs at mutation admission;
+	 * accepted remote writes must settle even if the caller later cancels.
 	 */
-	set(provider: string, credential: AuthCredentialEntry): Promise<void>;
+	set(provider: string, credential: AuthCredentialEntry, options?: { assertCurrent?: () => void }): Promise<void>;
 	/**
 	 * Upsert a credential into the underlying store, refresh the in-memory
 	 * snapshot, and return the redacted snapshot entries for the provider.

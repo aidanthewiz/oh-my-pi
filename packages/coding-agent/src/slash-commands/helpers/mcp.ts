@@ -498,6 +498,22 @@ async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): 
 	// un-quoting) would truncate "MaaS Slack" to "MaaS".
 	const name = rest.trim();
 	if (!name) return usage("Usage: /mcp reauth <name>", runtime);
+	const modelRegistry = runtime.session.modelRegistry;
+	const sessionId = runtime.session.sessionId;
+	const model = runtime.session.model;
+	const authStorage = modelRegistry?.authStorage;
+	const credentialPool = authStorage?.credentials;
+	const isCurrent = (): boolean =>
+		!runtime.signal?.aborted &&
+		!runtime.session.isDisposed &&
+		runtime.session.model === model &&
+		runtime.session.modelRegistry?.authStorage === authStorage &&
+		authStorage?.credentials === credentialPool &&
+		runtime.isCurrent?.() !== false &&
+		runtime.session.sessionManager === runtime.sessionManager &&
+		runtime.session.sessionId === sessionId &&
+		runtime.session.modelRegistry === modelRegistry;
+	if (!isCurrent()) return commandConsumed();
 	const found = await findMcpServerForAuth(name, runtime.cwd, runtime.mcpManager, {
 		preferManager: true,
 		// `mcp.enableProjectConfig: false` opts the project out of project-scoped
@@ -505,19 +521,33 @@ async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): 
 		// opted-out entry.
 		enableProjectConfig: cfgMcpEnableProjectConfig.get(runtime.settings),
 	});
+	if (!isCurrent()) return commandConsumed();
 	if (!found) return usage(`Server "${name}" not found. Run /mcp list to see configured servers.`, runtime);
+	if (!authStorage) return usage("MCP browser authorization requires the original session credential store.", runtime);
 
 	const emit = (text: string): void => {
-		void Promise.resolve(runtime.output(text)).catch(() => {});
+		if (isCurrent()) void Promise.resolve(runtime.output(text)).catch(() => {});
 	};
 	const run = async (): Promise<SlashCommandResult> => {
 		try {
-			await reauthorizeMcpServer(name, found, {
-				authStorage: runtime.session.modelRegistry.authStorage,
+			if (!isCurrent()) return commandConsumed();
+			const outcome = await reauthorizeMcpServer(name, found, {
+				authStorage,
 				signal: runtime.signal,
+				isCurrent,
+				mcpManager: runtime.mcpManager,
 				cwd: runtime.cwd,
-				onReauthorizing: () => emit(`Reauthorizing "${name}"… opening your browser (5 minute timeout).`),
+				onReauthorizing: () => {
+					if (runtime.allowMcpBrowserAuth !== true) {
+						throw new McpReauthRefusalError(
+							"MCP browser authorization requires explicit browser consent from this host.",
+						);
+					}
+					if (!isCurrent()) throw new MCPOAuthCancelledError();
+					emit(`Reauthorizing "${name}"… opening your browser (5 minute timeout).`);
+				},
 				onAuth: info => {
+					if (!isCurrent()) throw new MCPOAuthCancelledError();
 					openPath(info.url);
 					emit(
 						[
@@ -530,10 +560,9 @@ async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): 
 				},
 				onProgress: message => emit(message),
 			});
-			// Ask the host to pick the fresh credential up now when it keeps a
-			// live manager for this server (the ACP session manager does); RPC
-			// and print mode have none, so the guidance says what to do instead.
-			const state = await runtime.reconnectMcpServer?.(name, found.config);
+			if (!isCurrent()) return commandConsumed();
+			const state = await runtime.reconnectMcpServer?.(name, found, outcome.config);
+			if (!isCurrent()) return commandConsumed();
 			const suffix =
 				state === "connected"
 					? " Server reconnected."
@@ -555,20 +584,22 @@ async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): 
 			return usage(`Failed to reauthorize server "${name}": ${errorMessage(error)}`, runtime);
 		}
 	};
+	const runGuarded = (): Promise<SlashCommandResult> =>
+		runtime.runCancellationBarrier ? runtime.runCancellationBarrier(run) : run();
 
 	// RPC's prompt API must return immediately and keep its serialized command
 	// queue free for `abort`; a browser wait would otherwise park it for up to
 	// five minutes (same dispatch as /compact and /handoff use).
 	if (runtime.runCommandInBackground) {
 		runtime.runCommandInBackground(() =>
-			run().then(
+			runGuarded().then(
 				() => undefined,
 				() => undefined,
 			),
 		);
 		return commandConsumed();
 	}
-	return await run();
+	return await runGuarded();
 }
 
 const MCP_HELP_TEXT = [

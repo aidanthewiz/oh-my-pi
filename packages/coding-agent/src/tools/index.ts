@@ -6,7 +6,7 @@ import type {
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type { EditStore } from "@oh-my-pi/pi-natives";
-import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, TextContent, ToolChoice } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
@@ -388,6 +388,8 @@ export interface ToolSession {
 	getEvalBridgeToolNames?: () => readonly string[];
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
+	/** Candidate activity for prompt metadata; never authorizes tool execution. */
+	isToolActiveForPrompt?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Canonical map containing every registered tool exactly once. */
@@ -436,6 +438,12 @@ export interface ToolSession {
 	getActiveModelString?: () => string | undefined;
 	/** Get the current session model object (provider/api capabilities), regardless of how it was chosen. */
 	getActiveModel?: () => Model | undefined;
+	/** Owned auxiliary image requests; includes admission, usage persistence and lifecycle draining. */
+	describeAttachedImages?: (
+		images: ImageContent[],
+		signal?: AbortSignal,
+		isCurrent?: () => boolean,
+	) => Promise<TextContent[]>;
 	/** Get the effective live thinking level, including disabled reasoning. */
 	getActiveThinkingLevel?: () => ThinkingLevel | undefined;
 	/** Get the session's live per-family service tiers (undefined = none). Source of truth for subagent `tier.subagent: inherit`. */
@@ -872,6 +880,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		session.setActiveToolNames(activeToolNames);
 	} else {
 		session.isToolActive = name => activeToolNames.has(name);
+		session.isToolActiveForPrompt = name => activeToolNames.has(name);
 	}
 
 	const baseResults = await Promise.all(
@@ -958,9 +967,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		}
 	}
 	if (xdevEnabled) {
-		const finalActiveNames = new Set(tools.map(tool => tool.name));
-		if (session.setActiveToolNames) session.setActiveToolNames(finalActiveNames);
-		else session.isToolActive = name => finalActiveNames.has(name);
+		activeToolNames.clear();
+		for (const tool of tools) activeToolNames.add(tool.name);
+		if (session.setActiveToolNames) session.setActiveToolNames(activeToolNames);
 	}
 
 	return tools;

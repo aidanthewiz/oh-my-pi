@@ -393,6 +393,7 @@ export class EventController {
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
 			model_changed: async () => {
+				this.refreshIdleCompactionTimer();
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender();
 			},
@@ -2858,8 +2859,11 @@ export class EventController {
 			cacheEntry && refreshDelayMs !== undefined && cacheEntry.touchedAt + cacheEntry.ttlMs > now
 				? Math.max(0, cacheEntry.touchedAt + refreshDelayMs - IDLE_COMPACTION_CACHE_LEAD_MS - now)
 				: Math.max(60, Math.min(3600, idleSettings.idleTimeoutSeconds)) * 1000;
+		const session = this.ctx.viewSession;
+		const sessionId = session.sessionId;
 		this.#idleCompactionTimer = setTimeout(() => {
 			this.#idleCompactionTimer = undefined;
+			if (this.ctx.viewSession !== session || session.sessionId !== sessionId || session.isDisposed) return;
 			// Re-check conditions before firing. Pruning may have run between arming
 			// the timer and now, dropping usage back below the idle threshold.
 			if (this.ctx.viewSession.isStreaming) return;

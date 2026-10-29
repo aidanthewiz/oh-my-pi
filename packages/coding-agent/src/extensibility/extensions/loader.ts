@@ -55,11 +55,17 @@ import type {
 	ToolDefinition,
 	ToolInfo,
 } from "./types";
+import { deduplicateMCPToolsByName, type MCPToolOriginSource } from "../../mcp/tool-bridge";
 
 installLegacyPiSpecifierShim();
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory };
+
+/** Optional owner lifetime for factories bound into an existing session. */
+export interface ExtensionLoadOptions {
+	isActive?: () => boolean;
+}
 
 function getExtensionFactory(module: LoadedExtensionModule): ExtensionFactory | null {
 	const candidate = typeof module === "function" ? module : module.default;
@@ -190,13 +196,16 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		sourceId: string;
 	}> = [];
 
+	#providerOperations: Array<() => void> | undefined;
 	constructor(
 		public readonly pi: typeof PiCodingAgent,
 		private readonly extension: Extension,
 		private readonly runtime: IExtensionRuntime,
 		private readonly cwd: string,
 		public readonly events: EventBus,
+		private readonly isActive?: () => boolean,
 	) {
+		if (isActive) this.#providerOperations = [];
 		// Extensions destructure `pi.on` or forward API methods as callbacks, so every
 		// prototype method must keep its receiver when detached. Walk the prototype
 		// rather than listing methods: a new method is bound without touching this.
@@ -205,8 +214,23 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 			if (name === "constructor") continue;
 			const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
 			if (typeof descriptor?.value !== "function") continue;
-			Object.defineProperty(this, name, { value: descriptor.value.bind(this), writable: true, configurable: true });
+			Object.defineProperty(this, name, {
+				value: this.isActive
+					? (...args: unknown[]) => {
+							if (!this.isActive!()) throw new Error("Extension owner is no longer active");
+							return descriptor.value.apply(this, args);
+						}
+					: descriptor.value.bind(this),
+				writable: true,
+				configurable: true,
+			});
 		}
+	}
+
+	commitFactory(): void {
+		const operations = this.#providerOperations;
+		this.#providerOperations = undefined;
+		for (const operation of operations ?? []) operation();
 	}
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
@@ -216,9 +240,19 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
+		const previous = this.extension.tools.get(tool.name);
+		if (
+			previous &&
+			(tool.mcpServerName !== previous.definition.mcpServerName ||
+				tool.mcpToolName !== previous.definition.mcpToolName)
+		) {
+			const competing = deduplicateMCPToolsByName<MCPToolOriginSource>([tool, previous.definition]);
+			if (competing.length === 1 && competing[0] !== tool) return;
+		}
 		const registered = {
 			definition: tool,
 			extensionPath: this.extension.path,
+			owner: this.extension,
 			sourceInfo: extensionToolSourceInfo(tool, this.extension.resolvedPath),
 		};
 		this.extension.tools.set(tool.name, registered);
@@ -363,11 +397,19 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	registerProvider(name: string, config: ProviderConfig): void {
 		this.extension.registersProviders = true;
-		this.runtime.registerProvider(name, config, this.extension.path);
+		if (this.#providerOperations) {
+			this.#providerOperations.push(() => this.runtime.registerProvider(name, config, this.extension.path));
+		} else {
+			this.runtime.registerProvider(name, config, this.extension.path);
+		}
 	}
 
 	unregisterProvider(name: string): void {
-		this.runtime.unregisterProvider(name, this.extension.path);
+		if (this.#providerOperations) {
+			this.#providerOperations.push(() => this.runtime.unregisterProvider(name, this.extension.path));
+		} else {
+			this.runtime.unregisterProvider(name, this.extension.path);
+		}
 	}
 }
 
@@ -401,17 +443,20 @@ async function runExtensionFactory(
 	factory: ExtensionFactory,
 	api: ExtensionAPI,
 	runtime: IExtensionRuntime,
+	stagedProviders = false,
 ): Promise<void> {
-	const providerRegistrationCheckpoint = [...runtime.pendingProviderRegistrations];
+	const providerRegistrationCheckpoint = stagedProviders ? undefined : [...runtime.pendingProviderRegistrations];
 
 	try {
 		await factory(api);
 	} catch (error) {
-		runtime.pendingProviderRegistrations.splice(
-			0,
-			runtime.pendingProviderRegistrations.length,
-			...providerRegistrationCheckpoint,
-		);
+		if (providerRegistrationCheckpoint) {
+			runtime.pendingProviderRegistrations.splice(
+				0,
+				runtime.pendingProviderRegistrations.length,
+				...providerRegistrationCheckpoint,
+			);
+		}
 		throw error;
 	}
 }
@@ -444,18 +489,31 @@ async function bindExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
+	options: ExtensionLoadOptions,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const factory = imported.factory;
 	if (imported.error !== null || factory === null) {
 		return { extension: null, error: imported.error };
 	}
+	let bindingValid = true;
+	const isActive = options.isActive ? () => bindingValid && options.isActive!() : undefined;
 	try {
 		const extension = createExtension(extensionPath, imported.resolvedPath);
-		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
-		await withHostGuard(() => runExtensionFactory(factory, api, runtime));
+		extension.isActive = isActive;
+		const api = new ConcreteExtensionAPI(
+			PiCodingAgent,
+			extension,
+			runtime,
+			cwd,
+			eventBus,
+			isActive ? () => extension.isActive?.() !== false : undefined,
+		);
+		await withHostGuard(() => runExtensionFactory(factory, api, runtime, isActive !== undefined));
+		api.commitFactory();
 
 		return { extension, error: null };
 	} catch (err) {
+		bindingValid = false;
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
@@ -490,9 +548,10 @@ export async function loadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: IExtensionRuntime,
+	options: ExtensionLoadOptions = {},
 ): Promise<LoadExtensionsResult> {
 	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
-	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime);
+	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime, options);
 }
 
 /**
@@ -505,13 +564,23 @@ export async function bindPreparedExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime: IExtensionRuntime = new ExtensionRuntime(),
+	options: ExtensionLoadOptions = {},
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
 
 	for (const prepared of preparedExtensions) {
-		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
+		if (options.isActive && !options.isActive()) throw new Error("Extension owner is no longer active");
+		const { extension, error } = await bindExtension(
+			prepared.path,
+			prepared,
+			cwd,
+			resolvedEventBus,
+			runtime,
+			options,
+		);
+		if (options.isActive && !options.isActive()) throw new Error("Extension owner is no longer active");
 
 		if (error) {
 			errors.push({ path: prepared.path, error });

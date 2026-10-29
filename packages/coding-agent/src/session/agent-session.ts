@@ -106,6 +106,7 @@ import {
 	Snowflake,
 	stringProperty,
 	toError,
+	untilAborted,
 	withTimeout,
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
@@ -597,6 +598,12 @@ const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
 export const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
 /** Vision descriptions gate admission; stay under the RPC clients' 30 s request timeout. */
 const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
+/** Only fully bound session_start replay may bypass its own pending readiness. */
+const deferredExtensionLoadScope = new AsyncLocalStorage<{
+	session: AgentSession;
+	active: boolean;
+	messagesAllowed: boolean;
+}>();
 
 /** A failed preparation, not a provider failure: the ordinary input can still be restored. */
 class AgentStartPolicyChangedError extends Error {
@@ -702,6 +709,7 @@ type ScheduledAgentContinueOptions = {
 type ScheduledAgentContinueRequest = {
 	schedulerToken: number;
 	options: ScheduledAgentContinueOptions;
+	clientClaim?: { live: boolean; runId?: string };
 };
 
 type AgentContinueOutcome =
@@ -1093,6 +1101,7 @@ export class AgentSession implements SettingsScope {
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	/** In-flight vision descriptions that gate prompt admission; abort() cancels them. */
 	#imageDescriptionAbortControllers = new Set<AbortController>();
+	#imageDescriptionOperations = new Set<Promise<CustomMessage | undefined>>();
 	#queuedMessageDrainBlocked = false;
 	#modeExitDrainSuppressionDepth = 0;
 	#usagePreflightReadyForNextModelCall = false;
@@ -1148,12 +1157,41 @@ export class AgentSession implements SettingsScope {
 	 * otherwise the prompt changes on the next turn and the provider prompt cache misses.
 	 */
 	#pendingMCPDiscovery: Promise<void> | undefined;
+	/**
+	 * Startup-deferred extensions (see `startup-deferral.ts`): the loader binding
+	 * them into this session, then its in-flight run once started. Submissions and
+	 * turns await the run so the first request carries their tools and hooks.
+	 */
+	#deferredExtensionLoader:
+		| ((isCurrent: () => boolean, allowReentrantMessages: () => void) => Promise<void>)
+		| undefined;
+	#deferredExtensionLoad: Promise<void> | undefined;
+	#captureSideRequestOwner: (() => () => boolean) | undefined;
 	#activeAgentContinue: ActiveAgentContinue | undefined;
 	#agentContinueSchedulerToken = 0;
+	#agentContinueClientScope = new AsyncLocalStorage<{
+		claim: { live: boolean; runId?: string };
+		active: boolean;
+		runId?: string;
+	}>();
 
 	readonly #streamingEditGuard: StreamingEditGuard;
 	readonly #loopGuards: LoopGuards;
 	#promptInFlightCount = 0;
+	/**
+	 * Brackets owned by a client-submitted prompt (`#prompt`) only: claimed
+	 * synchronously at submission, before any dispatch preprocessing await, and
+	 * released when the dispatched turn settles. Autonomous in-flight runs —
+	 * IRC wakes (`#wakeForIrc`), idle yield injections, scheduler continuations,
+	 * agent-initiated turns, auto-continues, queued-hidden drains — raise
+	 * `#promptInFlightCount` but not this, so steer admission
+	 * (`joinActiveTurn`), the dispatch-live park, and the defer-client drain
+	 * gate can key on real client ownership: a steer must never inject into a
+	 * run whose output the client has no prompt turn for (its events would be
+	 * dropped by the ACP host).
+	 */
+	#clientPromptInFlightCount = 0;
+	#clientPromptClaims = new Set<{ live: boolean; runId?: string }>();
 	/** Dialogs open and waiting for the user's answer; while any is, the computer turn is ended. */
 	#userWaitCount = 0;
 	/** Whether the open dialogs ended a prompt's computer turn, which goes on once they settle. */
@@ -1162,6 +1200,7 @@ export class AgentSession implements SettingsScope {
 	#abortInProgress = false;
 	/** In-flight {@link abort} calls; each settles after scheduling its stranded-queue drain, which {@link waitForIdle} must observe. */
 	#abortUnwinds = new Set<Promise<void>>();
+	#abortCancellationUnwinds = new Set<Promise<void>>();
 	/** Submissions accepted by prompt()/promptCustomMessage()/sendCustomMessage() that have not
 	 *  yet dispatched a turn, queued, or bailed. Preprocessing (manual-compaction wait, slash
 	 *  commands, image normalization, vision description) runs before #promptInFlightCount is
@@ -1286,6 +1325,10 @@ export class AgentSession implements SettingsScope {
 		this.#releasePowerAssertion();
 		this.#endComputerTurn();
 		this.#flushPendingAgentEnd();
+		// The in-flight bracket drained: wake steers parked on a dispatch that
+		// settled without ever going live (setup failure, abort, disposal) —
+		// they re-check liveness and keep their content.
+		this.#wakeDispatchLiveWaiters();
 		if (this.#inFlightSettledCallbacks.length === 0) {
 			this.#drainStrandedQueuedMessages();
 			return;
@@ -1664,10 +1707,16 @@ export class AgentSession implements SettingsScope {
 	#resetInFlight(): void {
 		this.#inFlightEpoch++;
 		this.#promptInFlightCount = 0;
+		this.#clientPromptInFlightCount = 0;
+		this.#clientPromptClaims.clear();
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#endComputerTurn();
 		this.#flushPendingAgentEnd();
+		// The abort/disposal cleared every in-flight bracket: wake steers
+		// parked on a dispatch that will never go live — they re-check
+		// `#abortInProgress` and keep their content.
+		this.#wakeDispatchLiveWaiters();
 		if (this.#inFlightSettledCallbacks.length === 0) {
 			this.#drainStrandedQueuedMessages();
 			return;
@@ -2219,6 +2268,10 @@ export class AgentSession implements SettingsScope {
 			agentKind: () => this.#agentKind,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
+			steeringArrivalSignal: () => this.#steeringArrivalSignal(),
+			steeringArrivalSeq: () => this.#steeringArrivalSeq(),
+			steeringArrivalAdmitted: since => this.#steeringArrivalAdmitted(since),
+			steeringArrivalRelease: seq => this.#steeringArrivalRelease(seq),
 			queuedMessageCount: () => this.queuedMessageCount,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			model: () => this.model,
@@ -3256,9 +3309,20 @@ export class AgentSession implements SettingsScope {
 		return this.#admittedSubmissionsSettled.promise;
 	}
 
-	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
+	async #admitSubmission<T>(work: () => Promise<T>, deferReadiness = false): Promise<T> {
 		this.#admittedSubmissionCount++;
+		const generation = this.#promptGeneration;
+		const sessionGeneration = this.#sessionGeneration;
 		try {
+			if (!deferReadiness && this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
+			if (
+				this.#isDisposed ||
+				this.#abortInProgress ||
+				generation !== this.#promptGeneration ||
+				sessionGeneration !== this.#sessionGeneration
+			) {
+				throw new PromptDroppedError();
+			}
 			return await work();
 		} finally {
 			if (--this.#admittedSubmissionCount === 0 && this.#admittedSubmissionsSettled) {
@@ -3675,6 +3739,13 @@ export class AgentSession implements SettingsScope {
 			this.#agentRunId = Bun.randomUUIDv7();
 			this.#lifecycleState = { runId: this.#agentRunId, phase: "running" };
 			this.#lifecycleIsMirrored = false;
+			const scope = this.#agentContinueClientScope.getStore();
+			if (scope?.active && this.#clientPromptClaims.has(scope.claim)) {
+				scope.runId = this.#agentRunId;
+				scope.claim.live = true;
+				scope.claim.runId = this.#agentRunId;
+				this.#wakeDispatchLiveWaiters();
+			}
 		}
 		if (event.type === "agent_start" || event.type === "agent_end") {
 			this.#lifecycleRunIds.set(event, this.#agentRunId);
@@ -5039,6 +5110,11 @@ export class AgentSession implements SettingsScope {
 		request: ScheduledAgentContinueRequest,
 		coalescedSources: Set<string>,
 	): Promise<AgentContinueOutcome> {
+		const isCurrent = () =>
+			!signal.aborted &&
+			!this.#isDisposed &&
+			!this.#abortInProgress &&
+			(request.options.generation === undefined || request.options.generation === this.#promptGeneration);
 		try {
 			// During an automatic-retry saga the primary model's selector cooldown
 			// can expire while a chain-tail fallback is still mid-backoff. Restoring
@@ -5048,7 +5124,7 @@ export class AgentSession implements SettingsScope {
 			// prompt or after the saga terminates.
 			const isAutomaticRetry = request.options.source === "automatic-retry";
 			const reverted = isAutomaticRetry ? false : await this.#recovery.maybeRestoreRetryFallbackPrimary();
-			if (signal.aborted || this.#isDisposed || this.#abortInProgress) {
+			if (!isCurrent()) {
 				return { status: "skipped", reason: "post-restore-unavailable" };
 			}
 			// A cooldown-expiry revert can drop the active window below the
@@ -5058,7 +5134,7 @@ export class AgentSession implements SettingsScope {
 			// predictably oversized request to the reverted (smaller) model.
 			if (reverted) {
 				await this.#maintenance.runPrePromptCompactionIfNeeded([]);
-				if (signal.aborted || this.#isDisposed || this.#abortInProgress) {
+				if (!isCurrent()) {
 					return { status: "skipped", reason: "post-restore-unavailable" };
 				}
 			}
@@ -5067,12 +5143,26 @@ export class AgentSession implements SettingsScope {
 					return { status: "skipped", reason: "session-unavailable" };
 				}
 			}
-			if (signal.aborted || this.#isDisposed || this.#abortInProgress) {
+			if (!isCurrent()) {
 				return { status: "skipped", reason: "session-unavailable" };
 			}
 			for (;;) {
 				try {
-					await this.agent.continue(signal);
+					const claim = request.clientClaim;
+					const scope =
+						claim && this.#clientPromptClaims.has(claim)
+							? { claim, active: true, runId: undefined as string | undefined }
+							: undefined;
+					try {
+						if (scope) await this.#agentContinueClientScope.run(scope, () => this.agent.continue(signal));
+						else await this.#agentContinueClientScope.exit(() => this.agent.continue(signal));
+					} finally {
+						if (scope) {
+							scope.active = false;
+							if (scope.claim.runId === scope.runId) scope.claim.live = false;
+							this.#wakeDispatchLiveWaiters();
+						}
+					}
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -5116,9 +5206,15 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#scheduleAgentContinue(options: ScheduledAgentContinueOptions): void {
+		const scope = this.#agentContinueClientScope.getStore();
+		const clientClaim =
+			scope && scope.runId === this.#agentRunId && this.#clientPromptClaims.has(scope.claim)
+				? scope.claim
+				: undefined;
 		const request: ScheduledAgentContinueRequest = {
 			schedulerToken: ++this.#agentContinueSchedulerToken,
 			options,
+			clientClaim,
 		};
 		logger.debug("agent.continue scheduled", {
 			source: options.source,
@@ -5852,6 +5948,7 @@ export class AgentSession implements SettingsScope {
 
 	#beginSessionTransition(): Disposable {
 		this.#cacheWarmer?.cancel();
+		for (const controller of this.#imageDescriptionAbortControllers) controller.abort();
 		this.#ownedAsyncJobManager?.widgets?.invalidate();
 		if (this.#sessionTransitionDepth++ === 0) {
 			const settled = Promise.withResolvers<void>();
@@ -5860,16 +5957,20 @@ export class AgentSession implements SettingsScope {
 		}
 		return this.#sessionTransitionScope;
 	}
-	/** Keep the journal stable until accepted widget, extraction, and cache-warm usage settles. */
+	/** Keep the journal stable until accepted auxiliary requests and utility usage settle. */
 	async #drainCacheWarmerForTransition(): Promise<void> {
 		await this.#ownedAsyncJobManager?.widgets?.drain();
 		const state = getMnemopiSessionState(this);
 		const memory = state?.aliasOf ?? state;
-		if (!this.#cacheWarmer && !memory) return;
+		if (!this.#cacheWarmer && !memory && this.#imageDescriptionOperations.size === 0) return;
 		const timeout = new Error("Timed out draining utility usage before session transition");
 		try {
 			await withTimeout(
-				Promise.all([this.#cacheWarmer?.drain(), memory?.consolidate({ retain: false, sleep: false })]),
+				Promise.all([
+					this.#cacheWarmer?.drain(),
+					memory?.consolidate({ retain: false, sleep: false }),
+					Promise.allSettled(this.#imageDescriptionOperations),
+				]),
 				POST_PROMPT_DRAIN_TIMEOUT_MS,
 				timeout,
 			);
@@ -6070,6 +6171,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		for (const controller of this.#imageDescriptionAbortControllers) controller.abort();
 		if (this.#cacheWarmer) {
 			this.#cacheWarmer.cancel();
 		}
@@ -6364,6 +6466,7 @@ export class AgentSession implements SettingsScope {
 		// already durable, and close() (scheduled post-seal) still flushes and
 		// closes the writer.
 		await widgetDrain;
+		await Promise.allSettled(this.#imageDescriptionOperations);
 		this.sessionManager.seal();
 		await this.sessionManager.close();
 
@@ -7026,14 +7129,19 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.setActiveToolsByName(toolNames);
 	}
 
+	getPromptToolActivity(name: string): boolean | undefined {
+		return this.#tools.getPromptToolActivity(name);
+	}
+
 	/** Restores an exact top-level versus `xd://` tool partition. */
 	setActiveToolPresentation(
 		toolNames: string[],
 		mountedToolNames: string[],
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
+		isCurrent?: () => boolean,
 	): Promise<void> {
-		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal);
+		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal, isCurrent);
 	}
 
 	/** Restores a non-MCP presentation snapshot while retaining the current MCP selection. */
@@ -7093,7 +7201,17 @@ export class AgentSession implements SettingsScope {
 
 	/** Replaces connected MCP tools and enables them immediately. */
 	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
-		return this.#tools.refreshMCPTools(mcpTools);
+		const generation = this.#promptGeneration;
+		const sessionGeneration = this.#sessionGeneration;
+		const ownerCurrent = this.#captureSideRequestOwner?.();
+		return this.#tools.refreshMCPTools(
+			mcpTools,
+			() =>
+				!this.#isDisposed &&
+				generation === this.#promptGeneration &&
+				sessionGeneration === this.#sessionGeneration &&
+				ownerCurrent?.() !== false,
+		);
 	}
 
 	/** Makes turns wait, bounded, for in-flight MCP discovery before building their system prompt. */
@@ -7103,6 +7221,76 @@ export class AgentSession implements SettingsScope {
 		};
 		const pending = discovery.then(settled, settled);
 		this.#pendingMCPDiscovery = pending;
+	}
+
+	/** Bind startup-deferred extensions on the first {@link loadDeferredExtensions} call. */
+	setDeferredExtensionLoader(
+		load: (isCurrent: () => boolean, allowReentrantMessages: () => void) => Promise<void>,
+	): void {
+		this.#deferredExtensionLoader = load;
+	}
+
+	/** Bind SDK root/account authority to auxiliary provider requests. */
+	setSideRequestOwnerCapture(capture: () => () => boolean): void {
+		this.#captureSideRequestOwner = capture;
+	}
+
+	/** Describe answer attachments through the same admitted and journaled session boundary as prompt images. */
+	async describeAttachedImages(
+		images: ImageContent[],
+		signal?: AbortSignal,
+		isCurrent?: () => boolean,
+	): Promise<TextContent[]> {
+		const notice = await this.#buildImageDescriptionNotice(images, isCurrent, signal);
+		return Array.isArray(notice?.content)
+			? notice.content.filter((part): part is TextContent => part.type === "text")
+			: [];
+	}
+
+	/** Whether startup-deferred extensions are still unbound (loading or not yet started). */
+	get hasPendingDeferredExtensions(): boolean {
+		return this.#deferredExtensionLoader !== undefined || this.#deferredExtensionLoad !== undefined;
+	}
+
+	/**
+	 * Start binding startup-deferred extensions once. A failed load remains a
+	 * submission failure. A deferred session_start handler cannot await itself.
+	 */
+	loadDeferredExtensions(): Promise<void> {
+		const scope = deferredExtensionLoadScope.getStore();
+		if (scope?.session === this && scope.active) {
+			return scope.messagesAllowed
+				? Promise.resolve()
+				: Promise.reject(new Error("Deferred extensions cannot submit messages before binding completes"));
+		}
+		const load = this.#deferredExtensionLoader;
+		if (load) {
+			this.#deferredExtensionLoader = undefined;
+			const generation = this.#promptGeneration;
+			const sessionGeneration = this.#sessionGeneration;
+			const isCurrent = () =>
+				!this.#isDisposed && generation === this.#promptGeneration && sessionGeneration === this.#sessionGeneration;
+			const loadScope = { session: this, active: true, messagesAllowed: false };
+			const pending = Promise.resolve()
+				.then(() =>
+					deferredExtensionLoadScope.run(loadScope, () =>
+						load(isCurrent, () => {
+							if (!isCurrent()) throw new PromptDroppedError();
+							loadScope.messagesAllowed = true;
+						}),
+					),
+				)
+				.then(() => {
+					if (!isCurrent()) throw new PromptDroppedError();
+					this.#notifyCommandMetadataChanged();
+					if (this.#deferredExtensionLoad === pending) this.#deferredExtensionLoad = undefined;
+				})
+				.finally(() => {
+					loadScope.active = false;
+				});
+			this.#deferredExtensionLoad = pending;
+		}
+		return this.#deferredExtensionLoad ?? Promise.resolve();
 	}
 
 	/** Replaces host-owned RPC tools before the next model call. */
@@ -7821,16 +8009,45 @@ export class AgentSession implements SettingsScope {
 	 * let abort() cancel it. Either way the image stays saved and the notice says the
 	 * description is unavailable.
 	 */
-	async #buildImageDescriptionNotice(normalizedImages: ImageContent[]): Promise<CustomMessage | undefined> {
+	async #buildImageDescriptionNotice(
+		normalizedImages: ImageContent[],
+		admissionCurrent?: () => boolean,
+		signal?: AbortSignal,
+	): Promise<CustomMessage | undefined> {
 		const controller = new AbortController();
+		const generation = this.#promptGeneration;
+		const sessionGeneration = this.#sessionGeneration;
+		const model = this.model;
+		const ownerCurrent = this.#captureSideRequestOwner?.();
+		const isCurrent = () =>
+			!this.#isDisposed &&
+			!this.#abortInProgress &&
+			!this.isSessionTransitioning &&
+			generation === this.#promptGeneration &&
+			sessionGeneration === this.#sessionGeneration &&
+			model === this.model &&
+			ownerCurrent?.() !== false &&
+			admissionCurrent?.() !== false;
 		this.#imageDescriptionAbortControllers.add(controller);
+		const descriptionSignal = AbortSignal.any([
+			controller.signal,
+			AbortSignal.timeout(IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS),
+			...(signal ? [signal] : []),
+		]);
+		const pending = (async () => {
+			if (this.hasPendingDeferredExtensions) {
+				await untilAborted(descriptionSignal, () => this.loadDeferredExtensions());
+			}
+			descriptionSignal.throwIfAborted();
+			if (!isCurrent()) return undefined;
+			return this.#providerBoundary.buildImageDescriptionNotice(normalizedImages, descriptionSignal, isCurrent);
+		})();
+		this.#imageDescriptionOperations.add(pending);
 		try {
-			return await this.#providerBoundary.buildImageDescriptionNotice(
-				normalizedImages,
-				AbortSignal.any([controller.signal, AbortSignal.timeout(IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS)]),
-			);
+			return await pending;
 		} finally {
 			this.#imageDescriptionAbortControllers.delete(controller);
+			this.#imageDescriptionOperations.delete(pending);
 		}
 	}
 
@@ -7892,7 +8109,7 @@ export class AgentSession implements SettingsScope {
 	 * {@link PromptDroppedError} instead.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
-		return this.#admitSubmission(() => this.#prompt(text, options));
+		return this.#admitSubmission(() => this.#prompt(text, options), true);
 	}
 
 	async #prompt(text: string, options?: PromptOptions): Promise<boolean> {
@@ -7900,18 +8117,77 @@ export class AgentSession implements SettingsScope {
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
 		const submittedAt = Date.now();
-		// A manual `/compact` disconnects the agent until its cleanup re-drains
-		// preserved queues; `/handoff` commits a new history after its side request.
-		// Neither may overlap an ordinary turn. A prompt parked by `/compact`
-		// supersedes its interrupted-turn resume only if it claims the session;
-		// locally handled commands and failed dispatches release that claim.
-		const release = await this.#maintenance.waitForManualMaintenanceCleanup();
-		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
+		// Client-ownership reservation: claimed before the first await so a
+		// steer landing anywhere in dispatch preprocessing (maintenance wait,
+		// command expansion, image normalization) parks instead of being
+		// declined — before this, the claim first appeared in
+		// #promptWithMessage, past those awaits. Released when the dispatched
+		// turn settles (this bracket spans dispatch + run, matching
+		// #promptWithMessage's awaited lifetime) or on every path that never
+		// starts a turn. The epoch guard keeps an aborted prompt's finally
+		// from eating a later prompt's claim after #resetInFlight zeroed the
+		// count.
+		const claimEpoch = this.#inFlightEpoch;
+		this.#clientPromptInFlightCount++;
+		const claim: { live: boolean; runId?: string } = { live: false };
+		this.#clientPromptClaims.add(claim);
+		const promptGeneration = this.#promptGeneration;
+		const sessionGeneration = this.#sessionGeneration;
+		const imageModel = this.model;
+		const imageOwnerCurrent = options?.images?.length ? this.#captureSideRequestOwner?.() : undefined;
 		try {
-			return await this.#dispatchPrompt(text, options, submittedAt, outcome);
+			try {
+				if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
+				if (
+					this.#isDisposed ||
+					this.#abortInProgress ||
+					promptGeneration !== this.#promptGeneration ||
+					sessionGeneration !== this.#sessionGeneration ||
+					(options?.images?.length && (imageModel !== this.model || imageOwnerCurrent?.() === false))
+				)
+					throw new PromptDroppedError();
+			} catch (error) {
+				if (!options?.synthetic) this.#promptDropped?.({ text, images: options?.images });
+				throw error;
+			}
+			// A manual `/compact` disconnects the agent until its cleanup re-drains
+			// preserved queues; `/handoff` commits a new history after its side request.
+			// Neither may overlap an ordinary turn. A prompt parked by `/compact`
+			// supersedes its interrupted-turn resume only if it claims the session;
+			// locally handled commands and failed dispatches release that claim.
+			const release = await this.#maintenance.waitForManualMaintenanceCleanup();
+			if (
+				this.#isDisposed ||
+				this.#abortInProgress ||
+				promptGeneration !== this.#promptGeneration ||
+				sessionGeneration !== this.#sessionGeneration ||
+				(options?.images?.length && (imageModel !== this.model || imageOwnerCurrent?.() === false))
+			) {
+				release?.(false);
+				if (!options?.synthetic) this.#promptDropped?.({ text, images: options?.images });
+				throw new PromptDroppedError();
+			}
+			const outcome: PromptDispatchOutcome = { sessionClaimed: false };
+			if (!release) return await this.#dispatchPrompt(text, options, submittedAt, outcome, claim);
+			try {
+				return await this.#dispatchPrompt(text, options, submittedAt, outcome, claim);
+			} finally {
+				release(outcome.sessionClaimed);
+			}
 		} finally {
-			release(outcome.sessionClaimed);
+			this.#clientPromptClaims.delete(claim);
+			this.#wakeDispatchLiveWaiters();
+			if (claimEpoch === this.#inFlightEpoch) {
+				this.#clientPromptInFlightCount = Math.max(0, this.#clientPromptInFlightCount - 1);
+				// Dropped after the settle wake inside #endInFlight (this
+				// frame settles after #promptWithMessage returns): wake the
+				// parked steers again so they re-check against zero and
+				// refuse (keeping their content) instead of admitting after
+				// settle, mirroring #resetInFlight's wake.
+				if (this.#clientPromptInFlightCount === 0) {
+					this.#wakeDispatchLiveWaiters();
+				}
+			}
 		}
 	}
 
@@ -7920,6 +8196,7 @@ export class AgentSession implements SettingsScope {
 		options: PromptOptions | undefined,
 		submittedAt: number,
 		outcome: PromptDispatchOutcome,
+		clientClaim: { live: boolean; runId?: string },
 	): Promise<boolean> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		// Slash/custom-command handling below rewrites `text`; keep the original
@@ -8029,7 +8306,18 @@ export class AgentSession implements SettingsScope {
 		const eagerTaskPrelude =
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
 		const attachmentSourceNotices = this.#createAttachmentSourceNotices(options?.images, submittedAt);
+		const ownerCurrent = options?.images?.length ? this.#captureSideRequestOwner?.() : undefined;
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
+		if (
+			this.#isDisposed ||
+			this.#promptGeneration !== preflightGeneration ||
+			this.model !== activeModel ||
+			ownerCurrent?.() === false
+		) {
+			if (!options?.synthetic) this.#promptDropped?.({ text: typedText, images: options?.images });
+			if (options?.throwOnDrop) throw new PromptDroppedError();
+			return true;
+		}
 
 		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
@@ -8038,7 +8326,7 @@ export class AgentSession implements SettingsScope {
 		// Text-only model + image attachment: describe via a vision model and inject the
 		// description as a hidden companion (the image stays in the visible user message).
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, ownerCurrent)
 			: undefined;
 
 		// abort() bumps #promptGeneration and can land while normalization and the
@@ -8047,11 +8335,17 @@ export class AgentSession implements SettingsScope {
 		// would dispatch a brand-new turn as if the abort never happened. Drop the
 		// prompt here instead — same contract as #promptWithMessage's own
 		// generation-race checks further down.
-		if (this.#promptGeneration !== preflightGeneration) {
+		if (
+			this.#isDisposed ||
+			this.#promptGeneration !== preflightGeneration ||
+			this.model !== activeModel ||
+			ownerCurrent?.() === false
+		) {
 			outcome.sessionClaimed = false;
 			if (!options?.synthetic) {
 				this.#promptDropped?.({ text: typedText, images: options?.images });
 			}
+			if (options?.throwOnDrop) throw new PromptDroppedError();
 			return true;
 		}
 
@@ -8128,6 +8422,7 @@ export class AgentSession implements SettingsScope {
 		try {
 			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
+				clientClaim,
 				images: normalizedImages,
 				prependMessages:
 					preludeMessages.length > 0 ||
@@ -8153,6 +8448,8 @@ export class AgentSession implements SettingsScope {
 			// (e.g., compaction aborted, validation failed).
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
 			this.#toolChoiceQueue.removeByLabel("external-thinking");
+			// Focused-turn cancellation must release admission before this prompt returns.
+			if (observation) await Promise.all(this.#abortCancellationUnwinds);
 			// Detached: settling owned async work may outlast this prompt call.
 			void this.#finishTurnObservation(observation, turnError);
 		}
@@ -8408,6 +8705,7 @@ export class AgentSession implements SettingsScope {
 			(!this.#isDisposed || alreadyDisposing) &&
 			!signal?.aborted;
 		const cancelled = { baseXdevCatalogDelivered: false, commit: () => undefined };
+		if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
 		const pendingMCPDiscovery = this.#pendingMCPDiscovery;
 		if (pendingMCPDiscovery) {
 			const timedOut = new Error("MCP discovery still pending");
@@ -8511,6 +8809,7 @@ export class AgentSession implements SettingsScope {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
+			clientClaim?: { live: boolean; runId?: string };
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -8518,6 +8817,10 @@ export class AgentSession implements SettingsScope {
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
 		const inFlightEpoch = this.#beginInFlight();
+		// Client ownership is reserved by #prompt before dispatch preprocessing
+		// and released when its bracket settles; callers that reach this
+		// directly (auto-continue, queued-hidden drain) are autonomous and
+		// deliberately do not claim it.
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
 		const setupAbort = new AbortController();
@@ -8745,9 +9048,18 @@ export class AgentSession implements SettingsScope {
 			if (planReferenceMessage) {
 				this.#planReferenceSent = true;
 			}
+			const claimScope = options?.clientClaim
+				? { claim: options.clientClaim, active: true, runId: undefined as string | undefined }
+				: undefined;
 			try {
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, options?.onModelPrepared);
+				const prompt = () =>
+					this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, options?.onModelPrepared);
+				if (claimScope) await this.#agentContinueClientScope.run(claimScope, prompt);
+				else await this.#agentContinueClientScope.exit(prompt);
 			} finally {
+				if (claimScope) claimScope.active = false;
+				if (claimScope && claimScope.claim.runId === claimScope.runId) claimScope.claim.live = false;
+				this.#wakeDispatchLiveWaiters();
 				this.#stats.setPendingSnapshot(undefined);
 			}
 			if (!options?.skipPostPromptRecoveryWait) {
@@ -8758,6 +9070,9 @@ export class AgentSession implements SettingsScope {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#usagePreflightReadyForNextModelCall = false;
+			// Client ownership is released by #prompt's bracket, which settles
+			// after this frame returns; its wake re-checks parked steers
+			// against zero.
 			this.#endInFlight(inFlightEpoch);
 			if (this.#promptSetupAbortController === setupAbort) this.#promptSetupAbortController = undefined;
 		}
@@ -8978,14 +9293,26 @@ export class AgentSession implements SettingsScope {
 		// #queueUserMessage (which clears advisor auto-resume suppression and
 		// enqueues as a user-role message) and place the developer message
 		// directly on the follow-up queue.
+		const generation = this.#promptGeneration;
+		const sessionGeneration = this.#sessionGeneration;
+		const model = this.model;
+		const ownerCurrent = images?.length ? this.#captureSideRequestOwner?.() : undefined;
+		const isCurrent = () =>
+			!this.#isDisposed &&
+			generation === this.#promptGeneration &&
+			sessionGeneration === this.#sessionGeneration &&
+			model === this.model &&
+			ownerCurrent?.() !== false;
 		const normalizedImages = await this.#normalizeImagesForModel(images);
+		if (!isCurrent()) return;
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
 			content.push(...normalizedImages);
 		}
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, isCurrent)
 			: undefined;
+		if (!isCurrent()) return;
 		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		this.agent.followUp({
@@ -8999,6 +9326,108 @@ export class AgentSession implements SettingsScope {
 			synthetic: true,
 		});
 		this.#scheduleIdleQueueDrain();
+	}
+
+	/**
+	 * Atomically enqueue a user-authored message onto the steering or follow-up
+	 * queue of the currently running turn. The primitive behind the ACP
+	 * `_session/steering` extension method (`packages/coding-agent/src/modes/acp/acp-agent.ts`).
+	 *
+	 * The busy-check is not a TOCTOU snapshot: the message is admitted through
+	 * `#queueUserMessage`, which — for this admission — re-checks liveness after
+	 * its awaits (image normalization / vision description) and never schedules
+	 * the idle queue drain, so:
+	 *
+	 * - a run that settled mid-admission classifies as `false` (not admitted)
+	 *   and the caller keeps its content — no invisible autonomous continuation
+	 *   can claim it;
+	 * - a run that stays live owns delivery: its agent loop polls the steering
+	 *   queue at tool-batch and model-call boundaries.
+	 *
+	 * Everything else that enqueues user input (`prompt()`, `steer()`,
+	 * `followUp()`, the idle paths) schedules the idle drain as before; only
+	 * this admission does not, because it only ever targets a live run.
+	 *
+	 * @returns `true` when the message was admitted onto the live run's queue;
+	 *   `false` when no run was live at (or survived) admission.
+	 */
+	async joinActiveTurn(
+		text: string,
+		images?: ImageContent[],
+		options?: { queue?: "steering" | "followUp"; isCurrent?: () => boolean },
+	): Promise<boolean> {
+		if (options?.isCurrent?.() === false) return false;
+		// Liveness first: an idle session hands the content back
+		// (`promptRequired` at the ACP bridge) without validating it — the
+		// host resubmits through session/prompt, the only path that can
+		// execute an extension slash command anyway. `#abortInProgress` is
+		// set synchronously at abort() entry, before its first await, so this
+		// read is race-free against a concurrent cancel; a steer admitted
+		// during the abort window would land in the post-abort
+		// stranded-message drain, whose continuation has no owner on the
+		// client side (the ACP promptTurn has already settled and
+		// unsubscribed) — refuse instead so the caller keeps its content.
+		if (this.#abortInProgress) return false;
+		// A client-owned prompt must own the run: `#clientPromptInFlightCount`
+		// is raised by `#prompt` (the session.prompt — ACP session/prompt —
+		// path) synchronously at submission, before any dispatch
+		// preprocessing (commands, normalization, vision description), and
+		// held across setup and the live run. Autonomous in-flight brackets
+		// (IRC wakes, idle yield injections, scheduler continuations,
+		// agent-initiated turns, auto-continues, queued-hidden drains) raise
+		// the general `#promptInFlightCount` but never this one: their output
+		// has no client forwarder (`#handlePromptEvent` drops events with no
+		// promptTurn), so a steer admitted into one would answer invisibly
+		// and be reported `injected`. Refuse instead — the host keeps its
+		// content and resubmits through session/prompt.
+		let claim: { live: boolean; runId?: string } | undefined;
+		for (const candidate of this.#clientPromptClaims) {
+			claim ??= candidate;
+			if (candidate.live && candidate.runId === this.#agentRunId) {
+				claim = candidate;
+				break;
+			}
+		}
+		if (!claim) return false;
+		if (text.startsWith("/")) {
+			this.#throwIfExtensionCommand(text);
+		}
+		// Park-until-live: a steer that lands while the owning prompt is
+		// still dispatching (setup awaits; `agent.state.isStreaming` not
+		// yet raised) cannot inject mid-dispatch, and refusing it back to
+		// the host loses it — agent-shell answers `promptRequired` while
+		// busy by interrupting the very turn the steer targeted. Hold it
+		// until the owning prompt goes live, then admit: the steer injects
+		// at the first batch boundary of the run it was meant for, and the
+		// ACP bridge answers `injected`.
+		if (!claim.live) {
+			for (;;) {
+				await this.#waitForPromptDispatchLive();
+				// The owning prompt settled without going live (setup
+				// failure, abort, disposal) or an abort took the window:
+				// keep the caller's content instead of injecting into a
+				// dead run.
+				if (this.#abortInProgress || !this.#clientPromptClaims.has(claim) || options?.isCurrent?.() === false)
+					return false;
+				if (claim.live && this.agent.state.isStreaming) break;
+				// The client prompt is still dispatching behind an
+				// autonomous run (e.g. an IRC wake its busy-retry is
+				// waiting out) that has since ended: keep parking — only
+				// the client run's own claim (the dispatch-live wake)
+				// admits, never an autonomous run's streaming.
+			}
+		}
+		const mode = options?.queue === "followUp" ? "followUp" : "steer";
+		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		return await this.#queueUserMessage(expandedText, images, mode, {
+			timestamp: Date.now(),
+			rawText: text,
+			requireActiveRun: true,
+			clientClaim: claim,
+			isOwnerCurrent: options?.isCurrent,
+			promptGeneration: this.#promptGeneration,
+			skipIdleDrain: true,
+		});
 	}
 
 	/**
@@ -9055,6 +9484,24 @@ export class AgentSession implements SettingsScope {
 			/** Called synchronously once the message is pushed onto its queue. See {@link PromptOptions.onPromptAdmitted}. */
 			onPromptAdmitted?: () => void;
 			/**
+			 * `joinActiveTurn` admission: the caller treats "not admitted" as "keep
+			 * your content". A run that settled while normalization/vision
+			 * description was in flight must not strand a late message on an idle
+			 * queue (the idle drain is skipped via `skipIdleDrain`), so classify
+			 * as not-admitted instead. Synchronous from this check to the enqueue —
+			 * no interleaving drain can race it.
+			 */
+			requireActiveRun?: boolean;
+			clientClaim?: { live: boolean; runId?: string };
+			isOwnerCurrent?: () => boolean;
+			/**
+			 * `joinActiveTurn` admission: never schedule the idle queue drain —
+			 * the live run owns delivery (its loop polls the steering queue at
+			 * batch/model-call boundaries), and a message admitted while no run
+			 * streams must not auto-continue as an autonomous turn.
+			 */
+			skipIdleDrain?: boolean;
+			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
 			 * history rewrite) bumps it; if that lands while images are being prepared, the
 			 * message is not queued, matching prompt()'s idle drop.
@@ -9072,6 +9519,24 @@ export class AgentSession implements SettingsScope {
 		// description was in flight and drop a record that would otherwise land in a
 		// different session's queue.
 		const sessionGeneration = this.#sessionGeneration;
+		const promptGeneration = this.#promptGeneration;
+		const model = this.model;
+		const clientRunId = options?.clientClaim?.runId;
+		const ownerCurrent = images?.length ? this.#captureSideRequestOwner?.() : undefined;
+		// Text asides belong to the session; image work also belongs to its admitting turn.
+		const isCurrent = () =>
+			!this.#isDisposed &&
+			sessionGeneration === this.#sessionGeneration &&
+			((mode === "aside" && !images?.length) || promptGeneration === this.#promptGeneration) &&
+			options?.isOwnerCurrent?.() !== false &&
+			ownerCurrent?.() !== false &&
+			model === this.model &&
+			(options?.promptGeneration === undefined || options.promptGeneration === this.#promptGeneration) &&
+			(!options?.clientClaim ||
+				(options.clientClaim.live &&
+					options.clientClaim.runId === this.#agentRunId &&
+					clientRunId === this.#agentRunId &&
+					this.#clientPromptClaims.has(options.clientClaim)));
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed. An aside is non-interrupting by design — it must
@@ -9085,6 +9550,8 @@ export class AgentSession implements SettingsScope {
 		// vision-model request for the same attachment.
 		const attachmentSourceNotices = this.#createAttachmentSourceNotices(images, timestamp ?? Date.now());
 		const normalizedImages = preprocessed ? preprocessed.images : await this.#normalizeImagesForModel(images);
+		if (mode === "aside" && (await this.#sessionGenerationChanged(sessionGeneration))) return false;
+		if (!isCurrent()) return false;
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (normalizedImages?.length) {
 			content.push(...normalizedImages);
@@ -9094,9 +9561,31 @@ export class AgentSession implements SettingsScope {
 		const imageDescriptionNotice = preprocessed
 			? preprocessed.descriptionNotice
 			: normalizedImages?.length
-				? await this.#buildImageDescriptionNotice(normalizedImages)
+				? await this.#buildImageDescriptionNotice(normalizedImages, isCurrent)
 				: undefined;
+		if (!isCurrent()) return false;
 		if (options?.promptGeneration !== undefined && this.#promptGeneration !== options.promptGeneration) {
+			return false;
+		}
+		// `joinActiveTurn` admission: after every await above, the run that was
+		// live at call time may have settled — or `abort()` may have started
+		// (its `#abortInProgress` flag is raised synchronously at entry, while
+		// `isStreaming` can stay true until cleanup drains) — or, with
+		// `requireActiveRun`, the CLIENT turn that admitted this steer may
+		// have settled during the preprocessing awaits while an autonomous
+		// wake (IRC, scheduler) took over `isStreaming`. Classify either as
+		// not-admitted so the caller (the ACP bridge) keeps its content for the
+		// host; the enqueue below is synchronous, so nothing interleaves
+		// between this check and the message landing on the queue.
+		if (
+			options?.requireActiveRun &&
+			(this.#abortInProgress ||
+				!this.agent.state.isStreaming ||
+				!options.clientClaim?.live ||
+				options.clientClaim.runId !== this.#agentRunId ||
+				clientRunId !== this.#agentRunId ||
+				!this.#clientPromptClaims.has(options.clientClaim))
+		) {
 			return false;
 		}
 		if (mode === "aside") {
@@ -9144,10 +9633,147 @@ export class AgentSession implements SettingsScope {
 			};
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			this.agent.steer(userMessage);
+			// Wake any listener parked on steering arrival (the ACP permission
+			// gate): the message is on the queue now, so its wait ends even
+			// though the streaming boundary poll has not run yet. The whole
+			// admitted group rides along so the gate promotes exactly these
+			// messages — never an agent-authored steer that happened to be
+			// enqueued in the same window without firing the signal.
+			this.#fireSteeringArrival([
+				...prependMessages,
+				...attachmentSourceNotices,
+				...(imageDescriptionNotice ? [imageDescriptionNotice] : []),
+				userMessage,
+			]);
 		}
 		options?.onPromptAdmitted?.();
-		this.#scheduleIdleQueueDrain();
+		// joinActiveTurn admission must never start an autonomous turn: the
+		// live run owns delivery, and an idle queue stays put until the host
+		// decides what to do with its content.
+		if (!options?.skipIdleDrain) {
+			this.#scheduleIdleQueueDrain();
+		}
 		return true;
+	}
+
+	/**
+	 * Resolvers parked on reserved-but-dispatching client prompts going live
+	 * (or settling without streaming): `joinActiveTurn` parks a mid-dispatch
+	 * steer here instead of refusing it, so the steer injects at the owning
+	 * run's first batch boundary. Fired from the client prompt's own
+	 * `agent.prompt` claim (the `onClaimed` hook in
+	 * `#promptAgentWithIdleRetry` — an autonomous run's streaming never
+	 * fires it), and from `#endInFlight`/`#resetInFlight` when the count
+	 * drains without the client run ever going live (setup failure, abort,
+	 * disposal).
+	 */
+	#dispatchLiveWaiters = new Set<() => void>();
+
+	/**
+	 * Park until the dispatching CLIENT prompt goes live or settles. No-op
+	 * when no client prompt is in flight — an autonomous run streaming in
+	 * the meantime is not a go-live for a parked steer and must not un-park
+	 * it (`joinActiveTurn`'s loop decides admission from the client claim
+	 * wake alone).
+	 */
+	async #waitForPromptDispatchLive(): Promise<void> {
+		if (this.#clientPromptInFlightCount === 0) return;
+		const gate = Promise.withResolvers<void>();
+		const wake = (): void => {
+			this.#dispatchLiveWaiters.delete(wake);
+			gate.resolve();
+		};
+		this.#dispatchLiveWaiters.add(wake);
+		// Double-checked after registration: the client prompt may have
+		// settled between the caller's reads and this registration.
+		if (this.#clientPromptInFlightCount === 0) wake();
+		else await gate.promise;
+	}
+
+	/** Resolve every parked dispatch-live waiter (streaming rose, or drained). */
+	#wakeDispatchLiveWaiters(): void {
+		for (const wake of this.#dispatchLiveWaiters) wake();
+		this.#dispatchLiveWaiters.clear();
+	}
+
+	/**
+	 * Aborted (and replaced) once per user steering-message arrival. The ACP
+	 * permission gate (`SessionTools.#wrapToolForAcpPermission`) races a wait
+	 * on this signal against its elicit, so a steer sent while a permission
+	 * dialog is open ends the wait: the elicit is superseded, its tool call
+	 * throws, and the queued message is injected at the next batch boundary
+	 * instead of sitting behind the dialog until the user answers. A fire while
+	 * no listener is parked is a no-op (the fresh controller replaces the old).
+	 */
+	#steeringArrivalController = new AbortController();
+
+	/**
+	 * User-message groups admitted by steering arrivals, in admission order,
+	 * each tagged with its arrival's sequence number, not yet consumed by a
+	 * permission gate. A single latest-slot would let a second concurrent
+	 * admission (both landing while one dialog is open, before the gate's
+	 * abort wake runs) shadow the first group: the gate would promote only
+	 * the second and reorder the two steers. The sequence tags let the gate
+	 * drain exactly the arrivals fired after it parked (its park snapshot
+	 * from `#steeringArrivalSeq`), first post-dialog admission first, while
+	 * a steer that fired before the dialog opened keeps its natural queue
+	 * position instead of riding the promotion.
+	 */
+	#steeringArrivalPendingGroups: { seq: number; group: readonly AgentMessage[] }[] = [];
+	/** Monotonic count of steering arrivals fired so far; see the field above. */
+	#steeringArrivalFireCount = 0;
+	/** Reference-counted permission windows retain arrivals until every dialog releases them. */
+	#steeringArrivalParkSnapshots = new Map<number, number>();
+
+	/** Current {@link #steeringArrivalController} signal; see that field. */
+	#steeringArrivalSignal(): AbortSignal {
+		return this.#steeringArrivalController.signal;
+	}
+
+	/** Snapshot of {@link #steeringArrivalFireCount} for a parking listener's window. */
+	#steeringArrivalSeq(): number {
+		const seq = this.#steeringArrivalFireCount;
+		this.#steeringArrivalParkSnapshots.set(seq, (this.#steeringArrivalParkSnapshots.get(seq) ?? 0) + 1);
+		return seq;
+	}
+
+	/** Release exactly one permission window, including windows sharing a sequence. */
+	#steeringArrivalRelease(seq: number): void {
+		const count = this.#steeringArrivalParkSnapshots.get(seq) ?? 0;
+		if (count > 1) this.#steeringArrivalParkSnapshots.set(seq, count - 1);
+		else this.#steeringArrivalParkSnapshots.delete(seq);
+		if (this.#steeringArrivalParkSnapshots.size === 0) this.#steeringArrivalPendingGroups.length = 0;
+	}
+
+	/** Read a dialog's arrivals without consuming another parallel dialog's evidence. */
+	#steeringArrivalAdmitted(since?: number): readonly AgentMessage[] | undefined {
+		const boundary = since ?? 0;
+		const pending = this.#steeringArrivalPendingGroups;
+		const inWindow = pending.filter(entry => entry.seq > boundary).map(entry => entry.group);
+		return inWindow.length > 0 ? inWindow.flat() : undefined;
+	}
+
+	/** Record an admitted steering group and arm the next arrival signal. */
+	#fireSteeringArrival(admitted: readonly AgentMessage[]): void {
+		const previous = this.#steeringArrivalController;
+		// Prune inert history before recording: only a gate whose snapshot
+		// precedes an arrival can promote it, so with no live gate every
+		// prior entry is inert, and with live gates everything at or below
+		// the oldest live snapshot is inert for all of them. Without this,
+		// a session that steers often but rarely opens a dialog retains one
+		// group per steer for its lifetime.
+		if (this.#steeringArrivalParkSnapshots.size === 0) {
+			this.#steeringArrivalPendingGroups.length = 0;
+		} else {
+			let oldest = Infinity;
+			for (const snapshot of this.#steeringArrivalParkSnapshots.keys()) {
+				if (snapshot < oldest) oldest = snapshot;
+			}
+			this.#steeringArrivalPendingGroups = this.#steeringArrivalPendingGroups.filter(entry => entry.seq > oldest);
+		}
+		this.#steeringArrivalPendingGroups.push({ seq: ++this.#steeringArrivalFireCount, group: admitted });
+		this.#steeringArrivalController = new AbortController();
+		previous.abort();
 	}
 
 	#scheduleIdleQueueDrain(): void {
@@ -9189,8 +9815,27 @@ export class AgentSession implements SettingsScope {
 	 * Gate for idle-path queued-message auto-continue (see `#scheduleQueuedMessageDrain`).
 	 */
 	#canAutoContinueForFollowUp(): boolean {
-		if (this.isStreaming) return false;
 		if (this.isRetrying) return false;
+		// An ACP client that defers agent-initiated turns owns turn
+		// lifecycle, and a queued steer/follow-up may only resume while a
+		// CLIENT prompt owns the turn: `#clientPromptInFlightCount` covers
+		// exactly `#promptWithMessage` brackets, so a drain scheduled inside
+		// that bracket continues under the owning prompt — the client sees
+		// and can cancel it. Autonomous brackets (IRC wakes, idle injections,
+		// scheduler continuations) do not count: a drain there would be an
+		// autonomous run the client can neither see nor cancel. Explicit
+		// agent-initiated deliveries re-enable the drain via
+		// #allowAcpAgentInitiatedTurns. Inside a client bracket the ordinary
+		// gates below still apply (not streaming, user-interrupt suppression,
+		// provider-valid tail for follow-up-only resumes).
+		if (
+			this.#clientBridge?.deferAgentInitiatedTurns === true &&
+			!this.#allowAcpAgentInitiatedTurns &&
+			this.#clientPromptInFlightCount === 0
+		) {
+			return false;
+		}
+		if (this.isStreaming) return false;
 		// A queued steer resumes from ANY tail: Agent.continue() runs #runLoop(undefined),
 		// whose initial steering poll injects the steer before the first provider call, so the
 		// request tail becomes the steer (valid) regardless of any injected custom / bashExecution
@@ -9328,7 +9973,12 @@ export class AgentSession implements SettingsScope {
 				this.#resetPromptMaintenanceState();
 			}
 			this.#recovery.setAcceptTerminalEmptyStop(acceptTerminalEmptyStop);
-			await this.agent.prompt(message);
+			const run = this.agent.prompt(message);
+			// No dispatch-live wake here: an agent-initiated turn has no
+			// client promptTurn, so steers parked on a dispatching CLIENT
+			// prompt must keep parking through it — waking on this claim
+			// would admit them into a run whose output the client drops.
+			await run;
 			await this.#waitForPostPromptRecovery();
 			return true;
 		} finally {
@@ -10497,6 +11147,7 @@ export class AgentSession implements SettingsScope {
 		this.#cacheWarmer?.cancel();
 		const unwind = Promise.withResolvers<void>();
 		this.#abortUnwinds.add(unwind.promise);
+		this.#abortCancellationUnwinds.add(unwind.promise);
 		try {
 			this.#titleGenerationRequest++;
 			this.#titleGenerationInFlightFor = undefined;
@@ -10548,7 +11199,6 @@ export class AgentSession implements SettingsScope {
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
 			await manualCompactionCleanup;
 			await this.#drainAutolearnCapture();
-			await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
 			// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 			// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 			// a subsequent prompt() can incorrectly observe the session as busy after an abort.
@@ -10575,9 +11225,17 @@ export class AgentSession implements SettingsScope {
 			for (const card of [...strandedAdvisorCards, ...parkedAdvisorCards]) {
 				this.#preserveAdvisorCard(card);
 			}
+			await this.#goalRuntime.onTaskAborted({
+				reason: options?.goalReason ?? "interrupted",
+				onAccountingSettled: () => {
+					this.#abortCancellationUnwinds.delete(unwind.promise);
+					this.#abortInProgress = this.#abortCancellationUnwinds.size > 0;
+				},
+			});
 		} finally {
 			this.#abortUnwinds.delete(unwind.promise);
-			this.#abortInProgress = this.#abortUnwinds.size > 0;
+			this.#abortCancellationUnwinds.delete(unwind.promise);
+			this.#abortInProgress = this.#abortCancellationUnwinds.size > 0;
 			this.#drainStrandedQueuedMessages();
 			unwind.resolve();
 		}

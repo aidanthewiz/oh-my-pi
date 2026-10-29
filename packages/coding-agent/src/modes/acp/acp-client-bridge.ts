@@ -140,54 +140,27 @@ async function requestPermission(
 		toolCall: update,
 		options: acpOptions,
 	};
-	if (signal?.aborted) {
+	if (signal?.aborted || steeringSignal?.aborted) {
 		return { outcome: "cancelled" };
 	}
-	// A steer queued while the dialog is open supersedes it: cancel the pending
-	// wire request (`$/cancel_request`) so the client is not left with a live
-	// dialog for a tool call the loop has already reported as cancelled.
+	// Steering admission belongs to the session; either admitted steering or
+	// host cancellation must also terminate the client's permission dialog.
 	const { promise, cancel } = connection.requestPermissionWithCancel(request);
-	if (!steeringSignal) {
-		const response = await promise;
-		return permissionOutcomeFromResponse(response, options);
-	}
-	if (steeringSignal.aborted) {
-		cancel();
-		// `cancel()` rejects the wire promise (RequestError.requestCancelled)
-		// that nothing else will observe on this early-exit path; keep it
-		// handled so the rejection cannot take down the process.
-		void promise.catch(() => undefined);
-		return { outcome: "cancelled" };
-	}
-	const steered = Promise.withResolvers<void>();
-	const onSteer = () => {
-		cancel();
-		steered.resolve();
-	};
-	steeringSignal.addEventListener("abort", onSteer, { once: true });
+	signal?.addEventListener("abort", cancel, { once: true });
+	steeringSignal?.addEventListener("abort", cancel, { once: true });
 	try {
-		const winner = await Promise.race([
-			promise.then(
-				response => ({ kind: "response" as const, response }),
-				error =>
-					// `cancel()` rejects the wire promise with
-					// request-cancelled; that rejection is the steer
-					// superseding the dialog, not a transport failure.
-					error instanceof RequestError && error.code === -32800
-						? { kind: "steered" as const }
-						: { kind: "error" as const, error },
-			),
-			steered.promise.then(() => ({ kind: "steered" as const })),
-		]);
-		if (winner.kind === "steered") {
+		if (signal?.aborted || steeringSignal?.aborted) cancel();
+		const response = await promise;
+		if (signal?.aborted || steeringSignal?.aborted) return { outcome: "cancelled" };
+		return permissionOutcomeFromResponse(response, options);
+	} catch (error) {
+		if (signal?.aborted || steeringSignal?.aborted || (error instanceof RequestError && error.code === -32800)) {
 			return { outcome: "cancelled" };
 		}
-		if (winner.kind === "error") {
-			throw winner.error;
-		}
-		return permissionOutcomeFromResponse(winner.response, options);
+		throw error;
 	} finally {
-		steeringSignal.removeEventListener("abort", onSteer);
+		signal?.removeEventListener("abort", cancel);
+		steeringSignal?.removeEventListener("abort", cancel);
 	}
 }
 

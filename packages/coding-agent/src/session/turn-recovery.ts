@@ -3152,7 +3152,11 @@ export class TurnRecovery {
 		onClaimed?: () => void,
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
+		const generation = this.#host.promptGeneration();
 		for (;;) {
+			if (this.#host.isDisposed() || this.#host.abortInProgress() || generation !== this.#host.promptGeneration()) {
+				throw new DOMException("Prompt admission superseded", "AbortError");
+			}
 			if (onModelPrepared && this.#host.agent.state.isStreaming) {
 				await this.#host.agent.waitForIdle();
 				continue;
@@ -3316,13 +3320,14 @@ export class TurnRecovery {
 	 */
 	async retry(): Promise<boolean> {
 		if (this.#host.isStreaming() || this.#host.isCompacting() || this.isRetrying) return false;
+		const generation = this.#host.promptGeneration();
 
 		const messages = this.#withoutPassiveStopResults(this.#host.agent.state.messages);
 		const activeTurnEnd = retryableAssistantTurnEnd(messages);
 		if (activeTurnEnd !== undefined) {
 			const replayStart = toolReplayStart(messages);
 			if (replayStart !== undefined) {
-				await this.#stripForToolReplay(messages, replayStart);
+				if (!(await this.#stripForToolReplay(messages, replayStart, generation))) return false;
 			} else {
 				// Remove the failed/aborted assistant message plus its synthetic tool
 				// results (same as auto-retry does before re-attempting), keeping the
@@ -3344,14 +3349,16 @@ export class TurnRecovery {
 			// The boundary is already gone from active context; when the intact
 			// failed batch is still the tail, replay the tools directly.
 			const replayStart = toolReplayStart(messages);
-			if (replayStart !== undefined) await this.#stripForToolReplay(messages, replayStart);
+			if (replayStart !== undefined && !(await this.#stripForToolReplay(messages, replayStart, generation)))
+				return false;
 		}
+		if (generation !== this.#host.promptGeneration()) return false;
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
 
 		// Re-attempt the turn
-		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1 });
+		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1, generation });
 
 		return true;
 	}
@@ -3362,7 +3369,11 @@ export class TurnRecovery {
 	 * on replay — then cut the active context to the same point. Trailing eval
 	 * snapshots go too: none may sit between the calls and their re-run results.
 	 */
-	async #stripForToolReplay(messages: readonly AgentMessage[], replayStart: number): Promise<void> {
+	async #stripForToolReplay(
+		messages: readonly AgentMessage[],
+		replayStart: number,
+		generation: number,
+	): Promise<boolean> {
 		const tail = messages[conversationEnd(messages) - 1];
 		if (tail?.role === "assistant") {
 			try {
@@ -3373,6 +3384,7 @@ export class TurnRecovery {
 				});
 			}
 		}
+		if (generation !== this.#host.promptGeneration()) return false;
 		const anchor = messages[replayStart - 1] as AssistantMessage;
 		const branch = this.#host.sessionManager.getBranchView();
 		const persistedEntryId = this.#host.persistedAssistantEntryId(anchor);
@@ -3395,5 +3407,6 @@ export class TurnRecovery {
 			});
 		}
 		this.#host.agent.replaceMessages(messages.slice(0, replayStart));
+		return true;
 	}
 }

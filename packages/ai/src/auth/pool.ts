@@ -566,11 +566,23 @@ export class CredentialPool implements CredentialsApi {
 	/**
 	 * Set credential for a provider.
 	 */
-	async set(provider: string, credential: AuthCredentialEntry): Promise<void> {
+	async set(
+		provider: string,
+		credential: AuthCredentialEntry,
+		options?: { assertCurrent?: () => void },
+	): Promise<void> {
+		if (this.#closed) throw new DOMException("Credential storage is closed", "AbortError");
+		options?.assertCurrent?.();
+		const store = this.#store;
 		const normalized = Array.isArray(credential) ? credential : [credential];
 		const deduped = this.dedupe(provider, normalized);
 		this.#options.policies.validateFor(provider, deduped);
-		const stored = await this.#store.replaceAuthCredentials(provider, deduped);
+		options?.assertCurrent?.();
+		if (this.#closed || this.#store !== store)
+			throw new DOMException("Credential storage owner changed before mutation", "AbortError");
+		const stored = await store.replaceAuthCredentials(provider, deduped);
+		if (this.#closed || this.#store !== store)
+			throw new DOMException("Credential storage owner changed after accepted mutation", "AbortError");
 		this.replace(
 			provider,
 			stored.map(record => ({

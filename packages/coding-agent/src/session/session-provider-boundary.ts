@@ -297,9 +297,16 @@ export class SessionProviderBoundary {
 	async buildImageDescriptionNotice(
 		normalizedImages: ImageContent[],
 		signal?: AbortSignal,
+		isCurrent?: () => boolean,
 	): Promise<CustomMessage | undefined> {
 		const model = this.#host.model();
 		if (!shouldDescribeImagesForTextModel(model, this.#host.settings)) return undefined;
+		const sessionId = this.#host.sessionId();
+		const usageOwner = {
+			sessionId: this.#host.sessionManager.getSessionId(),
+			parentId: this.#host.sessionManager.getLeafId(),
+		};
+		const providerSessionId = this.#host.agent.sessionId ?? sessionId;
 
 		let blocks: TextContent[];
 		try {
@@ -312,7 +319,21 @@ export class SessionProviderBoundary {
 					localProtocolOptions: this.#host.localProtocolOptions(),
 					activeModelString: formatModelString(model),
 					telemetryConfig: this.#host.agent.telemetry,
-					sessionId: this.#host.sessionId(),
+					sessionId: providerSessionId,
+					isCurrent,
+					prepareStreamOptions: visionModel => this.prepareSimpleStreamOptions({ signal }, visionModel.provider),
+					onUsage: message =>
+						this.#host.sessionManager.appendModelUsage(
+							{
+								purpose: "image-attachment-describe",
+								api: message.api,
+								provider: message.provider,
+								model: message.model,
+								usage: message.usage,
+								stopReason: message.stopReason,
+							},
+							usageOwner,
+						),
 				},
 				signal,
 			);

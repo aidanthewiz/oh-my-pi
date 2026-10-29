@@ -38,11 +38,10 @@ import {
 import { shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
 import { ToolAbortError } from "./tool-errors";
 
-import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { cfgAskNotify, askTimeoutMs } from "../modes/settings";
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
-import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
+import { shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
 
 // =============================================================================
 // Types
@@ -602,32 +601,26 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	async #answerImageBlocks(
 		images: ImageContent[],
 		signal: AbortSignal | undefined,
+		isCurrent: () => boolean,
 	): Promise<Array<TextContent | ImageContent>> {
 		if (images.length === 0) return [];
+		signal?.throwIfAborted();
+		if (!isCurrent()) throw new ToolAbortError("Ask image answer owner changed");
 		let descriptions: TextContent[] | undefined;
 		const model = this.session.getActiveModel?.();
-		const modelRegistry = this.session.modelRegistry;
-		if (modelRegistry && shouldDescribeImagesForTextModel(model, this.session.settings)) {
+		const describe = this.session.describeAttachedImages;
+		if (shouldDescribeImagesForTextModel(model, this.session.settings)) {
+			if (!describe) throw new ToolAbortError("Owned image description is unavailable for this session");
 			try {
-				descriptions = await describeAttachedImagesForTextModel(
-					images,
-					{
-						activeModel: model,
-						modelRegistry,
-						settings: this.session.settings,
-						localProtocolOptions: sessionLocalProtocolOptions(this.session),
-						activeModelString: this.session.getActiveModelString?.(),
-						telemetryConfig: this.session.getTelemetry?.(),
-						sessionId: this.session.getSessionId?.() ?? undefined,
-					},
-					signal,
-				);
+				descriptions = await describe(images, signal, isCurrent);
 			} catch (error) {
 				logger.warn("ask answer image description failed; image left undescribed", {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
 		}
+		signal?.throwIfAborted();
+		if (!isCurrent()) throw new ToolAbortError("Ask image answer owner changed");
 		const blocks: Array<TextContent | ImageContent> = [];
 		for (const [index, image] of images.entries()) {
 			const notice = renderAttachmentSourceNotice(image, index + 1, { askAnswer: true });
@@ -647,6 +640,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
+		const ownerCurrent = this.session.captureOwnerCurrent?.();
+		const sessionId = this.session.getSessionId?.();
+		const model = this.session.getActiveModel?.();
+		const isCurrent = () =>
+			ownerCurrent?.() !== false &&
+			this.session.isDisposed?.() !== true &&
+			sessionId === this.session.getSessionId?.() &&
+			model === this.session.getActiveModel?.();
 		// Headless fallback
 		if (!context?.hasUI || !context.ui) {
 			context?.abort();
@@ -855,12 +856,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						timedOut: result.timedOut,
 					};
 					const responseText = formatSingleQuestionResponse(result);
-					const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+					const imageBlocks = await this.#answerImageBlocks(answerImages, signal, isCurrent);
 					return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
 				}
 				const details: AskToolDetails = { results };
 				const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
-				const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+				const imageBlocks = await this.#answerImageBlocks(answerImages, signal, isCurrent);
 				return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") {

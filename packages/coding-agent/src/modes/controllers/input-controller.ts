@@ -944,12 +944,23 @@ export class InputController {
 		images?: ImageContent[],
 		imageLinks?: (string | undefined)[],
 	): Promise<{ text: string; images?: ImageContent[]; imageLinks?: (string | undefined)[] } | undefined> {
-		const result = await this.ctx.session.extensionRunner?.emitInput(text, images, "interactive");
-		if (result?.handled) return undefined;
+		const session = this.ctx.session;
+		const sessionId = session.sessionId;
+		const model = session.model;
+		const focusedAgentId = this.ctx.focusedAgentId;
+		const isCurrent = (): boolean =>
+			this.ctx.session === session &&
+			session.sessionId === sessionId &&
+			!session.isDisposed &&
+			session.model === model &&
+			this.ctx.focusedAgentId === focusedAgentId;
+		const result = await session.extensionRunner?.emitInput(text, images, "interactive");
+		if (!isCurrent() || result?.handled) return undefined;
 		if (result?.text !== undefined) text = result.text.trim();
 		if (result?.images !== undefined) {
 			images = result.images;
-			imageLinks = await materializeImageChipLinks(images, this.ctx.sessionManager);
+			imageLinks = await materializeImageChipLinks(images, session.sessionManager);
+			if (!isCurrent()) return undefined;
 		}
 		if (!text && !images?.length) return undefined;
 		return { text, images, imageLinks };
@@ -1009,17 +1020,35 @@ export class InputController {
 				return;
 			}
 
-			const runner = this.ctx.session.extensionRunner;
+			const inputSession = this.ctx.session;
+			const inputSessionId = inputSession.sessionId;
+			const inputFocusedAgentId = this.ctx.focusedAgentId;
+			const inputModel = inputSession.model;
+			const isInputCurrent = (): boolean =>
+				this.ctx.session === inputSession &&
+				inputSession.sessionId === inputSessionId &&
+				!inputSession.isDisposed &&
+				inputSession.model === inputModel &&
+				this.ctx.focusedAgentId === inputFocusedAgentId;
+			const runner = inputSession.extensionRunner;
 			let inputImages = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 			let inputImageLinks =
 				this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
 			let hasInputImages = (inputImages?.length ?? 0) > 0;
 			const submittedImages = inputImages;
 
-			// A startup-deferred extension's input hook must see the first submission.
-			if (this.ctx.session.hasPendingDeferredExtensions) await this.ctx.session.loadDeferredExtensions();
+			try {
+				await inputSession.loadDeferredExtensions();
+			} catch (error) {
+				if (!isInputCurrent()) return;
+				restoreDetachedDraft(this.ctx.editor, text);
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+				return;
+			}
+			if (!isInputCurrent()) return;
 			if (runner?.hasHandlers("input")) {
 				const input = await this.#runInputHandlers(text, inputImages, inputImageLinks);
+				if (!isInputCurrent()) return;
 				if (!input) {
 					// The handler consumed the submission. The editor text was reset
 					// before this callback ran, so anything in it now is a newer draft;
@@ -1894,17 +1923,30 @@ export class InputController {
 		// same draft, and later typing belongs to the next submission.
 		this.ctx.editor.clearDraft();
 
-		if (this.ctx.session.hasPendingDeferredExtensions) await this.ctx.session.loadDeferredExtensions();
-		if (this.ctx.session.extensionRunner?.hasHandlers("input")) {
-			try {
+		const inputSession = this.ctx.session;
+		const inputSessionId = inputSession.sessionId;
+		const inputFocusedAgentId = this.ctx.focusedAgentId;
+		const inputModel = inputSession.model;
+		const isInputCurrent = (): boolean =>
+			this.ctx.session === inputSession &&
+			inputSession.sessionId === inputSessionId &&
+			!inputSession.isDisposed &&
+			inputSession.model === inputModel &&
+			this.ctx.focusedAgentId === inputFocusedAgentId;
+		try {
+			await inputSession.loadDeferredExtensions();
+			if (!isInputCurrent()) return;
+			if (inputSession.extensionRunner?.hasHandlers("input")) {
 				const input = await this.#runInputHandlers(text, images, imageLinks);
+				if (!isInputCurrent()) return;
 				if (!input) return;
 				({ text, images, imageLinks } = input);
-			} catch (error) {
-				restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
-				this.ctx.showError(error instanceof Error ? error.message : String(error));
-				return;
 			}
+		} catch (error) {
+			if (!isInputCurrent()) return;
+			restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			return;
 		}
 
 		// Compaction first: while compacting, free text gets queued via

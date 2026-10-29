@@ -134,7 +134,6 @@ import {
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
 import type { UserWaitTracker } from "./extensibility/extensions/user-wait";
-import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { partitionStartupExtensions, recordStartupVerdicts } from "./extensibility/extensions/startup-deferral";
 import {
 	createSkillDescriptionCompressor,
@@ -1145,9 +1144,9 @@ export async function discoverSessionExtensionPaths(
  * {@link CreateAgentSessionOptions.preloadedExtensions} so the work is not
  * repeated. Keep this the single source of the discovery branch logic.
  *
- * With `deferStartupSafe`, sources whose recorded startup verdict proves they
- * register nothing needed before the first frame are left unloaded and
- * returned as `deferredPaths` for {@link CreateAgentSessionOptions.deferredExtensionPaths}.
+ * With `deferStartupSafe`, prior observed registrations provide a scheduling
+ * hint, not trust evidence. Deferred sources remain behind first-input readiness
+ * through {@link CreateAgentSessionOptions.deferredExtensionPaths}.
  */
 export async function loadSessionExtensions(
 	options: ExtensionDiscoveryOptions,
@@ -2529,6 +2528,8 @@ async function createAgentSessionScoped(
 				activeToolNames.add(name);
 			}
 		};
+		const isToolActiveForPrompt = (name: string): boolean =>
+			session?.getPromptToolActivity(name) ?? activeToolNames.has(name);
 		const captureOwnerScope = () => {
 			const credentials = modelRegistry.authStorage.credentials;
 			const sourceIdentity = modelRegistry.authStorage.sourceIdentity;
@@ -2605,6 +2606,7 @@ async function createAgentSessionScoped(
 				return sessionManager.getCwd();
 			},
 			isToolActive: name => activeToolNames.has(name),
+			isToolActiveForPrompt,
 			setActiveToolNames,
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
@@ -2719,6 +2721,10 @@ async function createAgentSessionScoped(
 			getActiveThinkingLevel: () => (session ? session.thinkingLevel : effectiveThinkingLevel),
 			getServiceTierByFamily: () => session?.serviceTierByFamily,
 			getImageAttachments: () => session?.getImageAttachments() ?? [],
+			describeAttachedImages: (images, signal, isCurrent) => {
+				if (!hasSession) return Promise.reject(new Error("Session unavailable for image description"));
+				return session.describeAttachedImages(images, signal, isCurrent);
+			},
 			getPlanModeState: () => session?.getPlanModeState(),
 			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
@@ -2796,7 +2802,7 @@ async function createAgentSessionScoped(
 		let ratchetPrelude: EvalPreludeDefinition | undefined;
 		let archivePrelude: EvalPreludeDefinition | undefined;
 		const getEvalPreludes = (): readonly EvalPreludeDefinition[] => {
-			if (restrictToolNames || !toolRegistry.has("eval") || !activeToolNames.has("eval")) return [];
+			if (restrictToolNames || !toolRegistry.has("eval") || !isToolActiveForPrompt("eval")) return [];
 			const builtins: EvalPreludeDefinition[] = [];
 			if (cfgBrowserEnabled.get(settings)) {
 				const fallbackKind =
@@ -3899,11 +3905,16 @@ async function createAgentSessionScoped(
 		initialMcpManagerTools.push(...sdkMcpTools);
 		const sdkCustomTools = [...sdkMcpTools, ...explicitCustomTools];
 		const sdkCustomToolNames = new Set(sdkCustomTools.map(tool => tool.name));
-		const allCustomTools = [
+		const allCustomTools: RegisteredTool[] = [
 			...registeredTools,
 			...sdkCustomTools.map(tool => {
 				const definition = isCustomTool(tool) ? customToolToDefinition(tool) : tool;
-				return { definition, extensionPath: "<sdk>", sourceInfo: extensionToolSourceInfo(definition, "<sdk>") };
+				return {
+					definition,
+					extensionPath: "<sdk>",
+					owner: null,
+					sourceInfo: extensionToolSourceInfo(definition, "<sdk>"),
+				};
 			}),
 		];
 		// `wrapToolWithMetaNotice` runs the centralized large-output → artifact spill.
@@ -3911,7 +3922,11 @@ async function createAgentSessionScoped(
 		// TTS, and startup (non-deferred) MCP tools all funnel through here, so apply
 		// it once at this adapter boundary (idempotent — a no-op if already wrapped).
 		const wrappedExtensionTools: Tool[] = deduplicateMCPToolsByName(
-			wrapRegisteredTools(allCustomTools, extensionRunner).map(wrapToolWithMetaNotice),
+			wrapRegisteredTools(allCustomTools, extensionRunner).map((tool, index) => {
+				const wrapped = wrapToolWithMetaNotice(tool);
+				extensionRunner.toolRegistrations.set(wrapped, allCustomTools[index]!);
+				return wrapped;
+			}),
 		);
 		const initialMcpManagerToolNames = new Set<string>();
 		for (const tool of wrappedExtensionTools) {
@@ -3965,7 +3980,13 @@ async function createAgentSessionScoped(
 		// call site, regardless of whether any user extensions are loaded. See the runner-construction
 		// comment above for the safety invariant this enforces.
 		for (const tool of toolRegistry.values()) {
-			toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner, name => toolRegistry.get(name)));
+			const wrapped = new ExtensionToolWrapper(tool, extensionRunner, name => toolRegistry.get(name));
+			const registered = extensionRunner.toolRegistrations.get(tool);
+			if (registered !== undefined) {
+				extensionRunner.toolRegistrations.set(wrapped, registered);
+				extensionRunner.toolRegistrations.delete(tool);
+			}
+			toolRegistry.set(tool.name, wrapped);
 		}
 		// Image and speech generation are optional custom tools gated by live settings.
 		// They install here, not through the custom-tools extension, so the settings
@@ -3997,12 +4018,16 @@ async function createAgentSessionScoped(
 			for (const tool of wanted) {
 				if (toolRegistry.has(tool.name)) continue;
 				const definition = customToolToDefinition(tool);
-				const [adapted] = wrapRegisteredTools(
-					[{ definition, extensionPath: "<sdk>", sourceInfo: extensionToolSourceInfo(definition, "<sdk>") }],
-					extensionRunner,
-				);
+				const registered: RegisteredTool = {
+					definition,
+					extensionPath: "<sdk>",
+					owner: null,
+					sourceInfo: extensionToolSourceInfo(definition, "<sdk>"),
+				};
+				const [adapted] = wrapRegisteredTools([registered], extensionRunner);
 				if (!adapted) continue;
 				const entry = new ExtensionToolWrapper(wrapToolWithMetaNotice(adapted), extensionRunner) as Tool;
+				extensionRunner.toolRegistrations.set(entry, registered);
 				toolRegistry.set(tool.name, entry);
 				settingsGatedCustomEntries.set(tool.name, entry);
 				added.push(entry);
@@ -4288,7 +4313,15 @@ async function createAgentSessionScoped(
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
+			mountedToolNames?: ReadonlySet<string>,
 		): Promise<BuildSystemPromptResult> => {
+			const promptXdev = toolSession.xdev
+				? {
+						...toolSession.xdev,
+						tools,
+						mountedNames: new Set(mountedToolNames ?? toolSession.xdev.mountedNames),
+					}
+				: undefined;
 			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
@@ -4384,15 +4417,11 @@ async function createAgentSessionScoped(
 			// List each mounted MCP tool once. A routed tool that the xd:// catalog
 			// would list carries its catalog summary on the route line and gets no
 			// catalog line; a tool the route bound omits keeps its catalog line.
-			const xdevPromptDocs = toolSession.xdev
-				? planXdevPromptDocs(
-						toolSession.xdev,
-						cfgToolsXdevDocs.get(settings),
-						cfgToolsXdevInlineDevices.get(settings),
-					)
+			const xdevPromptDocs = promptXdev
+				? planXdevPromptDocs(promptXdev, cfgToolsXdevDocs.get(settings), cfgToolsXdevInlineDevices.get(settings))
 				: undefined;
 			const projection = projectMountedMCPXdevGuidance(
-				collectMountedMCPToolRoutes(toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
+				collectMountedMCPToolRoutes(promptXdev ? listXdevTools(promptXdev) : []),
 			);
 			const routedCatalogNames = new Set(
 				projection.mappings
@@ -4445,7 +4474,7 @@ async function createAgentSessionScoped(
 			// Mounted xd:// readers stay out of the direct inventory, but their skill
 			// capability still drives catalog/URI guidance: project them into the
 			// compact metadata map (inventory rendering stays driven by `toolNames`).
-			const mountedPromptToolNames = toolSession.xdev ? xdevEntries(toolSession.xdev).map(entry => entry.name) : [];
+			const mountedPromptToolNames = promptXdev ? xdevEntries(promptXdev).map(entry => entry.name) : [];
 			const promptTools = projectSystemPromptToolMetadata(
 				tools,
 				nativeTools && !inlineToolDescriptors
@@ -4455,7 +4484,7 @@ async function createAgentSessionScoped(
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
-				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
+				xdevTools: promptXdev ? xdevEntries(promptXdev) : [],
 				xdevDocs: xdevPromptDocs ? renderXdevPromptDocs(xdevPromptDocs, routedCatalogNames) : "",
 				coreforgeReportEnabled: options.hasUI === true && !restrictToolNames && toolNames.includes("write"),
 				resolvedCustomPrompt: options.customSystemPrompt,
@@ -5071,6 +5100,7 @@ async function createAgentSessionScoped(
 			// and the provider boundary handles text-only advisor models.
 			xdev: undefined,
 			isToolActive: name => toolSession.isToolActive?.(name) === true,
+			isToolActiveForPrompt,
 		};
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
 		for (const name in BUILTIN_TOOLS) {
@@ -5248,6 +5278,7 @@ async function createAgentSessionScoped(
 			autoTitle: options.autoTitle === true && !isSubagentSession,
 		});
 		hasSession = true;
+		session.setSideRequestOwnerCapture(toolSession.captureOwnerCurrent!);
 		accountPoolOwnedBySession = true;
 		credentialNoticeSession = session;
 		// Hashline snapshots are session-scoped: /new and switchSession fire the
@@ -5355,19 +5386,32 @@ async function createAgentSessionScoped(
 			const scheduled = scheduledToolRegistrations.get(registered);
 			if (scheduled) return scheduled;
 			const activationSignal = signal ?? AbortSignal.timeout(EXTENSION_HANDLER_TIMEOUT_MS);
+			const name = registered.definition.name;
+			const owner = registered.owner;
+			if (!owner || owner.tools.get(name) !== registered) return Promise.resolve();
+			const activationCurrent = owner.isActive;
+			const isCurrent = () => !session.isDisposed && activationCurrent?.() !== false;
 
 			const [wrapped] = wrapRegisteredTools([registered], extensionRunner);
 			if (!wrapped) return Promise.resolve();
-			const name = registered.definition.name;
 			const liveTool = new ExtensionToolWrapper(wrapToolWithMetaNotice(wrapped), extensionRunner, name =>
 				toolRegistry.get(name),
 			);
+			extensionRunner.toolRegistrations.set(liveTool, registered);
 			// Capture ordinary extension precedence while the listener observes this exact registration.
 			// A later same-name registration may replace the extension map before serialized activation runs.
 			const isEffectiveRegistrant = extensionRunner.getRegisteredTool(name) === registered;
 			const activation = session.runToolRegistryMutation(async () => {
+				for (const extension of extensionRunner.getLoadedExtensions()) {
+					if (extension.isActive?.() !== false) continue;
+					for (const rollback of [...(extension.toolActivationRollbacks ?? [])].reverse()) await rollback();
+				}
 				activationSignal.throwIfAborted();
+				if (!isCurrent()) throw new Error("Extension owner is no longer active");
+				if (owner.tools.get(name) !== registered) return;
 				const existingTool = toolRegistry.get(name);
+				const previousRegistration = existingTool ? extensionRunner.toolRegistrations.get(existingTool) : undefined;
+				const previousRollbacks = previousRegistration?.owner?.toolActivationRollbacks;
 				const previousExtensionMcpTool = session.getExtensionMCPTool(name);
 				const wasMcpManagerTool = session.hasMCPManagerTool(name);
 				if (existingTool) {
@@ -5395,6 +5439,42 @@ async function createAgentSessionScoped(
 				builtInRegistryToolNames.delete(name);
 				session.setToolBuiltIn(name, false);
 				session.setExtensionMCPTool(name, liveTool);
+				const ownsRegistration = () => toolRegistry.get(name) === liveTool;
+				const canPublish = () => isCurrent() && owner.tools.get(name) === registered && ownsRegistration();
+				const rollbacks = owner.toolActivationRollbacks;
+				const rollback = (): Promise<void> =>
+					session.runToolRegistryMutation(async () => {
+						if (!ownsRegistration()) return;
+						rollbacks?.delete(rollback);
+						if (previousRegistration?.owner === owner && owner.tools.get(name) === registered) {
+							owner.tools.set(name, previousRegistration);
+						}
+						if (existingTool) {
+							toolRegistry.set(name, existingTool);
+						} else {
+							toolRegistry.delete(name);
+						}
+						if (wasBuiltIn) builtInRegistryToolNames.add(name);
+						session.setToolBuiltIn(name, wasBuiltIn);
+						session.setExtensionMCPTool(name, previousExtensionMcpTool);
+						session.setMCPManagerTool(name, wasMcpManagerTool);
+						if (
+							previousRollbacks &&
+							previousRollbacks !== rollbacks &&
+							previousRegistration?.owner?.isActive?.() === false
+						) {
+							for (const previousRollback of [...previousRollbacks].reverse()) await previousRollback();
+							if (toolRegistry.get(name) !== existingTool) return;
+						}
+						const currentEnabled = session.getEnabledToolNames().filter(enabledName => enabledName !== name);
+						const currentMounted = session.getMountedXdevToolNames().filter(mountedName => mountedName !== name);
+						if (alreadyEnabled)
+							currentEnabled.splice(Math.min(enabled.indexOf(name), currentEnabled.length), 0, name);
+						if (mounted.includes(name))
+							currentMounted.splice(Math.min(mounted.indexOf(name), currentMounted.length), 0, name);
+						await session.setActiveToolPresentation(currentEnabled, currentMounted, true);
+					});
+				rollbacks?.add(rollback);
 				try {
 					if ((registered.definition.defaultInactive || registered.definition.hidden) && !explicitlyRequested) {
 						if (!alreadyEnabled) return;
@@ -5403,7 +5483,12 @@ async function createAgentSessionScoped(
 							mounted.filter(mountedName => mountedName !== name),
 							existingTool !== undefined,
 							activationSignal,
+							canPublish,
 						);
+						if (!canPublish()) {
+							await rollback();
+							if (!isCurrent()) throw new Error("Extension owner is no longer active");
+						}
 						return;
 					}
 					// Re-registration refreshes the implementation, but it must not reverse an
@@ -5427,17 +5512,14 @@ async function createAgentSessionScoped(
 						nextMounted,
 						existingTool !== undefined,
 						activationSignal,
+						canPublish,
 					);
-				} catch (error) {
-					if (existingTool) {
-						toolRegistry.set(name, existingTool);
-					} else {
-						toolRegistry.delete(name);
+					if (!canPublish()) {
+						await rollback();
+						if (!isCurrent()) throw new Error("Extension owner is no longer active");
 					}
-					if (wasBuiltIn) builtInRegistryToolNames.add(name);
-					session.setToolBuiltIn(name, wasBuiltIn);
-					session.setExtensionMCPTool(name, previousExtensionMcpTool);
-					session.setMCPManagerTool(name, wasMcpManagerTool);
+				} catch (error) {
+					await rollback();
 					throw error;
 				}
 			}, activationSignal);
@@ -5971,9 +6053,13 @@ async function createAgentSessionScoped(
 		}
 
 		if (deferredExtensionPaths.length > 0) {
-			const forwardedPreparedExtensions = extensionsResult.preparedExtensions ?? [];
+			const forwardedPreparedExtensions = (extensionsResult.preparedExtensions ??= []);
 			const runtime = extensionsResult.runtime;
-			session.setDeferredExtensionLoader(async () => {
+			session.setDeferredExtensionLoader(async (generationCurrent, allowReentrantMessages) => {
+				const ownerCurrent = toolSession.captureOwnerLifetimeCurrent!();
+				let activated = false;
+				const isActive = () => !session.isDisposed && (activated || (generationCurrent() && ownerCurrent()));
+				if (!isActive()) throw new Error("Deferred extension owner is no longer current");
 				const loaded = await logger.time(
 					"loadDeferredExtensions",
 					loadExtensions,
@@ -5981,21 +6067,25 @@ async function createAgentSessionScoped(
 					cwd,
 					eventBus,
 					runtime,
+					{ isActive },
 				);
+				if (!isActive()) throw new Error("Deferred extension owner changed while loading");
+				if (loaded.errors.length > 0) {
+					for (const { path, error } of loaded.errors) logger.error("Failed to load extension", { path, error });
+					throw new Error("Deferred extensions failed to load");
+				}
 				const storage = settings.getStorage();
 				if (storage) await recordStartupVerdicts(storage, loaded.extensions);
-				for (const { path, error } of loaded.errors) logger.error("Failed to load extension", { path, error });
-				for (const message of formatExtensionLoadNotifications(loaded.errors)) {
-					session.emitNotice("warning", message, "extensions");
-				}
-				if (session.isDisposed) return;
-				// Providers queue until the runner is initialized; drain them as session creation does.
+				if (!isActive()) throw new Error("Deferred extension owner changed while recording startup verdicts");
 				for (const { name, config, sourceId } of runtime.pendingProviderRegistrations.splice(0)) {
+					if (!isActive()) throw new Error("Deferred extension owner changed before provider registration");
 					modelRegistry.registerProvider(name, config, sourceId);
 				}
+				await extensionRunner.addExtensions(loaded.extensions, { isActive, onBound: allowReentrantMessages });
+				if (!isActive()) throw new Error("Deferred extension owner changed while activating");
+				activated = true;
 				forwardedPreparedExtensions.push(...(loaded.preparedExtensions ?? []));
 				extensionPaths.push(...loaded.extensions.map(extension => extension.resolvedPath));
-				await extensionRunner.addExtensions(loaded.extensions);
 			});
 		}
 		startDeferredMCPDiscovery?.(session);

@@ -253,7 +253,7 @@ export async function findMcpServerForAuth(
 			scope: "project",
 			profileIdentity,
 			sourceLevel: "project",
-			source: { provider: "omp", providerName: "OMP", path: projectPath, level: "project" },
+			source: { provider: "native", providerName: "OMP", path: projectPath, level: "project" },
 			config: projectConfig.mcpServers[name],
 			discovered: false,
 		};
@@ -264,7 +264,7 @@ export async function findMcpServerForAuth(
 			scope: "user",
 			profileIdentity,
 			sourceLevel: "user",
-			source: { provider: "omp", providerName: "OMP", path: userPath, level: "user" },
+			source: { provider: "native", providerName: "OMP", path: userPath, level: "user" },
 			config: userConfig.mcpServers[name],
 			discovered: false,
 		};
@@ -459,7 +459,7 @@ export async function probeMcpConnection(
 			"mcp_probe",
 			resolvedConfig,
 			options.source ?? {
-				provider: "omp",
+				provider: "native",
 				providerName: "OMP",
 				level: options.sourceLevel ?? "project",
 				path: "",
@@ -799,10 +799,14 @@ export async function runMcpOAuthFlow(opts: McpOAuthFlowRunOptions): Promise<OAu
 			throw new Error(`OAuth authentication failed: ${errorMsg}`);
 		}
 	} finally {
-		if (oauthTimeout.signal.aborted) await loginCompletion?.catch(() => undefined);
 		opts.releaseManualInput?.();
 		externalSignal?.removeEventListener("abort", onExternalAbort);
-		flowClaim.release();
+		if (oauthTimeout.signal.aborted && loginCompletion) {
+			// Cancelled callers return promptly; the original login retains its single-flight claim until settlement.
+			void loginCompletion.then(flowClaim.release, flowClaim.release);
+		} else {
+			flowClaim.release();
+		}
 	}
 }
 

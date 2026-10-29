@@ -15,6 +15,10 @@ import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
+import { executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
+import { parseSlashCommand, parseSubcommand } from "../slash-commands/helpers/parse";
+import type { SlashCommandRuntime } from "../slash-commands/types";
+import { reconnectMcpManagerServer } from "../mcp/oauth-reauth";
 import {
 	formatPersistenceDurabilityFailure,
 	formatPersistenceFailure,
@@ -30,9 +34,9 @@ import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 export interface PrintModeOptions {
 	/** Output mode: "text" for final response only, "json" for all events */
 	mode: "text" | "json";
-	/** Array of additional prompts to send after initialMessage */
+	/** Original CLI-authored prompts after initialMessage; never pipe, file, hook, or model-produced text. */
 	messages?: string[];
-	/** First message to send (may contain @file content) */
+	/** Untrusted merged first message, including stdin/@file content; never dispatch as a command. */
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
@@ -42,6 +46,8 @@ export interface PrintModeOptions {
 	planYolo?: boolean;
 	/** Manager returned by session creation; only print mode waits for its servers. */
 	mcpManager?: MCPManager;
+	/** Trusted local host consent for an original CLI-authored MCP browser-auth command. */
+	allowMcpBrowserAuth?: boolean;
 }
 
 /** Matches the longest built-in provider request deadline while bounding tool-loop stalls. */
@@ -115,13 +121,16 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// through postmortem (130/143/129). Record the reason so the aborted-response
 	// branch below never races that with its own ordinary failure status.
 	let signalReason: postmortem.Reason | undefined;
+	const builtinAbort = new AbortController();
 	const cancelSignalTeardown = postmortem.register("print-mode-session", reason => {
 		signalReason = reason;
+		builtinAbort.abort(reason);
 		return session.dispose({ reason, mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 	});
 	try {
-		return await runPrintModeCore(session, options, () => signalReason !== undefined);
+		return await runPrintModeCore(session, options, () => signalReason !== undefined, builtinAbort.signal);
 	} finally {
+		builtinAbort.abort("Print mode closed");
 		cancelSignalTeardown();
 	}
 }
@@ -130,6 +139,7 @@ async function runPrintModeCore(
 	session: AgentSession,
 	options: PrintModeOptions,
 	signalTeardownActive: () => boolean,
+	builtinSignal: AbortSignal,
 ): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages, printThoughts, planYolo = false } = options;
 	session.disableStopTimeTodoReminders();
@@ -207,6 +217,129 @@ async function runPrintModeCore(
 			// every later diagnostic and reject the awaited tail below.
 			.catch(() => {});
 	};
+	// Route slash input through the shared dispatcher so builtins run locally
+	// (e.g. `/mcp reauth <name>` opens the browser) instead of prompting the
+	// model with the literal text. Unknown or non-slash input falls through to
+	// the model; a `{ prompt }` residual is forwarded. Diagnostics go to stderr
+	// so stdout stays pure model output (critical in JSON mode).
+	// Each dispatch captures the current session ownership.
+	const mcpManager = options.mcpManager;
+	const builtinRuntimeFor = (): SlashCommandRuntime => {
+		const sessionManager = session.sessionManager;
+		const sessionId = session.sessionId;
+		const model = session.model;
+		const modelRegistry = session.modelRegistry;
+		const authStorage = modelRegistry?.authStorage;
+		const credentialPool = authStorage?.credentials;
+		const isCurrent = (): boolean =>
+			!builtinSignal.aborted &&
+			session.sessionManager === sessionManager &&
+			session.sessionId === sessionId &&
+			session.model === model &&
+			session.modelRegistry === modelRegistry &&
+			modelRegistry?.authStorage === authStorage &&
+			authStorage?.credentials === credentialPool;
+		return {
+			session,
+			sessionManager: session.sessionManager,
+			settings: session.settings,
+			cwd: session.sessionManager.getCwd(),
+			output: writeStderrLine,
+			refreshCommands: () => {},
+			reloadPlugins: () => Promise.resolve(),
+			mcpManager,
+			signal: builtinSignal,
+			isCurrent,
+			allowMcpBrowserAuth: options.allowMcpBrowserAuth === true,
+			reconnectMcpServer: mcpManager
+				? async (name, selected, committedConfig) => {
+						if (!isCurrent()) return undefined;
+						const state = await reconnectMcpManagerServer(mcpManager, name, selected, committedConfig, {
+							signal: builtinSignal,
+							isCurrent,
+						});
+						if (state && isCurrent()) {
+							// Print mode wires no tools-changed callback; refresh the
+							// session binding so later prompts see the recovered tools.
+							await session.refreshMCPTools(mcpManager.getTools());
+						}
+						if (!isCurrent()) return undefined;
+						return state;
+					}
+				: undefined,
+			// `/retry` only schedules its continuation (`session.retry()` posts a
+			// post-prompt task) and returns before the retried turn streams: hold
+			// the dispatch open until the session is idle — same pairing as the
+			// ACP runtime — or the next CLI-authored message would prompt ~1ms
+			// later and race the just-scheduled turn it should follow.
+			keepTurnOpenUntilIdle: async () => {
+				await session.waitForIdle();
+			},
+		};
+	};
+	// Whether a dispatched command consumed an input but failed (usage error,
+	// unknown server, refused operation). Print mode is automation surface: a
+	// failed `/mcp reauth` must not exit 0, or scripts treat a failed
+	// reauthorization as success.
+	let builtinFailed = false;
+	// Scheduled work may produce output, but only a new assistant belongs to this invocation.
+	let hasAgentWork = false;
+	const previousAssistant = session.getLastAssistantMessage();
+	// The print-mode-dispatched commands. Only commands whose runtime hooks
+	// are real in the headless runtime belong here: each runs a session API
+	// (`/mcp reauth` engine, `session.compact`, `session.handoff`,
+	// `session.retry`). Commands whose hooks would be stubs
+	// (`/reload-plugins` and friends) stay undispatched, and so does
+	// `/stats`: its dashboard server is in-process (`Bun.serve` inside this
+	// one-shot run), so launching it would open a browser tab that dies with
+	// the process and report a success the run cannot deliver. Keeping the
+	// process alive until the dashboard closes is a separate design
+	// decision; until then `/stats` keeps the historic prompt-the-literal
+	// behavior of every undispatched command.
+	// Matched with the dispatcher's own parser, so `/compact:focus` and
+	// `/compact focus` are treated alike; `/mcp` dispatches only `reauth`.
+	const PRINT_DISPATCHED_COMMANDS: Record<string, true> = { compact: true, handoff: true, retry: true };
+	/**
+	 * Dispatch a CLI-authored message as a local command, if it is one.
+	 * Only CLI-authored input (`messages`, the positional/-p args) is ever
+	 * dispatched. The merged stdin/@file `initialMessage` is attacker-shaped
+	 * end to end — `curl … | omp "summarize"` must never run a slash payload
+	 * from the pipe as a command — so it always prompts the model as text.
+	 * Commands outside the dispatched list keep the historic behavior of
+	 * prompting the model with the literal text. Returns whether the message
+	 * was consumed locally.
+	 */
+	const dispatchCliMessage = async (message: string): Promise<boolean> => {
+		const parsed = parseSlashCommand(message);
+		const dispatched =
+			parsed !== null &&
+			(parsed.name === "mcp"
+				? parseSubcommand(parsed.args).verb === "reauth"
+				: Object.hasOwn(PRINT_DISPATCHED_COMMANDS, parsed.name));
+		if (!dispatched) return false;
+		try {
+			await session.loadDeferredExtensions();
+		} catch (error) {
+			extensionFailure = true;
+			extensionShutdownRequested = true;
+			writeStderrLine(
+				`Extension readiness failed: ${singleLine(error instanceof Error ? error.message : String(error))}`,
+			);
+			return true;
+		}
+		if (session.isDisposed || extensionShutdownRequested || signalTeardownActive()) return true;
+		if (parsed.name !== "mcp" && !(await prepareAgentTurn())) return true;
+		const result = await executeAcpBuiltinSlashCommand(message, builtinRuntimeFor());
+		// The allow-list only matches registered commands, so `false` (not a
+		// command) and a `{ prompt }` residual cannot occur; stay defensive.
+		if (result === false || "prompt" in result) return false;
+		if (result.failed) builtinFailed = true;
+		// Scheduling is not credit admission; the session owns the actual retry preflight.
+		if (result.agentInvoked) hasAgentWork = true;
+		// A recovery command may have repaired a server the strict gate
+		// failed on, so the gate re-evaluates before the next model turn.
+		return true;
+	};
 
 	let extensionFailure = false;
 	let extensionSendsObserved = false;
@@ -234,6 +367,7 @@ async function runPrintModeCore(
 
 	// Always subscribe to enable session persistence via _handleAgentEvent
 	session.subscribe(event => {
+		if (event.type === "agent_start") hasAgentWork = true;
 		// In JSON mode, output all events
 		if (mode === "json") {
 			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
@@ -266,8 +400,15 @@ async function runPrintModeCore(
 	});
 
 	const timeoutMs = resolveMCPTimeoutMs();
+	const strict = $flag("OMP_MCP_REQUIRE_READY");
 	let strictMCPFailure = false;
-	if (options.mcpManager) {
+	// Warn once per unavailable server across evaluations: readiness is
+	// re-evaluated after a dispatched recovery command, and a still-broken
+	// server must not repeat its warning on every pass.
+	const warnedUnavailable = new Set<string>();
+	/** Await manager startup and bind its current tool set; report unavailable server names. */
+	const evaluateReadiness = async (): Promise<string[]> => {
+		if (!options.mcpManager) return [];
 		const readiness = await options.mcpManager.waitForStartup(timeoutMs);
 		// The manager's initial callback may have fired before SDK wiring, or a
 		// reconnect may have fired it without awaiting the session mutation.
@@ -277,21 +418,28 @@ async function runPrintModeCore(
 		for (const name of readiness.pending) {
 			const server = singleLine(name);
 			unavailable.push(server);
+			if (warnedUnavailable.has(server)) continue;
+			warnedUnavailable.add(server);
 			const after = timeoutMs > 0 ? ` after ${timeoutMs}ms` : "";
 			writeStderrLine(`Warning: MCP server "${server}" not ready${after}; its tools are unavailable for this run.`);
 		}
 		for (const { name, error } of readiness.failed) {
 			const server = singleLine(name);
 			unavailable.push(server);
+			if (warnedUnavailable.has(server)) continue;
+			warnedUnavailable.add(server);
 			writeStderrLine(
 				`Warning: MCP server "${server}" failed to connect: ${singleLine(error)}; its tools are unavailable for this run.`,
 			);
 		}
-		if ($flag("OMP_MCP_REQUIRE_READY") && unavailable.length > 0) {
-			writeStderrLine(`Error: MCP servers not ready: ${unavailable.join(", ")}`);
-			strictMCPFailure = true;
-		}
-	}
+		return unavailable;
+	};
+	let unavailable: string[] = [];
+	const reportStrictFailure = (): void => {
+		if (strictMCPFailure) return;
+		writeStderrLine(`Error: MCP servers not ready: ${unavailable.join(", ")}`);
+		strictMCPFailure = true;
+	};
 
 	let wroteTextWorkingIndicator = false;
 	const writeTextWorkingIndicator = (): void => {
@@ -299,24 +447,45 @@ async function runPrintModeCore(
 		process.stderr.write("Working...\n");
 		wroteTextWorkingIndicator = true;
 	};
-
-	// Send initial message with attachments
-	if (!strictMCPFailure && !extensionShutdownRequested && initialMessage !== undefined) {
+	const prepareAgentTurn = async (): Promise<boolean> => {
+		if (extensionShutdownRequested || signalTeardownActive()) return false;
+		unavailable = await evaluateReadiness();
+		if (extensionShutdownRequested || signalTeardownActive()) return false;
+		if (strict && unavailable.length > 0) {
+			reportStrictFailure();
+			return false;
+		}
 		writeTextWorkingIndicator();
 		if (mode === "text") session.setTextOutputCommitted(false);
-		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
+		return true;
+	};
+	const promptTurn = async (text: string, images?: PrintModeOptions["initialImages"]): Promise<void> => {
+		if (!(await prepareAgentTurn())) return;
+		const admitted = await logger.time("print:prompt", () =>
+			images !== undefined ? session.prompt(text, { images }) : session.prompt(text),
+		);
+		if (admitted) hasAgentWork = true;
 		await drainExtensionWork();
-	}
+	};
 
-	// Send remaining messages
-	if (!strictMCPFailure) {
-		for (const message of messages) {
-			if (extensionShutdownRequested) break;
-			writeTextWorkingIndicator();
-			if (mode === "text") session.setTextOutputCommitted(false);
-			await logger.time("print:prompt:next", () => session.prompt(message));
+	if (!extensionShutdownRequested && initialMessage !== undefined) {
+		await promptTurn(initialMessage, initialImages);
+	}
+	for (const message of messages) {
+		if (strictMCPFailure || extensionShutdownRequested || signalTeardownActive()) break;
+		if (await dispatchCliMessage(message)) {
 			await drainExtensionWork();
+			continue;
 		}
+		await promptTurn(message);
+	}
+	// A run with no model turn (every input consumed locally, or none) still
+	// reports strict unreadiness: `OMP_MCP_REQUIRE_READY=1 omp -p '/mcp reauth
+	// foo'` that failed to repair its server exits with the strict error, not
+	// only the builtin's own failure.
+	if (strict && !hasAgentWork && !strictMCPFailure) {
+		unavailable = await evaluateReadiness();
+		if (unavailable.length > 0) reportStrictFailure();
 	}
 	await drainExtensionWork();
 
@@ -329,7 +498,8 @@ async function runPrintModeCore(
 	// refusal is pruned from active context at settle, and an aborted turn
 	// can trail synthetic tool results — both would hide the terminal
 	// assistant message (and its error) from a last-element read.
-	const assistantMsg = session.getLastAssistantMessage();
+	const currentAssistant = hasAgentWork ? session.getLastAssistantMessage() : undefined;
+	const assistantMsg = currentAssistant !== previousAssistant ? currentAssistant : undefined;
 	// The terminal stop reason decides the process exit code in every output
 	// mode: `--mode json` used to report success for the same turn-fatal error
 	// text mode exits 1 on (issue #11498). Silent aborts (plan-mode compaction
@@ -417,5 +587,5 @@ async function runPrintModeCore(
 	}
 
 	await stderrTail;
-	return terminalFailure || durabilityFailure || strictMCPFailure || extensionFailure ? 1 : 0;
+	return terminalFailure || durabilityFailure || strictMCPFailure || extensionFailure || builtinFailed ? 1 : 0;
 }
