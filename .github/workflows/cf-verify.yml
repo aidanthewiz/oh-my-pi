@@ -224,6 +224,10 @@ jobs:
       - name: Install verified released native addon
         if: needs.prepare.outputs.native_changed != 'true'
         run: bun scripts/ci-released-native.ts install "${{ needs.prepare.outputs.release_tag }}" "${{ matrix.target }}" packages/natives/native "${{ runner.temp }}/released-native"
+      - name: Verify artifact publication ownership
+        if: matrix.cross != '1'
+        working-directory: packages/coding-agent
+        run: bun test --timeout=30000 ./test/artifacts-integrity.test.ts
       - name: Install project-local TUI test dependencies
         if: matrix.windows == '1'
         run: bun install --cwd .omp/tools --frozen-lockfile

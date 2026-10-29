@@ -4,7 +4,7 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
-import { renameSync, rmSync, statSync } from "node:fs";
+import { renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
@@ -84,6 +84,7 @@ import {
 	PromptDroppedError,
 	type PromptOptions,
 } from "../session/agent-session";
+import { withArtifactPublicationLock } from "../session/artifact-publication";
 import {
 	artifactFileGeneration,
 	type ArtifactManager,
@@ -2921,66 +2922,80 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 		!signal?.aborted &&
 		!monitor.runtimeLimitExceeded() &&
 		rawOutput.trim().length > 0;
-	if (args.artifactsDir && args.isPublicationCurrent() && (!args.followUpTurn || hasYield || hasMessageResult)) {
+	if (
+		args.artifactsDir &&
+		args.isPublicationCurrent() &&
+		!signal?.aborted &&
+		!monitor.runtimeLimitExceeded() &&
+		(!args.followUpTurn || hasYield || hasMessageResult)
+	) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
 		const nonce = Snowflake.next();
 		const stagedOutput = `${candidatePath}.tmp-${nonce}`;
 		const stagedSidecar = `${sidecarPath}.tmp-${nonce}`;
 		try {
-			await writeArtifact(stagedOutput, rawOutput);
-			const primaryGeneration = artifactFileGeneration(statSync(stagedOutput, { bigint: true }));
-			let sidecarReady = false;
-			try {
-				const structuredOutput = finalized.structuredOutput;
-				const serialized =
-					structuredOutput && Object.hasOwn(structuredOutput, "data")
-						? JSON.stringify(structuredOutput.data, null, 2)
-						: undefined;
-				if (serialized !== undefined) {
-					const envelope = serializeStructuredArtifactSidecar(serialized, primaryGeneration);
-					await writeArtifact(stagedSidecar, envelope);
-					sidecarReady = true;
-				}
-			} catch (error) {
-				logger.warn("Failed to persist subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.stack || error.message : String(error),
-				});
-			}
-			// No event-loop yield separates the ownership check from either commit.
-			if (args.isPublicationCurrent() && !signal?.aborted && !monitor.runtimeLimitExceeded()) {
-				if (artifactFileGeneration(statSync(stagedOutput, { bigint: true })) !== primaryGeneration)
-					throw new Error("Subagent staged primary changed before publication.");
-				renameSync(stagedOutput, candidatePath);
-				outputPath = candidatePath;
-				outputMeta = { lineCount: rawOutput.split("\n").length, charCount: rawOutput.length };
+			await withArtifactPublicationLock(async () => {
+				if (!args.isPublicationCurrent() || signal?.aborted || monitor.runtimeLimitExceeded()) return;
+				await writeArtifact(stagedOutput, rawOutput);
+				const stagedGeneration = artifactFileGeneration(statSync(stagedOutput, { bigint: true }));
+				let serialized: string | undefined;
+				let sidecarReady = false;
 				try {
-					if (sidecarReady) renameSync(stagedSidecar, sidecarPath);
-					else rmSync(sidecarPath, { force: true });
+					const structuredOutput = finalized.structuredOutput;
+					serialized =
+						structuredOutput && Object.hasOwn(structuredOutput, "data")
+							? JSON.stringify(structuredOutput.data, null, 2)
+							: undefined;
+					if (serialized !== undefined) {
+						await writeArtifact(stagedSidecar, serializeStructuredArtifactSidecar(serialized, stagedGeneration));
+						sidecarReady = true;
+					}
 				} catch (error) {
 					logger.warn("Failed to persist subagent structured output sidecar", {
 						agentId: id,
 						path: sidecarPath,
 						error: error instanceof Error ? error.stack || error.message : String(error),
 					});
+				}
+				// No event-loop yield separates the ownership check from either commit.
+				if (args.isPublicationCurrent() && !signal?.aborted && !monitor.runtimeLimitExceeded()) {
+					if (artifactFileGeneration(statSync(stagedOutput, { bigint: true })) !== stagedGeneration)
+						throw new Error("Subagent staged primary changed before publication.");
+					renameSync(stagedOutput, candidatePath);
+					outputPath = candidatePath;
+					outputMeta = { lineCount: rawOutput.split("\n").length, charCount: rawOutput.length };
 					try {
-						if (
-							sidecarReady &&
-							args.isPublicationCurrent() &&
-							artifactFileGeneration(statSync(candidatePath, { bigint: true })) === primaryGeneration
-						)
+						if (sidecarReady && serialized !== undefined) {
+							const publishedGeneration = artifactFileGeneration(statSync(candidatePath, { bigint: true }));
+							// Some filesystems change identity on rename; bind the published primary.
+							if (publishedGeneration !== stagedGeneration)
+								writeFileSync(
+									stagedSidecar,
+									serializeStructuredArtifactSidecar(serialized, publishedGeneration),
+								);
+							renameSync(stagedSidecar, sidecarPath);
+						} else {
 							rmSync(sidecarPath, { force: true });
-					} catch (cleanupError) {
-						logger.warn("Failed to remove stale subagent structured output sidecar", {
+						}
+					} catch (error) {
+						logger.warn("Failed to persist subagent structured output sidecar", {
 							agentId: id,
 							path: sidecarPath,
-							error: String(cleanupError),
+							error: error instanceof Error ? error.stack || error.message : String(error),
 						});
+						try {
+							if (args.isPublicationCurrent()) rmSync(sidecarPath, { force: true });
+						} catch (cleanupError) {
+							logger.warn("Failed to remove stale subagent structured output sidecar", {
+								agentId: id,
+								path: sidecarPath,
+								error: String(cleanupError),
+							});
+						}
 					}
 				}
-			}
+			}, signal);
 		} catch (error) {
 			publicationFailure = error instanceof Error ? error.message : String(error);
 			logger.warn("Failed to persist subagent output artifact", {

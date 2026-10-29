@@ -31,6 +31,7 @@ import {
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
+import { withArtifactPublicationLock } from "./artifact-publication";
 import {
 	artifactFileGeneration,
 	ArtifactManager,
@@ -181,24 +182,26 @@ function artifactsDirectoryFor(sessionFile: string | undefined): string | null {
 }
 
 /**
- * Copy a session's artifact directory to another session, matching interactive
- * `/fork`. Never overwrites: a destination file written while the copy runs
- * (a session that already moved and kept working) wins over the source's copy.
+ * Copy a session's artifacts without replacing destination owners. Current
+ * engine publications and relocations share one lease; older or external
+ * writers do not participate.
  * Failures are logged, never thrown.
  */
 export async function copySessionArtifacts(sourceSessionFile: string, destinationSessionFile: string): Promise<void> {
-	// Artifacts sit beside the journal's real name: a session reached through a
-	// symlink keeps them next to the link's target, not next to the link.
-	let realSource = sourceSessionFile;
-	try {
-		realSource = await fs.promises.realpath(sourceSessionFile);
-	} catch {}
-	const sourceArtifactsDir = artifactsDirectoryFor(realSource);
+	let sourceArtifactsDir: string | null = null;
 	const destinationArtifactsDir = artifactsDirectoryFor(destinationSessionFile);
-	if (!sourceArtifactsDir || !destinationArtifactsDir) return;
-	if (path.resolve(sourceArtifactsDir) === path.resolve(destinationArtifactsDir)) return;
 	try {
-		await copyArtifactDirectoryWithoutReplacing(sourceArtifactsDir, destinationArtifactsDir);
+		await withArtifactPublicationLock(async () => {
+			// A journal symlink keeps artifacts beside its target.
+			let realSource = sourceSessionFile;
+			try {
+				realSource = await fs.promises.realpath(sourceSessionFile);
+			} catch {}
+			sourceArtifactsDir = artifactsDirectoryFor(realSource);
+			if (!sourceArtifactsDir || !destinationArtifactsDir) return;
+			if (path.resolve(sourceArtifactsDir) === path.resolve(destinationArtifactsDir)) return;
+			await copyArtifactDirectoryWithoutReplacing(sourceArtifactsDir, destinationArtifactsDir);
+		});
 	} catch (error) {
 		if (!isEnoent(error)) {
 			logger.warn("Failed to copy session artifacts", {
@@ -210,77 +213,7 @@ export async function copySessionArtifacts(sourceSessionFile: string, destinatio
 	}
 }
 
-function isUnsupportedArtifactLink(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS" || code === "EXDEV" || code === "EPERM";
-}
-
-async function publishStructuredPrimary(
-	staged: string,
-	destination: string,
-	expectedGeneration: string,
-): Promise<{ generation: string; ctimeNs: bigint } | undefined> {
-	try {
-		await fs.promises.link(staged, destination);
-		const published = await fs.promises.lstat(destination, { bigint: true });
-		if (!published.isFile() || artifactFileGeneration(published) !== expectedGeneration) return undefined;
-		return { generation: expectedGeneration, ctimeNs: published.ctimeNs };
-	} catch (error) {
-		if (isEexist(error)) return undefined;
-		if (!isUnsupportedArtifactLink(error)) throw error;
-	}
-	const source = await fs.promises.open(staged, "r");
-	let output: fs.promises.FileHandle | undefined;
-	try {
-		const before = await source.stat({ bigint: true });
-		if (!before.isFile() || artifactFileGeneration(before) !== expectedGeneration) {
-			throw new Error(`Structured artifact staging changed: ${staged}`);
-		}
-		try {
-			output = await fs.promises.open(destination, "wx", Number(before.mode & 0o777n));
-		} catch (error) {
-			if (isEexist(error)) return undefined;
-			throw error;
-		}
-		const buffer = Buffer.allocUnsafe(64 * 1024);
-		let position = 0;
-		for (;;) {
-			const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
-			if (bytesRead === 0) break;
-			let written = 0;
-			while (written < bytesRead) {
-				const { bytesWritten } = await output.write(buffer, written, bytesRead - written, position + written);
-				if (bytesWritten === 0) throw new Error(`Structured artifact copy made no progress: ${destination}`);
-				written += bytesWritten;
-			}
-			position += bytesRead;
-		}
-		const [after, published, named] = await Promise.all([
-			source.stat({ bigint: true }),
-			output.stat({ bigint: true }),
-			fs.promises.lstat(destination, { bigint: true }).catch(error => {
-				if (isEnoent(error)) return undefined;
-				throw error;
-			}),
-		]);
-		if (artifactFileGeneration(after) !== expectedGeneration || after.ctimeNs !== before.ctimeNs) {
-			throw new Error(`Structured artifact staging changed: ${staged}`);
-		}
-		const generation = artifactFileGeneration(published);
-		if (
-			!named?.isFile() ||
-			artifactFileGeneration(named) !== generation ||
-			named.ctimeNs !== published.ctimeNs ||
-			published.size !== BigInt(position)
-		)
-			return undefined;
-		return { generation, ctimeNs: published.ctimeNs };
-	} finally {
-		await Promise.all([source.close(), output?.close()]);
-	}
-}
-
-async function copyBoundStructuredArtifact(from: string, to: string): Promise<boolean> {
+async function copyBoundStructuredArtifact(from: string, to: string, moveSource = false): Promise<boolean> {
 	const sourceSidecar = `${from.slice(0, -3)}.json`;
 	const destinationSidecar = `${to.slice(0, -3)}.json`;
 	const primary = await fs.promises.open(from, "r");
@@ -305,9 +238,10 @@ async function copyBoundStructuredArtifact(from: string, to: string): Promise<bo
 			throw error;
 		}
 		if (!envelope) return false;
-		const nonce = crypto.randomUUID();
-		const stagedPrimary = `${to}.copy-${nonce}`;
-		const stagedSidecar = `${destinationSidecar}.copy-${nonce}`;
+		const stagingDirectory = await fs.promises.mkdtemp(`${to}.copy-`);
+		const stagedPrimary = path.join(stagingDirectory, "primary");
+		const stagedSidecar = path.join(stagingDirectory, "sidecar");
+		let copied: fs.promises.FileHandle | undefined;
 		try {
 			await fs.promises.copyFile(from, stagedPrimary, fs.constants.COPYFILE_EXCL);
 			const [primaryAfter, sidecarAfter, namedPrimary, namedSidecar] = await Promise.all([
@@ -327,42 +261,82 @@ async function copyBoundStructuredArtifact(from: string, to: string): Promise<bo
 				namedSidecar.ctimeNs !== sidecarBefore.ctimeNs
 			)
 				throw new Error(`Structured artifact changed while copying: ${from}`);
-			const copiedGeneration = artifactFileGeneration(await fs.promises.stat(stagedPrimary, { bigint: true }));
-			const publication = await publishStructuredPrimary(stagedPrimary, to, copiedGeneration);
-			if (!publication) return true;
-			await fs.promises.writeFile(
-				stagedSidecar,
-				serializeStructuredArtifactSidecar(JSON.stringify(envelope.data), publication.generation),
-				{ flag: "wx", mode: 0o600 },
-			);
-			const current = await fs.promises.lstat(to, { bigint: true }).catch(error => {
-				if (isEnoent(error)) return undefined;
-				throw error;
-			});
+			copied = await fs.promises.open(stagedPrimary, "r");
+			if (!(await publishStagedArtifactWithoutReplacing(stagedPrimary, to))) return true;
+			const [owned, published] = await Promise.all([
+				copied.stat({ bigint: true }),
+				fs.promises.lstat(to, { bigint: true }).catch(error => {
+					if (isEnoent(error)) return undefined;
+					throw error;
+				}),
+			]);
+			const copiedGeneration = artifactFileGeneration(owned);
 			if (
-				!current?.isFile() ||
-				artifactFileGeneration(current) !== publication.generation ||
-				current.ctimeNs !== publication.ctimeNs
+				!published?.isFile() ||
+				artifactFileGeneration(published) !== copiedGeneration ||
+				published.ctimeNs !== owned.ctimeNs
 			)
 				return true;
 			try {
-				await fs.promises.link(stagedSidecar, destinationSidecar);
+				await fs.promises.writeFile(
+					stagedSidecar,
+					serializeStructuredArtifactSidecar(JSON.stringify(envelope.data), copiedGeneration),
+					{ flag: "wx", mode: 0o600 },
+				);
+				const current = await fs.promises.lstat(to, { bigint: true }).catch(error => {
+					if (isEnoent(error)) return undefined;
+					throw error;
+				});
+				if (
+					current?.isFile() &&
+					artifactFileGeneration(current) === copiedGeneration &&
+					current.ctimeNs === owned.ctimeNs
+				)
+					if (await publishStagedArtifactWithoutReplacing(stagedSidecar, destinationSidecar)) {
+						if (moveSource) {
+							await fs.promises.unlink(sourceSidecar);
+							await fs.promises.unlink(from);
+						}
+					}
 			} catch (error) {
-				if (isEexist(error)) return true;
-				if (!isUnsupportedArtifactLink(error)) throw error;
-				try {
-					await fs.promises.copyFile(stagedSidecar, destinationSidecar, fs.constants.COPYFILE_EXCL);
-				} catch (copyError) {
-					if (!isEexist(copyError)) throw copyError;
-				}
+				logger.warn("Failed to copy optional structured artifact data", {
+					from,
+					to,
+					error: toError(error).message,
+				});
 			}
 			return true;
 		} finally {
-			await fs.promises.rm(stagedPrimary, { force: true });
-			await fs.promises.rm(stagedSidecar, { force: true });
+			try {
+				await copied?.close();
+			} finally {
+				await fs.promises.rm(stagingDirectory, { recursive: true, force: true });
+			}
 		}
 	} finally {
 		await Promise.all([sidecar?.close(), primary.close()]);
+	}
+}
+
+/** The caller holds the shared artifact publication lease through occupancy and rename. */
+async function publishStagedArtifactWithoutReplacing(staged: string, destination: string): Promise<boolean> {
+	const occupant = await fs.promises.lstat(destination).catch(error => {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	});
+	if (occupant) return false;
+	await fs.promises.rename(staged, destination);
+	return true;
+}
+
+async function copyArtifactFileWithoutReplacing(source: string, destination: string): Promise<boolean> {
+	const stagingDirectory = await fs.promises.mkdtemp(`${destination}.copy-`);
+	const staged = path.join(stagingDirectory, "payload");
+	try {
+		await fs.promises.copyFile(source, staged, fs.constants.COPYFILE_EXCL);
+		return await publishStagedArtifactWithoutReplacing(staged, destination);
+	} finally {
+		await fs.promises.rm(stagingDirectory, { recursive: true, force: true });
 	}
 }
 
@@ -393,11 +367,7 @@ async function copyArtifactDirectoryWithoutReplacing(source: string, destination
 				pairedSidecars.add(`${entry.name.slice(0, -3)}.json`);
 				continue;
 			}
-			try {
-				await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL);
-			} catch (error) {
-				if (!isEexist(error)) throw error;
-			}
+			await copyArtifactFileWithoutReplacing(from, to);
 		} else {
 			throw new Error(`Session artifact is not a regular file or directory: ${from}`);
 		}
@@ -409,28 +379,23 @@ function artifactIdOf(name: string): string | undefined {
 	return /^(\d+)\./.exec(name)?.[1];
 }
 
-/**
- * Move one directory entry without replacing anything that has appeared at
- * `to` since the caller listed the destination. `link(2)` refuses an existing
- * target where `rename(2)` would silently overwrite it; where hard links are
- * unavailable an exclusive copy keeps the same guarantee. A directory rename
- * only ever replaces an empty directory, which is harmless.
- */
+/** The caller holds the shared artifact lease for source removal and destination publication. */
 async function moveEntryWithoutReplacing(from: string, to: string, isDirectory: boolean): Promise<void> {
-	if (isDirectory) {
-		await fs.promises.rename(from, to);
-		return;
-	}
 	try {
-		await fs.promises.link(from, to);
+		if (!(await publishStagedArtifactWithoutReplacing(from, to))) {
+			throw Object.assign(new Error(`Artifact destination already exists: ${to}`), { code: "EEXIST" });
+		}
+		return;
 	} catch (err) {
-		if (isEexist(err)) throw err;
-		await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL);
+		if (isDirectory || !isFsError(err) || err.code !== "EXDEV") throw err;
+	}
+	if (!(await copyArtifactFileWithoutReplacing(from, to))) {
+		throw Object.assign(new Error(`Artifact destination already exists: ${to}`), { code: "EEXIST" });
 	}
 	try {
 		await fs.promises.unlink(from);
 	} catch (err) {
-		// The entry has landed; a second copy left behind is not a failed move.
+		// A complete destination remains authoritative if source cleanup fails.
 		if (!isEnoent(err)) logger.debug("Artifact placed but its source copy could not be removed", { from, to });
 	}
 }
@@ -486,17 +451,18 @@ async function mergeDirectoryInto(
 ): Promise<string[]> {
 	let { occupants, takenIds } = await destinationOccupancy(destination);
 	const strandedBefore = stranded.length;
-	for (const entry of await fs.promises.readdir(source, { withFileTypes: true })) {
+	const entries = await fs.promises.readdir(source, { withFileTypes: true });
+	entries.sort((left, right) => Number(right.name.endsWith(".md")) - Number(left.name.endsWith(".md")));
+	const pairedSidecars = new Set<string>();
+	for (const entry of entries) {
+		if (pairedSidecars.has(entry.name)) continue;
 		const from = path.join(source, entry.name);
 		const to = path.join(destination, entry.name);
 		const label = prefix + entry.name;
 		const id = artifactIdOf(entry.name);
 		try {
-			// A writer can publish another `<id>.*` file while earlier entries move,
-			// and a different file name slips past link(2)'s EEXIST; list again right
-			// before an id-bearing move so the check is one syscall old, not the
-			// whole merge. Inside the boundary: a failed listing strands this entry
-			// like a failed move would, instead of aborting a merge already under way.
+			// Refresh id occupancy inside the lease before each id-bearing move.
+			// A failed listing strands this entry without aborting an earlier move.
 			if (id !== undefined) ({ occupants, takenIds } = await destinationOccupancy(destination));
 			const occupant = occupants.get(entry.name);
 			if (occupant === undefined && (id === undefined || !takenIds.has(id))) {
@@ -508,15 +474,24 @@ async function mergeDirectoryInto(
 						await fs.promises.mkdir(to);
 						await mergeDirectoryInto(from, to, stranded, `${label}/`);
 					}
+				} else if (entry.name.endsWith(".md") && (await copyBoundStructuredArtifact(from, to, true))) {
+					pairedSidecars.add(`${entry.name.slice(0, -3)}.json`);
+					const retained = await fs.promises.lstat(from).catch(error => {
+						if (isEnoent(error)) return undefined;
+						throw error;
+					});
+					if (retained) stranded.push(`${label} (structured source retained)`);
 				} else {
 					await moveEntryWithoutReplacing(from, to, false);
 				}
 			} else if (occupant?.isDirectory() && entry.isDirectory()) {
 				await mergeDirectoryInto(from, to, stranded, `${label}/`);
 			} else {
+				if (entry.name.endsWith(".md")) pairedSidecars.add(`${entry.name.slice(0, -3)}.json`);
 				stranded.push(`${label} (${occupant === undefined ? "id" : "name"} taken)`);
 			}
 		} catch (err) {
+			if (entry.name.endsWith(".md")) pairedSidecars.add(`${entry.name.slice(0, -3)}.json`);
 			// ENOENT: the entry vanished under us (a writer's temp file); nothing to move.
 			if (!isEnoent(err)) stranded.push(`${label} (${isFsError(err) ? err.code : String(err)})`);
 		}
@@ -2939,108 +2914,110 @@ export class SessionManager {
 
 		try {
 			if (this.#persist && this.#sessionFile) {
-				this.#storage.ensureDirSync(nextSessionDir);
 				await this.#drainAndCloseWriter();
 				this.#clearDiskError();
 
 				const oldSessionFile = this.#sessionFile;
-				const newSessionFile = path.join(nextSessionDir, path.basename(oldSessionFile));
-				const oldArtifactsDir = artifactsDirectoryFor(oldSessionFile);
-				const newArtifactsDir = artifactsDirectoryFor(newSessionFile);
-				const sessionPathChanged = path.resolve(oldSessionFile) !== path.resolve(newSessionFile);
-				const artifactPathChanged =
-					oldArtifactsDir !== null &&
-					newArtifactsDir !== null &&
-					path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
-				sessionFileExisted = this.#storage.existsSync(oldSessionFile);
-				if (sessionPathChanged && !sessionFileExisted) {
-					const occupant = await fs.promises.lstat(newSessionFile).catch((error: unknown) => {
-						if (isEnoent(error)) return null;
-						throw error;
-					});
-					if (occupant) throw new Error(`Session destination already exists: ${newSessionFile}`);
-				}
+				await withArtifactPublicationLock(async () => {
+					this.#storage.ensureDirSync(nextSessionDir);
+					const newSessionFile = path.join(nextSessionDir, path.basename(oldSessionFile));
+					const oldArtifactsDir = artifactsDirectoryFor(oldSessionFile);
+					const newArtifactsDir = artifactsDirectoryFor(newSessionFile);
+					const sessionPathChanged = path.resolve(oldSessionFile) !== path.resolve(newSessionFile);
+					const artifactPathChanged =
+						oldArtifactsDir !== null &&
+						newArtifactsDir !== null &&
+						path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
+					sessionFileExisted = this.#storage.existsSync(oldSessionFile);
+					if (sessionPathChanged && !sessionFileExisted) {
+						const occupant = await fs.promises.lstat(newSessionFile).catch((error: unknown) => {
+							if (isEnoent(error)) return null;
+							throw error;
+						});
+						if (occupant) throw new Error(`Session destination already exists: ${newSessionFile}`);
+					}
 
-				let sessionMoved = false;
-				let artifactsRenamed = false;
+					let sessionMoved = false;
+					let artifactsRenamed = false;
 
-				try {
+					try {
+						if (sessionFileExisted && sessionPathChanged) {
+							await assertSourceIsOurs(oldSessionFile);
+							await claimDestination(newSessionFile);
+							if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
+							await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
+							sessionMoved = true;
+						}
+
+						if (artifactPathChanged) {
+							let artifactStat: fs.Stats | null = null;
+							try {
+								artifactStat = await fs.promises.lstat(oldArtifactsDir);
+							} catch (err) {
+								if (!isEnoent(err)) throw err;
+							}
+							if (artifactStat && !artifactStat.isDirectory()) {
+								throw new Error(`Session artifacts path is not a real directory: ${oldArtifactsDir}`);
+							}
+							if (artifactStat?.isDirectory()) {
+								// Only a whole-directory rename can be undone by renaming back;
+								// a merge leaves the rollback below to the session file alone.
+								artifactsRenamed =
+									(await relocateArtifactsDirectory(oldArtifactsDir, newArtifactsDir)) === "renamed";
+							}
+						}
+						// A synchronous append may materialize a lazy session while
+						// artifact relocation awaits I/O; move those durable bytes too.
+						if (!sessionFileExisted && sessionPathChanged && this.#storage.existsSync(oldSessionFile)) {
+							if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
+							await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
+							sessionMoved = true;
+							sessionFileExisted = true;
+						}
+					} catch (err) {
+						if (artifactsRenamed && oldArtifactsDir && newArtifactsDir) {
+							try {
+								await relocateArtifactsDirectory(newArtifactsDir, oldArtifactsDir);
+							} catch (rollbackErr) {
+								throw new Error(
+									`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+								);
+							}
+						}
+
+						if (sessionMoved) {
+							try {
+								await moveSessionFileWithoutReplacing(newSessionFile, oldSessionFile);
+							} catch (rollbackErr) {
+								throw new Error(
+									`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+								);
+							}
+						}
+
+						throw err;
+					}
+
 					if (sessionFileExisted && sessionPathChanged) {
-						await assertSourceIsOurs(oldSessionFile);
-						await claimDestination(newSessionFile);
-						if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
-						await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
-						sessionMoved = true;
+						this.#header.previousSessionFiles = [
+							...new Set([...(this.#header.previousSessionFiles ?? []), path.resolve(oldSessionFile)]),
+						];
 					}
 
-					if (artifactPathChanged) {
-						let artifactStat: fs.Stats | null = null;
-						try {
-							artifactStat = await fs.promises.lstat(oldArtifactsDir);
-						} catch (err) {
-							if (!isEnoent(err)) throw err;
-						}
-						if (artifactStat && !artifactStat.isDirectory()) {
-							throw new Error(`Session artifacts path is not a real directory: ${oldArtifactsDir}`);
-						}
-						if (artifactStat?.isDirectory()) {
-							// Only a whole-directory rename can be undone by renaming back;
-							// a merge leaves the rollback below to the session file alone.
-							artifactsRenamed =
-								(await relocateArtifactsDirectory(oldArtifactsDir, newArtifactsDir)) === "renamed";
-						}
-					}
-					// A synchronous append may materialize a lazy session while
-					// artifact relocation awaits I/O; move those durable bytes too.
-					if (!sessionFileExisted && sessionPathChanged && this.#storage.existsSync(oldSessionFile)) {
-						if (this.#sessionFileRelocating) this.#sessionFileRelocating.moving = true;
-						await moveSessionFileWithoutReplacing(oldSessionFile, newSessionFile);
-						sessionMoved = true;
-						sessionFileExisted = true;
-					}
-				} catch (err) {
-					if (artifactsRenamed && oldArtifactsDir && newArtifactsDir) {
-						try {
-							await relocateArtifactsDirectory(newArtifactsDir, oldArtifactsDir);
-						} catch (rollbackErr) {
-							throw new Error(
-								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-							);
-						}
-					}
-
-					if (sessionMoved) {
-						try {
-							await moveSessionFileWithoutReplacing(newSessionFile, oldSessionFile);
-						} catch (rollbackErr) {
-							throw new Error(
-								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-							);
-						}
-					}
-
-					throw err;
-				}
-
-				if (sessionFileExisted && sessionPathChanged) {
-					this.#header.previousSessionFiles = [
-						...new Set([...(this.#header.previousSessionFiles ?? []), path.resolve(oldSessionFile)]),
-					];
-				}
-
-				this.#sessionFile = newSessionFile;
-				// The freshness expectation must describe the NEW path. A successful
-				// rename carried this manager's tracked bytes to `newSessionFile`, so
-				// #expectedDiskSize still applies; without a rename the destination
-				// holds no bytes this manager wrote, so a recreate-from-memory must
-				// publish against an absent file rather than a stale size.
-				if (sessionPathChanged && !sessionMoved) this.#expectedDiskSize = null;
-				if (sessionPathChanged && !sessionMoved) this.#expectedDiskFingerprint = undefined;
-				if (sessionPathChanged && !sessionMoved) this.#expectedDiskTitleMeta = undefined;
-				this.#artifactManager = null;
-				this.#artifactManagerSessionFile = null;
-				// Path is repointed; hot-path appends may use `#sessionFile` again.
-				this.#sessionFileRelocating = null;
+					this.#sessionFile = newSessionFile;
+					// The freshness expectation must describe the NEW path. A successful
+					// rename carried this manager's tracked bytes to `newSessionFile`, so
+					// #expectedDiskSize still applies; without a rename the destination
+					// holds no bytes this manager wrote, so a recreate-from-memory must
+					// publish against an absent file rather than a stale size.
+					if (sessionPathChanged && !sessionMoved) this.#expectedDiskSize = null;
+					if (sessionPathChanged && !sessionMoved) this.#expectedDiskFingerprint = undefined;
+					if (sessionPathChanged && !sessionMoved) this.#expectedDiskTitleMeta = undefined;
+					this.#artifactManager = null;
+					this.#artifactManagerSessionFile = null;
+					// Path is repointed; hot-path appends may use `#sessionFile` again.
+					this.#sessionFileRelocating = null;
+				});
 			}
 
 			this.#cwd = resolvedCwd;

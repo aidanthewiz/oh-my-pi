@@ -9,10 +9,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { replaceFileAtomically } from "../utils/atomic-file";
+import { withArtifactPublicationLock } from "./artifact-publication";
 
 const TASK_STRUCTURED_SIDECAR_SCHEMA = "coreforge.task-structured-sidecar.v1";
 
-/** Rename changes ctime, but preserves this staged file generation. */
+/** File identity and content metadata for the primary's current published path. */
 export function artifactFileGeneration(stat: BigIntStats): string {
 	if (!stat.isFile()) throw new Error("Artifact is not a regular file.");
 	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}:${stat.mtimeNs}:${stat.size}`;
@@ -71,24 +72,26 @@ function sanitizeToolType(toolType: string): string {
  * Returns the verified UTF-8 byte count.
  */
 export async function writeArtifact(path: string, content: string): Promise<number> {
-	const expectedBytes = Buffer.byteLength(content);
-	const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
-	try {
-		const writtenBytes = await Bun.write(tempPath, content);
-		if (writtenBytes !== expectedBytes) {
-			throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
+	return withArtifactPublicationLock(async () => {
+		const expectedBytes = Buffer.byteLength(content);
+		const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
+		try {
+			const writtenBytes = await Bun.write(tempPath, content);
+			if (writtenBytes !== expectedBytes) {
+				throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
+			}
+			const file = Bun.file(tempPath);
+			if (file.size !== expectedBytes) {
+				throw new Error(`Artifact size mismatch: found ${file.size} of ${expectedBytes} bytes`);
+			}
+			await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
+			await replaceFileAtomically(tempPath, path);
+		} catch (error) {
+			await fs.rm(tempPath, { force: true });
+			throw error;
 		}
-		const file = Bun.file(tempPath);
-		if (file.size !== expectedBytes) {
-			throw new Error(`Artifact size mismatch: found ${file.size} of ${expectedBytes} bytes`);
-		}
-		await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
-		await replaceFileAtomically(tempPath, path);
-	} catch (error) {
-		await fs.rm(tempPath, { force: true });
-		throw error;
-	}
-	return expectedBytes;
+		return expectedBytes;
+	});
 }
 
 /**

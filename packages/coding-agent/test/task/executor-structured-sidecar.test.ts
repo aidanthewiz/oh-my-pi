@@ -10,6 +10,8 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
+import { withArtifactPublicationLock } from "../../src/session/artifact-publication";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -104,6 +106,121 @@ describe("structured output sidecar lifecycle", () => {
 		vi.restoreAllMocks();
 		if (artifactsDir) await fs.rm(artifactsDir, { recursive: true, force: true });
 		artifactsDir = undefined;
+	});
+
+	it.each(["cancelled", "retired"] as const)(
+		"does not publish an owner %s while waiting for publication",
+		async mode => {
+			artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-publication-wait-"));
+			const id = `WaitingOwner-${mode}`;
+			const primary = path.join(artifactsDir, `${id}.md`);
+			const sidecar = path.join(artifactsDir, `${id}.json`);
+			const accepted = '{"report":"accepted result"}';
+			await fs.writeFile(primary, accepted);
+			const envelope = serializeStructuredArtifactSidecar(
+				accepted,
+				artifactFileGeneration(await fs.stat(primary, { bigint: true })),
+			);
+			await fs.writeFile(sidecar, envelope);
+			const session = yieldEmittingSession({ report: "waiting result" });
+			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const contended = Promise.withResolvers<void>();
+			const acquire = FileLock.tryAcquire.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+				const lock = acquire(...args);
+				if (!lock.acquired) contended.resolve();
+				return lock;
+			});
+			const holder = withArtifactPublicationLock(async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+			const controller = new AbortController();
+			const pending = runSubprocess({
+				cwd: "/tmp",
+				agent: baseAgent,
+				task: "do work",
+				index: 0,
+				id,
+				settings: Settings.isolated(),
+				modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+				enableLsp: false,
+				artifactsDir,
+				signal: controller.signal,
+			});
+			try {
+				await contended.promise;
+				expect(await fs.readFile(primary, "utf8")).toBe(accepted);
+				if (mode === "cancelled") {
+					controller.abort();
+				} else {
+					AgentRegistry.global().register({
+						id,
+						displayName: id,
+						kind: "sub",
+						status: "idle",
+						session: yieldEmittingSession({ replacement: true }),
+					});
+					release.resolve();
+				}
+				const result = await pending;
+				expect(result.exitCode).toBe(1);
+				expect(result.aborted).toBe(true);
+				expect(result.outputPath).toBeUndefined();
+				expect(await fs.readFile(primary, "utf8")).toBe(accepted);
+				expect(await fs.readFile(sidecar, "utf8")).toBe(envelope);
+			} finally {
+				controller.abort();
+				release.resolve();
+				await holder;
+				await pending;
+				AgentRegistry.global().unregister(id);
+			}
+		},
+	);
+
+	it("binds structured data to the primary identity after rename", async () => {
+		artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-post-rename-generation-"));
+		const id = "RenamedIdentity";
+		const primary = path.join(artifactsDir, `${id}.md`);
+		const payload = { report: "complete result", nested: { value: "retained" } };
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(yieldEmittingSession(payload)));
+		const rename = fsSync.renameSync;
+		vi.spyOn(fsSync, "renameSync").mockImplementation((source, destination) => {
+			rename(source, destination);
+			if (String(destination) === primary) {
+				const replacement = `${primary}.replacement`;
+				fsSync.copyFileSync(primary, replacement);
+				rename(replacement, primary);
+			}
+		});
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: baseAgent,
+			task: "do work",
+			index: 0,
+			id,
+			settings: Settings.isolated(),
+			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+			enableLsp: false,
+			artifactsDir,
+			outputSchema: {
+				type: "object",
+				properties: { report: { type: "string" }, nested: { type: "object" } },
+				required: ["report", "nested"],
+			},
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.structuredOutput).toMatchObject({ status: "valid", data: payload });
+		expect(await fs.readFile(primary, "utf8")).toBe(result.output);
+		const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+		expect(
+			parseStructuredArtifactSidecar(await fs.readFile(path.join(artifactsDir, `${id}.json`), "utf8"), generation)
+				?.data,
+		).toEqual(payload);
 	});
 
 	it("drops a stale sidecar instead of leaving it behind when the replacement write fails", async () => {

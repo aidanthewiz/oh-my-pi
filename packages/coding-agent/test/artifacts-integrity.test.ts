@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
+import { withArtifactPublicationLock } from "../src/session/artifact-publication";
 import { ArtifactManager, writeArtifact } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -17,6 +19,113 @@ describe("ArtifactManager write integrity", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
+	});
+
+	it("waits for a live publication before replacing its complete artifact", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const contended = Promise.withResolvers<void>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		});
+		const holder = withArtifactPublicationLock(async () => {
+			await writeArtifact(destination, "first accepted report");
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const replacement = writeArtifact(destination, "second accepted report");
+		try {
+			await contended.promise;
+			expect(await Bun.file(destination).text()).toBe("first accepted report");
+		} finally {
+			release.resolve();
+			await holder;
+			await replacement;
+		}
+		expect(await Bun.file(destination).text()).toBe("second accepted report");
+	});
+
+	it("cancels a waiting publisher without changing the accepted artifact", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		await writeArtifact(destination, "accepted report");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const contended = Promise.withResolvers<void>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		});
+		const holder = withArtifactPublicationLock(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const controller = new AbortController();
+		const waiting = withArtifactPublicationLock(
+			() => writeArtifact(destination, "cancelled report"),
+			controller.signal,
+		).then(
+			() => undefined,
+			error => error,
+		);
+		try {
+			await contended.promise;
+			controller.abort();
+			expect(await waiting).toMatchObject({ name: "AbortError" });
+			expect(await Bun.file(destination).text()).toBe("accepted report");
+		} finally {
+			controller.abort();
+			release.resolve();
+			await holder;
+			await waiting;
+		}
+	});
+
+	it("makes a detached continuation reacquire after its publication scope ends", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		await writeArtifact(destination, "accepted report");
+		const wake = Promise.withResolvers<void>();
+		let detached!: Promise<number>;
+		await withArtifactPublicationLock(() => {
+			detached = wake.promise.then(() => writeArtifact(destination, "detached report"));
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const contended = Promise.withResolvers<void>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		});
+		const holder = withArtifactPublicationLock(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		wake.resolve();
+		try {
+			await contended.promise;
+			expect(await Bun.file(destination).text()).toBe("accepted report");
+		} finally {
+			release.resolve();
+			await holder;
+			await detached;
+		}
+		expect(await Bun.file(destination).text()).toBe("detached report");
 	});
 
 	it("rejects a short write instead of publishing an unreadable artifact id", async () => {

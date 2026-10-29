@@ -23,6 +23,7 @@ import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-ag
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { isTaskToolDetails, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { getAgentDir, getTerminalSessionsDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { withArtifactPublicationLock } from "../../src/session/artifact-publication";
 import {
 	writeArtifact,
 	artifactFileGeneration,
@@ -74,15 +75,17 @@ async function loadHistory(file: string): Promise<SessionEntry[]> {
 }
 
 async function writeStructuredArtifact(dir: string, id: string, data: unknown, markdown: string): Promise<string> {
-	const primary = path.join(dir, `${id}.md`);
-	await fs.mkdir(path.dirname(primary), { recursive: true });
-	await writeArtifact(primary, markdown);
-	const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
-	await fs.writeFile(
-		path.join(dir, `${id}.json`),
-		serializeStructuredArtifactSidecar(JSON.stringify(data), generation),
-	);
-	return generation;
+	return withArtifactPublicationLock(async () => {
+		const primary = path.join(dir, `${id}.md`);
+		await fs.mkdir(path.dirname(primary), { recursive: true });
+		await writeArtifact(primary, markdown);
+		const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+		await fs.writeFile(
+			path.join(dir, `${id}.json`),
+			serializeStructuredArtifactSidecar(JSON.stringify(data), generation),
+		);
+		return generation;
+	});
 }
 
 async function readStructuredArtifact(dir: string, id: string): Promise<unknown> {
@@ -162,6 +165,8 @@ describe("structured fork artifacts", () => {
 			expect(await readStructuredArtifact(destination, "Worker")).toBeUndefined();
 			if (kind === "md")
 				await expect(fs.stat(path.join(destination, "Worker.json"))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+			expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
 		},
 	);
 
@@ -192,129 +197,242 @@ describe("structured fork artifacts", () => {
 		});
 	});
 
-	it("preserves a newer same-Markdown destination pair published before the sidecar link", async () => {
-		using root = TempDir.createSync("@omp-racing-fork-");
-		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
-		const markdown = "The same shortened schema-error preview";
-		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, markdown);
-		const destinationFile = path.join(sessionDir, "racing.jsonl");
-		const destination = destinationFile.slice(0, -6);
-		const link = promises.link;
-		let replaced = false;
-		const publication = vi.spyOn(promises, "link").mockImplementation(async (...args) => {
-			if (args[1] === path.join(destination, "Worker.json") && !replaced) {
-				replaced = true;
-				await writeStructuredArtifact(destination, "Worker", { generation: "destination" }, markdown);
+	it.each([false, true])(
+		"preserves a coordinated accepted replacement after sidecar staging (failure: %s)",
+		async fail => {
+			using root = TempDir.createSync("@omp-coordinated-fork-");
+			const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+			const markdown = "The same shortened schema-error preview";
+			await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, markdown);
+			const destinationFile = path.join(sessionDir, "racing.jsonl");
+			const destination = destinationFile.slice(0, -6);
+			const staged = Promise.withResolvers<void>();
+			const resume = Promise.withResolvers<void>();
+			const writeFile = promises.writeFile;
+			let stagedPath: string | undefined;
+			const publication = vi.spyOn(promises, "writeFile").mockImplementation(async (...args) => {
+				if (
+					!stagedPath &&
+					String(args[0]).startsWith(path.join(destination, "Worker.md.copy-")) &&
+					path.basename(String(args[0])) === "sidecar"
+				) {
+					stagedPath = String(args[0]);
+					await writeFile(stagedPath, fail ? '{"schema"' : args[1], args[2]);
+					staged.resolve();
+					await resume.promise;
+					if (fail) throw Object.assign(new Error("Synthetic staging volume is full"), { code: "ENOSPC" });
+					return;
+				}
+				return writeFile(...args);
+			});
+			const copying = copySessionArtifacts(sourceFile, destinationFile);
+			let replacement: Promise<string> | undefined;
+			try {
+				await Promise.race([
+					staged.promise,
+					copying.then(() => {
+						throw new Error("Copy finished before structured staging");
+					}),
+				]);
+				replacement = writeStructuredArtifact(destination, "Worker", { generation: "accepted" }, markdown);
+				expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
+			} finally {
+				resume.resolve();
+				try {
+					await copying;
+					await replacement;
+				} finally {
+					publication.mockRestore();
+				}
 			}
-			await link(...args);
+			expect(stagedPath).toBeDefined();
+			await expect(fs.stat(stagedPath!)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
+			expect(await readStructuredArtifact(destination, "Worker")).toEqual({ generation: "accepted" });
+			expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+			expect(await readStructuredArtifact(sourceArtifactsDir, "Worker")).toEqual({ generation: "source" });
+		},
+	);
+
+	it.each(["Worker.md", "1.read.log"])(
+		"keeps a failed %s stage undiscoverable and permits a complete retry",
+		async name => {
+			using root = TempDir.createSync("@omp-staged-copy-failure-");
+			const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+			const data = { complete: "Submitted structured data".repeat(100) };
+			const markdown = "Complete Markdown result";
+			await writeStructuredArtifact(sourceArtifactsDir, "Worker", data, markdown);
+			const sourcePrimary = await fs.realpath(path.join(sourceArtifactsDir, name));
+			const destinationFile = path.join(sessionDir, "staged-failure.jsonl");
+			const destination = destinationFile.slice(0, -6);
+			const copyFile = promises.copyFile;
+			let failedStagingPath: string | undefined;
+			const copy = vi.spyOn(promises, "copyFile").mockImplementation(async (...args) => {
+				await copyFile(...args);
+				if (args[0] === sourcePrimary && !failedStagingPath) {
+					failedStagingPath = String(args[1]);
+					await fs.truncate(failedStagingPath, 8);
+					throw Object.assign(new Error("Synthetic staging volume is full"), { code: "ENOSPC" });
+				}
+			});
+			try {
+				await copySessionArtifacts(sourceFile, destinationFile);
+			} finally {
+				copy.mockRestore();
+			}
+			expect(failedStagingPath).toBeDefined();
+			await expect(fs.stat(failedStagingPath!)).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.stat(path.join(destination, name))).rejects.toMatchObject({ code: "ENOENT" });
+			if (name === "Worker.md")
+				await expect(fs.stat(path.join(destination, "Worker.json"))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await readStructuredArtifact(sourceArtifactsDir, "Worker")).toEqual(data);
+			await copySessionArtifacts(sourceFile, destinationFile);
+			expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
+			expect(await readStructuredArtifact(destination, "Worker")).toEqual(data);
+			expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+		},
+	);
+
+	it("keeps complete Markdown and later artifacts when optional sidecar staging fails", async () => {
+		using root = TempDir.createSync("@omp-sidecar-copy-failure-");
+		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const data = { complete: "Submitted structured data".repeat(100) };
+		const markdown = "Complete source Markdown";
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", data, markdown);
+		const destinationFile = path.join(sessionDir, "sidecar-failure.jsonl");
+		const destination = destinationFile.slice(0, -6);
+		const writeFile = promises.writeFile;
+		let failedStagingPath: string | undefined;
+		const write = vi.spyOn(promises, "writeFile").mockImplementation(async (...args) => {
+			if (
+				String(args[0]).startsWith(path.join(destination, "Worker.md.copy-")) &&
+				path.basename(String(args[0])) === "sidecar" &&
+				!failedStagingPath
+			) {
+				failedStagingPath = String(args[0]);
+				await writeFile(failedStagingPath, '{"schema"', { flag: "wx", mode: 0o600 });
+				throw Object.assign(new Error("Synthetic staging volume is full"), { code: "ENOSPC" });
+			}
+			return writeFile(...args);
 		});
 		try {
 			await copySessionArtifacts(sourceFile, destinationFile);
 		} finally {
-			publication.mockRestore();
+			write.mockRestore();
 		}
-		expect(replaced).toBe(true);
+		expect(failedStagingPath).toBeDefined();
+		await expect(fs.stat(failedStagingPath!)).rejects.toMatchObject({ code: "ENOENT" });
 		expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
-		expect(await readStructuredArtifact(destination, "Worker")).toEqual({ generation: "destination" });
+		expect(await readStructuredArtifact(destination, "Worker")).toBeUndefined();
+		expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+		expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
+		expect(await readStructuredArtifact(sourceArtifactsDir, "Worker")).toEqual(data);
 	});
-
-	it("preserves structured results and later artifacts through a fork without hard links", async () => {
-		using root = TempDir.createSync("@omp-linkless-fork-");
+	it("preserves complete structured results through directory merge, rollback and cold reopen", async () => {
+		using root = TempDir.createSync("@omp-structured-move-");
 		const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
-		const data = { invalidForSchema: "complete submitted data".repeat(10_000), sentinel: "beyond the preview" };
-		const markdown = "Schema validation failed. Submitted preview only.";
+		const newCwd = path.join(root.path(), "new-project");
+		const targetSessionDir = path.join(root.path(), "moved-sessions");
+		await fs.mkdir(cwd);
+		await fs.mkdir(newCwd);
+		const destination = path.join(targetSessionDir, path.basename(sourceArtifactsDir));
+		await fs.mkdir(path.join(destination, "nested"), { recursive: true });
+		const data = { invalidForSchema: "Complete data outside the shortened preview".repeat(1_000) };
 		for (const id of ["Worker", "nested/Worker"])
-			await writeStructuredArtifact(sourceArtifactsDir, id, data, markdown);
-		const unsupported = vi
-			.spyOn(promises, "link")
-			.mockRejectedValue(Object.assign(new Error("Filesystem has no hard links"), { code: "ENOTSUP" }));
-		let forkFile: string;
+			await writeStructuredArtifact(sourceArtifactsDir, id, data, "Schema error preview");
+		const manager = await SessionManager.open(sourceFile, sessionDir);
 		try {
-			const fork = await SessionManager.forkFrom(sourceFile, cwd, sessionDir);
-			forkFile = fork.getSessionFile()!;
-			try {
-				fork.appendMessage({ role: "user", content: "Retain the linkless fork", timestamp: 1 });
-				await fork.flush();
-				const destination = fork.getArtifactsDir()!;
-				for (const id of ["Worker", "nested/Worker"]) {
-					expect(await fs.readFile(path.join(destination, `${id}.md`), "utf8")).toBe(markdown);
-					expect(await readStructuredArtifact(destination, id)).toEqual(data);
-					expect(await readStructuredArtifact(sourceArtifactsDir, id)).toEqual(data);
-				}
-				expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
-				expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
-			} finally {
-				await fork.close();
-			}
+			manager.appendMessage({ role: "user", content: "Retain the moved session", timestamp: 1 });
+			await manager.flush();
+			const snapshot = manager.captureState();
+			await manager.moveTo(newCwd, targetSessionDir);
+			for (const id of ["Worker", "nested/Worker"])
+				expect(await readStructuredArtifact(manager.getArtifactsDir()!, id)).toEqual(data);
+			await manager.rollbackMove(snapshot);
+			expect(manager.getSessionFile()).toBe(sourceFile);
+			for (const id of ["Worker", "nested/Worker"])
+				expect(await readStructuredArtifact(manager.getArtifactsDir()!, id)).toEqual(data);
 		} finally {
-			unsupported.mockRestore();
+			await manager.close();
 		}
-		const reopened = await SessionManager.open(forkFile, sessionDir);
+		const reopened = await SessionManager.open(sourceFile, sessionDir);
 		try {
-			expect(await readStructuredArtifact(reopened.getArtifactsDir()!, "Worker")).toEqual(data);
-			expect(await readStructuredArtifact(reopened.getArtifactsDir()!, "nested/Worker")).toEqual(data);
+			for (const id of ["Worker", "nested/Worker"])
+				expect(await readStructuredArtifact(reopened.getArtifactsDir()!, id)).toEqual(data);
 		} finally {
 			await reopened.close();
 		}
 	});
 
-	it("preserves occupied primary and sidecar owners without hard links", async () => {
-		using root = TempDir.createSync("@omp-linkless-occupied-");
-		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
-		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, "Source preview");
-		await writeStructuredArtifact(sourceArtifactsDir, "JsonOnly", { generation: "source" }, "Source preview");
-		const destinationFile = path.join(sessionDir, "occupied-linkless.jsonl"),
-			destination = destinationFile.slice(0, -6);
-		await writeStructuredArtifact(destination, "Worker", { generation: "destination" }, "Newer destination");
-		await fs.writeFile(path.join(destination, "JsonOnly.json"), "Destination-owned sidecar");
-		const unsupported = vi
-			.spyOn(promises, "link")
-			.mockRejectedValue(Object.assign(new Error("Filesystem has no hard links"), { code: "ENOTSUP" }));
+	it("keeps an occupied structured destination and its stranded source pair during a merge", async () => {
+		using root = TempDir.createSync("@omp-occupied-artifact-merge-");
+		const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const targetSessionDir = path.join(root.path(), "moved-sessions");
+		const destination = path.join(targetSessionDir, path.basename(sourceArtifactsDir));
+		await fs.mkdir(cwd);
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { owner: "source" }, "Source Markdown");
+		await writeStructuredArtifact(destination, "Worker", { owner: "destination" }, "Accepted destination Markdown");
+		const manager = await SessionManager.open(sourceFile, sessionDir);
 		try {
-			await copySessionArtifacts(sourceFile, destinationFile);
+			manager.appendMessage({ role: "user", content: "Retain the moved session", timestamp: 1 });
+			await manager.flush();
+			await manager.moveTo(cwd, targetSessionDir);
+			expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe("Accepted destination Markdown");
+			expect(await readStructuredArtifact(destination, "Worker")).toEqual({ owner: "destination" });
+			expect(await fs.readFile(path.join(sourceArtifactsDir, "Worker.md"), "utf8")).toBe("Source Markdown");
+			expect(await readStructuredArtifact(sourceArtifactsDir, "Worker")).toEqual({ owner: "source" });
+			expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
 		} finally {
-			unsupported.mockRestore();
+			await manager.close();
 		}
-		expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe("Newer destination");
-		expect(await readStructuredArtifact(destination, "Worker")).toEqual({ generation: "destination" });
-		expect(await fs.readFile(path.join(destination, "JsonOnly.json"), "utf8")).toBe("Destination-owned sidecar");
-		expect(await readStructuredArtifact(destination, "JsonOnly")).toBeUndefined();
-		expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
 	});
 
-	it("never binds a linkless copy to a replacement primary with the same Markdown", async () => {
-		using root = TempDir.createSync("@omp-linkless-replacement-");
-		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
-		const markdown = "Identical shortened schema-error preview";
-		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, markdown);
-		const destinationFile = path.join(sessionDir, "racing-linkless.jsonl"),
-			destination = destinationFile.slice(0, -6);
-		await fs.mkdir(destination);
-		const namedPrimary = path.join(destination, "Worker.md");
-		const lstat = promises.lstat;
-		let replaced = false;
-		const unsupported = vi
-			.spyOn(promises, "link")
-			.mockRejectedValue(Object.assign(new Error("Filesystem has no hard links"), { code: "ENOTSUP" }));
-		const inspect = vi.spyOn(promises, "lstat").mockImplementation((async (...args: Parameters<typeof lstat>) => {
-			if (!replaced && String(args[0]).endsWith(path.join("racing-linkless", "Worker.md"))) {
-				replaced = true;
-				await fs.writeFile(`${namedPrimary}.new`, markdown);
-				await fs.rename(`${namedPrimary}.new`, namedPrimary);
+	it.each(["Worker", "nested/Worker"])(
+		"retains %s's complete source pair after primary-stage failure while merging later artifacts",
+		async id => {
+			using root = TempDir.createSync("@omp-failed-structured-merge-");
+			const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+			const targetSessionDir = path.join(root.path(), "moved-sessions");
+			const destination = path.join(targetSessionDir, path.basename(sourceArtifactsDir));
+			await fs.mkdir(cwd);
+			await fs.mkdir(path.join(destination, "nested"), { recursive: true });
+			const data = { complete: "Full submitted data outside the preview".repeat(1_000) };
+			const markdown = "Complete source Markdown";
+			await writeStructuredArtifact(sourceArtifactsDir, id, data, markdown);
+			const primary = path.join(sourceArtifactsDir, `${id}.md`);
+			const manager = await SessionManager.open(sourceFile, sessionDir);
+			let failedStage: string | undefined;
+			try {
+				manager.appendMessage({ role: "user", content: "Retain the moved session", timestamp: 1 });
+				await manager.flush();
+				const copyFile = promises.copyFile;
+				const copy = vi.spyOn(promises, "copyFile").mockImplementation(async (...args) => {
+					await copyFile(...args);
+					if (String(args[0]) === primary && !failedStage) {
+						failedStage = String(args[1]);
+						await fs.truncate(failedStage, 8);
+						throw Object.assign(new Error("Synthetic staging volume is full"), { code: "ENOSPC" });
+					}
+				});
+				try {
+					await manager.moveTo(cwd, targetSessionDir);
+				} finally {
+					copy.mockRestore();
+				}
+				expect(failedStage).toBeDefined();
+				await expect(fs.stat(failedStage!)).rejects.toMatchObject({ code: "ENOENT" });
+				expect(manager.getArtifactsDir()).toBe(destination);
+				expect(await fs.readFile(primary, "utf8")).toBe(markdown);
+				expect(await readStructuredArtifact(sourceArtifactsDir, id)).toEqual(data);
+				await expect(fs.stat(path.join(destination, `${id}.md`))).rejects.toMatchObject({ code: "ENOENT" });
+				await expect(fs.stat(path.join(destination, `${id}.json`))).rejects.toMatchObject({ code: "ENOENT" });
+				expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+				expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
+			} finally {
+				await manager.close();
 			}
-			return lstat(...args);
-		}) as typeof lstat);
-		try {
-			await copySessionArtifacts(sourceFile, destinationFile);
-		} finally {
-			inspect.mockRestore();
-			unsupported.mockRestore();
-		}
-		expect(replaced).toBe(true);
-		expect(await fs.readFile(namedPrimary, "utf8")).toBe(markdown);
-		expect(await readStructuredArtifact(destination, "Worker")).toBeUndefined();
-		expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
-	});
+		},
+	);
 });
 
 describe("SessionManager.forkFrom", () => {
