@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
 import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
@@ -347,6 +348,98 @@ describe("runSubprocess result acceptance", () => {
 			expect(job!.status).toBe("failed");
 			expect(await delivered.promise).toMatchObject({ id: jobId });
 		} finally {
+			manager.cancel(jobId);
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it("settles a retired task before another publication lease is released", async () => {
+		using tmp = TempDir.createSync("@omp-test-task-publication-retirement-");
+		const artifactsDir = tmp.path();
+		const primary = path.join(artifactsDir, `${AGENT_ID}.md`);
+		await Bun.write(primary, "Previously accepted complete result");
+		const sidecar = await writeBoundAcceptedSidecar(artifactsDir, '{"accepted":true}');
+		const harness = createHarness();
+		const promptStarted = Promise.withResolvers<void>();
+		const continuePrompt = Promise.withResolvers<void>();
+		const prompt = harness.session.prompt.bind(harness.session);
+		harness.session.prompt = async (text, options) => {
+			promptStarted.resolve();
+			await continuePrompt.promise;
+			return prompt(text, options);
+		};
+		const ref = registerRunning(harness.session);
+		const manager = new AsyncJobManager({});
+		let callerSignal: AbortSignal | undefined;
+		const jobId = manager.register("task", AGENT_ID, async ({ signal }) => {
+			callerSignal = signal;
+			const result = await runSubagentFollowUpTurn({
+				agent: baseAgent,
+				message: "publish a complete result",
+				id: AGENT_ID,
+				artifactsDir,
+				signal,
+			});
+			if (result.exitCode !== 0) throw new Error(result.abortReason ?? result.error ?? "Task failed");
+			return result.output;
+		});
+		const waiting = Promise.withResolvers<void>();
+		let holderHeld = false;
+		let holder: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const wait = scheduler.wait.bind(scheduler);
+		vi.spyOn(scheduler, "wait").mockImplementation((delay, options) => {
+			if (delay === 25 && holderHeld) waiting.resolve();
+			return wait(delay, options);
+		});
+		try {
+			expect(
+				await Promise.race([
+					promptStarted.promise.then(() => true),
+					manager.getJob(jobId)!.promise.then(() => false),
+				]),
+			).toBe(true);
+			holder = Bun.spawn(
+				[
+					process.execPath,
+					"--no-env-file",
+					"--eval",
+					`import { withArtifactPublicationLock } from ${JSON.stringify(import.meta.resolve("@oh-my-pi/pi-coding-agent/session/artifact-publication"))};
+await withArtifactPublicationLock(async () => {
+	console.log("lease-held");
+	await Bun.stdin.text();
+});`,
+				],
+				{ stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+			);
+			const output = holder.stdout.getReader();
+			const ready = await output.read();
+			output.releaseLock();
+			expect(new TextDecoder().decode(ready.value)).toBe("lease-held\n");
+			holderHeld = true;
+			continuePrompt.resolve();
+			await waiting.promise;
+			await harness.session.abort();
+			await AgentLifecycleManager.global().release(AGENT_ID, ref, { tombstone: true });
+			const job = manager.getJob(jobId)!;
+			const settledBeforeRelease = await Promise.race([
+				job.promise.then(() => true),
+				new Promise<boolean>(resolve => {
+					timeout = setTimeout(() => resolve(false), 2000);
+				}),
+			]);
+			expect(settledBeforeRelease).toBe(true);
+			expect(callerSignal?.aborted).toBe(false);
+			expect(job.status).toBe("failed");
+			expect(holderHeld).toBe(true);
+			expect(holder.exitCode).toBeNull();
+			expect(await Bun.file(primary).text()).toBe("Previously accepted complete result");
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(sidecar);
+		} finally {
+			clearTimeout(timeout);
+			continuePrompt.resolve();
+			holder?.stdin.end();
+			if (holder) await holder.exited;
 			manager.cancel(jobId);
 			await manager.dispose({ timeoutMs: 1000 });
 		}

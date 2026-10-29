@@ -19,6 +19,7 @@
 - Show each selected settings option's complete description at narrow widths, including cache-retention prices. Preserve previews and confirmation-only selection.
 - Prevent truncated session-copy artifacts after failed writes. Preserve complete structured results, destination owners, and complete Markdown after optional JSON failure.
 - Coordinate current engine artifact copies, publications, moves, and rollback. Older engines and external writers do not share this protection.
+- Cancel queued task artifact publication when its originating agent retires, without interrupting another session's active copy.
 - Finish initial model discovery before headless commands capture session ownership. Keep browser authorization limited to explicit host consent.
 - Keep deferred extension tools and source metadata bound to the active registration. Roll back failed activations without replacing newer tools or prompts. Preserve surviving event policies and shutdown cleanup during extension changes.
 - Return promptly from cancelled MCP logins while preventing conflicting logins until pending work settles. Keep accepted credential persistence serialized.

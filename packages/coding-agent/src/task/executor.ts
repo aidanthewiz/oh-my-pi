@@ -2934,7 +2934,16 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 		const nonce = Snowflake.next();
 		const stagedOutput = `${candidatePath}.tmp-${nonce}`;
 		const stagedSidecar = `${sidecarPath}.tmp-${nonce}`;
+		const retirement = new AbortController();
+		const publicationSignal = signal ? AbortSignal.any([signal, retirement.signal]) : retirement.signal;
+		const cancelRetiredPublication = () => {
+			if (!args.isPublicationCurrent()) retirement.abort();
+		};
+		const unsubscribeRetirement = AgentRegistry.global().onChange(event => {
+			if (event.ref.id === id) cancelRetiredPublication();
+		});
 		try {
+			cancelRetiredPublication();
 			await withArtifactPublicationLock(async () => {
 				if (!args.isPublicationCurrent() || signal?.aborted || monitor.runtimeLimitExceeded()) return;
 				await writeArtifact(stagedOutput, rawOutput);
@@ -2995,7 +3004,7 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 						}
 					}
 				}
-			}, signal);
+			}, publicationSignal);
 		} catch (error) {
 			publicationFailure = error instanceof Error ? error.message : String(error);
 			logger.warn("Failed to persist subagent output artifact", {
@@ -3004,6 +3013,7 @@ async function finalizeOwnedRunResult(args: FinalizeRunArgs): Promise<SingleResu
 				error: error instanceof Error ? error.message : String(error),
 			});
 		} finally {
+			unsubscribeRetirement();
 			await Promise.all(
 				[stagedOutput, stagedSidecar].map(file =>
 					fs.rm(file, { force: true }).catch(error => {
