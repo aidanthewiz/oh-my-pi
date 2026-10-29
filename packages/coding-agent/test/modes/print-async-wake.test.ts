@@ -13,6 +13,10 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
+import { HeadlessShutdownCoordinator } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { ExtensionRuntime as RuntimeActions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { cfgCompactionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -39,6 +43,7 @@ async function sessionWithJobs(
 		jobsStartedByFirstWake?: number;
 		settleMs?: number;
 		retryBackoff?: "prompt" | "follow-up";
+		extensionSends?: "prompt" | "manual";
 	} = {},
 ) {
 	const manager = new AsyncJobManager({});
@@ -51,6 +56,9 @@ async function sessionWithJobs(
 	let delivered = 0;
 	let settling = false;
 	let retryStarts = 0;
+	const retryStarted = Promise.withResolvers<number>();
+	const extensionRuntime: RuntimeActions | undefined = options.extensionSends ? new ExtensionRuntime() : undefined;
+	let extensionSends = 0;
 	const startJobs = (count: number): void => {
 		for (let i = 0; i < count; i++) {
 			const gate = Promise.withResolvers<void>();
@@ -80,6 +88,13 @@ async function sessionWithJobs(
 	};
 	const mock = createMockModel({
 		handler: context => {
+			if (options.extensionSends === "prompt" && extensionRuntime && extensionSends === 0) {
+				extensionSends++;
+				extensionRuntime.sendMessage(
+					{ customType: "print-deadline", content: "Real extension send before settlement", display: false },
+					{ triggerTurn: false },
+				);
+			}
 			const text = context.messages
 				.flatMap(message =>
 					typeof message.content === "string"
@@ -111,10 +126,11 @@ async function sessionWithJobs(
 	cfgFeaturesUnexpectedStopDetection.override(settings, "none");
 	cfgRetryEnabled.override(settings, true);
 	cfgRetryModelFallback.override(settings, false);
-	cfgRetryBaseDelayMs.override(settings, 1_000);
-	cfgRetryMaxDelayMs.override(settings, 1_000);
+	const retryDelayMs = options.extensionSends ? 10_000 : 1_000;
+	cfgRetryBaseDelayMs.override(settings, retryDelayMs);
+	cfgRetryMaxDelayMs.override(settings, retryDelayMs);
 	const modelRegistry = new ModelRegistry(authStorage);
-	const deadline = options.retryBackoff ? Date.now() + 50 : undefined;
+	const deadline = options.retryBackoff && !options.extensionSends ? Date.now() + 50 : undefined;
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		deadline,
@@ -122,20 +138,35 @@ async function sessionWithJobs(
 		convertToLlm,
 		streamFn: mock.stream,
 	});
+	const sessionManager = SessionManager.inMemory();
 	const session = new AgentSession({
 		agent,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager,
 		settings,
 		modelRegistry,
 		agentId: "Main",
 		asyncJobManager: manager,
+		extensionRunner: extensionRuntime
+			? new ExtensionRunner(
+					[],
+					extensionRuntime,
+					sessionManager.getCwd(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					settings,
+				)
+			: undefined,
 	});
 	sessions.push(session);
 	const releaseNext = (): void => {
 		if (!options.jobsNeverFinish) gates[delivered]?.resolve();
 	};
 	session.subscribe(event => {
-		if (event.type === "auto_retry_start") retryStarts++;
+		if (event.type === "auto_retry_start") {
+			retryStarts++;
+			retryStarted.resolve(Date.now());
+		}
 		if (event.type === "agent_end" && settling && session.getLastAssistantMessage()?.stopReason === "stop") {
 			releaseNext();
 		}
@@ -152,6 +183,9 @@ async function sessionWithJobs(
 		deadline,
 		statuses: () => jobs.map(job => job.status),
 		retryStarts: () => retryStarts,
+		retryStarted: retryStarted.promise,
+		extensionRuntime,
+		extensionSends: () => extensionSends,
 	};
 }
 
@@ -331,6 +365,83 @@ describe("print mode async-result wake", () => {
 		});
 		expect(session.isDisposed).toBe(true);
 		expect(lines.join("")).toBe("");
+	});
+
+	test("an initialized extension send cannot keep an expired retry and its owned job alive", async () => {
+		const { lines } = captureStdout();
+		const settings = Settings.isolated();
+		cfgAsyncPrintWake.override(settings, true);
+		const { session, mock, statuses, retryStarts, retryStarted, extensionSends } = await sessionWithJobs(
+			settings,
+			1,
+			{ retryBackoff: "prompt", extensionSends: "prompt" },
+		);
+		const deadline = Date.now() + 1_000;
+		const completion = runPrintMode(session, { mode: "json", messages: ["go"], deadline });
+		const retryAt = await Promise.race([
+			retryStarted,
+			completion.then(() => {
+				throw new Error("Print closed before the extension retry started");
+			}),
+		]);
+		expect(retryAt).toBeLessThan(deadline);
+		expect(session.isDisposed).toBe(false);
+		expect(statuses()).toEqual(["running"]);
+
+		expect(await completion).toBe(1);
+		expect(mock.calls).toHaveLength(1);
+		expect(retryStarts()).toBe(1);
+		expect(extensionSends()).toBe(1);
+		expect(statuses()).toEqual(["cancelled"]);
+		expect(session.isDisposed).toBe(true);
+		const events = lines.map(line => JSON.parse(line));
+		expect(events.some(event => event.type === "auto_retry_start")).toBe(true);
+		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
+			1,
+		);
+	});
+
+	test("the same deadline remains armed when a real extension turn enters retry during the final drain", async () => {
+		const { lines } = captureStdout();
+		const settings = Settings.isolated();
+		cfgAsyncPrintWake.override(settings, true);
+		const { session, mock, retryStarts, retryStarted, extensionRuntime } = await sessionWithJobs(settings, 0, {
+			retryBackoff: "follow-up",
+			extensionSends: "manual",
+		});
+		if (!extensionRuntime) throw new Error("Expected an extension runtime");
+		const catchup = session.waitForAdvisorCatchup.bind(session);
+		vi.spyOn(session, "waitForAdvisorCatchup").mockImplementation(async (timeout, options) => {
+			const settled = await catchup(timeout, options);
+			extensionRuntime.sendUserMessage("Run the extension follow-up");
+			await retryStarted;
+			return settled;
+		});
+		const drainEntered = Promise.withResolvers<number>();
+		const drain = HeadlessShutdownCoordinator.prototype.drain;
+		vi.spyOn(HeadlessShutdownCoordinator.prototype, "drain").mockImplementation(
+			function (this: HeadlessShutdownCoordinator) {
+				if (retryStarts() > 0 && !session.isDisposed) drainEntered.resolve(Date.now());
+				return drain.call(this);
+			},
+		);
+		const deadline = Date.now() + 1_000;
+		const completion = runPrintMode(session, { mode: "text", messages: ["go"], deadline });
+		const enteredAt = await Promise.race([
+			drainEntered.promise,
+			completion.then(() => {
+				throw new Error("Print closed before the extension drain started");
+			}),
+		]);
+		expect(enteredAt).toBeLessThan(deadline);
+		expect(mock.calls).toHaveLength(2);
+		expect(retryStarts()).toBe(1);
+		expect(session.isDisposed).toBe(false);
+
+		expect(await completion).toBe(1);
+		expect(mock.calls).toHaveLength(2);
+		expect(session.isDisposed).toBe(true);
+		expect(lines.join("")).toBe("started\n");
 	});
 });
 

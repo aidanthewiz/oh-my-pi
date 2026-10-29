@@ -362,9 +362,18 @@ async function runPrintModeCore(
 		performShutdown: async () => {},
 	});
 	const drainExtensionWork = async (): Promise<void> => {
+		if (!extensionSendsObserved || asyncWaitExpired || builtinSignal.aborted || session.isDisposed) return;
+		if (cfgAsyncPrintWake.get(session.settings) && deadlineTimer === undefined) armDeadline();
 		do {
-			await extensionSends.drain();
-			if (extensionSendsObserved) await session.waitForIdle();
+			if (await expires(extensionSends.drain())) {
+				asyncWaitExpired = true;
+				return;
+			}
+			if (builtinSignal.aborted || session.isDisposed) return;
+			if (await expires(session.waitForIdle())) {
+				asyncWaitExpired = true;
+				return;
+			}
 		} while (extensionSends.hasPendingTasks);
 	};
 
@@ -556,27 +565,20 @@ async function runPrintModeCore(
 	// and fails the run.
 	if (!asyncWaitExpired && hasAgentWork && !strictMCPFailure && cfgAsyncPrintWake.get(session.settings)) {
 		if (deadlineTimer === undefined) armDeadline();
-		try {
-			// Without owned jobs a late primary turn is not this wait's business: it keeps its own exit path.
-			asyncWaitExpired = (await expires(session.waitForIdle())) && session.hasPendingAsyncWork();
-			while (!asyncWaitExpired && session.hasPendingAsyncWork() && !session.isDisposed && !signalTeardownActive()) {
-				// Checked synchronously too: an already-due timer fires only in the timers
-				// phase, after a settle of finished work would have resolved. The deadline
-				// stops new waits; a settle that already finished is kept: its follow-up turn
-				// ran under the agent-loop deadline (which aborts a turn that crosses it), so
-				// its answer is complete.
-				if (deadline !== undefined && Date.now() >= deadline) {
-					asyncWaitExpired = true;
-					break;
-				}
-				asyncWaitExpired = await expires(session.settleAsyncWork());
+		// Without owned jobs a late primary turn is not this wait's business: it keeps its own exit path.
+		asyncWaitExpired = (await expires(session.waitForIdle())) && session.hasPendingAsyncWork();
+		while (!asyncWaitExpired && session.hasPendingAsyncWork() && !session.isDisposed && !signalTeardownActive()) {
+			// Checked synchronously too: an already-due timer fires only in the timers
+			// phase, after a settle of finished work would have resolved. The deadline
+			// stops new waits; a settle that already finished is kept: its follow-up turn
+			// ran under the agent-loop deadline (which aborts a turn that crosses it), so
+			// its answer is complete.
+			if (deadline !== undefined && Date.now() >= deadline) {
+				asyncWaitExpired = true;
+				break;
 			}
-		} finally {
-			clearTimeout(deadlineTimer);
+			asyncWaitExpired = await expires(session.settleAsyncWork());
 		}
-	}
-	if (asyncWaitExpired) {
-		writeStderrLine("Error: --max-time reached before background work settled; any running jobs were cancelled.");
 	}
 
 	// From this point onward a late blocker must be recorded without starting a
@@ -662,6 +664,9 @@ async function runPrintModeCore(
 		);
 	}
 	await drainExtensionWork();
+	if (asyncWaitExpired) {
+		writeStderrLine("Error: --max-time reached before background work settled; any running jobs were cancelled.");
+	}
 	// Error spans must reach the exporter; the postmortem `exit` handler can't await.
 	if (terminalFailure) await flushTelemetryExport();
 

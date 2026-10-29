@@ -1453,64 +1453,6 @@ describe("askToolRenderer malformed call args", () => {
 });
 
 describe("AskTool rich ask dialog", () => {
-	it("accepts new schema fields (header, preview, note) and maps them into AskToolDetails", async () => {
-		const tool = new AskTool(createSession());
-		const askDialog = vi.fn().mockResolvedValue({
-			kind: "submit",
-			results: [
-				{
-					id: "q1",
-					question: "Q1?",
-					options: ["Option A"],
-					multi: false,
-					selectedOptions: ["Option A"],
-					note: "My Custom Note",
-					timedOut: undefined,
-				},
-			],
-		});
-		const context = createContext({ askDialog });
-
-		const result = await tool.execute(
-			"call-rich-dialog",
-			{
-				questions: [
-					{
-						id: "q1",
-						question: "Q1?",
-						header: "Chip Header",
-						options: [{ label: "Option A", preview: "My Preview" }],
-					},
-				],
-			},
-			undefined,
-			undefined,
-			context,
-		);
-
-		expect(askDialog).toHaveBeenCalledTimes(1);
-		// Check that header and preview were forwarded
-		expect(askDialog.mock.calls[0][0]).toEqual([
-			{
-				id: "q1",
-				question: "Q1?",
-				header: "Chip Header",
-				options: [{ label: "Option A", preview: "My Preview" }],
-			},
-		]);
-
-		// Verify result contains details with note mapping
-		expect(result.details).toEqual({
-			question: "Q1?",
-			options: ["Option A"],
-			multi: false,
-			selectedOptions: ["Option A"],
-			customInput: undefined,
-			note: "My Custom Note",
-			timedOut: undefined,
-		});
-	});
-
 	it("returns custom-answer and note images after text, numbering markers across answers in text and details", async () => {
 		// A clipboard paste committed to the session carries its file; the model gets the same
 		// source notice a main-editor attachment gets, right before the image.

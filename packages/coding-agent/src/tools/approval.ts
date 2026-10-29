@@ -6,6 +6,8 @@
  * - compare a tool capability tier against the active approval mode,
  * - format the generic approval prompt body.
  */
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -13,12 +15,14 @@ import type {
 	ToolApprovalDecision,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import approvalFolderTemplate from "../prompts/tools/approval-folder.md" with { type: "text" };
 import * as path from "node:path";
 import type { Settings } from "../config/settings";
+import { all as allSettings } from "../config/registry";
 import { normalizeToLF } from "../edit/normalize";
 import type {
 	ExtensionApprovalAnswer,
@@ -30,10 +34,11 @@ import type {
 import {
 	type ApprovalGrantStore,
 	type ApprovalGrants,
+	approvalCacheKeyForPath,
 	approvalGrantKey,
 	commonApprovalDirectoryKey,
 } from "./approval-cache";
-import { cfgToolsApproval, cfgToolsApprovalMode } from "./settings";
+import { cfgToolsApproval, cfgToolsApprovalMode, cfgToolsRestrictedFolders } from "./settings";
 import {
 	approvalFolderListing,
 	type ApprovalFolderListing,
@@ -42,6 +47,7 @@ import {
 	approvalTreeSearchFolderKey,
 	approvalTargetIdentities,
 } from "./approval-targets";
+import { expandTilde, resolveToCwd } from "./path-utils";
 
 export type { ToolApproval, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
 
@@ -148,7 +154,7 @@ export interface ResolvedApproval {
 	tier: ToolTier;
 	reason?: string;
 	override: boolean;
-	source?: "tool" | "user" | "mode";
+	source?: "tool" | "user" | "mode" | "restriction";
 	/**
 	 * User-policy key that produced `source: "user"` (defaults to the tool name), or the keyed
 	 * sub-tool (an `xd://` device) a tool-owned or mode decision is about.
@@ -192,6 +198,82 @@ export interface CapturedApprovalTargets {
 	readonly targets: readonly string[];
 	readonly identities: readonly ToolApprovalCacheIdentity[];
 	readonly failed: boolean;
+}
+
+export interface CapturedApprovalAuthority {
+	readonly scope: string;
+	readonly credentials: AgentToolContext["modelRegistry"]["authStorage"]["credentials"];
+	readonly model: Model | undefined;
+	readonly settings: Settings;
+	readonly sessionId: string;
+}
+
+/** The same source and settings authority used to scope remembered approvals. */
+export function captureApprovalAuthority(
+	cwd: string,
+	sessionId: string,
+	settings: Settings | undefined,
+	owner: Pick<AgentToolContext, "modelRegistry" | "model">,
+): CapturedApprovalAuthority | undefined {
+	if (!settings) return undefined;
+	try {
+		const auth = owner.modelRegistry.authStorage;
+		const model = owner.model;
+		const realCwd = fs.realpathSync(cwd);
+		const cwdStat = fs.statSync(realCwd);
+		const providers = [...new Set(auth.credentials.list().map(credential => credential.provider))].sort();
+		const accounts = providers.flatMap(provider =>
+			auth.oauth
+				.accounts(provider, sessionId)
+				.filter(account => account.active)
+				.map(account => [provider, account.credentialId, account.accountId, account.orgId, account.projectId]),
+		);
+		const scope = createHash("sha256")
+			.update(
+				JSON.stringify({
+					cwd: [realCwd, cwdStat.dev, cwdStat.ino],
+					model: model && [model.provider, model.id, model.baseUrl],
+					accounts,
+					source: auth.sourceIdentity,
+					unboundAccountSession: accounts.length === 0 ? sessionId : undefined,
+					settings: allSettings().map(setting => [
+						setting.id,
+						setting.get(settings),
+						settings.getProvenance(setting),
+					]),
+				}),
+			)
+			.digest("hex");
+		return { scope, credentials: auth.credentials, model, settings, sessionId };
+	} catch {
+		return undefined;
+	}
+}
+
+export function sameApprovalAuthority(
+	left: CapturedApprovalAuthority | undefined,
+	right: CapturedApprovalAuthority | undefined,
+): boolean {
+	if (!left || !right) return left === right;
+	return (
+		left.scope === right.scope &&
+		left.credentials === right.credentials &&
+		left.model === right.model &&
+		left.settings === right.settings &&
+		left.sessionId === right.sessionId
+	);
+}
+
+/** An ACP answer covers one call under its captured policy and execution destination. */
+export interface AcpApproval {
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly args: unknown;
+	readonly targets: CapturedApprovalTargets;
+	readonly authority: CapturedApprovalAuthority;
+	readonly policy: ResolvedExecuteTimeApproval;
+	readonly restrictions: ApprovalRestrictions | undefined;
+	readonly perCall: boolean;
 }
 
 export async function captureApprovalTargets(
@@ -419,6 +501,28 @@ function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
 	return TIER_RANK[tier] <= TIER_RANK[APPROVAL_MODE_MAX_TIER[mode]];
 }
 
+/** `tools.restrictedFolders` as one call sees it. */
+export interface ApprovalRestrictions {
+	/** Folders where every action needs an explicit approval, whatever the mode, policy, or grant. */
+	restrictedFolders: readonly string[];
+	/**
+	 * Directory the call runs in: a tool that names no path is matched by it (or by its own `cwd`
+	 * argument, resolved against it), and relative configured folders resolve against it.
+	 */
+	cwd?: string;
+}
+
+/** The restrictions `settings` configure for calls running in `cwd`; `undefined` when none are. */
+export function approvalRestrictions(
+	settings: Settings | undefined,
+	cwd: string | undefined,
+): ApprovalRestrictions | undefined {
+	if (!settings) return undefined;
+	const restrictedFolders = [...cfgToolsRestrictedFolders.get(settings)];
+	if (restrictedFolders.length === 0) return undefined;
+	return cwd === undefined ? { restrictedFolders } : { restrictedFolders, cwd };
+}
+
 /**
  * Resolve approval policy for a tool call.
  *
@@ -433,6 +537,8 @@ function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
  *  3. Active mode tier comparison. In `always-ask-cached`, a call whose
  *     `approvalCacheTargets` are all granted in `grants` is allowed instead
  *     (see {@link resolveCachedModeApproval}).
+ *  4. A call touching a folder in `restrictions` turns any non-deny result into
+ *     a per-call prompt sourced `restriction` (see {@link restrictedFolderReason}).
  *
  * In yolo mode, override-based tool prompts are ignored; user `tools.approval`
  * settings remain authoritative.
@@ -443,6 +549,32 @@ export function resolveApproval(
 	mode: ApprovalMode,
 	userConfig: Record<string, unknown> = {},
 	grants?: ApprovalGrantStore,
+	restrictions?: ApprovalRestrictions,
+	snapshot?: CapturedApprovalTargets,
+): ResolvedApproval {
+	const resolved = resolvePolicy(tool, args, mode, userConfig, grants, snapshot);
+	if (resolved.policy === "deny") return resolved;
+	const reason = restrictedFolderReason(tool, args, restrictions, snapshot);
+	if (reason === undefined) return resolved;
+	// A restricted folder outranks every mode, policy, and grant. `override` keeps nested `xd://`
+	// dispatches asking, and a source other than `mode` makes the prompt neither session-grantable
+	// nor rememberable, so every call asks again.
+	return {
+		policy: "prompt",
+		tier: resolved.tier,
+		override: true,
+		source: "restriction",
+		reason,
+		...(resolved.policyKey ? { policyKey: resolved.policyKey } : {}),
+	};
+}
+
+function resolvePolicy(
+	tool: ApprovalSubject,
+	args: unknown,
+	mode: ApprovalMode,
+	userConfig: Record<string, unknown>,
+	grants: ApprovalGrantStore | undefined,
 	snapshot?: CapturedApprovalTargets,
 ): ResolvedApproval {
 	const decision = resolveToolDecision(tool, args);
@@ -559,6 +691,88 @@ export function resolveApproval(
 		...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 		...(decision.reason ? { reason: decision.reason } : {}),
 	};
+}
+
+/** Whether `candidate` is `root` or lies below it; both are cache keys, so equally normalized. */
+function isWithinFolder(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	if (relative === "") return true;
+	// `..name` is a child, not an escape: only a `..` segment leaves the root.
+	return !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
+/**
+ * Absolute filesystem paths a call touches, keyed like grants (symlinks resolved, case-folded on
+ * Windows); `recursive` marks a search that reads the whole tree below its path. A call whose tool
+ * reports no targets is matched by the directory it runs in: its own `cwd` argument when it names
+ * one, else the session's. Non-filesystem targets (internal and web URLs) touch no folder.
+ */
+function restrictionSubjects(
+	tool: ApprovalSubject,
+	args: unknown,
+	cwd: string | undefined,
+	snapshot?: CapturedApprovalTargets,
+): { path: string; recursive: boolean }[] {
+	const targets = approvalCacheTargets(tool, args, snapshot);
+	if (targets.length > 0) {
+		const subjects: { path: string; recursive: boolean }[] = [];
+		for (const target of targets) {
+			const treeFolder = approvalTreeSearchFolderKey(target);
+			const subject = treeFolder ?? target;
+			// Re-keyed: the path resolves symlinks and drops a directory key's trailing separator.
+			if (path.isAbsolute(subject)) {
+				subjects.push({ path: approvalCacheKeyForPath(subject), recursive: treeFolder !== undefined });
+			}
+		}
+		return subjects;
+	}
+	if (cwd === undefined) return [];
+	let workingDirectory = cwd;
+	const requested = isRecord(args) ? args.cwd : undefined;
+	if (typeof requested === "string" && requested.trim().length > 0) {
+		try {
+			workingDirectory = resolveToCwd(requested, cwd);
+		} catch {
+			// An internal-URL working directory is no local folder; the session's still applies.
+		}
+	}
+	return [{ path: approvalCacheKeyForPath(workingDirectory), recursive: false }];
+}
+
+/**
+ * The prompt reason for a call that touches a restricted folder, or `undefined` when it touches
+ * none. A restricted folder covers itself and everything below it; a recursive search rooted above
+ * one reads into it, so it is covered too. Configured folders expand `~` and resolve relative to the
+ * call's working directory; they are compared like grant keys, so a symlink or a differently cased
+ * Windows path names the same folder and `/a/foo` never covers `/a/foobar`.
+ */
+export function restrictedFolderReason(
+	tool: ApprovalSubject,
+	args: unknown,
+	restrictions: ApprovalRestrictions | undefined,
+	snapshot?: CapturedApprovalTargets,
+): string | undefined {
+	if (!restrictions || restrictions.restrictedFolders.length === 0) return undefined;
+	if (tool.approvalCacheTargets && (!snapshot || snapshot.failed)) {
+		return "Restricted folder policy requires a captured execution target";
+	}
+	const base = restrictions.cwd ?? process.cwd();
+	// Compared by key, shown as configured: a Windows key is case-folded.
+	const folders: { key: string; label: string }[] = [];
+	for (const entry of restrictions.restrictedFolders) {
+		if (typeof entry !== "string" || entry.trim().length === 0) continue;
+		const label = path.resolve(base, expandTilde(entry.trim()));
+		folders.push({ key: approvalCacheKeyForPath(label), label });
+	}
+	if (folders.length === 0) return undefined;
+	for (const subject of restrictionSubjects(tool, args, restrictions.cwd, snapshot)) {
+		for (const { key, label } of folders) {
+			if (isWithinFolder(key, subject.path) || (subject.recursive && isWithinFolder(subject.path, key))) {
+				return `Restricted folder: ${sanitizeText(shortenPath(label))}`;
+			}
+		}
+	}
+	return undefined;
 }
 
 /**

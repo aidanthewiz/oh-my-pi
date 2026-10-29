@@ -1,9 +1,6 @@
 /**
  * Tool wrappers for extensions.
  */
-import { createHash } from "node:crypto";
-import * as fs from "node:fs";
-import { all as allSettings } from "../../config/registry";
 import {
 	type AgentTool,
 	type AgentToolContext,
@@ -19,8 +16,11 @@ import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import { cfgApprovalNotify } from "../../tools/settings";
 import {
+	approvalRestrictions,
 	denyError,
 	captureApprovalTargets,
+	captureApprovalAuthority,
+	sameApprovalAuthority,
 	formatApprovalPrompt,
 	type RuntimeApprovalCapableTool,
 	recordApprovalGrant,
@@ -341,51 +341,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 		const runtimeApprovalTool = this.tool as AgentTool<TParameters, TDetails> & RuntimeApprovalCapableTool;
-		const captureCredentials = () => {
+		const captureAuthority = () => {
 			try {
-				return this.runner.createContext().modelRegistry.authStorage.credentials;
-			} catch {
-				return undefined;
-			}
-		};
-		const captureScope = (): string | undefined => {
-			try {
-				const settings = approvalContext?.settings;
-				if (!settings) return undefined;
-				const owner = this.runner.createContext();
-				const auth = owner.modelRegistry.authStorage;
-				const model = owner.model;
-				const realCwd = fs.realpathSync(this.runner.cwd);
-				const cwdStat = fs.statSync(realCwd);
-				const providers = [...new Set(auth.credentials.list().map(credential => credential.provider))].sort();
-				const accounts = providers.flatMap(provider =>
-					auth.oauth
-						.accounts(provider, approvalSessionId)
-						.filter(account => account.active)
-						.map(account => [
-							provider,
-							account.credentialId,
-							account.accountId,
-							account.orgId,
-							account.projectId,
-						]),
+				return captureApprovalAuthority(
+					this.runner.cwd,
+					approvalSessionId,
+					approvalContext?.settings,
+					this.runner.createContext(),
 				);
-				return createHash("sha256")
-					.update(
-						JSON.stringify({
-							cwd: [realCwd, cwdStat.dev, cwdStat.ino],
-							model: model && [model.provider, model.id, model.baseUrl],
-							accounts,
-							source: auth.sourceIdentity,
-							unboundAccountSession: accounts.length === 0 ? approvalSessionId : undefined,
-							settings: allSettings().map(setting => [
-								setting.id,
-								setting.get(settings),
-								settings.getProvenance(setting),
-							]),
-						}),
-					)
-					.digest("hex");
 			} catch {
 				return undefined;
 			}
@@ -396,8 +359,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				signal?.throwIfAborted();
 				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
 				const gateInput = structuredClone(effectiveParams);
-				const gateScope = captureScope();
-				const gateCredentials = captureCredentials();
+				const gateAuthority = captureAuthority();
 				if (!loopDispatchedToolCall || recheckPreflight) {
 					const preflight = await this.runner.runToolCallPreflightBefore?.(
 						toolCallId,
@@ -416,8 +378,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 				if (
 					!Bun.deepEquals(gateInput, effectiveParams) ||
-					gateScope !== captureScope() ||
-					gateCredentials !== captureCredentials()
+					!sameApprovalAuthority(gateAuthority, captureAuthority())
 				) {
 					runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
 					recheckPreflight = true;
@@ -427,8 +388,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error(`Tool "${this.tool.name}" requested runtime approval without a grant handler.`);
 				}
 				const { approvalMode, userPolicies } = resolveApprovalFromContext(approvalContext);
-				const scope = captureScope();
-				const credentials = captureCredentials();
+				const authority = captureAuthority();
+				const scope = authority?.scope;
+				const credentials = authority?.credentials;
 				const approvalOwner = scope === undefined ? undefined : this.runner.createContext();
 				const allowPersistentGrants =
 					approvalOwner?.model !== undefined &&
@@ -440,6 +402,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const resolvedArgs = structuredClone(approvalArgs(inputSnapshot, context));
 				const safetySnapshot = structuredClone(computerSafetyChecks(context));
 				const targets = await captureApprovalTargets(this.tool, resolvedArgs, this.runner.cwd);
+				const restrictions = approvalRestrictions(approvalContext?.settings, this.runner.cwd);
 				const approvalGrants =
 					approvalMode === "always-ask-cached" && scope !== undefined
 						? getApprovalGrants(approvalContext?.settings?.getAgentDir(), approvalSessionId, scope, {
@@ -453,6 +416,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					approvalMode,
 					userPolicies,
 					approvalGrants,
+					restrictions,
 					targets,
 				);
 				context?.xdevTierResolved?.(resolved.tier);
@@ -461,10 +425,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const explicitPrompt =
 					resolved.override || (resolved.source !== "mode" && policyKey !== context?.xdevPolicyKey);
 				const xdevBypass = context?.xdevPolicyKey !== undefined && effectiveParams === params;
+				const acp = context?.acpApproval;
 				const acpBypass =
-					context !== undefined &&
-					Object.hasOwn(context, "acpApprovedArgs") &&
-					Bun.deepEquals(inputSnapshot, context.acpApprovedArgs);
+					acp !== undefined &&
+					acp.toolCallId === toolCallId &&
+					acp.toolName === this.tool.name &&
+					(resolved.source !== "restriction" || acp.perCall) &&
+					!targets.failed &&
+					!acp.targets.failed &&
+					sameApprovalAuthority(acp.authority, authority) &&
+					Bun.deepEquals(inputSnapshot, acp.args) &&
+					Bun.deepEquals(targets, acp.targets) &&
+					Bun.deepEquals({ approvalMode, userPolicies }, acp.policy) &&
+					Bun.deepEquals(restrictions, acp.restrictions);
 				const cacheTargets =
 					approvalGrants !== undefined &&
 					!targets.failed &&
@@ -495,6 +468,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const reason = runtimeApproval?.reason ?? resolved.reason;
 				const capability = runtimeApprovalTool.sessionApproval;
 				const sessionApproval =
+					resolved.source !== "restriction" &&
 					safetySnapshot.length === 0 &&
 					(!runtimeApproval || runtimeApproval.allowSessionApproval === true) &&
 					capability?.label &&
@@ -547,6 +521,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						if (safetySnapshot.length > 0) {
 							throw new Error(
 								`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+							);
+						}
+						if (resolved.source === "restriction") {
+							throw new Error(
+								`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+									`Reason: ${resolved.reason}\n` +
+									`A restricted folder (tools.restrictedFolders) asks in every approval mode.`,
 							);
 						}
 						throw new Error(
@@ -617,7 +598,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					this.runner.cwd,
 				);
 				signal?.throwIfAborted();
-				if (approvalMode === "always-ask-cached" && targets.failed && finalTargets.failed) {
+				if (
+					(approvalMode === "always-ask-cached" || resolved.source === "restriction") &&
+					targets.failed &&
+					finalTargets.failed
+				) {
 					throw new Error(`Tool "${this.tool.name}" approval target identity is unavailable; execution refused.`);
 				}
 				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
@@ -626,8 +611,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					!Bun.deepEquals(inputSnapshot, effectiveParams) ||
 					!Bun.deepEquals(resolvedArgs, approvalArgs(effectiveParams, context)) ||
 					!Bun.deepEquals(targets, finalTargets) ||
-					scope !== captureScope() ||
-					credentials !== captureCredentials() ||
+					!sameApprovalAuthority(authority, captureAuthority()) ||
 					!Bun.deepEquals(safetySnapshot, computerSafetyChecks(context)) ||
 					!Bun.deepEquals({ approvalMode, userPolicies }, finalPolicy) ||
 					!Bun.deepEquals(
@@ -638,6 +622,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							finalPolicy.approvalMode,
 							finalPolicy.userPolicies,
 							approvalGrants,
+							approvalRestrictions(approvalContext?.settings, this.runner.cwd),
 							finalTargets,
 						),
 					)

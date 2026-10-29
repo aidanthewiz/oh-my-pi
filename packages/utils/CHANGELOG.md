@@ -5,6 +5,12 @@
 ### Fixed
 
 - Share mnemopi embedding endpoints across profiles while keeping session data and configured cache identities separate.
+## [18.13.1] - 2026-10-27
+
+### Added
+
+- Added an optional `maxFractionDigits` to `formatNumber()` that caps decimals on values below 1,000 ([#16973](https://github.com/can1357/oh-my-pi/pull/16973) by [@DusKing1](https://github.com/DusKing1))
+
 ## [18.13.0] - 2026-10-26
 
 ### Added

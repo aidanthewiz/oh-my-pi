@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Preserve populated Moonshot K3.1 prices. Apply official list rates only when discovery omits pricing.
 - Reject credential-bearing URLs and nondefault HTTPS ports for automatic catalog compression and connection warming.
 - Preserve maintained role selector order when migrating priority chains into catalog rules.
 - Preserve earlier token rates when successive partial dated price cards take effect, including rebuilt models and historical request billing.
@@ -18,6 +19,13 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.13.1] - 2026-10-27
+
+### Added
+
+- Added GPT-6.1 Terra: `openai/gpt-6.1-terra` ships bundled ($1/$5, $0.05 cached, >272K long-context tier, 1.05M window), and Codex-discovered `gpt-6.1-terra`/`-wm` get API-equivalent pricing, the 922K extended-context maximum, and routing to Plus-or-higher accounts.
+- Added Kimi K3.1 Pro and K3.1 Pro Highspeed support on Kimi Code (`k3.1-pro`, `k3.1-pro-highspeed`) and the Moonshot API (`kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed`): official pricing ($2/$10 and $4/$20 per MTok), a 131K output cap, and K3's reasoning and wire contract ([#16901](https://github.com/can1357/oh-my-pi/pull/16901) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.13.0] - 2026-10-26
 
 ### Breaking Changes

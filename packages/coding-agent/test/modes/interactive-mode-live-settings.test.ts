@@ -4,6 +4,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -73,6 +74,38 @@ describe("InteractiveMode live settings", () => {
 		expect(effective.leftSegments).toEqual(["time", "model"]);
 		expect(effective.contextLine).toBe("off");
 		expect(mode.hideThinkingBlock).toBe(true);
+	});
+
+	it("coalesces restored agent registrations and renders their final state", async () => {
+		cfgStatusLineLeftSegments.override(session.settings, ["model"]);
+		await Promise.resolve();
+		const sync = vi.spyOn(mode, "syncRunningSubagentBadge");
+		const initialCount = mode.statusLine.subagentCount;
+		const registry = AgentRegistry.global();
+		const ids = Array.from({ length: 100 }, (_, index) => `restore-burst-${index}`);
+		vi.useFakeTimers();
+		try {
+			for (const id of ids) {
+				registry.register({ id, displayName: id, kind: "sub", session: null, status: "running" });
+			}
+			expect(sync).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(100);
+			expect(sync).toHaveBeenCalledTimes(1);
+			expect(mode.statusLine.subagentCount).toBe(initialCount + ids.length);
+			expect(Bun.stripANSI(mode.statusLine.getTopBorder(120).content)).toContain(
+				`${theme.theme.icon.agents} ${initialCount + ids.length}`,
+			);
+			for (const id of ids) registry.unregister(id);
+			vi.advanceTimersByTime(100);
+			expect(sync).toHaveBeenCalledTimes(2);
+			expect(mode.statusLine.subagentCount).toBe(initialCount);
+			expect(Bun.stripANSI(mode.statusLine.getTopBorder(120).content)).not.toContain(
+				`${theme.theme.icon.agents} ${initialCount + ids.length}`,
+			);
+		} finally {
+			vi.useRealTimers();
+			for (const id of ids) registry.unregister(id);
+		}
 	});
 
 	it("keeps an explicitly configured unicode status bar after Glyph Protocol confirmation", async () => {

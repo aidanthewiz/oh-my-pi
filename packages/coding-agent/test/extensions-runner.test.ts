@@ -34,7 +34,13 @@ import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { mcpToolEventIdentity } from "@oh-my-pi/pi-coding-agent/extensibility/tool-event-input";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { RuntimeApprovalCapableTool } from "@oh-my-pi/pi-coding-agent/tools/approval";
+import {
+	approvalRestrictions,
+	captureApprovalAuthority,
+	captureApprovalTargets,
+	resolveApprovalFromContext,
+	type RuntimeApprovalCapableTool,
+} from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -4303,15 +4309,36 @@ describe("ExtensionRunner", () => {
 				sessionManager,
 				modelRegistry,
 			);
-			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
-			const acpContext = {
-				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
-				acpApprovedArgs: { command: "echo original" },
-			} as never;
+			const tool = createRecordingTool(recordPath);
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			const settings = Settings.isolated({ "tools.approvalMode": "always-ask" });
+			const runnerContext = runner.createContext();
+			const authority = captureApprovalAuthority(tempDir.path(), runner.sessionId, settings, runnerContext);
+			if (!authority) throw new Error("Expected fixture approval authority");
+			const args = { command: "echo original" };
+			const acpContext: AgentToolContext = {
+				sessionManager,
+				modelRegistry,
+				settings,
+				model: runnerContext.model,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				acpApproval: {
+					toolCallId: "acp-call-id",
+					toolName: tool.name,
+					args: structuredClone(args),
+					targets: await captureApprovalTargets(tool, args, tempDir.path()),
+					authority,
+					policy: resolveApprovalFromContext({ settings }),
+					restrictions: approvalRestrictions(settings, tempDir.path()),
+					perCall: true,
+				},
+			};
 
-			await expect(
-				wrapped.execute("acp-call-id", { command: "echo original" }, undefined, undefined, acpContext),
-			).rejects.toThrow(/requires approval but no interactive UI available/);
+			await expect(wrapped.execute("acp-call-id", args, undefined, undefined, acpContext)).rejects.toThrow(
+				/requires approval but no interactive UI available/,
+			);
 			expect(fs.existsSync(recordPath)).toBe(false);
 		});
 

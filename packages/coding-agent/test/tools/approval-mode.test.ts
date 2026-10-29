@@ -133,6 +133,30 @@ console.log(JSON.stringify({
 		return bash;
 	}
 
+	function acpBashTool() {
+		session.setClientBridge({
+			capabilities: { requestPermission: true },
+			requestPermission: async () => ({ outcome: "selected", optionId: "allow_once" }),
+		});
+		const tool = session.getToolForEvalBridge("bash");
+		if (!tool) throw new Error("Expected ACP bash tool");
+		return tool;
+	}
+
+	function approvalContext(settings: Settings): AgentToolContext {
+		return {
+			sessionManager: session.sessionManager,
+			modelRegistry: session.modelRegistry,
+			model: session.model,
+			settings,
+			isIdle: () => !session.isStreaming,
+			hasQueuedMessages: () => false,
+			abort: () => {
+				session.abort();
+			},
+		};
+	}
+
 	it("yolo mode (default) bypasses approval for non-overriding tool calls", async () => {
 		const settings = approvalSettings();
 		const result = await bashTool().execute("yolo", { command: "echo ok" }, undefined, undefined, {
@@ -336,66 +360,72 @@ console.log(JSON.stringify({
 		).rejects.toThrow(/blocked by user policy/);
 	});
 
-	it("ACP-approved arguments satisfy explicit user and tool-override prompts", async () => {
-		const promptSettings = approvalSettings({
+	it("a fresh ACP permission satisfies an explicit prompt and permits the approved filesystem effect", async () => {
+		const settings = approvalSettings({
 			"tools.approvalMode": "always-ask",
 			"tools.approval": { bash: "prompt" },
 		});
-		const explicitResult = await bashTool().execute(
-			"acp-explicit-prompt",
-			{ command: "echo acp-explicit" },
-			undefined,
-			undefined,
-			{
-				settings: promptSettings,
-				acpApprovedArgs: { command: "echo acp-explicit" },
-			} as AgentToolContext,
-		);
-		expect(textOf(explicitResult)).toContain("acp-explicit");
-
-		const overrideSettings = approvalSettings({ "tools.approvalMode": "always-ask" });
-		const overrideResult = await bashTool().execute(
-			"acp-tool-override",
-			{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
-			undefined,
-			undefined,
-			{
-				settings: overrideSettings,
-				acpApprovedArgs: { command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
-			} as AgentToolContext,
-		);
-		expect(textOf(overrideResult)).toContain("(no output)");
+		const marker = path.join(tempDir, "acp-explicit-approved");
+		try {
+			await acpBashTool().execute(
+				"acp-explicit-prompt",
+				{ command: `mkdir "${marker}"` },
+				undefined,
+				undefined,
+				approvalContext(settings),
+			);
+			expect(fs.statSync(marker).isDirectory()).toBe(true);
+		} finally {
+			session.setClientBridge(undefined);
+		}
 	});
 
-	it("ACP-approved arguments do not bypass deny policies", async () => {
-		const settings = approvalSettings({ "tools.approvalMode": "always-ask" });
-		await expect(
-			bashTool().execute("acp-denied", { command: "rm -rf /tmp/never-run" }, undefined, undefined, {
-				settings,
-				acpApprovedArgs: { command: "rm -rf /tmp/never-run" },
-			} as AgentToolContext),
-		).rejects.toThrow(/blocked by tool policy/);
+	it("a fresh ACP permission does not bypass user deny policies", async () => {
+		const settings = approvalSettings({
+			"tools.approvalMode": "always-ask",
+			"tools.approval": { bash: "deny" },
+		});
+		const marker = path.join(tempDir, "acp-user-denied");
+		try {
+			await expect(
+				acpBashTool().execute(
+					"acp-denied",
+					{ command: `mkdir "${marker}"` },
+					undefined,
+					undefined,
+					approvalContext(settings),
+				),
+			).rejects.toThrow(/blocked by user policy/);
+			expect(fs.existsSync(marker)).toBe(false);
+		} finally {
+			session.setClientBridge(undefined);
+		}
 	});
 
-	it("ACP-approved arguments do not bypass provider safety checks", async () => {
+	it("a fresh ACP permission does not bypass provider safety checks", async () => {
 		const settings = approvalSettings({ "tools.approvalMode": "always-ask" });
-		await expect(
-			bashTool().execute("acp-safety", { command: "echo blocked" }, undefined, undefined, {
-				settings,
-				acpApprovedArgs: { command: "echo blocked" },
-				toolCall: {
-					batchId: "safety-batch",
-					index: 0,
-					total: 1,
-					toolCalls: [],
-					providerMetadata: {
-						type: "computer",
-						providerItemId: "computer-call",
-						actions: [],
-						pendingSafetyChecks: [{ id: "safety-check" }],
+		const marker = path.join(tempDir, "acp-safety-denied");
+		try {
+			await expect(
+				acpBashTool().execute("acp-safety", { command: `mkdir "${marker}"` }, undefined, undefined, {
+					...approvalContext(settings),
+					toolCall: {
+						batchId: "safety-batch",
+						index: 0,
+						total: 1,
+						toolCalls: [],
+						providerMetadata: {
+							type: "computer",
+							providerItemId: "computer-call",
+							actions: [],
+							pendingSafetyChecks: [{ id: "safety-check" }],
+						},
 					},
-				},
-			} as never),
-		).rejects.toThrow(/pending provider safety checks but no interactive UI/);
+				}),
+			).rejects.toThrow(/pending provider safety checks but no interactive UI/);
+			expect(fs.existsSync(marker)).toBe(false);
+		} finally {
+			session.setClientBridge(undefined);
+		}
 	});
 });

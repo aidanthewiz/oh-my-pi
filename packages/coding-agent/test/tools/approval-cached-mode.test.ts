@@ -157,8 +157,8 @@ describe("captured approval grants", () => {
 		const args = { path: "a.txt" };
 		const captured = await captureApprovalTargets(read, args, root.path());
 		recordApprovalGrant(read, args, grants, "read", { grant: "target", always: false }, captured);
-		expect(resolveApproval(read, args, "always-ask-cached", {}, grants, captured).policy).toBe("allow");
-		expect(resolveApproval(write, args, "always-ask-cached", {}, grants, captured).policy).toBe("prompt");
+		expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, captured).policy).toBe("allow");
+		expect(resolveApproval(write, args, "always-ask-cached", {}, grants, undefined, captured).policy).toBe("prompt");
 		const both = {
 			...read,
 			approvalCacheTargets: () => [
@@ -167,13 +167,20 @@ describe("captured approval grants", () => {
 			],
 		};
 		expect(
-			resolveApproval(both, {}, "always-ask-cached", {}, grants, await captureApprovalTargets(both, {}, root.path()))
-				.policy,
+			resolveApproval(
+				both,
+				{},
+				"always-ask-cached",
+				{},
+				grants,
+				undefined,
+				await captureApprovalTargets(both, {}, root.path()),
+			).policy,
 		).toBe("prompt");
 		const otherArgs = { path: "b.txt" };
 		const other = await captureApprovalTargets(write, otherArgs, root.path());
 		recordApprovalGrant(write, otherArgs, grants, "write", { grant: "target", always: false }, other);
-		expect(resolveApproval(read, otherArgs, "always-ask-cached", {}, grants, other).policy).toBe("allow");
+		expect(resolveApproval(read, otherArgs, "always-ask-cached", {}, grants, undefined, other).policy).toBe("allow");
 	});
 
 	it("binds persistent grants to account/trust and resolved file identity", async () => {
@@ -185,8 +192,8 @@ describe("captured approval grants", () => {
 		recordApprovalGrant(tool, args, first, "read", { grant: "target", always: true }, captured);
 		const same = getApprovalGrants(root.path(), "two", "account-A-trust-A");
 		const changed = getApprovalGrants(root.path(), "two", "account-B-trust-A");
-		expect(resolveApproval(tool, args, "always-ask-cached", {}, same, captured).policy).toBe("allow");
-		expect(resolveApproval(tool, args, "always-ask-cached", {}, changed, captured).policy).toBe("prompt");
+		expect(resolveApproval(tool, args, "always-ask-cached", {}, same, undefined, captured).policy).toBe("allow");
+		expect(resolveApproval(tool, args, "always-ask-cached", {}, changed, undefined, captured).policy).toBe("prompt");
 		fs.renameSync(root.join("a.txt"), root.join("old.txt"));
 		fs.writeFileSync(root.join("a.txt"), "PRIVATE");
 		expect(
@@ -196,6 +203,7 @@ describe("captured approval grants", () => {
 				"always-ask-cached",
 				{},
 				same,
+				undefined,
 				await captureApprovalTargets(tool, args, root.path()),
 			).policy,
 		).toBe("prompt");
@@ -209,7 +217,7 @@ describe("captured approval grants", () => {
 			},
 		};
 		const captured = await captureApprovalTargets(tool, {}, root.path());
-		expect(resolveApproval(tool, {}, "always-ask-cached", {}, undefined, captured).policy).toBe("prompt");
+		expect(resolveApproval(tool, {}, "always-ask-cached", {}, undefined, undefined, captured).policy).toBe("prompt");
 		let ran = false;
 		const h = harness(async () => "once");
 		await expect(

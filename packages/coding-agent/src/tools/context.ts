@@ -2,6 +2,7 @@ import type { AgentToolContext, ToolCallContext } from "@oh-my-pi/pi-agent-core"
 import type { CustomToolContext } from "../extensibility/custom-tools/types";
 import type { ExtensionUIContext } from "../extensibility/extensions/types";
 import { trackUserWaits, type UserWaitTracker } from "../extensibility/extensions/user-wait";
+import type { AcpApproval } from "./approval";
 
 declare module "@oh-my-pi/pi-agent-core" {
 	interface AgentToolContext extends CustomToolContext {
@@ -15,10 +16,9 @@ declare module "@oh-my-pi/pi-agent-core" {
 		 *  prompt and an explicit prompt policy under this same key; overrides and
 		 *  policies under other keys still apply. */
 		xdevPolicyKey?: string;
-		/** Immutable snapshot of the arguments an ACP client approved. The inner
-		 *  wrapper skips tier and explicit prompts only while the effective input
-		 *  remains equal; deny policies and provider safety checks still apply. */
-		acpApprovedArgs?: unknown;
+		/** One ACP acknowledgment bound to the call, target, policy, and source authority.
+		 *  Cached client decisions never cover a restricted-folder prompt. */
+		acpApproval?: AcpApproval;
 		/** Reports the approval tier resolved after an extension rewrites an
 		 *  xd:// device call, so dispatch metadata describes the input that ran. */
 		xdevTierResolved?(tier: "read" | "write" | "exec"): void;

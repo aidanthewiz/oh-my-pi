@@ -5050,12 +5050,17 @@ export function moonshotModelManagerOptions(
 			// the endpoint reports zero cost, plus the structured reasoning fact.
 			const identity = classifyModel("moonshot", id, { lenient: true });
 			if (!reference && identity.class === "kimi" && identity.family === "k3") {
-				const isZeroCost = model.cost.input === 0 && model.cost.output === 0 && model.cost.cacheRead === 0;
+				const seedK3Cost =
+					id !== "kimi-k3.1-pro" &&
+					id !== "kimi-k3.1-pro-highspeed" &&
+					model.cost.input === 0 &&
+					model.cost.output === 0 &&
+					model.cost.cacheRead === 0;
 				const limits = modelLimitsFor("moonshot", id) ?? modelLimitsFor("moonshot", "kimi-k3");
 				return {
 					...model,
 					reasoning: true,
-					cost: isZeroCost ? { ...MOONSHOT_KIMI_K3_COST } : model.cost,
+					cost: seedK3Cost ? { ...MOONSHOT_KIMI_K3_COST } : model.cost,
 					contextWindow: model.contextWindow ?? limits?.context ?? null,
 					maxTokens: model.maxTokens ?? limits?.maxTokens ?? null,
 				};

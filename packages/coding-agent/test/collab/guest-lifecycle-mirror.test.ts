@@ -562,7 +562,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			settings,
 			statusLine: { setCollabStatus: () => {}, resetActiveTime: () => {} },
 			resetObserverRegistry: () => {},
-			syncRunningSubagentBadge: () => {},
+			syncRunningSubagentBadge: () => false,
 			syncComposerShape: () => {},
 			eventBus: bus,
 		});
@@ -876,7 +876,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				settings,
 				statusLine: { setCollabStatus: () => {}, resetActiveTime: () => {} },
 				resetObserverRegistry: () => {},
-				syncRunningSubagentBadge: () => {},
+				syncRunningSubagentBadge: () => false,
 				syncComposerShape: () => {},
 				eventBus: new EventBus(),
 			});
@@ -1440,7 +1440,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				markActivityEnd: () => {},
 			},
 			resetObserverRegistry: () => {},
-			syncRunningSubagentBadge: () => {},
+			syncRunningSubagentBadge: () => false,
 			syncComposerShape: () => {},
 		});
 		const controller = new EventController(ctx);
@@ -1660,7 +1660,7 @@ describe("collab guest extension lifecycle mirror", () => {
 					return lookup.promise;
 				},
 				resetObserverRegistry: () => {},
-				syncRunningSubagentBadge: () => {},
+				syncRunningSubagentBadge: () => false,
 				syncComposerShape: () => {},
 			});
 			ctx.renderInitialMessages = async () => {

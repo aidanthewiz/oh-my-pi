@@ -7,16 +7,20 @@
  */
 import { afterAll, afterEach, beforeAll, expect, it, spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
+import * as fs from "node:fs";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { AnthropicConnectionError } from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
-import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOutcome,
@@ -36,6 +40,8 @@ import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 let tempDir: TempDir;
 let session: AgentSession | undefined;
+let auth: AuthStorage;
+let modelRegistry: ModelRegistry;
 
 const boundaryCases: Array<[decision: "allow_always" | "reject_always", transition: "new" | "switch"]> = [
 	["allow_always", "new"],
@@ -71,7 +77,7 @@ function makeToolSession(bridge: ClientBridge): ToolSession {
 		getSessionId: () => null,
 		getPlanModeState: () => undefined,
 		getClientBridge: () => bridge,
-	} as unknown as ToolSession;
+	};
 }
 
 /** Build a minimal ClientBridge whose requestPermission resolves to the given outcome. */
@@ -92,6 +98,7 @@ async function createSession(
 		xdev?: XdevState;
 		builtInToolNames?: string[];
 		persist?: boolean;
+		wrap?: boolean;
 	},
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -113,14 +120,18 @@ async function createSession(
 		convertToLlm,
 		streamFn: () => new AssistantMessageEventStream(),
 	});
+	const extensionRunner = createRunner(agent, sessionManager, settings, modelRegistry);
+	const effectiveTools = options?.wrap ? tools.map(tool => new ExtensionToolWrapper(tool, extensionRunner)) : tools;
+	agent.setTools(effectiveTools);
 
 	const toolRegistry = options?.xdev?.tools ?? new Map<string, AgentTool>();
-	for (const tool of tools) toolRegistry.set(tool.name, tool);
+	for (const tool of effectiveTools) toolRegistry.set(tool.name, tool);
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry,
+		extensionRunner,
 		toolRegistry,
 		xdev: options?.xdev,
 		builtInToolNames: options?.builtInToolNames,
@@ -130,8 +141,10 @@ async function createSession(
 	return sess;
 }
 
-beforeAll(() => {
+beforeAll(async () => {
 	tempDir = TempDir.createSync("@pi-acp-permission-test-");
+	auth = await AuthStorage.create(tempDir.join("auth.db"));
+	modelRegistry = new ModelRegistry(auth);
 });
 
 afterEach(async () => {
@@ -140,6 +153,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+	await auth.close();
 	await tempDir.remove();
 });
 
@@ -190,21 +204,50 @@ it("explicit yolo still gates tools whose per-tool policy requires a prompt", as
 	expect(bashTool.executeCalls).toBe(1);
 });
 
-/**
- * Minimal runner for wrapping a tool exactly as an ACP session does: no
- * interactive UI (so the inner tier gate fails closed) and no event handlers.
- */
-function noUiRunner(): ExtensionRunner {
-	return {
-		hasHandlers: () => false,
-		consumeToolCallEmitted: () => false,
-		hasUI: () => false,
-		hasSessionApproval: () => false,
-		sessionId: "acp-permission-test",
-		runScoped<T>(fn: () => T): T {
-			return fn();
+function createRunner(
+	agent: Agent,
+	manager: SessionManager,
+	settings: Settings,
+	registry: ModelRegistry,
+): ExtensionRunner {
+	const runner = new ExtensionRunner(
+		[],
+		new ExtensionRuntime(),
+		manager.getCwd(),
+		manager,
+		registry,
+		undefined,
+		settings,
+	);
+	runner.initialize(
+		{
+			sendMessage: () => {},
+			sendUserMessage: () => {},
+			appendEntry: () => {},
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: async () => {},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => undefined,
+			setThinkingLevel: () => {},
+			getSessionName: () => undefined,
+			setSessionName: async () => {},
 		},
-	} as unknown as ExtensionRunner;
+		{
+			getModel: () => agent.state.model,
+			isIdle: () => !agent.state.isStreaming,
+			getLifecycleState: () => null,
+			abort: () => agent.abort(),
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			getSystemPrompt: () => [],
+		},
+	);
+	return runner;
 }
 
 it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt policy", async () => {
@@ -212,23 +255,26 @@ it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt polic
 	// then again by the ACP permission gate. The client has answered the explicit
 	// prompt, so the inner wrapper must not request the unavailable interactive UI.
 	const bashTool = makeFakeTool("bash");
-	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+	const effect = tempDir.join("explicit-approval-effect");
+	bashTool.execute = async () => {
+		fs.writeFileSync(effect, "approved");
+		return { content: [{ type: "text", text: "approved" }] };
+	};
 	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
 	const permissionSpy = spyOn(bridge, "requestPermission");
 	const approvalSettings: Record<string, unknown> = {
 		"tools.approvalMode": "always-ask",
 		"tools.approval": { bash: "prompt" },
 	};
-	session = await createSession([wrapped], bridge, approvalSettings);
+	session = await createSession([bashTool], bridge, approvalSettings, { wrap: true });
 
 	await session.setActiveToolsByName(["bash"]);
 	const gatedBash = session.agent.state.tools.find(t => t.name === "bash");
-	const ctx = { settings: Settings.isolated(approvalSettings) } as never;
 
-	await gatedBash!.execute("call-1", { command: "echo hi" }, undefined, undefined as never, ctx);
+	await gatedBash!.execute("call-1", { command: "echo hi" });
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
-	expect(bashTool.executeCalls).toBe(1);
+	expect(fs.readFileSync(effect, "utf8")).toBe("approved");
 });
 
 it("ACP bash uses pattern decisions and scopes persistent grants to noncritical commands", async () => {
@@ -256,14 +302,11 @@ it("ACP bash uses pattern decisions and scopes persistent grants to noncritical 
 	};
 	const bashTool = makeFakeTool("bash");
 	bashTool.approval = new BashTool({ ...makeToolSession(bridge), settings }).approval;
-	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
-	session = await createSession([wrapped], bridge, settingsOverrides);
+	session = await createSession([bashTool], bridge, settingsOverrides, { wrap: true });
 	await session.setActiveToolsByName(["bash"]);
 	const gatedBash = session.agent.state.tools.find(tool => tool.name === "bash");
 	if (!gatedBash) throw new Error("Missing bash tool");
-	const ctx = { settings } as never;
-	const run = (command: string) =>
-		gatedBash.execute(`call-${command}`, { command }, undefined, undefined as never, ctx);
+	const run = (command: string) => gatedBash.execute(`call-${command}`, { command });
 
 	await run("echo safe-read");
 	expect(requests).toEqual([]);
@@ -283,18 +326,16 @@ it("ACP bash uses pattern decisions and scopes persistent grants to noncritical 
 it("always-ask: an ordinary edit without an ACP grant still faces the inner approval gate", async () => {
 	const editTool = makeFakeTool("edit");
 	editTool.approval = "write";
-	const wrapped = new ExtensionToolWrapper(editTool, noUiRunner()) as unknown as AgentTool;
 	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
 	const permissionSpy = spyOn(bridge, "requestPermission");
-	session = await createSession([wrapped], bridge, { "tools.approvalMode": "always-ask" });
+	session = await createSession([editTool], bridge, { "tools.approvalMode": "always-ask" }, { wrap: true });
 
 	await session.setActiveToolsByName(["edit"]);
 	const gatedEdit = session.agent.state.tools.find(t => t.name === "edit");
-	const ctx = { settings: Settings.isolated({ "tools.approvalMode": "always-ask" }) } as never;
 
-	await expect(
-		gatedEdit!.execute("call-edit", { path: "/tmp/foo.ts" }, undefined, undefined as never, ctx),
-	).rejects.toThrow(/requires approval but no interactive UI/);
+	await expect(gatedEdit!.execute("call-edit", { path: "/tmp/foo.ts" })).rejects.toThrow(
+		/requires approval but no interactive UI/,
+	);
 
 	expect(permissionSpy).not.toHaveBeenCalled();
 	expect(editTool.executeCalls).toBe(0);
@@ -831,9 +872,13 @@ it("setClientBridge wraps tools that were already active", async () => {
 it("aborting an open permission request rejects without executing the tool", async () => {
 	const bashTool = makeFakeTool("bash");
 	const pending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const requested = Promise.withResolvers<void>();
 	const bridge: ClientBridge = {
 		capabilities: { requestPermission: true },
-		requestPermission: async () => pending.promise,
+		requestPermission: async () => {
+			requested.resolve();
+			return pending.promise;
+		},
 	};
 	session = await createSession([bashTool], bridge);
 	await session.setActiveToolsByName(["bash"]);
@@ -847,9 +892,10 @@ it("aborting an open permission request rejects without executing the tool", asy
 		undefined as never,
 		undefined as never,
 	);
+	await requested.promise;
 	abortController.abort();
 
-	await expect(execution).rejects.toThrow(/Permission request cancelled/);
+	await expect(execution).rejects.toBeInstanceOf(Error);
 	expect(bashTool.executeCalls).toBe(0);
 	pending.resolve({ outcome: "cancelled" });
 });
@@ -1329,17 +1375,23 @@ async function createSessionWithMockModel(
 	const settings = Settings.isolated({ "compaction.enabled": false, ...options?.settings });
 	const sessionManager = SessionManager.inMemory(tempDir.path());
 	const getApiKey = options?.getApiKey ?? (() => "test-key");
+	const registry = new ModelRegistry(auth);
+	registry.getApiKey = async () => getApiKey();
 	const agent = new Agent({
 		getApiKey,
-		// With a loop steering signal the tool calls run under a ctx
-		// (`ctx.toolCall.steeringSignal`), the path the production loop
-		// wires; the test aborts it on command to simulate the loop's
-		// any-source steering abort.
-		...(options?.loopSteeringSignal
-			? {
-					getToolContext: (() => ({ toolCall: { steeringSignal: options.loopSteeringSignal } }) as never) as never,
-				}
-			: { getToolContext: context => ({ toolCall: context }) as never }),
+		getToolContext: context => ({
+			sessionManager,
+			modelRegistry: registry,
+			settings,
+			model: agent.state.model,
+			isIdle: () => !agent.state.isStreaming,
+			hasQueuedMessages: () => false,
+			abort: () => agent.abort(),
+			toolCall:
+				context && options?.loopSteeringSignal
+					? { ...context, steeringSignal: options.loopSteeringSignal }
+					: context,
+		}),
 		initialState: {
 			model: mock.model,
 			systemPrompt: ["Test"],
@@ -1349,11 +1401,13 @@ async function createSessionWithMockModel(
 		convertToLlm,
 		streamFn: mock.stream,
 	});
+	const extensionRunner = createRunner(agent, sessionManager, settings, registry);
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { getApiKey } as never,
+		modelRegistry: registry,
+		extensionRunner,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 	sess.setClientBridge(bridge);

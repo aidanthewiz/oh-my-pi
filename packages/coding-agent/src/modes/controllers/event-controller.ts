@@ -45,7 +45,12 @@ import {
 	resolveAbortLabel,
 	USER_INTERRUPT_LABEL,
 } from "../../session/messages";
-import { formatApprovalPrompt, resolveApproval, sessionApprovalScope } from "../../tools/approval";
+import {
+	approvalRestrictions,
+	formatApprovalPrompt,
+	resolveApproval,
+	sessionApprovalScope,
+} from "../../tools/approval";
 import { recoverAskQuestions } from "../../tools/ask";
 import { previewLine, PREVIEW_LIMITS, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
@@ -2045,9 +2050,17 @@ export class EventController {
 		const session = this.ctx.viewSession;
 		const tool = session.getToolByName(toolName);
 		if (!tool) return undefined;
-		const mode = cfgToolsApprovalMode.get(session.settings);
-		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(session.settings);
-		const approval = resolveApproval(tool, args, mode, userPolicies);
+		const settings = session.settings;
+		const mode = cfgToolsApprovalMode.get(settings);
+		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(settings);
+		const approval = resolveApproval(
+			tool,
+			args,
+			mode,
+			userPolicies,
+			undefined,
+			approvalRestrictions(settings, session.sessionManager.getCwd()),
+		);
 		if (approval.policy !== "prompt") return undefined;
 		// Approved for this session: the wrapper runs it without asking.
 		const scope = sessionApprovalScope(approval, tool.name);

@@ -8,6 +8,12 @@
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
 - Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 - Recount cross-model Claude signed thinking when the same reader's endpoint or prefix-binding policy changes.
+## [18.13.1] - 2026-10-27
+
+### Added
+
+- Hosts can distinguish safely paused agents from turns still draining with `Agent.isPaused` ([#17073](https://github.com/can1357/oh-my-pi/pull/17073) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+
 ## [18.13.0] - 2026-10-26
 
 ### Added

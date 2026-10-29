@@ -113,6 +113,73 @@ describe("dialogs under a native surface", () => {
 		expect(onSubmit.mock.calls[0]?.[0].results[1].selectedOptions).toEqual(["Yes"]);
 	});
 
+	it("ask: Next after a cancelled Other moves on to the review instead of reopening the editor", async () => {
+		const onPrompt = vi.fn(async () => undefined);
+		const onSubmit = vi.fn();
+		const dialog = new AskDialogComponent(QUESTIONS, { onSubmit, onCancel: vi.fn(), onPrompt });
+		dialog.handleInput(ENTER);
+		const options = find(dialog.describe(CX), node => node.p?.role === "omp.ask.options");
+		dialog.handleNativeEvent({ type: "activate", key: options!.path, item: "other" });
+		// The dialog awaits this same promise first, so its cancel handling has run once it settles.
+		await onPrompt.mock.results[0]?.value;
+		expect(onPrompt).toHaveBeenCalledTimes(1);
+		dialog.handleNativeEvent({ type: "action", key: "x", act: "submit", mods: [] });
+		expect(onPrompt).toHaveBeenCalledTimes(1);
+		expect(onSubmit).not.toHaveBeenCalled();
+		dialog.handleNativeEvent({ type: "action", key: "x", act: "submit", mods: [] });
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit.mock.calls[0][0].results).toMatchObject([
+			{ id: "policy", selectedOptions: ["Park them"] },
+			{ id: "flag", selectedOptions: [], customInput: undefined },
+		]);
+	});
+
+	for (const answer of ["option", "custom"] as const) {
+		it(`ask: cancelling Other then Next preserves the saved ${answer} answer, note and images`, async () => {
+			const image = { type: "image" as const, data: "note-image", mimeType: "image/png" };
+			const onImagePrompt = vi.fn().mockResolvedValueOnce({ text: "reason [Image #1]", images: [image] });
+			if (answer === "custom") {
+				onImagePrompt.mockResolvedValueOnce({ text: "my answer [Image #1]", images: [image] });
+			}
+			onImagePrompt.mockResolvedValueOnce(undefined);
+			const onSubmit = vi.fn();
+			const dialog = new AskDialogComponent(QUESTIONS, {
+				onSubmit,
+				onCancel: vi.fn(),
+				onPrompt: vi.fn(),
+				onImagePrompt,
+			});
+			dialog.handleInput(ENTER);
+			dialog.handleNativeEvent({ type: "select", key: "tabs", item: "1" });
+			if (answer === "custom") {
+				dialog.handleInput(DOWN);
+				dialog.handleInput(DOWN);
+			}
+			dialog.handleNativeEvent({ type: "action", key: "x", act: "note", mods: [] });
+			await onImagePrompt.mock.results[0]?.value;
+			dialog.handleNativeEvent({ type: "activate", key: "q1", item: answer === "custom" ? "other" : "option:0" });
+			if (answer === "custom") await onImagePrompt.mock.results[1]?.value;
+			dialog.handleNativeEvent({ type: "select", key: "tabs", item: "1" });
+			dialog.handleNativeEvent({ type: "activate", key: "q1", item: "other" });
+			const promptCount = answer === "custom" ? 3 : 2;
+			await onImagePrompt.mock.results[promptCount - 1]?.value;
+			dialog.handleNativeEvent({ type: "action", key: "x", act: "submit", mods: [] });
+			expect(onImagePrompt).toHaveBeenCalledTimes(promptCount);
+			expect(onSubmit).not.toHaveBeenCalled();
+			dialog.handleNativeEvent({ type: "action", key: "x", act: "submit", mods: [] });
+
+			expect(onSubmit).toHaveBeenCalledTimes(1);
+			expect(onSubmit.mock.calls[0][0].results[1]).toMatchObject({
+				selectedOptions: answer === "custom" ? [] : ["Yes"],
+				customInput: answer === "custom" ? "my answer [Image #1]" : undefined,
+				customInputImages: answer === "custom" ? [image] : undefined,
+				note: "reason [Image #1]",
+				noteOption: answer === "custom" ? undefined : "Yes",
+				noteImages: [image],
+			});
+		});
+	}
+
 	it("ask: docks in place of the composer instead of a modal sheet over the transcript", async () => {
 		// A modal bottom sheet hid the transcript rows explaining the question and blocked scrolling.
 		const transcript: Component = { render: () => [], invalidate: () => {}, describe: () => md("Why this decision") };

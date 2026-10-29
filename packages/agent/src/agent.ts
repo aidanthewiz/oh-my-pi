@@ -39,6 +39,7 @@ import {
 	unpairedToolCallTail,
 } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import { agentPauseGate } from "./pause";
 import { isProviderRefusalMessage } from "./replay-policy";
 import { SentToolDefinitions } from "./sent-tool-definitions";
 import { Tokenizer } from "./tokenizer";
@@ -475,6 +476,14 @@ export class Agent {
 	#cwdResolver?: () => string | undefined;
 
 	#runningPrompt?: Promise<void>;
+	#isPaused = false;
+
+	/** True while this unfinished turn is safely parked by the process pause gate. */
+	get isPaused(): boolean {
+		return (
+			this.#state.isStreaming && this.#isPaused && agentPauseGate.paused && !this.#abortController?.signal.aborted
+		);
+	}
 	#resolveRunningPrompt?: () => void;
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
@@ -1588,6 +1597,7 @@ export class Agent {
 
 	reset() {
 		this.#detachedToolUpdateEpoch++;
+		this.#isPaused = false;
 		if (this.#queuedMessageClaims.steering || this.#queuedMessageClaims.followUp) {
 			this.#abortController?.abort();
 			this.#abortController = undefined;
@@ -1788,6 +1798,7 @@ export class Agent {
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
+		this.#isPaused = false;
 
 		// Clear Cursor tool result buffer at start of each run
 		this.#cursorToolResultBuffer = [];
@@ -1960,6 +1971,9 @@ export class Agent {
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
 			onHarmonyLeak: this.#onHarmonyLeak,
 			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
+			onPauseChange: paused => {
+				if (this.#abortController === loopAbortController) this.#isPaused = paused;
+			},
 			getToolChoice,
 			softToolRequirementState: this.#softToolRequirementState,
 			onToolChoiceRejected: () => {
@@ -2217,6 +2231,7 @@ export class Agent {
 			this.#restoreUndeliveredQueuedMessages(loopAbortController);
 			resolveRun?.();
 			if (this.#abortController === loopAbortController) {
+				this.#isPaused = false;
 				this.#state.isStreaming = false;
 				this.#state.streamMessage = null;
 				this.#state.pendingToolCalls.clear();

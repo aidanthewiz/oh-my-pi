@@ -36,7 +36,13 @@ import {
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { cursorMcpPrefersReplaceEdit, normalizeCursorReplaceArgs } from "./cursor-bridge-tools";
 import type { MCPResourceReadResult } from "./mcp/types";
-import { resolveApproval, resolveApprovalFromContext } from "./tools/approval";
+import {
+	approvalRestrictions,
+	captureApprovalTargets,
+	resolveApproval,
+	resolveApprovalFromContext,
+} from "./tools/approval";
+import { approvalTargetKey } from "./tools/approval-targets";
 import {
 	confineToWorkspace,
 	resolveReadPathAsync,
@@ -367,14 +373,31 @@ function allowsDirectFileMutation(options: CursorExecBridgeOptions): boolean {
  * a file creation or removal belongs to. Returns `null` when the call may
  * proceed, or the refusal text to answer with.
  */
-function refuseByWritePolicy(options: CursorExecBridgeOptions, toolName: string, pathArg: string): string | null {
+async function refuseByWritePolicy(
+	options: CursorExecBridgeOptions,
+	toolName: string,
+	pathArg: string,
+): Promise<string | null> {
 	const context = options.getToolContext?.();
 	const { approvalMode, userPolicies } = resolveApprovalFromContext(context);
+	const cwd = options.getCwd?.() ?? options.cwd;
+	const subject = {
+		name: toolName,
+		approval: "write" as const,
+		approvalCacheTargets: () => {
+			const target = approvalTargetKey(cwd, pathArg);
+			return target === undefined ? undefined : [target];
+		},
+	};
+	const targets = await captureApprovalTargets(subject, { path: pathArg }, cwd);
 	const approval = resolveApproval(
-		{ name: toolName, approval: "write" },
+		subject,
 		{ path: pathArg },
 		approvalMode,
 		userPolicies,
+		undefined,
+		approvalRestrictions(context?.settings, cwd),
+		targets,
 	);
 	if (approval.policy === "allow") return null;
 	return approval.policy === "deny"
@@ -394,7 +417,7 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 	// `allowDirectFileMutation` answers "was a mutating tool granted", which is a
 	// different question from "does the user's policy allow this call" — without
 	// this, a configured `deny` or an `always-ask` session still lost the file.
-	const refusal = refuseByWritePolicy(options, toolName, pathArg);
+	const refusal = await refuseByWritePolicy(options, toolName, pathArg);
 	if (refusal) {
 		return createToolResultMessage(toolCallId, toolName, buildToolErrorResult(refusal), true);
 	}
@@ -910,7 +933,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			if (!allowsDirectFileMutation(this.options)) {
 				throw new Error('Tool "write" not available: this session cannot download resources to disk.');
 			}
-			const refusal = refuseByWritePolicy(this.options, "write", downloadPath);
+			const refusal = await refuseByWritePolicy(this.options, "write", downloadPath);
 			if (refusal) throw new Error(refusal);
 		}
 		const mcp = this.options.mcpResources;
@@ -1097,11 +1120,17 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		if (!tool) return false;
 		const context = this.options.getToolContext?.();
 		const { approvalMode, userPolicies } = resolveApprovalFromContext(context);
+		const resolvedArgs = preferReplace ? normalizeCursorReplaceArgs(args) : args;
+		const cwd = this.options.getCwd?.() ?? this.options.cwd;
+		const targets = await captureApprovalTargets(tool, resolvedArgs, cwd);
 		const approval = resolveApproval(
 			tool,
-			preferReplace ? normalizeCursorReplaceArgs(args) : args,
+			resolvedArgs,
 			approvalMode,
 			userPolicies,
+			undefined,
+			approvalRestrictions(context?.settings, cwd),
+			targets,
 		);
 		return approval.policy === "allow";
 	}

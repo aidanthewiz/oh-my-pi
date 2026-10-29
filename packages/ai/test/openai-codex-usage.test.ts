@@ -424,6 +424,78 @@ describe("openai-codex usage parser", () => {
 		expect(chat?.healthy).toBe(false);
 	});
 
+	it.each([
+		["full counters", (cap: Record<string, unknown>) => cap],
+		["only remaining: 0", (cap: Record<string, unknown>) => ({ unit: cap.unit, remaining: "0" })],
+		["negative remaining", (cap: Record<string, unknown>) => ({ unit: cap.unit, remaining: "-1" })],
+		["percent only", (cap: Record<string, unknown>) => ({ unit: cap.unit, used_percent: 100 })],
+	] as const)(
+		"does not let credits fund plan overage when the spend cap has %s and the verdict is omitted",
+		async (_name, shape) => {
+			const { reached: _omitted, ...rest } = makeSpendCapPayload(false, "500000").spend_control;
+			const spendControl = { ...rest, individual_limit: shape(rest.individual_limit) };
+			const payload = {
+				...makePayload(),
+				rate_limit: {
+					allowed: false,
+					limit_reached: true,
+					primary_window: { used_percent: 100, limit_window_seconds: 604800, reset_at: 2_000_500_000 },
+					secondary_window: null,
+				},
+				credits: { has_credits: true, unlimited: false, overage_limit_reached: false, balance: "489.25" },
+				spend_control: spendControl,
+			};
+			const report = await openaiCodexUsageProvider.fetchUsage(
+				{
+					provider: "openai-codex",
+					credential: { type: "oauth", accessToken: accessTokenFixture, accountId: "acct-1" },
+				},
+				{ fetch: fakeFetch(payload) },
+			);
+			expect(report?.metadata).toMatchObject({ allowed: false, limitReached: true });
+			const chat = report ? (codexRankingStrategy.scopeLimits?.(report, { modelId: "gpt-5.3-codex" }) ?? []) : [];
+			expect(chat.find(l => l.id === "openai-codex:primary")?.status).toBe("exhausted");
+			const scopes = report ? (codexRankingStrategy.healableBlockScopes?.(report) ?? []) : [];
+			expect(scopes.find(s => s.blockScope === "chat")?.healthy).toBe(false);
+			expect(scopes.find(s => s.blockScope === "shared")?.healthy).toBe(false);
+		},
+	);
+
+	it.each([
+		["precise headroom despite rounded percentage", undefined, "499999", true],
+		["explicit denial with headroom", true, "450000", false],
+		["explicit allow at the rounded cap", false, "500000", true],
+	] as const)("preserves the overage funding verdict with %s", async (_label, reached, used, allowed) => {
+		const baseCap = makeSpendCapPayload(false, used).spend_control;
+		const { reached: _omitted, ...capWithoutVerdict } = baseCap;
+		const spendControl = {
+			...capWithoutVerdict,
+			...(reached === undefined ? {} : { reached }),
+		};
+		const payload = {
+			...makePayload(),
+			rate_limit: {
+				allowed: false,
+				limit_reached: true,
+				primary_window: { used_percent: 100, limit_window_seconds: 604800, reset_at: 2_000_500_000 },
+				secondary_window: null,
+			},
+			credits: { has_credits: true, unlimited: false, overage_limit_reached: false },
+			spend_control: spendControl,
+		};
+		const report = await openaiCodexUsageProvider.fetchUsage(
+			{
+				provider: "openai-codex",
+				credential: { type: "oauth", accessToken: accessTokenFixture, accountId: "acct-1" },
+			},
+			{ fetch: fakeFetch(payload) },
+		);
+		expect(report?.metadata).toMatchObject({ allowed, limitReached: !allowed });
+		const scopes = report ? (codexRankingStrategy.healableBlockScopes?.(report) ?? []) : [];
+		expect(scopes.find(scope => scope.blockScope === "chat")?.healthy).toBe(allowed);
+		expect(scopes.find(scope => scope.blockScope === "shared")?.healthy).toBe(allowed);
+	});
+
 	it("surfaces rate_limit_reset_credits.available_count as report.resetCredits", async () => {
 		const usagePayload = { ...makePayload(), rate_limit_reset_credits: { available_count: 1 } };
 		const fetchImpl: FetchImpl = (async (url: string | URL | Request) => {

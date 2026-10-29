@@ -35,7 +35,19 @@ import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md"
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
-import { denyError, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
+import {
+	approvalRestrictions,
+	captureApprovalTargets,
+	captureApprovalAuthority,
+	sameApprovalAuthority,
+	type AcpApproval,
+	type CapturedApprovalAuthority,
+	type ResolvedExecuteTimeApproval,
+	denyError,
+	resolveApproval,
+	resolveApprovalFromContext,
+	restrictedFolderReason,
+} from "../tools/approval";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
 import { supportsExternalThinking } from "../tools/think";
@@ -468,7 +480,11 @@ export class SessionTools {
 	 * prefix without the intended prompt refresh. The refresh lifecycle updates it.
 	 */
 	#promptSurface: PromptSurface;
-	#acpPermissionDecisions = new Map<string, "allow_always" | "reject_always">();
+	#acpPermissionDecisions = new Map<
+		string,
+		| { kind: "allow_always"; authority: CapturedApprovalAuthority; policy: ResolvedExecuteTimeApproval }
+		| { kind: "reject_always" }
+	>();
 
 	constructor(host: SessionToolsHost, options: SessionToolsOptions) {
 		this.#host = host;
@@ -950,13 +966,6 @@ export class SessionTools {
 		// Match the capability+method gating pattern used by read/write/bash.
 		if (!bridge?.capabilities.requestPermission || !bridge.requestPermission) return tool;
 		if (PERMISSION_REQUIRED_TOOLS[tool.name] !== true) return tool;
-		// Default-config ACP sessions still ask for executable calls even though
-		// the schema defaults to yolo; explicit yolo is an intentional opt-in.
-		if (tool.name !== "bash" && this.#isExplicitAutoApproveMode()) {
-			const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.#host.settings);
-			const toolPolicy = userPolicies[tool.name];
-			if (!toolPolicy || toolPolicy === "allow") return tool;
-		}
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return target[prop as keyof T];
@@ -973,7 +982,43 @@ export class SessionTools {
 					const model = this.#host.model();
 					const approvedInput = structuredCloneJSON(args);
 					const approvedInputJson = JSON.stringify(approvedInput);
-					let cacheable = true;
+					const baseContext = ctx ?? this.#getCustomToolContext();
+					const captureAuthority = () => {
+						try {
+							return captureApprovalAuthority(
+								this.#host.sessionManager.getCwd(),
+								this.#host.sessionManager.getSessionId(),
+								baseContext.settings,
+								this.#host.extensionRunner()?.createContext() ?? {
+									modelRegistry: this.#host.modelRegistry,
+									model: this.#host.model(),
+								},
+							);
+						} catch {
+							return undefined;
+						}
+					};
+					const authority = captureAuthority();
+					if (!authority) throw new ToolError("Tool permission authority is unavailable; execution refused.");
+					const policy = structuredClone(resolveApprovalFromContext(baseContext));
+					const targets = await captureApprovalTargets(target, approvedInput, this.#host.sessionManager.getCwd());
+					const restrictions = approvalRestrictions(this.#host.settings, this.#host.sessionManager.getCwd());
+					const restricted = restrictedFolderReason(target, approvedInput, restrictions, targets) !== undefined;
+					signal?.throwIfAborted();
+					if (
+						!sameApprovalAuthority(authority, captureAuthority()) ||
+						!Bun.deepEquals(policy, resolveApprovalFromContext(baseContext))
+					) {
+						throw new ToolError("Tool permission context changed; request permission again.");
+					}
+					let cacheable = !restricted;
+					if (target.name !== "bash" && !restricted && this.#isExplicitAutoApproveMode()) {
+						const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.#host.settings);
+						const toolPolicy = userPolicies[target.name];
+						if (!toolPolicy || toolPolicy === "allow") {
+							return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
+						}
+					}
 					if (target.name === "bash") {
 						const explicitAutoApprove = this.#isExplicitAutoApproveMode();
 						const { approvalMode, userPolicies } = resolveApprovalFromContext({
@@ -981,22 +1026,38 @@ export class SessionTools {
 							settings: this.#host.settings,
 						});
 						const mode = approvalMode === "yolo" && !explicitAutoApprove ? "always-ask" : approvalMode;
-						const resolved = resolveApproval(target, args, mode, userPolicies);
+						const resolved = resolveApproval(
+							target,
+							approvedInput,
+							mode,
+							userPolicies,
+							undefined,
+							restrictions,
+							targets,
+						);
 						if (resolved.policy === "deny") throw denyError(resolved, target.name);
 						if (resolved.policy === "allow") {
 							return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
 						}
 						// A prompt forced by a critical command or an explicit pattern
 						// remains per-call, even after the client selects Always allow.
-						cacheable = !resolved.override;
+						cacheable = cacheable && !resolved.override;
 					}
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
 					}
-					// Preserve the exact arguments authorized by a selected or
-					// persisted ACP grant; inner handlers may mutate `args` in place.
-					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: approvedInput } : ctx) as never;
+					const acknowledgment: AcpApproval = {
+						toolCallId,
+						toolName: target.name,
+						args: approvedInput,
+						targets,
+						authority,
+						policy,
+						restrictions,
+						perCall: false,
+					};
+					const approvedCtx = { ...baseContext, acpApproval: acknowledgment };
 					const command =
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")
@@ -1005,11 +1066,16 @@ export class SessionTools {
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
 					// Short-circuit on persisted decisions.
-					const persisted = cacheable ? this.#acpPermissionDecisions.get(permissionIntent.cacheKey) : undefined;
-					if (persisted === "allow_always") {
-						return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx);
+					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
+					if (
+						cacheable &&
+						persisted?.kind === "allow_always" &&
+						sameApprovalAuthority(persisted.authority, authority) &&
+						Bun.deepEquals(persisted.policy, policy)
+					) {
+						return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx as never);
 					}
-					if (persisted === "reject_always") {
+					if (persisted?.kind === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (preference)`);
 					}
 					if (signal?.aborted) {
@@ -1158,13 +1224,22 @@ export class SessionTools {
 					if (raced.kind === "aborted" || signal?.aborted) {
 						throw new ToolAbortError("Permission request cancelled");
 					}
+					const finalTargets = await captureApprovalTargets(target, args, this.#host.sessionManager.getCwd());
+					signal?.throwIfAborted();
 					if (
 						this.#host.sessionManager.getSessionId() !== sessionId ||
 						this.#host.sessionManager.getSessionFile() !== sessionFile ||
 						this.#host.settings.getAgentDir() !== agentDir ||
 						this.#host.model() !== model ||
 						this.#host.clientBridge() !== bridge ||
-						JSON.stringify(args) !== approvedInputJson
+						JSON.stringify(args) !== approvedInputJson ||
+						!sameApprovalAuthority(authority, captureAuthority()) ||
+						!Bun.deepEquals(policy, resolveApprovalFromContext(baseContext)) ||
+						!Bun.deepEquals(targets, finalTargets) ||
+						!Bun.deepEquals(
+							restrictions,
+							approvalRestrictions(this.#host.settings, this.#host.sessionManager.getCwd()),
+						)
 					) {
 						throw new ToolError("Tool permission context changed; request permission again.");
 					}
@@ -1177,14 +1252,22 @@ export class SessionTools {
 						throw new ToolError(`Tool permission response used unknown option ID: ${outcome.optionId}`);
 					}
 					if (cacheable && selectedOption.kind === "allow_always") {
-						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "allow_always");
+						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, {
+							kind: "allow_always",
+							authority,
+							policy,
+						});
 					} else if (cacheable && selectedOption.kind === "reject_always") {
-						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "reject_always");
+						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, { kind: "reject_always" });
 					}
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (${target.name})`);
 					}
-					return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx);
+					signal?.throwIfAborted();
+					return await target.execute(toolCallId, args as never, signal, onUpdate, {
+						...approvedCtx,
+						acpApproval: { ...acknowledgment, perCall: true },
+					});
 				};
 			},
 		}) as T;
