@@ -118,9 +118,22 @@ describe("HTML export template", () => {
 		expect(buildExitCode, `${buildStdout}\n${buildStderr}`).toBe(0);
 		expect(await Bun.file(staleAssetPath).exists()).toBe(false);
 
-		const packDir = path.join(tempRoot, "production-package");
-		await Bun.write(path.join(packDir, "package.json"), Bun.file(path.join(packageDir, "package.json")));
-		await Bun.write(path.join(packDir, "bun.lock"), Bun.file(path.resolve(packageDir, "../../bun.lock")));
+		const packRoot = path.join(tempRoot, "production-package");
+		const packDir = path.join(packRoot, "packages", "coding-agent");
+		const repoRoot = path.resolve(packageDir, "../..");
+		const rootManifestPath = path.join(repoRoot, "package.json");
+		const rootManifest = await Bun.file(rootManifestPath).json();
+		await Bun.write(path.join(packRoot, "package.json"), Bun.file(rootManifestPath));
+		await Bun.write(path.join(packRoot, "bun.lock"), Bun.file(path.join(repoRoot, "bun.lock")));
+		const workspacePatterns = Array.isArray(rootManifest.workspaces)
+			? rootManifest.workspaces
+			: rootManifest.workspaces.packages;
+		for (const pattern of workspacePatterns) {
+			const glob = new Bun.Glob(path.join(pattern, "package.json"));
+			for await (const manifestPath of glob.scan({ cwd: repoRoot, onlyFiles: true })) {
+				await Bun.write(path.join(packRoot, manifestPath), Bun.file(path.join(repoRoot, manifestPath)));
+			}
+		}
 		for (const entry of await fs.promises.readdir(productionBundleDir)) {
 			await Bun.write(path.join(packDir, "dist", entry), Bun.file(path.join(productionBundleDir, entry)));
 		}

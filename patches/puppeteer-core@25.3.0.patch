@@ -750,16 +750,138 @@ diff --git a/lib/puppeteer/node/NodeWebSocketTransport.js b/lib/puppeteer/node/N
 index a1af6472f4fb346978e3bd073ddb34963b129da2..951b5968947edaf24775716ccbab31d3fe98fabe 100644
 --- a/lib/puppeteer/node/NodeWebSocketTransport.js
 +++ b/lib/puppeteer/node/NodeWebSocketTransport.js
-@@ -25,7 +25,11 @@ export class NodeWebSocketTransport {
-             ws.addEventListener('open', () => {
-                 return resolve(new NodeWebSocketTransport(ws));
-             });
+@@ -14,16 +14,50 @@ export class NodeWebSocketTransport {
+         return new Promise((resolve, reject) => {
+-            const ws = new NodeWebSocket(url, [], {
+-                followRedirects: true,
+-                perMessageDeflate: false,
+-                allowSynchronousEvents: false,
+-                maxPayload: 256 * 1024 * 1024, // 256Mb
+-                headers: {
+-                    'User-Agent': `Puppeteer ${packageVersion}`,
+-                    ...headers,
+-                },
+-            });
+-            ws.addEventListener('open', () => {
+-                return resolve(new NodeWebSocketTransport(ws));
+-            });
 -            ws.addEventListener('error', reject);
-+            // Reject with an Error carrying the handshake failure: the raw
-+            // ErrorEvent stringifies to "[object ErrorEvent]" wherever it surfaces.
-+            ws.addEventListener('error', event => {
-+                reject(new Error(event.message, { cause: event.error }));
++            const onError = event => {
++                const cause = event instanceof Error ? event : event.error;
++                let endpoint;
++                try {
++                    endpoint = new URL(url);
++                } catch {
++                    reject(new Error('WebSocket connection failed: invalid debugger endpoint'));
++                    return;
++                }
++                const safeEndpoint = `${endpoint.origin}${endpoint.pathname}`;
++                const message = event.message || (cause instanceof Error ? cause.message : 'WebSocket connection failed');
++                let detail = message.replaceAll(url, safeEndpoint).replaceAll(endpoint.href, safeEndpoint);
++                for (const secret of [endpoint.username, endpoint.password, endpoint.hash.slice(1), ...endpoint.searchParams.values()]) {
++                    if (!secret) continue;
++                    let decoded = secret;
++                    try {
++                        decoded = decodeURIComponent(secret);
++                    } catch {}
++                    const encoded = encodeURIComponent(secret);
++                    detail = detail
++                        .replaceAll(secret, '[REDACTED]')
++                        .replaceAll(decoded, '[REDACTED]')
++                        .replaceAll(encoded, '[REDACTED]')
++                        .replaceAll(encoded.replaceAll('%20', '+'), '[REDACTED]');
++                }
++                const options = endpoint.username || endpoint.password || endpoint.search || endpoint.hash ? undefined : { cause };
++                reject(new Error(`WebSocket connection to ${safeEndpoint}: ${detail}`, options));
++            };
++            let ws;
++            try {
++                ws = new NodeWebSocket(url, [], {
++                    followRedirects: true,
++                    perMessageDeflate: false,
++                    allowSynchronousEvents: false,
++                    maxPayload: 256 * 1024 * 1024, // 256Mb
++                    headers: {
++                        'User-Agent': `Puppeteer ${packageVersion}`,
++                        ...headers,
++                    },
++                });
++            } catch (error) {
++                onError(error instanceof Error ? error : { message: String(error) });
++                return;
++            }
++            ws.addEventListener('open', () => {
++                return resolve(new NodeWebSocketTransport(ws));
 +            });
++            ws.addEventListener('error', onError);
          });
-     }
-     #ws;
+diff --git a/src/node/NodeWebSocketTransport.ts b/src/node/NodeWebSocketTransport.ts
+--- a/src/node/NodeWebSocketTransport.ts
++++ b/src/node/NodeWebSocketTransport.ts
+@@ -20,17 +20,51 @@ export class NodeWebSocketTransport implements ConnectionTransport {
+     return new Promise((resolve, reject) => {
+-      const ws = new NodeWebSocket(url, [], {
+-        followRedirects: true,
+-        perMessageDeflate: false,
+-        allowSynchronousEvents: false,
+-        maxPayload: 256 * 1024 * 1024, // 256Mb
+-        headers: {
+-          'User-Agent': `Puppeteer ${packageVersion}`,
+-          ...headers,
+-        },
+-      });
+-
+-      ws.addEventListener('open', () => {
+-        return resolve(new NodeWebSocketTransport(ws));
+-      });
+-      ws.addEventListener('error', reject);
++      const onError = (event: {message?: string; error?: unknown}) => {
++        const cause = event instanceof Error ? event : event.error;
++        let endpoint;
++        try {
++          endpoint = new URL(url);
++        } catch {
++          reject(new Error('WebSocket connection failed: invalid debugger endpoint'));
++          return;
++        }
++        const safeEndpoint = `${endpoint.origin}${endpoint.pathname}`;
++        const message = event.message || (cause instanceof Error ? cause.message : 'WebSocket connection failed');
++        let detail = message.replaceAll(url, safeEndpoint).replaceAll(endpoint.href, safeEndpoint);
++        for (const secret of [endpoint.username, endpoint.password, endpoint.hash.slice(1), ...endpoint.searchParams.values()]) {
++          if (!secret) continue;
++          let decoded = secret;
++          try {
++            decoded = decodeURIComponent(secret);
++          } catch {}
++          const encoded = encodeURIComponent(secret);
++          detail = detail
++            .replaceAll(secret, '[REDACTED]')
++            .replaceAll(decoded, '[REDACTED]')
++            .replaceAll(encoded, '[REDACTED]')
++            .replaceAll(encoded.replaceAll('%20', '+'), '[REDACTED]');
++        }
++        const options = endpoint.username || endpoint.password || endpoint.search || endpoint.hash ? undefined : { cause };
++        reject(new Error(`WebSocket connection to ${safeEndpoint}: ${detail}`, options));
++      };
++      let ws: NodeWebSocket;
++      try {
++        ws = new NodeWebSocket(url, [], {
++          followRedirects: true,
++          perMessageDeflate: false,
++          allowSynchronousEvents: false,
++          maxPayload: 256 * 1024 * 1024, // 256Mb
++          headers: {
++            'User-Agent': `Puppeteer ${packageVersion}`,
++            ...headers,
++          },
++        });
++      } catch (error) {
++        onError(error instanceof Error ? error : {message: String(error)});
++        return;
++      }
++
++      ws.addEventListener('open', () => {
++        return resolve(new NodeWebSocketTransport(ws));
++      });
++      ws.addEventListener('error', onError);
+     });

@@ -8,8 +8,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { resolveRelayWebSocketEndpoint } from "../../src/tools/browser/relay/kind";
-import { connectPuppeteer } from "../../src/tools/browser/launch";
-import type Puppeteer from "puppeteer-core";
+import { connectPuppeteer, loadPuppeteer } from "../../src/tools/browser/launch";
 
 describe("resolveRelayKind", () => {
 	it("is disabled by default", () => {
@@ -56,26 +55,100 @@ describe("resolveRelayWebSocketEndpoint", () => {
 });
 
 describe("authenticated relay connection errors", () => {
-	it.each([false, true])("omits raw and encoded tokens from transport failures (ErrorEvent: %s)", async event => {
+	it("identifies the rejected credential-free websocket endpoint", async () => {
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("Forbidden", { status: 403 }),
+		});
+		try {
+			const puppeteer = await loadPuppeteer();
+			const endpoint = `ws://127.0.0.1:${server.port}/cdp`;
+			const error = await connectPuppeteer(puppeteer, { browserWSEndpoint: endpoint }).then(
+				() => undefined,
+				error => error,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect(error.message).toContain(endpoint);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("redacts discovered websocket credentials when construction fails before the upgrade", async () => {
+		const username = "synthetic discovered user";
+		const password = "synthetic discovered password";
+		const token = "synthetic discovered&token";
+		const fragment = "synthetic discovered fragment";
+		let upgradeAttempts = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, server) {
+				if (new URL(request.url).pathname === "/json/version") {
+					const endpoint = new URL(`ws://127.0.0.1:${server.port}/devtools/browser/invalid`);
+					endpoint.username = username;
+					endpoint.password = password;
+					endpoint.searchParams.set("token", token);
+					endpoint.hash = fragment;
+					return Response.json({ webSocketDebuggerUrl: endpoint.toString() });
+				}
+				upgradeAttempts++;
+				return new Response("Unexpected upgrade", { status: 418 });
+			},
+		});
+		try {
+			const puppeteer = await loadPuppeteer();
+			const error = await connectPuppeteer(puppeteer, { browserURL: `http://127.0.0.1:${server.port}` }).then(
+				() => undefined,
+				error => error,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect(error.message).toContain(`ws://127.0.0.1:${server.port}/devtools/browser/invalid`);
+			expect(upgradeAttempts).toBe(0);
+			const diagnostic = `${error.message}\n${error.stack}`;
+			for (const secret of [username, password, token, fragment]) {
+				expect(diagnostic).not.toContain(secret);
+				expect(diagnostic).not.toContain(encodeURIComponent(secret));
+				expect(diagnostic).not.toContain(encodeURIComponent(secret).replaceAll("%20", "+"));
+			}
+			expect(error.cause).toBeUndefined();
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("keeps the rejected endpoint without exposing relay credentials", async () => {
 		const token = "synthetic relay&secret";
-		const endpointUrl = new URL("ws://127.0.0.1:9224/cdp");
+		const received: { token: string | null } = { token: null };
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				received.token = new URL(request.url).searchParams.get("token");
+				return new Response("Unauthorized", { status: 401 });
+			},
+		});
+		const endpointUrl = new URL(`ws://127.0.0.1:${server.port}/cdp`);
 		endpointUrl.searchParams.set("token", token);
 		const endpoint = endpointUrl.toString();
-		const message = `Unexpected HTTP 401 at ${endpoint}; token ${token}`;
-		const failure = event ? { message, target: { url: endpoint } } : new Error(message, { cause: { endpoint } });
-		const puppeteer = {
-			connect: async () => {
-				throw failure;
-			},
-		} as unknown as typeof Puppeteer;
-		const error = await connectPuppeteer(puppeteer, { browserWSEndpoint: endpoint }).catch(error => error);
-		expect(error).toBeInstanceOf(Error);
-		expect(error.message).toContain("HTTP 401");
-		expect(error.message).not.toContain(token);
-		expect(error.message).not.toContain(encodeURIComponent(token).replaceAll("%20", "+"));
-		expect(error.message).not.toContain(encodeURIComponent(token));
-		expect(error.stack).not.toContain(token);
-		expect(error.cause).toBeUndefined();
+		try {
+			const puppeteer = await loadPuppeteer();
+			const error = await connectPuppeteer(puppeteer, { browserWSEndpoint: endpoint }).then(
+				() => undefined,
+				error => error,
+			);
+			expect(received.token).toBe(token);
+			expect(error).toBeInstanceOf(Error);
+			expect(error.message).toContain(`ws://127.0.0.1:${server.port}/cdp`);
+			expect(error.message).not.toContain(token);
+			expect(error.message).not.toContain(encodeURIComponent(token).replaceAll("%20", "+"));
+			expect(error.message).not.toContain(encodeURIComponent(token));
+			expect(error.stack).not.toContain(token);
+			expect(error.cause).toBeUndefined();
+		} finally {
+			server.stop(true);
+		}
 	});
 });
 

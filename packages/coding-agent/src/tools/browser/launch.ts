@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { redactUrlQuery } from "@oh-my-pi/pi-ai/utils/http-inspector";
 import {
 	$which,
 	filterChildShellEnv,
@@ -229,17 +230,42 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 	try {
 		return await puppeteer.connect(options);
 	} catch (error) {
+		const event = !(error instanceof Error) && isRecord(error) ? error : undefined;
+		const eventEndpoint =
+			event && isRecord(event.target) && typeof event.target.url === "string" ? event.target.url : undefined;
+		const eventMessage =
+			event && typeof event.message === "string"
+				? event.message || (event.error instanceof Error ? event.error.message : "WebSocket connection failed")
+				: undefined;
 		const normalized =
-			!(error instanceof Error) && isRecord(error) && typeof error.message === "string"
-				? new Error(error.message)
+			eventMessage !== undefined
+				? new Error(
+						eventEndpoint
+							? `WebSocket connection to ${redactUrlQuery(eventEndpoint)}: ${eventMessage}`
+							: eventMessage,
+						{ cause: event?.error instanceof Error ? event.error : undefined },
+					)
 				: toError(error);
-		const endpoint = options.browserWSEndpoint;
-		const token = endpoint ? new URL(endpoint).searchParams.get("token") : null;
-		if (token) {
-			const message = normalized.message
-				.replaceAll(token, "[REDACTED]")
-				.replaceAll(encodeURIComponent(token), "[REDACTED]")
-				.replaceAll(encodeURIComponent(token).replaceAll("%20", "+"), "[REDACTED]");
+		let message = normalized.message;
+		let redacted = false;
+		for (const endpoint of [eventEndpoint, options.browserWSEndpoint, options.browserURL]) {
+			const safeEndpoint = redactUrlQuery(endpoint);
+			if (!endpoint || !safeEndpoint || safeEndpoint === endpoint) continue;
+			redacted = true;
+			message = message.replaceAll(endpoint, safeEndpoint);
+			if (URL.canParse(endpoint)) {
+				const parsed = new URL(endpoint);
+				const secrets = [parsed.username, parsed.password, parsed.hash.slice(1), ...parsed.searchParams.values()];
+				for (const secret of secrets) {
+					if (!secret) continue;
+					message = message
+						.replaceAll(secret, "[REDACTED]")
+						.replaceAll(encodeURIComponent(secret), "[REDACTED]")
+						.replaceAll(encodeURIComponent(secret).replaceAll("%20", "+"), "[REDACTED]");
+				}
+			}
+		}
+		if (redacted) {
 			const sanitized = new Error(message);
 			sanitized.name = normalized.name;
 			throw sanitized;

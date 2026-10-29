@@ -24,6 +24,7 @@
 - Preserve OAuth discovery endpoints privately when credential-bearing diagnostics are redacted, including HTTP and legacy SSE challenges.
 - Close freshly initialized MCP sessions when reconnect ownership retires before registration.
 - Keep unrelated worktree edits visible when native cherry-picks rewrite a racy Git index, without invalidating older stable stat caches.
+- Identify refused browser CDP endpoints independently of transport error wording. Preserve available failure details without exposing discovered URL credentials or unsafe causes, including constructor failures.
 - Preserve the stable MCP tool collision winner before late same-owner registrations replace its declaration.
 - Render tool descriptions against candidate prompt activity without granting execution before publication. Revoke removed tools while rebuilding and restore prior authority after failure.
 - Preserve text-only asides when a session switch rolls back. Finish cancellation cleanup before a focused turn releases its result ownership.

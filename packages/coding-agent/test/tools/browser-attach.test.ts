@@ -707,15 +707,23 @@ describe("pickElectronTarget", () => {
 		30_000,
 	);
 
-	test("names the refused CDP websocket instead of reporting [object ErrorEvent]", async () => {
+	test("identifies the refused CDP websocket without exposing discovered credentials", async () => {
 		// `/json/version` answers, but its debugger websocket refuses the upgrade.
+		const token = "synthetic discovered&secret";
+		const received: { token: string | null } = { token: null };
 		const cdp = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
-			fetch: (request, server) =>
-				new URL(request.url).pathname === "/json/version"
-					? Response.json({ webSocketDebuggerUrl: `ws://127.0.0.1:${server.port}/devtools/browser/gone` })
-					: new Response("gone", { status: 404 }),
+			fetch: (request, server) => {
+				const url = new URL(request.url);
+				if (url.pathname === "/json/version") {
+					const endpoint = new URL(`ws://127.0.0.1:${server.port}/devtools/browser/gone`);
+					endpoint.searchParams.set("token", token);
+					return Response.json({ webSocketDebuggerUrl: endpoint.toString() });
+				}
+				received.token = url.searchParams.get("token");
+				return new Response("gone", { status: 404 });
+			},
 		});
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);
@@ -731,11 +739,11 @@ describe("pickElectronTarget", () => {
 				),
 			);
 			expect(error).toBeInstanceOf(Error);
-			expect(error).toMatchObject({
-				message: expect.stringContaining(
-					`WebSocket connection to 'ws://127.0.0.1:${cdp.port}/devtools/browser/gone'`,
-				),
-			});
+			expect((error as Error).message).toContain(`ws://127.0.0.1:${cdp.port}/devtools/browser/gone`);
+			expect(received.token).toBe(token);
+			expect((error as Error).message).not.toContain(token);
+			expect((error as Error).message).not.toContain(encodeURIComponent(token));
+			expect((error as Error).message).not.toContain(encodeURIComponent(token).replaceAll("%20", "+"));
 		} finally {
 			cdp.stop(true);
 		}
