@@ -24,6 +24,7 @@ import {
 	resolveModelFromSettings,
 	resolveModelFromString,
 	resolveModelOverride,
+	resolveModelOverrideWithAuthFallback,
 	resolveModelRoleValue,
 	resolveModelScope,
 	resolveRoleChain,
@@ -2922,4 +2923,32 @@ describe("Devin selector parity", () => {
 		const withRaw = [...devinModels, devinModel("claude-mythos-9-high")];
 		expect(resolveProviderModelReference("devin", "claude-mythos-9-high", withRaw)?.id).toBe("claude-mythos-9-high");
 	});
+});
+
+test("an authenticated later override route wins before the parent's model", async () => {
+	const models = ["candidate-primary", "candidate-authorized", "parent"].map(id =>
+		buildModel({
+			id,
+			name: id,
+			provider: "route-proxy",
+			api: "openai-responses",
+			baseUrl: `https://${id}.example.test/v1`,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8192,
+		}),
+	);
+	const result = await resolveModelOverrideWithAuthFallback(
+		["route-proxy/candidate-primary", "route-proxy/candidate-authorized"],
+		"route-proxy/parent",
+		{
+			getAvailable: () => models,
+			getApiKeyForProvider: async (_provider, _sessionId, options) =>
+				options?.baseUrl === "https://candidate-primary.example.test/v1" ? undefined : "route-key",
+		},
+	);
+	expect(result.model?.id).toBe("candidate-authorized");
+	expect(result.authFallbackUsed).toBe(false);
 });

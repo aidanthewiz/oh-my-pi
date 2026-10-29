@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS build
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS build
 WORKDIR /src
 
 COPY package.json bun.lock tsconfig.base.json tsconfig.json tsconfig.tools.json bunfig.toml ./
@@ -13,7 +13,7 @@ RUN bun --cwd=packages/collab-web run build \
  && bun build packages/relay/src/main.ts --target=bun --minify --outfile=/out/server.js \
  && bun build packages/relay/src/jwks-mirror.ts --target=bun --minify --outfile=/out/jwks-mirror.js
 
-FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS runtime
+FROM oven/bun:1.4.4-alpine@sha256:4cf82f5686b196504fe119db3fcd9185b191f82ece82c40680e597228ec6070a AS runtime
 WORKDIR /app
 ENV HOST=0.0.0.0 \
     PORT=8080 \

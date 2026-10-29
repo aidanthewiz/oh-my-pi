@@ -448,16 +448,16 @@ it("publishes a consumed parent injection during a peer wake without publishing 
 		await manager.waitForOwnerJobs(PARENT_ID);
 		expect(await Bun.file(child.artifact).text()).toContain("NEGATIVE_FINAL");
 		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
-		expect(child.deliveries.filter(text => text.includes("PEER_ONLY_FINAL"))).toHaveLength(1);
-		expect(child.deliveries).toHaveLength(3);
-		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(3);
+		expect(child.deliveries.filter(text => text.includes("PEER_ONLY_FINAL"))).toHaveLength(0);
+		expect(child.deliveries).toHaveLength(2);
+		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(2);
 		await bus.send({ from: PARENT_ID, to: AGENT_ID, body: "Announcement, not a request", broadcast: true });
 		await child.session.waitForIdle();
 		await child.session.waitForIrcReplies();
 		await manager.waitForOwnerJobs(PARENT_ID);
 		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
-		expect(child.deliveries).toHaveLength(3);
-		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(3);
+		expect(child.deliveries).toHaveLength(2);
+		expect(manager.getAllJobs({ ownerId: PARENT_ID })).toHaveLength(2);
 		expect(await Bun.file(child.artifact).text()).toContain("NEGATIVE_FINAL");
 		expect(AgentRegistry.global().get(AGENT_ID)?.lifecycle?.acceptedAt).toBeUndefined();
 	} finally {
@@ -773,3 +773,64 @@ it("does not migrate a queued task into changed caller admission after its permi
 		await fixture.authStorage.close();
 	}
 }, 20_000);
+
+for (const source of ["queued steering", "async completion"] as const) {
+	it(`publishes a consumed parent injection during ${source}`, async () => {
+		const continuationStarted = Promise.withResolvers<void>();
+		const peerOnlySeen = Promise.withResolvers<void>();
+		const releaseContinuation = Promise.withResolvers<void>();
+		let request = 0;
+		const child = await spawnKeptAliveChild({
+			structured: false,
+			enableIrc: true,
+			handler: async () => {
+				request++;
+				if (request === 1) return { content: ["INITIAL_FINAL"] };
+				if (request === 2) {
+					continuationStarted.resolve();
+					await releaseContinuation.promise;
+					return { content: ["INTERMEDIATE_FINAL"] };
+				}
+				if (request === 4) peerOnlySeen.resolve();
+				return { content: [request === 3 ? "PARENT_FRESH_FINAL" : "PEER_ONLY_FINAL"] };
+			},
+		});
+		try {
+			if (source === "queued steering") {
+				await child.session.steer("Continue the task", undefined, { attribution: "agent" });
+			} else {
+				manager.register("bash", "child-owned work", async () => "work complete", {
+					ownerId: AGENT_ID,
+					agentId: AGENT_ID,
+				});
+			}
+			await continuationStarted.promise;
+			const parent = await IrcBus.global().send({ from: PARENT_ID, to: AGENT_ID, body: "Publish fresh result" });
+			expect(parent.outcome).toBe("injected");
+			expect(await Bun.file(child.artifact).text()).toContain("INITIAL_FINAL");
+			releaseContinuation.resolve();
+			await child.session.waitForIdle();
+			await child.session.settleAsyncWork();
+			await child.session.waitForIrcReplies();
+			await manager.waitForOwnerJobs(PARENT_ID);
+			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
+			expect(JSON.stringify(child.mock.calls.at(-1)?.context.messages)).toContain("Publish fresh result");
+			expect(await Bun.file(child.artifact).text()).toContain("PARENT_FRESH_FINAL");
+			expect(child.deliveries.filter(text => text.includes("PARENT_FRESH_FINAL"))).toHaveLength(1);
+			expect(
+				manager.getAllJobs({ ownerId: PARENT_ID }).filter(job => job.resultText?.includes("PARENT_FRESH_FINAL")),
+			).toHaveLength(1);
+			if (source === "queued steering") {
+				await child.session.steer("Continue without parent input", undefined, { attribution: "agent" });
+				await peerOnlySeen.promise;
+				await child.session.waitForIdle();
+				await child.session.waitForIrcReplies();
+				expect(await Bun.file(child.artifact).text()).toContain("PARENT_FRESH_FINAL");
+				expect(child.deliveries).toHaveLength(1);
+			}
+		} finally {
+			releaseContinuation.resolve();
+			await child.close();
+		}
+	}, 15_000);
+}

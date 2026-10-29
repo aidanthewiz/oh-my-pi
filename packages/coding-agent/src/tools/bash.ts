@@ -235,7 +235,7 @@ const FALLBACK_DESTRUCTIVE_BASH_PATTERNS = [
 	/\bchown\s+-R\s+\S+\s+\//i,
 	/>\s*\/dev\/sd[a-z]/i,
 	/\bmkfs(\.|\b)/i,
-	/\bdd\s+if=.+of=\/dev\//i,
+	/\bdd\s+if=.+of=\/dev\/(?!(?:null|zero|stdout|stderr|tty|fd\/\d+)(?:[\s;&|)<>]|$))/i,
 	/\bshred\s+\/dev\//i,
 	/\bcryptsetup\b/i,
 	/>\s*\/etc\/(?:passwd|shadow|sudoers)\b/i,
@@ -433,6 +433,8 @@ function normalizeBashInput(input: BashToolInput): BashToolInput {
 	return {
 		...input,
 		name,
+		async: name === undefined ? input.async : undefined,
+		timeout: name === undefined ? input.timeout : undefined,
 		ready: name === undefined ? undefined : normalizeReady(input.ready),
 	};
 }
@@ -877,10 +879,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (input.name !== undefined) {
 			if (!this.#launchEnabled) throw new ToolError("Service launch is disabled in this session.");
-			if (input.async === true || input.timeout !== undefined)
-				throw new ToolError("Service mode does not accept async or timeout; use ready.timeout for readiness.");
 		}
-		if (input.async === true && !cfgAsyncEnabled.get(this.session.settings)) {
+		if (input.name === undefined && input.async === true && !cfgAsyncEnabled.get(this.session.settings)) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
 
@@ -1419,8 +1419,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const { command, commandCwd, backend } = prepared;
 		const pendingNotices: string[] = [];
 		const ignoredReady = normalizeReady(input.ready);
-		if (
-			normalizedInput.name === undefined &&
+		if (normalizedInput.name !== undefined) {
+			if (input.timeout != null)
+				pendingNotices.push("Ignored timeout: service-only; readiness follows ready.timeout.");
+			if (input.async === true)
+				pendingNotices.push("Ignored async: service-only; a service start is asynchronous already.");
+		} else if (
 			ignoredReady !== undefined &&
 			(ignoredReady.log !== undefined || (ignoredReady.port !== undefined && ignoredReady.port !== 0))
 		) {
@@ -1484,6 +1488,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					`NOT ready — readiness timed out after ${normalizedInput.ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
 				);
 			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
+			lines.push(...pendingNotices);
 			const log = await serviceLogs(this.session, normalizedInput.name, signal);
 			if (log) lines.push(log);
 			return {

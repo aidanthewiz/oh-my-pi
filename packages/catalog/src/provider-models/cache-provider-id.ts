@@ -16,6 +16,7 @@ export interface ModelCacheProviderIdOptions extends AccountScope {
 }
 
 const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = {
+	"openai-codex": true,
 	"opencode-go": true,
 	"opencode-zen": true,
 	"github-copilot": true,
@@ -102,20 +103,21 @@ function cursorCredentialSubject(apiKey: string): string | undefined {
 export function resolveModelCacheProviderId(providerId: string, options: ModelCacheProviderIdOptions = {}): string {
 	switch (providerId) {
 		case "openai-codex": {
-			// The backend filters the roster by client version. A Codex-compatible
-			// gateway publishes its own roster; discovery is authoritative, so the
-			// namespace must follow the endpoint. The official backend keeps the
-			// unhashed namespace so existing caches stay valid.
 			const baseUrl = options.baseUrl?.trim().replace(/\/+$/, "");
-			if (!baseUrl || baseUrl === CODEX_BASE_URL) return `${providerId}:${CODEX_CLIENT_VERSION}`;
-			return `${providerId}:${CODEX_CLIENT_VERSION}:${Bun.hash(baseUrl).toString(36)}`;
+			const endpointKey =
+				!baseUrl || baseUrl === CODEX_BASE_URL
+					? `${providerId}:${CODEX_CLIENT_VERSION}`
+					: `${providerId}:${CODEX_CLIENT_VERSION}:${Bun.hash(baseUrl).toString(36)}`;
+			return options.apiKey === undefined
+				? endpointKey
+				: `${endpointKey}:accounts-v1:${Bun.hash(options.apiKey).toString(36)}`;
 		}
 		case "ollama":
 			return resolveOllamaModelCacheProviderId(providerId, options.baseUrl);
 		case "google-antigravity":
 		case "google-gemini-cli": {
 			const baseUrl = (options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!).replace(/\/+$/, "");
-			const projectId = providerId === "google-gemini-cli" ? (options.projectId ?? "") : "";
+			const projectId = options.projectId ?? "";
 			const scope = `${options.apiKey ?? ""}\u0000${baseUrl}\u0000${projectId}`;
 			return `${providerId}:oauth-models-v1:${Bun.hash(scope).toString(36)}`;
 		}
@@ -182,6 +184,7 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 		}
 		case "litellm": {
 			const baseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
+			// rich-v13 moves `mode: decisions` groups off chat onto the Decisions runner.
 			// rich-v12 invalidates namespaced ids that missed bare catalog references.
 			// rich-v11 excluded ClinePass gateway metadata (issue #10932). rich-v10
 			// filtered known non-conversational LiteLLM modes, unioned compat across
@@ -189,7 +192,7 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			// declaration into it; earlier versions invalidated rows whose
 			// `compatConfig` retained a colliding bundled model's provider-specific
 			// transport (e.g. Fireworks `wireModelIdMode`) (issue #9938).
-			return `litellm:rich-v12:${Bun.hash(baseUrl).toString(36)}`;
+			return `litellm:rich-v13:${Bun.hash(baseUrl).toString(36)}`;
 		}
 		case "gmi-cloud":
 		case "siliconflow":
@@ -239,7 +242,9 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			// v2: rows cached before Fusion pairings carried their lead uid as
 			// `requestModelId` send the composite uid and fail with
 			// `permission_denied: no API providers are available`.
-			return "devin:models-v2";
+			// v3: rows cached before discovery read `ModelInfo.maxTokens` hold a
+			// 200K window on every model.
+			return "devin:models-v3";
 		default:
 			return providerId;
 	}

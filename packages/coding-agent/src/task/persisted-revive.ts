@@ -30,6 +30,7 @@ import {
 	createMCPProxyTools,
 	createSubagentSettings,
 	followMCPTools,
+	replayRevivedAgentStart,
 	subagentRetryFallbackRole,
 } from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
@@ -277,6 +278,7 @@ export function createPersistedSubagentReviverFactory(
 				if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
 				({ session } = await createAgentSession({
 					cwd: restoredSeance?.cwd ?? ctx.session.sessionManager.getCwd(),
+					costGate: ctx.session.costGate,
 					authStorage: ctx.authStorage,
 					// Revived agents join the root session tree, so their observability
 					// frames ride the same bus the RPC/collab surfaces subscribed to.
@@ -372,6 +374,7 @@ export function createPersistedSubagentReviverFactory(
 					reportRuntimeError: err =>
 						logger.error("Extension error", { path: err.extensionPath, error: err.error }),
 				});
+				await replayRevivedAgentStart(session);
 				if (!isOwnerCurrent()) {
 					throw new Error(`Cannot revive subagent "${ref.id}": its owner was retired.`);
 				}

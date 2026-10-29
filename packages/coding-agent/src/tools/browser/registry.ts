@@ -29,7 +29,7 @@ import {
 import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
 import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
-import { waitForRelayExtension } from "./relay/probe";
+import { UPDATE_RELAY_EXTENSION, waitForRelayExtension } from "./relay/probe";
 import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
 import { ensureSharedBrowser } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
@@ -361,9 +361,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			);
 		}
 		if (outcome === "outdated-extension") {
-			throw new ToolError(
-				`The ${CF_BRAND} Browser Relay extension is out of date. Run \`${CF_COMMAND} browser-relay install\` and reload the extension in Chrome.`,
-			);
+			throw new ToolError(`The ${CF_BRAND} Browser Relay extension is out of date. ${UPDATE_RELAY_EXTENSION}`);
 		}
 		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);
 		const puppeteer = await loadPuppeteer();

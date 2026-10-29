@@ -4243,8 +4243,8 @@ describe("ExtensionRunner", () => {
 			]);
 		});
 
-		it("forfeits the xdevApproved prompt bypass when a handler revises the input", async () => {
-			// write.ts dispatches xd:// devices with xdevApproved: true because its
+		it("forfeits the xd:// prompt bypass when a handler revises the input", async () => {
+			// write.ts dispatches xd:// devices with xdevPolicyKey because its
 			// outer gate already approved the ORIGINAL device input. A tool_call
 			// revision may raise the tier, so revised input must face the full gate
 			// (here: no interactive UI => reject) instead of riding the outer approval.
@@ -4270,7 +4270,7 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 			const xdevContext = {
 				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
-				xdevApproved: true,
+				xdevPolicyKey: "bash",
 			} as never;
 
 			await expect(
@@ -4348,7 +4348,7 @@ describe("ExtensionRunner", () => {
 			let effectiveTier: string | undefined;
 			const xdevContext = {
 				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
-				xdevApproved: true,
+				xdevPolicyKey: "bash",
 				xdevTierResolved: (tier: string) => {
 					effectiveTier = tier;
 				},
@@ -4357,6 +4357,42 @@ describe("ExtensionRunner", () => {
 			await wrapped.execute("xdev-tier-id", { command: "echo original" }, undefined, undefined, xdevContext);
 			expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toEqual({ command: "echo revised" });
 			expect(effectiveTier).toBe("write");
+		});
+
+		it.each([
+			["bash", true],
+			["unrelated_device", false],
+		] as const)("limits a tool-owned prompt grant to its outer policy key %s", async (policyKey, allowed) => {
+			const recordPath = path.join(tempDir.path(), `xdev-tool-policy-${policyKey}.jsonl`);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const tool = createRecordingTool(recordPath);
+			tool.approval = () => ({ tier: "exec", policy: "prompt" }) as const;
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			const context = {
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
+				xdevPolicyKey: policyKey,
+			} as never;
+			const execution = wrapped.execute(
+				"tool-policy-grant",
+				{ command: "echo approved" },
+				undefined,
+				undefined,
+				context,
+			);
+			if (allowed) {
+				await execution;
+				expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toEqual({ command: "echo approved" });
+			} else {
+				await expect(execution).rejects.toThrow(/requires approval but no interactive UI available/);
+				expect(fs.existsSync(recordPath)).toBe(false);
+			}
 		});
 
 		it("emits tool_call before the approval prompt so approval sees the final input", async () => {

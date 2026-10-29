@@ -259,6 +259,8 @@ export function sessionJudge(
 		purpose,
 		telemetry: session.getTelemetry?.(),
 		cache: sharedJudgmentCache(),
+		costGate: session.costGate,
+		prepareSimpleStreamOptions: session.prepareSimpleStreamOptions,
 		onUsage:
 			onUsage && journal
 				? usage => {

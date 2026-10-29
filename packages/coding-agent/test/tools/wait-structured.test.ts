@@ -141,4 +141,38 @@ describe("wait structured output rendering", () => {
 
 		expect(text).toContain(`full payload at agent://Foo,`);
 	});
+
+	test("does not recover or consume a replacement job through a stale snapshot", async () => {
+		const manager = new AsyncJobManager({});
+		const pending = Promise.withResolvers<AsyncJobRunResult>();
+		try {
+			const jobId = manager.register("task", "current owner", async () => pending.promise, {
+				ownerId: SELF_ID,
+				agentId: "CurrentAgent",
+			});
+			const current = manager.getJob(jobId)!;
+			const stale = {
+				...current,
+				status: "completed" as const,
+				resultText: "old generation report",
+				structured: { source: "agent", mode: "strict", status: "valid", data: { old: true } } as const,
+			};
+			const result = buildJobResult(makeSession(manager), manager, "wait", [stale], []);
+			expect(result.details?.jobs).toMatchObject([
+				{ resultText: "old generation report", structured: { data: { old: true } } },
+			]);
+			expect(manager.isJobResultConsumed(jobId)).toBe(false);
+			pending.resolve({ text: "new generation report" });
+			await current.promise;
+			const recovered = buildJobResult(makeSession(manager), manager, "wait", [current], []);
+			expect(recovered.details?.jobs).toMatchObject([{ resultText: "new generation report" }]);
+			expect(manager.isJobResultConsumed(jobId)).toBe(true);
+			const repeated = buildJobResult(makeSession(manager), manager, "wait", [current], []);
+			expect(repeated.details?.jobs?.[0]?.resultText).toBeUndefined();
+			expect(repeated.details?.jobs?.[0]?.structured).toBeUndefined();
+		} finally {
+			pending.resolve({ text: "new generation report" });
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
 });

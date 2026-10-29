@@ -10,6 +10,10 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
+import * as ai from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { attemptEditAutoRepair } from "@oh-my-pi/pi-coding-agent/edit/auto-repair";
+import { CostCapError, CostGate } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 
 function makeSession(cwd: string, settings: Record<string, unknown> = {}): ToolSession {
 	return {
@@ -131,6 +135,82 @@ describe("EditTool details", () => {
 			newText: "B\n",
 		});
 		expect(details.perFileResults?.[1]?.diff).toContain("+1|B");
+	});
+
+	test("a refused edit carries the engine's error kind beside the message", async () => {
+		const session = makeSession(tempDir);
+		const absolute = path.join(tempDir, "a.ts");
+		await Bun.write(absolute, "a\n");
+		const tag = getEditStore(session).recordSnapshot(absolute, "a\n");
+		await Bun.write(absolute, "changed\n");
+
+		const result = await new EditTool(session, "hashline").execute("hashline-stale", {
+			input: `[a.ts#${tag}]\nPUT 1-1:\n+A`,
+		});
+		expect(result.isError).toBe(true);
+		expect(result.details).toEqual({ diff: "", errorKind: "stale_tag" });
+		expect(result.content[0]).toMatchObject({ text: expect.stringContaining("file changed between read and edit") });
+	});
+
+	test("refuses repair dispatch when the session reaches its cap during provider admission", async () => {
+		const model = buildModel({
+			id: "repair",
+			name: "Repair",
+			provider: "test",
+			api: "openai-completions",
+			baseUrl: "https://example.invalid",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 8192,
+			maxTokens: 2048,
+		});
+		const session = makeSession(tempDir, {
+			"edit.autoRepair.enabled": true,
+			"session.maxCost": 1,
+			modelRoles: { smol: "test/repair" },
+		});
+		const costGate = new CostGate(session.settings, 0, () => {});
+		session.costGate = costGate;
+		session.modelRegistry = {
+			getAvailable: () => [model],
+			getApiKey: async () => "synthetic-repair-key",
+			resolver: () => async () => "synthetic-repair-key",
+		} as unknown as NonNullable<ToolSession["modelRegistry"]>;
+		session.prepareSimpleStreamOptions = () => ({
+			onPayload: async payload => {
+				await Promise.resolve();
+				costGate.record(1);
+				return payload;
+			},
+		});
+		let dispatched = false;
+		const completion = vi.spyOn(ai, "completeSimple").mockImplementation(async (actualModel, _context, options) => {
+			await options?.onPayload?.({}, actualModel, options.signal);
+			dispatched = true;
+			throw new Error("Unexpected provider dispatch");
+		});
+		const absolute = path.join(tempDir, "repair.ts");
+		const next = "const value = (1 + ;\n";
+		await Bun.write(absolute, next);
+		let wrote = false;
+		try {
+			await expect(
+				attemptEditAutoRepair({
+					session,
+					snapshot: { path: absolute, prev: "const value = 1;\n", next },
+					writethrough: async (_path, content) => {
+						wrote = true;
+						return { finalContent: content };
+					},
+				}),
+			).rejects.toBeInstanceOf(CostCapError);
+			expect(dispatched).toBe(false);
+			expect(wrote).toBe(false);
+			expect(await Bun.file(absolute).text()).toBe(next);
+		} finally {
+			completion.mockRestore();
+		}
 	});
 
 	test("preserves diff metadata while native snapshot pruning removes oversized texts", async () => {

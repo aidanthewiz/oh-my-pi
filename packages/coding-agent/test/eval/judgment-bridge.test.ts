@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import * as ai from "@oh-my-pi/pi-ai";
-import type { Api, AssistantMessage, ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { runEvalJudgment } from "../../src/eval/judgment-bridge";
@@ -10,9 +12,11 @@ import { MAX_IMAGE_INPUT_BYTES } from "@oh-my-pi/pi-tui/chat/image-loading";
 import type { ToolSession } from "../../src/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { asGlobalFetch } from "../helpers/fetch-mock";
+import { rejectionOf } from "../helpers/rejection";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { CostCapError, CostGate } from "../../src/session/cost-gate";
 
-const SMOL: Model<Api> = {
+const SMOL_SPEC: ModelSpec<Api> = {
 	id: "smol",
 	name: "smol",
 	api: "openai-responses",
@@ -23,25 +27,26 @@ const SMOL: Model<Api> = {
 	cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 1 },
 	contextWindow: 128000,
 	maxTokens: 4096,
-} as Model<Api>;
+};
+const SMOL = buildModel(SMOL_SPEC);
 
-const VISION: Model<Api> = {
-	...SMOL,
+const VISION = buildModel({
+	...SMOL_SPEC,
 	input: ["text", "image"],
-} as Model<Api>;
+});
 
-const JEV_PREVIEW: Model<Api> = {
-	...SMOL,
+const JEV_PREVIEW = buildModel({
+	...SMOL_SPEC,
 	id: "jev-preview",
 	name: "JEV Preview",
 	api: "typesafe",
 	provider: "typesafe",
 	baseUrl: "https://judge.example.test/",
 	kind: "judge",
-} as Model<Api>;
+});
 
-const OPENAI_DECISIONS: Model<Api> = {
-	...SMOL,
+const OPENAI_DECISIONS = buildModel({
+	...SMOL_SPEC,
 	id: "gpt-6-luna-decisions",
 	requestModelId: "gpt-6-luna",
 	name: "GPT-6 Luna Decisions",
@@ -49,7 +54,7 @@ const OPENAI_DECISIONS: Model<Api> = {
 	provider: "openai",
 	baseUrl: "https://api.openai.com/v1",
 	input: ["text", "image"],
-} as Model<Api>;
+});
 
 const IMAGE_ONE: ImageContent = {
 	type: "image",
@@ -151,6 +156,89 @@ describe("eval judge() bridge", () => {
 			"state must be a string, a JSON object, or a JSON array",
 		);
 		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("counts billed attempts against the session's cost cap and refuses at it", async () => {
+		const billed = reply("bucket: hard\ntests: yes\ntone: 2");
+		// 1.2M input tokens at SMOL's $1/M.
+		billed.usage.input = 1_200_000;
+		billed.usage.totalTokens = 1_200_000;
+		billed.usage.cost = { input: 1.2, output: 0, cacheRead: 0, cacheWrite: 0, total: 1.2 };
+		// The real completeSimple reports each provider attempt through `onAttempt`.
+		const spy = vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			(options as { onAttempt?: (message: AssistantMessage) => void } | undefined)?.onAttempt?.(billed);
+			return billed;
+		});
+		const session = makeSession();
+		const costGate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		const capped = { ...session, costGate } as ToolSession;
+
+		await runEvalJudgment({ state: "first request", questions: QUESTIONS }, { session: capped });
+		expect(costGate.spent).toBe(1.2);
+		const refused = await rejectionOf(
+			runEvalJudgment({ state: "second request", questions: QUESTIONS }, { session: capped }),
+		);
+		expect(refused).toBeInstanceOf(CostCapError);
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	it("refuses a judgment when another request reaches the cap during credential resolution", async () => {
+		const session = makeSession();
+		const costGate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		session.costGate = costGate;
+		const resolving = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		vi.spyOn(session.modelRegistry!, "getApiKey").mockImplementation(() => {
+			resolving.resolve();
+			return credential.promise;
+		});
+		const provider = vi.spyOn(ai, "completeSimple").mockResolvedValue(reply("bucket: hard\ntests: yes\ntone: 2"));
+		const judgment = runEvalJudgment({ state: "held credential", questions: QUESTIONS }, { session });
+		await resolving.promise;
+		costGate.record(1);
+		credential.resolve("test-key");
+
+		expect(await rejectionOf(judgment)).toBeInstanceOf(CostCapError);
+		expect(costGate.spent).toBe(1);
+		expect(provider).not.toHaveBeenCalled();
+	});
+
+	it("runs session admission before a prompted judgment can reach the provider", async () => {
+		const session = makeSession();
+		let admissionRefused = false;
+		session.prepareSimpleStreamOptions = options => ({
+			...options,
+			onPayload: () => {
+				admissionRefused = true;
+				throw new Error("judgment credit admission refused");
+			},
+		});
+		const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected provider request"));
+
+		const refused = await rejectionOf(runEvalJudgment({ state: "refused", questions: QUESTIONS }, { session }));
+		expect(refused).toBeInstanceOf(Error);
+		expect(admissionRefused).toBe(true);
+		expect(fetch).not.toHaveBeenCalled();
+	});
+
+	it("runs session admission before a native judgment can reach the provider", async () => {
+		const session = makeSession({ typesafe: true });
+		let admissionRefused = false;
+		session.prepareSimpleStreamOptions = options => ({
+			...options,
+			onPayload: () => {
+				admissionRefused = true;
+				throw new Error("native judgment credit admission refused");
+			},
+		});
+		const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected provider request"));
+
+		const refused = await rejectionOf(
+			runEvalJudgment({ state: "native refused", questions: QUESTIONS }, { session }),
+		);
+		expect(refused).toBeInstanceOf(Error);
+		expect(admissionRefused).toBe(true);
+		expect(fetch).not.toHaveBeenCalled();
 	});
 
 	it("answers through the smol chat model and returns typed answers with the backend", async () => {

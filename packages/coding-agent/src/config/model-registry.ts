@@ -83,6 +83,7 @@ import {
 	getImplicitOllamaBaseUrl,
 	getOllamaContextLengthOverride,
 	isDiscoveryAuthRejection,
+	LLAMA_CPP_DEFAULT_BASE_URLS,
 	normalizeBareDiscoveryBaseUrl,
 	normalizeLiteLLMDiscoveryBaseUrl,
 	normalizeLlamaCppBaseUrl,
@@ -1676,9 +1677,10 @@ export class ModelRegistry {
 			this.#discoverableProviders.push({
 				provider: "llama.cpp",
 				api: "openai-responses",
-				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
+				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || LLAMA_CPP_DEFAULT_BASE_URLS[0],
 				discovery: { type: "llama.cpp" },
 				optional: !Bun.env.LLAMA_CPP_BASE_URL,
+				fallbackBaseUrls: Bun.env.LLAMA_CPP_BASE_URL ? undefined : LLAMA_CPP_DEFAULT_BASE_URLS.slice(1),
 			});
 			// Only mark as keyless if no API key is configured
 			if (this.authStorage.keys.source("llama.cpp") === undefined) {
@@ -2055,10 +2057,11 @@ export class ModelRegistry {
 				: `${providerConfig.provider}:openai-models-list-context-v4`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
-			// rich-v5 invalidates rows written before discovery filtered known
+			// rich-v6 invalidates rows written before `mode: decisions` groups moved
+			// to the Decisions runner; rich-v5 before discovery filtered known
 			// non-conversational modes. Keep this in lockstep with the catalog
 			// package's `litellm:rich-vN` namespace whenever mapping behavior changes.
-			return `${providerConfig.provider}:litellm-rich-v5`;
+			return `${providerConfig.provider}:litellm-rich-v6`;
 		}
 		return providerConfig.provider;
 	}
@@ -2390,20 +2393,29 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken => {
+				createOptions: (oauthToken, raw) => {
 					const providerId = "google-antigravity";
 					const endpoint = this.#descriptorBaseUrl(providerId);
+					const preflightProjectId = extractGoogleOAuthProjectId(raw);
 					const credentials = getOAuthCredentialsForProvider(this.authStorage, providerId);
 					const source = this.authStorage.keys.source(providerId, { env: "none" });
 					const included = source?.kind === "oauth" ? credentials : [];
 					const accountKeys = included.map(credential => {
 						const accountKey = oauthAccountKey(credential);
-						return accountKey === undefined ? `token:${credential.access}` : `account:${accountKey}`;
+						return JSON.stringify([
+							accountKey === undefined ? `token:${credential.access}` : `account:${accountKey}`,
+							(credential.access === oauthToken ? preflightProjectId : undefined) ?? credential.projectId ?? "",
+						]);
 					});
 					if (!included.some(credential => credential.access === oauthToken)) {
 						const matching = credentials.find(credential => credential.access === oauthToken);
 						const accountKey = matching && oauthAccountKey(matching);
-						accountKeys.push(accountKey === undefined ? `token:${oauthToken}` : `account:${accountKey}`);
+						accountKeys.push(
+							JSON.stringify([
+								accountKey === undefined ? `token:${oauthToken}` : `account:${accountKey}`,
+								preflightProjectId ?? matching?.projectId ?? "",
+							]),
+						);
 					}
 					return {
 						...googleAntigravityModelManagerOptions({
@@ -2413,6 +2425,9 @@ export class ModelRegistry {
 									accounts?.map(account => ({
 										accessToken: account.accessToken,
 										accountKey: oauthAccountKey(account),
+										projectId:
+											(account.accessToken === oauthToken ? preflightProjectId : undefined) ??
+											account.projectId,
 									})) ?? null
 								);
 							},
@@ -2422,7 +2437,7 @@ export class ModelRegistry {
 						cacheProviderId: `${resolveModelCacheProviderId(providerId, {
 							apiKey: JSON.stringify([...new Set(accountKeys)].sort()),
 							baseUrl: endpoint,
-						})}:union-v2`,
+						})}:union-v3`,
 					};
 				},
 			},
@@ -2449,19 +2464,35 @@ export class ModelRegistry {
 					// fallback behind a live OAuth token, which `peek` returns first.
 					const configuredBaseUrl = this.#descriptorBaseUrl("openai-codex");
 					const officialCredential = this.#isOfficialCodexDiscoveryCredential(accessToken);
-					if (officialCredential || isOfficialCodexApiUrl(configuredBaseUrl)) {
-						return openaiCodexModelManagerOptions({
-							baseUrl: officialCredential ? undefined : configuredBaseUrl,
-							resolveAccounts: () =>
-								resolveOAuthDiscoveryAccounts(this.authStorage, "openai-codex", accessToken),
-							fetch: this.#fetch,
-						});
+					const officialEndpoint = officialCredential || isOfficialCodexApiUrl(configuredBaseUrl);
+					const baseUrl = officialCredential ? undefined : configuredBaseUrl;
+					const credentials = officialEndpoint
+						? getOAuthCredentialsForProvider(this.authStorage, "openai-codex")
+						: [];
+					const accountKeys: string[] = [];
+					if (officialEndpoint) {
+						for (const credential of credentials) {
+							const accountKey = oauthAccountKey(credential);
+							accountKeys.push(
+								accountKey === undefined ? `token:${credential.access}` : `account:${accountKey}`,
+							);
+						}
 					}
-					return openaiCodexModelManagerOptions({
-						baseUrl: configuredBaseUrl,
-						resolveAccounts: async () => [{ accessToken }],
-						fetch: this.#fetch,
-					});
+					const matching = credentials.some(credential => credential.access === accessToken);
+					if (!matching) accountKeys.push(`token:${accessToken}`);
+					return {
+						...openaiCodexModelManagerOptions({
+							baseUrl,
+							resolveAccounts: officialEndpoint
+								? () => resolveOAuthDiscoveryAccounts(this.authStorage, "openai-codex", accessToken)
+								: async () => [{ accessToken }],
+							fetch: this.#fetch,
+						}),
+						cacheProviderId: resolveModelCacheProviderId("openai-codex", {
+							baseUrl,
+							apiKey: JSON.stringify([...new Set(accountKeys)].sort()),
+						}),
+					};
 				},
 			},
 		];
@@ -2495,7 +2526,9 @@ export class ModelRegistry {
 				this.#resolveBuiltInDiscoveryApiKey(
 					descriptor.providerId,
 					strategy,
-					descriptor.providerId,
+					isCredentialScopedModelCacheProvider(descriptor.providerId)
+						? undefined
+						: this.#resolveStartupModelCacheProviderId(descriptor.providerId),
 					AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(descriptor.providerId),
 				),
 			),

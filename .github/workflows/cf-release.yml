@@ -239,7 +239,7 @@ jobs:
           printf 'Apple Foundation Models bridge: %s\n' "$toolchain"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.2"
+          bun-version: "1.4.4"
       - name: Guard tag against package version
         if: matrix.windows != '1'
         run: |

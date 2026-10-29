@@ -27,7 +27,7 @@ import { $env, isRecord, parseImageMetadata } from "@oh-my-pi/pi-utils";
 import { type ApiKey, withAuth } from "../auth-retry";
 import * as AIError from "../error";
 import { isDataUrlMimeType, isEmbeddedImageContent } from "../images/shared";
-import type { ImageContent, Model, Usage } from "../types";
+import type { ImageContent, Model, SimpleStreamOptions, Usage } from "../types";
 import { getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { openaiDecisionsWire } from "./openai-decisions";
 import { openrouterDecisionsWire, referencedImageAssets, typesafeWire, workersAiWire } from "./systemone";
@@ -169,6 +169,8 @@ export interface NativeJudgeConnection {
 	/** Static headers attached to judgment requests (e.g. proxy routing, gateway auth). */
 	headers?: Record<string, string>;
 	fetch?: FetchImpl;
+	/** Existing provider payload hook, called before each native request attempt. */
+	onPayload?: SimpleStreamOptions["onPayload"];
 }
 
 export interface NativeJudgeOptions extends NativeJudgeConnection {
@@ -342,6 +344,7 @@ export class NativeJudge implements Judge {
 	readonly #timeoutMs: number;
 	readonly #maxQuestions: number | undefined;
 	readonly #imageInput: JudgmentImageInput | undefined;
+	readonly #onPayload: NativeJudgeConnection["onPayload"];
 
 	constructor(options: NativeJudgeOptions) {
 		this.#apiKey = options.apiKey;
@@ -353,6 +356,7 @@ export class NativeJudge implements Judge {
 		this.#headers = options.headers;
 		this.#fetch = options.fetch ?? fetch;
 		this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		this.#onPayload = options.onPayload;
 		if (options.maxQuestions !== undefined && !(Number.isInteger(options.maxQuestions) && options.maxQuestions > 0)) {
 			throw new RangeError(`NativeJudge maxQuestions must be a positive integer, got ${options.maxQuestions}`);
 		}
@@ -533,13 +537,24 @@ export class NativeJudge implements Judge {
 		};
 		for (let attempt = 0; ; attempt++) {
 			signal?.throwIfAborted();
+			let requestBody = body;
+			if (this.#onPayload) {
+				const payload: unknown = JSON.parse(body);
+				const replacement = await this.#onPayload(payload, undefined, signal);
+				const serialized = JSON.stringify(replacement === undefined ? payload : replacement);
+				if (serialized === undefined) {
+					throw new AIError.ConfigurationError("Native judgment payload must be JSON serializable");
+				}
+				requestBody = serialized;
+				signal?.throwIfAborted();
+			}
 			const timeout = AbortSignal.timeout(this.#timeoutMs);
 			let response: Response;
 			try {
 				response = await this.#fetch(target.url, {
 					method: "POST",
 					headers,
-					body,
+					body: requestBody,
 					signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 				});
 			} catch (error) {
@@ -571,8 +586,10 @@ export function createNativeJudge(model: Model, connection: NativeJudgeConnectio
 	if (!isJudgmentApi(model.api)) {
 		throw new AIError.ConfigurationError(`${model.provider}/${model.id} does not answer native judgments`);
 	}
+	const onPayload = connection.onPayload;
 	return new NativeJudge({
 		...connection,
+		onPayload: onPayload ? (payload, _model, signal) => onPayload(payload, model, signal) : undefined,
 		api: model.api,
 		provider: model.provider,
 		model: model.requestModelId ?? model.id,

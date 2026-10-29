@@ -183,6 +183,7 @@ export interface JobWidgetAuthorAdmission {
 	apiKey: SimpleStreamOptions["apiKey"];
 	signal?: AbortSignal;
 	isCurrent(): boolean;
+	admit(): void;
 	onUsage(message: AssistantMessage): void;
 }
 
@@ -269,20 +270,23 @@ export function createModelJobWidgetAuthor(options: ModelJobWidgetAuthorOptions)
 			content.text = text.slice(0, low);
 		}
 		if (!current()) return undefined;
-		const response = await instrumentedCompleteSimple(
-			model,
-			context,
-			{
-				apiKey: lease.apiKey,
-				signal: requestSignal,
-				// Spec writing is formatting work; a forced tool call also rules out thinking on some providers.
-				disableReasoning: true,
-				maxTokens: MAX_SPEC_TOKENS,
-				toolChoice: { type: "tool", name: RESPOND_TOOL },
+		const streamOptions: SimpleStreamOptions & { onAttempt(message: AssistantMessage): void } = {
+			apiKey: lease.apiKey,
+			signal: requestSignal,
+			onPayload: (_payload, _model, signal) => {
+				(signal ?? requestSignal).throwIfAborted();
+				lease.admit();
 			},
-			{ telemetry: resolveTelemetry(telemetry, lease.sessionId), oneshotKind: "job_widget" },
-		);
-		lease.onUsage(response);
+			onAttempt: lease.onUsage,
+			// Spec writing is formatting work; a forced tool call also rules out thinking on some providers.
+			disableReasoning: true,
+			maxTokens: MAX_SPEC_TOKENS,
+			toolChoice: { type: "tool", name: RESPOND_TOOL },
+		};
+		const response = await instrumentedCompleteSimple(model, context, streamOptions, {
+			telemetry: resolveTelemetry(telemetry, lease.sessionId),
+			oneshotKind: "job_widget",
+		});
 		if (!current()) return undefined;
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			throw new Error(response.errorMessage ?? `widget spec request ${response.stopReason}`);

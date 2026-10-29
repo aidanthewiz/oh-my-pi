@@ -4,22 +4,14 @@
  * intentional user-facing output.
  */
 
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getBrowserRelayDir } from "@oh-my-pi/pi-utils";
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { probeRelayServer } from "../tools/browser/relay/daemon";
-import backgroundJs from "../tools/browser/relay/extension-assets/background.js.txt" with { type: "text" };
-import licenseText from "../tools/browser/relay/extension-assets/LICENSE.txt" with { type: "text" };
-import manifestJson from "../tools/browser/relay/extension-assets/manifest.json.txt" with { type: "text" };
-import optionsHtml from "../tools/browser/relay/extension-assets/options.html.txt" with { type: "text" };
-import optionsJs from "../tools/browser/relay/extension-assets/options.js.txt" with { type: "text" };
-import thirdPartyNotices from "../tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
+import { defaultRelayExtensionDir, writeRelayExtension } from "../tools/browser/relay/extension-files";
 import { DEFAULT_RELAY_URL } from "../tools/browser/relay/kind";
 import { type RelayServer, startRelayServer } from "../tools/browser/relay/server";
 import { ensureBrowserRelayToken, writeBrowserRelayToken } from "../tools/browser/relay/token";
 import { CF_BRAND, CF_COMMAND } from "./cf-version";
-
-const INJECTED_TOKEN = "__COREFORGE_BROWSER_RELAY_TOKEN__";
 
 export const BROWSER_RELAY_ACTIONS = ["serve", "install"] as const;
 export type BrowserRelayAction = (typeof BROWSER_RELAY_ACTIONS)[number];
@@ -35,14 +27,6 @@ export interface BrowserRelayCommandArgs {
 	verbose?: boolean;
 }
 
-const EXTENSION_FILES: Record<string, string> = {
-	LICENSE: licenseText,
-	"manifest.json": manifestJson,
-	"options.html": optionsHtml,
-	"options.js": optionsJs,
-	"THIRD-PARTY-NOTICES.txt": thirdPartyNotices,
-};
-
 /** Default port of the relay endpoint (kept in sync with DEFAULT_RELAY_URL). */
 export const DEFAULT_RELAY_PORT = Number(new URL(DEFAULT_RELAY_URL).port);
 
@@ -54,19 +38,8 @@ export async function runBrowserRelayCommand(args: BrowserRelayCommandArgs): Pro
 	await runServe(args);
 }
 async function runInstall(dirOverride: string | undefined): Promise<void> {
-	const dir = dirOverride ? path.resolve(dirOverride) : path.join(getBrowserRelayDir(), "extension");
-	const token = await ensureBrowserRelayToken();
-	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-	await fs.chmod(dir, 0o700);
-	const background = backgroundJs.replace(JSON.stringify(INJECTED_TOKEN), JSON.stringify(token));
-	if (background === backgroundJs) throw new Error("Browser Relay extension token placeholder is missing");
-	await Bun.write(path.join(dir, "background.js"), background);
-	for (const [name, contents] of Object.entries(EXTENSION_FILES)) {
-		await Bun.write(path.join(dir, name), contents);
-	}
-	for (const name of ["background.js", ...Object.keys(EXTENSION_FILES)]) {
-		await fs.chmod(path.join(dir, name), 0o600);
-	}
+	const dir = dirOverride ? path.resolve(dirOverride) : defaultRelayExtensionDir();
+	await writeRelayExtension(dir, VERSION);
 	console.log(`Installed the ${CF_BRAND} Browser Relay extension to ${dir}`);
 	console.log("");
 	console.log("Finish setup in Chrome:");
@@ -77,6 +50,8 @@ async function runInstall(dirOverride: string | undefined): Promise<void> {
 	console.log(`${CF_BRAND} starts the relay automatically when the browser prelude needs it;`);
 	console.log(`run \`${CF_COMMAND} browser-relay\` yourself only for --token or --no-group.`);
 	console.log("The extension badge shows 'on' once it reaches a relay.");
+	if (!dirOverride)
+		console.log(`Newer ${CF_BRAND} versions update the extension in this folder and reload it on their own.`);
 	console.log(
 		"Old connection-refused entries in chrome://extensions > Errors may persist after reconnect; use Clear all.",
 	);

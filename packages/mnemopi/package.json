@@ -1,6 +1,6 @@
 {
 	"name": "@oh-my-pi/pi-mnemopi",
-	"version": "18.12.6",
+	"version": "18.13.0",
 	"description": "Local SQLite memory engine for omp agents",
 	"keywords": [
 		"agent",

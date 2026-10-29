@@ -13,6 +13,7 @@ import {
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type {
+	Api,
 	Context,
 	CredentialDisabledEvent,
 	Effort,
@@ -32,7 +33,6 @@ import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-pre
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
-import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { $env } from "@oh-my-pi/pi-utils/env";
@@ -204,6 +204,7 @@ import {
 	loadEffectiveAuthAccountPolicyConfig,
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
+import { CostCapError, type CostGate, guardStreamFn } from "./session/cost-gate";
 import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
@@ -696,6 +697,8 @@ export interface CreateAgentSessionOptions {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
 	deadline?: number;
+	/** Cost gate of the parent session tree; without one the session starts its own from `session.warnCost` / `session.maxCost`. */
+	costGate?: CostGate;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -784,6 +787,8 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
+	/** Discover no context files: not from cwd (on start or a cwd change), not for additional workspace roots, and no nested AGENTS.md list. Explicit `contextFiles` still load. Inherited by subagents. */
+	noContextFiles?: boolean;
 	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
 	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
@@ -1931,8 +1936,9 @@ async function createAgentSessionScoped(
 	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
 	// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
 	// session-context build, tool creation, MCP discovery, and extension discovery.
-	const contextFilesPromise = options.contextFiles
-		? Promise.resolve(options.contextFiles)
+	const pinnedContextFiles = options.contextFiles ?? (options.noContextFiles ? [] : undefined);
+	const contextFilesPromise = pinnedContextFiles
+		? Promise.resolve(pinnedContextFiles)
 		: logger.time("discoverContextFiles", () => withSessionPluginPolicy(() => discoverContextFiles(cwd, agentDir)));
 	contextFilesPromise.catch(() => {});
 	const resolveRepoContext = async (repoCwd: string) => {
@@ -2343,6 +2349,10 @@ async function createAgentSessionScoped(
 	let hasSession = false;
 	let hasRegistered = false;
 	const restrictToolNames = options.restrictToolNames === true;
+	// The session tree shares one cost gate: a subagent is given its parent's; a root
+	// session owns one that follows its session file. Read it per request, so a request
+	// lands on the gate of the session file it was sent for.
+	const currentCostGate = (): CostGate | undefined => session?.costGate ?? options.costGate;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
 	// Every root owns its jobs and delivery sinks, even when another root is live.
@@ -2354,6 +2364,7 @@ async function createAgentSessionScoped(
 			})
 		: undefined;
 	let widgetGeneration = 0;
+	let captureRequestOwner: NonNullable<ToolSession["captureRequestOwner"]>;
 	const remoteWidgetEnabled = (): boolean =>
 		cfgAsyncWidgets.get(settings) &&
 		cfgAsyncWidgetRemoteAuthoring.get(settings) &&
@@ -2392,6 +2403,8 @@ async function createAgentSessionScoped(
 							);
 						if (!remoteWidgetEnabled() || signal.aborted || request.canAuthor?.() !== true || !modelAdmitted())
 							return undefined;
+						const costGate = currentCostGate();
+						costGate?.admit();
 						const owner = {
 							sessionId: sessionManager.getSessionId(),
 							parentId: sessionManager.getLeafId(),
@@ -2400,27 +2413,22 @@ async function createAgentSessionScoped(
 							generation: widgetGeneration,
 							credentials: modelRegistry.authStorage.credentials,
 						};
-						const accountIdentity = () =>
-							JSON.stringify(
-								modelRegistry.authStorage.oauth
-									.accounts(candidate.provider, owner.sessionId)
-									.filter(account => account.active)
-									.map(account => [account.credentialId, account.accountId, account.orgId, account.projectId]),
-							);
-						let capturedAccount = accountIdentity();
-						let credentialSelected = false;
-						let selectedCredentialId: number | undefined;
+						const requestOwner = captureRequestOwner(candidate);
+						let usageRecorded = false;
+						let attemptAdmitted = false;
 						const isCurrent = (): boolean =>
 							remoteWidgetEnabled() &&
 							!signal.aborted &&
 							request.canAuthor?.() === true &&
+							currentCostGate() === costGate &&
+							(usageRecorded || !costGate?.check()) &&
 							owner.generation === widgetGeneration &&
 							owner.sessionId === sessionManager.getSessionId() &&
 							owner.file === sessionManager.getSessionFile() &&
 							owner.cwd === sessionManager.getCwd() &&
 							!modelRegistry.authStorage.isClosed &&
 							owner.credentials === modelRegistry.authStorage.credentials &&
-							capturedAccount === accountIdentity() &&
+							requestOwner.isCurrent() &&
 							modelAdmitted();
 						const supplied = options.getApiKey
 							? await options.getApiKey(candidate)
@@ -2429,6 +2437,12 @@ async function createAgentSessionScoped(
 						return {
 							sessionId: owner.sessionId,
 							isCurrent,
+							admit: () => {
+								attemptAdmitted = false;
+								costGate?.admit();
+								if (!isCurrent()) throw new Error("Job widget authorization changed");
+								attemptAdmitted = true;
+							},
 							apiKey:
 								typeof supplied === "function"
 									? async request => {
@@ -2438,33 +2452,16 @@ async function createAgentSessionScoped(
 												signal: request.signal ? AbortSignal.any([signal, request.signal]) : signal,
 											});
 											const credentialId = typeof resolved === "object" ? resolved?.credentialId : undefined;
-											if (selectedCredentialId !== undefined && credentialId !== selectedCredentialId) {
-												throw new Error("Job widget account changed");
-											}
-											selectedCredentialId ??= credentialId;
-											const currentAccount = accountIdentity();
-											if (currentAccount !== capturedAccount) {
-												const selected = modelRegistry.authStorage.oauth
-													.accounts(candidate.provider, owner.sessionId)
-													.filter(account => account.active);
-												if (
-													credentialSelected ||
-													capturedAccount !== "[]" ||
-													credentialId === undefined ||
-													selected.length !== 1 ||
-													selected[0]!.credentialId !== credentialId
-												) {
-													throw new Error("Job widget account changed");
-												}
-												capturedAccount = currentAccount;
-											}
-											credentialSelected = true;
-											if (!isCurrent()) throw new Error("Job widget authorization changed");
+											if (!requestOwner.bindCredential(credentialId) || !isCurrent())
+												throw new Error("Job widget authorization changed");
 											return resolved;
 										}
 									: supplied,
 							onUsage: message => {
-								if (!message.usage) return;
+								if (!attemptAdmitted || !message.usage) return;
+								attemptAdmitted = false;
+								usageRecorded = true;
+								costGate?.record(message.usage.cost.total);
 								sessionManager.appendModelUsage(
 									{
 										purpose: "job-widget",
@@ -2530,13 +2527,19 @@ async function createAgentSessionScoped(
 		};
 		const isToolActiveForPrompt = (name: string): boolean =>
 			session?.getPromptToolActivity(name) ?? activeToolNames.has(name);
-		const captureOwnerScope = () => {
-			const credentials = modelRegistry.authStorage.credentials;
-			const sourceIdentity = modelRegistry.authStorage.sourceIdentity;
-			const ownerId = sessionManager.getSessionId();
-			const ownerFile = sessionManager.getSessionFile();
-			const ownerCwd = sessionManager.getCwd();
-			const ownerRef = registeredAgentRef;
+		const captureSelectedAccountOwner = (ownerId: string, candidate?: Model<Api>) => {
+			const provider = candidate?.provider;
+			const availableAccounts =
+				provider === undefined
+					? undefined
+					: () =>
+							modelRegistry.authStorage.oauth
+								.accounts(provider, ownerId)
+								.map(account => [account.credentialId, account.accountId, account.orgId, account.projectId])
+								.sort((a, b) => Number(a[0]) - Number(b[0]));
+			const capturedAvailableAccounts = availableAccounts?.();
+			const inventoryCurrent = (): boolean =>
+				availableAccounts === undefined || Bun.deepEquals(capturedAvailableAccounts, availableAccounts());
 			const accountSnapshot = () =>
 				[...new Set(modelRegistry.authStorage.credentials.list().map(credential => credential.provider))]
 					.sort()
@@ -2552,7 +2555,45 @@ async function createAgentSessionScoped(
 								account.projectId,
 							]),
 					);
-			const accounts = accountSnapshot();
+			let accounts = accountSnapshot();
+			let bound = false;
+			let selectedCredentialId: number | undefined;
+			return {
+				isCurrent: () => inventoryCurrent() && Bun.deepEquals(accounts, accountSnapshot()),
+				bindCredential: (credentialId: number | undefined): boolean => {
+					if (provider === undefined || !inventoryCurrent() || (bound && credentialId !== selectedCredentialId))
+						return false;
+					const current = accountSnapshot();
+					if (!Bun.deepEquals(accounts, current)) {
+						const selected = current.filter(account => account[0] === provider);
+						if (
+							bound ||
+							credentialId === undefined ||
+							accounts.some(account => account[0] === provider) ||
+							selected.length !== 1 ||
+							selected[0]![1] !== credentialId ||
+							!Bun.deepEquals(
+								accounts,
+								current.filter(account => account[0] !== provider),
+							)
+						)
+							return false;
+						accounts = current;
+					}
+					bound = true;
+					selectedCredentialId = credentialId;
+					return true;
+				},
+			};
+		};
+		const captureOwnerScope = (candidate?: Model<Api>) => {
+			const credentials = modelRegistry.authStorage.credentials;
+			const sourceIdentity = modelRegistry.authStorage.sourceIdentity;
+			const ownerId = sessionManager.getSessionId();
+			const ownerFile = sessionManager.getSessionFile();
+			const ownerCwd = sessionManager.getCwd();
+			const ownerRef = registeredAgentRef;
+			const accountOwner = captureSelectedAccountOwner(ownerId, candidate);
 			return {
 				isCurrent: (allowParked: boolean): boolean => {
 					if (
@@ -2565,7 +2606,7 @@ async function createAgentSessionScoped(
 						ownerCwd !== sessionManager.getCwd() ||
 						ownerRef !== registeredAgentRef ||
 						(ownerRef !== undefined && agentRegistry.get(resolvedAgentId) !== ownerRef) ||
-						!Bun.deepEquals(accounts, accountSnapshot())
+						!accountOwner.isCurrent()
 					)
 						return false;
 					if (options.asyncJobManager && inheritedOwnerLifetimeCurrent?.() !== true) return false;
@@ -2595,15 +2636,41 @@ async function createAgentSessionScoped(
 						current.sessionManager.getCwd() === ownerCwd
 					);
 				},
+				bindCredential: accountOwner.bindCredential,
 				modelSnapshot: () => {
 					const current = ownerRef?.session?.agent.state.model ?? agent.state.model;
 					return current && [current.provider, current.id, current.api, current.baseUrl];
 				},
 			};
 		};
+		captureRequestOwner = candidate => {
+			const owner = captureOwnerScope(candidate);
+			const model = owner.modelSnapshot();
+			const requestedModel = [candidate.provider, candidate.id, candidate.api, candidate.baseUrl];
+			const policy = allSettings().map(setting => [
+				setting.id,
+				setting.get(settings),
+				settings.getProvenance(setting),
+			]);
+			const isCurrent = (): boolean =>
+				owner.isCurrent(false) &&
+				Bun.deepEquals(model, owner.modelSnapshot()) &&
+				Bun.deepEquals(requestedModel, [candidate.provider, candidate.id, candidate.api, candidate.baseUrl]) &&
+				Bun.deepEquals(
+					policy,
+					allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]),
+				);
+			return {
+				isCurrent,
+				bindCredential: credentialId => owner.bindCredential(credentialId) && isCurrent(),
+			};
+		};
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
+			},
+			get costGate() {
+				return currentCostGate();
 			},
 			isToolActive: name => activeToolNames.has(name),
 			isToolActiveForPrompt,
@@ -2617,6 +2684,8 @@ async function createAgentSessionScoped(
 			// sessions inherit stored affinity into the child's own provider session.
 			getApiKey: options.getApiKey,
 			getCredentialSourceSessionId: options.getApiKey ? undefined : () => agent.sessionId,
+			prepareSimpleStreamOptions: (streamOptions, provider) =>
+				session.prepareSimpleStreamOptions(streamOptions, provider),
 			get additionalDirectories() {
 				return sessionManager.getAdditionalDirectories();
 			},
@@ -2647,6 +2716,7 @@ async function createAgentSessionScoped(
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
 			contextFiles,
+			noContextFiles: options.noContextFiles,
 			get workspaceTree() {
 				return lateWorkspaceTree ?? resolvedWorkspaceTree;
 			},
@@ -2690,6 +2760,7 @@ async function createAgentSessionScoped(
 						allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]),
 					);
 			},
+			captureRequestOwner,
 			captureOwnerLifetimeCurrent: () => {
 				const owner = captureOwnerScope();
 				return () => owner.isCurrent(true);
@@ -2700,7 +2771,7 @@ async function createAgentSessionScoped(
 			getPromptCacheKey: () => {
 				if (!session) return undefined;
 				const model = session.agent.state.model;
-				if (!model || resolveCatalogPolicy(model).taskSiblingPromptCache !== true) return undefined;
+				if (!model) return undefined;
 				return session.getPromptCacheKeyForModel(model) ?? session.agent.sessionId;
 			},
 			getToolByName: name => session?.getToolByName(name),
@@ -2948,6 +3019,8 @@ async function createAgentSessionScoped(
 
 				const deferredMCPManager = mcpManager;
 				startDeferredMCPDiscovery = liveSession => {
+					const ownerCurrent = toolSession.captureOwnerLifetimeCurrent!();
+					const managerGeneration = deferredMCPManager.lifecycleGeneration;
 					const discovery = (async () => {
 						try {
 							const mcpResult = await logger.time("discoverAndLoadMCPTools", () =>
@@ -2966,6 +3039,7 @@ async function createAgentSessionScoped(
 								await deferredMCPManager.disconnectAll();
 								return;
 							}
+							if (!ownerCurrent() || deferredMCPManager.lifecycleGeneration !== managerGeneration) return;
 							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
 							// Connected MCP tools (and cached routes of servers still connecting) are
@@ -2976,7 +3050,12 @@ async function createAgentSessionScoped(
 							// connecting. Give them the first turn's wait budget, then publish the
 							// final snapshot so that turn's prompt carries their instructions too.
 							await deferredMCPManager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
-							if (liveSession.isDisposed) return;
+							if (
+								liveSession.isDisposed ||
+								!ownerCurrent() ||
+								deferredMCPManager.lifecycleGeneration !== managerGeneration
+							)
+								return;
 							await liveSession.refreshMCPTools(deferredMCPManager.getTools());
 						} catch (error) {
 							logger.error("MCP tool load failed", {
@@ -4310,6 +4389,18 @@ async function createAgentSessionScoped(
 					: resolveTelemetry(options.telemetry, providerSessionId),
 			),
 		});
+		// Instructions from MCP servers the host connects outside `mcpManager`
+		// (ACP client-declared servers); installed via
+		// `AgentSession.setMcpServerInstructionsSource`.
+		let hostMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
+		/** Live server instructions from the session's own manager and any host source, sorted by server name. */
+		const readMcpServerInstructions = (): Map<string, string> | undefined => {
+			const own = mcpManager?.getServerInstructions();
+			const hosted = hostMcpServerInstructions?.();
+			if (!hosted || hosted.size === 0) return own;
+			if (!own || own.size === 0) return hosted;
+			return new Map([...own, ...hosted].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)));
+		};
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
@@ -4326,7 +4417,7 @@ async function createAgentSessionScoped(
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
 				: initialActiveRepoContext;
-			if (hasSession && options.contextFiles === undefined) {
+			if (hasSession && pinnedContextFiles === undefined) {
 				contextFiles = await logger.time("discoverContextFiles", discoverContextFiles, promptCwd, agentDir, [
 					...cfgDisabledExtensions.get(settings),
 				]);
@@ -4397,7 +4488,7 @@ async function createAgentSessionScoped(
 			// `getServerInstructions()` are empty until the background connect
 			// completes; the rebuild that `refreshMCPTools` triggers post-discovery
 			// then picks up the mounted routes and any connected-server instructions.
-			const serverInstructions = mcpManager?.getServerInstructions();
+			const serverInstructions = readMcpServerInstructions();
 			// Drive guidance off the auto-learn BUILTINS currently registered (provenance,
 			// not just an active name): a custom/extension tool that merely shares the
 			// name is not built-in, and the settings reconcile adds/removes the built-ins
@@ -4484,6 +4575,7 @@ async function createAgentSessionScoped(
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
+				noContextFiles: options.noContextFiles,
 				xdevTools: promptXdev ? xdevEntries(promptXdev) : [],
 				xdevDocs: xdevPromptDocs ? renderXdevPromptDocs(xdevPromptDocs, routedCatalogNames) : "",
 				coreforgeReportEnabled: options.hasUI === true && !restrictToolNames && toolNames.includes("write"),
@@ -4840,15 +4932,21 @@ async function createAgentSessionScoped(
 		// the session drives. Wrapped in a per-provider concurrency limiter so
 		// each LLM HTTP request — not the whole subagent lifecycle — holds the
 		// slot, preventing the nested-spawn deadlock from issue #3749.
+		// Every attempt this session sends (primary, side-channel, advisor, cache warming,
+		// image-source retries) passes the session tree's cost gate once it holds its
+		// concurrency slot, and adds its cost to the gate before releasing the slot.
 		const settingsBoundStreamFn = wrapStreamFnWithBlobUrlFallback(
 			wrapStreamFnWithProviderConcurrency(
 				settings,
-				createSettingsAwareStreamFn(settings, undefined, {
-					canAutoAccept: streamModel =>
-						anthropicSlowModeHasNoSiblingHeadroom(modelRegistry.authStorage, streamModel, session?.sessionId),
-					notify: (level, message) => session?.emitNotice(level, message, "anthropic-slow-mode"),
-					onLane: lane => session?.noteAnthropicSlowModeLane(lane),
-				}),
+				guardStreamFn(
+					createSettingsAwareStreamFn(settings, undefined, {
+						canAutoAccept: streamModel =>
+							anthropicSlowModeHasNoSiblingHeadroom(modelRegistry.authStorage, streamModel, session?.sessionId),
+						notify: (level, message) => session?.emitNotice(level, message, "anthropic-slow-mode"),
+						onLane: lane => session?.noteAnthropicSlowModeLane(lane),
+					}),
+					currentCostGate,
+				),
 			),
 			() => blobBroker.current,
 		);
@@ -4931,6 +5029,13 @@ async function createAgentSessionScoped(
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: effectiveGetApiKey,
 			streamFn: (streamModel, context, streamOptions) => {
+				// The loop checks the cap before each request, but a side request can finish
+				// in between: refuse here, as this run's refusal, before announcing a dispatch.
+				const refusal = currentCostGate()?.check();
+				if (refusal) {
+					session.reportCostCapRefusal(refusal);
+					return Promise.reject(new CostCapError(refusal));
+				}
 				if (notifyFirstChatDispatch) {
 					const cb = notifyFirstChatDispatch;
 					notifyFirstChatDispatch = undefined;
@@ -4947,6 +5052,7 @@ async function createAgentSessionScoped(
 					agent.state.tools.some(tool => tool.name === "think") &&
 					supportsExternalThinking(streamModel);
 				const fallbackCreditRedemption = session?.consumeActiveFallbackCreditRedemption(streamModel);
+				if (streamOptions?.promptCacheKey === undefined) session?.promoteTaskSiblingCandidate(streamModel);
 				const merged: SimpleStreamOptions = {
 					...streamOptions,
 					promptCacheKey: streamOptions?.promptCacheKey ?? session?.getPromptCacheKeyForModel(streamModel),
@@ -4955,6 +5061,11 @@ async function createAgentSessionScoped(
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
+				});
+				// A request that waited for a provider slot is checked again when it goes out.
+				const completion = stream instanceof Promise ? stream.then(sent => sent.result()) : stream.result();
+				completion.catch(error => {
+					if (error instanceof CostCapError) session.reportCostCapRefusal(error.refusal);
 				});
 				// Every request through this streamFn is this session's own main
 				// loop (side-channel, advisor, and maintenance requests use
@@ -5143,6 +5254,7 @@ async function createAgentSessionScoped(
 		// streamed and parsed on the main thread.
 		session = new AgentSession({
 			cacheWarmer,
+			costGate: options.costGate,
 			advisorWatchdogPrompt,
 			advisorContextPrompt,
 			advisorMemoryPrompt,
@@ -5237,20 +5349,21 @@ async function createAgentSessionScoped(
 			},
 			ensureGoalRegistered,
 			reconcileSettingsGatedTools,
-			getMcpServerInstructions: mcpManager
-				? () => {
-						const raw = mcpManager.getServerInstructions();
-						if (!raw || raw.size === 0) return raw;
-						const out = new Map<string, string>();
-						for (const [name, text] of raw) {
-							out.set(
-								name,
-								text.length > MAX_MCP_INSTRUCTIONS_LENGTH ? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH) : text,
-							);
-						}
-						return out;
-					}
-				: undefined,
+			getMcpServerInstructions: () => {
+				const raw = readMcpServerInstructions();
+				if (!raw || raw.size === 0) return raw;
+				const out = new Map<string, string>();
+				for (const [name, text] of raw) {
+					out.set(
+						name,
+						text.length > MAX_MCP_INSTRUCTIONS_LENGTH ? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH) : text,
+					);
+				}
+				return out;
+			},
+			setMcpServerInstructionsSource: source => {
+				hostMcpServerInstructions = source;
+			},
 			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,
 			ttsrManager,
 			obfuscator,

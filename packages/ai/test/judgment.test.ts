@@ -328,6 +328,91 @@ describe("NativeJudge", () => {
 		expect(result.usage.totalTokens).toBe(6);
 	});
 
+	it("refuses native admission before sending a request", async () => {
+		let sends = 0;
+		const judge = createNativeJudge(typesafeVisionModel("jev-1.14.0", "typesafe"), {
+			apiKey: "test-key",
+			onPayload: () => {
+				throw new ConfigurationError("credit admission denied");
+			},
+			fetch: async () => {
+				sends++;
+				return answered();
+			},
+		});
+		await expect(judge.judge(request)).rejects.toBeInstanceOf(ConfigurationError);
+		expect(sends).toBe(0);
+	});
+
+	it("does not send after caller cancellation while native admission is pending", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		const reason = new Error("cancel judgment");
+		let sends = 0;
+		const judge = new NativeJudge({
+			apiKey: "test-key",
+			onPayload: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+			fetch: async () => {
+				sends++;
+				return answered();
+			},
+		});
+		const outcome = judge.judge(request, { signal: controller.signal }).then(
+			() => undefined,
+			error => error,
+		);
+		await entered.promise;
+		controller.abort(reason);
+		release.resolve();
+		expect(await outcome).toBe(reason);
+		expect(sends).toBe(0);
+	});
+
+	it("checks native admission again before a transient retry and does not retry its refusal", async () => {
+		let sends = 0;
+		const sleep = spyOn(Bun, "sleep").mockResolvedValue(undefined);
+		const judge = new NativeJudge({
+			apiKey: "test-key",
+			onPayload: () => {
+				if (sends > 0) throw new ConfigurationError("credit admission denied");
+			},
+			fetch: async () => {
+				sends++;
+				return new Response("busy", { status: 529 });
+			},
+		});
+		try {
+			await expect(judge.judge(request)).rejects.toBeInstanceOf(ConfigurationError);
+			expect(sends).toBe(1);
+		} finally {
+			sleep.mockRestore();
+		}
+	});
+
+	it("uses the catalog model for payload privacy admission before native serialization", async () => {
+		const model = typesafeVisionModel("jev-1.14.0", "typesafe", "wire-judge");
+		let sent = "";
+		const judge = createNativeJudge(model, {
+			apiKey: "test-key",
+			onPayload: (payload, actualModel) => {
+				expect(actualModel).toBe(model);
+				return { ...(payload as Record<string, unknown>), state: "redacted" };
+			},
+			fetch: async (_url, init) => {
+				sent = String(init?.body);
+				return answered();
+			},
+		});
+		const result = await judge.judge(request);
+		expect(result.answers.urgent.noul).toBe(0.92);
+		expect(JSON.parse(sent).state).toBe("redacted");
+		expect(sent).not.toContain(request.state);
+	});
+
 	it.each([undefined, 1])("preserves prototype-named question IDs with cap %s", async maxQuestions => {
 		const ids = ["__proto__", "constructor", "toString"];
 		const questions = Object.fromEntries(
@@ -1821,6 +1906,49 @@ describe("NativeJudge Workers AI dialect", () => {
 });
 
 describe("chat judgment backend images", () => {
+	it("refuses chat judgment admission before any provider request", async () => {
+		const model = buildModel({
+			id: "judge-admission",
+			name: "Judge admission",
+			api: "openai-completions",
+			provider: "openai",
+			baseUrl: "https://judge.example.test/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4096,
+		});
+		let sends = 0;
+		const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async () => {
+					sends++;
+					throw new Error("inadmissible chat judgment must not dispatch");
+				},
+				{
+					preconnect: () => {
+						throw new Error("inadmissible chat judgment must not preconnect");
+					},
+				},
+			),
+		);
+		try {
+			const backend = chatTextBackend(model, {
+				apiKey: "test-key",
+				onPayload: () => {
+					throw new ConfigurationError("credit admission denied");
+				},
+			});
+			await expect(backend.complete({ system: "Judge.", user: "Inspect this." }, {})).rejects.toBeInstanceOf(
+				ProviderResponseError,
+			);
+			expect(sends).toBe(0);
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
 	it("sends image blocks for supported models and rejects guarded text-only models before send", async () => {
 		const chatModel = buildModel({
 			id: "gpt-4o-mini",

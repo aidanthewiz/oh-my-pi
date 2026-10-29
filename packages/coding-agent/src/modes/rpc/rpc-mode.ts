@@ -35,7 +35,7 @@ import {
 } from "../../extensibility/extensions";
 import {
 	type BuiltSkillPromptMessage,
-	buildSkillPromptMessage,
+	loadSkillPromptBody,
 	parseSkillInvocation,
 	type Skill,
 	type SkillPromptInput,
@@ -307,7 +307,10 @@ export function rpcControlEventFrame(event: AgentSessionEvent): RpcControlEventF
 
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
 
-export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
+export type RpcSkillCommandSession = Pick<
+	AgentSession,
+	"buildUserSkillPrompt" | "renderUserSkillPrompt" | "promptCustomMessage" | "skills" | "skillsSettings"
+>;
 export type RpcSkillCommandResult = { agentInvoked: true };
 
 export interface RpcSkillInvocation extends SkillPromptInput {
@@ -345,7 +348,7 @@ export async function runRpcSkillCommand(
 	images?: ImageContent[],
 	registerPromptReady?: (ready: Promise<void>) => void,
 ): Promise<boolean> {
-	const built = prebuilt ?? (await buildSkillPromptMessage(invocation.skill, invocation, "user"));
+	const built = prebuilt ?? (await session.buildUserSkillPrompt(invocation.skill, invocation));
 	return withRpcModelPreparationFence(
 		!!images?.length,
 		onModelPrepared =>
@@ -394,13 +397,12 @@ export async function dispatchRpcSkillPrompt(input: {
 }): Promise<RpcSkillCommandResult | "cancelled" | null> {
 	const invocation = resolveRpcSkillInvocation(input.session, input.message);
 	if (!invocation) return null;
-	// buildSkillPromptMessage is cheap file I/O and covers the failure the old
-	// synchronous path reported immediately (a removed or unreadable SKILL.md);
-	// keep that error contract by awaiting it before answering. The expensive
-	// promptCustomMessage pipeline (usage preflight, compaction, provider
-	// calls) is what moves behind the acknowledgement.
-	const built = await buildSkillPromptMessage(invocation.skill, invocation, "user");
+	// Read the skill before acknowledging the command so a missing SKILL.md
+	// still fails immediately. Rendering (and authorizing model tags) happens
+	// only after the in-flight submission survives the currentness check.
+	const body = await loadSkillPromptBody(invocation.skill);
 	if (input.isCurrent && !input.isCurrent()) return "cancelled";
+	const built = input.session.renderUserSkillPrompt(invocation.skill, invocation, body);
 	// A failure before admission still resolves this wait (without rejecting this
 	// call) — reportPromptResult already routed it to onError and a failed prompt_result.
 	await watchAndReportPromptResult({
@@ -1521,9 +1523,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		() => goalController.continuationPending,
 		() => settleWatcher,
 	);
-	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled);
-	const sessionEvents = new RpcSessionEventForwarder(output);
 	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);
+	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled, {
+		costCapRefusal: () => session.costCapRefusal,
+		settledWithoutRun: () => void settleWatcher.check(),
+	});
+	const sessionEvents = new RpcSessionEventForwarder(output);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);

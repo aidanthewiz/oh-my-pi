@@ -648,6 +648,7 @@ tools:
 | `tools.xdevInlineDevices` | array | `[]` | Dynamic-device name globs to inline in `builtins` mode; ignored in `catalog` mode. |
 | `async.enabled` | boolean | `true` | Enable async bash commands and background task execution. |
 | `async.maxJobs` | number | `100` | Running background-job cap, floored to at least 1; parked/queued jobs do not consume execution slots. |
+| `async.printWake` | boolean | `false` | Print mode (`-p`, `--mode json`) waits for the run's background jobs instead of cancelling them at exit, and starts another turn in the same session with each result; same as `--wait-async`. |
 | `async.widgets` | boolean | `true` | Live widgets for running background jobs in the `wait` card, jobs pill, hover card, and jobs sheet. Local deterministic rendering does not authorize remote model calls. The `widget` role can author specs only with explicit managed consent and provider/model/credit admission; later updates run locally. Off: plain job rows. |
 | `async.widgetRemoteAuthoring` | boolean | `false` | Only managed or runtime consent can enable remote spec authoring. Local, project, and user settings cannot authorize it. The selected model, provider, account, and credits must also pass current admission. |
 
@@ -719,7 +720,7 @@ lsp:
 | --------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bash.enabled`                    | boolean | `true`    | Enable the bash tool.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `bash.allowCompoundCommands`      | boolean | `false`   | Evaluate flat, literal `&&` chains per segment; unmatched segments inherit normal bash approval policy and mode.                                                                                                                                                                                                                                                                                                                                                          |
-| `bash.gitGuard`                   | boolean | `false`   | For checkouts shared by concurrent agents: refuse `git stash` (except `list`/`show`), `reset --hard`, `reset` to another commit, and `checkout`/`switch`/working-tree `restore` unless a merge or rebase conflict is being resolved. Unstaging stays allowed. Enforced by the embedded shell's `git` builtin, so it sees expanded commands and the real cwd; services, client terminals, `pty` calls, and git started by path or through another program are not guarded. |
+| `bash.gitGuard`                   | boolean | `false`   | For checkouts shared by concurrent agents: refuse `git stash` (except `list`/`show`/`create`), `reset --hard`, `reset` to another commit, `switch` and branch `checkout`, and `checkout`/working-tree `restore` of paths unless a merge or rebase conflict is being resolved. Unstaging stays allowed. Enforced by the embedded shell's `git` builtin, so it sees expanded commands and the real cwd; services, client terminals, `pty` calls, and git started by path or through another program are not guarded. |
 | `launch.enabled`                  | boolean | `true`    | Enable named `bash` services and `proc://` supervision for shared long-running project processes; there is no separate launch tool.                                                                                           |
 | `bash.autoBackground.enabled`     | boolean | `true`   | Auto-background long-running commands.                                                                                                                      |
 | `bash.autoBackground.thresholdMs` | number  | `60000`   | Threshold before auto-backgrounding.                                                                                                                        |
@@ -832,6 +833,8 @@ memory:
 | `autolearn.minToolCalls`                 | number  | `5`                                         | Minimum completed tool calls in a primary turn before automatic capture is eligible.                                                                                                                                                            |
 
 A positive `compaction.thresholdTokens` wins over `thresholdPercent`. A fixed trigger (this or an `f` model entry) at or past the model's context window, for example where a provider caps the window lower, compacts at the window less the reserve, like the reserve-based default; the `/models` preview marks it `capped by window`. Otherwise, a positive percentage is clamped to 1–99%; non-positive percentages use the reserve-based threshold.
+
+The trigger is exactly what you configure. On a small or provider-capped window, compaction instead keeps less recent history: the kept tail is capped at `0.8 × trigger − reserveFloor` (half of `0.8 × trigger` when the floor alone fills it) so the compacted context lands under the trigger's recovery band, where `reserveFloor` is the smaller of the effective budget reserve and `compaction.reserveTokens` (or `16384` when unset). For example, a 100k window with `thresholdPercent: 40` compacts at 40,000 tokens and keeps at most 15,616 tokens of recent history instead of the configured 20,000.
 
 `compaction` has additional tuning keys (idle compaction, supersede/drop heuristics) visible in `omp config list`. See [Compaction](./compaction.md) for the full strategy reference.
 
@@ -1049,6 +1052,16 @@ To spend one by hand, use `/usage reset` in a session or `coreforge usage reset`
 #### Composer predictions
 
 `composer.predictions` defaults to `false`. Enabling it permits an additional provider request on the session's model and context after a turn. Prediction requests are billed and appear under `composer-prediction` usage, even when the reply arrives too late to display. Guests and disposed sessions cannot start them. Session transitions drain pending requests and retain costs on the original session journal.
+
+### Cost limits
+
+```yaml
+session:
+  warnCost: 5   # USD: warn once when the session's spend reaches it
+  maxCost: 10   # USD: stop sending model requests from this spend on
+```
+
+Both are unset by default and accept positive USD amounts; `--warn-cost` and `--max-cost` override them for one run, and setting or changing either while a session is open applies to its next request. Spend counts every model request of the session and its subagents at the costs the model catalog prices: agent turns, side requests (compaction, handoff, advisor reviews, `/btw`, cache warming), eval `completion()`/`judge()`/`judge_batch()`, judgment-backed `find`, image questions, image descriptions for text-only models, edit auto-repair, and job widgets; at the cap these are refused too, and no session title is generated. Memory extraction (Mnemopi and memories consolidation) runs in the background and is neither counted nor refused. The cap is checked before each request goes out, so requests already in flight can finish past it. A session started with `--resume`/`--continue`, or switched to, starts from the spend its session file records (the total the footer and `/usage` show), which leaves out background subagents' spend and side requests from earlier runs; `/new` starts from zero, while fork, branch and `/btw` keep the session's spend. When the cap stops a run, the interactive TUI shows the reason and puts a refused prompt back in the editor, print mode exits with status `3`, and RPC reports `error.code: "cost_cap"`.
 
 ### Other groups
 

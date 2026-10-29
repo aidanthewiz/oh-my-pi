@@ -40,6 +40,7 @@ import {
 import { RegisteredToolAdapter } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
+import * as imageVisionFallback from "@oh-my-pi/pi-coding-agent/utils/image-vision-fallback";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/memory-backend/recall-entry";
 import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/types";
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
@@ -51,6 +52,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/sdk";
 import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { EphemeralTurnResult } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -982,33 +984,6 @@ describe("AgentSession message pipeline", () => {
 		expect(convertedText).not.toContain("&amp;");
 	});
 
-	it("composes session payload hooks into direct side-request options", async () => {
-		const sessionOnPayload = vi.fn(async (payload: unknown) => ({
-			...(payload as Record<string, unknown>),
-			session: true,
-		}));
-		const requestOnPayload = vi.fn(async () => undefined);
-		const session = new AgentSession({
-			agent: createAgent(),
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
-			onPayload: sessionOnPayload,
-		});
-		sessions.push(session);
-		const options: SimpleStreamOptions = {
-			apiKey: "key",
-			onPayload: requestOnPayload,
-		};
-
-		const prepared = session.prepareSimpleStreamOptions(options);
-		const result = await prepared.onPayload?.({ original: true });
-
-		expect(sessionOnPayload).toHaveBeenCalledWith({ original: true }, undefined);
-		expect(requestOnPayload).toHaveBeenCalledWith({ original: true, session: true }, undefined);
-		expect(result).toEqual({ original: true, session: true });
-	});
-
 	it("does not dispatch a provider payload after its hook aborts the request", async () => {
 		const controller = new AbortController();
 		const requestOnPayload = vi.fn(async () => ({ replaced: true }));
@@ -1212,6 +1187,291 @@ describe("AgentSession message pipeline", () => {
 		expect(agent.state.messages).toEqual(mainSnapshot);
 		expect(session.sessionManager.getEntries()).toEqual(journalSnapshot);
 	});
+
+	it.each([
+		["sends the image to a vision model", ["text", "image"]],
+		["describes the image for a text-only model", ["text"]],
+	] as const)("ephemeral prompt and history images: %s", async (_label, input) => {
+		const describe = vi
+			.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel")
+			.mockResolvedValue([{ type: "text", text: "A red square." }]);
+		const model = buildModel({
+			id: "side-stream-model",
+			name: "Side Stream Model",
+			api: "anthropic",
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: [...input],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const contexts: Context[] = [];
+		const sideStreamFn: StreamFn = (_model, context) => {
+			contexts.push({ ...context, messages: structuredClone(context.messages) });
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Red") }));
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: createModelRegistryStub() as never,
+			sideStreamFn,
+		});
+		sessions.push(session);
+		const screenshot: ImageContent = { type: "image", data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
+
+		await session.runEphemeralTurn({ promptText: "What colour is this?", promptImages: [screenshot] });
+
+		const request = JSON.stringify(contexts[0]?.messages);
+		expect(contexts[0]?.messages.at(-1)?.content).toContainEqual(expect.objectContaining({ type: "image" }));
+		expect(request.includes("A red square.")).toBe(input.length === 1);
+		expect(describe).toHaveBeenCalledTimes(input.length === 1 ? 1 : 0);
+
+		// A follow-up replays the image from history with the same handling.
+		await session.runEphemeralTurn({
+			promptText: "And the border?",
+			history: [
+				{ role: "user", content: [{ type: "text", text: "What colour is this?" }, screenshot], timestamp: 1 },
+				createAssistantMessage("Red"),
+			],
+		});
+		expect(JSON.stringify(contexts[1]?.messages).includes("A red square.")).toBe(input.length === 1);
+		expect(describe).toHaveBeenCalledTimes(input.length === 1 ? 2 : 0);
+		expect(agent.state.messages).toEqual([]);
+	});
+
+	it.each(["prompt", "history"] as const)(
+		"cancels an ephemeral %s image description before side inference",
+		async source => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const caller = new AbortController();
+			let descriptionCancelled = false;
+			vi.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel").mockImplementation(
+				async (_images, _options, signal) => {
+					entered.resolve();
+					await Promise.race([
+						release.promise,
+						new Promise<void>(resolve => {
+							signal?.addEventListener(
+								"abort",
+								() => {
+									descriptionCancelled = true;
+									resolve();
+								},
+								{ once: true },
+							);
+						}),
+					]);
+					return [{ type: "text", text: "A late description." }];
+				},
+			);
+			const model = buildModel({
+				id: "text-only-side-model",
+				name: "Text-only side model",
+				api: "openai-responses",
+				provider: "test-provider",
+				baseUrl: "https://provider.invalid",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 4096,
+				maxTokens: 1024,
+			});
+			let sideRequests = 0;
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: createModelRegistryStub() as never,
+				sideStreamFn: () => {
+					sideRequests++;
+					return new AssistantMessageEventStream();
+				},
+			});
+			sessions.push(session);
+			const image: ImageContent = { type: "image", data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
+			const pending = session.runEphemeralTurn({
+				promptText: "Describe this.",
+				signal: caller.signal,
+				...(source === "prompt"
+					? { promptImages: [image] }
+					: { history: [{ role: "user" as const, content: [image], timestamp: 1 }] }),
+			});
+			const outcome = pending.then(
+				() => undefined,
+				error => error,
+			);
+			try {
+				await entered.promise;
+				caller.abort(new Error("cancelled image description"));
+				release.resolve();
+				expect(await outcome).toBeInstanceOf(Error);
+				expect(descriptionCancelled).toBe(true);
+				expect(sideRequests).toBe(0);
+				expect(session.agent.state.messages).toEqual([]);
+				expect(session.sessionManager.getBranch()).toEqual([]);
+			} finally {
+				release.resolve();
+			}
+		},
+	);
+
+	it.each(["model change", "cancellation", "unchanged owner"] as const)(
+		"preserves the original ephemeral owner between saved-history captions: %s",
+		async change => {
+			using tempDir = TempDir.createSync("@pi-side-history-owner-");
+			const authStorage = await AuthStorage.create(":memory:");
+			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"), {
+				ignoreLocalModelConfig: true,
+			});
+			const textProvider = "side-history-text";
+			const visionProvider = "side-history-vision";
+			const visionApi = "test-side-history-vision";
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const caller = new AbortController();
+			const visionRequests: Context[] = [];
+			const sideRequests: Context[] = [];
+			let firstDescriptionSignal: AbortSignal | undefined;
+			let session: AgentSession | undefined;
+			let outcome: Promise<{ result?: EphemeralTurnResult; error?: unknown }> | undefined;
+			try {
+				const definition = {
+					name: "Saved-history fixture",
+					reasoning: false,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 4096,
+					maxTokens: 1024,
+				};
+				modelRegistry.registerProvider(textProvider, {
+					api: "openai-responses",
+					baseUrl: "https://side-history.invalid/v1",
+					apiKey: "synthetic-history-key",
+					models: [
+						{ ...definition, id: "text-a", input: ["text"] },
+						{ ...definition, id: "text-b", input: ["text"] },
+					],
+				});
+				modelRegistry.registerProvider(visionProvider, {
+					api: visionApi,
+					baseUrl: "https://side-history-vision.invalid/v1",
+					apiKey: "synthetic-vision-key",
+					models: [{ ...definition, id: "vision", input: ["text", "image"] }],
+					streamSimple: (model, context, options) => {
+						visionRequests.push(structuredClone(context));
+						const index = visionRequests.length;
+						const stream = new AssistantMessageEventStream();
+						const finish = () => {
+							const message = {
+								...createAssistantMessage(index === 1 ? "A red square." : "A grey pixel."),
+								api: model.api,
+								provider: model.provider,
+								model: model.id,
+							};
+							stream.push({ type: "done", reason: "stop", message });
+						};
+						if (index === 1) {
+							firstDescriptionSignal = options?.signal;
+							entered.resolve();
+							void release.promise.then(finish);
+						} else {
+							queueMicrotask(finish);
+						}
+						return stream;
+					},
+				});
+				const initialModel = modelRegistry.find(textProvider, "text-a");
+				const replacementModel = modelRegistry.find(textProvider, "text-b");
+				if (!initialModel || !replacementModel) throw new Error("Missing text-only fixture models");
+				const agent = new Agent({
+					initialState: { model: initialModel, systemPrompt: ["system prompt"], tools: [], messages: [] },
+				});
+				session = new AgentSession({
+					agent,
+					sessionManager: SessionManager.create(tempDir.path(), tempDir.join("sessions")),
+					modelRegistry,
+					settings: Settings.isolated({
+						"compaction.enabled": false,
+						"images.describeForTextModels": true,
+						modelRoles: { vision: `${visionProvider}/vision` },
+					}),
+					sideStreamFn: (_model, context) => {
+						sideRequests.push(structuredClone(context));
+						const stream = new AssistantMessageEventStream();
+						queueMicrotask(() => {
+							const message = createAssistantMessage("Both described.");
+							stream.push({ type: "text_delta", contentIndex: 0, delta: "Both described.", partial: message });
+							stream.push({ type: "done", reason: "stop", message });
+						});
+						return stream;
+					},
+				});
+				const images: ImageContent[] = [
+					{
+						type: "image",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+						mimeType: "image/png",
+					},
+					{
+						type: "image",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+						mimeType: "image/png",
+					},
+				];
+				const history: Message[] = [
+					{ role: "user", content: [images[0]!], timestamp: 1 },
+					createAssistantMessage("First saved answer."),
+					{ role: "user", content: [images[1]!], timestamp: 2 },
+				];
+				const historySnapshot = structuredClone(history);
+				outcome = session
+					.runEphemeralTurn({ promptText: "Compare the saved images.", history, signal: caller.signal })
+					.then(
+						result => ({ result }),
+						error => ({ error }),
+					);
+				await entered.promise;
+				expect(visionRequests).toHaveLength(1);
+				if (change === "model change") agent.setModel(replacementModel);
+				if (change === "cancellation") caller.abort(new Error("Cancelled saved-history replay"));
+				release.resolve();
+				const completed = await outcome;
+				if (change === "unchanged owner") {
+					expect(completed.error).toBeUndefined();
+					expect(completed.result?.replyText).toBe("Both described.");
+					expect(visionRequests).toHaveLength(2);
+					expect(sideRequests).toHaveLength(1);
+					const outbound = JSON.stringify(sideRequests[0]!.messages);
+					expect(outbound).toContain("A red square.");
+					expect(outbound).toContain("A grey pixel.");
+					expect(outbound.indexOf("A red square.")).toBeLessThan(outbound.indexOf("A grey pixel."));
+				} else {
+					expect(completed.error).toBeInstanceOf(Error);
+					expect(visionRequests).toHaveLength(1);
+					expect(sideRequests).toEqual([]);
+				}
+				if (change === "cancellation") expect(firstDescriptionSignal?.aborted).toBe(true);
+				expect(history).toEqual(historySnapshot);
+				expect(agent.state.messages).toEqual([]);
+				expect(session.sessionManager.getEntries().filter(entry => entry.type === "message")).toEqual([]);
+			} finally {
+				release.resolve();
+				await outcome;
+				await session?.dispose();
+				modelRegistry.unregisterProvider(visionProvider);
+				modelRegistry.unregisterProvider(textProvider);
+				await authStorage.close();
+			}
+		},
+	);
 
 	it.each(["anthropic-messages", "ollama-chat", "openai-responses"])(
 		"encodes the output cap and omits tools in the %s HTTP request",

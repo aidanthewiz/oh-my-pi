@@ -40,6 +40,7 @@ import {
 import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import { cfgImagesBlockImages } from "../modes/settings";
+import type { CostGate } from "../session/cost-gate";
 import { cfgImagesDescribeForTextModels } from "../session/settings";
 import describeUserPrompt from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
 import describeSystemPrompt from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
@@ -86,6 +87,8 @@ export interface DescribeAttachedImagesDeps {
 	onUsage?: (message: AssistantMessage) => void;
 	/** Test seam: overrides the underlying completeSimple call. */
 	completeImpl?: typeof completeSimple;
+	/** The session tree's cost gate: at the cap images are not described, and each description's cost is added. */
+	costGate?: CostGate;
 }
 
 /** Map an image MIME type to a file extension for the saved artifact. */
@@ -158,6 +161,7 @@ async function describeImage(
 	telemetry: AgentTelemetry | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<string | null> {
+	if (deps.costGate?.check()) return null;
 	try {
 		signal?.throwIfAborted();
 		if (deps.isCurrent?.() === false) throw new Error("Image description owner is no longer current");
@@ -195,6 +199,7 @@ async function describeImage(
 					const replacement = await streamOptions?.onPayload?.(payload, model, requestSignal);
 					signal?.throwIfAborted();
 					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during admission");
+					deps.costGate?.admit();
 					return replacement ?? payload;
 				},
 				onResponse: async (response, model, requestSignal) => {
@@ -207,6 +212,7 @@ async function describeImage(
 			},
 			{ telemetry, oneshotKind: ONESHOT_KIND, completeImpl: deps.completeImpl },
 		);
+		deps.costGate?.record(response.usage.cost.total);
 		deps.onUsage?.(response);
 		signal?.throwIfAborted();
 		if (deps.isCurrent?.() === false) return null;

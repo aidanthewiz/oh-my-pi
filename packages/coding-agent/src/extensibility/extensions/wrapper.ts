@@ -457,8 +457,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 				context?.xdevTierResolved?.(resolved.tier);
 				if (resolved.policy === "deny") throw denyError(resolved, this.tool.name);
-				const explicitPrompt = resolved.source !== "mode";
-				const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
+				const policyKey = resolved.policyKey ?? this.tool.name;
+				const explicitPrompt =
+					resolved.override || (resolved.source !== "mode" && policyKey !== context?.xdevPolicyKey);
+				const xdevBypass = context?.xdevPolicyKey !== undefined && effectiveParams === params;
 				const acpBypass =
 					context !== undefined &&
 					Object.hasOwn(context, "acpApprovedArgs") &&

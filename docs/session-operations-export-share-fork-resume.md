@@ -28,7 +28,7 @@ This document describes operator-visible behavior for session export, sharing, c
 | `/new`                                  | Interactive slash command    | Yes (starts an empty conversation)            | Switches identity and materializes a new header in persistent mode                         | None                                                                                |
 | `/fresh`                                | Slash command (TUI/headless) | Yes (provider-facing in-memory id/state only) | No; keeps current session file/header                                                      | None                                                                                |
 | `/clear`                                | Interactive slash command    | Yes (clears live/model conversation context)  | Retains identity/file/history; a lazy session still follows the normal persistence gate    | Appends `reset_boundary`                                                            |
-| `/delete`                               | Interactive slash command    | Yes (starts an empty conversation)            | Attempts to delete the current persisted session and artifacts, then switches to a new one | None                                                                                |
+| `/delete`                               | Interactive slash command    | Yes (starts an empty conversation)            | Attempts to delete the current persisted session and artifacts, then switches to a lazy successor (no empty file until content) | None                                                                                |
 | `/fork`                                 | Interactive slash command    | Normally yes; existing Tern pane specialization retains the parent | Forks in place, except the existing Tern pane flow | Copies artifacts according to the selected flow |
 | `/fork pane`, `/fork window`, `/fork tab` | Interactive slash command  | No (parent session retained)                   | Opens a child OMP process from the flushed current transcript in a multiplexer pane/group (tmux window, Zellij/Herdr/Orca tab, or CMUX workspace) | Child receives a separate forked session                                            |
 | `--fork <id\|path>`                     | CLI startup                  | Yes after session creation                    | Creates a new session fork from the selected source into current cwd/session dir           | Copies source artifacts recursively by default                                      |
@@ -248,7 +248,9 @@ The TUI leaves a focused subagent view and clears its transcript.
 
 `/delete` uses the same transition with `drop: true`. It requires a session-file
 path, attempts to delete the old JSONL and artifact tree instead of retaining
-them, and still starts a new session if deletion fails. A before-switch hook can
+them, and still starts a new session if deletion fails. Unlike `/new`, that
+successor is lazy: no header is written until it has content, so quitting
+without a message leaves no zero-turn session behind. A before-switch hook can
 cancel either operation. Both are rejected while vibe mode is active.
 
 ## Fresh

@@ -205,6 +205,72 @@ fn rejects_a_leading_keeper_echo_when_the_payload_cannot_fill_the_widened_range(
 }
 
 #[test]
+fn refuses_a_too_short_leading_echo_the_same_way_with_or_without_a_parser() {
+	let file = "import time\n\ndef run(a=None, b=None):\n    \"\"\"Time each phase: reap, \
+	            collect,\n    grade, so the part outside the cap is\n    measured, not \
+	            assumed.\"\"\"\n    rs, wd = a or 1, b or 2\n    t0 = time.monotonic()\n    return \
+	            rs, wd, t0\n";
+	let edits = replacement(
+		5,
+		8,
+		&[
+			"    \"\"\"Time each phase: reap, collect,",
+			"    collect_objects, grade, so the part outside the cap is",
+			"    measured, not assumed.\"\"\"",
+		],
+		1,
+	);
+	for path in ["server.py", "server.txt"] {
+		let error = apply_edits(file, &edits, ApplyOptions {
+			clipboard:      None,
+			path:           Some(path),
+			on_empty_paste: EmptyPaste::Throw,
+		})
+		.expect_err(path);
+		assert_eq!(error.kind(), "ambiguous_boundary", "{path}: {error}");
+	}
+}
+
+#[test]
+fn refuses_a_too_short_echo_whose_keep_row_repair_also_parses() {
+	let file =
+		"def stop_of(choice):\n    usage = {\n        \"a\": 1,\n    }\n    stop = (\n        \
+		 \"length\"\n        if choice\n        else \"stop\"\n    )\n    return stop\n";
+	let error = apply_edits(
+		file,
+		&replacement(6, 8, &["    stop = (", "        \"max_tokens\""], 1),
+		ApplyOptions {
+			clipboard:      None,
+			path:           Some("stop.py"),
+			on_empty_paste: EmptyPaste::Throw,
+		},
+	)
+	.expect_err("stop.py");
+	assert_eq!(error.kind(), "ambiguous_boundary", "{error}");
+}
+
+#[test]
+fn refuses_a_too_short_echo_a_dropped_copy_exposed() {
+	let one = "const z = 0;\nfunction f() {\n\told();\n}\nafter();\n";
+	let two = "const z = 0;\nfunction f() {\n\told();\n\tmore();\n}\nafter();\n";
+	type Case<'a> = (&'a str, u32, u32, &'a [&'a str]);
+	let cases: [Case; 3] = [
+		(one, 3, 4, &["function f() {", "function f() {", "}"]),
+		(one, 2, 3, &["function f() {", "}", "}"]),
+		(two, 3, 4, &["function f() {", "function f() {", "\tfresh();", "}"]),
+	];
+	for (file, start, end, body) in cases {
+		let error = apply_edits(file, &replacement(start, end, body, 1), ApplyOptions {
+			clipboard:      None,
+			path:           Some("f.ts"),
+			on_empty_paste: EmptyPaste::Throw,
+		})
+		.expect_err("f.ts");
+		assert_eq!(error.kind(), "ambiguous_boundary", "{body:?}: {error}");
+	}
+}
+
+#[test]
 fn drops_a_trailing_attribute_echo_in_a_single_line_replacement() {
 	let file = "/// Old summary.\n#[napi]\npub fn f() {}";
 	let result = apply(file, &replacement(1, 1, &["/// New summary.", "#[napi]"], 1), Some("x.rs"));

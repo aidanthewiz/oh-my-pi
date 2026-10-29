@@ -39,6 +39,7 @@ import {
 	type NativeJudge,
 	type Question,
 	type Questions,
+	type SimpleStreamOptions,
 	type TextBackend,
 	type TextCompletion,
 	type TextPrompt,
@@ -63,6 +64,7 @@ import {
 	type RoleChainCandidate,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { CostCapError, type CostGate } from "../session/cost-gate";
 import type { SessionManager } from "../session/session-manager";
 import { getTinyLocalModelSpec } from "../tiny/models";
 import localPromptTemplate from "../prompts/system/judgment-local.md" with { type: "text" };
@@ -103,6 +105,10 @@ export interface JudgeDeps {
 	telemetry?: AgentTelemetryConfig;
 	/** Answer cache for native judgments; omitted runs every question against the provider. */
 	cache?: JudgmentCache;
+	/** The session tree's cost gate: refuses each candidate attempt at the cap and adds billed attempts' cost. */
+	costGate?: CostGate;
+	/** Prepare side requests through the owning session's provider admission boundary. */
+	prepareSimpleStreamOptions?: (options: SimpleStreamOptions, provider?: string) => SimpleStreamOptions;
 }
 
 /**
@@ -451,6 +457,8 @@ export class ChainJudge implements Judge {
 				}
 				rejections.delete(identity);
 			}
+			// Outside the candidate's failure handling: a refusal ends the judgment.
+			this.#deps.costGate?.admit();
 			try {
 				this.#assertModelEnabled(candidate.model);
 				const fitted =
@@ -480,6 +488,8 @@ export class ChainJudge implements Judge {
 					...(judge.supportsImages === undefined ? {} : { supportsImages: judge.supportsImages }),
 					judge: (request, options) => {
 						this.#assertModelEnabled(candidate.model);
+						options?.signal?.throwIfAborted();
+						this.#deps.costGate?.admit();
 						return judge.judge(request, options);
 					},
 				};
@@ -489,6 +499,7 @@ export class ChainJudge implements Judge {
 					throw signal.reason instanceof Error ? signal.reason : new AIError.AbortError("judgment aborted");
 				}
 				if (isAbortOrTimeout(error)) throw error;
+				if (error instanceof CostCapError) throw error;
 				const rejected = isAccountRejection(error);
 				if (rejected) rejections.set(identity, Date.now() + CANDIDATE_REJECTION_COOLDOWN_MS);
 				lastFailure = error instanceof Error ? error.message : String(error);
@@ -517,7 +528,10 @@ export class ChainJudge implements Judge {
 	#report(attempt: JudgmentAttempt): void {
 		const { startedAt, responseModel, questions, cachedQuestions, ...rest } = attempt;
 		const usage: JudgmentUsage = { purpose: this.#deps.purpose, ...rest };
-		if (questions === undefined || cachedQuestions !== questions) this.#deps.onUsage?.(usage);
+		if (questions === undefined || cachedQuestions !== questions) {
+			this.#deps.costGate?.record(usage.usage.cost.total);
+			this.#deps.onUsage?.(usage);
+		}
 		recordJudgmentTelemetry(this.#telemetry, {
 			provider: usage.provider,
 			model: usage.model,
@@ -568,18 +582,31 @@ export class ChainJudge implements Judge {
 		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
 		this.#assertModelEnabled(model);
 		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);
+		const streamOptions: SimpleStreamOptions = {
+			apiKey,
+			signal,
+			sessionId: this.#deps.sessionId,
+			onPayload: (_payload, _model, signal) => {
+				signal?.throwIfAborted();
+				this.#assertModelEnabled(model);
+				this.#deps.costGate?.admit();
+			},
+		};
 		if (isJudgmentApi(model.api)) {
 			const headers = await this.#deps.registry.resolveModelHeaders(model, signal);
 			this.#assertModelEnabled(model);
-			const judge = createNativeJudge(model, { apiKey, headers });
+			const prepared = this.#deps.prepareSimpleStreamOptions?.(streamOptions, model.provider) ?? streamOptions;
+			const judge = createNativeJudge(model, {
+				apiKey,
+				headers,
+				onPayload: prepared.onPayload,
+			});
 			return nativeJudge(judge, model, this.#deps.cache, attempt => this.#report(attempt));
 		}
 		// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
-		const metadata = this.#deps.metadataResolver?.(model.provider);
+		streamOptions.metadata = this.#deps.metadataResolver?.(model.provider);
 		const backend = chatTextBackend(model, {
-			apiKey,
-			sessionId: this.#deps.sessionId,
-			metadata,
+			...(this.#deps.prepareSimpleStreamOptions?.(streamOptions, model.provider) ?? streamOptions),
 			// Sole attribution point for prompted judgments: TextJudge's result.usage
 			// aggregates these same attempts and must never be billed again.
 			onAttempt: attempt =>

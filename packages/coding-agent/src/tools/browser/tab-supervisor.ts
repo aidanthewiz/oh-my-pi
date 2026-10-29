@@ -143,6 +143,8 @@ export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle>
 	workerExitedAt?: number;
 	/** Set when a worker exited with no run in flight and the tab was reattached; the next call reports it. */
 	workerExitNotice?: string;
+	/** The tab was opened with `ignore_https_errors`; a replacement worker re-applies it. */
+	ignoreHttpsErrors?: boolean;
 }
 
 export interface CmuxTabSession extends TabSessionBase<CmuxBrowserHandle> {
@@ -589,6 +591,7 @@ async function acquireTabImpl(
 		lastActivityAt: Date.now(),
 		frozen: false,
 		uploadDir: initPayload.uploadDir,
+		ignoreHttpsErrors: opts.ignoreHttpsErrors,
 	};
 	attachTabWorker(tab, worker);
 	tabs.set(name, tab);
@@ -2033,6 +2036,8 @@ async function recycleTimedOutWorkerTab(
 		knownInfo: tab.info,
 		dialogs: tab.dialogPolicy,
 		allowedDomains: tab.allowedDomains,
+		// The override's CDP session died with the old worker.
+		ignoreHttpsErrors: tab.ignoreHttpsErrors,
 		// Unblock a wedged page (open JS dialog, hung navigation) before adopting it —
 		// otherwise init stalls, times out, and the tab gets force-killed.
 		recover: opts.recover ?? true,

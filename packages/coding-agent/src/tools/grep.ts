@@ -18,7 +18,12 @@ import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
-import { DEFAULT_MAX_COLUMN, truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_COLUMN,
+	type TruncationResult,
+	truncateHead,
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -37,13 +42,16 @@ import {
 	isLineInRanges,
 	parseSearchPathPreferringLiteral,
 	probeLiteralPathExists,
+	probeLiteralPathExistsSync,
 	relativeSearchResultPath,
 	resolveReadPath,
 	resolveSearchResultPath,
 	resolveToolSearchScope,
+	resolveToCwd,
 	searchPathTier,
 	splitMixedUrlPathList,
 	splitPathAndSelPreferringLiteral,
+	splitPathAndSelPreferringLiteralSync,
 } from "./path-utils";
 import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { approvalTargetIdentities } from "./approval-targets";
@@ -426,7 +434,9 @@ async function recordSnapshotTags(store: EditStore, snapshotPaths: readonly stri
 		const st = stats[index];
 		if (!st) {
 			stamps.delete(filePath);
-			return store.recordSnapshotFile(filePath);
+			const tag = store.recordSnapshotFile(filePath);
+			if (tag) store.recordSeenLines(filePath, tag, [0]);
+			return tag;
 		}
 		const prior = stamps.get(filePath);
 		if (
@@ -437,9 +447,11 @@ async function recordSnapshotTags(store: EditStore, snapshotPaths: readonly stri
 			prior.ino === st.ino &&
 			store.headHash(filePath) === prior.tag
 		) {
+			store.recordSeenLines(filePath, prior.tag, [0]);
 			return prior.tag;
 		}
 		const tag = store.recordSnapshotFile(filePath);
+		if (tag) store.recordSeenLines(filePath, tag, [0]);
 		const changedNs = st.mtimeNs > st.ctimeNs ? st.mtimeNs : st.ctimeNs;
 		if (tag && BigInt(Date.now()) * 1_000_000n - changedNs >= RACY_STAMP_WINDOW_NS) {
 			stamps.set(filePath, { size: st.size, mtimeNs: st.mtimeNs, ctimeNs: st.ctimeNs, ino: st.ino, tag });
@@ -469,6 +481,79 @@ function lineRangeFetchCap(pathSpecs: readonly GrepPathSpec[], perFileKeep: numb
 		}
 	}
 	return Math.min(cap, NATIVE_GREP_MAX_FILE_BYTES);
+}
+
+/** Names of the files a per-file cap trimmed: the first few, then a count. */
+function formatCappedFiles(paths: readonly string[]): string {
+	const shown = paths.slice(0, 5).join(", ");
+	const rest = paths.length - 5;
+	return rest > 0 ? `${shown} and ${rest} more ${rest === 1 ? "file" : "files"}` : shown;
+}
+
+/**
+ * Whether a path entry is a `!glob` exclusion rather than a path to search: it
+ * starts with `!` and is confirmed missing on disk once a `:selector` is split
+ * off the way `read` splits it, so `!notes.txt:1-2` still reads a real
+ * `!notes.txt`, and a dangling `!link` or an inconclusive probe stays a path
+ * whose error the search reports. Approval and execution both classify entries
+ * through this.
+ */
+function isExclusionEntry(entry: string, cwd: string): boolean {
+	if (!entry.startsWith("!")) return false;
+	return probeLiteralPathExistsSync(splitPathAndSelPreferringLiteralSync(entry, cwd).path, cwd) === "missing";
+}
+
+/** One exclusion with Windows separators and trailing separators normalized away. */
+function normalizeExclusion(pattern: string): string {
+	return pattern.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+/**
+ * Where an anchored exclusion points: one with a `/` that does not start with
+ * `**`, resolved against cwd like any tool path. `undefined` for a pattern that
+ * matches at any depth, `null` for one that resolves to no filesystem path.
+ */
+function anchoredExclusionPath(pattern: string, cwd: string): string | null | undefined {
+	if (!pattern.includes("/") || pattern.startsWith("**")) return undefined;
+	try {
+		return resolveToCwd(pattern, cwd);
+	} catch {
+		return null;
+	}
+}
+
+/** `target` relative to `root` with `/` separators, or `undefined` unless it lies strictly inside `root`. */
+function relativeInside(root: string, target: string): string | undefined {
+	const relative = path.relative(root, target);
+	// Across Windows drives `path.relative` returns an absolute path.
+	if (relative === "" || path.isAbsolute(relative)) return undefined;
+	const posix = relative.split(path.sep).join("/");
+	return posix === ".." || posix.startsWith("../") ? undefined : posix;
+}
+
+/**
+ * Rebase `!glob` exclusions, written relative to cwd, onto one search root for
+ * native grep, which matches them against root-relative paths. A pattern with
+ * no `/` (or starting with `**`) matches at any depth and passes through; any
+ * other is anchored to the root with a leading `/` (`!./gen` must not drop
+ * `sub/gen`); one naming a place outside this root has nothing to exclude there.
+ */
+function exclusionsForRoot(patterns: readonly string[], cwd: string, root: string): string[] | undefined {
+	const rebased: string[] = [];
+	const internalRoot = InternalUrlRouter.instance().canHandle(root);
+	for (const raw of patterns) {
+		const pattern = normalizeExclusion(raw);
+		if (!pattern) continue;
+		const target = anchoredExclusionPath(pattern, cwd);
+		if (target === undefined) {
+			rebased.push(pattern);
+			continue;
+		}
+		if (internalRoot || target === null) continue;
+		const relative = relativeInside(root, target);
+		if (relative !== undefined) rebased.push(`/${relative}`);
+	}
+	return rebased.length > 0 ? rebased : undefined;
 }
 
 type SearchParams = typeof searchSchema.infer;
@@ -503,22 +588,35 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			sessionResolveContext(this.session),
 		);
 
-	async #pathSpecs(roots: readonly string[]): Promise<GrepPathSpec[]> {
+	async #searchScope(roots: readonly string[]): Promise<{ pathSpecs: GrepPathSpec[]; exclusions: string[] }> {
 		const entries: string[] = [];
 		for (const entry of roots.length > 0 ? roots : ["."]) {
 			const parts = await splitMixedUrlPathList(
 				entry,
 				this.session.cwd,
-				part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
+				part =>
+					parseReadUrlTarget(part) !== null ||
+					InternalUrlRouter.instance().canResolve(part) ||
+					isExclusionEntry(part, this.session.cwd),
 			);
 			entries.push(...(parts ?? [entry]));
 		}
-		return parsePathSpecs(await expandDelimitedPathEntries(entries, this.session.cwd), this.session.cwd);
+		const expanded = await expandDelimitedPathEntries(entries, this.session.cwd, { exclusionParts: true });
+		const exclusions: string[] = [];
+		const searchEntries: string[] = [];
+		for (const entry of expanded) {
+			if (isExclusionEntry(entry, this.session.cwd)) exclusions.push(entry.slice(1));
+			else searchEntries.push(entry);
+		}
+		return {
+			pathSpecs: await parsePathSpecs(searchEntries.length > 0 ? searchEntries : ["."], this.session.cwd),
+			exclusions,
+		};
 	}
 
 	async #approvalTargets(args: unknown, includePublic = false): Promise<readonly string[]> {
 		const a = args as { path?: string | string[]; paths?: string | string[] } | null | undefined;
-		const specs = await this.#pathSpecs(toPathList(a?.path ?? a?.paths));
+		const { pathSpecs: specs } = await this.#searchScope(toPathList(a?.path ?? a?.paths));
 		const roots = await Promise.all(
 			specs.map(async spec => {
 				const member = archiveSearchMember(spec);
@@ -614,7 +712,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			if (normalizedSkip < 0 || !Number.isFinite(normalizedSkip)) {
 				throw new ToolError("Skip must be a non-negative number");
 			}
-			const pathSpecs = await this.#pathSpecs(toPathList(rawPath));
+			const { pathSpecs, exclusions } = await this.#searchScope(toPathList(rawPath));
 			const resolveContext = sessionResolveContext(this.session, { signal });
 			// Internal URLs resolve inside the native search, bounded by the tier this call was approved at.
 			const urlFilesystem = new InternalUrlFilesystem({
@@ -747,6 +845,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					limitReached: false,
 				};
 				let skippedOversizedCount = 0;
+				// Native sets `limitReached` for the per-file cap too; only the total cap
+				// stops the walk before every file has been surfaced.
+				let totalCapReached = false;
 				// Only a glob spelled without a directory prefix matches at any depth.
 				// The parsed base alone cannot distinguish `*.ts` from `./*.ts`.
 				try {
@@ -780,6 +881,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
 									maxCountPerFile: nativeMaxCountPerFile,
+									exclude: exclusionsForRoot(exclusions, this.session.cwd, target.basePath),
 									signal,
 									timeoutMs: SEARCH_GREP_TIMEOUT_MS,
 									filesystem,
@@ -788,6 +890,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							);
 							skippedOversizedCount += targetResult.skippedOversized ?? 0;
 							limitReached = limitReached || Boolean(targetResult.limitReached);
+							totalCapReached ||= targetResult.matches.length >= nativeMaxCount;
 							totalMatches += targetResult.totalMatches;
 							filesSearched += targetResult.filesSearched;
 							for (const match of targetResult.matches) {
@@ -828,6 +931,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								maxColumns: DEFAULT_MAX_COLUMN,
 								mode: effectiveOutputMode,
 								maxCountPerFile: nativeMaxCountPerFile,
+								exclude: exclusionsForRoot(exclusions, this.session.cwd, searchPath),
 								signal,
 								timeoutMs: SEARCH_GREP_TIMEOUT_MS,
 								filesystem,
@@ -835,6 +939,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							undefined,
 						);
 						skippedOversizedCount = result.skippedOversized ?? 0;
+						totalCapReached = result.matches.length >= nativeMaxCount;
 					}
 				} catch (err) {
 					if (err instanceof Error && /^regex(?: parse)? error/i.test(err.message)) {
@@ -912,6 +1017,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const fileGroups = new Map<string, { count: number; list?: GrepMatch[] }>();
 				const windowLists: GrepMatch[][] = [];
 				let perFileLimitReached = false;
+				// Files in the page window whose matches past the cap were dropped.
+				const cappedFiles: string[] = [];
 				for (const match of result.matches) {
 					const group = fileGroups.get(match.path);
 					if (!group) {
@@ -924,14 +1031,15 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					group.count++;
 					if (group.count > perFileMatchCap) {
 						perFileLimitReached = true;
+						if (group.count === perFileMatchCap + 1 && group.list) cappedFiles.push(match.path);
 						continue;
 					}
 					group.list?.push(match);
 				}
 				const totalFiles = fileGroups.size;
-				// When native grep stopped at its internal cap, files past the cap were
+				// When native grep stopped at its total cap, files past the cap were
 				// never surfaced — the file total is only a lower bound.
-				const totalFilesLabel = result.limitReached ? `${totalFiles}+` : `${totalFiles}`;
+				const totalFilesLabel = totalCapReached ? `${totalFiles}+` : `${totalFiles}`;
 				const skipFiles = canPaginate ? Math.min(normalizedSkip, totalFiles) : 0;
 				const fileLimitReached = canPaginate && totalFiles > skipFiles + fileWindow;
 				const selectedMatches: GrepMatch[] = [];
@@ -1047,7 +1155,15 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					matchesByFile.get(relativePath)!.push(match);
 				}
 				const displayLines: string[] = [];
-				const hashContexts = new Map<string, { tag: string; path: string }>();
+				const hashContexts = new Map<
+					string,
+					{
+						tag: string;
+						path: string;
+						body?: string[];
+						cutLines?: Set<number>;
+					}
+				>();
 				if (baseDisplayMode.hashLines) {
 					const candidates = fileList.filter(relativePath => !archiveDisplaySet.has(relativePath));
 					// Immutable schemes get no host file; mutable URLs (`local://`) bind to their backing file.
@@ -1060,9 +1176,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						if (snapshotPath === undefined || isImmutableSourcePath(snapshotPath, immutableSourcePaths)) continue;
 						editable.push({ relativePath: candidates[index], snapshotPath });
 					}
-					// Mint a whole-file content tag so any anchor validates while the
-					// file is unchanged; over-cap / unreadable files get no tag (and
-					// therefore plain, non-editable line output).
+					// Tags bind the whole file; seen-row authority includes only complete rows retained by the byte cap.
+					// Over-cap or unreadable files have no editable tag.
 					const tags = await recordSnapshotTags(
 						getEditStore(this.session),
 						editable.map(entry => entry.snapshotPath),
@@ -1121,29 +1236,70 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						}
 						fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
 					}
-					if (hashContext?.tag) {
-						recordFullySeenRows(
-							getEditStore(this.session),
-							hashContext.path,
-							hashContext.tag,
-							modelOut.join("\n"),
-							cutLines,
-						);
+					if (hashContext) {
+						hashContext.body = modelOut;
+						hashContext.cutLines = cutLines;
 					}
 					return { model: modelOut, display: displayOut, tag: hashContext?.tag };
 				};
 				const matchOutput = formatFileMatches(fileList, isDirectory || isMultiScope, renderMatchesForFile);
 				outputLines.push(...matchOutput.model);
 				displayLines.push(...matchOutput.display);
-				if (limitMessage) {
-					outputLines.push("", limitMessage);
-				}
-				if (warningNote) {
-					outputLines.push("", warningNote);
-				}
+				const trailer = (shownCapped: readonly string[]): string => {
+					const capNotice =
+						shownCapped.length === 0
+							? ""
+							: isMultiScope
+								? `More than ${perFileMatchCap} matches in ${formatCappedFiles(shownCapped)}; grep keeps the first ${perFileMatchCap} per file when searching several. Search one file alone for up to ${SINGLE_FILE_MATCHES}.`
+								: `More than ${perFileMatchCap} matches; grep keeps the first ${perFileMatchCap} in a file. Add a line range (\`path:N-M\`) or narrow the pattern for the rest.`;
+					return [limitMessage, warningNote, capNotice]
+						.filter(Boolean)
+						.map(note => `\n\n${note}`)
+						.join("");
+				};
+				// The page, warning and cap notices sit past the byte cap so a long result
+				// cannot cut them off. A multi-file notice names only files the kept text
+				// shows with a full cap's worth of matches: a smaller total limit (`pi_grep`)
+				// can leave a capped file short, and the byte cap can drop its section. A
+				// single file's notice names no file, so it stays when the byte cap cuts it.
 				const rawOutput = outputLines.join("\n");
-				const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
-				const output = truncation.content;
+				const cappedCandidates = cappedFiles
+					.map(formatPath)
+					.filter(relativePath => fileMatchCounts.get(relativePath) === perFileMatchCap);
+				let suffix = trailer(cappedCandidates);
+				let truncation: TruncationResult;
+				for (;;) {
+					const reserved = Buffer.byteLength(suffix);
+					truncation = truncateHead(rawOutput, {
+						maxLines: Number.MAX_SAFE_INTEGER,
+						maxBytes: DEFAULT_MAX_BYTES - reserved,
+					});
+					const keptLines = truncation.truncated ? (truncation.outputLines ?? 0) : outputLines.length;
+					const shownCapped = isMultiScope
+						? cappedCandidates.filter(
+								relativePath => (matchOutput.modelEnds.get(relativePath) ?? Infinity) <= keptLines,
+							)
+						: cappedCandidates;
+					suffix = trailer(shownCapped);
+					// Fewer files named can still mean longer names; re-cut until the notice fits its room.
+					if (Buffer.byteLength(suffix) <= reserved) break;
+				}
+				const output = truncation.content + suffix;
+				const keptRows = truncation.truncated ? (truncation.outputLines ?? 0) : outputLines.length;
+				for (const [relativePath, hashContext] of hashContexts) {
+					const body = hashContext.body;
+					if (!body) continue;
+					const end = matchOutput.modelEnds.get(relativePath);
+					const shown = end === undefined ? 0 : Math.max(0, Math.min(body.length, keptRows - (end - body.length)));
+					const store = getEditStore(this.session);
+					recordFullySeenRows(
+						store,
+						hashContext.path,
+						hashContext.tag,
+						(shown === body.length ? body : body.slice(0, shown)).join("\n"),
+						hashContext.cutLines,
+					);
+				}
 				const displayText = displayLines.join("\n");
 				let displayTargets: Record<string, string> | undefined;
 				// Only grouped headers start with `#`; code-frame rows start with their gutter.

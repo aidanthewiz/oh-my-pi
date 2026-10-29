@@ -713,6 +713,11 @@ async function tryDelimitedPathSplit(
  * string. Existing paths are kept intact, so real filenames containing spaces,
  * commas, or semicolons win over delimiter recovery.
  */
+/** A `!glob` exclusion part of a path list, which search tools take beside URLs. */
+function isExclusionPart(part: string): boolean {
+	return part.length > 1 && part.startsWith("!") && !part.includes("://");
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
@@ -720,6 +725,7 @@ export async function splitDelimitedPathEntry(
 		splitter?: PathEntrySplitter;
 		routedUrlPredicate?: (entry: string) => boolean;
 		queryOwner?: (part: string) => Promise<boolean>;
+		exclusionParts?: boolean;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
@@ -729,7 +735,8 @@ export async function splitDelimitedPathEntry(
 		options.routedUrlPredicate ??
 		((part: string) =>
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
-	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isUrl, options.queryOwner);
+	const isBoundary = (part: string) => isUrl(part) || (options.exclusionParts === true && isExclusionPart(part));
+	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
 	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
 	const opaqueUrl = isUrl(normalizedEntry);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
@@ -876,7 +883,7 @@ async function findLiteralPathListPart(
 export async function expandDelimitedPathEntries(
 	entries: readonly string[],
 	cwd: string,
-	options: { splitter?: PathEntrySplitter } = {},
+	options: { splitter?: PathEntrySplitter; exclusionParts?: boolean } = {},
 ): Promise<string[]> {
 	const expanded: string[] = [];
 	for (const entry of entries) {

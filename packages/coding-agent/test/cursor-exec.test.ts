@@ -1737,8 +1737,7 @@ describe("CursorExecHandlers native delete gating (issue #5680)", () => {
 		const result = await handlers.delete(create(DeleteArgsSchema, { toolCallId: "call-del", path: target }));
 
 		expect(result.isError).toBe(true);
-		expect(result.content).toEqual([{ type: "text", text: 'Tool "delete" not available' }]);
-		expect(await Bun.file(target).exists()).toBe(true);
+		expect(await Bun.file(target).text()).toBe("keep me");
 	});
 
 	it("performs native delete when allowDirectFileMutation is true", async () => {

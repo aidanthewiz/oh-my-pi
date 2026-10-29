@@ -17,6 +17,7 @@ import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { resetRegisteredArtifactDirsForTests } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -28,6 +29,7 @@ import {
 	artifactFileGeneration,
 	serializeStructuredArtifactSidecar,
 } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import {
 	attachIrcWakeTurnMonitor,
 	runSubagentFollowUpTurn,
@@ -205,6 +207,8 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 			wakeObserver = observer;
 		},
 		trackIrcReply: () => {},
+		holdIrcWakes: () => () => {},
+		hasQueuedIrcFrom: () => false,
 		subscribeRunState: () => () => {},
 		isParentIrcSteer: () => false,
 		asyncJobManager: options?.asyncJobManager,
@@ -662,7 +666,7 @@ await withArtifactPublicationLock(async () => {
 		}
 	});
 
-	it("delivers a peer-only plain report once without replacing the parent's accepted artifact", async () => {
+	it("relays a peer-only plain answer without publishing an owner result or replacing its accepted artifact", async () => {
 		const tempDir = TempDir.createSync("@omp-peer-agent-result-");
 		const artifactsDir = tempDir.path();
 		const manager = new AsyncJobManager({});
@@ -719,13 +723,11 @@ await withArtifactPublicationLock(async () => {
 			await finish?.(undefined);
 			await manager.waitForAll();
 			await manager.drainDeliveries({ timeoutMs: 1000 });
-			await manager.drainDeliveries({ timeoutMs: 1000 });
-			expect(delivered).toHaveLength(1);
-			expect(delivered[0]).toContain("line 42 is fine");
+			expect(delivered).toEqual([]);
 			expect(relayed.Parent).toEqual([]);
 			expect(relayed.OtherAgent).toHaveLength(1);
 			expect(relayed.OtherAgent[0]).toContain("line 42 is fine");
-			expect(manager.getJob(AGENT_ID)?.ownerId).toBe("Parent");
+			expect(manager.getAllJobs()).toEqual([]);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(acceptedSidecar);
 		} finally {
@@ -1363,6 +1365,192 @@ await withArtifactPublicationLock(async () => {
 			expect(deliveries).toEqual([]);
 			expect(ircReplies.Parent).toEqual(["reply despite unavailable manager"]);
 		});
+	});
+
+	it("owes the parent no reply once the wake job its message started has delivered the turn's answer", async () => {
+		using tmp = TempDir.createSync("@omp-accepted-wake-reply-");
+		const artifactsDir = tmp.path();
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		AgentRegistry.global().register({
+			id: "Parent",
+			displayName: "Parent",
+			kind: "main",
+			session: createHarness().session,
+			status: "running",
+		});
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		// The parent's message reaches the idle child through the real bus and bridge, as a live send would.
+		let finish: ((error?: unknown) => void | Promise<void>) | undefined;
+		const bridge = new IrcBridge({
+			isDisposed: () => false,
+			isStreaming: () => false,
+			planModeEnabled: () => false,
+			emitSessionEvent: async () => {},
+			wakeForIrc: (records: AgentMessage[]) => {
+				finish = observer(records);
+			},
+		} as unknown as IrcBridgeHost);
+		Object.assign(harness.session, { deliverIrcMessage: (msg: IrcMessage) => bridge.deliver(msg) });
+		const parent = {
+			cwd: "/tmp",
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: AgentRegistry.global(),
+			asyncJobManager: manager,
+			getAgentId: () => "Parent",
+		} as unknown as ToolSession;
+
+		try {
+			const receipt = await IrcBus.global().send({ from: "Parent", to: AGENT_ID, body: "fix the mask path too" });
+			expect(receipt.outcome).toBe("woken");
+			expect(
+				IrcBus.global()
+					.unansweredSends("Parent", 0)
+					.map(sent => sent.to),
+			).toEqual([AGENT_ID]);
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			harness.emitAssistantText("mask path fixed too");
+			expect(
+				IrcBus.global()
+					.unansweredSends("Parent", 0)
+					.map(sent => sent.to),
+			).toEqual([AGENT_ID]);
+			await finish?.(undefined);
+			const job = (await waiting).details?.jobs?.[0];
+			expect(job).toMatchObject({ id: AGENT_ID, status: "completed" });
+			expect(job?.resultText).toContain("mask path fixed too");
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe("mask path fixed too");
+
+			expect(IrcBus.global().unansweredSends("Parent", 0)).toEqual([]);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it.each(["completed", "failed", "cancelled"] as const)(
+		"does not answer a successor child's question when an unqualified old job is %s",
+		async outcome => {
+			const registry = AgentRegistry.global();
+			registry.register({
+				id: "Parent",
+				displayName: "Parent",
+				kind: "main",
+				session: createHarness().session,
+				status: "running",
+			});
+			registry.register({
+				id: AGENT_ID,
+				displayName: AGENT_ID,
+				kind: "sub",
+				parentId: "Parent",
+				session: createHarness().session,
+				status: "running",
+			});
+			const manager = new AsyncJobManager({});
+			const release = Promise.withResolvers<void>();
+			const jobId = manager.register(
+				"task",
+				"old generation",
+				async () => {
+					await release.promise;
+					if (outcome === "failed") throw new Error("old generation failed");
+					return "old generation report";
+				},
+				{ ownerId: "Parent", agentId: AGENT_ID },
+			);
+			try {
+				const replacement = createHarness();
+				Object.assign(replacement.session, { deliverIrcMessage: async () => "injected" });
+				registry.register({
+					id: AGENT_ID,
+					displayName: AGENT_ID,
+					kind: "sub",
+					parentId: "Parent",
+					session: replacement.session,
+					status: "running",
+				});
+				await IrcBus.global().send({ from: "Parent", to: AGENT_ID, body: "question for the successor" });
+				if (outcome === "cancelled") manager.cancel(jobId, { ownerId: "Parent" });
+				release.resolve();
+				await manager.getJob(jobId)!.promise;
+				expect(
+					IrcBus.global()
+						.unansweredSends("Parent", 0)
+						.map(sent => sent.to),
+				).toEqual([AGENT_ID]);
+			} finally {
+				release.resolve();
+				await manager.dispose({ timeoutMs: 1000 });
+			}
+		},
+	);
+
+	it("does not acknowledge a new parent's question with an accepted prior-parent result", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "Parent",
+			displayName: "Parent",
+			kind: "main",
+			session: createHarness().session,
+			status: "running",
+		});
+		const harness = createHarness();
+		Object.assign(harness.session, { deliverIrcMessage: async () => "injected" });
+		registry.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(harness.session, "prompt").mockImplementation(async () => {
+			harness.emitAssistantText("original accepted report");
+			entered.resolve();
+			await release.promise;
+			return true;
+		});
+		const run = runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: baseAgent,
+			message: "original parent request",
+			structured: false,
+		});
+		try {
+			await entered.promise;
+			registry.register({
+				id: "Parent",
+				displayName: "Parent",
+				kind: "main",
+				session: createHarness().session,
+				status: "running",
+			});
+			await IrcBus.global().send({ from: "Parent", to: AGENT_ID, body: "new parent question" });
+			release.resolve();
+			const result = await run;
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toBe("original accepted report");
+			expect(
+				IrcBus.global()
+					.unansweredSends("Parent", 0)
+					.map(sent => sent.to),
+			).toEqual([AGENT_ID]);
+		} finally {
+			release.resolve();
+			await run;
+		}
 	});
 
 	/** Wake an idle agent from a peer, play `turn`, and return the relay body the peer receives. */

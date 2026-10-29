@@ -44,6 +44,7 @@ import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type
 import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type: "text" };
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withDownload } from "../../downloads/activity";
+import { probeCdpResponse } from "./attach";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
 
@@ -237,7 +238,7 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 			event && typeof event.message === "string"
 				? event.message || (event.error instanceof Error ? event.error.message : "WebSocket connection failed")
 				: undefined;
-		const normalized =
+		let normalized =
 			eventMessage !== undefined
 				? new Error(
 						eventEndpoint
@@ -246,9 +247,21 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 						{ cause: event?.error instanceof Error ? event.error : undefined },
 					)
 				: toError(error);
+		let debuggerEndpoint: string | undefined;
+		if (normalized.message.startsWith("Unexpected server response: ")) {
+			debuggerEndpoint =
+				options.browserWSEndpoint ??
+				(options.browserURL && (await debuggerEndpointOf(options.browserURL))) ??
+				options.browserURL;
+			if (debuggerEndpoint) {
+				normalized = new Error(
+					`WebSocket connection to '${redactUrlQuery(debuggerEndpoint)}' failed: ${normalized.message}`,
+				);
+			}
+		}
 		let message = normalized.message;
 		let redacted = false;
-		for (const endpoint of [eventEndpoint, options.browserWSEndpoint, options.browserURL]) {
+		for (const endpoint of [eventEndpoint, debuggerEndpoint, options.browserWSEndpoint, options.browserURL]) {
 			const safeEndpoint = redactUrlQuery(endpoint);
 			if (!endpoint || !safeEndpoint || safeEndpoint === endpoint) continue;
 			redacted = true;
@@ -271,6 +284,20 @@ export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: Con
 			throw sanitized;
 		}
 		throw normalized;
+	}
+}
+
+/** The `webSocketDebuggerUrl` a CDP HTTP endpoint advertises, or undefined when it does not answer with one. */
+async function debuggerEndpointOf(browserURL: string): Promise<string | undefined> {
+	const response = await probeCdpResponse(`${browserURL.replace(/\/+$/, "")}/json/version`, { timeoutMs: 1500 });
+	if (response?.status !== 200) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(response.body);
+		return isRecord(parsed) && typeof parsed.webSocketDebuggerUrl === "string"
+			? parsed.webSocketDebuggerUrl
+			: undefined;
+	} catch {
+		return undefined;
 	}
 }
 

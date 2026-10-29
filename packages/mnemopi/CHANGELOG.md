@@ -6,6 +6,12 @@
 
 - Rebuild stored local E5-large and all-MiniLM vectors after fastembed's CLS-to-mean pooling change, without deleting memories or changing configured model names.
 - Keep cached query vectors isolated between local mean-pooling models and API or custom providers.
+## [18.13.0] - 2026-10-26
+
+### Fixed
+
+- Fixed polyphonic recall's graph voice finding no memories for non-English names (e.g. `Hà Nội`) or names of three or more words, and Vietnamese words like `tôi` being stored as the participant `i` ([#16723](https://github.com/can1357/oh-my-pi/issues/16723))
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

@@ -1,21 +1,12 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as path from "node:path";
-import * as agentCore from "@oh-my-pi/pi-agent-core";
-import { type Api, type AssistantMessage, createAssistantMessageEventStream, type Model } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import type { AsyncJob } from "../../src/async/job-manager";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
-import {
-	buildPromptSources,
-	createModelJobWidgetAuthor,
-	type JobWidgetAuthorRequest,
-	JobWidgets,
-	redactWidgetSample,
-	renderJobWidgetPrompt,
-	TextTap,
-} from "../../src/job-widgets";
+import { buildPromptSources, redactWidgetSample, renderJobWidgetPrompt, TextTap } from "../../src/job-widgets";
 import { createAgentSession } from "../../src/sdk";
 import type { AgentSession } from "../../src/session/agent-session";
 import { SessionManager } from "../../src/session/session-manager";
@@ -163,25 +154,6 @@ describe("job widget author prompt", () => {
 
 describe("managed widget author dispatch", () => {
 	afterEach(() => vi.restoreAllMocks());
-	const model = {
-		id: "widget-model",
-		name: "Widget model",
-		provider: "synthetic",
-		api: "openai-completions",
-		baseUrl: "https://synthetic.invalid",
-		contextWindow: 32000,
-		maxTokens: 3000,
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	} as Model<Api>;
-	const settings = Settings.isolated({ modelRoles: { widget: "synthetic/widget-model" } });
-	const request: JobWidgetAuthorRequest = {
-		jobId: "job",
-		canAuthor: () => true,
-		brief: { kind: "bash", command: "bench" },
-		sources: [{ id: "out", label: "out", size: 18, lines: 3, head: ["rps=1", "rps=2", "rps=3"], tail: [] }],
-	};
 	const spec = {
 		title: "throughput",
 		rules: [{ from: "out", match: String.raw`rps=(?P<rps>\d+)` }],
@@ -189,150 +161,16 @@ describe("managed widget author dispatch", () => {
 		headline: { field: "rps", agg: "last" },
 	};
 
-	it("does not resolve credentials or dispatch before explicit admission", async () => {
-		const complete = spyOn(agentCore, "instrumentedCompleteSimple").mockImplementation(async () => {
-			throw new Error("forbidden dispatch");
-		});
-		const registry = { getAvailable: () => [model], getApiKey: vi.fn(), resolver: vi.fn() };
-		const withoutAdmission = createModelJobWidgetAuthor({
-			settings,
-			modelRegistry: registry as unknown as ModelRegistry,
-		});
-		expect(await withoutAdmission(request, new AbortController().signal)).toBeUndefined();
-		const denied = createModelJobWidgetAuthor({
-			settings,
-			modelRegistry: registry as unknown as ModelRegistry,
-			admit: async () => undefined,
-		});
-		expect(await denied(request, new AbortController().signal)).toBeUndefined();
-		const admission = vi.fn(async () => {
-			throw new Error("Unbound source must not reach admission");
-		});
-		const unbound = createModelJobWidgetAuthor({
-			settings,
-			modelRegistry: registry as unknown as ModelRegistry,
-			admit: admission,
-		});
-		const unboundRequest = { ...request };
-		delete unboundRequest.canAuthor;
-		expect(await unbound(unboundRequest, new AbortController().signal)).toBeUndefined();
-		expect(admission).not.toHaveBeenCalled();
-		expect(registry.getApiKey).not.toHaveBeenCalled();
-		expect(registry.resolver).not.toHaveBeenCalled();
-		expect(complete).not.toHaveBeenCalled();
-	});
-
-	it("dispatches admitted specs with a completely redacted payload and no ambient credential probe", async () => {
-		const secret = "synthetic-origin-secret";
-		let payload = "";
-		const usage: AssistantMessage[] = [];
-		spyOn(agentCore, "instrumentedCompleteSimple").mockImplementation(async (_model, context) => {
-			payload = JSON.stringify(context);
-			return createAssistantMessage(JSON.stringify(spec));
-		});
-		const author = createModelJobWidgetAuthor({
-			settings,
-			modelRegistry: { getAvailable: () => [model] } as unknown as ModelRegistry,
-			obfuscate: () => value => value.replaceAll(secret, "[secret]"),
-			admit: async () => ({
-				sessionId: "origin",
-				apiKey: "synthetic-key",
-				isCurrent: () => true,
-				onUsage: message => usage.push(message),
-			}),
-		});
-		const answer = await author(
-			{
-				...request,
-				brief: { kind: "task", task: secret, watch: secret, stage: secret },
-				sources: [{ ...request.sources[0]!, label: secret, head: [secret], tail: [secret] }],
-				previous: { reason: secret, spec: { title: secret, rules: [{ from: "*", match: secret }], blocks: [] } },
-				rejected: {
-					answer: `${secret}${"\0".repeat(20_000)}`,
-					errors: Array.from({ length: 12 }, () => `${secret}${"\0".repeat(20_000)}`),
-				},
-			},
-			new AbortController().signal,
-		);
-		expect(answer).toEqual(spec);
-		expect(payload).not.toContain(secret);
-		expect(payload).toContain("[secret]");
-		expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(64 * 1024);
-		expect(usage).toHaveLength(1);
-	});
-
-	it("drains late originating usage after invalidation without installing or retrying the stale answer", async () => {
-		const response = Promise.withResolvers<AssistantMessage>();
-		const started = Promise.withResolvers<void>();
-		spyOn(agentCore, "instrumentedCompleteSimple").mockImplementation(async () => {
-			started.resolve();
-			return response.promise;
-		});
-		const journals = { origin: [] as AssistantMessage[], next: [] as AssistantMessage[] };
-		let current = true;
-		const origin = journals.origin;
-		const author = createModelJobWidgetAuthor({
-			settings,
-			modelRegistry: { getAvailable: () => [model] } as unknown as ModelRegistry,
-			admit: async () => ({
-				sessionId: "origin",
-				apiKey: "synthetic-key",
-				isCurrent: () => current,
-				onUsage: message => origin.push(message),
-			}),
-		});
-		const widgets = new JobWidgets({ author, now: () => 15000, minIngestMs: 0 });
-		const tap = new TextTap("out", "out");
-		tap.append("rps=1\nrps=2\nrps=3\n");
-		const completion = Promise.withResolvers<void>();
-		const job: AsyncJob = {
-			id: "origin-job",
-			type: "bash",
-			label: "bench",
-			startTime: 0,
-			status: "running",
-			abortController: new AbortController(),
-			promise: completion.promise,
-			widgetInputs: {
-				canAuthor: () => true,
-				sources: () => [tap],
-				brief: () => ({ kind: "bash" as const, command: "bench" }),
-			},
-		};
-		try {
-			widgets.view(job);
-			await started.promise;
-			current = false;
-			widgets.invalidate();
-			let drained = false;
-			const draining = widgets.drain().then(() => {
-				drained = true;
-			});
-			await Promise.resolve();
-			expect(drained).toBe(false);
-			response.resolve(createAssistantMessage(JSON.stringify(spec)));
-			await draining;
-			expect(journals.origin).toHaveLength(1);
-			expect(journals.next).toEqual([]);
-		} finally {
-			response.resolve(createAssistantMessage(JSON.stringify(spec)));
-			await widgets.drain();
-			widgets.dispose();
-			job.status = "completed";
-			completion.resolve();
-			await job.promise;
-		}
-		expect(widgets.view(job)).toBeUndefined();
-	});
-
 	it.each([
-		{ enabled: false, transition: false, creditDenied: false },
-		{ enabled: true, transition: false, creditDenied: false },
-		{ enabled: true, transition: true, creditDenied: false },
-		{ enabled: true, transition: false, creditDenied: true },
+		{ enabled: false, transition: false, creditDenied: false, bound: true, invalidated: false },
+		{ enabled: true, transition: false, creditDenied: false, bound: true, invalidated: false },
+		{ enabled: true, transition: true, creditDenied: false, bound: true, invalidated: false },
+		{ enabled: true, transition: false, creditDenied: true, bound: true, invalidated: false },
+		{ enabled: true, transition: false, creditDenied: false, bound: false, invalidated: false },
+		{ enabled: true, transition: false, creditDenied: false, bound: true, invalidated: true },
 	])(
 		"uses default SDK admission and originating journal drain: %j",
-		async ({ enabled, transition, creditDenied }) => {
+		async ({ enabled, transition, creditDenied, bound, invalidated }) => {
 			const temp = TempDir.createSync("@widget-sdk-admission-");
 			const authStorage = createInMemoryAuthStorage();
 			const provider = "widget-author-sdk-synthetic";
@@ -375,16 +213,17 @@ describe("managed widget author dispatch", () => {
 							model: selected.id,
 						};
 						message.usage = { ...message.usage, input: 11, output: 3, totalTokens: 14 };
-						void resolveApiKeyOnce(options?.apiKey, options?.signal).then(
-							async () => {
+						void (async () => {
+							try {
+								await resolveApiKeyOnce(options?.apiKey, options?.signal);
+								await options?.onPayload?.({ widget: true }, selected, options?.signal);
 								calls++;
 								payload = JSON.stringify(context);
 								started.resolve();
-								if (transition) await release.promise;
+								if (transition || invalidated) await release.promise;
 								stream.push({ type: "start", partial: message });
 								stream.push({ type: "done", reason: "stop", message });
-							},
-							error => {
+							} catch (error) {
 								stream.push({
 									type: "error",
 									reason: "error",
@@ -397,8 +236,8 @@ describe("managed widget author dispatch", () => {
 										errorMessage: String(error),
 									},
 								});
-							},
-						);
+							}
+						})();
 						return stream;
 					},
 				},
@@ -440,7 +279,7 @@ describe("managed widget author dispatch", () => {
 				const widgets = session.asyncJobManager?.widgets;
 				if (!widgets) throw new Error("Default SDK widget registry is missing");
 				const tap = new TextTap("out", "out");
-				tap.append("rps=1\nrps=2\nrps=3\n");
+				tap.append(`rps=1\nrps=2\nrps=3\n${TOKEN}${"\0".repeat(20_000)}\n`);
 				job = {
 					id: "sdk-widget",
 					type: "bash",
@@ -450,15 +289,37 @@ describe("managed widget author dispatch", () => {
 					abortController: new AbortController(),
 					promise: completion.promise,
 					widgetInputs: {
-						canAuthor: () => true,
+						canAuthor: bound ? () => true : undefined,
 						sources: () => [tap],
-						brief: () => ({ kind: "bash" as const, command: `bench ${TOKEN}` }),
+						brief: () => ({
+							kind: "bash" as const,
+							command: `bench ${TOKEN}`,
+							watch: TOKEN,
+							stage: TOKEN,
+						}),
 					},
 				};
 				const initial = widgets.view(job);
 				if (!enabled) expect(initial?.state).toBe("fallback");
+				if (transition || invalidated) {
+					await Promise.race([
+						started.promise,
+						widgets.drain().then(() => {
+							throw new Error("Widget completed before its provider response gate");
+						}),
+					]);
+				}
+				if (invalidated) {
+					widgets.invalidate();
+					release.resolve();
+					await widgets.drain();
+					job.status = "completed";
+					expect(calls).toBe(1);
+					expect(session.sessionManager.getUsageStatistics().totalTokens).toBe(14);
+					expect(widgets.view(job)?.state).not.toBe("live");
+					return;
+				}
 				if (transition) {
-					await started.promise;
 					const originFile = session.sessionManager.getSessionFile();
 					if (!originFile) throw new Error("Originating widget journal is missing");
 					let switched = false;
@@ -490,12 +351,13 @@ describe("managed widget author dispatch", () => {
 						await widgets.drain();
 					}
 				}
-				const admitted = enabled && !creditDenied;
+				const admitted = enabled && !creditDenied && bound;
 				expect(calls).toBe(admitted ? 1 : 0);
 				expect(widgets.view(job)?.state).toBe(admitted ? "live" : "fallback");
 				if (admitted) {
 					expect(widgets.view(job)?.headline?.text).toBe("3");
 					expect(payload).not.toContain(TOKEN);
+					expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(64 * 1024);
 					expect(session.sessionManager.getUsageStatistics().totalTokens).toBe(14);
 				}
 				if (creditDenied) expect(session.sessionManager.getUsageStatistics().totalTokens).toBe(0);

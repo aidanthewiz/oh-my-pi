@@ -14,6 +14,7 @@
  * raw candidates being reverts — hence the explicit revert rejection.
  */
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { resolvedApiKeyBearer, seedApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
 import { diffLineRuns, editDiffString, parseCodeStatus } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
@@ -352,11 +353,31 @@ export async function attemptEditAutoRepair(options: {
 		getAllowedAvailableModels(registry, session.settings),
 	)?.model;
 	if (!model) return undefined;
-	const sessionId = session.getSessionId?.() ?? undefined;
-	// Resolve the key eagerly so the session-sticky credential is recorded and
-	// an unauthenticated smol role bails before any region work.
-	const apiKey = await registry.getApiKey(model, sessionId);
-	if (!apiKey) return undefined;
+	const sessionId = session.getCredentialSourceSessionId?.() ?? session.getSessionId?.() ?? undefined;
+	const requestOwner = session.captureRequestOwner?.(model);
+	const isCurrent = requestOwner
+		? () => requestOwner.isCurrent()
+		: (session.captureOwnerCurrent?.() ?? (() => session.isDisposed?.() !== true));
+	const journal = session.sessionManager;
+	const journalSessionId = journal?.getSessionId?.();
+	const usageOwner = journalSessionId
+		? { sessionId: journalSessionId, parentId: journal?.getLeafId?.() ?? null }
+		: undefined;
+	const costGate = session.costGate;
+	options.signal?.throwIfAborted();
+	if (!isCurrent()) return undefined;
+	// Preserve the selected credential identity across the preflight and first dispatch.
+	const resolver = registry.resolver(model, sessionId);
+	const credential = await resolver({ lastChance: false, error: undefined, signal: options.signal });
+	if (!resolvedApiKeyBearer(credential)) return undefined;
+	if (
+		requestOwner &&
+		!requestOwner.bindCredential(typeof credential === "string" ? undefined : credential?.credentialId)
+	)
+		return undefined;
+	const apiKey = seedApiKeyResolver(credential, resolver);
+	options.signal?.throwIfAborted();
+	if (!isCurrent()) return undefined;
 
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
@@ -376,19 +397,59 @@ export async function attemptEditAutoRepair(options: {
 	const timeout = AbortSignal.timeout(REPAIR_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 	const complete = async (builtPrompt: string): Promise<string> => {
+		signal.throwIfAborted();
+		if (!isCurrent()) throw new Error("Edit auto-repair owner changed");
+		const prepared = session.prepareSimpleStreamOptions?.({ signal }, model.provider);
 		const response = await retryTransientCompletion(
-			() =>
-				completeSimple(
+			async () => {
+				signal.throwIfAborted();
+				if (!isCurrent()) throw new Error("Edit auto-repair owner changed");
+				costGate?.admit();
+				const message = await completeSimple(
 					model,
 					{ messages: [{ role: "user", content: builtPrompt, timestamp: Date.now() }] },
 					{
-						apiKey: registry.resolver(model, sessionId),
+						...prepared,
+						apiKey,
 						sessionId,
 						maxTokens: COMPLETION_MAX_TOKENS,
 						disableReasoning: true,
 						signal,
+						onAttempt: message => {
+							costGate?.record(message.usage.cost.total);
+							if (usageOwner)
+								journal?.appendModelUsage?.(
+									{
+										purpose: "edit-auto-repair",
+										api: message.api,
+										provider: message.provider,
+										model: message.model,
+										usage: message.usage,
+										stopReason: message.stopReason,
+									},
+									usageOwner,
+								);
+						},
+						onPayload: async (payload, actualModel, requestSignal) => {
+							signal.throwIfAborted();
+							if (!isCurrent()) throw new Error("Edit auto-repair owner changed before dispatch");
+							const replacement = await prepared?.onPayload?.(payload, actualModel, requestSignal);
+							signal.throwIfAborted();
+							if (!isCurrent()) throw new Error("Edit auto-repair owner changed during admission");
+							costGate?.admit();
+							return replacement ?? payload;
+						},
+						onResponse: async (response, actualModel, requestSignal) => {
+							if (!signal.aborted && isCurrent())
+								await prepared?.onResponse?.(response, actualModel, requestSignal);
+						},
+						onSseEvent: (event, actualModel) => {
+							if (!signal.aborted && isCurrent()) prepared?.onSseEvent?.(event, actualModel);
+						},
 					},
-				),
+				);
+				return message;
+			},
 			{ signal, provider: model.provider },
 		);
 		if (response.stopReason === "error") {
@@ -408,6 +469,8 @@ export async function attemptEditAutoRepair(options: {
 
 	const repair = await repairParseRegression({ ...snapshot, next: current }, complete);
 	if (!repair) return undefined;
+	signal.throwIfAborted();
+	if (!isCurrent()) return undefined;
 
 	await writethrough(snapshot.path, repair.content, options.signal, Bun.file(snapshot.path));
 	invalidateFsScanAfterWrite(snapshot.path);

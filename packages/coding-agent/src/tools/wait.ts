@@ -48,7 +48,7 @@ function abortedWaitResult(signal: AbortSignal | undefined): AgentToolResult<Coo
 }
 
 interface PendingReplies {
-	/** Agents asked that can still answer: running, and not blocked on the caller. */
+	/** Agents asked that can still answer: running, or holding the question for a turn of its own, and not blocked on the caller. */
 	from: string[];
 	/** Agents asked that cannot answer before the caller finishes (see `AgentAwaits.blocksOn`). */
 	blocked: string[];
@@ -58,10 +58,13 @@ interface PendingReplies {
 
 /**
  * Agents the caller messaged during its current run that have not answered
- * yet, split by whether a reply can still come. Only a running agent can
- * answer: one that went idle after the question has finished the turn it got
- * it in, and any automatic reply (a woken subagent's relayed output) has
- * arrived by then.
+ * yet, split by whether a reply can still come. A message back answers, and
+ * so does a settled job of the agent the caller owns, which delivers its
+ * result. Only a running agent, or one still holding the question for a turn
+ * of its own (a subagent answers a message that reached it as it finished
+ * after its result is out), can answer: one that went idle otherwise has
+ * finished the turn it got it in, and any automatic reply (a woken subagent's
+ * relayed output) has arrived by then.
  */
 function pendingReplies(messaging: WaitMessaging): PendingReplies {
 	const { registry, senderId } = messaging;
@@ -70,7 +73,7 @@ function pendingReplies(messaging: WaitMessaging): PendingReplies {
 	for (const { to, sentAt } of IrcBus.global().unansweredSends(senderId, since)) {
 		const session = registry.get(to)?.session;
 		if (session && registry.awaits.blocksOn(to, senderId, sentAt)) replies.blocked.push(to);
-		else if (session?.isStreaming) replies.from.push(to);
+		else if (session?.isStreaming || session?.hasQueuedIrcFrom(senderId)) replies.from.push(to);
 		else replies.stopped.push(to);
 	}
 	return replies;

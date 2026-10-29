@@ -6,7 +6,16 @@ import type {
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type { EditStore } from "@oh-my-pi/pi-natives";
-import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, TextContent, ToolChoice } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	FetchImpl,
+	ImageContent,
+	Model,
+	ServiceTierByFamily,
+	SimpleStreamOptions,
+	TextContent,
+	ToolChoice,
+} from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
@@ -37,6 +46,7 @@ import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { CostGate } from "../session/cost-gate";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -220,6 +230,8 @@ export interface DeferredDiagnosticsEntry {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Cost gate of the session tree, forwarded to subagents. */
+	costGate?: CostGate;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
 	/** Whether UI is available */
@@ -234,6 +246,11 @@ export interface ToolSession {
 	isDisposed?: () => boolean;
 	/** Capture the root/session/account/policy authority for one asynchronous launch. */
 	captureOwnerCurrent?: (options?: { allowParked?: boolean }) => () => boolean;
+	/** Bind only this request's first selected provider account to its captured authority. */
+	captureRequestOwner?: (model: Model<Api>) => {
+		isCurrent(): boolean;
+		bindCredential(credentialId: number | undefined): boolean;
+	};
 	/** Capture retained root/reference/journal/account lifetime for warm revival. */
 	captureOwnerLifetimeCurrent?: () => () => boolean;
 	/** Capture the originating root authority for one background widget source. */
@@ -249,12 +266,16 @@ export interface ToolSession {
 	fetch?: FetchImpl;
 	/** Provider credential resolver forwarded unchanged to restricted child sessions. */
 	getApiKey?: AgentOptions["getApiKey"];
+	/** Prepare side requests through the owning session's actual-provider admission boundary. */
+	prepareSimpleStreamOptions?: (options: SimpleStreamOptions, provider?: string) => SimpleStreamOptions;
 	/** Current session whose stored credential affinities should seed a child session. */
 	getCredentialSourceSessionId?: () => string | undefined;
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
 	contextFiles?: ContextFileEntry[];
+	/** No context files beyond `contextFiles`, not even for additional workspace roots (forwarded to subagents) */
+	noContextFiles?: boolean;
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
@@ -353,7 +374,7 @@ export interface ToolSession {
 	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
 	 */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
-		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage">>;
+		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getResidentArtifactContent">>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */
@@ -376,7 +397,7 @@ export interface ToolSession {
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
-	/** Parent cache identity for sibling sharing, only when the parent model opts in. */
+	/** Parent cache identity for sibling sharing; the child stores it independently of its initial model, and each request consumes it only when its own model opts in. */
 	getPromptCacheKey?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;

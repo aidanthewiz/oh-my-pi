@@ -7,6 +7,7 @@ import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import { oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -756,6 +757,52 @@ describe("ModelRegistry runtime discovery", () => {
 
 		expect(modelListCalls).toBe(1);
 		expect(registry.find("openai-codex", "runtime-codex-model")).toBeDefined();
+	});
+
+	test("Codex authoritative cache follows the complete account set and survives offline token expiry", async () => {
+		const credential = (accountId: string, access = `bearer-${accountId}`): OAuthCredentials & { type: "oauth" } => ({
+			type: "oauth",
+			accountId,
+			email: `${accountId}@example.test`,
+			access,
+			refresh: `refresh-${accountId}`,
+			expires: Date.now() + 3_600_000,
+		});
+		let rosterCalls = 0;
+		const fetcher: FetchImpl = async (_input, init) => {
+			rosterCalls++;
+			const accountId = new Headers(init?.headers).get("chatgpt-account-id");
+			return Response.json({
+				models: [{ slug: `codex-${accountId}`, display_name: `Account ${accountId}`, context_window: 123_456 }],
+			});
+		};
+		const registry = () => new ModelRegistry(authStorage, modelsJsonPath, { cacheDbPath, fetch: fetcher });
+		await authStorage.credentials.set("openai-codex", credential("scope-a"));
+		await registry().refreshProvider("openai-codex", "online");
+		await authStorage.credentials.set("openai-codex", [credential("scope-a"), credential("scope-b")]);
+		const expanded = registry();
+		await expanded.refreshProvider("openai-codex", "online-if-uncached");
+		expect(expanded.find("openai-codex", "codex-scope-a")?.contextWindow).toBe(123_456);
+		expect(expanded.find("openai-codex", "codex-scope-b")?.contextWindow).toBe(123_456);
+		const cacheBytes = fs.readFileSync(cacheDbPath).toString("latin1");
+		expect(cacheBytes.includes("bearer-scope-a")).toBe(false);
+		expect(cacheBytes.includes("bearer-scope-b")).toBe(false);
+		const callsBeforeRestart = rosterCalls;
+		await authStorage.credentials.set("openai-codex", [
+			{ ...credential("scope-b", "rotated-b"), expires: Date.now() - 1 },
+			{ ...credential("scope-a", "rotated-a"), expires: Date.now() - 1 },
+		]);
+		const restarted = registry();
+		await restarted.hydrateCredentialScopedModelCaches();
+		expect(restarted.find("openai-codex", "codex-scope-a")?.contextWindow).toBe(123_456);
+		expect(restarted.find("openai-codex", "codex-scope-b")?.contextWindow).toBe(123_456);
+		expect(rosterCalls).toBe(callsBeforeRestart);
+		await authStorage.credentials.set("openai-codex", credential("scope-a"));
+		const narrowed = registry();
+		await narrowed.hydrateCredentialScopedModelCaches();
+		expect(narrowed.find("openai-codex", "codex-scope-a")?.contextWindow).toBe(123_456);
+		expect(narrowed.find("openai-codex", "codex-scope-b")).toBeUndefined();
+		expect(rosterCalls).toBe(callsBeforeRestart);
 	});
 
 	test("Codex discovery follows a configured baseUrl and sends only the configured key there (#13830)", async () => {
@@ -1940,6 +1987,75 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(llama?.contextWindow).toBe(262144);
 		expect(llama?.maxTokens).toBe(262144);
 		expect(llama?.input).toEqual(["text", "image"]);
+	});
+
+	test("implicit llama.cpp discovery falls back to port 9931 when 8080 is unreachable", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url.startsWith("http://127.0.0.1:8080/")) {
+				throw new TypeError("Unable to connect");
+			}
+			if (url === "http://127.0.0.1:9931/models") {
+				return new Response(JSON.stringify({ data: [{ id: "gemma-3-4b" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:9931/props") {
+				return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 16384 } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("llama.cpp", "gemma-3-4b");
+		expect(model?.baseUrl).toBe("http://127.0.0.1:9931/v1");
+		expect(model?.contextWindow).toBe(16384);
+	});
+
+	test("implicit llama.cpp discovery reports a 9931 auth rejection as unauthenticated, not an 8080 outage", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url.startsWith("http://127.0.0.1:8080/")) {
+				throw new TypeError("Unable to connect");
+			}
+			if (url.startsWith("http://127.0.0.1:9931/")) {
+				return new Response("unauthorized", { status: 401 });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.getProviderDiscoveryState("llama.cpp")?.status).toBe("unauthenticated");
+	});
+
+	test("implicit llama.cpp discovery does not bypass a failing 8080 server for 9931", async () => {
+		const requested: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requested.push(url);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response("internal error", { status: 500 });
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response("internal error", { status: 500 });
+			}
+			if (url === "http://127.0.0.1:9931/models") {
+				return new Response(JSON.stringify({ data: [{ id: "other-server-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("llama.cpp", "other-server-model")).toBeUndefined();
+		expect(registry.getProviderDiscoveryState("llama.cpp")?.status).toBe("unavailable");
+		expect(requested.some(url => url.startsWith("http://127.0.0.1:9931/"))).toBe(false);
 	});
 
 	test("llama.cpp discovery routes Qwen models to chat-completions with the top-level disable dialect", async () => {
@@ -3392,6 +3508,87 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(unknown?.reasoning).toBe(false);
 	});
 
+	test("openai-models-list discovery marks advertised reasoning ladders reasoning-capable (codex-lb metadata shape)", async () => {
+		writeRawModelsJson({
+			"openai-test": {
+				baseUrl: "http://127.0.0.1:9994",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9994/v1/models") {
+				// codex-lb shape: the Codex registry nests `supported_reasoning_levels`
+				// and `default_reasoning_level` under `metadata`. `acme-think-1` has
+				// no bundled reference, so without advertised-level parsing it stays
+				// non-reasoning and requests never carry `reasoning_effort`.
+				return new Response(
+					JSON.stringify({
+						data: [
+							{
+								id: "acme-think-1",
+								object: "model",
+								owned_by: "codex-lb",
+								metadata: {
+									display_name: "Acme Think 1",
+									context_window: 272000,
+									input_modalities: ["text", "image"],
+									supported_reasoning_levels: [
+										{ effort: "low" },
+										{ effort: "medium" },
+										{ effort: "high" },
+										{ effort: "xhigh" },
+										{ effort: "max" },
+										{ effort: "ultra" },
+									],
+									default_reasoning_level: "medium",
+								},
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const advertised = registry.find("openai-test", "acme-think-1");
+		// The same metadata block carries the route's identity and window; the
+		// bundled-catalog fallback must not shadow what the server advertises.
+		expect(advertised?.name).toBe("Acme Think 1");
+		expect(advertised?.contextWindow).toBe(272_000);
+		expect(advertised?.input).toEqual(["text", "image"]);
+		expect(advertised?.reasoning).toBe(true);
+		expect(advertised?.thinking?.mode).toBe("effort");
+		expect(advertised?.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+		expect(advertised?.thinking?.defaultLevel).toBe(Effort.Medium);
+		const advertisedCompat = advertised?.compat as OpenAICompat | undefined;
+		expect(advertisedCompat?.supportsReasoningEffort).toBe(true);
+		if (!advertised || advertised.api !== "openai-completions") {
+			throw new Error("expected the discovered model to use OpenAI Completions");
+		}
+		// A request at effort `high` carries the wire effort.
+		let requestPayload: Record<string, unknown> | undefined;
+		const chatFetch: FetchImpl = async (input, init) => {
+			requestPayload = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+			const events = [
+				{ id: "chatcmpl-advertised-fixture", choices: [{ index: 0, delta: { role: "assistant", content: "OK" } }] },
+				{ id: "chatcmpl-advertised-fixture", choices: [{ index: 0, finish_reason: "stop", delta: {} }] },
+			];
+			const body = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\ndata: [DONE]\n\n`;
+			return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+		};
+		await streamOpenAICompletions(
+			advertised as Model<"openai-completions">,
+			{ messages: [{ role: "user", content: "Reply with exactly OK.", timestamp: Date.now() }] },
+			{ apiKey: "TEST_KEY", fetch: chatFetch, reasoning: "high" },
+		).result();
+		expect(requestPayload?.reasoning_effort).toBe("high");
+	});
+
 	test("openai-models-list discovery reads server-advertised input modalities for ids absent from the catalog", async () => {
 		writeRawModelsJson({
 			"openai-test": {
@@ -4110,6 +4307,58 @@ describe("ModelRegistry runtime discovery", () => {
 			"keep-responses",
 			"keep-unknown",
 		]);
+	});
+
+	test("configured litellm discovery routes decisions-mode groups to the judge role on both paths (#16939)", async () => {
+		writeRawModelsJson({
+			"litellm-rich": {
+				baseUrl: "http://127.0.0.1:4012/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+			"litellm-fallback": {
+				baseUrl: "http://127.0.0.1:4013/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4012/model_group/info") {
+				return Response.json({
+					data: [
+						{
+							model_group: "typesafe/jev-1.14",
+							mode: "decisions",
+							providers: ["typesafe"],
+							supports_vision: false,
+						},
+						{ model_group: "keep-chat", mode: "chat", providers: ["anthropic"], supports_vision: false },
+					],
+				});
+			}
+			if (url === "http://127.0.0.1:4013/v1/models") {
+				return Response.json({
+					data: [
+						{ id: "typesafe/jev-1.14", mode: "decisions" },
+						{ id: "keep-chat", mode: "chat" },
+					],
+				});
+			}
+			return new Response("Not Found", { status: 404 });
+		};
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		for (const provider of ["litellm-rich", "litellm-fallback"]) {
+			expect(registry.find(provider, "typesafe/jev-1.14")).toMatchObject({ api: "openai-decisions", kind: "judge" });
+			const chat = registry.find(provider, "keep-chat");
+			expect(chat?.api).toBe("openai-completions");
+			expect(chat?.kind).toBeUndefined();
+		}
 	});
 
 	test("litellm discovery reuses configured bearer on rich and fallback requests", async () => {

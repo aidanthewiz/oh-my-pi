@@ -63,8 +63,14 @@ describe("browser handle enrichment — fill()", () => {
 					matches: () => false,
 				});
 			},
-			type: async (text: string) => {
-				node.value += text;
+			frame: {
+				page: () => ({
+					keyboard: {
+						type: async (text: string) => {
+							node.value += text;
+						},
+					},
+				}),
 			},
 		} as unknown as ElementHandle;
 

@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, AppendOnlyContextManager } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -11,6 +12,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { cfgSessionMaxCost } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { assistantMsg } from "./utilities";
 
@@ -108,6 +110,83 @@ describe("AgentSession.newSession boundary", () => {
 
 		expect(session.sessionId).not.toBe(previousSessionId);
 		expect(session.sessionId).toBe(sessionManager.getSessionId());
+	});
+
+	it("keeps unpersisted tree spend when reloading the same session", async () => {
+		const { session, sessionManager } = await createHarness();
+		cfgSessionMaxCost.override(session.settings, 1);
+		session.costGate.record(1);
+		await sessionManager.ensureOnDisk();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected current session file");
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+
+		expect(session.costGate.check()).toMatchObject({ spent: 1, cap: 1 });
+		expect(() => session.costGate.admit()).toThrow("Cost cap reached");
+	});
+
+	it("restores the outgoing budget when a loaded session switch rolls back", async () => {
+		const { agent, session, sessionManager } = await createHarness();
+		cfgSessionMaxCost.override(session.settings, 1);
+		session.costGate.record(1);
+		await sessionManager.ensureOnDisk();
+		const previousId = sessionManager.getSessionId();
+		const previousFile = sessionManager.getSessionFile();
+		if (!previousFile) throw new Error("Expected current session file");
+		const target = SessionManager.create(sessionManager.getCwd(), path.dirname(previousFile));
+		await target.ensureOnDisk();
+		const targetFile = target.getSessionFile();
+		if (!targetFile) throw new Error("Expected target session file");
+		await target.close();
+		const replace = spyOn(agent, "replaceMessages").mockImplementationOnce(() => {
+			throw new Error("Target context rejected");
+		});
+		try {
+			await expect(session.switchSession(targetFile)).rejects.toThrow("Target context rejected");
+			expect(sessionManager.getSessionId()).toBe(previousId);
+			expect(session.costGate.check()).toMatchObject({ spent: 1, cap: 1 });
+			expect(() => session.costGate.admit()).toThrow("Cost cap reached");
+		} finally {
+			replace.mockRestore();
+		}
+	});
+
+	it("retires the outgoing budget once a new transcript commits even if its prompt refresh fails", async () => {
+		const { session, sessionManager } = await createHarness();
+		cfgSessionMaxCost.override(session.settings, 1);
+		session.costGate.record(1);
+		const previousId = sessionManager.getSessionId();
+		const refresh = spyOn(session, "refreshBaseSystemPrompt").mockRejectedValueOnce(new Error("Refresh failed"));
+		try {
+			await expect(session.newSession()).rejects.toThrow("Refresh failed");
+			expect(sessionManager.getSessionId()).not.toBe(previousId);
+			expect(session.costGate.spent).toBe(0);
+			expect(session.costGate.check()).toBeUndefined();
+		} finally {
+			refresh.mockRestore();
+		}
+	});
+
+	it("keeps the /delete successor lazy so quitting leaves no empty session", async () => {
+		const { session, sessionManager } = await createHarness();
+		await sessionManager.ensureOnDisk();
+		const droppedSessionFile = sessionManager.getSessionFile();
+		expect(droppedSessionFile).toBeDefined();
+		expect(fs.existsSync(droppedSessionFile!)).toBe(true);
+
+		expect(await session.newSession({ drop: true })).toBe(true);
+
+		expect(fs.existsSync(droppedSessionFile!)).toBe(false);
+		const successorSessionFile = sessionManager.getSessionFile();
+		expect(successorSessionFile).toBeDefined();
+		expect(successorSessionFile).not.toBe(droppedSessionFile);
+		expect(sessionManager.isSessionOnDisk()).toBe(false);
+		expect(fs.existsSync(successorSessionFile!)).toBe(false);
+
+		// A zero-turn quit must not materialize the successor either.
+		await session.dispose();
+		expect(fs.existsSync(successorSessionFile!)).toBe(false);
 	});
 
 	it("keeps old-session messages out of the new session when notifications finish late", async () => {

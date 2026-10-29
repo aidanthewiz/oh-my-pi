@@ -1785,5 +1785,6 @@ describe("AgentSession aside delivery", () => {
 		);
 		expect(noticeIndex).toBeGreaterThanOrEqual(0);
 		expect(noticeIndex).toBeLessThan(userIndex);
+		expect(mock.calls.length).toBe(2);
 	});
 });

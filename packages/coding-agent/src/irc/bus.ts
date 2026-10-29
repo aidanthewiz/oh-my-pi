@@ -60,6 +60,8 @@ export class IrcBus {
 	readonly #lastSent = new Map<string, Map<string, SendMark>>();
 	/** The latest direct (non-broadcast) send per `from` → `to`; see {@link unansweredSends}. */
 	readonly #lastDirect = new Map<string, Map<string, SendMark>>();
+	/** The latest accepted task result per agent → owner. */
+	readonly #lastJobReply = new Map<string, Map<string, SendMark>>();
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
 	#sendSeq = 0;
 
@@ -109,20 +111,47 @@ export class IrcBus {
 			mark.toFile = ref.sessionFile;
 		});
 		if (receipt.outcome !== "failed" && this.#markCurrent(message.from, message.to, mark)) {
-			this.#record(this.#lastSent, message, mark);
-			if (!message.broadcast && !message.wakeRelay) this.#record(this.#lastDirect, message, mark);
+			this.#record(this.#lastSent, message.from, message.to, mark);
+			if (!message.broadcast && !message.wakeRelay) this.#record(this.#lastDirect, message.from, message.to, mark);
 		}
 		return receipt;
 	}
 
-	#record(table: Map<string, Map<string, SendMark>>, message: IrcMessage, mark: SendMark): void {
-		let sent = table.get(message.from);
+	#record(table: Map<string, Map<string, SendMark>>, from: string, to: string, mark: SendMark): void {
+		let sent = table.get(from);
 		if (!sent) {
 			sent = new Map();
-			table.set(message.from, sent);
+			table.set(from, sent);
 		}
 		// Deliveries can settle out of order; keep the latest send.
-		if ((sent.get(message.to)?.seq ?? 0) < mark.seq) sent.set(message.to, mark);
+		if ((sent.get(to)?.seq ?? 0) < mark.seq) sent.set(to, mark);
+	}
+
+	/** Captures the originating refs before work starts; commit only an accepted result. */
+	captureReply(from: AgentRef, to: AgentRef): () => void {
+		const fromSession = from.session;
+		const toSession = to.session;
+		const toRunId = toSession?.lifecycleState?.runId;
+		const mark: SendMark = {
+			ts: 0,
+			seq: 0,
+			fromRef: new WeakRef(from),
+			fromSessionId: fromSession?.sessionManager?.getSessionId(),
+			fromFile: from.sessionFile,
+			toRef: new WeakRef(to),
+			toSessionId: toSession?.sessionManager?.getSessionId(),
+			toFile: to.sessionFile,
+		};
+		let committed = false;
+		return () => {
+			if (committed || to.session !== toSession || toSession?.lifecycleState?.runId !== toRunId) return;
+			mark.fromRunId = fromSession?.lifecycleState?.runId;
+			if (!this.#markCurrent(from.id, to.id, mark)) return;
+			committed = true;
+			mark.ts = Date.now();
+			mark.seq = ++this.#sendSeq;
+			this.#record(this.#lastJobReply, from.id, to.id, mark);
+		};
 	}
 
 	#markCurrent(from: string, to: string, mark: SendMark): boolean {
@@ -155,10 +184,10 @@ export class IrcBus {
 
 	/**
 	 * Agents `from` messaged directly at or after `sinceTs` that have sent
-	 * nothing back since, with when the latest of those messages went out:
-	 * the replies a `wait` can block for. "Since" is by send order, not
-	 * timestamp, so an answer to an earlier question never settles a later one
-	 * sent within the same millisecond.
+	 * nothing back since, nor settled a job `from` owns, with when the latest
+	 * of those messages went out: the replies a `wait` can block for. "Since"
+	 * is by send order, not timestamp, so an answer to an earlier question
+	 * never settles a later one sent within the same millisecond.
 	 */
 	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number }> {
 		const sends = this.#lastDirect.get(from);
@@ -166,9 +195,11 @@ export class IrcBus {
 		const unanswered: Array<{ to: string; sentAt: number }> = [];
 		for (const [to, sent] of sends) {
 			if (sent.ts < sinceTs || !this.#markCurrent(from, to, sent)) continue;
-			const reply = this.#lastSent.get(to)?.get(from);
-			if (reply === undefined || !this.#markCurrent(to, from, reply) || reply.seq < sent.seq)
-				unanswered.push({ to, sentAt: sent.ts });
+			const answered = [this.#lastSent, this.#lastJobReply].some(replies => {
+				const reply = replies.get(to)?.get(from);
+				return reply !== undefined && this.#markCurrent(to, from, reply) && reply.seq > sent.seq;
+			});
+			if (!answered) unanswered.push({ to, sentAt: sent.ts });
 		}
 		return unanswered;
 	}

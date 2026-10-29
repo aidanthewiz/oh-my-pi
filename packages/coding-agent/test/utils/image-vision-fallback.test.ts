@@ -10,6 +10,7 @@ import {
 	type DescribeAttachedImagesDeps,
 	describeAttachedImagesForTextModel,
 } from "@oh-my-pi/pi-coding-agent/utils/image-vision-fallback";
+import { CostGate } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 // 1x1 transparent PNG.
@@ -108,6 +109,51 @@ describe("describeAttachedImagesForTextModel", () => {
 		const fileName = match![1].slice("local://".length);
 		const saved = await fs.readFile(path.join(testDir, "local", fileName));
 		expect(saved.toString("base64")).toBe(TINY_PNG_BASE64);
+	});
+
+	it("counts each description against the session's cost cap and describes nothing at it", async () => {
+		const stub = makeCompleteStub("A man holding a red balloon.");
+		const billed = (async (...args: Parameters<typeof completeSimple>) => {
+			const message = await stub.fn(...args);
+			message.usage.cost.total = 1.2;
+			return message;
+		}) as typeof completeSimple;
+		const costGate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		const deps = { ...makeDeps(testDir, [textModel, visionModel], billed), costGate };
+		const image = { type: "image" as const, data: TINY_PNG_BASE64, mimeType: "image/png" };
+
+		await describeAttachedImagesForTextModel([image], deps);
+		expect(costGate.spent).toBe(1.2);
+		const capped = await describeAttachedImagesForTextModel([image], deps);
+
+		expect(stub.calls).toHaveLength(1);
+		expect(capped[0]!.text).not.toContain("red balloon");
+	});
+
+	it("refuses image dispatch when another request reaches the cap during admission", async () => {
+		const gate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		const stub = makeCompleteStub("must not be dispatched");
+		let dispatched = false;
+		const deps = makeDeps(testDir, [textModel, visionModel], (async (model, context, options) => {
+			await options?.onPayload?.({}, model, options.signal);
+			dispatched = true;
+			return stub.fn(model, context, options);
+		}) as typeof completeSimple);
+		deps.costGate = gate;
+		deps.prepareStreamOptions = () => ({
+			onPayload: async payload => {
+				await Promise.resolve();
+				gate.record(1);
+				return payload;
+			},
+		});
+		const blocks = await describeAttachedImagesForTextModel(
+			[{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }],
+			deps,
+		);
+		expect(dispatched).toBe(false);
+		expect(gate.spent).toBe(1);
+		expect(blocks[0]!.text).toContain("Image description unavailable");
 	});
 
 	it("saves the image but emits a no-vision note when no vision model is available", async () => {
