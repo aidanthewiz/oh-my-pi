@@ -210,6 +210,76 @@ export async function copySessionArtifacts(sourceSessionFile: string, destinatio
 	}
 }
 
+function isUnsupportedArtifactLink(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS" || code === "EXDEV" || code === "EPERM";
+}
+
+async function publishStructuredPrimary(
+	staged: string,
+	destination: string,
+	expectedGeneration: string,
+): Promise<{ generation: string; ctimeNs: bigint } | undefined> {
+	try {
+		await fs.promises.link(staged, destination);
+		const published = await fs.promises.lstat(destination, { bigint: true });
+		if (!published.isFile() || artifactFileGeneration(published) !== expectedGeneration) return undefined;
+		return { generation: expectedGeneration, ctimeNs: published.ctimeNs };
+	} catch (error) {
+		if (isEexist(error)) return undefined;
+		if (!isUnsupportedArtifactLink(error)) throw error;
+	}
+	const source = await fs.promises.open(staged, "r");
+	let output: fs.promises.FileHandle | undefined;
+	try {
+		const before = await source.stat({ bigint: true });
+		if (!before.isFile() || artifactFileGeneration(before) !== expectedGeneration) {
+			throw new Error(`Structured artifact staging changed: ${staged}`);
+		}
+		try {
+			output = await fs.promises.open(destination, "wx", Number(before.mode & 0o777n));
+		} catch (error) {
+			if (isEexist(error)) return undefined;
+			throw error;
+		}
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		let position = 0;
+		for (;;) {
+			const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+			if (bytesRead === 0) break;
+			let written = 0;
+			while (written < bytesRead) {
+				const { bytesWritten } = await output.write(buffer, written, bytesRead - written, position + written);
+				if (bytesWritten === 0) throw new Error(`Structured artifact copy made no progress: ${destination}`);
+				written += bytesWritten;
+			}
+			position += bytesRead;
+		}
+		const [after, published, named] = await Promise.all([
+			source.stat({ bigint: true }),
+			output.stat({ bigint: true }),
+			fs.promises.lstat(destination, { bigint: true }).catch(error => {
+				if (isEnoent(error)) return undefined;
+				throw error;
+			}),
+		]);
+		if (artifactFileGeneration(after) !== expectedGeneration || after.ctimeNs !== before.ctimeNs) {
+			throw new Error(`Structured artifact staging changed: ${staged}`);
+		}
+		const generation = artifactFileGeneration(published);
+		if (
+			!named?.isFile() ||
+			artifactFileGeneration(named) !== generation ||
+			named.ctimeNs !== published.ctimeNs ||
+			published.size !== BigInt(position)
+		)
+			return undefined;
+		return { generation, ctimeNs: published.ctimeNs };
+	} finally {
+		await Promise.all([source.close(), output?.close()]);
+	}
+}
+
 async function copyBoundStructuredArtifact(from: string, to: string): Promise<boolean> {
 	const sourceSidecar = `${from.slice(0, -3)}.json`;
 	const destinationSidecar = `${to.slice(0, -3)}.json`;
@@ -258,21 +328,33 @@ async function copyBoundStructuredArtifact(from: string, to: string): Promise<bo
 			)
 				throw new Error(`Structured artifact changed while copying: ${from}`);
 			const copiedGeneration = artifactFileGeneration(await fs.promises.stat(stagedPrimary, { bigint: true }));
+			const publication = await publishStructuredPrimary(stagedPrimary, to, copiedGeneration);
+			if (!publication) return true;
 			await fs.promises.writeFile(
 				stagedSidecar,
-				serializeStructuredArtifactSidecar(JSON.stringify(envelope.data), copiedGeneration),
+				serializeStructuredArtifactSidecar(JSON.stringify(envelope.data), publication.generation),
 				{ flag: "wx", mode: 0o600 },
 			);
-			try {
-				await fs.promises.link(stagedPrimary, to);
-			} catch (error) {
-				if (isEexist(error)) return true;
+			const current = await fs.promises.lstat(to, { bigint: true }).catch(error => {
+				if (isEnoent(error)) return undefined;
 				throw error;
-			}
+			});
+			if (
+				!current?.isFile() ||
+				artifactFileGeneration(current) !== publication.generation ||
+				current.ctimeNs !== publication.ctimeNs
+			)
+				return true;
 			try {
 				await fs.promises.link(stagedSidecar, destinationSidecar);
 			} catch (error) {
-				if (!isEexist(error)) throw error;
+				if (isEexist(error)) return true;
+				if (!isUnsupportedArtifactLink(error)) throw error;
+				try {
+					await fs.promises.copyFile(stagedSidecar, destinationSidecar, fs.constants.COPYFILE_EXCL);
+				} catch (copyError) {
+					if (!isEexist(copyError)) throw copyError;
+				}
 			}
 			return true;
 		} finally {

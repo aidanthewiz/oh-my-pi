@@ -217,6 +217,104 @@ describe("structured fork artifacts", () => {
 		expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe(markdown);
 		expect(await readStructuredArtifact(destination, "Worker")).toEqual({ generation: "destination" });
 	});
+
+	it("preserves structured results and later artifacts through a fork without hard links", async () => {
+		using root = TempDir.createSync("@omp-linkless-fork-");
+		const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const data = { invalidForSchema: "complete submitted data".repeat(10_000), sentinel: "beyond the preview" };
+		const markdown = "Schema validation failed. Submitted preview only.";
+		for (const id of ["Worker", "nested/Worker"])
+			await writeStructuredArtifact(sourceArtifactsDir, id, data, markdown);
+		const unsupported = vi
+			.spyOn(promises, "link")
+			.mockRejectedValue(Object.assign(new Error("Filesystem has no hard links"), { code: "ENOTSUP" }));
+		let forkFile: string;
+		try {
+			const fork = await SessionManager.forkFrom(sourceFile, cwd, sessionDir);
+			forkFile = fork.getSessionFile()!;
+			try {
+				fork.appendMessage({ role: "user", content: "Retain the linkless fork", timestamp: 1 });
+				await fork.flush();
+				const destination = fork.getArtifactsDir()!;
+				for (const id of ["Worker", "nested/Worker"]) {
+					expect(await fs.readFile(path.join(destination, `${id}.md`), "utf8")).toBe(markdown);
+					expect(await readStructuredArtifact(destination, id)).toEqual(data);
+					expect(await readStructuredArtifact(sourceArtifactsDir, id)).toEqual(data);
+				}
+				expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+				expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
+			} finally {
+				await fork.close();
+			}
+		} finally {
+			unsupported.mockRestore();
+		}
+		const reopened = await SessionManager.open(forkFile, sessionDir);
+		try {
+			expect(await readStructuredArtifact(reopened.getArtifactsDir()!, "Worker")).toEqual(data);
+			expect(await readStructuredArtifact(reopened.getArtifactsDir()!, "nested/Worker")).toEqual(data);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("preserves occupied primary and sidecar owners without hard links", async () => {
+		using root = TempDir.createSync("@omp-linkless-occupied-");
+		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, "Source preview");
+		await writeStructuredArtifact(sourceArtifactsDir, "JsonOnly", { generation: "source" }, "Source preview");
+		const destinationFile = path.join(sessionDir, "occupied-linkless.jsonl"),
+			destination = destinationFile.slice(0, -6);
+		await writeStructuredArtifact(destination, "Worker", { generation: "destination" }, "Newer destination");
+		await fs.writeFile(path.join(destination, "JsonOnly.json"), "Destination-owned sidecar");
+		const unsupported = vi
+			.spyOn(promises, "link")
+			.mockRejectedValue(Object.assign(new Error("Filesystem has no hard links"), { code: "ENOTSUP" }));
+		try {
+			await copySessionArtifacts(sourceFile, destinationFile);
+		} finally {
+			unsupported.mockRestore();
+		}
+		expect(await fs.readFile(path.join(destination, "Worker.md"), "utf8")).toBe("Newer destination");
+		expect(await readStructuredArtifact(destination, "Worker")).toEqual({ generation: "destination" });
+		expect(await fs.readFile(path.join(destination, "JsonOnly.json"), "utf8")).toBe("Destination-owned sidecar");
+		expect(await readStructuredArtifact(destination, "JsonOnly")).toBeUndefined();
+		expect(await fs.readFile(path.join(destination, "nested/result.txt"), "utf8")).toBe("nested output");
+	});
+
+	it("never binds a linkless copy to a replacement primary with the same Markdown", async () => {
+		using root = TempDir.createSync("@omp-linkless-replacement-");
+		const { sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(root.path());
+		const markdown = "Identical shortened schema-error preview";
+		await writeStructuredArtifact(sourceArtifactsDir, "Worker", { generation: "source" }, markdown);
+		const destinationFile = path.join(sessionDir, "racing-linkless.jsonl"),
+			destination = destinationFile.slice(0, -6);
+		await fs.mkdir(destination);
+		const namedPrimary = path.join(destination, "Worker.md");
+		const lstat = promises.lstat;
+		let replaced = false;
+		const unsupported = vi
+			.spyOn(promises, "link")
+			.mockRejectedValue(Object.assign(new Error("Filesystem has no hard links"), { code: "ENOTSUP" }));
+		const inspect = vi.spyOn(promises, "lstat").mockImplementation((async (...args: Parameters<typeof lstat>) => {
+			if (!replaced && String(args[0]).endsWith(path.join("racing-linkless", "Worker.md"))) {
+				replaced = true;
+				await fs.writeFile(`${namedPrimary}.new`, markdown);
+				await fs.rename(`${namedPrimary}.new`, namedPrimary);
+			}
+			return lstat(...args);
+		}) as typeof lstat);
+		try {
+			await copySessionArtifacts(sourceFile, destinationFile);
+		} finally {
+			inspect.mockRestore();
+			unsupported.mockRestore();
+		}
+		expect(replaced).toBe(true);
+		expect(await fs.readFile(namedPrimary, "utf8")).toBe(markdown);
+		expect(await readStructuredArtifact(destination, "Worker")).toBeUndefined();
+		expect(await fs.readFile(path.join(destination, "1.read.log"), "utf8")).toBe("tool output");
+	});
 });
 
 describe("SessionManager.forkFrom", () => {

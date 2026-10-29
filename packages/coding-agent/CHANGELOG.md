@@ -17,7 +17,7 @@
 - Refuse conflict blocks whose closing line was cut by the scan byte cap. Resume ranged reads from unfinished openers while preserving complete prefix blocks.
 - Preserve provider-computed cache-warming charges, including partial responses and authoritative zero. Recheck final payload TTL, extension policy and cancellation before paid refreshes.
 - Show each selected settings option's complete description at narrow widths, including cache-retention prices. Preserve previews and confirmation-only selection.
-- Preserve complete structured task results when copying session artifacts. Keep generation binding and newer destination files. Reject stale source sidecars.
+- Preserve complete structured task results when copying session artifacts, including filesystems without hard links. Keep generation binding and newer destination files. Reject stale source sidecars.
 - Finish initial model discovery before headless commands capture session ownership. Keep browser authorization limited to explicit host consent.
 - Keep deferred extension tools and source metadata bound to the active registration. Roll back failed activations without replacing newer tools or prompts. Preserve surviving event policies and shutdown cleanup during extension changes.
 - Return promptly from cancelled MCP logins while preventing conflicting logins until pending work settles. Keep accepted credential persistence serialized.
