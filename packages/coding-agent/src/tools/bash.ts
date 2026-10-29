@@ -746,7 +746,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly loadMode = "essential";
 	get description(): string {
 		const evalBackends = resolveEvalBackends(this.session);
-		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
+		const isToolActive = (name: string, fallback: boolean): boolean =>
+			this.session.isToolActiveForPrompt?.(name) ?? fallback;
 		return prompt.render(bashDescription, {
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			// The deadline an omitted `timeout` resolves to, after the `tools.maxTimeout` cap.
@@ -757,7 +758,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasAstEdit: isToolActive("ast_edit", cfgAstEditEnabled.get(this.session.settings)),
 			hasGrep: isToolActive("grep", cfgGrepEnabled.get(this.session.settings)),
 			hasGlob: isToolActive("glob", cfgGlobEnabled.get(this.session.settings)),
-			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
+			hasFind: isToolActive("find", isFindEnabled(this.session)),
 			hasRead: isToolActive("read", true),
 			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
 			// building a bare ToolSession lack the rebuild lifecycle, so fall back
@@ -765,7 +766,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasSkills:
 				(this.session.skillHintVisible ??
 					(cfgSkillful.get(this.session.settings) && (this.session.skills?.length ?? 0) > 0)) === true,
-			hasLaunch: this.#launchEnabled,
+			hasLaunch: cfgLaunchEnabled.get(this.session.settings) === true && isToolActive("bash", true),
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
 			isWindows: process.platform === "win32",
@@ -774,7 +775,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	/** Schema variant for the live `async.enabled` and `launch.enabled` settings. */
 	get parameters(): BashToolSchema {
 		const asyncEnabled = cfgAsyncEnabled.get(this.session.settings);
-		if (this.#launchEnabled) return asyncEnabled ? bashSchemaWithAsyncAndService : bashSchemaWithService;
+		if (
+			cfgLaunchEnabled.get(this.session.settings) === true &&
+			(this.session.isToolActiveForPrompt?.("bash") ?? true)
+		)
+			return asyncEnabled ? bashSchemaWithAsyncAndService : bashSchemaWithService;
 		return asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
 	}
 	// Non-pty calls run alongside each other (the executor isolates overlapping

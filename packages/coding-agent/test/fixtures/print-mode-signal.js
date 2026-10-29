@@ -15,6 +15,11 @@ const session = {
 		onPersistenceNotice: () => () => {},
 	},
 	disableStopTimeTodoReminders() {},
+	getLastAssistantMessage: () => undefined,
+	prepareForHeadlessAdvisorDrain() {},
+	async waitForAdvisorCatchup() {
+		return true;
+	},
 	setTextOutputCommitted() {},
 	async waitForIdle() {},
 	async prompt() {

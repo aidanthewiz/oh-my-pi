@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort, type FetchImpl } from "@oh-my-pi/pi-ai";
+import { Effort, streamSimple, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -19,8 +19,17 @@ import {
 } from "@oh-my-pi/pi-coding-agent/main";
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	getRetryFallbackRole,
+	installRetryFallbackRole,
+	type RetryFallbackRole,
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 import { compactionThresholdSettings, createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -1322,6 +1331,214 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+
+	test("keeps an explicitly empty inherited chain empty for a deferred singleton sharing the default model", async () => {
+		const primary = "runtime-provider/runtime-model";
+		const fallback = "runtime-provider/runtime-fallback-model";
+		const role = "subagent:deferred-empty";
+		const ownerSettings = () => {
+			const settings = Settings.isolated({ "retry.fallbackChains": { default: [fallback] } });
+			settings.setModelRole("default", primary);
+			return settings;
+		};
+		// Live chain lookup on the primary: the persisted role must win over `default`, which shares the model.
+		const chainFor = (session: AgentSession) => {
+			const recovery = new TurnRecovery({
+				model: () => session.model,
+				thinkingLevel: () => undefined,
+				sessionManager: session.sessionManager,
+				settings: session.settings,
+				modelRegistry: session.modelRegistry,
+				configWarnings: [],
+			} as unknown as TurnRecoveryHost);
+			const keys = recovery.retryFallbackChainKeys(primary);
+			const candidates = keys.flatMap(key =>
+				recovery.findRetryFallbackCandidates(key, primary).map(candidate => candidate.raw),
+			);
+			return { keys, candidates };
+		};
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const { session } = await createAgentSession({
+			...buildSessionOptions(primary),
+			settings: ownerSettings(),
+			sessionManager,
+			modelPatternFallbackRole: role,
+			modelPatternDefaultFallbackChain: [],
+		});
+
+		let retryFallback: RetryFallbackRole | undefined;
+		try {
+			expect(chainFor(session)).toEqual({ keys: [role], candidates: [] });
+
+			// A runtime fallback answers; resume must still restore the primary as the default.
+			session.sessionManager.appendModelChange(fallback, EPHEMERAL_MODEL_CHANGE_ROLE, true);
+			session.sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				api: "openai-completions",
+				provider: "runtime-provider",
+				model: "runtime-fallback-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+			const context = session.sessionManager.buildSessionContext();
+			expect(getRestorableSessionModels(context.models, session.sessionManager.getLastModelChangeRole())).toEqual([
+				primary,
+			]);
+
+			// Switching back to the primary is temporary too; the role's empty chain must still own it.
+			session.sessionManager.appendModelChange(primary, EPHEMERAL_MODEL_CHANGE_ROLE);
+			expect(chainFor(session)).toEqual({ keys: [role], candidates: [] });
+			retryFallback = getRetryFallbackRole(session.settings, role);
+		} finally {
+			await session.dispose();
+		}
+		if (!retryFallback) throw new Error("Expected the deferred role's retry fallback");
+
+		// Cold revival reopens the transcript and reinstalls the persisted role before resuming.
+		const reviveSettings = ownerSettings();
+		installRetryFallbackRole(reviveSettings, role, retryFallback);
+		const { session: revived } = await createAgentSession({
+			...buildSessionOptions(primary),
+			settings: reviveSettings,
+			sessionManager: await SessionManager.open(sessionFile, undefined, undefined, { throwIfMissing: true }),
+		});
+		try {
+			expect(`${revived.model?.provider}/${revived.model?.id}`).toBe(primary);
+			expect(chainFor(revived)).toEqual({ keys: [role], candidates: [] });
+		} finally {
+			await revived.dispose();
+		}
+	});
+
+	test.each(["empty", "absent", "exact", "wildcard"] as const)(
+		"dispatches provider failures under the %s deferred chain across temporary hops and cold reopening",
+		async policy => {
+			const primary = "runtime-provider/runtime-model";
+			const fallback = "runtime-provider/runtime-fallback-model";
+			const role = "subagent:dispatch-empty";
+			const requested: string[] = [];
+			const fetch: FetchImpl = async (_input, init) => {
+				const body = JSON.parse(String(init?.body)) as { model: string };
+				requested.push(body.model);
+				if (body.model === "runtime-model") {
+					return new Response(
+						JSON.stringify({ error: { message: "provider overloaded", type: "server_error" } }),
+						{
+							status: 503,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				const chunk = {
+					id: "chatcmpl-deferred-fallback",
+					choices: [{ index: 0, delta: { content: "fallback recovered" }, finish_reason: "stop" }],
+				};
+				return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
+					headers: { "content-type": "text/event-stream" },
+				});
+			};
+			const extension: ExtensionFactory = pi => {
+				pi.registerProvider("runtime-provider", {
+					baseUrl: "https://runtime.example.com/v1",
+					apiKey: "synthetic-deferred-key",
+					api: "deferred-chain-test",
+					streamSimple: (model, context, options) =>
+						streamSimple({ ...model, api: "openai-completions" } as Model<"openai-completions">, context, {
+							...options,
+							fetch,
+							maxHttpAttempts: 1,
+						}),
+					models: ["runtime-model", "runtime-fallback-model"].map(id => ({
+						id,
+						name: id,
+						reasoning: false,
+						input: ["text"] as ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128000,
+						maxTokens: 8192,
+					})),
+				});
+			};
+			const ownerSettings = () => {
+				const settings = Settings.isolated({
+					"compaction.enabled": false,
+					"retry.baseDelayMs": 1,
+					"retry.maxRetries": 0,
+					"retry.modelFallback": true,
+					"retry.fallbackChains": {
+						default: [fallback],
+						...(policy === "exact" ? { [primary]: [fallback] } : {}),
+						...(policy === "wildcard" ? { "runtime-provider/*": [fallback] } : {}),
+					},
+				});
+				settings.setModelRole("default", primary);
+				return settings;
+			};
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted dispatch session");
+			const open = (settings: Settings, sessionManager: SessionManager, revive = false) =>
+				createAgentSession({
+					...buildSessionOptions(primary),
+					modelPattern: revive ? undefined : primary,
+					extensions: [extension],
+					settings,
+					sessionManager,
+					modelPatternFallbackRole: role,
+					...(policy !== "absent" ? { modelPatternDefaultFallbackChain: [] } : {}),
+				});
+			const checkDispatch = async (session: AgentSession) => {
+				requested.length = 0;
+				await session.prompt("Exercise the synthetic overloaded primary");
+				expect(requested).toEqual(
+					policy === "empty" ? ["runtime-model"] : ["runtime-model", "runtime-fallback-model"],
+				);
+				const last = session.messages.at(-1);
+				expect(last?.role).toBe("assistant");
+				if (last?.role !== "assistant") throw new Error("Expected assistant result");
+				expect(last.stopReason).toBe(policy === "empty" ? "error" : "stop");
+				if (policy !== "empty") expect(last.content).toContainEqual({ type: "text", text: "fallback recovered" });
+			};
+			let retryFallback: RetryFallbackRole | undefined;
+			const { session } = await open(ownerSettings(), manager);
+			try {
+				await checkDispatch(session);
+				const hop = session.modelRegistry.find("runtime-provider", "runtime-fallback-model");
+				const original = session.modelRegistry.find("runtime-provider", "runtime-model");
+				if (!hop || !original) throw new Error("Expected runtime fixture models");
+				await session.setModel(hop, EPHEMERAL_MODEL_CHANGE_ROLE, { persist: false });
+				await session.setModel(original, EPHEMERAL_MODEL_CHANGE_ROLE, { persist: false });
+				await checkDispatch(session);
+				retryFallback = getRetryFallbackRole(session.settings, role);
+			} finally {
+				await session.dispose();
+			}
+			const settings = ownerSettings();
+			if (retryFallback) installRetryFallbackRole(settings, role, retryFallback);
+			const { session: revived } = await open(
+				settings,
+				await SessionManager.open(sessionFile, undefined, undefined, { throwIfMissing: true }),
+				true,
+			);
+			try {
+				expect(`${revived.model?.provider}/${revived.model?.id}`).toBe(primary);
+				await checkDispatch(revived);
+			} finally {
+				await revived.dispose();
+			}
+		},
+	);
 
 	test("splits deferred comma-delimited modelPattern and installs fallback chain", async () => {
 		const { session } = await createAgentSession({

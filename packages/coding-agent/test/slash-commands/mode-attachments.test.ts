@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext, SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 type Attachments = Pick<SubmittedUserInput, "images" | "imageLinks">;
 
@@ -37,6 +38,10 @@ function createHarness(
 		},
 	};
 	const showError = vi.fn();
+	const sessionManager = {
+		getSessionId: () => "mode-attachments-main",
+		putBlob: vi.fn(async () => ({ displayPath: "file:///replacement.png" })),
+	};
 	const ctx = {
 		editor,
 		planModeEnabled: false,
@@ -47,6 +52,11 @@ function createHarness(
 		skillCommands: new Map(),
 		fileSlashCommands: new Set(),
 		session: {
+			...createSessionDefaults(),
+			sessionManager,
+			get sessionId() {
+				return sessionManager.getSessionId();
+			},
 			isStreaming: false,
 			isCompacting: false,
 			queuedMessageCount: 0,
@@ -58,9 +68,7 @@ function createHarness(
 				getCommand: () => undefined,
 			},
 		},
-		sessionManager: {
-			putBlob: vi.fn(async () => ({ displayPath: "file:///replacement.png" })),
-		},
+		sessionManager,
 		focusedAgentId: undefined,
 		collabGuest: undefined,
 		ui: { requestRender: vi.fn() },

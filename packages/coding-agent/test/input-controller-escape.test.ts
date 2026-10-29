@@ -9,6 +9,7 @@ import { vocalizer } from "@oh-my-pi/pi-coding-agent/tts/vocalizer";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 
 import { cfgDoubleEscapeAction } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 type Spy = Mock<(...args: unknown[]) => unknown>;
 type StartPendingSubmissionSpy = Mock<InteractiveModeContext["startPendingSubmission"]>;
@@ -30,6 +31,11 @@ type FakeEditor = {
 	onChange?: (text: string) => void;
 	setText(text: string): void;
 	getText(): string;
+	getExpandedText(): string;
+	setCollapsedText(text: string): void;
+	clearDraft(historyText?: string): void;
+	composerChips(): unknown[];
+	imageLinks?: (string | undefined)[];
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => void): void;
@@ -122,6 +128,20 @@ function createContext(): {
 		getText() {
 			return editorText;
 		},
+		getExpandedText() {
+			return editorText;
+		},
+		setCollapsedText(text: string) {
+			editorText = text;
+		},
+		clearDraft(historyText?: string) {
+			if (historyText !== undefined) this.addToHistory(historyText);
+			editorText = "";
+			this.pendingImages = [];
+			this.pendingImageLinks = [];
+			this.imageLinks = undefined;
+		},
+		composerChips: () => [],
 		addToHistory: vi.fn(),
 		setActionKeys: vi.fn(),
 		setCustomKeyHandler: vi.fn(),
@@ -152,6 +172,8 @@ function createContext(): {
 		autoCompactionEscapeHandler: undefined,
 		retryEscapeHandler: undefined,
 		session: {
+			...createSessionDefaults(),
+			sessionId: "escape-main",
 			isStreaming: false,
 			isCompacting: false,
 			isGeneratingHandoff: false,

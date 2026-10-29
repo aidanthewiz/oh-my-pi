@@ -45,6 +45,7 @@ import { TokenRateMeter } from "@oh-my-pi/pi-coding-agent/utils/token-rate";
 import { type Component, Container } from "@oh-my-pi/pi-tui";
 
 import { cfgTerminalShowImages } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { createSessionDefaults } from "./session-defaults";
 
 type AnyFn = (...args: never[]) => unknown;
 
@@ -96,8 +97,12 @@ export function createSessionStub(
 ): AgentSession {
 	if (overrides !== undefined && !isPlainObject(overrides)) return overrides as AgentSession;
 	const stub = {
+		...createSessionDefaults(),
 		sessionManager,
 		settings: sessionSettings,
+		get sessionId() {
+			return sessionManager.getSessionId();
+		},
 		isStreaming: false,
 		isCompacting: false,
 		isAborting: false,

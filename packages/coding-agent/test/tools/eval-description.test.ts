@@ -25,7 +25,7 @@ function makeSession(opts: {
 		getSessionFile: () => null,
 		getSessionSpawns: () => opts.spawns ?? "*",
 		taskDepth: opts.taskDepth,
-		isToolActive: (name: string) => name !== "read" || opts.readActive !== false,
+		isToolActiveForPrompt: (name: string) => name !== "read" || opts.readActive !== false,
 		...(opts.preludes ? { getEvalPreludes: opts.preludes } : {}),
 		settings,
 	} as unknown as ToolSession;

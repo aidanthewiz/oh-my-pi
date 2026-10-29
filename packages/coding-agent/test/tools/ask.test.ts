@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
 	ExtensionAskDialogQuestion,
@@ -19,6 +19,8 @@ import * as ai from "@oh-my-pi/pi-ai";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
 // 1x1 transparent PNG.
 const TINY_PNG_BASE64 =
@@ -1625,20 +1627,28 @@ describe("AskTool rich ask dialog", () => {
 		const answerText = { type: "text" as const, text: "User selected: A\nUser added note: see [Image #1]" };
 		let tempDir: TempDir;
 		let describeCalls: unknown[][];
+		let sessions: AgentSession[];
 
 		beforeEach(async () => {
 			tempDir = await TempDir.create("@omp-ask-describe-");
 			describeCalls = [];
+			sessions = [];
 			vi.spyOn(ai, "completeSimple").mockImplementation(completeImpl);
 		});
 
 		afterEach(async () => {
+			for (const session of sessions) await session.dispose();
 			vi.restoreAllMocks();
 			await tempDir.remove();
 		});
 
-		/** Vision-model stand-in, shaped like `makeCompleteStub` in image-vision-fallback.test.ts. */
-		const completeImpl = async (...args: unknown[]) => {
+		const completeImpl = async (...args: Parameters<typeof ai.completeSimple>) => {
+			const [model, , options] = args;
+			if (typeof options?.apiKey === "function") {
+				await options.apiKey({ lastChance: false, error: undefined, signal: options.signal });
+			}
+			await options?.onPayload?.({}, model, options.signal);
+			options?.signal?.throwIfAborted();
 			describeCalls.push(args);
 			return {
 				role: "assistant",
@@ -1664,7 +1674,33 @@ describe("AskTool rich ask dialog", () => {
 			settings?: Settings;
 			getApiKey?: () => Promise<string | undefined>;
 			selectedOptions?: string[];
+			signal?: AbortSignal;
+			ownerCurrent?: () => boolean;
+			onLookup?: (session: AgentSession) => void | Promise<void>;
+			onPayload?: ai.SimpleStreamOptions["onPayload"];
 		}) {
+			const settings = options.settings ?? Settings.isolated({ modelRoles: { vision: "openai/gpt-4o" } });
+			const modelRegistry = {
+				getAvailable: () => [visionModel],
+				getApiKey: async () => {
+					await options.onLookup?.(session);
+					return options.getApiKey ? options.getApiKey() : "test-key";
+				},
+				resolver: () => async () => "test-key",
+			} as unknown as NonNullable<ToolSession["modelRegistry"]>;
+			const agent = new Agent({
+				initialState: { model: options.model, tools: [] },
+				getApiKey: () => "test-key",
+			});
+			const session: AgentSession = new AgentSession({
+				agent,
+				sessionManager: SessionManager.create(tempDir.path(), `${tempDir.path()}/sessions`),
+				settings,
+				modelRegistry,
+				onPayload: options.onPayload,
+			});
+			sessions.push(session);
+			session.setSideRequestOwnerCapture(() => options.ownerCurrent ?? (() => true));
 			const askDialog = vi.fn().mockResolvedValue({
 				kind: "submit",
 				results: [
@@ -1678,20 +1714,18 @@ describe("AskTool rich ask dialog", () => {
 			});
 			return new AskTool(
 				createSession({
-					settings: options.settings ?? Settings.isolated(),
-					getActiveModel: () => options.model,
-					getArtifactsDir: () => tempDir.path(),
-					getSessionId: () => "session",
-					modelRegistry: {
-						getAvailable: () => [visionModel],
-						getApiKey: options.getApiKey ?? (async () => "test-key"),
-						resolver: () => async () => "test-key",
-					} as unknown as ToolSession["modelRegistry"],
+					settings,
+					getActiveModel: () => session.model,
+					getSessionId: () => session.sessionId,
+					isDisposed: () => session.isDisposed,
+					captureOwnerCurrent: () => options.ownerCurrent ?? (() => true),
+					describeAttachedImages: (images, signal, isCurrent) =>
+						session.describeAttachedImages(images, signal, isCurrent),
 				}),
 			).execute(
 				"call-describe",
 				{ questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }] }] },
-				undefined,
+				options.signal,
 				undefined,
 				createContext({ askDialog }),
 			);
@@ -1705,6 +1739,8 @@ describe("AskTool rich ask dialog", () => {
 				image,
 				{ type: "text", text: expect.stringContaining("A red banner reading ZEBRA 42.") },
 			]);
+			expect(describeCalls.map(call => call[0])).toEqual([visionModel]);
+			expect(sessions[0]!.model).toBe(textModel);
 		});
 
 		it("keeps the answer and its images when describing them fails", async () => {
@@ -1716,6 +1752,91 @@ describe("AskTool rich ask dialog", () => {
 			});
 
 			expect(result.content).toEqual([answerText, image]);
+		});
+
+		it.each(["model", "account", "session"] as const)(
+			"rejects an image answer when its %s owner changes during credential lookup",
+			async replacement => {
+				let current = true;
+				await expect(
+					runAsk({
+						model: textModel,
+						ownerCurrent: () => current,
+						onLookup: async session => {
+							if (replacement === "model") session.agent.setModel(visionModel);
+							else if (replacement === "session") await session.sessionManager.newSession();
+							else current = false;
+						},
+					}),
+				).rejects.toBeInstanceOf(ToolAbortError);
+				expect(describeCalls).toEqual([]);
+			},
+		);
+
+		it("does not dispatch if the account owner changes while credit admission awaits", async () => {
+			let current = true;
+			await expect(
+				runAsk({
+					model: textModel,
+					ownerCurrent: () => current,
+					onPayload: async () => {
+						await Promise.resolve();
+						current = false;
+					},
+				}),
+			).rejects.toBeInstanceOf(ToolAbortError);
+			expect(describeCalls).toEqual([]);
+		});
+
+		it("does not dispatch after caller cancellation during credit admission", async () => {
+			const controller = new AbortController();
+			await expect(
+				runAsk({
+					model: textModel,
+					signal: controller.signal,
+					onPayload: () => {
+						controller.abort();
+					},
+				}),
+			).rejects.toBeInstanceOf(ToolAbortError);
+			expect(describeCalls).toEqual([]);
+		});
+
+		it("stops the vision request when credit admission refuses it", async () => {
+			const result = await runAsk({
+				model: textModel,
+				onPayload: () => {
+					throw new Error("Insufficient credit");
+				},
+			});
+			expect(describeCalls).toEqual([]);
+			expect(result.content.slice(0, 2)).toEqual([answerText, image]);
+			expect(JSON.stringify(result.content)).not.toContain("A red banner reading ZEBRA 42.");
+		});
+
+		it("does not dispatch after cancellation during credential lookup", async () => {
+			const controller = new AbortController();
+			await expect(
+				runAsk({
+					model: textModel,
+					signal: controller.signal,
+					onLookup: () => controller.abort(),
+				}),
+			).rejects.toBeInstanceOf(ToolAbortError);
+			expect(describeCalls).toEqual([]);
+		});
+
+		it("does not use a selected vision role excluded by the model allowlist", async () => {
+			const result = await runAsk({
+				model: textModel,
+				settings: Settings.isolated({
+					modelRoles: { vision: "openai/gpt-4o" },
+					enabledModels: ["openai/gpt-4.1-mini"],
+				}),
+			});
+			expect(describeCalls).toEqual([]);
+			expect(result.content.slice(0, 2)).toEqual([answerText, image]);
+			expect(JSON.stringify(result.content)).toContain("No vision-capable model");
 		});
 
 		it("makes no vision call for a cancelled ask", async () => {

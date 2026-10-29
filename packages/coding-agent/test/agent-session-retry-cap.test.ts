@@ -3796,7 +3796,10 @@ describe("AgentSession retry delay cap", () => {
 		// skips without resolving #retryPromise, hanging prompt() during shutdown.
 		const mock = createMockModel({
 			responses: [
-				{ stopReason: "aborted", errorMessage: "Request was aborted" },
+				() => {
+					session!.beginDispose();
+					return { stopReason: "aborted", errorMessage: "Request was aborted" };
+				},
 				{ content: ["should not be reached after dispose"] },
 			],
 		});
@@ -3832,10 +3835,7 @@ describe("AgentSession retry delay cap", () => {
 			if (event.type === "auto_retry_start") retryStartEvents.push(event);
 		});
 
-		// Enter the disposing window before the empty abort lands. Without the
-		// #isDisposed guard this prompt would hang on an orphaned retry promise.
-		session.beginDispose();
-		await session.prompt("Trigger empty aborted turn while disposing");
+		await session.prompt("Trigger empty aborted turn during disposal");
 		await session.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(0);

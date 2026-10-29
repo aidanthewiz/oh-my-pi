@@ -1836,6 +1836,7 @@ export async function runRootCommand(
 		await logger.time("initTheme:initial", ensureTheme);
 
 		const parsedArgs = parsed;
+		const originalCliMcpReauth = parsed.messages.length === 1 ? parsed.messages[0] : undefined;
 		try {
 			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 		} catch (error: unknown) {
@@ -2407,7 +2408,11 @@ export async function runRootCommand(
 			// discovery arms; running these concurrently contends for the event loop and stretches
 			// every parallel arm by ~30ms. Interactive startup defers it further, behind the first
 			// frame (see `startDeferredStartupWork`), for the same reason.
-			if (!isInteractive) modelRegistry.refreshInBackground();
+			if (!isInteractive) {
+				modelRegistry.refreshInBackground();
+				// Initial discovery can replace the selected model before headless commands capture its owner.
+				await modelRegistry.awaitBackgroundRefresh();
+			}
 			return result;
 		};
 
@@ -2456,9 +2461,20 @@ export async function runRootCommand(
 
 			const eventBus = new EventBus();
 			const subagentEventBus = new EventBus();
+			// Interactive launches bind startup-safe extensions after the composer accepts
+			// input; the first request waits for them instead. Kept eager when argv may
+			// carry extension flags (they must parse now), `--tools` must validate
+			// extension tools, or a restored transcript needs extension renderers.
+			const deferStartupSafeExtensions =
+				isInteractive &&
+				parsedArgs.unrecognizedFlags.length === 0 &&
+				!parsedArgs.tools?.length &&
+				!(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || parsedArgs.restore || foreignSource);
 			const extensionsResult = parsedArgs.trustedExtensions?.length
-				? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
-				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+				? { ...(await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)), deferredPaths: [] }
+				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus, {
+						deferStartupSafe: deferStartupSafeExtensions,
+					});
 			const extensionFlagSink: ExtensionFlagSink = {
 				getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 				setFlagValue: (name, value) => {
@@ -2513,6 +2529,13 @@ export async function runRootCommand(
 			if (autoPrintNeedsArgPrompt && initialArgs.messages.length === 0 && initialArgs.fileArgs.length === 0) {
 				exitWithoutTerminal();
 			}
+			const allowMcpBrowserAuth =
+				originalCliMcpReauth !== undefined &&
+				/^\/mcp[ \t]+reauth(?:[ \t]+\S+)*[ \t]*$/.test(originalCliMcpReauth) &&
+				initialArgs.messages.length === 1 &&
+				initialArgs.messages[0] === originalCliMcpReauth &&
+				initialArgs.fileArgs.length === 0 &&
+				pipedInput === undefined;
 			const processedFiles =
 				initialArgs.fileArgs.length > 0
 					? await logger.time("processFileArguments", () =>
@@ -2584,6 +2607,7 @@ export async function runRootCommand(
 				eventBus,
 				subagentEventBus,
 				preloadedExtensions: extensionsResult,
+				deferredExtensionPaths: extensionsResult.deferredPaths,
 				// Validated once the background refresh is in flight, so selectors it
 				// may still supply defer instead of warning; interactive mode also
 				// waits for the first frame (`startDeferredStartupWork`).
@@ -2657,6 +2681,9 @@ export async function runRootCommand(
 			// prompt: fallback-chain validation only produces header warnings, and the
 			// background refresh already raced the first prompt when it ran earlier.
 			const startDeferredStartupWork = (): void => {
+				void session
+					.loadDeferredExtensions()
+					.catch(error => logger.error("Deferred extension readiness failed", { error: String(error) }));
 				modelRegistry.refreshInBackground();
 				session.validateRetryFallbackChains();
 				if (configuredScope.length > 0) {
@@ -2735,6 +2762,7 @@ export async function runRootCommand(
 					setToolUIContext: mode === "rpc-ui" ? setToolUIContext : undefined,
 					headless: parsedArgs.noUi === true,
 					subagentEventBus,
+					mcpManager,
 					input: rpcInput,
 				});
 			} else if (isInteractive) {
@@ -2809,6 +2837,7 @@ export async function runRootCommand(
 					printThoughts: initialArgs.printThoughts,
 					planYolo: parsedArgs.planYolo,
 					mcpManager,
+					allowMcpBrowserAuth,
 				});
 				if ($env.PI_TIMING) {
 					logger.printTimings();

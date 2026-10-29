@@ -17,7 +17,15 @@
 - Refuse conflict blocks whose closing line was cut by the scan byte cap. Resume ranged reads from unfinished openers while preserving complete prefix blocks.
 - Preserve provider-computed cache-warming charges, including partial responses and authoritative zero. Recheck final payload TTL, extension policy and cancellation before paid refreshes.
 - Show each selected settings option's complete description at narrow widths, including cache-retention prices. Preserve previews and confirmation-only selection.
-- Preserve complete structured task results when copying session artifacts. Rebind only stable source pairs and keep newer destination files and stale-sidecar refusal.
+- Preserve complete structured task results when copying session artifacts. Keep generation binding and newer destination files. Reject stale source sidecars.
+- Finish initial model discovery before headless commands capture session ownership. Keep browser authorization limited to explicit host consent.
+- Keep deferred extension tools and source metadata bound to the active registration. Roll back failed activations without replacing newer tools or prompts. Preserve surviving event policies and shutdown cleanup during extension changes.
+- Return promptly from cancelled MCP logins while preventing conflicting logins until pending work settles. Keep accepted credential persistence serialized.
+- Preserve the stable MCP tool collision winner before late same-owner registrations replace its declaration.
+- Render tool descriptions against candidate prompt activity without granting execution before publication. Revoke removed tools while rebuilding and restore prior authority after failure.
+- Preserve text-only asides when a session switch rolls back. Finish cancellation cleanup before a focused turn releases its result ownership.
+- Print delayed extension-started responses and settle their cancellation status without treating command scheduling as agent admission.
+- Keep edit inspection metadata off caller arguments so approval revalidation terminates and immutable arguments remain usable.
 - Apply the consuming session's model and provider policy to CLI, RPC, TUI and setup login, including delayed credential entry.
 - Keep queued memory extraction and usage bound to the originating session, branch and credential authority across session changes.
 - Bind optional structured task sidecars to the accepted Markdown generation. Preserve successful Markdown without serving stale JSON after sidecar failures.
@@ -153,6 +161,31 @@
 - Resume interrupted daemon upgrades without replacing adopted history. Refuse migration while an older broker or client owns the scope.
 - Keep terminal status consistent with retained host outcomes when collaboration recovery prunes or replaces transcript messages.
 - Verify cached grammar size and SHA-256 before reuse; corrupt files require a verified atomic replacement.
+## [18.12.6] - 2026-10-21
+
+### Added
+
+- Added the `_session/steering` ACP extension (advertised as `_meta.steering.supported`), so clients such as agent-shell can steer a running turn; a steer sent while a permission dialog is open cancels that dialog, and `_meta.steering.queue: "followUp"` queues a follow-up instead ([#15885](https://github.com/can1357/oh-my-pi/pull/15885) by [@marcintustin](https://github.com/marcintustin))
+- `/mcp reauth <name>` now works over ACP, RPC, and print mode (`omp -p '/mcp reauth <name>'`): it opens the browser, prints the authorization URL, reconnects the server in the running session, and print mode exits 1 when reauthorization fails ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
+
+### Changed
+
+- ACP `session/cancel` now also cancels prompts that are queued or still dispatching, and stops autonomous runs, instead of being ignored when no client turn is streaming ([#15885](https://github.com/can1357/oh-my-pi/pull/15885) by [@marcintustin](https://github.com/marcintustin))
+- Idle compaction no longer runs on logged-in OpenAI Codex accounts, whose prompt cache never expires; compacting while idle only threw away a warm cache
+- ACP sessions no longer fail to start when a client-declared MCP server cannot connect; the failure is reported in the session, and an HTTP/SSE server can be repaired with `/mcp reauth` ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
+- `/mcp reauth`, `/mcp test`, and `/mcp unauth` now pick the project entry when a server is defined in both project and user config, and skip project config when `mcp.enableProjectConfig` is off ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
+- `/mcp reauth` removes the server's stale `Authorization` header from its config when it writes the new OAuth binding ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
+- `omp -p '/compact'`, `/handoff`, and `/retry` given as CLI arguments now run the command instead of sending the text to the model, and exit 1 when the command fails; slash text arriving on stdin or from `@file` is still sent to the model ([#16387](https://github.com/can1357/oh-my-pi/pull/16387) by [@marcintustin](https://github.com/marcintustin))
+- Interactive startup no longer waits for extensions that register only tools, commands, flags, renderers, or event hooks (for example MCP bridge plugins): they load once the composer accepts input, and your first message waits for them instead. An extension is deferred only after one launch has confirmed it registers no providers, shortcuts, composer shapes, or file fallbacks. Launches that resume a session, pass `--tools`, or pass flags omp does not recognize still load every extension first ([#16684](https://github.com/can1357/oh-my-pi/pull/16684) by [@H4vC](https://github.com/H4vC))
+
+### Fixed
+
+- Fixed subagents whose role has an explicitly empty fallback chain falling back through the `default` chain when the default role uses the same model, including after a retry fallback, prewalk or context promotion briefly switched models or the subagent was revived ([#16548](https://github.com/can1357/oh-my-pi/pull/16548) by [@eggpeat](https://github.com/eggpeat))
+- Fixed `/usage` and `omp usage --json` listing identity-less OAuth accounts such as Devin as missing usage beside their working reports ([#16549](https://github.com/can1357/oh-my-pi/pull/16549) by [@eggpeat](https://github.com/eggpeat))
+- Fixed releasing or reaping a browser tab returning while Chromium still listed the page; the close now waits until Chromium reports the tab destroyed ([#16680](https://github.com/can1357/oh-my-pi/pull/16680) by [@H4vC](https://github.com/H4vC))
+- Fixed the advisor prompt forbidding all repeated advice, including real escalations: advisors may now re-raise a prior nit or concern as a blocker once new evidence makes it one ([#13887](https://github.com/can1357/oh-my-pi/issues/13887), [#16484](https://github.com/can1357/oh-my-pi/pull/16484) by [@pjh890321](https://github.com/pjh890321))
+- Fixed Esc no longer interrupting in the TUI after a second MCP OAuth login replaced an unfinished first one ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
+
 ## [18.12.5] - 2026-10-21
 
 ### Added
@@ -19300,3 +19333,4 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@d48cee7db400](
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@04d4ab14b45f](https://github.com/can1357/oh-my-pi/blob/04d4ab14b45f8dbd4055b675519f8815a1eb1841/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@3faa7ce5154a](https://github.com/can1357/oh-my-pi/blob/3faa7ce5154a0a1e29561772048dac6dcab1c5cf/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@bb90cc8aa23d](https://github.com/can1357/oh-my-pi/blob/bb90cc8aa23db1d5e47fa1332e9dcbaab769681a/packages/coding-agent/CHANGELOG.md).
+Older entries are archived in [packages/coding-agent/CHANGELOG.md@5041889e64d3](https://github.com/can1357/oh-my-pi/blob/5041889e64d39ab59633bbc45b6dbb143fc936cc/packages/coding-agent/CHANGELOG.md).

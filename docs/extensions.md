@@ -462,6 +462,23 @@ Canonical event unions and payload types are in `types.ts`.
 - `session_before_tree` / `session_tree`
 - `session_shutdown`
 
+In the interactive TUI, prior factory registrations can schedule an extension
+after the composer accepts input. Providers, shortcuts, composer shapes, and
+file fallbacks observed during loading require eager startup. The cache checks
+only the entry file's size and modification time. It does not validate imported
+dependencies, environment changes, same-stat replacements, or trust.
+
+Deferred extensions share the session runtime, flags, and event bus.
+Their `session_start` is delivered when they bind; other earlier events are not
+replayed. The first submitted message and every model turn wait for readiness.
+Loading errors reject readiness rather than admitting a request without hooks.
+Disposal or session replacement invalidates pending binding and replay.
+Late extensions win name collisions with earlier-loaded extensions.
+
+Managed source admission and mandatory eager policy apply independently of the
+cache. Resumed sessions, `--tools`, unknown flags, and trusted or mandatory
+extension launches load extensions before the session starts.
+
 `session.compacting` receives `{ sessionId, messages }` and can return
 `{ context?: string[]; prompt?: string; preserveData?: Record<string, unknown> }`
 to customize summary context, the summarizer prompt, and stored compaction data.

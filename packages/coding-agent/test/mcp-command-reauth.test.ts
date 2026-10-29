@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import * as oauthFlow from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import type { SourceMeta } from "@oh-my-pi/pi-coding-agent/capability/types";
@@ -103,6 +104,54 @@ describe("/mcp auth commands", () => {
 		openAuthStores.push(storage);
 		return storage;
 	}
+
+	test("does not persist a completed login into a replacement session", async () => {
+		const authStorage = freshAuthStorage();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<OAuthCredentials>();
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async () => {
+			entered.resolve();
+			return await release.promise;
+		});
+		const { controller, ctx } = createController(authStorage);
+		const previous = await Bun.file(configPath).text();
+		const reauth = controller.handle("/mcp reauth envserver");
+		await entered.promise;
+		ctx.session = { ...ctx.session, sessionId: "replacement-session" } as typeof ctx.session;
+		release.resolve({ access: "stale-session-access", refresh: "stale-refresh", expires: Date.now() + 3_600_000 });
+		await reauth;
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toBeUndefined();
+		expect(await Bun.file(configPath).text()).toBe(previous);
+	});
+
+	test("Esc cancels the anonymous probe before any browser login can start", async () => {
+		const authStorage = freshAuthStorage();
+		const entered = Promise.withResolvers<void>();
+		let observedSignal: AbortSignal | undefined;
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation((_name, _config, options) => {
+			observedSignal = options?.signal;
+			entered.resolve();
+			return new Promise<never>((_resolve, reject) => {
+				observedSignal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+					once: true,
+				});
+			});
+		});
+		const login = vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login");
+		const { controller, ctx } = createController(authStorage);
+		const previous = await Bun.file(configPath).text();
+		const reauth = controller.handle("/mcp reauth envserver");
+		await entered.promise;
+		const escape = [...ctx.mcpTestEscapeHandlers][0];
+		if (!escape) throw new Error("MCP preflight has no cancellation owner");
+		escape();
+		await reauth;
+		expect(observedSignal?.aborted).toBe(true);
+		expect(login).not.toHaveBeenCalled();
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toBeUndefined();
+		expect(await Bun.file(configPath).text()).toBe(previous);
+	});
 
 	beforeAll(() => {
 		initTheme();
@@ -843,6 +892,8 @@ describe("/mcp auth commands", () => {
 			refresh: "old-refresh",
 			expires: Date.now() + 3_600_000,
 			tokenUrl: "https://auth.example.com/token",
+			authorizationUrl: "https://auth.example.com/authorize?client_id=discovered-client",
+			issuerUrl: "https://mcp.example.com",
 			clientId: "dcr-client",
 			clientSecret: "dcr-secret",
 			resource: EXPANDED_SERVER_URL,
@@ -854,6 +905,7 @@ describe("/mcp auth commands", () => {
 					if (url === "https://mcp.example.com/.well-known/oauth-authorization-server") {
 						return new Response(
 							JSON.stringify({
+								issuer: "https://mcp.example.com",
 								authorization_endpoint: "https://auth.example.com/authorize?client_id=discovered-client",
 								token_endpoint: "https://auth.example.com/token",
 								client_id: "discovered-client",
@@ -1048,6 +1100,7 @@ describe("/mcp auth commands", () => {
 		});
 
 		const { controller, ctx, showError, showStatus, editor, oauthManualInput } = createController(authStorage);
+		const defaultOnEscape = editor.onEscape;
 		// Event-gate the claim instead of polling to a wall-clock deadline: on a
 		// loaded runner the old 1s budget could expire before the flow claimed the
 		// manual-input slot, and the assertion below then read `undefined` from a
@@ -1075,6 +1128,11 @@ describe("/mcp auth commands", () => {
 		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
 			access: "replacement-access",
 		});
+
+		// The replacement flow restored the session's default Esc handler, not
+		// the superseded flow's dead one: after both flows unwind the editor
+		// keeps interrupt/cancel-compaction semantics for the session.
+		expect(editor.onEscape).toBe(defaultOnEscape);
 	});
 
 	test("Esc cancels even when OAuth login has not registered its signal listener yet", async () => {

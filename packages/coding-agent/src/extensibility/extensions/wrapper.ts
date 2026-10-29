@@ -86,11 +86,19 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	renderCall?: (args: any, options: any, theme: any) => any;
 	renderResult?: (result: any, options: any, theme: any, args?: any) => any;
 	readonly loadMode: ToolLoadMode;
+	readonly #isActive: () => boolean;
 
 	constructor(
 		private registeredTool: RegisteredTool,
 		private runner: ExtensionRunner,
 	) {
+		const owner = registeredTool.owner;
+		const activationCurrent = owner?.isActive;
+		this.#isActive = () =>
+			owner === null ||
+			(owner !== undefined &&
+				owner.tools.get(registeredTool.definition.name) === registeredTool &&
+				activationCurrent?.() !== false);
 		applyToolProxy(registeredTool.definition, this);
 		this.loadMode = defaultLoadModeForToolName(registeredTool.definition.name, registeredTool.definition.loadMode);
 
@@ -128,6 +136,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		onUpdate?: AgentToolUpdateCallback<any>,
 		context?: AgentToolContext,
 	) {
+		if (!this.#isActive()) throw new Error("Extension owner is no longer active");
 		// Bind the extension context to this tool's own name so `ctx.invokeTool` delegates to the
 		// native built-in of the same name (present only when this tool re-registers a built-in). The
 		// wrapper's own context, abort signal, and progress callback are inherited by the delegated

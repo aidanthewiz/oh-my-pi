@@ -5,6 +5,7 @@ declare const devicePixelRatio: number;
 declare const window: { open(url: string, target: string, features: string): unknown };
 
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as toolBridge from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -630,6 +631,154 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(String(outcome)).toContain("the tab could not be reattached and was closed");
 			} finally {
 				await releaseTab(name, { kill: true });
+				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"cancels a crashed worker's run before reporting recovery instead of letting it continue",
+		async () => {
+			let gateOpen = false;
+			const started = Promise.withResolvers<void>();
+			// Whichever the run reaches once the gate opens: `stopped` when its wait was cancelled, `continued` when not.
+			const outcome = Promise.withResolvers<"stopped" | "continued">();
+			const server = Bun.serve({
+				port: 0,
+				fetch: request => {
+					const { pathname } = new URL(request.url);
+					if (pathname === "/started") started.resolve();
+					else if (pathname === "/gate") return new Response(null, { status: gateOpen ? 200 : 503 });
+					else if (pathname === "/stopped") outcome.resolve("stopped");
+					else outcome.resolve("continued");
+					return new Response("ok");
+				},
+			});
+			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const name = `crashed-continuation-${process.pid}`;
+			const url = `data:text/html,<title>${name}</title>`;
+			try {
+				await acquireTab(name, browser, { url, timeoutMs: 30_000 });
+				const crashedWorker = getTab(name);
+				if (!crashedWorker || crashedWorker.backend !== "worker") throw new Error("Expected a worker tab");
+				const oldWorker = crashedWorker.worker;
+				// The run holds at a gate the test opens only once its caller was told of the crash, however long the
+				// crash takes to land; a run left going passes it into the second fetch, a cancelled one reports it stopped.
+				const origin = `http://127.0.0.1:${server.port}`;
+				const run = runInTab(name, {
+					code: `await fetch("${origin}/started"); try { await wait(async () => (await fetch("${origin}/gate")).ok, { timeout: 8_000, interval: 20 }); } catch (error) { await fetch("${origin}/stopped"); throw error; } await fetch("${origin}/after-crash");`,
+					timeoutMs: 10_000,
+					session,
+				}).catch((error: unknown) => error);
+				await started.promise;
+				await crashRenderer(browser, url);
+				expect(String(await run)).toContain("its page reloaded");
+				const recovered = getTab(name);
+				if (!recovered || recovered.backend !== "worker") throw new Error("Expected a recovered worker tab");
+				expect(recovered.worker).not.toBe(oldWorker);
+				gateOpen = true;
+				// A run left going passes the 20 ms gate poll at once; a run torn down harder than a cancelled wait
+				// (worker terminated, fetches aborted) never reports, which is no less stopped. Only `continued` is the bug.
+				const reported = await Promise.race([outcome.promise, Bun.sleep(2_000).then(() => "no-report" as const)]);
+				expect(["stopped", "no-report"]).toContain(reported);
+			} finally {
+				await releaseTab(name, { kill: true });
+				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
+				server.stop(true);
+			}
+		},
+		45_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"does not admit old-worker tool calls or deliver aborted tool results to a recovered worker",
+		async () => {
+			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const name = `crashed-tool-identity-${process.pid}`;
+			const url = `data:text/html,<title>${name}</title>`;
+			const oldGate = Promise.withResolvers<string>();
+			const currentGate = Promise.withResolvers<string>();
+			const oldEntered = Promise.withResolvers<AbortSignal>();
+			const currentEntered = Promise.withResolvers<void>();
+			const oldFinished = Promise.withResolvers<void>();
+			const admitted: string[] = [];
+			const hostTool = spyOn(toolBridge, "callSessionTool").mockImplementation(async (toolName, _args, options) => {
+				admitted.push(toolName);
+				if (toolName === "old") {
+					if (!options.signal) throw new Error("Expected a tool abort signal");
+					oldEntered.resolve(options.signal);
+					const value = await oldGate.promise;
+					oldFinished.resolve();
+					return value;
+				}
+				currentEntered.resolve();
+				return await currentGate.promise;
+			});
+			const RealWorker = globalThis.Worker;
+			let oldRaw: Worker | undefined;
+			let currentRun: Promise<unknown> | undefined;
+			try {
+				globalThis.Worker = class extends RealWorker {
+					constructor(...args: ConstructorParameters<typeof Worker>) {
+						super(...args);
+						oldRaw = this;
+					}
+				};
+				try {
+					await acquireTab(name, browser, { url, timeoutMs: 30_000 });
+				} finally {
+					globalThis.Worker = RealWorker;
+				}
+				if (!oldRaw) throw new Error("Expected the original worker");
+				const oldRun = runInTab(name, {
+					code: 'return await __omp_call_tool__("old", {});',
+					timeoutMs: 10_000,
+					session,
+				}).catch((error: unknown) => error);
+				const signal = await oldEntered.promise;
+				await crashRenderer(browser, url);
+				expect(String(await oldRun)).toContain("its page reloaded");
+				expect(signal.aborted).toBe(true);
+				const recovered = getTab(name);
+				if (!recovered || recovered.backend !== "worker") throw new Error("Expected a recovered worker tab");
+				const replies: WorkerInbound[] = [];
+				const send = recovered.worker.send.bind(recovered.worker);
+				const replySpy = spyOn(recovered.worker, "send").mockImplementation((message, transfers) => {
+					if (message.type === "tool-reply") replies.push(message);
+					send(message, transfers);
+				});
+				try {
+					oldGate.resolve("old-run-only-result");
+					await oldFinished.promise;
+					for (let i = 0; i < 32; i++) await Promise.resolve();
+					expect(replies).toEqual([]);
+					currentRun = runInTab(name, {
+						code: 'return await __omp_call_tool__("current", {});',
+						timeoutMs: 10_000,
+						session,
+					}).catch((error: unknown) => error);
+					await currentEntered.promise;
+					const runId = recovered.pending.keys().next().value;
+					if (!runId) throw new Error("Expected the current run");
+					oldRaw.dispatchEvent(
+						new MessageEvent("message", {
+							data: { type: "tool-call", id: "stale-call", runId, name: "stale", args: {} },
+						}),
+					);
+					expect(admitted).toEqual(["old", "current"]);
+					currentGate.resolve("current-result");
+					expect(await currentRun).toMatchObject({ returnValue: "current-result" });
+				} finally {
+					replySpy.mockRestore();
+				}
+			} finally {
+				globalThis.Worker = RealWorker;
+				oldGate.resolve("cleanup");
+				currentGate.resolve("cleanup");
+				await releaseTab(name, { kill: true });
+				await currentRun;
+				hostTool.mockRestore();
 				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},

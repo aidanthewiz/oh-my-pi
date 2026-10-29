@@ -8,6 +8,7 @@
 import { afterAll, afterEach, beforeAll, expect, it, spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { AnthropicConnectionError } from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -27,7 +28,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -126,37 +127,6 @@ async function createSession(
 	});
 
 	if (bridge) sess.setClientBridge(bridge);
-	return sess;
-}
-
-async function createSessionWithMockModel(
-	tools: AgentTool[],
-	bridge: ClientBridge,
-	responses: NonNullable<MockModelOptions["responses"]>,
-): Promise<AgentSession> {
-	const mock = createMockModel({ responses });
-	const settings = Settings.isolated({ "compaction.enabled": false });
-	const sessionManager = SessionManager.inMemory(tempDir.path());
-	const agent = new Agent({
-		getApiKey: () => "test-key",
-		initialState: {
-			model: mock.model,
-			systemPrompt: ["Test"],
-			tools,
-			messages: [],
-		},
-		convertToLlm,
-		streamFn: mock.stream,
-	});
-
-	const sess = new AgentSession({
-		agent,
-		sessionManager,
-		settings,
-		modelRegistry: { getApiKey: () => "test-key" } as never,
-		toolRegistry: new Map(tools.map(t => [t.name, t])),
-	});
-	sess.setClientBridge(bridge);
 	return sess;
 }
 
@@ -996,4 +966,689 @@ it("setActiveToolsByName normalizes legacy tool names", async () => {
 	await session.setActiveToolsByName(["Search", "glob", "grep"]);
 
 	expect(session.getActiveToolNames()).toEqual(["grep", "glob"]);
+});
+
+// ---------------------------------------------------------------------------
+// 5. Steering supersedes an open permission dialog (ACP `_session/steering`)
+// ---------------------------------------------------------------------------
+
+it("a steer sent while a permission dialog is open supersedes it instead of waiting behind it", async () => {
+	const deleteTool = makeFakeTool("delete");
+	const permissionPending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const permissionOpened = Promise.withResolvers<void>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(_toolCall, _options, _signal) {
+			permissionOpened.resolve();
+			return await permissionPending.promise;
+		},
+	};
+	session = await createSessionWithMockModel([deleteTool as AgentTool], bridge, [
+		{
+			content: [{ type: "toolCall", id: "call-delete-1", name: "delete", arguments: { path: "/tmp/gone.ts" } }],
+		},
+		{ content: ["done after steer"] },
+	]);
+
+	// Drive the turn; the delete tool's permission elicit pends inside it.
+	let promptSettled = false;
+	const promptDone = session.prompt("delete something").then(() => {
+		promptSettled = true;
+	});
+	// Await the observable signal that the elicit is open — not a guessed delay.
+	await permissionOpened.promise;
+
+	// The turn is live, so the steer joins it — and must supersede the open
+	// dialog: the elicit is abandoned, its tool call surfaces as a cancelled
+	// permission (a normal tool error), and the queued message is injected at
+	// the next batch boundary (the model call that produced the final
+	// response), not behind the dialog until the user answers.
+	const admitted = await session.joinActiveTurn("wait — use the other parser instead");
+	expect(admitted).toBe(true);
+
+	await promptDone;
+	expect(promptSettled).toBe(true);
+	// The superseded call never executed.
+	expect(deleteTool.executeCalls).toBe(0);
+	// The steer reached the model inside the same turn.
+	const messages = session.agent.state.messages;
+	expect(
+		messages.some(
+			message => message.role === "user" && JSON.stringify(message.content).includes("use the other parser"),
+		),
+	).toBe(true);
+
+	// Resolve the abandoned elicit so nothing dangles into the next test.
+	permissionPending.resolve({ outcome: "cancelled" });
+});
+
+it("keeps the dialog open when an agent-authored steer queues mid-dialog", async () => {
+	const deleteTool = makeFakeTool("delete");
+	const permissionPending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const permissionOpened = Promise.withResolvers<void>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(_toolCall, _options, _signal) {
+			permissionOpened.resolve();
+			return await permissionPending.promise;
+		},
+	};
+	// A controllable loop steering signal: tool calls run under a ctx
+	// (`ctx.toolCall.steeringSignal`), so the gate takes the production
+	// loop-signal path and the test aborts it on command, exactly the way
+	// the loop's any-source steering poll does.
+	const loopSteering = new AbortController();
+	session = await createSessionWithMockModel(
+		[deleteTool as AgentTool],
+		bridge,
+		[
+			{
+				content: [{ type: "toolCall", id: "call-delete-9", name: "delete", arguments: { path: "/tmp/gone2.ts" } }],
+			},
+			{ content: ["done after steer"] },
+		],
+		{ loopSteeringSignal: loopSteering.signal },
+	);
+
+	let promptSettled = false;
+	const promptDone = session.prompt("delete something else").then(() => {
+		promptSettled = true;
+	});
+	await permissionOpened.promise;
+
+	// An agent-authored steer queues while the dialog is open: the loop's
+	// steering signal aborts for it (any queued source), but no user
+	// steering arrival fired, so the dialog must stay open — the tool call
+	// keeps waiting on the user instead of being classified as superseded.
+	await session.agent.steer({
+		role: "user",
+		content: [{ type: "text", text: "agent-authored aside while the dialog is open" }],
+		timestamp: Date.now(),
+	});
+	loopSteering.abort();
+	await Bun.sleep(50);
+	expect(promptSettled).toBe(false);
+	expect(deleteTool.executeCalls).toBe(0);
+
+	// A user steer through the arrival channel still supersedes the dialog.
+	const admitted = await session.joinActiveTurn("wait — the user changed their mind");
+	expect(admitted).toBe(true);
+	await promptDone;
+	expect(promptSettled).toBe(true);
+	expect(deleteTool.executeCalls).toBe(0);
+	const messages = session.agent.state.messages;
+	expect(
+		messages.some(
+			message => message.role === "user" && JSON.stringify(message.content).includes("the user changed their mind"),
+		),
+	).toBe(true);
+
+	// Resolve the abandoned elicit so nothing dangles into the next test.
+	permissionPending.resolve({ outcome: "cancelled" });
+});
+
+it("delivers the steer that supersedes a permission dialog ahead of older queued steers", async () => {
+	const deleteTool = makeFakeTool("delete");
+	const permissionPending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const permissionOpened = Promise.withResolvers<void>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(_toolCall, _options, _signal) {
+			permissionOpened.resolve();
+			return await permissionPending.promise;
+		},
+	};
+	// Hold the first response open so an older steer can queue before the
+	// delete call dispatches; the later steer supersedes the elicit and must
+	// deliver first (agent.prioritizeSteering — same semantics as the TUI
+	// approval dialog's denying steer).
+	const turnStreamStarted = Promise.withResolvers<void>();
+	const releaseTurnStream = Promise.withResolvers<void>();
+	session = await createSessionWithMockModel([deleteTool as AgentTool], bridge, [
+		async () => {
+			turnStreamStarted.resolve();
+			await releaseTurnStream.promise;
+			return {
+				content: [{ type: "toolCall", id: "call-delete-1", name: "delete", arguments: { path: "/tmp/gone.ts" } }],
+			};
+		},
+		{ content: ["answered superseding steer"] },
+		{ content: ["answered older steer"] },
+	]);
+
+	const promptDone = session.prompt("delete something");
+	await withTimeout(turnStreamStarted.promise, 5_000, "Held turn stream never started");
+	// An older steer queues while the turn streams, before any dialog exists.
+	expect(await session.joinActiveTurn("older question about the batch")).toBe(true);
+	releaseTurnStream.resolve();
+	await permissionOpened.promise;
+
+	// This steer supersedes the open dialog.
+	expect(await session.joinActiveTurn("why this deletion?")).toBe(true);
+
+	await promptDone;
+	await session.waitForIdle();
+	expect(deleteTool.executeCalls).toBe(0);
+
+	// Order proof: the superseding steer was delivered to the model before
+	// the older queued one.
+	const messages = session.agent.state.messages;
+	const contentIndexOf = (needle: string) =>
+		messages.findIndex(message => message.role === "user" && JSON.stringify(message.content).includes(needle));
+	const supersedeIndex = contentIndexOf("why this deletion?");
+	const olderIndex = contentIndexOf("older question about the batch");
+	expect(supersedeIndex).toBeGreaterThanOrEqual(0);
+	expect(olderIndex).toBeGreaterThan(supersedeIndex);
+
+	permissionPending.resolve({ outcome: "cancelled" });
+});
+
+it("delivers the user steer that supersedes a dialog ahead of an agent-authored steer", async () => {
+	// Regression: the permission gate promoted *any* queued message older
+	// than the dialog-open baseline — including steers the agent enqueued
+	// itself without ever firing the steering-arrival signal. The user's
+	// superseding steer must deliver first; the agent-authored one waits
+	// for the next boundary.
+	const deleteTool = makeFakeTool("delete");
+	const permissionPending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const permissionOpened = Promise.withResolvers<void>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(_toolCall, _options, _signal) {
+			permissionOpened.resolve();
+			return await permissionPending.promise;
+		},
+	};
+	const turnStreamStarted = Promise.withResolvers<void>();
+	const releaseTurnStream = Promise.withResolvers<void>();
+	session = await createSessionWithMockModel([deleteTool as AgentTool], bridge, [
+		async () => {
+			turnStreamStarted.resolve();
+			await releaseTurnStream.promise;
+			return {
+				content: [{ type: "toolCall", id: "call-delete-1", name: "delete", arguments: { path: "/tmp/gone.ts" } }],
+			};
+		},
+		{ content: ["answered user steer"] },
+		{ content: ["answered agent steer"] },
+	]);
+
+	const promptDone = session.prompt("delete something");
+	await withTimeout(turnStreamStarted.promise, 5_000, "Held turn stream never started");
+	releaseTurnStream.resolve();
+	await permissionOpened.promise;
+
+	// The agent enqueues a steer while the dialog is open. This path never
+	// fires the steering-arrival signal, so it must not be promoted.
+	session.agent.steer({
+		role: "user",
+		content: [{ type: "text", text: "agent-authored steer" }],
+		timestamp: Date.now(),
+	});
+
+	// The user steer supersedes the open dialog and delivers first.
+	expect(await session.joinActiveTurn("user steer superseding the dialog")).toBe(true);
+
+	await promptDone;
+	await session.waitForIdle();
+	expect(deleteTool.executeCalls).toBe(0);
+
+	const messages = session.agent.state.messages;
+	const contentIndexOf = (needle: string) =>
+		messages.findIndex(message => message.role === "user" && JSON.stringify(message.content).includes(needle));
+	const userSteerIndex = contentIndexOf("user steer superseding the dialog");
+	const agentSteerIndex = contentIndexOf("agent-authored steer");
+	expect(userSteerIndex).toBeGreaterThanOrEqual(0);
+	expect(agentSteerIndex).toBeGreaterThan(userSteerIndex);
+
+	permissionPending.resolve({ outcome: "cancelled" });
+});
+
+it("parks a steer that lands mid-dispatch until the owning prompt goes live, then injects it", async () => {
+	// Park-until-live: a steer arriving while the owning prompt is reserved
+	// but still dispatching (`#promptInFlightCount` raised, the agent not yet
+	// streaming) must neither be refused back to the host (agent-shell would
+	// interrupt the very turn it targeted) nor injected mid-dispatch — it
+	// parks, then admits when the run goes live, and the loop's boundary
+	// poll delivers it into that run.
+	const keyGate = Promise.withResolvers<void>();
+	const dispatched = Promise.withResolvers<void>();
+	let keyCalls = 0;
+	const gatedApiKey = (): Promise<string> | string => {
+		keyCalls++;
+		if (keyCalls === 1) {
+			dispatched.resolve();
+			return keyGate.promise.then(() => "test-key");
+		}
+		return "test-key";
+	};
+	const bridge: ClientBridge = { capabilities: {} };
+	session = await createSessionWithMockModel(
+		[],
+		bridge,
+		[{ content: ["first answer"] }, { content: ["steer answer"] }],
+		{ getApiKey: gatedApiKey },
+	);
+
+	const promptDone = session.prompt("first");
+	// Hold open the pre-dispatch window: the prompt is in flight (its
+	// in-flight bracket raised — `isStreaming` true) while the agent has
+	// not started streaming.
+	await dispatched.promise;
+	expect(session.isStreaming).toBe(true);
+	expect(session.agent.state.isStreaming).toBe(false);
+
+	const admitted = session.joinActiveTurn("steer the dispatching turn");
+	// The steer parks rather than settling: give it a beat to prove it
+	// neither admitted early nor refused.
+	await Bun.sleep(20);
+	let settled = false;
+	void admitted.then(
+		() => {
+			settled = true;
+		},
+		() => {
+			settled = true;
+		},
+	);
+	await Bun.sleep(20);
+	expect(settled).toBe(false);
+
+	// The owning prompt goes live: the parked steer admits and injects into
+	// the now-running turn.
+	keyGate.resolve();
+	expect(await admitted).toBe(true);
+	await promptDone;
+	await session.waitForIdle();
+
+	// The run went live; the loop's boundary poll injected the parked steer
+	// after the first response, and the continuation answered it in turn.
+	const messages = session.agent.state.messages;
+	const steerIndex = messages.findIndex(
+		message => message.role === "user" && JSON.stringify(message.content).includes("steer the dispatching turn"),
+	);
+	const answerIndex = messages.findIndex(
+		message => message.role === "assistant" && JSON.stringify(message.content).includes("steer answer"),
+	);
+	expect(steerIndex).toBeGreaterThanOrEqual(0);
+	expect(answerIndex).toBeGreaterThan(steerIndex);
+});
+
+it("refuses a steer into an agent-initiated turn whose output has no client forwarder", async () => {
+	// An idle `triggerTurn` custom message starts an agent-initiated turn:
+	// `#beginInFlight` counts it, but no client prompt owns it, so its
+	// output has no promptTurn forwarder. A steer arriving mid-run must be
+	// refused (the host keeps its content and resubmits via session/prompt)
+	// instead of being admitted into a run whose answer would be dropped.
+	const turnStarted = Promise.withResolvers<void>();
+	const releaseTurn = Promise.withResolvers<void>();
+	session = await createSessionWithMockModel([], { capabilities: {} }, [
+		async () => {
+			turnStarted.resolve();
+			await releaseTurn.promise;
+			return { content: ["agent-initiated done"] };
+		},
+	]);
+	const sent = session.sendCustomMessage(
+		{ customType: "background", content: "do work", display: false },
+		{
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		},
+	);
+	await turnStarted.promise;
+	expect(session.agent.state.isStreaming).toBe(true);
+	expect(session.isStreaming).toBe(true);
+
+	expect(await session.joinActiveTurn("steer the agent-initiated turn")).toBe(false);
+	expect(session.getQueuedMessages().steering).toEqual([]);
+
+	releaseTurn.resolve();
+	await sent;
+	await session.waitForIdle();
+	const messages = session.agent.state.messages;
+	expect(
+		messages.some(
+			message =>
+				message.role === "user" && JSON.stringify(message.content).includes("steer the agent-initiated turn"),
+		),
+	).toBe(false);
+});
+
+async function createSessionWithMockModel(
+	tools: AgentTool[],
+	bridge: ClientBridge,
+	responses: NonNullable<MockModelOptions["responses"]>,
+	options?: {
+		getApiKey?: () => Promise<string> | string;
+		loopSteeringSignal?: AbortSignal;
+		settings?: Record<string, unknown>;
+	},
+): Promise<AgentSession> {
+	const mock = createMockModel({ responses });
+	const settings = Settings.isolated({ "compaction.enabled": false, ...options?.settings });
+	const sessionManager = SessionManager.inMemory(tempDir.path());
+	const getApiKey = options?.getApiKey ?? (() => "test-key");
+	const agent = new Agent({
+		getApiKey,
+		// With a loop steering signal the tool calls run under a ctx
+		// (`ctx.toolCall.steeringSignal`), the path the production loop
+		// wires; the test aborts it on command to simulate the loop's
+		// any-source steering abort.
+		...(options?.loopSteeringSignal
+			? {
+					getToolContext: (() => ({ toolCall: { steeringSignal: options.loopSteeringSignal } }) as never) as never,
+				}
+			: { getToolContext: context => ({ toolCall: context }) as never }),
+		initialState: {
+			model: mock.model,
+			systemPrompt: ["Test"],
+			tools,
+			messages: [],
+		},
+		convertToLlm,
+		streamFn: mock.stream,
+	});
+	const sess = new AgentSession({
+		agent,
+		sessionManager,
+		settings,
+		modelRegistry: { getApiKey } as never,
+		toolRegistry: new Map(tools.map(t => [t.name, t])),
+	});
+	sess.setClientBridge(bridge);
+	return sess;
+}
+
+it("delivers two steers admitted in one dialog window first-arrival-first", async () => {
+	// Two admissions can land while one permission dialog is open, before
+	// the gate's abort wake runs: the first group must stay first (the
+	// promotion is FIFO within the window), not be shadowed by the second
+	// group's latest-slot write.
+	const deleteTool = makeFakeTool("delete");
+	const permissionPending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const permissionOpened = Promise.withResolvers<void>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(_toolCall, _options, _signal) {
+			permissionOpened.resolve();
+			return await permissionPending.promise;
+		},
+	};
+	const turnStreamStarted = Promise.withResolvers<void>();
+	const releaseTurnStream = Promise.withResolvers<void>();
+	session = await createSessionWithMockModel([deleteTool as AgentTool], bridge, [
+		async () => {
+			turnStreamStarted.resolve();
+			await releaseTurnStream.promise;
+			return {
+				content: [{ type: "toolCall", id: "call-delete-1", name: "delete", arguments: { path: "/tmp/gone.ts" } }],
+			};
+		},
+		{ content: ["answered first steer"] },
+		{ content: ["answered second steer"] },
+	]);
+
+	const promptDone = session.prompt("delete something");
+	await turnStreamStarted.promise;
+	releaseTurnStream.resolve();
+	await permissionOpened.promise;
+
+	// Both admissions in the same dialog window, with no await between the
+	// calls: each call's enqueue fires before the gate's abort wake runs.
+	const first = session.joinActiveTurn("first steering question");
+	const second = session.joinActiveTurn("second steering question");
+	expect(await first).toBe(true);
+	expect(await second).toBe(true);
+
+	await promptDone;
+	await session.waitForIdle();
+	expect(deleteTool.executeCalls).toBe(0);
+
+	const messages = session.agent.state.messages;
+	const contentIndexOf = (needle: string) =>
+		messages.findIndex(message => message.role === "user" && JSON.stringify(message.content).includes(needle));
+	expect(contentIndexOf("first steering question")).toBeLessThan(contentIndexOf("second steering question"));
+
+	permissionPending.resolve({ outcome: "cancelled" });
+});
+
+it("supersedes both parallel dialogs without transferring late approvals", async () => {
+	const effects: unknown[] = [];
+	const deleteTool: AgentTool = {
+		name: "delete",
+		label: "delete",
+		description: "Delete a selected synthetic entry",
+		parameters: type({ path: "string" }),
+		concurrency: "shared",
+		async execute(_id, args) {
+			effects.push(args);
+			return { content: [{ type: "text", text: "deleted" }] };
+		},
+	};
+	const opened = Promise.withResolvers<void>();
+	const pending = new Map<string, PromiseWithResolvers<ClientBridgePermissionOutcome>>();
+	const cancelled = new Set<string>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		requestPermission(call, _options, _signal, steeringSignal) {
+			const response = Promise.withResolvers<ClientBridgePermissionOutcome>();
+			pending.set(call.toolCallId, response);
+			steeringSignal?.addEventListener("abort", () => cancelled.add(call.toolCallId), { once: true });
+			if (pending.size === 2) opened.resolve();
+			return response.promise;
+		},
+	};
+	session = await createSessionWithMockModel([deleteTool], bridge, [
+		{
+			content: [
+				{ type: "toolCall", id: "parallel-a", name: "delete", arguments: { path: "/synthetic/a" } },
+				{ type: "toolCall", id: "parallel-b", name: "delete", arguments: { path: "/synthetic/b" } },
+			],
+		},
+		{ content: ["kept both entries"] },
+	]);
+	const turn = session.prompt("delete two entries");
+	await withTimeout(opened.promise, 2_000, "Session admission boundary timed out");
+	expect(await session.joinActiveTurn("keep both entries")).toBe(true);
+	await withTimeout(turn, 2_000, "Session admission boundary timed out");
+	expect([...cancelled].sort()).toEqual(["parallel-a", "parallel-b"]);
+	for (const response of pending.values()) response.resolve({ outcome: "selected", optionId: "allow_always" });
+	await session.waitForIdle();
+	expect(effects).toEqual([]);
+	const results = session.messages.filter(message => message.role === "toolResult");
+	expect(
+		results
+			.filter(message => message.isError)
+			.map(message => message.toolCallId)
+			.sort(),
+	).toEqual(["parallel-a", "parallel-b"]);
+});
+
+it("preserves wait-mode permission policy across repeated real user arrivals", async () => {
+	const permission = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const opened = Promise.withResolvers<void>();
+	let cancelled = false;
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		requestPermission(_call, _options, _signal, steeringSignal) {
+			steeringSignal?.addEventListener(
+				"abort",
+				() => {
+					cancelled = true;
+				},
+				{ once: true },
+			);
+			opened.resolve();
+			return permission.promise;
+		},
+	};
+	session = await createSessionWithMockModel([makeFakeTool("delete")], bridge, [
+		{ content: [{ type: "toolCall", id: "wait-dialog", name: "delete", arguments: { path: "/synthetic/entry" } }] },
+		{ content: ["first answer"] },
+		{ content: ["second answer"] },
+	]);
+	session.agent.setInterruptMode("wait");
+	const turn = session.prompt("request a protected change");
+	await withTimeout(opened.promise, 2_000, "Session admission boundary timed out");
+	expect(await session.joinActiveTurn("first user direction")).toBe(true);
+	expect(await session.joinActiveTurn("second user direction")).toBe(true);
+	permission.resolve({ outcome: "selected", optionId: "reject_once" });
+	await withTimeout(turn, 2_000, "Session admission boundary timed out");
+	expect(cancelled).toBe(false);
+	const result = session.messages.find(
+		message => message.role === "toolResult" && message.toolCallId === "wait-dialog",
+	);
+	expect(result?.role === "toolResult" && result.isError).toBe(true);
+	const delivered = session.messages
+		.filter(message => message.role === "user")
+		.map(message => JSON.stringify(message.content));
+	expect(delivered.some(content => content.includes("first user direction"))).toBe(true);
+	expect(delivered.some(content => content.includes("second user direction"))).toBe(true);
+});
+
+it("parks a steer submitted before the owning prompt's dispatch preprocessing", async () => {
+	const session = await createSessionWithMockModel([makeFakeTool("noop")], makeBridge({ outcome: "cancelled" }), [
+		{ content: ["ok"] },
+	]);
+
+	// The submission's synchronous prefix must reserve the client claim
+	// before any dispatch preprocessing await (maintenance wait, command
+	// expansion, image normalization): a steer landing in that window parks
+	// until the run goes live and injects into it, instead of being declined
+	// (the pre-fix claim appeared only after normalization, so this steer
+	// answered false and the host's resubmission implicitly cancelled the
+	// still-dispatching prompt).
+	const dispatched = session.prompt("hello there");
+	const steer = session.joinActiveTurn("steer the dispatching prompt");
+	expect(await steer).toBe(true);
+	expect(await dispatched).toBe(true);
+	await session.waitForIdle();
+});
+
+it("steers the actual automatic retry permission wait under the still-outstanding client prompt", async () => {
+	const deleteTool = makeFakeTool("delete");
+	const opened = Promise.withResolvers<void>();
+	const cancelled = Promise.withResolvers<void>();
+	const permission = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		requestPermission: async (_call, _options, _signal, steeringSignal) => {
+			steeringSignal?.addEventListener("abort", () => cancelled.resolve(), { once: true });
+			opened.resolve();
+			return permission.promise;
+		},
+	};
+	session = await createSessionWithMockModel(
+		[deleteTool],
+		bridge,
+		[
+			{
+				stopReason: "error",
+				errorMessage: new AnthropicConnectionError(new Error("ECONNRESET: connection reset by peer")).message,
+			},
+			{ content: [{ type: "toolCall", id: "retry-delete", name: "delete", arguments: { path: "/tmp/retry" } }] },
+			{ content: ["retry answered the user's steering"] },
+		],
+		{ settings: { "retry.enabled": true, "retry.baseDelayMs": 1, "retry.modelFallback": false } },
+	);
+	let settled = false;
+	let physicalRuns = 0;
+	let automaticRetries = 0;
+	session.subscribe(event => {
+		if (event.type === "agent_start") physicalRuns++;
+		if (event.type === "auto_retry_start") automaticRetries++;
+	});
+	const prompt = session.prompt("client-owned retry").then(() => {
+		settled = true;
+	});
+	try {
+		await withTimeout(opened.promise, 2_000, "Session admission boundary timed out");
+		expect(settled).toBe(false);
+		expect(automaticRetries).toBe(1);
+		expect(physicalRuns).toBe(2);
+		expect(
+			await withTimeout(
+				session.joinActiveTurn("keep the retry file"),
+				2_000,
+				"Session admission boundary timed out",
+			),
+		).toBe(true);
+		await withTimeout(cancelled.promise, 2_000, "Session admission boundary timed out");
+		permission.resolve({ outcome: "selected", optionId: "allow_always", kind: "allow_always" });
+		await withTimeout(prompt, 2_000, "Session admission boundary timed out");
+		expect(deleteTool.executeCalls).toBe(0);
+		expect(
+			session.messages.some(
+				message => message.role === "user" && JSON.stringify(message.content).includes("keep the retry file"),
+			),
+		).toBe(true);
+		expect(
+			session.messages.some(
+				message =>
+					message.role === "assistant" &&
+					JSON.stringify(message.content).includes("retry answered the user's steering"),
+			),
+		).toBe(true);
+	} finally {
+		permission.resolve({ outcome: "cancelled" });
+	}
+});
+
+it("never lends a client claim to an autonomous automatic retry permission wait", async () => {
+	const deleteTool = makeFakeTool("delete");
+	const opened = Promise.withResolvers<void>();
+	const permission = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	let cancelled = false;
+	session = await createSessionWithMockModel(
+		[deleteTool],
+		{
+			capabilities: { requestPermission: true },
+			requestPermission: async (_call, _options, _signal, steeringSignal) => {
+				steeringSignal?.addEventListener(
+					"abort",
+					() => {
+						cancelled = true;
+					},
+					{ once: true },
+				);
+				opened.resolve();
+				return permission.promise;
+			},
+		},
+		[
+			{
+				stopReason: "error",
+				errorMessage: new AnthropicConnectionError(new Error("ECONNRESET: connection reset by peer")).message,
+			},
+			{ content: [{ type: "toolCall", id: "autonomous-retry-delete", name: "delete", arguments: {} }] },
+			{ content: ["autonomous completion"] },
+		],
+		{ settings: { "retry.enabled": true, "retry.baseDelayMs": 1, "retry.modelFallback": false } },
+	);
+	let physicalRuns = 0;
+	let automaticRetries = 0;
+	session.subscribe(event => {
+		if (event.type === "agent_start") physicalRuns++;
+		if (event.type === "auto_retry_start") automaticRetries++;
+	});
+	const pending = session.sendCustomMessage("autonomous retry", { deliverAs: "nextTurn", triggerTurn: true });
+	try {
+		await withTimeout(opened.promise, 2_000, "Session admission boundary timed out");
+		expect(automaticRetries).toBe(1);
+		expect(physicalRuns).toBe(2);
+		expect(await session.joinActiveTurn("private client instruction")).toBe(false);
+		expect(cancelled).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+	} finally {
+		permission.resolve({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	}
+	await withTimeout(pending, 2_000, "Session admission boundary timed out");
+	await session.waitForIdle();
+	expect(deleteTool.executeCalls).toBe(0);
+	expect(
+		session.messages.some(
+			message => "content" in message && JSON.stringify(message.content).includes("private client instruction"),
+		),
+	).toBe(false);
 });

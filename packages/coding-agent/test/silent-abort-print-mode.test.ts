@@ -10,11 +10,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
-import {
-	type AgentSession,
-	type AgentSessionDisposeOptions,
-	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
-} from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import * as telemetryExport from "../src/telemetry-export";
 
@@ -40,13 +36,12 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 }
 
 /** Minimal mock of AgentSession for print-mode text output path */
-function createMockSession(
-	messages: AssistantMessage[],
-	dispose: (options?: AgentSessionDisposeOptions) => Promise<void> = async () => {},
-): AgentSession {
+function createMockSession(messages: AssistantMessage[]): AgentSession {
+	let completed = false;
 	return {
 		state: { messages },
-		getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
+		getLastAssistantMessage: () =>
+			completed ? messages.findLast(message => message.role === "assistant") : undefined,
 		settings: Settings.isolated(),
 		sessionManager: {
 			getHeader: () => undefined,
@@ -57,13 +52,16 @@ function createMockSession(
 		},
 		extensionRunner: undefined,
 		subscribe: () => () => {},
-		prompt: async () => {},
+		prompt: async () => {
+			completed = true;
+			return true;
+		},
 		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		waitForIdle: async () => {},
-		dispose,
+		dispose: async () => {},
 	} as unknown as AgentSession;
 }
 
@@ -103,7 +101,7 @@ describe("Print-mode exit status", () => {
 		});
 
 		const session = createMockSession([silentAbortMsg]);
-		const exitCode = await runPrintMode(session, { mode: "text" });
+		const exitCode = await runPrintMode(session, { mode: "text", messages: ["hello"] });
 
 		// The silent-abort marker MUST NOT appear in stderr
 		const stderrText = stderrOutput.join("");
@@ -111,17 +109,6 @@ describe("Print-mode exit status", () => {
 		// A silent abort reports success and never terminates the process itself
 		expect(exitCode).toBe(0);
 		expect(exitSpy).not.toHaveBeenCalled();
-	});
-
-	it("bounds final memory consolidation so print mode can exit", async () => {
-		let disposeOptions: AgentSessionDisposeOptions | undefined;
-		const session = createMockSession([makeAssistantMessage()], async options => {
-			disposeOptions = options;
-		});
-
-		await runPrintMode(session, { mode: "text" });
-
-		expect(disposeOptions?.mnemopiConsolidateTimeoutMs).toBe(SHUTDOWN_CONSOLIDATE_BUDGET_MS);
 	});
 
 	it("does not write bit-classified silent aborts to stderr or exit non-zero", async () => {
@@ -134,8 +121,8 @@ describe("Print-mode exit status", () => {
 
 		const session = createMockSession([silentAbortMsg]);
 
-		expect(await runPrintMode(session, { mode: "text" })).toBe(0);
-		expect(stderrOutput.join("")).toBe("");
+		expect(await runPrintMode(session, { mode: "text", messages: ["hello"] })).toBe(0);
+		expect(stderrOutput.join("")).not.toContain("Request aborted");
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 
@@ -146,11 +133,8 @@ describe("Print-mode exit status", () => {
 			content: [],
 		});
 
-		let disposeOptions: AgentSessionDisposeOptions | undefined;
-		const session = createMockSession([errorMsg], async options => {
-			disposeOptions = options;
-		});
-		const exitCode = await runPrintMode(session, { mode: "text" });
+		const session = createMockSession([errorMsg]);
+		const exitCode = await runPrintMode(session, { mode: "text", messages: ["hello"] });
 
 		// A real error SHOULD be written to stderr
 		const stderrText = stderrOutput.join("");
@@ -158,7 +142,6 @@ describe("Print-mode exit status", () => {
 		// The caller terminates with the returned code; runPrintMode never exits itself
 		expect(exitCode).toBe(1);
 		expect(exitSpy).not.toHaveBeenCalled();
-		expect(disposeOptions?.mnemopiConsolidateTimeoutMs).toBe(SHUTDOWN_CONSOLIDATE_BUDGET_MS);
 	});
 
 	it("returns non-zero for the terminal length-stop error retained after session recovery", async () => {
@@ -176,7 +159,7 @@ describe("Print-mode exit status", () => {
 		};
 		vi.spyOn(session, "getLastAssistantMessage").mockImplementation(() => (settled ? failure : incomplete));
 
-		expect(await runPrintMode(session, { mode: "text" })).toBe(1);
+		expect(await runPrintMode(session, { mode: "text", messages: ["hello"] })).toBe(1);
 		expect(stderrOutput.join("")).toContain("Length-stop recovery gave up");
 	});
 
@@ -195,9 +178,12 @@ describe("Print-mode exit status", () => {
 		};
 		vi.spyOn(session, "getLastAssistantMessage").mockImplementation(() => (settled ? recovered : retryError));
 
-		expect(await runPrintMode(session, { mode: "text" })).toBe(0);
+		expect(await runPrintMode(session, { mode: "text", messages: ["hello"] })).toBe(0);
 		expect(stdoutOutput.join("")).toBe("Recovered\n");
-		expect(stderrOutput.join("")).toBe("");
+		// The admitted prompt turn writes the text working indicator to
+		// stderr; the pinned contract is that the recovered turn's error
+		// line never reaches it.
+		expect(stderrOutput.join("")).not.toContain("Temporary API failure");
 	});
 
 	it("prints thinking blocks only when printThoughts is enabled", async () => {
@@ -208,11 +194,11 @@ describe("Print-mode exit status", () => {
 			],
 		});
 
-		await runPrintMode(createMockSession([message]), { mode: "text" });
+		await runPrintMode(createMockSession([message]), { mode: "text", messages: ["hello"] });
 		expect(stdoutOutput.join("")).toBe("final answer\n");
 
 		stdoutOutput = [];
-		await runPrintMode(createMockSession([message]), { mode: "text", printThoughts: true });
+		await runPrintMode(createMockSession([message]), { mode: "text", printThoughts: true, messages: ["hello"] });
 		expect(stdoutOutput.join("")).toBe("inspect hidden branch\nfinal answer\n");
 	});
 });

@@ -8,7 +8,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
-import { escapeXmlText } from "@oh-my-pi/pi-utils";
+import { escapeXmlText, withTimeout } from "@oh-my-pi/pi-utils";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
 	return {
@@ -79,6 +79,7 @@ function createHarness(initial: { state?: GoalModeState; usage?: GoalTokenUsage;
 		now: () => now,
 	};
 	return {
+		host,
 		runtime: new GoalRuntime(host),
 		getState: () => cloneState(state),
 		setState: (next: GoalModeState | undefined) => {
@@ -211,6 +212,79 @@ describe("goal runtime", () => {
 			mode: "goal",
 			state: { goal: { timeUsedSeconds: 2 } },
 		});
+	});
+
+	it("retains abort accounting admission until persisted goal updates settle", async () => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		harness.runtime.onTurnStart("original", createUsage({ input: 10 }));
+		harness.setUsage({ input: 17, output: 5 });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const emit = harness.host.emit;
+		harness.host.emit = async event => {
+			await emit(event);
+			if (event.type === "goal_updated" && event.goal?.tokensUsed === 12 && event.goal.status === "active") {
+				started.resolve();
+				await release.promise;
+			}
+		};
+		let admitted = false;
+		const aborting = harness.runtime.onTaskAborted({
+			reason: "interrupted",
+			onAccountingSettled: () => {
+				admitted = true;
+				harness.runtime.onTurnStart("successor", createUsage({ input: 17, output: 5 }));
+			},
+		});
+		try {
+			await withTimeout(started.promise, 2_000, "Goal accounting boundary timed out");
+			expect(admitted).toBe(false);
+			expect(harness.persists).toMatchObject([{ mode: "goal", state: { goal: { tokensUsed: 12 } } }]);
+		} finally {
+			release.resolve();
+			await withTimeout(aborting, 2_000, "Goal accounting boundary timed out");
+		}
+		expect(admitted).toBe(true);
+		expect(harness.getState()).toMatchObject({ enabled: false, goal: { status: "paused", tokensUsed: 12 } });
+		expect(harness.persists).toMatchObject([
+			{ mode: "goal", state: { goal: { tokensUsed: 12 } } },
+			{ mode: "goal_paused", state: { goal: { status: "paused", tokensUsed: 12 } } },
+		]);
+		expect(harness.runtime.snapshot.turnSnapshot).toMatchObject({ turnId: "successor" });
+	});
+
+	it("does not clear or pause a successor goal while original abort accounting finishes", async () => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		harness.runtime.onTurnStart("original", createUsage({ input: 10 }));
+		harness.setUsage({ input: 17, output: 5 });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const emit = harness.host.emit;
+		harness.host.emit = async event => {
+			await emit(event);
+			if (event.type === "goal_updated" && event.goal?.id === "goal-1") {
+				started.resolve();
+				await release.promise;
+			}
+		};
+		const aborting = harness.runtime.onTaskAborted({ reason: "interrupted" });
+		try {
+			await withTimeout(started.promise, 2_000, "Goal accounting boundary timed out");
+			harness.setState({ enabled: true, mode: "active", goal: createGoal({ id: "goal-2" }) });
+			harness.runtime.onTurnStart("successor", createUsage({ input: 100 }));
+			harness.setUsage({ input: 105 });
+		} finally {
+			release.resolve();
+			await withTimeout(aborting, 2_000, "Goal accounting boundary timed out");
+		}
+		expect(harness.getState()).toMatchObject({ enabled: true, goal: { id: "goal-2", status: "active" } });
+		expect(harness.runtime.snapshot.turnSnapshot).toMatchObject({ turnId: "successor", activeGoalId: "goal-2" });
+		await harness.runtime.flushUsage("suppressed");
+		expect(harness.getState()?.goal.tokensUsed).toBe(5);
+		expect(harness.persists).toMatchObject([
+			{ mode: "goal", state: { goal: { id: "goal-1", tokensUsed: 12 } } },
+			{ mode: "goal", state: { goal: { id: "goal-2", tokensUsed: 5 } } },
+		]);
 	});
 
 	it("resets wall-clock baseline when preserving an active goal after a no-goal switch", async () => {

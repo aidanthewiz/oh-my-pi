@@ -8,7 +8,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { createAgentSession, type CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { credentialPinHash, recordCredentialPin } from "@oh-my-pi/pi-coding-agent/session/credential-pin";
@@ -25,6 +25,7 @@ const taskAgent: AgentDefinition = {
 	description: "General-purpose task agent",
 	systemPrompt: "Do the assigned work.",
 	source: "bundled",
+	spawns: ["task"],
 };
 
 function oauthCredential(suffix: string): OAuthCredential {
@@ -196,6 +197,7 @@ describe("task subagent OAuth pin inheritance", () => {
 			const children: AgentSession[] = [];
 			for (const [index, childOptions] of dispatched.entries()) {
 				const providerSessionId = `child-provider-session-${index + 1}`;
+				if (!childOptions.id) throw new Error("Expected child agent id");
 				const { session: child } = await createAgentSession({
 					cwd: tempDir.path(),
 					agentDir: tempDir.path(),
@@ -205,6 +207,16 @@ describe("task subagent OAuth pin inheritance", () => {
 					settings,
 					model,
 					providerSessionId,
+					agentId: childOptions.id,
+					parentTaskPrefix: childOptions.id,
+					parentAgentId: childOptions.parentAgentId,
+					agentName: childOptions.agent.name,
+					taskDepth: (childOptions.taskDepth ?? 0) + 1,
+					spawns: "task",
+					expectedAgentRef: null,
+					inheritedSessionAgents: childOptions.inheritedSessionAgents,
+					contextFiles: childOptions.contextFiles,
+					oauthAccountPools: childOptions.oauthAccountPools,
 					getApiKey: childOptions.getApiKey,
 					credentialSourceSessionId: childOptions.credentialSourceSessionId,
 					toolNames: ["task"],
@@ -228,14 +240,15 @@ describe("task subagent OAuth pin inheritance", () => {
 
 			const childTask = child.getToolByName("task");
 			if (!childTask) throw new Error("Expected child task tool");
-			await childTask.execute("nested-task-call", {
+			const nestedResult = await childTask.execute("nested-task-call", {
 				context: "Check the nested target.",
 				tasks: [{ agent: "task", name: "Grandchild", task: "Inspect the nested target." }],
 			});
 
+			expect(nestedResult.isError).not.toBe(true);
 			expect(dispatched).toHaveLength(3);
 			const nestedOptions = dispatched[2];
-			if (!nestedOptions) throw new Error("Expected nested child options");
+			if (!nestedOptions?.id) throw new Error("Expected nested child id");
 			expect(nestedOptions.getApiKey).toBeUndefined();
 			expect(nestedOptions.credentialSourceSessionId).toBe("child-provider-session-1");
 			const { session: grandchild } = await createAgentSession({
@@ -247,9 +260,19 @@ describe("task subagent OAuth pin inheritance", () => {
 				settings,
 				model,
 				providerSessionId: "grandchild-provider-session",
+				agentId: nestedOptions.id,
+				parentTaskPrefix: nestedOptions.id,
+				parentAgentId: nestedOptions.parentAgentId,
+				agentName: nestedOptions.agent.name,
+				taskDepth: (nestedOptions.taskDepth ?? 0) + 1,
+				spawns: "",
+				expectedAgentRef: null,
+				inheritedSessionAgents: nestedOptions.inheritedSessionAgents,
+				contextFiles: nestedOptions.contextFiles,
+				oauthAccountPools: nestedOptions.oauthAccountPools,
 				getApiKey: nestedOptions.getApiKey,
 				credentialSourceSessionId: nestedOptions.credentialSourceSessionId,
-				toolNames: ["task"],
+				toolNames: ["read"],
 				disableExtensionDiscovery: true,
 			});
 			sessions.push(grandchild);
@@ -260,6 +283,91 @@ describe("task subagent OAuth pin inheritance", () => {
 				session_id: "grandchild-provider-session",
 				account_uuid: "account-b",
 			});
+
+			await grandchild.dispose();
+			expect(await resolveApiKeyOnce(await childGetApiKey(model))).toBe("access-b");
+			await child.dispose();
+			const sibling = children[1];
+			if (!sibling?.agent.getApiKey || !parent.agent.getApiKey) throw new Error("Expected live family resolvers");
+			expect(await resolveApiKeyOnce(await sibling.agent.getApiKey(model))).toBe("access-b");
+			expect(await resolveApiKeyOnce(await parent.agent.getApiKey(otherProviderModel))).toBe("openai-key");
+		} finally {
+			for (const session of sessions.reverse()) await session.dispose();
+			await authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("keeps a supplied resolver authoritative for each provider in a dispatched child", async () => {
+		const tempDir = TempDir.createSync("@pi-subagent-supplied-auth-");
+		const authStorage = createInMemoryAuthStorage();
+		const sessions: AgentSession[] = [];
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const otherProviderModel = getBundledModel("openai", "gpt-5-mini");
+			if (!model || !otherProviderModel) throw new Error("Expected bundled test models");
+			await authStorage.credentials.set("anthropic", [oauthCredential("a")]);
+			authStorage.keys.setRuntime("openai", "stored-openai-key");
+			const getApiKey: CreateAgentSessionOptions["getApiKey"] = async candidate =>
+				candidate.provider === "anthropic" ? "supplied-anthropic-key" : "supplied-openai-key";
+			const options = {
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
+				settings: Settings.isolated({
+					"async.enabled": false,
+					"compaction.enabled": false,
+					"task.batch": true,
+					"task.isolation.enabled": false,
+					"todo.enabled": false,
+				}),
+				model,
+				disableExtensionDiscovery: true,
+			};
+			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+			const dispatched: executorModule.ExecutorOptions[] = [];
+			vi.spyOn(executorModule, "runSubprocess").mockImplementation(async childOptions => {
+				dispatched.push(childOptions);
+				return subprocessResult(childOptions.id ?? "task");
+			});
+			const { session: parent } = await createAgentSession({
+				...options,
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				getApiKey,
+				toolNames: ["task"],
+			});
+			sessions.push(parent);
+			const task = parent.getToolByName("task");
+			if (!task) throw new Error("Expected parent task tool");
+			await task.execute("supplied-auth-task", {
+				context: "Inspect the target.",
+				tasks: [{ agent: "task", name: "SuppliedAuthChild", task: "Inspect the target." }],
+			});
+			expect(dispatched).toHaveLength(1);
+			const childOptions = dispatched[0];
+			if (!childOptions?.id) throw new Error("Expected child agent id");
+			const { session: child } = await createAgentSession({
+				...options,
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				providerSessionId: "supplied-child-provider-session",
+				agentId: childOptions.id,
+				parentTaskPrefix: childOptions.id,
+				parentAgentId: childOptions.parentAgentId,
+				agentName: childOptions.agent.name,
+				taskDepth: (childOptions.taskDepth ?? 0) + 1,
+				expectedAgentRef: null,
+				getApiKey: childOptions.getApiKey,
+				credentialSourceSessionId: childOptions.credentialSourceSessionId,
+				toolNames: ["read"],
+			});
+			sessions.push(child);
+			const childGetApiKey = child.agent.getApiKey;
+			if (!childGetApiKey || !parent.agent.getApiKey) throw new Error("Expected supplied credential resolvers");
+			expect(await resolveApiKeyOnce(await childGetApiKey(model))).toBe("supplied-anthropic-key");
+			expect(await resolveApiKeyOnce(await childGetApiKey(otherProviderModel))).toBe("supplied-openai-key");
+			await child.dispose();
+			expect(await resolveApiKeyOnce(await parent.agent.getApiKey(model))).toBe("supplied-anthropic-key");
 		} finally {
 			for (const session of sessions.reverse()) await session.dispose();
 			await authStorage.close();
@@ -461,7 +569,7 @@ describe("task subagent OAuth pin inheritance", () => {
 
 			expect(dispatched).toHaveLength(1);
 			const childOptions = dispatched[0];
-			if (!childOptions) throw new Error("Expected child options");
+			if (!childOptions?.id) throw new Error("Expected child agent id");
 			const { session: child } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -471,6 +579,15 @@ describe("task subagent OAuth pin inheritance", () => {
 				settings,
 				model,
 				providerSessionId: "child-provider-session",
+				agentId: childOptions.id,
+				parentTaskPrefix: childOptions.id,
+				parentAgentId: childOptions.parentAgentId,
+				agentName: childOptions.agent.name,
+				taskDepth: (childOptions.taskDepth ?? 0) + 1,
+				spawns: "task",
+				expectedAgentRef: null,
+				inheritedSessionAgents: childOptions.inheritedSessionAgents,
+				contextFiles: childOptions.contextFiles,
 				credentialSourceSessionId: childOptions.credentialSourceSessionId,
 				oauthAccountPools: childOptions.oauthAccountPools,
 				toolNames: ["read"],

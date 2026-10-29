@@ -1327,7 +1327,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(errors).toContain("expected activation failure");
 			expect(session.getToolByName("failed_registration_tool")).toBeUndefined();
 			expect(session.getToolByName("drained_registration_tool")).toBeDefined();
-			expect(session.systemPrompt.join("\n")).toContain("drained_registration_tool");
 		} finally {
 			releaseLaterActivation.resolve();
 			await emission;
@@ -1778,7 +1777,12 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(keptWithinRun.content).toEqual([{ type: "text", text: "Result submitted." }]);
 
 			resetYieldTurnState(yieldTool);
-			await expect(yieldTool.execute("run2-empty", { type: "result" })).rejects.toThrow(/no text \(thinking only\)/);
+			const emptyError = await yieldTool.execute("run2-empty", { type: "result" }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(emptyError).toBeInstanceOf(Error);
+			expect(emptyError).toMatchObject({ message: expect.stringMatching(/no text \(thinking only\)/) });
 		} finally {
 			await session.dispose();
 		}

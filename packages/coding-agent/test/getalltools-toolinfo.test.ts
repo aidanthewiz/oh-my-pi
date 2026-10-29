@@ -119,19 +119,21 @@ describe("AgentSession.getAllToolInfos", () => {
 			builtInToolNames: [],
 			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [toolNames.join(",")] }),
 			extensionRunner: {
-				getRegisteredTool: (name: string) =>
-					name === "git"
-						? {
-								extensionPath: "./extension.ts",
-								definition: { sourcePath: "./tools/git.ts" },
-								sourceInfo: {
-									path: sourcePath,
-									source: "extension",
-									scope: "temporary",
-									origin: "top-level",
-								},
-							}
-						: undefined,
+				toolRegistrations: new WeakMap([
+					[
+						custom,
+						{
+							extensionPath: "./extension.ts",
+							definition: { sourcePath: "./tools/git.ts" },
+							sourceInfo: {
+								path: sourcePath,
+								source: "extension",
+								scope: "temporary",
+								origin: "top-level",
+							},
+						},
+					],
+				]),
 			} as never,
 		});
 

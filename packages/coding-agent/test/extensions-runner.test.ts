@@ -3293,10 +3293,10 @@ describe("ExtensionRunner", () => {
 			).rejects.toThrow('Tool "dangerous_tool" requires approval but no interactive UI available.');
 
 			expect(events).toEqual([
-				{ type: "tool_approval_requested", sessionId: "", reason: undefined },
+				{ type: "tool_approval_requested", sessionId: sessionManager.getSessionId(), reason: undefined },
 				{
 					type: "tool_approval_resolved",
-					sessionId: "",
+					sessionId: sessionManager.getSessionId(),
 					approved: false,
 					reason: "no interactive UI available",
 				},

@@ -61,7 +61,7 @@ describe("/compact dispatch (ACP)", () => {
 		const h = acpRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/compact snapcompact keep the diffs", h.runtime);
 		expect(h.compact).not.toHaveBeenCalled();
-		expect(result).toEqual({ consumed: true });
+		expect(result).toEqual({ consumed: true, failed: true });
 		expect((h.output.mock.calls[0]?.[0] as string) ?? "").toContain("snapcompact");
 	});
 
@@ -88,6 +88,22 @@ describe("/compact dispatch (ACP)", () => {
 		compactFinished.resolve();
 		await Promise.all(backgroundTasks);
 		expect(h.output).toHaveBeenCalledWith("Compaction complete.");
+	});
+
+	it("does not start deferred maintenance after the originating host loses ownership", async () => {
+		const h = acpRuntime();
+		let current = true;
+		let pending: (() => Promise<void>) | undefined;
+		h.runtime.isCurrent = () => current;
+		h.runtime.runCommandInBackground = task => {
+			pending = task;
+		};
+		await executeAcpBuiltinSlashCommand("/compact", h.runtime);
+		current = false;
+		if (!pending) throw new Error("Compaction did not register background work");
+		await pending();
+		expect(h.compact).not.toHaveBeenCalled();
+		expect(h.output).not.toHaveBeenCalled();
 	});
 
 	it("stays silent when compaction is cancelled by a user interrupt", async () => {

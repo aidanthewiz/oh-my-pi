@@ -156,7 +156,11 @@ describe("MCP tools/call progress updates", () => {
 	for (const kind of ["connected", "deferred"] as const) {
 		for (const failure of ["auth", "connection"] as const) {
 			it(`${kind}: retains progress on a ${failure} retry`, async () => {
+				const readDefinition = { ...definition, annotations: { readOnlyHint: true } };
+				let attempts = 0;
+				let reconnects = 0;
 				const first = connectionFor(options => {
+					attempts++;
 					report(options, { progress: 1, message: "initial" });
 					if (failure === "connection") throw new Error("Transport closed");
 					return {
@@ -165,21 +169,74 @@ describe("MCP tools/call progress updates", () => {
 						_meta: { "mcp/www_authenticate": ["Bearer realm=fixture"] },
 					};
 				});
-				const next = withSteps([{ progress: 2, message: "retry" }]);
+				const next = connectionFor(options => {
+					attempts++;
+					report(options, { progress: 2, message: "retry" });
+					return result;
+				});
+				const reconnect = async () => {
+					reconnects++;
+					return next;
+				};
 				const tool =
 					kind === "connected"
-						? new MCPTool(first, definition, async () => next)
-						: new DeferredMCPTool(
-								first.name,
-								definition,
-								async () => first,
-								first._source,
-								async () => next,
-							);
+						? new MCPTool(first, readDefinition, reconnect)
+						: new DeferredMCPTool(first.name, readDefinition, async () => first, first._source, reconnect);
 				const messages: string[] = [];
 				await tool.execute("retry", {}, partial => messages.push(partial.details!.progress!.message!), context);
 				expect(messages).toEqual(["initial", "retry"]);
+				expect(attempts).toBe(2);
+				expect(reconnects).toBe(1);
 			});
+		}
+	}
+
+	for (const kind of ["connected", "deferred"] as const) {
+		for (const failure of ["auth", "connection"] as const) {
+			for (const safety of ["unknown", "mutation"] as const) {
+				it(`${kind}: reports only the original progress for a non-replayed ${safety} ${failure} failure`, async () => {
+					let attempts = 0;
+					let reconnects = 0;
+					const first = connectionFor(options => {
+						attempts++;
+						report(options, { progress: 1, message: "initial" });
+						if (failure === "connection") throw new Error("Transport closed");
+						return {
+							content: [{ type: "text", text: "authorize" }],
+							isError: true,
+							_meta: { "mcp/www_authenticate": ["Bearer realm=fixture"] },
+						};
+					});
+					const next = connectionFor(options => {
+						attempts++;
+						report(options, { progress: 2, message: "duplicate" });
+						return result;
+					});
+					const reconnect = async () => {
+						reconnects++;
+						return next;
+					};
+					const unsafeDefinition =
+						safety === "unknown"
+							? definition
+							: { ...definition, annotations: { readOnlyHint: false, destructiveHint: true } };
+					const tool =
+						kind === "connected"
+							? new MCPTool(first, unsafeDefinition, reconnect)
+							: new DeferredMCPTool(first.name, unsafeDefinition, async () => first, first._source, reconnect);
+					const messages: string[] = [];
+					const actual = await tool.execute(
+						"unsafe",
+						{},
+						partial => messages.push(partial.details!.progress!.message!),
+						context,
+					);
+					expect(actual.isError).toBe(true);
+					expect(messages).toEqual(["initial"]);
+					expect(attempts).toBe(1);
+					expect(reconnects).toBe(0);
+				});
+			}
 		}
 	}
 

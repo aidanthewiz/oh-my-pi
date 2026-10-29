@@ -34,7 +34,7 @@ function makeProxyModel(id: string, compat?: ModelSpec["compat"]): Model<Api> {
 function makeHost(active: Model<Api>, artifactsDir: string): SessionProviderBoundaryHost {
 	return {
 		agent: { telemetry: undefined },
-		sessionManager: {},
+		sessionManager: { getSessionId: () => "test-session", getLeafId: () => null },
 		settings: Settings.isolated(),
 		modelRegistry: {
 			getAvailable: () => [],

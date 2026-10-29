@@ -18,6 +18,16 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.12.6] - 2026-10-21
+
+### Added
+
+- Added the `prompt-cache-persistent` catalog axis (`isPromptCachePersistent`) for providers whose own endpoint never expires prompt caches; logged-in OpenAI Codex declares it
+
+### Changed
+
+- Updated the bundled Yolo-Auto catalog to its current models, `qwen3.8-27b` (now the default), `yolo`, `yolo-small`, and `yolo-128k`, and removed the retired `deepseek-flash-v4` and `qwen3.8-flash`
+
 ## [18.12.5] - 2026-10-21
 
 ### Fixed

@@ -3262,6 +3262,7 @@ describe("AgentSession message pipeline", () => {
 				resetConversationTracking() {
 					remembered = false;
 				},
+				async consolidate() {},
 				async dispose() {},
 			} as unknown as MnemopiSessionState);
 
@@ -3360,6 +3361,7 @@ describe("AgentSession message pipeline", () => {
 			resetConversationTracking() {
 				remembered = false;
 			},
+			async consolidate() {},
 			async dispose() {},
 		} as unknown as MnemopiSessionState);
 
@@ -3458,6 +3460,7 @@ describe("AgentSession message pipeline", () => {
 				resetConversationTracking() {
 					remembered = false;
 				},
+				async consolidate() {},
 				async dispose() {},
 			} as unknown as MnemopiSessionState);
 

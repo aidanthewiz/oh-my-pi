@@ -15,6 +15,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
 import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 type FakeEditor = {
 	onEscape?: () => void;
@@ -108,6 +109,8 @@ async function createContext() {
 	const retry = vi.fn(async () => true);
 	const abort = vi.fn(async () => {});
 	const session = {
+		...createSessionDefaults(),
+		sessionId: "keybindings-main",
 		isStreaming: false,
 		isCompacting: false,
 		isGeneratingHandoff: false,

@@ -25,6 +25,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { Container } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 type StubEditor = {
 	setText: (text: string) => void;
@@ -107,6 +108,8 @@ function createStubInputControllerContext(opts: {
 		ui: { requestRender },
 		skillCommands: opts.skillCommands,
 		session: {
+			...createSessionDefaults(),
+			sessionId: "skill-queue-main",
 			isStreaming: opts.isStreaming,
 			isCompacting: opts.isCompacting ?? false,
 			isBashRunning: false,

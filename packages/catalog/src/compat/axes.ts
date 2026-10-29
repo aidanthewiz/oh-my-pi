@@ -560,6 +560,13 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	 * Unassigned: no known lookback bound.
 	 */
 	"prompt-cache-lookback": { key: "promptCacheLookback", set: "catalog", shape: "scalar" },
+	/**
+	 * Persistent prompt-cache lifetime metadata on the provider's own endpoint.
+	 * Read through `compat/prompt-cache-persistent.ts` to exempt idle compaction,
+	 * not threshold or manual compaction. It proves no cache hit or request
+	 * permission. Unassigned: no persistent-cache exemption.
+	 */
+	"prompt-cache-persistent": { key: "promptCachePersistent", set: "catalog", shape: "scalar", values: [true, false] },
 	"long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
 	"max-context-window": { key: "maxContextWindow", set: "catalog", shape: "scalar" },
 	/**

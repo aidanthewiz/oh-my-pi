@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
@@ -49,6 +50,7 @@ function createContext(
 		isStreaming?: boolean;
 		runIdleCompaction?: AgentSession["runIdleCompaction"];
 		promptCacheEntry?: AgentSession["promptCacheEntry"];
+		model?: AgentSession["model"];
 		runEphemeralTurn?: AgentSession["runEphemeralTurn"];
 		present?: InteractiveModeContext["present"];
 		sessionName?: string;
@@ -83,7 +85,7 @@ function createContext(
 			runIdleCompaction,
 			promptCacheEntry: options.promptCacheEntry,
 			runEphemeralTurn,
-			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			model: options.model ?? { provider: "anthropic", id: "claude-sonnet-4-5" },
 			messages: [createAssistantMessage()],
 			getContextUsage: () => ({ tokens: 210, contextWindow: 1_000, percent: 21 }),
 			getGoalModeState: () => goalState,
@@ -217,6 +219,78 @@ describe("EventController idle compaction teardown", () => {
 		expect(runIdleCompaction).not.toHaveBeenCalled();
 		vi.advanceTimersByTime(1);
 		expect(runIdleCompaction).toHaveBeenCalledTimes(1);
+		controller.dispose();
+	});
+
+	it.each([
+		["https://chatgpt.com/backend-api", false],
+		["https://codex-proxy.example/backend-api", true],
+	] as const)("uses endpoint-qualified idle cache policy for %s", async (baseUrl, shouldCompact) => {
+		const runIdleCompaction = vi.fn(async () => {});
+		const model = buildModel({
+			provider: "openai-codex",
+			id: "gpt-5.5",
+			name: "Codex idle-cache fixture",
+			api: "openai-codex-responses",
+			baseUrl,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		const context = createContext({ runIdleCompaction, model });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+		expect(runIdleCompaction).toHaveBeenCalledTimes(shouldCompact ? 1 : 0);
+		controller.dispose();
+	});
+
+	it.each([true, false])("reconciles an idle timer when persistence changes from %s", async persistent => {
+		const runIdleCompaction = vi.fn(async () => {});
+		const firstParty = buildModel({
+			provider: "openai-codex",
+			id: "gpt-5.5",
+			name: "Codex idle-cache fixture",
+			api: "openai-codex-responses",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		const gateway = { ...firstParty, baseUrl: "https://codex-proxy.example/backend-api" };
+		const context = createContext({ runIdleCompaction, model: persistent ? firstParty : gateway });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(30_000);
+		Object.defineProperty(context.session, "model", { value: persistent ? gateway : firstParty, configurable: true });
+		await controller.handleEvent({ type: "model_changed" });
+		vi.advanceTimersByTime(59_999);
+		expect(runIdleCompaction).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(runIdleCompaction).toHaveBeenCalledTimes(persistent ? 1 : 0);
+		controller.dispose();
+	});
+
+	it.each(["session", "focus"] as const)("does not compact a replacement %s from the original timer", async change => {
+		const originalCompaction = vi.fn(async () => {});
+		const replacementCompaction = vi.fn(async () => {});
+		const context = createContext({ runIdleCompaction: originalCompaction });
+		Object.defineProperty(context.session, "sessionId", { value: "original", configurable: true });
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		if (change === "session") {
+			Object.defineProperty(context.session, "sessionId", { value: "replacement", configurable: true });
+		} else {
+			const replacement = createContext({ runIdleCompaction: replacementCompaction }).session;
+			Object.defineProperty(context, "viewSession", { get: () => replacement, configurable: true });
+		}
+		vi.advanceTimersByTime(60_000);
+		expect(originalCompaction).not.toHaveBeenCalled();
+		expect(replacementCompaction).not.toHaveBeenCalled();
 		controller.dispose();
 	});
 

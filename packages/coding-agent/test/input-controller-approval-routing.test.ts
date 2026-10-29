@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 function createContext(approvalOwnsComposer: boolean) {
 	const mainPrompt = vi.fn(async () => true);
@@ -27,6 +28,8 @@ function createContext(approvalOwnsComposer: boolean) {
 		editor,
 		ui: { requestRender: vi.fn() },
 		session: {
+			...createSessionDefaults(),
+			sessionId: "approval-routing-main",
 			isStreaming: true,
 			isCompacting: false,
 			isBashRunning: false,

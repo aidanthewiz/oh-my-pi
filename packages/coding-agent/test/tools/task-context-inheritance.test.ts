@@ -71,15 +71,15 @@ describe("TaskTool context inheritance", () => {
 		const runSubprocessSpy = vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult());
 		const tool = await TaskTool.create(createSession(true));
 
-		await tool.execute("tool-call", {
-			agent: "task",
+		const result = await tool.execute("tool-call", {
 			context: "Shared batch context.",
 			tasks: [
-				{ name: "Inherited", task: "Use project conventions", contextFilePolicy: "inherit" },
-				{ name: "Fresh", task: "Start fresh", contextFilePolicy: "none" },
+				{ agent: "task", name: "Inherited", task: "Use project conventions", contextFilePolicy: "inherit" },
+				{ agent: "task", name: "Fresh", task: "Start fresh", contextFilePolicy: "none" },
 			],
 		});
 
+		expect(result.isError).not.toBe(true);
 		expect(runSubprocessSpy).toHaveBeenCalledTimes(2);
 		const contextsByAssignment = new Map(
 			runSubprocessSpy.mock.calls.map(([options]) => [options.assignment, options.contextFiles]),

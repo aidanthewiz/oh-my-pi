@@ -347,7 +347,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			eagerDelegation: sessionDelegationBias(session) === "eager",
 			waitTool: hasWaitTool(session),
 			preludes: this.#advertisedPreludes(session),
-			inlineTopics: session.isToolActive?.("read") === false,
+			inlineTopics: session.isToolActiveForPrompt?.("read") === false,
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
 		};
 	}

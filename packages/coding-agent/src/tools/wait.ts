@@ -90,7 +90,7 @@ function noReplyText(replies: PendingReplies): string {
 
 /** Whether `session` has the `wait` tool active, so prompts may point blocked callers at it. */
 export function hasWaitTool(session: ToolSession): boolean {
-	return session.isToolActive?.("wait") ?? true;
+	return session.isToolActiveForPrompt?.("wait") ?? true;
 }
 
 /**

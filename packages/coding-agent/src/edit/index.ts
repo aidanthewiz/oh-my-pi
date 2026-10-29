@@ -345,12 +345,7 @@ async function chmodMovedFile(filePath: string, mode: number): Promise<void> {
 	}
 }
 
-/** Memoized native inspection, tagged onto the streamed args object it describes. */
-const kInspection = Symbol("edit.inspection");
-
-interface InspectedArgs {
-	[kInspection]?: { mode: EditMode; inspection: EditInspection };
-}
+const editInspections = new WeakMap<object, { mode: EditMode; inspection: EditInspection }>();
 
 /** A native edit session paired with the router context its URL targets resolve with. */
 interface OpenEditSession {
@@ -619,23 +614,19 @@ export class EditTool implements AgentTool<TInput> {
 		return result;
 	}
 
-	/**
-	 * TTSR asks `matcherPaths` and `matcherEntries` (and approval asks again)
-	 * for the same streamed args object on every delta, and the native inspect
-	 * re-parses the whole payload each time; the result is tagged onto the args
-	 * so repeat lookups for one object pay once.
-	 */
+	/** Memoize by argument identity and edit mode without modifying caller-owned input. */
 	#inspect(args: unknown): EditInspection {
-		const tagged = typeof args === "object" && args !== null ? (args as InspectedArgs) : undefined;
-		const cached = tagged?.[kInspection];
-		if (cached?.mode === this.mode) return cached.inspection;
+		const key = typeof args === "object" && args !== null ? args : undefined;
+		const mode = this.mode;
+		const cached = key ? editInspections.get(key) : undefined;
+		if (cached?.mode === mode) return cached.inspection;
 		let inspection: EditInspection;
 		try {
-			inspection = editInspect(this.mode, JSON.stringify(args ?? {}));
+			inspection = editInspect(mode, JSON.stringify(args ?? {}));
 		} catch {
 			inspection = { paths: [], entries: [], fileOps: [] };
 		}
-		if (tagged) tagged[kInspection] = { mode: this.mode, inspection };
+		if (key) editInspections.set(key, { mode, inspection });
 		return inspection;
 	}
 

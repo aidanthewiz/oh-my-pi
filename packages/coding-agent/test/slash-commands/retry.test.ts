@@ -71,7 +71,7 @@ describe("/retry dispatch (ACP)", () => {
 		const h = acpRuntime({ isStreaming: true });
 		const result = await executeAcpBuiltinSlashCommand("/retry", h.runtime);
 		expect(h.retry).not.toHaveBeenCalled();
-		expect(result).toEqual({ consumed: true });
+		expect(result).toEqual({ consumed: true, failed: true });
 		expect((h.output.mock.calls[0]?.[0] as string) ?? "").toContain("before retrying");
 	});
 
@@ -80,7 +80,7 @@ describe("/retry dispatch (ACP)", () => {
 		const result = await executeAcpBuiltinSlashCommand("/retry", h.runtime);
 		expect(h.output).toHaveBeenCalledWith("Nothing to retry.");
 		expect(h.keepTurnOpenUntilIdle).not.toHaveBeenCalled();
-		expect(result).toEqual({ consumed: true });
+		expect(result).toEqual({ consumed: true, failed: true });
 	});
 
 	it("announces the retry and holds the ACP turn open for the retried turn", async () => {
@@ -89,6 +89,20 @@ describe("/retry dispatch (ACP)", () => {
 		expect(h.output.mock.calls[0]?.[0]).toBe("Retrying the last failed turn.");
 		expect(h.keepTurnOpenUntilIdle).toHaveBeenCalledTimes(1);
 		expect(result).toEqual({ consumed: true, agentInvoked: true });
+	});
+
+	it("does not report another owner's retry as this host's agent turn", async () => {
+		const h = acpRuntime({ retryResult: true });
+		const ready = Promise.withResolvers<boolean>();
+		const signal = new AbortController();
+		h.runtime.signal = signal.signal;
+		h.retry.mockImplementation(() => ready.promise);
+		const dispatched = executeAcpBuiltinSlashCommand("/retry", h.runtime);
+		signal.abort("host replaced");
+		ready.resolve(true);
+		expect(await dispatched).toEqual({ consumed: true });
+		expect(h.output).not.toHaveBeenCalled();
+		expect(h.keepTurnOpenUntilIdle).not.toHaveBeenCalled();
 	});
 
 	it("returns immediately for hosts that stream the continuation themselves (RPC/TUI)", async () => {

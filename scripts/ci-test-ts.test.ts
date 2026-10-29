@@ -3,7 +3,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ptree, TempDir } from "@oh-my-pi/pi-utils";
 
-const packages = ["natives", "tui", "collab-web", "typescript-edit-benchmark"];
+const fixtures = [
+	...["natives", "tui", "collab-web", "typescript-edit-benchmark"].map(name => ({
+		name,
+		file: path.join("packages", name, "consumer.test.ts"),
+	})),
+	{ name: "project-tui", file: path.join(".omp", "tests", "tui.test.ts") },
+];
+const consumers = fixtures.map(fixture => fixture.name);
 const inspectedNames = [
 	"ANTHROPIC_API_KEY",
 	"AWS_PROFILE",
@@ -19,11 +26,11 @@ const inspectedNames = [
 async function prepareFixture(root: string): Promise<void> {
 	await fs.mkdir(path.join(root, "scripts"), { recursive: true });
 	await fs.copyFile(new URL("./ci-test-ts.ts", import.meta.url), path.join(root, "scripts/ci-test-ts.ts"));
-	for (const name of packages) {
-		const directory = path.join(root, "packages", name);
-		await fs.mkdir(directory, { recursive: true });
+	for (const { name, file } of fixtures) {
+		const target = path.join(root, file);
+		await fs.mkdir(path.dirname(target), { recursive: true });
 		await fs.writeFile(
-			path.join(directory, "consumer.test.ts"),
+			target,
 			`import { test } from "bun:test";
 import * as path from "node:path";
 test("owned runner consumer", async () => {
@@ -88,8 +95,8 @@ describe("CI runner process boundaries", () => {
 			OMP_TEST_CONCURRENCY: "3",
 		});
 		expect(result.exitCode, result.stderr || result.stdout).toBe(0);
-		expect(await completedConsumers(output)).toEqual(packages.map(name => `${name}.json`).sort());
-		for (const name of packages) {
+		expect(await completedConsumers(output)).toEqual(consumers.map(name => `${name}.json`).sort());
+		for (const name of consumers) {
 			const observed = await Bun.file(path.join(output, `${name}.json`)).json();
 			for (const key of inspectedNames.slice(0, 7)) expect(observed.env[key], key).toBeNull();
 			expect(observed.env.OMP_TEST_CONCURRENCY).toBe("3");
@@ -109,7 +116,7 @@ describe("CI runner process boundaries", () => {
 		expect(await Bun.file(path.join(output, "natives.started")).text()).toBe("started");
 		expect(await Bun.file(path.join(output, "natives.json")).exists()).toBe(false);
 		expect(await completedConsumers(output)).toEqual(
-			packages
+			consumers
 				.slice(1)
 				.map(name => `${name}.json`)
 				.sort(),
@@ -126,7 +133,7 @@ describe("CI runner process boundaries", () => {
 			expect(result.exitCode, result.stderr || result.stdout).toBe(0);
 			selected.push(await completedConsumers(output));
 		}
-		expect(selected.flat().sort()).toEqual(packages.map(name => `${name}.json`).sort());
+		expect(selected.flat().sort()).toEqual(consumers.map(name => `${name}.json`).sort());
 		const widths = selected.map(rows => rows.length);
 		expect(Math.max(...widths) - Math.min(...widths)).toBeLessThanOrEqual(1);
 	}, 20_000);
@@ -134,7 +141,8 @@ describe("CI runner process boundaries", () => {
 	test("rejects malformed and empty shard requests without running consumers", async () => {
 		using dir = TempDir.createSync("omp-test-runner-invalid-shard-");
 		await prepareFixture(dir.path());
-		for (const [index, spec] of ["0/2", "3/2", "1/0", "2", "a/b", "1/2/3", "5/5"].entries()) {
+		const emptyShard = `${consumers.length + 1}/${consumers.length + 1}`;
+		for (const [index, spec] of ["0/2", "3/2", "1/0", "2", "a/b", "1/2/3", emptyShard].entries()) {
 			const output = dir.join(`invalid-${index}`);
 			const result = await runFixture(dir.path(), output, { OMP_TEST_SHARD: spec });
 			expect(result.exitCode).not.toBe(0);

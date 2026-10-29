@@ -53,6 +53,10 @@ async function createHarness(factory: ExtensionFactory) {
 	const prompt = vi.fn(async (_text: string, _options?: PromptOptions) => true);
 	const session = {
 		extensionRunner: runner,
+		sessionManager,
+		sessionId: sessionManager.getSessionId(),
+		isDisposed: false,
+		loadDeferredExtensions: vi.fn(async () => {}),
 		isStreaming: true,
 		isCompacting: false,
 		queuedMessageCount: 0,
@@ -131,12 +135,108 @@ async function createHarness(factory: ExtensionFactory) {
 		editor.imageLinks = editor.pendingImageLinks;
 		editor.setText(text);
 	}
-	return { ctx, editor, session, prompt, runner, blobs, generatedMessages, pressSubmit, draftWithImage };
+	return {
+		ctx,
+		editor,
+		session,
+		prompt,
+		runner,
+		runtime,
+		sessionManager,
+		blobs,
+		generatedMessages,
+		pressSubmit,
+		draftWithImage,
+	};
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("interactive native input ingress", () => {
+	it.each([ENTER, FOLLOW_UP])("waits for a deferred input veto before the first submission (%p)", async key => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const seen: string[] = [];
+		const h = await createHarness(() => {});
+		h.session.loadDeferredExtensions.mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			const deferred = await loadExtensionFromFactory(
+				pi => {
+					pi.on("input", event => {
+						seen.push(event.text);
+						return { handled: true };
+					});
+				},
+				process.cwd(),
+				new EventBus(),
+				h.runtime,
+				"deferred-input-guard",
+			);
+			await h.runner.addExtensions([deferred]);
+		});
+		h.editor.setText("first submission");
+		const submitting = h.pressSubmit(key);
+		await entered.promise;
+		expect(seen).toEqual([]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		h.editor.setText("new draft");
+		release.resolve();
+		await submitting;
+		expect(seen).toEqual(["first submission"]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.generatedMessages).toEqual([]);
+		expect(h.editor.getText()).toBe("new draft");
+	});
+
+	it.each([ENTER, FOLLOW_UP])("refuses input and preserves its draft when deferred loading fails (%p)", async key => {
+		const seen: string[] = [];
+		const h = await createHarness(pi => {
+			pi.on("input", event => {
+				seen.push(event.text);
+			});
+		});
+		h.session.loadDeferredExtensions.mockRejectedValue(new Error("required guard failed"));
+		h.draftWithImage();
+		await h.pressSubmit(key);
+		expect(seen).toEqual([]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.session.followUp).not.toHaveBeenCalled();
+		expect(h.generatedMessages).toEqual([]);
+		expect(h.editor.getText()).toContain("original");
+		expect(h.editor.pendingImages).toEqual([originalImage]);
+		expect(h.ctx.showError).toHaveBeenCalledWith("required guard failed");
+	});
+
+	it.each([ENTER, FOLLOW_UP])("never routes a pending submission into a replacement session (%p)", async key => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const seen: string[] = [];
+		const h = await createHarness(pi => {
+			pi.on("input", event => {
+				seen.push(event.text);
+			});
+		});
+		h.session.loadDeferredExtensions.mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		h.draftWithImage();
+		const submitting = h.pressSubmit(key);
+		await entered.promise;
+		h.session.sessionId = "replacement-session";
+		h.editor.pendingImages = [newerImage];
+		h.editor.pendingImageLinks = ["local://new.jpg"];
+		h.editor.setText("replacement draft");
+		release.resolve();
+		await submitting;
+		expect(seen).toEqual([]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.generatedMessages).toEqual([]);
+		expect(h.editor.getText()).toBe("replacement draft");
+		expect(h.editor.pendingImages).toEqual([newerImage]);
+	});
+
 	it("Ctrl+Enter chains partial text/image transforms and restores materialized images after rejection", async () => {
 		const seen: InputEvent[] = [];
 		const h = await createHarness(pi => {

@@ -825,13 +825,14 @@ export class TurnRecovery {
 		return (await recorded).switchedCredential;
 	}
 
-	/** Prompts after transient overlap with a prior agent run. */
+	/** Prompts after transient overlap; onClaimed reports successful dispatch, not credit admission. */
 	promptAgentWithIdleRetry(
 		messages: AgentMessage[],
 		options?: { toolChoice?: ToolChoice },
 		onModelPrepared?: () => void,
+		onClaimed?: () => void,
 	): Promise<void> {
-		return this.#promptAgentWithIdleRetry(messages, options, onModelPrepared);
+		return this.#promptAgentWithIdleRetry(messages, options, onModelPrepared, onClaimed);
 	}
 
 	/** Parses provider retry and rate-limit reset hints into a delay. */
@@ -1903,10 +1904,14 @@ export class TurnRecovery {
 		return current && current !== pinned ? [pinned, current] : [pinned];
 	}
 
-	/** Live session role for chain lookup, provided its assignment still matches the active model. */
+	/**
+	 * Live session role for chain lookup, provided its assignment still matches the active model.
+	 * Temporary switches record the `fallback` role; skipping them keeps the assigned role (e.g. a
+	 * subagent's own, possibly empty, chain) once the session is back on that role's model.
+	 */
 	#liveRetryRoleHint(currentModel: Model | null | undefined): string | undefined {
-		const role = this.#host.sessionManager?.getLastModelChangeRole?.();
-		if (!role || role === EPHEMERAL_MODEL_CHANGE_ROLE || !currentModel) return undefined;
+		const role = this.#host.sessionManager?.getLastModelChangeRole?.({ skipEphemeral: true });
+		if (!role || !currentModel) return undefined;
 		const configured = this.#host.settings.getModelRole(role);
 		if (!configured) return undefined;
 		const resolved = resolveModelOverride([configured], this.#host.modelRegistry, this.#host.settings);
@@ -3144,6 +3149,7 @@ export class TurnRecovery {
 		messages: AgentMessage[],
 		options?: { toolChoice?: ToolChoice },
 		onModelPrepared?: () => void,
+		onClaimed?: () => void,
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
 		for (;;) {
@@ -3158,8 +3164,18 @@ export class TurnRecovery {
 						onModelPrepared();
 					})
 				: undefined;
+			let claimFailed = false;
 			try {
-				await this.#host.agent.prompt(messages, options);
+				const claim = this.#host.agent.prompt(messages, options).then(undefined, error => {
+					claimFailed = true;
+					throw error;
+				});
+				// One microtask turn: an already-rejected promise's reaction
+				// job is queued ahead of this await's continuation, so
+				// `claimFailed` is settled by the time we resume.
+				await Promise.resolve();
+				if (!claimFailed) onClaimed?.();
+				await claim;
 				return;
 			} catch (err) {
 				if (!(err instanceof AgentBusyError)) {

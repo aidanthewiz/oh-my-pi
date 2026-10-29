@@ -38,6 +38,14 @@ afterEach(async () => {
 });
 
 describe("EditTool details", () => {
+	test("keeps approval inspection read-only for immutable caller arguments", () => {
+		const tool = new EditTool(makeSession(tempDir), "replace");
+		const args = Object.freeze({ path: "target.txt", old_string: "before", new_string: "after" });
+
+		expect(tool.approval(args)).toBe("write");
+		expect(tool.matcherPaths(args)).toEqual(["target.txt"]);
+	});
+
 	test("apply_patch reports complete per-file update, move, and create details", async () => {
 		await Bun.write(path.join(tempDir, "update.txt"), "old\n");
 		await Bun.write(path.join(tempDir, "move.txt"), "move me\n");

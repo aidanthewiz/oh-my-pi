@@ -48,6 +48,9 @@ describe("/switch session role transitions", () => {
 		});
 		context = {
 			session,
+			get viewSession() {
+				return context.session;
+			},
 			sessionManager: manager,
 			settings,
 			editor: { setText: () => {} },

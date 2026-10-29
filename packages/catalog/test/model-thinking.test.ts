@@ -1020,13 +1020,13 @@ describe("model thinking derivation", () => {
 	it("corrects Moonshot K3 cache writes without changing another serving host", () => {
 		const discovered = {
 			...createModel({ id: "kimi-k3", api: "openai-completions", provider: "moonshot" }),
-			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 },
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
 		};
 		const moonshot = buildGeneratedModel(discovered);
 		const gateway = buildGeneratedModel({ ...discovered, provider: "private-gateway" });
 
-		expect(moonshot.cost).toEqual({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 });
-		expect(gateway.cost.cacheWrite).toBe(3);
+		expect(moonshot.cost).toEqual({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 });
+		expect(gateway.cost.cacheWrite).toBe(0);
 	});
 
 	it("keeps per-message effort off every Vertex Claude line that takes it on the Claude API", () => {

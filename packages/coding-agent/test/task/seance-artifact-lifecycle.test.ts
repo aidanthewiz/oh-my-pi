@@ -9,6 +9,10 @@ import { sessionResolveContext } from "@oh-my-pi/pi-coding-agent/internal-urls/c
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import {
+	artifactFileGeneration,
+	serializeStructuredArtifactSidecar,
+} from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -500,7 +504,13 @@ describe("seance artifact lifecycle", () => {
 		await expect(router.resolve("agent://Worker", context)).rejects.toThrow("Not found: Worker");
 		const historicalOutput = path.join(sourceArtifacts, "Worker.md");
 		await Bun.write(historicalOutput, '{"report":"historical result"}');
-		await Bun.write(path.join(sourceArtifacts, "Worker.json"), '{"report":"historical typed result"}');
+		await Bun.write(
+			path.join(sourceArtifacts, "Worker.json"),
+			serializeStructuredArtifactSidecar(
+				'{"report":"historical typed result"}',
+				artifactFileGeneration(await fs.stat(historicalOutput, { bigint: true })),
+			),
+		);
 		const foreignFile = path.join(tempDir.path(), "foreign.jsonl");
 		await Bun.write(path.join(foreignFile.slice(0, -6), "HostOnly.md"), "unrelated host output");
 		AgentRegistry.global().register({

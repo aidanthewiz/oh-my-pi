@@ -2058,6 +2058,8 @@ export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
 export interface RegisteredTool<TParams extends TSchema = TSchema, TDetails = unknown> {
 	definition: ToolDefinition<TParams, TDetails>;
 	extensionPath: string;
+	/** Original registration owner; null identifies an explicit SDK registration. */
+	owner?: Extension | null;
 	/**
 	 * Upstream-shaped provenance mirroring {@link SourceInfo}. Extensions authored
 	 * against `@earendil-works/pi-coding-agent` — whose registered tools expose
@@ -2203,6 +2205,10 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	label?: string;
+	/** Host-owned lifetime guard for deferred binding and activation. */
+	isActive?: () => boolean;
+	/** Registry undo operations retained until this deferred activation graduates. */
+	toolActivationRollbacks?: Set<() => Promise<void>>;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
@@ -2214,6 +2220,8 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	/** Set once the extension calls `registerProvider`; providers feed startup model resolution. */
+	registersProviders?: boolean;
 }
 
 /**
