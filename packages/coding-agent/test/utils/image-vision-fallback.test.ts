@@ -31,6 +31,11 @@ const visionModel: Model<"openai-responses"> = buildModel({
 });
 
 const textModel: Model<"openai-responses"> = { ...visionModel, id: "gpt-4.1-mini", input: ["text"] };
+const cheaperVisionModel: Model<"openai-responses"> = {
+	...visionModel,
+	id: "gpt-4o-mini",
+	cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 },
+};
 
 function makeCompleteStub(text: string): { calls: unknown[][]; fn: typeof completeSimple } {
 	const calls: unknown[][] = [];
@@ -154,6 +159,46 @@ describe("describeAttachedImagesForTextModel", () => {
 		expect(dispatched).toBe(false);
 		expect(gate.spent).toBe(1);
 		expect(blocks[0]!.text).toContain("Image description unavailable");
+	});
+
+	it("chooses the cheaper available vision model instead of catalog order", async () => {
+		const unpriced = {
+			...visionModel,
+			id: "unpriced-vision",
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
+		const stub = makeCompleteStub("description");
+		await describeAttachedImagesForTextModel(
+			[{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }],
+			makeDeps(testDir, [textModel, unpriced, visionModel, cheaperVisionModel], stub.fn),
+		);
+
+		expect(stub.calls[0]?.[0]).toMatchObject({ id: "gpt-4o-mini" });
+	});
+
+	it("prefers a declared free vision model over a paid one listed before it", async () => {
+		const free = {
+			...visionModel,
+			id: "free-vision",
+			pricingStatus: "free" as const,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
+		const stub = makeCompleteStub("description");
+		await describeAttachedImagesForTextModel(
+			[{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }],
+			makeDeps(testDir, [textModel, cheaperVisionModel, free], stub.fn),
+		);
+
+		expect(stub.calls[0]?.[0]).toMatchObject({ id: "free-vision" });
+	});
+
+	it("keeps a configured vision role ahead of the cheaper fallback", async () => {
+		const stub = makeCompleteStub("description");
+		const deps = makeDeps(testDir, [textModel, visionModel, cheaperVisionModel], stub.fn);
+		deps.settings = Settings.isolated({ modelRoles: { vision: "openai/gpt-4o" } });
+		await describeAttachedImagesForTextModel([{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }], deps);
+
+		expect(stub.calls[0]?.[0]).toMatchObject({ id: "gpt-4o" });
 	});
 
 	it("saves the image but emits a no-vision note when no vision model is available", async () => {

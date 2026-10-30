@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
 
 import { HookInputComponent } from "@oh-my-pi/pi-tui/overlays/hook-input";
 import type { DescribeContext, NativeChild, NativeNode } from "@oh-my-pi/pi-tui/native/node";
@@ -117,6 +118,29 @@ describe("HookInputComponent timeout", () => {
 
 		expect(onSubmit).toHaveBeenCalledTimes(1);
 		expect(onSubmit).toHaveBeenCalledWith("sk-line1sk-line2");
+
+		component.dispose();
+	});
+
+	it("masks characters as bullets when secret is true", () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookInputComponent("API Key", undefined, onSubmit, onCancel, { secret: true });
+
+		component.handleInput("s");
+		component.handleInput("e");
+		component.handleInput("c");
+		component.handleInput("r");
+		component.handleInput("e");
+		component.handleInput("t");
+
+		const rendered = stripVTControlCharacters(component.render(80).join("\n"));
+		expect(rendered).toContain("••••••");
+		expect(rendered).not.toContain("secret");
+
+		component.handleInput("\n");
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("secret");
 
 		component.dispose();
 	});

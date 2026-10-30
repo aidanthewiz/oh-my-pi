@@ -90,7 +90,7 @@ pub mod matchers {
 					Ok(()) => true,
 					Err(e) => {
 						matcher_io.set_exit_code(1);
-						writeln!(&mut matcher_io.host().stderr, "Failed to delete {path_str}: {e}").unwrap();
+						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to delete {path_str}: {e}");
 						false
 					},
 				}
@@ -127,13 +127,12 @@ pub mod matchers {
 					match file_info.metadata() {
 						Ok(meta) => meta.len() == 0,
 						Err(err) => {
-							writeln!(
+							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error getting size for {}: {}",
 								file_info.path().display(),
 								err
-							)
-							.unwrap();
+							);
 							false
 						},
 					}
@@ -141,13 +140,12 @@ pub mod matchers {
 					match file_info.fs().read_dir(file_info.path()) {
 						Ok(mut it) => it.next().is_none(),
 						Err(err) => {
-							writeln!(
+							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error getting contents of {}: {}",
 								file_info.path().display(),
 								err
-							)
-							.unwrap();
+							);
 							false
 						},
 					}
@@ -569,7 +567,7 @@ pub mod matchers {
 				match matcher_io.host().run_command(command) {
 					Ok(status) => status.success(),
 					Err(e) => {
-						writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e).unwrap();
+						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
 						false
 					},
 				}
@@ -633,7 +631,7 @@ pub mod matchers {
 						}
 					},
 					Err(e) => {
-						writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e).unwrap();
+						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
 						matcher_io.set_exit_code(1);
 					},
 				}
@@ -662,13 +660,12 @@ pub mod matchers {
 					// Reset command status.
 					*command = self.new_command();
 					if let Err(e) = command.try_arg(&path_to_file) {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Cannot fit a single argument {}: {}",
 							path_to_file.to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						matcher_io.set_exit_code(1);
 					}
 				}
@@ -802,12 +799,11 @@ pub mod matchers {
 				match self.file_system_type(file_info) {
 					Ok(result) => result == self.fs_text,
 					Err(_) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting filesystem type for {}",
 							file_info.path().to_string_lossy()
-						)
-						.unwrap();
+						);
 
 						false
 					},
@@ -1085,13 +1081,12 @@ pub mod matchers {
 					// If it's not a symlink, then it's not an error that should be
 					// shown.
 					if err.kind() != std::io::ErrorKind::InvalidInput {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error reading target of {}: {}",
 							file_info.path().display(),
 							err
-						)
-						.unwrap();
+						);
 					}
 
 					None
@@ -1603,13 +1598,12 @@ pub mod matchers {
 				let metadata = match file_info.metadata() {
 					Ok(metadata) => metadata,
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting metadata for {}: {}",
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						matcher_io.set_exit_code(1);
 						return;
 					},
@@ -1655,13 +1649,12 @@ pub mod matchers {
 					Ok(_) => {},
 					Err(e) => {
 						if print_error_message {
-							writeln!(
+							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error writing {:?} for {}",
 								file_info.display_path().to_string_lossy(),
 								e
-							)
-							.unwrap();
+							);
 							matcher_io.set_exit_code(1);
 						}
 					},
@@ -1864,13 +1857,12 @@ pub mod matchers {
 							.mode_bits_match(pattern, metadata.permissions().mode())
 					},
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting permissions for {}: {}",
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 				}
@@ -1878,7 +1870,7 @@ pub mod matchers {
 
 			#[cfg(not(unix))]
 			fn matches(&self, _dummy_file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				writeln!(&mut matcher_io.host().stderr, "Permission matching not available on this platform!").unwrap();
+				let _ = writeln!(&mut matcher_io.host().stderr, "Permission matching not available on this platform!");
 				return false;
 			}
 		}
@@ -1933,13 +1925,12 @@ pub mod matchers {
 					Ok(()) => {},
 					Err(e) => {
 						if print_error_message {
-							writeln!(
+							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error writing {:?} for {}",
 								file_info.display_path().to_string_lossy(),
 								e
-							)
-							.unwrap();
+							);
 							matcher_io.set_exit_code(1);
 						}
 					},
@@ -2527,35 +2518,50 @@ pub mod matchers {
 			fs_cache:    fs::Cache,
 		}
 
+		/// Why [`Printf::print`] stopped a line.
+		enum PrintError {
+			/// A directive could not be rendered.
+			Directive(Box<dyn Error>),
+			/// The output rejected a write.
+			Write(io::Error),
+		}
+
+		impl From<io::Error> for PrintError {
+			fn from(error: io::Error) -> Self {
+				Self::Write(error)
+			}
+		}
+
 		impl Printf {
 			pub fn new(format: &str, output_file: Option<File>) -> Result<Self, Box<dyn Error>> {
 				Ok(Self { format: FormatString::parse(format)?, output_file, fs_cache: fs::Cache::default() })
 			}
 
 			/// Prints the format for `file_info`; a directive that cannot be
-			/// rendered stops the line and is returned for the caller to report.
-			fn print(&self, file_info: &WalkEntry, mut out: impl Write) -> Result<(), Box<dyn Error>> {
+			/// rendered or a write that fails stops the line and is returned for
+			/// the caller to report.
+			fn print(&self, file_info: &WalkEntry, mut out: impl Write) -> Result<(), PrintError> {
 				for component in &self.format.components {
 					match component {
-						FormatComponent::Literal(literal) => write!(out, "{literal}").unwrap(),
-						FormatComponent::Flush => out.flush().unwrap(),
+						FormatComponent::Literal(literal) => write!(out, "{literal}")?,
+						FormatComponent::Flush => out.flush()?,
 						FormatComponent::Directive { directive, width, justify } => {
 							match format_directive(file_info, directive, &self.fs_cache) {
 								Ok(content) => {
 									if let Some(width) = width {
 										match justify {
 											Justify::Left => {
-												write!(out, "{content:<width$}").unwrap();
+												write!(out, "{content:<width$}")?;
 											},
 											Justify::Right => {
-												write!(out, "{content:>width$}").unwrap();
+												write!(out, "{content:>width$}")?;
 											},
 										}
 									} else {
-										write!(out, "{content}").unwrap();
+										write!(out, "{content}")?;
 									}
 								},
-								Err(e) => return Err(e),
+								Err(e) => return Err(PrintError::Directive(e)),
 							}
 						},
 					}
@@ -2571,13 +2577,27 @@ pub mod matchers {
 				} else {
 					self.print(file_info, &mut *matcher_io.deps.get_output().borrow_mut())
 				};
-				if let Err(e) = printed {
-					let _ = writeln!(
-						matcher_io.host().stderr,
-						"Error processing '{}': {}",
-						file_info.path().to_string_lossy(),
-						e
-					);
+				match printed {
+					Ok(()) => {},
+					Err(PrintError::Directive(e)) => {
+						let _ = writeln!(
+							matcher_io.host().stderr,
+							"Error processing '{}': {}",
+							file_info.path().to_string_lossy(),
+							e
+						);
+					},
+					Err(PrintError::Write(e)) => {
+						if self.output_file.is_some() || e.kind() != io::ErrorKind::BrokenPipe {
+							let _ = writeln!(
+								matcher_io.host().stderr,
+								"Error writing {:?} for {}",
+								file_info.display_path().to_string_lossy(),
+								e
+							);
+							matcher_io.set_exit_code(1);
+						}
+					},
 				}
 
 				true
@@ -2893,13 +2913,12 @@ pub mod matchers {
 						.value_to_match
 						.matches(byte_size_to_unit_size(self.unit, metadata.len())),
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting file size for {}: {}",
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 				}
@@ -3035,13 +3054,12 @@ pub mod matchers {
 			fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				match self.matches_impl(file_info) {
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting modification time for {}: {}",
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 					Ok(t) => t,
@@ -3117,14 +3135,13 @@ pub mod matchers {
 			fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				match self.matches_impl(file_info) {
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
 							self.x_option,
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 					Ok(t) => t,
@@ -3164,14 +3181,13 @@ pub mod matchers {
 			fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				match self.matches_impl(file_info) {
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
 							self.newer_time_type,
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 					Ok(t) => t,
@@ -3209,14 +3225,13 @@ pub mod matchers {
 				let start_time = get_time(matcher_io, self.today_start);
 				match self.matches_impl(file_info, start_time) {
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
 							self.file_time_type,
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 					Ok(t) => t,
@@ -3278,14 +3293,13 @@ pub mod matchers {
 				let start_time = get_time(matcher_io, self.today_start);
 				match self.matches_impl(file_info, start_time) {
 					Err(e) => {
-						writeln!(
+						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
 							self.file_time_type,
 							file_info.path().to_string_lossy(),
 							e
-						)
-						.unwrap();
+						);
 						false
 					},
 					Ok(t) => t,
@@ -5026,7 +5040,7 @@ impl Utility for Find {
 			None => raw,
 		};
 		let deps = StandardDependencies::new(host);
-		let code = match do_find(&args, &deps, host) {
+		let mut code = match do_find(&args, &deps, host) {
 			Ok(code) => code,
 			Err(error) => {
 				let _ = deps.get_output().borrow_mut().flush();
@@ -5034,9 +5048,12 @@ impl Utility for Find {
 				1
 			},
 		};
-		// Like the per-entry writes before it, a failed stdout flush is not
-		// reported.
-		let _ = deps.get_output().borrow_mut().flush();
+		if let Err(error) = deps.get_output().borrow_mut().flush()
+			&& error.kind() != std::io::ErrorKind::BrokenPipe
+		{
+			let _ = writeln!(host.stderr, "find: stdout: {error}");
+			code = 1;
+		}
 		code
 	}
 }
@@ -5065,6 +5082,50 @@ mod tests {
 	fn run(root: &PathBuf, args: &[String]) -> (i32, crate::host::Capture) {
 		let args: Vec<&str> = args.iter().map(String::as_str).collect();
 		run_util::<Find>(&args, "", root)
+	}
+
+	/// A chain as deep as path syscalls reach must be walked, in both visit
+	/// orders, not overflow the stack of the thread the shell runs on.
+	#[test]
+	fn walks_a_directory_chain_deeper_than_the_stack() {
+		let (_dir, root) = fixture();
+		// Stay under the host's PATH_MAX: every level adds "/d".
+		#[cfg(unix)]
+		let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
+		#[cfg(not(unix))]
+		let path_max = 4096;
+		let depth = (path_max - 96 - root.join("deep/f").as_os_str().len()) / 2;
+		let mut chain = PathBuf::from("deep");
+		for _ in 0..depth {
+			chain.push("d");
+		}
+		fs::create_dir_all(root.join(&chain)).unwrap();
+		let leaf = chain.join("f");
+		fs::write(root.join(&leaf), b"x").unwrap();
+
+		let find = move |args: &'static [&'static str]| {
+			let root = root.clone();
+			std::thread::Builder::new()
+				.stack_size(256 * 1024)
+				.spawn(move || {
+					let (code, capture) = run_util::<Find>(args, "", &root);
+					(code, capture.out(), capture.err())
+				})
+				.unwrap()
+				.join()
+				.unwrap()
+		};
+		// find joins operand and names with '/', not the OS separator (Windows `display()` uses '\').
+		let leaf = format!("deep{}/f", "/d".repeat(depth));
+
+		let (code, out, err) = find(&["deep", "-name", "f"]);
+		assert_eq!((code, out, err.as_str()), (0, format!("{leaf}\n"), ""));
+
+		let (code, out, err) = find(&["deep", "-depth"]);
+		assert_eq!((code, err.as_str()), (0, ""));
+		let lines: Vec<&str> = out.lines().collect();
+		assert_eq!(lines.len(), depth + 2);
+		assert_eq!((lines[0], lines[depth + 1]), (leaf.as_str(), "deep"));
 	}
 
 	#[test]
@@ -5401,5 +5462,186 @@ mod tests {
 		let mut entry = WalkEntry::new(pi_vfs::BlockingFs::native(), file, 1, Follow::Never);
 		entry.set_display_root(Path::new("."), Path::new("/r"));
 		assert_eq!(entry.display_path().as_os_str().as_bytes(), b"./bad\xffname");
+	}
+
+	/// Runs `find` through [`Utility::run`] directly, outside the panic
+	/// boundary of a registered builtin, so a panic fails the test instead of
+	/// becoming an exit status.
+	#[cfg(unix)]
+	fn run_unguarded(host: &mut crate::host::Host, args: &[&str]) -> std::thread::Result<i32> {
+		use crate::host::Utility;
+
+		let argv = std::iter::once("find").chain(args.iter().copied());
+		let parsed = <Find as clap::Parser>::try_parse_from(argv).unwrap();
+		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parsed.run(host)))
+	}
+
+	/// Failure mode: `-printf` unwrapped its writes, so a reader that went
+	/// away (`find . -printf '%p\n' | head -1`) panicked the builtin instead of
+	/// stopping it the way SIGPIPE stops GNU find.
+	#[cfg(unix)]
+	#[test]
+	fn printf_into_closed_pipe_stops_without_panicking() {
+		use brush_core::openfiles::OpenFile;
+
+		let (_dir, root) = fixture();
+		let (mut host, capture) = crate::host::Host::for_test("find", "", &root);
+		let (reader, writer) = std::io::pipe().unwrap();
+		drop(reader);
+		host.set_test_stdout(OpenFile::from(writer));
+
+		let outcome = run_unguarded(&mut host, &[".", "-printf", "%p\n"]);
+		assert!(outcome.is_ok(), "find panicked writing to a closed pipe");
+		assert!(host.sigpipe_hit());
+		assert_eq!(capture.err(), "");
+	}
+
+	/// Failure mode: diagnostics were unwrapped as well, so a closed reader on
+	/// stderr (`find . -exec … 2>&1 >/dev/null | head -1`) panicked on the
+	/// next diagnostic.
+	#[cfg(unix)]
+	#[test]
+	fn diagnostic_into_closed_pipe_does_not_panic() {
+		use brush_core::openfiles::OpenFile;
+
+		use crate::host::StreamWriter;
+
+		let (_dir, root) = fixture();
+		let (mut host, _capture) = crate::host::Host::for_test("find", "", &root);
+		let (reader, writer) = std::io::pipe().unwrap();
+		drop(reader);
+		host.stderr = StreamWriter::line(OpenFile::from(writer));
+
+		// The test host cannot run commands, so `-exec` reports a diagnostic.
+		let outcome = run_unguarded(&mut host, &[".", "-maxdepth", "0", "-exec", "true", ";"]);
+		assert!(outcome.is_ok(), "find panicked writing a diagnostic to a closed pipe");
+	}
+
+	/// Failure mode: a failed `-fprintf` write panicked and surfaced as
+	/// `find: internal error`; like `-fprint`, it is reported and fails the
+	/// run.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn fprintf_write_error_is_reported() {
+		let (_dir, root) = fixture();
+		let (code, capture) = run(&root, &[
+			".".into(),
+			"-maxdepth".into(),
+			"0".into(),
+			"-fprintf".into(),
+			"/dev/full".into(),
+			"%p\n".into(),
+		]);
+		assert_eq!(code, 1);
+		assert!(capture.err().contains("No space left on device"), "stderr: {}", capture.err());
+		assert!(!capture.err().contains("internal error"), "stderr: {}", capture.err());
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	enum OutputFault {
+		Write,
+		Flush,
+	}
+
+	#[derive(Clone, Debug)]
+	struct FaultingOutput {
+		sink: std::sync::Arc<parking_lot::Mutex<fs::File>>,
+		fault: OutputFault,
+		failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	impl std::io::Read for FaultingOutput {
+		fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+	}
+
+	impl std::io::Write for FaultingOutput {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			if matches!(self.fault, OutputFault::Write) {
+				self.failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				return Err(std::io::Error::other("owned find output write failure"));
+			}
+			self.sink.lock().write(buf)
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			if matches!(self.fault, OutputFault::Flush) {
+				self.failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				return Err(std::io::Error::other("owned find output flush failure"));
+			}
+			self.sink.lock().flush()
+		}
+
+	}
+
+	impl brush_core::openfiles::Stream for FaultingOutput {
+		fn clone_box(&self) -> Box<dyn brush_core::openfiles::Stream> {
+			Box::new(self.clone())
+		}
+
+		#[cfg(unix)]
+		fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, brush_core::Error> {
+			Err(brush_core::error::ErrorKind::CannotConvertToNativeFd.into())
+		}
+
+		#[cfg(unix)]
+		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, brush_core::Error> {
+			Err(brush_core::error::ErrorKind::CannotConvertToNativeFd.into())
+		}
+	}
+
+	fn assert_stdout_fault_fails(fault: OutputFault, format: &str, expected_bytes: &[u8]) {
+		use std::{
+			io::{Read, Seek},
+			sync::{Arc, atomic::{AtomicUsize, Ordering}},
+		};
+		use parking_lot::Mutex;
+
+		let (_dir, root) = fixture();
+		let sink = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+		let failures = Arc::new(AtomicUsize::new(0));
+		let output = brush_core::openfiles::OpenFile::Stream(Box::new(FaultingOutput {
+			sink: Arc::clone(&sink),
+			fault,
+			failures: Arc::clone(&failures),
+		}));
+		let (mut host, capture) = crate::host::Host::for_test("find", "", &root);
+		host.set_test_stdout(output);
+		let parsed = <Find as clap::Parser>::try_parse_from([
+			"find", ".", "-maxdepth", "0", "-printf", format,
+		]).unwrap();
+		let code = crate::host::run_caught(parsed, &mut host);
+		let mut bytes = Vec::new();
+		{
+			let mut sink = sink.lock();
+			sink.rewind().unwrap();
+			sink.read_to_end(&mut bytes).unwrap();
+		}
+		assert!(failures.load(Ordering::SeqCst) > 0, "find did not reach the faulting provider");
+		assert_eq!(bytes, expected_bytes);
+		assert!(!host.sigpipe_hit(), "a non-BrokenPipe failure became SIGPIPE");
+		assert_eq!(code, 1, "find silently accepted {fault:?}: {}", capture.err());
+		let message = match fault {
+			OutputFault::Write => "owned find output write failure",
+			OutputFault::Flush => "owned find output flush failure",
+		};
+		assert!(capture.err().contains(message), "stderr: {}", capture.err());
+		assert!(!capture.err().contains("internal error"), "stderr: {}", capture.err());
+	}
+
+	#[test]
+	fn printf_non_broken_pipe_write_failure_is_reported() {
+		assert_stdout_fault_fails(OutputFault::Write, "%p\n", b"");
+	}
+
+	#[test]
+	fn printf_explicit_stdout_flush_failure_is_reported() {
+		assert_stdout_fault_fails(OutputFault::Flush, "%p\\c", b".");
+	}
+
+	#[test]
+	fn printf_final_stdout_flush_failure_is_reported() {
+		assert_stdout_fault_fails(OutputFault::Flush, "%p", b".");
 	}
 }

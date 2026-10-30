@@ -6,7 +6,6 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { renderWorkflowNotice } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
@@ -91,7 +90,12 @@ describe("AgentSession skill prompt keyword steering", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(tempDir.path()),
-			settings: Settings.isolated({ "compaction.enabled": false }),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"eval.py": false,
+				"eval.js": true,
+				"eval.workpool.freshAgents": true,
+			}),
 			modelRegistry,
 		});
 	});
@@ -105,7 +109,7 @@ describe("AgentSession skill prompt keyword steering", () => {
 		tempDir.removeSync();
 	});
 
-	it("injects magic keyword notices and turn budgets from user-authored skill args", async () => {
+	it("delivers user-authored skill args and applies their turn budget", async () => {
 		const skillPath = path.join(tempDir.path(), "deep-research.md");
 		const details: SkillPromptDetails = {
 			name: "deep-research",
@@ -125,9 +129,6 @@ describe("AgentSession skill prompt keyword steering", () => {
 		const observedTurn = observedTurns[0];
 		if (!observedTurn) throw new Error("Expected prompt context to be captured");
 		expect(observedTurn.texts).toContain(`Skill body\n\n---\n\nSkill: ${skillPath}\nUser: ${details.args}`);
-		expect(observedTurn.texts).toContain(
-			renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true }),
-		);
 		expect(session.sessionManager.getTurnBudget()).toEqual({ total: 500_000, spent: 0, hard: true });
 	});
 });

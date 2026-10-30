@@ -706,7 +706,13 @@ fn has_proc_selectors(options: &ProcMatchOptions) -> bool {
 fn select_processes(
 	options: &mut ProcMatchOptions,
 ) -> std::result::Result<(Vec<proc_snapshot::ProcInfo>, proc_snapshot::HostProcesses), String> {
-	let all = proc_snapshot::ProcInfo::all();
+	select_processes_in(options, proc_snapshot::ProcInfo::all())
+}
+
+fn select_processes_in(
+	options: &mut ProcMatchOptions,
+	all: Vec<proc_snapshot::ProcInfo>,
+) -> std::result::Result<(Vec<proc_snapshot::ProcInfo>, proc_snapshot::HostProcesses), String> {
 	let host = proc_snapshot::HostProcesses::resolve_in(&all);
 	let host_pid = std::process::id() as i32;
 	let host_group = all
@@ -817,6 +823,10 @@ fn select_processes(
 			selected.push(process);
 		}
 	}
+	#[cfg(target_os = "macos")]
+	if options.newest || options.oldest {
+		selected.retain(proc_snapshot::ProcInfo::has_known_start_time);
+	}
 	selected.sort_by_key(|process| (process.start_time(), process.pid()));
 	if options.newest {
 		selected = selected.into_iter().next_back().into_iter().collect();
@@ -884,5 +894,146 @@ mod tests {
 			ShellPaths::with_cwd(r"C:\workspace").resolve("/c/Users/Adam/app.pid"),
 			PathBuf::from(r"C:\Users\Adam\app.pid"),
 		);
+	}
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+	use super::*;
+
+	const OLDEST_PID: i32 = i32::MAX - 2;
+	const NEWEST_PID: i32 = i32::MAX - 3;
+	const FOREIGN_PID: i32 = i32::MAX - 1;
+	const OWNER: u32 = 70_001;
+	const FOREIGN_OWNER: u32 = 70_002;
+
+	fn full_record(pid: i32, start_usec: u64) -> proc_snapshot::ProcInfo {
+		// SAFETY: proc_bsdinfo contains only integer fields and fixed arrays.
+		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+		info.pbi_pid = pid as u32;
+		info.pbi_uid = OWNER;
+		info.pbi_ruid = OWNER;
+		info.pbi_status = 3;
+		info.pbi_start_tvsec = 1_000;
+		info.pbi_start_tvusec = start_usec;
+		for (slot, byte) in info.pbi_comm.iter_mut().zip(b"proc-proof") {
+			*slot = *byte as libc::c_char;
+		}
+		proc_snapshot::ProcInfo::test_from_bsdinfo(info)
+	}
+
+	fn mixed_records(unique_id: u64) -> Vec<proc_snapshot::ProcInfo> {
+		// SAFETY: proc_bsdshortinfo contains only integer fields and fixed arrays.
+		let mut short = unsafe { std::mem::zeroed::<libc::proc_bsdshortinfo>() };
+		short.pbsi_pid = FOREIGN_PID as u32;
+		short.pbsi_uid = FOREIGN_OWNER;
+		short.pbsi_ruid = FOREIGN_OWNER;
+		short.pbsi_status = 3;
+		for (slot, byte) in short.pbsi_comm.iter_mut().zip(b"proc-proof") {
+			*slot = *byte as libc::c_char;
+		}
+		vec![
+			full_record(NEWEST_PID, 20),
+			proc_snapshot::ProcInfo::test_from_short_bsdinfo(short, unique_id),
+			full_record(OLDEST_PID, 10),
+		]
+	}
+
+	fn matching_options() -> ProcMatchOptions {
+		ProcMatchOptions {
+			patterns: vec!["proc-proof".to_string()],
+			exact: true,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn macos_newest_ignores_unknown_start_time() {
+		for unique_id in [0, 91] {
+			for rotation in 0..3 {
+				let mut all = mixed_records(unique_id);
+				all.rotate_left(rotation);
+				let mut options = matching_options();
+				options.newest = true;
+				let (selected, _) = select_processes_in(&mut options, all).unwrap();
+				assert_eq!(
+					selected.iter().map(proc_snapshot::ProcInfo::pid).collect::<Vec<_>>(),
+					[NEWEST_PID],
+					"unknown start time must not outrank a known timestamp; id={unique_id}, \
+					 rotation={rotation}",
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn macos_oldest_ignores_unknown_start_time() {
+		for unique_id in [0, 91] {
+			for rotation in 0..3 {
+				let mut all = mixed_records(unique_id);
+				all.rotate_left(rotation);
+				let mut options = matching_options();
+				options.oldest = true;
+				let (selected, _) = select_processes_in(&mut options, all).unwrap();
+				assert_eq!(
+					selected.iter().map(proc_snapshot::ProcInfo::pid).collect::<Vec<_>>(),
+					[OLDEST_PID],
+					"unknown start time must not precede a known timestamp; id={unique_id}, \
+					 rotation={rotation}",
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn macos_unrestricted_selection_preserves_short_records() {
+		for unique_id in [0, 91] {
+			let (selected, _) =
+				select_processes_in(&mut matching_options(), mixed_records(unique_id)).unwrap();
+			let mut pids = selected.iter().map(proc_snapshot::ProcInfo::pid).collect::<Vec<_>>();
+			pids.sort_unstable();
+			assert_eq!(pids, [NEWEST_PID, OLDEST_PID, FOREIGN_PID]);
+			let foreign = selected.iter().find(|process| process.pid() == FOREIGN_PID).unwrap();
+			assert_eq!(foreign.effective_user_id(), Some(FOREIGN_OWNER));
+			assert_eq!(foreign.real_user_id(), Some(FOREIGN_OWNER));
+			assert_eq!(foreign.age(), None);
+			assert_eq!(foreign.terminal_id(), None);
+		}
+	}
+
+	#[test]
+	fn macos_chronological_selection_applies_owner_and_pid_filters_first() {
+		for newest in [false, true] {
+			let mut options = matching_options();
+			options.newest = newest;
+			options.oldest = !newest;
+			options.effective_users.push(OWNER);
+			options.pids.push(OLDEST_PID);
+			let (selected, _) = select_processes_in(&mut options, mixed_records(91)).unwrap();
+			assert_eq!(
+				selected.iter().map(proc_snapshot::ProcInfo::pid).collect::<Vec<_>>(),
+				[OLDEST_PID],
+			);
+			options.effective_users = vec![FOREIGN_OWNER];
+			let (selected, _) = select_processes_in(&mut options, mixed_records(91)).unwrap();
+			assert!(selected.is_empty(), "the requested PID belongs to a different owner");
+		}
+	}
+
+	#[test]
+	fn macos_chronological_selection_without_known_timestamps_has_no_match() {
+		for unique_id in [0, 91] {
+			for newest in [false, true] {
+				let mut options = matching_options();
+				options.newest = newest;
+				options.oldest = !newest;
+				options.pids.push(FOREIGN_PID);
+				let (selected, _) = select_processes_in(&mut options, mixed_records(unique_id)).unwrap();
+				assert!(
+					selected.is_empty(),
+					"unknown timestamps cannot establish chronology; id={unique_id}, newest={newest}",
+				);
+			}
+		}
 	}
 }

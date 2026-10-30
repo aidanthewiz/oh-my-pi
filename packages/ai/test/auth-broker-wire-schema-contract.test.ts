@@ -116,6 +116,7 @@ const schemaNames = [
 	"clientUsageReportRequestSchema",
 	"clientUsageReportResponseSchema",
 	"clientUsageSummaryResponseSchema",
+	"credentialRefreshRequestSchema",
 	"credentialRefreshResponseSchema",
 	"credentialDisableRequestSchema",
 	"credentialDisableResponseSchema",
@@ -179,6 +180,7 @@ const validSamples: Record<SchemaName, unknown> = {
 			},
 		],
 	},
+	credentialRefreshRequestSchema: { rejectedAccess: "synthetic-rejected-bearer" },
 	credentialRefreshResponseSchema: { entry: CREDENTIAL_ENTRY },
 	credentialDisableRequestSchema: {},
 	credentialDisableResponseSchema: { ok: true },
@@ -242,6 +244,23 @@ describe("auth-broker public wire schemas", () => {
 		reject(wireSchemas.apiKeyCredentialSchema, { ...API_KEY, extra: true });
 		reject(wireSchemas.apiKeyCredentialSchema, { ...API_KEY, source: "environment" });
 		reject(wireSchemas.credentialUploadRequestSchema, { provider: "", credential: REAL_OAUTH });
+	});
+
+	test("refresh bodies preserve rejected bearer bytes without accepting credential selectors", () => {
+		const rejectedAccess = "synthetic/rejected?access=1&source=not-a-selector";
+		expect(accept(wireSchemas.credentialRefreshRequestSchema, { rejectedAccess })).toEqual({ rejectedAccess });
+		accept(wireSchemas.credentialRefreshRequestSchema, {});
+		for (const invalid of [
+			{ rejectedAccess: "" },
+			{ rejectedAccess: 1 },
+			{ rejectedAccess: null },
+			{ rejectedAccess: [rejectedAccess] },
+			{ rejectedAccess, credentialId: 8 },
+			{ rejectedAccess, provider: "other-provider" },
+			{ rejectedAccess, sourceIdentity: "other-source" },
+		]) {
+			reject(wireSchemas.credentialRefreshRequestSchema, invalid);
+		}
 	});
 
 	test("preserves fixed envelopes, integer fields, discriminators, and block alias identity", () => {

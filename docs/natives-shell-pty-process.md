@@ -90,6 +90,26 @@ Each builtin runs inside the shell process (no `fork`/`exec`) against the `pi-bu
 
 Builtin switches are read from `sessionEnv` first, then the process environment, during session creation. Values are truthy when present and not empty, `"0"`, or case-insensitive `"false"`; command-scoped `env` does not change registration.
 
+### Shared process stdin
+
+Embedded Brush callers can supply `OpenFile::Stdin(std::io::stdin())`.
+This variant shares Rust's process-global input buffer.
+Raw descriptor readiness does not report bytes already held in that buffer.
+`LineInput` and the utility `Host` therefore read this variant through the standard library without a descriptor-only readiness wait.
+
+Both readers check cancellation before reading.
+An already-blocked shared-stdin read is not promptly cancellable: it waits for input or EOF before control returns.
+Callers must release that input boundary before waiting for the blocked reader to finish.
+No background reader is detached, and file-status flags remain unchanged for raw readers and inherited child descriptors.
+
+Pollable unbuffered pipes and FIFOs retain cancellation-aware readiness waits.
+Readiness includes data, EOF, and pending read errors.
+macOS uses Darwin's unlimited-select interface, including descriptors above `FD_SETSIZE`; other Unix targets retain `poll`.
+Readiness waits do not change descriptor flags.
+Utility provider-backed input retains its command-token cancellation race.
+These guarantees do not imply immediate cancellation of shared process stdin.
+
+
 ### Runtime lifecycle and state transitions
 
 Persistent shell (`Shell.run`) uses this state machine:
@@ -111,6 +131,17 @@ For internal jobs, `kill -0 %N` probes without stopping work; terminating signal
 Unix stop, continue, and default-ignored signals fail instead of reporting delivery or terminating internal work.
 These include `CHLD`, `CONT`, `STOP`, `TSTP`, `TTIN`, `TTOU`, `URG`, and `WINCH`, plus `INFO` and `IO` on macOS.
 External jobs retain platform process-signal behavior and host-process protection.
+
+Direct background dispatch never retries a pipeline after expansion or launch.
+Jobs retain completed stage statuses in pipeline order and apply the `pipefail` setting captured at launch.
+Completed jobs remain available to `wait`, including selection by an original child PID.
+Retained completion metadata does not authorize jobspec signals, including signal-zero probes.
+Explicit numeric targets retain their existing signal behavior.
+Successful `bg` records the resumed job's last external PID as `$!`.
+Before resuming stopped children, `bg` consumes their pending stop reports so later waits do not report obsolete stops.
+Only unreaped children retained by the job participate in that transition.
+Command expansion retains ambient descriptors, separate from the command's own redirections.
+Command substitutions capture their stdout; an outer deferred FIFO redirect cannot replace that capture.
 
 ### Streaming/output and minimizer behavior
 

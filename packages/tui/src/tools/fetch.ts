@@ -28,6 +28,7 @@ export interface ReadUrlToolDetails {
 	finalUrl: string;
 	contentType: string;
 	method: string;
+	raw?: boolean;
 	truncated: boolean;
 	notes: string[];
 	meta?: OutputMeta;
@@ -152,6 +153,13 @@ export function describeReadUrlCall(args: { path?: string; url?: string; raw?: b
 	return { tool: readUrlHead(args.path ?? args.url ?? "", args.raw ? ["raw"] : []), inline: true };
 }
 
+function readUrlContentBody(contentText: string, raw: boolean | undefined): string {
+	if (raw) return contentText;
+	const separator = "---\n\n";
+	const headerEnd = contentText.indexOf(separator);
+	return headerEnd < 0 ? contentText : contentText.slice(headerEnd + separator.length);
+}
+
 /** TSP result view of a URL read: a bounded content preview over one quiet stats line. */
 export function describeReadUrlResult(result: {
 	content: Array<{ type: string; text?: string }>;
@@ -171,10 +179,7 @@ export function describeReadUrlResult(result: {
 
 	const truncation = details.meta?.truncation;
 	const truncated = Boolean(details.truncated || truncation);
-	const contentText = result.content[0]?.text ?? "";
-	const contentBody = contentText.includes("---\n\n")
-		? contentText.split("---\n\n").slice(1).join("---\n\n")
-		: contentText;
+	const contentBody = readUrlContentBody(result.content[0]?.text ?? "", details.raw);
 	const contentLines = contentBody.split("\n").filter(l => l.trim());
 	const shown = contentLines.slice(0, PREVIEW_LIMITS.EXPANDED_LINES);
 	const hidden = contentLines.length - shown.length;
@@ -252,10 +257,7 @@ export function renderReadUrlResult(
 		uiTheme,
 	);
 
-	const contentText = result.content[0]?.text ?? "";
-	const contentBody = contentText.includes("---\n\n")
-		? contentText.split("---\n\n").slice(1).join("---\n\n")
-		: contentText;
+	const contentBody = readUrlContentBody(result.content[0]?.text ?? "", details.raw);
 	const lineCount = countNonEmptyLines(contentBody);
 	const charCount = contentBody.trim().length;
 	const contentLines = contentBody.split("\n").filter(l => l.trim());

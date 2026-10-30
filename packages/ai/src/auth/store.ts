@@ -139,6 +139,20 @@ export interface CredentialRefreshLeaseStore {
 	getCredentialRefreshLeaseExpiresAt(credentialId: number): number | undefined;
 	releaseCredentialRefreshLease(credentialId: number, owner: string): void;
 	renewCredentialRefreshLease(credentialId: number, owner: string, expiresAtMs: number): boolean;
+	/** The lease row as stored, expired or not; `undefined` when no lease row exists. */
+	getCredentialRefreshLeaseHolder?(credentialId: number): CredentialRefreshLeaseHolder | undefined;
+	/**
+	 * Give a lease this owner took back to the holder it replaced, with that
+	 * holder's own expiry, so the holder can still renew it and save the token
+	 * it may have exchanged. Returns false when `owner` no longer holds it.
+	 */
+	handBackCredentialRefreshLease?(credentialId: number, owner: string, holder: CredentialRefreshLeaseHolder): boolean;
+}
+
+/** Owner and expiry of a stored refresh lease row. */
+export interface CredentialRefreshLeaseHolder {
+	owner: string;
+	expiresAtMs: number;
 }
 
 /** Usage history and client-observed request accounting. */
@@ -181,6 +195,8 @@ export interface CredentialUpstream {
 	 * for `timeoutMs * (maxRetries + 1)`.
 	 * `reason` distinguishes provider-auth recovery from generic/MCP refreshes
 	 * that must always mint a new access token.
+	 * `rejectedAccess` names the rejected bearer for that row; delegates must
+	 * keep it out of URLs and logs.
 	 */
 	refreshOAuthCredential(
 		provider: Provider,
@@ -188,6 +204,7 @@ export interface CredentialUpstream {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 		reason?: OAuthRefreshReason,
+		rejectedAccess?: string,
 	): Promise<OAuthCredentials>;
 	/**
 	 * Optional async pre-read hook invoked after AuthStorage selects a stored

@@ -2,7 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { OutputPane, type OutputPaneOptions } from "@oh-my-pi/pi-tui/render/output-pane";
 import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { ensureThemeSync, getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
-import { resetHangulCompatibilityJamoWidthForTests, setHangulCompatibilityJamoWidth } from "@oh-my-pi/pi-tui/utils";
+import {
+	isTuiTight,
+	resetHangulCompatibilityJamoWidthForTests,
+	setHangulCompatibilityJamoWidth,
+	setTuiTight,
+} from "@oh-my-pi/pi-tui/utils";
 
 ensureThemeSync();
 
@@ -94,6 +99,23 @@ describe("OutputPane render memo", () => {
 		expect(pane.render(80)).toEqual(fresh.render(80));
 	});
 
+	it("updates visible rows when tight padding changes at the same outer width", () => {
+		const previous = isTuiTight();
+		const rows = Array.from({ length: 6 }, (_, i) => `row ${i} ${"x".repeat(23)}`);
+		const options: OutputPaneOptions = { ...DEFAULT_OPTIONS, collapsedMaxLines: 4, leadingBlank: false };
+		try {
+			setTuiTight(false);
+			const pane = makePane(rows, options);
+			expect(pane.render(30).join("\n")).not.toContain("row 2");
+			setTuiTight(true);
+			const rendered = pane.render(30);
+			expect(rendered).toEqual(makePane(rows, options).render(30));
+			expect(rendered.join("\n")).toContain("row 2");
+		} finally {
+			setTuiTight(previous);
+		}
+	});
+
 	it("renders what a fresh pane renders when the width configuration changes", () => {
 		// The visual cap counts visual lines, and the width of a Hangul
 		// Compatibility Jamo depends on the width-affecting runtime
@@ -137,7 +159,11 @@ describe("OutputPane render memo", () => {
 		// The styled rows bake in the active theme's colors, so a theme switch
 		// must re-shape them even though the rows themselves did not change.
 		const [dark, light] = await Promise.all([getThemeByName("dark"), getThemeByName("light")]);
-		if (dark === undefined || light === undefined) return;
+		// Builtin themes: if either is missing the theme-epoch case would pass
+		// silently without asserting anything, so fail loudly instead.
+		expect(dark).toBeDefined();
+		expect(light).toBeDefined();
+		if (dark === undefined || light === undefined) throw new Error("builtin dark/light themes must exist");
 		const previous = theme;
 		try {
 			setThemeInstance(dark);

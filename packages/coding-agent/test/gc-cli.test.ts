@@ -1,3 +1,4 @@
+import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { promises as storageFs } from "node:fs";
@@ -7,8 +8,13 @@ import * as path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import { withStatsSyncLock } from "@oh-my-pi/omp-stats/aggregator";
+import {
+	GC_AUTO_COMPRESS_INTERVAL_MS,
+	GC_AUTO_COMPRESS_LOG,
+	scheduleGcAutoCompress,
+} from "@oh-my-pi/pi-coding-agent/cli/gc-auto-compress";
 import { type GcResult, runGcCommand } from "@oh-my-pi/pi-coding-agent/cli/gc-cli";
-import { compressMethod } from "@oh-my-pi/pi-coding-agent/cli/gc-compress";
+import * as gcCompress from "@oh-my-pi/pi-coding-agent/cli/gc-compress";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { BlobStore, blobStagingPath } from "@oh-my-pi/pi-coding-agent/session/blob-store";
@@ -2669,8 +2675,18 @@ describe("runGcCommand stale state", () => {
 	});
 });
 
-// Test roots live under the temp dir, so its filesystem decides which compression tests run.
-const method = await compressMethod(os.tmpdir());
+const { method, savesSpace } = await (async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-gc-compression-probe-"));
+	try {
+		const method = await gcCompress.compressMethod(dir);
+		return {
+			method,
+			savesSpace: method !== undefined && (await gcCompress.compressionWorks(dir, method)),
+		};
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+})();
 const supported = method !== undefined;
 const onApfs = method === "apfs";
 
@@ -2710,6 +2726,27 @@ describe("runGcCommand session compression", () => {
 		};
 	}
 
+	async function withBackgroundRuns(
+		work: (schedule: () => Promise<Subprocess | undefined>) => Promise<void>,
+	): Promise<void> {
+		const launches: Promise<Subprocess | undefined>[] = [];
+		const schedule = () => {
+			const launch = scheduleGcAutoCompress(root);
+			launches.push(launch);
+			return launch;
+		};
+		try {
+			await work(schedule);
+		} finally {
+			const settled = await Promise.allSettled(launches);
+			await Promise.allSettled(
+				settled.flatMap(launch =>
+					launch.status === "fulfilled" && launch.value !== undefined ? [launch.value.exited] : [],
+				),
+			);
+		}
+	}
+
 	test.skipIf(supported)("reports the phase unsupported without touching sessions", async () => {
 		const { file } = await writeIdleSession(Bun.randomUUIDv7());
 		const before = await snapshot(file);
@@ -2720,7 +2757,7 @@ describe("runGcCommand session compression", () => {
 		expect(await snapshot(file)).toEqual(before);
 	});
 
-	test.skipIf(!supported)("--apply stores an idle session compressed with identical bytes and mtimes", async () => {
+	test.skipIf(!savesSpace)("--apply stores an idle session compressed with identical bytes and mtimes", async () => {
 		const { file, artifact } = await writeIdleSession(Bun.randomUUIDv7());
 		const before = await Promise.all([snapshot(file), snapshot(artifact)]);
 
@@ -2757,7 +2794,7 @@ describe("runGcCommand session compression", () => {
 		expect(await snapshot(file)).toEqual(before);
 	});
 
-	test.skipIf(!supported)("a session whose artifact tree cannot be read does not stop the run", async () => {
+	test.skipIf(!savesSpace)("a session whose artifact tree cannot be read does not stop the run", async () => {
 		const broken = await writeIdleSession(Bun.randomUUIDv7());
 		// A file where the artifact directory belongs makes the tree scan fail with ENOTDIR.
 		await fs.rm(path.dirname(broken.artifact), { recursive: true });
@@ -2773,6 +2810,8 @@ describe("runGcCommand session compression", () => {
 
 	test.skipIf(!onApfs)("--apply removes only the scratch dirs a killed run left behind", async () => {
 		const { file, artifact } = await writeIdleSession(Bun.randomUUIDv7());
+		const targets = [file, artifact];
+		const before = await Promise.all(targets.map(snapshot));
 		const inSessions = path.join(path.dirname(file), ".omp-gc-compress-a1b2c3");
 		const inArchive = path.join(root, "archive", "sessions", "project", "x", ".omp-gc-compress-d4e5f6");
 		for (const dir of [inSessions, inArchive]) {
@@ -2790,12 +2829,17 @@ describe("runGcCommand session compression", () => {
 		expect(await Bun.file(path.join(inSessions, "copy.jsonl")).exists()).toBe(true);
 
 		const applied = await runGcCommand({ flags: { agentDir: root, compress: true, apply: true } });
-		expect(applied.compress).toMatchObject({ leftoverScratchDirs: 2, compressed: 2, errors: [] });
+		expect(applied.compress).toMatchObject({ leftoverScratchDirs: 2, errors: [] });
 		for (const dir of [inSessions, inArchive]) expect(await fs.exists(dir)).toBe(false);
 		expect(await Bun.file(userArtifact).text()).toBe("keep");
+		for (const [index, target] of targets.entries()) {
+			const after = await snapshot(target);
+			expect(after.bytes).toBe(before[index].bytes);
+			expect(after.mtimeNs).toBe(before[index].mtimeNs);
+		}
 	});
 
-	test.skipIf(!onApfs)("a failed batch still counts its files as allocated afterwards", async () => {
+	test.skipIf(!onApfs || !savesSpace)("a failed batch still counts its files as allocated afterwards", async () => {
 		const { file, artifact } = await writeIdleSession(Bun.randomUUIDv7());
 		const artifactBefore = await snapshot(artifact);
 		// A read-only artifact dir cannot hold the scratch copy, so only the transcript compresses.
@@ -2825,12 +2869,15 @@ describe("runGcCommand session compression", () => {
 		const before = await Promise.all(targets.map(snapshot));
 		let result: GcResult;
 		try {
+			const planned = await runGcCommand({ flags: { agentDir: root, compress: true } });
+			expect(planned.compress).toMatchObject({ scanned: 2, skippedLive: 1, wouldCompress: 0, compressed: 0 });
 			result = await runGcCommand({ flags: { agentDir: root, compress: true, apply: true } });
 		} finally {
 			release();
 		}
 
-		expect(result.compress).toMatchObject({ scanned: 2, skippedLive: 1, wouldCompress: 0, compressed: 0 });
+		expect(result.compress).toMatchObject({ wouldCompress: 0, compressed: 0, errors: [] });
+		if (savesSpace) expect(result.compress).toMatchObject({ scanned: 2, skippedLive: 1 });
 		expect(await Promise.all(targets.map(snapshot))).toEqual(before);
 	});
 
@@ -2854,16 +2901,19 @@ describe("runGcCommand session compression", () => {
 		const before = await Promise.all(targets.map(snapshot));
 		let result: GcResult;
 		try {
+			const planned = await runGcCommand({ flags: { agentDir: root, compress: true } });
+			expect(planned.compress).toMatchObject({ skippedLive: 1, wouldCompress: 0, compressed: 0 });
 			result = await runGcCommand({ flags: { agentDir: root, compress: true, apply: true } });
 		} finally {
 			release();
 		}
 
-		expect(result.compress).toMatchObject({ skippedLive: 1, wouldCompress: 0, compressed: 0 });
+		expect(result.compress).toMatchObject({ wouldCompress: 0, compressed: 0, errors: [] });
+		if (savesSpace) expect(result.compress?.skippedLive).toBe(1);
 		expect(await Promise.all(targets.map(snapshot))).toEqual(before);
 	});
 
-	test.skipIf(!supported)("compresses an idle session whose last turn was interrupted", async () => {
+	test.skipIf(!savesSpace)("compresses an idle session whose last turn was interrupted", async () => {
 		const interrupted = await writeIdleSession(Bun.randomUUIDv7(), "pending");
 		const bytes = await fs.readFile(interrupted.file);
 
@@ -2873,7 +2923,7 @@ describe("runGcCommand session compression", () => {
 		expect(await fs.readFile(interrupted.file)).toEqual(bytes);
 	});
 
-	test.skipIf(!supported)("compresses a session whose artifact tree holds a copy of its transcript", async () => {
+	test.skipIf(!savesSpace)("compresses a session whose artifact tree holds a copy of its transcript", async () => {
 		const { file, artifact } = await writeIdleSession(Bun.randomUUIDv7());
 		// A plain copy keeps the parent's session id; leasing that id twice must not read as live.
 		const copy = path.join(path.dirname(artifact), "backup.jsonl");
@@ -2907,5 +2957,129 @@ describe("runGcCommand session compression", () => {
 
 		expect(configured.compress?.wouldCompress).toBe(0);
 		expect(overridden.compress?.wouldCompress).toBe(2);
+	});
+
+	test.skipIf(!supported)(
+		"the background run handles idle sessions, then waits a day before running again",
+		() =>
+			withBackgroundRuns(async schedule => {
+				const { file, artifact } = await writeIdleSession(Bun.randomUUIDv7());
+				const targets = [file, artifact];
+				const before = await Promise.all(targets.map(snapshot));
+				const logPath = path.join(root, GC_AUTO_COMPRESS_LOG);
+
+				const child = await schedule();
+				expect(await child?.exited).toBe(0);
+				for (const [index, target] of targets.entries()) {
+					const after = await snapshot(target);
+					expect(after.bytes).toBe(before[index].bytes);
+					expect(after.mtimeNs).toBe(before[index].mtimeNs);
+					if (savesSpace) expect(after.allocated).toBeLessThan(before[index].allocated);
+					else expect(after).toEqual(before[index]);
+				}
+				const skipped = `compress skipped: ${method} compression stored a compressible probe file uncompressed`;
+				expect(await Bun.file(logPath).text()).toContain(
+					savesSpace ? "compress: 2/2 files in 1 sessions" : skipped,
+				);
+
+				expect(await schedule()).toBeUndefined();
+
+				const lastRun = (Date.now() - GC_AUTO_COMPRESS_INTERVAL_MS - 60_000) / 1000;
+				await fs.utimes(logPath, lastRun, lastRun);
+				const next = await schedule();
+				expect(await next?.exited).toBe(0);
+				expect(await Bun.file(logPath).text()).toContain(
+					savesSpace ? "compress: 0/0 files in 0 sessions" : skipped,
+				);
+			}),
+		60_000,
+	);
+
+	test.skipIf(!supported)(
+		"simultaneous launches start one background run and keep its summary",
+		() =>
+			withBackgroundRuns(async schedule => {
+				const { file, artifact } = await writeIdleSession(Bun.randomUUIDv7());
+				const targets = [file, artifact];
+				const before = await Promise.all(targets.map(snapshot));
+				const logPath = path.join(root, GC_AUTO_COMPRESS_LOG);
+				const lastRun = (Date.now() - GC_AUTO_COMPRESS_INTERVAL_MS - 60_000) / 1000;
+				await Bun.write(logPath, "previous run\n");
+				await fs.utimes(logPath, lastRun, lastRun);
+
+				const launched = (await Promise.all([1, 2, 3].map(() => schedule()))).filter(child => child !== undefined);
+
+				expect(launched).toHaveLength(1);
+				expect(await launched[0].exited).toBe(0);
+				const log = await Bun.file(logPath).text();
+				expect(log).toContain(
+					savesSpace
+						? "compress: 2/2 files in 1 sessions"
+						: `compress skipped: ${method} compression stored a compressible probe file uncompressed`,
+				);
+				expect(log).not.toContain("GC already running");
+				for (const [index, target] of targets.entries()) {
+					const after = await snapshot(target);
+					expect(after.bytes).toBe(before[index].bytes);
+					expect(after.mtimeNs).toBe(before[index].mtimeNs);
+					if (savesSpace) expect(after.allocated).toBeLessThan(before[index].allocated);
+					else expect(after).toEqual(before[index]);
+				}
+			}),
+		60_000,
+	);
+
+	test.skipIf(!supported)("--apply on a volume whose compression shrinks nothing leaves sessions alone", async () => {
+		const { file } = await writeIdleSession(Bun.randomUUIDv7());
+		const before = await snapshot(file);
+		const probe = spyOn(gcCompress, "compressionWorks").mockResolvedValue(false);
+		let result: GcResult;
+		try {
+			result = await runGcCommand({ flags: { agentDir: root, compress: true, apply: true } });
+		} finally {
+			probe.mockRestore();
+		}
+
+		expect(result.compress).toMatchObject({ supported: true, scanned: 0, wouldCompress: 0, compressed: 0 });
+		expect(result.compress?.probeFailure).toContain("stored a compressible probe file uncompressed");
+		expect(await snapshot(file)).toEqual(before);
+	});
+
+	test("omp gc --compress --apply fails when the compression probe cannot run", async () => {
+		// A supported volume, but no sessions directory to hold the probe's scratch dir.
+		const volume = spyOn(gcCompress, "compressMethod").mockResolvedValue("ntfs");
+		try {
+			await runCli(["gc", "--agent-dir", root, "--compress", "--apply"]);
+		} finally {
+			volume.mockRestore();
+		}
+
+		const stderr = stderrWrites.join("");
+		expect(process.exitCode).toBe(1);
+		expect(stderr).toContain("GC completed with 1 error:");
+		expect(stderr).toContain("compress: compression probe: ENOENT");
+		expect(writes.join("")).not.toContain("compress skipped");
+	});
+
+	test("the compression probe throws when the compression tool fails instead of reporting no compression", async () => {
+		// The other platform's tool is absent here, so its batch reports a command failure.
+		const absentTool = process.platform === "win32" ? "apfs" : "ntfs";
+
+		await expect(gcCompress.compressionWorks(root, absentTool)).rejects.toThrow(
+			absentTool === "apfs" ? "ditto exited" : "compact exited",
+		);
+	});
+
+	test.skipIf(supported)("the background run never starts without filesystem compression", async () => {
+		await withBackgroundRuns(async schedule => {
+			const { file } = await writeIdleSession(Bun.randomUUIDv7());
+			const before = await snapshot(file);
+
+			expect(await schedule()).toBeUndefined();
+			expect(await Bun.file(path.join(root, GC_AUTO_COMPRESS_LOG)).text()).toContain(
+				"compress skipped: unsupported",
+			);
+			expect(await snapshot(file)).toEqual(before);
+		});
 	});
 });

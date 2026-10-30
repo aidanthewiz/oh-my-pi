@@ -65,6 +65,7 @@ import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-
 import type {
 	AgentHubOpenOptions,
 	InteractiveModeContext,
+	ResumeSessionOptions,
 	SelectOnlyModelSelectorOptions,
 	SessionPickHandler,
 } from "../../modes/types";
@@ -130,6 +131,7 @@ import type { LoginDialogComponent as LoginDialogComponentType } from "@oh-my-pi
 import type { LogoutAccountSelectorComponent as LogoutAccountSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { ModelHubComponent, type ModelRoleSelectionScope } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
+import { formatSessionContinuationNotice } from "../persistence-failure";
 import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { OAuthSelectorComponent as OAuthSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
@@ -148,7 +150,7 @@ import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-
 import { cfgAdvisorSyncBacklog } from "../../advisor/settings";
 import { cfgBranchSummaryEnabled } from "../../session/context-settings";
 import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
-import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../../session/settings";
+import { cfgDefaultThinkingLevel, cfgRetryFallbackChains, cfgSessionWorktreeScope } from "../../session/settings";
 import {
 	cfgStatusLineCompactThinkingLevel,
 	cfgStatusLineContextLine,
@@ -1855,7 +1857,12 @@ export class SelectorController {
 			};
 		} else {
 			const [loadedSessions, pinnedIds] = await Promise.all([
-				SessionManager.listForPicker(this.ctx.sessionManager.getCwd(), this.ctx.sessionManager.getSessionDir()),
+				SessionManager.listForPicker(
+					this.ctx.sessionManager.getCwd(),
+					this.ctx.sessionManager.getSessionDir(),
+					undefined,
+					cfgSessionWorktreeScope.get(this.ctx.settings),
+				),
 				loadPinnedSessionIds(),
 			]);
 			sessions = loadedSessions;
@@ -2004,7 +2011,10 @@ export class SelectorController {
 		return true;
 	}
 
-	async handleResumeSession(sessionPath: string, options?: { settingsFlushed?: boolean }): Promise<boolean> {
+	async handleResumeSession(
+		sessionPath: string,
+		options?: ResumeSessionOptions & { settingsFlushed?: boolean },
+	): Promise<boolean> {
 		const previousCwd = this.ctx.sessionManager.getCwd();
 		// Flush pending settings writes before switching sessions so a save
 		// failure leaves the session, process project dir, and Settings in the
@@ -2017,6 +2027,7 @@ export class SelectorController {
 				return false;
 			}
 		}
+		const continuation = options?.continuation;
 		const target = await this.#relocateFromRemovedWorktree(sessionPath);
 		if (!target) return false;
 		await this.ctx.prepareSessionSwitch();
@@ -2053,6 +2064,7 @@ export class SelectorController {
 					? `Resumed session in ${shortenPath(newCwd)}`
 					: "Resumed session",
 		);
+		if (continuation) this.ctx.showWarning(formatSessionContinuationNotice(continuation));
 		if (modelFallbackWarning) this.ctx.showWarning(modelFallbackWarning);
 		return true;
 	}

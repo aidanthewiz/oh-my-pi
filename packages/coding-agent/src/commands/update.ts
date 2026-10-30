@@ -27,7 +27,7 @@ export default class Update extends Command {
 		const { flags } = await this.parse(Update);
 		await initTheme();
 		if (flags.plugins) {
-			await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: {} });
+			await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: flags.check ? { dryRun: true } : {} });
 		} else {
 			await updateCli.runUpdateCommand({
 				force: flags.force,

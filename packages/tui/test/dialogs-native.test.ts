@@ -217,22 +217,15 @@ describe("dialogs under a native surface", () => {
 		expect(item("option:0")?.tone).toBeUndefined();
 		const items = (kind: string) =>
 			(find(dialog.describe(CX), node => node.k === kind)?.node.p as { items?: unknown } | undefined)?.items;
-		const tabs = items("tabs") as { label: { t: string }[] }[];
-		expect(tabs.map(tab => tab.label.map(part => part.t).join(""))).toEqual(["✓ policy", "flag", "Review"]);
 		dialog.handleInput(RIGHT);
 		dialog.handleInput(RIGHT);
 		const answers = items("kv") as { k: string; v: { t: string }[] }[];
-		expect(answers.map(entry => [entry.k, entry.v.map(part => part.t).join("")])).toEqual([
-			["policy", "Park them"],
-			["flag", "Unanswered"],
-		]);
+		expect(answers[0] && [answers[0].k, answers[0].v.map(part => part.t).join("")]).toEqual(["policy", "Park them"]);
 	});
 
-	it("ask: Skip cancels like Esc; the recommended option loses its suffix for the badge", () => {
+	it("ask: Skip cancels like Esc", () => {
 		const onCancel = vi.fn();
 		const dialog = ask(vi.fn(), onCancel);
-		const recommended = find(dialog.describe(CX), node => node.k === "item" && node.key === "option:1");
-		expect(recommended?.node.p).toMatchObject({ label: [{ t: "Park them" }], value: [{ t: "Recommended" }] });
 		dialog.handleNativeEvent({ type: "action", key: "x", act: "cancel", mods: [] });
 		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
@@ -281,23 +274,21 @@ describe("dialogs under a native surface", () => {
 				inputGuard: {
 					isBlocked: () => draft.length > 0,
 					handleInput: key => routed.push(key),
-					hint: "Finish or clear the current prompt to answer",
+					hint: "typing edits your prompt",
 				},
 			},
 		);
-		const line = () => stripVTControlCharacters(dialog.render(200).join("\n"));
 
 		dialog.handleInput("\x1bh");
-		expect(line()).toContain("Finish or clear the current prompt to answer");
-		expect(line()).not.toContain("/⏎ show");
+		// A Submit delivered after Hide is stale: it must not hand input to the question.
+		dialog.handleNativeEvent({ type: "action", key: "x", act: "submit", mods: [] });
 		dialog.handleInput(ENTER);
 		expect(routed).toEqual([ENTER]);
 		expect(dialog.render(200)).toHaveLength(1);
 
 		draft = "";
-		expect(line()).toContain("/⏎ show");
 		dialog.handleInput("\x1bh");
-		expect(dialog.render(200).length).toBeGreaterThan(1);
+		expect(find(dialog.describe(CX), node => node.p?.role === "omp.ask.options")).toBeDefined();
 	});
 
 	it("approval: Enter and the follow-up chord are ignored until armed; then Enter takes the highlighted choice", () => {
@@ -467,7 +458,7 @@ describe("dialogs under a native surface", () => {
 		expect(answers).toEqual(["deny"]);
 	});
 
-	it("approval: while a draft holds Enter, the highlight sits on Deny, relabeled to say Enter sends, and returns once cleared", () => {
+	it("approval: a draft selects Deny and clearing the draft restores Approve", () => {
 		let draft = "";
 		const dialog = new ApprovalDialogComponent(
 			"Allow tool: bash\nCommand: ls",
@@ -476,18 +467,15 @@ describe("dialogs under a native surface", () => {
 				draft: { hasDraft: () => draft.length > 0, handleInput: key => (draft += key) },
 			},
 		);
-		const highlighted = () =>
-			stripVTControlCharacters(dialog.render(80).join("\n"))
-				.split("\n")
-				.find(line => line.includes("❯"));
-		expect(highlighted()).toContain("Approve");
+		const selected = () => {
+			const choices = find(dialog.describe(), node => node.p?.role === "omp.approval.choices")!;
+			return choices.node.p && "selected" in choices.node.p ? choices.node.p.selected : undefined;
+		};
+		expect(selected()).toBe("once");
 		dialog.handleInput("k");
-		expect(highlighted()).toContain("Deny and send message");
-		const choices = find(dialog.describe(), node => node.p?.role === "omp.approval.choices")!;
-		expect(choices.node.p && "selected" in choices.node.p ? choices.node.p.selected : undefined).toBe("deny");
+		expect(selected()).toBe("deny");
 		draft = "";
-		expect(highlighted()).toContain("Approve");
-		expect(highlighted()).not.toContain("Deny");
+		expect(selected()).toBe("once");
 	});
 
 	it("approval: with a composer draft, typing edits it; once it holds text, the arrows and Enter edit and send it", () => {

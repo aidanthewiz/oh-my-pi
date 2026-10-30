@@ -80,6 +80,12 @@ export interface ClientUsageSummaryResponse {
 	clients: ClientUsageClientSummary[];
 }
 
+/** POST /v1/credential/:id/refresh request body. */
+export interface CredentialRefreshRequest {
+	/** Rejected bearer for this row, used only with auth-recovery intent. Never include in URLs or logs. */
+	rejectedAccess?: string;
+}
+
 /** POST /v1/credential/:id/refresh response body. */
 export interface CredentialRefreshResponse {
 	entry: AuthCredentialSnapshotEntry;

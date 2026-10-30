@@ -32,8 +32,8 @@ it("keeps each property name's answer to itself within one schema", () => {
 	expect(schemaDefinesProperty(schema, "missing")).toBe(false);
 });
 
-it("reports a property the schema requires but does not declare", () => {
-	const required = { type: "object", properties: { path: { type: "string" } }, required: ["path"] };
+it("reports a property a schema requires without declaring it", () => {
+	const required = { type: "object", required: ["path"] };
 
 	expect(schemaDefinesProperty(required, "path")).toBe(true);
 	expect(schemaDefinesProperty(required, "i")).toBe(false);

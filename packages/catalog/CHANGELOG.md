@@ -19,6 +19,12 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.13.2] - 2026-10-27
+
+### Added
+
+- Added LM Studio decision models to discovery: models LM Studio reports as `type: "decision"` are listed as `judge` models served over its `/v1/decisions` endpoint, alongside its chat models ([#17169](https://github.com/can1357/oh-my-pi/pull/17169) by [@richiestanaway](https://github.com/richiestanaway))
+
 ## [18.13.1] - 2026-10-27
 
 ### Added

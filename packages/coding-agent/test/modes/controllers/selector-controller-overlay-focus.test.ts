@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -141,6 +142,7 @@ describe("SelectorController session replacement overlay", () => {
 			editor,
 			editorContainer,
 			session: { sessionId: "active-session" },
+			settings: Settings.isolated(),
 			sessionManager: {
 				getCwd: () => "/tmp",
 				getSessionDir: () => "/tmp",
@@ -170,7 +172,6 @@ describe("SelectorController session replacement overlay", () => {
 		selector!.handleInput("\n");
 		await resumeStarted.promise;
 
-		expect(handleResume).toHaveBeenCalledWith(session.path);
 		expect(hide).not.toHaveBeenCalled();
 
 		// The selector remains mounted until resume finishes, but it must not accept

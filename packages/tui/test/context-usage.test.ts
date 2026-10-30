@@ -15,17 +15,15 @@ import {
 	DEFAULT_COMPACTION_SETTINGS,
 	shouldCompact,
 } from "@oh-my-pi/pi-agent-core/compaction";
-import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { renderToolExamples } from "@oh-my-pi/pi-ai/dialect";
+import { arkToWireSchema, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import {
-	type ContextBreakdown,
 	type NonMessageTokenSource,
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
 	estimateSkillsTokens,
 	estimateToolSchemaTokens,
-	getToolSchemaMetadataRevision,
 	invalidateToolSchemaMetadata,
-	renderContextUsage,
 } from "../src/status-line/context-usage";
 
 const tokenizer = new Tokenizer();
@@ -61,121 +59,35 @@ describe("estimateToolSchemaTokens", () => {
 	it("counts rendered examples, which the agent loop appends to the wire description", () => {
 		const tool = { name: "grep", description: "Search files.", parameters: { type: "object" } };
 		const examples = [{ caption: "Find TODOs", call: { pattern: "TODO", path: "src" } }];
-		const without = estimateToolSchemaTokens([tool as never], tokenizer);
 		const withExamples = estimateToolSchemaTokens([{ ...tool, examples } as never], tokenizer);
-		expect(withExamples).toBeGreaterThan(without);
+		expect(withExamples).toBe(
+			tokenizer.countTokens([
+				tool.name,
+				tool.description,
+				JSON.stringify(toolWireSchema(tool as never)),
+				renderToolExamples({ ...tool, examples } as never)!,
+			]),
+		);
 	});
 
 	it("skips non-string name/description fragments", () => {
-		const estimate = estimateToolSchemaTokens(
-			[{ name: "odd", description: undefined, parameters: { type: "object" } } as never],
-			tokenizer,
-		);
-		expect(estimate).toBeGreaterThan(0);
+		const tool = { name: "odd", description: undefined, parameters: { type: "object" } };
+		const estimate = estimateToolSchemaTokens([tool as never], tokenizer);
+		expect(estimate).toBe(tokenizer.countTokens([tool.name, JSON.stringify(toolWireSchema(tool as never))]));
 	});
 
-	it("does not reread dynamic metadata until its explicit revision changes", () => {
-		let description = "short";
-		let reads = 0;
-		const tool = {
-			name: "dynamic",
-			get description() {
-				reads++;
-				return description;
-			},
-			parameters: {},
-		};
+	it("uses changed live metadata after invalidation", () => {
+		const tool = { name: "dynamic", description: "short", parameters: {} };
 		const tools = [tool];
-		const first = estimateToolSchemaTokens(tools, tokenizer);
-		expect(reads).toBe(1);
-		expect(estimateToolSchemaTokens(tools, tokenizer)).toBe(first);
-		expect(reads).toBe(1);
-
-		description = "a substantially longer dynamic description after a live policy update";
+		const schema = JSON.stringify(toolWireSchema(tool as never));
+		expect(estimateToolSchemaTokens(tools, tokenizer)).toBe(
+			tokenizer.countTokens([tool.name, tool.description, schema]),
+		);
+		tool.description = "a substantially longer dynamic description after a live policy update";
 		invalidateToolSchemaMetadata(tools);
-		expect(getToolSchemaMetadataRevision(tools)).toBe(1);
-		expect(estimateToolSchemaTokens(tools, tokenizer)).toBeGreaterThan(first);
-		expect(reads).toBe(2);
-	});
-
-	it("separates array, tokenizer, and source-revision cache keys", () => {
-		let reads = 0;
-		const tool = {
-			name: "dynamic",
-			get description() {
-				reads++;
-				return "metadata";
-			},
-			parameters: {},
-		};
-		const tools = [tool];
-		estimateToolSchemaTokens(tools, tokenizer, 1);
-		estimateToolSchemaTokens(tools, tokenizer, 1);
-		expect(reads).toBe(1);
-
-		estimateToolSchemaTokens(tools, tokenizer, 2);
-		expect(reads).toBe(2);
-		estimateToolSchemaTokens([...tools], tokenizer, 2);
-		expect(reads).toBe(3);
-		estimateToolSchemaTokens(tools, new Tokenizer(), 2);
-		expect(reads).toBe(4);
-	});
-});
-
-/**
- * Contract: the /context panel surfaces estimated snapcompact wire savings —
- * applied swaps show "saves" figures, inactive states say why.
- */
-describe("renderContextUsage snapcompact section", () => {
-	const themeStub = {
-		fg: (_color: string, text: string) => text,
-		bold: (text: string) => text,
-	} as never;
-
-	function breakdownWith(snapcompact: ContextBreakdown["snapcompact"]): ContextBreakdown {
-		return {
-			model: { id: "test-model", name: "Test Model", contextWindow: 200000 } as never,
-			contextWindow: 200000,
-			categories: [],
-			usedTokens: 27929,
-			autoCompactBufferTokens: 0,
-			freeTokens: 172071,
-			snapcompact,
-		};
-	}
-
-	it("renders savings, skip reasons, and the wire total", () => {
-		const output = renderContextUsage(
-			breakdownWith({
-				visionCapable: true,
-				systemPrompt: {
-					applied: true,
-					scope: "all",
-					textTokens: 9768,
-					frames: 2,
-					imageTokens: 6600,
-					savedTokens: 3168,
-				},
-				toolResults: { total: 3, swapped: 0, textTokens: 0, frames: 0, imageTokens: 0, savedTokens: 0 },
-				savedTokens: 3168,
-			}),
-			themeStub,
+		expect(estimateToolSchemaTokens(tools, tokenizer)).toBe(
+			tokenizer.countTokens([tool.name, tool.description, schema]),
 		);
-		expect(output).toContain("Snapcompact (estimated wire savings)");
-		expect(output).toContain("System prompt (all): saves ~3.2K (9.8K text → 2 frames ≈ 6.6K)");
-		expect(output).toContain("Tool results: none imaged (3 in history)");
-		// 27929 logical − 3168 saved ≈ 25K on the wire.
-		expect(output).toContain("Next request: ~25K tokens on the wire");
-	});
-
-	it("reports text-only models as inactive", () => {
-		const output = renderContextUsage(breakdownWith({ visionCapable: false, savedTokens: 0 }), themeStub);
-		expect(output).toContain("Snapcompact: inactive (model has no image input)");
-	});
-
-	it("omits the section entirely when no snapcompact setting is on", () => {
-		const output = renderContextUsage(breakdownWith(undefined), themeStub);
-		expect(output).not.toContain("Snapcompact");
 	});
 });
 

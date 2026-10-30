@@ -49,6 +49,7 @@ import {
 import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import { parseInternalUrl } from "../internal-urls/parse";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -113,6 +114,7 @@ import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
 import { splitPathAndSel } from "@oh-my-pi/pi-tui/tools/read";
 import { readArchive, resolveArchiveReadPath } from "./read-archive";
 import {
+	appendReadNotice,
 	BRACKET_CONTEXT_ELLIPSIS,
 	buildInMemoryMultiRangeResult,
 	buildInMemorySelectorResult,
@@ -127,6 +129,7 @@ import {
 	hashlineHeaderContext,
 	hashlineHeaderContextForText,
 	lineNumbersFromSpans,
+	markRawSuffixResolution,
 	markMarkdownContentType,
 	prependHashlineHeader,
 	prependSuffixResolutionNotice,
@@ -142,7 +145,12 @@ import {
 	isRemoteMountPath,
 	type SuffixMatchCache,
 } from "./read-path-resolution";
-import { type PdfImageReadTarget, renderPdfPageScreenshot, splitPdfImageReadPath } from "./read-pdf";
+import {
+	type PdfImageReadTarget,
+	type PdfPageReadOptions,
+	renderPdfPageScreenshot,
+	splitPdfImageReadPath,
+} from "./read-pdf";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import {
 	VideoError,
@@ -169,7 +177,7 @@ import {
 import { splitAddressableFileLines } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { readBinary, resolveBinaryViewPath } from "./read-binary";
 import { readSqlite, resolveSqliteReadPath } from "./read-sqlite";
-import { readJson, resolveJsonReadPath, splitJsonQueryTarget } from "./read-json";
+import { parseJsonSelector, readJson, resolveJsonReadPath, splitJsonQueryTarget } from "./read-json";
 import {
 	getReadTextFileBridge,
 	isProseSummaryPath,
@@ -778,7 +786,6 @@ interface LocatedRead {
 }
 
 interface FilesystemReadOptions {
-	dispatch: ReadDispatchState;
 	literalQueryPath?: boolean;
 	located?: LocatedRead;
 	question?: string;
@@ -816,7 +823,8 @@ export function splitImageQuestionTarget(readPath: string): { path: string; ques
 		if (!scheme || !InternalUrlRouter.instance().spec(scheme)?.imageQuestion) return { path: readPath };
 	}
 	if (parseSqlitePathCandidates(readPath.slice(0, queryIndex)).length > 0) return { path: readPath };
-	if (splitJsonQueryTarget(readPath)) return { path: readPath };
+	const jsonTarget = splitJsonQueryTarget(readPath);
+	if (jsonTarget && /\.(?:jsonl?|ndjson)$/i.test(jsonTarget.jsonPath)) return { path: readPath };
 	const question = new URLSearchParams(readPath.slice(queryIndex + 1)).get("q");
 	return question ? { path: readPath.slice(0, queryIndex), question } : { path: readPath };
 }
@@ -824,11 +832,12 @@ export function splitImageQuestionTarget(readPath: string): { path: string; ques
 export async function ownsReadQuery(readPath: string, cwd: string): Promise<boolean> {
 	const queryIndex = readPath.indexOf("?");
 	if (queryIndex === -1) return false;
+	const jsonTarget = splitJsonQueryTarget(readPath);
 	if (
 		!parseSqlitePathCandidates(readPath).some(
 			candidate => candidate.sqlitePath.length <= queryIndex && candidate.queryString.length > 0,
 		) &&
-		!splitJsonQueryTarget(readPath) &&
+		!(jsonTarget && parseJsonSelector(jsonTarget.queryString)) &&
 		splitImageQuestionTarget(readPath).question === undefined
 	) {
 		return false;
@@ -836,6 +845,10 @@ export async function ownsReadQuery(readPath: string, cwd: string): Promise<bool
 	const literalParts = await splitDelimitedPathEntry(readPath, cwd);
 	return (await probeLiteralPathExists(literalParts?.[0] ?? readPath, cwd)) !== "exists";
 }
+
+/** Media questions on located files are peeled before their URL handler runs. */
+const MEDIA_QUESTION_TARGET =
+	/(?::img|:page\d+\.png|\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg|heic|heif|avif|ico|mp4|m4v|mov|webm|mkv|avi))$/i;
 
 // Maximum image file size (20MB) - larger images will be rejected to prevent OOM during serialization
 const MAX_IMAGE_SIZE = MAX_IMAGE_INPUT_BYTES;
@@ -847,9 +860,6 @@ const readSchema = type({
 export type ReadToolInput = typeof readSchema.infer;
 
 type ReadParams = ReadToolInput;
-interface ReadDispatchState {
-	verbatim: boolean;
-}
 
 /**
  * Resolve the filesystem path a read result should hyperlink to: the explicit
@@ -907,7 +917,8 @@ function appendRepeatReadHint(session: ToolSession, path: string, result: AgentT
 	}
 	entry.count++;
 	if (entry.count < REPEAT_READ_HINT_THRESHOLD) return;
-	block.text += `\n\n[You have received this identical output ${entry.count} times. Re-reading '${path}' will not change it — use a narrower selector (path:A-B), or proceed with the edit.]`;
+	const notice = `[You have received this identical output ${entry.count} times. Re-reading '${path}' will not change it — use a narrower selector (path:A-B), or proceed with the edit.]`;
+	block.text = appendReadNotice(block.text, notice, (result.details ??= {}), "\n\n");
 }
 
 const LOCAL_READ_SPECULATION_INELIGIBLE: ToolSpeculationAssessment = {
@@ -1064,9 +1075,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (router.spec(extractUriScheme(normalized) ?? "")?.backing !== "file") {
 				throw new ToolError(`Cannot bind approval destination: ${normalized}`);
 			}
-			const target = await router.target(normalized, sessionResolveContext(this.session));
+			const target = await router.target(normalized, sessionResolveContext(this.session, { inspectSkills: true }));
 			if (target?.kind !== "file") throw new ToolError(`Cannot bind approval destination: ${normalized}`);
-			return this.#approvalFilesystemEntry(target.path, entry, { sel: target.sel });
+			return this.#approvalFilesystemEntry(target.path, entry, {
+				sel: target.sel,
+				url: target.url.rawHref ?? target.url.href,
+			});
 		}
 		return this.#approvalFilesystemEntry(readPath, entry);
 	}
@@ -1074,9 +1088,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	async #approvalFilesystemEntry(
 		readPath: string,
 		entry: { literalQueryPath: boolean; question?: string },
-		located?: { sel?: string },
+		located?: { sel?: string; url: string },
 	): Promise<string[]> {
-		const literalSplit = located
+		let literalSplit = located
 			? { path: readPath, sel: located.sel }
 			: await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
 		const literal =
@@ -1085,11 +1099,34 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			(entry.literalQueryPath || splitPathAndSel(readPath).sel !== undefined);
 		const suffixCache: SuffixMatchCache = new Map();
 		let source: string | undefined;
+		let { question } = entry;
 		if (!literal) {
 			const archive = await resolveArchiveReadPath(this.session, readPath, suffixCache);
 			if (archive) source = archive.absolutePath;
 			if (!source) source = (await resolveSqliteReadPath(this.session, readPath, suffixCache))?.absolutePath;
-			if (!source) source = (await resolveJsonReadPath(this.session, literalSplit.path, suffixCache))?.absolutePath;
+			if (!source) {
+				const queryIndex = located?.url.indexOf("?") ?? -1;
+				const scheme = located ? extractUriScheme(located.url) : null;
+				const jsonReadPath =
+					located && queryIndex >= 0 && (scheme === "local" || scheme === "artifact")
+						? `${literalSplit.path}${located.url.slice(queryIndex)}`
+						: literalSplit.path;
+				if (!located || queryIndex >= 0) {
+					source = (await resolveJsonReadPath(this.session, jsonReadPath, suffixCache))?.absolutePath;
+				}
+				const questionTarget =
+					!located || scheme === "local" || scheme === "artifact"
+						? splitJsonQueryTarget(located?.url ?? readPath)
+						: null;
+				const imageQuestion = questionTarget ? new URLSearchParams(questionTarget.queryString).get("q") : null;
+				if (!source && questionTarget && imageQuestion) {
+					question = imageQuestion;
+					if (!located) {
+						readPath = questionTarget.jsonPath;
+						literalSplit = await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
+					}
+				}
+			}
 		}
 		const pdf = !literal && literalSplit.sel === undefined ? splitPdfImageReadPath(readPath) : null;
 		const localTarget =
@@ -1099,7 +1136,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (
 			!source &&
 			!literal &&
-			entry.question === undefined &&
+			question === undefined &&
 			!isVideoPath(localTarget.path) &&
 			!isRawSelector(parseSel(localTarget.sel))
 		) {
@@ -1222,7 +1259,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const result = await speculativeTool.#executeInner(
 				context.toolCall.id,
 				{ ...(context.args as ReadParams), path: absolutePath },
-				{ verbatim: false },
 				signal,
 				undefined,
 				undefined,
@@ -1335,7 +1371,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			});
 			if (literalParts) return { path: readPath, parts: literalParts, literalQueryPath };
 		}
-		const imageQuestion = literalQueryPath ? { path: readPath } : splitImageQuestionTarget(readPath);
+		const scheme = extractUriScheme(readPath);
+		const queryIndex = readPath.indexOf("?");
+		const mediaQuestion = queryIndex !== -1 && MEDIA_QUESTION_TARGET.test(readPath.slice(0, queryIndex));
+		const imageQuestion =
+			literalQueryPath || !scheme || ((scheme === "local" || scheme === "artifact") && !mediaQuestion)
+				? { path: readPath }
+				: splitImageQuestionTarget(readPath);
 		return { ...imageQuestion, parts: null, literalQueryPath };
 	}
 
@@ -1530,15 +1572,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			.done();
 	}
 
-	async #readPdfPageScreenshot(options: {
-		readPath: string;
-		absolutePdfPath: string;
-		page: number;
-		pdfFileSize: number;
-		question?: string;
-		suffixResolution?: { from: string; to: string };
-		signal?: AbortSignal;
-	}): Promise<AgentToolResult<ReadToolDetails>> {
+	async #readPdfPageScreenshot(options: PdfPageReadOptions): Promise<AgentToolResult<ReadToolDetails>> {
 		const { readPath, absolutePdfPath, page, pdfFileSize, question, suffixResolution, signal } = options;
 		const screenshot = await renderPdfPageScreenshot(this.session, absolutePdfPath, page, signal);
 		const screenshotFile = Bun.file(screenshot.dest);
@@ -1687,8 +1721,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	): Promise<{
 		outputText: string;
 		columnCut: ColumnCut | undefined;
-		displayContent?: { text: string; startLine: number; lineNumbers?: Array<number | null> };
-		rowPrefixes?: boolean;
+		details?: ReadToolDetails;
 		bridgeResult?: AgentToolResult<ReadToolDetails>;
 	}> {
 		const rawSelector = isRawSelector(parsed);
@@ -1709,9 +1742,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					raw: rawSelector,
 				});
 				if (suffixResolution) {
-					const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
 					const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
-					if (firstText) firstText.text = `${notice}\n${firstText.text}`;
+					if (firstText) firstText.text = prependSuffixResolutionNotice(firstText.text, suffixResolution);
 				}
 				return { outputText: "", columnCut: undefined, bridgeResult };
 			} catch (error) {
@@ -1829,7 +1861,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			};
 			outputText = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
 		} else {
-			outputText = blocks.join("\n\n…\n\n");
+			outputText = blocks.join(rawSelector ? "\n" : "\n\n…\n\n");
 		}
 		if (shouldAddHashLines && outputText) {
 			const tag = buffered
@@ -1849,10 +1881,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 			}
 		}
-		if (notices.length > 0) {
-			outputText = outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n");
-		}
-		return { outputText, columnCut, displayContent, rowPrefixes: shouldAddHashLines || shouldAddLineNumbers };
+		const details: ReadToolDetails = {
+			...(displayContent && { displayContent }),
+			rowPrefixes: shouldAddHashLines || shouldAddLineNumbers,
+			raw: rawSelector || undefined,
+		};
+		if (notices.length > 0) outputText = appendReadNotice(outputText, notices.join("\n"), details);
+		return { outputText, columnCut, details };
 	}
 
 	async execute(
@@ -1862,18 +1897,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		const dispatch: ReadDispatchState = { verbatim: false };
-		const result = await this.#executeInner(toolCallId, params, dispatch, signal, onUpdate, toolContext);
+		const result = await this.#executeInner(toolCallId, params, signal, onUpdate, toolContext);
 		const displayTarget = InternalUrlRouter.instance().locateSync(params.path);
 		if (displayTarget && result.details) result.details.displayTarget = displayTarget;
-		if (!dispatch.verbatim) appendRepeatReadHint(this.session, params.path, result);
+		appendRepeatReadHint(this.session, params.path, result);
 		return result;
 	}
 
 	async #executeInner(
 		_toolCallId: string,
 		params: ReadParams,
-		dispatch: ReadDispatchState,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		toolContext?: AgentToolContext,
@@ -1893,7 +1926,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 			const urlSel = parsedUrlTarget.sel;
 			const urlRaw = isRawSelector(urlSel);
-			dispatch.verbatim = urlRaw;
 			if (urlSel.kind === "lines" || urlSel.kind === "tail") {
 				const entry = await fetchReadUrl(this.session, { path: parsedUrlTarget.path, raw: urlRaw }, signal, {
 					ensureArtifact: true,
@@ -1904,7 +1936,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					entityLabel: "URL output",
 					immutable: true,
 				});
-				if (entry.details.truncated && entry.details.notes?.length) {
+				if (!urlRaw && entry.details.truncated && entry.details.notes?.length) {
 					result.content.push({ type: "text", text: entry.details.notes.join("\n") });
 				}
 				return result;
@@ -1925,22 +1957,45 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			// Reject a malformed peeled selector before any handler resolves the URL.
 			const peeled = internalRouter.split(normalizedPath);
 			const parsed = parseSel(peeled.sel);
-			dispatch.verbatim = isRawSelector(parsed);
 			if (peeled.sel !== undefined && parsed.kind === "none") {
 				throw new ToolError(
 					`Invalid selector ':${peeled.sel}' on '${peeled.path}'. Use :N, :N-M, :N+K, :N- (open-ended), :-N (last N lines), a comma-separated list of ranges, :raw, :img for SVG rendering, or a range combined with raw (e.g. :raw:50-100).`,
 				);
 			}
-			const target = await internalRouter.target(normalizedPath, sessionResolveContext(this.session, { signal }));
+			// SSH owns arbitrary URL queries. Only a recognized read-only JSON selector
+			// is peeled here; its filter never reaches the remote path or shell.
+			const sshQuery = extractUriScheme(peeled.path) === "ssh" ? splitJsonQueryTarget(peeled.path) : null;
+			const sshSelector =
+				sshQuery &&
+				!parseInternalUrl(peeled.path).hash &&
+				[...new URLSearchParams(sshQuery.queryString).keys()].every(key =>
+					["q", "query", "raw", "compact", "offset", "limit"].includes(key),
+				)
+					? parseJsonSelector(sshQuery.queryString)
+					: null;
+			const target = await internalRouter.target(
+				sshQuery && sshSelector ? sshQuery.jsonPath : normalizedPath,
+				sessionResolveContext(this.session, { signal }),
+			);
 			if (target) {
 				const url = target.url.rawHref ?? target.url.href;
+				if (sshSelector) {
+					const resource = await internalRouter.resolve(url, sessionResolveContext(this.session, { signal }));
+					if (resource.isDirectory)
+						throw new ToolError("JSON selectors require a regular SSH file, not a directory.");
+					return readJson(
+						this.session,
+						{ url: peeled.path, content: resource.content, selector: sshSelector },
+						peeled.sel,
+						signal,
+					);
+				}
 				if (target.kind === "resource") return this.#handleInternalUrl(url, target.spec, parsed, question, signal);
 				located = { url, path: target.path, sel: target.sel, spec: target.spec };
 			}
 		}
 		if (!located) {
 			return this.#readFilesystemPath(readPath, {
-				dispatch,
 				question,
 				literalQueryPath,
 				signal,
@@ -1954,7 +2009,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// `?q=`, archives, sqlite, streaming, paging) while the URL stays the read's identity.
 		const result = await this.#readFilesystemPath(located.path, {
 			located,
-			dispatch,
 			question,
 			questionPath: readPath,
 			signal,
@@ -1988,16 +2042,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const {
 			located,
-			question,
 			questionPath,
 			signal,
 			literalQueryPath = false,
 			onBufferedFile,
 			onConflictMarkers,
 			lexicalAbsolutePath,
-			dispatch,
 			toolContext,
 		} = options;
+		let { question } = options;
 		const rawImages = toolContext?.rawImages === true;
 		const immutable = located?.spec.immutable === true;
 		const displayMode = resolveFileDisplayMode(this.session, { immutable });
@@ -2012,7 +2065,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// POSIX filenames containing selector-looking suffixes win over structured
 		// archive / sqlite / unsupported PDF-image dispatch. A located URL's selector
 		// stays separate so it cannot be mistaken for part of the resolved path.
-		const literalSplit = located
+		let literalSplit = located
 			? { path: readPath, sel: located.sel }
 			: await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
 		const rawPathIsLiteral =
@@ -2024,18 +2077,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		if (!rawPathIsLiteral) {
 			const archivePath = await resolveArchiveReadPath(this.session, readPath, suffixCache, signal);
+			if (archivePath?.suffixResolution) {
+				markRawSuffixResolution(archivePath.suffixResolution, isRawSelector(parseSel(literalSplit.sel)));
+			}
 			if (archivePath) {
 				if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
 				const archiveSubPath = located
 					? { path: archivePath.archiveSubPath, sel: located.sel }
 					: splitPathAndSel(archivePath.archiveSubPath);
 				const archiveParsed = parseSel(archiveSubPath.sel);
-				dispatch.verbatim = isRawSelector(archiveParsed);
 				return readArchive(
 					this.session,
 					located?.url ?? readPath,
 					archiveParsed,
 					{ ...archivePath, archiveSubPath: archiveSubPath.path },
+					options => this.#readPdfPageScreenshot(options),
 					signal,
 				);
 			}
@@ -2052,9 +2108,30 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				located && (jsonScheme === "local" || jsonScheme === "artifact")
 					? `${literalSplit.path}${located.url.slice(jsonQuery)}`
 					: literalSplit.path;
-			const jsonPath = await resolveJsonReadPath(this.session, jsonReadPath, suffixCache, signal);
+			const jsonPath =
+				located && jsonQuery < 0
+					? null
+					: await resolveJsonReadPath(this.session, jsonReadPath, suffixCache, signal);
 			if (jsonPath) {
+				if (jsonPath.suffixResolution) {
+					markRawSuffixResolution(jsonPath.suffixResolution, isRawSelector(parseSel(literalSplit.sel)));
+				}
 				return readJson(this.session, jsonPath, literalSplit.sel, signal);
+			}
+
+			// JSON admission precedes vision; other URL schemes retain their own query semantics.
+			const questionScheme = located ? extractUriScheme(located.url) : null;
+			const questionTarget =
+				!located || questionScheme === "local" || questionScheme === "artifact"
+					? splitJsonQueryTarget(located?.url ?? readPath)
+					: null;
+			const imageQuestion = questionTarget ? new URLSearchParams(questionTarget.queryString).get("q") : null;
+			if (questionTarget && imageQuestion) {
+				question = imageQuestion;
+				if (!located) {
+					readPath = questionTarget.jsonPath;
+					literalSplit = await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
+				}
 			}
 
 			const pdfCandidate = literalSplit.sel === undefined ? splitPdfImageReadPath(readPath) : null;
@@ -2079,7 +2156,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const binaryView = await resolveBinaryViewPath(this.session, localTarget.path);
 			if (binaryView) return readBinary(this.session, binaryView, parsed, signal);
 		}
-		dispatch.verbatim = isRawSelector(parsed);
 
 		let absolutePath = await resolveReadPathAsync(localReadPath, this.session.cwd);
 		let suffixResolution: { from: string; to: string } | undefined;
@@ -2164,6 +2240,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// filesystem access keeps using absolutePath. Ordinary callers pass no
 		// lexical path, so this is identical to absolutePath for them.
 		const renderAbsolutePath = lexicalAbsolutePath ?? absolutePath;
+		markRawSuffixResolution(suffixResolution, isRawSelector(parsed));
 
 		if (isDirectory) {
 			if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
@@ -2472,10 +2549,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (multiResult.bridgeResult) return multiResult.bridgeResult;
 					content = [{ type: "text", text: multiResult.outputText }];
 					sourcePath = absolutePath;
-					details = {
-						...(multiResult.displayContent && { displayContent: multiResult.displayContent }),
-						rowPrefixes: multiResult.rowPrefixes,
-					};
+					details = multiResult.details ?? {};
 					columnCut = multiResult.columnCut;
 				} else {
 					// Raw text or line-range mode
@@ -2498,9 +2572,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								raw: isRawSelector(sel),
 							});
 							if (suffixResolution) {
-								const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
 								const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
-								if (firstText) firstText.text = `${notice}\n${firstText.text}`;
+								if (firstText) firstText.text = prependSuffixResolutionNotice(firstText.text, suffixResolution);
 							}
 							return bridgeResult;
 						} catch (error) {
@@ -2598,10 +2671,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							totalFileLines === 0
 								? "The file is empty."
 								: `Use ${selectorBase}:1 to read from the start, or ${selectorBase}:${totalFileLines} to read the last line.`;
-						return toolResult<ReadToolDetails>({ resolvedPath: renderAbsolutePath, suffixResolution })
-							.text(
-								`Line ${requestedStart + 1} is beyond end of file (${totalFileLines} lines total). ${suggestion}`,
-							)
+						const boundsDetails: ReadToolDetails = {
+							resolvedPath: renderAbsolutePath,
+							suffixResolution,
+							raw: rawSelector || undefined,
+						};
+						const notice = `Line ${requestedStart + 1} is beyond end of file (${totalFileLines} lines total). ${suggestion}`;
+						return toolResult(boundsDetails)
+							.text(appendReadNotice("", notice, boundsDetails))
 							.done();
 					}
 
@@ -2651,7 +2728,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const userLimitedLines = collectedLines.length;
 
 					const totalSelectedLines = totalFileLines - startLine;
-					const wasTruncated = reachedEof && (collectedLines.length < totalSelectedLines || stoppedByByteLimit);
+					const selectedWindowLines =
+						rawSelector && limit !== undefined ? Math.min(limit, totalSelectedLines) : totalSelectedLines;
+					const wasTruncated = reachedEof && (collectedLines.length < selectedWindowLines || stoppedByByteLimit);
 					const firstLineExceedsLimit = firstLineByteLength !== undefined && firstLineByteLength > maxBytesForRead;
 					if (
 						bracketContextFullLines &&
@@ -2905,12 +2984,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							} catch {
 								// Best-effort enrichment; fall back to window-only count.
 							}
-							outputText += formatConflictWarning(entries, {
+							const warning = formatConflictWarning(entries, {
 								totalInFile,
 								displayPath: displayPathForWarning,
 								truncatedAtLine,
 								continuationLine,
 							});
+							if (rawSelector) details.notes = [...(details.notes ?? []), warning];
+							else outputText += warning;
 							details.conflictCount = entries.length;
 						}
 					}
@@ -2936,16 +3017,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 
 		details.fileSize = fileSize;
+		if (isRawSelector(parsed)) details.raw = true;
 		markMarkdownContentType(this.session, details, renderAbsolutePath);
 		if (suffixResolution) {
 			details.suffixResolution = suffixResolution;
-			// Inline resolution notice into first text block so the model sees the actual path
-			const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
 			const firstText = content.find((c): c is TextContent => c.type === "text");
 			if (firstText) {
-				firstText.text = `${notice}\n${firstText.text}`;
+				firstText.text = prependSuffixResolutionNotice(firstText.text, suffixResolution);
 			} else {
-				content = [{ type: "text", text: notice }, ...content];
+				const notice = prependSuffixResolutionNotice("", suffixResolution);
+				if (notice) content = [{ type: "text", text: notice }, ...content];
 			}
 		}
 		const resultBuilder = toolResult(details).content(content);
@@ -3053,6 +3134,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (parsedSel.kind !== "none" && parsedSel.kind !== "raw") {
 				throw new ToolError("Cannot combine query extraction with line selectors");
 			}
+			if (parsedSel.kind === "raw") details.raw = true;
 		}
 
 		const result =
@@ -3066,7 +3148,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						ignoreResultLimits: resource.unbounded ?? spec.unbounded === true,
 						immutable: resource.immutable,
 					});
-		if (resource.notes?.length) result.content.push({ type: "text", text: resource.notes.join("\n") });
+		if (!details.raw && resource.notes?.length)
+			result.content.push({ type: "text", text: resource.notes.join("\n") });
 		return result;
 	}
 

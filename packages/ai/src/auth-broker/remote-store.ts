@@ -1528,9 +1528,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
 		reason?: OAuthRefreshReason,
+		rejectedAccess?: string,
 	): Promise<OAuthCredentials> {
 		this.#noteActivity();
-		const refreshed = await this.#refreshThroughBroker(credentialId, signal, reason);
+		const refreshed = await this.#refreshThroughBroker(credentialId, signal, reason, rejectedAccess);
 		if (!this.#streamingActive) {
 			await this.refreshSnapshot().catch(error => {
 				logger.debug("auth-broker snapshot refresh after credential refresh failed", { error: String(error) });
@@ -1557,10 +1558,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credentialId: number,
 		signal?: AbortSignal,
 		reason?: OAuthRefreshReason,
+		rejectedAccess?: string,
 	): Promise<RemoteOAuthCredential> {
 		const local = () => this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		const before = JSON.stringify(local()?.credential);
-		let { entry } = await this.#client.refreshCredential(credentialId, signal, reason);
+		let { entry } = await this.#client.refreshCredential(credentialId, signal, reason, rejectedAccess);
 		const current = JSON.stringify(local()?.credential);
 		if (current !== before && current !== JSON.stringify(entry.credential)) {
 			await this.refreshSnapshot();

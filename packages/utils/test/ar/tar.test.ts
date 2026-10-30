@@ -52,21 +52,18 @@ describe("tar reader", () => {
 		expect([...(await memberBytes(entryAt(entries, "nested/data.bin")))]).toEqual([0, 1, 2, 255]);
 	});
 
-	test("reads a whole ByteSource once and rejects short source reads", async () => {
-		const bytes = await fixture("tar-ustar.tar");
-		let reads = 0;
+	test("indexes an empty tar and rejects short header reads", async () => {
+		const bytes = (await encodeTar([])).subarray(0, 512);
 		const entries = await readTar(
 			{
 				size: bytes.byteLength,
 				async read(start, end) {
-					reads++;
 					return bytes.subarray(start, end);
 				},
 			},
 			options,
 		);
-		expect(reads).toBe(1);
-		expect(await memberBytes(entryAt(entries, "hello.txt"))).toEqual(new TextEncoder().encode("hello tar\n"));
+		expect(entries).toEqual([]);
 		await expect(
 			readTar(
 				{

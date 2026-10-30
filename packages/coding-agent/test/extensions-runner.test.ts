@@ -26,6 +26,7 @@ import {
 import type {
 	Extension,
 	ExtensionError,
+	ExtensionSessionModes,
 	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
@@ -167,8 +168,39 @@ describe("ExtensionRunner", () => {
 		runner.initialize(actions, contextActions, undefined, undefined, "json");
 		expect(runner.createContext().mode).toBe("json");
 
+		const sessionModes: ExtensionSessionModes = {
+			getState: () => ({
+				plan: { status: "inactive" },
+				vibe: { status: "inactive" },
+				goal: { status: "inactive" },
+				loop: { status: "inactive" },
+			}),
+			set: async () => {
+				throw new Error("Unexpected mode transition");
+			},
+		};
+		runner.initialize(actions, { ...contextActions, sessionModes }, undefined, undefined, "tui");
+		const savedContext = runner.createContext();
+		const savedCommandContext = runner.createCommandContext();
+		expect(savedContext.sessionModes).toBeDefined();
+		expect(savedCommandContext.sessionModes).toBeDefined();
+		expect(
+			runner.createContext(undefined, undefined, {
+				kind: "sub",
+				id: "advisor",
+				name: "advisor",
+				depth: 0,
+				parentId: "Main",
+			}).sessionModes,
+		).toBeUndefined();
+
+		runner.initialize(actions, contextActions, undefined, undefined, "rpc");
+		expect(savedContext.sessionModes).toBeUndefined();
+		expect(savedCommandContext.sessionModes).toBeUndefined();
+
 		runner.initialize(actions, contextActions, undefined, undefined, "tui");
-		expect(runner.createContext().mode).toBe("tui");
+		expect(savedContext.sessionModes).toBeUndefined();
+		expect(savedCommandContext.sessionModes).toBeUndefined();
 	});
 
 	it("uses required context actions when command actions are unavailable", async () => {
@@ -1257,6 +1289,40 @@ describe("ExtensionRunner", () => {
 				},
 			]);
 			expect(stopResult).toEqual({ continue: true, additionalContext: "Run one more pass." });
+		});
+
+		it("keeps both cleanup and unfinished-work feedback from separate stop handlers", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "session-stop-merge.ts"),
+				`
+				export default function(pi) {
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "", reason: "Clean abandoned process." }));
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "Continue unfinished work." }));
+				}
+			`,
+			);
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const message = createAssistantMessage("Next is another unfinished change.");
+			const result = await runner.emitSessionStop({
+				messages: [message],
+				turn_id: 1,
+				last_assistant_message: message,
+				session_id: "session-123",
+				session_file: "/tmp/session.jsonl",
+				stop_hook_active: false,
+				signal: new AbortController().signal,
+			});
+			expect(result).toEqual({
+				continue: true,
+				additionalContext: "Clean abandoned process.\n\nContinue unfinished work.",
+			});
 		});
 
 		it("skips cancelled handlers, releases in-flight handlers, and preserves timeout errors", async () => {

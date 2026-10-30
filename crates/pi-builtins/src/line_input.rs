@@ -2,7 +2,8 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use brush_core::openfiles::OpenFile;
+use brush_core::{ErrorKind, openfiles::OpenFile};
+use tokio_util::sync::CancellationToken;
 
 /// Bytes per read-ahead.
 const BLOCK: usize = 4096;
@@ -71,6 +72,64 @@ impl LineInput {
 		self.blocks
 	}
 
+	/// Waits, without holding the runtime worker, until the next
+	/// [`Self::next_byte`] would not block, or fails with `Interrupted` once
+	/// `cancel` fires. A caller on the task that also runs `timeout` (or that
+	/// another task on the same worker must cancel) needs this: a blocking read
+	/// of input that pauses before a delimiter or EOF would stop that task from
+	/// reaching its deadline. Returns at once when the next byte is already
+	/// buffered or input is ready, and for input that cannot be polled
+	/// (shared buffered Stdin, regular files, the null device, provider files
+	/// and in-process streams), which is read as before. A shared Stdin read
+	/// already blocked in the standard library waits for input, not cancellation.
+	pub(crate) async fn wait_for_input(
+		&self,
+		cancel: Option<&CancellationToken>,
+	) -> Result<(), brush_core::Error> {
+		if cancel.is_some_and(CancellationToken::is_cancelled) {
+			return Err(ErrorKind::Interrupted.into());
+		}
+		if matches!(self.input, OpenFile::Stdin(_)) {
+			return Ok(());
+		}
+		#[cfg(unix)]
+		if !self.blocks || self.pos == self.block.len() {
+			use tokio::io::{Interest, unix::AsyncFd};
+			let Ok(fd) = self.input.try_borrow_as_fd() else {
+				return Ok(());
+			};
+			if !pi_vfs::fd_reads_can_block(fd) || readable_now(fd)? {
+				return Ok(());
+			}
+			// A descriptor the reactor cannot watch is read as before.
+			let Ok(watched) = AsyncFd::with_interest(fd.try_clone_to_owned()?, Interest::READABLE) else {
+				return Ok(());
+			};
+			let readable = async {
+				#[cfg(target_os = "macos")]
+				loop {
+					let slice = std::time::Duration::from_millis(u64::from(pi_vfs::POLL_SLICE_MS.unsigned_abs()));
+					match tokio::time::timeout(slice, watched.readable()).await {
+						Ok(ready) => break ready.map(drop),
+						Err(_) if readable_now(fd)? => break Ok(()),
+						Err(_) => {},
+					}
+				}
+				#[cfg(not(target_os = "macos"))]
+				watched.readable().await.map(drop)
+			};
+			let waited = match cancel {
+				Some(token) => token.run_until_cancelled(readable).await,
+				None => Some(readable.await),
+			};
+			return match waited {
+				Some(result) => Ok(result?),
+				None => Err(ErrorKind::Interrupted.into()),
+			};
+		}
+		Ok(())
+	}
+
 	/// The next byte, or `None` at end of input.
 	pub(crate) fn next_byte(&mut self) -> io::Result<Option<u8>> {
 		if !self.blocks {
@@ -103,6 +162,17 @@ impl LineInput {
 		{
 			self.block.clear();
 			self.pos = 0;
+		}
+	}
+}
+
+/// Whether data, EOF, or a read error is pending now.
+#[cfg(unix)]
+fn readable_now(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+	loop {
+		match pi_vfs::readable_within(fd, std::time::Duration::ZERO) {
+			Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+			result => return result,
 		}
 	}
 }

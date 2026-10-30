@@ -51,11 +51,11 @@ import {
 	credentialBlocksDeleteRequestSchema,
 	credentialBlockRequestSchema,
 	credentialDisableRequestSchema,
+	credentialRefreshRequestSchema,
 	credentialUploadRequestSchema,
 } from "./wire-schemas";
 
 const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
-const AUTH_RECOVERY_REFRESH_OPTIONS = { reuseRecentMint: true } as const;
 const TEXT_ENCODER = new TextEncoder();
 const SSE_KEEPALIVE = TEXT_ENCODER.encode(": keepalive\n\n");
 
@@ -1005,11 +1005,15 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (refreshMatch) {
 					const id = Number.parseInt(refreshMatch[1], 10);
 					const authRecovery = url.searchParams.get("reason") === "auth-recovery";
+					const parsed = await parseBody(req, credentialRefreshRequestSchema, { allowEmpty: true });
+					if (!parsed.ok) return json(400, { error: "Invalid credential refresh request" });
 					try {
 						const entry = await opts.storage.oauth.refresh(
 							id,
 							req.signal,
-							authRecovery ? AUTH_RECOVERY_REFRESH_OPTIONS : undefined,
+							authRecovery
+								? { reuseRecentMint: true, reason: "auth-recovery", rejectedAccess: parsed.data.rejectedAccess }
+								: undefined,
 						);
 						const body: CredentialRefreshResponse = { entry };
 						logger.info("auth-broker credential refreshed", {

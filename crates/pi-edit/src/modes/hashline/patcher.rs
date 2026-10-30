@@ -15,11 +15,12 @@ use super::{
 	input::{Parsed, Patch, PatchSection},
 	messages::{
 		HEADTAIL_DRIFT_WARNING, RevealedLine, UnseenLinesReveal, path_recovered_from_tag_message,
-		unseen_lines_message, unverified_wide_lines_message, wide_unseen_lines_message,
+		stale_unseen_lines_message, unseen_lines_message, unverified_wide_lines_message,
+		wide_unseen_lines_message,
 	},
 	mismatch::{MismatchDetails, format_header_only_message, mismatch_error},
 	parser::{ParseFailure, parse_patch},
-	recovery::{RecoveryArgs, try_recover},
+	recovery::{RecoveryArgs, current_line_map, try_recover},
 	types::{ApplyResult, BlockOpKind, BlockResolution, Edit, FileOp},
 };
 use crate::{
@@ -421,6 +422,11 @@ fn possibly_cut_anchors(
 	Ok(wide)
 }
 
+/// `text` is the content `expected` names.
+///
+/// When that tag is stale, `current` is the live file: a reply that asks for a
+/// read then names the lines' current numbers and tag, because a read at the
+/// tag's numbers shows other rows.
 fn assert_seen_lines(
 	section: &PatchSection,
 	blocks: &[BlockResolution],
@@ -428,7 +434,9 @@ fn assert_seen_lines(
 	canonical: &Path,
 	store: &EditStore,
 	text: &str,
+	current: Option<&str>,
 	max_columns: usize,
+	record_provenance: bool,
 ) -> Result<(), EditError> {
 	let Some(snapshot) = store.by_content(canonical, text) else {
 		// No retained read (restart, store eviction): the tag still matches the
@@ -450,8 +458,10 @@ fn assert_seen_lines(
 	if seen.is_empty() {
 		return Ok(());
 	}
-	let mut unseen = guarded_lines(section, blocks)?
-		.into_iter()
+	let guarded = guarded_lines(section, blocks)?;
+	let mut unseen = guarded
+		.iter()
+		.copied()
 		.filter(|line| !seen.contains(line))
 		.collect::<Vec<_>>();
 	if unseen.is_empty() {
@@ -470,7 +480,6 @@ fn assert_seen_lines(
 		}
 	}
 	let source = snapshot.text.split('\n').collect::<Vec<_>>();
-	let mut revealed = Vec::new();
 	for &line in &unseen {
 		let Some(value) = usize::try_from(line)
 			.ok()
@@ -480,12 +489,41 @@ fn assert_seen_lines(
 			continue;
 		};
 		if value.chars().count() > SEEN_LINE_REVEAL_MAX_COLUMNS {
+			if let Some(current) = current {
+				return Err(stale_unseen_rejection(
+					section,
+					&unseen,
+					&guarded,
+					expected,
+					canonical,
+					store,
+					text,
+					current,
+					true,
+					record_provenance,
+				));
+			}
 			return Err(EditError::rejected(
 				Rejection::UnseenLines,
 				wide_unseen_lines_message(section.path.as_str(), &unseen),
 			));
 		}
 	}
+	if let Some(current) = current {
+		return Err(stale_unseen_rejection(
+			section,
+			&unseen,
+			&guarded,
+			expected,
+			canonical,
+			store,
+			text,
+			current,
+			false,
+			record_provenance,
+		));
+	}
+	let mut revealed = Vec::new();
 	for &line in unseen.iter().take(SEEN_LINE_REVEAL_CAP) {
 		let Some(value) = usize::try_from(line)
 			.ok()
@@ -504,6 +542,74 @@ fn assert_seen_lines(
 			truncated,
 		}),
 	))
+}
+
+/// The guard's read-first reply under a stale tag.
+///
+/// `expected` names the content `text`; the reply gives the unseen lines'
+/// numbers in `current` and its tag. Every guarded line is a recovered anchor,
+/// so each maps; if one does not, the mismatch reply hands back the current
+/// tag and rows instead.
+///
+/// The reply asks for `unseen` only, so the live snapshot carries the other
+/// `guarded` anchors: the earlier read displayed them, and a line the map
+/// carries over holds the same text. Without them the edit reissued after the
+/// requested read meets the guard again on an anchor nobody can read away.
+fn stale_unseen_rejection(
+	section: &PatchSection,
+	unseen: &[u32],
+	guarded: &[u32],
+	expected: &str,
+	canonical: &Path,
+	store: &EditStore,
+	text: &str,
+	current: &str,
+	raw: bool,
+	record_provenance: bool,
+) -> EditError {
+	let map = current_line_map(text, current);
+	let Some(live) = unseen
+		.iter()
+		.map(|line| map.get(line).copied())
+		.collect::<Option<Vec<u32>>>()
+	else {
+		return mismatch(section, canonical, current, expected, store, record_provenance);
+	};
+	let unseen_set: BTreeSet<u32> = unseen.iter().copied().collect();
+	let live_tag = if record_provenance {
+		record_recovered_provenance(store, canonical, current, || {
+			guarded
+				.iter()
+				.filter(|line| !unseen_set.contains(line))
+				.filter_map(|line| map.get(line).copied())
+				.collect()
+		})
+	} else {
+		file_hash(current)
+	};
+	EditError::rejected(
+		Rejection::UnseenLines,
+		stale_unseen_lines_message(section.path.as_str(), unseen, expected, &live, &live_tag, raw),
+	)
+}
+
+/// Carries previously seen anchors onto recovered content, never diagnostic
+/// rows.
+fn record_recovered_provenance(
+	store: &EditStore,
+	canonical: &Path,
+	text: &str,
+	seen_anchors: impl FnOnce() -> Vec<u32>,
+) -> String {
+	let restricted = store
+		.by_content(canonical, text)
+		.is_none_or(|snapshot| snapshot.seen_lines.is_some_and(|seen| !seen.is_empty()));
+	if !restricted {
+		return store.record(canonical, text, None);
+	}
+	let mut lines = seen_anchors();
+	lines.push(0);
+	store.record(canonical, text, Some(&lines))
 }
 
 /// `seen_line_guard` enables the displayed-line guard with its column cap
@@ -556,7 +662,9 @@ pub(crate) fn apply_with_recovery(
 				canonical,
 				store,
 				normalized,
+				None,
 				max_columns,
+				record_mismatch,
 			)?;
 		}
 		let mut result = apply_edits(normalized, &resolved, ApplyOptions {
@@ -585,16 +693,6 @@ pub(crate) fn apply_with_recovery(
 		result.warnings = resolve_warnings;
 		return Ok(result);
 	}
-	if seen_line_guard.is_some()
-		&& let Some(snapshot) = &stored
-		&& let Some(seen) = &snapshot.seen_lines
-		&& !seen.is_empty()
-		&& guarded_lines(section, &block_resolutions)?
-			.iter()
-			.any(|line| !seen.contains(line))
-	{
-		return Err(mismatch(section, canonical, normalized, expected, store, record_mismatch));
-	}
 	if let Some(recovered) = try_recover(store, RecoveryArgs {
 		path:         canonical,
 		current_text: normalized,
@@ -602,6 +700,23 @@ pub(crate) fn apply_with_recovery(
 		edits:        &resolved,
 		clipboard:    Some(clipboard),
 	})? {
+		// A stale tag still names what its read displayed: an anchor outside
+		// that version's seen lines gets the reveal a live tag would get. The
+		// check waits for recovery to succeed, so a tag that cannot be
+		// recovered keeps its mismatch reply instead of a reveal of old content.
+		if let (Some(max_columns), Some(snapshot)) = (seen_line_guard, &stored) {
+			assert_seen_lines(
+				section,
+				&block_resolutions,
+				expected,
+				canonical,
+				store,
+				&snapshot.text,
+				Some(normalized),
+				max_columns,
+				record_mismatch,
+			)?;
+		}
 		resolve_warnings.extend(recovered.warnings);
 		return Ok(ApplyResult {
 			text:               recovered.text,
@@ -1303,5 +1418,201 @@ mod lifecycle {
 			.await
 			.unwrap();
 		assert_eq!(ctx.text("short.txt"), format!("head\nfirst\n{wide}\nLAST\n"));
+	}
+
+	/// Rejections do not grant read authority; an unseen stale anchor requires
+	/// an explicit read, while previously seen anchors still recover.
+	#[tokio::test]
+	async fn stale_tag_anchor_outside_its_read_requires_explicit_read() {
+		let ctx = Lifecycle::new("stale.ts", 30);
+		let tag0 = ctx.read("stale.ts", &(18..=22).collect::<Vec<_>>());
+		ctx.edit(&format!("[stale.ts#{tag0}]\nPUT 20.=20:\n+let v0020 = 200;\n"))
+			.await
+			.unwrap();
+		let before = ctx.text("stale.ts");
+		let unseen = format!("[stale.ts#{tag0}]\nPUT 3.=3:\n+let v0003 = 300;\n");
+		let err = ctx.edit(&unseen).await.unwrap_err();
+		assert!(err.contains("never displayed"), "unexpected error: {err}");
+		assert_eq!(ctx.text("stale.ts"), before);
+		ctx.edit(&unseen).await.unwrap_err();
+		assert_eq!(ctx.text("stale.ts"), before);
+		let current = ctx.read("stale.ts", &[3]);
+		ctx.edit(&format!("[stale.ts#{current}]\nPUT 3.=3:\n+let v0003 = 300;\n"))
+			.await
+			.unwrap();
+		assert_eq!(ctx.text("stale.ts").lines().nth(2), Some("let v0003 = 300;"));
+		ctx.edit(&format!("[stale.ts#{tag0}]\nPUT 21.=21:\n+let v0021 = 210;\n"))
+			.await
+			.unwrap();
+		let text = ctx.text("stale.ts");
+		assert_eq!(text.lines().nth(19), Some("let v0020 = 200;"));
+		assert_eq!(text.lines().nth(20), Some("let v0021 = 210;"));
+	}
+
+	#[tokio::test]
+	async fn shifted_short_stale_anchor_requires_a_current_numbered_read() {
+		let ctx = Lifecycle::new("shift.ts", 30);
+		let tag0 = ctx.read("shift.ts", &[1]);
+		let original = ctx.text("shift.ts");
+		ctx.write_text("shift.ts", &format!("// external a\n// external b\n{original}"));
+		let before = ctx.text("shift.ts");
+		let err = ctx
+			.edit(&format!("[shift.ts#{tag0}]\nPUT 3.=3:\n+let v0003 = 300;\n"))
+			.await
+			.unwrap_err();
+		assert!(err.contains("shift.ts:5"), "unexpected read selector: {err}");
+		assert_eq!(ctx.text("shift.ts"), before);
+		let live_tag = ctx.head_tag("shift.ts");
+		let resend = format!("[shift.ts#{live_tag}]\nPUT 5.=5:\n+let v0003 = 300;\n");
+		ctx.edit(&resend).await.unwrap_err();
+		assert_eq!(ctx.text("shift.ts"), before);
+		assert_eq!(ctx.read("shift.ts", &[5]), live_tag);
+		ctx.edit(&resend).await.unwrap();
+		assert_eq!(ctx.text("shift.ts"), before.replacen("let v0003 = 3;", "let v0003 = 300;", 1));
+	}
+
+	/// The column-cut form: the read cut line 1, so it is not seen, and an edit
+	/// built from the cut text under a stale tag asks for a `:raw` read instead
+	/// of replacing the line and dropping its tail.
+	#[tokio::test]
+	async fn stale_tag_edit_of_a_cut_line_requires_full_read() {
+		let ctx = Lifecycle::new("cut.txt", 1);
+		let wide = format!("note: {} END-OF-LINE-TAIL", "abcdefghij".repeat(80));
+		ctx.write_text("cut.txt", &format!("{wide}\ntwo\nthree\nfour\nfive\nsix\n"));
+		let tag0 = ctx.read("cut.txt", &[0, 2, 3, 4, 5, 6]);
+		ctx.edit(&format!("[cut.txt#{tag0}]\nPUT 6.=6:\n+SIX\n"))
+			.await
+			.unwrap();
+		let before = ctx.text("cut.txt");
+		let err = ctx
+			.edit(&format!("[cut.txt#{tag0}]\nPUT 1.=1:\n+NOTE: {}\n", &wide[6..768]))
+			.await
+			.unwrap_err();
+		assert!(err.contains("cut.txt:1:raw"), "unexpected error: {err}");
+		assert_eq!(ctx.text("cut.txt"), before);
+	}
+
+	/// The column-cut form after rows were inserted above the cut line: the
+	/// stale tag's line 1 is now line 3, so the reply asks for a `:raw` read
+	/// of line 3 under the current tag, and the edit re-issued that way
+	/// applies to the wide line.
+	#[tokio::test]
+	async fn shifted_stale_tag_cut_line_reads_its_current_number() {
+		let ctx = Lifecycle::new("cut.txt", 1);
+		let wide = format!("note: {} END-OF-LINE-TAIL", "abcdefghij".repeat(80));
+		ctx.write_text("cut.txt", &format!("{wide}\ntwo\nthree\nfour\nfive\nsix\n"));
+		let tag0 = ctx.read("cut.txt", &[0, 2, 3, 4, 5, 6]);
+		ctx.edit(&format!("[cut.txt#{tag0}]\nPUT <1:\n+head a\n+head b\n"))
+			.await
+			.unwrap();
+		let before = ctx.text("cut.txt");
+		assert_eq!(before.lines().nth(2), Some(wide.as_str()));
+		let live_tag = ctx.head_tag("cut.txt");
+		let err = ctx
+			.edit(&format!("[cut.txt#{tag0}]\nPUT 1.=1:\n+NOTE: {}\n", &wide[6..768]))
+			.await
+			.unwrap_err();
+		assert!(err.contains("cut.txt:3:raw"), "unexpected error: {err}");
+		assert!(!err.contains("cut.txt:1:raw"), "unexpected error: {err}");
+		assert!(err.contains(&format!("#{live_tag}]")), "unexpected error: {err}");
+		assert_eq!(ctx.text("cut.txt"), before);
+
+		assert_eq!(ctx.read("cut.txt", &[3]), live_tag);
+		let full = wide.replacen("note:", "NOTE:", 1);
+		ctx.edit(&format!("[cut.txt#{live_tag}]\nPUT 3.=3:\n+{full}\n"))
+			.await
+			.unwrap();
+		assert_eq!(ctx.text("cut.txt"), before.replacen("note:", "NOTE:", 1));
+	}
+
+	/// More unseen lines than the inline reveal holds, after rows were
+	/// inserted above them: the reply names their current numbers and the
+	/// current tag, not the stale tag's numbers.
+	#[tokio::test]
+	async fn shifted_stale_tag_over_reveal_cap_reads_current_numbers() {
+		let ctx = Lifecycle::new("long.ts", 60);
+		let tag0 = ctx.read("long.ts", &(1..=5).collect::<Vec<_>>());
+		ctx.edit(&format!("[long.ts#{tag0}]\nPUT >3:\n+// ins a\n+// ins b\n"))
+			.await
+			.unwrap();
+		let before = ctx.text("long.ts");
+		let live_tag = ctx.head_tag("long.ts");
+		let err = ctx
+			.edit(&format!("[long.ts#{tag0}]\nCUT 10.=55\n"))
+			.await
+			.unwrap_err();
+		assert!(err.contains("`long.ts:12-57`"), "unexpected error: {err}");
+		assert!(!err.contains("long.ts:10-55"), "unexpected error: {err}");
+		assert!(err.contains(&format!("#{live_tag}]")), "unexpected error: {err}");
+		assert_eq!(ctx.text("long.ts"), before);
+	}
+
+	/// After an out-of-band write, the live content has no snapshot. The
+	/// read-first reply hands back its tag, so it records that content as
+	/// shown nowhere: the edit resent under that tag without the read meets
+	/// the guard instead of applying blind, and applies after the read.
+	#[tokio::test]
+	async fn external_change_live_tag_needs_the_requested_read() {
+		let ctx = Lifecycle::new("ext.ts", 60);
+		let tag0 = ctx.read("ext.ts", &(1..=5).collect::<Vec<_>>());
+		let original = ctx.text("ext.ts");
+		ctx.write_text("ext.ts", &format!("// ext a\n// ext b\n{original}"));
+		let before = ctx.text("ext.ts");
+		let err = ctx
+			.edit(&format!("[ext.ts#{tag0}]\nCUT 10.=55\n"))
+			.await
+			.unwrap_err();
+		assert!(err.contains("`ext.ts:12-57`"), "unexpected error: {err}");
+		// The tag the reply gives the caller, not one the test assumes.
+		let live_tag = err
+			.rsplit("[ext.ts#")
+			.next()
+			.and_then(|rest| rest.split(']').next())
+			.expect("reply names a tag")
+			.to_owned();
+		assert_eq!(ctx.text("ext.ts"), before);
+
+		let resend = format!("[ext.ts#{live_tag}]\nCUT 12.=57\n");
+		let err = ctx.edit(&resend).await.unwrap_err();
+		assert!(err.contains("never displayed"), "unexpected error: {err}");
+		assert_eq!(ctx.text("ext.ts"), before);
+
+		assert_eq!(ctx.read("ext.ts", &(12..=57).collect::<Vec<_>>()), live_tag);
+		ctx.edit(&resend).await.unwrap();
+		assert_eq!(ctx.text("ext.ts").lines().count(), 16);
+	}
+
+	/// A cut whose range mixes rows the old read showed with more unseen rows
+	/// than the reveal holds. The reply asks for the unseen rows only, so the
+	/// live snapshot must carry the shown ones: after that one read, the cut
+	/// reissued at the live numbers applies.
+	#[tokio::test]
+	async fn stale_cut_carries_its_seen_anchors_onto_the_live_tag() {
+		let ctx = Lifecycle::new("carry.ts", 60);
+		let tag0 = ctx.read("carry.ts", &[54, 55]);
+		let original = ctx.text("carry.ts");
+		ctx.write_text("carry.ts", &format!("// ext a\n// ext b\n{original}"));
+		let before = ctx.text("carry.ts");
+		let err = ctx
+			.edit(&format!("[carry.ts#{tag0}]\nCUT 10.=55\n"))
+			.await
+			.unwrap_err();
+		assert!(err.contains("`carry.ts:12-55`"), "unexpected error: {err}");
+		// The tag the reply gives the caller, not one the test assumes.
+		let live_tag = err
+			.rsplit("[carry.ts#")
+			.next()
+			.and_then(|rest| rest.split(']').next())
+			.expect("reply names a tag")
+			.to_owned();
+		assert_eq!(ctx.text("carry.ts"), before);
+
+		// Exactly the read the reply asked for: rows 56 and 57, which the
+		// first read displayed at 54 and 55, are not in it.
+		assert_eq!(ctx.read("carry.ts", &(12..=55).collect::<Vec<_>>()), live_tag);
+		ctx.edit(&format!("[carry.ts#{live_tag}]\nCUT 12.=57\n"))
+			.await
+			.unwrap();
+		assert_eq!(ctx.text("carry.ts").lines().count(), 16);
 	}
 }

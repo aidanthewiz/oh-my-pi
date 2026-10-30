@@ -7,6 +7,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ImageAttachmentEntry, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import * as pdfRead from "@oh-my-pi/pi-coding-agent/tools/read-pdf";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 import { cfgImagesAutoResize } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -125,7 +126,7 @@ function createCompleteSimpleForbiddenStub(): CompleteSimpleStub {
 	return { calls, fn };
 }
 
-function createCompleteSimpleHangingStub(): CompleteSimpleStub {
+function createCompleteSimpleHangingStub(onStarted?: () => void): CompleteSimpleStub {
 	const calls: unknown[][] = [];
 	const fn = (async (...args: unknown[]) => {
 		calls.push(args);
@@ -134,6 +135,7 @@ function createCompleteSimpleHangingStub(): CompleteSimpleStub {
 		const aborted = Promise.withResolvers<void>();
 		if (signal?.aborted) aborted.resolve();
 		else signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+		onStarted?.();
 		await aborted.promise;
 		return {
 			role: "assistant",
@@ -168,7 +170,7 @@ describe("read image questions", () => {
 	let imagePath: string;
 
 	beforeAll(() => {
-		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-read-image-question-"));
+		testDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-read-image-question-")));
 		imagePath = path.join(testDir, "screen.png");
 		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
 	});
@@ -205,6 +207,69 @@ describe("read image questions", () => {
 
 		expect(result.content).toEqual([{ type: "text", text: "Attached image" }]);
 		expect(stub.calls).toHaveLength(1);
+	});
+
+	it("keeps image questions content-based when a raster file has a JSON backup suffix", async () => {
+		const backupPath = path.join(testDir, "screen.json.bak");
+		await Bun.write(backupPath, Buffer.from(TINY_PNG_BASE64, "base64"));
+		const stub = createCompleteSimpleSuccessStub("Raster image");
+		const tool = new ReadTool(createSession(testDir, visionModel), stub.fn);
+		const readPath = `${backupPath}?q=Describe this image`;
+		expect(await tool.approvalCacheTargets({ path: readPath })).toEqual([backupPath]);
+		const result = await tool.execute("backup-image", { path: readPath });
+		expect(result.content).toEqual([{ type: "text", text: "Raster image" }]);
+		expect(stub.calls).toHaveLength(1);
+	});
+
+	it.each(["response-data", "response.json.bak", "response.json"])(
+		"queries %s as JSON without authorizing or invoking vision",
+		async filename => {
+			const sourcePath = path.join(testDir, filename);
+			await Bun.write(sourcePath, '\ufeff  {"answer":"selected JSON"}\n');
+			const stub = createCompleteSimpleForbiddenStub();
+			const tool = new ReadTool(createSession(testDir, visionModel), stub.fn);
+			const queryPath = `${sourcePath}?q=.answer&raw=true`;
+			expect(await tool.approvalCacheTargets({ path: queryPath })).toEqual([sourcePath]);
+			const result = await tool.execute("json-not-vision", { path: queryPath });
+			expect(textOf(result)).toBe("selected JSON");
+			expect(stub.calls).toHaveLength(0);
+		},
+	);
+
+	it("authorizes and reads a literal question filename before interpreting its query", async () => {
+		const sourcePath = path.join(testDir, "literal-source.json");
+		await Bun.write(sourcePath, '{"answer":"query result must not appear"}');
+		const literalPath = `${sourcePath}?q=.answer`;
+		await Bun.write(literalPath, "literal question filename");
+		const stub = createCompleteSimpleForbiddenStub();
+		const tool = new ReadTool(createSession(testDir, visionModel), stub.fn);
+		expect(await tool.approvalCacheTargets({ path: literalPath })).toEqual([literalPath]);
+		const result = await tool.execute("literal-before-query", { path: literalPath });
+		expect(textOf(result)).toContain("literal question filename");
+		expect(textOf(result)).not.toContain("query result must not appear");
+		expect(stub.calls).toHaveLength(0);
+	});
+
+	it("keeps PDF-page questions on the screenshot route instead of the JSON route", async () => {
+		const pdfPath = path.join(testDir, "question.pdf");
+		await Bun.write(pdfPath, "%PDF-fixture");
+		const render = vi.spyOn(pdfRead, "renderPdfPageScreenshot").mockResolvedValue({
+			dest: imagePath,
+			mimeType: "image/png",
+			bytes: Buffer.byteLength(TINY_PNG_BASE64, "base64"),
+			width: 1,
+			height: 1,
+		});
+		try {
+			const stub = createCompleteSimpleSuccessStub("PDF page two");
+			const result = await new ReadTool(createSession(testDir, visionModel), stub.fn).execute("pdf-question", {
+				path: `${pdfPath}:page2.png?q=Describe the page`,
+			});
+			expect(result.content).toEqual([{ type: "text", text: "PDF page two" }]);
+			expect(render).toHaveBeenCalledWith(expect.anything(), pdfPath, 2, undefined);
+		} finally {
+			render.mockRestore();
+		}
 	});
 
 	it("rasterizes selected SVGs before asking the vision model", async () => {
@@ -280,16 +345,15 @@ describe("read image questions", () => {
 	});
 
 	it("maps a stalled vision request to the image question timeout", async () => {
-		const stub = createCompleteSimpleHangingStub();
+		const timeoutController = new AbortController();
+		const stub = createCompleteSimpleHangingStub(() => timeoutController.abort());
 		const settings = Settings.isolated({ "images.questionTimeoutMs": 50 });
 		const tool = new ReadTool(createSession(testDir, visionModel, "test-key", settings), stub.fn);
-		const timeoutController = new AbortController();
 		const nativeTimeout = AbortSignal.timeout;
 		let sawConfiguredTimeout = false;
 		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(timeoutMs => {
 			if (timeoutMs !== 50) return nativeTimeout(timeoutMs);
 			sawConfiguredTimeout = true;
-			queueMicrotask(() => timeoutController.abort());
 			return timeoutController.signal;
 		});
 

@@ -57,7 +57,9 @@ export interface ReadToolDetails {
 	truncation?: ReadTruncationStats;
 	isDirectory?: boolean;
 	resolvedPath?: string;
-	suffixResolution?: { from: string; to: string };
+	suffixResolution?: { from: string; to: string; raw?: boolean };
+	/** Raw source output keeps descriptive diagnostics in details, not in the body. */
+	raw?: boolean;
 	url?: string;
 	finalUrl?: string;
 	contentType?: string;
@@ -612,6 +614,13 @@ export const readToolRenderer = {
 				uiTheme.fg("dim", wrapBrackets(`Resolved path: ${shortenPath(details.resolvedPath)}`, uiTheme)),
 			);
 		}
+		if (details?.raw) {
+			for (const note of details.notes ?? []) {
+				warningLines.push(
+					...sanitizeDisplayLines(note).map(line => uiTheme.fg("dim", wrapBrackets(line, uiTheme))),
+				);
+			}
+		}
 		if (truncation) {
 			if (fallback?.firstLineExceedsLimit) {
 				let warning = `First line exceeds ${formatBytes(fallback.outputBytes ?? fallback.totalBytes)} limit`;
@@ -772,6 +781,7 @@ export const readToolRenderer = {
 		const foot = footnoteText(
 			compact([
 				details?.resolvedPath !== undefined && `resolved ${shortenPath(details.resolvedPath)}`,
+				...(details?.raw ? (details.notes ?? []) : []),
 				firstLineTooLong &&
 					`First line exceeds ${formatBytes(fallback.outputBytes ?? fallback.totalBytes)} limit${truncation.artifactId ? `. ${formatFullOutputReference(truncation.artifactId)}` : ""}`,
 			]),

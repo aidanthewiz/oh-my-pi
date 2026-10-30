@@ -39,6 +39,7 @@ import type {
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
+import type { LoopConditionConfig } from "@oh-my-pi/pi-tui/status-line/loop";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type {
 	Api,
@@ -82,6 +83,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
+import type { LoopLimitConfig } from "../../modes/loop-limit";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { ExtensionMCPContext } from "../../mcp/types";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
@@ -209,6 +211,13 @@ export interface ExtensionUIDialogOptions {
 	onTimeoutStart?: () => void;
 	/** Invoked when user input resets a UI-managed timeout countdown */
 	onTimeoutReset?: () => void;
+	/**
+	 * Host hint to mask entered characters in `input` dialogs.
+	 * Enforced by the interactive TUI (masked as bullets), forwarded on RPC `input`
+	 * requests for hosts that honor it, and rejected (`undefined`) in ACP mode where
+	 * form elicitation does not support secret masking.
+	 */
+	secret?: boolean;
 	/** Initial cursor position for select dialogs (0-indexed) */
 	initialIndex?: number;
 	/** Render an outlined list for select dialogs */
@@ -741,6 +750,11 @@ export interface ExtensionContext {
 	 * plan file exists.
 	 */
 	openPlanReview(): Promise<boolean>;
+	/**
+	 * Query and control the built-in plan, vibe, goal, and loop modes. Interactive (TUI) sessions
+	 * only: `undefined` in print, JSON, RPC, and ACP modes and in subagents.
+	 */
+	sessionModes?: ExtensionSessionModes;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/** Get the current effective system prompt. */
@@ -982,6 +996,12 @@ export interface ToolInfo {
 	parameters: TSchema;
 	promptGuidelines?: string[];
 	sourceInfo: SourceInfo;
+	/** MCP server name (as configured) when this tool fronts an MCP server. */
+	mcpServerName?: string;
+	/** Original MCP tool name, before `mcp__<server>_<tool>` minting. */
+	mcpToolName?: string;
+	/** Server-declared `annotations.readOnlyHint`; provenance only, not execution or approval authority. */
+	mcpReadOnlyHint?: boolean;
 }
 
 // ============================================================================
@@ -1331,6 +1351,57 @@ export interface PlanReviewResolvedEvent {
 	by: "local" | "extension";
 }
 
+/**
+ * An explicit, idempotent mode transition. Requesting a state that already holds succeeds with
+ * `changed: false`. No transition submits a prompt; send one separately (e.g. `pi.sendUserMessage`).
+ * Plan `exit` leaves plan mode fully without approving the plan or deleting its draft. Loop `prompt`
+ * sets the text repeated after each turn ends (otherwise the user's next typed prompt); on an active
+ * loop it replaces that text, and on a paused loop `enter` resumes it.
+ */
+export type SessionModeRequest =
+	| { mode: "plan" | "vibe"; action: "enter" | "exit" }
+	| { mode: "goal"; action: "enter"; objective: string; tokenBudget?: number }
+	| { mode: "goal"; action: "pause" | "resume" | "drop" }
+	| { mode: "loop"; action: "enter"; prompt?: string; limit?: LoopLimitConfig; condition?: LoopConditionConfig }
+	| { mode: "loop"; action: "exit" };
+
+/** Detached snapshot of the built-in session modes. `paused` states come from the slash commands or a goal pause. */
+export interface SessionModeState {
+	plan: { status: "inactive" | "active" | "paused"; planFilePath?: string };
+	vibe: { status: "inactive" | "active" };
+	goal: { status: "inactive" | "active" | "paused"; objective?: string; tokenBudget?: number };
+	loop: { status: "inactive" | "active" | "paused" };
+}
+
+/**
+ * Outcome of `ctx.sessionModes.set()`. `busy`: a turn, compaction, or another mode transition is
+ * running, the session is still restoring its saved modes (startup or a session switch), or a
+ * completed goal is still being torn down — retry once idle. `conflict`: another mode blocks this one
+ * (exit it first). `disabled`: a setting gates it (`extensionHandlers.modeControl`, `plan.enabled`,
+ * `goal.enabled`). `invalid_request`: malformed or not applicable now.
+ */
+export type SessionModeResult =
+	| { ok: true; changed: boolean; state: SessionModeState }
+	| {
+			ok: false;
+			code: "busy" | "conflict" | "disabled" | "invalid_request";
+			message: string;
+			state: SessionModeState;
+	  };
+
+/** TUI-backed mode control. State reads do not grant mutation permission or approve a plan. */
+export interface ExtensionSessionModes {
+	getState(): SessionModeState;
+	set(request: SessionModeRequest): Promise<SessionModeResult>;
+}
+
+/** A built-in session mode changed, from any source: `ctx.sessionModes`, a slash command, a tool, or session restore. */
+export interface ModeChangedEvent {
+	type: "mode_changed";
+	previous: SessionModeState;
+	state: SessionModeState;
+}
+
 interface ToolCallEventBase extends McpToolEventIdentity {
 	type: "tool_call";
 	toolCallId: string;
@@ -1509,7 +1580,8 @@ export type ExtensionEvent =
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent
 	| PlanReviewRequestedEvent
-	| PlanReviewResolvedEvent;
+	| PlanReviewResolvedEvent
+	| ModeChangedEvent;
 
 // ============================================================================
 // Event Results
@@ -1714,6 +1786,7 @@ export interface ExtensionAPI {
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
 	on(event: "plan_review_requested", handler: ExtensionHandler<PlanReviewRequestedEvent>): void;
 	on(event: "plan_review_resolved", handler: ExtensionHandler<PlanReviewResolvedEvent>): void;
+	on(event: "mode_changed", handler: ExtensionHandler<ModeChangedEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
@@ -2178,6 +2251,7 @@ export interface ExtensionContextActions {
 	) => boolean;
 	getPendingPlanReview?: () => PlanReviewRequestedEvent | undefined;
 	openPlanReview?: () => Promise<boolean>;
+	sessionModes?: ExtensionSessionModes;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];

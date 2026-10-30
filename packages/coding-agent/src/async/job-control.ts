@@ -8,7 +8,7 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
 import type { AsyncJob, AsyncJobDetails, AsyncJobManager, AsyncJobType } from "./job-manager";
 
-import { renderStructuredJson, structuredStatusLabel } from "../session/async-job-delivery";
+import { renderStructuredJson, structuredStatusLabel, taskAgentHandles } from "../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -155,6 +155,9 @@ interface TrackedJobLike {
 	resultText?: string;
 	errorText?: string;
 	structured?: StructuredSubagentOutput;
+	agentId?: string;
+	/** See {@link AsyncJob.agentOutputPublished}. */
+	agentOutputPublished?: boolean;
 }
 
 export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
@@ -180,7 +183,7 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			if (Array.isArray(progressValue)) {
 				// A batch job's progress lists every spawn of the call, keyed by agent id.
 				// A collided job id is suffixed (`Foo-2`) while its agent id stays `Foo`.
-				const agentId = current?.agentId ?? latest.id;
+				const agentId = latest.agentId ?? latest.id;
 				let progressRecord: Record<string, unknown> | undefined;
 				for (const item of progressValue) {
 					if (!item || typeof item !== "object") continue;
@@ -245,7 +248,8 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
 			...(!resultConsumed && latest.latestDetails?.meta ? { meta: latest.latestDetails.meta } : {}),
 			...(!resultConsumed && latest.structured ? { structured: latest.structured } : {}),
-			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
+			...(latest.type === "task" ? { agentUrlId: latest.agentId ?? latest.id } : {}),
+			...(latest.agentOutputPublished !== undefined ? { agentOutputPublished: latest.agentOutputPublished } : {}),
 		};
 	});
 }
@@ -324,6 +328,14 @@ export function buildJobResult(
 		for (const j of completed) {
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
+			const handles = taskAgentHandles(j.id, j, j.agentUrlId);
+			if (handles) {
+				lines.push(
+					handles === "agent"
+						? `Agent: agent://${j.agentUrlId}, history://${j.agentUrlId}`
+						: `Agent: history://${j.agentUrlId}`,
+				);
+			}
 			if (j.status !== "cancelled") {
 				lines.push(
 					alreadyConsumed.has(j.id)
@@ -347,7 +359,7 @@ export function buildJobResult(
 				// `<output>` block above (or breaks mid-JSON once truncated at
 				// 4k), which contradicts async-result.md's contract of pointing
 				// to `agent://<id>` instead (PR #10625 review).
-				if (hasData)
+				if (hasData && j.status === "completed" && j.agentOutputPublished !== false)
 					header += `; full payload at agent://${j.agentUrlId}, fields via agent://${j.agentUrlId}/<field>`;
 				lines.push(header);
 				if (j.structured.status !== "valid") {

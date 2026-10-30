@@ -1,9 +1,5 @@
 /**
- * `buildJobResult` structured-output rendering for a settled wait.
- * Regression coverage: valid results must not inline a truncated JSON
- * block (breaks async-result.md's contract of pointing to `agent://<id>`
- * instead, and can emit invalid JSON once truncated at 4k), and any result
- * carrying data must advertise the `agent://<id>` handle (PR #10625 review).
+ * Settled waits expose only current-turn agent payloads and retain job-generation ownership.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
@@ -142,6 +138,128 @@ describe("wait structured output rendering", () => {
 		expect(text).toContain(`full payload at agent://Foo,`);
 	});
 
+	test("a woken agent's suffixed turn job names the agent's agent:// and history:// handles", async () => {
+		// Messaging a finished agent starts a new turn job; while the first
+		// turn's job is retained, the manager suffixes the new one (`Quick-2`).
+		// `agent://Quick-2` and `history://Quick-2` do not resolve, so the
+		// completed block must name the agent's own id.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const first = manager.register("task", "Quick", async () => ({ text: "DONE1" }), {
+			ownerId: SELF_ID,
+			id: "Quick",
+			agentId: "Quick",
+		});
+		await manager.getJob(first)!.promise;
+		const jobId = manager.register("task", "Quick", async () => ({ text: "DONE2" }), {
+			ownerId: SELF_ID,
+			id: "Quick",
+			agentId: "Quick",
+		});
+		expect(jobId).toBe("Quick-2");
+		await manager.getJob(jobId)!.promise;
+		const result = buildJobResult(makeSession(manager), manager, "wait", [manager.getJob(jobId)!], []);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toContain("### Quick-2 [task]");
+		expect(text).toContain("Agent: agent://Quick, history://Quick");
+		expect(text).not.toContain("agent://Quick-2");
+	});
+
+	test("a failed or cancelled turn job names only the agent's history:// handle", async () => {
+		// A follow-up turn that fails without yielding leaves `Quick.md` holding
+		// the previous turn's output, and a cancelled /tan clone is unregistered
+		// with none, so `agent://` would answer with another turn's output or
+		// not at all; only the transcript is this turn's record.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const first = manager.register("task", "Quick", async () => ({ text: "DONE1" }), {
+			ownerId: SELF_ID,
+			id: "Quick",
+			agentId: "Quick",
+		});
+		await manager.getJob(first)!.promise;
+		const failedId = manager.register(
+			"task",
+			"Quick",
+			async () => {
+				throw new Error("provider error");
+			},
+			{ ownerId: SELF_ID, id: "Quick", agentId: "Quick" },
+		);
+		expect(failedId).toBe("Quick-2");
+		await manager.getJob(failedId)!.promise;
+		const cancelledId = manager.register(
+			"task",
+			"/tan work",
+			({ signal }) => {
+				const { promise, reject } = Promise.withResolvers<string>();
+				signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				return promise;
+			},
+			{ ownerId: SELF_ID, agentId: "Tan-1" },
+		);
+		expect(manager.cancel(cancelledId)).toBe(true);
+		await manager.getJob(cancelledId)!.promise;
+		const jobs = [manager.getJob(failedId)!, manager.getJob(cancelledId)!];
+		expect(jobs.map(job => job.status)).toEqual(["failed", "cancelled"]);
+		const result = buildJobResult(makeSession(manager), manager, "wait", jobs, []);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toContain("Agent: history://Quick");
+		expect(text).toContain("Agent: history://Tan-1");
+		expect(text).not.toContain("agent://Quick");
+		expect(text).not.toContain("agent://Tan-1");
+	});
+
+	test("a completed turn that published no output names only the agent's history:// handle", async () => {
+		// A woken agent that neither yields nor reports a message result ends
+		// its turn completed, but `finalizeRunResult` writes no new `Quick.md`,
+		// so `agent://Quick` still holds the previous turn's output.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const first = manager.register("task", "Quick", async () => ({ text: "DONE1" }), {
+			ownerId: SELF_ID,
+			id: "Quick",
+			agentId: "Quick",
+		});
+		await manager.getJob(first)!.promise;
+		const jobId = manager.register(
+			"task",
+			"Quick",
+			async () => ({ text: "chatted, no yield", agentOutputPublished: false }),
+			{ ownerId: SELF_ID, id: "Quick", agentId: "Quick" },
+		);
+		expect(jobId).toBe("Quick-2");
+		await manager.getJob(jobId)!.promise;
+		expect(manager.getJob(jobId)!.status).toBe("completed");
+		const result = buildJobResult(makeSession(manager), manager, "wait", [manager.getJob(jobId)!], []);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toContain("Agent: history://Quick");
+		expect(text).not.toContain("agent://Quick");
+	});
+
+	test.each(["Quick", "Quick-2"])("unpublished structured job %s never points to a prior turn's payload", async id => {
+		const manager = new AsyncJobManager({});
+		try {
+			const jobId = manager.publishCompleted(
+				"task",
+				"unpublished",
+				{
+					text: "current turn could not publish",
+					agentOutputPublished: false,
+					structured: { source: "agent", mode: "strict", status: "valid", data: { current: true } },
+				},
+				{ id, agentId: "Quick", ownerId: SELF_ID },
+			);
+			const result = buildJobResult(makeSession(manager), manager, "wait", [manager.getJob(jobId)!], []);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("history://Quick");
+			expect(text).not.toContain("agent://Quick");
+			expect(result.details?.jobs?.[0]?.agentOutputPublished).toBe(false);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
 	test("does not recover or consume a replacement job through a stale snapshot", async () => {
 		const manager = new AsyncJobManager({});
 		const pending = Promise.withResolvers<AsyncJobRunResult>();
@@ -154,6 +272,7 @@ describe("wait structured output rendering", () => {
 			const stale = {
 				...current,
 				status: "completed" as const,
+				agentId: "PriorAgent",
 				resultText: "old generation report",
 				structured: { source: "agent", mode: "strict", status: "valid", data: { old: true } } as const,
 			};
@@ -162,6 +281,9 @@ describe("wait structured output rendering", () => {
 				{ resultText: "old generation report", structured: { data: { old: true } } },
 			]);
 			expect(manager.isJobResultConsumed(jobId)).toBe(false);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("agent://PriorAgent");
+			expect(text).not.toContain("agent://CurrentAgent");
 			pending.resolve({ text: "new generation report" });
 			await current.promise;
 			const recovered = buildJobResult(makeSession(manager), manager, "wait", [current], []);

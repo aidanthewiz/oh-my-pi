@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AuthStorage, SqliteAuthCredentialStore, withAuth, withOAuthAccess } from "@oh-my-pi/pi-ai";
+import { AuthStorage, SqliteAuthCredentialStore, withOAuthAccess } from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
 	AuthBrokerRefresher,
@@ -104,29 +104,15 @@ describe("auth broker OAuth refresh backoff", () => {
 		});
 		clientStorage = new AuthStorage(remote);
 		await clientStorage.credentials.reload();
-		const authError = Object.assign(new Error("401 invalid_api_key"), { status: 401 });
-		const firstBearers: string[] = [];
-		await expect(
-			withAuth(clientStorage.keys.resolver(PROVIDER, { sessionId: "late-recovery" }), async key => {
-				firstBearers.push(key);
-				throw authError;
-			}),
-		).rejects.toBe(authError);
-		expect(firstBearers).toEqual(["access-1"]);
+		const firstRecovery = await clientStorage.oauth.refresh(credentialId, undefined, { reason: "auth-recovery" });
+		expect(firstRecovery.credential).toMatchObject({ type: "oauth", access: "access-1" });
 		expect(refreshCalls).toBe(1);
 
-		// The 60 s credential block has elapsed and the broker's original mint is
-		// older than five minutes. A cached response received at t=4:59 must not
-		// restart the cooldown in this client process.
+		// A recovery without rejected-bearer provenance uses the original mint's
+		// five-minute cooldown, not the time this client received the cached token.
 		clock.mockReturnValue(start + 389_000);
-		const secondBearers: string[] = [];
-		await expect(
-			withAuth(clientStorage.keys.resolver(PROVIDER, { sessionId: "post-cooldown" }), async key => {
-				secondBearers.push(key);
-				throw authError;
-			}),
-		).rejects.toBe(authError);
-		expect(secondBearers).toEqual(["access-1", "access-2"]);
+		const secondRecovery = await clientStorage.oauth.refresh(credentialId, undefined, { reason: "auth-recovery" });
+		expect(secondRecovery.credential).toMatchObject({ type: "oauth", access: "access-2" });
 		expect(refreshCalls).toBe(2);
 	});
 

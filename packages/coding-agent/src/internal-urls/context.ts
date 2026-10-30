@@ -38,7 +38,12 @@ export function contextLocalProtocolOptions(session: ToolSession): LocalProtocol
 /** The single ResolveContext builder for a tool session; replaces per-tool literal assembly. */
 export function sessionResolveContext(
 	session: ToolSession,
-	options: { signal?: AbortSignal; skipDirectoryListing?: boolean } = {},
+	options: {
+		signal?: AbortSignal;
+		skipDirectoryListing?: boolean;
+		containSkillPaths?: boolean;
+		inspectSkills?: boolean;
+	} = {},
 ): ResolveContext {
 	return {
 		cwd: session.cwd,
@@ -51,6 +56,8 @@ export function sessionResolveContext(
 		agentRegistry: session.agentRegistry,
 		localProtocolOptions: contextLocalProtocolOptions(session),
 		skills: session.skills,
+		containSkillPaths: options.containSkillPaths,
+		inspectSkills: options.inspectSkills,
 		rules: session.activeRules,
 		session,
 		skipDirectoryListing: options.skipDirectoryListing,

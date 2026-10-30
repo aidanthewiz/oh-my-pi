@@ -6,6 +6,12 @@
 
 - Rebuild stored local E5-large and all-MiniLM vectors after fastembed's CLS-to-mean pooling change, without deleting memories or changing configured model names.
 - Keep cached query vectors isolated between local mean-pooling models and API or custom providers.
+## [18.13.2] - 2026-10-27
+
+### Fixed
+
+- Fixed local embeddings using one spinning CPU thread per core, so a single recall query cost several CPU-seconds on a many-core machine ([#17109](https://github.com/can1357/oh-my-pi/pull/17109) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.13.0] - 2026-10-26
 
 ### Fixed

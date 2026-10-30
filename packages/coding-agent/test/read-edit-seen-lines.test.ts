@@ -86,3 +86,81 @@ describe("read → edit seen-line guard under default settings", () => {
 		expect(await Bun.file(file).text()).toBe(SOURCE.replace("0.230", "0.240"));
 	});
 });
+
+// Regression: an edit under a stale tag went through snapshot recovery without
+// the seen-line check, so after one edit changed the file, a header copied
+// from the earlier read anchored lines that read never displayed.
+describe("read → edit seen-line guard under a stale tag", () => {
+	let cwd: string;
+	let file: string;
+	const LINES = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`);
+
+	beforeEach(async () => {
+		cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stale-seen-"));
+		file = path.join(cwd, "list.txt");
+		await Bun.write(file, `${LINES.join("\n")}\n`);
+	});
+
+	afterEach(async () => {
+		await removeWithRetries(cwd);
+	});
+
+	it("keeps stale unseen retries blocked until an explicit read", async () => {
+		const session = createSession(cwd);
+		const header = textOutput(await new ReadTool(session).execute("read", { path: "list.txt:18-22" })).split("\n")[0];
+		expect(header).toMatch(/^\[list\.txt#[0-9A-F]{4}\]$/);
+		const edit = new EditTool(session, "hashline");
+		await edit.execute("edit-1", { input: `${header}\nPUT 20.=20:\n+LINE TWENTY\n` });
+		const afterFirst = await Bun.file(file).text();
+		expect(afterFirst).toContain("LINE TWENTY");
+
+		// The header now names a stale version, whose read showed lines 18-22.
+		const stale = `${header}\nPUT 3.=3:\n+LINE THREE\n`;
+		const refused = textOutput(await edit.execute("edit-2", { input: stale }));
+		expect(refused).toContain("never displayed");
+		expect(refused).toContain("list.txt:3");
+		expect(await Bun.file(file).text()).toBe(afterFirst);
+
+		const diagnosticHeader = [...refused.matchAll(/\[list\.txt#[0-9A-F]{4}\]/g)]
+			.map(match => match[0])
+			.find(candidate => candidate !== header);
+		if (!diagnosticHeader) throw new Error("Expected the current snapshot header in the stale-anchor diagnostic");
+		const currentEdit = `${diagnosticHeader}\nPUT 3.=3:\n+LINE THREE\n`;
+		const retried = await edit.execute("edit-3", { input: currentEdit });
+		expect(textOutput(retried)).toContain("never displayed");
+		expect(await Bun.file(file).text()).toBe(afterFirst);
+
+		const current = textOutput(await new ReadTool(session).execute("read-current", { path: "list.txt:3-3" }));
+		const currentHeader = current.split("\n")[0];
+		expect(currentHeader).toBe(diagnosticHeader);
+		await edit.execute("edit-4", { input: currentEdit });
+		expect(await Bun.file(file).text()).toBe(afterFirst.replace("line 3\n", "LINE THREE\n"));
+	});
+
+	it("requires a read at current line numbers after an unseen stale anchor shifts", async () => {
+		const session = createSession(cwd);
+		const read = new ReadTool(session);
+		const header = textOutput(await read.execute("read", { path: "list.txt:18-22" })).split("\n")[0];
+		const shifted = `inserted one\ninserted two\n${LINES.join("\n")}\n`;
+		await Bun.write(file, shifted);
+		const edit = new EditTool(session, "hashline");
+
+		const refused = textOutput(await edit.execute("edit-stale", { input: `${header}\nPUT 3.=3:\n+LINE THREE\n` }));
+		expect(refused).toContain("list.txt:5");
+		expect(await Bun.file(file).text()).toBe(shifted);
+		const currentHeader = [...refused.matchAll(/\[list\.txt#[0-9A-F]{4}\]/g)]
+			.map(match => match[0])
+			.find(candidate => candidate !== header);
+		if (!currentHeader) throw new Error("Expected the current snapshot header in the stale-anchor diagnostic");
+		const currentEdit = `${currentHeader}\nPUT 5.=5:\n+LINE THREE\n`;
+
+		const blindRetry = await edit.execute("edit-blind-current", { input: currentEdit });
+		expect(textOutput(blindRetry)).toContain("never displayed");
+		expect(await Bun.file(file).text()).toBe(shifted);
+
+		const revealed = textOutput(await read.execute("read-current", { path: "list.txt:5-5" }));
+		expect(revealed.split("\n")[0]).toBe(currentHeader);
+		await edit.execute("edit-seen-current", { input: currentEdit });
+		expect(await Bun.file(file).text()).toBe(shifted.replace("line 3\n", "LINE THREE\n"));
+	});
+});

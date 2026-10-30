@@ -558,6 +558,7 @@ export class ExtensionRunner {
 	#resolvePlanReviewFn: NonNullable<ExtensionContextActions["resolvePlanReview"]> = () => false;
 	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
 	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
+	#sessionModes?: ExtensionContextActions["sessionModes"];
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
@@ -868,6 +869,8 @@ export class ExtensionRunner {
 		if (contextActions.resolvePlanReview) this.#resolvePlanReviewFn = contextActions.resolvePlanReview;
 		if (contextActions.getPendingPlanReview) this.#getPendingPlanReviewFn = contextActions.getPendingPlanReview;
 		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
+		// Assigned unconditionally: a headless rebind must not inherit a previous host's controls.
+		this.#sessionModes = contextActions.sessionModes;
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
@@ -1606,6 +1609,7 @@ export class ExtensionRunner {
 		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
 			this.runtime.sendUserMessage(text, options);
 		const delegationSignal = delegation?.signal;
+		const getSessionModes = () => (agent.kind === "main" && this.#mode === "tui" ? this.#sessionModes : undefined);
 		return {
 			ui: this.#uiContext,
 			mcp: delegationSignal
@@ -1640,6 +1644,10 @@ export class ExtensionRunner {
 			resolvePlanReview: (reviewId, choice, input) => this.#resolvePlanReviewFn(reviewId, choice, input),
 			getPendingPlanReview: () => this.#getPendingPlanReviewFn(),
 			openPlanReview: () => this.#openPlanReviewFn(),
+			// Live: a context saved before or across a host rebind sees the current controls.
+			get sessionModes() {
+				return getSessionModes();
+			},
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1723,8 +1731,12 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		const context = this.createContext();
 		return {
-			...this.createContext(),
+			...context,
+			get sessionModes() {
+				return context.sessionModes;
+			},
 			getContextUsage: () => this.#getContextUsageFn(),
 			waitForIdle: () => this.#waitForIdleFn(),
 			newSession: options => this.#newSessionHandler(options),
@@ -1919,10 +1931,18 @@ export class ExtensionRunner {
 					if (stopResult.decision === "block") {
 						return stopResult as RunnerEmitResult<TEvent>;
 					}
-					const hasContinuationContext =
-						(typeof stopResult.additionalContext === "string" && stopResult.additionalContext.length > 0) ||
-						(typeof stopResult.reason === "string" && stopResult.reason.length > 0);
-					if (stopResult.continue === true && hasContinuationContext) result ??= stopResult;
+					const continuationContext = stopResult.additionalContext || stopResult.reason;
+					if (stopResult.continue === true && continuationContext) {
+						if (result) {
+							const prior = result as SessionStopEventResult;
+							result = {
+								continue: true,
+								additionalContext: `${prior.additionalContext || prior.reason}\n\n${continuationContext}`,
+							};
+						} else {
+							result = stopResult;
+						}
+					}
 				}
 			}
 		}

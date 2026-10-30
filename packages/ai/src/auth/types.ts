@@ -365,6 +365,8 @@ export type AuthStorageOptions = {
 	 *
 	 * `reason` is `"auth-recovery"` only for a provider-auth retry; generic and
 	 * managed MCP force-refresh calls leave it unset.
+	 * `rejectedAccess` identifies the rejected bearer for the same credential;
+	 * delegates must keep it out of URLs and logs.
 	 *
 	 * Must return updated {@link OAuthCredentials} with at least `access` and
 	 * `expires`. `refresh` may be an opaque sentinel (e.g. `"__remote__"`) when
@@ -376,6 +378,7 @@ export type AuthStorageOptions = {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 		reason?: OAuthRefreshReason,
+		rejectedAccess?: string,
 	) => Promise<OAuthCredentials>;
 	/**
 	 * Set when {@link refreshOAuthCredential} exchanges the refresh token with the
@@ -501,6 +504,13 @@ export type AuthApiKeyOptions = {
 	forceRefresh?: boolean;
 	/** Explicit provider-401 recovery; generic force refreshes leave this unset. */
 	refreshReason?: OAuthRefreshReason;
+	/**
+	 * The access token the provider rejected with a 401, when this resolve is
+	 * that 401's recovery. A refresh adopts a stored token that differs from it
+	 * instead of exchanging the refresh token again: with single-use refresh
+	 * tokens every needless exchange revokes the token its peers are using.
+	 */
+	rejectedAccessToken?: string;
 	/** When false, select as `sessionId` would without recording the choice as that session's sticky credential. */
 	recordAffinity?: boolean;
 };
@@ -629,6 +639,12 @@ export interface StoredOAuthRefreshOptions<T extends OAuthCredential = OAuthCred
 	observedCredential?: T;
 	credentialFromRow: (credential: OAuthCredential) => T | undefined;
 	forceRefresh?: boolean;
+	/**
+	 * The access token a provider just rejected with a 401. A forced refresh
+	 * adopts a still-fresh stored row whose token differs from it: another
+	 * process rotated the row, and its token has not been rejected.
+	 */
+	rejectedAccess?: string;
 	canRefresh?: (credential: T) => boolean;
 	refreshSkewMs?: number;
 	signal?: AbortSignal;
@@ -1054,6 +1070,8 @@ export interface OAuthRefreshByIdOptions {
 	 * Local reuse still requires {@link reuseRecentMint}.
 	 */
 	reason?: OAuthRefreshReason;
+	/** The access token a provider 401 rejected; see {@link AuthApiKeyOptions.rejectedAccessToken}. */
+	rejectedAccess?: string;
 }
 
 /** OAuth login, access, account identity, and refresh operations. */
