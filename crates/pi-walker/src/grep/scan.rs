@@ -496,7 +496,7 @@ impl<M: Matcher> Sink for SharedCollector<'_, '_, M> {
 	}
 }
 
-async fn flush_collected<M>(
+async fn flush_collected<M: Sync>(
 	collector: &parking_lot::Mutex<StreamCollector<'_, M>>,
 	path: &str,
 	sink: &tokio::sync::mpsc::Sender<Vec<Match>>,

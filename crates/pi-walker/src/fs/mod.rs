@@ -662,7 +662,7 @@ impl Session {
 		}
 	}
 
-	pub(crate) fn stable_file_stamps(&mut self, file: &File, stamp: &Stamp) -> bool {
+	pub(crate) fn stable_file_stamps(&self, file: &File, stamp: &Stamp) -> bool {
 		match (&self.imp, &file.repr) {
 			(Imp::Native(_), FileRepr::Native(h)) => native::stable_stamps(h, stamp),
 			_ => false,

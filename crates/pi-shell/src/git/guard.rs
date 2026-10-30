@@ -76,8 +76,11 @@ impl Review {
 			return Ok(Decision::Run);
 		};
 		tokio::task::spawn_blocking(move || {
-			let place = Place::of(&site);
-			in_shared(&place, sub, verdict, &site.dir)
+			if site.redirected {
+				return Decision::Refuse(Refusal::Redirected(sub).message());
+			}
+			let repository = GitRepo::discover(&site.dir);
+			in_shared(&repository, sub, verdict, &site.dir)
 				.map_or(Decision::Run, |refusal| Decision::Refuse(refusal.message()))
 		})
 		.await
@@ -100,40 +103,15 @@ struct Site {
 	redirected: bool,
 }
 
-/// The checkout a command runs in.
-enum Place {
-	/// Git is redirected away from the repository found from the directory.
-	Redirected,
-	/// The repository there cannot be read.
-	Unreadable,
-	/// No repository: git fails on its own.
-	Outside,
-	/// A checkout other sessions may be using.
-	Shared(GitRepo),
-}
-
-impl Place {
-	fn of(site: &Site) -> Self {
-		if site.redirected {
-			return Self::Redirected;
-		}
-		match GitRepo::discover(&site.dir) {
-			Ok(Some(repo)) => Self::Shared(repo),
-			Ok(None) => Self::Outside,
-			Err(_) => Self::Unreadable,
-		}
-	}
-}
-
 /// Why `verdict`, run in `dir`, is refused in a checkout other sessions may be
 /// using, if it is.
-fn in_shared(place: &Place, sub: Sub, verdict: Verdict, dir: &Path) -> Option<Refusal> {
-	let repo = match place {
-		Place::Shared(repo) => Some(repo),
-		// The repository found from the directory is not the one git changes.
-		Place::Redirected => return Some(Refusal::Redirected(sub)),
-		Place::Unreadable | Place::Outside => None,
-	};
+fn in_shared<E>(
+	repository: &Result<Option<GitRepo>, E>,
+	sub: Sub,
+	verdict: Verdict,
+	dir: &Path,
+) -> Option<Refusal> {
+	let repo = repository.as_ref().ok().and_then(Option::as_ref);
 	match verdict {
 		Verdict::Allow => None,
 		Verdict::Stash => Some(Refusal::Stash),
@@ -142,7 +120,7 @@ fn in_shared(place: &Place, sub: Sub, verdict: Verdict, dir: &Path) -> Option<Re
 		Verdict::ResetTo(rev) => match repo {
 			Some(repo) => moves_head(repo, &rev).then_some(Refusal::CommitMove),
 			// Outside a repository git fails on its own.
-			None => matches!(place, Place::Unreadable).then_some(Refusal::CommitMove),
+			None => repository.is_err().then_some(Refusal::CommitMove),
 		},
 		Verdict::ConflictOnly => outside_conflict(repo, sub),
 		Verdict::CheckoutOne(operand) => {

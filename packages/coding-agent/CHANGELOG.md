@@ -21,6 +21,7 @@
 - Keep deferred MCP refreshes out of a destination session's restored tool selection.
 - Isolate corrupt compressed child transcripts while preserving readable export content and encrypted share fragments.
 - Honor export skip navigation during share loading. Preserve transcript selection and encrypted fragments after the viewer starts.
+- Include the offline viewer in packed CLI bundles.
 - Keep historical context snapshots on their original tool-schema estimate basis.
 - Cancel retired lazy browser runs before admission and discover nested WebMCP tools registered before the first helper call.
 - Preserve complete Windows console titles and let live RPC startup settle through server completion or explicit cancellation.

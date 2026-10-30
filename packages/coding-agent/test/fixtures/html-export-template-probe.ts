@@ -7,11 +7,18 @@ const html = getTemplate();
 const removalIndex = process.argv.indexOf("--remove-assets-after-first-use");
 if (removalIndex !== -1) {
 	const root = process.argv[removalIndex + 1];
-	if (!root || path.resolve(root) !== import.meta.dir || path.basename(root) !== "cached") {
+	const rootDirectory = root ? fs.realpathSync(root) : undefined;
+	if (
+		!rootDirectory ||
+		rootDirectory !== fs.realpathSync(import.meta.dir) ||
+		path.basename(rootDirectory) !== "cached"
+	) {
 		throw new Error("Asset removal requires the disposable cached probe directory");
 	}
 	const asset = resolveBundledHtmlAssetPath(viewerPath);
-	if (path.dirname(asset) !== path.resolve(root)) throw new Error("Viewer is outside the disposable probe directory");
+	if (fs.realpathSync(path.dirname(asset)) !== rootDirectory) {
+		throw new Error("Viewer is outside the disposable probe directory");
+	}
 	fs.rmSync(asset);
 	if (getTemplate() !== html) throw new Error("Cached template changed after asset removal");
 }
