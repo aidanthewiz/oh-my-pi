@@ -1690,8 +1690,8 @@ fn prune_nonrelocatable_clone_dirs(root: &Path) -> Result<BTreeSet<PathBuf>> {
 				Err(err) => return Err(err.into()),
 			}
 		}
-		let marked =
-			inherited || dir.join("pyvenv.cfg").is_file() || dir.join("CMakeCache.txt").is_file();
+		let marked = dir != root
+			&& (inherited || dir.join("pyvenv.cfg").is_file() || dir.join("CMakeCache.txt").is_file());
 		if marked && !inherited {
 			excluded.insert(
 				dir.strip_prefix(root)

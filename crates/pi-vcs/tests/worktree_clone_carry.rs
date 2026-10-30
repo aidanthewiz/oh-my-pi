@@ -483,3 +483,198 @@ fn clone_preserves_ignored_in_source_cmake_repositories_for_both_keep_changes_mo
 fn clone_preserves_ignored_cmake_repositories_beneath_marked_ancestors() {
 	assert_clone_preserves_ignored_cmake_repository(true);
 }
+
+fn assert_root_marker_checkout(marker: &str, clone: WorktreeClone, keep_changes: bool) {
+	let (temp, source, repo) = fixture();
+	if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	write(&source, ".gitignore", "node_modules/\nignored/\nenvironments/\n");
+	write(&source, "clean.txt", "clean tracked bytes\n");
+	write(&source, "environments/cmake/tracked.txt", "committed nested data\n");
+	git(&source, &["add", ".gitignore", "clean.txt"]);
+	git(&source, &["add", "-f", "environments/cmake/tracked.txt"]);
+	git(&source, &["commit", "-qm", "track root and nested data"]);
+	write(&source, "a.txt", "staged outer bytes\n");
+	git(&source, &["add", "a.txt"]);
+	write(&source, "a.txt", "staged then edited outer bytes\n");
+	write(&source, "environments/cmake/tracked.txt", "staged nested bytes\n");
+	git(&source, &["add", "-f", "environments/cmake/tracked.txt"]);
+	write(&source, "environments/cmake/tracked.txt", "staged then edited nested bytes\n");
+	let literal = "[scratch] #1.txt";
+	let literal_bytes = b"literal untracked bytes\0\xff\r\n";
+	fs::write(source.join(literal), literal_bytes).unwrap();
+	let nested_file = "notes/space dir/nontrivial.bin";
+	let nested_bytes = b"nested untracked bytes\0\xfe\n";
+	fs::create_dir_all(source.join("notes/space dir")).unwrap();
+	fs::write(source.join(nested_file), nested_bytes).unwrap();
+	write(&source, marker, "checkout-root configuration\n");
+	write(&source, "ignored/local.bin", "ignored user work\n");
+	write(&source, "environments/cmake/CMakeCache.txt", "CMAKE_HOME_DIRECTORY:INTERNAL=/source\n");
+	write(&source, "environments/cmake/generated.bin", "nonrelocatable cmake bytes\n");
+	write(&source, "environments/python/pyvenv.cfg", "home = /source/python\n");
+	write(&source, "environments/python/bin/tool", "#!/source/python\n");
+	let nested = source.join("environments/cmake/independent");
+	fs::create_dir_all(&nested).unwrap();
+	git(&nested, &["init", "-q", "-b", "main"]);
+	for (key, value) in [
+		("user.name", "Test"),
+		("user.email", "test@example.com"),
+		("commit.gpgsign", "false"),
+		("core.autocrlf", "false"),
+		("core.excludesFile", ".git/no-global-excludes"),
+		("core.hooksPath", ".git/hooks"),
+	] {
+		git(&nested, &["config", key, value]);
+	}
+	write(&nested, "CMakeCache.txt", "independent root configuration\n");
+	write(&nested, "data.bin", "committed independent bytes\n");
+	git(&nested, &["add", "."]);
+	git(&nested, &["commit", "-qm", "independent base"]);
+	write(&nested, "data.bin", "dirty independent bytes\n");
+	write(&nested, "untracked.bin", "independent untracked bytes\n");
+	let nested_head = git(&nested, &["rev-parse", "HEAD"]);
+	let nested_before = snapshot(&nested);
+	let nested_metadata_before = snapshot(&nested.join(".git"));
+	#[cfg(unix)]
+	let outside = {
+		let outside = temp.path().join("outside-checkout");
+		write(&outside, "CMakeCache.txt", "outside marker\n");
+		write(&outside, "precious.bin", "outside sentinel bytes\n");
+		std::os::unix::fs::symlink(&outside, source.join("external-link")).unwrap();
+		std::os::unix::fs::symlink(&outside, source.join("environments/cmake/external-link"))
+			.unwrap();
+		outside
+	};
+	let source_status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+	let source_before = snapshot(&source);
+	let source_index = fs::read(source.join(".git/index")).unwrap();
+	let source_head = fs::read(source.join(".git/HEAD")).unwrap();
+	let target = temp.path().join("root-marker-target");
+	let result = repo
+		.worktree_add(&target, "HEAD", WorktreeAddOptions { detach: true, clone, keep_changes })
+		.unwrap();
+	assert_eq!(
+		result.cloned_with.is_some(),
+		clone == WorktreeClone::Auto,
+		"{:?}",
+		result.clone_error
+	);
+	assert_eq!(snapshot(&source), source_before, "source working bytes changed");
+	assert_eq!(fs::read(source.join(".git/index")).unwrap(), source_index);
+	assert_eq!(fs::read(source.join(".git/HEAD")).unwrap(), source_head);
+	assert_eq!(snapshot(&nested.join(".git")), nested_metadata_before);
+	if keep_changes {
+		assert_eq!(fs::read(target.join(literal)).unwrap(), literal_bytes);
+		assert_eq!(fs::read(target.join(nested_file)).unwrap(), nested_bytes);
+		assert_eq!(fs::read(target.join(marker)).unwrap(), b"checkout-root configuration\n");
+	} else {
+		assert!(!target.join(literal).exists());
+		assert!(!target.join("notes").exists());
+		assert!(!target.join(marker).exists());
+	}
+	assert_eq!(fs::read(target.join("clean.txt")).unwrap(), b"clean tracked bytes\n");
+	assert_eq!(
+		fs::read(target.join("a.txt")).unwrap(),
+		if keep_changes {
+			b"staged then edited outer bytes\n".as_slice()
+		} else {
+			b"tracked\n".as_slice()
+		}
+	);
+	assert_eq!(
+		git(&target, &["show", ":a.txt"]),
+		if keep_changes {
+			"staged outer bytes"
+		} else {
+			"tracked"
+		}
+	);
+	assert_eq!(
+		fs::read(target.join("environments/cmake/tracked.txt")).unwrap(),
+		if keep_changes {
+			b"staged then edited nested bytes\n".as_slice()
+		} else {
+			b"committed nested data\n".as_slice()
+		}
+	);
+	assert_eq!(
+		git(&target, &["show", ":environments/cmake/tracked.txt"]),
+		if keep_changes {
+			"staged nested bytes"
+		} else {
+			"committed nested data"
+		}
+	);
+	assert!(!target.join("environments/cmake/generated.bin").exists());
+	assert!(!target.join("environments/cmake/CMakeCache.txt").exists());
+	assert!(!target.join("environments/python").exists());
+	if clone == WorktreeClone::Auto {
+		assert_eq!(fs::read(target.join("ignored/local.bin")).unwrap(), b"ignored user work\n");
+		assert_eq!(
+			fs::read(target.join("node_modules/pkg/index.js")).unwrap(),
+			b"relocatable cache\n"
+		);
+		let carried = target.join("environments/cmake/independent");
+		assert_eq!(snapshot(&carried), nested_before);
+		assert_eq!(snapshot(&carried.join(".git")), nested_metadata_before);
+		assert_eq!(git(&carried, &["rev-parse", "HEAD"]), nested_head);
+		assert_eq!(git(&carried, &["show", "HEAD:data.bin"]), "committed independent bytes");
+	} else {
+		assert!(!target.join("ignored").exists());
+		assert!(!target.join("node_modules").exists());
+		assert!(!target.join("environments/cmake/independent").exists());
+	}
+	#[cfg(unix)]
+	{
+		if keep_changes {
+			assert!(
+				fs::symlink_metadata(target.join("external-link"))
+					.unwrap()
+					.file_type()
+					.is_symlink()
+			);
+			assert_eq!(fs::read_link(target.join("external-link")).unwrap(), outside);
+		} else {
+			assert!(fs::symlink_metadata(target.join("external-link")).is_err());
+		}
+		assert!(fs::symlink_metadata(target.join("environments/cmake/external-link")).is_err());
+		assert_eq!(fs::read(outside.join("CMakeCache.txt")).unwrap(), b"outside marker\n");
+		assert_eq!(fs::read(outside.join("precious.bin")).unwrap(), b"outside sentinel bytes\n");
+	}
+	assert_eq!(
+		git(&target, &["status", "--porcelain", "--untracked-files=all"]),
+		if keep_changes {
+			source_status
+		} else {
+			String::new()
+		}
+	);
+	assert!(repo.worktree_remove(&target, true).unwrap());
+	assert!(!target.exists());
+}
+
+#[test]
+fn clone_root_cmake_marker_keeps_checkout_work() {
+	assert_root_marker_checkout("CMakeCache.txt", WorktreeClone::Auto, true);
+}
+
+#[test]
+fn clone_root_pyvenv_marker_keeps_checkout_work() {
+	assert_root_marker_checkout("pyvenv.cfg", WorktreeClone::Auto, true);
+}
+
+#[test]
+fn clone_root_markers_reconcile_without_keep_changes() {
+	for marker in ["CMakeCache.txt", "pyvenv.cfg"] {
+		assert_root_marker_checkout(marker, WorktreeClone::Auto, false);
+	}
+}
+
+#[test]
+fn clone_disabled_keeps_root_marked_uncommitted_work() {
+	for marker in ["CMakeCache.txt", "pyvenv.cfg"] {
+		assert_root_marker_checkout(marker, WorktreeClone::Off, true);
+	}
+}

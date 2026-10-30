@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Preserve carried work and ignored user files when cloned checkouts contain a root `CMakeCache.txt` or `pyvenv.cfg`.
 - Report actual external process IDs for quoted and escaped literal background commands without evaluating command-name substitutions during classification.
 - Preserve a job's result when it finishes during foreground continuation. Keep already completed jobs outside signal-control authority.
 - Do not repeat foreground terminal transfers when that process group already owns the terminal.
