@@ -562,6 +562,7 @@ fn startup_logger(io: &HostIo, am_server: bool) -> Logger {
 	let cfg = LogConfig {
 		am_server,
 		human_readable: 1,
+		output_charset: iconv::output_charset(&|key| io.getenv(key)),
 		time_zone: Some(io.tz.clone()),
 		..LogConfig::default()
 	};
@@ -577,6 +578,7 @@ fn log_config(io: &HostIo, opts: &Options, am_server: bool, local_server: bool) 
 		log_file_format: opts.logfile_format.clone(),
 		human_readable: u8::try_from(opts.human_readable).unwrap_or(u8::MAX),
 		eight_bit_output: opts.allow_8bit_chars,
+		output_charset: iconv::output_charset(&|key| io.getenv(key)),
 		stderr_mode: opts.stderr_mode(),
 		am_server,
 		quiet: opts.quiet > 0,

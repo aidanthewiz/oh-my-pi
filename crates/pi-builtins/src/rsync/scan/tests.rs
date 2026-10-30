@@ -594,6 +594,7 @@ fn unconvertible_link_and_filename_slots_are_inactive_but_following_entry_surviv
 	);
 	assert_eq!(std::fs::read_link(root.join("src/a-bad-link")).unwrap(), Path::new("é"));
 	assert_eq!(std::fs::read(root.join("src/b-snow☃")).unwrap(), b"bad");
+	rejected.sort();
 	assert_eq!(
 		rejected,
 		vec![(b"a-bad-link".to_vec(), false), (b"b-snow\xe2\x98\x83".to_vec(), false)]

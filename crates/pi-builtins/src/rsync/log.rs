@@ -119,6 +119,7 @@ pub(crate) struct LogConfig {
 	/// -h level: 0 = --no-h, 1 = default (separators), 2 = -h (1000), 3 = -hh (1024).
 	pub human_readable: u8,
 	pub eight_bit_output: bool,
+	pub output_charset: String,
 	/// [`STDERR_ERRORS`], [`STDERR_ALL`], or [`STDERR_CLIENT`].
 	pub stderr_mode: u8,
 	pub am_server: bool,
@@ -211,6 +212,7 @@ struct Inner {
 	remote: Option<RemoteSink>,
 	deleted: Mutex<Option<DeletedSink>>,
 	outputs: Mutex<Outputs>,
+	output_validator: Option<crate::rsync::iconv::OutputValidator>,
 	got_xfer_error: AtomicBool,
 	/// Negotiated receiver_symlink_times (starts as `cfg.receiver_symlink_times`).
 	receiver_symlink_times: AtomicBool,
@@ -284,6 +286,8 @@ impl Logger {
 		let levels = [cfg.levels.clone(), negated];
 		let tz = cfg.time_zone.clone().unwrap_or_else(jiff::tz::TimeZone::system);
 		let formats = Formats::new(&cfg);
+		let output_validator = (!cfg.eight_bit_output && !cfg.am_server && remote.is_none())
+			.then(|| crate::rsync::iconv::OutputValidator::new(&cfg.output_charset));
 		let inner = Inner {
 			formats,
 			levels,
@@ -292,6 +296,7 @@ impl Logger {
 			remote,
 			deleted: Mutex::new(None),
 			outputs: Mutex::new(Outputs { out, err, log: LogTarget::Off, in_block: false }),
+			output_validator,
 			got_xfer_error: AtomicBool::new(false),
 			receiver_symlink_times: AtomicBool::new(cfg.receiver_symlink_times),
 			needs_newline: AtomicU8::new(0),
@@ -738,7 +743,6 @@ impl Logger {
 			to_stderr = true;
 		}
 		let escape_8bit = !cfg.eight_bit_output;
-		let validate_utf8 = escape_8bit && !cfg.am_server && inner.remote.is_none();
 		let mut line = Vec::with_capacity(buf.len() + 8);
 		if inner.needs_newline.swap(0, Ordering::Relaxed) != 0 {
 			line.push(b'\n');
@@ -754,13 +758,16 @@ impl Logger {
 			}
 			_ => body,
 		};
-		if validate_utf8 {
-			for chunk in body.utf8_chunks() {
-				filter_into(&mut line, chunk.valid().as_bytes(), false, false);
-				for &byte in chunk.invalid() {
-					push_octal(&mut line, byte);
+		if let Some(validator) = &inner.output_validator {
+			validator.visit(body, |chunk, valid| {
+				if valid {
+					filter_into(&mut line, chunk, false, false);
+				} else {
+					for &byte in chunk {
+						push_octal(&mut line, byte);
+					}
 				}
-			}
+			});
 		} else {
 			filter_into(&mut line, body, escape_8bit, false);
 		}
@@ -1038,7 +1045,7 @@ mod tests {
 	fn names_are_escaped_like_the_reference() {
 		// Captured: `\001` and invalid UTF-8 escape, valid UTF-8, tab, and DEL pass, and a
 		// literal `\#123` gets its backslash escaped.
-		let (logger, out, _) = client(LogConfig::default());
+		let (logger, out, _) = client(LogConfig { output_charset: "UTF-8".to_owned(), ..LogConfig::default() });
 		logger.rprintf(LogCode::Info, b"a\x01b\n");
 		logger.rprintf(LogCode::Info, "caf\u{e9}\n".as_bytes());
 		logger.rprintf(LogCode::Info, b"x\\#123y\n");
@@ -1051,6 +1058,38 @@ mod tests {
 		let (logger, out, _) = client(LogConfig { eight_bit_output: true, ..LogConfig::default() });
 		logger.rprintf(LogCode::Info, b"l1 -> b\xffc\xc3 \xc2\x85\x01\n");
 		assert_eq!(out.bytes(), b"l1 -> b\xffc\xc3 \xc2\x85\\#001\n".to_vec());
+	}
+
+	#[test]
+	fn output_validation_uses_locale_charset() {
+		for (charset, eight_bit_output, expected) in [
+			("US-ASCII", false, &b"caf\\#303\\#251\n"[..]),
+			("UTF-8", false, &b"caf\xc3\xa9\n"[..]),
+			("US-ASCII", true, &b"caf\xc3\xa9\n"[..]),
+		] {
+			let (logger, out, _) = client(LogConfig {
+				output_charset: charset.to_owned(),
+				eight_bit_output,
+				..LogConfig::default()
+			});
+			logger.rprintf(LogCode::Info, "café\n".as_bytes());
+			assert_eq!(out.bytes(), expected, "{charset}, eight_bit_output={eight_bit_output}");
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn legacy_output_validation_recovers_after_invalid_bytes() {
+		let (logger, out, _) = client(LogConfig {
+			output_charset: "SHIFT_JIS".to_owned(),
+			..LogConfig::default()
+		});
+		let mut input = vec![b'x'; 1023];
+		input.extend_from_slice(b"\x82\xa0\x82 b\x82\n");
+		logger.rprintf(LogCode::Info, &input);
+		let mut expected = vec![b'x'; 1023];
+		expected.extend_from_slice(b"\x82\xa0\\#202 b\\#202\n");
+		assert_eq!(out.bytes(), expected);
 	}
 
 	#[test]

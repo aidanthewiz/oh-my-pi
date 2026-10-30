@@ -70,6 +70,13 @@ single one can be built and tested in isolation:
 $ cargo nextest run -p pi-builtins --no-default-features --features base,util.sed
 ```
 
+## rsync output
+
+`rsync` validates displayed filename bytes against the shell's locale charset.
+`C` and `POSIX` locales escape non-ASCII bytes on Linux.
+macOS uses UTF-8, matching the reference's libcharset backend.
+`--8-bit-output` bypasses charset validation but retains control-character and literal-escape handling.
+
 ## Licensing
 
 MIT throughout, but the ported utilities carry upstream notices — uutils

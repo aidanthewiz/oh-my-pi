@@ -60,6 +60,54 @@ fn ascii_codeset() -> &'static str {
 	if cfg!(target_os = "linux") { "ANSI_X3.4-1968" } else { "US-ASCII" }
 }
 
+/// rsync's libcharset backend uses UTF-8 on macOS, including the C locale.
+pub(crate) fn output_charset(env: &dyn Fn(&str) -> Option<String>) -> String {
+	if cfg!(target_os = "macos") { "UTF-8".to_owned() } else { locale_charset(env) }
+}
+
+pub(crate) struct OutputValidator {
+	utf8: bool,
+	#[cfg(unix)]
+	converter: Option<sys::Converter>,
+}
+
+impl OutputValidator {
+	pub(crate) fn new(charset: &str) -> Self {
+		let utf8 = charset.eq_ignore_ascii_case("UTF-8") || charset.eq_ignore_ascii_case("UTF8");
+		#[cfg(unix)]
+		let converter = if utf8
+			|| ["US-ASCII", "ASCII", "ANSI_X3.4-1968"].iter().any(|name| charset.eq_ignore_ascii_case(name))
+		{
+			None
+		} else {
+			sys::Converter::open(charset, charset).ok()
+		};
+		Self {
+			utf8,
+			#[cfg(unix)]
+			converter,
+		}
+	}
+
+	pub(crate) fn visit(&self, input: &[u8], mut emit: impl FnMut(&[u8], bool)) {
+		if self.utf8 {
+			for chunk in input.utf8_chunks() {
+				emit(chunk.valid().as_bytes(), true);
+				emit(chunk.invalid(), false);
+			}
+			return;
+		}
+		#[cfg(unix)]
+		if let Some(converter) = &self.converter {
+			converter.validate(input, emit);
+			return;
+		}
+		for chunk in input.chunk_by(|a, b| a.is_ascii() == b.is_ascii()) {
+			emit(chunk, chunk[0].is_ascii());
+		}
+	}
+}
+
 /// A pair of open conversions for one side of a transfer.
 pub(crate) struct Iconv {
 	charset: String,
@@ -220,6 +268,42 @@ mod sys {
 				return Err(io::Error::last_os_error());
 			}
 			Ok(Self { cd: Mutex::new(Handle(cd)) })
+		}
+
+		pub(super) fn validate(&self, input: &[u8], mut emit: impl FnMut(&[u8], bool)) {
+			let guard = lock(&self.cd);
+			let cd = guard.0;
+			// SAFETY: null buffers reset the descriptor while its mutex is held.
+			unsafe {
+				iconv(cd, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+			}
+			let mut in_ptr = input.as_ptr() as *mut c_char;
+			let mut in_left = input.len();
+			let mut output = [0u8; 1024];
+			while in_left > 0 {
+				let mut out_ptr = output.as_mut_ptr().cast();
+				let mut out_left = output.len();
+				// SAFETY: input and output pointers remain within their live byte slices.
+				let rc = unsafe { iconv(cd, &mut in_ptr, &mut in_left, &mut out_ptr, &mut out_left) };
+				let error = (rc == usize::MAX).then(io::Error::last_os_error);
+				emit(&output[..output.len() - out_left], true);
+				if let Some(error) = error {
+					match error.raw_os_error() {
+						Some(libc::E2BIG | libc::EINTR) => {},
+						Some(libc::EILSEQ | libc::EINVAL) if in_left > 0 => {
+							let position = input.len() - in_left;
+							emit(&input[position..position + 1], false);
+							// SAFETY: in_left proves one unread byte remains in input.
+							in_ptr = unsafe { in_ptr.add(1) };
+							in_left -= 1;
+						},
+						_ => {
+							emit(&input[input.len() - in_left..], false);
+							break;
+						},
+					}
+				}
+			}
 		}
 
 		/// Converts all of `input` (state reset first, like ICB_INIT); an invalid or
