@@ -115,9 +115,14 @@ impl<const SMART_WORKTREE: bool, const GUARD: bool> builtins::Command
 	) -> impl Future<Output = Result<ExecutionResult, Error>> + Send {
 		let args = self.args.clone();
 		async move {
-			if GUARD && let Some(refusal) = guard::Review::of(context.shell, &args).refusal().await? {
-				let _ = context.stderr().write_all(refusal.as_bytes());
-				return Ok(ExecutionResult::new(guard::REFUSED_EXIT));
+			if GUARD {
+				match guard::Review::of(context.shell, &args).decide().await? {
+					guard::Decision::Run => {},
+					guard::Decision::Refuse(refusal) => {
+						let _ = context.stderr().write_all(refusal.as_bytes());
+						return Ok(ExecutionResult::new(guard::REFUSED_EXIT));
+					},
+				}
 			}
 			if SMART_WORKTREE
 				&& let Some(request) = AddRequest::parse(&args)

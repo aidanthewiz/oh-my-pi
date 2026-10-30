@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { buildSessionTraceFromSnapshots } from "@oh-my-pi/omp-stats/trace";
+import type { SessionTrace } from "@oh-my-pi/omp-stats/types";
 import type { AgentState } from "@oh-my-pi/pi-agent-core";
 import { APP_NAME, isEnoent } from "@oh-my-pi/pi-utils";
 import { getResolvedThemeColors, getThemeExportColors } from "@oh-my-pi/pi-tui/theme";
@@ -8,14 +10,14 @@ import { SessionManager } from "../../session/session-manager";
 import { collectSubSessions, type SubSession } from "../../session/sub-sessions";
 import type { ExportThemeNames } from "./args";
 import { getTemplate } from "./template-assets";
-import { webExportThemeStyles, webExportThemeVars } from "./web-palette";
+import { exportThemeStyles, webExportThemeStyles, webExportThemeVars } from "./web-palette";
 
 export { type ExportThemeNames, parseExportArgs } from "./args";
 export { getTemplate, resolveBundledHtmlAssetPath } from "./template-assets";
 
 export interface ExportOptions {
 	outputPath?: string;
-	/** `"web"` bundles the omp web themes; `"theme"` bundles TUI themes. */
+	/** `"web"` bundles the web themes; `"theme"` embeds TUI theme overrides. */
 	palette?: "web" | "theme";
 	/** Legacy single TUI theme name. Prefer `themeNames` for dual-theme exports. */
 	themeName?: string;
@@ -131,11 +133,7 @@ export async function generateThemeStyles(
 		generateThemeVars("theme", themeNames?.dark ?? legacyThemeName ?? "dark"),
 		generateThemeVars("theme", themeNames?.light ?? legacyThemeName ?? "light"),
 	]);
-	return [
-		`:root, :root[data-theme="dark"] { color-scheme: dark; ${dark} }`,
-		`:root[data-theme="light"] { color-scheme: light; ${light} }`,
-		`@media (prefers-color-scheme: light) { :root:not([data-theme]) { color-scheme: light; ${light} } }`,
-	].join("\n");
+	return exportThemeStyles(dark, light);
 }
 
 export interface SessionData {
@@ -145,6 +143,8 @@ export interface SessionData {
 	systemPrompt?: string;
 	tools?: { name: string; description: string }[];
 	subSessions?: Record<string, SubSession>;
+	/** Offline trace for the embedded transcripts; absent in older share snapshots. */
+	trace?: SessionTrace;
 }
 
 function sessionHeaderForExport(header: SessionHeader | null): SessionHeader | null {
@@ -167,9 +167,9 @@ export function buildSessionData(sm: SessionManager, state?: AgentState): Sessio
 	};
 }
 
-/** Subagent transcripts next to `sessionFile`, with export-only header fields stripped. */
+/** All trace transcripts next to `sessionFile`, with export-only header fields stripped. */
 async function collectExportSubSessions(sessionFile: string): Promise<Record<string, SubSession>> {
-	const subSessions = await collectSubSessions(sessionFile);
+	const subSessions = await collectSubSessions(sessionFile, { includeAdvisors: true, includeCompressed: true });
 	for (const sub of Object.values(subSessions)) sub.header = sessionHeaderForExport(sub.header);
 	return subSessions;
 }
@@ -181,13 +181,13 @@ async function generateHtml(
 	themeNames?: ExportThemeNames,
 	themeName?: string,
 ): Promise<string> {
-	const themeStyles = await generateThemeStyles(palette, themeNames, themeName);
+	const themeStyles = palette === "theme" ? await generateThemeStyles(palette, themeNames, themeName) : "";
 	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toBase64();
 
 	// Use function replacements so `$'`, `$&`, `$$`, `$n`, etc. in the
 	// substituted CSS/base64 are not interpreted as substitution patterns.
 	return getTemplate()
-		.replace("<theme-vars/>", () => `<style>${themeStyles}</style>`)
+		.replace("<theme-vars/>", () => (themeStyles ? `<style>${themeStyles}</style>` : ""))
 		.replace("{{SESSION_DATA}}", () => sessionDataBase64);
 }
 
@@ -207,6 +207,7 @@ export async function exportSessionToHtml(
 		const subSessions = await collectExportSubSessions(sessionFile);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;
 	}
+	sessionData.trace = buildSessionTraceFromSnapshots(sessionData, sessionData.subSessions);
 
 	const palette = opts.palette ?? (opts.themeName ? "theme" : "web");
 	const html = await generateHtml(sessionData, palette, opts.themeNames, opts.themeName);
@@ -240,6 +241,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		const subSessions = await collectExportSubSessions(inputPath);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;
 	}
+	sessionData.trace = buildSessionTraceFromSnapshots(sessionData, sessionData.subSessions);
 
 	const palette = opts.palette ?? (opts.themeName ? "theme" : "web");
 	const html = await generateHtml(sessionData, palette, opts.themeNames, opts.themeName);

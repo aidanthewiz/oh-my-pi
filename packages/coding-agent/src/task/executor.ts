@@ -8,7 +8,7 @@ import { renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
+import { AgentBusyError, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
@@ -2476,7 +2476,6 @@ async function driveSessionToResult(
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy, restore } = options;
 	const structured = options.structured !== false;
-	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
 	let error: string | undefined;
@@ -3199,7 +3198,13 @@ function wakeSources(records: AgentMessage[], selfId: string): WakeSource[] {
 		// back would ping-pong two idle peers forever. A broadcast leg is not one
 		// either: it asks no one in particular, so relaying every woken peer's
 		// turn back would flood the broadcaster with "not for me" replies.
-		if (details && (Reflect.get(details, "wakeRelay") === true || Reflect.get(details, "broadcast") === true))
+		// A progress note promises a later answer and asks nothing back.
+		if (
+			details &&
+			(Reflect.get(details, "wakeRelay") === true ||
+				Reflect.get(details, "broadcast") === true ||
+				Reflect.get(details, "progress") === true)
+		)
 			continue;
 		const messageId = details ? Reflect.get(details, "id") : undefined;
 		sources.push({ from, messageId: typeof messageId === "string" ? messageId : undefined });

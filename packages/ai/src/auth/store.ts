@@ -214,23 +214,23 @@ export interface CredentialUpstream {
 	 */
 	prepareForRequest(credentialId: number, opts?: { signal?: AbortSignal }): Promise<boolean | undefined>;
 	/**
-	 * Optional store-supplied aggregate usage fetch. When present, `AuthStorage`
-	 * routes `fetchUsageReports()` here instead of fanning out per-credential.
-	 * `RemoteAuthCredentialStore` proxies to the broker (whose datacenter IP
-	 * isn't rate-limited like a heavy residential client).
+	 * Optional store-supplied usage fetch, restricted to one provider when given.
+	 * `AuthStorage` routes reports here instead of fanning out per-credential.
+	 * `RemoteAuthCredentialStore` proxies to the broker's provider-scoped or
+	 * aggregate endpoint.
 	 *
 	 * Precedence: `AuthStorageOptions.fetchUsageReports` > this hook > local fan-out.
 	 *
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
-	fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null>;
+	fetchUsageReports(signal?: AbortSignal, provider?: Provider): Promise<UsageReport[] | null>;
 	/**
 	 * Optional store-supplied per-credential usage report lookup. When present,
 	 * `AuthStorage` consults this before its own per-credential upstream fetch
 	 * (`UsageService.report`). `RemoteAuthCredentialStore` implements this against
-	 * the broker's aggregate `/v1/usage` (one coalesced round-trip shared across
-	 * all callers) so multi-credential ranking on the client never hits the
-	 * upstream provider's rate-limited usage endpoint from the laptop IP.
+	 * the broker's provider-scoped `/v1/usage`, coalesced for that provider,
+	 * so multi-credential ranking on the client never hits the upstream
+	 * provider's rate-limited usage endpoint from the laptop IP.
 	 *
 	 * Returning `null` is authoritative — `AuthStorage` does NOT fall back to
 	 * the local fetch path. The store hook owns the decision, since falling

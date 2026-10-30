@@ -40,35 +40,26 @@ pub fn poll_for_input(file: &OpenFile, timeout: Duration) -> std::io::Result<boo
 		return Ok(true);
 	}
 
-	// Convert timeout to deadline for accurate time tracking across EINTR retries.
-	let deadline = Instant::now() + timeout;
-
-	poll_fd_for_input(fd, deadline)
+	poll_fd_for_input(fd, Instant::now() + timeout)
 }
 
-/// Polls a file descriptor for input readability with a deadline.
-///
-/// Returns `Ok(true)` if data is available, `Ok(false)` if deadline passed.
-///
-/// # Arguments
-///
-/// * `fd` - File descriptor to poll
-/// * `deadline` - Maximum time to wait.
+/// Waits until `fd` has input (data, EOF or an error) or `deadline` passes;
+/// `Ok(false)` once it passed. Checks at least once, so a deadline already
+/// reached (`-t 0`) reports input that is there now.
 fn poll_fd_for_input(fd: BorrowedFd<'_>, deadline: Instant) -> std::io::Result<bool> {
 	let mut first_iteration = true;
-
 	loop {
+		// Recomputed after each wait, which a signal or a capped wait can end early.
 		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() && !first_iteration {
 			return Ok(false);
 		}
 		first_iteration = false;
-
 		match pi_vfs::readable_within(fd, remaining) {
 			Ok(true) => return Ok(true),
 			Ok(false) => {},
-			Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
-			Err(error) => return Err(error),
+			Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+			Err(e) => return Err(e),
 		}
 	}
 }

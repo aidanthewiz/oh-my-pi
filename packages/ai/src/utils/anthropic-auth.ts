@@ -8,7 +8,11 @@
  * before shaping headers and URL with {@link buildAnthropicAuthConfig}.
  */
 import { $env } from "@oh-my-pi/pi-utils";
-import { buildAnthropicHeaders, mergeHeaders, resolveAnthropicCustomHeadersForBaseUrl } from "../providers/anthropic";
+import {
+	buildAnthropicHeaders,
+	mergeHeaders,
+	resolveAnthropicCustomHeadersForBaseUrl,
+} from "../providers/anthropic-headers";
 import { normalizeAnthropicBaseUrl } from "../providers/anthropic-state";
 import { isFoundryEnabled } from "./foundry";
 

@@ -129,7 +129,7 @@ describe("InteractiveMode idle recap", () => {
 		cleanups.push(async () => {
 			mode.stop();
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		});
 		// With `holdStartup`, startup parks at the draft restore until `releaseStartup()` answers there is no saved draft.
 		const draftRestore = Promise.withResolvers<string | null>();

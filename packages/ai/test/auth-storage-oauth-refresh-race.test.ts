@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import {
 	type AuthCredentialStore,
 	AuthStorage,
@@ -1215,13 +1216,9 @@ describe("AuthStorage OAuth refresh race", () => {
 		const result = await authStorage.oauth.refreshStored("unit-oauth-lease-update", {
 			credentialFromRow: row => row,
 			forceRefresh: true,
-			// The clock jumps past the save window; keep the caller waiting for the save.
 			refreshTimeoutMs: 600_000,
 			refresh: async credential => {
-				// Keep the credential row bytes unchanged while expiring owner A's
-				// lease. A non-lease-fenced final CAS would still persist this token.
 				setSystemTime(new Date(now + 16_000));
-				// The peer's lease outlives the whole save window.
 				expect(stealLease(credentialId, "peer-owner", now + 600_000)).toBe(true);
 				return {
 					...credential,
@@ -1497,6 +1494,56 @@ describe("AuthStorage OAuth refresh race", () => {
 			type: "oauth",
 			refresh: "new-refresh",
 		});
+	});
+
+	test("a key request cancelled while taking the refresh lease settles without an unhandled rejection", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const provider = "unit-oauth-abort-during-lease";
+		const exchanges = registerSingleUseProvider(provider);
+		await authStorage.credentials.set(provider, [
+			{ type: "oauth", access: "access-0", refresh: "refresh-0", expires: 0 },
+		]);
+		const controller = new AbortController();
+		const acquire = store.tryAcquireCredentialRefreshLease?.bind(store);
+		if (!acquire) throw new Error("test store does not support refresh leases");
+		// The caller cancels while the refresh it started is still inside its synchronous lease acquisition.
+		vi.spyOn(store, "tryAcquireCredentialRefreshLease").mockImplementation((id, owner, expiresAt) => {
+			controller.abort();
+			return acquire(id, owner, expiresAt);
+		});
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(
+				authStorage.keys.get(provider, "cancelled-session", { signal: controller.signal }),
+			).resolves.toBeUndefined();
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+			expect(exchanges.exchanges()).toBe(0);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	test("a caller cancelled before refreshing does not hand its cancellation to a joining caller", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const provider = "unit-oauth-cancelled-owner";
+		const exchanges = registerSingleUseProvider(provider);
+		await authStorage.credentials.set(provider, [
+			{ type: "oauth", access: "access-0", refresh: "refresh-0", expires: 0 },
+		]);
+		const credentialId = store.listAuthCredentials(provider)[0]?.id;
+		if (credentialId === undefined) throw new Error("missing stored credential");
+		const cancelled = authStorage.oauth.refresh(credentialId, AbortSignal.abort());
+		const live = authStorage.oauth.refresh(credentialId);
+		await expect(cancelled).rejects.toThrow("credential refresh aborted");
+		expect((await live).credential).toMatchObject({ type: "oauth", access: "access-1" });
+		expect(exchanges.exchanges()).toBe(1);
 	});
 
 	/** Provider whose refresh tokens are single-use, like Anthropic's; counts exchanges. */
@@ -2388,15 +2435,12 @@ describe("AuthStorage OAuth refresh race", () => {
 		const peer = new AuthStorage(peerStore);
 		const laterStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		const later = new AuthStorage(laterStore);
-		// The clock jumps past the hand-back window; keep the caller waiting for the exchange.
 		const options = { ...refreshSpentToken(credentialId, () => {}), refreshTimeoutMs: 600_000 };
 		try {
-			// A refresher spent refresh-0 and is still saving refresh-1; its lease just lapsed.
 			expect(store.tryAcquireCredentialRefreshLease?.(credentialId, "stalled-peer", Date.now() - 1_000)).toBe(true);
 			let busyHandBacks = 0;
 			vi.spyOn(peerStore, "handBackCredentialRefreshLease").mockImplementation(() => {
 				busyHandBacks += 1;
-				// The store stays busy past the whole hand-back window.
 				setSystemTime(new Date(Date.now() + 61_000));
 				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
 			});
@@ -2406,12 +2450,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			);
 			expect(takeover).toContain("stalled refresher");
 			expect(busyHandBacks).toBeGreaterThan(0);
-			// The taker never released its lease, so the row still names a recent holder.
 			const holder = store.getCredentialRefreshLeaseHolder?.(credentialId);
 			expect(holder).toBeDefined();
 			expect(holder?.owner).not.toBe("stalled-peer");
 
-			// Another process has the same spent token rejected: the login stays.
 			const next = await later.oauth.refreshStored(provider, options).then(
 				() => "resolved",
 				(error: unknown) => String(error),
@@ -2419,8 +2461,8 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(next).toContain("stalled refresher");
 			expect(store.listAuthCredentials(provider)[0]?.credential).toMatchObject({ refresh: "refresh-0" });
 		} finally {
-			peer.close();
-			later.close();
+			await peer.close();
+			await later.close();
 		}
 	});
 
@@ -2466,7 +2508,6 @@ describe("AuthStorage OAuth refresh race", () => {
 			const acquire = peerStore.tryAcquireCredentialRefreshLease.bind(peerStore);
 			vi.spyOn(peerStore, "tryAcquireCredentialRefreshLease").mockImplementation((...args) => {
 				const acquired = acquire(...args);
-				// A write lock held the acquire past the caller's 10 s budget.
 				setSystemTime(new Date(Date.now() + 11_000));
 				return acquired;
 			});
@@ -2598,6 +2639,11 @@ describe("AuthStorage OAuth refresh race", () => {
 			vi.spyOn(Bun, "sleep").mockImplementation(async (ms: number | Date) => {
 				await peerAcquired.promise;
 				await sleep(typeof ms === "number" ? Math.min(ms, 10) : ms);
+			});
+			const wait = scheduler.wait.bind(scheduler);
+			vi.spyOn(scheduler, "wait").mockImplementation(async (ms, options) => {
+				await peerAcquired.promise;
+				await wait(Math.min(ms, 10), options);
 			});
 			const peerAcquire = peerStore.tryAcquireCredentialRefreshLease.bind(peerStore);
 			vi.spyOn(peerStore, "tryAcquireCredentialRefreshLease").mockImplementation((...args) => {
@@ -2779,7 +2825,6 @@ describe("AuthStorage OAuth refresh race", () => {
 		);
 		expect(first).toContain("stalled refresher");
 
-		// The refresher's exchange backstop and save window have both run out.
 		setSystemTime(new Date(Date.now() + 125_000));
 		expect(await authStorage.oauth.refreshStored(provider, options)).toMatchObject({ removed: true });
 		expect(invalidGrants).toBe(2);

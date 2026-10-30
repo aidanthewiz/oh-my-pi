@@ -119,7 +119,7 @@ impl HostCancel {
 
 /// How long one readiness wait lasts before cancellation is checked again.
 #[cfg(unix)]
-pub const POLL_SLICE_MS: i32 = 100;
+pub const POLL_SLICE: Duration = Duration::from_millis(100);
 
 /// Whether one read of a host file with `meta` can block until data arrives,
 /// so a cancellable read must first wait for readiness.
@@ -162,18 +162,17 @@ static NULL_DEVICE_RDEV: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock:
 });
 
 /// Waits until a read of `fd` would not block, checking `is_cancelled` every
-/// [`POLL_SLICE_MS`]; fails with [`crate::cancelled`] once it is.
+/// [`POLL_SLICE`]; fails with [`crate::cancelled`] once it is.
 #[cfg(unix)]
 pub fn wait_readable(
 	fd: std::os::fd::BorrowedFd<'_>,
 	is_cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
-	let slice = Duration::from_millis(u64::from(POLL_SLICE_MS.unsigned_abs()));
 	loop {
 		if is_cancelled() {
 			return Err(crate::cancelled());
 		}
-		match readable_within(fd, slice) {
+		match readable_within(fd, POLL_SLICE) {
 			Ok(true) => return Ok(()),
 			Ok(false) => {},
 			Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
@@ -186,13 +185,9 @@ pub fn wait_readable(
 /// A zero timeout checks without waiting; a signal returns `Interrupted`.
 #[cfg(unix)]
 pub fn readable_within(fd: std::os::fd::BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
-	#[cfg(target_os = "macos")]
-	{
-		select_readable(fd, timeout)
-	}
-	#[cfg(not(target_os = "macos"))]
-	{
-		poll_readable(fd, timeout)
+	cfg_select! {
+		target_os = "macos" => select_readable(fd, timeout),
+		_ => poll_readable(fd, timeout),
 	}
 }
 

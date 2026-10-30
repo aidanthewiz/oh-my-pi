@@ -194,7 +194,7 @@ async function executeSearch(
 	const { authStorage, sessionId, signal } = options;
 	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings });
 	const pool = roleCandidatePool("web", settings, modelRegistry);
-	const candidates = params.model
+	const candidates: RoleChainCandidate[] = params.model
 		? (() => {
 				const resolved = resolveModelRoleValue(params.model, pool, { settings });
 				return resolved.model
@@ -202,6 +202,7 @@ async function executeSearch(
 					: [];
 			})()
 		: resolveRoleChain("web", settings, pool);
+	const replacedSelector = candidates.find(candidate => candidate.replaces)?.replaces;
 	const parsedQuery = parseSearchQuery(params.query);
 	const sessionModel =
 		options.sessionModel && isModelEnabledBySettings(options.sessionModel, settings, modelRegistry)
@@ -328,7 +329,13 @@ async function executeSearch(
 				throw new SearchProviderError(provider.id, `${provider.label} returned no renderable search content.`, 204);
 			}
 
-			const text = formatForLLM(finalResponse, [...fallbackNotes(failures, provider), ...constraintNotes]);
+			const notes = [...fallbackNotes(failures, provider), ...constraintNotes];
+			if (replacedSelector) {
+				notes.unshift(
+					`configured model "${replacedSelector}" was not found; answered by ${provider.label} (${model.provider}/${model.id})`,
+				);
+			}
+			const text = formatForLLM(finalResponse, notes);
 
 			return {
 				content: [{ type: "text" as const, text }],

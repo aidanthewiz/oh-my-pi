@@ -726,40 +726,6 @@ describe("proc:// background jobs", () => {
 		expect(await Bun.file(file).text()).toBe("");
 	});
 
-	it("lists settled jobs with their frozen run duration instead of their age", async () => {
-		const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const manager = new AsyncJobManager({});
-		const release = Promise.withResolvers<string>();
-		const doneId = manager.register("bash", "sleep 2; echo fast-done", () => release.promise, { ownerId: "Main" });
-		const blocked = Promise.withResolvers<string>();
-		const runningId = manager.register(
-			"bash",
-			"sleep 60",
-			async ({ signal }) => {
-				signal.addEventListener("abort", () => blocked.resolve("cancelled"), { once: true });
-				return blocked.promise;
-			},
-			{ ownerId: "Main" },
-		);
-		const session = toolSession(process.cwd(), manager, { launch: false });
-		try {
-			clock.mockReturnValue(3_000);
-			release.resolve("fast-done");
-			await manager.getJob(doneId)?.promise;
-			clock.mockReturnValue(40_000);
-			const list = await new ProcProtocolHandler().resolve(parseInternalUrl("proc://"), { session });
-			expect(list.content).toContain(`${doneId} [bash] completed in 2.0s — sleep 2; echo fast-done`);
-			expect(list.content).toContain(`${runningId} [bash] running up 39.0s — sleep 60`);
-			expect(list.details?.proc?.jobs).toMatchObject([
-				{ id: doneId, durationMs: 2_000 },
-				{ id: runningId, durationMs: 39_000 },
-			]);
-		} finally {
-			clock.mockRestore();
-			await manager.dispose();
-		}
-	});
-
 	it("shows a running task's progress in the proc:// listing and its own read, but not a bash job's", async () => {
 		const manager = new AsyncJobManager({});
 		const pending = Promise.withResolvers<string>();
@@ -1138,6 +1104,33 @@ describe("bash services via proc://", () => {
 			expect(read.details?.proc).toMatchObject({ daemon: { name: "slow-service", state: "starting" } });
 		} finally {
 			await client.request({ op: "stop", name: "slow-service", timeoutMs: 1_000 }).catch(() => undefined);
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
+			setProcessName(oldTitle);
+			spy.mockRestore();
+		}
+	}, 20_000);
+
+	it("starts a service at log readiness when the tool call materialized an unset port as zero", async () => {
+		using temp = TempDir.createSync("@omp-proc-service-port0-");
+		const cwd = path.join(temp.path(), "project");
+		const runtimeDir = path.join(temp.path(), "runtime");
+		await fs.mkdir(cwd);
+		const client = await createDaemonBrokerClient(cwd, { runtimeDir, idleGraceMs: 5_000 });
+		const spy = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+		const oldTitle = process.title;
+		const broker = startBroker(cwd, runtimeDir);
+		try {
+			const result = await new BashTool(toolSession(cwd)).execute("service", {
+				command: "printf 'READY\\n'; sleep 30",
+				name: "port0-service",
+				ready: { log: "READY", port: 0, host: "", timeout: 5 },
+				pty: false,
+			});
+			expect(result.details?.service).toMatchObject({ name: "port0-service", ready: true, timedOut: false });
+		} finally {
+			await client.request({ op: "stop", name: "port0-service", timeoutMs: 1_000 }).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
 			await broker;

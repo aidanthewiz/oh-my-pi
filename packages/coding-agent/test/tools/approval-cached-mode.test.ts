@@ -6,6 +6,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { registerArtifactsDir } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
@@ -24,11 +25,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import {
 	approvalGrantKey,
+	approvalDirectoryKey,
 	clearApprovalGrants,
 	forgetSessionApprovals,
 	getApprovalGrants,
 } from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
-import { approvalTargetKey } from "@oh-my-pi/pi-coding-agent/tools/approval-targets";
+import { approvalTargetKey, approvalTreeSearchKey } from "@oh-my-pi/pi-coding-agent/tools/approval-targets";
 import { getAgentDir, isRecord, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 let root: TempDir;
@@ -111,6 +113,8 @@ function harness(approve: (prompt: ExtensionApprovalPrompt) => Promise<Extension
 			input: async () => undefined,
 			notify: () => {},
 			onTerminalInput: () => () => {},
+			rerenderMessage: () => {},
+			getLinkClicksAvailable: () => false,
 			setStatus: () => {},
 			setWorkingMessage: () => {},
 			setWidget: () => {},
@@ -181,6 +185,47 @@ describe("captured approval grants", () => {
 		const other = await captureApprovalTargets(write, otherArgs, root.path());
 		recordApprovalGrant(write, otherArgs, grants, "write", { grant: "target", always: false }, other);
 		expect(resolveApproval(read, otherArgs, "always-ask-cached", {}, grants, undefined, other).policy).toBe("allow");
+	});
+
+	it.each([
+		[
+			"a directory and a file outside it",
+			(dir: string) => [approvalDirectoryKey(dir), approvalTargetKey(root.path(), "outside.txt")!],
+		],
+		[
+			"a file and a recursive search",
+			(dir: string) => [approvalTargetKey(dir, "a.txt")!, approvalTreeSearchKey(approvalDirectoryKey(dir))],
+		],
+		["a file and an internal URL", (dir: string) => [approvalTargetKey(dir, "a.txt")!, "artifact://99"]],
+	] as const)("refuses a forged folder grant for %s", async (_label, targets) => {
+		const dir = root.join("dir");
+		fs.mkdirSync(dir);
+		fs.writeFileSync(path.join(dir, "a.txt"), "A");
+		fs.writeFileSync(root.join("outside.txt"), "OUTSIDE");
+		fs.writeFileSync(root.join("99.mcp.log"), "ARTIFACT");
+		const unregister = registerArtifactsDir(root.path());
+		try {
+			const tool = { ...fileTool(), approvalCacheTargets: () => targets(dir) };
+			const captured = await captureApprovalTargets(tool, {}, root.path());
+			expect(captured.failed).toBe(false);
+			let scopes: string[] = [];
+			const answer = await requestApproval(
+				{
+					select: async () => undefined,
+					approve: async prompt => {
+						scopes = prompt.grants?.map(grant => grant.scope) ?? [];
+						return { grant: "folder", always: false };
+					},
+				},
+				tool,
+				{},
+				{ grants: true, targets: captured },
+			);
+			expect(scopes).toEqual(["target"]);
+			expect(answer).toBe("deny");
+		} finally {
+			unregister();
+		}
 	});
 
 	it("binds persistent grants to account/trust and resolved file identity", async () => {

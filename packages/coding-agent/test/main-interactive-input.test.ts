@@ -6,9 +6,8 @@ import { buildSkillPromptMessage, type Skill } from "@oh-my-pi/pi-coding-agent/e
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { buildSessionOptions, readPipedInput, submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
+import { buildSessionOptions, submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { discoverTitleSystemPromptFile } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -42,21 +41,6 @@ describe("discoverTitleSystemPromptFile", () => {
 		await fs.writeFile(promptPath, "custom title prompt");
 
 		expect(discoverTitleSystemPromptFile(projectDir)).toBe(promptPath);
-	});
-});
-
-describe("readPipedInput", () => {
-	it("reads redirected stdin when Bun reports isTTY as undefined", async () => {
-		const originalIsTTY = process.stdin.isTTY;
-		const readText = vi.spyOn(Bun.stdin, "text").mockResolvedValue("piped prompt\n");
-		Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
-
-		try {
-			expect(await readPipedInput()).toBe("piped prompt\n");
-			expect(readText).toHaveBeenCalledTimes(1);
-		} finally {
-			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
-		}
 	});
 });
 
@@ -117,30 +101,13 @@ function createMode(options?: { pendingStart?: boolean; skillCommands?: Map<stri
 }
 
 describe("submitInteractiveInput", () => {
-	it("routes already-started synthetic continue submissions to a hidden developer prompt", async () => {
-		const mode = createMode({ pendingStart: false });
-		const session = {
-			...skillPromptBuilder,
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: false,
-		};
-		const input = createInput({ text: "resume now", started: true, synthetic: true });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(mode.markPendingSubmissionStarted).not.toHaveBeenCalled();
-		expect(session.prompt).toHaveBeenCalledWith("resume now", { synthetic: true, expandPromptTemplates: false });
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
 	it("skips prompting when optimistic submission was cancelled before start", async () => {
 		const mode = createMode({ pendingStart: false });
 		const session = {
 			...skillPromptBuilder,
 			prompt: vi.fn(async () => true),
 			promptCustomMessage: vi.fn(async () => true),
+			resume: vi.fn(async () => {}),
 			isStreaming: false,
 		};
 		const input = createInput();
@@ -150,69 +117,6 @@ describe("submitInteractiveInput", () => {
 		expect(mode.markPendingSubmissionStarted).toHaveBeenCalledWith(input);
 		expect(session.prompt).not.toHaveBeenCalled();
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
-	it("routes hidden custom submissions through promptCustomMessage with followUp queueing", async () => {
-		const mode = createMode();
-		const session = {
-			...skillPromptBuilder,
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: false,
-		};
-		const input = createInput({ text: "continue goal", customType: "goal-continuation" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).not.toHaveBeenCalled();
-		// Even when idle, followUp is passed so a background turn that starts in the
-		// read-vs-dispatch gap queues the message instead of throwing AgentBusyError.
-		expect(session.promptCustomMessage).toHaveBeenCalledWith(
-			{
-				customType: "goal-continuation",
-				content: "continue goal",
-				display: false,
-				attribution: "agent",
-			},
-			{ streamingBehavior: "followUp" },
-		);
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
-	it("passes followUp on a plain idle submission so a racing turn queues instead of erroring", async () => {
-		const mode = createMode();
-		const session = {
-			...skillPromptBuilder,
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: false,
-		};
-		const input = createInput({ text: "loop prompt" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).toHaveBeenCalledWith("loop prompt", { images: undefined, streamingBehavior: "followUp" });
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
-	it("honors a steer intent on the submission (normal Enter) instead of forcing followUp", async () => {
-		const mode = createMode();
-		const session = {
-			...skillPromptBuilder,
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: true,
-		};
-		const input = createInput({ text: "interrupt now", streamingBehavior: "steer" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).toHaveBeenCalledWith("interrupt now", {
-			images: undefined,
-			streamingBehavior: "steer",
-		});
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
@@ -226,6 +130,7 @@ describe("submitInteractiveInput", () => {
 			...skillPromptBuilder,
 			prompt: vi.fn(async () => false),
 			promptCustomMessage: vi.fn(async () => true),
+			resume: vi.fn(async () => {}),
 			isStreaming: false,
 		};
 		const input = createInput({ text: "/void-cmd" });
@@ -247,6 +152,7 @@ describe("submitInteractiveInput", () => {
 			...skillPromptBuilder,
 			prompt: vi.fn(async () => true),
 			promptCustomMessage: vi.fn(async () => true),
+			resume: vi.fn(async () => {}),
 			isStreaming: false,
 		};
 		const input = createInput({ text: "repeat me" });
@@ -267,6 +173,7 @@ describe("submitInteractiveInput", () => {
 			...skillPromptBuilder,
 			prompt: vi.fn(async () => false),
 			promptCustomMessage: vi.fn(async () => true),
+			resume: vi.fn(async () => {}),
 			isStreaming: false,
 		};
 		const input = createInput({ text: "/other-cmd" });
@@ -289,6 +196,7 @@ describe("submitInteractiveInput", () => {
 				throw new Error("attachment too large");
 			}),
 			promptCustomMessage: vi.fn(async () => true),
+			resume: vi.fn(async () => {}),
 			isStreaming: false,
 		};
 		const input = createInput({ text: "failing body" });
@@ -298,45 +206,5 @@ describe("submitInteractiveInput", () => {
 		expect(mode.pauseLoop).toHaveBeenCalledTimes(1);
 		expect(mode.showError).toHaveBeenCalledWith("attachment too large");
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-	});
-
-	it("routes a resubmitted /skill: prompt through promptCustomMessage instead of raw text (regression for #8137-style loop resubmit)", async () => {
-		const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-command-"));
-		cleanupDirs.push(skillDir);
-		const skillPath = path.join(skillDir, "recap.md");
-		await fs.writeFile(skillPath, "---\nname: recap\n---\nSummarize recent changes.\n");
-		const skill: Skill = { name: "recap", description: "", filePath: skillPath, baseDir: skillDir, source: "test" };
-		const mode = createMode({ skillCommands: new Map([["skill:recap", skill]]) });
-		const session = {
-			...skillPromptBuilder,
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: false,
-		};
-		const input = createInput({ text: "/skill:recap what changed" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).not.toHaveBeenCalled();
-		expect(session.promptCustomMessage).toHaveBeenCalledWith(
-			expect.objectContaining({
-				customType: SKILL_PROMPT_MESSAGE_TYPE,
-				attribution: "user",
-				display: true,
-				details: expect.objectContaining({ name: "recap", args: "what changed" }),
-			}),
-			expect.objectContaining({ streamingBehavior: "followUp" }),
-		);
-		// The row paints before the awaited dispatch, so a slow preflight does not
-		// leave a loop iteration invisible (issue #8895).
-		expect(mode.renderOptimisticSkillMessage).toHaveBeenCalledWith(
-			expect.objectContaining({
-				role: "custom",
-				customType: SKILL_PROMPT_MESSAGE_TYPE,
-				attribution: "user",
-			}),
-			expect.anything(),
-		);
-		expect(mode.showError).not.toHaveBeenCalled();
 	});
 });

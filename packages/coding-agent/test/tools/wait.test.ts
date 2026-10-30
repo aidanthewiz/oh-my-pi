@@ -582,8 +582,14 @@ describe("wait", () => {
 			const registry = AgentRegistry.global();
 			const main = liveSession();
 			const child = liveSession();
-			registry.register({ id: "Main", displayName: "Main", kind: "main", session: main.session, status: "running" });
-			registry.register({
+			const mainRef = registry.register({
+				id: "Main",
+				displayName: "Main",
+				kind: "main",
+				session: main.session,
+				status: "running",
+			});
+			const childRef = registry.register({
 				id: "Child",
 				displayName: "Child",
 				kind: "sub",
@@ -591,7 +597,7 @@ describe("wait", () => {
 				session: child.session,
 				status: "running",
 			});
-			return { registry, main, child };
+			return { registry, main, child, mainRef, childRef };
 		}
 
 		function registerChildJob(manager: AsyncJobManager) {
@@ -699,6 +705,42 @@ describe("wait", () => {
 			expect(settled).toBe(false);
 			await IrcBus.global().send({ from: "Main", to: "Child", body: "heliotrope" });
 			expect((await waiting).details?.waited).toMatchObject({ from: "Main", body: "heliotrope" });
+		});
+
+		test("a progress note leaves the question owed, even once the agent asked goes idle", async () => {
+			const { main } = registerParentAndChild();
+			await ask();
+			await IrcBus.global().send({ from: "Main", to: "Child", body: "on it", progress: true });
+			main.endTurn();
+			const waiting = childWait();
+			let settled = false;
+			void waiting.then(() => {
+				settled = true;
+			});
+			const checked = Promise.withResolvers<void>();
+			setImmediate(checked.resolve);
+			await checked.promise;
+			expect(settled).toBe(false);
+			await IrcBus.global().send({ from: "Main", to: "Child", body: "heliotrope" });
+			expect((await waiting).details?.waited).toMatchObject({ from: "Main", body: "heliotrope" });
+			expect(await idleText(childWait())).toContain("no agent you messaged this run owes a reply");
+		});
+
+		test("after a progress note, settling the job of the turn that sent it does not answer", async () => {
+			const { mainRef, childRef } = registerParentAndChild();
+			const publishReply = IrcBus.global().captureReply(childRef, mainRef);
+			await IrcBus.global().send({ from: "Main", to: "Child", body: "which codeword?" });
+			await IrcBus.global().send({ from: "Child", to: "Main", body: "checking", progress: true });
+			publishReply();
+			expect(IrcBus.global().unansweredSends("Main", 0)).toEqual([
+				{ to: "Child", sentAt: expect.any(Number), promised: true },
+			]);
+		});
+
+		test("a progress note asks nothing back", async () => {
+			registerParentAndChild();
+			await IrcBus.global().send({ from: "Child", to: "Main", body: "halfway", progress: true });
+			expect(await idleText(childWait())).toContain("no agent you messaged this run owes a reply");
 		});
 
 		test("returns at once when the agent asked runs the caller inline and cannot see the question", async () => {

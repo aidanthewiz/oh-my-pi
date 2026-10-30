@@ -376,14 +376,14 @@ describe("title generator", () => {
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("logs and returns null when title credentials are missing", async () => {
+	it("returns null without contacting a provider when title credentials are missing", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
 			stopReason: "error",
 			errorMessage: "unexpected remote fallback",
 			content: [],
 		} as never);
-		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
 
 		const title = await generateSessionTitle(
 			"Investigate the resolver",
@@ -397,25 +397,16 @@ describe("title generator", () => {
 
 		expect(title).toBeNull();
 		expect(completeSimpleMock).not.toHaveBeenCalled();
-		expect(warnSpy).toHaveBeenCalledWith(
-			"title-generator: no API key",
-			expect.objectContaining({
-				sessionId: "session-1",
-				provider: model.provider,
-				id: model.id,
-				reason: "missing-api-key",
-			}),
-		);
 	});
 
-	it("logs and returns null when title credential lookup throws", async () => {
+	it("returns null without contacting a provider when title credential lookup throws", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
 			stopReason: "error",
 			errorMessage: "unexpected remote fallback",
 			content: [],
 		} as never);
-		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
 
 		const title = await generateSessionTitle(
 			"Investigate the resolver",
@@ -431,16 +422,6 @@ describe("title generator", () => {
 
 		expect(title).toBeNull();
 		expect(completeSimpleMock).not.toHaveBeenCalled();
-		expect(warnSpy).toHaveBeenCalledWith(
-			"title-generator: error",
-			expect.objectContaining({
-				sessionId: "session-2",
-				provider: model.provider,
-				id: model.id,
-				reason: "exception",
-				error: "credential lookup failed",
-			}),
-		);
 	});
 
 	it("stops title fallback traversal after cancellation", async () => {

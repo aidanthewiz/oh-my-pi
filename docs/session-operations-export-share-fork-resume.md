@@ -58,14 +58,18 @@ Behavior details:
 
 - `--copy`, `clipboard`, and `copy` arguments are explicitly rejected with a warning to use `/dump`.
 - Export embeds session header/entries/leaf plus current `systemPrompt` and tool descriptions from agent state. `previousSessionFiles` is omitted from exported headers.
-- Subagent transcripts stored next to the session file (`<session>/<AgentId>.jsonl`, recursively for nested spawns) are embedded as `subSessions` (`collectSubSessions` in `src/session/sub-sessions.ts`; disable with `includeSubSessions: false` in `ExportOptions`). Discovery skips advisor transcripts (`__advisor*.jsonl`), descends only into real child directories, and flags tombstoned (killed) agents as `aborted`. In the page, agent ids in task tool cards open a breadcrumbed sub-session overlay.
-- Tool calls render through the `<omp-tool-view>` web component — the React per-tool renderers shared with collab-web (`packages/collab-web/src/tool-render/`), prebuilt into `src/export/html/tool-views.generated.js` by `bun run gen:tool-views`.
+- The viewer uses the `/stats` design, with Auto/Light/Dark themes; Light uses soft-gray surfaces and high-contrast secondary text. The sidebar lists the main session, nested subagents, and advisors; selecting a session or a task-card agent opens its transcript and conversation tree. Session and message links preserve the selected transcript.
+- Child transcripts stored next to the session file (`<session>/<AgentId>.jsonl`, recursively for nested spawns) are embedded as `subSessions`, including advisor and gzip-compressed transcripts. Discovery descends only into real child directories and flags tombstoned agents as `aborted`. `includeSubSessions: false` in `ExportOptions` excludes child transcripts and their trace tracks.
+- The bottom **Timeline** drawer and **Trace** view reuse `/trace`'s span assembly and viewer: duration/turn/call axes, idle compression, search, zoom, nested tracks, entry details, and tool aggregates. **Jump to transcript** opens the corresponding session and message. All transcript and trace data remain embedded; no stats server is needed.
+- Tool calls use `<omp-tool-view>` (shared with collab-web); traces use `<omp-session-trace>` (shared with stats). `bun gen:export-viewer` uses one local producer to bundle the shell, styles, default themes, Markdown, highlighting, and tool/trace renderers. Source, bundled, and compiled exports inline that generated viewer. Export does not fetch executable viewer dependencies from upstream services or upload viewer code or session data.
+- `--themes` embeds the selected TUI theme overrides in addition to the session data.
 - No session entries are appended during export.
 - The default filename is `omp-session-<session-file-stem>.html` in the current directory. HTML export is not secret-redacted or encrypted; it can contain raw context, image data, and extension payloads.
 
 Caveat:
 
 - Parsing is whitespace-based, so quoted paths with spaces are not preserved. Use a path without spaces.
+- A source checkout needs `bun gen:export-viewer` before exporting. A missing generated viewer reports the command to run. Distribution builds must include the matching locally generated viewer asset.
 
 ### `--export <inputSessionFile> [outputPath]` (CLI)
 
@@ -404,11 +408,11 @@ The original bare `/fork` uses `AgentSession.fork()`:
 - Requires persistent mode and an assigned session-file path; the source need not already be materialized on disk.
 - Creates new session id and new JSONL file path.
 - Rewrites header with:
-  - new `id`
-  - new timestamp
-  - `cwd` unchanged
-  - `parentSession` set to previous session id
-  - `providerPromptCacheKey` set to the previous header's inherited key, or the previous session id when none was pinned
+   - new `id`
+   - new timestamp
+   - `cwd` unchanged
+   - `parentSession` set to previous session id
+   - `providerPromptCacheKey` set to the previous header's inherited key, or the previous session id when none was pinned
 - Keeps all non-header entries unchanged in the new file.
 
 ### Non-persistent behavior
@@ -508,8 +512,8 @@ Id/filename-prefix discovery follows the session's continuations (`findSessionCo
 Id/filename-prefix match behavior (local or global):
 
 - If the matched session's recorded directory no longer exists, CLI asks `Session's directory no longer exists (...). Move (re-root) it into the current directory? [Y/n]`.
-  - On yes (default), `SessionManager.open()` is anchored at the missing source cwd with `initialCwd`, then `manager.moveTo(cwd, sessionDir)` re-roots the existing session without duplicating it.
-  - On no, startup is cancelled. In non-TTY mode, startup fails with an error directing the user to run interactively.
+   - On yes (default), `SessionManager.open()` is anchored at the missing source cwd with `initialCwd`, then `manager.moveTo(cwd, sessionDir)` re-roots the existing session without duplicating it.
+   - On no, startup is cancelled. In non-TTY mode, startup fails with an error directing the user to run interactively.
 - If the recorded directory still exists, the matched session is opened directly. Startup later changes the process/project scope to the resumed session's cwd and reloads cwd-scoped settings and plugin caches. It is not implicitly forked.
 
 Path-valued resume opens directly rather than using the missing-directory move
@@ -622,10 +626,10 @@ The spawn fallback receives the same scope through its explicit environment.
 7. Replace agent messages, reset advisor state, and synchronize todos. Close cached provider sessions for a different file, or for a same-file reload whose replay messages changed.
 8. Apply the resolved (or explicitly requested) model. If the loaded branch ended with an interrupted turn, append its synthetic abort message and rebuild context.
 9. Restore configured/effective thinking and per-family service tiers, falling back to current settings when the target branch has no corresponding entries.
-10. For a different transcript, reset memory context; for any conversation rewrite, clear session-scoped tool state.
-11. Reconnect agent events, run the optional session-switch reconciler (interactive mode uses it to re-enter persisted modes such as plan), and best-effort refresh the workspace-root system-prompt block. Reconciler/prompt-refresh errors are logged rather than rolling back the committed switch.
-12. Restore target advisor cost state, finish the bash transition, notify session-change callbacks when the session id changed, and return `true`.
-`switchSession()` returns `false` when a before-switch hook cancels or cwd policy rejects the transition. A cross-project switch without a cwd-change callback is rejected rather than silently adopting the target cwd; callback rejection is also cancellation. The interactive selector checks this result and leaves the existing session/UI unchanged.
+10.   For a different transcript, reset memory context; for any conversation rewrite, clear session-scoped tool state.
+11.   Reconnect agent events, run the optional session-switch reconciler (interactive mode uses it to re-enter persisted modes such as plan), and best-effort refresh the workspace-root system-prompt block. Reconciler/prompt-refresh errors are logged rather than rolling back the committed switch.
+12.   Restore target advisor cost state, finish the bash transition, notify session-change callbacks when the session id changed, and return `true`.
+      `switchSession()` returns `false` when a before-switch hook cancels or cwd policy rejects the transition. A cross-project switch without a cwd-change callback is rejected rather than silently adopting the target cwd; callback rejection is also cancellation. The interactive selector checks this result and leaves the existing session/UI unchanged.
 
 If a throwing step in the guarded transition fails, `switchSession()` restores the captured session, agent queues/messages, tools/prompts, model/thinking/service-tier, provider/cache, memory, and checkpoint state; it reconnects the prior agent subscription and re-runs mode reconciliation before rethrowing.
 
@@ -642,11 +646,11 @@ Model restoration fails closed, like startup resume: a switch never silently mov
 For `newSession`, `fork`, and `switchSession`:
 
 - Before event: `session_before_switch`
-  - reasons: `new`, `fork`, `resume`
-  - cancellable by returning `{ cancel: true }`
+   - reasons: `new`, `fork`, `resume`
+   - cancellable by returning `{ cancel: true }`
 - After event: `session_switch`
-  - same reason set
-  - includes `previousSessionFile`
+   - same reason set
+   - includes `previousSessionFile`
 
 `ExtensionRunner.emit()` returns early on the first cancelling before-event result.
 When a before-switch hook cancels, `switchSession()` returns `false` and does not emit the after-switch event.

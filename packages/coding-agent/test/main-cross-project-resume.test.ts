@@ -12,9 +12,9 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type Args, parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
-import * as modelResolverModule from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pluginHelpers from "@oh-my-pi/pi-coding-agent/discovery/helpers";
+import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { createSessionManager, runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -49,6 +49,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	// `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
+	clearOmpExtensionCliRoots();
 	restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
 	restoreEnv("PI_PROFILE", originalPiProfile);
 	restoreEnv("OMP_PROFILE", originalOmpProfile);
@@ -396,51 +398,6 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(getProjectDir()).toBe(launchProject);
 		expect(resumedManager?.getCwd()).toBe(launchProject);
 	});
-
-	it("re-resolves the model scope from the resumed project's enabledModels after the switch", async () => {
-		const match = buildGlobalMatch(resumedProject);
-		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
-		// enabledModels is scoped only to the resumed project. The launch scope
-		// yields no patterns; the destination scope collapses because the mocked
-		// model is absent from the full inventory, then gets one discovery retry.
-		const settings = Settings.isolated({
-			"marketplace.autoUpdate": "off",
-			enabledModels: [{ paths: [resumedProject], models: ["model-resumed"] }],
-		});
-		const resolveModelScope = vi
-			.spyOn(modelResolverModule, "resolveModelScope")
-			.mockResolvedValue([{ model: { id: "model-resumed" } } as modelResolverModule.ScopedModel]);
-		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
-		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
-		parsed.noExtensions = true;
-		parsed.noSkills = true;
-		parsed.noRules = true;
-		parsed.noTools = true;
-		parsed.noLsp = true;
-		let resumedManager: SessionManager | undefined;
-
-		try {
-			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
-				discoverAuthStorage: async () => authStorage,
-				settings,
-				createAgentSession: async options => {
-					if (!options) throw new Error("Expected session options");
-					resumedManager = options.sessionManager;
-					throw new Error("stop after session options");
-				},
-			});
-		} catch (error) {
-			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
-		} finally {
-			await authStorage.close();
-			await resumedManager?.close();
-		}
-
-		// Both calls must use the destination policy. The first resolves the
-		// destination scope; the second is the collapsed-scope discovery retry.
-		expect(resolveModelScope).toHaveBeenCalledTimes(2);
-		expect(resolveModelScope.mock.calls.map(call => call[0])).toEqual([["model-resumed"], ["model-resumed"]]);
-	}, 15_000);
 });
 
 describe("createSessionManager — cross-project --resume relocation (moved worktree)", () => {

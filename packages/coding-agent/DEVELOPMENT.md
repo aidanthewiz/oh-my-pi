@@ -23,8 +23,16 @@ Run from `packages/coding-agent/` (or add `--cwd=packages/coding-agent`):
 | Build the `dist/omp` binary    | `bun run build`       |
 
 Never invoke `tsc`/`npx tsc` directly — `bun run check` is the typecheck gate. After
-changing the React tool renderers under `collab-web/src/tool-render/`, rebuild them
-with `bun run gen:tool-views`.
+changing export HTML/CSS/JS, web themes, or the shared tool/trace renderers, run
+`bun run gen:export-viewer` and include `src/export/html/viewer.generated.json`
+with the change. The generated JavaScript lives in ignored `export-assets/`.
+The generator verifies committed metadata with `--check`, also implied by `CI=true`.
+
+Source and packaged exports inline the generated viewer and its Markdown,
+Highlight.js, theme, and shared-renderer dependencies. Run
+`bun run gen:export-viewer` before `/export` to exercise local changes without
+publishing or a local server. Relay share pages use the same embedded viewer.
+Keep generation before compiler imports so clean builds do not load stale assets.
 
 Scope fake timers to the deadline a test exercises, then restore real timers
 before real socket listeners are started. Bun's mocked clock can defer

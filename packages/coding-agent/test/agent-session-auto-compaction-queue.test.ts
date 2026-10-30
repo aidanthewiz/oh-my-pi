@@ -229,33 +229,19 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			// Real continue() polls and consumes the queued steering/follow-up
-			// messages. Mirror that here so the stranded-queue drain settles after
-			// one resume instead of rescheduling itself forever (a no-op mock
-			// leaves the queue populated, spinning the drain into an OOM loop).
 			session.agent.clearAllQueues();
 		});
 
-		// The continuation is already scheduled when the public agent_end arrives,
-		// so consumers must see it as a non-terminal scheduling pause.
 		const agentEndTerminalStates: Array<boolean | undefined> = [];
 		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
-		// Session subscribers are notified before extension listeners settle, so the
-		// continuation's delay timer is armed some microtasks after
-		// auto_compaction_end reaches this test; wait for the arm itself.
 		const waitSpy = vi.spyOn(scheduler, "wait");
 		session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "auto_compaction_end") onCompactionDone();
 			if (event.type === "agent_end") agentEndTerminalStates.push(event.isTerminal);
 		});
 
-		// Build a fake AssistantMessage with high token usage to trigger threshold
-		// compaction (contextWindow=200000, threshold ~80%).
 		const assistantMsg = {
 			role: "assistant" as const,
-			// Non-empty content: an empty `stop` turn would trip the empty-stop guard
-			// (#handleEmptyAssistantStop) and short-circuit the agent_end handler before
-			// compaction/todo checks run — hanging this test forever under fake timers.
 			content: [{ type: "text" as const, text: "Done." }],
 			api: "anthropic-messages" as const,
 			provider: "anthropic" as const,
@@ -272,13 +258,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		};
 
-		// Drive auto-compaction through the event flow:
-		// message_end → stores #lastAssistantMessage
-		// agent_end   → #checkCompaction → shouldCompact → #runAutoCompaction
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		// Wait for compaction completion, then verify waitForIdle blocks on queued continuation.
 		await compactionDone;
 		while (!waitSpy.mock.calls.some(([delayMs]) => delayMs === 100)) {
 			await Promise.resolve();

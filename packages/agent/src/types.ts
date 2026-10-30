@@ -1263,6 +1263,12 @@ export interface AgentTool<
 		args: unknown,
 	) => readonly ToolApprovalCacheIdentity[] | Promise<readonly ToolApprovalCacheIdentity[]>;
 
+	/**
+	 * Paths a call reads beyond its working directory, matched against restricted folders when it
+	 * reports no `approvalCacheTargets`. Unlike cache targets they never key a remembered grant.
+	 */
+	approvalRestrictionPaths?: (args: unknown) => readonly string[] | undefined;
+
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;
 

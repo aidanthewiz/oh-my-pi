@@ -62,7 +62,7 @@ export function expectedChecksum(checksums: string, assetName: string): string {
 	return matches[0][1];
 }
 
-async function run(command: readonly string[], cwd?: string): Promise<string> {
+async function run(command: string[], cwd?: string): Promise<string> {
 	const child = Bun.spawn(command, {
 		cwd,
 		stdout: "pipe",

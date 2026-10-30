@@ -76,8 +76,8 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 	const leafId = session.sessionManager.getLeafId();
 	const registry = AgentRegistry.global();
 	await ensurePersistedRoster(registry, sessionFile);
-	const subSessions = await collectSubSessions(sessionFile, key => {
-		logger.warn("Subagent transcript unreadable; not restored", { key });
+	const subSessions = await collectSubSessions(sessionFile, {
+		onUnreadable: key => logger.warn("Subagent transcript unreadable; not restored", { key }),
 	});
 	if (
 		session.isDisposed ||

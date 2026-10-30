@@ -768,17 +768,21 @@ describe("table charts in assistant Markdown", () => {
 		}
 	});
 
-	it("asks the smart planner only for multi-series tables, once per table", async () => {
-		const planner = vi.fn<TableChartPlanner>(async request => ({ ...request.guess, kind: "heatmap" }));
+	it("allows the planner to veto a single-series chart and caches multi-series refinement", async () => {
+		const planner = vi.fn<TableChartPlanner>(async request =>
+			request.table.measures.length > 1 ? { ...request.guess, kind: "heatmap" } : null,
+		);
 		setTableCharts("always");
 		const local = lookupTableChart(table(BEFORE_AFTER));
 		setTableCharts("smart", planner);
-		lookupTableChart(table(TIMINGS));
+		expect(lookupTableChart(table("| Step | Time |\n|---|---|\n| a | 1 s |\n| b | 2 s |\n| c | 3 s |"))).toBeNull();
+		await lookupTableChart(table(TIMINGS));
+		expect(lookupTableChart(table(TIMINGS))).toBeNull();
 		const pick = lookupTableChart(table(BEFORE_AFTER));
 		expect(pick).toBeInstanceOf(Promise);
 		await pick;
 		expect(lookupTableChart(table(BEFORE_AFTER))).not.toBe(local);
-		expect(planner).toHaveBeenCalledTimes(1);
+		expect(planner).toHaveBeenCalledTimes(2);
 	});
 
 	it("draws no chart when the planner declines, and the local guess when it fails", async () => {
@@ -794,5 +798,9 @@ describe("table charts in assistant Markdown", () => {
 		});
 		await lookupTableChart(table(BEFORE_AFTER));
 		expect(lookupTableChart(table(BEFORE_AFTER))).toBe(local);
+
+		setTableCharts("smart", () => undefined);
+		expect(lookupTableChart(table(BEFORE_AFTER))).toBe(local);
+		expect(lookupTableChart(table(RUNS))).toBeNull();
 	});
 });

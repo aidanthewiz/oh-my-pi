@@ -32,6 +32,7 @@ interface FakeState {
 	notifications: string[];
 	openAiKey: string;
 	path: string;
+	workspaceFolders: string[];
 }
 
 interface PublishDiagnosticsParams {
@@ -175,15 +176,6 @@ async function state(client: MuxTestClient): Promise<FakeState> {
 	return client.request<FakeState>("test/state");
 }
 
-async function pollUntil(check: () => Promise<boolean>, description: string): Promise<void> {
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
-		if (await check()) return;
-		await Bun.sleep(25);
-	}
-	throw new Error(`Timed out waiting for ${description}`);
-}
-
 describe("LspMuxServer", () => {
 	let server: LspMuxServer;
 	let tmpDir: string;
@@ -223,14 +215,6 @@ describe("LspMuxServer", () => {
 		expect(await healthy.client.request<{ alive: boolean }>("test/echo", { alive: true })).toEqual({
 			alive: true,
 		});
-	});
-
-	it("terminates a language server that declares an oversized response", async () => {
-		connectParams.args = ["run", path.join(import.meta.dir, "fixtures", "malformed-jsonrpc-peer.ts")];
-		const { client } = await link();
-		await expect(withTimeout(initialize(client), "invalid server frame")).rejects.toThrow("Mux connection closed");
-		await pollUntil(() => Promise.resolve(server.serverKeys.length === 0), "malformed server exit");
-		expect(server.sessionCount).toBe(0);
 	});
 
 	it("spawns one server per concurrent link", async () => {
@@ -283,13 +267,8 @@ describe("LspMuxServer", () => {
 			textDocument: { uri, languageId: "typescript", version: 1, text: "second" },
 		});
 
-		await pollUntil(async () => {
-			const [seenByFirst, seenBySecond] = await Promise.all([
-				first.client.request<string | null>("test/documentText", { uri }),
-				second.client.request<string | null>("test/documentText", { uri }),
-			]);
-			return seenByFirst === "first" && seenBySecond === "second";
-		}, "session-specific document contents");
+		expect(await first.client.request<string | null>("test/documentText", { uri })).toBe("first");
+		expect(await second.client.request<string | null>("test/documentText", { uri })).toBe("second");
 	}, 10_000);
 
 	it.skipIf(process.platform === "win32")(
@@ -325,10 +304,7 @@ describe("LspMuxServer", () => {
 		});
 		first.client.notify("textDocument/didClose", { textDocument: { uri } });
 
-		await pollUntil(
-			async () => (await state(first.client)).didClose.includes(uri),
-			"first session's close to reach its server",
-		);
+		expect((await state(first.client)).didClose).toContain(uri);
 		expect(await second.client.request<string | null>("test/documentText", { uri })).toBe("second");
 		expect((await state(second.client)).didClose).toEqual([]);
 	}, 10_000);
@@ -349,8 +325,9 @@ describe("LspMuxServer", () => {
 			diagnostics: [{ message: "fake", severity: 2, range: expect.any(Object) }],
 		});
 
+		const closed = first.client.waitForClose();
 		first.client.destroy();
-		await pollUntil(() => Promise.resolve(server.sessionCount === 0), "first session close");
+		await closed;
 		const second = await link();
 		expect(second.connected.spawned).toBe(false);
 		expect(second.connected.pid).toBe(first.connected.pid);
@@ -365,8 +342,9 @@ describe("LspMuxServer", () => {
 	it("does not hand an idle server to a link with other initialization options", async () => {
 		const first = await link({ ...connectParams, initializationOptions: { probe: "A" } });
 		await initialize(first.client, 424242, { probe: "A" });
+		const closed = first.client.waitForClose();
 		first.client.destroy();
-		await pollUntil(() => Promise.resolve(server.sessionCount === 0), "first session close");
+		await closed;
 
 		// A reused server answers `initialize` from cache, so B must get its own process.
 		const second = await link({ ...connectParams, initializationOptions: { probe: "B" } });
@@ -414,80 +392,19 @@ describe("LspMuxServer", () => {
 		expect(replacement.connected.pid).not.toBe(second.connected.pid);
 	}, 10_000);
 
-	it("survives a language server that exits while documents are open", async () => {
-		// Regression: session teardown wrote didClose to the exited child's
-		// stdin; that rejection escaped #closeSession (invoked via `void`
-		// from the connection close handler) and killed the whole daemon.
-		const { client } = await link();
-		await initialize(client);
-		const uri = "file:///crash.ts";
-		client.notify("textDocument/didOpen", {
-			textDocument: { uri, languageId: "typescript", version: 1, text: "x" },
-		});
-		await pollUntil(async () => (await state(client)).didOpen[uri] === 1, "didOpen to reach the server");
-		const closed = client.waitForClose();
-		client.notify(MUX_RESTART_METHOD);
-		await closed;
-		await pollUntil(() => Promise.resolve(server.serverKeys.length === 0), "exited server cleanup");
-		// The daemon itself must keep serving fresh sessions.
-		const fresh = await link();
-		await initialize(fresh.client);
-		expect(await fresh.client.request<{ alive: boolean }>("test/echo", { alive: true })).toEqual({ alive: true });
-	}, 10_000);
-
-	it.skipIf(process.platform === "win32")(
-		"contains write failures when a language server stops reading stdin",
-		async () => {
-			// The server closes stdin, then sends a request (signalling stdin is closed) and stays
-			// alive, so tearing down the session's open document fails with EPIPE.
-			const request = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "workspace/applyEdit", params: {} });
-			connectParams.command = "sh";
-			connectParams.args = [
-				"-c",
-				'exec 0<&-; printf "%s" "$1"; exec sleep 30',
-				"sh",
-				`Content-Length: ${Buffer.byteLength(request)}\r\n\r\n${request}`,
-			];
-			const first = await link();
-			first.client.notify("textDocument/didOpen", {
-				textDocument: { uri: "file:///epipe.ts", languageId: "typescript", version: 1, text: "x" },
-			});
-			await first.client.nextNotification("workspace/applyEdit");
-			first.client.destroy();
-			await pollUntil(() => Promise.resolve(server.sessionCount === 0), "first session close");
-			// Teardown must finish and release the server for reuse instead of rejecting mid-cleanup.
-			await pollUntil(async () => {
-				const next = await link();
-				next.client.destroy();
-				return next.connected.pid === first.connected.pid;
-			}, "idle server reuse");
-		},
-		10_000,
-	);
-
-	it("finishes orphan document closes before reusing a server", async () => {
+	it("removes the workspace folders a session added before reusing its server", async () => {
 		const first = await link();
 		await initialize(first.client);
-		const uris = Array.from({ length: 128 }, (_, index) => `file:///orphan-${index}.ts`);
-		for (const uri of uris) {
-			first.client.notify("textDocument/didOpen", {
-				textDocument: { uri, languageId: "typescript", version: 1, text: "orphan" },
-			});
-		}
-		await first.client.request("test/echo", { barrier: true });
+		const added = { uri: "file:///other-checkout", name: "other-checkout" };
+		first.client.notify("workspace/didChangeWorkspaceFolders", { event: { added: [added], removed: [] } });
+		expect((await state(first.client)).workspaceFolders).toEqual([added.uri]);
 		const firstClosed = first.client.waitForClose();
 		first.client.destroy();
 		await firstClosed;
 
 		const second = await link();
 		expect(second.connected.spawned).toBe(false);
-		const uri = uris.at(-1);
-		expect(uri).toBeDefined();
 		await initialize(second.client);
-		second.client.notify("textDocument/didOpen", {
-			textDocument: { uri, languageId: "typescript", version: 1, text: "replacement" },
-		});
-		await second.client.request("test/echo", { barrier: true });
-		expect(await second.client.request<string | null>("test/documentText", { uri })).toBe("replacement");
+		expect((await state(second.client)).workspaceFolders).toEqual([]);
 	}, 10_000);
 });

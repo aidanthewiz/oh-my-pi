@@ -20,7 +20,7 @@ export type ToolArgumentSource = "parsed" | "payload";
  * @throws the validation error when the tool is strict or the arguments failed to parse.
  */
 export function validateAgentToolArguments(
-	tool: AgentTool,
+	tool: Pick<AgentTool, "name" | "description" | "parameters" | "lenientArgValidation">,
 	toolCall: ToolCall,
 	source: ToolArgumentSource = "parsed",
 ): ToolCall["arguments"] {

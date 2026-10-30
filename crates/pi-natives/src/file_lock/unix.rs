@@ -1,7 +1,7 @@
 use std::{
-	fs::{File, OpenOptions},
+	fs::{File, OpenOptions, TryLockError},
 	io,
-	os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+	os::unix::fs::OpenOptionsExt,
 };
 
 /// Unix lock held by a persistent sidecar's open file description.
@@ -29,18 +29,12 @@ pub fn try_acquire_with_create(path: &str, create: bool) -> io::Result<Option<Pl
 		Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error),
 	};
-	// SAFETY: `file` owns a live descriptor for the duration of this call. The
-	// non-blocking operation only changes the advisory lock attached to that
-	// open file description.
-	let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-	if status == 0 {
-		return Ok(Some(PlatformFileLock { file: Some(file) }));
+	// The lock is attached to this open file description (`flock(2)`).
+	match file.try_lock() {
+		Ok(()) => Ok(Some(PlatformFileLock { file: Some(file) })),
+		Err(TryLockError::WouldBlock) => Ok(None),
+		Err(TryLockError::Error(error)) => Err(error),
 	}
-	let error = io::Error::last_os_error();
-	if error.kind() == io::ErrorKind::WouldBlock {
-		return Ok(None);
-	}
-	Err(error)
 }
 
 impl PlatformFileLock {

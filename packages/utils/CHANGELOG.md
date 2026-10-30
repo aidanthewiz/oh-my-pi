@@ -5,6 +5,16 @@
 ### Fixed
 
 - Share mnemopi embedding endpoints across profiles while keeping session data and configured cache identities separate.
+## [18.14.0] - 2026-10-29
+
+### Added
+
+- Added `logger.withContext(fields, fn)` to attach contextual fields to all records produced during a function and its asynchronous work, plus `logger.withoutContext(fn)` for work that should not inherit caller context.
+
+### Fixed
+
+- Fixed `untilAborted` so promises passed to an already-aborted signal are still observed, preventing later rejections from being reported as unhandled.
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed

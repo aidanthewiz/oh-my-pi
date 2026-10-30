@@ -19,6 +19,29 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.14.0] - 2026-10-29
+
+### Breaking Changes
+
+- Removed the raw `@oh-my-pi/pi-catalog/models.json` export; use the bundled model registry APIs instead.
+
+### Added
+
+- Added `nextBuildPriceChange(cost, now)` to identify when a model's dated pricing card may change, allowing callers to safely reuse earlier builds until that time.
+- Added the `selector-revision-suffix` catalog axis for Google Vertex, so `google-vertex/claude-opus-4-8` resolves exactly to `claude-opus-4-8@default`.
+
+### Changed
+
+- Reduced the bundled model catalog size and loading overhead.
+- Updated role defaults so Factory Droid image models are preferred for the `image` role, allowing `generate_image` to work with only a Factory login.
+- Updated `smol` and `slow` role defaults to use the currently bundled Cerebras and OpenAI Codex model identifiers.
+
+### Fixed
+
+- Fixed Mistral reasoning models so streamed thinking appears in the transcript and is preserved for subsequent turns.
+- Fixed later-turn HTTP 422 errors in Mistral-hosted DeepSeek conversations when assistant reasoning history is included.
+- Fixed DeepSeek V4.1 Flash image attachments being dropped for publisher-namespaced model IDs such as `ds/deepseek-flash`.
+
 ## [18.13.3] - 2026-10-28
 
 ### Added

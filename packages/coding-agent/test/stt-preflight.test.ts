@@ -276,7 +276,8 @@ describe("STTController preflight", () => {
 		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
 		controller = new STTController(() => ({ stop: vi.fn() }), { settings, registry: emptyRegistry });
 
-		await controller.toggle(makeEditor(), makeOptions());
+		const options = makeOptions();
+		await controller.toggle(makeEditor(), options);
 
 		expect(isCached).toHaveBeenCalledWith("parakeet-tdt-0.6b-v3");
 		expect(asrClient.sttClient.startStream).toHaveBeenCalledWith("parakeet-tdt-0.6b-v3", expect.anything());

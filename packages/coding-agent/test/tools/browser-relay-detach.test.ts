@@ -39,7 +39,6 @@ class ChromeBackedExtension {
 	readonly #inFlight = new Map<number, number>();
 	/** Resolved by the next forwarded command each one matches. */
 	readonly #sendWaiters = new Set<{ method: string; match: (params: unknown) => boolean; resolve: () => void }>();
-	/** Settled by the relay's next `detach` once Chrome has ended the tab's "chrome.debugger" attachment. */
 	readonly #detachWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
 	/** Answer attaches with Chrome's refusal, as while a foreign extension frame is in the tab. */
 	refuseAttach = false;
@@ -159,7 +158,6 @@ class ChromeBackedExtension {
 				const detached = root
 					? await this.#chromeSend("Target.detachFromTarget", { sessionId: root }).promise
 					: { result: {} };
-				// Waiters learn of the detach only once Chrome has ended the attachment.
 				const failure = isRecord(detached.error) ? new Error(String(detached.error.message)) : undefined;
 				for (const waiter of this.#detachWaiters) {
 					if (failure) waiter.reject(failure);
@@ -205,7 +203,6 @@ class ChromeBackedExtension {
 		return promise;
 	}
 
-	/** Resolves once the relay has detached "chrome.debugger" and Chrome confirmed it, which ends the debugging bar. */
 	nextDetach(): Promise<void> {
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#detachWaiters.add({ resolve, reject });

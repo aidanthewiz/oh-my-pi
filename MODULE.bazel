@@ -252,6 +252,11 @@ crate.annotation(
     deps = ["@@//crates/vendor/cranelift-codegen:cranelift-codegen"],
     version = "29.0.1",
 )
+# Registry consumers also need the vendored streaming searcher.
+crate.annotation(
+    crate = "grep-printer",
+    deps = ["@@//crates/vendor/grep-searcher:grep-searcher"],
+)
 
 # Release addons must never pick up a host libpcre2 (Homebrew paths leaked into
 # shipped dylibs before); always build the vendored static copy.

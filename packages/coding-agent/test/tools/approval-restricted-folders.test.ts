@@ -245,6 +245,8 @@ function harness(
 					handlers: new Map([["tool_call", [async () => options.onToolCall?.()]]]),
 					tools: new Map(),
 					assistantThinkingRenderers: [],
+					assistantTextRenderers: [],
+					linkSchemes: [],
 					fileWriteFallbackHandlers: [],
 					fileDeleteFallbackHandlers: [],
 					messageRenderers: new Map(),

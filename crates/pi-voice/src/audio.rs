@@ -39,6 +39,10 @@ const CAPTURE_PERIOD_MS: u32 = 20;
 // wakes — so count one extra empty callback: the racy, possibly-uncommitted
 // write is always the last one, which is margin rather than accounted flush.
 const PLAYBACK_DRAIN_MARGIN_CALLBACKS: usize = 1;
+// Output ramps to silence over this long when the queue runs dry and back
+// up when audio resumes, so a producer stall is a soft dropout instead of a
+// waveform step (a click). Short enough to stay inaudible as a fade.
+const PLAYBACK_FADE_MS: usize = 5;
 
 /// Shared render-time state for one playback device: gain, queue depth,
 /// drain, stop.
@@ -139,7 +143,8 @@ impl PlaybackStream {
 	/// arrival jitter as one short rebuffer instead of a hole in every late
 	/// period. Partial bursts play after one reserve's worth of device
 	/// callbacks even while the producer remains connected. Zero plays
-	/// samples as soon as they are queued.
+	/// samples as soon as they are queued. Either way, output fades out when
+	/// the queue runs dry and fades back in when audio resumes.
 	pub fn start(sample_rate: u32, jitter_buffer_ms: u32) -> VoiceResult<Self> {
 		let sample_rate = audio_sample_rate(sample_rate)?;
 		let state = Arc::new(PlaybackState::new());
@@ -150,6 +155,7 @@ impl PlaybackStream {
 			Arc::clone(&state),
 			(playback_drain_periods(config) as usize) + PLAYBACK_DRAIN_MARGIN_CALLBACKS,
 			sample_rate as usize * jitter_buffer_ms as usize / 1000,
+			sample_rate as usize * PLAYBACK_FADE_MS / 1000,
 		);
 		let device = PlaybackDevice::start(config, Box::new(move |output| renderer.fill(output)))
 			.map_err(|error| format!("Failed to open the default speaker: {error}"))?;
@@ -216,7 +222,8 @@ fn audio_sample_rate(sample_rate: u32) -> VoiceResult<u32> {
 }
 
 /// Render-thread side of a [`PlaybackStream`]: moves queued chunks into
-/// device buffers, holds back the jitter reserve, and detects drain.
+/// device buffers, holds back the jitter reserve, ramps the edges of every
+/// gap, and detects drain.
 ///
 /// Travels inside the device fill callback; dropping it (worker exit on
 /// device loss, stop) marks the stream stopped so `wait_for_drain` waiters
@@ -232,6 +239,17 @@ struct Renderer {
 	reserve:             usize,
 	buffering:           bool,
 	buffering_callbacks: usize,
+	/// Ramp length in samples for both gap edges; zero disables ramping.
+	fade:                usize,
+	/// Queued audio reached the previous output sample.
+	sounding:            bool,
+	/// Last sample handed to the device, where a fade-out starts from.
+	last:                f32,
+	/// Samples of fade-in already applied since audio resumed.
+	fade_in:             usize,
+	/// Level the running fade-out decays from, and samples it has left.
+	tail_level:          f32,
+	tail_left:           usize,
 }
 
 impl Renderer {
@@ -240,6 +258,7 @@ impl Renderer {
 		state: Arc<PlaybackState>,
 		drain_callbacks: usize,
 		reserve: usize,
+		fade: usize,
 	) -> Self {
 		Self {
 			rx,
@@ -251,15 +270,59 @@ impl Renderer {
 			reserve,
 			buffering: reserve > 0,
 			buffering_callbacks: 0,
+			fade,
+			sounding: false,
+			last: 0.0,
+			fade_in: 0,
+			tail_level: 0.0,
+			tail_left: 0,
 		}
 	}
 
-	/// Fill one device buffer, padding with silence when the queue runs dry.
+	/// Fill one device buffer, fading to silence when the queue runs dry.
 	fn fill(&mut self, output: &mut [f32]) {
 		output.fill(0.0);
 		if output.is_empty() || self.state.stopped.load(Ordering::Acquire) {
 			return;
 		}
+		let written = self.play(output);
+		let tail_pending = self.tail_left > 0 || self.sounding && self.fade > 0;
+		if written < output.len() {
+			if self.sounding {
+				// Audio stopped mid-waveform: decay from the last emitted sample
+				// instead of stepping to zero.
+				self.sounding = false;
+				self.tail_level = if written > 0 {
+					output[written - 1]
+				} else {
+					self.last
+				};
+				self.tail_left = self.fade;
+			}
+			for sample in &mut output[written..] {
+				if self.tail_left == 0 {
+					break;
+				}
+				self.tail_left -= 1;
+				*sample = self.tail_level * self.tail_left as f32 / self.fade as f32;
+			}
+		}
+		self.last = output[output.len() - 1];
+		// Only fully silent buffers count toward flushing the backend backlog.
+		if written == 0 && !tail_pending && self.rx.is_disconnected() {
+			self.empty_callbacks += 1;
+			if self.empty_callbacks >= self.drain_callbacks {
+				self.state.mark_drained();
+			}
+		} else {
+			self.empty_callbacks = 0;
+		}
+	}
+
+	/// Copy queued audio into the front of `output`; returns how many
+	/// samples it wrote before the reserve held output back or the queue ran
+	/// dry.
+	fn play(&mut self, output: &mut [f32]) -> usize {
 		if self.buffering {
 			let queued = self.state.queued.load(Ordering::Acquire);
 			if queued == 0 {
@@ -275,7 +338,7 @@ impl Renderer {
 				&& !self.rx.is_disconnected()
 				&& (queued == 0 || self.buffering_callbacks < self.reserve.div_ceil(output.len()))
 			{
-				return;
+				return 0;
 			}
 			self.buffering = false;
 			self.buffering_callbacks = 0;
@@ -291,6 +354,7 @@ impl Renderer {
 						self.current = next;
 						self.cursor = 0;
 						self.empty_callbacks = 0;
+						continue;
 					},
 					Err(TryRecvError::Empty) => {
 						// Underrun: rebuild the reserve before resuming.
@@ -299,13 +363,7 @@ impl Renderer {
 						self.buffering_callbacks = 0;
 						break;
 					},
-					Err(TryRecvError::Disconnected) => {
-						self.empty_callbacks += 1;
-						if self.empty_callbacks >= self.drain_callbacks {
-							self.state.mark_drained();
-						}
-						break;
-					},
+					Err(TryRecvError::Disconnected) => break,
 				}
 			}
 
@@ -319,8 +377,32 @@ impl Renderer {
 					*destination = *source * gain;
 				}
 			}
+			if !self.sounding {
+				self.sounding = true;
+				self.fade_in = 0;
+			}
+			self.ramp(destination);
 			self.cursor += count;
 			output_offset += count;
+		}
+		output_offset
+	}
+
+	/// Fade freshly resumed audio in and mix any still-running fade-out over
+	/// it, so a short gap neither steps up nor drops the old tail abruptly.
+	fn ramp(&mut self, audio: &mut [f32]) {
+		for sample in audio {
+			if self.fade_in >= self.fade && self.tail_left == 0 {
+				return;
+			}
+			if self.fade_in < self.fade {
+				self.fade_in += 1;
+				*sample *= self.fade_in as f32 / self.fade as f32;
+			}
+			if self.tail_left > 0 {
+				self.tail_left -= 1;
+				*sample += self.tail_level * self.tail_left as f32 / self.fade as f32;
+			}
 		}
 	}
 }
@@ -377,9 +459,12 @@ impl Drop for CaptureStream {
 #[cfg(test)]
 mod tests {
 	use std::{
+		collections::VecDeque,
 		env,
+		future::Future,
 		mem::forget,
 		sync::atomic::AtomicUsize,
+		task::{Context, Waker},
 		thread::sleep,
 		time::{Duration, Instant},
 	};
@@ -392,16 +477,18 @@ mod tests {
 	// period-sized local target.
 	const LOCAL_DRAIN_CALLBACKS: usize = 3 + PLAYBACK_DRAIN_MARGIN_CALLBACKS;
 
-	fn renderer(drain_callbacks: usize, reserve: usize) -> (PlaybackWriter, Renderer) {
+	/// Renderer plus its writer; `fade` zero keeps sample values exact for
+	/// tests that assert queue and reserve mechanics.
+	fn renderer(drain_callbacks: usize, reserve: usize, fade: usize) -> (PlaybackWriter, Renderer) {
 		let state = Arc::new(PlaybackState::new());
 		let (tx, rx) = flume::unbounded();
 		let writer = PlaybackWriter { tx, state: Arc::clone(&state) };
-		(writer, Renderer::new(rx, state, drain_callbacks, reserve))
+		(writer, Renderer::new(rx, state, drain_callbacks, reserve, fade))
 	}
 
 	#[test]
 	fn playback_preserves_chunk_order_and_applies_render_gain() {
-		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 0);
+		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 0, 0);
 		renderer.state.set_gain(0.5);
 		writer.write(&[1.0, -1.0]).expect("stream is open");
 		writer.write(&[0.5, -0.5]).expect("stream is open");
@@ -432,7 +519,7 @@ mod tests {
 	#[test]
 	fn widened_backlog_is_not_drained_within_local_margin() {
 		let widened_drain_callbacks = LOCAL_DRAIN_CALLBACKS * 4;
-		let (writer, mut renderer) = renderer(widened_drain_callbacks, 0);
+		let (writer, mut renderer) = renderer(widened_drain_callbacks, 0, 0);
 		drop(writer);
 		let mut output = [0.0; 2];
 
@@ -452,7 +539,7 @@ mod tests {
 
 	#[test]
 	fn jitter_reserve_holds_output_at_start_and_after_underrun() {
-		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 4);
+		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 4, 0);
 		let mut output = [9.0; 2];
 
 		writer.write(&[1.0; 3]).expect("stream is open");
@@ -476,7 +563,7 @@ mod tests {
 
 	#[test]
 	fn closed_writer_plays_tail_shorter_than_reserve() {
-		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 4);
+		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 4, 0);
 		writer.write(&[1.0]).expect("stream is open");
 		drop(writer);
 		let mut output = [9.0; 2];
@@ -490,7 +577,7 @@ mod tests {
 	/// must reach the speaker without waiting for the next assistant turn.
 	#[test]
 	fn connected_live_writer_releases_short_turns() {
-		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 6);
+		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 6, 0);
 		let mut output = [9.0; 2];
 
 		for _ in 0..5 {
@@ -547,7 +634,7 @@ mod tests {
 					latest
 				})
 				.collect();
-			let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, reserve);
+			let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, reserve, 0);
 			let total = arrivals.len() * FRAME;
 			// Last packet arrives by ~5.04 s; one extra second of callbacks is
 			// ample for the reserve and any rebuffer, and keeps a renderer that
@@ -577,6 +664,167 @@ mod tests {
 				"utterance not fully played by callback {deadline} at phase {phase} µs"
 			);
 		}
+	}
+
+	/// Regression guard for #17295: a network stall mid-word must fade to
+	/// silence and back instead of stepping the waveform (heard as a click).
+	#[test]
+	fn underrun_ramps_waveform_instead_of_stepping() {
+		const SAMPLE_RATE: usize = 48_000;
+		const FRAME: usize = SAMPLE_RATE / 50;
+		const AMPLITUDE: f32 = 0.5;
+		const HZ: f32 = 440.0;
+		// Largest step the tone itself takes between adjacent samples.
+		let natural = AMPLITUDE * std::f32::consts::TAU * HZ / SAMPLE_RATE as f32;
+		let live_reserve = SAMPLE_RATE * crate::live::OUTPUT_JITTER_BUFFER_MS as usize / 1000;
+		let fade = SAMPLE_RATE * PLAYBACK_FADE_MS / 1000;
+		// Live on macOS/Windows (stall lands on a callback boundary), live on
+		// Linux (stall lands mid-callback), and reserve-free local playback
+		// (resumes on the very next callback).
+		for (reserve, period) in [(live_reserve, FRAME), (live_reserve, 2_400), (0, FRAME)] {
+			let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, reserve, fade);
+			let mut sent = 0;
+			let mut played = Vec::new();
+			let mut output = vec![0.0; period];
+			for callback in 0..20 {
+				// One 20 ms frame stays ahead of the device; frames 6-10 stall
+				// for 100 ms, so speech stops and resumes mid-cycle.
+				while sent <= (callback + 1) * period / FRAME {
+					if !(6..11).contains(&sent) {
+						let samples: Vec<f32> = (sent * FRAME..(sent + 1) * FRAME)
+							.map(|sample| {
+								let phase = std::f32::consts::TAU * HZ * sample as f32 / SAMPLE_RATE as f32;
+								AMPLITUDE * phase.sin()
+							})
+							.collect();
+						writer.write(&samples).expect("stream is open");
+					}
+					sent += 1;
+				}
+				renderer.fill(&mut output);
+				played.extend_from_slice(&output);
+			}
+
+			let first = played
+				.iter()
+				.position(|sample| *sample != 0.0)
+				.expect("speech plays");
+			let last = played
+				.iter()
+				.rposition(|sample| *sample != 0.0)
+				.expect("speech plays");
+			let silent = played[first..last]
+				.iter()
+				.filter(|sample| **sample == 0.0)
+				.count();
+			assert!(silent >= FRAME, "stall never underran (reserve {reserve}, period {period})");
+			let step = played
+				.windows(2)
+				.map(|pair| (pair[1] - pair[0]).abs())
+				.fold(0.0, f32::max);
+			assert!(
+				step <= natural * 1.5,
+				"waveform stepped by {step}, tone steps at most {natural} (reserve {reserve}, period \
+				 {period})"
+			);
+		}
+	}
+
+	#[test]
+	fn graceful_drain_waits_for_fade_tail_buffer_completion() {
+		const BUFFERS: usize = 3;
+		const LEVEL: f32 = 0.5;
+		for sample_rate in [8_000usize, 48_000, 384_000] {
+			let fade = sample_rate * PLAYBACK_FADE_MS / 1000;
+			for period_ms in [20, 50] {
+				let period = sample_rate * period_ms / 1000;
+				for source_len in [period - fade, period - 1, period] {
+					for reserve in [0, period * 3] {
+						let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, reserve, fade);
+						writer
+							.write(&vec![LEVEL; source_len])
+							.expect("stream is open");
+						drop(writer);
+						let state = Arc::clone(&renderer.state);
+						let mut drain = std::pin::pin!(state.wait_for_drain());
+						let mut context = Context::from_waker(Waker::noop());
+						assert!(drain.as_mut().poll(&mut context).is_pending());
+						let mut pending = VecDeque::<Vec<f32>>::new();
+						let mut completed = Vec::new();
+						let mut drained = false;
+						let limit =
+							(source_len + fade).div_ceil(period) + LOCAL_DRAIN_CALLBACKS + BUFFERS;
+						for _ in 0..limit {
+							if pending.len() == BUFFERS {
+								completed.extend(pending.pop_front().expect("oldest buffer completed"));
+							}
+							let mut output = vec![0.0; period];
+							renderer.fill(&mut output);
+							// end() can stop before the notifying callback commits its
+							// buffer.
+							if drain.as_mut().poll(&mut context).is_ready() {
+								assert!(
+									pending.iter().flatten().all(|sample| *sample == 0.0),
+									"drain would discard a nonzero pending buffer: rate={sample_rate}, \
+									 period={period}, source={source_len}, reserve={reserve}"
+								);
+								assert!(
+									output.iter().all(|sample| *sample == 0.0),
+									"drain would discard the notifying buffer: rate={sample_rate}, \
+									 period={period}, source={source_len}, reserve={reserve}"
+								);
+								drained = true;
+								break;
+							}
+							pending.push_back(output);
+						}
+						assert!(drained, "graceful completion exceeded its bounded callback budget");
+						let mut expected: Vec<f32> = (0..source_len)
+							.map(|index| LEVEL * ((index + 1).min(fade) as f32 / fade as f32))
+							.collect();
+						expected.extend(
+							(0..fade).map(|index| LEVEL * (fade - index - 1) as f32 / fade as f32),
+						);
+						assert!(
+							completed.len() >= expected.len(),
+							"source or generated tail did not complete"
+						);
+						assert_eq!(&completed[..expected.len()], expected.as_slice());
+						assert!(
+							completed[expected.len()..]
+								.iter()
+								.all(|sample| *sample == 0.0)
+						);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn short_gap_retains_tail_and_applies_new_render_gain() {
+		let (writer, mut renderer) = renderer(LOCAL_DRAIN_CALLBACKS, 0, 4);
+		let state = Arc::clone(&renderer.state);
+		let mut drain = std::pin::pin!(state.wait_for_drain());
+		let mut context = Context::from_waker(Waker::noop());
+		let mut output = [0.0; 2];
+		writer.write(&[1.0; 4]).expect("stream is open");
+		renderer.fill(&mut output);
+		assert_eq!(output, [0.25, 0.5]);
+		renderer.fill(&mut output);
+		assert_eq!(output, [0.75, 1.0]);
+		renderer.fill(&mut output);
+		assert_eq!(output, [0.75, 0.5]);
+		assert!(drain.as_mut().poll(&mut context).is_pending());
+		writer
+			.write(&[2.0; 4])
+			.expect("same writer resumes after the gap");
+		renderer.state.set_gain(0.5);
+		renderer.fill(&mut output);
+		assert_eq!(output, [0.5, 0.5], "old tail overlaps newly gained audio");
+		renderer.fill(&mut output);
+		assert_eq!(output, [0.75, 1.0], "resumed source retains render-time gain");
+		assert!(drain.as_mut().poll(&mut context).is_pending());
 	}
 
 	#[test]

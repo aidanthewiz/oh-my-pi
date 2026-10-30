@@ -39,6 +39,8 @@ export interface RenderResultOptions {
 	elapsedMs?: number;
 	/** The call was abandoned without a final result (turn aborted, sealed). Native describe hooks only. */
 	cancelled?: boolean;
+	/** The native host draws raw JSON values (`cx.supports("json")`). Native describe hooks only. */
+	json?: boolean;
 }
 
 /** Render options for a result, plus the tool-specific context the transcript threads through. */

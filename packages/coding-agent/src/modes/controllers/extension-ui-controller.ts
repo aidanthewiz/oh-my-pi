@@ -27,6 +27,8 @@ import type {
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { cfgExtensionAssistantTextRenderers } from "../../extensibility/settings";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { ApprovalDialogComponent } from "@oh-my-pi/pi-tui/overlays/approval-dialog";
 import {
 	type AskDialogPrompt,
@@ -38,6 +40,7 @@ import { installExtensionComposerShape } from "@oh-my-pi/pi-tui/overlays/compose
 import { EditorTopGap } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
 import { boundPromptTitle, HookEditorComponent, type HookEditorOptions } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { HookInputComponent } from "@oh-my-pi/pi-tui/overlays/hook-input";
+import { extensionLinkClicksAvailable } from "@oh-my-pi/pi-tui/render/extension-links";
 import { HookSelectorComponent, type HookSelectorSlider } from "@oh-my-pi/pi-tui/overlays/hook-selector";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
@@ -146,11 +149,37 @@ export class ExtensionUiController {
 			this.#composerShapeDisposers.push(installExtensionComposerShape(definition));
 		}
 		this.ctx.syncComposerShape();
+		this.ctx.syncExtensionLinks();
 	}
 
 	/** Remove extension-owned composer styles from the process registries. */
 	disposeComposerShapes(): void {
 		for (const dispose of this.#composerShapeDisposers.splice(0)) dispose();
+	}
+
+	/**
+	 * Redraw every transcript component of the reply sent at `timestamp` (one per tool-call segment).
+	 * A plain terminal cannot repaint rows it already moved into scrollback, so a reply with retired
+	 * rows rebuilds the scrollback, as the thinking-visibility toggle does; one still in the live
+	 * viewport (and any block in Tern's native view) just repaints.
+	 */
+	#rerenderAssistantMessage(timestamp: number): void {
+		if (!cfgExtensionAssistantTextRenderers.get(this.ctx.settings)) return;
+		const native = isNativeRendering();
+		let redrawn = false;
+		let retired = false;
+		for (const child of this.ctx.chatContainer.children) {
+			if (!(child instanceof AssistantMessageComponent)) continue;
+			if (!child.rerenderMessage(timestamp)) continue;
+			redrawn = true;
+			retired ||= !native && !this.ctx.chatContainer.canRemoveBlock(child);
+		}
+		if (retired) {
+			this.ctx.chatContainer.resetStableEmission();
+			this.ctx.ui.resetDisplay();
+		} else if (redrawn) {
+			this.ctx.ui.requestRender();
+		}
 	}
 
 	/**
@@ -169,6 +198,8 @@ export class ExtensionUiController {
 			approve: (prompt, dialogOptions) => this.showCollabAwareApproval(prompt, dialogOptions),
 			notify: (message, type) => this.showHookNotify(message, type),
 			onTerminalInput: handler => this.addExtensionTerminalInputListener(handler),
+			rerenderMessage: timestamp => this.#rerenderAssistantMessage(timestamp),
+			getLinkClicksAvailable: extensionLinkClicksAvailable,
 			setStatus: (key, text) => this.setHookStatus(key, text),
 			setWorkingMessage: message => this.ctx.setWorkingMessage(message),
 			setWidget: (key, content, options) => this.setHookWidget(key, content, options),
@@ -226,6 +257,8 @@ export class ExtensionUiController {
 			return; // No hooks loaded
 		}
 
+		const liveOwner = this.ctx.session;
+		const liveOwnerId = liveOwner.sessionId;
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
@@ -276,6 +309,17 @@ export class ExtensionUiController {
 			runEphemeralTurn: async args => {
 				if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot run a local turn");
 				return this.ctx.session.runEphemeralTurn(args);
+			},
+			startLive: async options => {
+				if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot run a local turn");
+				if (
+					this.ctx.session !== liveOwner ||
+					liveOwner.sessionId !== liveOwnerId ||
+					liveOwner.isDisposed ||
+					this.ctx.viewSession !== liveOwner
+				)
+					throw new Error("Live session context is no longer active");
+				return this.ctx.startRemoteLive(options);
 			},
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -469,6 +513,8 @@ export class ExtensionUiController {
 			return;
 		}
 
+		const liveOwner = this.ctx.session;
+		const liveOwnerId = liveOwner.sessionId;
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
@@ -519,6 +565,17 @@ export class ExtensionUiController {
 			runEphemeralTurn: async args => {
 				if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot run a local turn");
 				return this.ctx.session.runEphemeralTurn(args);
+			},
+			startLive: async options => {
+				if (this.#rejectGuestExtensionTurn()) throw new Error("Collab guest cannot run a local turn");
+				if (
+					this.ctx.session !== liveOwner ||
+					liveOwner.sessionId !== liveOwnerId ||
+					liveOwner.isDisposed ||
+					this.ctx.viewSession !== liveOwner
+				)
+					throw new Error("Live session context is no longer active");
+				return this.ctx.startRemoteLive(options);
 			},
 		};
 		const commandActions: ExtensionCommandContextActions = {

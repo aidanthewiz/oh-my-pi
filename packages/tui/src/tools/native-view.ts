@@ -23,7 +23,7 @@ export function displayPath(filePath: string): string {
 	return shortenPath(filePath);
 }
 
-/** `file://` link for a head's path target, when the path is absolute. */
+/** Configured file link for a head's path target, when the path is absolute. */
 export function fileHref(filePath: string | undefined): string | undefined {
 	return filePath && path.isAbsolute(filePath) ? tryFileUri(filePath) : undefined;
 }
@@ -342,7 +342,7 @@ export function diagnosticsSection(
 	diagnostics: FileDiagnosticsResult | undefined,
 	opts?: { withPath?: boolean },
 ): NativeNode | undefined {
-	if (!diagnostics || diagnostics.messages.length === 0) return undefined;
+	if (!diagnostics || (diagnostics.messages.length === 0 && !diagnostics.unreported?.length)) return undefined;
 	const parsed: ParsedDiagnostic[] = [];
 	const unparsed: string[] = [];
 	for (const message of diagnostics.messages) {
@@ -365,6 +365,15 @@ export function diagnosticsSection(
 	if (hidden > 0) {
 		shown.push(text([span(`+${hidden} more`, "muted")], { role: "omp.tool.stats", key: "more" }));
 	}
+	if (diagnostics.unreported?.length) {
+		shown.unshift(
+			text([span(plainText(diagnostics.summary), "warning")], {
+				wrap: "word",
+				role: "omp.tool.diagnostics.unreported",
+				key: "unreported",
+			}),
+		);
+	}
 	return node(
 		"section",
 		{
@@ -377,17 +386,20 @@ export function diagnosticsSection(
 	);
 }
 
-/** Head chip counting LSP diagnostics across files (`2 diagnostics`), or undefined when there are none. */
+/** Head chip counting reported diagnostics and marking missing reports independently. */
 export function diagnosticsBadge(
 	files: readonly (FileDiagnosticsResult | undefined)[],
 ): { text: string; tone: TspTone } | undefined {
 	let count = 0;
 	let errored = false;
+	let unreported = false;
 	for (const file of files) {
 		if (!file) continue;
 		count += file.messages.length;
 		errored ||= file.errored;
+		unreported ||= !!file.unreported?.length;
 	}
-	if (count === 0) return undefined;
-	return { text: count === 1 ? "1 diagnostic" : `${count} diagnostics`, tone: errored ? "error" : "warning" };
+	if (count === 0) return unreported ? { text: "Diagnostics unverified", tone: "warning" } : undefined;
+	const label = count === 1 ? "1 diagnostic" : `${count} diagnostics`;
+	return { text: unreported ? `${label}; unverified` : label, tone: errored ? "error" : "warning" };
 }

@@ -14,6 +14,21 @@
 
 ### Fixed
 
+- Preserve explicit provider authority during deferred model discovery. Advertise `out://` only for eligible parent sessions and refresh it after configuredness changes.
+- Preserve foreground Bash replies after execution or completion-hook failure, and retain replay-owned reply prefixes across transcript rebuilds.
+- Keep task-file paths contained and retain restrictive conflict-read provenance for empty, capped, and BOM-prefixed excerpts.
+- Carry unverified language-server coverage through model notices and deferred diagnostics without reporting unanswered servers as clean.
+- Keep deferred MCP refreshes out of a destination session's restored tool selection.
+- Isolate corrupt compressed child transcripts while preserving readable export content and encrypted share fragments.
+- Honor export skip navigation during share loading. Preserve transcript selection and encrypted fragments after the viewer starts.
+- Keep historical context snapshots on their original tool-schema estimate basis.
+- Cancel retired lazy browser runs before admission and discover nested WebMCP tools registered before the first helper call.
+- Preserve complete Windows console titles and let live RPC startup settle through server completion or explicit cancellation.
+- Keep captured grid values out of job-widget diagnostic logs and author prompts.
+- Require complete rsync backups before sender admission. Preserve deletion caps, receiver filter semantics, bounded xattrs, and descriptor-bound metadata.
+- Preserve provider file snapshots and stop blocked native search delivery when its owning future is cancelled.
+- Preserve baseline CPU support when compiling Linux x64 musl binaries with Bun's current target spelling.
+- Include required package source dependencies in the composite tools TypeScript project.
 - Resolve pinned PR diff URLs with the captured GitHub host and credential namespace, including relative configuration paths.
 - Preserve fresh explicit prewalk requests after recorded handoffs, including same-model thinking-level changes.
 - Keep annotation-only sessions discoverable. Preserve saved review focus and attribute resumed feedback to its original assistant reply.
@@ -187,6 +202,80 @@
 - Resume interrupted daemon upgrades without replacing adopted history. Refuse migration while an older broker or client owns the scope.
 - Keep terminal status consistent with retained host outcomes when collaboration recovery prunes or replaces transcript messages.
 - Verify cached grammar size and SHA-256 before reuse; corrupt files require a verified atomic replacement.
+## [18.14.0] - 2026-10-29
+
+### Breaking Changes
+
+- Custom tool loaders now resolve the injected host SDK themselves; constructors take cwd as their first argument instead of a pi namespace.
+- WebMCP now uses Chrome's native WebMCP support through WebMcpController, which accepts a Puppeteer Page. The former page-hook installation helpers, bridge constant, and page-hook types have been removed; Tern tabs no longer support WebMCP.
+- Provider-qualified model selectors in --model, settings, roles, and task agents must identify an exact model ID or alias. Near matches now fail with a helpful error and suggestions instead of silently selecting a sibling model. Bare selectors such as opus retain fuzzy matching, and the Google Vertex Claude alias remains supported. Older migrated web fallback chains replace the retired Codex entry with openai-codex/gpt-5.6-sol.
+
+### Added
+
+- Agents can send an interim response without ending the current task by writing Markdown to out:// (or using > out:// in bash), with streaming output up to 64 KiB. This is enabled by default in the interactive TUI and can be configured with out.enabled; it is disabled by default in print, RPC, and ACP sessions.
+- Added computer-tool approval modes: tools.approval["computer.control"] can allow unattended foreground control on dedicated machines or deny the request without prompting. The approval mode does not itself grant access.
+- Added optional task-file input (task.file=true), allowing subagent instructions to be loaded from an absolute UTF-8 file path or local:// URL with the submitted path and SHA-256 recorded ([#17133](https://github.com/can1357/oh-my-pi/pull/17133) by [@iliaal](https://github.com/iliaal)).
+- Sessions can be pinned or unpinned from the resume picker with Alt+K and Alt+Shift+K, or the remappable app.session.pin and app.session.unpin actions. Pinned sessions move to the top and take priority in search results ([#9837](https://github.com/can1357/oh-my-pi/pull/9837) by [@zhang17-24](https://github.com/zhang17-24)).
+- Added PI_LINK_SCHEME and optional PI_LINK_HOST, allowing file links from SSH or tmux sessions to open through a desktop protocol handler ([#15855](https://github.com/can1357/oh-my-pi/pull/15855) by [@KunoLu](https://github.com/KunoLu)).
+- Extensions and RPC clients can start live voice sessions using their own WebRTC peer, including phone-browser clients, through ctx.startLive({ sdpOffer }) or live_connect ([#17013](https://github.com/can1357/oh-my-pi/pull/17013) by [@materemias](https://github.com/materemias)).
+- Extensions can customize assistant-text rendering and rerender individual replies through the opt-in extensionRenderers.assistantText setting ([#16238](https://github.com/can1357/oh-my-pi/pull/16238) by [@materemias](https://github.com/materemias)), and can register interactive link schemes with extension callbacks and renderer fallbacks ([#16239](https://github.com/can1357/oh-my-pi/pull/16239) by [@materemias](https://github.com/materemias)).
+- /debug reports now include session-logs.txt containing all log records written by the reporting session and its subagents for the current day.
+- Added prewalk.from and prewalk.into settings to choose the planning model and handoff target (default @default → @smol); /prewalk [into] and /prewalk restart [from] [into] override them for one command ([#17373](https://github.com/can1357/oh-my-pi/pull/17373) by [@H4vC](https://github.com/H4vC)).
+
+### Changed
+
+- Improved startup responsiveness by deferring nonessential UI, accessibility, browser, provider, slash-command, and interactive-composer loading until needed, and by overlapping independent session preparation work.
+- OpenAI live steering is now disabled by default for GPT models. Typed messages wait for the next tool boundary unless providers.openaiLiveSteering is enabled, avoiding unsupported in-flight message errors.
+- HTML exports now match the /stats visual design with a higher-contrast light theme, timeline and full-trace views, and navigation for nested subagents and advisors. Packaged viewers use integrity-pinned shared assets and require network access; source checkouts continue to embed the viewer.
+- tui.autoGraph now defaults to auto: charts are refined by the judge for supported native TypeSafe judge models and otherwise use the built-in estimate.
+- Filesystem changes are detected automatically, so manual scan-cache invalidation after edits is no longer needed.
+- Model refreshes use substantially less CPU by reusing unchanged models and avoiding repeated model-cache database opens.
+- Overlapping sloppy-edit operations are now applied sequentially, with each operation matched against the result of the preceding operation.
+- PI_INTENT_PROMPT and PI_INTENT_DESC can now customize the system guidance and tool-schema description for the i intent field.
+- Printed JSON values in eval, including large Python dictionaries and lists, are displayed as collapsible JSON trees.
+- Codex and Claude rate-limit reset warnings now appear once per reset across conversations and windows, only during the final six hours; the status line continues to show the countdown.
+- The . and c continue shortcuts now simply answer an unanswered last message instead of adding a hidden continue directive.
+- With bash.gitGuard enabled, checkout, switch, restore, reset, and stash operations run safely in linked worktrees, while discarded uncommitted changes are preserved for recovery.
+- Sessions with computer use enabled receive the desktop guide before the first computer call.
+- The Tern interface now presents warnings, errors, update notices, file reads, and completed background work consistently with chat messages.
+- Muted live voice sessions remain visibly muted while the voice model starts work.
+
+### Fixed
+
+- Fixed live configuration reloads missing edits immediately after a symlink switches to another file in the same directory.
+- Fixed auth-gateway model routing after catalog refreshes so bare model IDs select the highest-priority credentialed provider, with wire-format compatibility used as a tie-breaker.
+- Fixed chart recommendations that incorrectly inferred whether higher or lower values were better from row or column names; smart charting now uses the judge and avoids charting unsuitable numeric text such as page or step numbers.
+- Fixed binary data flowing through background Bash pipelines being displayed as corrupted text or counted as huge line output.
+- Fixed browser-tab closing delays when reattaching after a worker exits.
+- Fixed startup warnings being obscured by the Tern interface; they now appear as normal in-app warnings.
+- Fixed todo init clearing existing flat items when list was empty.
+- Fixed legacy extensions using detached event handlers failing to load.
+- Fixed MCP tools connected during vibe mode being activated prematurely and exceeding provider tool limits.
+- Fixed Bash services rejecting port 0 when a log readiness condition was also provided.
+- Fixed context usage and automatic compaction overstating token usage for inline tool descriptors.
+- Fixed terminal titles not being restored after exit on terminals without title-stack support, including Windows consoles.
+- Fixed cached approval directory grants that did not cover every target in a request.
+- Fixed text typed during startup being delayed until startup completed, including resumed drafts.
+- Fixed pull-request metadata and diffs remaining stale after a successful git push.
+- Fixed live voice playback clicks when audio stalls mid-word.
+- Fixed read rejecting artifact URLs from truncation hints under cached approvals or restricted folders.
+- Fixed peer task acknowledgements being mistaken for final answers, so wait continues until the peer replies.
+- Failed Hindsight memory recalls and retention operations now produce visible warnings instead of silently continuing without memory.
+- Fixed long conflict-path handling, conflict-content selectors, and stale conflict IDs after aborted merges or external file changes.
+- Fixed cancelled MCP OAuth flows and authentication lookups from crashing the session.
+- Fixed progress HUD entries for idle local-model workers that were no longer used.
+- Improved LSP diagnostics reliability across cold starts, push-diagnostics servers, save-only servers, retries, multi-server and multi-file edits, and reopened files; incomplete results are no longer reported as clean, and repeated clangd checks are faster.
+- Fixed live job widgets showing incidental text from files, web pages, or search results instead of the actual job status.
+- Fixed repeatedly failing advisor batches being retried indefinitely; they are now dropped after three failures.
+- Fixed thinking overrides on prefix-bound Claude models from losing their provider prefix behavior during compaction and retries.
+- Fixed failed large-value JSON queries from displaying the rejected value instead of a useful error.
+- Fixed F5 retry reporting no retry when a background result arrived after cancellation or interruption.
+- Fixed WebMCP invocation errors being empty and timed-out page invocations continuing to run.
+- Fixed HTTP 413 errors for Factory Droid GPT and Grok after computer-use sessions by removing obsolete screenshots from requests.
+- Fixed unavailable configured default or dictation models being silently replaced; omp now warns and identifies the fallback model.
+- Fixed LSP references for files in sibling Git worktrees by adding those checkouts to the active workspace.
+- Improved macOS computer-use behavior for applications without windows by opening the app and inspecting its returned window in one operation.
+
 ## [18.13.3] - 2026-10-28
 
 ### Added
@@ -19694,3 +19783,4 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@5041889e64d3](
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@4a170f8873d5](https://github.com/can1357/oh-my-pi/blob/4a170f8873d5280780c4057e6b2a5a45cfcf6f39/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@d94ea97cb492](https://github.com/can1357/oh-my-pi/blob/d94ea97cb492de52e2a49a0401eb48a6beaa60f2/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@3cc89b92a410](https://github.com/can1357/oh-my-pi/blob/3cc89b92a4109d55e9c4a1f2a741041e05efa578/packages/coding-agent/CHANGELOG.md).
+Older entries are archived in [packages/coding-agent/CHANGELOG.md@6693ddbfd58c](https://github.com/can1357/oh-my-pi/blob/6693ddbfd58ce9edcdc0dc3fe98a8882c9bae834/packages/coding-agent/CHANGELOG.md).

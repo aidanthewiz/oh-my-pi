@@ -2,6 +2,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthPrompt } from "@oh-my-pi/pi-ai/oauth/types";
 import { Container, getKeybindings, Spacer, Text, type TUI, wrapTextWithAnsi } from "../index";
 import { theme } from "../theme/theme";
+import { matchesKey } from "../keys";
 import { urlHyperlinkAlways, WidthAwareText } from "../render/index";
 import { formTheme } from "../chrome/form-theme";
 import { OverlayPanel } from "../chrome/overlay-box";
@@ -64,9 +65,12 @@ function urlPlace(url: string): string {
 export class LoginDialogComponent extends OverlayPanel {
 	#contentContainer: Container;
 	#input: TextFormField;
-	#tui: TUI;
+	#tui: Pick<TUI, "requestRender">;
+	#focused = false;
+	#useTerminalCursor = false;
 	#onComplete: (success: boolean, message?: string) => void;
 	#openUrl: (url: string) => void;
+	#copyToClipboard: ((text: string) => Promise<void>) | undefined;
 	#abortController = new AbortController();
 	#inputResolver?: (value: string) => void;
 	#inputRejecter?: (error: Error) => void;
@@ -78,10 +82,11 @@ export class LoginDialogComponent extends OverlayPanel {
 	#nativeRoot: NativeNode | undefined;
 
 	constructor(
-		tui: TUI,
+		tui: Pick<TUI, "requestRender">,
 		providerId: string,
 		onComplete: (success: boolean, message?: string) => void,
 		openUrl: (url: string) => void,
+		copyToClipboard?: (text: string) => Promise<void>,
 	) {
 		const providerInfo = getOAuthProviders().find(p => p.id === providerId);
 		const providerName = providerInfo?.name || providerId;
@@ -90,6 +95,7 @@ export class LoginDialogComponent extends OverlayPanel {
 		this.#tui = tui;
 		this.#onComplete = onComplete;
 		this.#openUrl = openUrl;
+		this.#copyToClipboard = copyToClipboard;
 
 		// Dynamic content area
 		this.#contentContainer = new Container();
@@ -98,8 +104,29 @@ export class LoginDialogComponent extends OverlayPanel {
 		this.#input = this.#createInput();
 	}
 
+	/** Focus reaches the live field: it draws the caret (the hardware cursor when the terminal's is on). */
+	get focused(): boolean {
+		return this.#focused;
+	}
+
+	set focused(value: boolean) {
+		this.#focused = value;
+		this.#input.focused = value;
+	}
+
+	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		this.#useTerminalCursor = useTerminalCursor;
+		this.#input.input.setUseTerminalCursor(useTerminalCursor);
+	}
+
+	/** A fresh field for the next answer; the previous one stops drawing a caret. */
+	#replaceInput(secret = false): void {
+		this.#input.focused = false;
+		this.#input = this.#createInput(secret);
+	}
+
 	#createInput(secret = false): TextFormField {
-		return new TextFormField({
+		const field = new TextFormField({
 			theme: formTheme,
 			secret,
 			empty: "submit",
@@ -116,17 +143,28 @@ export class LoginDialogComponent extends OverlayPanel {
 			},
 			requestRender: () => this.#tui.requestRender(),
 		});
+		field.focused = this.#focused;
+		field.input.setUseTerminalCursor(this.#useTerminalCursor);
+		return field;
 	}
 
 	get signal(): AbortSignal {
 		return this.#abortController.signal;
 	}
 
-	#cancel(): void {
+	override dispose(): void {
+		if (this.signal.aborted) return;
 		this.#abortController.abort();
 		const reject = this.#inputRejecter;
 		this.#clearInputHandlers();
 		reject?.(new Error("Login cancelled"));
+		this.focused = false;
+		super.dispose();
+	}
+
+	#cancel(): void {
+		if (this.signal.aborted) return;
+		this.dispose();
 		this.#onComplete(false, "Login cancelled");
 	}
 
@@ -158,6 +196,11 @@ export class LoginDialogComponent extends OverlayPanel {
 		const clickHint = `${formatKeyHint(keyHintPlatform() === "darwin" ? "super" : "ctrl")}+click to open`;
 		const hyperlink = `\x1b]8;;${url}\x07${clickHint}\x1b]8;;\x07`;
 		this.#contentContainer.addChild(new Text(theme.fg("dim", hyperlink), 0, 0));
+		if (this.#copyToClipboard) {
+			this.#contentContainer.addChild(
+				new Text(theme.fg("dim", `(clipboard copy attempted; ${formatKeyHint("alt+c")} retries)`), 0, 0),
+			);
+		}
 
 		if (launchUrl && launchUrl !== url) {
 			this.#contentContainer.addChild(
@@ -180,6 +223,7 @@ export class LoginDialogComponent extends OverlayPanel {
 		};
 		this.#nativeSteps = [];
 		this.#nativeRoot = undefined;
+		void this.#copyAuthUrl();
 
 		// Open browser (best-effort)
 		this.#openUrl(url);
@@ -191,10 +235,11 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * Show input for manual code/URL entry (for callback server providers)
 	 */
 	showManualInput(prompt: string, signal?: AbortSignal): Promise<string> {
+		if (this.signal.aborted) return Promise.reject(new Error("Login cancelled"));
 		// Keep retry chrome in place, but discard prior prompt undo/kill history.
 		const mounted = this.#contentContainer.children.indexOf(this.#input);
 		const previousInput = this.#input;
-		this.#input = this.#createInput();
+		this.#replaceInput();
 		const nativeMounted = this.#nativeSteps.find(step => step.kind === "input" && step.field === previousInput);
 		if (mounted !== -1) {
 			// The flow asks again only when the last paste carried no usable code.
@@ -236,6 +281,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * Note: Does NOT clear content, appends to existing (preserves URL from showAuth)
 	 */
 	showPrompt(prompt: OAuthPrompt): Promise<string> {
+		if (this.signal.aborted) return Promise.reject(new Error("Login cancelled"));
 		// Multi-step flows keep prior answers visible, except secrets.
 		const mounted = this.#contentContainer.children.indexOf(this.#input);
 		if (mounted !== -1) {
@@ -247,7 +293,7 @@ export class LoginDialogComponent extends OverlayPanel {
 			if (answered?.kind === "input") answered.answer = value;
 		}
 		// A new prompt must not recover a previous secret through undo or yank.
-		this.#input = this.#createInput(prompt.secret === true);
+		this.#replaceInput(prompt.secret === true);
 		if (prompt.placeholder) this.#input.input.placeholder = plainText(prompt.placeholder);
 		this.#contentContainer.addChild(new Spacer(1));
 		this.#contentContainer.addChild(new Text(theme.fg("text", prompt.message), 0, 0));
@@ -522,8 +568,31 @@ export class LoginDialogComponent extends OverlayPanel {
 		this.#input.pasteText(text);
 	}
 
+	async #copyAuthUrl(): Promise<void> {
+		const auth = this.#nativeAuth;
+		if (!auth || !this.#copyToClipboard || this.signal.aborted) return;
+		try {
+			await this.#copyToClipboard(auth.url);
+		} catch (error) {
+			if (this.signal.aborted || this.#nativeAuth !== auth) return;
+			this.showProgress(
+				`Could not copy sign-in link: ${error instanceof Error ? error.message : String(error)}. Press ${formatKeyHint("alt+c")} to copy again.`,
+			);
+			return;
+		}
+		if (!this.signal.aborted && this.#nativeAuth === auth) this.#tui.requestRender();
+	}
+
 	handleInput(data: string): void {
 		const kb = getKeybindings();
+		if (
+			this.#copyToClipboard &&
+			this.#nativeAuth &&
+			(matchesKey(data, "alt+c") || (data === "c" && !this.#inputResolver))
+		) {
+			void this.#copyAuthUrl();
+			return;
+		}
 
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.#cancel();

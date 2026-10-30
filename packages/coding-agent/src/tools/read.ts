@@ -20,6 +20,7 @@ import {
 	BINARY_SNIFF_BYTES,
 	type ImageMetadata,
 	IMAGE_METADATA_HEADER_BYTES,
+	hasFsCode,
 	isProbablyBinary,
 	isProbablyBinaryHeader,
 	isEnoent,
@@ -39,16 +40,11 @@ import {
 } from "../ida";
 import { normalizeToLF } from "../edit/normalize";
 import { getEditStore, recordFullySeenRows } from "../edit/store";
-import {
-	extractUriScheme,
-	type InternalResource,
-	InternalUrlRouter,
-	type SchemeSpec,
-	sessionResolveContext,
-} from "../internal-urls";
+import { extractUriScheme, InternalUrlRouter, type SchemeSpec, sessionResolveContext } from "../internal-urls";
 import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import { McpResourceNotFoundError } from "../internal-urls/mcp-protocol";
 import { parseInternalUrl } from "../internal-urls/parse";
 import {
 	DEFAULT_MAX_BYTES,
@@ -1146,13 +1142,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		try {
 			await fs.stat(absolute);
 		} catch (error) {
-			if (!isNotFoundError(error)) throw error;
-			if (readPath.includes(";")) {
+			if (!located && readPath.includes(";") && (isNotFoundError(error) || hasFsCode(error, "ENAMETOOLONG"))) {
 				const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, {
 					queryOwner: part => ownsReadQuery(part, this.session.cwd),
 				});
 				if (parts) return (await Promise.all(parts.map(part => this.#approvalReadEntry(part)))).flat();
 			}
+			if (!isNotFoundError(error)) throw error;
 			const suffix = isRemoteMountPath(absolute)
 				? null
 				: await findSuffixMatchCached(this.session, suffixCache, localTarget.path);
@@ -1990,8 +1986,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						signal,
 					);
 				}
-				if (target.kind === "resource") return this.#handleInternalUrl(url, target.spec, parsed, question, signal);
-				located = { url, path: target.path, sel: target.sel, spec: target.spec };
+				if (target.kind === "resource") {
+					try {
+						return await this.#handleInternalUrl(url, target.spec, parsed, question, signal);
+					} catch (error) {
+						// An opaque `name:rest` that no MCP server advertises is most likely a plain
+						// path (`Dockerfile:5`), so read it as one instead of reporting an MCP miss.
+						if (!(error instanceof McpResourceNotFoundError) || url.includes("://")) throw error;
+					}
+				} else {
+					located = { url, path: target.path, sel: target.sel, spec: target.spec };
+				}
 			}
 		}
 		if (!located) {
@@ -2169,19 +2174,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			isDirectory = stat.isDirectory();
 			specialKind = specialFileKind(stat);
 		} catch (error) {
+			// An explicit list can exceed NAME_MAX while each member is valid.
+			// Only list admission treats that error as recoverable, after the
+			// literal/archive/SQLite paths above; a single filename keeps its error.
+			if (!located && readPath.includes(";") && (isNotFoundError(error) || hasFsCode(error, "ENAMETOOLONG"))) {
+				const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, toolContext);
+				if (delimitedResult) return delimitedResult;
+			}
 			// A located file vanished after routing: the handler owns the canonical not-found error.
 			if (located && isNotFoundError(error)) {
 				return this.#handleInternalUrl(located.url, located.spec, parsed, question, signal);
 			}
 			if (isNotFoundError(error)) {
-				// A documented semicolon list is explicit user scope, while suffix
-				// matching is only fuzzy recovery. Fan the list out before a broad
-				// workspace scan, but only after literal/archive/sqlite resolution so
-				// real resources containing semicolons retain precedence.
-				if (readPath.includes(";")) {
-					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, toolContext);
-					if (delimitedResult) return delimitedResult;
-				}
 				// Attempt unique suffix resolution before falling back to the approved-plan
 				// alias or fuzzy suggestions. Existing workspace files retain precedence.
 				if (!isRemoteMountPath(absolutePath)) {
@@ -3064,6 +3068,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const scan = await scanFileForConflicts(absolutePath);
 		const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 		const history = getConflictHistory(this.session);
+		history.reconcilePath(absolutePath, scan);
 		const entries = scan.blocks.map(block =>
 			history.register({
 				absolutePath,
@@ -3119,15 +3124,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		const resource = await InternalUrlRouter.instance().resolve(url, sessionResolveContext(this.session, { signal }));
 		if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
-		const resourceDetails: NonNullable<InternalResource["details"]> = resource.details ?? {};
-		const { display, ...render } = resourceDetails;
 		const details: ReadToolDetails = {
 			shape: resource.shape,
 			resolvedPath: resource.sourcePath,
 			contentType: resource.contentType,
 			notes: resource.notes,
-			...render,
-			...(display ? { displayContent: display } : {}),
+			...resource.details,
 		};
 
 		if (resource.shape === "value") {
@@ -3143,6 +3145,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				: await buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
 						details,
 						sourcePath: resource.sourcePath,
+						sourceStartLine: resource.sourceStartLine,
+						sourceLineCount: resource.sourceLineCount,
 						sourceInternal: url,
 						entityLabel: "resource",
 						ignoreResultLimits: resource.unbounded ?? spec.unbounded === true,

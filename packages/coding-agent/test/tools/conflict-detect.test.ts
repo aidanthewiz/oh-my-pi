@@ -3,7 +3,6 @@ import { type ConflictEntry, renderConflictRegion } from "@oh-my-pi/pi-tui/tools
 import {
 	ConflictHistory,
 	expandContentTokens,
-	formatConflictWarning,
 	parseConflictUri,
 	recoverConflictUriPrefix,
 	scanConflictLines,
@@ -146,16 +145,16 @@ describe("ConflictHistory", () => {
 		});
 		const second = history.register({
 			absolutePath: "/abs/a.ts",
-			displayPath: "a.ts",
+			displayPath: "./a.ts",
 			startLine: 10,
 			separatorLine: 12,
-			endLine: 16, // file gained 2 lines in the ours section
-			oursLines: ["new-ours-1", "new-ours-2", "new-ours-3"],
-			theirsLines: ["new-theirs"],
+			endLine: 14,
+			oursLines: ["old-ours"],
+			theirsLines: ["old-theirs"],
 		});
 		expect(second.id).toBe(first.id);
-		expect(history.get(first.id)?.endLine).toBe(16);
-		expect(history.get(first.id)?.oursLines).toEqual(["new-ours-1", "new-ours-2", "new-ours-3"]);
+		expect(history.get(first.id)?.displayPath).toBe("./a.ts");
+		expect(history.get(first.id)?.oursLines).toEqual(["old-ours"]);
 	});
 
 	it("invalidatePath drops entries scoped to one absolutePath", () => {
@@ -547,117 +546,6 @@ describe("renderConflictRegion", () => {
 
 	it("rejects `base` scope for a 2-way conflict", () => {
 		expect(() => renderConflictRegion(twoWay, "base")).toThrow(/no base section/);
-	});
-});
-
-describe("formatConflictWarning", () => {
-	it("emits empty string when no entries", () => {
-		expect(formatConflictWarning([])).toBe("");
-	});
-
-	it("renders the compact diff-style block with labels aggregated at top", () => {
-		const entry = makeEntry({
-			id: 7,
-			startLine: 12,
-			separatorLine: 14,
-			endLine: 16,
-			oursLabel: "HEAD",
-			theirsLabel: "feature/x",
-			oursLines: ["a", "b"],
-			theirsLines: ["c"],
-		});
-		const text = formatConflictWarning([entry]);
-		expect(text).toContain("⚠ 1 unresolved conflict detected");
-		expect(text).toContain("- ours = HEAD");
-		expect(text).toContain("- theirs = feature/x");
-		expect(text).toContain("──── #7  L12-16 ────");
-		expect(text).toContain("<<< ours");
-		expect(text).toContain("\na\n");
-		expect(text).toContain("\nb\n");
-		expect(text).toContain(">>> theirs");
-		expect(text).toContain("\nc");
-		// NOTICE line with shorthand tokens.
-		expect(text).toContain("NOTICE: Inspect a block by reading `conflict://<N>`");
-		expect(text).toContain('`write({ path: "conflict://<N>", content })`');
-		expect(text).toContain('`write({ path: "conflict://*", content })`');
-		expect(text).toContain("@ours");
-		expect(text).toContain("@theirs");
-		// No per-block invocation; the old verbose header is gone.
-		expect(text).not.toContain('write({ path: "conflict://7"');
-		expect(text).not.toContain("--- ours");
-		expect(text).not.toContain("[conflict #7]");
-	});
-
-	it("pluralizes the summary count and emits one block per entry", () => {
-		const e1 = makeEntry({ id: 1 });
-		const e2 = makeEntry({ id: 2, startLine: 20, separatorLine: 22, endLine: 24 });
-		const text = formatConflictWarning([e1, e2]);
-		expect(text).toContain("⚠ 2 unresolved conflicts detected");
-		expect(text).toContain("──── #1  L2-6 ────");
-		expect(text).toContain("──── #2  L20-24 ────");
-	});
-
-	it("collapses base ≡ ours by skipping the redundant body", () => {
-		const entry = makeEntry({
-			id: 3,
-			baseLines: ["o"],
-			oursLines: ["o"],
-			theirsLines: ["t"],
-			baseLabel: "ancestor",
-		});
-		const text = formatConflictWarning([entry]);
-		expect(text).toContain("=== base ≡ ours");
-		// Base body should not be duplicated.
-		const baseHeaderIdx = text.indexOf("=== base ≡ ours");
-		const theirsHeaderIdx = text.indexOf(">>> theirs");
-		expect(theirsHeaderIdx).toBeGreaterThan(baseHeaderIdx);
-		const between = text.slice(baseHeaderIdx + "=== base ≡ ours".length, theirsHeaderIdx).trim();
-		expect(between).toBe("");
-	});
-
-	it("collapses base ≡ theirs the same way", () => {
-		const entry = makeEntry({
-			id: 4,
-			baseLines: ["t"],
-			oursLines: ["o"],
-			theirsLines: ["t"],
-		});
-		const text = formatConflictWarning([entry]);
-		expect(text).toContain("=== base ≡ theirs");
-	});
-
-	it("prints the base body when base differs from both sides", () => {
-		const entry = makeEntry({
-			id: 5,
-			baseLines: ["b"],
-			oursLines: ["o"],
-			theirsLines: ["t"],
-			baseLabel: "common ancestor",
-		});
-		const text = formatConflictWarning([entry]);
-		expect(text).toContain("- base = common ancestor");
-		expect(text).toContain("=== base");
-		expect(text).not.toContain("=== base ≡");
-		expect(text).toContain("\nb\n");
-	});
-
-	it("omits the ours/theirs label lines when no entry has labels", () => {
-		const entry = makeEntry({ oursLabel: undefined, theirsLabel: undefined });
-		const text = formatConflictWarning([entry]);
-		expect(text).not.toContain("- ours =");
-		expect(text).not.toContain("- theirs =");
-	});
-
-	it("caps the body preview at PREVIEW_SIDE_LINES with a `… N more lines` footer", () => {
-		const ours = Array.from({ length: 20 }, (_v, i) => `o${i}`);
-		const entry = makeEntry({ id: 6, oursLines: ours, theirsLines: ["t"] });
-		const text = formatConflictWarning([entry]);
-		expect(text).toContain("\no0\n");
-		expect(text).toContain("\no5\n");
-		// 6 lines shown, so 14 remain.
-		expect(text).toContain("… (14 more lines)");
-		// Lines past the cap are dropped from the preview.
-		expect(text).not.toContain("\no6\n");
 	});
 });
 

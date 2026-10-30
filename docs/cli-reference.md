@@ -74,16 +74,16 @@ Argument handling:
 
 #### Session and workspace
 
-| Flag | Description |
-| --- | --- |
-| `--cwd <dir>` | Directory to start in (overrides the launch cwd). |
-| `--add-dir <dir>` | Add a workspace directory beyond the working directory (repeatable). |
-| `--allow-home` | Allow starting in `~` without auto-switching to a temp dir. |
-| `--profile <name>` | Use an isolated profile for auth, sessions, settings, and caches. |
-| `--alias <name>` | Create a shell shortcut for a named profile and exit; requires `--profile` or `OMP_PROFILE`. |
-| `--config <file>` | Load an extra `config.yml`-style overlay for this run (repeatable). |
-| `--session-dir <dir>` | Directory for session storage and lookup. |
-| `--no-session` | Don't save the session (ephemeral). |
+| Flag                  | Description                                                                                  |
+| --------------------- | -------------------------------------------------------------------------------------------- |
+| `--cwd <dir>`         | Directory to start in (overrides the launch cwd).                                            |
+| `--add-dir <dir>`     | Add a workspace directory beyond the working directory (repeatable).                         |
+| `--allow-home`        | Allow starting in `~` without auto-switching to a temp dir.                                  |
+| `--profile <name>`    | Use an isolated profile for auth, sessions, settings, and caches.                            |
+| `--alias <name>`      | Create a shell shortcut for a named profile and exit; requires `--profile` or `OMP_PROFILE`. |
+| `--config <file>`     | Load an extra `config.yml`-style overlay for this run (repeatable).                          |
+| `--session-dir <dir>` | Directory for session storage and lookup.                                                    |
+| `--no-session`        | Don't save the session (ephemeral).                                                          |
 
 #### Session history
 
@@ -105,40 +105,40 @@ or `--fork`.
 
 #### Model selection
 
-| Flag | Description |
-| --- | --- |
-| `--model <id-or-role>` | Model or configured role to use (role: `slow` or `@slow`; fuzzy model match: `opus`, `gpt-5.2`, or `openai/gpt-5.2`). |
-| `--smol <id>` | Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`). |
-| `--slow <id>` | Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`). |
-| `--plan <id>` | Plan model for architectural planning (or `PI_PLAN_MODEL`). |
-| `--models <a,b,c>` | Comma-separated model patterns for `Ctrl+P` cycling. |
-| `--provider <name>` | Provider to use (legacy; prefer `--model`). |
-| `--api-key <key>` | API key (defaults to env vars). |
-| `--provider-session-id <id>` | Reuse a specific provider-side session id for continuity and cache scoping. |
-| `--prompt-cache-key <key>` | Override the provider prompt-cache key for this session. |
-| `--service-tier <tier>` | OpenAI service tier: `none`, `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast` (`none` omits `service_tier`). |
+| Flag                         | Description                                                                                                                |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `--model <id-or-role>` | Model or configured role to use (role: `slow` or `@slow`; fuzzy model match: `opus`, `gpt-5.2`; with a provider the id must be exact: `openai/gpt-5.2`). |
+| `--smol <id>`                | Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`).                                                                |
+| `--slow <id>`                | Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`).                                                           |
+| `--plan <id>`                | Plan model for architectural planning (or `PI_PLAN_MODEL`).                                                                |
+| `--model <id-or-role>` | Model or configured role to use (role: `slow` or `@slow`; fuzzy model match: `opus`, `gpt-5.2`; with a provider the id must be exact: `openai/gpt-5.2`). |
+| `--provider <name>`          | Provider to use (legacy; prefer `--model`).                                                                                |
+| `--api-key <key>`            | API key (defaults to env vars).                                                                                            |
+| `--provider-session-id <id>` | Reuse a specific provider-side session id for continuity and cache scoping.                                                |
+| `--prompt-cache-key <key>`   | Override the provider prompt-cache key for this session.                                                                   |
+| `--service-tier <tier>`      | OpenAI service tier: `none`, `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast` (`none` omits `service_tier`). |
 
 See [providers](./providers.md) and [models](./models.md) for model resolution.
 
 #### Thinking and reasoning
 
-| Flag | Description |
-| --- | --- |
-| `--thinking <level>` | Set the thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `auto`. |
-| `--hide-thinking` | Hide thinking blocks in TUI output (display only; does not disable model thinking). |
-| `--print-thoughts` | Include thinking blocks in print-mode text output. |
+| Flag                  | Description                                                                                                                                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--thinking <level>`  | Set the thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `auto`.                                                             |
+| `--hide-thinking`     | Hide thinking blocks in TUI output (display only; does not disable model thinking).                                                                       |
+| `--print-thoughts`    | Include thinking blocks in print-mode text output.                                                                                                        |
 | `--external-thinking` | Use a private scratchpad while disabling supported GPT/Claude/Gemini reasoning. Use at your own risk: providers have flagged this request shape as abuse. |
 
 #### Prewalk and plan modes
 
-| Flag | Description |
-| --- | --- |
-| `--prewalk` | Arm a one-shot handoff at the first eligible edit/write turn, gated on a successful todo call when `todo` is active (default off). See [prewalk](./prewalk.md). |
-| `--no-prewalk` | Disable prewalk even if `prewalk.enabled` is set, and keep `prewalk.auto` out of the startup session; incompatible with `--prewalk`/`--prewalk-into`. |
-| `--prewalk-into <id-or-role>` | Arm prewalk with this target instead of the `smol` role. |
-| `--plan-yolo` | Start in read-only plan mode, auto-approve the model's plan proposal, then switch to the execution target to implement it. |
-| `--plan-yolo-into <id-or-role>` | Target model for plan-yolo execution (default the `smol` role); requires `--plan-yolo`. |
-| `--goal <objective>` | Start a fresh interactive session in goal mode and begin working on the objective, without typing `/goal`. Requires `goal.enabled`; interactive only. Bypasses `autoResume`, and is rejected with a positional prompt, `@file` or stdin input, `--resume`/`--continue`/`--fork`/imports, `--plan-yolo`, `--no-tools`, or startup plan mode (`plan.defaultOnStartup`). |
+| Flag                            | Description                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--prewalk`                     | Arm a one-shot handoff at the first eligible edit/write turn, gated on a successful todo call when `todo` is active (default off). See [prewalk](./prewalk.md).                                                                                                                                                                                                       |
+| `--no-prewalk`                  | Disable prewalk even if `prewalk.enabled` is set, and keep `prewalk.auto` out of the startup session; incompatible with `--prewalk`/`--prewalk-into`.                                                                                                                                                                                                                 |
+| `--prewalk-into <id-or-role>`   | Arm prewalk with this target instead of the `smol` role.                                                                                                                                                                                                                                                                                                              |
+| `--plan-yolo`                   | Start in read-only plan mode, auto-approve the model's plan proposal, then switch to the execution target to implement it.                                                                                                                                                                                                                                            |
+| `--plan-yolo-into <id-or-role>` | Target model for plan-yolo execution (default the `smol` role); requires `--plan-yolo`.                                                                                                                                                                                                                                                                               |
+| `--goal <objective>`            | Start a fresh interactive session in goal mode and begin working on the objective, without typing `/goal`. Requires `goal.enabled`; interactive only. Bypasses `autoResume`, and is rejected with a positional prompt, `@file` or stdin input, `--resume`/`--continue`/`--fork`/imports, `--plan-yolo`, `--no-tools`, or startup plan mode (`plan.defaultOnStartup`). |
 
 #### Tools, approvals, and runtime
 
@@ -161,33 +161,33 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 
 #### Extensions, hooks, skills, and rules
 
-| Flag | Description |
-| --- | --- |
-| `--extension <path>`, `-e <path>` | Load an extension (repeatable). See [extensions](./extensions.md). |
-| `--hook <path>` | Load a hook/extension file (repeatable). See [hooks](./hooks.md). |
-| `--trusted-extension <abs-path>` | Exact allowlist of existing absolute module files (repeatable); disables ambient extension discovery and package-root sub-discovery. Cannot be combined with `--extension`/`-e`/`--hook`. |
-| `--plugin-dir <dir>` | Add a local plugin directory to discovery (repeatable). |
-| `--no-extensions` | Disable extension discovery (explicit `-e` paths still work). |
-| `--skills <globs>` | Comma-separated glob patterns to filter [skills](./skills.md) (e.g. `git-*,docker`). |
-| `--no-skills` | Disable skills discovery and loading. |
-| `--no-rules` | Disable rules discovery and loading. See [context files](./context-files.md). |
-| `--no-context-files` | Disable [context files](./context-files.md) (`AGENTS.md`, `CLAUDE.md`, ...) for the working directory and every `--add-dir` root. Subagents inherit it. |
+| Flag                              | Description                                                                                                                                                                               |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--extension <path>`, `-e <path>` | Load an extension (repeatable). See [extensions](./extensions.md).                                                                                                                        |
+| `--hook <path>`                   | Load a hook/extension file (repeatable). See [hooks](./hooks.md).                                                                                                                         |
+| `--trusted-extension <abs-path>`  | Exact allowlist of existing absolute module files (repeatable); disables ambient extension discovery and package-root sub-discovery. Cannot be combined with `--extension`/`-e`/`--hook`. |
+| `--plugin-dir <dir>`              | Add a local plugin directory to discovery (repeatable).                                                                                                                                   |
+| `--no-extensions`                 | Disable extension discovery (explicit `-e` paths still work).                                                                                                                             |
+| `--skills <globs>`                | Comma-separated glob patterns to filter [skills](./skills.md) (e.g. `git-*,docker`).                                                                                                      |
+| `--no-skills`                     | Disable skills discovery and loading.                                                                                                                                                     |
+| `--no-rules`                      | Disable rules discovery and loading. See [context files](./context-files.md).                                                                                                             |
+| `--no-context-files`              | Disable [context files](./context-files.md) (`AGENTS.md`, `CLAUDE.md`, ...) for the working directory and every `--add-dir` root. Subagents inherit it.                                   |
 
 #### System prompt
 
-| Flag | Description |
-| --- | --- |
-| `--system-prompt <text\|file>` | Plain-text system prompt override (default: coding assistant prompt). See [system prompt customization](./system-prompt-customization.md). |
-| `--system-prompt-template <path>` | Strictly read `<path>` as a Handlebars system-prompt template; mutually exclusive with `--system-prompt`. See [system prompt customization](./system-prompt-customization.md). |
-| `--append-system-prompt <text\|file>` | Append plain text or file contents to the system prompt. |
+| Flag                                  | Description                                                                                                                                                                    |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--system-prompt <text\|file>`        | Plain-text system prompt override (default: coding assistant prompt). See [system prompt customization](./system-prompt-customization.md).                                     |
+| `--system-prompt-template <path>`     | Strictly read `<path>` as a Handlebars system-prompt template; mutually exclusive with `--system-prompt`. See [system prompt customization](./system-prompt-customization.md). |
+| `--append-system-prompt <text\|file>` | Append plain text or file contents to the system prompt.                                                                                                                       |
 
 #### Output mode
 
-| Flag | Description |
-| --- | --- |
+| Flag            | Description                                                                                                           |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `--mode <mode>` | Output/transport mode: `text` (default), `json`, `rpc`, `acp`, or `rpc-ui`. See [output modes](#output-modes---mode). |
-| `--print`, `-p` | Process prompts non-interactively and exit. |
-| `--no-ui` | With `rpc`/`rpc-ui`, make extensions headless without disabling rpc-ui tool UI. |
+| `--print`, `-p` | Process prompts non-interactively and exit.                                                                           |
+| `--no-ui`       | With `rpc`/`rpc-ui`, make extensions headless without disabling rpc-ui tool UI.                                       |
 
 #### Information
 
@@ -255,13 +255,13 @@ print-mode disposal semantics when the advisor runtime is enabled.
 
 ### Output modes (`--mode`)
 
-| Mode | Description |
-| --- | --- |
-| `text` | Rendered text. Omitting `--mode` allows the TUI; explicit `--mode text` selects non-interactive text output. |
-| `json` | Newline-delimited JSON event stream for headless/machine consumption; `-p` is optional. |
-| `rpc` | Line-delimited JSON command/response/event transport over stdio (not JSON-RPC 2.0). See [RPC](./rpc.md). |
-| `rpc-ui` | RPC transport with UI extension events enabled. |
-| `acp` | Agent Client Protocol server over stdio. Equivalent to the [`acp`](#subcommands) subcommand; see [approval mode → ACP sessions](./approval-mode.md#acp-sessions). |
+| Mode     | Description                                                                                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text`   | Rendered text. Omitting `--mode` allows the TUI; explicit `--mode text` selects non-interactive text output.                                                      |
+| `json`   | Newline-delimited JSON event stream for headless/machine consumption; `-p` is optional.                                                                           |
+| `rpc`    | Line-delimited JSON command/response/event transport over stdio (not JSON-RPC 2.0). See [RPC](./rpc.md).                                                          |
+| `rpc-ui` | RPC transport with UI extension events enabled.                                                                                                                   |
+| `acp`    | Agent Client Protocol server over stdio. Equivalent to the [`acp`](#subcommands) subcommand; see [approval mode → ACP sessions](./approval-mode.md#acp-sessions). |
 
 `--no-ui` (with `--mode rpc` or `--mode rpc-ui`) runs extensions headless: `ctx.hasUI` is `false`, extension dialogs resolve to defaults, and extension presentation updates are dropped. In `rpc-ui`, tool UI such as `ask` still sends `extension_ui_request` frames for the host to answer. Host-issued `login` UI is unaffected. See [RPC startup](./rpc.md#startup).
 

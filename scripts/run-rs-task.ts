@@ -26,15 +26,18 @@ const VENDORED_FORK_EXCLUDES = [
 	"--exclude",
 	"napi",
 ] as const satisfies readonly string[];
-const VENDORED_CLIPPY_EXCLUDES = [
+// Vendored lint policy remains separate from required workspace test coverage.
+const LINT_EXEMPT_FORK_EXCLUDES = [
 	...VENDORED_FORK_EXCLUDES,
 	"--exclude",
 	"cranelift-codegen",
+	"--exclude",
+	"grep-searcher",
 ] as const satisfies readonly string[];
 const TASK_COMMANDS = {
 	"check:rs": [
 		["cargo", "fmt", "--all", "--", "--check"],
-		["cargo", "clippy", "--workspace", ...VENDORED_CLIPPY_EXCLUDES, "--no-deps", "--", "-D", "warnings"],
+		["cargo", "clippy", "--workspace", ...LINT_EXEMPT_FORK_EXCLUDES, "--no-deps", "--", "-D", "warnings"],
 	],
 	"fix:rs": [
 		["cargo", "fmt", "--all"],
@@ -42,7 +45,7 @@ const TASK_COMMANDS = {
 			"cargo",
 			"clippy",
 			"--workspace",
-			...VENDORED_CLIPPY_EXCLUDES,
+			...LINT_EXEMPT_FORK_EXCLUDES,
 			"--fix",
 			"--allow-dirty",
 			"--no-deps",
@@ -51,7 +54,7 @@ const TASK_COMMANDS = {
 		],
 	],
 	"fmt:rs": [["cargo", "fmt", "--all"]],
-	"lint:rs": [["cargo", "clippy", "--workspace", ...VENDORED_CLIPPY_EXCLUDES, "--no-deps", "--", "-D", "warnings"]],
+	"lint:rs": [["cargo", "clippy", "--workspace", ...LINT_EXEMPT_FORK_EXCLUDES, "--no-deps", "--", "-D", "warnings"]],
 	"test:rs": [
 		[
 			"cargo",

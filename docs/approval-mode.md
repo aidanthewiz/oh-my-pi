@@ -52,9 +52,9 @@ The **Remember across sessions** toggle selects the grant lifetime. Session gran
 
 ```yaml
 tools:
-  restrictedFolders:
-    - ~/secrets
-    - C:/work/payments
+   restrictedFolders:
+      - ~/secrets
+      - C:/work/payments
 ```
 
 - A restricted folder covers itself and everything below it. A call whose targets fall inside it (`read`, `write`, `edit`, `grep`, `glob`, `ast_grep`, `find`, and any tool reporting `approvalCacheTargets`) prompts with `Reason: Restricted folder: <folder>`. A recursive search rooted above a restricted folder prompts too, because it reads into it; a one-level listing of the parent does not.
@@ -70,11 +70,11 @@ tools:
 
 ```yaml
 tools:
-  approvalMode: write
-  approval:
-    bash: prompt
-    read: allow
-    mcp__filesystem_delete: deny
+   approvalMode: write
+   approval:
+      bash: prompt
+      read: allow
+      mcp__filesystem_delete: deny
 ```
 
 For MCP tools, key the policy by the exact final registered name. The ordinary form is
@@ -127,6 +127,8 @@ The disabled-by-default Eval [`computer` API](./computer-use.md) chooses its tie
 - `computer.run(fnOrCode, options)` uses `read` only for `read_only: true` (JavaScript trailing option or Python keyword); `read_only: false`, a missing field, malformed arguments, or any other value uses `exec`.
 
 The approval prompt shows `read-only` when applicable, followed by the resolved JavaScript (truncated to 2,000 characters by the standard formatter). For `computer.run`, `read_only: true` also enables the worker's desktop guard: input, focus, mutation, and clipboard writes throw. It is not static analysis or a general JavaScript sandbox.
+
+`computer.control.acquire` asks the user before handing the agent foreground control, in every mode, and answers `no-ui` when nobody can be asked. Only `tools.approval["computer.control"]` answers it without asking: `allow` grants control even without an interactive UI, for unattended machines, and `deny` refuses it. The approval mode and `tools.approval.computer` never grant it, because the default `yolo` would otherwise let every headless subagent take the user's foreground.
 
 Separately, provider-originated computer-use calls may carry `pendingSafetyChecks` metadata. Any pending check forces an interactive prompt regardless of yolo or per-tool `allow`. The prompt lists each safety-check code, message, and sanitized/truncated data. Without an interactive UI, the call fails closed with `pending provider safety checks but no interactive UI is available`.
 
@@ -181,17 +183,12 @@ Examples:
 ```ts
 approval: "read";
 
-approval: (args) => (LSP_READONLY_ACTIONS.has(args.action) ? "read" : "write");
+approval: args => (LSP_READONLY_ACTIONS.has(args.action) ? "read" : "write");
 
-approval: (args) =>
-  isCritical(args.command)
-    ? { tier: "exec", override: true, reason: "Critical pattern detected" }
-    : "exec";
+approval: args =>
+	isCritical(args.command) ? { tier: "exec", override: true, reason: "Critical pattern detected" } : "exec";
 
-approval: (args) =>
-  isForbidden(args)
-    ? { tier: "exec", policy: "deny", reason: "Blocked by tool policy" }
-    : "write";
+approval: args => (isForbidden(args) ? { tier: "exec", policy: "deny", reason: "Blocked by tool policy" } : "write");
 ```
 
 ## ACP sessions
@@ -202,7 +199,7 @@ To auto-approve ACP tool calls, set the mode in global or project config:
 
 ```yaml
 tools:
-  approvalMode: yolo
+   approvalMode: yolo
 ```
 
 Or launch the ACP server with a runtime override or a one-process config overlay:

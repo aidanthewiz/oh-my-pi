@@ -56,10 +56,12 @@ export class IrcBus {
 	readonly #lifecycle: () => AgentLifecycleManager;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
-	/** The latest successful send per `from` → `to`; see {@link sentSince}. */
+	/** The latest successful non-progress send per `from` → `to`; see {@link sentSince}. */
 	readonly #lastSent = new Map<string, Map<string, SendMark>>();
-	/** The latest direct (non-broadcast) send per `from` → `to`; see {@link unansweredSends}. */
+	/** The latest direct (non-broadcast, non-progress) send per `from` → `to`; see {@link unansweredSends}. */
 	readonly #lastDirect = new Map<string, Map<string, SendMark>>();
+	/** The latest progress message per `from` → `to`: a promise that a reply will follow. */
+	readonly #lastProgress = new Map<string, Map<string, SendMark>>();
 	/** The latest accepted task result per agent → owner. */
 	readonly #lastJobReply = new Map<string, Map<string, SendMark>>();
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
@@ -111,8 +113,13 @@ export class IrcBus {
 			mark.toFile = ref.sessionFile;
 		});
 		if (receipt.outcome !== "failed" && this.#markCurrent(message.from, message.to, mark)) {
-			this.#record(this.#lastSent, message.from, message.to, mark);
-			if (!message.broadcast && !message.wakeRelay) this.#record(this.#lastDirect, message.from, message.to, mark);
+			if (message.progress) {
+				this.#record(this.#lastProgress, message.from, message.to, mark);
+			} else {
+				this.#record(this.#lastSent, message.from, message.to, mark);
+				if (!message.broadcast && !message.wakeRelay)
+					this.#record(this.#lastDirect, message.from, message.to, mark);
+			}
 		}
 		return receipt;
 	}
@@ -173,33 +180,41 @@ export class IrcBus {
 	}
 
 	/**
-	 * Whether `from` successfully sent `to` anything at or after `sinceTs`.
-	 * The wake-turn relay uses it to skip agents that already answered their
-	 * waker themselves.
+	 * Whether `from` successfully sent `to` anything, progress included, at or
+	 * after `sinceTs`. The wake-turn relay uses it to skip agents that already
+	 * answered their waker themselves, or promised it a later answer.
 	 */
 	sentSince(from: string, to: string, sinceTs: number): boolean {
-		const sent = this.#lastSent.get(from)?.get(to);
-		return sent !== undefined && this.#markCurrent(from, to, sent) && sent.ts >= sinceTs;
+		return [this.#lastSent, this.#lastProgress].some(table => {
+			const sent = table.get(from)?.get(to);
+			return sent !== undefined && this.#markCurrent(from, to, sent) && sent.ts >= sinceTs;
+		});
 	}
 
 	/**
-	 * Agents `from` messaged directly at or after `sinceTs` that have sent
-	 * nothing back since, nor settled a job `from` owns, with when the latest
-	 * of those messages went out: the replies a `wait` can block for. "Since"
-	 * is by send order, not timestamp, so an answer to an earlier question
-	 * never settles a later one sent within the same millisecond.
+	 * Agents `from` messaged directly at or after `sinceTs` that have not
+	 * answered since, with when the latest of those messages went out: the
+	 * replies a `wait` can block for. A message back answers, and so does a
+	 * settled job of the agent `from` owns, which delivers its result. Progress
+	 * answers nothing; it marks the request `promised`, and from then on only
+	 * an explicit message answers it (a job settling the turn that sent the
+	 * progress must not). "Since" is by send order, not timestamp, so an answer
+	 * to an earlier question never settles a later one sent within the same
+	 * millisecond.
 	 */
-	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number }> {
+	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number; promised: boolean }> {
 		const sends = this.#lastDirect.get(from);
 		if (!sends) return [];
-		const unanswered: Array<{ to: string; sentAt: number }> = [];
+		const unanswered: Array<{ to: string; sentAt: number; promised: boolean }> = [];
 		for (const [to, sent] of sends) {
 			if (sent.ts < sinceTs || !this.#markCurrent(from, to, sent)) continue;
-			const answered = [this.#lastSent, this.#lastJobReply].some(replies => {
-				const reply = replies.get(to)?.get(from);
+			const after = (table: Map<string, Map<string, SendMark>>) => {
+				const reply = table.get(to)?.get(from);
 				return reply !== undefined && this.#markCurrent(to, from, reply) && reply.seq > sent.seq;
-			});
-			if (!answered) unanswered.push({ to, sentAt: sent.ts });
+			};
+			const promised = after(this.#lastProgress);
+			if (after(this.#lastSent) || (!promised && after(this.#lastJobReply))) continue;
+			unanswered.push({ to, sentAt: sent.ts, promised });
 		}
 		return unanswered;
 	}

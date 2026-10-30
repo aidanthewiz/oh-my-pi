@@ -947,6 +947,7 @@ export class Settings {
 		if (layer === "override" && setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
+		const wasConfigured = setting.isConfigured(this);
 		if (layer === "override") this.#softPins.delete(setting);
 		const prev = setting.get(this);
 		// Re-setting the persisted global value is a no-op for config.yml: staging it would still
@@ -960,7 +961,7 @@ export class Settings {
 		}
 		this.#rebuildMerged();
 		if (persistGlobal) this.#queueSave();
-		this.#fireIfChanged(setting, prev);
+		this.#fireIfChanged(setting, prev, wasConfigured);
 	}
 
 	/**
@@ -972,11 +973,12 @@ export class Settings {
 		const current = getByPath(this.#global, setting.segments);
 		if (current === undefined && !this.#softPins.has(setting)) return;
 		const prev = setting.get(this);
+		const wasConfigured = setting.isConfigured(this);
 		this.#releaseSoftPin(setting);
 		if (current !== undefined) this.#stageGlobal(setting.segments, undefined);
 		this.#rebuildMerged();
 		if (current !== undefined) this.#queueSave();
-		this.#fireIfChanged(setting, prev);
+		this.#fireIfChanged(setting, prev, wasConfigured);
 	}
 
 	/**
@@ -998,6 +1000,7 @@ export class Settings {
 				: isRecord(record) && Object.hasOwn(record, key);
 		if (!staged && !this.#softPins.has(setting)) return;
 		const prev = setting.get(this);
+		const wasConfigured = setting.isConfigured(this);
 		this.#releaseSoftPin(setting);
 		if (staged) {
 			// Replace rather than mutate the record: the merged view and cached reads may share it.
@@ -1006,7 +1009,7 @@ export class Settings {
 		}
 		this.#rebuildMerged();
 		if (staged) this.#queueSave();
-		this.#fireIfChanged(setting, prev);
+		this.#fireIfChanged(setting, prev, wasConfigured);
 	}
 
 	/**
@@ -1081,33 +1084,48 @@ export class Settings {
 		if (setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
+		const wasConfigured = setting.isConfigured(this);
 		this.#softPins.delete(setting);
 		if (getByPath(this.#overrides, setting.segments) === undefined) return;
 		const prev = setting.get(this);
 		deleteByPath(this.#overrides, setting.segments);
 		this.#rebuildMerged();
-		this.#fireIfChanged(setting, prev);
+		this.#fireIfChanged(setting, prev, wasConfigured);
 	}
 
-	/** Effective value of every setting (in registration order), captured before a bulk layer refresh. */
-	#snapshot(): unknown[] {
-		return allSettings().map(setting => setting.get(this));
-	}
-
-	/**
-	 * Notifies change listeners for every setting whose effective value differs from
-	 * `previous` (disk reload, save-time merge, project re-scope).
-	 */
-	#fireChangesSince(previous: readonly unknown[]): void {
+	/** Values and configuredness, in registration order, before a bulk layer refresh. */
+	#snapshot(): { values: unknown[]; configured: boolean[] } {
 		const settings = allSettings();
-		for (let i = 0; i < previous.length; i++) {
+		const values = new Array<unknown>(settings.length);
+		const configured = new Array<boolean>(settings.length);
+		for (let i = 0; i < settings.length; i++) {
+			values[i] = settings[i].get(this);
+			configured[i] = settings[i].isConfigured(this);
+		}
+		return { values, configured };
+	}
+
+	/** Notifies observers after a value or configuredness change. */
+	#fireChangesSince(previous: { values: readonly unknown[]; configured: readonly boolean[] }): void {
+		const settings = allSettings();
+		for (let i = 0; i < previous.values.length; i++) {
 			const setting = settings[i];
-			if (!settingValuesEqual(setting.get(this), previous[i])) this.#notifyChange(setting);
+			if (
+				!settingValuesEqual(setting.get(this), previous.values[i]) ||
+				setting.isConfigured(this) !== previous.configured[i]
+			) {
+				this.#notifyChange(setting);
+			}
 		}
 	}
 
-	#fireIfChanged(setting: AnySetting, prev: unknown): void {
-		if (!Object.is(setting.get(this), prev)) this.#notifyChange(setting);
+	#fireIfChanged(setting: AnySetting, prev: unknown, wasConfigured?: boolean): void {
+		if (
+			!Object.is(setting.get(this), prev) ||
+			(wasConfigured !== undefined && setting.isConfigured(this) !== wasConfigured)
+		) {
+			this.#notifyChange(setting);
+		}
 	}
 
 	/** Runs the listeners observing `setting`, then forwards the change to overlay children. */
@@ -1119,7 +1137,7 @@ export class Settings {
 
 	/**
 	 * Registry plumbing behind `Derived.listen` and `effect`: calls `listener` synchronously
-	 * whenever the effective value of one of `sources` changes in this instance. Returns the
+	 * whenever the effective value or configuredness of one of `sources` changes. Returns the
 	 * unsubscribe. Consumers observe settings through handles instead.
 	 */
 	onEffectiveChange(sources: readonly AnySetting[], listener: SettingChangeListener): () => void {
@@ -1242,6 +1260,15 @@ export class Settings {
 		for (const [dir, names] of targets) {
 			const existing = this.#fileWatchers.get(dir);
 			if (existing) {
+				// A newly followed target can share a directory with the old one.
+				// Events for its name were filtered out while the reload was reading
+				// the files, so reconcile once even though no new watch was opened.
+				for (const name of names) {
+					if (!existing.names.has(name)) {
+						armed = true;
+						break;
+					}
+				}
 				existing.names = names;
 				continue;
 			}
@@ -1266,10 +1293,9 @@ export class Settings {
 			this.#fileWatchers.set(dir, { watcher, names });
 			armed = true;
 		}
-		// The sources were last read before this watch existed, and Bun arms macOS
-		// FSEvents asynchronously, so a write in between raises no event (a write
-		// right after a symlink retarget, or any edit during startup). Re-read once
-		// the watch is live; that reload's own sync arms nothing new, so it settles.
+		// The sources were last read before a watch or name was added. Bun also
+		// arms macOS FSEvents asynchronously, so a write in between may raise no
+		// event. Re-read once; the next sync adds nothing new, so it settles.
 		if (armed) this.#scheduleWatchReload();
 	}
 
@@ -3588,6 +3614,23 @@ export class Settings {
 		}
 		migrateKindRoleSettings();
 
+		// The old web-provider migration persisted this pair of fuzzy defaults.
+		// Qualified selectors are now exact, so replace the pair without changing
+		// independently configured selectors or other role chains.
+		{
+			const retry = isRecord(raw.retry) ? raw.retry : undefined;
+			const chains = retry && isRecord(retry.fallbackChains) ? retry.fallbackChains : undefined;
+			const web = chains?.web;
+			if (chains && Array.isArray(web)) {
+				const index = web.findIndex(
+					(selector, i) => selector === "openai-codex/gpt-5.6" && web[i + 1] === "openai-codex/gpt-5.5",
+				);
+				if (index !== -1) {
+					chains.web = [...web.slice(0, index), "openai-codex/gpt-5.6-sol", ...web.slice(index + 2)];
+				}
+			}
+		}
+
 		// Consolidate the retired Exa suite toggles onto the sole remaining
 		// provider switch. The old runtime required both `enabled` and
 		// `enableSearch`, so preserve that AND semantics when both are present.
@@ -3878,7 +3921,7 @@ export class Settings {
 	 * never overlap ({@link #chainSave}) — so a live value never regresses to its on-disk one. An
 	 * invalid result keeps the live layer, which is last good and already holds the save's writes,
 	 * like a keep-last-good reload; the file keeps the external edit for the user to fix.
-	 * Notifies every setting whose effective value changed.
+	 * Notifies every setting whose effective value or configuredness changed.
 	 */
 	#adoptSavedGlobal(saved: RawSettings, source: string): void {
 		this.#applyPendingGlobalWrites(saved);

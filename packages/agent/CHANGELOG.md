@@ -4,10 +4,22 @@
 
 ### Fixed
 
+- Validate tool arguments without imposing unrelated renderer theme types on the tool metadata.
 - Preserve visible signed narration in compaction summaries without retaining private reasoning.
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
 - Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 - Recount cross-model Claude signed thinking when the same reader's endpoint or prefix-binding policy changes.
+## [18.14.0] - 2026-10-29
+
+### Breaking Changes
+
+- Removed the Bun event-loop workaround utilities from `@oh-my-pi/pi-agent-core/utils/yield`; agent loops no longer insert cooperative sleeps while streaming or between tool calls.
+
+### Added
+
+- Added `AgentTool.approvalRestrictionPaths` so tools can report the paths they read, allowing restricted-folder approvals to cover those paths without remembering approval separately for each path.
+- Added `Agent.logContext`, which adds custom context fields to every log record written during an agent run.
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed

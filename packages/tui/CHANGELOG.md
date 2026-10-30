@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Invalidate stale link hints during resize publication gaps and dispose pending sign-in dialogs without detached focus or refresh effects.
+- Preserve full sign-in link targets and pending answers when clipboard operations fail.
+- Keep task timers bound to their component lifetime and preserve literal file-backed assignments across native and ANSI rendering.
+- Keep finalized fence replay and transcript outlines bound to the visible snapshot.
+- Retain missing language-server coverage in native and ANSI diagnostic views without counting it as a reported issue.
 - Restore unfinished whole-file annotation notes after closing the overlay or replacing an earlier note.
 - Preserve selected session identity when renaming changes search order.
 - Honor native advisor preview limits and preserve literal `i`, `constructor`, and `__partialJson` result fields.
@@ -25,6 +30,22 @@
 - Scrub provider and operational AWS credentials from tmux capability queries while preserving terminal session identity.
 - Keep tool-image links bound to captured blob copies instead of reopening mutable read paths. Refresh native image links when hyperlink policy or file identity changes.
 - Preserve the focused worker's live loader when an older completion arrives. Fence teardown across view changes and asynchronous model switches.
+## [18.14.0] - 2026-10-29
+
+### Breaking Changes
+
+- Moved `PINNED_HUD_TOGGLE_ID` to the coding agent's task output manager so reserving subagent IDs no longer loads the interactive editor.
+- Updated `StatusLineHost.resetExpiryNotice` to receive the session and manage warning deduplication; custom status-line components must use the new signature.
+- Removed `ToolExecutionHandle.setToolActivityVisible`; tool-activity visibility is now controlled by transcript components, while reply blocks remain visible by default.
+- Removed the `@oh-my-pi/pi-tui/theme/defaults` export. Bundled palettes are now available through `getBuiltinThemes()` from `theme/defaults.json`.
+
+### Fixed
+
+- Fixed table-chart direction detection so measures are not incorrectly marked as better based on header words; single-measure tables are now sent for judging when local charting is appropriate.
+- Fixed LSP diagnostics that incorrectly showed “No issues” before a language server had reported; such files are now shown as unverified. ([#17293](https://github.com/can1357/oh-my-pi/pull/17293) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+- Fixed Esc-Esc rewind in Tern selecting interrupted turns with no visible output instead of the last displayed turn.
+- Fixed streamed code blocks losing lines that scrolled off screen before the closing fence arrived; completed lines now remain available in scrollback. ([#17333](https://github.com/can1357/oh-my-pi/pull/17333) by [@gzkGit777](https://github.com/gzkGit777))
+
 ## [18.13.3] - 2026-10-28
 
 ### Added
@@ -2542,3 +2563,4 @@
 
 Older entries are archived in [packages/tui/CHANGELOG.md@3d45d8557cd7](https://github.com/can1357/oh-my-pi/blob/3d45d8557cd7493221b69c7ed3c6b6a2307f46e7/packages/tui/CHANGELOG.md).
 Older entries are archived in [packages/tui/CHANGELOG.md@3deb6751027b](https://github.com/can1357/oh-my-pi/blob/3deb6751027b11b10ac14b2a5c07303817276505/packages/tui/CHANGELOG.md).
+Older entries are archived in [packages/tui/CHANGELOG.md@6693ddbfd58c](https://github.com/can1357/oh-my-pi/blob/6693ddbfd58ce9edcdc0dc3fe98a8882c9bae834/packages/tui/CHANGELOG.md).

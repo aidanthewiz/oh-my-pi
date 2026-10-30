@@ -286,6 +286,217 @@ fn captured_text(mut file: &fs::File) -> String {
 	text
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_utility_preflight_awaits_virtual_output() {
+	let directory = tempfile::tempdir().unwrap();
+	for prefix in ["", "printf x | "] {
+		for (option, stderr, expected) in [
+			("--help", false, 0),
+			("--version", false, 0),
+			("--invalid-native-preflight-option", true, 2),
+		] {
+			let output = tempfile::tempfile().unwrap();
+			let error = tempfile::tempfile().unwrap();
+			let mut shell = virtual_shell(directory.path()).await;
+			let parameters = capture_parameters(&shell, &output, &error);
+			let result = shell
+				.run_string(
+					&format!("{prefix}grep {option}"),
+					&SourceInfo::from("native-preflight-reference"),
+					&parameters,
+				)
+				.await
+				.unwrap();
+			assert_eq!(u8::from(result.exit_code), expected, "{prefix}grep {option}");
+			let reference = if stderr {
+				assert_eq!(captured_text(&output), "");
+				captured_text(&error)
+			} else {
+				assert_eq!(captured_text(&error), "");
+				captured_text(&output)
+			};
+			let output = tempfile::tempfile().unwrap();
+			let error = tempfile::tempfile().unwrap();
+			let parameters = capture_parameters(&shell, &output, &error);
+			let redirection = if stderr { "2>" } else { ">" };
+			let result = shell
+				.run_string(
+					&format!(
+						"{prefix}grep {option} {redirection} virtual://preflight; status=$?; printf \
+						 'continued:%s' \"$status\""
+					),
+					&SourceInfo::from("native-preflight-provider"),
+					&parameters,
+				)
+				.await
+				.unwrap();
+			assert_eq!(u8::from(result.exit_code), 0);
+			assert_eq!(
+				fs::read_to_string(directory.path().join("preflight")).unwrap(),
+				reference,
+				"{prefix}grep {option}"
+			);
+			assert_eq!(captured_text(&output), format!("continued:{expected}"));
+			assert_eq!(captured_text(&error), "");
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fd_reports_a_non_broken_pipe_output_failure() {
+	let directory = tempfile::tempdir().unwrap();
+	let fixture = directory.path().join("fixture");
+	fs::create_dir(&fixture).unwrap();
+	fs::write(fixture.join("needle"), b"x").unwrap();
+	let mut shell = virtual_shell(directory.path()).await;
+	for fail_output in [true, false] {
+		let output = tempfile::tempfile().unwrap();
+		let error = tempfile::tempfile().unwrap();
+		let parameters = capture_parameters(&shell, &output, &error);
+		let redirection = if fail_output { " > /dev/full" } else { "" };
+		let result = shell
+			.run_string(
+				&format!("fd -u -1 needle '{}'{}", fixture.display(), redirection),
+				&SourceInfo::from("fd-output-failure"),
+				&parameters,
+			)
+			.await
+			.unwrap();
+		if fail_output {
+			assert_eq!(u8::from(result.exit_code), 2, "{}", captured_text(&error));
+			let diagnostic = captured_text(&error);
+			assert!(diagnostic.contains("fd:"), "{diagnostic}");
+			assert!(
+				diagnostic.contains(&io::Error::from_raw_os_error(libc::ENOSPC).to_string()),
+				"{diagnostic}"
+			);
+			assert_eq!(captured_text(&output), "");
+		} else {
+			assert_eq!(u8::from(result.exit_code), 0, "{}", captured_text(&error));
+			assert_eq!(captured_text(&output), format!("{}\n", fixture.join("needle").display()));
+			assert_eq!(captured_text(&error), "");
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn find_fifo_output_preserves_runtime_and_cancellation() {
+	use std::{
+		ffi::CString,
+		os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+		process::{Child, Command, Stdio},
+		time::Instant,
+	};
+
+	const CHILD: &str = "PI_FIND_FIFO_REGRESSION_CHILD";
+	const PAYLOAD_LEN: usize = 1024 * 1024;
+
+	if let Some(root) = std::env::var_os(CHILD) {
+		let root = PathBuf::from(root);
+		fs::create_dir(root.join("fixture")).unwrap();
+		let fifo = root.join("output");
+		let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+		// SAFETY: path is NUL-terminated and lives for this call.
+		assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+		let mut reader = fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&fifo)
+			.unwrap();
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let output = tempfile::tempfile().unwrap();
+			let error = tempfile::tempfile().unwrap();
+			let mut shell = virtual_shell(&root).await;
+			let mut parameters = capture_parameters(&shell, &output, &error);
+			let cancel = CancellationToken::new();
+			parameters.set_cancel_token(cancel.clone());
+			let source = SourceInfo::from("find-fifo-regression");
+			let command = format!(
+				"find '{}' -maxdepth 0 -fprintf '{}' '{}'",
+				root.join("fixture").display(),
+				fifo.display(),
+				"x".repeat(PAYLOAD_LEN)
+			);
+			let run = shell.run_string(&command, &source, &parameters);
+			tokio::pin!(run);
+			let first_byte = async {
+				loop {
+					let mut byte = [0];
+					match reader.read(&mut byte) {
+						Ok(1) => break byte[0],
+						Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+							tokio::time::sleep(Duration::from_millis(1)).await;
+						},
+						other => panic!("FIFO read before first output: {other:?}"),
+					}
+				}
+			};
+			tokio::select! {
+				result = &mut run => panic!("find finished before writing its FIFO payload: {result:?}"),
+				byte = first_byte => assert_eq!(byte, b'x'),
+			}
+			tokio::select! {
+				result = &mut run => panic!("find finished with an undrained FIFO: {result:?}"),
+				() = tokio::time::sleep(Duration::from_millis(100)) => {},
+			}
+			cancel.cancel();
+			let result = tokio::time::timeout(Duration::from_secs(2), &mut run)
+				.await
+				.expect("find cancellation")
+				.unwrap();
+			assert_eq!(u8::from(result.exit_code), 130, "{}", captured_text(&error));
+			assert_eq!(captured_text(&output), "");
+			let mut queued = vec![b'x'];
+			assert_eq!(reader.read_to_end(&mut queued).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+			assert!(
+				queued.len() < PAYLOAD_LEN,
+				"find completed the blocked output after cancellation"
+			);
+			assert_eq!(queued, vec![b'x'; queued.len()]);
+			tokio::time::sleep(Duration::from_millis(30)).await;
+			let mut byte = [0];
+			assert_eq!(reader.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+		});
+		return;
+	}
+
+	struct ReapedChild(Child);
+	impl Drop for ReapedChild {
+		fn drop(&mut self) {
+			let _ = self.0.kill();
+			let _ = self.0.wait();
+		}
+	}
+
+	let directory = tempfile::tempdir().unwrap();
+	let mut child = ReapedChild(
+		Command::new(std::env::current_exe().unwrap())
+			.args(["--exact", "find_fifo_output_preserves_runtime_and_cancellation", "--nocapture"])
+			.env(CHILD, directory.path())
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::inherit())
+			.spawn()
+			.unwrap(),
+	);
+	let deadline = Instant::now() + Duration::from_secs(15);
+	loop {
+		if let Some(status) = child.0.try_wait().unwrap() {
+			assert!(status.success(), "FIFO consumer child failed: {status}");
+			break;
+		}
+		assert!(Instant::now() < deadline, "find blocked its current-thread runtime on FIFO output");
+		std::thread::sleep(Duration::from_millis(20));
+	}
+}
+
 #[tokio::test]
 async fn expanded_urls_redirect_and_edit_without_blocking_the_provider_runtime() {
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");

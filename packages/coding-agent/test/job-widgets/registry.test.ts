@@ -416,6 +416,104 @@ describe("job widget registry", () => {
 		expect(widgets.view(job)).toMatchObject({ title: "training", headline: { text: "0.01" } });
 	});
 
+	describe("specs matching unrelated lines", () => {
+		const GRID_SPEC = {
+			title: "PR checks",
+			rules: [{ from: "out", match: String.raw`^(?P<name>\S+)\s+(?P<status>\S+)`, key: "name", text: "status" }],
+			blocks: [{ kind: "grid", field: "status", label: "checks", tones: { pass: "success", pending: "pending" } }],
+		};
+		const checks = (count: number) =>
+			Array.from({ length: count }, (_, index) => `job${index % 4} ${index % 2 ? "pass" : "pending"}\n`).join("");
+		const prose = (count: number) =>
+			Array.from({ length: count }, (_, index) => `Rule${index} should hold for every module\n`).join("");
+
+		it("recovers from a candidate that fits samples but draws unrelated full-output lines", async () => {
+			const { manager, widgets, calls, advance } = setup();
+			const { job, tap, finish } = startJob(manager, "gh pr checks --watch");
+			try {
+				// The author sees the first 30 and the last 60 lines, not the prose between them.
+				tap.append(`${checks(30)}${prose(60)}${checks(60)}`);
+				advance(15_000);
+				widgets.view(job);
+				calls[0].answer.resolve(GRID_SPEC);
+				await settle();
+				expect(calls).toHaveLength(2);
+				const fallback = widgets.view(job);
+				expect(fallback?.state).toBe("authoring");
+				expect(fallback?.blocks.some(block => block.kind === "grid")).toBe(false);
+				calls[1].answer.resolve({
+					...GRID_SPEC,
+					rules: [
+						{
+							from: "out",
+							match: String.raw`^(?P<name>job\d+)\s+(?P<status>pass|pending)$`,
+							key: "name",
+							text: "status",
+						},
+					],
+				});
+				await widgets.drain();
+				const repaired = widgets.view(job);
+				expect(repaired?.state).toBe("live");
+				const grid = repaired?.blocks.find(block => block.kind === "grid");
+				expect(grid?.kind === "grid" ? grid.items : []).toEqual([
+					{ label: "job0", text: "pending", tone: "pending" },
+					{ label: "job1", text: "pass", tone: "success" },
+					{ label: "job2", text: "pending", tone: "pending" },
+					{ label: "job3", text: "pass", tone: "success" },
+				]);
+				expect(calls).toHaveLength(2);
+			} finally {
+				widgets.dispose();
+				finish();
+			}
+		});
+
+		it("recovers after new output makes a live spec draw unrelated lines", async () => {
+			const { manager, widgets, calls, advance } = setup();
+			const { job, tap, finish } = startJob(manager, "gh pr checks --watch");
+			try {
+				tap.append(checks(8));
+				advance(15_000);
+				widgets.view(job);
+				calls[0].answer.resolve(GRID_SPEC);
+				await widgets.drain();
+				expect(widgets.view(job)?.state).toBe("live");
+
+				tap.append(prose(5));
+				const view = widgets.view(job);
+				expect(view?.state).toBe("authoring");
+				expect(view?.blocks.some(entry => entry.kind === "grid")).toBe(false);
+				expect(calls).toHaveLength(2);
+				calls[1].answer.resolve({
+					...GRID_SPEC,
+					rules: [
+						{
+							from: "out",
+							match: String.raw`^(?P<name>job\d+)\s+(?P<status>pass|pending)$`,
+							key: "name",
+							text: "status",
+						},
+					],
+				});
+				await widgets.drain();
+				const repaired = widgets.view(job);
+				expect(repaired?.state).toBe("live");
+				const grid = repaired?.blocks.find(block => block.kind === "grid");
+				expect(grid?.kind === "grid" ? grid.items : []).toEqual([
+					{ label: "job0", text: "pending", tone: "pending" },
+					{ label: "job1", text: "pass", tone: "success" },
+					{ label: "job2", text: "pending", tone: "pending" },
+					{ label: "job3", text: "pass", tone: "success" },
+				]);
+				expect(calls).toHaveLength(2);
+			} finally {
+				widgets.dispose();
+				finish();
+			}
+		});
+	});
+
 	it("freezes a settled job's view after a final read and pushes changes to subscribers", async () => {
 		const manager = new AsyncJobManager({});
 		managers.push(manager);

@@ -55,9 +55,10 @@ poetry.lock -text
 # Changelogs are append-mostly; auto-merge by unioning both sides.
 packages/*/CHANGELOG.md merge=union
 
-# Generated, minified catalog artifacts: regenerate instead of diffing/merging.
+# Minified JSON artifacts: regenerate instead of diffing/merging.
 packages/catalog/src/models.json binary
 packages/catalog/src/compat/rules.json binary
+packages/tui/src/theme/defaults.json binary
 
 # Preserve verbatim third-party license payload whitespace in generated notices.
 THIRD-PARTY-NOTICES.txt whitespace=-trailing-space

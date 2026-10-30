@@ -142,8 +142,7 @@ import {
 	BrowserTracingController,
 } from "./tracing";
 import {
-	installWebMcp,
-	type WebMcpController,
+	WebMcpController,
 	type WebMcpEventsOptions,
 	type WebMcpEventsResult,
 	type WebMcpInvokeOptions,
@@ -1834,7 +1833,14 @@ export class WorkerCore {
 		const targetId = await targetIdForPage(page);
 		this.#targetId = targetId;
 		this.#lastViewport = payload.mode === "headless" ? payload.viewport : payload.knownInfo?.viewport;
-		this.#webmcp = await installWebMcp(page);
+		if (this.#stopped) return;
+		const webmcp = new WebMcpController(page);
+		this.#webmcp = webmcp;
+		await webmcp.initialize();
+		if (this.#stopped || this.#webmcp !== webmcp) {
+			await webmcp.dispose();
+			return;
+		}
 		await installVitalsObservers(page);
 		if (payload.userAgent !== undefined) await applyUserAgentOverride(page, payload.userAgent);
 		if (payload.ignoreHttpsErrors) this.#certificateOverride = await applyIgnoreHttpsErrors(page);
@@ -2826,14 +2832,15 @@ export class WorkerCore {
 					}),
 				),
 			recording: () => op("tab.recording()", quickOpMs, () => Promise.resolve(this.#recording.status())),
-			webmcpList: opts => op("tab.webmcpList()", quickOpMs, sig => untilAborted(sig, () => webmcp.list(opts))),
+			webmcpList: opts => op("tab.webmcpList()", quickOpMs, sig => untilAborted(sig, () => webmcp.list(opts, sig))),
 			webmcpInvoke: (toolName, params, opts) => {
 				const w = waitMs(opts?.timeout);
 				return op(`tab.webmcpInvoke(${JSON.stringify(toolName)})`, w, sig =>
-					untilAborted(sig, () => webmcp.invoke(toolName, params, opts)),
+					untilAborted(sig, () => webmcp.invoke(toolName, params, opts, sig)),
 				);
 			},
-			webmcpEvents: opts => op("tab.webmcpEvents()", quickOpMs, sig => untilAborted(sig, () => webmcp.events(opts))),
+			webmcpEvents: opts =>
+				op("tab.webmcpEvents()", quickOpMs, sig => untilAborted(sig, () => webmcp.events(opts, sig))),
 			a11y: opts =>
 				read("tab.a11y()", budgetBound, async sig => {
 					const result = await untilAborted(sig, () => runA11yAudit(page, opts));

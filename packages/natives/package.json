@@ -1,7 +1,22 @@
 {
 	"name": "@oh-my-pi/pi-natives",
-	"version": "18.13.3",
+	"version": "18.14.0",
 	"description": "Native Rust bindings for PDF conversion, audio, WebRTC, grep, clipboard, image processing, syntax highlighting, PTY, and shell operations via N-API",
+	"type": "module",
+	"homepage": "https://omp.sh",
+	"author": {
+		"name": "Stencil Labs, Inc.",
+		"url": "https://stencil.so"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/oh-my-pi.git",
+		"directory": "packages/natives"
+	},
+	"bugs": {
+		"url": "https://github.com/can1357/oh-my-pi/issues"
+	},
 	"keywords": [
 		"clipboard",
 		"grep",
@@ -14,61 +29,8 @@
 		"syntax-highlighting",
 		"text-processing"
 	],
-	"homepage": "https://omp.sh",
-	"bugs": {
-		"url": "https://github.com/can1357/oh-my-pi/issues"
-	},
-	"license": "MIT",
-	"author": {
-		"name": "Stencil Labs, Inc.",
-		"url": "https://stencil.so"
-	},
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/can1357/oh-my-pi.git",
-		"directory": "packages/natives"
-	},
-	"files": [
-		"src",
-		"native",
-		"README.md",
-		"CHANGELOG.md"
-	],
-	"type": "module",
 	"main": "./native/index.js",
 	"types": "./native/index.d.ts",
-	"exports": {
-		".": {
-			"types": "./native/index.d.ts",
-			"import": "./native/index.js",
-			"default": "./native/index.js"
-		},
-		"./path": {
-			"types": "./native/path.d.ts",
-			"import": "./native/path.js",
-			"default": "./native/path.js"
-		},
-		"./desktop": {
-			"types": "./native/desktop.d.ts",
-			"import": "./native/desktop.js",
-			"default": "./native/desktop.js"
-		},
-		"./clipboard": {
-			"types": "./native/clipboard.d.ts",
-			"import": "./native/clipboard.js",
-			"default": "./native/clipboard.js"
-		},
-		"./mermaid": {
-			"types": "./native/mermaid.d.ts",
-			"import": "./native/mermaid.js",
-			"default": "./native/mermaid.js"
-		},
-		"./vcs": {
-			"types": "./native/vcs.d.ts",
-			"import": "./native/vcs.js",
-			"default": "./native/vcs.js"
-		}
-	},
 	"scripts": {
 		"build": "bun ../../scripts/bazel-natives.ts host --dest native",
 		"build:bindings": "bun scripts/build-bindings.ts",
@@ -94,11 +56,50 @@
 		"string-width": "8.2.2",
 		"wrap-ansi": "10.0.0"
 	},
+	"engines": {
+		"bun": ">=1.4.4"
+	},
 	"napi": {
 		"binaryName": "pi_natives",
 		"triples": {}
 	},
-	"engines": {
-		"bun": ">=1.4.4"
+	"files": [
+		"src",
+		"native",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"exports": {
+		".": {
+			"types": "./native/index.d.ts",
+			"import": "./native/index.js",
+			"default": "./native/index.js"
+		},
+		"./THIRD-PARTY-NOTICES.txt": "./THIRD-PARTY-NOTICES.txt",
+		"./path": {
+			"types": "./native/path.d.ts",
+			"import": "./native/path.js",
+			"default": "./native/path.js"
+		},
+		"./desktop": {
+			"types": "./native/desktop.d.ts",
+			"import": "./native/desktop.js",
+			"default": "./native/desktop.js"
+		},
+		"./clipboard": {
+			"types": "./native/clipboard.d.ts",
+			"import": "./native/clipboard.js",
+			"default": "./native/clipboard.js"
+		},
+		"./vcs": {
+			"types": "./native/vcs.d.ts",
+			"import": "./native/vcs.js",
+			"default": "./native/vcs.js"
+		},
+		"./mermaid": {
+			"types": "./native/mermaid.d.ts",
+			"import": "./native/mermaid.js",
+			"default": "./native/mermaid.js"
+		}
 	}
 }

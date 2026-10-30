@@ -6,6 +6,16 @@
 
 - Fixed dashboard controls remaining busy after a cached query's refresh is abandoned by hiding the page or switching keys.
 - Preserve the Coreforce hammer favicon in the branded stats dashboard.
+## [18.14.0] - 2026-10-29
+
+### Changed
+
+- Improved `omp stats` session synchronization performance by approximately 2–5× on large histories. The first sync after upgrading may take up to a minute while the stats database is optimized.
+
+### Fixed
+
+- Fixed `/stats` and `omp stats` failing when another dashboard was syncing sessions or the configured port was already in use; busy dashboards are now reused, and a free port is selected when necessary.
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed

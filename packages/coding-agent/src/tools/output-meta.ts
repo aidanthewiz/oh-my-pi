@@ -422,10 +422,10 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
-	/** Add LSP diagnostics. No-op if no messages. */
-	diagnostics(summary: string, messages: string[]): this {
-		if (messages.length === 0) return this;
-		this.#meta.diagnostics = { summary, messages };
+	/** Add reported diagnostics and servers that sent no fresh report. */
+	diagnostics(summary: string, messages: string[], unreported?: string[]): this {
+		if (messages.length === 0 && !unreported?.length) return this;
+		this.#meta.diagnostics = { summary, messages, ...(unreported?.length ? { unreported } : {}) };
 		return this;
 	}
 

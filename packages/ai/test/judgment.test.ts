@@ -1,6 +1,7 @@
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { calculateUsageCost } from "@oh-my-pi/pi-catalog/models";
 import { YAML } from "bun";
+import { USER_AGENT } from "@oh-my-pi/pi-utils";
 import { describe, expect, it, spyOn } from "bun:test";
 import {
 	type ApiKeyResolveContext,
@@ -477,6 +478,26 @@ describe("NativeJudge", () => {
 				],
 			]),
 		);
+	});
+
+	it("sends the default User-Agent unless configured headers override it", async () => {
+		for (const headers of [undefined, { "User-Agent": "custom-judge-client/1.0" }]) {
+			const calls: { init: RequestInit | undefined }[] = [];
+			const judge = new NativeJudge({
+				apiKey: "ts-key",
+				baseUrl: "https://ts.example/",
+				headers,
+				fetch: async (_url, init) => {
+					calls.push({ init });
+					return answered();
+				},
+			});
+
+			await judge.judge(request);
+
+			expect(calls).toHaveLength(1);
+			expect(new Headers(calls[0].init?.headers).get("User-Agent")).toBe(headers?.["User-Agent"] ?? USER_AGENT);
+		}
 	});
 
 	it("requires explicit image opt-in for an unknown direct System One model", async () => {

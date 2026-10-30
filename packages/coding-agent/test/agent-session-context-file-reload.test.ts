@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Api, Model, ModelSpec } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import * as capabilities from "@oh-my-pi/pi-coding-agent/capability";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -84,5 +85,23 @@ describe("AgentSession context-file reload on session reset", () => {
 
 	it("re-reads an edited AGENTS.md after resetSessionContext()", async () => {
 		await expectContextReload(session => session.resetSessionContext());
+	});
+
+	it("rejects a failed parallel discovery without replacing the prompt and can retry", async () => {
+		await expectContextReload(async session => {
+			const previousPrompt = [...session.systemPrompt];
+			const loadCapability = capabilities.loadCapability;
+			const discovery = vi.spyOn(capabilities, "loadCapability").mockImplementation(async (id, options) => {
+				if (id === "rules") throw new Error("Rule discovery failed");
+				return await loadCapability(id, options);
+			});
+			try {
+				await expect(session.refreshBaseSystemPrompt()).rejects.toThrow("Rule discovery failed");
+				expect(session.systemPrompt).toEqual(previousPrompt);
+			} finally {
+				discovery.mockRestore();
+			}
+			return await session.resetSessionContext();
+		});
 	});
 });

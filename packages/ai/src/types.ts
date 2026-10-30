@@ -1265,6 +1265,8 @@ export interface ContextSnapshot {
 	 * differs rebase the provider anchor instead of inheriting its schemas.
 	 */
 	toolSchemaTokens?: number;
+	/** Pruning-aware schema estimator; absent on historical full-schema estimates. */
+	toolSchemaEstimateVersion?: 1;
 	/** Estimated prompt tokens removed by local history rewrites after this provider snapshot was recorded. */
 	historyRewriteTokensRemoved?: number;
 	/**

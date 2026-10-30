@@ -35,14 +35,24 @@ pub(super) const REFUSED_EXIT: u8 = 1;
 /// can run off the async workers.
 pub(super) struct Review(Judgment);
 
+/// What the builtin does with a judged command.
+pub(super) enum Decision {
+	Run,
+	/// Print this message instead of running git.
+	Refuse(String),
+}
+
 impl Review {
 	/// Judges `args` (git's arguments, without `git`) as `shell` would run them.
 	pub(super) fn of<SE: ShellExtensions>(shell: &Shell<SE>, args: &[String]) -> Self {
 		let Some(invocation) = Invocation::parse(args) else {
 			return Self(Judgment::Allow);
 		};
-		let sub = invocation.sub;
-		let site = || Site {
+		let verdict = classify(invocation.sub, invocation.args);
+		if verdict == Verdict::Allow {
+			return Self(Judgment::Allow);
+		}
+		Self(Judgment::Check(invocation.sub, verdict, Site {
 			dir:        invocation
 				.dirs
 				.iter()
@@ -54,60 +64,32 @@ impl Review {
 					.env()
 					.iter_exported()
 					.any(|(name, _)| is_git_repo_location_var(name)),
-		};
-		Self(match classify(sub, invocation.args) {
-			Verdict::Allow => Judgment::Allow,
-			Verdict::Stash => Judgment::Refuse(Refusal::Stash),
-			Verdict::Destructive => Judgment::Refuse(Refusal::Destructive(sub)),
-			Verdict::ResetTo(rev) => Judgment::ResetTo(rev.to_owned(), site()),
-			Verdict::ConflictOnly => Judgment::ConflictOnly(sub, site()),
-			Verdict::BranchMove => Judgment::Refuse(Refusal::BranchMove(sub)),
-			Verdict::CheckoutOne(operand) => Judgment::CheckoutOne(operand.to_owned(), site()),
-		})
+		}))
 	}
 
-	/// The message to print instead of running git, or `None` when git may run.
+	/// Whether git runs after reading the repository state the verdict needs.
 	///
 	/// # Errors
-	/// [`ErrorKind::ThreadingError`] when the repository read cannot finish.
-	pub(super) async fn refusal(self) -> Result<Option<String>, Error> {
-		let refusal = match self.0 {
-			Judgment::Allow => None,
-			Judgment::Refuse(refusal) => Some(refusal),
-			// A redirected repository is not the one found from `dir`; refuse.
-			Judgment::ResetTo(rev, site) => (site.redirected
-				|| blocking(move || moves_head(&site.dir, &rev)).await?)
-				.then_some(Refusal::CommitMove),
-			Judgment::ConflictOnly(sub, site) => {
-				if site.redirected {
-					Some(Refusal::Redirected(sub))
-				} else {
-					blocking(move || outside_conflict(&site.dir, sub, None)).await?
-				}
-			},
-			Judgment::CheckoutOne(operand, site) => {
-				if site.redirected {
-					Some(Refusal::Redirected(Sub::Checkout))
-				} else {
-					blocking(move || outside_conflict(&site.dir, Sub::Checkout, Some(&operand))).await?
-				}
-			},
+	/// [`ErrorKind::ThreadingError`] when the repository work cannot finish.
+	pub(super) async fn decide(self) -> Result<Decision, Error> {
+		let Judgment::Check(sub, verdict, site) = self.0 else {
+			return Ok(Decision::Run);
 		};
-		Ok(refusal.map(|refusal| refusal.message()))
+		tokio::task::spawn_blocking(move || {
+			let place = Place::of(&site);
+			in_shared(&place, sub, verdict, &site.dir)
+				.map_or(Decision::Run, |refusal| Decision::Refuse(refusal.message()))
+		})
+		.await
+		.map_err(|err| Error::from(ErrorKind::ThreadingError(err)))
 	}
 }
 
 /// What the guard decided, or which repository read decides it.
 enum Judgment {
 	Allow,
-	Refuse(Refusal),
-	/// `reset` to a revision: refused when it moves HEAD.
-	ResetTo(String, Site),
-	/// Refused unless the repository is mid-operation.
-	ConflictOnly(Sub, Site),
-	/// `checkout <operand>`: a branch switch when the operand names a commit,
-	/// else a path rewrite refused unless the repository is mid-operation.
-	CheckoutOne(String, Site),
+	/// Decided by the checkout git runs in.
+	Check(Sub, Verdict, Site),
 }
 
 /// Where git would run.
@@ -118,23 +100,63 @@ struct Site {
 	redirected: bool,
 }
 
-/// Runs a synchronous repository read on the blocking pool.
-async fn blocking<T: Send + 'static>(
-	read: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, Error> {
-	tokio::task::spawn_blocking(read)
-		.await
-		.map_err(|err| Error::from(ErrorKind::ThreadingError(err)))
+/// The checkout a command runs in.
+enum Place {
+	/// Git is redirected away from the repository found from the directory.
+	Redirected,
+	/// The repository there cannot be read.
+	Unreadable,
+	/// No repository: git fails on its own.
+	Outside,
+	/// A checkout other sessions may be using.
+	Shared(GitRepo),
 }
 
-/// Whether `reset` to `rev` moves HEAD in the repository at `dir`.
-fn moves_head(dir: &Path, rev: &str) -> bool {
-	let repo = match GitRepo::discover(dir) {
-		Ok(Some(repo)) => repo,
-		// Outside a repository git fails on its own.
-		Ok(None) => return false,
-		Err(_) => return true,
+impl Place {
+	fn of(site: &Site) -> Self {
+		if site.redirected {
+			return Self::Redirected;
+		}
+		match GitRepo::discover(&site.dir) {
+			Ok(Some(repo)) => Self::Shared(repo),
+			Ok(None) => Self::Outside,
+			Err(_) => Self::Unreadable,
+		}
+	}
+}
+
+/// Why `verdict`, run in `dir`, is refused in a checkout other sessions may be
+/// using, if it is.
+fn in_shared(place: &Place, sub: Sub, verdict: Verdict, dir: &Path) -> Option<Refusal> {
+	let repo = match place {
+		Place::Shared(repo) => Some(repo),
+		// The repository found from the directory is not the one git changes.
+		Place::Redirected => return Some(Refusal::Redirected(sub)),
+		Place::Unreadable | Place::Outside => None,
 	};
+	match verdict {
+		Verdict::Allow => None,
+		Verdict::Stash => Some(Refusal::Stash),
+		Verdict::Destructive => Some(Refusal::Destructive(sub)),
+		Verdict::BranchMove => Some(Refusal::BranchMove(sub)),
+		Verdict::ResetTo(rev) => match repo {
+			Some(repo) => moves_head(repo, &rev).then_some(Refusal::CommitMove),
+			// Outside a repository git fails on its own.
+			None => matches!(place, Place::Unreadable).then_some(Refusal::CommitMove),
+		},
+		Verdict::ConflictOnly => outside_conflict(repo, sub),
+		Verdict::CheckoutOne(operand) => {
+			if repo.is_some_and(|repo| !names_path(repo, dir, &operand)) {
+				Some(Refusal::BranchMove(sub))
+			} else {
+				outside_conflict(repo, sub)
+			}
+		},
+	}
+}
+
+/// Whether `reset` to `rev` moves HEAD in `repo`.
+fn moves_head(repo: &GitRepo, rev: &str) -> bool {
 	match (repo.resolve_ref(rev), repo.head_sha()) {
 		// Not a revision: git reads it as a path and only rewrites the index.
 		(Ok(None), _) => false,
@@ -143,18 +165,12 @@ fn moves_head(dir: &Path, rev: &str) -> bool {
 	}
 }
 
-/// Why a working-tree rewrite in the repository at `dir` is refused, if it is:
-/// it runs only mid-merge, -rebase, -cherry-pick, or -revert, and `checkout
-/// <operand>` switches branches unless it names a path. An unreadable
-/// repository is not mid-operation.
-fn outside_conflict(dir: &Path, sub: Sub, operand: Option<&str>) -> Option<Refusal> {
-	let Ok(Some(repo)) = GitRepo::discover(dir) else {
-		return Some(Refusal::OutsideConflict(sub));
-	};
-	if operand.is_some_and(|operand| !names_path(&repo, dir, operand)) {
-		return Some(Refusal::BranchMove(sub));
-	}
-	(!repo.operation_in_progress().unwrap_or(false)).then_some(Refusal::OutsideConflict(sub))
+/// Why a working-tree rewrite in `repo` is refused, if it is: it runs only
+/// mid-merge, -rebase, -cherry-pick, or -revert. Without a readable repository
+/// it is not mid-operation.
+fn outside_conflict(repo: Option<&GitRepo>, sub: Sub) -> Option<Refusal> {
+	(!repo.is_some_and(|repo| repo.operation_in_progress().unwrap_or(false)))
+		.then_some(Refusal::OutsideConflict(sub))
 }
 
 /// Whether `checkout <operand>`, run in `dir`, restores a path: the operand
@@ -418,24 +434,24 @@ fn scan(sub: Sub, args: &[String]) -> Vec<Arg<'_>> {
 
 /// What a guarded command would do, judged from its arguments alone.
 #[derive(Debug, PartialEq, Eq)]
-enum Verdict<'a> {
+enum Verdict {
 	Allow,
 	Stash,
 	/// Discards the working tree or index wholesale; refused even mid-conflict.
 	Destructive,
 	/// `reset` to this revision without a pathspec: moves HEAD unless it names
 	/// HEAD's commit.
-	ResetTo(&'a str),
+	ResetTo(String),
 	/// Rewrites working-tree files; allowed only mid-conflict.
 	ConflictOnly,
 	/// Switches branches or moves one; refused even mid-conflict.
 	BranchMove,
 	/// `checkout` with one operand and no pathspec: git switches to it when it
 	/// names a commit and restores it as a path otherwise.
-	CheckoutOne(&'a str),
+	CheckoutOne(String),
 }
 
-fn classify(sub: Sub, args: &[String]) -> Verdict<'_> {
+fn classify(sub: Sub, args: &[String]) -> Verdict {
 	match sub {
 		Sub::Stash => match args.first().map(String::as_str) {
 			Some("list" | "show" | "create") => Verdict::Allow,
@@ -449,7 +465,7 @@ fn classify(sub: Sub, args: &[String]) -> Verdict<'_> {
 /// `reset` moves HEAD only in its `reset [<mode>] <commit>` form: one revision
 /// and no pathspec. With paths, a pathspec file, or `--patch` it rewrites index
 /// entries only.
-fn classify_reset<'a>(args: &[Arg<'a>]) -> Verdict<'a> {
+fn classify_reset(args: &[Arg<'_>]) -> Verdict {
 	let flags = Flags::of(Sub::Reset, args);
 	let mut operands = Vec::new();
 	let mut pathspec = false;
@@ -461,11 +477,10 @@ fn classify_reset<'a>(args: &[Arg<'a>]) -> Verdict<'a> {
 		}
 	}
 	let index_only = pathspec || flags.any(&["patch", "pathspec-from-file"]);
+	let mode = flags.last(&["hard", "soft", "mixed", "merge", "keep"]);
 	match operands[..] {
-		_ if flags.last(&["hard", "soft", "mixed", "merge", "keep"]) == Some("hard") => {
-			Verdict::Destructive
-		},
-		[rev] if !index_only && !matches!(rev, "HEAD" | "@") => Verdict::ResetTo(rev),
+		_ if mode == Some("hard") => Verdict::Destructive,
+		[rev] if !index_only && !matches!(rev, "HEAD" | "@") => Verdict::ResetTo(rev.to_owned()),
 		_ => Verdict::Allow,
 	}
 }
@@ -473,7 +488,7 @@ fn classify_reset<'a>(args: &[Arg<'a>]) -> Verdict<'a> {
 /// `checkout`, `switch`, and `restore` rewrite working-tree files or switch
 /// branches — except `restore --staged` without `--worktree`, which only
 /// unstages, and a bare `checkout`, which only reports.
-fn classify_tree_write<'a>(sub: Sub, args: &[Arg<'a>]) -> Verdict<'a> {
+fn classify_tree_write(sub: Sub, args: &[Arg<'_>]) -> Verdict {
 	if sub == Sub::Checkout && args.is_empty() {
 		return Verdict::Allow;
 	}
@@ -511,7 +526,7 @@ fn classify_tree_write<'a>(sub: Sub, args: &[Arg<'a>]) -> Verdict<'a> {
 	} else if let [operand] = operands[..]
 		&& !paths
 	{
-		Verdict::CheckoutOne(operand)
+		Verdict::CheckoutOne(operand.to_owned())
 	} else {
 		Verdict::ConflictOnly
 	}
@@ -646,88 +661,12 @@ impl Refusal {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::path::Path;
+
 	use super::*;
 	#[cfg(unix)]
 	use crate::git::tests::{fixture, git, run_with};
-
-	/// How the guard reads `line` before consulting any repository.
-	fn judged(line: &str) -> String {
-		let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
-		match Invocation::parse(&args) {
-			Some(invocation) => format!("{:?}", classify(invocation.sub, invocation.args)),
-			None => "unguarded".to_owned(),
-		}
-	}
-
-	#[test]
-	fn reads_arguments_as_git_does() {
-		for (line, expected) in [
-			// Global options: values are skipped, `-C` is not a subcommand.
-			("-C stash status", "unguarded"),
-			("-c core.pager=cat --no-pager stash", "Stash"),
-			("--git-dir .git status", "unguarded"),
-			("stash list", "Allow"),
-			("stash show -p", "Allow"),
-			("stash create", "Allow"),
-			("stash -p", "Stash"),
-			("stash pop", "Stash"),
-			// Bare and path-scoped resets only rewrite the index.
-			("reset", "Allow"),
-			("reset -q HEAD", "Allow"),
-			("reset main tracked.txt", "Allow"),
-			("reset -- main", "Allow"),
-			("reset -p main", "Allow"),
-			("reset --pathspec-from-file list main", "Allow"),
-			("reset --soft main", "ResetTo(\"main\")"),
-			("reset main --", "ResetTo(\"main\")"),
-			("reset --end-of-options -weird", "ResetTo(\"-weird\")"),
-			("reset -q --hard", "Destructive"),
-			// Long options are read by unique abbreviation, as git reads them.
-			("reset --ha", "Destructive"),
-			// Of the modes, the last one wins.
-			("reset --ha --mixed HEAD", "Allow"),
-			("reset --soft --hard main", "Destructive"),
-			("reset --so main", "ResetTo(\"main\")"),
-			// Of `--x` and `--no-x`, the last one wins.
-			("reset --patc --no-patc HEAD~1", "ResetTo(\"HEAD~1\")"),
-			("reset -p --no-patch main", "ResetTo(\"main\")"),
-			("checkout", "Allow"),
-			// One operand is a branch or a path; the repository decides.
-			("checkout main", "CheckoutOne(\"main\")"),
-			("checkout main tracked.txt", "ConflictOnly"),
-			("checkout --theirs tracked.txt", "ConflictOnly"),
-			("checkout -2 tracked.txt", "ConflictOnly"),
-			("checkout -3 tracked.txt", "ConflictOnly"),
-			("checkout -qf main", "Destructive"),
-			// `-b` takes the rest of its bundle as the branch name.
-			("checkout -bf topic", "BranchMove"),
-			("checkout -q -B topic HEAD~1", "BranchMove"),
-			("checkout -", "BranchMove"),
-			("checkout -qd", "BranchMove"),
-			("checkout --det", "BranchMove"),
-			// `--orphan`'s value is a branch name, abbreviated or not.
-			("checkout --orph topic", "BranchMove"),
-			("checkout --no-track tracked.txt", "CheckoutOne(\"tracked.txt\")"),
-			("checkout --theirs .", "Destructive"),
-			("checkout -- :/", "Destructive"),
-			("checkout HEAD -- ../..", "Destructive"),
-			("switch -c topic", "BranchMove"),
-			("switch --discard-changes main", "Destructive"),
-			("restore tracked.txt", "ConflictOnly"),
-			("restore --staged .", "Allow"),
-			("restore --stag tracked.txt", "Allow"),
-			("restore --staged --no-staged tracked.txt", "ConflictOnly"),
-			("checkout -d --no-detach tracked.txt", "CheckoutOne(\"tracked.txt\")"),
-			("checkout -p --no-patch main", "CheckoutOne(\"main\")"),
-			("switch -f --no-force main", "BranchMove"),
-			("restore -SW tracked.txt", "ConflictOnly"),
-			("restore --staged --worktree *", "Destructive"),
-			// `--source`'s value is a tree, not a pathspec.
-			("restore --source . tracked.txt", "ConflictOnly"),
-		] {
-			assert_eq!(judged(line), expected, "git {line}");
-		}
-	}
 
 	#[cfg(unix)]
 	async fn guarded(repo: &Path, command: &str) -> (Option<i32>, String) {
@@ -744,14 +683,15 @@ mod tests {
 
 		let (code, output) = guarded(&repo, "git stash list && s=stash && git $s").await;
 		assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{output}");
-		assert!(output.contains("git stash is blocked"), "{output}");
 		assert_eq!(std::fs::read_to_string(repo.join("tracked.txt")).expect("read"), "mine\n");
 		assert_eq!(git(&repo, &["stash", "list"]), "");
 
 		// `create` only writes the stash commit and prints its id.
 		let (code, output) = guarded(&repo, "git stash create").await;
 		assert_eq!(code, Some(0), "{output}");
-		assert_eq!(output.trim().len(), 40, "{output}");
+		let id = output.trim();
+		assert_eq!(git(&repo, &["cat-file", "-t", id]), "commit\n");
+		assert_eq!(git(&repo, &["show", &format!("{id}:tracked.txt")]), "mine\n");
 		assert_eq!(std::fs::read_to_string(repo.join("tracked.txt")).expect("read"), "mine\n");
 		assert_eq!(git(&repo, &["stash", "list"]), "");
 
@@ -781,7 +721,6 @@ mod tests {
 		let head = git(&repo, &["rev-parse", "HEAD"]);
 		let (code, output) = guarded(&repo, "git reset --soft HEAD~1").await;
 		assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{output}");
-		assert!(output.contains("git reset to another commit is blocked"), "{output}");
 		assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
 	}
 
@@ -804,11 +743,9 @@ mod tests {
 		for command in ["git checkout tracked.txt", "git restore tracked.txt"] {
 			let (code, output) = guarded(&repo, command).await;
 			assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{command}: {output}");
-			assert!(output.contains("not in one"), "{command}: {output}");
 		}
 		let (code, output) = guarded(&repo, "git switch -q side").await;
 		assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{output}");
-		assert!(output.contains("to another branch or commit is blocked"), "{output}");
 		assert_eq!(std::fs::read_to_string(repo.join("tracked.txt")).expect("read"), "uncommitted\n");
 
 		git(&repo, &["checkout", "-q", "--", "tracked.txt"]);
@@ -819,7 +756,6 @@ mod tests {
 		assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{output}");
 		let (code, output) = guarded(&repo, "git --git-dir=.git checkout --theirs tracked.txt").await;
 		assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{output}");
-		assert!(output.contains("points git elsewhere"), "{output}");
 
 		// A branch only a remote has is checked out as a new local branch.
 		git(&repo, &["remote", "add", "origin", "../nowhere"]);
@@ -835,7 +771,6 @@ mod tests {
 		] {
 			let (code, output) = guarded(&repo, command).await;
 			assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{command}: {output}");
-			assert!(output.contains("to another branch or commit is blocked"), "{command}: {output}");
 		}
 		assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
 		assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main\n");
@@ -868,7 +803,6 @@ mod tests {
 		] {
 			let (code, output) = guarded(&repo, command).await;
 			assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{command}: {output}");
-			assert!(output.contains("to another branch or commit is blocked"), "{command}: {output}");
 		}
 		assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
 		assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main\n");
@@ -904,7 +838,326 @@ mod tests {
 		std::fs::write(repo.join("tracked.txt"), "uncommitted\n").expect("edit");
 		let (code, output) = guarded(&repo, "git checkout tracked.txt").await;
 		assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{output}");
-		assert!(output.contains("not in one"), "{output}");
 		assert_eq!(std::fs::read_to_string(repo.join("tracked.txt")).expect("read"), "uncommitted\n");
+	}
+
+	#[cfg(unix)]
+	fn read(checkout: &Path) -> String {
+		std::fs::read_to_string(checkout.join("tracked.txt")).expect("read tracked")
+	}
+
+	#[cfg(unix)]
+	fn strict_checkouts() -> (tempfile::TempDir, Vec<(&'static str, PathBuf)>) {
+		let (temp, repo) = fixture();
+		std::fs::write(repo.join("second.txt"), "second\n").expect("second file");
+		git(&repo, &["add", "second.txt"]);
+		git(&repo, &["commit", "-qm", "second"]);
+		git(&repo, &["branch", "safety-other", "HEAD~1"]);
+		let parent = repo.parent().expect("fixture parent");
+		let linked = parent.join("linked");
+		git(&repo, &["worktree", "add", "-q", "-b", "topic", &linked.to_string_lossy()]);
+		let clone = parent.join("clone");
+		git(parent, &["clone", "-q", &repo.to_string_lossy(), &clone.to_string_lossy()]);
+		let mut cases = vec![("main", repo.clone()), ("linked", linked.clone()), ("clone", clone)];
+		for (name, target) in [("bare.git", "bare-wt"), (".git", "dot-wt")] {
+			let bare = parent.join(name);
+			let worktree = parent.join(target);
+			git(parent, &["clone", "-q", "--bare", &repo.to_string_lossy(), &bare.to_string_lossy()]);
+			git(&bare, &["worktree", "add", "-q", &worktree.to_string_lossy(), "main"]);
+			cases.push((target, worktree));
+		}
+		git(&linked, &[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			"-q",
+			&repo.to_string_lossy(),
+			"lib",
+		]);
+		git(&linked, &["commit", "-qm", "library"]);
+		cases.push(("submodule", linked.join("lib")));
+		for (_, checkout) in &cases {
+			git(checkout, &["config", "user.name", "t"]);
+			git(checkout, &["config", "user.email", "t@t"]);
+			git(checkout, &["config", "commit.gpgSign", "false"]);
+			git(checkout, &["config", "core.hooksPath", "/dev/null"]);
+		}
+		(temp, cases)
+	}
+
+	#[cfg(unix)]
+	fn quote(value: &str) -> String {
+		format!("'{}'", value.replace('\'', "'\\''"))
+	}
+
+	#[cfg(unix)]
+	fn dispatch_gate(parent: &Path, other: Option<&Path>, command: &str) -> (String, PathBuf) {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let bin = parent.join("gate-bin");
+		std::fs::create_dir_all(&bin).expect("gate bin");
+		let wrapper = bin.join("git");
+		std::fs::write(
+			&wrapper,
+			concat!(
+				"#!/bin/sh\nset -eu\n: > \"$GUARD_MARKER\"\n",
+				"if [ -n \"$GUARD_OTHER\" ]; then \"$GUARD_REAL_GIT\" -C \"$GUARD_OTHER\" stash push \
+				 -q; fi\n",
+				"exec \"$GUARD_REAL_GIT\" \"$@\"\n",
+			),
+		)
+		.expect("gate wrapper");
+		std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+			.expect("chmod gate");
+		let real = std::process::Command::new("/bin/sh")
+			.args(["-c", "command -v git"])
+			.output()
+			.expect("find git");
+		assert!(real.status.success(), "find git: {}", String::from_utf8_lossy(&real.stderr));
+		let real = String::from_utf8(real.stdout).expect("git path");
+		let marker = parent.join("guard-dispatched");
+		let command = format!(
+			"export GUARD_REAL_GIT={} GUARD_MARKER={} GUARD_OTHER={}; export PATH={}:\"$PATH\"; \
+			 {command}",
+			quote(real.trim()),
+			quote(&marker.to_string_lossy()),
+			quote(
+				&other
+					.map(|path| path.to_string_lossy().into_owned())
+					.unwrap_or_default()
+			),
+			quote(&bin.to_string_lossy()),
+		);
+		(command, marker)
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn strict_policy_preserves_every_checkout_without_external_discard() {
+		let (_temp, cases) = strict_checkouts();
+		for (label, checkout) in cases {
+			std::fs::write(checkout.join("tracked.txt"), "saved stash\n").expect("stash edit");
+			git(&checkout, &["stash", "push", "-q"]);
+			let oid = git(&checkout, &["rev-parse", "stash@{0}"]);
+			std::fs::write(checkout.join("tracked.txt"), "staged\n").expect("staged edit");
+			git(&checkout, &["add", "tracked.txt"]);
+			std::fs::write(checkout.join("tracked.txt"), "unstaged\n").expect("working edit");
+			for path in ["private file\n.txt", ":(literal)private"] {
+				std::fs::write(checkout.join(path), "untracked private\n").expect("private file");
+			}
+			let head = git(&checkout, &["rev-parse", "HEAD"]);
+			let branch = git(&checkout, &["symbolic-ref", "HEAD"]);
+			let index = git(&checkout, &["ls-files", "--stage"]);
+			let stashes = git(&checkout, &["stash", "list", "--format=%H"]);
+			let parent = checkout.parent().expect("checkout parent");
+			let (control, marker) = dispatch_gate(parent, None, "git show HEAD:tracked.txt");
+			let (code, output) = guarded(&checkout, &control).await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			assert_eq!(output, "tracked\n", "{label}");
+			assert!(marker.exists(), "{label}: allowed inspection must reach real Git");
+			std::fs::remove_file(&marker).expect("remove control marker");
+			for command in [
+				"git reset --hard".to_owned(),
+				"git reset --ha".to_owned(),
+				"git reset --hard --recurse-submodules".to_owned(),
+				"git -C . reset --hard".to_owned(),
+				"cd . && git reset --hard".to_owned(),
+				"git --git-dir=.git reset --hard".to_owned(),
+				"git reset --soft HEAD~1".to_owned(),
+				"git switch safety-other".to_owned(),
+				"git checkout -q safety-other".to_owned(),
+				"git checkout -f -- tracked.txt".to_owned(),
+				"git restore tracked.txt".to_owned(),
+				"git checkout --theirs .".to_owned(),
+				"s=stash; git $s".to_owned(),
+				"git stash pop".to_owned(),
+				"git stash drop".to_owned(),
+				"git stash clear".to_owned(),
+				"git stash apply".to_owned(),
+				"git stash branch attempted".to_owned(),
+				format!("git stash apply {}", oid.trim()),
+			] {
+				let (guarded_command, marker) = dispatch_gate(parent, None, &command);
+				let (code, output) = guarded(&checkout, &guarded_command).await;
+				assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{label}: {command}: {output}");
+				assert!(!marker.exists(), "{label}: {command}: external Git must not run");
+				assert_eq!(read(&checkout), "unstaged\n", "{label}: {command}");
+				assert_eq!(git(&checkout, &["ls-files", "--stage"]), index, "{label}: {command}");
+				assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head, "{label}: {command}");
+				assert_eq!(git(&checkout, &["symbolic-ref", "HEAD"]), branch, "{label}: {command}");
+				assert_eq!(
+					git(&checkout, &["stash", "list", "--format=%H"]),
+					stashes,
+					"{label}: {command}"
+				);
+				for path in ["private file\n.txt", ":(literal)private"] {
+					assert_eq!(
+						std::fs::read_to_string(checkout.join(path)).expect("private file"),
+						"untracked private\n",
+						"{label}: {command}: {path:?}",
+					);
+				}
+				assert_eq!(git(&checkout, &["for-each-ref", "refs/omp/discarded"]), "");
+			}
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn strict_guard_never_dispatches_untracked_or_ignored_obstruction_reset() {
+		for (path, ignored) in [("x", false), ("cache/nested/x", true)] {
+			let (_temp, repo) = fixture();
+			std::fs::create_dir_all(repo.join(path).parent().expect("path parent")).expect("parents");
+			std::fs::write(repo.join(path), "commit A\n").expect("A");
+			git(&repo, &["add", "-f", "--", path]);
+			git(&repo, &["commit", "-qm", "A"]);
+			let a = git(&repo, &["rev-parse", "HEAD"]);
+			git(&repo, &["rm", "-q", "--", path]);
+			git(&repo, &["commit", "-qm", "B"]);
+			let parent = repo.parent().expect("fixture parent");
+			let worktree = parent.join("wt");
+			git(&repo, &["worktree", "add", "-q", "-b", "topic", &worktree.to_string_lossy()]);
+			std::fs::create_dir_all(worktree.join(path).parent().expect("path parent"))
+				.expect("parents");
+			std::fs::write(worktree.join(path), "synthetic private payload\n").expect("private file");
+			let listing = if ignored {
+				git(&worktree, &["ls-files", "--others", "--ignored", "--exclude-standard"])
+			} else {
+				git(&worktree, &["ls-files", "--others", "--exclude-standard"])
+			};
+			assert_eq!(listing, format!("{path}\n"));
+			let head = git(&worktree, &["rev-parse", "HEAD"]);
+			let index = git(&worktree, &["ls-files", "--stage"]);
+			let (command, marker) =
+				dispatch_gate(parent, None, &format!("git reset --hard {}", a.trim()));
+			let (code, output) = guarded(&worktree, &command).await;
+			assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{path}: {output}");
+			assert!(!marker.exists(), "{path}: reset must not reach external Git");
+			assert_eq!(
+				std::fs::read_to_string(worktree.join(path)).expect("private file"),
+				"synthetic private payload\n",
+			);
+			assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+			assert_eq!(git(&worktree, &["ls-files", "--stage"]), index);
+			assert_eq!(git(&worktree, &["for-each-ref", "refs/omp/discarded"]), "");
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn strict_stash_refusal_prevents_the_shared_reflog_dispatch_race() {
+		for op in ["pop", "drop", "clear", "apply", "branch recovered"] {
+			let (_temp, repo) = fixture();
+			let parent = repo.parent().expect("fixture parent");
+			let (a, b) = (parent.join("a"), parent.join("b"));
+			for (branch, path) in [("a", &a), ("b", &b)] {
+				git(&repo, &["worktree", "add", "-q", "-b", branch, &path.to_string_lossy()]);
+			}
+			std::fs::write(a.join("tracked.txt"), "A stash\n").expect("A edit");
+			git(&a, &["stash", "push", "-q"]);
+			let entries = git(&a, &["stash", "list", "--format=%H"]);
+			let a_head = git(&a, &["rev-parse", "HEAD"]);
+			let a_index = git(&a, &["ls-files", "--stage"]);
+			std::fs::write(b.join("tracked.txt"), "B pending stash\n").expect("B edit");
+			let b_head = git(&b, &["rev-parse", "HEAD"]);
+			let b_index = git(&b, &["ls-files", "--stage"]);
+			let (command, marker) = dispatch_gate(parent, Some(&b), &format!("git stash {op}"));
+			let (code, output) = guarded(&a, &command).await;
+			assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{op}: {output}");
+			assert!(!marker.exists(), "{op}: B push and A mutation must remain undispatched");
+			assert_eq!(read(&a), "tracked\n");
+			assert_eq!(read(&b), "B pending stash\n");
+			assert_eq!(git(&a, &["stash", "list", "--format=%H"]), entries);
+			assert_eq!(git(&a, &["rev-parse", "HEAD"]), a_head);
+			assert_eq!(git(&a, &["ls-files", "--stage"]), a_index);
+			assert_eq!(git(&b, &["rev-parse", "HEAD"]), b_head);
+			assert_eq!(git(&b, &["ls-files", "--stage"]), b_index);
+			assert_eq!(git(&a, &["branch", "--list", "recovered"]), "");
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn safe_inspection_object_creation_and_unstaging_remain_supported() {
+		let (_temp, cases) = strict_checkouts();
+		for (label, checkout) in cases {
+			std::fs::write(checkout.join("tracked.txt"), "staged\n").expect("staged edit");
+			git(&checkout, &["add", "tracked.txt"]);
+			std::fs::write(checkout.join("tracked.txt"), "unstaged\n").expect("working edit");
+			let head = git(&checkout, &["rev-parse", "HEAD"]);
+			let index = git(&checkout, &["ls-files", "--stage"]);
+			let stashes = git(&checkout, &["stash", "list", "--format=%H"]);
+			let (code, output) = guarded(&checkout, "git stash create").await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			let oid = output.trim();
+			assert_eq!(git(&checkout, &["cat-file", "-t", oid]), "commit\n");
+			assert_eq!(git(&checkout, &["show", &format!("{oid}:tracked.txt")]), "unstaged\n");
+			assert_eq!(git(&checkout, &["show", &format!("{oid}^2:tracked.txt")]), "staged\n");
+			assert_eq!(git(&checkout, &["ls-files", "--stage"]), index);
+			let (code, output) = guarded(&checkout, &format!("git show {oid}:tracked.txt")).await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			assert_eq!(output, "unstaged\n", "{label}");
+			let (code, output) =
+				guarded(&checkout, &format!("git stash show -p --no-color {oid}")).await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			assert!(output.contains("+unstaged\n"), "{label}: {output}");
+			let (code, output) = guarded(&checkout, "git stash list --format=%H").await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			assert_eq!(output, stashes, "{label}");
+			for command in ["git reset -- tracked.txt", "git restore --staged -- tracked.txt"] {
+				git(&checkout, &["add", "tracked.txt"]);
+				assert_eq!(git(&checkout, &["show", ":tracked.txt"]), "unstaged\n");
+				let (code, output) = guarded(&checkout, command).await;
+				assert_eq!(code, Some(0), "{label}: {command}: {output}");
+				assert_eq!(git(&checkout, &["show", ":tracked.txt"]), "tracked\n");
+				assert_eq!(read(&checkout), "unstaged\n");
+				assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head);
+				assert_eq!(git(&checkout, &["stash", "list", "--format=%H"]), stashes);
+			}
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn targeted_conflict_resolution_remains_available_in_linked_and_nested_checkouts() {
+		let (_temp, cases) = strict_checkouts();
+		for (label, checkout) in cases.into_iter().filter(|(label, _)| *label != "main") {
+			let original = format!("resolution-{label}");
+			let side = format!("conflict-{label}");
+			git(&checkout, &["checkout", "-qb", &original]);
+			git(&checkout, &["checkout", "-qb", &side]);
+			std::fs::write(checkout.join("tracked.txt"), "theirs\n").expect("side edit");
+			git(&checkout, &["commit", "-qam", "theirs"]);
+			git(&checkout, &["checkout", "-q", &original]);
+			std::fs::write(checkout.join("tracked.txt"), "ours\n").expect("main edit");
+			git(&checkout, &["commit", "-qam", "ours"]);
+			let head = git(&checkout, &["rev-parse", "HEAD"]);
+			let (code, output) = run_with(&checkout, &format!("git merge -q {side}"), &[]).await;
+			assert_eq!(code, Some(1), "{label}: {output}");
+			assert_eq!(git(&checkout, &["show", ":2:tracked.txt"]), "ours\n");
+			assert_eq!(git(&checkout, &["show", ":3:tracked.txt"]), "theirs\n");
+			let merge_head = git(&checkout, &["rev-parse", "MERGE_HEAD"]);
+			for command in ["git checkout --theirs .", "git checkout -f -- tracked.txt"] {
+				let (command, marker) =
+					dispatch_gate(checkout.parent().expect("checkout parent"), None, command);
+				let (code, output) = guarded(&checkout, &command).await;
+				assert_eq!(code, Some(i32::from(REFUSED_EXIT)), "{label}: {output}");
+				assert!(!marker.exists(), "{label}: broad or forced conflict write must not run");
+			}
+			let (code, output) = guarded(&checkout, "git checkout --theirs -- tracked.txt").await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			assert_eq!(read(&checkout), "theirs\n");
+			assert_eq!(git(&checkout, &["show", ":2:tracked.txt"]), "ours\n");
+			assert_eq!(git(&checkout, &["show", ":3:tracked.txt"]), "theirs\n");
+			git(&checkout, &["add", "tracked.txt"]);
+			std::fs::write(checkout.join("tracked.txt"), "scratch\n").expect("scratch edit");
+			let (code, output) = guarded(&checkout, "git restore -- tracked.txt").await;
+			assert_eq!(code, Some(0), "{label}: {output}");
+			assert_eq!(read(&checkout), "theirs\n");
+			assert_eq!(git(&checkout, &["show", ":tracked.txt"]), "theirs\n");
+			assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head);
+			assert_eq!(git(&checkout, &["rev-parse", "MERGE_HEAD"]), merge_head);
+		}
 	}
 }

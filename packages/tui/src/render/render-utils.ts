@@ -534,13 +534,13 @@ export function parseDiagnosticMessage(msg: string): ParsedDiagnostic | null {
 
 /** Render diagnostic summaries and optionally expanded messages. */
 export function formatDiagnostics(
-	diag: { errored: boolean; summary: string; messages: string[] },
+	diag: { errored: boolean; summary: string; messages: string[]; unreported?: string[] },
 	expanded: boolean,
 	theme: Theme,
 	getLangIcon: (filePath: string) => string,
 	options?: { title?: string },
 ): string {
-	if (diag.messages.length === 0) return "";
+	if (diag.messages.length === 0 && !diag.unreported?.length) return "";
 
 	const byFile = new Map<string, ParsedDiagnostic[]>();
 	const unparsed: string[] = [];

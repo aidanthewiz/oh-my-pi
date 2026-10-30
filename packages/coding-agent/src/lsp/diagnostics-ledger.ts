@@ -1,4 +1,5 @@
 import type { FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
+import { unreportedSummary } from "./diagnostics";
 import { summarizeDiagnosticMessages } from "./utils";
 
 const DIAGNOSTIC_LOCATION_PREFIX_RE = /^.*?:\d+:\d+\s+/;
@@ -22,6 +23,9 @@ export class DiagnosticsLedger {
 				fresh.push(message);
 			}
 		}
+		if (result.unreported?.length && previous) {
+			for (const identity of previous) currentIdentities.add(identity);
+		}
 
 		if (currentIdentities.size === 0) {
 			this.#seen.delete(absPath);
@@ -33,10 +37,14 @@ export class DiagnosticsLedger {
 			return result;
 		}
 
+		const summary = summarizeDiagnosticMessages(fresh);
 		return {
 			...result,
 			messages: fresh,
-			...summarizeDiagnosticMessages(fresh),
+			...summary,
+			summary: result.unreported?.length
+				? unreportedSummary(result.unreported, fresh.length > 0 ? summary.summary : undefined)
+				: summary.summary,
 		};
 	}
 }

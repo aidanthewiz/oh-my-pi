@@ -79,11 +79,8 @@ async function main(): Promise<void> {
 	// placeholders (stats client archive, docs index) even on failure.
 	try {
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
-		// The in-memory legacy Pi virtual module reaches the coding-agent
-		// `export/html` subpath, whose source imports `tool-views.generated.js`.
-		// Rebuild it before compilation so clean checkouts that skipped install
-		// hooks still contain that generated bundle.
-		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:tool-views"]);
+		// Generate viewer metadata before loading the compiler's export imports.
+		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:export-viewer"]);
 		const { compileCodingAgent } = await import("./compile-binary");
 		await compileCodingAgent({
 			repoRoot,

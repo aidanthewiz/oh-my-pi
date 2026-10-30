@@ -542,34 +542,40 @@ describe("eval native run boxes", () => {
 		]);
 	});
 
-	it("shows a json view as a tree in place of its printed text", () => {
-		const printed = "{'alpha': 1, 'beta': [1, 2, 3]}";
-		const view = evalToolRenderer.describeResult(
-			{
-				content: [{ type: "text", text: "" }],
-				details: {
-					cells: [
-						cell({
-							output: `${printed}\n`,
-							views: [{ text: printed, view: { kind: "json", value: { alpha: 1, beta: [1, 2, 3] } } }],
-						}),
-					],
+	it("shows a json view in place of its printed text: the host's json viewer when it has one, else a tree", () => {
+		const printed = "{'alpha': 1, 'beta': [1, 2, 3], 'i': 'kept'}";
+		const value = { alpha: 1, beta: [1, 2, 3], i: "kept" };
+		const describeBox = (options: RenderResultOptions) => {
+			const view = evalToolRenderer.describeResult(
+				{
+					content: [{ type: "text", text: "" }],
+					details: {
+						cells: [cell({ output: `${printed}\n`, views: [{ text: printed, view: { kind: "json", value } }] })],
+					},
 				},
-			},
-			done,
-		);
-		const [box] = nodes(view.body);
-		expect(collect(box?.c, "ansi")).toHaveLength(0);
-		const trees = collect(box?.c, "tree");
-		expect(trees).toHaveLength(1);
-		const tree = trees[0];
+				options,
+			);
+			return nodes(view.body)[0];
+		};
+
+		const native = describeBox({ ...done, json: true });
+		expect(collect(native?.c, "ansi")).toHaveLength(0);
+		expect(collect(native?.c, "tree")).toHaveLength(0);
+		const [viewer] = collect(native?.c, "json");
+		// The value itself, `i` included (a cell's data, not call metadata); top-level entries listed, containers folded.
+		expect(props(viewer)).toEqual({ value });
+
+		const fallback = describeBox(done);
+		expect(collect(fallback?.c, "ansi")).toHaveLength(0);
+		expect(collect(fallback?.c, "json")).toHaveLength(0);
+		const [tree] = collect(fallback?.c, "tree");
 		if (tree?.k !== "tree") throw new Error("Expected a native JSON tree");
 		const entries = tree.p?.nodes;
-		const tokens = (label: string | readonly TspSpan[]) =>
-			typeof label === "string" ? [label] : label.map(span => span.t);
-		expect(entries?.map(entry => tokens(entry.label)[0])).toEqual(["alpha", "beta"]);
-		expect(entries?.[0] && tokens(entries[0].label).at(-1)).toBe("1");
-		expect(entries?.[1]?.children?.map(entry => tokens(entry.label).at(-1))).toEqual(["1", "2", "3"]);
+		expect(
+			entries?.map(entry =>
+				typeof entry.label === "string" ? entry.label : entry.label.map(span => span.t).join(""),
+			),
+		).toEqual(["alpha: 1", "beta: [1, 2, 3]", 'i: "kept"']);
 	});
 });
 

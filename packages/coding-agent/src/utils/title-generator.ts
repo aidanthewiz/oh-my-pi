@@ -54,7 +54,7 @@ const CONSOLE_TITLE_READ_CHARS = 1024;
 interface WindowsConsoleTitleApi {
 	set(title: string): boolean;
 	/** The live console title, or `undefined` when it cannot be read. */
-	get(): string | undefined;
+	get(full?: boolean): string | undefined;
 	close(): void;
 }
 
@@ -75,11 +75,12 @@ function getWindowsConsoleTitleApi(): WindowsConsoleTitleApi | null {
 				const wideTitle = Buffer.from(`${title}\0`, "utf16le");
 				return kernel32.symbols.SetConsoleTitleW(ptr(wideTitle));
 			},
-			get() {
-				readBuffer.fill(0);
-				if (kernel32.symbols.GetConsoleTitleW(ptr(readBuffer), readBuffer.length) === 0) return undefined;
-				const end = readBuffer.indexOf(0);
-				return Buffer.from(readBuffer.buffer, 0, (end < 0 ? readBuffer.length : end) * 2).toString("utf16le");
+			get(full = false) {
+				const buffer = full ? new Uint16Array(65_536) : readBuffer;
+				if (!full) buffer.fill(0);
+				const length = kernel32.symbols.GetConsoleTitleW(ptr(buffer), buffer.length);
+				if (length === 0 || (full && length >= buffer.length - 1)) return undefined;
+				return Buffer.from(buffer.buffer, 0, length * 2).toString("utf16le");
 			},
 			close: () => kernel32.close(),
 		};
@@ -212,14 +213,14 @@ export async function generateSessionTitle(
 	// deterministically before any model is invoked; the caller retries on the
 	// next user message while the session stays unnamed.
 	if (isLowSignalTitleInput(firstMessage)) {
-		logger.debug("title-generator: skipped low-signal input", { sessionId, reason: "low-signal" });
+		logger.debug("title-generator: skipped low-signal input", { titleSessionId: sessionId, reason: "low-signal" });
 		return null;
 	}
 
 	const models = getTitleModels(registry, settings, currentModel);
 	const firstModel = models[0];
 	if (!firstModel) {
-		logger.warn("title-generator: no title model found", { sessionId, reason: "no-title-model" });
+		logger.warn("title-generator: no title model found", { titleSessionId: sessionId, reason: "no-title-model" });
 		return null;
 	}
 
@@ -257,7 +258,7 @@ export async function generateSessionTitle(
 		}
 		if (!localTitle) {
 			logger.warn("title-generator: local tiny model produced no title; skipping (no online fallback)", {
-				sessionId,
+				titleSessionId: sessionId,
 				model: firstModel.id,
 				reason: "local-no-output",
 			});
@@ -266,7 +267,7 @@ export async function generateSessionTitle(
 		return localTitle;
 	} catch (err) {
 		logger.warn("title-generator: local tiny model errored; skipping (no online fallback)", {
-			sessionId,
+			titleSessionId: sessionId,
 			model: firstModel.id,
 			error: err instanceof Error ? err.message : String(err),
 		});
@@ -287,7 +288,7 @@ export async function generateTitleOnline(
 ): Promise<string | null> {
 	const models = getTitleModels(registry, settings, currentModel);
 	if (models.length === 0) {
-		logger.warn("title-generator: no title model found", { sessionId, reason: "no-title-model" });
+		logger.warn("title-generator: no title model found", { titleSessionId: sessionId, reason: "no-title-model" });
 		return null;
 	}
 	return generateTitleOnlineWithModels(
@@ -324,7 +325,7 @@ async function generateTitleOnlineWithModels(
 	for (const model of models) {
 		const modelName = `${model.provider}/${model.id}`;
 		const modelContext = {
-			sessionId,
+			titleSessionId: sessionId,
 			provider: model.provider,
 			id: model.id,
 			model: modelName,
@@ -853,6 +854,14 @@ const terminalTitleRuntime: {
 	 *  While latched the working separator stays `:` and no interval is
 	 *  scheduled. */
 	nativeTitleFailed: boolean;
+	/** The console title `initTerminalTitleState()` read on a Windows console.
+	 *  The console has no title stack, so teardown puts it back through
+	 *  `SetConsoleTitleW`. */
+	initialWindowsConsoleTitle: string | undefined;
+	/** Set when teardown restored `initialWindowsConsoleTitle` natively. ConPTY
+	 *  turns OSC 0 into a console-title set, so `popTerminalTitle()` must then
+	 *  skip its clear or it blanks the title just restored. */
+	nativeTitleRestored: boolean;
 } = {
 	label: undefined,
 	sessionName: undefined,
@@ -866,6 +875,8 @@ const terminalTitleRuntime: {
 	extensionOverride: undefined,
 	disposed: false,
 	nativeTitleFailed: false,
+	initialWindowsConsoleTitle: undefined,
+	nativeTitleRestored: false,
 };
 
 /**
@@ -1037,6 +1048,14 @@ export function initTerminalTitleState(): void {
 	// stale failure-shaped binding would otherwise survive the reset.
 	disposeWindowsConsoleTitleApi();
 	terminalTitleRuntime.nativeTitleFailed = false;
+	terminalTitleRuntime.nativeTitleRestored = false;
+	// `??=` keeps the shell's title across a repeat claim, which would otherwise
+	// read omp's own title back.
+	try {
+		terminalTitleRuntime.initialWindowsConsoleTitle ??= getWindowsConsoleTitleApi()?.get(true);
+	} catch {
+		// Unreadable: teardown falls back to the OSC clear in `popTerminalTitle()`.
+	}
 	// A fresh claim starts from the shell's title, not whatever the previous
 	// session last emitted: the dedupe cache must not swallow the first write.
 	// Releasing the latch alone would leave a stopped timer behind a `working`
@@ -1069,6 +1088,11 @@ export function disposeTerminalTitleState(): void {
 	// longer knows what is on screen: the stale dedupe cache (`lastTerminalTitle`,
 	// cleared below) must not swallow the first write after the latch releases.
 	stopTerminalTitleSpinner();
+	const initialTitle = terminalTitleRuntime.initialWindowsConsoleTitle;
+	if (initialTitle !== undefined) {
+		terminalTitleRuntime.nativeTitleRestored = setWindowsConsoleTitle(initialTitle);
+		terminalTitleRuntime.initialWindowsConsoleTitle = undefined;
+	}
 	disposeWindowsConsoleTitleApi();
 	lastTerminalTitle = undefined;
 }
@@ -1082,9 +1106,20 @@ export function pushTerminalTitle(): void {
 }
 
 /**
- * Restore the previously saved terminal title on terminals that support xterm window ops.
+ * Hand the terminal title back to the shell on teardown, after
+ * {@link disposeTerminalTitleState}.
+ *
+ * Clears the title (OSC 0) before popping the one {@link pushTerminalTitle} saved
+ * (CSI 23;2t): a terminal with a title stack (xterm, iTerm2, VTE, mintty) restores
+ * the saved title over the clear, and one without a stack ignores the pop and
+ * keeps the clear instead of omp's title. Writes nothing when teardown already
+ * restored a Windows console title natively.
  */
 export function popTerminalTitle(): void {
 	if (!process.stdout.isTTY || isTerminalHeadless()) return;
-	writeTerminalSequence("\x1b[23;2t");
+	if (terminalTitleRuntime.nativeTitleRestored) {
+		terminalTitleRuntime.nativeTitleRestored = false;
+		return;
+	}
+	writeTerminalSequence("\x1b]0;\x07\x1b[23;2t");
 }

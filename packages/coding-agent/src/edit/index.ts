@@ -41,11 +41,6 @@ import {
 	isPermissionDeniedError,
 	writeFileWithFallback,
 } from "../tools/file-write-fallback";
-import {
-	invalidateFsScanAfterDelete,
-	invalidateFsScanAfterRename,
-	invalidateFsScanAfterWrite,
-} from "../tools/fs-cache-invalidation";
 import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -252,7 +247,7 @@ function toPerFileResult(file: EditFileOutcome, mode: EditMode): EditToolPerFile
 		newText: file.newText,
 		snapshotsPruned: file.snapshotsPruned || undefined,
 		meta: outputMeta()
-			.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [])
+			.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [], diagnostics?.unreported)
 			.get(),
 	};
 }
@@ -276,6 +271,9 @@ function aggregateDetails(files: readonly EditFileOutcome[], mode: EditMode): Ed
 			meta: file.meta,
 		};
 	}
+	const diagnostics = perFileResults.flatMap(file =>
+		file.meta?.diagnostics ? [{ path: file.path, ...file.meta.diagnostics }] : [],
+	);
 	return {
 		diff: perFileResults
 			.map(file => file.diff)
@@ -283,6 +281,13 @@ function aggregateDetails(files: readonly EditFileOutcome[], mode: EditMode): Ed
 			.join("\n"),
 		firstChangedLine: perFileResults.find(file => file.firstChangedLine !== undefined)?.firstChangedLine,
 		perFileResults: capPerFileSnapshots(perFileResults),
+		meta: outputMeta()
+			.diagnostics(
+				diagnostics.map(file => `${file.path}: ${file.summary}`).join("; "),
+				diagnostics.flatMap(file => file.messages),
+				Array.from(new Set(diagnostics.flatMap(file => file.unreported ?? []))),
+			)
+			.get(),
 	};
 }
 
@@ -710,7 +715,6 @@ export class EditTool implements AgentTool<TInput> {
 					signal,
 				);
 			}
-			invalidateFsScanAfterDelete(request.path);
 			this.session.bumpFileMutationVersion?.(request.path);
 			const diagnostics =
 				request.flushLsp && request.lspBatchId
@@ -745,7 +749,6 @@ export class EditTool implements AgentTool<TInput> {
 					signal,
 				);
 			}
-			invalidateFsScanAfterRename(request.path, request.moveTo);
 			this.session.bumpFileMutationVersion?.(request.path);
 			this.session.bumpFileMutationVersion?.(request.moveTo);
 			const diagnostics =
@@ -819,7 +822,6 @@ export class EditTool implements AgentTool<TInput> {
 			}
 		}
 
-		invalidateFsScanAfterWrite(request.path);
 		if (!began) this.session.bumpFileMutationVersion?.(request.path);
 		return {
 			written: diagnostics.finalContent,

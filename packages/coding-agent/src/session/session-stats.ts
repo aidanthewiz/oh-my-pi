@@ -28,12 +28,15 @@ interface NonMessageSnapshot {
 	nonMessageTokens: number;
 	/** Schema tokens inside `nonMessageTokens`; absent on snapshots that predate the field. */
 	toolSchemaTokens?: number;
+	/** Missing on historical snapshots whose schema estimates included descriptions. */
+	toolSchemaEstimateVersion?: 1;
 }
 
 interface PendingContextSnapshot {
 	promptTokens: number;
 	nonMessageTokens: number;
 	toolSchemaTokens: number;
+	toolSchemaEstimateVersion: 1;
 	cutoffCount: number;
 	/**
 	 * Compaction epoch at rebase time. Distinguishes a genuinely fresh in-turn
@@ -108,15 +111,13 @@ export class SessionStatsTracker {
 		return this.#host.agent.tokenizer;
 	}
 
-	/** Tool-schema tokens the active model carries in its prompt. */
-	#currentToolSchemaTokens(): number {
+	/** Tool-schema estimate in the selected description basis. */
+	#currentToolSchemaTokens(pruneDescriptions?: boolean): number {
 		const session = this.#host.session;
-		return estimateContextToolSchemaTokens(
-			session.agent?.state?.tools ?? [],
-			this.#tokenizer,
-			session.model,
-			session.settings?.revision,
-		);
+		return estimateContextToolSchemaTokens(session.agent?.state?.tools ?? [], this.#tokenizer, session.model, {
+			sourceRevision: session.settings?.revision,
+			pruneDescriptions: pruneDescriptions ?? session.agent?.prunesToolDescriptions?.(session.model),
+		});
 	}
 
 	/**
@@ -135,16 +136,20 @@ export class SessionStatsTracker {
 		activeMessages: readonly AgentMessage[],
 		pendingTokens: number,
 	): number {
+		// Provider occupancy must compare schemas in the anchor's estimator basis.
+		const currentToolSchemaTokens =
+			anchor.toolSchemaEstimateVersion === 1 ? current.toolSchemaTokens : this.#currentToolSchemaTokens(false);
+		const currentNonMessageTokens = current.nonMessageTokens - current.toolSchemaTokens + currentToolSchemaTokens;
 		const nonMessageDelta =
 			anchor.toolSchemaTokens === undefined
-				? Math.max(0, current.nonMessageTokens - anchor.nonMessageTokens)
+				? Math.max(0, currentNonMessageTokens - anchor.nonMessageTokens)
 				: Math.max(
 						0,
 						current.nonMessageTokens -
 							current.toolSchemaTokens -
 							(anchor.nonMessageTokens - anchor.toolSchemaTokens),
 					) +
-					current.toolSchemaTokens -
+					currentToolSchemaTokens -
 					anchor.toolSchemaTokens;
 		return (
 			Math.max(0, base + nonMessageDelta) +
@@ -299,6 +304,7 @@ export class SessionStatsTracker {
 		const current = {
 			nonMessageTokens: computeNonMessageTokens(this.#host.session, this.#tokenizer, settings?.revision),
 			toolSchemaTokens: toolsTokens,
+			toolSchemaEstimateVersion: 1 as const,
 		};
 		const branchEntries = this.#host.sessionManager.getBranchView();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
@@ -418,7 +424,13 @@ export class SessionStatsTracker {
 	 */
 	nonMessageSnapshot(): Required<NonMessageSnapshot> {
 		const pending = this.#pendingContextSnapshot;
-		if (pending) return { nonMessageTokens: pending.nonMessageTokens, toolSchemaTokens: pending.toolSchemaTokens };
+		if (pending) {
+			return {
+				nonMessageTokens: pending.nonMessageTokens,
+				toolSchemaTokens: pending.toolSchemaTokens,
+				toolSchemaEstimateVersion: pending.toolSchemaEstimateVersion,
+			};
+		}
 		return this.#currentNonMessageSnapshot();
 	}
 
@@ -430,6 +442,7 @@ export class SessionStatsTracker {
 				this.#host.session.settings?.revision,
 			),
 			toolSchemaTokens: this.#currentToolSchemaTokens(),
+			toolSchemaEstimateVersion: 1,
 		};
 	}
 
@@ -468,9 +481,16 @@ export class SessionStatsTracker {
 	}
 
 	/** Sets or clears the in-flight context snapshot. */
-	setPendingSnapshot(snapshot: Omit<PendingContextSnapshot, "epoch" | "toolSchemaTokens"> | undefined): void {
+	setPendingSnapshot(
+		snapshot: Omit<PendingContextSnapshot, "epoch" | "toolSchemaTokens" | "toolSchemaEstimateVersion"> | undefined,
+	): void {
 		this.#pendingContextSnapshot = snapshot
-			? { ...snapshot, toolSchemaTokens: this.#currentToolSchemaTokens(), epoch: this.#compactionEpoch }
+			? {
+					...snapshot,
+					toolSchemaTokens: this.#currentToolSchemaTokens(),
+					toolSchemaEstimateVersion: 1,
+					epoch: this.#compactionEpoch,
+				}
 			: undefined;
 		this.#contextUsageRevision++;
 	}

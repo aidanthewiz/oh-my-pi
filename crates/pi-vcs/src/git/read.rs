@@ -863,7 +863,19 @@ impl GitRepo {
 				owned.push("--".to_owned());
 				owned.extend(paths.iter().cloned());
 			}
-			return Ok(cli_text_owned(self.root(), &owned, super::cli::SYNC_TIMEOUT)?
+			let text = cli_text_owned_capped(
+				self.root(),
+				&owned,
+				super::cli::SYNC_TIMEOUT,
+				path_list_capture_limit(),
+			)?;
+			if super::cli::is_truncated(&text) {
+				return Err(Error::backend(
+					"git ls-tree",
+					"path list exceeded the subprocess capture limit",
+				));
+			}
+			return Ok(text
 				.split('\0')
 				.filter(|s| !s.is_empty())
 				.map(str::to_owned)
@@ -1527,6 +1539,81 @@ mod tests {
 			return Ok(false);
 		}
 		Err(format!("git init --ref-format=reftable failed: {stderr}").into())
+	}
+
+	fn tree_with_names(
+		root: &Path,
+		names: &[String],
+	) -> std::result::Result<String, Box<dyn std::error::Error>> {
+		use std::{io::Write, process::Stdio};
+
+		let blob = git(root, &["hash-object", "-w", "--stdin"])?;
+		let mut entries = Vec::new();
+		for name in names {
+			write!(entries, "100644 blob {}\t{name}\0", blob.trim())?;
+		}
+		let mut child = Command::new("git")
+			.current_dir(root)
+			.args(["mktree", "-z"])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()?;
+		let write_result = {
+			let mut stdin = child.stdin.take().ok_or("missing mktree stdin")?;
+			stdin.write_all(&entries)
+		};
+		let output = child.wait_with_output()?;
+		write_result?;
+		if !output.status.success() {
+			return Err(
+				format!("git mktree failed: {}", String::from_utf8_lossy(&output.stderr)).into(),
+			);
+		}
+		Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+	}
+
+	#[test]
+	fn reftable_ls_tree_rejects_truncation_without_corrupting_literal_paths() -> TestResult {
+		let dir = tempfile::tempdir()?;
+		let root = dir.path();
+		if !init_reftable(root)? {
+			return Ok(());
+		}
+		let repo = GitRepo::require(root)?;
+		assert!(repo.is_reftable(), "fixture must reach the reftable CLI consumer");
+		let literal_names =
+			["literal\nname.txt", "literal[abc]?.txt", "plain.txt"].map(str::to_owned);
+		let literal_tree = tree_with_names(root, &literal_names)?;
+		assert_eq!(repo.ls_tree(&literal_tree, &[])?, literal_names);
+		assert_eq!(repo.ls_tree(&literal_tree, &["plain.txt".to_owned()])?, ["plain.txt"]);
+
+		let limit = super::super::cli::OUTPUT_LIMIT_BYTES;
+		let mut names: Vec<_> = (0..limit / 240)
+			.map(|index| format!("{index:06}-{}", "x".repeat(232)))
+			.collect();
+		let remainder = limit % 240;
+		assert!((2..=255).contains(&remainder));
+		names.push(format!("z{}", "x".repeat(remainder - 2)));
+		assert_eq!(names.iter().map(|name| name.len() + 1).sum::<usize>(), limit);
+		let exact_tree = tree_with_names(root, &names)?;
+		assert_eq!(repo.ls_tree(&exact_tree, &[])?, names);
+
+		names
+			.last_mut()
+			.ok_or("missing final tree entry")?
+			.push('x');
+		assert_eq!(names.iter().map(|name| name.len() + 1).sum::<usize>(), limit + 1);
+		let oversized_tree = tree_with_names(root, &names)?;
+		let args = ["ls-tree", "--name-only", "-r", "-z", &oversized_tree].map(str::to_owned);
+		let capture = cli_text_owned_capped(root, &args, super::super::cli::SYNC_TIMEOUT, limit)?;
+		assert!(super::super::cli::is_truncated(&capture), "fixture must exceed the real cap");
+		assert!(
+			matches!(repo.ls_tree(&oversized_tree, &[]), Err(Error::Backend { .. })),
+			"an incomplete reftable tree must not become an authoritative path list"
+		);
+		assert_eq!(repo.ls_tree(&literal_tree, &[])?, literal_names);
+		Ok(())
 	}
 
 	#[test]

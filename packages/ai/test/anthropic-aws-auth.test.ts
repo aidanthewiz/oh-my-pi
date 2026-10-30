@@ -1,10 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
-import {
-	buildAnthropicClientOptions,
-	regionFromAnthropicAwsBaseUrl,
-	streamAnthropic,
-} from "@oh-my-pi/pi-ai/providers/anthropic";
+import { buildAnthropicClientOptions, streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { regionFromAnthropicAwsBaseUrl } from "@oh-my-pi/pi-ai/providers/anthropic-http-options";
 import { clearAwsCredentialCache } from "@oh-my-pi/pi-ai/providers/aws-credentials";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";

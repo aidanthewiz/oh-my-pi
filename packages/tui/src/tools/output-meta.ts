@@ -53,6 +53,7 @@ export type SourceMeta =
 export interface DiagnosticMeta {
 	summary: string;
 	messages: string[];
+	unreported?: string[];
 }
 
 /**
@@ -357,9 +358,10 @@ export function formatOutputNotice(meta: OutputMeta | undefined): string {
 
 	// Diagnostics
 	let diagnosticsNotice = "";
-	if (meta.diagnostics && meta.diagnostics.messages.length > 0) {
+	if (meta.diagnostics && (meta.diagnostics.messages.length > 0 || meta.diagnostics.unreported?.length)) {
 		const d = meta.diagnostics;
-		diagnosticsNotice = `\n\nLSP Diagnostics (${d.summary}):\n${formatGroupedDiagnosticMessages(d.messages)}`;
+		diagnosticsNotice = `\n\nLSP Diagnostics (${d.summary})`;
+		if (d.messages.length > 0) diagnosticsNotice += `:\n${formatGroupedDiagnosticMessages(d.messages)}`;
 	}
 
 	const notice = parts.length ? `\n\n[${parts.join(". ")}]` : "";

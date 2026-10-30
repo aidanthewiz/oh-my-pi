@@ -216,6 +216,8 @@ export interface DeferredDiagnosticsEntry {
 	summary: string;
 	/** Formatted, ready-to-display diagnostic lines. */
 	messages: string[];
+	/** Servers whose current diagnostic coverage remains unverified. */
+	unreported?: string[];
 	/** True when any message is error severity. */
 	errored: boolean;
 	/**
@@ -242,6 +244,11 @@ export interface ToolSession {
 	advertiseHeadlessAsk?: boolean;
 	/** The user approves `cfg://` writes for this session (top-level TUI session only). */
 	settingsApproval?: boolean;
+	/**
+	 * Replies render in omp's own transcript (the top-level interactive session, terminal or Tern);
+	 * false for print, RPC, ACP, and subagent sessions. See `CreateAgentSessionOptions.tuiTranscript`.
+	 */
+	tuiTranscript?: boolean;
 	/** Whether this session has begun disposal. */
 	isDisposed?: () => boolean;
 	/** Capture the root/session/account/policy authority for one asynchronous launch. */

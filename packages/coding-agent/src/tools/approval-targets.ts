@@ -95,28 +95,6 @@ export function approvalTargetNamesFile(target: string): boolean {
 }
 
 /**
- * The directory an exact target covers for a folder answer: a directory target is
- * the folder itself (a directory read must offer its own directory, never the
- * parent that would grant every sibling), a file target's parent is, and a path
- * nothing occupies yet counts as a file so its parent is offered. `undefined`
- * when the target names no filesystem path.
- */
-export function approvalTargetDirectory(target: string): string | undefined {
-	const trimmed = target.replace(/[\\/]+$/, "");
-	if (trimmed.length === 0) return undefined;
-	const router = InternalUrlRouter.instance();
-	if (router.canHandle(router.normalize(trimmed)) || isReadableUrlPath(trimmed)) return undefined;
-	// A filesystem root is its own directory: stripping its separator leaves POSIX "" and Windows
-	// "C:", which names the drive's current directory rather than the root.
-	if (path.parse(target).root === target) return target;
-	try {
-		return fs.statSync(trimmed).isDirectory() ? trimmed : path.dirname(trimmed);
-	} catch {
-		return path.dirname(trimmed);
-	}
-}
-
-/**
  * Normalize one tool argument into an approval-cache key, or `undefined` when
  * the argument is empty. Unresolvable-but-non-empty targets fall back to their
  * trimmed text so a grant still sticks to the exact target that was approved.

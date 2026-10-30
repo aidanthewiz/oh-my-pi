@@ -31392,7 +31392,6 @@ Used by:
 - unicode-normalization 0.1.25 (https://github.com/unicode-rs/unicode-normalization)
 - unicode-properties 0.1.4 (https://github.com/unicode-rs/unicode-properties)
 - unicode-segmentation 1.13.3 (https://github.com/unicode-rs/unicode-segmentation)
-- unicode-width 0.1.14 (https://github.com/unicode-rs/unicode-width)
 - unicode-width 0.2.2 (https://github.com/unicode-rs/unicode-width)
 
 Full license text:
@@ -32077,6 +32076,39 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- md4 0.10.2 (https://github.com/RustCrypto/hashes)
+
+Full license text:
+
+Copyright (c) 2016 bacher09, Artyom Pavlov
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
@@ -37131,7 +37163,6 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- html-escape 0.2.15 (https://github.com/magiclen/html-escape)
 - html-escape 0.3.0 (https://github.com/magiclen/html-escape)
 
 Full license text:
@@ -37489,7 +37520,7 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- ansi-width 0.1.0
+- ansi-width 0.1.1 (https://github.com/uutils/ansi-width)
 
 Full license text:
 
@@ -37815,13 +37846,13 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- pi-ast 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-builtins 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-iso 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-natives 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-shell 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-voice 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-walker 18.13.3 (https://github.com/can1357/oh-my-pi)
+- pi-ast 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-builtins 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-iso 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-natives 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-shell 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-voice 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-walker 18.14.0 (https://github.com/can1357/oh-my-pi)
 
 Full license text:
 
@@ -37960,11 +37991,11 @@ Used by:
 - objc2-metal 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-quartz-core 0.3.2 (https://github.com/madsmtm/objc2)
 - palette_math 0.7.7 (https://github.com/Ogeon/palette)
-- pi-diff 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-edit 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-predict 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-vcs 18.13.3 (https://github.com/can1357/oh-my-pi)
-- pi-vfs 18.13.3 (https://github.com/can1357/oh-my-pi)
+- pi-diff 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-edit 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-predict 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-vcs 18.14.0 (https://github.com/can1357/oh-my-pi)
+- pi-vfs 18.14.0 (https://github.com/can1357/oh-my-pi)
 - pulp-wasm-simd-flag 0.1.1 (https://github.com/sarah-quinones/pulp/)
 - quantette 0.6.0 (https://github.com/IanManske/quantette)
 - rcgen 0.13.2 (https://github.com/rustls/rcgen)
@@ -39066,6 +39097,35 @@ THE SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
+- twox-hash 2.1.5 (https://github.com/shepmaster/twox-hash)
+
+Full license text:
+
+The MIT License (MIT)
+
+Copyright (c) 2015 Jake Goulding
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
 - shlex 2.0.1 (https://github.com/comex/rust-shlex)
 
 Full license text:
@@ -39632,6 +39692,34 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+License: MIT License (MIT)
+Used by:
+- lz4_flex 0.14.0 (https://github.com/pseitz/lz4_flex)
+
+Full license text:
+
+The MIT License (MIT)
+
+Copyright (c) 2020 Pascal Seitz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 License: MIT License (MIT)

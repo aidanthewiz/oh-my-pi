@@ -1800,11 +1800,10 @@ export async function anonymizeSessionTranscripts(session: AnonymizeSessionInput
 	};
 	try {
 		if (session.sessionFile) {
-			subSessions = await collectSubSessions(
-				session.sessionFile,
-				key => unreadable.push(memberFor(key)),
-				reportSubagentError,
-			);
+			subSessions = await collectSubSessions(session.sessionFile, {
+				onUnreadable: key => unreadable.push(memberFor(key)),
+				onError: reportSubagentError,
+			});
 		}
 	} catch (error) {
 		reportSubagentError(error);

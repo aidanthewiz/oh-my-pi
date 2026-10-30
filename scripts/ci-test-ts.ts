@@ -121,7 +121,7 @@ const localOnlyWorkspacePackages = ["python/robomp/web"];
 // Coreforge release channel. Workspace test discovery does not include root scripts.
 const repoScriptTests = [
 	"scripts/cf-release-notes.test.ts",
-	"scripts/ci-release-build-binaries.test.ts",
+	"packages/coding-agent/scripts/build-binary.test.ts",
 	"scripts/ci-release-checksums.test.ts",
 	"scripts/ci-test-ts.test.ts",
 	"scripts/fix-changelogs.test.ts",
@@ -395,10 +395,8 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	}
 }
 
-// Hosted runners may inject cloud credentials, GitHub Actions injects
-// GITHUB_TOKEN, and Coreforge launches the suite with an active profile and
-// managed DCG state. Strip caller-owned state so ordinary fixtures stay
-// hermetic; focused profile and guard tests install explicit fixtures.
+// Hosted runners and Coreforge can inject credentials, managed profiles and DCG
+// state. Ordinary fixtures receive only their explicitly configured identity.
 const SCRUBBED_ENV_PREFIXES = ["ANTHROPIC_", "AWS_", "GOOGLE_CLOUD_", "OMP_DCG_", "OMP_MODEL_", "DCG_"];
 const SCRUBBED_ENV_NAMES = new Set([
 	"BUN_OPTIONS",

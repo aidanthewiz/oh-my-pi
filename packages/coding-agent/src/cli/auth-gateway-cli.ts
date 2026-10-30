@@ -35,10 +35,12 @@ import {
 import {
 	type AuthGatewayClient,
 	DEFAULT_AUTH_GATEWAY_BIND,
+	type ModelResolveOptions,
 	parseAuthGatewayClients,
 	startAuthGateway,
 } from "@oh-my-pi/pi-ai/auth-gateway";
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
+import { buildModelProviderPriorityRank } from "@oh-my-pi/pi-catalog/identity";
 import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
 import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
@@ -49,7 +51,7 @@ import {
 	filterModelsByConfiguredScope,
 	resolveProviderModelReference,
 } from "../config/model-resolver";
-import { cfgDisabledModels, cfgDisabledProviders } from "../config/model-settings";
+import { cfgDisabledModels, cfgDisabledProviders, cfgModelProviderOrder } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import {
 	type AuthBrokerClientConfig,
@@ -250,46 +252,96 @@ export function gatewayRoutableProviders(storage: AuthStorage, settings: Setting
 }
 
 /**
- * Index resolvable models by the request ids clients may send: the
- * provider-qualified `provider/id` (always) and the bare `id` (first-write-wins
- * fallback for legacy clients). Scoped to providers the gateway holds broker
- * credentials for, since only those are routable.
+ * One catalog rebuild's served models, indexed by the ids clients send. Built by
+ * {@link indexModelsByRequestId}, read by {@link resolveGatewayModel} and `/v1/models`.
+ */
+export interface GatewayModelIndex {
+	/**
+	 * Every served model, catalog order. One array per rebuild:
+	 * `resolveProviderModelReference` caches its lookups on the array identity.
+	 */
+	readonly models: readonly Model<Api>[];
+	/** `provider/id` → model. */
+	readonly qualified: ReadonlyMap<string, Model<Api>>;
+	/**
+	 * Bare `id` → its models grouped into provider-priority tiers, best first.
+	 * A tier holds the providers sharing one rank (every provider the priority
+	 * order leaves unranked shares the last), sorted by provider id.
+	 */
+	readonly bare: ReadonlyMap<string, readonly (readonly Model<Api>[])[]>;
+}
+
+/**
+ * Index the models of credentialed providers by the request ids clients may
+ * send: `provider/id` names one model, a bare `id` every served model of that
+ * id. Bare ids rank by provider priority (`providerOrder`, the
+ * `modelProviderOrder` setting, ahead of the built-in native-before-mirror
+ * order), then provider id — never catalog position, which every discovery
+ * refresh reshuffles.
  */
 export function indexModelsByRequestId(
 	models: Model<Api>[],
 	providersWithCreds: ReadonlySet<string>,
+	providerOrder?: readonly string[],
 	settings?: Settings,
-): Map<string, Model<Api>> {
-	const modelById = new Map<string, Model<Api>>();
-	for (const model of filterModelsByConfiguredScope(models, settings)) {
-		if (!providersWithCreds.has(model.provider)) continue;
-		modelById.set(`${model.provider}/${model.id}`, model);
-		if (!modelById.has(model.id)) modelById.set(model.id, model);
+): GatewayModelIndex {
+	const served = filterModelsByConfiguredScope(models, settings).filter(model =>
+		providersWithCreds.has(model.provider),
+	);
+	const priority = buildModelProviderPriorityRank(providerOrder);
+	const rankOf = (model: Model<Api>): number => priority.get(model.provider.toLowerCase()) ?? Number.POSITIVE_INFINITY;
+	const qualified = new Map<string, Model<Api>>();
+	const byId = new Map<string, Model<Api>[]>();
+	for (const model of served) {
+		qualified.set(`${model.provider}/${model.id}`, model);
+		const sameId = byId.get(model.id);
+		if (sameId) sameId.push(model);
+		else byId.set(model.id, [model]);
 	}
-	return modelById;
+	const bare = new Map<string, Model<Api>[][]>();
+	for (const [id, candidates] of byId) {
+		candidates.sort((a, b) => rankOf(a) - rankOf(b) || a.provider.localeCompare(b.provider));
+		const tiers: Model<Api>[][] = [];
+		let tierRank: number | undefined;
+		for (const model of candidates) {
+			const rank = rankOf(model);
+			if (rank === tierRank) tiers[tiers.length - 1].push(model);
+			else tiers.push([model]);
+			tierRank = rank;
+		}
+		bare.set(id, tiers);
+	}
+	return { models: served, qualified, bare };
 }
 
 /**
- * Resolve a client-requested model id: the exact `provider/id` or bare `id` first, then an
- * OpenRouter routing-variant selector the catalog does not list (`openrouter/<id>:floor`,
- * `:nitro`, …), cloned from its base model under the requested id so the suffix reaches
- * OpenRouter — the same selectors `--model` accepts.
+ * Resolve a client-requested model id: the exact `provider/id`, else the bare
+ * `id`'s best candidate — the first priority tier `options.accepts` admits any
+ * model from, preferring one on the route's `options.api` within it — else an
+ * OpenRouter routing-variant selector the catalog does not list
+ * (`openrouter/<id>:floor`, `:nitro`, …), cloned from its base model under the
+ * requested id so the suffix reaches OpenRouter — the same selectors `--model`
+ * accepts. A refused `provider/id` resolves to nothing.
  */
 export function resolveGatewayModel(
 	id: string,
-	modelById: ReadonlyMap<string, Model<Api>>,
-	routable: readonly Model<Api>[],
-	settings: Settings,
+	index: GatewayModelIndex,
+	options?: ModelResolveOptions,
+	settings?: Settings,
 ): Model<Api> | undefined {
-	const exact = modelById.get(id);
-	if (exact) return exact;
+	const accepts = options?.accepts ?? (() => true);
+	const exact = index.qualified.get(id);
+	if (exact) return accepts(exact) ? exact : undefined;
+	for (const tier of index.bare.get(id) ?? []) {
+		const admitted = tier.filter(accepts);
+		if (admitted.length > 0) return admitted.find(model => model.api === options?.api) ?? admitted[0];
+	}
 	const prefix = "openrouter/";
-	const resolved = id.startsWith(prefix)
-		? resolveProviderModelReference("openrouter", id.slice(prefix.length), routable)
-		: undefined;
-	if (!resolved) return undefined;
-	const excluded = cfgDisabledModels.get(settings);
-	return excluded.length === 0 ? resolved : excludeModelsByDisabledPatterns([resolved], excluded)[0];
+	if (!id.startsWith(prefix)) return undefined;
+	const variant = resolveProviderModelReference("openrouter", id.slice(prefix.length), index.models);
+	if (!variant || !accepts(variant)) return undefined;
+	const excluded = settings ? cfgDisabledModels.get(settings) : [];
+	return excluded.length === 0 ? variant : excludeModelsByDisabledPatterns([variant], excluded)[0];
 }
 
 /**
@@ -389,10 +441,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// `listModels` powers `/v1/models`. `settings` carries `disabledProviders`, so
 	// discovery skips disabled providers too.
 	const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
-	let modelById = new Map<string, Model<Api>>();
-	// Routable models as one stable array per rebuild: `resolveProviderModelReference` caches its
-	// index on the array identity, so variant lookups stay O(1) between rebuilds.
-	let routable: Model<Api>[] = [];
+	let index = indexModelsByRequestId([], new Set());
 	// Rebuild the served catalog (a `registry.refresh()` pass, then re-index
 	// against the current credential set). Credential-triggered rebuilds force
 	// `online` discovery: an account added to or removed from an
@@ -402,11 +451,12 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// for up to a cache TTL. Periodic rebuilds stay cached.
 	const rebuildCatalog = createSerializedRebuilder(async force => {
 		await registry.refresh(force ? "online" : "online-if-uncached");
-		const providers = gatewayRoutableProviders(storage, settings);
-		routable = filterModelsByConfiguredScope(gatewayRoutableModels(registry), settings).filter(model =>
-			providers.has(model.provider),
+		index = indexModelsByRequestId(
+			gatewayRoutableModels(registry),
+			gatewayRoutableProviders(storage, settings),
+			cfgModelProviderOrder.get(settings),
+			settings,
 		);
-		modelById = indexModelsByRequestId(routable, providers);
 	});
 	await rebuildCatalog();
 
@@ -416,8 +466,8 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		bearerTokens: gatewayToken ? [gatewayToken] : [],
 		trustProxyHeaders: flags.trustProxyHeaders,
 		version: VERSION,
-		resolveModel: (id: string) => resolveGatewayModel(id, modelById, routable, settings),
-		listModels: () => modelById.values(),
+		resolveModel: (id, options) => resolveGatewayModel(id, index, options, settings),
+		listModels: () => index.qualified.values(),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 		clients,
 	});

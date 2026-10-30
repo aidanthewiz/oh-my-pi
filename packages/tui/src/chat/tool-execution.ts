@@ -30,7 +30,7 @@ import {
 	rootToggleExpanded,
 } from "../native/node";
 import { plainText } from "../native/spans";
-import { diagnosticsSection, displayPath, toolHead } from "../tools/native-view";
+import { diagnosticsBadge, diagnosticsSection, displayPath, toolHead } from "../tools/native-view";
 import type { FileDiagnosticsResult } from "../tools/lsp";
 import { NativeImageCache, shownImageBlobs } from "../native/blobs";
 import { imageLinksEnabled, linkedImageText } from "../prompt/image-references";
@@ -125,6 +125,9 @@ function cardPreview(preview: NativeToolView["preview"]): TspPreview | undefined
 
 /** The describe hooks of a registry renderer or of a custom tool object. */
 type ToolDescriber = Pick<ToolRenderer, "describeCall" | "describeResult" | "mergeCallAndResult">;
+
+/** Optional kinds of the host's vocabulary the describe hooks branch on. */
+type NativeHostKinds = Required<Pick<RenderResultContextOptions, "json">>;
 
 class SafeToolRendererComponent implements Component {
 	#toolName: string;
@@ -235,7 +238,6 @@ export interface ToolExecutionHandle extends Component {
 	setArgsComplete(toolCallId?: string): void;
 	setExecutionStarted(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
-	setToolActivityVisible(visible: boolean): void;
 	/** Mark the call parked: it returned, but stays tracked for async job frames. */
 	parkAsBackground(): void;
 	/** Seal the block as final history and stop its animations. */
@@ -465,6 +467,7 @@ export class ToolExecutionComponent extends Container {
 	readonly #nativeImages = new NativeImageCache();
 	// Wall clock captured whenever a task card is rebuilt.
 	#taskRenderNowMs = Date.now();
+	#taskTimerOwner: object | undefined;
 	// Set on each `render()` when the last painted pending shape must be
 	// replayed wholesale when the first result arrives. Reset gates key off
 	// these so a topology-changing update that lands before the shape reaches
@@ -1026,6 +1029,7 @@ export class ToolExecutionComponent extends Container {
 	override describe(cx?: DescribeContext): NativeNode {
 		if (this.#toolName === "wait" && this.#isBenignSkip()) return EMPTY_NODE;
 		const dataFirst = cx?.supports("tool") === true;
+		const host: NativeHostKinds = { json: cx?.supports("json") === true };
 		const key = [
 			dataFirst,
 			this.#resultVersion,
@@ -1039,10 +1043,11 @@ export class ToolExecutionComponent extends Container {
 			imageLinksEnabled(),
 			this.#displayInputVersion,
 			this.#toolActivityVisible,
+			host.json,
 			getThemeEpoch(),
 		];
 		return this.#native.get(key, () =>
-			withHidden(dataFirst ? this.#describeTool() : this.#describeCard(), !this.#toolActivityVisible),
+			withHidden(dataFirst ? this.#describeTool(host) : this.#describeCard(host), !this.#toolActivityVisible),
 		);
 	}
 
@@ -1072,15 +1077,15 @@ export class ToolExecutionComponent extends Container {
 		const files = this.#lateDiagnostics;
 		if (!files || files.length === 0) return {};
 		const sections = files.map(file => diagnosticsSection(file)).filter((n): n is NativeNode => n !== undefined);
-		const count = files.reduce((sum, file) => sum + file.messages.length, 0);
-		const errored = files.some(file => file.errored);
+		if (sections.length === 0) return {};
+		const chip = diagnosticsBadge(files);
 		const section =
 			sections.length === 1
 				? sections[0]
 				: node("col", { gap: "sm", role: "omp.tool.diagnostics" }, sections, "late");
 		return {
 			section,
-			chip: { text: count === 1 ? "1 diagnostic" : `${count} diagnostics`, tone: errored ? "error" : "warning" },
+			chip,
 		};
 	}
 
@@ -1088,8 +1093,8 @@ export class ToolExecutionComponent extends Container {
 	 * The data-first `tool` node (§7.2): the renderer's head data, status,
 	 * timer, exit and intent as props; its body as borderless children.
 	 */
-	#describeTool(): NativeNode {
-		const view = this.#nativeView();
+	#describeTool(host: NativeHostKinds): NativeNode {
+		const view = this.#nativeView(host);
 		const status = this.#nativeStatus();
 		const head = view.tool;
 		const late = this.#lateDiagnosticsParts();
@@ -1158,8 +1163,8 @@ export class ToolExecutionComponent extends Container {
 		return spans;
 	}
 
-	#describeCard(): NativeNode {
-		const view = this.#nativeView();
+	#describeCard(host: NativeHostKinds): NativeNode {
+		const view = this.#nativeView(host);
 		const status = this.#nativeStatus();
 		const late = this.#lateDiagnosticsParts();
 		const fallbackHead = this.#fallbackHead(view);
@@ -1213,9 +1218,10 @@ export class ToolExecutionComponent extends Container {
 	 * the result view (merged renderers) or the call head over both bodies.
 	 * A renderer that throws falls back to the generic card.
 	 */
-	#nativeView(): NativeToolView {
+	#nativeView(host: NativeHostKinds): NativeToolView {
 		const status = this.#nativeStatus();
 		const options: RenderResultContextOptions = {
+			...host,
 			showImages: this.#showImages,
 			expanded: this.#expanded,
 			isPartial: this.#isPartial,
@@ -1883,6 +1889,7 @@ export class ToolExecutionComponent extends Container {
 			context.hasResult = Boolean(this.#result);
 			this.#taskRenderNowMs = Date.now();
 			context.nowMs = this.#taskRenderNowMs;
+			context.taskTimerOwner = this.#taskTimerOwner ??= {};
 		} else if (isEditLikeToolName(this.#toolName)) {
 			context.editMode = this.#editMode;
 			const previews = this.#editDiffPreview;

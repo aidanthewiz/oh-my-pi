@@ -103,6 +103,8 @@ describe("cached approval protects executed content and effects", () => {
 				input: async () => undefined,
 				notify: () => {},
 				onTerminalInput: () => () => {},
+				rerenderMessage: () => {},
+				getLinkClicksAvailable: () => false,
 				setStatus: () => {},
 				setWorkingMessage: () => {},
 				setWidget: () => {},

@@ -109,6 +109,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 	interface NewSessionOptions {
 		getMcpServerInstructions?: () => Map<string, string> | undefined;
+		createVibeTools?: () => AgentTool[];
 		xdev?: XdevState;
 		lazyWrite?: boolean;
 		deviceOnlyWrite?: boolean;
@@ -187,6 +188,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
 			toolRegistry,
+			createVibeTools: options.createVibeTools,
 			builtInToolNames: options.xdev && !options.lazyWrite ? ["read", "write"] : ["read"],
 			ensureWriteRegistered: async () => {
 				if (!options.xdev) return false;
@@ -232,6 +234,46 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		};
 	}
 
+	it.each([false, true])(
+		"preserves the destination selection after a deferred vibe refresh (xd=%s)",
+		async withDevices => {
+			const xdev = withDevices ? createTestXdevState() : undefined;
+			const { session } = newSession(async names => `tools:${names.join(",")}`, {
+				xdev,
+				createVibeTools: () => [createBasicTool("vibe_test", "Vibe test")],
+			});
+			await session.activateVibeTools(["read"]);
+			const deferred = createMcpCustomTool("mcp__synthetic_lookup", "synthetic", "lookup", "Synthetic lookup");
+			await session.refreshMCPTools([deferred]);
+			expect(session.getEnabledToolNames()).not.toContain(deferred.name);
+			await session.setActiveToolsByName(["read"]);
+			await session.removeVibeToolsPreservingActive();
+			expect(session.getEnabledToolNames()).toEqual(["read"]);
+			expect(session.getActiveToolNames()).toEqual(["read"]);
+			expect(xdev?.mountedNames.has(deferred.name) ?? false).toBe(false);
+			expect(session.getAllToolNames()).not.toContain("vibe_test");
+
+			await session.activateVibeTools(["read"]);
+			await session.deactivateVibeTools(["read"]);
+			expect(session.getEnabledToolNames()).toEqual(["read"]);
+		},
+	);
+
+	it.each([false, true])("activates a deferred tool on same-session vibe exit (xd=%s)", async withDevices => {
+		const xdev = withDevices ? createTestXdevState() : undefined;
+		const { session } = newSession(async names => `tools:${names.join(",")}`, {
+			xdev,
+			createVibeTools: () => [createBasicTool("vibe_test", "Vibe test")],
+		});
+		await session.activateVibeTools(["read"]);
+		const deferred = createMcpCustomTool("mcp__synthetic_lookup", "synthetic", "lookup", "Synthetic lookup");
+		await session.refreshMCPTools([deferred]);
+		expect(session.getEnabledToolNames()).not.toContain(deferred.name);
+		await session.deactivateVibeTools(["read"]);
+		expect(session.getEnabledToolNames().toSorted()).toEqual(["read", deferred.name].toSorted());
+		expect([...session.getActiveToolNames(), ...(xdev?.mountedNames ?? [])]).toContain(deferred.name);
+	});
+
 	it("skips rebuild when an MCP refresh produces an identical tool set", async () => {
 		let rebuildCount = 0;
 		const { session } = newSession(async toolNames => {
@@ -256,6 +298,43 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([initialMcp]);
 		expect(rebuildCount).toBe(1);
 	});
+
+	for (const exit of ["restore snapshot", "preserve active"] as const) {
+		it(`preserves the selected MCP state when a failed vibe exit is retried (${exit})`, async () => {
+			let failExit = false;
+			const exitFailure = new Error("Synthetic prompt rebuild failure");
+			const { session } = newSession(
+				async toolNames => {
+					if (failExit && !toolNames.includes("vibe_spawn")) {
+						failExit = false;
+						throw exitFailure;
+					}
+					return `tools:${toolNames.join(",")}`;
+				},
+				{ createVibeTools: () => [createBasicTool("vibe_spawn", "Spawn")] },
+			);
+			const beforeVibe = session.getEnabledToolNames();
+			await session.activateVibeTools(["read"]);
+			const added = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch");
+			await session.refreshMCPTools([added]);
+			expect(session.getActiveToolNames()).not.toContain(added.name);
+
+			const leaveVibe = () =>
+				exit === "restore snapshot"
+					? session.deactivateVibeTools(beforeVibe)
+					: session.removeVibeToolsPreservingActive();
+			failExit = true;
+			await expect(leaveVibe()).rejects.toBe(exitFailure);
+			await leaveVibe();
+			expect(session.getActiveToolNames().toSorted()).toEqual(
+				exit === "restore snapshot" ? ["read", added.name].toSorted() : ["read"],
+			);
+			expect(session.getAllToolNames()).toContain(added.name);
+			await session.activateVibeTools(["read"]);
+			await session.deactivateVibeTools(["read"]);
+			expect(session.getActiveToolNames()).toEqual(["read"]);
+		});
+	}
 
 	it("warns and keeps the stable winner when distinct MCP tools mint the same name", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
