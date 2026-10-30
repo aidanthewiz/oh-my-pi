@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Resolve pinned PR diff URLs with the captured GitHub host and credential namespace, including relative configuration paths.
 - Preserve fresh explicit prewalk requests after recorded handoffs, including same-model thinking-level changes.
 - Keep annotation-only sessions discoverable. Preserve saved review focus and attribute resumed feedback to its original assistant reply.
 - Bind pinned review snapshots to the credential namespace captured before retrieval, even when credentials change while waiting.

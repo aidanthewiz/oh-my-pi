@@ -33,7 +33,8 @@ import {
 	parsePositiveDecimalInt,
 	resolveDefaultRepoMemoized,
 } from "../tools/gh";
-import { type CacheStatus, formatFreshnessNote } from "../tools/github-cache";
+import { parseRepoRef } from "../tools/gh-common";
+import { type CacheStatus, formatFreshnessNote, resolveGithubCacheAuthKey } from "../tools/github-cache";
 import { github } from "../utils/github";
 import { captureForgeCliEnvironment } from "../utils/forge-cli";
 import { renderDiffFamilyResource, resolveCwd, splitInternalUrlSegments } from "./forge-diff";
@@ -395,8 +396,15 @@ function buildSingleResource({
 	};
 }
 
-function loadPinnedPrDiff(repo: string, number: number, fetchedAt: number, settings: ResolveContext["settings"]) {
-	const pinned = getPinnedPrDiff({ repo, number, fetchedAt, settings });
+function loadPinnedPrDiff(
+	repo: string,
+	number: number,
+	fetchedAt: number,
+	settings: ResolveContext["settings"],
+	env: Readonly<Record<string, string | undefined>>,
+) {
+	const cacheAuthKey = resolveGithubCacheAuthKey(parseRepoRef(repo).host, env) ?? null;
+	const pinned = getPinnedPrDiff({ repo, number, fetchedAt, settings, cacheAuthKey });
 	if (!pinned) {
 		throw new Error(
 			`pr://${repo}/${number}/diff?at=${fetchedAt} is not available: the pinned snapshot expired, the GitHub cache is disabled, or it was saved under another GitHub account. Run /review again.`,
@@ -433,7 +441,7 @@ async function fetchAndRenderPrDiff(
 					settings: context?.settings,
 					env,
 				})
-			: loadPinnedPrDiff(repo, parsed.number, parsed.fetchedAt, context?.settings);
+			: loadPinnedPrDiff(repo, parsed.number, parsed.fetchedAt, context?.settings, env);
 	return renderDiffFamilyResource(url, parsed.mode, parsed.index, lookup, {
 		baseUrl: `pr://${repo}/${parsed.number}`,
 		heading: `Pull Request Diff: ${repo}#${parsed.number}`,
