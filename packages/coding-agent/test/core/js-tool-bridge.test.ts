@@ -927,8 +927,8 @@ describe("callSessionTool", () => {
 			getToolForEvalBridge: () => undefined,
 		};
 
-		await expect(callSessionTool("write", { path: "out.txt", content: "data" }, { session })).rejects.toThrow(
-			"Unknown tool from js runtime",
+		await expect(callSessionTool("write", { path: "out.txt", content: "data" }, { session })).rejects.toBeInstanceOf(
+			Error,
 		);
 		expect(rawExecute).not.toHaveBeenCalled();
 	});

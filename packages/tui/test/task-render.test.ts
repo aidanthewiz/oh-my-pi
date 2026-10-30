@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import type { NativeChild } from "@oh-my-pi/pi-tui/native/node";
 import { getThemeByName, setThemeInstance, type Theme } from "@oh-my-pi/pi-tui/theme";
 import { renderResult, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { taskToolRenderer } from "@oh-my-pi/pi-tui/tools/task";
@@ -131,6 +132,67 @@ describe("task live progress rendering", () => {
 
 	afterEach(() => {
 		restoreViewportRows();
+	});
+
+	for (const expanded of [false, true]) {
+		it(`preserves literal structured result fields in ${expanded ? "expanded" : "collapsed"} task output`, () => {
+			const data = { i: 7, constructor: 8, __partialJson: 9 };
+			const details: TaskToolDetails = {
+				projectAgentsDir: null,
+				totalDurationMs: 1,
+				results: [
+					makeSingleResult(0, {
+						output: JSON.stringify(data),
+						structuredOutput: { source: "caller", mode: "strict", status: "valid", data },
+					}),
+				],
+			};
+			const component = renderResult(
+				{ content: [{ type: "text", text: "Ran 1 agent" }], details },
+				{ expanded, isPartial: false },
+				uiTheme,
+			);
+			try {
+				const rendered = strip(component.render(120));
+				if (expanded) {
+					for (const [key, value] of Object.entries(data)) expect(rendered).toContain(`${key}: ${value}`);
+				} else {
+					expect(rendered).toContain("Output: i=7, constructor=8, __partialJson=9");
+				}
+			} finally {
+				component.dispose?.();
+			}
+		});
+	}
+
+	it("preserves literal structured result fields in the native task tree", () => {
+		const data = { i: 7, constructor: 8, __partialJson: 9 };
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			totalDurationMs: 1,
+			results: [
+				makeSingleResult(0, {
+					output: JSON.stringify(data),
+					structuredOutput: { source: "caller", mode: "strict", status: "valid", data },
+				}),
+			],
+		};
+		const native = taskToolRenderer.describeResult(
+			{ content: [{ type: "text", text: "Ran 1 agent" }], details },
+			{ expanded: false, isPartial: false },
+		);
+		function treeLabels(children: readonly NativeChild[]): string[] {
+			return children.flatMap(child => {
+				if (!("k" in child)) return [];
+				if (child.k === "tree") {
+					return (child.p?.nodes ?? []).map(entry =>
+						typeof entry.label === "string" ? entry.label : entry.label.map(part => part.t).join(""),
+					);
+				}
+				return treeLabels(child.c ?? []);
+			});
+		}
+		expect(treeLabels(native?.body ?? [])).toEqual(["i: 7", "constructor: 8", "__partialJson: 9"]);
 	});
 
 	it("caps subagent recent output with the viewport budget instead of a fixed six lines", () => {

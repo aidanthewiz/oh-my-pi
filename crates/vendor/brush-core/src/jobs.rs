@@ -705,8 +705,12 @@ impl Job {
 
 	/// Moves the job to execute in the background.
 	pub fn move_to_background(&mut self) -> Result<(), error::Error> {
+		let was_active = matches!(self.state, JobState::Running | JobState::Stopped);
 		if let Some(result) = self.poll_done_preserving_process_ids()? {
 			self.completed_result = Some(result);
+			if was_active {
+				return Ok(());
+			}
 		}
 		match &self.state {
 			JobState::Stopped => {
@@ -945,6 +949,8 @@ mod tests {
 		.await??;
 
 		let job = shell.jobs_mut().resolve_process_id(pid).expect("reaped PID remains selectable");
+		job.move_to_foreground()?;
+		assert!(job.move_to_background().is_err());
 		let result = job.wait().await?;
 		assert_eq!(u8::from(result.exit_code), 9);
 		Ok(())

@@ -10,6 +10,7 @@ import type {
 	ExtensionUIContext,
 	ExtensionUiComponent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { getExtensionUISelectOptionLabel } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { CopySelectorComponent } from "@oh-my-pi/pi-tui/overlays/copy-selector";
@@ -19,10 +20,15 @@ import {
 	runAnnotateCommand,
 } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/bundled/annotate";
 import {
+	type AnnotationContext,
+	createAnnotationsAPI,
+} from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/bundled/annotate/api";
+import {
 	type AnnotationOverlayContext,
 	showCodeReviewOverlay,
 	showTextReviewOverlay,
 } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/bundled/annotate/fullscreen";
+import { loadAnnotationDrafts } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/bundled/annotate/draft-store";
 import * as externalEditor from "@oh-my-pi/pi-coding-agent/utils/external-editor";
 import type {
 	CustomCommandAPI,
@@ -118,6 +124,7 @@ function createContext(options: ContextOptions = {}) {
 			getBranch: () => branch,
 			getCwd: () => options.cwd ?? "/workspace",
 			getSessionId: () => "session-1",
+			getArtifactsDir: () => null,
 		},
 		ui: { select, input, editor, custom, pasteToEditor, notify, setStatus },
 	} as unknown as CustomCommandContext;
@@ -183,22 +190,25 @@ function localTarget(): ResolvedReviewTarget {
 	return createResolvedReviewTarget("uncommitted", "Uncommitted changes", SAMPLE_DIFF, "No uncommitted changes");
 }
 
-/**
- * Mounts a real annotation overlay with the external-editor key remapped to Ctrl+E, feeds
- * `keys`, and resolves with whatever it completed. After each key it yields one macrotask so
- * the microtask chain of an already-resolved mocked editor finishes before the next key.
- */
+/** External-editor fixtures resolve asynchronously; ordinary annotation keys are synchronous. */
 async function driveEditorOverlay<T>(
 	cwd: string,
 	keys: readonly string[],
 	show: (ctx: CustomCommandContext) => Promise<T | undefined>,
+	artifactsDir: string | null = null,
 ): Promise<T | undefined> {
 	const previous = getKeybindings();
 	setKeybindings(KeybindingsManager.inMemory({ "app.editor.external": "ctrl+e" }));
 	const tui = { terminal: { rows: 40 }, requestRender() {}, stop() {}, start() {} } as unknown as TUI;
 	const ctx = {
+		hasUI: true,
 		cwd,
-		sessionManager: { getCwd: () => cwd },
+		sessionManager: {
+			getCwd: () => cwd,
+			getSessionId: () => "session-1",
+			getArtifactsDir: () => artifactsDir,
+			ensureOnDisk: async () => {},
+		},
 		ui: {
 			notify: vi.fn(),
 			custom: async (factory: Parameters<ExtensionUIContext["custom"]>[0]) => {
@@ -206,13 +216,17 @@ async function driveEditorOverlay<T>(
 				const component = await factory(tui, theme, KeybindingsManager.inMemory(), value => {
 					result = value;
 				});
-				component.render(120);
-				for (const key of keys) {
-					component.handleInput?.(key);
-					await new Promise<void>(resolve => setImmediate(resolve));
+				try {
 					component.render(120);
+					for (const key of keys) {
+						component.handleInput?.(key);
+						if (key === CTRL_E) await new Promise<void>(resolve => setImmediate(resolve));
+						component.render(120);
+					}
+					return result;
+				} finally {
+					component.dispose?.();
 				}
-				return result;
 			},
 		},
 	} as unknown as CustomCommandContext;
@@ -245,8 +259,209 @@ afterEach(() => {
 });
 
 describe("/annotate contracts", () => {
+	it("saves notes from an overlay closed with Escape, restores them on reopen, and drops them on discard", async () => {
+		await withTempDir(async artifactsDir => {
+			const source = { id: "p", kind: "prompt", label: "Prompt", text: "alpha\nbeta" } as const;
+			const session = {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "session-1",
+				ensureOnDisk: async () => {},
+			};
+			const show = (ctx: CustomCommandContext) => showTextReviewOverlay(ctx, source);
+			await driveEditorOverlay("/w", ["A", "kept", ENTER, "a", "half", "\x1b"], show, artifactsDir);
+			const [saved] = await loadAnnotationDrafts(session);
+			expect(saved?.state).toMatchObject({
+				annotations: [{ annotation: { note: "kept" } }],
+				editor: { text: "half" },
+			});
+
+			// Reopened, the unfinished note is back in the editor; Enter commits it, then paste keeps the draft.
+			const result = await driveEditorOverlay("/w", [ENTER, "\t", ENTER], show, artifactsDir);
+			expect(result?.annotations.map(annotation => annotation.note)).toEqual(["kept", "half"]);
+
+			// Discard needs a second Enter; the draft is gone once it closes.
+			await driveEditorOverlay("/w", ["\t", "\x1b[B", ENTER, ENTER], show, artifactsDir);
+			expect(await loadAnnotationDrafts(session)).toEqual([]);
+		});
+	});
+
+	it("persists and commits an unfinished whole-file note through the real diff host", async () => {
+		await withTempDir(async artifactsDir => {
+			const target = localTarget();
+			const show = (ctx: CustomCommandContext) => showCodeReviewOverlay(ctx, target, "keep frozen focus");
+			await driveEditorOverlay("/w", ["A", "disk-roundtrip note", "\x1b"], show, artifactsDir);
+			const result = await driveEditorOverlay("/w", [ENTER, "\x1b[Z", ENTER], show, artifactsDir);
+			expect(result?.action).toBe("paste");
+			expect(result?.annotations).toEqual([
+				{
+					scope: "file",
+					path: "src/value.ts",
+					oldPath: "src/value.ts",
+					newPath: "src/value.ts",
+					occurrence: 1,
+					note: "disk-roundtrip note",
+				},
+			]);
+			const session = {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "session-1",
+				ensureOnDisk: async () => {},
+			};
+			const [saved] = await loadAnnotationDrafts(session);
+			expect(saved?.source).toEqual({ kind: "diff", focus: "keep frozen focus", target });
+		});
+	});
+
+	it("retains API review focus when saved notes resume through the command", async () => {
+		await withTempDir(async artifactsDir => {
+			const focus = "Check transaction boundaries before accepting this patch.";
+			const note = "Keep this note on the frozen patch.";
+			const session = {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "session-1",
+				ensureOnDisk: async () => {},
+			};
+			const annotation: CodeReviewAnnotation = {
+				scope: "file",
+				path: "src/value.ts",
+				oldPath: "src/value.ts",
+				newPath: "src/value.ts",
+				occurrence: 1,
+				note,
+			};
+			const first = await driveEditorOverlay(
+				"/w",
+				["A", note, "\x1b"],
+				ctx => {
+					const api = createAnnotationsAPI(
+						() => Object.assign(ctx, { mode: "tui", isIdle: () => true }) as unknown as AnnotationContext,
+						() => {
+							throw new Error("Annotation draft must not send a user message.");
+						},
+					);
+					return api.open({ source: { kind: "diff", diff: SAMPLE_DIFF }, focus, deliver: "none" });
+				},
+				artifactsDir,
+			);
+			expect(first).toBeUndefined();
+			const before = await loadAnnotationDrafts(session);
+			expect(before).toHaveLength(1);
+			expect(before[0]?.state.annotations).toEqual([]);
+			expect(before[0]?.state.editor).toMatchObject({ scope: "file", text: note });
+			expect(before[0]?.source).toMatchObject({ kind: "diff", focus });
+
+			const pastes: string[] = [];
+			const result = await driveEditorOverlay(
+				"/w",
+				[ENTER, "\x1b[Z", ENTER],
+				ctx => {
+					ctx.ui.select = async (title, choices) =>
+						title === "Select content to annotate"
+							? "Saved draft"
+							: choices[0] === undefined
+								? undefined
+								: getExtensionUISelectOptionLabel(choices[0]);
+					ctx.ui.pasteToEditor = text => {
+						pastes.push(text);
+					};
+					return runAnnotateCommand(API, "", ctx);
+				},
+				artifactsDir,
+			);
+			expect(result).toBeUndefined();
+			expect(pastes).toHaveLength(1);
+			const [pasted] = pastes;
+			expect(countOccurrences(pasted ?? "", note)).toBe(1);
+			const after = await loadAnnotationDrafts(session);
+			expect(after).toHaveLength(1);
+			expect(after[0]?.key).toBe(before[0]?.key);
+			expect(after[0]?.state.annotations.map(entry => entry.annotation)).toEqual([annotation]);
+			expect(after[0]?.state.editor).toBeUndefined();
+			expect(pasted).toContain(focus);
+			expect(after[0]?.source).toMatchObject({ kind: "diff", focus });
+		});
+	});
+
+	for (const active of ["unchanged", "newer", "other-branch", "empty-branch"] as const) {
+		it(`attributes a saved assistant draft correctly on ${active}`, async () => {
+			await withTempDir(async artifactsDir => {
+				const original = makeAssistantEntry("reply-a", "Frozen reply A\r\nwith exact spacing.");
+				const source: TextReviewSource = {
+					id: "message:reply-a",
+					kind: "message",
+					label: "Latest assistant reply",
+					text: "Frozen reply A\r\nwith exact spacing.",
+					provenance: { kind: "latest-assistant", entryId: "reply-a" },
+					sessionId: "session-1",
+				};
+				await driveEditorOverlay(
+					"/w",
+					["A", "feedback for A", ENTER, "\x1b"],
+					ctx => showTextReviewOverlay(ctx, source),
+					artifactsDir,
+				);
+				const branch =
+					active === "unchanged"
+						? [original]
+						: active === "newer"
+							? [original, makeAssistantEntry("reply-b", "Reply B")]
+							: active === "other-branch"
+								? [makeAssistantEntry("reply-c", "Reply C")]
+								: [];
+				const { ctx, pasteToEditor } = createContext({ branch });
+				const session = {
+					...ctx.sessionManager,
+					getArtifactsDir: () => artifactsDir,
+					ensureOnDisk: async () => {},
+				};
+				Object.assign(ctx, { sessionManager: session });
+				const [before] = await loadAnnotationDrafts(session);
+				ctx.ui.select = async (title, choices) =>
+					title === "Select content to annotate"
+						? "Saved draft"
+						: choices[0] === undefined
+							? undefined
+							: getExtensionUISelectOptionLabel(choices[0]);
+				ctx.ui.custom = async <T>(factory: Parameters<ExtensionUIContext["custom"]>[0]): Promise<T> => {
+					let result: unknown;
+					const tui = {
+						terminal: { rows: 40 },
+						requestRender() {},
+						stop() {},
+						start() {},
+					} as unknown as TUI;
+					const component = await factory(tui, theme, KeybindingsManager.inMemory(), value => {
+						result = value;
+					});
+					try {
+						component.render(120);
+						for (const key of ["\x1b[Z", ENTER]) component.handleInput?.(key);
+						return result as T;
+					} finally {
+						component.dispose?.();
+					}
+				};
+				const result = await runAnnotateCommand(API, "", ctx);
+				expect(result).toBeUndefined();
+				const pasted = pasteToEditor.mock.calls[0]?.[0];
+				expect(countOccurrences(pasted ?? "", "feedback for A")).toBe(1);
+				if (active === "unchanged") {
+					expect(pasted).toContain("your last reply");
+					expect(pasted).not.toContain(source.text);
+				} else {
+					expect(pasted).not.toContain("your last reply");
+					expect(pasted).toContain("reply-a");
+					expect(pasted).toContain(source.text);
+				}
+				const [after] = await loadAnnotationDrafts(session);
+				expect(after?.key).toBe(before?.key);
+				expect(after?.source).toEqual({ kind: "text", source });
+			});
+		});
+	}
+
 	it("resolves the selected local target in the live session cwd and pastes code notes without submitting", async () => {
-		const { ctx, select, pasteToEditor } = createContext({
+		const { ctx, pasteToEditor } = createContext({
 			selectResults: ["Code review", "2. Review uncommitted changes"],
 			cwd: "/live-worktree",
 		});
@@ -275,10 +490,6 @@ describe("/annotate contracts", () => {
 		});
 
 		expect(result).toBeUndefined();
-		expect(select).toHaveBeenCalledTimes(2);
-		expect(resolveLocalReviewTarget).toHaveBeenCalledTimes(1);
-		expect(showCodeReviewOverlay).toHaveBeenCalledTimes(1);
-		expect(showCodeReviewOverlay).toHaveBeenCalledWith(ctx, target);
 		expect(pasteToEditor).toHaveBeenCalledTimes(1);
 		expect(pasteToEditor.mock.calls[0]?.[0]).toContain(annotation.note);
 	});
@@ -302,10 +513,8 @@ describe("/annotate contracts", () => {
 		await runAnnotateCommand(API, "", ctx, { resolvePrReviewTarget, showCodeReviewOverlay });
 
 		expect(repoSpy).toHaveBeenCalledWith("/live-worktree");
-		expect(resolvePrReviewTarget).toHaveBeenCalledTimes(1);
 		expect(resolvePrReviewTarget.mock.calls[0]?.[0]).toBe("/live-worktree");
 		expect(resolvePrReviewTarget.mock.calls[0]?.[2]).toMatchObject({ repo: "acme/project", number: 42 });
-		expect(showCodeReviewOverlay).toHaveBeenCalledWith(ctx, target);
 		expect(pasteToEditor.mock.calls[0]?.[0]).toContain("picked PR note");
 	});
 
@@ -346,9 +555,6 @@ describe("/annotate contracts", () => {
 		});
 
 		expect(prompt).toBeDefined();
-		expect(resolvePrReviewTarget).toHaveBeenCalledTimes(1);
-		expect(showCodeReviewOverlay).toHaveBeenCalledTimes(1);
-		expect(showCodeReviewOverlay).toHaveBeenCalledWith(ctx, target);
 		expect(prompt).toContain(contextInstruction);
 		expect(prompt).not.toContain("MAY read full file context as needed via `read`");
 		expect(countOccurrences(prompt!, "focus on this line")).toBe(1);

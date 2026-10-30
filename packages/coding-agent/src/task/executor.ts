@@ -4159,6 +4159,7 @@ function buildSubagentSessionOptions(
 	const customTools = spec.options.customTools ?? [];
 	return {
 		...spec.options,
+		prewalkInherited: inputs.reviving,
 		mcpTools: mcpTools.length > 0 ? mcpTools : undefined,
 		customTools: customTools.length > 0 ? customTools : undefined,
 		settings,
@@ -4361,6 +4362,11 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 		let revived: AgentSession | undefined;
 		let mcpFollower: MCPToolFollower | undefined;
 		capture.spec.prompt.reviving = true;
+		// A session-local switch since spawn (a prewalk handoff) owns the model and effort: the
+		// transcript restores the effort, and the spawn selection only backs the model up when it is
+		// unavailable. The spawn's prewalk stays configured; the coordinator sees it was spent. A seance
+		// fork's selections belong to its source run, never to the consult.
+		const sessionLocalModel = capture.spec.preparedSession ? undefined : reopened.getSessionLocalModelChange()?.model;
 		try {
 			if (!hasConversationalHistory(reopened.getEntries())) {
 				throw new Error(
@@ -4377,13 +4383,30 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 			mcpFollower = mcpManager ? followMCPTools(mcpManager, explicitSubagentToolNames(capture.spec)) : undefined;
 			const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
 			if (!isOwnerCurrent()) throw new Error(`Cannot revive subagent "${id}": its owner was retired.`);
+			const options = buildSubagentSessionOptions(
+				capture.spec,
+				restoreSubagentSettings(capture.settings),
+				reopened,
+				expectedAgentRef,
+			);
 			({ session: revived } = await createAgentSession({
-				...buildSubagentSessionOptions(
-					capture.spec,
-					restoreSubagentSettings(capture.settings),
-					reopened,
-					expectedAgentRef,
-				),
+				...options,
+				...(sessionLocalModel
+					? {
+							model: undefined,
+							modelPattern: [
+								sessionLocalModel,
+								...(options.model
+									? [formatModelStringWithRouting(options.model)]
+									: options.modelPattern === undefined
+										? []
+										: [options.modelPattern].flat()),
+							],
+							modelPatternFallbackRole: undefined,
+							modelPatternDefaultFallbackChain: undefined,
+							thinkingLevel: undefined,
+						}
+					: undefined),
 				oauthAccountPools: Object.hasOwn(agentAccountPools, capture.agentName)
 					? agentAccountPools[capture.agentName]
 					: undefined,

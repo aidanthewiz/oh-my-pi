@@ -1,6 +1,6 @@
 {
 	"name": "@oh-my-pi/pi-natives",
-	"version": "18.13.2",
+	"version": "18.13.3",
 	"description": "Native Rust bindings for PDF conversion, audio, WebRTC, grep, clipboard, image processing, syntax highlighting, PTY, and shell operations via N-API",
 	"keywords": [
 		"clipboard",
@@ -99,6 +99,6 @@
 		"triples": {}
 	},
 	"engines": {
-		"bun": ">=1.3.14"
+		"bun": ">=1.4.4"
 	}
 }

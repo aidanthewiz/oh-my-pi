@@ -182,6 +182,7 @@ export class CommandController {
 	#reportSheet: { handle: OverlayHandle; component: Component } | undefined;
 	#reportPaintUnsubscribe: (() => void) | undefined;
 	#forkTerminalDependencies: ForkTerminalDependencies;
+	#retireForegroundPtyInput: (() => void) | undefined;
 
 	constructor(
 		private readonly ctx: InteractiveModeContext,
@@ -1926,7 +1927,25 @@ export class CommandController {
 		isDeferred: boolean,
 		shouldPersistCwd: boolean,
 	): Promise<boolean> {
-		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		const session = this.ctx.session;
+		const sessionId = session.sessionId;
+		const component = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		this.ctx.bashComponent = component;
+		let detachInput: (() => void) | undefined;
+		let finished = false;
+		const isCurrent = () =>
+			!finished &&
+			!session.isDisposed &&
+			this.ctx.session === session &&
+			session.sessionId === sessionId &&
+			this.ctx.bashComponent === component;
+		const retireInput = () => {
+			finished = true;
+			detachInput?.();
+			if (this.#retireForegroundPtyInput === retireInput) this.#retireForegroundPtyInput = undefined;
+		};
+		this.#retireForegroundPtyInput?.();
+		this.#retireForegroundPtyInput = retireInput;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.bashComponent);
@@ -1937,7 +1956,7 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 
 		try {
-			const result = await this.ctx.session.executeBash(
+			const result = await session.executeBash(
 				command,
 				chunk => {
 					if (this.ctx.bashComponent) {
@@ -1952,9 +1971,20 @@ export class CommandController {
 					pty: {
 						...bashPtyViewport(this.ctx.ui),
 						onChunk: chunk => this.ctx.bashComponent?.appendPtyChunk(chunk),
+						onStdin: write => {
+							if (!isCurrent()) return;
+							detachInput?.();
+							// A TSP field without a mode handles printable keys itself and sends
+							// `edit` packets instead of raw input. Label it while the PTY owns
+							// the keyboard so Tern delivers those keys to the input listener.
+							detachInput = this.#forwardKeysToPty(component, write, isCurrent);
+							this.ctx.editor.nativeKeyPassthrough = true;
+							this.ctx.ui.requestRender();
+						},
 					},
 				},
 			);
+			retireInput();
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
@@ -1980,10 +2010,37 @@ export class CommandController {
 			}
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		} finally {
-			this.ctx.bashComponent = undefined;
+			retireInput();
+			if (this.ctx.bashComponent === component) this.ctx.bashComponent = undefined;
 			this.ctx.ui.requestRender();
 		}
 		return false;
+	}
+
+	/** Binds decoded composer input to this command's stdin until its owner retires. */
+	#forwardKeysToPty(
+		component: BashExecutionComponent,
+		write: (data: string) => void,
+		isCurrent: () => boolean,
+	): () => void {
+		let active = true;
+		const forward = (data: string): void => {
+			if (!active || this.ctx.foregroundPtyInput !== forward) return;
+			if (!isCurrent()) {
+				detach();
+				return;
+			}
+			const bytes = component.encodePtyInput(data);
+			if (bytes) write(bytes);
+		};
+		const detach = () => {
+			active = false;
+			if (this.ctx.foregroundPtyInput !== forward) return;
+			this.ctx.foregroundPtyInput = undefined;
+			this.ctx.editor.nativeKeyPassthrough = false;
+		};
+		this.ctx.foregroundPtyInput = forward;
+		return detach;
 	}
 
 	async #applyBashResultCwd(result: BashResult): Promise<boolean> {

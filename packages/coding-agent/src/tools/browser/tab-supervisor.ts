@@ -62,7 +62,7 @@ import { newUploadStagingDir, removeUploadStaging, sweepUploadStaging } from "./
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 
-interface WorkerHandle {
+export interface WorkerHandle {
 	send(msg: WorkerInbound, transferList?: Transferable[]): void;
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
@@ -169,6 +169,8 @@ export interface AcquireTabOptions {
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	target?: string;
 	signal?: AbortSignal;
+	/** Transfers a worker admitted before the browser's initial connection. */
+	takePreparedWorker?: () => WorkerHandle | undefined;
 	timeoutMs: number;
 	/**
 	 * `performance.now()` timestamp at which the caller's timeout budget
@@ -526,8 +528,14 @@ async function acquireTabImpl(
 	let initPayload: WorkerInitPayload;
 	let worker: WorkerHandle;
 	try {
-		initPayload = await buildInitPayload(browser, opts);
-		worker = await spawnTabWorker();
+		// Selecting a borrowed page can attach its debugger; require an isolated worker first.
+		worker = opts.takePreparedWorker?.() ?? (await spawnTabWorker());
+		try {
+			initPayload = await buildInitPayload(browser, opts);
+		} catch (error) {
+			await worker.terminate().catch(() => undefined);
+			throw error;
+		}
 	} catch (error) {
 		// Failing before the worker took its own hold must release the
 		// temporary one, or the browser's refCount never reaches 0 again.
@@ -2318,7 +2326,7 @@ async function raceWithTimeout<T>(
 	}
 }
 
-async function spawnTabWorker(): Promise<WorkerHandle> {
+export async function spawnTabWorker(): Promise<WorkerHandle> {
 	const options: WorkerOptions = {
 		type: "module",
 		env: buildTabWorkerEnv(),

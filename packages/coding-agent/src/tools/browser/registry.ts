@@ -129,6 +129,8 @@ export interface AcquireBrowserOptions {
 	cwd: string;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	signal?: AbortSignal;
+	/** Runs before a fresh browser connection, never when reusing a connected handle. */
+	beforeOpen?: () => Promise<void>;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -157,7 +159,12 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 			await untilAborted(opts.signal, () => pending.settled);
 			continue;
 		}
-		const open = openBrowserHandle(kind, opts);
+		const open = opts.beforeOpen
+			? opts.beforeOpen().then(() => {
+					if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
+					return openBrowserHandle(kind, opts);
+				})
+			: openBrowserHandle(kind, opts);
 		const settled = Promise.withResolvers<void>();
 		const entry = { settled: settled.promise };
 		// An open whose caller aborted is disposed below, never published, so it

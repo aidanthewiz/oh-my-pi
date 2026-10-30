@@ -43,6 +43,8 @@ export interface InlineFormatOptions {
 	multilineSummary?: boolean;
 	/** Character-count output budget, retaining the first pair even when oversized. */
 	characterBudget?: boolean;
+	/** Root keys omitted from inline objects; defaults to tool argument metadata. */
+	hiddenRootKeys?: readonly string[];
 }
 
 /** Format a scalar with optional sanitized multiline summaries. */
@@ -79,11 +81,12 @@ export function formatArgsInline(
 	maxWidth: number,
 	options: InlineFormatOptions = {},
 ): string {
+	const hiddenRootKeys = options.hiddenRootKeys ?? DEFAULT_HIDDEN_ROOT_KEYS;
 	if (options.characterBudget) {
 		const pairs: string[] = [];
 		let length = 0;
 		for (const key in args) {
-			if (!Object.hasOwn(args, key)) continue;
+			if (!Object.hasOwn(args, key) || hiddenRootKeys.includes(key)) continue;
 			const pair = `${options.sanitizeText?.(key) ?? key}=${formatScalar(args[key], 24, options)}`;
 			const added = pair.length + (pairs.length > 0 ? 2 : 0);
 			if (length + added > maxWidth && pairs.length > 0) {
@@ -97,7 +100,7 @@ export function formatArgsInline(
 	}
 	const keys: string[] = [];
 	for (const key in args) {
-		if (key in HIDDEN_ARG_KEYS) continue;
+		if (hiddenRootKeys.includes(key)) continue;
 		keys.push(key);
 	}
 	let result = "";
@@ -141,6 +144,7 @@ const OUTPUT_INLINE_OPTIONS: InlineFormatOptions = {
 	sanitizeText,
 	multilineSummary: true,
 	characterBudget: true,
+	hiddenRootKeys: [],
 };
 
 /** Summarize a task's structured output without expanding its JSON tree. */

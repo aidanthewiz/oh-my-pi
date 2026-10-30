@@ -1,6 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
-import { formatArgsInline } from "@oh-my-pi/pi-tui/tools/json-tree";
+import { formatArgsInline, formatOutputInline } from "@oh-my-pi/pi-tui/tools/json-tree";
+
+describe("literal inline result keys", () => {
+	for (const [key, value] of [
+		["i", 7],
+		["constructor", 8],
+		["__partialJson", 9],
+	] as const) {
+		test(`preserves result field ${key}`, () => {
+			expect(formatOutputInline({ [key]: value })).toBe(`Output: ${key}=${value}`);
+		});
+	}
+
+	for (const characterBudget of [false, true]) {
+		test(`hides argument metadata without hiding constructor data (characterBudget=${characterBudget})`, () => {
+			expect(
+				formatArgsInline({ [INTENT_FIELD]: "intent", __partialJson: "{}", constructor: 8, path: "ok" }, 120, {
+					characterBudget,
+				}),
+			).toBe('constructor=8, path="ok"');
+		});
+	}
+});
 
 describe("formatArgsInline", () => {
 	test("a trailing scalar grows into the available width instead of a fixed cap", () => {

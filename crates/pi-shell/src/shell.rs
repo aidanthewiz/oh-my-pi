@@ -4465,9 +4465,14 @@ mod tests {
 					.await
 					.expect("continue stages");
 				assert_eq!(exit_code(&continued), 0, "subset {stopped_subset:#b}");
+				let fg_stderr = files.path().join("fg.stderr");
 				let resumed = time::timeout(
 					Duration::from_secs(20),
-					session.shell.run_string("fg %1", &source_info, &params),
+					session.shell.run_string(
+						format!("fg %1 2> {}", quote_arg(fg_stderr.to_str().expect("utf8 stderr path"))),
+						&source_info,
+						&params,
+					),
 				)
 				.await
 				.expect("resumed pipeline did not complete")
@@ -4475,7 +4480,8 @@ mod tests {
 				assert_eq!(
 					exit_code(&resumed),
 					0,
-					"subset {stopped_subset:#b} reported a stale stop after fg"
+					"subset {stopped_subset:#b} did not complete after fg; stderr: {}",
+					fs::read_to_string(&fg_stderr).expect("foreground diagnostic"),
 				);
 			}
 		}

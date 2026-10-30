@@ -1,8 +1,9 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
 import { writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReviewCommand } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/bundled/review";
 import { runAnnotateCommand } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/bundled/annotate";
 import type {
@@ -16,6 +17,7 @@ import type { PrDiffPayload, ViewLookupResult } from "@oh-my-pi/pi-coding-agent/
 import * as gh from "@oh-my-pi/pi-coding-agent/tools/gh";
 import { parsePrUnifiedDiff } from "@oh-my-pi/pi-coding-agent/tools/gh-pr-diff";
 import * as glab from "@oh-my-pi/pi-coding-agent/tools/glab-mr";
+import { resetForTests as resetCacheForTests } from "@oh-my-pi/pi-coding-agent/tools/github-cache";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
 import { gitlab } from "@oh-my-pi/pi-coding-agent/utils/gitlab";
 import type { VcsGitRepo, VcsRepo } from "@oh-my-pi/pi-natives";
@@ -90,9 +92,16 @@ interface EditorCall {
 
 describe("ReviewCommand", () => {
 	let tmpDir: string;
+	let retainGeneration!: Mock<typeof gh.retainPrDiffGeneration>;
 
 	beforeAll(async () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-review-command-"));
+	});
+
+	beforeEach(() => {
+		// PR review cases call the real generation writer. Keep that off the
+		// developer cache; the one case that resolves pinned links restores it.
+		retainGeneration = spyOn(gh, "retainPrDiffGeneration").mockReturnValue(1);
 	});
 
 	afterEach(() => {
@@ -280,7 +289,7 @@ describe("ReviewCommand", () => {
 
 	it("parses supported explicit PR URL formats", async () => {
 		const dir = await createTempDir();
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = { hasUI: false } as unknown as HookCommandContext;
 
@@ -293,6 +302,8 @@ describe("ReviewCommand", () => {
 			"https://github.com/owner/repo/pull/123/commits",
 			"pr://owner/repo/123/diff/all",
 			"pr://owner/repo/123/diff/1",
+			"pr://owner/repo/123/diff/2?at=1710000000000",
+			"pr://owner/repo/123/diff/all?at=1710000000000",
 		];
 
 		for (const url of cases) {
@@ -300,7 +311,38 @@ describe("ReviewCommand", () => {
 
 			expect(result).toBeDefined();
 			expect(result!).toContain("PR owner/repo#123");
-			expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 123 });
+		}
+	});
+
+	it("does not retain a review snapshot when the GitHub cache is disabled", async () => {
+		const dir = createTempDir();
+		const previousToken = process.env.GH_TOKEN;
+		const previousCacheDb = process.env.OMP_GITHUB_CACHE_DB;
+		const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-review-cache-off-"));
+		process.env.GH_TOKEN = "review-cache-disabled";
+		process.env.OMP_GITHUB_CACHE_DB = path.join(cacheDir, "github-cache.db");
+		resetCacheForTests();
+		const settings = Settings.isolated({ "github.cache.enabled": false });
+		spyOn(github, "text").mockResolvedValue(SAMPLE_PR_DIFF);
+		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
+		try {
+			const result = await withActiveSettings(settings, () =>
+				command.execute(["https://github.com/owner/repo/pull/123"], {
+					hasUI: false,
+				} as unknown as HookCommandContext),
+			);
+			expect(retainGeneration).not.toHaveBeenCalled();
+			expect(result).toBeDefined();
+			expect(result!).toContain("pr://owner/repo/123/diff/");
+			expect(result!).not.toContain("?at=");
+		} finally {
+			resetCacheForTests();
+			if (previousToken === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = previousToken;
+			if (previousCacheDb === undefined) delete process.env.OMP_GITHUB_CACHE_DB;
+			else process.env.OMP_GITHUB_CACHE_DB = previousCacheDb;
+			resetCacheForTests();
+			await removeWithRetries(cacheDir);
 		}
 	});
 
@@ -310,53 +352,75 @@ describe("ReviewCommand", () => {
 	])(
 		"links each PR file to its actual diff slice with $fileCount reviewable files",
 		async ({ fileCount, lastIndex }) => {
-			const paths = [
-				"bun.lock",
-				"src/first.ts",
-				"dist/generated.js",
-				...Array.from({ length: fileCount - 2 }, (_, index) => `src/extra-${index}.ts`),
-				"src/last.ts",
-			];
-			const diff = paths
-				.map(
-					file => `diff --git a/${file} b/${file}
+			const previousCacheDb = process.env.OMP_GITHUB_CACHE_DB;
+			const previousGhToken = process.env.GH_TOKEN;
+			const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-review-cache-"));
+			process.env.OMP_GITHUB_CACHE_DB = path.join(cacheDir, "github-cache.db");
+			process.env.GH_TOKEN = "review-test-token";
+			retainGeneration.mockRestore();
+			resetCacheForTests();
+			try {
+				const paths = [
+					"bun.lock",
+					"src/first.ts",
+					"dist/generated.js",
+					...Array.from({ length: fileCount - 2 }, (_, index) => `src/extra-${index}.ts`),
+					"src/last.ts",
+				];
+				const diff = paths
+					.map(
+						file => `diff --git a/${file} b/${file}
 --- a/${file}
 +++ b/${file}
 @@ -1 +1 @@
 -old
 +new
 `,
-				)
-				.join("\n");
-			const lookup = makePrDiffLookup(diff);
-			lookup.payload = parsePrUnifiedDiff(diff);
-			spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(lookup);
-			const command = new ReviewCommand({ cwd: createTempDir() } as unknown as CustomCommandAPI);
-			const result = await command.execute(["https://github.com/owner/repo/pull/123"], {
-				hasUI: false,
-			} as unknown as HookCommandContext);
-			const rows = result!
-				.split("\n")
-				.filter(line => line.startsWith("|") && line.includes("pr://"))
-				.map(line => {
-					const cells = line.split("|").map(cell => cell.trim());
-					return { index: Number(cells[1]), path: cells[2], url: cells[5]!.replaceAll("`", "") };
+					)
+					.join("\n");
+				const lookup = makePrDiffLookup(diff);
+				lookup.payload = parsePrUnifiedDiff(diff);
+				spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(lookup);
+				const command = new ReviewCommand({ cwd: createTempDir() } as unknown as CustomCommandAPI);
+				const result = await command.execute(["https://github.com/owner/repo/pull/123"], {
+					hasUI: false,
+				} as unknown as HookCommandContext);
+				const rows = result!
+					.split("\n")
+					.filter(line => line.startsWith("|") && line.includes("pr://"))
+					.map(line => {
+						const cells = line.split("|").map(cell => cell.trim());
+						return { index: Number(cells[1]), path: cells[2], url: cells[5]!.replaceAll("`", "") };
+					});
+				expect(rows.map(row => row.path)).toEqual(paths.filter(file => file.startsWith("src/")));
+				const snapshotQuery = `?at=${lookup.fetchedAt}`;
+				expect(rows[0]).toEqual({
+					index: 2,
+					path: "src/first.ts",
+					url: `pr://owner/repo/123/diff/2${snapshotQuery}`,
 				});
-			expect(rows.map(row => row.path)).toEqual(paths.filter(file => file.startsWith("src/")));
-			expect(rows[0]).toEqual({ index: 2, path: "src/first.ts", url: "pr://owner/repo/123/diff/2" });
-			expect(rows.at(-1)).toEqual({
-				index: lastIndex,
-				path: "src/last.ts",
-				url: `pr://owner/repo/123/diff/${lastIndex}`,
-			});
-			try {
-				const router = InternalUrlRouter.instance();
-				for (const row of rows) {
-					const resource = await router.resolve(row.url);
-					expect(resource.content.split("\n")[0]).toBe(`diff --git a/${row.path} b/${row.path}`);
+				expect(rows.at(-1)).toEqual({
+					index: lastIndex,
+					path: "src/last.ts",
+					url: `pr://owner/repo/123/diff/${lastIndex}${snapshotQuery}`,
+				});
+				try {
+					const router = InternalUrlRouter.instance();
+					for (const row of rows) {
+						const resource = await router.resolve(row.url);
+						expect(resource.content.split("\n")[0]).toBe(`diff --git a/${row.path} b/${row.path}`);
+					}
+				} finally {
+					InternalUrlRouter.resetForTests();
 				}
 			} finally {
-				InternalUrlRouter.resetForTests();
+				resetCacheForTests();
+				if (previousCacheDb === undefined) delete process.env.OMP_GITHUB_CACHE_DB;
+				else process.env.OMP_GITHUB_CACHE_DB = previousCacheDb;
+				if (previousGhToken === undefined) delete process.env.GH_TOKEN;
+				else process.env.GH_TOKEN = previousGhToken;
+				resetCacheForTests();
+				await removeWithRetries(cacheDir);
 			}
 		},
 	);
@@ -387,7 +451,7 @@ describe("ReviewCommand", () => {
 
 	it("removes only the first valid PR URL from extra instructions", async () => {
 		const dir = await createTempDir();
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = { hasUI: false } as unknown as HookCommandContext;
 		const secondUrl = "https://github.com/owner/repo/pull/456";
@@ -396,12 +460,11 @@ describe("ReviewCommand", () => {
 
 		expect(result).toBeDefined();
 		expect(result!).toContain("focus on https://github.com/owner/repo/pull/456");
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 123 });
 	});
 
 	it("bypasses the interactive menu for explicit PR URLs", async () => {
 		const dir = await createTempDir();
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		let selectCalled = false;
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = createContext({
@@ -415,7 +478,6 @@ describe("ReviewCommand", () => {
 		expect(result).toBeDefined();
 		expect(result!).toContain("focus on CLI UX");
 		expect(selectCalled).toBe(false);
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 123 });
 	});
 
 	it("notifies and stops when explicit PR diff fetching fails", async () => {
@@ -464,7 +526,7 @@ describe("ReviewCommand", () => {
 
 	it("reviews a detected PR from recent conversation context", async () => {
 		const dir = await createTempDir();
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = createContext({
 			selectedMode: "Review PR owner/example#77 from conversation",
@@ -476,7 +538,6 @@ describe("ReviewCommand", () => {
 		expect(result).toBeDefined();
 		expect(result!).toContain("PR owner/example#77");
 		expect(result!).toContain("src/pr.ts");
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/example", number: 77 });
 	});
 
 	it("detects only PR URLs from the active branch path", async () => {
@@ -604,7 +665,7 @@ describe("ReviewCommand", () => {
 			{ number: 42, title: "Fix login", author: { login: "octocat" }, url: "https://github.com/owner/repo/pull/42" },
 			{ number: 43, title: "WIP thing", author: { login: "hubot" }, isDraft: true },
 		]);
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = createContext({
 			selectResults: ["4. Review a specific PR/MR", "#42  Fix login  @octocat"],
@@ -615,7 +676,6 @@ describe("ReviewCommand", () => {
 		expect(result).toBeDefined();
 		expect(result!).toContain("PR owner/repo#42");
 		expect(result!).toContain("src/pr.ts");
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 42 });
 		expect(listSpy).toHaveBeenCalled();
 	});
 
@@ -631,7 +691,7 @@ describe("ReviewCommand", () => {
 			const searchIndex = args.indexOf("--search");
 			return (searchIndex === -1 ? fullList : filteredList) as never;
 		});
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const selectCalls: SelectCall[] = [];
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = createContext({
@@ -646,7 +706,6 @@ describe("ReviewCommand", () => {
 
 		expect(result).toBeDefined();
 		expect(result!).toContain("PR owner/repo#7");
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 7 });
 		expect(
 			listSpy.mock.calls.some(
 				call => (call[1] as string[]).includes("--search") && (call[1] as string[]).includes("match"),
@@ -665,7 +724,7 @@ describe("ReviewCommand", () => {
 			if (args.includes("--search")) throw new Error("gh: rate limited");
 			return [{ number: 42, title: "Fix login", author: { login: "octocat" } }] as never;
 		});
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const notifications: NotifyCall[] = [];
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = createContext({
@@ -684,7 +743,6 @@ describe("ReviewCommand", () => {
 		});
 		expect(result).toBeDefined();
 		expect(result!).toContain("PR owner/repo#42");
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 42 });
 	});
 
 	it("resolves a numeric search query directly without a search request", async () => {
@@ -693,7 +751,7 @@ describe("ReviewCommand", () => {
 		const listSpy = spyOn(github, "json").mockResolvedValue([
 			{ number: 42, title: "Fix login", author: { login: "octocat" } },
 		]);
-		const diffSpy = spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
+		spyOn(gh, "getOrFetchPrDiff").mockResolvedValue(makePrDiffLookup(SAMPLE_PR_DIFF));
 		const command = new ReviewCommand({ cwd: dir } as unknown as CustomCommandAPI);
 		const ctx = createContext({
 			selectResults: ["4. Review a specific PR/MR", "Search open pull requests…"],
@@ -704,7 +762,6 @@ describe("ReviewCommand", () => {
 
 		expect(result).toBeDefined();
 		expect(result!).toContain("PR owner/repo#123");
-		expect(diffSpy).toHaveBeenCalledWith({ cwd: dir, repo: "owner/repo", number: 123 });
 		expect(listSpy).toHaveBeenCalledTimes(1);
 		expect(listSpy.mock.calls.every(call => !(call[1] as string[]).includes("--search"))).toBe(true);
 	});

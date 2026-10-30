@@ -660,6 +660,8 @@ export interface CreateAgentSessionOptions {
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
 	prewalk?: Prewalk;
+	/** Replayed launch intent; a recorded completed prewalk may consume this arm. Defaults to false. */
+	prewalkInherited?: boolean;
 	/** CLI prewalk selector awaiting extension provider registration; patterns retain role fallback order. */
 	deferredPrewalk?: { target: string; patterns: string[] };
 	/** Host-owned display sink for non-fatal startup prewalk warnings. */
@@ -5283,6 +5285,7 @@ async function createAgentSessionScoped(
 			initialRetryFallback,
 			deferRetryFallbackValidation: options.deferRetryFallbackValidation,
 			prewalk,
+			prewalkInherited: options.prewalkInherited,
 			suppressAutoPrewalk: options.suppressAutoPrewalk,
 			planYolo: options.planYolo,
 			serviceTierByFamily: initialServiceTierByFamily,

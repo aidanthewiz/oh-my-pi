@@ -39,6 +39,8 @@ import {
 	type TabSession,
 	type TernTabSession,
 	ternBlocksTaken,
+	type WorkerHandle,
+	spawnTabWorker,
 } from "./browser/tab-supervisor";
 import { renderTabCall } from "./browser/tab-call";
 import { resolveToCwd } from "./path-utils";
@@ -446,6 +448,7 @@ async function openOnKind(
 	const openSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 	// The step in flight when the deadline fires; a timeout names it.
 	let stage = `launching or connecting to the browser (${describeKind(kind)})`;
+	let preparedWorker: WorkerHandle | undefined;
 	try {
 		const browser = await untilAborted(openSignal, () =>
 			acquireBrowser(kind, {
@@ -458,6 +461,17 @@ async function openOnKind(
 						}
 					: undefined,
 				signal: openSignal,
+				beforeOpen:
+					kind.kind === "cmux" || kind.kind === "tern"
+						? undefined
+						: async () => {
+								const worker = await spawnTabWorker();
+								if (openSignal.aborted) {
+									await worker.terminate();
+									throw new ToolAbortError("Browser open aborted");
+								}
+								preparedWorker = worker;
+							},
 			}),
 		);
 
@@ -517,6 +531,13 @@ async function openOnKind(
 					userAgent: params.user_agent,
 					ignoreHttpsErrors: params.ignore_https_errors,
 					signal: openSignal,
+					takePreparedWorker: preparedWorker
+						? () => {
+								const worker = preparedWorker;
+								preparedWorker = undefined;
+								return worker;
+							}
+						: undefined,
 					ownerSessionId: session.getSessionId?.() ?? undefined,
 					// Omitted stays undefined: creation defaults it to false
 					// while reuse by the owner leaves a set value alone.
@@ -561,6 +582,8 @@ async function openOnKind(
 		if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
 		if (timeoutSignal.aborted) throw new ToolError(`Browser open timed out after ${timeoutMs}ms while ${stage}`);
 		throw error;
+	} finally {
+		await preparedWorker?.terminate();
 	}
 }
 

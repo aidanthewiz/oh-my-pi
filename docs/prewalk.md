@@ -53,6 +53,12 @@ Calls to other tools do not trigger the handoff. A read-only `xd://` device requ
 
 The switch is one-shot: after the handoff, prewalk disarms itself, removes the planning nudge, and steers the target with an implementation checklist. It changes the session's active model and optional thinking level without rewriting model-role assignments. A same-model handoff can still change thinking; when the model and effective thinking configuration already match, prewalk disarms without switching.
 
+The handoff is recorded in the session, so resuming it, restoring it with `--restore`, or reviving a parked subagent continues on the handoff model and thinking level instead of returning to the planning model. A retry fallback taken after the handoff supersedes it, as for any session-local model. A revived subagent does not arm its prewalk again while it is still on that target.
+
+A fresh explicit startup request can arm prewalk after an earlier recorded handoff, including a same-model thinking-level change.
+SDK hosts set `prewalkInherited: true` only when replaying the original launch during revival.
+This marker is transient; it is not a saved setting.
+
 ## Arm from an active session
 
 In a top-level session, changing `prewalk.enabled` live also takes effect:

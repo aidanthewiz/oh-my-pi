@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { findScopedSettings } from "../../../../config/settings";
 import type { CustomCommand, CustomCommandAPI } from "../../../../extensibility/custom-commands/types";
 import type { HookCommandContext } from "../../../../extensibility/hooks/types";
 import { parseMrUrl } from "../../../../internal-urls/mr-protocol";
@@ -8,10 +9,12 @@ import { parseInternalUrl } from "../../../../internal-urls/parse";
 import reviewCustomRequestTemplate from "../../../../prompts/review-custom-request.md" with { type: "text" };
 import reviewHeadlessRequestTemplate from "../../../../prompts/review-headless-request.md" with { type: "text" };
 import * as gh from "../../../../tools/gh";
+import { parseRepoRef } from "../../../../tools/gh-common";
 import * as glab from "../../../../tools/glab-mr";
 import {
 	getGlabConfigPath,
 	getGlabCredentialSourceIdentity,
+	resolveGithubCacheAuthKey,
 	resolveGitlabCacheAuthKey,
 } from "../../../../tools/github-cache";
 import { captureForgeCliEnvironment, ForgeCredentialsChangedError } from "../../../../utils/forge-cli";
@@ -89,7 +92,8 @@ const PICK_PR_CHOICE_LABEL = "4. Review a specific PR/MR";
 /** `gh pr list` / `glab mr list` page size. 100 is the per-page maximum of both forges. */
 const PR_PICKER_LIMIT = 100;
 const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]+$/;
-const PR_SCHEME_PATTERN = /^pr:\/\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/([1-9]\d*)(?:\/diff(?:\/(?:all|[1-9]\d*))?)?$/;
+const PR_SCHEME_PATTERN =
+	/^pr:\/\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/([1-9]\d*)(?:\/diff(?:\/(?:all|[1-9]\d*))?)?(?:\?at=\d+)?$/;
 const PR_REF_TEXT_PATTERN =
 	/https:\/\/github\.com\/[^\s<>"']+|pr:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[^\s<>"']+|https:\/\/[^\s<>"'/]+\/[^\s<>"']*\/-\/merge_requests\/[^\s<>"']+|mr:\/\/[^\s<>"']+/g;
 
@@ -207,6 +211,10 @@ export async function fetchPrReviewTarget(
 	glabContext: ReviewGlabContext = captureReviewGlabContext(cwd),
 ): Promise<ResolvedReviewTarget> {
 	const label = formatReviewRefLabel(ref);
+	// Session settings are the active scope (set around `/review`). Without them,
+	// `resolveCacheTtl(undefined)` uses the default enabled cache and a kill switch
+	// still stores a generation.
+	const settings = findScopedSettings(cwd);
 	if (ref.forge === "gitlab") {
 		try {
 			glabContext.assertCurrent(ref.repo.split("/")[0]!);
@@ -216,6 +224,7 @@ export async function fetchPrReviewTarget(
 				iid: ref.number,
 				env: glabContext.env,
 				credentialSourceIdentity: glabContext.credentialSourceIdentity,
+				...(settings ? { settings } : {}),
 			});
 			glabContext.assertCurrent(ref.repo.split("/")[0]!);
 			return createResolvedReviewTarget(
@@ -234,9 +243,30 @@ export async function fetchPrReviewTarget(
 		}
 	}
 	try {
-		const lookup = await gh.getOrFetchPrDiff({ cwd, repo: ref.repo, number: ref.number });
+		const env = captureForgeCliEnvironment(cwd, "gh");
+		const cacheAuthKey = resolveGithubCacheAuthKey(parseRepoRef(ref.repo).host, env) ?? null;
+		const lookup = await gh.getOrFetchPrDiff({
+			cwd,
+			repo: ref.repo,
+			number: ref.number,
+			env,
+			cacheAuthKey,
+			...(settings ? { settings } : {}),
+		});
+		const generationAt =
+			lookup.status === "disabled"
+				? null
+				: gh.retainPrDiffGeneration({
+						repo: ref.repo,
+						number: ref.number,
+						rendered: lookup.rendered,
+						files: lookup.payload.files,
+						fetchedAt: lookup.fetchedAt,
+						cacheAuthKey,
+					});
 		return createResolvedReviewTarget("pr", label, lookup.payload.unified, `${label} has no diff content available`, {
 			prDiffUrl: `pr://${ref.repo}/${ref.number}/diff`,
+			prDiffQuery: generationAt !== null ? `?at=${generationAt}` : "",
 		});
 	} catch (error) {
 		throw new Error(

@@ -5,6 +5,12 @@
 ### Fixed
 
 - Browser guests remain Working across host continuations and ignore older loop completions while a newer loop runs.
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

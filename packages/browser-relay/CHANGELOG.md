@@ -5,6 +5,12 @@
 ### Fixed
 
 - Authenticated the manual relay smoke against the configured authority and removed tokenized endpoint output.
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
 ## [18.13.0] - 2026-10-26
 
 ### Added

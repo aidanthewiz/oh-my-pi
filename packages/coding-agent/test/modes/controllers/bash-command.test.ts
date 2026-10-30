@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { BashResult } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import type { BashPtyOptions, BashResult } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { BashExecutionComponent } from "@oh-my-pi/pi-tui/chat/bash-execution";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
@@ -27,20 +27,26 @@ function createCwdContext(sourceDir: string, isStreaming = false, showImages = t
 		completedBtwVisible: true,
 		gateHeld: false,
 	};
-	const executeBash = vi.fn(async (command: string): Promise<BashResult> => {
-		state.executedCwds.push(state.cwd);
-		return {
-			output: command === "pwd" ? `${state.cwd}\n` : "ok",
-			exitCode: 0,
-			cancelled: false,
-			truncated: false,
-			totalLines: 1,
-			totalBytes: state.cwd.length,
-			outputLines: 1,
-			outputBytes: state.cwd.length,
-			workingDir: state.cwd,
-		};
-	});
+	const executeBash = vi.fn(
+		async (
+			command: string,
+			_onChunk?: (chunk: string) => void,
+			_options?: { pty?: BashPtyOptions },
+		): Promise<BashResult> => {
+			state.executedCwds.push(state.cwd);
+			return {
+				output: command === "pwd" ? `${state.cwd}\n` : "ok",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: state.cwd.length,
+				outputLines: 1,
+				outputBytes: state.cwd.length,
+				workingDir: state.cwd,
+			};
+		},
+	);
 	const pendingMessagesContainer = createContainer();
 	const present = vi.fn();
 	const ctx = {
@@ -156,6 +162,7 @@ describe("bash shortcut command", () => {
 					cols: expect.any(Number),
 					rows: expect.any(Number),
 					onChunk: expect.any(Function),
+					onStdin: expect.any(Function),
 				},
 			});
 			expect(executeBash).toHaveBeenNthCalledWith(2, "cd", expect.any(Function), {
@@ -165,6 +172,7 @@ describe("bash shortcut command", () => {
 					cols: expect.any(Number),
 					rows: expect.any(Number),
 					onChunk: expect.any(Function),
+					onStdin: expect.any(Function),
 				},
 			});
 			expect(ctx.applyCwdChange).toHaveBeenNthCalledWith(1, childDir);

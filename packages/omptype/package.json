@@ -1,6 +1,6 @@
 {
 	"name": "@oh-my-pi/omptype",
-	"version": "18.13.2",
+	"version": "18.13.3",
 	"description": "ArkType-compatible runtime schema validation with lazy JIT compilation",
 	"keywords": [
 		"arktype",
@@ -60,7 +60,7 @@
 		"arktype": "2.2.3"
 	},
 	"engines": {
-		"bun": ">=1.3.14",
+		"bun": ">=1.4.4",
 		"node": ">=20"
 	}
 }

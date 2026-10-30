@@ -266,6 +266,8 @@ export interface InteractiveModeContext {
 	pendingTools: Map<string, ToolExecutionHandle>;
 	pendingBashComponents: BashExecutionComponent[];
 	bashComponent: BashExecutionComponent | undefined;
+	/** Decoded terminal input accepted while a foreground PTY owns the composer. */
+	foregroundPtyInput?: (data: string) => void;
 	pendingPythonComponents: EvalExecutionComponent[];
 	pythonComponent: EvalExecutionComponent | undefined;
 	isPythonMode: boolean;

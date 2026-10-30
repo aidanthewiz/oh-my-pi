@@ -1986,7 +1986,7 @@ function describeResultAgent(result: SingleResult, state: AgentDescribeState, de
 			result.error ? errorLine(result.error) : undefined,
 			result.retryFailure ? errorLine(`auto-retry gave up: ${result.retryFailure.errorMessage}`) : undefined,
 			structured !== undefined
-				? describeJsonTree(structured)
+				? describeJsonTree(structured, { hiddenRootKeys: [] })
 				: output
 					? md(output, { role: "omp.task.output" })
 					: undefined,

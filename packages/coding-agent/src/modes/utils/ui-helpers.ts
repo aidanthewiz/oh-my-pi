@@ -1106,6 +1106,7 @@ export class UiHelpers {
 			// Drops deferred bash/python blocks with the old transcript, then repaints
 			// the queued-message bar from the live session queue: a mid-turn rebuild
 			// (rewind, /tree) keeps the queue, so it must stay visible and editable.
+			this.ctx.pendingMessagesContainer.disposeChildren();
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.pendingBashComponents = [];
 			this.ctx.pendingPythonComponents = [];
@@ -1242,7 +1243,13 @@ export class UiHelpers {
 	}
 
 	updatePendingMessagesDisplay(): void {
-		this.ctx.pendingMessagesContainer.disposeChildren();
+		const container = this.ctx.pendingMessagesContainer;
+		for (let index = container.children.length - 1; index >= 0; index--) {
+			const child = container.children[index];
+			if (!(child instanceof QueuedMessagesBand)) continue;
+			container.removeChild(child);
+			child.dispose();
+		}
 		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
 
 		const steeringMessages = [...queuedMessages.steering];

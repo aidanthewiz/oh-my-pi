@@ -237,7 +237,7 @@ export function createAnnotationsAPI(
 			const target = await resolveDiffTarget(ctx, request.source);
 			// The overlay defaults to a review request; reject before the operator writes notes it would drop.
 			assertReviewablePatchSize(target);
-			const result = await showCodeReviewOverlay(ctx, target);
+			const result = await showCodeReviewOverlay(ctx, target, request.focus);
 			if (!result) return undefined;
 			const review = result.action === "review";
 			const text = buildCodeReviewFeedback(target, result.annotations, review, request.focus);

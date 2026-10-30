@@ -12,6 +12,8 @@ To develop from this fork, follow [Getting started from source](#getting-started
 
 For Nix 2.30 or later, use `nix profile add github:Coreforce-CAD/oh-my-pi/coreforge`. Older Nix uses `nix profile install` with the same Coreforce source.
 
+macOS · Linux · Windows · bun ≥ 1.4.4
+
 ### Shell completions
 
 `omp` generates its own completion scripts for **bash**, **zsh**, and **fish** from the live command/flag metadata, so they never drift from the actual CLI. Subcommands, flags, and enum values complete statically; model names (`--model`, `--smol`, `--slow`, `--plan`) resolve against the bundled model catalog and `--resume` against your on-disk sessions.

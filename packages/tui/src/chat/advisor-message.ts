@@ -2,6 +2,7 @@ import { type Component } from "../tui";
 import { Disclosure } from "../components/disclosure";
 import { visibleWidth } from "../utils";
 import type { AdvisorMessageDetails, AdvisorNote, AdvisorSeverity } from "./messages";
+import { chatTranscriptDisplayPreferences } from "./display-preferences";
 import { formatBadge, replaceTabs, type ToolUIColor, wrapTextWithAnsi } from "../render/render-utils";
 import { Ellipsis, truncateToWidth } from "../render";
 import type { Theme } from "../theme";
@@ -215,6 +216,8 @@ export function createAdvisorMessageCard(
 	uiTheme: Theme,
 ): AdvisorMessageCard {
 	const notes = details?.notes ?? [];
+	const collapsedLines = chatTranscriptDisplayPreferences.advisorCollapsedLines || undefined;
+	const collapsible = collapsedLines !== undefined || notes.length > COLLAPSED_NOTES;
 	const blockers = notes.filter(note => note.severity === "blocker").length;
 	const meta: string[] = [`${notes.length} ${notes.length === 1 ? "note" : "notes"}`];
 	if (blockers > 0) meta.push(uiTheme.fg("error", `${blockers} blocker${blockers === 1 ? "" : "s"}`));
@@ -259,9 +262,9 @@ export function createAdvisorMessageCard(
 			{
 				role: "omp.advisor",
 				tone: look.tone,
-				collapsible: notes.length > COLLAPSED_NOTES,
-				collapsed: notes.length > COLLAPSED_NOTES ? !isExpanded : undefined,
-				preview: notes.length > COLLAPSED_NOTES ? "auto" : undefined,
+				collapsible,
+				collapsed: collapsible ? !isExpanded : undefined,
+				preview: collapsedLines !== undefined ? { lines: collapsedLines } : collapsible ? "auto" : undefined,
 			},
 			[head, ...body],
 		);
@@ -274,6 +277,7 @@ export function createAdvisorMessageCard(
 		body: () => new AdvisorNotes(notes, 0, uiTheme),
 		expanded: getExpanded(),
 		paddingX: 1,
+		maxCollapsedRows: collapsedLines,
 	});
 	// The tool-output toggle owns expansion state; synchronize the controlled
 	// disclosure from the callback on every render.

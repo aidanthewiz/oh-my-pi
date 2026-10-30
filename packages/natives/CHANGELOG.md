@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- Report actual external process IDs for quoted and escaped literal background commands without evaluating command-name substitutions during classification.
+- Preserve a job's result when it finishes during foreground continuation. Keep already completed jobs outside signal-control authority.
+- Do not repeat foreground terminal transfers when that process group already owns the terminal.
 - Keep hashline mismatch diagnostics and previews non-authorizing. Require explicit reads for unseen rows and refuse ambiguous recovery after budget exhaustion.
 - Reject undecodable files in hashline mode; preserve explicit binary deletion in Patch mode.
 - Keep native crash reports private and validate macOS capture value types before conversion.
@@ -39,6 +42,11 @@
 - Exclude unknown process start times from newest/oldest selection without dropping them from unrestricted process listings.
 - Launch background pipelines once, preserve completed-stage statuses and launch-time `pipefail`, and isolate command-substitution capture from outer redirects.
 - Keep completed-job metadata available to `wait` without granting signal authority, and update `$!` when resuming a background job.
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
 
 ## [18.13.2] - 2026-10-27
 

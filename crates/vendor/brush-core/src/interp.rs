@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	collections::VecDeque,
 	io::Write,
 	path::{Path, PathBuf},
@@ -606,6 +607,62 @@ fn background_process_pipeline_for_async_job<SE: extensions::ShellExtensions>(
 	None
 }
 
+fn literal_background_command_name<'a, SE: extensions::ShellExtensions>(
+	word: &'a ast::Word,
+	shell: &Shell<SE>,
+) -> Option<Cow<'a, str>> {
+	fn is_bare_literal(text: &str) -> bool {
+		text.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'))
+	}
+
+	fn join_literals(
+		pieces: Vec<brush_parser::word::WordPieceWithSource>,
+		quoted: bool,
+	) -> Option<String> {
+		use brush_parser::word::WordPiece;
+
+		pieces.into_iter().try_fold(String::new(), |mut name, piece| {
+			let text = match piece.piece {
+				WordPiece::Text(text) if quoted || is_bare_literal(&text) => text,
+				WordPiece::SingleQuotedText(text) => text,
+				WordPiece::DoubleQuotedSequence(pieces) => join_literals(pieces, true)?,
+				WordPiece::EscapeSequence(mut text) => {
+					if text.starts_with('\\') {
+						text.remove(0);
+					}
+					text
+				},
+				WordPiece::AnsiCQuotedText(text) => {
+					let (bytes, _) = crate::escape::expand_backslash_escapes(
+						&text,
+						crate::escape::EscapeExpansionMode::AnsiCQuotes,
+					).ok()?;
+					String::from_utf8(bytes).ok()?
+				},
+				_ => return None,
+			};
+			if name.is_empty() {
+				name = text;
+			} else {
+				name.push_str(&text);
+			}
+			Some(name)
+		})
+	}
+
+	let raw = word.value.as_str();
+	if raw.is_empty() {
+		return None;
+	}
+	if is_bare_literal(raw) {
+		return Some(Cow::Borrowed(raw));
+	}
+	// Parsing removes literal quoting without executing substitutions or expansions.
+	let pieces = brush_parser::word::parse(raw, &shell.parser_options()).ok()?;
+	let name = join_literals(pieces, false)?;
+	(!name.is_empty()).then_some(Cow::Owned(name))
+}
+
 fn classify_background_process_pipeline<SE: extensions::ShellExtensions>(
 	pipeline: &ast::Pipeline,
 	shell: &Shell<SE>,
@@ -625,12 +682,12 @@ fn classify_background_process_pipeline<SE: extensions::ShellExtensions>(
 			let Some(word) = simple_cmd.word_or_name.as_ref() else {
 				return BackgroundProcessPipeline::Internal;
 			};
-			let name = word.value.as_str();
-			if name.is_empty()
-				|| !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'))
-				|| shell.aliases().contains_key(name)
-				|| shell.builtins().get(name).is_some_and(|registration| !registration.disabled)
-				|| shell.funcs().get(name).is_some()
+			let Some(name) = literal_background_command_name(word, shell) else {
+				return BackgroundProcessPipeline::Internal;
+			};
+			if shell.aliases().contains_key(name.as_ref())
+				|| shell.builtins().get(name.as_ref()).is_some_and(|registration| !registration.disabled)
+				|| shell.funcs().get(name.as_ref()).is_some()
 			{
 				return BackgroundProcessPipeline::Internal;
 			}
@@ -645,14 +702,13 @@ fn classify_background_process_pipeline<SE: extensions::ShellExtensions>(
 		return BackgroundProcessPipeline::Internal;
 	};
 
-	let command_name = command_word.value.as_str();
-	if command_name.is_empty()
-		|| !command_name.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'))
-		|| shell.aliases().contains_key(command_name)
-	{
+	let Some(command_name) = literal_background_command_name(command_word, shell) else {
+		return BackgroundProcessPipeline::Internal;
+	};
+	if shell.aliases().contains_key(command_name.as_ref()) {
 		return BackgroundProcessPipeline::Internal;
 	}
-	if let Some(registration) = shell.builtins().get(command_name)
+	if let Some(registration) = shell.builtins().get(command_name.as_ref())
 		&& !registration.disabled
 	{
 		return if registration.transparent_background_wrapper {
@@ -662,7 +718,7 @@ fn classify_background_process_pipeline<SE: extensions::ShellExtensions>(
 			BackgroundProcessPipeline::Internal
 		};
 	}
-	if shell.funcs().get(command_name).is_some() {
+	if shell.funcs().get(command_name.as_ref()).is_some() {
 		return BackgroundProcessPipeline::Internal;
 	}
 
@@ -2849,4 +2905,59 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
 	}
 
 	Ok(reader.into())
+}
+
+#[cfg(all(test, unix))]
+mod background_literal_tests {
+	use anyhow::Result;
+
+	#[tokio::test]
+	async fn quoted_external_jobs_report_the_child_pid_and_preserve_status() -> Result<()> {
+		let scratch = tempfile::tempdir()?;
+		let executable = scratch.path().join("shell's $literal");
+		std::os::unix::fs::symlink("/bin/sh", &executable)?;
+		let executable = executable.to_str().expect("utf8 fixture path");
+		let single = format!("'{}'", executable.replace('\'', "'\\''"));
+		let double = format!("\"{}\"", executable.replace('$', "\\$"));
+		let escaped = executable.replace(' ', "\\ ").replace('\'', "\\'").replace('$', "\\$");
+
+		for name in [single, double, escaped] {
+			for pipeline in [false, true] {
+				let pid_file = scratch.path().join("child-pid");
+				let command = format!(
+					"{}{} -c 'printf \"%s\" \"$$\" > \"$1\"; exit 7' sh '{}' &",
+					if pipeline { "'/bin/echo' input | " } else { "" },
+					name,
+					pid_file.display(),
+				);
+				let mut shell = crate::Shell::builder().build().await?;
+				let params = shell.default_exec_params();
+				shell.run_string(command, &crate::SourceInfo::default(), &params).await?;
+				let pid = shell.last_background_pid().expect("external child PID");
+				let waited = shell.jobs_mut()
+					.wait_next(&[crate::jobs::JobSelector::ProcessId(pid)])
+					.await?
+					.expect("job remains waitable by PID");
+				assert_eq!(u8::from(waited.result.exit_code), 7);
+				assert_eq!(std::fs::read_to_string(&pid_file)?, pid.to_string());
+				std::fs::remove_file(&pid_file)?;
+			}
+		}
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn dynamic_background_command_names_are_not_replayed_by_classification() -> Result<()> {
+		let scratch = tempfile::tempdir()?;
+		let marker = scratch.path().join("substitutions");
+		let mut shell = crate::Shell::builder().build().await?;
+		let params = shell.default_exec_params();
+		shell.run_string(
+			format!("$(printf x >> '{}'; printf /bin/sh) -c 'exit 7' & wait", marker.display()),
+			&crate::SourceInfo::default(),
+			&params,
+		).await?;
+		assert_eq!(std::fs::read_to_string(marker)?, "x");
+		Ok(())
+	}
 }

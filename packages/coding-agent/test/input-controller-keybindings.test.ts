@@ -5,12 +5,16 @@ import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { BashPtyOptions } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 import { SpaceHoldGesture } from "@oh-my-pi/pi-tui/space-hold";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { type KeyId, matchesKey } from "@oh-my-pi/pi-tui";
+import { type Component, Container, type KeyId, matchesKey } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
 import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
@@ -44,6 +48,7 @@ type FakeEditor = {
 	clearCustomKeyHandlers(): void;
 	spaceHold: SpaceHoldGesture;
 	pasteText(text: string): void;
+	handleInput?(data: string): void;
 	imageLinks?: (string | undefined)[];
 	pendingImages: ImageContent[];
 	pendingImageLinks: (string | undefined)[];
@@ -175,6 +180,7 @@ async function createContext() {
 		resetDisplayAfterAppearanceRefresh,
 		ui: {
 			requestRender,
+			requestComponentRender: vi.fn(),
 			resetDisplay,
 			clearInlineImages,
 			addInputListener,
@@ -321,6 +327,157 @@ function dispatchEnhancedImagePaste(listeners: InputListener[], png: Uint8Array)
 		dispatchInput(listeners, input);
 	}
 }
+
+/** Replay a kitty OSC 5522 enhanced paste that offers and delivers plain `text`. */
+function dispatchEnhancedTextPaste(listeners: InputListener[], text: string): void {
+	const packet = (metadata: string, payload?: string) =>
+		`\x1b]5522;${metadata}${payload === undefined ? "" : `;${payload}`}\x1b\\`;
+	const textMime = Buffer.from("text/plain").toString("base64");
+	for (const input of [
+		packet("type=read:status=OK:pw=secret"),
+		packet(`type=read:status=DATA:mime=${textMime}`),
+		packet("type=read:status=DONE"),
+		packet("type=read:status=OK"),
+		packet(`type=read:status=DATA:mime=${textMime}`, Buffer.from(text).toString("base64")),
+		packet("type=read:status=DONE"),
+	]) {
+		dispatchInput(listeners, input);
+	}
+}
+
+it("completes enhanced paste while a foreground PTY owns input and returns paste to the editor on exit", async () => {
+	await initTheme(false);
+	const context = await createContext();
+	const { ctx } = context;
+	const editor = new CustomEditor(getEditorTheme());
+	editor.setText("untouched draft");
+	ctx.editor = editor;
+	context.setFocused(editor);
+	context.setKeybinding("app.interrupt", ["escape"]);
+	type Listener = Parameters<InteractiveModeContext["ui"]["addInputListener"]>[0];
+	let listeners: Listener[] = [];
+	ctx.ui.addInputListener = (listener, options) => {
+		listeners = options?.prepend ? [listener, ...listeners] : [...listeners, listener];
+		return () => {
+			listeners = listeners.filter(entry => entry !== listener);
+		};
+	};
+	const press = (data: string) => listeners.some(listener => listener(data)?.consume === true);
+	const route: InputListener[] = [data => (press(data) ? { consume: true } : undefined)];
+	const mounted = new Container();
+	ctx.present = content => {
+		for (const component of Array.isArray(content) ? content : [content as Component]) mounted.addChild(component);
+	};
+	const terminalWrite = vi.spyOn(ctx.ui.terminal, "write");
+	let admitted = Promise.withResolvers<void>();
+	let release = Promise.withResolvers<void>();
+	let cancelled = false;
+	const written: string[] = [];
+	let lateStdin: BashPtyOptions["onStdin"];
+	ctx.session.executeBash = async (_command, _chunk, options) => {
+		lateStdin = options?.pty?.onStdin;
+		if (!lateStdin) throw new Error("foreground executor did not receive a stdin admission callback");
+		lateStdin(data => written.push(data));
+		admitted.resolve();
+		await release.promise;
+		return {
+			output: "",
+			exitCode: 0,
+			cancelled,
+			truncated: false,
+			totalLines: 0,
+			totalBytes: 0,
+			outputLines: 0,
+			outputBytes: 0,
+		};
+	};
+	let run: Promise<void> | undefined;
+	const commandController = new CommandController(ctx);
+	try {
+		new InputController(ctx).setupKeyHandlers();
+		run = commandController.handleBashCommand("read answer");
+		await Promise.race([
+			admitted.promise,
+			run.then(() => {
+				throw new Error("foreground command finished before stdin admission");
+			}),
+		]);
+		expect(editor.nativeKeyPassthrough).toBe(true);
+		dispatchEnhancedTextPaste(route, "enhanced answer\n");
+		expect(terminalWrite.mock.calls.some(([data]) => data.includes("mime=dGV4dC9wbGFpbg=="))).toBe(true);
+		expect(written).toEqual(["\x1b[200~enhanced answer\n\x1b[201~"]);
+		expect(editor.getText()).toBe("untouched draft");
+		press("\x1b[200~ordinary answer\x1b[201~");
+		const expected = ["\x1b[200~enhanced answer\n\x1b[201~", "\x1b[200~ordinary answer\x1b[201~"];
+		expect(written).toEqual(expected);
+		press("\x1b");
+		press("\x1b[<0;10;5M");
+		expect(written).toEqual(expected);
+		const dialogText: string[] = [];
+		context.setFocused({ pasteText: (text: string) => dialogText.push(text) });
+		dispatchEnhancedTextPaste(route, "dialog text");
+		expect(dialogText).toEqual(["dialog text"]);
+		expect(written).toEqual(expected);
+		context.setFocused(editor);
+		release.resolve();
+		await run;
+		expect(editor.nativeKeyPassthrough).toBe(false);
+		lateStdin?.(data => written.push(data));
+		expect(editor.nativeKeyPassthrough).toBe(false);
+		dispatchEnhancedTextPaste(route, " after exit");
+		expect(written).toEqual(expected);
+		expect(editor.getText()).toBe("untouched draft after exit");
+
+		admitted = Promise.withResolvers<void>();
+		release = Promise.withResolvers<void>();
+		cancelled = true;
+		run = commandController.handleBashCommand("read cancelled");
+		await Promise.race([
+			admitted.promise,
+			run.then(() => {
+				throw new Error("cancelled command finished before stdin admission");
+			}),
+		]);
+		const cancelledStdin = lateStdin;
+		dispatchEnhancedTextPaste(route, "before cancellation");
+		expected.push("\x1b[200~before cancellation\x1b[201~");
+		expect(written).toEqual(expected);
+		release.resolve();
+		await run;
+		expect(editor.nativeKeyPassthrough).toBe(false);
+
+		admitted = Promise.withResolvers<void>();
+		release = Promise.withResolvers<void>();
+		cancelled = false;
+		run = commandController.handleBashCommand("read successor");
+		await Promise.race([
+			admitted.promise,
+			run.then(() => {
+				throw new Error("successor command finished before stdin admission");
+			}),
+		]);
+		const retiredWrites: string[] = [];
+		cancelledStdin?.(data => retiredWrites.push(data));
+		dispatchEnhancedTextPaste(route, "successor answer");
+		expected.push("\x1b[200~successor answer\x1b[201~");
+		expect(written).toEqual(expected);
+		expect(retiredWrites).toEqual([]);
+		expect(editor.getText()).toBe("untouched draft after exit");
+		expect(editor.nativeKeyPassthrough).toBe(true);
+		release.resolve();
+		await run;
+		expect(editor.nativeKeyPassthrough).toBe(false);
+	} finally {
+		release.resolve();
+		await run;
+		admitted.resolve();
+		listeners = [];
+		mounted.disposeChildren();
+		const editorComponent: Component = editor;
+		editorComponent.dispose?.();
+		terminalWrite.mockRestore();
+	}
+});
 
 describe("InputController keybinding setup", () => {
 	it("registers model selector and display reset actions separately", async () => {
@@ -539,6 +696,36 @@ describe("InputController keybinding setup", () => {
 		expect(result).toEqual({ consume: true });
 		expect(await pasted).toBe("sk-test-key");
 		expect(focusedPasteText).toHaveBeenCalledWith("sk-test-key");
+	});
+
+	it("delivers an enhanced text paste to a focused dialog without pasteText as a bracketed paste", async () => {
+		const { promise: received, resolve: resolveReceived } = Promise.withResolvers<string>();
+		const handleInput = vi.fn((data: string) => {
+			resolveReceived(data);
+		});
+		const { InputController, ctx, editor, setFocused, spies } = await createContext();
+		setFocused({ handleInput });
+		new InputController(ctx).setupKeyHandlers();
+
+		dispatchEnhancedTextPaste(registeredInputListeners(spies.addInputListener), "sk-test-key");
+
+		expect(await received).toBe("\x1b[200~sk-test-key\x1b[201~");
+		expect(editor.getText()).toBe("");
+	});
+
+	it("delivers an enhanced text paste to the main editor as a bracketed paste so image paths attach", async () => {
+		const { promise: received, resolve: resolveReceived } = Promise.withResolvers<string>();
+		const { InputController, ctx, editor, spies } = await createContext();
+		editor.handleInput = vi.fn((data: string) => {
+			resolveReceived(data);
+		});
+		new InputController(ctx).setupKeyHandlers();
+
+		const path = "/tmp/Screenshot\\ 2026-10-19\\ at\\ 14.25.32.png";
+		dispatchEnhancedTextPaste(registeredInputListeners(spies.addInputListener), path);
+
+		expect(await received).toBe(`\x1b[200~${path}\x1b[201~`);
+		expect(editor.getText()).toBe("");
 	});
 
 	it("rejects image smart-paste while a login input is focused instead of mutating the hidden editor", async () => {

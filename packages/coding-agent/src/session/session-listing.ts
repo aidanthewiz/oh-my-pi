@@ -15,6 +15,7 @@ import { cfgTitleIcons } from "../utils/title-settings";
 import type { SessionHeader } from "./session-entries";
 import { applySessionTitleSlot, parseTitleSlotLine, titleUpdateFromSlot } from "./session-title-slot";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
+import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { visitEntriesFromFile } from "./session-loader";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
@@ -703,8 +704,9 @@ export async function listAllSessions(
  * True when a scanned session is a 0-turn stub with no display name: the tail
  * lifecycle shows no assistant activity (pending user-only or unscannable)
  * and neither a title nor a first prompt worth showing. Covers header-only
- * records (`newSession()` boundaries, `ensureOnDisk()` stubs, drafts) and
- * user-only sessions whose prompt text never made the prefix scan. A title or
+ * records (`newSession()` boundaries and `ensureOnDisk()` stubs) and
+ * user-only sessions whose prompt text never made the prefix scan. Saved
+ * annotation drafts also keep their owning session discoverable. A title or
  * first prompt is user intent worth resuming, so named 0-turn sessions stay
  * discoverable. The tail — not the 4 KB prefix — decides answered-ness, so a
  * transcript whose first assistant record starts past the prefix is never
@@ -716,6 +718,8 @@ export function isEmptySession(session: SessionInfo): boolean {
 	if ((session.assistantTurns ?? 1) > 0) return false;
 	if (sanitizeSessionName(session.title)) return false;
 	if (sanitizeSessionName(session.firstMessage === "(no messages)" ? undefined : session.firstMessage)) return false;
+	if (session.path.endsWith(".jsonl") && hasAnnotationDraftsSync(session.path.slice(0, -".jsonl".length), session.id))
+		return false;
 	return true;
 }
 

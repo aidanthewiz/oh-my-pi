@@ -97,6 +97,9 @@ pub fn get_foreground_pid() -> Option<sys::process::ProcessId> {
 
 /// Move the specified process to the foreground of the attached terminal.
 pub fn move_to_foreground(pid: sys::process::ProcessId) -> Result<(), error::Error> {
+	if pid > 0 && get_foreground_pid() == Some(pid) {
+		return Ok(());
+	}
 	nix::unistd::tcsetpgrp(std::io::stdin(), nix::unistd::Pid::from_raw(pid))?;
 	Ok(())
 }

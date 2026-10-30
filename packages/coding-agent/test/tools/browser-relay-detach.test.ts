@@ -39,8 +39,13 @@ class ChromeBackedExtension {
 	readonly #inFlight = new Map<number, number>();
 	/** Resolved by the next forwarded command each one matches. */
 	readonly #sendWaiters = new Set<{ method: string; match: (params: unknown) => boolean; resolve: () => void }>();
+	/** Settled by the relay's next `detach` once Chrome has ended the tab's "chrome.debugger" attachment. */
+	readonly #detachWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
 	/** Answer attaches with Chrome's refusal, as while a foreign extension frame is in the tab. */
 	refuseAttach = false;
+	attachRequests = 0;
+	/** Commands answered with Chrome's refusal, as a foreign extension frame in the tab makes some of them fail. */
+	readonly refuseMethods = new Set<string>();
 
 	private constructor(
 		relay: WebSocket,
@@ -138,6 +143,7 @@ class ChromeBackedExtension {
 		const id = message.id;
 		switch (message.op) {
 			case "attach": {
+				this.attachRequests++;
 				if (this.refuseAttach) return this.#reply(id, { error: FOREIGN_FRAME_REFUSAL });
 				const answer = await this.#chromeSend("Target.attachToTarget", { targetId: this.targetId, flatten: true })
 					.promise;
@@ -150,7 +156,16 @@ class ChromeBackedExtension {
 			case "detach": {
 				const root = this.#root;
 				this.#root = undefined;
-				if (root) await this.#chromeSend("Target.detachFromTarget", { sessionId: root }).promise;
+				const detached = root
+					? await this.#chromeSend("Target.detachFromTarget", { sessionId: root }).promise
+					: { result: {} };
+				// Waiters learn of the detach only once Chrome has ended the attachment.
+				const failure = isRecord(detached.error) ? new Error(String(detached.error.message)) : undefined;
+				for (const waiter of this.#detachWaiters) {
+					if (failure) waiter.reject(failure);
+					else waiter.resolve();
+				}
+				this.#detachWaiters.clear();
 				this.#relay.send(
 					JSON.stringify({ t: "detached", tabId: TAB_ID, reason: "target_closed", relayInitiated: true }),
 				);
@@ -160,6 +175,7 @@ class ChromeBackedExtension {
 				const root = this.#root;
 				if (!root) return this.#reply(id, { error: "Debugger is not attached to the tab with id: 1." });
 				const method = String(message.method);
+				if (this.refuseMethods.has(method)) return this.#reply(id, { error: FOREIGN_FRAME_REFUSAL });
 				const sent = this.#chromeSend(
 					method,
 					isRecord(message.params) ? message.params : {},
@@ -186,6 +202,13 @@ class ChromeBackedExtension {
 	nextSend(method: string, match: (params: unknown) => boolean = () => true): Promise<void> {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#sendWaiters.add({ method, match, resolve });
+		return promise;
+	}
+
+	/** Resolves once the relay has detached "chrome.debugger" and Chrome confirmed it, which ends the debugging bar. */
+	nextDetach(): Promise<void> {
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		this.#detachWaiters.add({ resolve, reject });
 		return promise;
 	}
 
@@ -283,7 +306,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 	}
 
 	/** Adopt a page through the relay and leave state on it that only survives a re-adoption without reload. */
-	async function openRelayTab(): Promise<ChromeBackedExtension> {
+	async function openRelayTab(adopt = true): Promise<ChromeBackedExtension> {
 		if (!chromium || !site) throw new Error("Chromium not launched");
 		page = await chromium.newPage();
 		pageUrl = `${site.url}login?case=${crypto.randomUUID()}`;
@@ -309,8 +332,10 @@ describe("relay tabs Chrome detaches omp from", () => {
 				"tools.maxTimeout": 0,
 			}),
 		};
-		await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
-		await invoke({ action: "run", code: "await page.evaluate(() => { window.mark = 'kept'; });", timeout: 10 });
+		if (adopt) {
+			await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
+			await invoke({ action: "run", code: "await page.evaluate(() => { window.mark = 'kept'; });", timeout: 10 });
+		}
 		return extension;
 	}
 
@@ -331,16 +356,34 @@ describe("relay tabs Chrome detaches omp from", () => {
 		return promise;
 	}
 
+	/** Reject isolated startup without admitting an in-process execution fallback. */
+	async function withoutWorkerThreads<T>(fn: () => Promise<T>): Promise<T> {
+		// `Worker` is typed as a constructor, which a throwing mock implementation does not satisfy.
+		const unavailable = spyOn(globalThis, "Worker").mockImplementation((() => {
+			throw new Error("Worker threads unavailable");
+		}) as never);
+		try {
+			return await fn();
+		} finally {
+			unavailable.mockRestore();
+		}
+	}
+
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"fails the call in flight and re-adopts the same page for the next call",
 		async () => {
 			const ext = await openRelayTab();
 			const evaluating = ext.hanging();
-			const stalled = invoke({ action: "run", ...HANG }).catch((error: unknown) => error);
+			const stalled = invoke({
+				action: "run",
+				code: `await page.evaluate(() => { window.detachRuns = (window.detachRuns ?? 0) + 1; }); ${HANG.code}`,
+				timeout: HANG.timeout,
+			}).catch((error: unknown) => error);
 			await evaluating;
 			await ext.chromeDetach("target_closed");
 			expect(await stalled).toBeInstanceOf(ToolError);
 			expect((await invoke(readMark)).value).toBe("kept");
+			expect(await page?.evaluate("window.detachRuns")).toBe(1);
 		},
 		60_000,
 	);
@@ -505,6 +548,66 @@ describe("relay tabs Chrome detaches omp from", () => {
 				held.mockRestore();
 			}
 			expect((await invoke(readMark)).value).toBe("kept");
+		},
+		60_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"refuses relay adoption without attaching when an isolated worker cannot start",
+		async () => {
+			const ext = await openRelayTab(false);
+			const url = page?.url();
+			const failure = await withoutWorkerThreads(() =>
+				invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 }),
+			).catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(ToolError);
+			expect(getTab(name)).toBeUndefined();
+			expect(ext.attachRequests).toBe(0);
+			expect(page?.isClosed()).toBe(false);
+			expect(page?.url()).toBe(url);
+			await expect(
+				invoke({
+					action: "run",
+					code: "await page.evaluate(() => { window.failedStartupRan = true; });",
+					timeout: 10,
+				}),
+			).rejects.toBeInstanceOf(ToolError);
+			expect(await page?.evaluate("window.failedStartupRan")).toBeUndefined();
+		},
+		60_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"releases a timed-out relay claim without replay when its isolated replacement cannot start",
+		async () => {
+			const ext = await openRelayTab();
+			const attaches = ext.attachRequests;
+			const detached = ext.nextDetach();
+			const failure = await withoutWorkerThreads(() => invoke({ action: "run", ...HANG, timeout: 1 })).catch(
+				(error: unknown) => error,
+			);
+			expect(failure).toBeInstanceOf(ToolError);
+			expect(getTab(name)).toBeUndefined();
+			await detached;
+			expect(ext.attachRequests).toBe(attaches);
+			expect(page?.isClosed()).toBe(false);
+			expect(await page?.evaluate("window.mark")).toBe("kept");
+		},
+		60_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"releases the relay claim when its isolated replacement fails initialization",
+		async () => {
+			const ext = await openRelayTab();
+			const detached = ext.nextDetach();
+			ext.refuseMethods.add("Network.enable");
+			const failure = await invoke({ action: "run", ...HANG, timeout: 1 }).catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(ToolError);
+			expect(getTab(name)).toBeUndefined();
+			await detached;
+			expect(page?.isClosed()).toBe(false);
+			expect(await page?.evaluate("window.mark")).toBe("kept");
 		},
 		60_000,
 	);
