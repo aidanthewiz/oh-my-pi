@@ -970,14 +970,15 @@ mod zombie_repro_tests {
 			let (tx, rx) = flume::unbounded();
 			let ct = task::CancelToken::new(Some(1), None);
 			let config = PtyRunConfig {
-				command: PtyCommand::Argv {
+				command:   PtyCommand::Argv {
 					application: STORM_CHILD_COMM.to_string(),
 					args:        vec!["5".to_string()],
 				},
-				cwd:     None,
-				env:     None,
-				cols:    80,
-				rows:    24,
+				cwd:       None,
+				env:       None,
+				clear_env: false,
+				cols:      80,
+				rows:      24,
 			};
 			// Pre-spawn heartbeats bail with `Err`, so `Ok` means this iteration
 			// reached the post-spawn cancellation path.

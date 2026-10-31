@@ -303,10 +303,10 @@ describe("ProcessTerminal win32-input-mode fallback", () => {
 		process.stdin.emit("data", `\x1b[0;0;27;1;0;${count}_`);
 		process.stdin.emit("data", "\x1b[?0u");
 		expect(harness.terminal.kittyProtocolActive).toBe(true);
-		vi.runAllTimers();
+		await harness.settle();
 		expect(recorder.received).toEqual(Array.from({ length: count }, () => "\x1b"));
 		process.stdin.emit("data", "q");
-		vi.runAllTimers();
+		await harness.settle();
 		expect(recorder.received).toEqual([...Array.from({ length: count }, () => "\x1b"), "q"]);
 	});
 

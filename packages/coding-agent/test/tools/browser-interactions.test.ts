@@ -12,7 +12,7 @@ import {
 	prepareInputUpload,
 	resolveActionableQueryHandlerClickTarget,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/interactions";
-import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import { acquireBrowser, holdBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { TERN_KIT_SOURCE } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/page-kit";
 import { UploadStaging } from "@oh-my-pi/pi-coding-agent/tools/browser/upload-files";
@@ -176,6 +176,7 @@ try {
 	test("rejects promptly when a text-click candidate evaluation is aborted", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		const page = await browserHandle.browser.newPage();
 		try {
 			await page.setContent('<button id="abort-candidate">Abort candidate</button>');
@@ -1303,6 +1304,7 @@ return picks;`,
 	test("fails a click the browser does not deliver and completes the rest", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		const page = await browserHandle.browser.newPage();
 		const outcomes = async (ids: string[]): Promise<Record<string, string>> => {
 			const result: Record<string, string> = {};
@@ -1377,6 +1379,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	test("rejects unverified clicks and retires watches across acquisition and verification cancellation", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		try {
 			for (const fault of ["transport", "cancel", "acquire"] as const) {
 				const page = await browserHandle.browser.newPage();
@@ -1456,6 +1459,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	test("disposes an upload target that arrives after delivery cancellation without filling the input", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		const page = await browserHandle.browser.newPage();
 		const controller = new AbortController();
 		const held = Promise.withResolvers<void>();
@@ -1516,6 +1520,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	test("skips an off-screen text match that stays clipped once scrolled to", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		const page = await browserHandle.browser.newPage();
 		try {
 			await page.setContent(`<div style="height: 3000px"></div><div style="overflow: hidden; height: 0"><button id="clipped">Far</button></div>
@@ -1538,6 +1543,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	test("scrolls off-screen text matches only until the first reachable one", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		const page = await browserHandle.browser.newPage();
 		try {
 			await page.setContent(`<div style="height: 3000px"></div><button id="near">Far</button>
@@ -1571,6 +1577,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	test("clips query matches only by overflow boxes holding their containing block, through slots", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
 		const page = await browserHandle.browser.newPage();
 		const later = `<button id="later" style="position: absolute; top: 200px; left: 10px">Pick</button>`;
 		const shadow = (id: string, html: string) =>

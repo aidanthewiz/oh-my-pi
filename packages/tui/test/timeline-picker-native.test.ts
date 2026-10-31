@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { TspKind, TspPickerProps, TspProps } from "@oh-my-pi/pi-wire";
 import type { SessionMessageEntryLike } from "../src/chat/transcript-entry";
@@ -19,6 +19,12 @@ const pickerCx: DescribeContext = {
 };
 const genericCx: DescribeContext = { ...pickerCx, supports: (kind: TspKind) => kind !== "picker" };
 const ui = { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI;
+const rewindSelectors: RewindSelectorComponent[] = [];
+
+afterEach(() => {
+	for (const selector of rewindSelectors) selector.dispose();
+	rewindSelectors.length = 0;
+});
 
 beforeAll(async () => {
 	await initTheme(false);
@@ -82,7 +88,7 @@ const typeText = (component: { handleInput(data: string): void }, text: string) 
 
 describe("rewind page", () => {
 	function rewind(deps: { selected?: string[]; cancelled?: { count: number }; siblings?: BranchVariantPath[] } = {}) {
-		return new RewindSelectorComponent(transcript(), {
+		const selector = new RewindSelectorComponent(transcript(), {
 			ui,
 			cwd: "/tmp",
 			requestRender: () => {},
@@ -92,6 +98,8 @@ describe("rewind page", () => {
 				if (deps.cancelled) deps.cancelled.count++;
 			},
 		});
+		rewindSelectors.push(selector);
+		return selector;
 	}
 
 	const UP = "\x1b[A";

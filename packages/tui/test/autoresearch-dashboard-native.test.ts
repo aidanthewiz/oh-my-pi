@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import {
 	type AutoresearchDashboardRuntime,
 	createDashboardController,
@@ -10,6 +10,12 @@ import type { Component } from "@oh-my-pi/pi-tui/tui";
 import type { TspText } from "@oh-my-pi/pi-wire";
 
 const cx: DescribeContext = { cols: 120, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
+const ownedSheets: Component[] = [];
+
+afterEach(() => {
+	for (const sheet of ownedSheets) sheet.dispose?.();
+	ownedSheets.length = 0;
+});
 
 function result(runNumber: number, metric: number, status: ExperimentResult["status"]): ExperimentResult {
 	return {
@@ -73,6 +79,7 @@ async function openSheet(rt: AutoresearchDashboardRuntime): Promise<Component> {
 		rt,
 	);
 	if (!sheet) throw new Error("the dashboard opened no overlay");
+	ownedSheets.push(sheet);
 	return sheet;
 }
 

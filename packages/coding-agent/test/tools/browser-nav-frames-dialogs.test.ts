@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
@@ -103,10 +103,13 @@ async function observe(invoke: (parameters: unknown) => Promise<{ details?: unkn
 	return { elements, names: elements.map(entry => `${entry.role}:${entry.name}`) };
 }
 
-afterAll(async () => {
+afterEach(async () => {
 	await releaseAllTabs({ kill: true });
 	await disposeAllVmContexts();
-	server.stop(true);
+});
+
+afterAll(async () => {
+	await server.stop(true);
 });
 
 function fakePage(frame: { _lifecycleEvents: Set<string>; detached?: boolean }, closed = () => false): Page {
@@ -473,12 +476,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser navigation, frames, dialogs, and t
 
 	test("stops the page load when a run is cancelled mid-goto", async () => {
 		const requested = Promise.withResolvers<AbortSignal>();
+		const response = Promise.withResolvers<Response>();
 		const slow = Bun.serve({
 			port: 0,
 			idleTimeout: 0,
 			fetch(request) {
 				requested.resolve(request.signal);
-				return new Promise<Response>(() => {});
+				return response.promise;
 			},
 		});
 		try {
@@ -489,7 +493,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser navigation, frames, dialogs, and t
 				{ action: "run", name: "cancelled", code: `await tab.goto("http://127.0.0.1:${slow.port}/slow");` },
 				cancel.signal,
 			);
-			const request = await requested.promise;
+			const request = await Promise.race([
+				requested.promise,
+				run.then(result => {
+					throw new Error(`Navigation ended before the owned slow request: ${JSON.stringify(result)}`);
+				}),
+			]);
 			cancel.abort();
 			// The cancel itself, not a cleanup failure from a page still loading.
 			expect(await run.catch((error: unknown) => error)).toMatchObject({ message: "Operation aborted" });
@@ -500,18 +509,20 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser navigation, frames, dialogs, and t
 			});
 			expect(await Promise.race([dropped, Bun.sleep(5_000).then(() => "still loading")])).toBe("stopped");
 		} finally {
-			slow.stop(true);
+			response.resolve(new Response("Owned fixture cleanup"));
+			await slow.stop(true);
 		}
 	}, 30_000);
 
 	test("does not call a cancelled run's page listeners for the requests the cancel stops", async () => {
 		const requested = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<Response>();
 		const slow = Bun.serve({
 			port: 0,
 			idleTimeout: 0,
 			fetch() {
 				requested.resolve();
-				return new Promise<Response>(() => {});
+				return response.promise;
 			},
 		});
 		try {
@@ -530,7 +541,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser navigation, frames, dialogs, and t
 				},
 				cancel.signal,
 			);
-			await requested.promise;
+			await Promise.race([
+				requested.promise,
+				run.then(result => {
+					throw new Error(`Navigation ended before the owned slow request: ${JSON.stringify(result)}`);
+				}),
+			]);
 			cancel.abort();
 			expect(await run.catch((error: unknown) => error)).toMatchObject({ message: "Operation aborted" });
 			const after = await invoke({
@@ -540,7 +556,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser navigation, frames, dialogs, and t
 			});
 			expect(valueOf(after)).toEqual({ url: `${baseUrl}/one`, failedCalls: 0 });
 		} finally {
-			slow.stop(true);
+			response.resolve(new Response("Owned fixture cleanup"));
+			await slow.stop(true);
 		}
 	}, 30_000);
 });
