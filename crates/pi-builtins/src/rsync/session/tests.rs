@@ -548,13 +548,18 @@ fn delete_removes_extraneous_files() {
 	let dir = tempfile::tempdir().unwrap();
 	let src = dir.path().join("src");
 	make_tree(&src);
+	let source_time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+	fs::set_times_nofollow(&src, fs::FileTimes::new().set_modified(source_time)).unwrap();
 	assert_eq!(run(&["-a", "src/", "dst/"], dir.path()).0, 0);
 	fs::write(dir.path().join("dst/extra"), b"gone").unwrap();
 	fs::create_dir(dir.path().join("dst/olddir")).unwrap();
+	let dst = dir.path().join("dst");
+	fs::set_times_nofollow(&dst, fs::FileTimes::new().set_modified(source_time + Duration::from_secs(2))).unwrap();
 	let (code, out, err) = run(&["-ai", "--delete", "src/", "dst/"], dir.path());
 	assert_eq!((code, err.as_str()), (0, ""));
-	assert_eq!(out, "*deleting   olddir/\n*deleting   extra\n");
-	assert_same_tree(&src, &dir.path().join("dst"));
+	assert_eq!(out, "*deleting   olddir/\n*deleting   extra\n.d..t...... ./\n");
+	assert_same_tree(&src, &dst);
+	assert_eq!(mtime(&dst), source_time);
 }
 
 #[test]

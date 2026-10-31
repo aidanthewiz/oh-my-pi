@@ -2953,10 +2953,15 @@ mod background_literal_tests {
 		let mut shell = crate::Shell::builder().build().await?;
 		let params = shell.default_exec_params();
 		shell.run_string(
-			format!("$(printf x >> '{}'; printf /bin/sh) -c 'exit 7' & wait", marker.display()),
+			format!("$(printf x >> '{}'; printf /bin/sh) -c 'exit 7' &", marker.display()),
 			&crate::SourceInfo::default(),
 			&params,
 		).await?;
+		let waited = shell.jobs_mut()
+			.wait_next(&[])
+			.await?
+			.expect("dynamic background job remains waitable");
+		assert_eq!(u8::from(waited.result.exit_code), 7);
 		assert_eq!(std::fs::read_to_string(marker)?, "x");
 		Ok(())
 	}
