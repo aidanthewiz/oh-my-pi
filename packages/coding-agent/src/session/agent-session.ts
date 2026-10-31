@@ -1109,8 +1109,10 @@ export class AgentSession implements SettingsScope {
 	#ircWakeTurnObserver:
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
 		| undefined;
-	/** Task-executor {@link holdIrcWakes} holds; continuations retain that executor's monitor. */
+	/** Active {@link holdIrcWakes} holds. */
 	#ircWakeHolds = 0;
+	/** Task-executor monitors currently subscribed to session events. */
+	#taskExecutorMonitors = 0;
 	/** IRC wakes waiting out a running idle compaction (see {@link #wakeForIrc}). */
 	#ircWakesAwaitingIdleCompaction = 0;
 	/** The observation whose monitor is attached; at most one at a time. */
@@ -2340,7 +2342,7 @@ export class AgentSession implements SettingsScope {
 					return;
 				}
 				const observation =
-					this.#ircWakeHolds === 0 && this.#ircWakeTurnObserver && !this.#openTurnObservation
+					this.#taskExecutorMonitors === 0 && this.#ircWakeTurnObserver && !this.#openTurnObservation
 						? this.#startTurnObservation(messages)
 						: undefined;
 				let turnError: unknown;
@@ -5563,7 +5565,7 @@ export class AgentSession implements SettingsScope {
 				const coalescedSources = new Set([options.source]);
 				let observation: TurnObservation | undefined;
 				const onStart =
-					this.#ircWakeHolds === 0 && this.#ircWakeTurnObserver
+					this.#taskExecutorMonitors === 0 && this.#ircWakeTurnObserver
 						? () => {
 								observation = this.#startTurnObservation(options.turnRecords ?? []);
 							}
@@ -6030,18 +6032,25 @@ export class AgentSession implements SettingsScope {
 	 * Subscribe to agent events.
 	 * Session persistence is handled internally (saves messages on message_end).
 	 * Multiple listeners can be added. Returns unsubscribe function for this listener.
+	 * Task-executor subscriptions own automatic continuation observation until unsubscribed.
 	 */
-	subscribe(listener: AgentSessionEventListener): () => void {
+	subscribe(listener: AgentSessionEventListener, ownership: "observer" | "task-executor" = "observer"): () => void {
 		// Copy-on-write: `#emit` iterates the array it read without copying it.
 		this.#eventListeners = [...this.#eventListeners, listener];
+		const taskExecutor = ownership === "task-executor";
+		if (taskExecutor) this.#taskExecutorMonitors++;
+		let subscribed = true;
 
 		// Return unsubscribe function for this specific listener
 		return () => {
+			if (!subscribed) return;
+			subscribed = false;
 			const index = this.#eventListeners.indexOf(listener);
 			if (index === -1) return;
 			const listeners = this.#eventListeners.slice();
 			listeners.splice(index, 1);
 			this.#eventListeners = listeners;
+			if (taskExecutor) this.#taskExecutorMonitors--;
 		};
 	}
 
@@ -6717,6 +6726,7 @@ export class AgentSession implements SettingsScope {
 		// beginDispose() drained the rest; this catches registrations made during teardown.
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#eventListeners = [];
+		this.#taskExecutorMonitors = 0;
 		this.#lifecycleListeners = [];
 		this.#lifecycleState = null;
 		this.#lifecycleIsMirrored = false;

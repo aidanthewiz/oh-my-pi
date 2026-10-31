@@ -1242,6 +1242,7 @@ const MAX_YIELD_TOOL_ERRORS = 6;
 
 /** Inputs for the run monitor driving one subagent assignment. */
 interface RunMonitorArgs {
+	ownership: "observer" | "task-executor";
 	index: number;
 	id: string;
 	agent: AgentDefinition;
@@ -2293,7 +2294,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					popLoopPhase();
 				}
 			}
-		});
+		}, args.ownership);
 	};
 
 	const captureSalvage = (session: AgentSession): void => {
@@ -3472,6 +3473,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				(record.role === "developer" && record.userInitiated === true),
 		);
 		const turnMonitor = createSubagentRunMonitor({
+			ownership: "observer",
 			index,
 			id,
 			agent,
@@ -3970,6 +3972,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	const commitReply = ref ? captureTaskReply(ref) : undefined;
 
 	const monitor = createSubagentRunMonitor({
+		ownership: "task-executor",
 		index,
 		id,
 		agent,
@@ -4612,6 +4615,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const completionProbe = isCompletionProbeEnabled(settings, parentDepth, options.parentHasUI === true);
 	const monitor = createSubagentRunMonitor({
+		ownership: "task-executor",
 		index,
 		id,
 		agent,

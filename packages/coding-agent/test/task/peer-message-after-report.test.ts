@@ -462,6 +462,62 @@ it("keeps a follow-up turn's report when a peer message arrives right after it",
 	}
 }, 20_000);
 
+it("publishes an owned service completion after its task monitor detaches while the wake hold remains", async () => {
+	const held = Promise.withResolvers<() => void>();
+	const child = await startRun({
+		structured: true,
+		deferIrcWakeRelease: release => held.resolve(release),
+		respond: (request, context) => {
+			if (context.messages.at(-1)?.role === "toolResult") return { content: ["ok"] };
+			return {
+				content: [
+					{
+						type: "toolCall",
+						id: `service-result-${request}`,
+						name: "yield",
+						arguments: { type: "result", data: request === 1 ? "INITIAL_RESULT" : "SERVICE_RESULT" },
+					},
+				],
+			};
+		},
+	});
+	let release: (() => void) | undefined;
+	try {
+		expect((await child.run).output).toContain("INITIAL_RESULT");
+		release = await held.promise;
+		const session = AgentRegistry.global().get(AGENT_ID)?.session;
+		if (!session) throw new Error("kept-alive subagent has no live session");
+		expect(session.ircWakesPending).toBe(true);
+		const owner = session.sessionManager.getSessionId();
+		await session.queueLaunchCompletion({
+			event: "daemon-completed",
+			completionId: "publication-window-service",
+			owner,
+			daemon: {
+				name: "owned-service",
+				id: "publication-window-service",
+				state: "exited",
+				createdAt: 1,
+				startedAt: 1,
+				exitedAt: 2,
+				exitCode: 0,
+				restartCount: 0,
+				outputBytes: 0,
+				owner,
+				persist: false,
+				detached: false,
+			},
+		});
+		await settle();
+		expect(await Bun.file(child.artifact).text()).toContain("SERVICE_RESULT");
+		expect(child.deliveries).toHaveLength(1);
+		expect(child.deliveries[0]).toContain("SERVICE_RESULT");
+	} finally {
+		release?.();
+		await child.close();
+	}
+}, 20_000);
+
 it("keeps a structured run's yield when a peer message arrives as a turn of it ends without yielding", async () => {
 	const child = await startRun({
 		structured: true,
