@@ -16,6 +16,7 @@ function replaceBlock(text: string, start: string, end: string, replacement: str
 
 export function adaptFixture(id: string, raw: string, checkout: string): string {
 	let text = raw;
+	const boundPaths = [checkout];
 	// These fixtures intentionally import after binding private HOME and transport guards.
 	text = text.replace(
 		/(["'])\.\.\/\.\.\/(packages\/[^"']+)\1/g,
@@ -99,14 +100,23 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 		);
 	}
 	if (id === "browser") {
+		const puppeteerPath = Bun.resolveSync("puppeteer-core", checkout);
+		boundPaths.push(puppeteerPath);
+		text = replaceOne(text, 'from "puppeteer-core"', `from ${JSON.stringify(puppeteerPath)}`);
 		text = replaceOne(
 			text,
-			'from "puppeteer-core"',
-			`from ${JSON.stringify(Bun.resolveSync("puppeteer-core", checkout))}`,
+			'import { createReadStream, createWriteStream } from "node:fs";',
+			'import { spawn, type ChildProcess } from "node:child_process";',
 		);
-		text = replaceOne(text, 'import { createReadStream, createWriteStream } from "node:fs";\n', "");
-		text = replaceOne(text, 'import { StringDecoder } from "node:string_decoder";\n', "");
-		text = replaceOne(text, 'import type { Readable, Writable } from "node:stream";\n', "");
+		text = replaceOne(
+			text,
+			"let browser: Browser | undefined;",
+			`let browser: Browser | undefined;
+let browserChild: ChildProcess | undefined;
+let browserExited: Promise<void> | undefined;
+let closeTransport: (() => void) | undefined;
+let browserStderr = "";`,
+		);
 		text = replaceBlock(
 			text,
 			"assert.equal(context.binding.version, '18.12.2');",
@@ -122,37 +132,108 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 			text,
 			" launch = context.browserHost;",
 			" for (const scenario of scenarios) {",
-			` browser = await bounded(puppeteer.launch({ executablePath: executable, userDataDir: profile,
-  headless: true, pipe: true, defaultViewport: { width: 1000, height: 850 }, protocolTimeout: 5000,
-  args: ['--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--disable-sync', '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'],
- }), 15000, 'CI Chromium launch');
- const child = browser.process(); assert(child && child.pid);
- const spawnargs = child.spawnargs;
+			` const spawnargs = await puppeteer.defaultArgs({ userDataDir: profile, headless: true,
+  args: ['--remote-debugging-pipe', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--disable-sync', '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'],
+ });
  assert(!spawnargs.some(arg => /no-sandbox|disable-setuid-sandbox|ignore-certificate-errors|allow-file-access|remote-debugging-port/i.test(arg)));
  assert(spawnargs.includes('--headless=new') || spawnargs.includes('--headless'));
- launch = { pid: child.pid, spawnfile: child.spawnfile, spawnargs, headless: true, nativeSandboxEnabled: true, freshProfileVerified: true };
- await retain('launch.json', JSON.stringify(launch, null, 2) + '\\n');
+ assert(spawnargs.includes(\`--user-data-dir=\${profile}\`));
+ // Chromium pipe creation precedes CDP readiness.
+ const child = browserChild = spawn(executable, spawnargs, { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });
+ const ready = Promise.withResolvers<void>();
+ void ready.promise.catch(() => undefined);
+ browserExited = new Promise<void>(resolve => child.once('close', () => {
+  ready.reject(new Error('Owned Chromium closed before CDP readiness'));
+  resolve();
+ }));
+ child.once('error', error => ready.reject(error));
+ child.stderr!.on('data', (chunk: Buffer) => { browserStderr = (browserStderr + chunk.toString()).slice(-65536); });
+ launch = { pid: child.pid, spawnfile: child.spawnfile, spawnargs: child.spawnargs, headless: true, nativeSandboxEnabled: true, freshProfileVerified: true };
+ const writer = child.stdio[3] as Writable, reader = child.stdio[4] as Readable;
+ const decoder = new StringDecoder('utf8');
+ let pending = "", closed = false, startupComplete = false, notifiedClosed = false;
+ let receive: ((message: string) => void) | undefined;
+ const inbox: string[] = [];
+ const transport: { send(message: string): void; close(): void; onmessage?: (message: string) => void; onclose?: () => void } = {
+  send(message) { assert(!closed && !notifiedClosed, 'Owned CDP transport is closed'); writer.write(message + '\\0'); },
+  close() { if (closed) return; closed = true; writer.end(); reader.destroy(); },
+  get onmessage() { return receive; },
+  set onmessage(callback: ((message: string) => void) | undefined) {
+   receive = callback;
+   if (callback) for (const message of inbox.splice(0)) callback(message);
+  },
+ };
+ closeTransport = () => transport.close();
+ const disconnected = () => {
+  if (notifiedClosed) return;
+  notifiedClosed = true;
+  ready.reject(new Error('Owned Chromium CDP pipe closed before readiness'));
+  transport.onclose?.();
+ };
+ reader.on('data', (chunk: Buffer) => {
+  pending += decoder.write(chunk);
+  let boundary;
+  while ((boundary = pending.indexOf('\\0')) !== -1) {
+   const message = pending.slice(0, boundary); pending = pending.slice(boundary + 1);
+   if (!startupComplete) {
+    try {
+     const response = JSON.parse(message);
+     if (response.id === 0) {
+      if (response.error) ready.reject(new Error(JSON.stringify(response.error)));
+      else { assert.equal(typeof response.result?.product, 'string'); startupComplete = true; ready.resolve(); }
+      continue;
+     }
+    } catch (error) { ready.reject(error); return; }
+   }
+   if (receive) receive(message); else inbox.push(message);
+  }
+ });
+ reader.on('close', disconnected);
+ reader.on('end', disconnected);
+ reader.on('error', error => { ready.reject(error); disconnected(); });
+ writer.on('error', error => { ready.reject(error); disconnected(); });
+ browser = await bounded((async () => {
+  await retain('launch.json', JSON.stringify(launch, null, 2) + '\\n');
+  transport.send(JSON.stringify({ id: 0, method: 'Browser.getVersion' }));
+  await ready.promise;
+  return await puppeteer.connect({ transport, defaultViewport: { width: 1000, height: 850 }, protocolTimeout: 5000 });
+ })(), 15000, 'CI Chromium launch');
+ await retain('browser-process.json', JSON.stringify(launch, null, 2) + '\\n');
 `,
 		);
-		text = replaceOne(
+		text = replaceBlock(
 			text,
-			'  if (browser) await bounded(browser.close(), 5000, "browser close");',
-			`  if (browser) {
-   const child = browser.process(); assert(child);
-   const exited = child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise<void>(resolve => child.once('exit', () => resolve()));
-   await bounded(browser.close(), 5000, 'browser close');
-   await bounded(exited, 5000, 'Chromium process exit');
-   await fs.rm(profile, { recursive: true });
-  }`,
-		);
-		text = replaceOne(
-			text,
-			'processAndProfileClosureAuthority: "host guardian verifies actual Chrome exit and private singleton metadata; fenced consumer never removes the profile"',
-			"processExited: Boolean(browser), privateProfileRemoved: Boolean(browser)",
+			"finally {\n try {\n  if (browser)",
+			"const report =",
+			`finally {
+ let browserCloseCompleted = false, processExited = false, privateProfileRemoved = false;
+ const cleanupErrors: unknown[] = [];
+ try {
+  if (browser) { await bounded(browser.close(), 5000, 'browser close'); browserCloseCompleted = true; }
+ } catch (error) { fatal ??= serializeError(error); cleanupErrors.push(serializeError(error)); }
+ try {
+  if (browserChild && browserExited) {
+   if (browserChild.exitCode === null && browserChild.signalCode === null) browserChild.kill('SIGTERM');
+   try { await bounded(browserExited, 5000, 'Chromium process exit'); }
+   catch { browserChild.kill('SIGKILL'); await bounded(browserExited, 5000, 'Chromium forced process exit'); }
+   processExited = true;
+   assert.equal(await fs.readFile(path.join(work, '.owner'), 'utf8'), owner);
+   await fs.rm(profile, { recursive: true, force: true });
+   assert.equal(await fs.stat(profile).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return false; throw error; }), false);
+   privateProfileRemoved = true;
+  }
+ } catch (error) { fatal ??= serializeError(error); cleanupErrors.push(serializeError(error)); }
+ finally { closeTransport?.(); server.stop(true); }
+ cleanup = { browserCloseCompleted, fixtureServerStopped: true, processExited, privateProfileRemoved, cleanupErrors };
+ await retain('chromium-stderr.txt', browserStderr);
+}
+`,
 		);
 	}
-	assert(!text.includes("/private/tmp"));
-	assert(!text.includes("/Users/"));
+	let unboundText = text;
+	for (const bound of boundPaths) unboundText = unboundText.replaceAll(bound, "<bound-path>");
+	assert(!unboundText.includes("/private/tmp"));
+	assert(!unboundText.includes("/Users/"));
 	assert(!text.includes("'../../packages/") && !text.includes('"../../packages/'));
 	return text;
 }

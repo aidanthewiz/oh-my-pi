@@ -17,6 +17,7 @@ import { SessionManager } from "../../packages/coding-agent/src/session/session-
 import type { AgentSession } from "../../packages/coding-agent/src/session/agent-session";
 import { TaskTool } from "../../packages/coding-agent/src/task/index";
 import { SUBAGENT_WARNING_EMPTY_MESSAGE } from "../../packages/coding-agent/src/task/executor";
+import { INLINE_OUTPUT_CHARS } from "../../packages/coding-agent/src/task/result-summary";
 import { IrcBus } from "../../packages/coding-agent/src/irc/bus";
 import { type } from "../../packages/omptype/src/index";
 import { nativeAddonStatus } from "../../packages/natives/native/loader-state.js";
@@ -57,7 +58,7 @@ const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0
  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 type Scenario = "plain" | "structured" | "empty" | "manual" | "chatter";
 let scenario: Scenario = "plain";
-const manualReport = `Manual report ${marker}\n${Array.from({ length: 90 }, (_, index) => `${index}: ${sha256(`${marker}:${index}`)}`).join("\n")}`;
+const manualReport = `Manual report ${marker}\n${Array.from({ length: Math.ceil(INLINE_OUTPUT_CHARS / 64) }, (_, index) => `${index}: ${sha256(`${marker}:${index}`)}`).join("\n")}`;
 const wire: Array<{ scenario: Scenario; model: string; tools: unknown; messages: unknown; content: unknown; stopReason: string; streamEvents: string[] }> = [];
 function stream(model: Model<Api>, context: Context): AssistantMessageEventStream {
  assert.equal(model.provider, provider); assert.equal(model.id, "owned"); assert.equal(model.api, api);
@@ -214,6 +215,7 @@ try {
  cases.push({ id: "actual-task-empty-plain-fails", status: "passed", evidence: { exitCode: empty.exitCode, output: empty.output, stderr: empty.stderr } });
 
  scenario = "manual";
+ assert(manualReport.length > INLINE_OUTPUT_CHARS);
  await plainChild.prompt(`Manual report requested ${marker}`);
  await plainChild.waitForIdle(); await plainChild.waitForIrcReplies();
  await plainParent.manager.waitForOwnerJobs(plainParent.id);
@@ -225,7 +227,9 @@ try {
  }));
  assert.equal(plainParent.deliveries.filter(text => text.includes(`Manual report ${marker}`)).length, 1,
   JSON.stringify({ deliveries: plainParent.deliveries, manualArtifact, wire }));
- assert(plainParent.deliveries.some(text => text.includes(`agent://${plain.id}`)),
+ const manualDeliveries = plainParent.deliveries.filter(text => text.includes(`Manual report ${marker}`));
+ assert.match(manualDeliveries[0], new RegExp(`^<task-result id="${plain.id}" agent="proofworker" status="completed"`));
+ assert(manualDeliveries[0].includes(`agent://${plain.id}`),
   JSON.stringify({ deliveries: plainParent.deliveries, manualArtifact, wire }));
  const persistedManual = plainChild.messages.filter(message => message.role === "assistant").some(message => JSON.stringify(message.content).includes(`Manual report ${marker}`));
  assert(persistedManual);
