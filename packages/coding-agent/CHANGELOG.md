@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Keep task-managed recovery and async-result continuations on their existing monitor, preventing duplicate restored-child jobs and publications.
 - Retire daemon brokers after runtime directory deletion or replacement, including relocated Unix sockets, without removing a successor's lease.
 - Honor live legacy broker leases on Linux and Windows even when they have no filesystem marker.
 - Preserve opaque URI semicolons during path-list expansion. Explicit path arrays disambiguate missing extensionless paths from opaque resources.

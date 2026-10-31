@@ -1109,7 +1109,7 @@ export class AgentSession implements SettingsScope {
 	#ircWakeTurnObserver:
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
 		| undefined;
-	/** Active {@link holdIrcWakes} holds. */
+	/** Task-executor {@link holdIrcWakes} holds; continuations retain that executor's monitor. */
 	#ircWakeHolds = 0;
 	/** IRC wakes waiting out a running idle compaction (see {@link #wakeForIrc}). */
 	#ircWakesAwaitingIdleCompaction = 0;
@@ -2340,7 +2340,7 @@ export class AgentSession implements SettingsScope {
 					return;
 				}
 				const observation =
-					this.#ircWakeTurnObserver && !this.#openTurnObservation
+					this.#ircWakeHolds === 0 && this.#ircWakeTurnObserver && !this.#openTurnObservation
 						? this.#startTurnObservation(messages)
 						: undefined;
 				let turnError: unknown;
@@ -5562,11 +5562,12 @@ export class AgentSession implements SettingsScope {
 				const inFlightEpoch = this.#beginInFlight();
 				const coalescedSources = new Set([options.source]);
 				let observation: TurnObservation | undefined;
-				const onStart = this.#ircWakeTurnObserver
-					? () => {
-							observation = this.#startTurnObservation(options.turnRecords ?? []);
-						}
-					: undefined;
+				const onStart =
+					this.#ircWakeHolds === 0 && this.#ircWakeTurnObserver
+						? () => {
+								observation = this.#startTurnObservation(options.turnRecords ?? []);
+							}
+						: undefined;
 				const promise = this.#runAgentContinue(signal, request, coalescedSources, onStart);
 				const attempt: ActiveAgentContinue = {
 					schedulerToken: request.schedulerToken,
