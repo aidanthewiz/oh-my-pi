@@ -1092,6 +1092,23 @@ mod tests {
 		assert_eq!(out.bytes(), expected);
 	}
 
+	#[cfg(unix)]
+	#[test]
+	fn legacy_output_preserves_literal_escapes_across_validation_buffers() {
+		for prefix_len in 1020..=1024 {
+			let (logger, out, _) = client(LogConfig {
+				output_charset: "ISO-8859-1".to_owned(),
+				..LogConfig::default()
+			});
+			let mut input = vec![b'x'; prefix_len];
+			input.extend_from_slice(b"\\#123\xff\n");
+			logger.rprintf(LogCode::Info, &input);
+			let mut expected = vec![b'x'; prefix_len];
+			expected.extend_from_slice(b"\\#134#123\xff\n");
+			assert_eq!(out.bytes(), expected, "prefix length {prefix_len}");
+		}
+	}
+
 	#[test]
 	fn carriage_returns_and_pending_newline() {
 		let (logger, out, _) = client(LogConfig::default());

@@ -14,16 +14,14 @@
 //!
 //! The reference itself is not deterministic run to run: its three local
 //! processes (and a remote peer) report through one stream, so sender,
-//! generator, and receiver lines interleave differently, and its byte totals
-//! (`Total bytes sent/received`, the `sent … received …` summary) depend on
-//! how many multiplexed frames each run happened to flush. Rather than mask
-//! those values, the comparison stays exact and samples the reference: when
-//! ours differs from the reference in any way, the reference is rerun on a
-//! fresh fixture up to [`REFERENCE_RETRIES`] times, and the scenario passes if
-//! ours exactly equals (exit code, normalized stdout and stderr, tree) any
-//! one reference outcome. A real bug still fails because ours matches none of
-//! them; the failure report names how many distinct reference outcomes were
-//! seen and diffs ours against the first.
+//! generator, and receiver lines interleave differently.
+//! Wire byte totals vary with multiplexed frame boundaries, so normalization
+//! excludes them and derived rates while preserving logical transfer sizes.
+//! Remaining process-output interleavings are sampled: when ours differs,
+//! the reference is rerun on a fresh fixture up to [`REFERENCE_RETRIES`] times.
+//! A scenario passes only if its exit code, normalized stdout/stderr and
+//! complete tree match one reference outcome. Failure reports retain each
+//! distinct reference outcome and diff against the first.
 //!
 //! Kept-directory-link metadata has native contract tests: the 3.5.1 reference
 //! stamps the symlink instead of its directory referent.

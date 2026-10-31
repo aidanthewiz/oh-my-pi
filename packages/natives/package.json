@@ -67,7 +67,8 @@
 		"src",
 		"native",
 		"README.md",
-		"CHANGELOG.md"
+		"CHANGELOG.md",
+		"THIRD-PARTY-NOTICES.txt"
 	],
 	"exports": {
 		".": {

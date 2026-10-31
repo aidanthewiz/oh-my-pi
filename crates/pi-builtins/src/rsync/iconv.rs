@@ -270,6 +270,7 @@ mod sys {
 			Ok(Self { cd: Mutex::new(Handle(cd)) })
 		}
 
+		/// Visits original input spans validated by a charset-to-itself converter.
 		pub(super) fn validate(&self, input: &[u8], mut emit: impl FnMut(&[u8], bool)) {
 			let guard = lock(&self.cd);
 			let cd = guard.0;
@@ -280,30 +281,35 @@ mod sys {
 			let mut in_ptr = input.as_ptr() as *mut c_char;
 			let mut in_left = input.len();
 			let mut output = [0u8; 1024];
+			let mut valid_start = 0;
 			while in_left > 0 {
 				let mut out_ptr = output.as_mut_ptr().cast();
 				let mut out_left = output.len();
 				// SAFETY: input and output pointers remain within their live byte slices.
 				let rc = unsafe { iconv(cd, &mut in_ptr, &mut in_left, &mut out_ptr, &mut out_left) };
 				let error = (rc == usize::MAX).then(io::Error::last_os_error);
-				emit(&output[..output.len() - out_left], true);
 				if let Some(error) = error {
 					match error.raw_os_error() {
 						Some(libc::E2BIG | libc::EINTR) => {},
 						Some(libc::EILSEQ | libc::EINVAL) if in_left > 0 => {
 							let position = input.len() - in_left;
+							emit(&input[valid_start..position], true);
 							emit(&input[position..position + 1], false);
 							// SAFETY: in_left proves one unread byte remains in input.
 							in_ptr = unsafe { in_ptr.add(1) };
 							in_left -= 1;
+							valid_start = position + 1;
 						},
 						_ => {
+							emit(&input[valid_start..input.len() - in_left], true);
 							emit(&input[input.len() - in_left..], false);
+							valid_start = input.len();
 							break;
 						},
 					}
 				}
 			}
+			emit(&input[valid_start..], true);
 		}
 
 		/// Converts all of `input` (state reset first, like ICB_INIT); an invalid or

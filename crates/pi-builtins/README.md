@@ -77,6 +77,10 @@ $ cargo nextest run -p pi-builtins --no-default-features --features base,util.se
 macOS uses UTF-8, matching the reference's libcharset backend.
 `--8-bit-output` bypasses charset validation but retains control-character and literal-escape handling.
 
+Conformance compares exit status, logical transfer sizes, output events and resulting filesystem state.
+It normalizes packetization-dependent wire totals and derived rates.
+Known concurrent output compares as a multiset, preserving every event and duplicate count.
+
 ## Licensing
 
 MIT throughout, but the ported utilities carry upstream notices — uutils

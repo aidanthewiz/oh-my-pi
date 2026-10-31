@@ -141,3 +141,46 @@ describe("generated native npm leaf packages", () => {
 		}
 	});
 });
+
+it("imports native notices from the packed package in an isolated consumer", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-packed-notices-"));
+	const packageDir = path.resolve(import.meta.dir, "..");
+	try {
+		const pack = Bun.spawn([process.execPath, "pm", "pack", "--ignore-scripts", "--destination", root], {
+			cwd: packageDir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		const [packCode, packError] = await Promise.all([pack.exited, new Response(pack.stderr).text()]);
+		expect(packCode, packError).toBe(0);
+		const tarball = (await fs.readdir(root)).find(file => file.endsWith(".tgz"))!;
+		const consumer = path.join(root, "consumer");
+		const installed = path.join(consumer, "node_modules/@oh-my-pi/pi-natives");
+		await fs.mkdir(path.dirname(installed), { recursive: true });
+		const archive = new Bun.Archive(await Bun.file(path.join(root, tarball)).bytes());
+		await archive.extract(path.join(root, "extracted"));
+		await fs.rename(path.join(root, "extracted/package"), installed);
+		await Bun.write(
+			path.join(consumer, "notice.ts"),
+			'import notices from "@oh-my-pi/pi-natives/THIRD-PARTY-NOTICES.txt" with { type: "text" }; process.stdout.write(notices);',
+		);
+		const proc = Bun.spawn([process.execPath, path.join(consumer, "notice.ts")], {
+			cwd: consumer,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [code, stdout, stderr, notices] = await Promise.all([
+			proc.exited,
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			Bun.file(path.join(packageDir, "THIRD-PARTY-NOTICES.txt")).text(),
+		]);
+		expect(code, stderr).toBe(0);
+		expect(stderr).toBe("");
+		expect(stdout).toBe(notices);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 60_000);
