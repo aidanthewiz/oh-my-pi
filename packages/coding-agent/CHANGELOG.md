@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Retire daemon brokers after runtime directory deletion or replacement, including relocated Unix sockets, without removing a successor's lease.
+- Honor live legacy broker leases on Linux and Windows even when they have no filesystem marker.
 - Preserve opaque URI semicolons during path-list expansion. Explicit path arrays disambiguate missing extensionless paths from opaque resources.
 - Retain bounded JSON-query error reasons before truncating large values, including streamed diagnostics and cancellation.
 - Capture artifact approval identities without materializing content, and keep grants scoped to the selected artifact.

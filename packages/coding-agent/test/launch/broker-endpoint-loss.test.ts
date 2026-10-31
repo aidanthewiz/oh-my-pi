@@ -1,12 +1,9 @@
-// Integration test — real timers are required (ts-no-test-timers exception): the bug is a broker that
-// keeps its native scope lease after its runtime dir is deleted, so no replacement broker can bind the
-// socket. Fake timers cannot drive the unix-socket RPC or the replacement broker process. Shutdown is
-// observed by awaiting the broker's own run() promise; a regression leaves it pending, so the test's
-// own timeout surfaces the failure.
+// Integration test — real timers are required (ts-no-test-timers exception): native IPC, process
+// shutdown, and replacement broker startup cannot run on fake timers.
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isEnoent, TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
 import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
@@ -23,7 +20,7 @@ function startBroker(projectDir: string, runtimeDir: string, onListening: () => 
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
 	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
-	process.env[DAEMON_IDLE_GRACE_ENV] = "60000";
+	process.env[DAEMON_IDLE_GRACE_ENV] = "1000";
 	const broker = startDaemonBrokerFromEnvironment({ endpointCheckMs: 50, onListening });
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
 	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
@@ -31,39 +28,106 @@ function startBroker(projectDir: string, runtimeDir: string, onListening: () => 
 	return broker;
 }
 
-describe.skipIf(process.platform === "win32")("daemon broker runtime dir loss", () => {
-	it("hands the scope to a new broker after its runtime dir is deleted under it", async () => {
-		using tempDir = TempDir.createSync("@omp-launch-endpoint-loss-");
-		const projectDir = path.join(tempDir.path(), "project");
-		const runtimeDir = path.join(tempDir.path(), "runtime");
-		await fs.mkdir(projectDir);
+async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error("Broker lifecycle did not settle")), timeoutMs);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
-		const previousTitle = process.title;
-		// Create the client (writes broker.token) before starting the broker, which reads that token.
-		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 1_000 });
-		const listening = Promise.withResolvers<void>();
-		const broker = startBroker(projectDir, daemonBrokerRuntimeDir(runtimeDir), listening.resolve);
-		try {
-			await listening.promise;
-			expect((await client.request({ op: "ping" })).op).toBe("ping");
-
-			// A sweep or cleaner removes the scope, socket and token included, while the broker still
-			// runs with a connected client. The broker must give the scope up rather than keep its lease.
-			await fs.rm(runtimeDir, { recursive: true, force: true });
-			await broker;
-
-			// The same client reconnects: it recreates the token, spawns a fresh broker, and is served.
-			const ping = await client.request({ op: "ping" });
-			if (ping.op !== "ping") throw new Error(`unexpected daemon result ${ping.op}`);
-			expect(ping.projectDir).toBe(client.projectDir);
-		} finally {
-			process.title = previousTitle;
+async function cleanUpReplacement(pidPath: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	for (;;) {
+		const raw = await fs.readFile(pidPath, "utf8").catch(error => {
+			if (isEnoent(error)) return undefined;
+			throw error;
+		});
+		if (raw === undefined) return;
+		const { pid } = JSON.parse(raw) as { pid: number };
+		if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid owned broker PID");
+		if (pid === process.pid) return;
+		if (Date.now() >= deadline) {
 			try {
-				await client.request({ op: "shutdown" });
-			} catch {
-				// The replacement broker may already be gone.
+				process.kill(pid, "SIGKILL");
+			} catch (error) {
+				if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
 			}
-			client.close();
+			throw new Error("Owned replacement broker did not exit after its client closed");
 		}
-	}, 30_000);
+		await Bun.sleep(25);
+	}
+}
+
+describe.skipIf(process.platform === "win32")("daemon broker runtime dir loss", () => {
+	it.each(["deleted", "replaced"] as const)(
+		"hands the scope to a new broker after its runtime dir is %s",
+		async loss => {
+			using tempDir = TempDir.createSync("@omp-launch-endpoint-loss-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime", "long-private-root-".repeat(8));
+			const brokerDir = daemonBrokerRuntimeDir(runtimeDir);
+			const pidPath = path.join(brokerDir, "broker.pid");
+			const tokenPath = path.join(brokerDir, "broker.token");
+			const successorLease = JSON.stringify({ pid: process.pid, successor: true });
+			await fs.mkdir(projectDir);
+
+			const previousTitle = process.title;
+			// Create the client (writes broker.token) before starting the broker, which reads that token.
+			const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 1_000 });
+			const originalToken = await fs.readFile(tokenPath, "utf8");
+			const listening = Promise.withResolvers<void>();
+			const broker = startBroker(projectDir, brokerDir, listening.resolve);
+			try {
+				await within(
+					Promise.race([
+						listening.promise,
+						broker.then(() => {
+							throw new Error("Broker stopped before listening");
+						}),
+					]),
+					5_000,
+				);
+				expect((await client.request({ op: "ping" })).op).toBe("ping");
+
+				// The relocated socket survives deletion of this long private runtime path.
+				if (loss === "deleted") {
+					await fs.rm(runtimeDir, { recursive: true, force: true });
+				} else {
+					await fs.rename(runtimeDir, `${runtimeDir}.retired`);
+					await fs.mkdir(brokerDir, { recursive: true });
+					await fs.writeFile(pidPath, successorLease);
+				}
+				await within(broker, 5_000);
+				if (loss === "replaced") {
+					expect(await fs.readFile(pidPath, "utf8")).toBe(successorLease);
+					await fs.rm(pidPath);
+				}
+
+				// The same client reconnects: it recreates the token, spawns a fresh broker, and is served.
+				const ping = await client.request({ op: "ping" });
+				if (ping.op !== "ping") throw new Error(`unexpected daemon result ${ping.op}`);
+				expect(ping.projectDir).toBe(client.projectDir);
+				expect(await fs.readFile(tokenPath, "utf8")).not.toBe(originalToken);
+			} finally {
+				client.close();
+				try {
+					await within(broker, 5_000);
+				} finally {
+					try {
+						await cleanUpReplacement(pidPath);
+					} finally {
+						process.title = previousTitle;
+					}
+				}
+			}
+		},
+		30_000,
+	);
 });

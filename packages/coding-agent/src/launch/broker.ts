@@ -61,9 +61,8 @@ const READINESS_BUFFER_CHARS = 64 * 1024;
 const RESTART_MAX_DELAY_MS = 30_000;
 const RESTART_BACKOFF_BASE_MS = 1_000;
 /**
- * How often a broker checks that its Unix socket still exists. Something that
- * deletes the runtime dir leaves the broker holding the scope lease while no
- * client can reach it, so the broker gives the scope up instead.
+ * How often a broker checks that its endpoint and runtime directory still
+ * belong to it. Long Unix socket paths can be relocated outside that directory.
  */
 const ENDPOINT_CHECK_MS = 5_000;
 /**
@@ -131,6 +130,7 @@ interface ManagedDaemon {
 
 interface BrokerLease {
 	path: string;
+	identity: { dev: number; ino: number };
 	/** Process-owned native lock; the OS drops it however this broker exits. */
 	lock: FileLock;
 }
@@ -410,7 +410,8 @@ async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise
 			return null;
 		}
 		await fs.writeFile(pidPath, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
-		return { path: pidPath, lock };
+		const identity = await fs.stat(pidPath);
+		return { path: pidPath, identity, lock };
 	} catch (error) {
 		lock.release();
 		throw error;
@@ -419,7 +420,13 @@ async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise
 
 async function releaseBrokerLease(lease: BrokerLease): Promise<void> {
 	try {
-		await fs.rm(lease.path, { force: true });
+		const identity = await fs.stat(lease.path).catch(error => {
+			if (isEnoent(error)) return undefined;
+			throw error;
+		});
+		if (identity?.dev === lease.identity.dev && identity.ino === lease.identity.ino) {
+			await fs.rm(lease.path, { force: true });
+		}
 	} finally {
 		lease.lock.release();
 	}
@@ -491,12 +498,13 @@ class DaemonBroker {
 
 	async run(onListening?: () => void): Promise<void> {
 		await this.#recoverRecords();
+		const runtimeIdentity = await fs.stat(this.#runtimeDir);
 		this.#server = await IpcServer.listen(
 			this.#endpoint,
 			{ framing: "lines", maxFrameBytes: MAX_REQUEST_BYTES },
 			socket => this.#accept(socket),
 		);
-		if (process.platform !== "win32") this.#watchEndpoint();
+		if (process.platform !== "win32") this.#watchEndpoint(runtimeIdentity);
 		this.#scheduleIdleShutdown();
 		onListening?.();
 		await this.#finished.promise;
@@ -1609,29 +1617,31 @@ class DaemonBroker {
 	}
 
 	/**
-	 * Give up the scope once the socket file is gone. The native lease outlives a
-	 * deleted runtime dir, so a broker that kept running would hold the scope
-	 * while every new broker exits on the held lease and every new client fails
-	 * with `connect ENOENT`. Shutting down releases the lease, and the next client
-	 * spawns a broker that rebuilds the scope.
+	 * Retire when the endpoint disappears or the runtime directory is replaced.
+	 * Relocated sockets survive runtime deletion, but their token and lease do not.
 	 */
-	#watchEndpoint(): void {
+	#watchEndpoint(runtimeIdentity: { dev: number; ino: number }): void {
 		this.#endpointTimer = setInterval(() => {
-			void fs
-				.stat(this.#endpoint)
-				.then(
-					() => undefined,
-					error => {
-						if (!isEnoent(error) || this.#shuttingDown) return;
-						logger.warn("Daemon broker socket was deleted; releasing the scope", { endpoint: this.#endpoint });
-						return this.shutdown();
-					},
-				)
-				.catch(error => {
-					logger.warn("Daemon broker shutdown after socket loss failed", {
-						error: error instanceof Error ? error.message : String(error),
-					});
+			void (async () => {
+				let ownsRuntime: boolean;
+				try {
+					const [, currentRuntime] = await Promise.all([fs.stat(this.#endpoint), fs.stat(this.#runtimeDir)]);
+					ownsRuntime = currentRuntime.dev === runtimeIdentity.dev && currentRuntime.ino === runtimeIdentity.ino;
+				} catch (error) {
+					if (!isEnoent(error)) throw error;
+					ownsRuntime = false;
+				}
+				if (ownsRuntime || this.#shuttingDown) return;
+				logger.warn("Daemon broker endpoint or runtime was lost; releasing the scope", {
+					endpoint: this.#endpoint,
+					runtimeDir: this.#runtimeDir,
 				});
+				await this.shutdown();
+			})().catch(error => {
+				logger.warn("Daemon broker shutdown after endpoint or runtime loss failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 		}, this.#endpointCheckMs);
 		this.#endpointTimer.unref();
 	}
@@ -1640,7 +1650,7 @@ class DaemonBroker {
 export interface DaemonBrokerStartOptions {
 	/** Base of the exponential child-restart backoff. */
 	restartBackoffBaseMs?: number;
-	/** How often the broker checks that its socket file still exists. */
+	/** How often the broker checks that its endpoint and runtime directory still belong to it. */
 	endpointCheckMs?: number;
 	/**
 	 * Called once the broker accepts connections. An embedding host connects its
@@ -1678,14 +1688,19 @@ async function acquireLegacyRuntimeLease(legacyRuntimeDir: string): Promise<File
 	const oldRecords = path.join(legacyRuntimeDir, "daemons");
 	const pidPath = path.join(legacyRuntimeDir, PID_FILE);
 	const clientsDir = path.join(legacyRuntimeDir, "clients");
-	if (!(await fs.exists(oldRecords)) && !(await fs.exists(pidPath)) && !(await fs.exists(clientsDir)))
-		return undefined;
+	const hasLegacyState = (await fs.exists(oldRecords)) || (await fs.exists(pidPath)) || (await fs.exists(clientsDir));
+	// Linux and Windows native leases have no filesystem marker.
+	if (!hasLegacyState && process.platform !== "linux" && process.platform !== "win32") return undefined;
 	const lock = FileLock.tryAcquire(pidPath);
 	if (!lock.acquired) {
 		lock.release();
 		throw new Error(`An older daemon broker still owns ${legacyRuntimeDir}; stop it before upgrading.`);
 	}
 	try {
+		if (!hasLegacyState) {
+			lock.release();
+			return undefined;
+		}
 		// Pre-native Windows pipe names differ, so a live legacy PID cannot be disproved by the new endpoint.
 		const legacyPid = process.platform === "win32" ? await readLiveDaemonBrokerPid(legacyRuntimeDir) : undefined;
 		if (legacyPid !== undefined && legacyPid !== process.pid) {
