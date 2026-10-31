@@ -469,11 +469,13 @@ impl<K: Sink> Drop for Ctx<K> {
 struct Owned<K: Sink> {
 	ctx:     Arc<Ctx<K>>,
 	scratch: ManuallyDrop<Scratch<K::State>>,
+	/// Completion must follow publication of the scratch and its path arenas.
+	_done:   flume::Sender<()>,
 }
 
 impl<K: Sink> Owned<K> {
-	const fn new(ctx: Arc<Ctx<K>>, scratch: Scratch<K::State>) -> Self {
-		Self { ctx, scratch: ManuallyDrop::new(scratch) }
+	const fn new(ctx: Arc<Ctx<K>>, scratch: Scratch<K::State>, done: flume::Sender<()>) -> Self {
+		Self { ctx, scratch: ManuallyDrop::new(scratch), _done: done }
 	}
 }
 
@@ -675,7 +677,7 @@ impl<K: Sink> Ctx<K> {
 
 	/// One worker: settles the already listed `root` if it has one (counted
 	/// as a job), runs `first`, then jobs from `queue`, until the walk's last
-	/// job has finished. `_done` disconnects when the worker ends.
+	/// job has finished. Completion follows publication of the worker's scratch.
 	fn work(
 		self: Arc<Self>,
 		scratch: Scratch<K::State>,
@@ -684,8 +686,8 @@ impl<K: Sink> Ctx<K> {
 		queue: flume::Receiver<Option<Job>>,
 		done: flume::Sender<()>,
 	) -> impl Future<Output = ()> + Send {
-		let scratch = Owned::new(Arc::clone(&self), scratch);
-		async move { self.work_owned(scratch, first, root, queue, done).await }
+		let scratch = Owned::new(Arc::clone(&self), scratch, done);
+		async move { self.work_owned(scratch, first, root, queue).await }
 	}
 
 	async fn work_owned(
@@ -694,7 +696,6 @@ impl<K: Sink> Ctx<K> {
 		first: Option<Job>,
 		root: Option<Listed<K>>,
 		queue: flume::Receiver<Option<Job>>,
-		_done: flume::Sender<()>,
 	) {
 		if let Some(root) = root {
 			self.deliver(&mut scratch, root).await;

@@ -35,6 +35,82 @@ fn dropping_an_unpolled_worker_retains_published_path_storage() {
 	assert_eq!(unsafe { published.get() }, b"root/child");
 }
 
+#[tokio::test]
+async fn worker_completion_publishes_entries_before_waking_the_collector() {
+	struct Observe<F>(F);
+	impl<F: Fn() + Send + Sync> std::task::Wake for Observe<F> {
+		fn wake(self: Arc<Self>) {
+			(self.0)();
+		}
+	}
+
+	let tmp = super::super::tests::make_tree("completion-publication", &["child"]);
+	let fs = Fs::native();
+	let (jobs, queue) = flume::unbounded();
+	let sink = CollectSink::new(|_: &mut Worker<'_>, _: &mut Entry<'_>| Action::Continue);
+	let ctx = Arc::new(Ctx {
+		fs: fs.clone(),
+		root: tmp.path().to_path_buf(),
+		opts: Options::default(),
+		sink,
+		ignorer: None,
+		cache: None,
+		root_dev: None,
+		retained: Arc::new(AtomicUsize::new(0)),
+		jobs,
+		workers: 1,
+		pending: AtomicUsize::new(1),
+		scratches: Mutex::new(Vec::new()),
+		shared: Arc::new(Shared::default()),
+		tx: None,
+		total: AtomicUsize::new(0),
+	});
+	let first = Job {
+		parent:   None,
+		rel:      Bytes::EMPTY,
+		name_len: 0,
+		depth:    0,
+		count:    0,
+		frame:    None,
+		out:      None,
+	};
+	let (done_tx, done) = flume::unbounded();
+	let worker = ctx
+		.clone()
+		.work(Scratch::new(&fs, ()), Some(first), None, queue, done_tx);
+	let observed = Arc::new(Mutex::new(None));
+	let waker = std::task::Waker::from(Arc::new(Observe({
+		let ctx = ctx.clone();
+		let observed = observed.clone();
+		move || {
+			let scratches = ctx.scratches.lock();
+			let entries: Vec<Vec<u8>> = scratches
+				.iter()
+				.flat_map(|scratch| &scratch.out)
+				.map(|entry| {
+					// SAFETY: the locked scratches own every observed path arena.
+					unsafe { entry.path.get() }.to_vec()
+				})
+				.collect();
+			*observed.lock() = Some(entries);
+		}
+	})));
+	let mut completion = std::pin::pin!(done.recv_async());
+	assert!(
+		completion
+			.as_mut()
+			.poll(&mut std::task::Context::from_waker(&waker))
+			.is_pending()
+	);
+	worker.await;
+	assert_eq!(
+		*observed.lock(),
+		Some(vec![b"child".to_vec()]),
+		"completion must expose all collected entries and their owning arenas"
+	);
+	assert!(completion.await.is_err());
+}
+
 #[test]
 fn sorted_slots_release_deep_and_shared_subtrees_iteratively() {
 	if super::super::tests::isolated_case(
